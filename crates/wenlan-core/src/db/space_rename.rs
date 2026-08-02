@@ -36,9 +36,10 @@ use crate::WenlanError;
 /// invokes this only after the memories/entities/pages cascade has run.
 ///
 /// A `true` in the second field means a row already keyed to the destination
-/// name would collide on the PRIMARY KEY, so that row is retired before the
-/// rewrite. This is not defensive: the ORDINARY rename hits it. The pre-existing
-/// `pages` cascade fires `m4_page_community_page_invalidate`, which does
+/// name would collide on the PRIMARY KEY. Re-derivable community control rows
+/// are retired before the rewrite. This is not defensive: the ORDINARY rename
+/// hits it. The pre-existing `pages` cascade fires
+/// `m4_page_community_page_invalidate`, which does
 /// `INSERT OR IGNORE INTO community_route_space_inputs (NEW.space, 0)`
 /// (`db.rs:11014`) — so by the time this runs, a row under the destination name
 /// already exists, created by this very rename.
@@ -50,10 +51,11 @@ use crate::WenlanError;
 ///
 /// Rows that predate the rename are orphans by construction. `spaces.name` is
 /// UNIQUE, so a rename to a live space fails before the cascade runs and any
-/// surviving row under that name names no live space; every table here holds
-/// derived state its producer re-derives (Leiden recomputes communities and
-/// members, leases expire, receipts are re-proven, genesis coverage is
-/// re-derived per epoch).
+/// surviving community row under that name names no live space. The genesis
+/// rows are different: they carry permanent provenance/coverage and may never
+/// be retired merely because their space name does not currently resolve. The
+/// destination fence below therefore refuses the entire rename when any such
+/// row exists.
 const CLOSURE: &[(&str, bool)] = &[
     ("communities", false),
     ("community_members", true),
@@ -85,6 +87,13 @@ const CLOSURE: &[(&str, bool)] = &[
     ("genesis_frontier", true),
 ];
 
+const PERMANENT_GENESIS_TABLES: &[&str] = &[
+    "genesis_candidates",
+    "genesis_coverage_state",
+    "genesis_group_coverage",
+    "genesis_frontier",
+];
+
 /// Rewrite every space-keyed row from `old_name` to `new_name` inside the
 /// caller's transaction. The caller must already have renamed the `spaces` row
 /// and cascaded `memories`, `entities`, and `pages` (see the `edges` fence
@@ -96,6 +105,34 @@ pub(super) async fn cascade_space_rename(
 ) -> Result<(), WenlanError> {
     // Table names come from `CLOSURE`, never from a caller; the space names are
     // parameterized.
+    for table in PERMANENT_GENESIS_TABLES {
+        let mut rows = tx
+            .query(
+                &format!("SELECT 1 FROM {table} WHERE space = ?1 LIMIT 1"),
+                libsql::params![new_name],
+            )
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!(
+                    "update_space inspect destination genesis {table}: {e}"
+                ))
+            })?;
+        if rows
+            .next()
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!(
+                    "update_space inspect destination genesis {table}: {e}"
+                ))
+            })?
+            .is_some()
+        {
+            return Err(WenlanError::Validation(format!(
+                "destination genesis table {table} already has rows for space {new_name:?}"
+            )));
+        }
+    }
+
     for (table, space_in_primary_key) in CLOSURE {
         if !space_in_primary_key {
             continue;

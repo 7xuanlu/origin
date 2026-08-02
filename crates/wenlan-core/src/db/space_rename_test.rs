@@ -132,6 +132,42 @@ async fn seed_substrate(conn: &libsql::Connection, space: &str) {
     }
 }
 
+async fn seed_destination_genesis(conn: &libsql::Connection) {
+    let stmts = [
+        "INSERT INTO genesis_candidates
+             (candidate_id, slot_id, page_id, space, signal_kind, coverage_epoch,
+              input_generation, active_root_digest, state, created_at, updated_at)
+         VALUES ('cand-destination', 'slot-destination', 'page-destination', ?1,
+                 'evidence-cluster', 7, 11, 'destination-root', 'published', 2, 3)",
+        "INSERT INTO genesis_coverage_state
+             (space, coverage_epoch, epoch_state, opened_at, genesis_enabled)
+         VALUES (?1, 7, 'active', 2, 1)",
+        "INSERT INTO genesis_group_coverage
+             (space, independence_group_id, coverage_epoch, page_id, candidate_id, covered_at)
+         VALUES (?1, 'grp-destination', 7, 'page-destination', 'cand-destination', 4)",
+        "INSERT INTO genesis_frontier
+             (space, independence_group_id, coverage_epoch, first_seen_at, next_scan_at)
+         VALUES (?1, 'grp-destination', 7, 5, 6)",
+    ];
+    for sql in stmts {
+        conn.execute(sql, libsql::params![NEW])
+            .await
+            .unwrap_or_else(|e| panic!("seed destination genesis failed: {sql}\n{e}"));
+    }
+}
+
+async fn seed_source_evidence(conn: &libsql::Connection) {
+    conn.execute(
+        "INSERT INTO genesis_candidate_roots
+             (candidate_id, root_id, independence_group_id, coverage_epoch,
+              claim_role, consumed, retained, created_at)
+         VALUES ('cand-1', 'root-source', 'grp-source', 1, 'concept', 1, 1, 7)",
+        (),
+    )
+    .await
+    .expect("seed source genesis evidence");
+}
+
 async fn rows_naming(conn: &libsql::Connection, table: &str, space: &str) -> i64 {
     let mut rows = conn
         .query(
@@ -244,6 +280,78 @@ async fn an_orphan_row_under_the_new_name_is_retired() {
     assert_eq!(count, 1, "the orphan must be retired, not kept alongside");
     assert_eq!(generation, 0, "the renamed row must be the survivor");
     assert_eq!(dirty, 1, "the renamed row must be the survivor");
+}
+
+#[tokio::test]
+async fn destination_genesis_rows_refuse_the_rename_without_mutating_either_side() {
+    let (db, _dir) = seeded_db().await;
+    {
+        let conn = db.conn.lock().await;
+        seed_source_evidence(&conn).await;
+        seed_destination_genesis(&conn).await;
+    }
+
+    let error = db
+        .update_space(OLD, NEW, Some("renamed"))
+        .await
+        .expect_err("permanent destination genesis rows must refuse the rename");
+    assert!(
+        error.to_string().contains("destination genesis"),
+        "rename was refused for the wrong reason: {error}"
+    );
+
+    assert!(db.get_space(OLD).await.unwrap().is_some());
+    assert!(db.get_space(NEW).await.unwrap().is_none());
+
+    let conn = db.conn.lock().await;
+    for table in closed_tables() {
+        assert_eq!(
+            rows_naming(&conn, table, OLD).await,
+            1,
+            "source row in {table} was not rolled back"
+        );
+    }
+    for table in [
+        "genesis_candidates",
+        "genesis_coverage_state",
+        "genesis_group_coverage",
+        "genesis_frontier",
+    ] {
+        assert_eq!(
+            rows_naming(&conn, table, NEW).await,
+            1,
+            "destination row in {table} changed during the refused rename"
+        );
+    }
+
+    let mut rows = conn
+        .query(
+            "SELECT candidate_id, coverage_epoch, input_generation, active_root_digest, state
+             FROM genesis_candidates WHERE space = ?1",
+            libsql::params![NEW],
+        )
+        .await
+        .unwrap();
+    let candidate = rows.next().await.unwrap().unwrap();
+    assert_eq!(candidate.get::<String>(0).unwrap(), "cand-destination");
+    assert_eq!(candidate.get::<i64>(1).unwrap(), 7);
+    assert_eq!(candidate.get::<i64>(2).unwrap(), 11);
+    assert_eq!(candidate.get::<String>(3).unwrap(), "destination-root");
+    assert_eq!(candidate.get::<String>(4).unwrap(), "published");
+
+    let mut rows = conn
+        .query(
+            "SELECT root_id, independence_group_id, consumed, retained
+             FROM genesis_candidate_roots WHERE candidate_id = 'cand-1'",
+            (),
+        )
+        .await
+        .unwrap();
+    let evidence = rows.next().await.unwrap().unwrap();
+    assert_eq!(evidence.get::<String>(0).unwrap(), "root-source");
+    assert_eq!(evidence.get::<String>(1).unwrap(), "grp-source");
+    assert_eq!(evidence.get::<i64>(2).unwrap(), 1);
+    assert_eq!(evidence.get::<i64>(3).unwrap(), 1);
 }
 
 #[tokio::test]
