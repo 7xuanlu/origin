@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.15.4](https://github.com/7xuanlu/wenlan/compare/v0.15.3...v0.15.4) (2026-08-02)
+
+
+### Features
+
+* complete M6 migration 109 substrate follow-up ([#437](https://github.com/7xuanlu/wenlan/issues/437)) ([247185b](https://github.com/7xuanlu/wenlan/commit/247185ba215d3426a4a1f2b97ad76d924fd1b30d))
+* enforce truth-aware page exposure ([#429](https://github.com/7xuanlu/wenlan/issues/429)) ([5141f7b](https://github.com/7xuanlu/wenlan/commit/5141f7bf21586aee75a1204607651b1eba484c42))
+* land M6 deterministic identity primitives and genesis substrate ([#433](https://github.com/7xuanlu/wenlan/issues/433)) ([aa77814](https://github.com/7xuanlu/wenlan/commit/aa77814c6a736e8ffef128e013ece56357f33481))
+
+
+### Bug Fixes
+
+* fence M5 derivation runs and bound reconciliation ([#439](https://github.com/7xuanlu/wenlan/issues/439)) ([f9b0789](https://github.com/7xuanlu/wenlan/commit/f9b07890d34697cc058e139d50bb250773fed50a))
+* focus affected tests and harden release fallback ([#438](https://github.com/7xuanlu/wenlan/issues/438)) ([228576a](https://github.com/7xuanlu/wenlan/commit/228576a55d15bfc1c5af640302e4d0c4ab485add))
+* keep release candidate tree current ([#436](https://github.com/7xuanlu/wenlan/issues/436)) ([9098693](https://github.com/7xuanlu/wenlan/commit/90986936e949416f7b0faa90324f084ff7a11602))
+* publish tested release artifacts ([#431](https://github.com/7xuanlu/wenlan/issues/431)) ([096af3f](https://github.com/7xuanlu/wenlan/commit/096af3f9a9919162bd4966d82ba1ed6cfec18565))
+
 ## [0.15.3](https://github.com/7xuanlu/wenlan/compare/v0.15.2...v0.15.3) (2026-08-01)
 
 
