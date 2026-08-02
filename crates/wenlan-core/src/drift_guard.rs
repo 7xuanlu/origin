@@ -2259,6 +2259,12 @@ fn ci_routing_contract_violations(
                 .into(),
         );
     }
+    if !rust_paths.contains("release-please-config.json") {
+        violations.push(
+            "release-please config cannot bootstrap its fail-closed policy contract through rust"
+                .into(),
+        );
+    }
     if !rust_paths.contains("clippy.toml") {
         violations.push(
             "clippy configuration cannot bootstrap its syntax-aware FastEmbed guard through rust"
@@ -3360,7 +3366,7 @@ fn ci_release_reuse_and_linux_shards_are_fail_closed() {
         .unwrap_or_default();
     assert_eq!(
         proof_test,
-        "python3 scripts/verify-release-merge.test.py\npython3 scripts/release-promotion.test.py\n",
+        "python3 scripts/verify-release-merge.test.py\npython3 scripts/release-promotion.test.py\npython3 scripts/sync-release-pr.test.py\n",
         "release proof tests must run before routing"
     );
     assert_eq!(
@@ -4690,6 +4696,7 @@ fn release_promotion_contract_violations(
     fast_maintenance_workflow: &str,
     release_workflow: &str,
     promotion_script: &str,
+    sync_release_pr_script: &str,
 ) -> Vec<String> {
     let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
     let release_please: serde_yaml::Value =
@@ -4796,18 +4803,6 @@ fn release_promotion_contract_violations(
         "maintain-release-pr",
         "googleapis/release-please-action",
     );
-    let fast_push = job_step(
-        &fast_maintenance,
-        "maintain-release-pr",
-        "Commit synced versions to release PR branch",
-    )
-    .and_then(|step| step["run"].as_str())
-    .unwrap_or_default();
-    let push_commands = fast_push
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("git push"))
-        .collect::<Vec<_>>();
     if fast_job["if"].as_str()
         != Some("github.event_name == 'push' && github.ref == 'refs/heads/main'")
         || fast_job["timeout-minutes"].as_u64() != Some(5)
@@ -4818,7 +4813,6 @@ fn release_promotion_contract_violations(
         || fast_action.and_then(|step| step["uses"].as_str())
             != Some("googleapis/release-please-action@0dfd8538845b8e92600d271a895a5372865d4062")
         || fast_action.and_then(|step| step["with"]["skip-github-release"].as_bool()) != Some(true)
-        || push_commands != ["git push origin HEAD"]
     {
         violations.push(
             "fast release maintenance is not pinned, least-privilege, PR-only, and non-force"
@@ -4842,6 +4836,135 @@ fn release_promotion_contract_violations(
         if fast_maintenance_workflow.contains(forbidden) {
             violations.push(format!(
                 "fast release maintenance contains publishing or lifecycle mutation {forbidden:?}"
+            ));
+        }
+    }
+    for (workflow, label, trusted_ref) in [
+        (&fast_maintenance, "fast", "${{ github.sha }}"),
+        (
+            &release_please,
+            "fallback",
+            "${{ github.event.workflow_run.head_sha }}",
+        ),
+    ] {
+        let trusted_checkout = job_step(
+            workflow,
+            "maintain-release-pr",
+            "Checkout trusted release PR synchronizer",
+        );
+        let resolver = job_step(
+            workflow,
+            "maintain-release-pr",
+            "Resolve exact pending Release PR",
+        );
+        let exact_checkout = job_step(
+            workflow,
+            "maintain-release-pr",
+            "Checkout exact release PR head",
+        );
+        let synchronizer = job_step(
+            workflow,
+            "maintain-release-pr",
+            "Merge main and sync release PR branch",
+        );
+        if trusted_checkout.and_then(|step| step["uses"].as_str())
+            != Some("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803")
+            || trusted_checkout.and_then(|step| step["with"]["ref"].as_str()) != Some(trusted_ref)
+            || trusted_checkout.and_then(|step| step["with"]["persist-credentials"].as_bool())
+                != Some(false)
+        {
+            violations.push(format!(
+                "{label} maintenance does not stage the trusted synchronizer without credentials"
+            ));
+        }
+        let resolver_run = resolver
+            .and_then(|step| step["run"].as_str())
+            .unwrap_or_default();
+        if resolver.and_then(|step| step["id"].as_str()) != Some("release_pr")
+            || resolver.and_then(|step| step["env"]["GITHUB_TOKEN"].as_str())
+                != Some("${{ github.token }}")
+            || !resolver_run.contains("scripts/sync-release-pr.py")
+            || !resolver_run.contains("scripts/bump-version.sh")
+            || !resolver_run.contains("sync-release-pr.py\" resolve")
+            || !resolver_run.contains("--github-output \"$GITHUB_OUTPUT\"")
+        {
+            violations.push(format!(
+                "{label} maintenance does not use the trusted exact Release PR resolver"
+            ));
+        }
+        if exact_checkout.and_then(|step| step["uses"].as_str())
+            != Some("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803")
+            || exact_checkout.and_then(|step| step["if"].as_str())
+                != Some("steps.release_pr.outputs.release_pr_state == 'present'")
+            || exact_checkout.and_then(|step| step["with"]["ref"].as_str())
+                != Some("${{ steps.release_pr.outputs.release_pr_head_sha }}")
+            || exact_checkout.and_then(|step| step["with"]["token"].as_str())
+                != Some("${{ secrets.RELEASE_TOKEN }}")
+            || exact_checkout.and_then(|step| step["with"]["fetch-depth"].as_u64()) != Some(0)
+            || exact_checkout.and_then(|step| step["with"]["persist-credentials"].as_bool())
+                != Some(true)
+        {
+            violations.push(format!(
+                "{label} maintenance checkout is not bound to the immutable resolved head"
+            ));
+        }
+        let sync_run = synchronizer
+            .and_then(|step| step["run"].as_str())
+            .unwrap_or_default();
+        if synchronizer.and_then(|step| step["if"].as_str())
+            != Some("steps.release_pr.outputs.release_pr_state == 'present'")
+            || !sync_run.contains("sync-release-pr.py\" sync")
+            || !sync_run.contains(
+                "--expected-head-sha \"${{ steps.release_pr.outputs.release_pr_head_sha }}\"",
+            )
+            || !sync_run.contains("--bump-script \"$RUNNER_TEMP/bump-version.sh\"")
+        {
+            violations.push(format!(
+                "{label} maintenance does not invoke the shared branch synchronizer"
+            ));
+        }
+        let job_text =
+            serde_yaml::to_string(&workflow["jobs"]["maintain-release-pr"]).unwrap_or_default();
+        if job_text.contains("steps.release.outputs.pr") {
+            violations.push(format!(
+                "{label} maintenance still trusts the optional action PR output"
+            ));
+        }
+    }
+    for required in [
+        "\"X-GitHub-Api-Version\": \"2026-03-10\"",
+        "\"state\": \"open\"",
+        "\"base\": BASE_BRANCH",
+        "\"head\": f\"{RELEASE_AUTHOR}:{RELEASE_BRANCH}\"",
+        "if owner != RELEASE_AUTHOR:",
+        "if not payload:",
+        "if len(payload) != 1:",
+        "user.get(\"login\") != RELEASE_AUTHOR",
+        "head[\"repo\"].get(\"full_name\") != repository",
+        "current != expected_head_sha",
+        "[\"git\", \"fetch\", \"--no-tags\", \"origin\", BASE_BRANCH]",
+        "[\"git\", \"merge\", \"--no-edit\", \"origin/main\"]",
+        "[\"bash\", str(bump_script)]",
+        "[\"git\", \"ls-remote\", \"--exit-code\", \"origin\", f\"refs/heads/{RELEASE_BRANCH}\"]",
+        "remote_shas != [expected_head_sha]",
+        "\"HEAD:refs/heads/release-please--branches--main\"",
+        "except subprocess.CalledProcessError as error:",
+    ] {
+        if !sync_release_pr_script.contains(required) {
+            violations.push(format!("release PR synchronizer omits {required:?}"));
+        }
+    }
+    for forbidden in [
+        "git rebase",
+        "--force",
+        "\"-f\"",
+        "git tag",
+        "gh release",
+        "refs/tags/",
+    ] {
+        if sync_release_pr_script.contains(forbidden) {
+            violations.push(format!(
+                "release PR synchronizer contains unsafe mutation {forbidden:?}"
             ));
         }
     }
@@ -5061,6 +5184,8 @@ fn release_promotion_reuses_exact_archives_and_fails_closed() {
         std::fs::read_to_string(root.join(".github/workflows/release.yml")).expect("read release");
     let promotion = std::fs::read_to_string(root.join("scripts/release-promotion.py"))
         .expect("read promotion resolver");
+    let sync_release_pr = std::fs::read_to_string(root.join("scripts/sync-release-pr.py"))
+        .expect("read release PR synchronizer");
     let violations = release_promotion_contract_violations(
         &ci,
         &release_please,
@@ -5068,6 +5193,7 @@ fn release_promotion_reuses_exact_archives_and_fails_closed() {
         &fast_maintenance,
         &release,
         &promotion,
+        &sync_release_pr,
     );
     assert!(
         violations.is_empty(),
@@ -5099,6 +5225,8 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
             "MAX_RECEIPT_CANDIDATES = 20",
             "MAX_RECEIPT_CANDIDATES = 1000",
         );
+    let sync_release_pr = std::fs::read_to_string(root.join("scripts/sync-release-pr.py"))
+        .expect("read release PR synchronizer");
     let violations = release_promotion_contract_violations(
         &ci,
         &release_please,
@@ -5106,6 +5234,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
         &fast_maintenance,
         &release,
         &promotion,
+        &sync_release_pr,
     );
     for expected in ["duplicate compilation", "MAX_RECEIPT_CANDIDATES"] {
         assert!(
@@ -5130,12 +5259,68 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
             &fast_maintenance,
             &release,
             &promotion,
+            &sync_release_pr,
         );
         assert!(
             config_violations
                 .iter()
                 .any(|item| item.contains("always-update is not exact true")),
             "{label} always-update mutation must fail closed: {config_violations:?}"
+        );
+    }
+    for (label, old, new) in [
+        ("zero", "if not payload:", "if False:"),
+        ("multiple", "if len(payload) != 1:", "if False:"),
+        (
+            "repository owner",
+            "if owner != RELEASE_AUTHOR:",
+            "if False:",
+        ),
+        (
+            "identity",
+            "user.get(\"login\") != RELEASE_AUTHOR",
+            "user.get(\"login\") == RELEASE_AUTHOR",
+        ),
+        (
+            "immutable checkout",
+            "current != expected_head_sha",
+            "False",
+        ),
+        (
+            "remote branch move",
+            "remote_shas != [expected_head_sha]",
+            "False",
+        ),
+        (
+            "merge",
+            "[\"git\", \"merge\", \"--no-edit\", \"origin/main\"]",
+            "[\"git\", \"rebase\", \"origin/main\"]",
+        ),
+        (
+            "non-force push",
+            "\"HEAD:refs/heads/release-please--branches--main\"",
+            "\"+HEAD:refs/heads/release-please--branches--main\"",
+        ),
+    ] {
+        assert!(
+            sync_release_pr.contains(old),
+            "stale {label} mutation fixture"
+        );
+        let mutated_sync = sync_release_pr.replacen(old, new, 1);
+        let sync_violations = release_promotion_contract_violations(
+            &ci,
+            &release_please,
+            &release_please_config,
+            &fast_maintenance,
+            &release,
+            &promotion,
+            &mutated_sync,
+        );
+        assert!(
+            sync_violations
+                .iter()
+                .any(|item| item.contains("release PR synchronizer")),
+            "{label} synchronizer mutation must fail closed: {sync_violations:?}"
         );
     }
     let duplicate_publish_verification =
@@ -5153,6 +5338,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
         &duplicate_publish_verification,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
             .expect("read promotion resolver"),
+        &sync_release_pr,
     );
     assert!(
         duplicate_publish_violations
@@ -5174,6 +5360,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
         &retry_unsafe_release,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
             .expect("read promotion resolver"),
+        &sync_release_pr,
     );
     assert!(
         retry_violations
@@ -5193,6 +5380,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
         &mutable_tag_release,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
             .expect("read promotion resolver"),
+        &sync_release_pr,
     );
     assert!(
         mutable_tag_violations
@@ -5212,6 +5400,7 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
         &stable_incremental_release,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
             .expect("read promotion resolver"),
+        &sync_release_pr,
     );
     assert!(
         stable_violations
@@ -5227,8 +5416,10 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
             "group: release-please-main",
         )
         .replace("queue: max", "queue: single")
-        .replace("run: bash scripts/bump-version.sh", "run: gh api /git/refs")
-        .replace("git push origin HEAD", "git push --force origin HEAD");
+        .replace(
+            "ref: ${{ steps.release_pr.outputs.release_pr_head_sha }}",
+            "ref: release-please--branches--main",
+        );
     let unsafe_release_please = release_please
         .replace(
             "github.event.workflow_run.conclusion == 'success'",
@@ -5246,11 +5437,13 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
         &std::fs::read_to_string(root.join(".github/workflows/release.yml")).expect("read release"),
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
             .expect("read promotion resolver"),
+        &sync_release_pr,
     );
     for expected in [
         "fixed maintenance lock",
         "pinned, least-privilege, PR-only, and non-force",
         "publishing or lifecycle mutation",
+        "immutable resolved head",
         "observed successful main receipt",
     ] {
         assert!(

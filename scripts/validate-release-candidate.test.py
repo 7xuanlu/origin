@@ -182,7 +182,11 @@ def release_contents() -> tuple[dict[str, str], dict[str, str]]:
     old["release-please-config.json"] = json.dumps(
         {
             "packages": {
-                ".": {"release-type": "simple", "versioning": "always-bump-patch"}
+                ".": {
+                    "release-type": "simple",
+                    "versioning": "always-bump-patch",
+                    "always-update": True,
+                }
             },
             "$schema": "https://example.invalid/release-please.schema.json",
         }
@@ -933,13 +937,29 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
     def test_always_bump_patch_and_release_as_are_fail_closed(self) -> None:
         base = {
             "packages": {
-                ".": {"release-type": "simple", "versioning": "always-bump-patch"}
+                ".": {
+                    "release-type": "simple",
+                    "versioning": "always-bump-patch",
+                    "always-update": True,
+                }
             },
             "$schema": "https://example.invalid/schema.json",
         }
         VALIDATOR._release_version_policy(json.dumps(base), "0.15.3", "0.15.4")
         with self.assertRaisesRegex(VALIDATOR.CandidateError, "next patch"):
             VALIDATOR._release_version_policy(json.dumps(base), "0.15.3", "9.9.9")
+        for mutation in [False, None]:
+            with self.subTest(always_update=mutation), self.assertRaisesRegex(
+                VALIDATOR.CandidateError, "closed always-bump-patch"
+            ):
+                hostile = json.loads(json.dumps(base))
+                if mutation is None:
+                    del hostile["packages"]["."]["always-update"]
+                else:
+                    hostile["packages"]["."]["always-update"] = mutation
+                VALIDATOR._release_version_policy(
+                    json.dumps(hostile), "0.15.3", "0.15.4"
+                )
         base["packages"]["."]["release-as"] = "1.0.0"
         VALIDATOR._release_version_policy(json.dumps(base), "0.15.3", "1.0.0")
         with self.assertRaisesRegex(VALIDATOR.CandidateError, "exactly match release-as"):

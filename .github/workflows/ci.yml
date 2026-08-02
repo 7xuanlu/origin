@@ -142,6 +142,7 @@ jobs:
               # on the one PR class most likely to introduce drift.
               - 'version.txt'
               - '.release-please-manifest.json'
+              - 'release-please-config.json'
             plugin:
               - 'plugin/**'
               - 'plugin-codex/**'
@@ -423,6 +424,7 @@ jobs:
         run: |
           python3 scripts/verify-release-merge.test.py
           python3 scripts/release-promotion.test.py
+          python3 scripts/sync-release-pr.test.py
       # A release-please PR already proved and sealed its exact six archives.
       # Main reuses that proof only after a bounded wait for the trusted
       # observer's small closed receipt. An ordinary main push keeps the full
