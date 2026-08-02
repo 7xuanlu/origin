@@ -7,10 +7,12 @@
 //! on purpose (update the `*_violations` fn AND its positive control). New teeth
 //! follow the same form.
 
+use proc_macro2::LineColumn;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use syn::parse::{Parse, ParseStream, Parser as _};
+use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{Expr, Lit, Pat, Token};
 
@@ -7813,92 +7815,6 @@ fn db_domain_guard_rejects_missing_duplicate_inline_and_visible_scope_drift() {
 
 // ── Teeth #15: every production `INSERT INTO pages` names `kind` ──
 
-/// True when this attribute SPAN makes what it applies to test-only, judged by
-/// the same predicate the AST half uses.
-///
-/// The lexical half used to compare against the exact text `#[cfg(test)]`, which
-/// the AST half stopped doing in round 5. That left the two halves of this tooth
-/// disagreeing: `#[cfg(all(test, feature = "slow"))]` is every bit as test-only,
-/// and the visitor gates cannot retract a finding the text scan has already
-/// recorded — so a test-only comparison surfaced as a production finding no
-/// matter what the parser decided.
-///
-/// Round 7 fixed the PREDICATE and left the SHAPE wrong: it still asked whether
-/// one line both began and ended an attribute, so the equally valid
-///
-/// ```text
-/// #[cfg(
-///     all(test, feature = "slow")
-/// )]
-/// ```
-///
-/// was not a gate, and neither was an attribute sharing its line with the item
-/// it gates. Spans replace lines here, so formatting stops being a semantic
-/// signal. A span that will not parse is left in place and therefore SCANNED —
-/// unreadable is not clean, and the bias stays with the visible false finding.
-fn attribute_gates_out_of_production(span: &str, inner: bool) -> bool {
-    let parsed = if inner {
-        syn::Attribute::parse_inner.parse_str(span)
-    } else {
-        syn::Attribute::parse_outer.parse_str(span)
-    };
-    parsed.is_ok_and(|attrs| is_cfg_test(&attrs))
-}
-
-/// Index just past the `]` closing the bracket that opens at `open`.
-///
-/// Counted on the MASKED text, so a bracket inside a string or a comment can
-/// neither open nor close an attribute.
-fn bracket_end(masked: &[u8], open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (offset, byte) in masked[open..].iter().enumerate() {
-        match byte {
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(open + offset + 1);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Index just past the item an attribute applies to: the closing brace of a
-/// braced item, or the `;` of a plain one.
-///
-/// Depth is counted over all three bracket kinds, so the `;` inside `[u8; 3]`
-/// cannot end the item early. Ending early is the safe direction anyway — it
-/// leaves the rest of the item scanned, a false finding at worst — while ending
-/// late would blank the production code that follows, which is a silent hole.
-fn item_end(masked: &[u8], from: usize) -> usize {
-    let (mut curly, mut round, mut square) = (0usize, 0usize, 0usize);
-    let mut entered_braces = false;
-    for (offset, byte) in masked[from..].iter().enumerate() {
-        match byte {
-            b'{' => {
-                curly += 1;
-                entered_braces = true;
-            }
-            b'}' => {
-                curly = curly.saturating_sub(1);
-                if entered_braces && curly == 0 {
-                    return from + offset + 1;
-                }
-            }
-            b'(' => round += 1,
-            b')' => round = round.saturating_sub(1),
-            b'[' => square += 1,
-            b']' => square = square.saturating_sub(1),
-            b';' if curly == 0 && round == 0 && square == 0 => return from + offset + 1,
-            _ => {}
-        }
-    }
-    masked.len()
-}
-
 /// Overwrite `[from, to)` with spaces, leaving newlines alone so reported
 /// offsets still line up with the file.
 fn blank_span(out: &mut [u8], from: usize, to: usize) {
@@ -7907,73 +7823,6 @@ fn blank_span(out: &mut [u8], from: usize, to: usize) {
             *byte = b' ';
         }
     }
-}
-
-/// Blank out `cfg`-gated test-only items so a test fixture sitting beside
-/// production code is not mistaken for a production writer. Brace-balanced
-/// rather than truncating at the first marker, because the gate also appears
-/// as a statement *inside* production functions (`page_drafts.rs` gates a test
-/// hook two statements above the real Page-draft INSERT) — truncating there
-/// would blind the scan to the very write it exists to check. Line count is
-/// preserved so reported offsets still line up with the file.
-fn strip_cfg_test_items(source: &str) -> String {
-    // Structure is read off the masked twin, content off the original: a brace
-    // living inside a string or a comment must not move the depth counter, or
-    // the region "ends" in the wrong place and real production code after it
-    // gets blanked from the scan — a silent false negative in a fail-closed
-    // guard, which is worse than no guard at all. Scanning the masked twin also
-    // means a `#[cfg(test)]` written inside a comment or a string is already
-    // blanked and never reaches this loop at all.
-    let masked = mask_lexical(source, false);
-    let masked = masked.as_bytes();
-    let mut out = source.as_bytes().to_vec();
-    let mut brace_depth = 0usize;
-    let mut cursor = 0usize;
-    while cursor < masked.len() {
-        match masked[cursor] {
-            b'{' => brace_depth += 1,
-            b'}' => brace_depth = brace_depth.saturating_sub(1),
-            b'#' => {
-                let inner = masked.get(cursor + 1) == Some(&b'!');
-                let open = if inner { cursor + 2 } else { cursor + 1 };
-                if masked.get(open) == Some(&b'[') {
-                    if let Some(close) = bracket_end(masked, open) {
-                        let gates = source
-                            .get(cursor..close)
-                            .is_some_and(|span| attribute_gates_out_of_production(span, inner));
-                        // An inner attribute outside every brace is the FILE's
-                        // own, and gates every item in it. Inside braces it
-                        // belongs to a block this lexical pass cannot delimit,
-                        // so only the attribute is blanked and the block stays
-                        // scanned — the cry-wolf direction. The AST half reads
-                        // that case through the item's own attribute list.
-                        cursor = match (gates, inner) {
-                            (false, _) => close,
-                            (true, false) => {
-                                let end = item_end(masked, close);
-                                blank_span(&mut out, cursor, end);
-                                end
-                            }
-                            (true, true) if brace_depth == 0 => {
-                                blank_span(&mut out, cursor, masked.len());
-                                masked.len()
-                            }
-                            (true, true) => {
-                                blank_span(&mut out, cursor, close);
-                                close
-                            }
-                        };
-                        continue;
-                    }
-                }
-            }
-            _ => {}
-        }
-        cursor += 1;
-    }
-    // Blanking only ever writes ASCII spaces over whole bytes, so what comes
-    // back is still the UTF-8 that went in.
-    String::from_utf8(out).expect("blanking writes only ASCII spaces")
 }
 
 /// Blank comments — and, when `keep_strings` is false, string and char literals
@@ -8335,6 +8184,87 @@ fn page_insert_kind_guard_is_fail_closed_after_test_items() {
     );
 }
 
+/// A cfg attribute gates the syntactic node that OWNS it, not the next braced
+/// item or semicolon-terminated statement. The old lexical delimiter applied
+/// one item-shaped heuristic everywhere, so an attribute on a parameter, arm,
+/// or field could consume later production code and make both teeth pass on
+/// code they never scanned.
+#[test]
+fn cfg_stripping_preserves_production_after_nested_attribute_positions() {
+    let path = "crates/wenlan-core/src/somewhere.rs";
+    let fixtures = [
+        (
+            "function parameter",
+            "fn create(#[cfg(test)] _: (), page: &Page) {\n\
+                 if page.kind.as_str() == \"source\" {}\n\
+                 tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n\
+             }",
+        ),
+        (
+            "closure parameter",
+            "fn create(page: &Page) {\n\
+                 let _probe = |#[cfg(test)] _: (), value: u8| value;\n\
+                 if page.kind.as_str() == \"source\" {}\n\
+                 tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n\
+             }",
+        ),
+        (
+            "match arm",
+            "fn create(page: &Page, tag: &str) {\n\
+                 let _ = match tag {\n\
+                     #[cfg(test)] \"probe\" => 0,\n\
+                     _ => {\n\
+                         if page.kind.as_str() == \"source\" {}\n\
+                         tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n\
+                         1\n\
+                     }\n\
+                 };\n\
+             }",
+        ),
+        (
+            "struct field",
+            "struct Probe { #[cfg(test)] only: (), value: u8 }\n\
+             fn create(page: &Page) {\n\
+                 if page.kind.as_str() == \"source\" {}\n\
+                 tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n\
+             }",
+        ),
+    ];
+
+    for (label, source) in fixtures {
+        assert_eq!(
+            page_kind_routing_sites(path, source),
+            [format!("{path}: kind == \"source\"")],
+            "a cfg-gated {label} must not blank the production comparison after it"
+        );
+        assert_eq!(
+            page_insert_sites_without_kind(path, source),
+            [format!("{path}: id, title")],
+            "a cfg-gated {label} must not blank the production INSERT after it"
+        );
+    }
+
+    let token_whitespace = "# [cfg(test)]\n\
+         fn probe(page: &Page) {\n\
+             if page.kind.as_str() == \"source\" {}\n\
+             tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n\
+         }\n\
+         fn create(page: &Page) {\n\
+             if page.kind.as_str() == \"source\" {}\n\
+             tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n\
+         }";
+    assert_eq!(
+        page_kind_routing_sites(path, token_whitespace),
+        [format!("{path}: kind == \"source\"")],
+        "whitespace between `#` and `[` must not expose a test-only comparison"
+    );
+    assert_eq!(
+        page_insert_sites_without_kind(path, token_whitespace),
+        [format!("{path}: id, title")],
+        "whitespace between `#` and `[` must not expose a test-only INSERT"
+    );
+}
+
 /// A brace that is only *text* must not move the depth counter. Both fixtures
 /// below put an unmatched `{` inside the `#[cfg(test)]` region — once in a
 /// string, once in a comment — so a counter reading raw bytes never sees the
@@ -8351,17 +8281,19 @@ fn page_insert_kind_guard_counts_only_structural_braces() {
             concat!(
                 "#[cfg(test)]\n",
                 "mod tests {{\n",
-                "{}",
                 "    fn fixture() {{\n",
+                "{}",
                 "        conn.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ());\n",
                 "    }}\n",
                 "}}\n",
-                "async fn create(&self) {{\n",
+                "async fn create() {{\n",
                 "    tx.execute(\"INSERT INTO pages (id, summary) VALUES (?1, ?2)\", ());\n",
                 "}}\n",
             ),
             text
         );
+        syn::parse_file(&source)
+            .unwrap_or_else(|error| panic!("the {label} control must be valid Rust: {error}"));
         assert_eq!(
             page_insert_sites_without_kind("crates/wenlan-core/src/somewhere.rs", &source),
             ["crates/wenlan-core/src/somewhere.rs: id, summary"],
@@ -8677,11 +8609,9 @@ fn page_kind_routing_sites(path: &str, source: &str) -> Vec<String> {
         }
         sites.push(format!("{path}: kind {op} {quote}{routed}{quote}"));
     }
-    // The match scan gets the ORIGINAL source, not the stripped twin.
-    // `strip_cfg_test_items` blanks whole lines, which is right for a text scan
-    // but does not always leave valid Rust — eight files in this tree stop
-    // parsing after it runs — and the parser needs a file it can read. Test
-    // items are skipped structurally instead, by attribute.
+    // The match scan gets the ORIGINAL source, not the stripped twin. Exact
+    // span blanking need not leave delimiters parseable, and the parser already
+    // skips test-only syntax structurally with the same gate list.
     sites.extend(page_kind_match_sites(path, source));
     sites
 }
@@ -8966,48 +8896,48 @@ fn expr_attrs(expr: &Expr) -> &[syn::Attribute] {
 /// is what stops the two from drifting apart again.
 ///
 /// Each visitor still writes its own `visit_expr`: `KindReader` stops walking
-/// the moment it has found the column, and `MatchVisitor` does not.
+/// the moment it has found the column, and `MatchVisitor` does not. The callback
+/// is a no-op for those readers and records an exact source span for the text
+/// stripper below, so all three consumers share one closed gate list.
+macro_rules! return_if_cfg_test_node {
+    ($visitor:expr, $node:expr, $attrs:expr) => {{
+        let attrs = $attrs;
+        if is_cfg_test(attrs) {
+            $visitor.record_cfg_test_node($node, attrs);
+            return;
+        }
+    }};
+}
+
 macro_rules! skip_cfg_test_nodes {
     () => {
         fn visit_item(&mut self, node: &'ast syn::Item) {
-            if is_cfg_test(item_attrs(node)) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, item_attrs(node));
             visit::visit_item(self, node);
         }
 
         fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
-            if is_cfg_test(impl_item_attrs(node)) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, impl_item_attrs(node));
             visit::visit_impl_item(self, node);
         }
 
         fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
-            if is_cfg_test(trait_item_attrs(node)) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, trait_item_attrs(node));
             visit::visit_trait_item(self, node);
         }
 
         fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
-            if is_cfg_test(stmt_attrs(node)) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, stmt_attrs(node));
             visit::visit_stmt(self, node);
         }
 
         fn visit_arm(&mut self, node: &'ast syn::Arm) {
-            if is_cfg_test(&node.attrs) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, &node.attrs);
             visit::visit_arm(self, node);
         }
 
         fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
-            if is_cfg_test(foreign_item_attrs(node)) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, foreign_item_attrs(node));
             visit::visit_foreign_item(self, node);
         }
 
@@ -9016,9 +8946,7 @@ macro_rules! skip_cfg_test_nodes {
         // an empty attribute list and descends. This is live style here
         // (crates/wenlan-core/src/lint/runner.rs:132).
         fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
-            if is_cfg_test(&node.attrs) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, &node.attrs);
             visit::visit_field_value(self, node);
         }
 
@@ -9026,27 +8954,18 @@ macro_rules! skip_cfg_test_nodes {
         // type's array length and their discriminant. Both are const positions,
         // and a const position can hold a macro this scan re-parses.
         fn visit_field(&mut self, node: &'ast syn::Field) {
-            if is_cfg_test(&node.attrs) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, &node.attrs);
             visit::visit_field(self, node);
         }
 
         fn visit_variant(&mut self, node: &'ast syn::Variant) {
-            if is_cfg_test(&node.attrs) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, &node.attrs);
             visit::visit_variant(self, node);
         }
 
-        // A file's own inner `#![cfg(test)]` gates every item in it. No file in
-        // this tree carries one, which is why round 7 disclosed it instead of
-        // reading it; reading it is four lines, and a disclosure that costs more
-        // than the fix is not worth defending.
+        // A file's own inner `#![cfg(test)]` gates every item in it.
         fn visit_file(&mut self, node: &'ast syn::File) {
-            if is_cfg_test(&node.attrs) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, &node.attrs);
             visit::visit_file(self, node);
         }
 
@@ -9054,68 +8973,121 @@ macro_rules! skip_cfg_test_nodes {
         // pattern; `visit_field_pat` covers a struct pattern's fields, which
         // syn reaches directly without passing through `visit_pat`.
         fn visit_pat(&mut self, node: &'ast Pat) {
-            if is_cfg_test(pat_attrs(node)) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, pat_attrs(node));
             visit::visit_pat(self, node);
         }
 
         fn visit_field_pat(&mut self, node: &'ast syn::FieldPat) {
-            if is_cfg_test(&node.attrs) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, &node.attrs);
             visit::visit_field_pat(self, node);
         }
 
         // A function parameter is a `PatType`, which `visit_fn_arg` reaches
-        // WITHOUT going through `visit_pat` — so the pattern gate above does
-        // not cover it and this one is not redundant.
+        // WITHOUT going through `visit_pat` — so this is not redundant.
         fn visit_pat_type(&mut self, node: &'ast syn::PatType) {
-            if is_cfg_test(&node.attrs) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, &node.attrs);
             visit::visit_pat_type(self, node);
         }
 
         fn visit_receiver(&mut self, node: &'ast syn::Receiver) {
-            if is_cfg_test(&node.attrs) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, &node.attrs);
             visit::visit_receiver(self, node);
         }
 
         fn visit_generic_param(&mut self, node: &'ast syn::GenericParam) {
-            if is_cfg_test(generic_param_attrs(node)) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, generic_param_attrs(node));
             visit::visit_generic_param(self, node);
         }
 
-        // The three variadic/bare-fn argument positions. Nothing in this tree
-        // writes them; they are here because the list is now closed by
-        // derivation rather than by taste, and leaving three out would put it
-        // back to being a list someone has to remember to extend.
         fn visit_variadic(&mut self, node: &'ast syn::Variadic) {
-            if is_cfg_test(&node.attrs) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, &node.attrs);
             visit::visit_variadic(self, node);
         }
 
         fn visit_bare_fn_arg(&mut self, node: &'ast syn::BareFnArg) {
-            if is_cfg_test(&node.attrs) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, &node.attrs);
             visit::visit_bare_fn_arg(self, node);
         }
 
         fn visit_bare_variadic(&mut self, node: &'ast syn::BareVariadic) {
-            if is_cfg_test(&node.attrs) {
-                return;
-            }
+            return_if_cfg_test_node!(self, node, &node.attrs);
             visit::visit_bare_variadic(self, node);
         }
     };
+}
+
+/// Convert proc-macro line/column locations back to source byte offsets.
+/// `LineColumn::line` is one-based while `column` is a zero-based byte count.
+fn source_line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (offset, byte) in source.bytes().enumerate() {
+        if byte == b'\n' {
+            starts.push(offset + 1);
+        }
+    }
+    starts
+}
+
+fn source_offset(starts: &[usize], location: LineColumn, source_len: usize) -> Option<usize> {
+    let line = location.line.checked_sub(1)?;
+    starts
+        .get(line)?
+        .checked_add(location.column)
+        .filter(|offset| *offset <= source_len)
+}
+
+struct CfgTestSpanCollector {
+    spans: Vec<(LineColumn, LineColumn)>,
+}
+
+impl CfgTestSpanCollector {
+    fn record_cfg_test_node<T: Spanned>(&mut self, node: &T, attrs: &[syn::Attribute]) {
+        let start = attrs
+            .first()
+            .map_or_else(|| node.span().start(), |attr| attr.span().start());
+        self.spans.push((start, node.span().end()));
+    }
+}
+
+impl<'ast> Visit<'ast> for CfgTestSpanCollector {
+    skip_cfg_test_nodes!();
+
+    fn visit_expr(&mut self, node: &'ast Expr) {
+        return_if_cfg_test_node!(self, node, expr_attrs(node));
+        visit::visit_expr(self, node);
+    }
+}
+
+/// Blank exactly the parsed syntax nodes that a test-only cfg attribute owns.
+/// On a parse failure the original text remains visible, which can cry wolf
+/// but cannot make a production writer or routing comparison disappear.
+fn strip_cfg_test_items(source: &str) -> String {
+    let Ok(file) = syn::parse_file(source) else {
+        return source.to_string();
+    };
+
+    let mut out = source.as_bytes().to_vec();
+    if is_cfg_test(&file.attrs) {
+        blank_span(&mut out, 0, source.len());
+        return String::from_utf8(out).expect("blanking writes only ASCII spaces");
+    }
+
+    let mut collector = CfgTestSpanCollector { spans: Vec::new() };
+    collector.visit_file(&file);
+    let starts = source_line_starts(source);
+    for (start, end) in collector.spans {
+        let Some(from) = source_offset(&starts, start, source.len()) else {
+            continue;
+        };
+        let Some(to) = source_offset(&starts, end, source.len()) else {
+            continue;
+        };
+        if from <= to {
+            blank_span(&mut out, from, to);
+        }
+    }
+
+    String::from_utf8(out).expect("blanking writes only ASCII spaces")
 }
 
 struct MatchVisitor<'a> {
@@ -9124,6 +9096,8 @@ struct MatchVisitor<'a> {
 }
 
 impl MatchVisitor<'_> {
+    fn record_cfg_test_node<T: Spanned>(&mut self, _node: &T, _attrs: &[syn::Attribute]) {}
+
     /// Records the pattern if it routes on a forbidden kind, and says whether
     /// it did, so a `match` can stop at its first offending arm.
     fn record(&mut self, pattern: &Pat) -> bool {
@@ -9143,9 +9117,7 @@ impl<'ast> Visit<'ast> for MatchVisitor<'_> {
     skip_cfg_test_nodes!();
 
     fn visit_expr(&mut self, node: &'ast Expr) {
-        if is_cfg_test(expr_attrs(node)) {
-            return;
-        }
+        return_if_cfg_test_node!(self, node, expr_attrs(node));
         visit::visit_expr(self, node);
     }
 
@@ -9272,13 +9244,18 @@ fn expr_names_kind(expr: &Expr) -> bool {
         found: bool,
     }
 
+    impl KindReader {
+        fn record_cfg_test_node<T: Spanned>(&mut self, _node: &T, _attrs: &[syn::Attribute]) {}
+    }
+
     impl<'ast> Visit<'ast> for KindReader {
         skip_cfg_test_nodes!();
 
         fn visit_expr(&mut self, node: &'ast Expr) {
-            if self.found || is_cfg_test(expr_attrs(node)) {
+            if self.found {
                 return;
             }
+            return_if_cfg_test_node!(self, node, expr_attrs(node));
             self.found = names_kind_here(node);
             if !self.found {
                 visit::visit_expr(self, node);
