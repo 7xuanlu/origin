@@ -6776,6 +6776,10 @@ fn main_canary_contract_violations(ci_workflow: &str, canary_workflow: &str) -> 
     let eval_run = eval
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default()
+        // Compare the command after shell line-continuation folding. The YAML
+        // scalar retains each backslash even though bash removes it.
+        .replace("\\\r\n", " ")
+        .replace("\\\n", " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
