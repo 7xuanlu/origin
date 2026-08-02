@@ -55,8 +55,14 @@ are resolved by NAME, which over-matches on generic names; rows whose name is
 ambiguous are flagged rather than given a caller list. PR-B replaces this with
 language-server resolution.
 
+IDENTITY: committed rows use `short/path.rs::function[#ordinal]`; line numbers
+remain in --json only. Caller identities are the uniquely enclosing
+brace-matched function. A relevant name-resolvable call with no unique owner
+fails closed. The exact generated list retains duplicate multiplicity.
+
 Usage:
   python3 scripts/m5-reader-sweep.py [--json]
+  python3 scripts/m5-reader-sweep.py --self-test
   python3 scripts/m5-reader-sweep.py --check
   python3 scripts/m5-reader-sweep.py --update-inventory
 """
@@ -65,7 +71,9 @@ import json
 import os
 import re
 import sys
+from bisect import bisect_right
 from collections import Counter
+from pathlib import Path
 
 MAX_FN_LINES = 12000
 # One entry per depth the closure walks, so the walk and the rendered sections
@@ -81,6 +89,7 @@ TRUNCATED = []
 INVENTORY = 'docs/plans/2026-07-27-m5-reader-manifest-inventory.md'
 INVENTORY_BEGIN = '<!-- m5-reader-sweep:begin -->'
 INVENTORY_END = '<!-- m5-reader-sweep:end -->'
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 FN = re.compile(
     r'^(\s*)(pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\s+(\w+)'
@@ -171,13 +180,13 @@ def rust_structure(lines):
     return out
 
 
-def strip_test(lines):
-    """Blank out #[cfg(test)] blocks by brace tracking, preserving line numbers."""
-    out, skip, depth, armed = [], 0, 0, False
+def strip_test(lines, include_structure=False):
+    """Blank test blocks, optionally returning the already-computed structure."""
+    out, kept_structure, skip, depth, armed = [], [], 0, 0, False
     structure = rust_structure(lines)
     for l, structural in zip(lines, structure):
         if not skip and re.match(r'\s*#\[cfg\(test\)\]', structural):
-            armed = True; out.append(''); continue
+            armed = True; out.append(''); kept_structure.append(''); continue
         if armed and not skip:
             if '{' not in structural and structural.strip().endswith(';'):
                 # `#[cfg(test)] mod foo;` / `use ...;` / a test-only const.
@@ -185,41 +194,47 @@ def strip_test(lines):
                 # arming the brace scan here would blank forward until the NEXT
                 # unrelated `{` and swallow real code -- 45% of db.rs, in the
                 # version that shipped. Blank the item, disarm, move on.
-                out.append(''); armed = False; continue
+                out.append(''); kept_structure.append(''); armed = False; continue
             if '{' in structural:
                 skip, depth, armed = (
                     1,
                     structural.count('{') - structural.count('}'),
                     False,
                 )
-                out.append('')
+                out.append(''); kept_structure.append('')
                 if depth <= 0: skip = 0
                 continue
-            out.append(''); continue
+            out.append(''); kept_structure.append(''); continue
         if skip:
             depth += structural.count('{') - structural.count('}')
-            out.append('')
+            out.append(''); kept_structure.append('')
             if depth <= 0: skip = 0
             continue
-        out.append(l)
+        out.append(l); kept_structure.append(structural)
+    if include_structure:
+        return out, kept_structure
     return out
 
 
-def bodies(lines):
-    """Yield (line_no, name, visibility, body) with brace-matched bodies."""
+def body_spans(lines, structure=None, offsets=None):
+    """Yield brace-matched function spans without changing scanner semantics."""
     i, n = 0, len(lines)
-    structure = rust_structure(lines)
+    structure = structure or rust_structure(lines)
+    offsets = offsets or _line_offsets(structure)
     while i < n:
         m = FN.match(structure[i])
         if not m:
             i += 1; continue
         name_hint = m.group(3)
-        j, depth, started = i, 0, False
+        j, depth, started, closed_at = i, 0, False, None
         while j < n:
-            for ch in structure[j]:
+            for column, ch in enumerate(structure[j]):
                 if ch == '{': depth += 1; started = True
                 elif ch == '}': depth -= 1
-            if started and depth <= 0: break
+                if started and depth <= 0:
+                    closed_at = column + 1
+                    break
+            if closed_at is not None: break
             j += 1
             if j - i > MAX_FN_LINES:
                 # run_migrations is a known multi-thousand-line function. Past
@@ -231,101 +246,53 @@ def bodies(lines):
                 if t not in TRUNCATED: TRUNCATED.append(t)
                 break
         vis = (m.group(2) or '').strip() or 'private'
-        yield (i + 1, m.group(3), vis, '\n'.join(lines[i:j + 1]))
+        end_index = min(j, n - 1)
+        body_lines = lines[i:end_index + 1]
+        if closed_at is not None:
+            body_lines[-1] = body_lines[-1][:closed_at]
+        start_offset = offsets[i] if closed_at is not None else None
+        end_offset = (
+            offsets[end_index] + closed_at
+            if closed_at is not None else None
+        )
+        yield (
+            i + 1,
+            end_index + 1,
+            m.group(3),
+            vis,
+            '\n'.join(body_lines),
+            start_offset,
+            end_offset,
+        )
         i = max(j + 1, i + 1)
 
 
+def bodies(lines):
+    """Yield the historical body tuple used by structural regression tests."""
+    for start, _, name, vis, body, _, _ in body_spans(lines):
+        yield (start, name, vis, body)
+
+
+def canonical_path(path):
+    """Return one repository-relative spelling on POSIX and Windows."""
+    return os.path.normpath(path).replace('\\', '/')
+
+
 def rust_files():
+    paths = []
     for base in CRATES:
-        for root, _, fs in os.walk(base):
+        for root, dirs, fs in os.walk(REPO_ROOT / base):
+            dirs.sort()
             for f in fs:
                 if f.endswith('.rs') and not f.endswith(('_test.rs', '_tests.rs')):
-                    yield os.path.join(root, f)
-
-
-def sweep():
-    readers, texts, code_texts = [], {}, {}
-    for p in rust_files():
-        lines = strip_test(open(p, errors='ignore').read().split('\n'))
-        texts[p] = '\n'.join(lines)
-        code_texts[p] = '\n'.join(rust_structure(lines))
-        for ln, name, vis, body in bodies(lines):
-            sqls = SQLBLK.findall(body)
-            if sqls and any(PROSE.search(q) for q in sqls):
-                readers.append({'file': p, 'line': ln, 'fn': name, 'vis': vis})
-
-    # A name is ambiguous when more than one distinct function in the tree
-    # declares it; a name-keyed caller scan cannot attribute edges then.
-    declared = {}
-    for p, t in code_texts.items():
-        for m in re.finditer(r'\bfn\s+(\w+)', t):
-            declared.setdefault(m.group(1), set()).add(p + ':' + str(t[:m.start()].count('\n') + 1))
-
-    for r in readers:
-        r['ambiguous'] = len(declared.get(r['fn'], ())) > 1
-        ext = []
-        if not r['ambiguous']:
-            pat = re.compile(r'\b' + re.escape(r['fn']) + r'\s*\(')
-            for p, t in code_texts.items():
-                if p.startswith(CORE): continue
-                for m in pat.finditer(t):
-                    ln = t[:m.start()].count('\n') + 1
-                    if p == r['file'] and ln == r['line']: continue
-                    ext.append('%s:%d' % (p, ln))
-        r['ext'] = sorted(set(ext))
-        r['exposure'] = (r['vis'] == 'pub') and bool(r['ext'])
-    readers.sort(key=lambda r: (r['file'], r['line']))
-    for r in readers:
-        r['depth'] = 0
-
-    # Transitive caller closure. Depth 1 is the wrapper layer (get_page over
-    # get_page_inner), depth 2+ the consumers the governing spec asks for.
-    all_fns = {}
-    for p, t in texts.items():
-        for ln, name, vis, body in bodies(t.split('\n')):
-            all_fns.setdefault((p, ln), {'file': p, 'line': ln, 'fn': name,
-                                         'vis': vis, 'body': body,
-                                         'code': '\n'.join(
-                                             rust_structure(body.split('\n'))
-                                         )})
-    known = {(r['file'], r['line']) for r in readers}
-    frontier = {r['fn'] for r in readers}
-    out = list(readers)
-    for depth in range(1, MAX_DEPTH + 1):
-        pats = [(n, re.compile(r'\b' + re.escape(n) + r'\s*\(')) for n in sorted(frontier)
-                if len(declared.get(n, ())) == 1]
-        nxt = set()
-        for key, f in all_fns.items():
-            if key in known: continue
-            for n, pat in pats:
-                if pat.search(f['code']):
-                    f = dict(f)
-                    f.pop('body', None)
-                    f.pop('code', None)
-                    f['depth'] = depth; f['via'] = n
-                    f['ambiguous'] = len(declared.get(f['fn'], ())) > 1
-                    f['ext'] = []
-                    f['exposure'] = False
-                    out.append(f); known.add(key); nxt.add(f['fn'])
-                    break
-        frontier = nxt
-    for r in out:
-        if r['depth'] and not r['ambiguous']:
-            pat = re.compile(r'\b' + re.escape(r['fn']) + r'\s*\(')
-            ext = []
-            for p, t in code_texts.items():
-                if p.startswith(CORE): continue
-                for m in pat.finditer(t):
-                    ln = t[:m.start()].count('\n') + 1
-                    if p == r['file'] and ln == r['line']: continue
-                    ext.append('%s:%d' % (p, ln))
-            r['ext'] = sorted(set(ext))
-            r['exposure'] = (r['vis'] == 'pub') and bool(r['ext'])
-    out.sort(key=lambda r: (r['depth'], r['file'], r['line']))
-    return out
+                    paths.append(
+                        (Path(root) / f).relative_to(REPO_ROOT).as_posix()
+                    )
+    yield from sorted(paths)
 
 
 def short_path(path):
+    path = canonical_path(path)
     prefixes = {
         'crates/wenlan-core/src/': 'core/',
         'crates/wenlan-server/src/': 'server/',
@@ -338,33 +305,228 @@ def short_path(path):
     return path
 
 
+CALL = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
+
+
+def _line_offsets(lines):
+    offsets, position = [], 0
+    for line in lines:
+        offsets.append(position)
+        position += len(line) + 1
+    return offsets
+
+
+def _owner_locators(functions, offset):
+    return [
+        function['locator']
+        for function in functions
+        if function['start_offset'] is not None
+        and function['start_offset'] <= offset < function['end_offset']
+    ]
+
+
+def _validate_call_ownership(index, names):
+    """Fail closed if a relevant, name-resolvable call has no unique owner."""
+    for name in sorted(set(names)):
+        if len(index['declared'].get(name, ())) != 1:
+            continue
+        unresolved = index['unresolved_by_name'].get(name, ())
+        if unresolved:
+            raise ValueError(
+                'callsite ownership for %s is not unique: %s'
+                % (name, ', '.join(unresolved))
+            )
+
+
+def build_index(sources):
+    """Index functions and calls once; retain lines only for diagnostics."""
+    normalized = {
+        canonical_path(path): text
+        for path, text in sources.items()
+    }
+    functions = []
+    declared = {}
+    per_file = {}
+
+    for path in sorted(normalized):
+        lines, structure = strip_test(
+            normalized[path].split('\n'), include_structure=True
+        )
+        code_text = '\n'.join(structure)
+        offsets = _line_offsets(structure)
+        file_functions = []
+        definition_offsets = set()
+
+        for line_index, structural in enumerate(structure):
+            match = FN.match(structural)
+            if match:
+                definition_offsets.add(offsets[line_index] + match.start(3))
+
+        for match in re.finditer(r'\bfn\s+(\w+)', code_text):
+            name = match.group(1)
+            line = bisect_right(offsets, match.start())
+            declared.setdefault(name, set()).add('%s:%d' % (path, line))
+
+        for start, end, name, vis, body, start_offset, end_offset in body_spans(
+                lines, structure, offsets):
+            function = {
+                'file': path,
+                'line': start,
+                'end_line': end,
+                'fn': name,
+                'vis': vis,
+                'body': body,
+                'start_offset': start_offset,
+                'end_offset': end_offset,
+            }
+            file_functions.append(function)
+
+        totals = Counter(function['fn'] for function in file_functions)
+        seen = Counter()
+        for function in file_functions:
+            seen[function['fn']] += 1
+            suffix = ''
+            if totals[function['fn']] > 1:
+                suffix = '#%d' % seen[function['fn']]
+            function['locator'] = '%s::%s%s' % (
+                short_path(path), function['fn'], suffix
+            )
+        functions.extend(file_functions)
+        per_file[path] = {
+            'code': code_text,
+            'offsets': offsets,
+            'definitions': definition_offsets,
+            'functions': file_functions,
+        }
+
+    calls_by_locator = {}
+    callers_by_name = {}
+    unresolved_by_name = {}
+    for path, file_index in per_file.items():
+        for match in CALL.finditer(file_index['code']):
+            if match.start(1) in file_index['definitions']:
+                continue
+            name = match.group(1)
+            line = bisect_right(file_index['offsets'], match.start(1))
+            owners = _owner_locators(file_index['functions'], match.start(1))
+            if len(owners) != 1:
+                detail = '%s:%d (%d owners)' % (path, line, len(owners))
+                unresolved_by_name.setdefault(name, []).append(detail)
+                continue
+            owner = owners[0]
+            calls_by_locator.setdefault(owner, set()).add(name)
+            callers_by_name.setdefault(name, set()).add(owner)
+
+    return {
+        'functions': functions,
+        'by_locator': {function['locator']: function for function in functions},
+        'declared': declared,
+        'calls_by_locator': calls_by_locator,
+        'callers_by_name': callers_by_name,
+        'unresolved_by_name': unresolved_by_name,
+    }
+
+
+def _public_row(function, depth, index, via=None):
+    row = {
+        key: function[key]
+        for key in ('file', 'line', 'fn', 'vis', 'locator')
+    }
+    row['depth'] = depth
+    if via is not None:
+        row['via'] = sorted(via)
+    row['ambiguous'] = len(index['declared'].get(row['fn'], ())) > 1
+    if row['ambiguous']:
+        row['ext'] = []
+    else:
+        _validate_call_ownership(index, (row['fn'],))
+        row['ext'] = sorted(
+            caller
+            for caller in index['callers_by_name'].get(row['fn'], ())
+            if not index['by_locator'][caller]['file'].startswith(CORE + '/')
+            and index['by_locator'][caller]['file'] != CORE
+        )
+    row['exposure'] = row['vis'] == 'pub' and bool(row['ext'])
+    return row
+
+
+def _read_sources():
+    return {
+        path: (REPO_ROOT / path).read_text(encoding='utf-8')
+        for path in rust_files()
+    }
+
+
+def sweep(sources=None, index=None):
+    if index is None:
+        index = build_index(_read_sources() if sources is None else sources)
+    readers = []
+    for function in index['functions']:
+        sqls = SQLBLK.findall(function['body'])
+        if sqls and any(PROSE.search(query) for query in sqls):
+            readers.append(_public_row(function, 0, index))
+
+    # Transitive caller closure. Name ambiguity remains explicit until a Rust
+    # resolver replaces this scanner, but every accepted call has one owner.
+    known = {reader['locator'] for reader in readers}
+    frontier = {reader['fn']: reader['locator'] for reader in readers}
+    out = list(readers)
+    for depth in range(1, MAX_DEPTH + 1):
+        eligible = {
+            name for name in frontier
+            if len(index['declared'].get(name, ())) == 1
+        }
+        _validate_call_ownership(index, eligible)
+        for function in index['functions']:
+            if function['locator'] in known:
+                continue
+            matches = sorted(
+                index['calls_by_locator'].get(function['locator'], set()) & eligible
+            )
+            if not matches:
+                continue
+            row = _public_row(
+                function,
+                depth,
+                index,
+                via=[frontier[name] for name in matches],
+            )
+            out.append(row)
+            known.add(function['locator'])
+        frontier = {
+            row['fn']: row['locator']
+            for row in out if row['depth'] == depth
+        }
+    out.sort(key=lambda row: (row['depth'], row['locator']))
+    return out
+
+
 def render_inventory(rows):
     """Render the canonical, generated reader rows embedded in the M5 inventory."""
     sections = [INVENTORY_BEGIN]
     for depth, title in enumerate(DEPTH_TITLES):
-        last_column = 'Exposure' if depth == 0 else 'Reaches prose via'
         sections.extend([
             '',
             '### Depth %d — %s' % (depth, title),
             '',
-            '| Address | Function | Visibility | %s |' % last_column,
-            '|---|---|---|---|',
+            '| Reader | Visibility | Ambiguous | Exposure | External callers | Reaches prose via |',
+            '|---|---|---|---|---|---|',
         ])
         for row in (r for r in rows if r['depth'] == depth):
-            address = '%s:%d' % (short_path(row['file']), row['line'])
-            if depth == 0:
-                if row['ambiguous']:
-                    tail = 'name-ambiguous'
-                elif row['exposure']:
-                    callers = ', '.join('`%s`' % short_path(c) for c in row['ext'])
-                    tail = '**exposure** — ' + callers
-                else:
-                    tail = 'internal-only'
-            else:
-                tail = '`%s`' % row['via']
+            callers = ', '.join('`%s`' % caller for caller in row['ext']) or '—'
+            via = ', '.join(
+                '`%s`' % predecessor for predecessor in row.get('via', ())
+            ) or '—'
             sections.append(
-                '| `%s` | `%s` | `%s` | %s |'
-                % (address, row['fn'], row['vis'], tail)
+                '| `%s` | `%s` | %s | %s | %s | %s |'
+                % (
+                    row['locator'],
+                    row['vis'],
+                    'yes' if row['ambiguous'] else 'no',
+                    '**yes**' if row['exposure'] else 'no',
+                    callers,
+                    via,
+                )
             )
     sections.extend(['', INVENTORY_END])
     return '\n'.join(sections)
@@ -391,7 +553,7 @@ def replace_inventory_block(document, generated):
 
 def check_inventory(rows):
     generated = render_inventory(rows)
-    document = open(INVENTORY, encoding='utf-8').read()
+    document = (REPO_ROOT / INVENTORY).read_text(encoding='utf-8')
     current = inventory_block(document)
     if current != generated:
         diff = difflib.unified_diff(
@@ -420,14 +582,15 @@ def check_inventory(rows):
 
 def update_inventory(rows):
     generated = render_inventory(rows)
-    document = open(INVENTORY, encoding='utf-8').read()
+    inventory_path = REPO_ROOT / INVENTORY
+    document = inventory_path.read_text(encoding='utf-8')
     updated = replace_inventory_block(document, generated)
-    with open(INVENTORY, 'w', encoding='utf-8') as f:
-        f.write(updated)
+    with open(inventory_path, 'w', encoding='utf-8', newline='') as handle:
+        handle.write(updated)
     print('updated %s (%d rows)' % (INVENTORY, len(rows)))
 
 
-def selftest():
+def selftest(repository_index=None):
     """Assert the structural predicates that decide what this script can see.
 
     These bugs all shipped once. `strip_test` armed the brace scan on
@@ -480,63 +643,254 @@ fn after_stringy() {}'''
         'braces inside Rust strings/comments changed function boundaries'
     assert 'let raw' in parsed[0][3], 'a brace in a string truncated the function body'
 
-    db_lines = strip_test(open('crates/wenlan-core/src/db.rs').read().split('\n'))
-    db_bodies = {name: body for _, name, _, body in bodies(db_lines)}
+    if repository_index is None:
+        db_lines = strip_test(
+            (REPO_ROOT / 'crates/wenlan-core/src/db.rs')
+            .read_text(encoding='utf-8')
+            .split('\n')
+        )
+        db_bodies = {name: body for _, name, _, body in bodies(db_lines)}
+    else:
+        db_bodies = {
+            function['fn']: function['body']
+            for function in repository_index['functions']
+            if function['file'] == 'crates/wenlan-core/src/db.rs'
+        }
     assert 'migrate_80_page_scope_fold' in db_bodies, \
         'run_migrations swallowed the next sibling method'
     assert 'fn migrate_80_page_scope_fold' not in db_bodies['run_migrations'], \
         'run_migrations body overran its LSP-resolved end'
 
-    # A definition is not a call site of itself.
-    for r in sweep():
-        assert '%s:%d' % (r['file'], r['line']) not in r['ext'], \
-            '%s counts its own definition as an external caller' % r['fn']
+    core_path = 'crates/wenlan-core/src/db.rs'
+    server_path = 'crates/wenlan-server/src/routes.rs'
+    base = {
+        core_path: '''fn read_one() {
+    let query = "SELECT content FROM pages";
+}
 
-    # Positive control for exact set equality: either an added or a missing
-    # reader must change the generated block. This is deliberately independent
-    # of the current inventory so a stale snapshot cannot make the self-test
-    # agree with itself.
-    fixture_rows = [
-        {
-            'file': 'crates/wenlan-core/src/db.rs',
-            'line': 10,
-            'fn': 'read_one',
-            'vis': 'pub',
-            'depth': 0,
-            'ambiguous': False,
-            'exposure': False,
-            'ext': [],
-        },
-        {
-            'file': 'crates/wenlan-server/src/routes.rs',
-            'line': 20,
-            'fn': 'handle_one',
-            'vis': 'pub',
-            'depth': 1,
-            'via': 'read_one',
-            'ambiguous': False,
-            'exposure': False,
-            'ext': [],
-        },
-    ]
-    fixture = 'before\n%s\nafter\n' % render_inventory(fixture_rows)
+fn bridge() {
+    read_one();
+}
+''',
+        server_path: '''pub fn handle_one() {
+    bridge();
+}
+''',
+    }
+
+    def rendered(sources):
+        return render_inventory(sweep(sources))
+
+    stable = rendered(base)
+    shifted = dict(base)
+    shifted[core_path] = '// line shift only\n\n' + shifted[core_path]
+    shifted_rows = sweep(shifted)
+    assert stable == rendered(shifted), 'pure line shifts changed the semantic contract'
+    assert sweep(base)[0]['line'] != shifted_rows[0]['line'], \
+        'diagnostic JSON lines must still report source movement'
+
+    windows = {path.replace('/', '\\'): text for path, text in base.items()}
+    assert stable == rendered(windows), 'Windows and POSIX paths produced different identities'
+    assert all('\\' not in row['locator'] for row in sweep(windows)), \
+        'a Windows path escaped canonical locator normalization'
+
+    added = dict(base)
+    added[core_path] += '''
+fn read_two() {
+    let query = "SELECT title FROM pages";
+}
+'''
+    assert stable != rendered(added), 'an added reader must fail exact equality'
+    deleted = {
+        core_path: added[core_path].replace('''
+fn read_two() {
+    let query = "SELECT title FROM pages";
+}
+''', ''),
+        server_path: base[server_path],
+    }
+    assert rendered(added) != rendered(deleted), \
+        'a deleted reader must fail exact equality'
+    assert stable == rendered(deleted), \
+        'the delete-reader control did not restore its baseline'
+
+    visible = dict(base)
+    visible[core_path] = visible[core_path].replace('fn read_one()', 'pub fn read_one()')
+    assert stable != rendered(visible), 'a visibility change must fail exact equality'
+
+    direct = {
+        core_path: base[core_path].split('\n\nfn bridge')[0] + '\n',
+        server_path: '''pub fn handle_one() {
+    read_one();
+}
+
+pub fn handle_two() {}
+''',
+    }
+    no_caller = dict(direct)
+    no_caller[server_path] = no_caller[server_path].replace('    read_one();\n', '')
+    assert rendered(direct) != rendered(no_caller), \
+        'adding or removing an external caller must fail exact equality'
+    moved_caller = dict(direct)
+    moved_caller[server_path] = '''pub fn handle_one() {}
+
+pub fn handle_two() {
+    read_one();
+}
+'''
+    assert rendered(direct) != rendered(moved_caller), \
+        'moving a call to another enclosing function must change its caller identity'
+    shifted_caller = dict(direct)
+    shifted_caller[server_path] = direct[server_path].replace(
+        '    read_one();', '\n\n    read_one();'
+    )
+    assert rendered(direct) == rendered(shifted_caller), \
+        'moving a call inside one enclosing function changed its identity'
+
+    two_readers = {
+        core_path: '''fn read_one() {
+    let query = "SELECT content FROM pages";
+}
+
+fn read_two() {
+    let query = "SELECT title FROM pages";
+}
+
+fn bridge() {
+    read_one();
+}
+''',
+    }
+    via_two = dict(two_readers)
+    via_two[core_path] = via_two[core_path].replace(
+        'fn bridge() {\n    read_one();', 'fn bridge() {\n    read_two();'
+    )
+    assert rendered(two_readers) != rendered(via_two), \
+        'changing the prose path (`via`) must fail exact equality'
+    both_via = dict(two_readers)
+    both_via[core_path] = both_via[core_path].replace(
+        '    read_one();\n}', '    read_one();\n    read_two();\n}', 1
+    )
+    bridge = next(row for row in sweep(both_via) if row['fn'] == 'bridge')
+    assert bridge['via'] == [
+        'core/db.rs::read_one', 'core/db.rs::read_two'
+    ], 'multiple shortest predecessors were not retained and sorted'
+    assert rendered(both_via) != rendered(two_readers), \
+        'removing a non-first predecessor must fail exact equality'
+
+    indirect = dict(direct)
+    indirect[core_path] += '''
+fn bridge() {
+    read_one();
+}
+'''
+    indirect[server_path] = indirect[server_path].replace('read_one()', 'bridge()')
+    assert rendered(direct) != rendered(indirect), \
+        'changing closure depth must fail exact equality'
+
+    duplicate = {
+        core_path: '''impl One {
+    fn duplicate() {
+        let query = "SELECT content FROM pages";
+    }
+}
+
+impl Two {
+    fn duplicate() {
+        let query = "SELECT title FROM pages";
+    }
+}
+''',
+    }
+    duplicate_rows = sweep(duplicate)
+    assert [row['locator'] for row in duplicate_rows] == [
+        'core/db.rs::duplicate#1', 'core/db.rs::duplicate#2'
+    ], 'same-file same-name readers lost their ordinal multiplicity'
+    one_duplicate = dict(duplicate)
+    one_duplicate[core_path] = duplicate[core_path][duplicate[core_path].index('impl Two'):]
+    assert rendered(duplicate) != rendered(one_duplicate), \
+        'deleting one duplicate reader must fail exact equality'
+    duplicate_caller = dict(duplicate)
+    duplicate_caller[core_path] += '''
+fn wrapper() {
+    duplicate();
+}
+'''
+    assert all(row['fn'] != 'wrapper' for row in sweep(duplicate_caller)), \
+        'a name-ambiguous callee produced a downstream edge'
+
+    split_predicate = {
+        core_path: '''fn not_a_reader() {
+    let columns = "SELECT content";
+    let table = "FROM pages";
+}
+''',
+    }
+    assert not sweep(split_predicate), \
+        'SQL and prose in different string literals must not qualify'
+
+    masked_calls = dict(direct)
+    masked_calls[server_path] = '''pub fn handle_one() {
+    let example = "read_one(";
+    // read_one();
+}
+'''
+    assert all(row['fn'] != 'handle_one' for row in sweep(masked_calls)), \
+        'calls inside strings/comments entered the call index'
+
+    recursive_index = build_index({
+        core_path: '''fn recursive() {
+    let query = "SELECT body FROM pages";
+    recursive();
+}
+''',
+    })
+    assert recursive_index['callers_by_name']['recursive'] == {'core/db.rs::recursive'}, \
+        'a declaration was counted as a call or recursion was dropped'
+
+    unowned = {
+        core_path: base[core_path].split('\n\nfn bridge')[0]
+        + '\n\nconst _: () = { read_one(); };\n',
+    }
+    try:
+        sweep(unowned)
+        assert False, 'an unowned relevant callsite must fail closed'
+    except ValueError as error:
+        assert 'callsite ownership' in str(error)
+
+    same_line_unowned = {
+        core_path: base[core_path].split('\n\nfn bridge')[0]
+        + '\n\nfn helper() {} const _: () = { read_one(); };\n',
+    }
+    try:
+        sweep(same_line_unowned)
+        assert False, 'a call after a same-line closing brace must fail closed'
+    except ValueError as error:
+        assert '(0 owners)' in str(error)
+
+    synthetic = {
+        'declared': {'read_one': {'core/db.rs:1'}},
+        'unresolved_by_name': {'read_one': ['core/db.rs:9 (2 owners)']},
+    }
+    try:
+        _validate_call_ownership(synthetic, {'read_one'})
+        assert False, 'an ambiguously owned relevant callsite must fail closed'
+    except ValueError as error:
+        assert '2 owners' in str(error)
+
+    fixture = 'before\n%s\nafter\n' % stable
     expected = inventory_block(fixture)
-    added = fixture_rows + [
-        dict(fixture_rows[1], line=21, fn='handle_two')
-    ]
-    assert expected != render_inventory(added), 'an added reader must fail exact equality'
-    assert expected != render_inventory(fixture_rows[:-1]), \
-        'a missing reader must fail exact equality'
     assert replace_inventory_block(fixture, expected) == fixture, \
         'replacing an unchanged generated block must be stable'
     print('selftest: ok')
 
 
 if __name__ == '__main__':
-    if '--selftest' in sys.argv:
+    if '--selftest' in sys.argv or '--self-test' in sys.argv:
         selftest()
         sys.exit(0)
-    rows = sweep()
+    repository_index = build_index(_read_sources())
+    rows = sweep(index=repository_index)
     if TRUNCATED:
         print(
             'BRACE SCAN LOST SYNC in: %s' % ', '.join(TRUNCATED),
@@ -545,6 +899,7 @@ if __name__ == '__main__':
         sys.exit(1)
     if '--check' in sys.argv:
         try:
+            selftest(repository_index)
             ok = check_inventory(rows)
         except (OSError, ValueError) as error:
             print('reader inventory check failed: %s' % error, file=sys.stderr)
