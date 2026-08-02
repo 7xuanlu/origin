@@ -7,7 +7,6 @@
 //! on purpose (update the `*_violations` fn AND its positive control). New teeth
 //! follow the same form.
 
-use proc_macro2::LineColumn;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use syn::parse::{Parse, ParseStream};
@@ -8263,6 +8262,25 @@ fn cfg_stripping_preserves_production_after_nested_attribute_positions() {
         [format!("{path}: id, title")],
         "whitespace between `#` and `[` must not expose a test-only INSERT"
     );
+
+    let utf8_before_routing = "fn create(page: &Page) { let 測試測試測試測試測試測試 = 0; \
+         if page.kind.as_str() == \"source\" {} #[cfg(test)] let _probe = [0; 64]; }";
+    syn::parse_file(utf8_before_routing).expect("the UTF-8 routing control must be valid Rust");
+    assert_eq!(
+        page_kind_routing_sites(path, utf8_before_routing),
+        [format!("{path}: kind == \"source\"")],
+        "UTF-8 before a cfg span must not move blanking onto an earlier production comparison"
+    );
+
+    let utf8_before_insert = "fn create() { let 測試測試測試測試測試測試 = 0; \
+         tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ()); \
+         #[cfg(test)] let _probe = [0; 64]; }";
+    syn::parse_file(utf8_before_insert).expect("the UTF-8 INSERT control must be valid Rust");
+    assert_eq!(
+        page_insert_sites_without_kind(path, utf8_before_insert),
+        [format!("{path}: id, title")],
+        "UTF-8 before a cfg span must not move blanking onto an earlier production INSERT"
+    );
 }
 
 /// A brace that is only *text* must not move the depth counter. Both fixtures
@@ -9016,36 +9034,17 @@ macro_rules! skip_cfg_test_nodes {
     };
 }
 
-/// Convert proc-macro line/column locations back to source byte offsets.
-/// `LineColumn::line` is one-based while `column` is a zero-based byte count.
-fn source_line_starts(source: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    for (offset, byte) in source.bytes().enumerate() {
-        if byte == b'\n' {
-            starts.push(offset + 1);
-        }
-    }
-    starts
-}
-
-fn source_offset(starts: &[usize], location: LineColumn, source_len: usize) -> Option<usize> {
-    let line = location.line.checked_sub(1)?;
-    starts
-        .get(line)?
-        .checked_add(location.column)
-        .filter(|offset| *offset <= source_len)
-}
-
 struct CfgTestSpanCollector {
-    spans: Vec<(LineColumn, LineColumn)>,
+    spans: Vec<(usize, usize)>,
 }
 
 impl CfgTestSpanCollector {
     fn record_cfg_test_node<T: Spanned>(&mut self, node: &T, attrs: &[syn::Attribute]) {
-        let start = attrs
-            .first()
-            .map_or_else(|| node.span().start(), |attr| attr.span().start());
-        self.spans.push((start, node.span().end()));
+        let start = attrs.first().map_or_else(
+            || node.span().byte_range().start,
+            |attr| attr.span().byte_range().start,
+        );
+        self.spans.push((start, node.span().byte_range().end));
     }
 }
 
@@ -9074,15 +9073,12 @@ fn strip_cfg_test_items(source: &str) -> String {
 
     let mut collector = CfgTestSpanCollector { spans: Vec::new() };
     collector.visit_file(&file);
-    let starts = source_line_starts(source);
-    for (start, end) in collector.spans {
-        let Some(from) = source_offset(&starts, start, source.len()) else {
-            continue;
-        };
-        let Some(to) = source_offset(&starts, end, source.len()) else {
-            continue;
-        };
-        if from <= to {
+    for (from, to) in collector.spans {
+        if from <= to
+            && to <= source.len()
+            && source.is_char_boundary(from)
+            && source.is_char_boundary(to)
+        {
             blank_span(&mut out, from, to);
         }
     }
