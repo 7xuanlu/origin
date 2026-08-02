@@ -498,7 +498,7 @@ def release_cache_retry_contract_violations(ci: str) -> list[str]:
     )
 
     primary_inputs = [
-        "shared-key: release-v3-${{ matrix.target }}",
+        "shared-key: release-v4-${{ matrix.target }}",
         "workspaces: . -> target",
         'cache-all-crates: "true"',
         'cache-workspace-crates: "false"',
@@ -508,7 +508,7 @@ def release_cache_retry_contract_violations(ci: str) -> list[str]:
     primary_input_map = dict(input_pattern.findall(primary))
     retry_input_map = dict(input_pattern.findall(retry))
     expected_primary_inputs = {
-        "shared-key": "release-v3-${{ matrix.target }}",
+        "shared-key": "release-v4-${{ matrix.target }}",
         "workspaces": ". -> target",
         "cache-all-crates": '"true"',
         "cache-workspace-crates": '"false"',

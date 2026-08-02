@@ -33,6 +33,13 @@ ISOLATED_UNIT_MODULES = {
     ),
 }
 
+ISOLATED_UNIT_TESTS = {
+    "scripts/m5-reader-sweep.py": (
+        "wenlan-core",
+        "drift_guard::m5_reader_inventory_matches_current_tree",
+    ),
+}
+
 SHARED_TEST_HELPERS = {
     "crates/wenlan-core/src/lint/test_support.rs",
     "crates/wenlan-core/src/lint/test_support_db.rs",
@@ -297,19 +304,26 @@ def _integration_targets(package: dict) -> set[str]:
 def _workspace_lib_plan(
     broad_packages: set[str],
     isolated_filters: dict[str, set[str]],
+    isolated_tests: dict[str, set[str]],
 ) -> dict:
     for package in broad_packages:
         isolated_filters.pop(package, None)
+        isolated_tests.pop(package, None)
     expressions = [f"package({package})" for package in sorted(broad_packages)]
     for package in sorted(isolated_filters):
         for prefix in sorted(isolated_filters[package]):
             expressions.append(f"package({package}) & test(/^{prefix}::/)")
+    for package in sorted(isolated_tests):
+        for test_name in sorted(isolated_tests[package]):
+            expressions.append(f"package({package}) & test(/^{test_name}$/)")
     if not expressions:
         return {"mode": "skip"}
-    if isolated_filters:
+    if isolated_filters or isolated_tests:
         return {
             "mode": "filterset",
-            "packages": sorted(broad_packages | set(isolated_filters)),
+            "packages": sorted(
+                broad_packages | set(isolated_filters) | set(isolated_tests)
+            ),
             "filterset": " | ".join(expressions),
         }
     return {"mode": "packages", "packages": sorted(broad_packages)}
@@ -338,6 +352,7 @@ def build_plan(
 
     broad_packages: set[str] = set()
     isolated_filters: dict[str, set[str]] = defaultdict(set)
+    isolated_tests: dict[str, set[str]] = defaultdict(set)
     cli_server_packages: set[str] = set()
     cli_server_targets: dict[str, set[str]] = defaultdict(set)
     contract_packages: set[str] = set()
@@ -372,6 +387,19 @@ def build_plan(
             return _full_plan(f"shared build or native input changed: {path}")
         if path in SHARED_TEST_HELPERS:
             return _full_plan(f"shared test helper changed: {path}")
+
+        isolated_test = ISOLATED_UNIT_TESTS.get(path)
+        if isolated_test is not None:
+            if path not in existing:
+                return _full_plan(f"isolated unit test owner was removed: {path}")
+            package, test_name = isolated_test
+            if package not in packages:
+                raise PlanError(
+                    f"isolated unit test maps to unknown package {package!r}"
+                )
+            isolated_tests[package].add(test_name)
+            reasons.append(f"isolated unit test owner changed: {path}")
+            continue
 
         isolated = ISOLATED_UNIT_MODULES.get(path)
         if isolated is not None:
@@ -495,7 +523,9 @@ def build_plan(
         "version": 1,
         "mode": "differential",
         "reasons": sorted(set(reasons)),
-        "workspace_lib": _workspace_lib_plan(broad_packages, isolated_filters),
+        "workspace_lib": _workspace_lib_plan(
+            broad_packages, isolated_filters, isolated_tests
+        ),
         "cli_server_integration": cli_server_plan,
         "core_integration": core_plan,
         "contract_integration": contract_plan,
@@ -771,19 +801,30 @@ def local_test_commands_for(plan: object, cargo_metadata: object) -> list[list[s
             raise PlanError("workspace filterset is empty")
         broad: set[str] = set()
         isolated: list[tuple[str, str]] = []
+        exact: list[tuple[str, str]] = []
         for expression in filterset.split(" | "):
             broad_match = re.fullmatch(r"package\(([A-Za-z0-9_-]+)\)", expression)
             isolated_match = re.fullmatch(
                 r"package\(([A-Za-z0-9_-]+)\) & test\(/\^([A-Za-z0-9_:]+)::/\)",
                 expression,
             )
+            exact_match = re.fullmatch(
+                r"package\(([A-Za-z0-9_-]+)\) & test\(/\^([A-Za-z0-9_:]+)\$/\)",
+                expression,
+            )
             if broad_match is not None:
                 broad.add(broad_match.group(1))
             elif isolated_match is not None:
                 isolated.append((isolated_match.group(1), isolated_match.group(2)))
+            elif exact_match is not None:
+                exact.append((exact_match.group(1), exact_match.group(2)))
             else:
                 raise PlanError("workspace filterset is not locally executable")
-        selected = broad | {package for package, _prefix in isolated}
+        selected = (
+            broad
+            | {package for package, _prefix in isolated}
+            | {package for package, _test_name in exact}
+        )
         if selected != names:
             raise PlanError("workspace filterset package inventory is inconsistent")
         if broad:
@@ -797,6 +838,19 @@ def local_test_commands_for(plan: object, cargo_metadata: object) -> list[list[s
         for package, prefix in isolated:
             commands.append(
                 ["cargo", "test", "-p", package, "--lib", f"{prefix}::"]
+            )
+        for package, test_name in exact:
+            commands.append(
+                [
+                    "cargo",
+                    "test",
+                    "-p",
+                    package,
+                    "--lib",
+                    test_name,
+                    "--",
+                    "--exact",
+                ]
             )
     elif workspace_mode != "skip":
         raise PlanError(f"unknown workspace-lib mode: {workspace_mode!r}")

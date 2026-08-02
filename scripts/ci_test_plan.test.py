@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 from ci_test_plan import (
@@ -25,6 +27,15 @@ from ci_test_plan import (
 
 
 WORKSPACE_ROOT = "/repo"
+M5_READER_PATHS = (
+    "scripts/m5-reader-sweep.py",
+    "crates/wenlan-core/AGENTS.md",
+    "docs/plans/2026-07-27-m5-reader-manifest-inventory.md",
+)
+M5_READER_FILTERSET = (
+    "package(wenlan-core) & "
+    "test(/^drift_guard::m5_reader_inventory_matches_current_tree$/)"
+)
 
 
 def package(
@@ -379,6 +390,23 @@ class PlatformPlanTests(unittest.TestCase):
         self.assertEqual(plan["contract_integration"], {"mode": "skip"})
         self.assertFalse(any(required_suite_outputs(plan).values()))
 
+    def test_m5_reader_inventory_diff_skips_platform_and_release_suites(self) -> None:
+        plan = self.platform_plan_for(*M5_READER_PATHS)
+
+        self.assertEqual(plan["mode"], "differential")
+        self.assertFalse(any(required_suite_outputs(plan).values()))
+
+        workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+        workflow = workflow_path.read_text(encoding="utf-8")
+        release_block = workflow.split("            release-preflight:\n", 1)[1]
+        release_block = release_block.split("            mcp-platform:\n", 1)[0]
+        patterns = re.findall(r"^\s+- '([^']+)'\s*$", release_block, re.MULTILINE)
+        self.assertTrue(patterns)
+        self.assertFalse(
+            any(fnmatchcase(M5_READER_PATHS[0], pattern) for pattern in patterns),
+            patterns,
+        )
+
     def test_infrastructure_does_not_widen_mixed_server_change(self) -> None:
         product = "crates/wenlan-server/src/bind_addr_tests.rs"
         focused = self.platform_plan_for(product)
@@ -492,6 +520,47 @@ class NarrowOwnerTests(unittest.TestCase):
         "crates/wenlan-core/src/drift_guard/r4_test_support_api_manifest.txt",
         "crates/wenlan-core/src/drift_guard/r4_test_support_raw_manifest.txt",
     )
+
+    def test_m5_reader_diff_selects_only_the_exact_inventory_contract(self) -> None:
+        plan = plan_for(*M5_READER_PATHS)
+
+        self.assertEqual(plan["mode"], "differential")
+        self.assertEqual(
+            plan["workspace_lib"],
+            {
+                "mode": "filterset",
+                "packages": ["wenlan-core"],
+                "filterset": M5_READER_FILTERSET,
+            },
+        )
+        self.assertEqual(plan["cli_server_integration"], {"mode": "skip"})
+        self.assertEqual(plan["core_integration"], {"mode": "skip"})
+        self.assertEqual(plan["contract_integration"], {"mode": "skip"})
+        self.assertEqual(plan["canonical_smokes"], {"mode": "skip"})
+        outputs = required_suite_outputs(plan)
+        self.assertTrue(outputs["workspace-lib-required"])
+        self.assertTrue(outputs["rust-ci-required"])
+        self.assertFalse(outputs["canonical-acceptance-required"])
+
+    def test_removed_m5_reader_sweep_fails_closed_to_every_suite(self) -> None:
+        plan = plan_for(M5_READER_PATHS[0], existing_paths=set())
+
+        self.assertEqual(plan["mode"], "full")
+        self.assertTrue(all(required_suite_outputs(plan).values()))
+
+    def test_broad_core_change_overrides_exact_m5_reader_filter(self) -> None:
+        core_path = "crates/wenlan-core/src/search.rs"
+        core_only = plan_for(core_path)
+        mixed = plan_for(core_path, M5_READER_PATHS[0])
+
+        for suite in (
+            "workspace_lib",
+            "cli_server_integration",
+            "core_integration",
+            "contract_integration",
+            "canonical_smokes",
+        ):
+            self.assertEqual(mixed[suite], core_only[suite])
 
     def test_r4_manifests_select_only_their_canonical_contract_module(self) -> None:
         for path in self.R4_MANIFESTS:
@@ -988,6 +1057,91 @@ class CommandGenerationTests(unittest.TestCase):
                     "wenlan-core",
                     "--lib",
                     "drift_guard::r4_test_support_test::",
+                ]
+            ],
+        )
+
+    def test_m5_reader_owner_uses_exact_local_and_nextest_commands(self) -> None:
+        plan = plan_for(M5_READER_PATHS[0])
+
+        self.assertEqual(
+            local_test_commands_for(plan, cargo_metadata()),
+            [
+                [
+                    "cargo",
+                    "test",
+                    "-p",
+                    "wenlan-core",
+                    "--lib",
+                    "drift_guard::m5_reader_inventory_matches_current_tree",
+                    "--",
+                    "--exact",
+                ]
+            ],
+        )
+        self.assertEqual(
+            command_groups_for("workspace-lib", plan, cargo_metadata()),
+            [
+                [
+                    "cargo",
+                    "nextest",
+                    "run",
+                    "-p",
+                    "wenlan-core",
+                    "--lib",
+                    "-E",
+                    M5_READER_FILTERSET,
+                ]
+            ],
+        )
+
+    def test_m5_reader_archive_defers_exact_selector_to_run(self) -> None:
+        plan = plan_for(M5_READER_PATHS[0])
+
+        archive = archive_command_for(
+            plan,
+            cargo_metadata(),
+            archive_file="/tmp/workspace-lib.tar.zst",
+        )
+        run = command_groups_for(
+            "workspace-lib",
+            plan,
+            cargo_metadata(),
+            partition="slice:1/2",
+            archive_file="/tmp/workspace-lib.tar.zst",
+            workspace_remap="/repo",
+        )
+
+        self.assertEqual(
+            archive,
+            [
+                "cargo",
+                "nextest",
+                "archive",
+                "--archive-file",
+                "/tmp/workspace-lib.tar.zst",
+                "-p",
+                "wenlan-core",
+                "--lib",
+            ],
+        )
+        self.assertNotIn("-E", archive)
+        self.assertEqual(
+            run,
+            [
+                [
+                    "cargo",
+                    "nextest",
+                    "run",
+                    "--archive-file",
+                    "/tmp/workspace-lib.tar.zst",
+                    "--workspace-remap",
+                    "/repo",
+                    "-E",
+                    M5_READER_FILTERSET,
+                    "--no-tests=pass",
+                    "--partition",
+                    "slice:1/2",
                 ]
             ],
         )

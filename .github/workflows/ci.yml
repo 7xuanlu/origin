@@ -1514,8 +1514,9 @@ jobs:
         with:
           # The nested CACHEDIR.TAG makes rust-cache preserve the explicit
           # target while this top-level root also carries host build artifacts.
-          # v3 rotates the immutable cache to the coherent host+target layout.
-          shared-key: release-v3-${{ matrix.target }}
+          # v4 rotates the immutable cache for the shipped no-LTO release
+          # profile while retaining the coherent host+target layout.
+          shared-key: release-v4-${{ matrix.target }}
           workspaces: . -> target
           cache-all-crates: "true"
           cache-workspace-crates: "false"
@@ -1568,7 +1569,7 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc' && steps.windows-cache-probe.outputs.state == 'cold-miss'
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: release-v3-${{ matrix.target }}
+          shared-key: release-v4-${{ matrix.target }}
           workspaces: . -> target
           cache-all-crates: "true"
           cache-workspace-crates: "false"
