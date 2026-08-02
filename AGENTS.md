@@ -80,7 +80,7 @@ cargo test -p wenlan-core --test eval_harness save_longmemeval_baseline -- --ign
 # Baselines saved to <EVAL_BASELINES_DIR>/*.json (gitignored, default ~/.cache/origin-eval).
 ```
 
-Pre-commit auto-formats Rust and runs Clippy on changed crates. Pre-push uses the CI planner to run Clippy and tests over the affected reverse-dependency closure.
+Pre-commit checks Rust formatting without changing the worktree and runs Clippy on directly changed crates. Pre-push uses the CI planner to run Clippy and tests over the affected reverse-dependency closure.
 
 ## Cross-platform
 
@@ -133,7 +133,7 @@ Wenlan runs across several layers. The split is driven by three questions: **(1)
 | Layer | What runs | Where | When | Time | Blocks? |
 |---|---|---|---|---|---|
 | **L1 dev loop** | rust-analyzer / IDE | Local | Every save | <1s | No |
-| **L2 pre-commit** | `cargo fmt --all`; Clippy on directly changed crates only | Local | `git commit` | ~5s | Yes |
+| **L2 pre-commit** | `cargo fmt --all -- --check`; Clippy on directly changed crates only | Local | `git commit` | ~5s | Yes |
 | **L3 pre-push** | Planner-selected Clippy + lib tests over the affected reverse-dependency closure; directly edited integration targets and isolated unit-test owners run alone | Local | `git push` | change-dependent | Yes |
 | **L4 CI on PR/main** | Fail-closed differential plan: affected lib, integration, contract, platform, and HTTP smoke owners only; aggregate `conclusion` verifies every expected job. Pushes to `main` reuse the same source-owned routing and retain the Windows release-profile cache warmer; manual dispatch is the full backstop. An exact same-repository Release PR whose current-main diff passes the semantic validator omits duplicate base-tree Rust/platform lanes only after independently proving that base's main CI succeeded; release-managed plugin/npm/docs checks and all four shipped-target preflights remain. | GitHub (`ci.yml`) | Every PR/main push | target ≤20min | Yes (required) |
 | **L5 coverage** | `cargo llvm-cov` on wenlan-core + wenlan-server only | GitHub (`coverage.yml`) | Relevant source-owner push to `main`, or manual dispatch | ~30min | **No (informational)** |
@@ -189,11 +189,11 @@ Releases are automated via [release-please](https://github.com/googleapis/releas
 
 Main branch has: required CI (`conclusion` — aggregate gate over `fmt` + `lint` + `test`, rust-lang convention from cargo / rustup / rust-analyzer) before merge, no force pushes, no deletion. `enforce_admins: false` so the repo owner can push directly for hotfixes. Force push requires temporarily enabling it via API (remember to re-disable after).
 
-### Git hooks (auto-activated)
+### Git hooks
 
 Manual setup: `bash scripts/setup-hooks.sh`. Hooks live under `.githooks/`.
 
-- **Pre-commit:** auto-formats Rust (`cargo fmt --all`, re-stages changed files) + Clippy on changed crates. Formatting issues can never reach CI.
+- **Pre-commit:** checks formatting (`cargo fmt --all -- --check`) without modifying or staging files, then runs Clippy on directly changed crates.
 - **Pre-push:** planner-selected Clippy + library tests for affected packages and reverse dependents. Direct integration-test edits and isolated unit-test owners run only that target/module. No coverage gate (see above).
 
 ### Drift-defense (doc/flag/config drift)
