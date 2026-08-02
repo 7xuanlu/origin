@@ -1089,122 +1089,89 @@ async fn a_verdict_from_a_superseded_extractor_stops_being_readable() {
     );
 }
 
-/// N2. The startup backlog drain WRITES, so it may not run in repair recovery.
+/// N2. The runtime backlog continuation WRITES, so it may not run in repair
+/// recovery, and no exhaustion loop may return to pre-serve startup.
 ///
 /// Repair recovery opens the database through `open_for_repair` precisely so
 /// that startup performs no ordinary side effect: an operator inspecting a
-/// damaged database must see only what the repair itself does. The drain
-/// deletes stale `done` jobs and inserts pending ones, so an unfenced call put
-/// queue mutations into the one startup that promised none.
+/// damaged database must see only what the repair itself does. The runtime
+/// sweep deletes stale `done` jobs and inserts pending ones, so an unfenced
+/// worker would put queue mutations into the one mode that promised none.
 ///
-/// Same shape and same honest limit as the projection tooth above: a source
-/// scan cannot prove the guard is reached at runtime, and does not try to. It
-/// is exactly strong enough to catch the failure that actually occurred --
-/// a writer landing outside the fence, invisible to every behavioural test
-/// because none of them boots a repair-mode daemon.
+/// Startup must not call `drain_stale_derivation_jobs`: looping to exhaustion
+/// before `serve` has no wall-clock bound. The optional runtime worker instead
+/// calls one enqueue sweep per turn and yields, under the existing repair-mode
+/// fence. The durable queue makes that continuation restart-safe.
 #[test]
-fn the_startup_backlog_drain_is_fenced_out_of_repair_mode() {
-    const DRAIN: &str = "drain_stale_derivation_jobs(";
-    const FENCE: &str = "repair_recovery_pending";
-
-    // Braces inside line comments would confuse the depth walk below, and the
-    // call is preceded by a long comment block. Strip comments, keep the lines.
-    let uncommented = |line: &str| line.split("//").next().unwrap_or("").to_string();
-
-    let mut checked = 0usize;
-    for (path, body) in workspace_sources() {
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with("_test.rs"))
-        {
-            continue;
-        }
-        let lines: Vec<String> = body.lines().map(uncommented).collect();
-        for (index, line) in lines.iter().enumerate() {
-            if !line.contains(DRAIN) || line.trim_start().starts_with("pub async fn") {
-                continue;
-            }
-            // Walk up to the `{` that opens the block this call sits in.
-            let mut depth = 0i32;
-            let mut opener: Option<&str> = None;
-            for above in lines[..index].iter().rev() {
-                for ch in above.chars().rev() {
-                    match ch {
-                        '}' => depth += 1,
-                        '{' if depth == 0 => {
-                            opener = Some(above);
-                            break;
-                        }
-                        '{' => depth -= 1,
-                        _ => {}
-                    }
-                }
-                if opener.is_some() {
-                    break;
-                }
-            }
-            let opener = opener.unwrap_or_else(|| {
-                panic!(
-                    "{}: found no enclosing block for the backlog drain",
-                    path.display()
-                )
-            });
-            assert!(
-                opener.contains(FENCE),
-                "{}: the backlog drain must sit directly inside the repair fence, but its \
-                 enclosing block opens with `{}`. The drain mutates `claim_derivation_jobs`; \
-                 repair recovery opens the database side-effect-free and must stay that way.",
-                path.display(),
-                opener.trim()
-            );
-            checked += 1;
-        }
-    }
+fn the_runtime_backlog_continuation_is_fenced_out_of_repair_mode() {
+    let sources = workspace_sources();
+    let startup = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("crates/wenlan-server/src/main/startup.rs"))
+        .map(|(_, body)| body.as_str())
+        .expect("startup.rs must be in the production source inventory");
+    let runtime = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("crates/wenlan-server/src/main/runtime.rs"))
+        .map(|(_, body)| body.as_str())
+        .expect("runtime.rs must be in the production source inventory");
 
     assert!(
-        checked > 0,
-        "no production call to {DRAIN} anywhere in the workspace. The drain is what continues \
-         the migration's truncated batch; without it a vault larger than one batch stays \
-         partially enqueued forever. If it moved, update this test to name its new home -- do \
-         not delete it."
+        !startup.contains("drain_stale_derivation_jobs(")
+            && !startup.contains("enqueue_stale_derivation_jobs("),
+        "pre-serve startup must open only the read gate, never run data-sized backlog work"
+    );
+    let fence = runtime
+        .find("if optional_runtime_workers_allowed(repair_recovery_pending)")
+        .expect("repair recovery must fence optional runtime workers");
+    let continuation = runtime
+        .find("enqueue_stale_derivation_jobs(")
+        .expect("the runtime worker must continue migration 105's truncated backlog");
+    assert!(
+        fence < continuation,
+        "the backlog writer must remain inside the optional-worker repair fence"
     );
 }
 
-/// The startup reconciliation pass is what WITHDRAWS a stored `supported` whose
-/// §1 conditions no longer hold. When it errors before the listener binds, the
-/// daemon must refuse startup rather than serve exactly the stale `supported`
-/// the pass exists to retract.
+/// Startup atomically opens the reconciliation frontier before serving. That
+/// gate WITHHOLDS a stored `supported` until the runtime evaluator re-proves it.
+/// If opening the gate errors, the daemon must refuse startup rather than serve
+/// exactly the stale `supported` the frontier exists to hide.
 ///
 /// That is the failure this asserts against: a `warn!`-and-continue arm. The
-/// pass must be able to refuse the boot, which on this codebase means reaching
+/// gate must be able to refuse the boot, which on this codebase means reaching
 /// `report_bootstrap_error` and returning an error, the same two moves the
 /// projection-invariant pass directly above it makes for the same reason.
 ///
-/// Same shape and the same honest limit as the drain fence above: a source scan
-/// establishes that the refusal is WRITTEN, not that a running daemon reaches
-/// it. It is intentionally scoped to `startup.rs`. The post-serve continuation
-/// may pause on an error because startup first opens the durable read frontier;
-/// pages beyond that frontier read `Unevaluated`, and the daemon-structure and
-/// frontier behaviour tests pin that separate fail-closed path.
+/// The data-sized evaluator belongs only to the shutdown-aware runtime worker.
+/// A source scan establishes both placements; frontier behaviour tests pin the
+/// resulting `Unevaluated` reads.
 ///
 /// The generation-0 carve-out inside the arm is deliberate and is not what this
 /// checks: below the cutover every adapter is pass-through and no truth state
 /// reaches a reader, so there is no restriction to fail closed on.
 #[test]
 fn a_failed_startup_reconciliation_refuses_to_serve() {
-    const RECONCILE: &str = "reconcile_supported_pages(";
+    const GATE: &str = "begin_support_reconcile_pass(";
 
     let mut checked = 0usize;
+    let mut runtime_continuations = 0usize;
     for (path, body) in workspace_sources() {
         let file_name = path.file_name().and_then(|name| name.to_str());
+        if file_name == Some("runtime.rs") {
+            runtime_continuations += body.matches("reconcile_supported_pages(").count();
+        }
         if file_name != Some("startup.rs") {
             continue;
         }
+        assert!(
+            !body.contains("reconcile_supported_pages("),
+            "startup.rs must not run a page evaluator whose per-page work is unbounded"
+        );
         let lines: Vec<&str> = body.lines().collect();
         for (index, line) in lines.iter().enumerate() {
             let code = line.split("//").next().unwrap_or("");
-            if !code.contains(RECONCILE) || code.trim_start().starts_with("pub async fn") {
+            if !code.contains(GATE) || code.trim_start().starts_with("pub async fn") {
                 continue;
             }
             // The handling of this call's result, bounded generously. Anything
@@ -1214,17 +1181,15 @@ fn a_failed_startup_reconciliation_refuses_to_serve() {
             let handler: String = lines[index..(index + 80).min(lines.len())].join("\n");
             assert!(
                 handler.contains("report_bootstrap_error"),
-                "{}: the startup reconciliation result is handled without ever reaching \
-                 `report_bootstrap_error`. A pass that withdraws stale `supported` state \
-                 cannot fail open -- when it does not complete, the daemon cannot know which \
-                 pages it was going to demote.",
+                "{}: the startup reconciliation gate is handled without ever reaching \
+                 `report_bootstrap_error`. If the frontier cannot open, stored support cannot \
+                 be served safely.",
                 path.display()
             );
             assert!(
                 handler.contains("return Err("),
-                "{}: the startup reconciliation result is handled without ever returning an \
-                 error. Logging and serving anyway serves exactly the stale `supported` state \
-                 this pass exists to retract.",
+                "{}: the startup reconciliation gate is handled without ever returning an \
+                 error. Logging and serving anyway exposes the stale state it should withhold.",
                 path.display()
             );
             checked += 1;
@@ -1233,11 +1198,12 @@ fn a_failed_startup_reconciliation_refuses_to_serve() {
 
     assert!(
         checked > 0,
-        "no production call to {RECONCILE} anywhere in the workspace. It is the only pass that \
-         re-proves ALL of §1 against live evidence -- the marker's existence and extractor, and \
-         the exact-edge revalidation no SQL scan can express. Without it a stored `supported` \
-         survives a restart unchecked. If it moved, update this test to name its new home -- do \
-         not delete it."
+        "no production startup call to {GATE}; without the frontier, stored `supported` is \
+         exposed before the runtime evaluator reaches it"
+    );
+    assert!(
+        runtime_continuations > 0,
+        "no runtime reconciliation continuation; the frontier would withhold support forever"
     );
 }
 

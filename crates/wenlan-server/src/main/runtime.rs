@@ -180,13 +180,11 @@ pub(super) async fn register_optional_runtime_workers(
         });
         let _ = wenlan_core::llm_provider::LLM_READINESS_HOOK.set(hook);
 
-        // Startup spends only a bounded latency budget on the full support
-        // predicate. Continue the durable pass after the listener has had time
-        // to enter `serve`, yielding between small batches so foreground reads
-        // are never queued behind a whole-vault scan. The read gate consumes
-        // the same frontier and withholds every stored `supported` this worker
-        // has not reached, so a failure here is degraded availability rather
-        // than stale truth escaping.
+        // Startup opens only the fail-closed frontier. Continue both data-sized
+        // truth jobs here, after the listener can serve: one bounded enqueue
+        // sweep and one bounded reconciliation batch per turn, yielding between
+        // turns. Queue rows plus the reconciliation cursor are durable, so a
+        // restart resumes instead of losing the tail.
         let db_for_reconcile = db_arc.clone();
         let mut reconcile_shutdown = shutdown_for_reconcile.subscribe();
         tokio::spawn(async move {
@@ -199,34 +197,50 @@ pub(super) async fn register_optional_runtime_workers(
                 return;
             }
 
+            let mut backlog_complete = false;
             loop {
-                let pass = {
+                let work = async {
                     let _maintenance_guard = maintenance_for_reconcile.begin_background().await;
-                    db_for_reconcile
+                    let enqueued = if backlog_complete {
+                        0
+                    } else {
+                        db_for_reconcile
+                            .enqueue_stale_derivation_jobs(startup::SUPPORT_RECONCILE_BATCH as i64)
+                            .await?
+                    };
+                    if enqueued == 0 {
+                        backlog_complete = true;
+                    }
+                    let pass = db_for_reconcile
                         .reconcile_supported_pages(startup::SUPPORT_RECONCILE_BATCH)
-                        .await
-                };
-                match pass {
-                    Ok(pass) if pass.complete => {
+                        .await?;
+                    Ok::<_, wenlan_core::WenlanError>((enqueued, pass))
+                }
+                .await;
+                match work {
+                    Ok((enqueued, pass)) if backlog_complete && pass.complete => {
                         tracing::info!(
-                            "[truth] background support reconciliation completed; {} page(s) \
-                             demoted in the final batch",
-                            pass.demoted
+                            "[truth] background derivation backlog and support reconciliation \
+                             completed; {enqueued} page(s) enqueued and {} page(s) demoted in \
+                             the final batch",
+                            pass.demoted,
                         );
                         return;
                     }
-                    Ok(pass) => {
-                        if pass.demoted > 0 {
+                    Ok((enqueued, pass)) => {
+                        if enqueued > 0 || pass.demoted > 0 {
                             tracing::info!(
-                                "[truth] background support reconciliation demoted {} page(s)",
-                                pass.demoted
+                                "[truth] background truth maintenance enqueued {enqueued} page(s) \
+                                 and demoted {} page(s)",
+                                pass.demoted,
                             );
                         }
                     }
                     Err(error) => {
                         tracing::warn!(
-                            "[truth] background support reconciliation paused after an error; \
-                             unproved pages remain unevaluated: {error}"
+                            "[truth] background truth maintenance paused after an error; \
+                             unproved pages remain unevaluated and the durable backlog remains \
+                             resumable: {error}"
                         );
                         return;
                     }

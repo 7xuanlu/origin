@@ -132,6 +132,7 @@ const RUNTIME_WORKER_ORDER: &[&str] = &[
     "OnDeviceProvider::new_with_model(",
     "LLM_READINESS_HOOK.set(",
     "let db_for_reconcile = db_arc.clone()",
+    "enqueue_stale_derivation_jobs(",
     "reconcile_supported_pages(startup::SUPPORT_RECONCILE_BATCH)",
 ];
 
@@ -1973,6 +1974,39 @@ fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
             .any(|violation| violation.contains("immediately before")),
         "finish_recovery adjacency mutation must be rejected: {violations:?}"
     );
+}
+
+/// The listener cannot have a real wall-clock startup bound while pre-serve
+/// code calls either an exhaustion loop or an evaluator whose work per page is
+/// unbounded. Startup may atomically open the fail-closed frontier; the durable
+/// backlog and reconciliation work itself belongs to the shutdown-aware
+/// runtime worker after `serve` can accept requests.
+#[test]
+fn truth_reconciliation_work_runs_only_in_the_runtime_worker() {
+    let root = repo_root();
+    let startup = read_source(&root, MAIN_STARTUP_CHILD);
+    let runtime = read_source(&root, MAIN_RUNTIME_CHILD);
+
+    assert!(
+        startup.contains("begin_support_reconcile_pass("),
+        "startup must open the read-gating frontier before serving"
+    );
+    for forbidden in ["drain_stale_derivation_jobs(", "reconcile_supported_pages("] {
+        assert!(
+            !startup.contains(forbidden),
+            "pre-serve startup must not call unbounded truth work: {forbidden}"
+        );
+    }
+    for required in [
+        "enqueue_stale_derivation_jobs(",
+        "reconcile_supported_pages(startup::SUPPORT_RECONCILE_BATCH)",
+        "lifecycle::sleep_or_shutdown(",
+    ] {
+        assert!(
+            runtime.contains(required),
+            "the shutdown-aware runtime continuation is missing {required}"
+        );
+    }
 }
 
 #[test]

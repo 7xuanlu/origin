@@ -510,124 +510,38 @@ pub(super) async fn prepare_startup_state(
         }
     }
 
-    // M5: finish the claim-derivation backlog the migration could only start.
+    // Open the truth read gate before serving, but do no data-sized work here.
+    // A single page can contain unbounded claims and candidates, so neither a
+    // page batch nor a deadline checked after evaluation is a real startup
+    // bound. The runtime worker continues both the durable derivation backlog
+    // and this reconciliation pass after `serve` can accept requests. Until it
+    // reaches a stored `supported`, the frontier makes that read `Unevaluated`;
+    // availability degrades without stale truth escaping.
     //
-    // Migration 105 sweeps one bounded batch, because it runs holding the single
-    // connection's mutex and a full scan of a large vault would delay boot. That
-    // bound truncates rather than defers unless something continues it: a vault
-    // with more pages than the batch leaves the remainder reachable only by
-    // being edited, and the derivation queue is then quietly partial on exactly
-    // the installs the backlog scan exists for.
-    //
-    // Once per boot is the right cadence and not merely the convenient one. The
-    // three inputs that can strand a page here — a new binary's
-    // EXTRACTOR_VERSION, a new binary's SUPPORT_THRESHOLD, and an interrupted
-    // migration — are all things that change across a restart and not during
-    // one. Everything that moves while the daemon runs already has a trigger.
-    //
-    // Fenced, because the drain WRITES. Repair recovery opens the database
-    // through `open_for_repair`, which deliberately performs no ordinary
-    // constructor side effect, and the whole point of that mode is that an
-    // operator inspecting or repairing a damaged database sees only what the
-    // repair itself does. The drain deletes stale `done` jobs and inserts
-    // pending ones, so leaving it unfenced put queue mutations into exactly the
-    // startup that promised none. The backlog is not lost — it is a boot-time
-    // sweep, so the next ordinary start performs it.
-    // The drain also DEMOTES. Row 15's whole point is that a page whose support
-    // stopped clearing the live bar must stop asserting `supported` now rather
-    // than whenever a worker reaches it, and `reconcile_supported_pages` extends
-    // that to the conditions no SQL scan can see — a missing or stale marker, an
-    // extractor bump, a citation whose bytes moved. Both are reconciliation, so
-    // both are treated the same way when they fail.
-    //
-    // BOUNDED, and it has to be. The reconcile pass holds the single connection
-    // every foreground request needs and spends a multi-query evaluator per
-    // page, per claim, per candidate; run to completion here it would occupy
-    // the port for as long as a large supported vault takes, which is the very
-    // thing the batch above the drain exists to avoid. So it runs in batches
-    // under a wall-clock deadline, and what it does not reach is withheld
-    // rather than served: the durable cursor it leaves makes every unproved
-    // `supported` read `Unevaluated` until a later batch gets there. Truncating
-    // WITHOUT that gate would serve exactly the stale state the pass retracts.
-    //
-    // The deadline is a boot-latency budget, not a correctness one. Overrunning
-    // it costs re-derivation and a slower path back to `supported`; it can
-    // never publish an unproved verdict.
+    // Repair recovery remains side-effect-free and therefore does not open a
+    // pass. The next ordinary start does, then the runtime worker resumes it.
     if !repair_recovery_pending {
-        const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
-        // Start a new pass after a completed one, or resume an incomplete pass
-        // under the same ruleset. The durable ruleset binds the cursor to the
-        // extractor, threshold, and reconciliation algorithm that earned it;
-        // a changed rule restarts from the beginning, while a short-lived
-        // process cannot starve a large vault by repeatedly proving one prefix.
-        let drained = match db_arc.drain_stale_derivation_jobs(500).await {
-            Ok(enqueued) => db_arc
-                .begin_support_reconcile_pass()
-                .await
-                .map(|()| enqueued),
-            Err(e) => Err(e),
-        };
-        let reconciled = match drained {
-            Ok(enqueued) => {
-                let deadline = std::time::Instant::now() + RECONCILE_BUDGET;
-                let mut demoted = 0usize;
-                let mut outcome = Ok(());
-                loop {
-                    match db_arc
-                        .reconcile_supported_pages(SUPPORT_RECONCILE_BATCH)
-                        .await
-                    {
-                        Ok(pass) => {
-                            demoted += pass.demoted;
-                            if pass.complete {
-                                break;
-                            }
-                            if std::time::Instant::now() >= deadline {
-                                tracing::info!(
-                                    "[truth] support reconciliation paused at its boot budget; \
-                                     unproved pages read as unevaluated until the runtime worker \
-                                     resumes"
-                                );
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            outcome = Err(e);
-                            break;
-                        }
-                    }
-                }
-                outcome.map(|()| (enqueued, demoted))
-            }
-            Err(e) => Err(e),
-        };
-        match reconciled {
-            Ok((0, 0)) => {}
-            Ok((enqueued, demoted)) => tracing::info!(
-                "[truth] claim-derivation reconciliation: {enqueued} page(s) enqueued, \
-                 {demoted} demoted out of supported"
-            ),
+        match db_arc.begin_support_reconcile_pass().await {
+            Ok(()) => {}
             // Fail CLOSED, on the same rule and through the same helper as the
-            // projection invariant above. This pass is what withdraws a stored
-            // `supported` whose evidence no longer holds; when it does not
-            // complete, the daemon does not know which pages those are, and
-            // logging and serving anyway means serving exactly the stale
-            // `supported` state the pass exists to retract. At generation 0
-            // every adapter is pass-through and no truth state reaches a
-            // reader, so the failure records the absence of a restriction that
-            // is not in force: `error!` and serve.
+            // projection invariant above. The frontier is what withholds each
+            // stored `supported` until the runtime pass re-proves it. If the
+            // gate cannot be opened, serving would expose exactly the stale
+            // state the pass exists to retract. At generation 0 every adapter
+            // is pass-through and no truth state reaches a reader, so the
+            // failure records the absence of a restriction that is not in
+            // force: `error!` and serve.
             Err(e) => {
                 let live = db_arc.truth_cutover_generation().await.unwrap_or(1) != 0;
                 if live {
                     let msg = format!(
-                        "[truth] claim-derivation reconciliation failed at cutover generation \
+                        "[truth] claim-derivation reconciliation gate failed at cutover generation \
                          >= 1; refusing to serve possibly-stale supported state: {e}"
                     );
                     report_bootstrap_error(&wenlan_root, &msg);
                     return Err(anyhow::anyhow!(msg));
                 }
-                tracing::error!("[truth] claim-derivation reconciliation failed: {e}");
+                tracing::error!("[truth] claim-derivation reconciliation gate failed: {e}");
             }
         }
     }

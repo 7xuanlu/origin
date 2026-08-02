@@ -778,6 +778,7 @@ async fn attempt_on(db: &MemoryDB, revision_id: &str, candidate: &Candidate, out
 /// This run weighed every candidate for the claim and none cleared the bar —
 /// as distinct from nobody ever looking, and from looking and not finishing.
 async fn judged_but_short(db: &MemoryDB, revision_id: &str) {
+    add_live_candidate_chunk(db, revision_id, 0).await;
     attempt_on(
         db,
         revision_id,
@@ -2070,6 +2071,42 @@ async fn add_sibling_chunk(db: &MemoryDB, revision_id: &str, chunk_index: i64) {
     .unwrap();
 }
 
+/// A real candidate chunk with no support edge. This is the positive control
+/// for a completed judgement that genuinely fell short: the locator resolves,
+/// but no active edge says the candidate supports the claim.
+async fn add_live_candidate_chunk(db: &MemoryDB, revision_id: &str, chunk_index: i64) {
+    let conn = db.conn.lock().await;
+    let space: String = {
+        let mut rows = conn
+            .query(
+                "SELECT p.space
+                   FROM pages p
+                   JOIN page_version_claims pvc ON pvc.page_id = p.id
+                  WHERE pvc.claim_revision_id = ?1 LIMIT 1",
+                libsql::params![revision_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    let source_id = format!("mem_{revision_id}");
+    conn.execute(
+        "INSERT OR IGNORE INTO memories
+             (id, content, source, source_id, title, chunk_index,
+              last_modified, chunk_type, space)
+         VALUES (?1, ?2, 'memory', ?3, 'candidate', ?4, 0, 'text', ?5)",
+        libsql::params![
+            format!("candidate_{source_id}_{chunk_index}"),
+            EVIDENCE_TEXT,
+            source_id,
+            chunk_index,
+            space,
+        ],
+    )
+    .await
+    .unwrap();
+}
+
 /// Whether the read surface still tells callers this page is supported.
 async fn exposed_support(db: &MemoryDB, page_id: &str) -> crate::truth_contract::Support {
     db.page_truth_states(&[page_id.to_string()])
@@ -2396,20 +2433,18 @@ async fn a_dead_chunk_edge_cannot_republish_support() {
     );
 
     let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
-    assert_ne!(
-        outcome,
-        SupportOutcome::Supported,
-        "an active, above-threshold edge whose chunk is gone is not support"
+    assert!(
+        matches!(outcome, SupportOutcome::NoPublish { .. }),
+        "an active, above-threshold edge whose chunk is gone is malformed live \
+         evidence, not support or a refutation; got {outcome:?}"
     );
-    let job = lease_page(&db, "p1", 1, "worker2").await;
-    assert!(db
-        .finalize_page_support("p1", 1, &job, "worker2", &outcome)
-        .await
-        .unwrap());
+    db.begin_support_reconcile_pass().await.unwrap();
+    assert_eq!(db.reconcile_supported_pages(1000).await.unwrap().demoted, 1);
     assert_eq!(
         truth_row(&db, "p1").await.unwrap().0,
         "provisional",
-        "publishing the re-evaluation must take the page out of supported"
+        "the fail-closed reconciler must take inherited malformed support out \
+         of circulation without publishing the malformed run"
     );
 }
 
@@ -2425,10 +2460,11 @@ async fn a_candidate_this_run_never_concluded_blocks_publication() {
     add_page(&db, "p1").await;
     let revisions = derive_page(&db, "p1", 1).await;
 
+    add_live_candidate_chunk(&db, &revisions[0], 0).await;
     attempt_on(
         &db,
         &revisions[0],
-        &Candidate::named(&revisions[0], "candidate_a"),
+        &Candidate::at_chunk(&revisions[0], 0),
         "concluded",
     )
     .await;
@@ -2440,10 +2476,11 @@ async fn a_candidate_this_run_never_concluded_blocks_publication() {
         "a run that concluded on every candidate and found nothing IS a verdict"
     );
 
+    add_live_candidate_chunk(&db, &revisions[0], 1).await;
     attempt_on(
         &db,
         &revisions[0],
-        &Candidate::named(&revisions[0], "candidate_b"),
+        &Candidate::at_chunk(&revisions[0], 1),
         "deferred",
     )
     .await;
@@ -2844,12 +2881,9 @@ async fn a_candidate_that_left_neither_an_attempt_nor_an_edge_blocks_publication
         "candidate A alone proves out, which is what makes the next step a test"
     );
 
-    owed_but_unjudged(
-        &db,
-        &revisions[0],
-        &Candidate::named(&revisions[0], "digest_of_the_candidate_nobody_reached"),
-    )
-    .await;
+    add_live_candidate_chunk(&db, &revisions[0], 1).await;
+    let unfinished = Candidate::at_chunk(&revisions[0], 1);
+    owed_but_unjudged(&db, &revisions[0], &unfinished).await;
 
     let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
     let SupportOutcome::NoPublish { ref reason } = outcome else {
@@ -2865,13 +2899,7 @@ async fn a_candidate_that_left_neither_an_attempt_nor_an_edge_blocks_publication
 
     // Conclude on it and the page is supported again — so the refusal is about
     // the missing conclusion, not about the row's mere existence.
-    attempt_on(
-        &db,
-        &revisions[0],
-        &Candidate::named(&revisions[0], "digest_of_the_candidate_nobody_reached"),
-        "concluded",
-    )
-    .await;
+    attempt_on(&db, &revisions[0], &unfinished, "concluded").await;
     assert_eq!(
         db.evaluate_page_support("p1", 1).await.unwrap(),
         SupportOutcome::Supported
@@ -2911,6 +2939,39 @@ async fn a_conclusion_outside_the_sealed_inventory_blocks_publication() {
     assert!(
         reason.contains("outside the sealed inventory"),
         "the stored reason must name the inventory mismatch: {reason}"
+    );
+}
+
+/// A sealed inventory is a declaration about candidates that existed in the
+/// evidence universe the run judged. Set equality alone is not enough: a
+/// worker can seal a locator that resolves to no chunk (or no valid span),
+/// write the matching concluded attempt, and otherwise look complete. Reading
+/// that as `Refuted` turns malformed pipeline state into a verdict about the
+/// page. Every sealed, concluded locator must still resolve to the live bytes
+/// and digest it names before any verdict may publish.
+#[tokio::test]
+async fn a_concluded_locator_that_resolves_to_no_live_evidence_publishes_nothing() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    attempt_on(
+        &db,
+        &revisions[0],
+        &Candidate::named(&revisions[0], "ghost_span"),
+        "concluded",
+    )
+    .await;
+
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    let SupportOutcome::NoPublish { ref reason } = outcome else {
+        panic!(
+            "a matching seal and conclusion cannot turn an unresolvable locator into a verdict; \
+             got {outcome:?}"
+        );
+    };
+    assert!(
+        reason.contains("locator") || reason.contains("evidence"),
+        "the refusal must name the unresolvable candidate: {reason}"
     );
 }
 
@@ -3077,6 +3138,52 @@ async fn an_interrupted_reconcile_pass_resumes_from_its_durable_frontier() {
     );
 }
 
+/// Ruleset and frontier form one promise: the cursor was earned by exactly the
+/// evaluator named by the ruleset. A failure between two autocommit writes can
+/// leave the new ruleset next to the old cursor, and the next boot then trusts
+/// an old prefix as though the new evaluator had proved it. Inject failure on
+/// the frontier write and require the ruleset write to roll back with it.
+#[tokio::test]
+async fn a_reconcile_ruleset_reset_is_atomic_with_its_frontier_reset() {
+    let (db, _temp) = db_with_queue().await;
+    db.set_app_metadata("support_reconcile_ruleset", "old-ruleset")
+        .await
+        .unwrap();
+    db.set_app_metadata("support_reconcile_frontier", "p1")
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute_batch(
+            "CREATE TRIGGER fail_reconcile_frontier_reset
+             BEFORE INSERT ON app_metadata
+             WHEN NEW.key = 'support_reconcile_frontier' AND NEW.value = ''
+             BEGIN
+               SELECT RAISE(ABORT, 'injected frontier reset failure');
+             END;",
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(db.begin_support_reconcile_pass().await.is_err());
+    assert_eq!(
+        db.get_app_metadata("support_reconcile_ruleset")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old-ruleset"),
+        "a failed frontier reset must not leave a new ruleset beside an old cursor"
+    );
+    assert_eq!(
+        db.get_app_metadata("support_reconcile_frontier")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("p1")
+    );
+}
+
 /// Blocker 2, shaped like the caller that actually does this. The folder sync in
 /// `crates/wenlan-server/src/source_routes.rs` treats a file whose content hash
 /// matches a vanished file as a RENAME and calls
@@ -3145,5 +3252,53 @@ async fn a_renamed_document_stops_its_pages_asserting_support() {
     assert_eq!(
         live_edges, 0,
         "an edge citing an id no memory holds must not stay active"
+    );
+}
+
+/// A same-ID rebind is observationally a no-op after proving the source exists.
+/// Even `UPDATE memories SET source_id = old WHERE source_id = old` is not a
+/// no-op in SQLite: the unconditional AFTER UPDATE parity trigger advances the
+/// generation, invalidating proof that depends on that generation. The public
+/// primitive must return before issuing any write at all.
+#[tokio::test]
+async fn a_same_id_rebind_has_no_database_side_effects() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+    let source_id = format!("mem_{}", revisions[0]);
+    let before = {
+        let conn = db.conn.lock().await;
+        conn.total_changes()
+    };
+
+    db.rebind_source_id("memory", &source_id, &source_id)
+        .await
+        .unwrap();
+
+    let after = {
+        let conn = db.conn.lock().await;
+        conn.total_changes()
+    };
+    assert_eq!(
+        after, before,
+        "same-ID rebind must not execute UPDATEs or fire parity triggers"
+    );
+
+    let missing = db
+        .rebind_source_id("memory", "missing", "missing")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(missing, crate::error::WenlanError::NotFound(_)),
+        "the no-op fold must preserve the public primitive's existence check: {missing}"
+    );
+    let after_missing = {
+        let conn = db.conn.lock().await;
+        conn.total_changes()
+    };
+    assert_eq!(
+        after_missing, after,
+        "a missing same-ID lookup is read-only"
     );
 }

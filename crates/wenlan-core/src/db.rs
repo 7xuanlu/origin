@@ -26455,6 +26455,27 @@ impl MemoryDB {
         source_page_ids: Option<(&str, &str)>,
     ) -> Result<(), WenlanError> {
         let conn = self.conn.lock().await;
+        if old_source_id == new_source_id {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM memories
+                     WHERE source = ?1 AND source_id = ?2 LIMIT 1",
+                    libsql::params![source, old_source_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("rebind source lookup: {e}")))?;
+            if rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("rebind source row: {e}")))?
+                .is_none()
+            {
+                return Err(WenlanError::NotFound(format!(
+                    "rebind source not found: {old_source_id}"
+                )));
+            }
+            return Ok(());
+        }
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("rebind_source_id begin: {e}")))?;

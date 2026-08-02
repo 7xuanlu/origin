@@ -279,7 +279,7 @@ const SUPPORT_RECONCILE_FRONTIER_KEY: &str = "support_reconcile_frontier";
 /// was proved under. Bump the first component whenever reconciliation semantics
 /// change without changing the extractor or threshold.
 const SUPPORT_RECONCILE_RULESET_KEY: &str = "support_reconcile_ruleset";
-const SUPPORT_RECONCILE_RULESET_VERSION: i64 = 1;
+const SUPPORT_RECONCILE_RULESET_VERSION: i64 = 2;
 
 /// The frontier value meaning the pass finished. Not a page ID, and it cannot
 /// collide with one: page IDs are `page_`-prefixed and never contain a space.
@@ -1059,24 +1059,90 @@ impl MemoryDB {
     /// verdict is asserted before the current process re-earns it.
     pub async fn begin_support_reconcile_pass(&self) -> Result<(), WenlanError> {
         let ruleset = support_reconcile_ruleset();
-        let frontier = self
-            .get_app_metadata(SUPPORT_RECONCILE_FRONTIER_KEY)
-            .await?;
-        let recorded_ruleset = self.get_app_metadata(SUPPORT_RECONCILE_RULESET_KEY).await?;
-        if frontier
-            .as_deref()
-            .is_some_and(|value| value != SUPPORT_RECONCILE_COMPLETE)
-            && recorded_ruleset.as_deref() == Some(ruleset.as_str())
-        {
-            return Ok(());
-        }
-
-        // Ruleset first. A crash between these two writes makes the next boot
-        // reset again; it cannot make an old frontier look current.
-        self.set_app_metadata(SUPPORT_RECONCILE_RULESET_KEY, &ruleset)
-            .await?;
-        self.set_app_metadata(SUPPORT_RECONCILE_FRONTIER_KEY, "")
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("support reconcile pass begin: {error}"))
+            })?;
+        let reset = async {
+            let frontier = {
+                let mut rows = tx
+                    .query(
+                        "SELECT value FROM app_metadata WHERE key = ?1",
+                        libsql::params![SUPPORT_RECONCILE_FRONTIER_KEY],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("support reconcile frontier read: {error}"))
+                    })?;
+                rows.next()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("support reconcile frontier decode: {error}"))
+                    })?
+                    .map(|row| row.get::<String>(0))
+                    .transpose()
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("support reconcile frontier decode: {error}"))
+                    })?
+            };
+            let recorded_ruleset = {
+                let mut rows = tx
+                    .query(
+                        "SELECT value FROM app_metadata WHERE key = ?1",
+                        libsql::params![SUPPORT_RECONCILE_RULESET_KEY],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("support reconcile ruleset read: {error}"))
+                    })?;
+                rows.next()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("support reconcile ruleset decode: {error}"))
+                    })?
+                    .map(|row| row.get::<String>(0))
+                    .transpose()
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("support reconcile ruleset decode: {error}"))
+                    })?
+            };
+            if frontier
+                .as_deref()
+                .is_some_and(|value| value != SUPPORT_RECONCILE_COMPLETE)
+                && recorded_ruleset.as_deref() == Some(ruleset.as_str())
+            {
+                return Ok::<_, WenlanError>(());
+            }
+
+            for (key, value) in [
+                (SUPPORT_RECONCILE_RULESET_KEY, ruleset.as_str()),
+                (SUPPORT_RECONCILE_FRONTIER_KEY, ""),
+            ] {
+                tx.execute(
+                    "INSERT INTO app_metadata (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    libsql::params![key, value],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("support reconcile pass reset: {error}"))
+                })?;
+            }
+            Ok(())
+        }
+        .await;
+        match reset {
+            Ok(()) => tx.commit().await.map_err(|error| {
+                WenlanError::VectorDb(format!("support reconcile pass commit: {error}"))
+            }),
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     /// How far the current reconciliation pass has got, for the read gate.
@@ -1369,8 +1435,9 @@ impl MemoryDB {
     ///    stop or disagree with its declaration: claim membership must match
     ///    the marker count; the per-run candidate set must be sealed; sealed
     ///    candidates and attempt locators must match in both directions; every
-    ///    attempt must have concluded; and every live candidate edge must have
-    ///    been weighed by the run. Failure → `NoPublish` (row 6).
+    ///    concluded locator must still resolve to the live bytes and digest it
+    ///    names; every attempt must have concluded; and every live candidate
+    ///    edge must have been weighed by the run. Failure → `NoPublish` (row 6).
     ///
     ///    **Condition 4 is checked before condition 3, per claim, and a valid
     ///    support edge does not excuse it.** Reading condition 3 first and
@@ -1563,6 +1630,71 @@ impl MemoryDB {
             )));
         }
 
+        Ok(None)
+    }
+
+    /// Resolve one run-inventory locator against the evidence bytes that are
+    /// live now. A seal plus a matching attempt proves only that two tables
+    /// agree with each other; it does not prove that either names a real
+    /// candidate. Missing, ambiguous, out-of-range, and digest-mismatched
+    /// locators are malformed run state, never a short judgement.
+    async fn revalidate_candidate_locator(
+        conn: &libsql::Connection,
+        locator: &CandidateLocator,
+    ) -> Result<Option<String>, WenlanError> {
+        let content = {
+            let mut rows = conn
+                .query(
+                    "SELECT content FROM memories
+                      WHERE source_id = ?1 AND chunk_index = ?2 LIMIT 2",
+                    libsql::params![locator.source_id.as_str(), locator.chunk_index],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("candidate locator memory: {error}"))
+                })?;
+            let Some(row) = rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!("candidate locator memory decode: {error}"))
+            })?
+            else {
+                return Ok(Some(format!(
+                    "candidate locator names no live chunk {} of {}",
+                    locator.chunk_index, locator.source_id
+                )));
+            };
+            let content: String = row.get(0).map_err(|error| {
+                WenlanError::VectorDb(format!("candidate locator memory decode: {error}"))
+            })?;
+            if rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("candidate locator memory decode: {error}"))
+                })?
+                .is_some()
+            {
+                return Ok(Some(format!(
+                    "candidate locator is ambiguous: {} has more than one chunk {}",
+                    locator.source_id, locator.chunk_index
+                )));
+            }
+            content
+        };
+
+        let start = usize::try_from(locator.span_start).unwrap_or(usize::MAX);
+        let end = usize::try_from(locator.span_end).unwrap_or(usize::MAX);
+        let Some(span) = content.get(start..end) else {
+            return Ok(Some(format!(
+                "candidate locator span [{start}, {end}) is invalid for {} chunk {}",
+                locator.source_id, locator.chunk_index
+            )));
+        };
+        if crate::provenance::revision_content_digest(span) != locator.span_digest {
+            return Ok(Some(format!(
+                "candidate locator digest no longer matches {} chunk {} span [{start}, {end})",
+                locator.source_id, locator.chunk_index
+            )));
+        }
         Ok(None)
     }
 
@@ -1841,7 +1973,9 @@ impl MemoryDB {
             mut incomplete,
             mut outside_inventory,
             mut unregistered,
-        ) = (0i64, 0i64, 0i64, 0i64, 0i64);
+            mut invalid_locator,
+        ) = (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
+        let mut first_invalid_locator_reason = None;
         for claim_revision_id in &claim_revision_ids {
             // The candidate's LOCATION comes out of the payload alongside the
             // edge, because location is what identifies a candidate: the same
@@ -2027,6 +2161,18 @@ impl MemoryDB {
                 incomplete += 1;
                 continue;
             }
+            let mut locator_invalid = false;
+            for locator in &expected {
+                if let Some(reason) = Self::revalidate_candidate_locator(conn, locator).await? {
+                    invalid_locator += 1;
+                    locator_invalid = true;
+                    first_invalid_locator_reason.get_or_insert(reason);
+                    break;
+                }
+            }
+            if locator_invalid {
+                continue;
+            }
             // The inventory half of condition 4. Every live candidate has to be
             // one this run actually weighed; an edge with no attempt row behind
             // it is evidence the run never accounted for, and publishing on it
@@ -2095,6 +2241,22 @@ impl MemoryDB {
                 reason: format!(
                     "incomplete derivation: {incomplete} of {inventory_count} claim(s) have a \
                      candidate this run never concluded on"
+                ),
+            });
+        }
+
+        // A concluded locator that cannot be resolved is malformed pipeline
+        // state, not evidence that was judged and fell short. Set equality
+        // between the seal and attempts cannot manufacture the missing bytes.
+        if invalid_locator > 0 {
+            return Ok(SupportOutcome::NoPublish {
+                reason: format!(
+                    "unresolvable candidate locator: {invalid_locator} of {inventory_count} \
+                     claim(s) name evidence that cannot be verified{}",
+                    first_invalid_locator_reason
+                        .as_deref()
+                        .map(|reason| format!(": {reason}"))
+                        .unwrap_or_default()
                 ),
             });
         }
