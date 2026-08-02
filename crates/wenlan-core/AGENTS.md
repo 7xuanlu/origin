@@ -75,6 +75,15 @@ pub struct NoopEmitter;
 
 > Moved from root `AGENTS.md` (index-and-pointer refactor): these name `wenlan-core` internals (`run_canonical_enrichment`, `eval/seed_contract.rs`), loaded when working in this crate.
 
+### M5 reader inventory identity
+
+`scripts/m5-reader-sweep.py --check` owns the executable page-prose reader
+contract in `docs/plans/2026-07-27-m5-reader-manifest-inventory.md`. Its stable
+identity is `short/path.rs::function[#ordinal]`; never put source line numbers
+back into the committed block. Lines belong only in `--json` diagnostics, and
+unowned relevant callsites fail closed. The required check includes mutation
+controls for identity, visibility, depth/`via`, callers, and duplicates.
+
 ### Ingest-path parity (training-serving skew)
 - **All post-store enrichment goes through `wenlan_core::ingest::run_canonical_enrichment`.** It is the ONE shared path for classify + extract + `apply_enrichment` + tags (Phase 1), entity/title/page enrichment (Phase 2), and dual-pool dedup/contradiction resolution (Phase 3). The server `handle_store_memory`, the eval seed pipeline, and the importer all call it. Do NOT re-implement a subset of enrichment in any consumer.
 - **Why.** The eval seed used to re-implement a divergent subset (`enrich_db_for_eval` = entity + title + page only), so every new write-time feature (importance/T8, event_date/T11+T20, episode/T2, fact-channel/T15, dual-pool/T14, summary-nodes/T18) silently lagged in the eval path and shipped merged-but-inert, re-discovered as "starved" each eval cycle. Sharing the code makes seed-vs-production fidelity hold by construction. This is the standard fix for **training-serving skew** — Google "Rules of ML", Rule #32: *"Re-use code between your training pipeline and your serving pipeline whenever possible"* → *"eliminates a source of training-serving skew."* See also 12-Factor X (dev/prod parity) and the technical-debt framing (Cunningham, OOPSLA '92): the eval shortcut was debt never repaid.
