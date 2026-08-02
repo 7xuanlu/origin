@@ -564,17 +564,31 @@ def _latest_release_target_attempts(
     run_id: int,
     current_attempt: int,
     head_sha: str,
+    target_attempts: dict[str, int],
 ) -> dict[str, int]:
-    """Bind every release target to the last attempt that actually ran its job."""
+    """Validate each target's job on the attempt that produced its latest artifact."""
 
     targets = [entry["target"] for entry in release_matrix()["include"]]
+    if set(target_attempts) != set(targets):
+        raise CandidateError("release target artifact attempt inventory is not exact")
     target_by_job = {f"release-preflight ({target})": target for target in targets}
-    latest: dict[str, tuple[int, dict]] = {}
-    for attempt in range(1, current_attempt + 1):
+    targets_by_attempt: dict[int, set[str]] = {}
+    for target, attempt in target_attempts.items():
+        if (
+            not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or attempt < 1
+            or attempt > current_attempt
+        ):
+            raise CandidateError("release target artifact attempt is invalid")
+        targets_by_attempt.setdefault(attempt, set()).add(target)
+
+    validated: dict[str, int] = {}
+    for attempt, expected_targets in sorted(targets_by_attempt.items()):
         seen: dict[str, dict] = {}
         for job in _attempt_jobs(api, repository, run_id, attempt):
             target = target_by_job.get(job.get("name"))
-            if target is None:
+            if target not in expected_targets:
                 continue
             if target in seen:
                 raise CandidateError(
@@ -588,33 +602,29 @@ def _latest_release_target_attempts(
             ):
                 raise CandidateError("release-preflight job control-plane identity mismatch")
             seen[target] = job
-        for target, job in seen.items():
-            latest[target] = (attempt, job)
-
-    missing = set(targets) - set(latest)
-    if missing:
-        raise CandidateError(
-            f"release-preflight jobs never ran for targets: {sorted(missing)}"
-        )
-    selected: dict[str, int] = {}
-    for target in targets:
-        attempt, job = latest[target]
-        if job.get("status") != "completed" or job.get("conclusion") != "success":
+        missing = expected_targets - set(seen)
+        if missing:
             raise CandidateError(
-                f"latest release-preflight job for {target!r} in attempt {attempt} "
-                f"concluded {job.get('conclusion')!r}"
+                f"release-preflight jobs are missing for artifact attempt {attempt}: "
+                f"{sorted(missing)}"
             )
-        selected[target] = attempt
-    return selected
+        for target in expected_targets:
+            job = seen[target]
+            if job.get("status") != "completed" or job.get("conclusion") != "success":
+                raise CandidateError(
+                    f"release-preflight job for {target!r} in artifact attempt {attempt} "
+                    f"concluded {job.get('conclusion')!r}"
+                )
+            validated[target] = attempt
+    return validated
 
 
-def _candidate_artifacts_for_attempts(
+def _candidate_artifact_index(
     artifacts: list,
     *,
     run_id: int,
     current_attempt: int,
-    target_attempts: dict[str, int],
-) -> dict[str, dict]:
+) -> tuple[dict[tuple[int, str], dict], set[str]]:
     prefix = f"release-candidate-{run_id}-"
     targets = {entry["target"] for entry in release_matrix()["include"]}
     indexed: dict[tuple[int, str], dict] = {}
@@ -635,6 +645,48 @@ def _candidate_artifacts_for_attempts(
         if key in indexed:
             raise CandidateError("release candidate artifact attempt/target is duplicated")
         indexed[key] = artifact
+    return indexed, targets
+
+
+def _latest_candidate_artifact_attempts(
+    artifacts: list,
+    *,
+    run_id: int,
+    current_attempt: int,
+) -> dict[str, int]:
+    """Select the newest attempt that actually emitted an artifact per target."""
+
+    indexed, targets = _candidate_artifact_index(
+        artifacts, run_id=run_id, current_attempt=current_attempt
+    )
+    selected: dict[str, int] = {}
+    for entry in release_matrix()["include"]:
+        target = entry["target"]
+        attempts = [
+            attempt for attempt, artifact_target in indexed if artifact_target == target
+        ]
+        if attempts:
+            selected[target] = max(attempts)
+    missing = targets - set(selected)
+    if missing:
+        raise CandidateError(
+            f"release candidate artifacts are missing for targets: {sorted(missing)}"
+        )
+    return selected
+
+
+def _candidate_artifacts_for_attempts(
+    artifacts: list,
+    *,
+    run_id: int,
+    current_attempt: int,
+    target_attempts: dict[str, int],
+) -> dict[str, dict]:
+    indexed, targets = _candidate_artifact_index(
+        artifacts, run_id=run_id, current_attempt=current_attempt
+    )
+    if set(target_attempts) != targets:
+        raise CandidateError("release target artifact attempt inventory is not exact")
 
     selected: dict[str, dict] = {}
     for target, attempt in target_attempts.items():
@@ -924,12 +976,18 @@ def validate_candidate(
     all_artifacts = _api_pages(
         api, f"/repos/{repository}/actions/runs/{run_id}/artifacts", "run artifacts"
     )
-    target_attempts = _latest_release_target_attempts(
+    target_attempts = _latest_candidate_artifact_attempts(
+        all_artifacts,
+        run_id=run_id,
+        current_attempt=run_attempt,
+    )
+    _latest_release_target_attempts(
         api,
         repository,
         run_id=run_id,
         current_attempt=run_attempt,
         head_sha=head_sha,
+        target_attempts=target_attempts,
     )
     selected_artifacts = _candidate_artifacts_for_attempts(
         all_artifacts,

@@ -192,6 +192,37 @@ class ReleasePromotionTests(unittest.TestCase):
         with self.assertRaisesRegex(PROMOTION.PromotionError, "candidate count"):
             PROMOTION._artifact_pages(api, REPOSITORY, name)
 
+    def test_receipt_locator_rejects_incomplete_or_unstable_pagination(self) -> None:
+        name = "validated-release-receipt-7-2"
+        path = f"/repos/{REPOSITORY}/actions/artifacts"
+        first = {"name": name, "id": 1}
+        incomplete = FakeApi(
+            {
+                (
+                    path,
+                    (("name", name), ("page", 1), ("per_page", 100)),
+                ): {"total_count": 2, "artifacts": [first]},
+            }
+        )
+        with self.assertRaisesRegex(PROMOTION.PromotionError, "does not match pages"):
+            PROMOTION._artifact_pages(incomplete, REPOSITORY, name)
+
+        full_page = [dict(first, id=index + 1) for index in range(100)]
+        unstable = FakeApi(
+            {
+                (
+                    path,
+                    (("name", name), ("page", 1), ("per_page", 100)),
+                ): {"total_count": 20, "artifacts": full_page},
+                (
+                    path,
+                    (("name", name), ("page", 2), ("per_page", 100)),
+                ): {"total_count": 19, "artifacts": []},
+            }
+        )
+        with self.assertRaisesRegex(PROMOTION.PromotionError, "changed during pagination"):
+            PROMOTION._artifact_pages(unstable, REPOSITORY, name)
+
     def test_consistent_old_attempt_is_ignored_for_latest_successful_rerun(self) -> None:
         source = {
             "id": 7,

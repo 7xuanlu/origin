@@ -25,17 +25,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Verify release checkout
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          expected=$(git rev-list -n1 "refs/tags/$RELEASE_TAG")
-          actual=$(git rev-parse HEAD)
-          if [[ "$actual" != "$expected" ]]; then
-            echo "ERROR: checkout $actual does not match refs/tags/$RELEASE_TAG ($expected)"
+          set -euo pipefail
+          checkout_sha="$(git rev-parse HEAD)"
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$checkout_sha" != "$GITHUB_SHA" || "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "ERROR: immutable event SHA $GITHUB_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
             exit 1
           fi
 
@@ -101,26 +107,36 @@ jobs:
 
       - name: Gate the release behind a prerelease
         run: |
-          # release-please already created this release â€” published, carrying the
-          # changelog body â€” and pushed the tag that triggered this run. Demote it
-          # to a prerelease at once: prereleases are excluded from
-          # `releases/latest`, so installers keep resolving the last good version
-          # while the builds below run. finalize-release promotes it back only
-          # after every build + publish job succeeds.
+          # This workflow creates a prerelease after release-please pushes the
+          # receipt-derived tag. Prereleases are excluded from `releases/latest`,
+          # so installers keep resolving the last good version while publication
+          # runs. finalize-release promotes it only after every channel succeeds.
           #
           # A draft cannot serve as the gate. Drafts carry no git tag, and GitHub
           # does not enforce tag uniqueness for drafts, so `gh release create
           # --draft` forged a second, empty release beside the real v0.12.0.
           # `--repo` is passed explicitly so this never depends on git context.
           set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+            exit 1
+          fi
           if state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --json isDraft,isPrerelease 2>/dev/null)"; then
             if [[ "$(jq -r '.isDraft' <<<"$state")" == true ]]; then
               echo "Existing release is unexpectedly a draft."
               exit 1
             fi
-            # Never demote a stable release during a manual rerun.
+            if [[ "$(jq -r '.isPrerelease' <<<"$state")" != true ]]; then
+              echo "Existing stable release cannot enter an incremental publication rerun."
+              exit 1
+            fi
             gh release edit "$RELEASE_TAG" \
+              --prerelease=true \
               --notes-file release-body.md \
               --repo "$GITHUB_REPOSITORY"
           else
@@ -166,7 +182,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
@@ -174,12 +190,20 @@ jobs:
         id: release-gate
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag_sha="$(git rev-list -n1 "refs/tags/$RELEASE_TAG")"
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$GITHUB_SHA" || "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "ERROR: release tag or checkout differs from immutable event SHA $GITHUB_SHA."
+            exit 1
+          fi
           python3 scripts/release-promotion.py consume-main-receipt \
             --repository "$GITHUB_REPOSITORY" \
-            --sha "$tag_sha" \
+            --sha "$GITHUB_SHA" \
             --temp-root "$RUNNER_TEMP" \
             --github-output "$GITHUB_OUTPUT" \
             --plan-output "$RUNNER_TEMP/release-promotion-plan.json"
@@ -214,7 +238,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -237,6 +261,14 @@ jobs:
           existing="$RUNNER_TEMP/existing-release-assets"
           mkdir -p "$existing"
           for asset in "$RUNNER_TEMP"/promoted-assets/*; do
+            tag_sha="$(gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+            if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+              echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+              exit 1
+            fi
             name="$(basename "$asset")"
             if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
               --json assets --jq '.assets[].name' | grep -Fxq "$name"; then
@@ -305,7 +337,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -328,6 +360,19 @@ jobs:
             --image "$LOCAL_IMAGE" \
             --dockerfile docker/Dockerfile.release-runtime \
             --output "$RUNNER_TEMP/runtime-image-evidence-${{ matrix.tag-suffix }}.json"
+      - name: Require immutable release tag before registry credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+            exit 1
+          fi
       # No untrusted binary runs after this point.
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
@@ -381,6 +426,19 @@ jobs:
           path: ${{ runner.temp }}/docker-digests
           merge-multiple: true
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Require immutable release tag before manifest credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+            exit 1
+          fi
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
@@ -391,6 +449,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+            exit 1
+          fi
           TAG="${{ env.RELEASE_TAG }}"
           IMG="ghcr.io/7xuanlu/wenlan-server"
           amd="$(cat "$RUNNER_TEMP/docker-digests/docker-image-digest-amd64.txt")"
@@ -442,28 +508,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Verify release checkout
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          expected=$(git rev-list -n1 "refs/tags/$RELEASE_TAG")
-          actual=$(git rev-parse HEAD)
-          if [[ "$actual" != "$expected" ]]; then
-            echo "ERROR: checkout $actual does not match refs/tags/$RELEASE_TAG ($expected)"
+          set -euo pipefail
+          checkout_sha="$(git rev-parse HEAD)"
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$checkout_sha" != "$GITHUB_SHA" || "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "ERROR: immutable event SHA $GITHUB_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
             exit 1
           fi
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Pre-flight cargo publish dry-run
-        # Only wenlan-types â€” wenlan-mcp's --dry-run resolves wenlan-types from
-        # crates.io which doesn't have the new version until the publish step
-        # runs. Real wenlan-mcp publish happens after wenlan-types is indexed.
-        run: cargo publish -p wenlan-types --dry-run
 
       - name: Resolve workspace version
         id: version
@@ -478,16 +544,29 @@ jobs:
         # behind by minutes-to-hours under load and gave false "not
         # published" answers that caused cargo publish to attempt a
         # duplicate upload, failing the job.
-        if: env.CARGO_REGISTRY_TOKEN != ''
         run: |
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+            exit 1
+          fi
           VERSION="${{ steps.version.outputs.value }}"
           if curl -sf "https://index.crates.io/we/nl/wenlan-types" | grep -q "\"vers\":\"$VERSION\""; then
             echo "wenlan-types ${VERSION} already on sparse index, skipping publish"
           else
+            if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+              echo "ERROR: CARGO_REGISTRY_TOKEN is required because wenlan-types ${VERSION} is not published."
+              exit 1
+            fi
             cargo publish -p wenlan-types
           fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
 
       - name: Wait for wenlan-types to be available on crates.io
         # Poll the sparse index (https://index.crates.io) â€” that's what
@@ -519,16 +598,45 @@ jobs:
       - name: Publish wenlan-mcp to crates.io
         # Sparse index check (see wenlan-types step) avoids the v1 web API
         # propagation lag that previously caused duplicate-publish failures.
-        if: env.CARGO_REGISTRY_TOKEN != ''
         run: |
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+            exit 1
+          fi
           VERSION="${{ steps.version.outputs.value }}"
           if curl -sf "https://index.crates.io/we/nl/wenlan-mcp" | grep -q "\"vers\":\"$VERSION\""; then
             echo "wenlan-mcp ${VERSION} already on sparse index, skipping publish"
           else
+            if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+              echo "ERROR: CARGO_REGISTRY_TOKEN is required because wenlan-mcp ${VERSION} is not published."
+              exit 1
+            fi
             cargo publish -p wenlan-mcp
           fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Require wenlan-mcp on crates.io
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.value }}"
+          INDEX_URL="https://index.crates.io/we/nl/wenlan-mcp"
+          for i in $(seq 1 60); do
+            if curl -sf "$INDEX_URL" | grep -q "\"vers\":\"$VERSION\""; then
+              echo "wenlan-mcp ${VERSION} visible on sparse index"; exit 0
+            fi
+            echo "Waiting for sparse index to publish wenlan-mcp ${VERSION}... ($i/60)"
+            sleep 10
+          done
+          echo "ERROR: wenlan-mcp ${VERSION} not visible on sparse index after 10 min"
+          curl -s "$INDEX_URL" | tail -5
+          exit 1
 
   publish-npm:
     name: Publish to npm
@@ -540,16 +648,22 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           fetch-tags: true
       - name: Verify release checkout
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          expected=$(git rev-list -n1 "refs/tags/$RELEASE_TAG")
-          actual=$(git rev-parse HEAD)
-          if [[ "$actual" != "$expected" ]]; then
-            echo "ERROR: checkout $actual does not match refs/tags/$RELEASE_TAG ($expected)"
+          set -euo pipefail
+          checkout_sha="$(git rev-parse HEAD)"
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$checkout_sha" != "$GITHUB_SHA" || "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "ERROR: immutable event SHA $GITHUB_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
             exit 1
           fi
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -588,21 +702,43 @@ jobs:
         # previously published versions". `npm view <pkg>@<v> version`
         # exits 0 + prints the version when published, exits 1 otherwise.
         run: |
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+            exit 1
+          fi
           VERSION="${RELEASE_TAG#v}"
           if npm view "wenlan-mcp@$VERSION" version >/dev/null 2>&1; then
             echo "wenlan-mcp@$VERSION already on npm, skipping"
           else
             npm publish --provenance --access public
           fi
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Publish wenlan
         working-directory: crates/wenlan-cli/npm
         run: |
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+            exit 1
+          fi
           VERSION="${RELEASE_TAG#v}"
           if npm view "wenlan@$VERSION" version >/dev/null 2>&1; then
             echo "wenlan@$VERSION already on npm, skipping"
           else
             npm publish --provenance --access public
           fi
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   update-homebrew:
     name: Update Homebrew tap
@@ -619,7 +755,21 @@ jobs:
       - name: Compute checksums and update formulae
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          require_event_tag() {
+            local tag_sha
+            tag_sha="$(gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+            if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+              echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+              exit 1
+            fi
+          }
+          require_event_tag
           VERSION="${RELEASE_TAG#v}"
           SHA_MCP_DARWIN_ARM64=$(shasum -a 256 wenlan-mcp-darwin-arm64.tar.gz | cut -d' ' -f1)
           SHA_CLI_DARWIN_ARM64=$(shasum -a 256 wenlan-cli-darwin-arm64.tar.gz | cut -d' ' -f1)
@@ -697,6 +847,7 @@ jobs:
             echo "Homebrew formulas already describe ${VERSION}; nothing to commit."
           else
             git commit -m "wenlan + wenlan-mcp ${VERSION}"
+            require_event_tag
             git push origin HEAD:main
           fi
 
@@ -737,6 +888,19 @@ jobs:
       - name: Promote
         run: |
           set -euo pipefail
+          require_event_tag() {
+            local current
+            current="$(gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+            if [[ "$current" != "$GITHUB_SHA" ]]; then
+              echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $current." >&2
+              exit 1
+            fi
+            printf '%s' "$current"
+          }
+          tag_sha="$(require_event_tag)"
           if [[ "$RELEASE_TAG" == *-* ]]; then
             echo "$RELEASE_TAG is a prerelease tag; leaving it unpromoted."
           else
@@ -752,16 +916,14 @@ jobs:
             else
               echo "$RELEASE_TAG is not the highest stable tag ($highest); not moving latest."
             fi
+            tag_sha="$(require_event_tag)"
             gh release edit "$RELEASE_TAG" \
               --prerelease=false \
               "${latest_args[@]}" \
               --repo "$GITHUB_REPOSITORY"
           fi
 
-          tag_sha="$(gh api --method GET \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          tag_sha="$(require_event_tag)"
           pr_number="$(gh api --method GET \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \

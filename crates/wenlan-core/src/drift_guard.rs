@@ -4268,9 +4268,9 @@ fn release_candidate_observer_contract_violations(
         || closed_upload.and_then(|step| step["with"]["if-no-files-found"].as_str())
             != Some("error")
         || closed_upload.and_then(|step| step["with"]["overwrite"].as_bool())
-            != Some(false)
+            != Some(true)
     {
-        violations.push("closed receipt upload is not immutable and source-run scoped".into());
+        violations.push("closed receipt upload is not a retry-safe source-run locator".into());
     }
     for forbidden in [
         "workflow_dispatch",
@@ -4375,7 +4375,8 @@ fn release_candidate_observer_contract_violations(
         "This receipt is observe-only",
         "def _latest_release_target_attempts(",
         "job.get(\"run_attempt\") != attempt",
-        "latest release-preflight job",
+        "def _latest_candidate_artifact_attempts(",
+        "release-preflight job for {target!r} in artifact attempt {attempt}",
         "def _candidate_artifacts_for_attempts(",
     ] {
         if !validator_script.contains(required) {
@@ -4611,6 +4612,76 @@ fn release_promotion_contract_violations(
     {
         violations.push("tag release has an unbound trigger or duplicate compilation lane".into());
     }
+    if release_workflow.contains("cargo publish -p wenlan-types --dry-run") {
+        violations.push("tag release duplicates Cargo publish verification".into());
+    }
+    let crates_text = serde_yaml::to_string(&release["jobs"]["publish-crates"]).unwrap_or_default();
+    for required in [
+        "CARGO_REGISTRY_TOKEN is required because wenlan-types",
+        "CARGO_REGISTRY_TOKEN is required because wenlan-mcp",
+        "Require wenlan-mcp on crates.io",
+        "wenlan-mcp ${VERSION} not visible on sparse index after 10 min",
+    ] {
+        if !crates_text.contains(required) {
+            violations.push(format!(
+                "crates.io publication omits fail-closed proof {required:?}"
+            ));
+        }
+    }
+    if crates_text.contains("if: env.CARGO_REGISTRY_TOKEN != ''") {
+        violations.push("crates.io publication can silently skip a missing credential".into());
+    }
+    let mut checkout_count = 0;
+    for job in release["jobs"].as_mapping().into_iter().flatten() {
+        for step in job
+            .1
+            .get("steps")
+            .and_then(serde_yaml::Value::as_sequence)
+            .into_iter()
+            .flatten()
+        {
+            if step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+            {
+                checkout_count += 1;
+                if step["with"]["ref"].as_str() != Some("${{ github.sha }}") {
+                    violations.push(
+                        "tag release checkout is not pinned to the immutable event SHA".into(),
+                    );
+                }
+            }
+        }
+    }
+    if checkout_count == 0 || release_workflow.contains("ref: refs/tags/${{ env.RELEASE_TAG }}") {
+        violations.push("tag release retains a mutable tag-ref checkout".into());
+    }
+    for job_name in [
+        "prepare-release",
+        "resolve-promotion",
+        "promote-assets",
+        "docker",
+        "docker-manifest",
+        "publish-crates",
+        "publish-npm",
+        "update-homebrew",
+        "finalize-release",
+    ] {
+        let job_text = serde_yaml::to_string(&release["jobs"][job_name]).unwrap_or_default();
+        if !job_text.contains("/git/ref/tags/$RELEASE_TAG") || !job_text.contains("GITHUB_SHA") {
+            violations.push(format!(
+                "publication job {job_name:?} does not revalidate the immutable event tag"
+            ));
+        }
+    }
+    let prepare_text =
+        serde_yaml::to_string(&release["jobs"]["prepare-release"]).unwrap_or_default();
+    if !prepare_text
+        .contains("Existing stable release cannot enter an incremental publication rerun.")
+        || !prepare_text.contains("isPrerelease")
+    {
+        violations.push("existing stable release can enter incremental publication".into());
+    }
     let resolve = job_step(
         &release,
         "resolve-promotion",
@@ -4739,6 +4810,26 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
             "mutation must exercise {expected:?}: {violations:?}"
         );
     }
+    let duplicate_publish_verification =
+        std::fs::read_to_string(root.join(".github/workflows/release.yml"))
+            .expect("read release")
+            .replace(
+                "cargo publish -p wenlan-types",
+                "cargo publish -p wenlan-types --dry-run",
+            );
+    let duplicate_publish_violations = release_promotion_contract_violations(
+        &ci,
+        &release_please,
+        &duplicate_publish_verification,
+        &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
+            .expect("read promotion resolver"),
+    );
+    assert!(
+        duplicate_publish_violations
+            .iter()
+            .any(|item| item.contains("duplicates Cargo publish verification")),
+        "mutation must reject duplicate Cargo publish verification: {duplicate_publish_violations:?}"
+    );
     let retry_unsafe_release = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
         .expect("read release")
         .replace(
@@ -4757,6 +4848,40 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
             .iter()
             .any(|item| item.contains("retry-safe")),
         "mutation must exercise retry-safe tag promotion: {retry_violations:?}"
+    );
+    let mutable_tag_release = retry_unsafe_release.replace(
+        "ref: ${{ github.sha }}",
+        "ref: refs/tags/${{ env.RELEASE_TAG }}",
+    );
+    let mutable_tag_violations = release_promotion_contract_violations(
+        &ci,
+        &release_please,
+        &mutable_tag_release,
+        &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
+            .expect("read promotion resolver"),
+    );
+    assert!(
+        mutable_tag_violations
+            .iter()
+            .any(|item| item.contains("mutable tag")),
+        "mutation must reject mutable tag checkout: {mutable_tag_violations:?}"
+    );
+    let stable_incremental_release = retry_unsafe_release.replace(
+        "Existing stable release cannot enter an incremental publication rerun.",
+        "Continuing existing stable release.",
+    );
+    let stable_violations = release_promotion_contract_violations(
+        &ci,
+        &release_please,
+        &stable_incremental_release,
+        &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
+            .expect("read promotion resolver"),
+    );
+    assert!(
+        stable_violations
+            .iter()
+            .any(|item| item.contains("stable release")),
+        "mutation must reject incremental stable release: {stable_violations:?}"
     );
 }
 

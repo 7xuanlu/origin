@@ -119,10 +119,32 @@ def contract_violations(
 
     if re.search(r"\n\s+workflow_dispatch:", release):
         violations.append("tag release retains an unbound manual dispatch path")
+    checkout_refs = re.findall(
+        r"uses: actions/checkout@[0-9a-f]{40}[^\n]*\n\s+with:\n(?:\s+[^\n]+\n)*?\s+ref: ([^\n]+)",
+        release,
+    )
+    if not checkout_refs or any(ref.strip() != "${{ github.sha }}" for ref in checkout_refs):
+        violations.append("tag release checkout is not pinned to the immutable event SHA")
+    if "ref: refs/tags/${{ env.RELEASE_TAG }}" in release:
+        violations.append("tag release can checkout a mutable tag ref")
     if job_body(release, "release"):
         violations.append("tag release retains the duplicate release build matrix")
     if "cargo build" in release or "build-release-binaries" in release:
         violations.append("tag release can recompile the PR-validated release binaries")
+    if "cargo publish -p wenlan-types --dry-run" in release:
+        violations.append("tag release duplicates Cargo publish verification")
+    crates = job_body(release, "publish-crates")
+    for marker in [
+        'if [[ -z "$CARGO_REGISTRY_TOKEN" ]]',
+        "CARGO_REGISTRY_TOKEN is required because wenlan-types",
+        "CARGO_REGISTRY_TOKEN is required because wenlan-mcp",
+        "name: Require wenlan-mcp on crates.io",
+        "wenlan-mcp ${VERSION} not visible on sparse index after 10 min",
+    ]:
+        if marker not in crates:
+            violations.append(f"crates.io publication omits fail-closed proof {marker!r}")
+    if "if: env.CARGO_REGISTRY_TOKEN != ''" in crates:
+        violations.append("crates.io publication can silently skip a missing credential")
     for job in [
         "resolve-promotion",
         "prepare-release",
@@ -142,12 +164,37 @@ def contract_violations(
     resolve = job_body(release, "resolve-promotion")
     for marker in [
         "scripts/release-promotion.py consume-main-receipt",
+        '--sha "$GITHUB_SHA"',
         "name: release-promotion-plan-${{ github.run_id }}",
         "retention-days: 30",
         "overwrite: true",
     ]:
         if marker not in resolve:
             violations.append(f"tag promotion resolver omits {marker!r}")
+    for job_name in [
+        "prepare-release",
+        "resolve-promotion",
+        "promote-assets",
+        "docker",
+        "docker-manifest",
+        "publish-crates",
+        "publish-npm",
+        "update-homebrew",
+        "finalize-release",
+    ]:
+        job = job_body(release, job_name)
+        for marker in ["/git/ref/tags/$RELEASE_TAG", "GITHUB_SHA"]:
+            if marker not in job:
+                violations.append(
+                    f"publication job {job_name!r} omits immutable tag check {marker!r}"
+                )
+    prepare = job_body(release, "prepare-release")
+    if (
+        "Existing stable release cannot enter an incremental publication rerun."
+        not in prepare
+        or 'isPrerelease' not in prepare
+    ):
+        violations.append("existing stable release can enter incremental publication")
     promote = job_body(release, "promote-assets")
     for marker in [
         "scripts/release-promotion.py download-assets",
@@ -547,10 +594,10 @@ def candidate_observer_contract_violations(
         "compression-level: 0",
         "retention-days: 30",
         "if-no-files-found: error",
-        "overwrite: false",
+        "overwrite: true",
     ]:
         if marker not in closed_upload:
-            violations.append(f"closed receipt upload omits immutable contract {marker!r}")
+            violations.append(f"closed receipt upload omits retry-safe locator contract {marker!r}")
     for marker in [
         "close-receipt",
         "GH_TOKEN: ${{ github.token }}",
@@ -602,12 +649,18 @@ def candidate_observer_contract_violations(
         '"validated_assets_artifact"',
         "def _latest_release_target_attempts(",
         'job.get("run_attempt") != attempt',
-        "latest release-preflight job",
+        "def _latest_candidate_artifact_attempts(",
+        "release-preflight job for {target!r} in artifact attempt {attempt}",
         "def _candidate_artifacts_for_attempts(",
     ]
     for marker in required_validator_markers:
         if marker not in validator:
             violations.append(f"candidate validator omits fail-closed evidence {marker!r}")
+    artifact_selection = validator.find("target_attempts = _latest_candidate_artifact_attempts(")
+    job_validation = validator.find("    _latest_release_target_attempts(", artifact_selection)
+    artifact_binding = validator.find("    selected_artifacts = _candidate_artifacts_for_attempts(", job_validation)
+    if artifact_selection < 0 or job_validation < 0 or artifact_binding < 0:
+        violations.append("candidate validator does not select artifacts before validating attempt jobs")
     for forbidden in [
         "subprocess.",
         ".chmod(",
@@ -708,6 +761,18 @@ def main() -> None:
             "release",
         ),
         (
+            "cargo publish -p wenlan-types",
+            "cargo publish -p wenlan-types --dry-run",
+            "duplicates Cargo publish verification",
+            "release",
+        ),
+        (
+            "CARGO_REGISTRY_TOKEN is required because wenlan-mcp",
+            "missing token accepted for wenlan-mcp",
+            "crates.io publication omits fail-closed proof",
+            "release",
+        ),
+        (
             "docker/Dockerfile.release-runtime",
             "docker/Dockerfile.daemon",
             "compile a different",
@@ -805,6 +870,12 @@ def main() -> None:
             "observer",
         ),
         (
+            "          overwrite: true",
+            "          overwrite: false",
+            "retry-safe locator",
+            "observer",
+        ),
+        (
             '--observer-workflow-id "$observer_workflow_id"',
             "# observer workflow identity removed",
             "artifact binding",
@@ -845,6 +916,12 @@ def main() -> None:
             "new != old.replace(old_version, new_version)",
             "new == old",
             "fail-closed evidence",
+            "validator",
+        ),
+        (
+            "target_attempts = _latest_candidate_artifact_attempts(",
+            "target_attempts = _jobs_first_attempt_guess(",
+            "does not select artifacts",
             "validator",
         ),
         (

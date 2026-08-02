@@ -73,11 +73,12 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           # Source-only name is a locator, never proof. Consumers inspect every
-          # same-name immutable artifact and bind its owning observer run plus
-          # closed receipt before selecting the newest semantically consistent attempt.
+          # returned artifact and bind its owning observer run plus closed receipt.
+          # A workflow rerun replaces this locator with a new immutable ID so
+          # upload-artifact's same-run unique-name rule cannot block recovery.
           name: validated-release-receipt-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           path: ${{ runner.temp }}/validated-release-receipt.json
           compression-level: 0
           retention-days: 30
           if-no-files-found: error
-          overwrite: false
+          overwrite: true

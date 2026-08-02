@@ -249,6 +249,7 @@ def _source_run(
 
 def _artifact_pages(api: PromotionApi, repository: str, name: str) -> list[dict]:
     artifacts: list[dict] = []
+    expected_total: int | None = None
     for page in range(1, MAX_ARTIFACT_PAGES + 1):
         payload = _mapping(
             api.get_json(
@@ -261,10 +262,16 @@ def _artifact_pages(api: PromotionApi, repository: str, name: str) -> list[dict]
         total = payload.get("total_count")
         if not isinstance(total, int) or isinstance(total, bool) or total < 0:
             raise PromotionError("repository artifact total_count is invalid")
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            raise PromotionError("repository artifact total_count changed during pagination")
         if total > MAX_RECEIPT_CANDIDATES:
             raise PromotionError("receipt candidate count exceeds the fail-closed bound")
         artifacts.extend(_mapping(value, "repository artifact") for value in values)
         if len(values) < 100:
+            if len(artifacts) != expected_total:
+                raise PromotionError("repository artifact total_count does not match pages")
             return artifacts
     raise PromotionError("repository artifact search exceeded the bounded page limit")
 

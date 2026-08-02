@@ -473,13 +473,25 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
                     {
                         "id": 200 + index,
                         "run_id": 1,
+                        "run_attempt": 2,
                         "head_sha": HEAD_SHA,
                         "name": f"release-preflight ({entry['target']})",
                         "status": "completed",
                         "conclusion": "success",
+                        # GitHub's attempt endpoint re-emits inherited jobs with
+                        # new IDs/run_attempt but their original timestamps.
+                        "started_at": (
+                            "2026-08-01T01:00:00Z"
+                            if index < 2
+                            else "2026-08-01T02:00:00Z"
+                        ),
+                        "completed_at": (
+                            "2026-08-01T01:10:00Z"
+                            if index < 2
+                            else "2026-08-01T02:10:00Z"
+                        ),
                     }
                     for index, entry in enumerate(matrix_entries)
-                    if index >= 2
                 ],
             }
             api = HappyPathApi(
@@ -625,53 +637,83 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
         with self.assertRaisesRegex(VALIDATOR.CandidateError, "total_count"):
             VALIDATOR._api_pages(CountApi(), "/artifacts", "artifacts")
 
-    def test_target_attempts_follow_only_jobs_reexecuted_by_partial_rerun(self) -> None:
+    def test_target_attempts_follow_latest_artifacts_not_inherited_rerun_jobs(self) -> None:
         targets = [entry["target"] for entry in VALIDATOR.release_matrix()["include"]]
-        api = AttemptJobsApi(
+        expected = {
+            target: 1 if index < 2 else 2 for index, target in enumerate(targets)
+        }
+        artifacts = [
             {
-                1: [
-                    release_job(
-                        target,
-                        job_id=100 + index,
-                        conclusion="success" if index < 2 else "failure",
-                    )
-                    for index, target in enumerate(targets)
-                ],
-                2: [
-                    release_job(target, job_id=200 + index)
-                    for index, target in enumerate(targets)
-                    if index >= 2
-                ],
+                "id": 300 + index,
+                "name": f"release-candidate-1-{expected[target]}-{target}",
             }
-        )
-        selected = VALIDATOR._latest_release_target_attempts(
-            api,
-            "7xuanlu/wenlan",
-            run_id=1,
-            current_attempt=2,
-            head_sha=HEAD_SHA,
-        )
-        self.assertEqual(
-            selected,
-            {
-                target: 1 if index < 2 else 2
-                for index, target in enumerate(targets)
-            },
-        )
-
-    def test_latest_reexecuted_target_failure_cannot_fallback(self) -> None:
-        targets = [entry["target"] for entry in VALIDATOR.release_matrix()["include"]]
+            for index, target in enumerate(targets)
+        ]
         api = AttemptJobsApi(
             {
                 1: [
                     release_job(target, job_id=100 + index)
                     for index, target in enumerate(targets)
                 ],
-                2: [release_job(targets[0], job_id=200, conclusion="failure")],
+                2: [
+                    {
+                        **release_job(target, job_id=200 + index),
+                        "run_attempt": 2,
+                        # Inherited jobs retain attempt-one timing even though
+                        # GitHub gives them attempt-two IDs and run_attempt.
+                        "started_at": (
+                            "2026-08-01T01:00:00Z"
+                            if index < 2
+                            else "2026-08-01T02:00:00Z"
+                        ),
+                        "completed_at": (
+                            "2026-08-01T01:10:00Z"
+                            if index < 2
+                            else "2026-08-01T02:10:00Z"
+                        ),
+                    }
+                    for index, target in enumerate(targets)
+                ],
+            }
+        )
+        selected = VALIDATOR._latest_candidate_artifact_attempts(
+            artifacts,
+            run_id=1,
+            current_attempt=2,
+        )
+        validated = VALIDATOR._latest_release_target_attempts(
+            api,
+            "7xuanlu/wenlan",
+            run_id=1,
+            current_attempt=2,
+            head_sha=HEAD_SHA,
+            target_attempts=selected,
+        )
+        self.assertEqual(selected, expected)
+        self.assertEqual(validated, expected)
+
+    def test_latest_artifact_attempt_failure_cannot_fallback(self) -> None:
+        targets = [entry["target"] for entry in VALIDATOR.release_matrix()["include"]]
+        target_attempts = {target: 1 for target in targets}
+        target_attempts[targets[0]] = 2
+        api = AttemptJobsApi(
+            {
+                1: [
+                    release_job(target, job_id=100 + index)
+                    for index, target in enumerate(targets)
+                ],
+                2: [
+                    release_job(
+                        target,
+                        job_id=200 + index,
+                        conclusion="failure" if index == 0 else "success",
+                    )
+                    for index, target in enumerate(targets)
+                ],
             }
         )
         with self.assertRaisesRegex(
-            VALIDATOR.CandidateError, "latest release-preflight job.*failure"
+            VALIDATOR.CandidateError, "artifact attempt 2.*failure"
         ):
             VALIDATOR._latest_release_target_attempts(
                 api,
@@ -679,6 +721,7 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
                 run_id=1,
                 current_attempt=2,
                 head_sha=HEAD_SHA,
+                target_attempts=target_attempts,
             )
 
     def test_duplicate_release_target_job_in_one_attempt_is_rejected(self) -> None:
@@ -695,19 +738,25 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
                 run_id=1,
                 current_attempt=1,
                 head_sha=HEAD_SHA,
+                target_attempts={target: 1 for target in targets},
             )
 
     def test_release_target_job_attempt_must_match_attempt_endpoint(self) -> None:
-        target = VALIDATOR.release_matrix()["include"][0]["target"]
-        mismatched = release_job(target, job_id=100)
+        targets = [entry["target"] for entry in VALIDATOR.release_matrix()["include"]]
+        mismatched = release_job(targets[0], job_id=100)
         mismatched["run_attempt"] = 2
+        jobs = [mismatched] + [
+            release_job(target, job_id=100 + index)
+            for index, target in enumerate(targets[1:], start=1)
+        ]
         with self.assertRaisesRegex(VALIDATOR.CandidateError, "control-plane identity"):
             VALIDATOR._latest_release_target_attempts(
-                AttemptJobsApi({1: [mismatched]}),
+                AttemptJobsApi({1: jobs}),
                 "7xuanlu/wenlan",
                 run_id=1,
                 current_attempt=1,
                 head_sha=HEAD_SHA,
+                target_attempts={target: 1 for target in targets},
             )
 
     def test_candidate_artifact_attempt_index_is_closed_and_conflict_safe(self) -> None:
@@ -727,6 +776,14 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
             target_attempts=attempts,
         )
         self.assertEqual(set(selected), set(targets))
+        self.assertEqual(
+            VALIDATOR._latest_candidate_artifact_attempts(
+                artifacts,
+                run_id=1,
+                current_attempt=2,
+            ),
+            attempts,
+        )
 
         duplicate = artifacts + [dict(artifacts[0], id=999)]
         with self.assertRaisesRegex(VALIDATOR.CandidateError, "duplicated"):
