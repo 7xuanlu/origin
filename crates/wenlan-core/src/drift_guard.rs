@@ -3972,6 +3972,42 @@ fn ci_release_reuse_and_linux_shards_are_fail_closed() {
     }
 }
 
+const ARCHIVE_SERVER_SPAWN_TARGETS: [(&str, usize); 3] = [
+    ("crates/wenlan-server/tests/graceful_shutdown.rs", 2),
+    ("crates/wenlan-server/tests/port_discovery.rs", 3),
+    ("crates/wenlan-server/tests/port_taken_no_db_init.rs", 2),
+];
+
+fn archive_server_binary_path_violations(
+    targets: &[(&str, String, usize)],
+    helper: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    for required in [
+        "resolve_wenlan_server_binary(std::env::var_os(\"NEXTEST_BIN_EXE_wenlan_server\"))",
+        "env!(\"CARGO_BIN_EXE_wenlan-server\")",
+        "!path.as_os_str().is_empty()",
+    ] {
+        if !helper.contains(required) {
+            violations.push(format!("archive daemon binary resolver omits {required:?}"));
+        }
+    }
+    for (path, source, expected_calls) in targets {
+        if source.contains("env!(\"CARGO_BIN_EXE_")
+            || source
+                .matches("daemon_binary::wenlan_server_binary()")
+                .count()
+                != *expected_calls
+            || !source.contains("#[path = \"common/daemon_binary.rs\"]")
+        {
+            violations.push(format!(
+                "archive-owned server integration target {path} does not resolve every daemon spawn from the relocatable nextest runtime path"
+            ));
+        }
+    }
+    violations
+}
+
 fn macos_archive_contract_violations(ci_workflow: &str, planner: &str) -> Vec<String> {
     let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
     let mut violations = Vec::new();
@@ -3985,6 +4021,11 @@ fn macos_archive_contract_violations(ci_workflow: &str, planner: &str) -> Vec<St
             != BTreeSet::from([
                 "scripts/ci_test_plan.py".to_string(),
                 "scripts/ci_test_plan.test.py".to_string(),
+                "crates/wenlan-server/tests/common/daemon_binary.rs".to_string(),
+                "crates/wenlan-server/tests/daemon_binary_path.rs".to_string(),
+                "crates/wenlan-server/tests/graceful_shutdown.rs".to_string(),
+                "crates/wenlan-server/tests/port_discovery.rs".to_string(),
+                "crates/wenlan-server/tests/port_taken_no_db_init.rs".to_string(),
             ])
     {
         violations.push(
@@ -4205,7 +4246,25 @@ fn macos_nextest_archives_are_build_once_sharded_and_fail_closed() {
         std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
     let planner = std::fs::read_to_string(root.join("scripts/ci_test_plan.py"))
         .expect("read CI test planner");
-    let violations = macos_archive_contract_violations(&workflow, &planner);
+    let helper =
+        std::fs::read_to_string(root.join("crates/wenlan-server/tests/common/daemon_binary.rs"))
+            .expect("read archive daemon binary resolver");
+    let target_sources = ARCHIVE_SERVER_SPAWN_TARGETS
+        .iter()
+        .map(|(path, expected_calls)| {
+            (
+                *path,
+                std::fs::read_to_string(root.join(path))
+                    .unwrap_or_else(|error| panic!("read {path}: {error}")),
+                *expected_calls,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut violations = macos_archive_contract_violations(&workflow, &planner);
+    violations.extend(archive_server_binary_path_violations(
+        &target_sources,
+        &helper,
+    ));
     assert!(
         violations.is_empty(),
         "macOS archive/shard contract drift:\n{}",
@@ -4285,6 +4344,42 @@ fn macos_nextest_archive_contract_rejects_routing_and_execution_mutations() {
             .iter()
             .any(|violation| violation.contains("each allow an empty slice")),
         "macOS empty-slice mutation unexpectedly passed"
+    );
+
+    let helper =
+        std::fs::read_to_string(root.join("crates/wenlan-server/tests/common/daemon_binary.rs"))
+            .expect("read archive daemon binary resolver");
+    let mut target_sources = ARCHIVE_SERVER_SPAWN_TARGETS
+        .iter()
+        .map(|(path, expected_calls)| {
+            (
+                *path,
+                std::fs::read_to_string(root.join(path))
+                    .unwrap_or_else(|error| panic!("read {path}: {error}")),
+                *expected_calls,
+            )
+        })
+        .collect::<Vec<_>>();
+    target_sources[0].1 = target_sources[0].1.replacen(
+        "daemon_binary::wenlan_server_binary()",
+        "std::path::PathBuf::from(env!(\"CARGO_BIN_EXE_wenlan-server\"))",
+        1,
+    );
+    assert!(
+        archive_server_binary_path_violations(&target_sources, &helper)
+            .iter()
+            .any(|violation| violation.contains("relocatable nextest runtime path")),
+        "compile-time daemon spawn mutation unexpectedly passed"
+    );
+    let helper_mutation = helper.replace(
+        "NEXTEST_BIN_EXE_wenlan_server",
+        "CARGO_BIN_EXE_wenlan-server",
+    );
+    assert!(
+        archive_server_binary_path_violations(&target_sources, &helper_mutation)
+            .iter()
+            .any(|violation| violation.contains("resolver omits")),
+        "nextest runtime resolver mutation unexpectedly passed"
     );
 }
 

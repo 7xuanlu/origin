@@ -483,6 +483,11 @@ jobs:
               # unrelated Windows or MCP platform owners.
               - 'scripts/ci_test_plan.py'
               - 'scripts/ci_test_plan.test.py'
+              - 'crates/wenlan-server/tests/common/daemon_binary.rs'
+              - 'crates/wenlan-server/tests/daemon_binary_path.rs'
+              - 'crates/wenlan-server/tests/graceful_shutdown.rs'
+              - 'crates/wenlan-server/tests/port_discovery.rs'
+              - 'crates/wenlan-server/tests/port_taken_no_db_init.rs'
 
       - name: Test release merge proof
         run: |

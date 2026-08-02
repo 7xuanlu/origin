@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Process-level proof for graceful and bounded daemon shutdown.
 
+#[path = "common/daemon_binary.rs"]
+mod daemon_binary;
+
 use axum::{routing::post, Json, Router};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -24,10 +27,6 @@ struct RunningDaemon {
     child: ChildGuard,
     port: u16,
     _tempdir: tempfile::TempDir,
-}
-
-fn binary_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_wenlan-server"))
 }
 
 fn prepare_isolated_data_dir(root: &Path) -> PathBuf {
@@ -99,7 +98,7 @@ async fn start_daemon() -> RunningDaemon {
     let port_file = tempdir.path().join("port");
     let stdout_path = tempdir.path().join("daemon.stdout.log");
     let stderr_path = tempdir.path().join("daemon.stderr.log");
-    let child = Command::new(binary_path())
+    let child = Command::new(daemon_binary::wenlan_server_binary())
         .env("WENLAN_BIND_ADDR", "127.0.0.1:0")
         // Keep the child isolated from both durable user config and data. The
         // reranker overrides below are safe only while this tempdir-scoped
@@ -283,7 +282,7 @@ async fn sigterm_after_bind_during_startup_uses_cooperative_shutdown() {
     let data_dir = prepare_isolated_data_dir(tempdir.path());
     let barrier = tempdir.path().join("startup-signal-barrier");
     std::fs::create_dir_all(&barrier).unwrap();
-    let child = Command::new(binary_path())
+    let child = Command::new(daemon_binary::wenlan_server_binary())
         .env("WENLAN_BIND_ADDR", "127.0.0.1:0")
         // Preserve the same isolated-config invariant as start_daemon(); the
         // removed parent reranker settings must not expose real user state.
