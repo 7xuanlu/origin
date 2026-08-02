@@ -60,6 +60,8 @@ jobs:
       contract-integration-required: ${{ steps.test-plan.outputs.contract-integration-required }}
       canonical-smokes-required: ${{ steps.test-plan.outputs.canonical-smokes-required }}
       canonical-acceptance-required: ${{ steps.test-plan.outputs.canonical-acceptance-required }}
+      fmt-required: ${{ steps.test-plan.outputs.fmt-required }}
+      clippy-required: ${{ steps.test-plan.outputs.clippy-required }}
       rust-ci-required: ${{ steps.test-plan.outputs.rust-ci-required }}
       platform-test-plan: ${{ steps.platform-test-plan.outputs.test-plan }}
       platform-workspace-lib-required: ${{ steps.platform-test-plan.outputs.workspace-lib-required }}
@@ -494,9 +496,9 @@ jobs:
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             include="${macos},${windows}"
           elif [ "${{ steps.release-candidate-trust.outputs.trusted-release-candidate }}" = "true" ]; then
-            # Linux canonical acceptance plus the four shipped-target
-            # release-preflight builds retain the candidate proof. Avoid
-            # compiling that exact metadata-only tree twice in debug profile.
+            # Exact-base main CI plus the four shipped-target release preflights
+            # retain the product proof. Release-managed plugin/npm/docs checks
+            # remain, without recompiling the metadata-only tree in debug.
             include=""
           elif [ "${{ startsWith(github.head_ref, 'release-please--branches--') }}" = "true" ]; then
             # A same-looking but untrusted branch must get more work, never a
@@ -633,7 +635,36 @@ jobs:
           key: fastembed-bge-base-en-v1.5-q-v3-portable
           enableCrossOsArchive: "true"
 
-  # On PRs, Rust fmt + lint only run when Rust-affecting paths changed.
+  # A semantic Release PR may omit the base tree's duplicate debug/test lanes
+  # only when the exact current-main base has its own successful push CI. The
+  # immutable base owns this control-plane check; candidate code is not run.
+  release-base-proof:
+    name: release base main CI proof
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout trusted main CI verifier
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted-main-ci-proof
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify exact base main CI succeeded
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 trusted-main-ci-proof/scripts/release-promotion.py verify-main-ci
+          --repository "$GITHUB_REPOSITORY"
+          --sha "${{ github.event.pull_request.base.sha }}"
+          --wait-seconds 1080
+
+  # On PRs, Rust fmt + lint only run when their exact source classes changed.
   # Docs/image-only PRs should still get the required aggregate `conclusion`
   # check, but they should not spend runners on Cargo jobs. Non-PR runs keep the
   # full backstop. The fail-open surface is closed by `conclusion`, which
@@ -641,7 +672,7 @@ jobs:
   fmt:
     name: fmt
     needs: [detect-changes]
-    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true'
+    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.fmt-required == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -654,7 +685,7 @@ jobs:
   lint:
     name: lint
     needs: [detect-changes]
-    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true'
+    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.clippy-required == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -696,7 +727,7 @@ jobs:
   linux-nextest-build:
     name: linux-nextest archive
     needs: [detect-changes]
-    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.workspace-lib-required == 'true'
+    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.workspace-lib-required == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ github.event_name == 'pull_request' && 30 || 60 }}
     env:
@@ -743,7 +774,7 @@ jobs:
   linux-nextest:
     name: linux-nextest (${{ matrix.partition }})
     needs: [detect-changes, linux-nextest-build]
-    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.workspace-lib-required == 'true'
+    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.workspace-lib-required == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ github.event_name == 'pull_request' && 30 || 60 }}
     strategy:
@@ -1127,7 +1158,7 @@ jobs:
   mcp-platform:
     name: platform-compile (${{ matrix.os }})
     needs: [detect-changes]
-    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.mcp-platform == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request')"
+    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.mcp-platform == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request')"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
@@ -1208,7 +1239,7 @@ jobs:
   canonical-acceptance:
     name: canonical-acceptance (ubuntu)
     needs: [detect-changes]
-    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.canonical-acceptance-required == 'true'
+    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.canonical-acceptance-required == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ github.event_name == 'pull_request' && 30 || 60 }}
     env:
@@ -1765,7 +1796,7 @@ jobs:
   contract-integration:
     name: contract integration
     needs: [detect-changes]
-    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.contract-integration-required == 'true'
+    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.contract-integration-required == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -1880,7 +1911,7 @@ jobs:
   # with no matching diff must be skipped.
   conclusion:
     name: conclusion
-    needs: [detect-changes, fmt, lint, linux-nextest-build, linux-nextest, test, mcp-platform, canonical-acceptance, contract-integration, release-preflight, docs, plugin, plugin-rust-contract, npm]
+    needs: [detect-changes, release-base-proof, fmt, lint, linux-nextest-build, linux-nextest, test, mcp-platform, canonical-acceptance, contract-integration, release-preflight, docs, plugin, plugin-rust-contract, npm]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     steps:
@@ -1907,17 +1938,19 @@ jobs:
             exit 1
           fi
 
-          run_rust='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' }}'
+          run_fmt='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.fmt-required == 'true' }}'
+          run_clippy='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.clippy-required == 'true' }}'
           run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request') }}'
-          run_workspace_lib='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.workspace-lib-required == 'true' }}'
-          run_canonical='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.canonical-acceptance-required == 'true' }}'
-          run_contract='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.contract-integration-required == 'true' }}'
-          expect_job fmt "$run_rust" '${{ needs.fmt.result }}'
-          expect_job lint "$run_rust" '${{ needs.lint.result }}'
+          run_workspace_lib='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.workspace-lib-required == 'true' }}'
+          run_canonical='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.canonical-acceptance-required == 'true' }}'
+          run_contract='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.contract-integration-required == 'true' }}'
+          expect_job release-base-proof '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate == 'true' }}' '${{ needs.release-base-proof.result }}'
+          expect_job fmt "$run_fmt" '${{ needs.fmt.result }}'
+          expect_job lint "$run_clippy" '${{ needs.lint.result }}'
           expect_job linux-nextest-build "$run_workspace_lib" '${{ needs.linux-nextest-build.result }}'
           expect_job linux-nextest "$run_workspace_lib" '${{ needs.linux-nextest.result }}'
           expect_job test "$run_platform" '${{ needs.test.result }}'
-          expect_job mcp-platform '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.mcp-platform == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request') }}' '${{ needs.mcp-platform.result }}'
+          expect_job mcp-platform '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.mcp-platform == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request') }}' '${{ needs.mcp-platform.result }}'
           expect_job canonical-acceptance "$run_canonical" '${{ needs.canonical-acceptance.result }}'
           expect_job contract-integration "$run_contract" '${{ needs.contract-integration.result }}'
           expect_job release-preflight '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true') }}' '${{ needs.release-preflight.result }}'

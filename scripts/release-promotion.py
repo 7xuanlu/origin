@@ -47,6 +47,9 @@ MAX_RECEIPT_WRAPPER_BYTES = 2 * 1024 * 1024
 MAX_MAIN_PLAN_WRAPPER_BYTES = 2 * 1024 * 1024
 MAX_ARTIFACT_PAGES = 10
 MAX_RECEIPT_CANDIDATES = 20
+MAIN_CI_PENDING_STATUSES = frozenset(
+    {"pending", "queued", "in_progress", "requested", "waiting"}
+)
 
 
 class PromotionError(RuntimeError):
@@ -713,6 +716,115 @@ def _main_ci_run(
     return run
 
 
+def _verify_main_ci_once(
+    api: PromotionApi,
+    repository: str,
+    repository_id: int,
+    main_sha: str,
+) -> dict:
+    path = f"/repos/{repository}/actions/workflows/{CI_WORKFLOW_FILE}/runs"
+    params = {"event": "push", "head_sha": main_sha, "per_page": 100}
+    payload = _mapping(
+        api.get_json(path, params=params),
+        "main CI workflow runs",
+    )
+    runs = _array(payload.get("workflow_runs"), "main CI workflow runs")
+    total_count = payload.get("total_count")
+    if (
+        not isinstance(total_count, int)
+        or isinstance(total_count, bool)
+        or total_count < 0
+        or total_count != len(runs)
+    ):
+        raise PromotionError("main CI workflow run inventory is incomplete")
+    if not runs:
+        raise PendingEvidence("main CI workflow run is not visible yet")
+    if len(runs) != 1:
+        raise PromotionError(
+            f"expected exactly one main CI run at {main_sha}, found {len(runs)}"
+        )
+
+    listed = _mapping(runs[0], "main CI workflow run")
+    run_id = _positive_int(listed.get("id"), "main CI run id")
+    run = _mapping(
+        api.get_json(f"/repos/{repository}/actions/runs/{run_id}"),
+        "main CI workflow run",
+    )
+    workflow_id = _positive_int(run.get("workflow_id"), "main CI workflow id")
+    workflow = _mapping(
+        api.get_json(f"/repos/{repository}/actions/workflows/{workflow_id}"),
+        "main CI workflow metadata",
+    )
+    _repo_identity(run.get("repository"), repository, repository_id, "main CI repository")
+    _repo_identity(
+        run.get("head_repository"), repository, repository_id, "main CI head repository"
+    )
+    head_repository = _mapping(run.get("head_repository"), "main CI head repository")
+    if (
+        run.get("id") != run_id
+        or run.get("path") != CI_WORKFLOW_PATH
+        or run.get("event") != "push"
+        or run.get("head_branch") != "main"
+        or run.get("head_sha") != main_sha
+        or head_repository.get("fork") is not False
+        or workflow.get("id") != workflow_id
+        or workflow.get("path") != CI_WORKFLOW_PATH
+        or workflow.get("state") != "active"
+    ):
+        raise PromotionError("main CI control-plane identity mismatch")
+    _positive_int(run.get("run_attempt"), "main CI run attempt")
+
+    status = run.get("status")
+    conclusion = run.get("conclusion")
+    if status in MAIN_CI_PENDING_STATUSES:
+        if conclusion is not None:
+            raise PromotionError("pending main CI run has a terminal conclusion")
+        raise PendingEvidence(f"main CI run {run_id} is {status}")
+    if status != "completed":
+        raise PromotionError(f"main CI run has unknown status {status!r}")
+    if conclusion != "success":
+        raise PromotionError(
+            f"main CI run {run_id} completed with conclusion {conclusion!r}"
+        )
+    return run
+
+
+def verify_main_ci(
+    api: PromotionApi,
+    repository: str,
+    main_sha: str,
+    *,
+    wait_seconds: int = 0,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> dict:
+    if re.fullmatch(r"[^/\s]+/[^/\s]+", repository) is None:
+        raise PromotionError("repository must be OWNER/REPO")
+    _sha(main_sha, "main SHA")
+    repository_info = _mapping(
+        api.get_json(f"/repos/{repository}"),
+        "repository metadata",
+    )
+    repository_id = _positive_int(repository_info.get("id"), "repository id")
+    if repository_info.get("full_name") != repository:
+        raise PromotionError("repository metadata differs from workflow scope")
+
+    deadline = monotonic() + max(wait_seconds, 0)
+    while True:
+        try:
+            return _verify_main_ci_once(
+                api,
+                repository,
+                repository_id,
+                main_sha,
+            )
+        except PendingEvidence as error:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise PromotionError(f"timed out waiting for main CI: {error}") from error
+            sleep(min(15, remaining))
+
+
 def _main_receipt_artifacts(
     api: PromotionApi,
     repository: str,
@@ -1086,6 +1198,11 @@ def _main(argv: list[str]) -> int:
     gate.add_argument("--main-run-id", type=int)
     gate.add_argument("--main-run-attempt", type=int)
 
+    verify_ci = subparsers.add_parser("verify-main-ci")
+    verify_ci.add_argument("--repository", required=True)
+    verify_ci.add_argument("--sha", required=True)
+    verify_ci.add_argument("--wait-seconds", type=int, default=0)
+
     consume = subparsers.add_parser("consume-main-receipt")
     consume.add_argument("--repository", required=True)
     consume.add_argument("--sha", required=True)
@@ -1105,6 +1222,34 @@ def _main(argv: list[str]) -> int:
         os.environ.get("GITHUB_TOKEN", ""),
         os.environ.get("GITHUB_API_URL", "https://api.github.com"),
     )
+    if args.command == "verify-main-ci":
+        try:
+            run = verify_main_ci(
+                api,
+                args.repository,
+                args.sha,
+                wait_seconds=max(args.wait_seconds, 0),
+            )
+        except Exception as error:
+            print(
+                f"main CI verification failed: {type(error).__name__}: {_single_line(error)}",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            json.dumps(
+                {
+                    "head_sha": run["head_sha"],
+                    "run_attempt": run["run_attempt"],
+                    "run_id": run["id"],
+                    "status": "validated",
+                    "workflow_path": CI_WORKFLOW_PATH,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
     if args.command == "gate-main":
         result = verify_main(
             api,

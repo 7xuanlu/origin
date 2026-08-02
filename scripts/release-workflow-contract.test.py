@@ -850,7 +850,7 @@ def candidate_observer_contract_violations(
 def trusted_candidate_gate_violations(
     ci: str, classifier: str, validator: str
 ) -> list[str]:
-    """Only a semantically closed Release PR may omit duplicate platform tests."""
+    """Only a semantically closed Release PR with green base CI may omit duplicates."""
 
     violations: list[str] = []
     detect = job_body(ci, "detect-changes")
@@ -907,24 +907,63 @@ def trusted_candidate_gate_violations(
     ):
         violations.append("trusted candidate matrix is not fail-closed against lookalike branches")
 
-    test_if = re.search(
-        r"^  test:\n.*?^    if: (?P<value>.+)$", ci, re.MULTILINE | re.DOTALL
-    )
-    test_condition = test_if.group("value") if test_if else ""
-    if (
-        ci.count("needs.detect-changes.outputs.trusted-release-candidate != 'true'")
-        != 2
-        or "needs.detect-changes.outputs.trusted-release-candidate != 'true'"
-        not in test_condition
-        or "startsWith(github.head_ref, 'release-please--branches--')" not in test_condition
-    ):
-        violations.append("platform test skip is not bound to semantic candidate trust")
+    trust_guard = "needs.detect-changes.outputs.trusted-release-candidate != 'true'"
+    for job in [
+        "fmt",
+        "lint",
+        "linux-nextest-build",
+        "linux-nextest",
+        "test",
+        "mcp-platform",
+        "canonical-acceptance",
+        "contract-integration",
+    ]:
+        body = job_body(ci, job)
+        condition = re.search(r"^    if: (?P<value>.+)$", body, re.MULTILINE)
+        if condition is None or trust_guard not in condition.group("value"):
+            violations.append(
+                f"trusted candidate duplicate base test skip omits {job}"
+            )
+
+    base_proof = job_body(ci, "release-base-proof")
+    proof_checkout = named_step_body(base_proof, "Checkout trusted main CI verifier")
+    proof_run = named_step_body(base_proof, "Verify exact base main CI succeeded")
+    for marker in [
+        "needs: [detect-changes]",
+        "trusted-release-candidate == 'true'",
+        "timeout-minutes: 20",
+        "actions: read",
+        "contents: read",
+    ]:
+        if marker not in base_proof:
+            violations.append(f"trusted candidate base CI proof omits {marker!r}")
+    for marker in [
+        "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        "ref: ${{ github.event.pull_request.base.sha }}",
+        "path: trusted-main-ci-proof",
+        "fetch-depth: 1",
+        "persist-credentials: false",
+    ]:
+        if marker not in proof_checkout:
+            violations.append(f"trusted candidate base CI checkout omits {marker!r}")
+    for marker in [
+        "GITHUB_TOKEN: ${{ github.token }}",
+        "trusted-main-ci-proof/scripts/release-promotion.py verify-main-ci",
+        '--repository "$GITHUB_REPOSITORY"',
+        '--sha "${{ github.event.pull_request.base.sha }}"',
+        "--wait-seconds 1080",
+    ]:
+        if marker not in proof_run:
+            violations.append(f"trusted candidate base CI proof omits {marker!r}")
     conclusion = job_body(ci, "conclusion")
     if (
         "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true'"
         not in conclusion
+        or "expect_job release-base-proof '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate == 'true' }}'"
+        not in conclusion
+        or "release-base-proof" not in conclusion
     ):
-        violations.append("conclusion does not mirror the semantic candidate test skip")
+        violations.append("conclusion does not require the semantic candidate base CI proof")
 
     for marker in [
         "VALIDATOR.validate_trusted_release_candidate(",
@@ -1258,7 +1297,13 @@ def main() -> None:
         (
             "needs.detect-changes.outputs.trusted-release-candidate != 'true'",
             "true",
-            "platform test skip is not bound",
+            "duplicate base test skip",
+            "ci",
+        ),
+        (
+            "trusted-main-ci-proof/scripts/release-promotion.py verify-main-ci",
+            "trusted-main-ci-proof/scripts/release-promotion.py skipped-main-ci-proof",
+            "base CI proof omits",
             "ci",
         ),
         (
