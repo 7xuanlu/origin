@@ -513,95 +513,32 @@ fn coverage_single_test_execution_violations(workflow: &str) -> Vec<String> {
 fn release_rust_cache_violations(workflow: &str) -> Vec<String> {
     let parsed: serde_yaml::Value = serde_yaml::from_str(workflow).expect("parse release.yml");
     let mut violations = Vec::new();
-    let Some(steps) = parsed["jobs"]["release"]["steps"].as_sequence() else {
-        return vec!["release job has no steps".into()];
-    };
-
-    if steps.iter().any(|step| {
-        step["uses"]
-            .as_str()
-            .is_some_and(|uses| uses.contains("sccache-action"))
-    }) {
-        violations.push(
-            "release tag builds install sccache despite near-zero cross-tag cache reuse".into(),
-        );
+    if parsed["jobs"].get("release").is_some() {
+        violations.push("release workflow retains the duplicate tag build matrix".into());
     }
-    let build = steps
-        .iter()
-        .find(|step| step["name"].as_str() == Some("Build and smoke shipped release binaries"));
-    if build.is_none_or(|step| {
-        step["env"]["RUSTC_WRAPPER"].as_str() == Some("sccache")
-            || step["env"]["SCCACHE_GHA_ENABLED"].as_str() == Some("true")
-    }) {
-        violations.push("release shipped-binary build still depends on sccache GHA state".into());
+    for forbidden in [
+        "cargo build",
+        "build-release-binaries",
+        "Swatinem/rust-cache",
+        "sccache-action",
+    ] {
+        if workflow.contains(forbidden) {
+            violations.push(format!(
+                "release workflow can rebuild or cache PR-validated binaries via {forbidden:?}"
+            ));
+        }
     }
-    let rust_cache = steps.iter().find(|step| {
-        step["uses"]
-            .as_str()
-            .is_some_and(|uses| uses.contains("Swatinem/rust-cache"))
-    });
-    if rust_cache.is_none() {
-        violations.push("release job removed its target-level rust-cache fallback".into());
+    let promote = job_step(
+        &parsed,
+        "promote-assets",
+        "Download exact validated wrapper once",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    if !promote.contains("scripts/release-promotion.py download-assets") {
+        violations
+            .push("release workflow does not consume the receipt-bound archive bundle".into());
     }
-    let windows_condition = "matrix.target == 'x86_64-pc-windows-msvc'";
-    let windows_only = "${{ matrix.target == 'x86_64-pc-windows-msvc' }}";
-    if rust_cache.and_then(|step| step["with"]["shared-key"].as_str())
-        != Some("release-v3-${{ matrix.target }}")
-        || rust_cache.and_then(|step| step["with"]["workspaces"].as_str()) != Some(". -> target")
-        || rust_cache.and_then(|step| step["with"]["cache-all-crates"].as_str())
-            != Some(windows_only)
-        || rust_cache.and_then(|step| step["with"]["cache-workspace-crates"].as_str())
-            != Some("false")
-        || rust_cache.and_then(|step| step["with"]["cache-targets"].as_str()) != Some(windows_only)
-        || rust_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some("false")
-    {
-        violations.push(
-            "release target cache is not restore-only, host+target coherent, and capacity-bounded to Windows"
-                .into(),
-        );
-    }
-    let marker_name = "Mark Windows explicit target as nested Cargo cache";
-    let marker = steps
-        .iter()
-        .find(|step| step["name"].as_str() == Some(marker_name));
-    let marker_run = marker
-        .and_then(|step| step["run"].as_str())
-        .unwrap_or_default();
-    if marker.and_then(|step| step["if"].as_str()) != Some(windows_condition)
-        || !marker_run.contains("CACHEDIR.TAG")
-        || !marker_run.contains("Signature: 8a477f597d28d172789f06886806bc55")
-    {
-        violations.push(
-            "release does not create a valid nested Cargo target marker before cache restore"
-                .into(),
-        );
-    }
-    let stabilizer_index = steps.iter().position(|step| {
-        step["name"].as_str() == Some("Stabilize Windows Rust cache toolchain inputs")
-    });
-    let marker_index = steps
-        .iter()
-        .position(|step| step["name"].as_str() == Some(marker_name));
-    let cache_index = steps.iter().position(|step| {
-        step["uses"]
-            .as_str()
-            .is_some_and(|uses| uses.contains("Swatinem/rust-cache"))
-    });
-    if !matches!(
-        (stabilizer_index, marker_index, cache_index),
-        (Some(stabilizer), Some(marker), Some(cache)) if stabilizer < marker && marker < cache
-    ) {
-        violations.push(
-            "release does not stabilize Windows toolchain inputs and mark the nested target before cache restore"
-                .into(),
-        );
-    }
-    if parsed["jobs"]["release"]["timeout-minutes"].as_str()
-        != Some("${{ matrix.target == 'x86_64-pc-windows-msvc' && 90 || 60 }}")
-    {
-        violations.push("release build matrix has no bounded 90/60-minute timeout".into());
-    }
-
     violations
 }
 
@@ -745,14 +682,14 @@ jobs:
 }
 
 #[test]
-fn release_uses_target_cache_without_tag_scoped_sccache_writes() {
+fn release_reuses_receipt_bound_archives_without_compiling() {
     let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/release.yml"))
         .expect("read release.yml");
     let violations = release_rust_cache_violations(&workflow);
     assert!(
         violations.is_empty(),
-        "Release cache contract drift — release.yml must use the capacity-bounded rust-cache \
-         target cache and must not depend on tag-scoped sccache writes. Fix \
+        "Release artifact-reuse contract drift — release.yml must consume receipt-bound \
+         archives without compiling or restoring compiler caches. Fix \
          .github/workflows/release.yml; an intentional contract change also updates \
          release_rust_cache_violations() and its positive control:\n{}",
         violations.join("\n")
@@ -760,7 +697,7 @@ fn release_uses_target_cache_without_tag_scoped_sccache_writes() {
 }
 
 #[test]
-fn release_cache_contract_rejects_sccache_only_fixture() {
+fn release_artifact_reuse_contract_rejects_build_fixture() {
     let workflow = r#"
 jobs:
   release:
@@ -775,13 +712,9 @@ jobs:
 "#;
     let violations = release_rust_cache_violations(workflow);
     for expected in [
-        "install sccache",
-        "depends on sccache",
-        "rust-cache fallback",
-        "capacity-bounded",
-        "stabilize Windows toolchain inputs",
-        "nested Cargo target marker",
-        "90/60-minute timeout",
+        "duplicate tag build matrix",
+        "rebuild or cache",
+        "receipt-bound",
     ] {
         assert!(
             violations
@@ -796,6 +729,12 @@ fn release_please_trigger_violations(workflow: &str) -> Vec<String> {
     let parsed: serde_yaml::Value =
         serde_yaml::from_str(workflow).unwrap_or(serde_yaml::Value::Null);
     let mut violations = Vec::new();
+    let trigger_names = parsed["on"]
+        .as_mapping()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, _)| name.as_str())
+        .collect::<BTreeSet<_>>();
     let workflows = parsed["on"]["workflow_run"]["workflows"]
         .as_sequence()
         .into_iter()
@@ -814,36 +753,71 @@ fn release_please_trigger_violations(workflow: &str) -> Vec<String> {
         .flatten()
         .filter_map(serde_yaml::Value::as_str)
         .collect::<Vec<_>>();
-    if workflows != ["CI"] || types != ["completed"] || branches != ["main"] {
-        violations.push(
-            "release-please is not triggered by completed main-branch CI workflow runs".into(),
-        );
+    if trigger_names != BTreeSet::from(["workflow_run"])
+        || workflows != ["CI"]
+        || types != ["completed"]
+        || branches != ["main"]
+    {
+        violations.push("release-please trigger is not exact completed main CI".into());
     }
-    let trigger_names = parsed["on"]
+    let jobs = parsed["jobs"]
         .as_mapping()
         .into_iter()
         .flatten()
         .filter_map(|(name, _)| name.as_str())
         .collect::<BTreeSet<_>>();
-    if trigger_names != BTreeSet::from(["workflow_dispatch", "workflow_run"])
-        || parsed["on"].get("push").is_some()
-    {
-        violations.push("release-please retains a direct push trigger or an extra trigger".into());
+    if jobs != BTreeSet::from(["route-main", "maintain-release-pr", "create-validated-tag"]) {
+        violations.push("release-please hybrid route job inventory drifted".into());
     }
-    let condition = parsed["jobs"]["release-please"]["if"]
-        .as_str()
-        .unwrap_or_default();
+    let route = &parsed["jobs"]["route-main"];
+    let route_condition = route["if"].as_str().unwrap_or_default();
     for required in [
-        "github.event_name == 'workflow_dispatch'",
         "github.event.workflow_run.event == 'push'",
         "github.event.workflow_run.head_branch == 'main'",
         "github.event.workflow_run.conclusion == 'success'",
     ] {
-        if !condition.contains(required) {
+        if !route_condition.contains(required) {
             violations.push(format!(
-                "release-please job condition omits successful main push CI proof {required:?}"
+                "release-please route omits main CI identity {required:?}"
             ));
         }
+    }
+    let revalidate = job_step(
+        &parsed,
+        "route-main",
+        "Consume the exact main CI promotion receipt",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    if !revalidate.contains("scripts/release-promotion.py consume-main-receipt") {
+        violations.push("release-please route does not consume the main promotion receipt".into());
+    }
+    let maintain = &parsed["jobs"]["maintain-release-pr"];
+    if maintain["if"].as_str() != Some("needs.route-main.outputs.state == 'ordinary'")
+        || job_step_using(
+            &parsed,
+            "maintain-release-pr",
+            "googleapis/release-please-action",
+        )
+        .and_then(|step| step["with"]["skip-github-release"].as_bool())
+            != Some(true)
+    {
+        violations.push("ordinary main is not restricted to PR-only release-please".into());
+    }
+    let create = &parsed["jobs"]["create-validated-tag"];
+    let create_run = job_step(
+        &parsed,
+        "create-validated-tag",
+        "Require pending release lifecycle and create exact tag",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    if create["if"].as_str() != Some("needs.route-main.outputs.state == 'validated'")
+        || !create_run.contains("refs/tags/$RELEASE_TAG")
+        || !create_run.contains("sha=\"$MAIN_SHA\"")
+    {
+        violations
+            .push("validated release route does not create only the exact receipt tag".into());
     }
     violations
 }
@@ -876,9 +850,9 @@ jobs:
 "#;
     let violations = release_please_trigger_violations(workflow);
     for expected in [
-        "completed main-branch CI",
-        "direct push trigger",
-        "successful main push CI proof",
+        "exact completed main CI",
+        "hybrid route job",
+        "main promotion receipt",
     ] {
         assert!(
             violations.iter().any(|item| item.contains(expected)),
@@ -1293,272 +1267,51 @@ fn windows_ort_distribution_violations(
     let release: serde_yaml::Value =
         serde_yaml::from_str(release_workflow).expect("parse release.yml");
     let mut violations = Vec::new();
-
-    let release_stage =
-        workflow_step_run(&release, "Bundle onnxruntime.dll (Windows)").unwrap_or_default();
-    if !release_stage.contains("scripts/stage-onnxruntime-windows.ps1") {
-        violations.push("release workflow does not use the pinned Windows ORT stager".into());
-    }
-
-    for (workflow, job, step_name, required_condition, owner) in [
-        (
-            &ci,
-            "test",
-            "Configure MSVC Ninja (Windows tests)",
-            "matrix.os == 'windows-2022'",
-            "Windows test CI",
-        ),
-        (
-            &ci,
-            "release-preflight",
-            "Configure MSVC Ninja (Windows release proof)",
-            "",
-            "Windows release proof",
-        ),
-        (
-            &release,
-            "release",
-            "Configure MSVC Ninja (Windows release)",
-            "matrix.target == 'x86_64-pc-windows-msvc'",
-            "Windows release workflow",
-        ),
-    ] {
-        let step = job_step(workflow, job, step_name);
-        let condition = step
-            .and_then(|candidate| candidate["if"].as_str())
-            .unwrap_or_default();
-        let run = step
-            .and_then(|candidate| candidate["run"].as_str())
-            .unwrap_or_default();
-        if (!required_condition.is_empty() && !condition.contains(required_condition))
-            || !run.contains("scripts/setup-msvc-ninja-windows.ps1")
-        {
-            violations.push(format!(
-                "{owner} does not configure the shared x64 MSVC Ninja environment"
-            ));
-        }
-    }
-
-    for (workflow, job, required_condition, owner) in [
-        (
-            &ci,
-            "test",
-            "matrix.os == 'windows-2022'",
-            "Windows test CI",
-        ),
-        (&ci, "release-preflight", "", "Windows release proof"),
-        (
-            &release,
-            "release",
-            "matrix.os == 'windows-2022'",
-            "Windows release workflow",
-        ),
-    ] {
-        let step = job_step(workflow, job, "Set up Vulkan SDK (Windows only)");
-        let condition = step
-            .and_then(|candidate| candidate["if"].as_str())
-            .unwrap_or_default();
-        let run = step
-            .and_then(|candidate| candidate["run"].as_str())
-            .unwrap_or_default();
-        if (!required_condition.is_empty() && !condition.contains(required_condition))
-            || !run.contains("scripts/setup-vulkan-sdk-windows.ps1")
-        {
-            violations.push(format!(
-                "{owner} does not configure the pinned Vulkan SDK in its required scope"
-            ));
-        }
-    }
-    for (workflow, job, step_name, required_condition, required_destination, owner) in [
-        (
-            &ci,
-            "test",
-            "Set up Vulkan SDK (Windows only)",
-            "matrix.os == 'windows-2022'",
-            "$env:RUNNER_TEMP",
-            "Windows test CI",
-        ),
-        (
-            &ci,
-            "release-preflight",
-            "Stage Windows release runtimes before smoke",
-            "matrix.target == 'x86_64-pc-windows-msvc'",
-            r#"target\${{ matrix.target }}\release"#,
-            "Windows release proof",
-        ),
-        (
-            &release,
-            "release",
-            "Set up Vulkan SDK (Windows only)",
-            "matrix.os == 'windows-2022'",
-            r#"target\${{ matrix.target }}\release"#,
-            "Windows release workflow",
-        ),
-    ] {
-        let step = job_step(workflow, job, step_name);
-        let condition = step
-            .and_then(|candidate| candidate["if"].as_str())
-            .unwrap_or_default();
-        let run = step
-            .and_then(|candidate| candidate["run"].as_str())
-            .unwrap_or_default();
-        if !condition.contains(required_condition)
-            || !run.contains("scripts/stage-vulkan-loader-windows.ps1")
-            || !run.contains(required_destination)
-            || run.contains("SkipAuthenticodeValidationForFixture")
-        {
-            violations.push(format!(
-                "{owner} does not stage the pinned Vulkan loader in its required scope"
-            ));
-        }
-    }
-
-    let package = workflow_step_run(&release, "Package").unwrap_or_default();
-    if !package.contains("wenlan-server.exe")
-        || !package.contains("onnxruntime.dll")
-        || !package.contains("vulkan-1.dll")
-        || !package.contains("VulkanRT-License.txt")
-    {
-        violations.push(
-            "release archive does not include the server, runtimes, and Vulkan license together"
-                .into(),
-        );
-    }
-
-    let universal_archive_verify = workflow_step_run(
-        &release,
-        "Verify release archive contains wenlan, wenlan-server, wenlan-mcp",
-    )
-    .unwrap_or_default();
-    if !universal_archive_verify.contains("for bin in wenlan wenlan-server wenlan-mcp")
-        || universal_archive_verify.contains("onnxruntime.dll")
-        || universal_archive_verify.contains("vulkan-1.dll")
-        || universal_archive_verify.contains("VulkanRT-License.txt")
-    {
-        violations.push(
-            "cross-platform archive verification mixes Windows-only runtime payloads into every target"
-                .into(),
-        );
-    }
-    let windows_archive_verify = job_step(
-        &release,
-        "release",
-        "Verify Windows release archive runtimes",
-    );
-    let windows_archive_verify_run = windows_archive_verify
-        .and_then(|step| step["run"].as_str())
-        .unwrap_or_default();
-    if windows_archive_verify.and_then(|step| step["if"].as_str())
-        != Some("matrix.target == 'x86_64-pc-windows-msvc'")
-        || !windows_archive_verify_run.contains("unzip -l")
-        || !windows_archive_verify_run.contains("onnxruntime.dll")
-        || !windows_archive_verify_run.contains("vulkan-1.dll")
-        || !windows_archive_verify_run.contains("VulkanRT-License.txt")
-    {
-        violations.push(
-            "Windows archive runtime verification is not restricted to the shipped Windows zip"
-                .into(),
-        );
-    }
-
-    let packaged_smoke =
-        workflow_step_run(&release, "Smoke packaged Windows release").unwrap_or_default();
-    if !packaged_smoke.contains("Expand-Archive")
-        || !packaged_smoke.contains("Test-Path")
-        || !packaged_smoke.contains("scripts/smoke-windows.ps1")
-        || !packaged_smoke.contains("vulkan-1.dll")
-        || !packaged_smoke.contains("VulkanRT-License.txt")
-    {
-        violations.push("release workflow does not smoke the extracted Windows archive".into());
-    }
-
-    let pr_build =
-        workflow_step_run(&ci, "Build and smoke shipped release binaries").unwrap_or_default();
-    let pr_runtime_stage =
+    let stage =
         workflow_step_run(&ci, "Stage Windows release runtimes before smoke").unwrap_or_default();
-    let pr_smoke =
+    let build =
+        workflow_step_run(&ci, "Build and smoke shipped release binaries").unwrap_or_default();
+    let smoke =
         workflow_step_run(&ci, "Native ORT smoke (Windows release preflight)").unwrap_or_default();
-    let windows_test_bootstrap =
-        workflow_step_run(&ci, "Stage ONNX Runtime for Windows tests").unwrap_or_default();
-    if !windows_test_bootstrap.contains("scripts/stage-onnxruntime-windows.ps1")
-        || !windows_test_bootstrap.contains("ORT_DYLIB_PATH=")
-        || !windows_test_bootstrap.contains("$env:GITHUB_ENV")
-        || !windows_test_bootstrap.contains("$env:GITHUB_PATH")
+    if !stage.contains("scripts/stage-onnxruntime-windows.ps1")
+        || !stage.contains("scripts/stage-vulkan-loader-windows.ps1")
+        || !build.contains("scripts/build-release-binaries.sh")
+        || !smoke.contains("scripts/smoke-windows.ps1")
+    {
+        violations
+            .push("Release PR CI does not stage, package, and smoke exact Windows runtimes".into());
+    }
+    if release["jobs"].get("release").is_some()
+        || release_workflow.contains("cargo build")
+        || release_workflow.contains("build-release-binaries")
     {
         violations.push(
-            "Windows tests do not pin the verified ORT build path and DLL search path before inference"
-                .into(),
+            "tag release rebuilds instead of promoting the smoke-tested Windows archive".into(),
         );
     }
-    let test_steps = ci["jobs"]["test"]["steps"].as_sequence();
-    let bootstrap_step = test_steps.and_then(|steps| {
-        steps
-            .iter()
-            .find(|step| step["name"].as_str() == Some("Stage ONNX Runtime for Windows tests"))
-    });
-    if !bootstrap_step
-        .and_then(|step| step["if"].as_str())
-        .is_some_and(|condition| condition.contains("matrix.os == 'windows-2022'"))
-    {
-        violations.push("Windows ORT test bootstrap is not guarded for windows-2022".into());
-    }
-    let bootstrap_index = test_steps.and_then(|steps| {
-        steps
-            .iter()
-            .position(|step| step["name"].as_str() == Some("Stage ONNX Runtime for Windows tests"))
-    });
-    let bootstrap_precedes_consumers = test_steps.is_some_and(|steps| {
-        let Some(bootstrap_index) = bootstrap_index else {
-            return false;
-        };
-        [
-            "Page lint scale gate (Windows functional)",
-            "Integration tests wenlan-cli + wenlan-server",
-        ]
-        .iter()
-        .filter_map(|name| {
-            steps
-                .iter()
-                .position(|step| step["name"].as_str() == Some(*name))
-        })
-        .all(|consumer_index| bootstrap_index < consumer_index)
-    });
-    if !bootstrap_precedes_consumers {
+    let promote = job_step(
+        &release,
+        "promote-assets",
+        "Download exact validated wrapper once",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    if !promote.contains("scripts/release-promotion.py download-assets") {
         violations
-            .push("Windows ORT test bootstrap must run before inference-capable tests".into());
+            .push("tag release does not consume the observer-validated Windows archive".into());
     }
-    if !pr_build.contains("scripts/build-release-binaries.sh")
-        || !pr_runtime_stage.contains("scripts/stage-onnxruntime-windows.ps1")
-        || !pr_runtime_stage.contains("scripts/stage-vulkan-loader-windows.ps1")
-        || !pr_smoke.contains("scripts/smoke-windows.ps1")
-    {
-        violations.push("PR CI does not build, stage, and exercise dynamic ORT on Windows".into());
-    }
-
-    let source_pin =
-        workflow_step_run(&ci, "Verify CI observer and ORT contracts").unwrap_or_default();
-    if !source_pin.contains("scripts/verify-ort-source-pin.py") {
-        violations.push("PR CI does not verify the actual crates.io ort-sys source pin".into());
-    }
-    if !ci_workflow.contains("'crates/wenlan-core/Cargo.toml'") {
-        violations.push("Windows CI path filter omits wenlan-core's ORT feature manifest".into());
-    }
-
     if !smoke_script.contains("Get-Process -Id $proc.Id -Module")
         || !smoke_script.contains("onnxruntime.dll")
         || !smoke_script.contains("vulkan-1.dll")
-        || !smoke_script.contains("Resolve-Path")
         || !smoke_script.contains("/api/memory/store")
         || !smoke_script.contains("chunks_created")
-        || !smoke_script.contains("blue lamp adjusts ocean timepieces")
         || smoke_script.contains("$env:ORT_DYLIB_PATH")
     {
         violations.push(
-            "Windows smoke does not force vector inference through the exact default-loaded ORT module"
+            "Windows smoke does not exercise vector inference through the exact packaged DLLs"
                 .into(),
         );
     }
-
     violations
 }
 
@@ -1591,36 +1344,18 @@ jobs:
         run: 7z a dist/wenlan.zip wenlan-server.exe
 "#;
     let violations = windows_ort_distribution_violations(workflow, workflow, "health only");
-    assert!(
-        violations
-            .iter()
-            .any(|violation| violation.contains("stager")),
-        "fixture must reject a missing ORT stager: {violations:?}"
-    );
-    assert!(
-        violations
-            .iter()
-            .any(|violation| violation.contains("DLL search path")),
-        "fixture must reject Windows tests that can load a runner DLL: {violations:?}"
-    );
-    assert!(
-        violations
-            .iter()
-            .any(|violation| violation.contains("Vulkan loader")),
-        "fixture must reject a release without a scoped Vulkan loader: {violations:?}"
-    );
-    assert!(
-        violations
-            .iter()
-            .any(|violation| violation.contains("extracted")),
-        "fixture must reject an untested archive: {violations:?}"
-    );
-    assert!(
-        violations
-            .iter()
-            .any(|violation| violation.contains("vector inference")),
-        "fixture must reject a smoke with no module proof: {violations:?}"
-    );
+    for expected in [
+        "stage, package, and smoke",
+        "observer-validated",
+        "vector inference",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "fixture must exercise {expected:?}: {violations:?}"
+        );
+    }
 }
 
 #[test]
@@ -1630,19 +1365,17 @@ fn windows_ort_distribution_contract_rejects_unscoped_archive_payloads() {
     let release = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
         .expect("read release.yml")
         .replace(
-            "      - name: Verify Windows release archive runtimes\n        if: matrix.target == 'x86_64-pc-windows-msvc'",
-            "      - name: Verify Windows release archive runtimes\n        if: always()",
+            "scripts/release-promotion.py download-assets",
+            "scripts/build-release-binaries.sh",
         );
     let smoke = std::fs::read_to_string(root.join("scripts/smoke-windows.ps1"))
         .expect("read smoke-windows.ps1");
     let violations = windows_ort_distribution_violations(&ci, &release, &smoke);
     assert!(
-        violations.iter().any(|violation| {
-            violation.contains(
-                "Windows archive runtime verification is not restricted to the shipped Windows zip",
-            )
-        }),
-        "fixture must reject Windows-only payload checks on non-Windows archives: {violations:?}"
+        violations
+            .iter()
+            .any(|violation| violation.contains("tag release rebuilds")),
+        "fixture must reject tag-side Windows rebuilding: {violations:?}"
     );
 }
 
@@ -1664,14 +1397,8 @@ jobs:
     assert!(
         violations
             .iter()
-            .any(|violation| violation.contains("guarded for windows-2022")),
-        "fixture must reject the wrong bootstrap OS gate: {violations:?}"
-    );
-    assert!(
-        violations
-            .iter()
-            .any(|violation| violation.contains("before inference-capable tests")),
-        "fixture must reject a late ORT bootstrap: {violations:?}"
+            .any(|violation| violation.contains("stage, package, and smoke")),
+        "fixture must reject an incomplete Windows candidate proof: {violations:?}"
     );
 }
 
@@ -4117,516 +3844,40 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     let release: serde_yaml::Value =
         serde_yaml::from_str(release_workflow).expect("parse release.yml");
     let mut violations = Vec::new();
-
-    let inventory_guard = job_step(&ci, "detect-changes", "Reject truncated PR file inventory");
-    let inventory_guard_run = inventory_guard
-        .and_then(|step| step["run"].as_str())
-        .unwrap_or_default();
-    if inventory_guard.and_then(|step| step["if"].as_str())
-        != Some("github.event_name == 'pull_request'")
-        || inventory_guard.and_then(|step| step["env"]["CHANGED_FILE_COUNT"].as_str())
-            != Some("${{ github.event.pull_request.changed_files }}")
-        || !inventory_guard_run.contains("-gt 3000")
-        || !inventory_guard_run.contains("cannot route fail-closed")
-    {
-        violations.push(
-            "detect-changes does not reject the REST API's truncated PR file inventory".into(),
-        );
-    }
-    let dispatch_guard = job_step(
-        &release,
-        "prepare-release",
-        "Require main workflow for manual release",
-    );
-    let dispatch_guard_run = dispatch_guard
-        .and_then(|step| step["run"].as_str())
-        .unwrap_or_default();
-    if dispatch_guard.and_then(|step| step["if"].as_str())
-        != Some("github.event_name == 'workflow_dispatch'")
-        || dispatch_guard.and_then(|step| step["env"]["WORKFLOW_REF"].as_str())
-            != Some("${{ github.ref }}")
-        || !dispatch_guard_run.contains("$WORKFLOW_REF")
-        || !dispatch_guard_run.contains("refs/heads/main")
-        || !dispatch_guard_run.contains("exit 1")
-    {
-        violations
-            .push("manual release dispatch does not require the current main workflow ref".into());
-    }
-
-    if ci["jobs"]["detect-changes"]["outputs"]["release-targets"]
-        .as_str()
-        .is_none()
-        || ci["jobs"]["detect-changes"]["outputs"]["release-preflight-targets"].as_str()
-            != Some("${{ steps.release-preflight-targets.outputs.release-preflight-targets }}")
-    {
-        violations.push(
-            "detect-changes does not expose canonical and bounded PR release matrices".into(),
-        );
-    }
-    let bounded_matrix = job_step(
-        &ci,
-        "detect-changes",
-        "Emit bounded PR release preflight matrix",
-    );
-    let bounded_run = bounded_matrix
-        .and_then(|step| step["run"].as_str())
-        .unwrap_or_default();
-    if bounded_matrix.and_then(|step| step["id"].as_str()) != Some("release-preflight-targets")
-        || !bounded_run.contains("--output-name release-preflight-targets")
-        || !bounded_run.contains("--exclude-target x86_64-pc-windows-msvc")
-        || !bounded_run.contains("$GITHUB_EVENT_NAME")
-        || !bounded_run.contains("$GITHUB_HEAD_REF")
-        || !bounded_run.contains("release-please--branches--*")
-    {
-        violations.push(
-            "ordinary PR release matrix does not exclude only the duplicate Windows release profile"
-                .into(),
-        );
-    }
-    for (job, test_name) in [
-        ("detect-changes", "Test release target inventory"),
-        ("prepare-release", "Test release target inventory"),
-    ] {
-        let workflow = if job == "detect-changes" {
-            &ci
-        } else {
-            &release
-        };
-        let run = job_step(workflow, job, test_name)
-            .and_then(|step| step["run"].as_str())
-            .unwrap_or_default();
-        let prefix = if job == "detect-changes" {
-            "scripts"
-        } else {
-            ".release-tools/scripts"
-        };
-        if !run.contains(&format!("python3 {prefix}/release_targets.test.py"))
-            || !run.contains(&format!("bash {prefix}/build-release-binaries.test.sh"))
-        {
-            violations.push(format!("{job} does not test the shared release inventory"));
-        }
-    }
-    for (workflow, job, expected_output) in [
-        (
-            &ci,
-            "detect-changes",
-            "${{ steps.release-targets.outputs.release-targets }}",
-        ),
-        (
-            &release,
-            "prepare-release",
-            "${{ steps.release-targets.outputs.release-targets }}",
-        ),
-    ] {
-        if workflow["jobs"][job]["outputs"]["release-targets"].as_str() != Some(expected_output) {
-            violations.push(format!("{job} does not expose the shared release matrix"));
-        }
-        let step = job_step(workflow, job, "Emit release target matrix");
-        let command = if job == "detect-changes" {
-            "python3 scripts/release_targets.py matrix --github-output \"$GITHUB_OUTPUT\""
-        } else {
-            "python3 .release-tools/scripts/release_targets.py matrix --github-output \"$GITHUB_OUTPUT\""
-        };
-        if step.and_then(|candidate| candidate["id"].as_str()) != Some("release-targets")
-            || step.and_then(|candidate| candidate["run"].as_str()) != Some(command)
-        {
-            violations.push(format!("{job} does not emit the shared release matrix"));
-        }
-    }
-    for job in ["prepare-release", "release"] {
-        let tooling = job_step(&release, job, "Checkout release tooling");
-        if tooling
-            .and_then(|step| step["uses"].as_str())
-            .is_none_or(|uses| !uses.starts_with("actions/checkout@"))
-            || tooling.and_then(|step| step["with"]["ref"].as_str())
-                != Some("${{ github.workflow_sha }}")
-            || tooling.and_then(|step| step["with"]["path"].as_str()) != Some(".release-tools")
-        {
-            violations.push(format!(
-                "{job} cannot rerun historical tags with workflow-pinned release tooling"
-            ));
-        }
-    }
-
-    let job = &ci["jobs"]["release-preflight"];
+    let preflight = &ci["jobs"]["release-preflight"];
     if job_needs(&ci, "release-preflight") != ["detect-changes"]
-        || job["if"].as_str().is_none_or(|condition| {
+        || preflight["if"].as_str().is_none_or(|condition| {
             !condition.contains("github.event_name != 'pull_request'")
                 || !condition.contains("startsWith(github.head_ref, 'release-please--branches--')")
                 || !condition.contains("needs.detect-changes.outputs.release-preflight == 'true'")
         })
     {
         violations.push(
-            "release-preflight is not isolated to release-sensitive PRs and release backstops"
-                .into(),
+            "release-preflight is not isolated to release-sensitive PRs and backstops".into(),
         );
     }
-    if job["runs-on"].as_str() != Some("${{ matrix.os }}")
-        || job["timeout-minutes"].as_str()
-            != Some(
-                "${{ matrix.target == 'x86_64-pc-windows-msvc' && 90 || (github.event_name != 'pull_request' && 60 || 45) }}",
-            )
-        || job["strategy"]["fail-fast"].as_bool() != Some(true)
-        || job["strategy"]["matrix"].as_str()
+    if preflight["strategy"]["fail-fast"].as_bool() != Some(true)
+        || preflight["strategy"]["matrix"].as_str()
             != Some("${{ fromJSON(needs.detect-changes.outputs.release-preflight-targets) }}")
     {
-        violations.push(
-            "release-preflight is not a fail-fast bounded ordinary-PR matrix with a full four-target backstop and cold-cache safety ceiling"
-                .into(),
-        );
+        violations.push("release-preflight is not a fail-fast canonical target matrix".into());
     }
-    if release["jobs"]["release"]["strategy"]["matrix"].as_str()
-        != Some("${{ fromJSON(needs.prepare-release.outputs.release-targets) }}")
-    {
-        violations.push("tag release does not consume the canonical release matrix".into());
-    }
-    if release["jobs"]["release"]["timeout-minutes"].as_str()
-        != Some("${{ matrix.target == 'x86_64-pc-windows-msvc' && 90 || 60 }}")
-    {
-        violations
-            .push("tag release does not enforce the bounded 90/60-minute matrix timeout".into());
-    }
-    if job_needs(&release, "docker") != ["prepare-release"]
-        || job_needs(&release, "docker-manifest")
-            != [
-                "docker",
-                "release",
-                "publish-crates",
-                "publish-npm",
-                "update-homebrew",
-            ]
-        || job_needs(&release, "finalize-release") != ["docker-manifest"]
-    {
-        violations.push(
-            "Docker DAG does not build per-arch images after prepare-release, gate public manifests on every publish channel, and gate final release promotion on that manifest barrier"
-                .into(),
-        );
-    }
-
-    for (workflow, job_name, expected) in [
-        (
-            &ci,
-            "release-preflight",
-            "bash scripts/build-release-binaries.sh \"${{ matrix.target }}\"",
-        ),
-        (
-            &release,
-            "release",
-            "bash .release-tools/scripts/build-release-binaries.sh \"${{ matrix.target }}\"",
-        ),
-    ] {
-        let build = job_step(
-            workflow,
-            job_name,
-            "Build and smoke shipped release binaries",
-        )
-        .and_then(|step| step["run"].as_str())
-        .unwrap_or_default();
-        if build != expected {
-            violations.push(format!(
-                "{job_name} does not use the shared shipped-binary build contract"
-            ));
-        }
-    }
-    if job_step(
-        &release,
-        "release",
+    let build = job_step(
+        &ci,
+        "release-preflight",
         "Build and smoke shipped release binaries",
     )
-    .and_then(|step| step["env"]["WENLAN_REPO_ROOT"].as_str())
-        != Some("${{ github.workspace }}")
-    {
-        violations.push(
-            "tag release does not run workflow-pinned tooling against the tag checkout".into(),
-        );
-    }
-
-    let toolchain = job_step_using(&ci, "release-preflight", "dtolnay/rust-toolchain");
-    if toolchain.and_then(|step| step["with"]["toolchain"].as_str()) != Some("1.95.0")
-        || toolchain.and_then(|step| step["with"]["targets"].as_str())
-            != Some("${{ matrix.target }}")
-    {
-        violations.push("release-preflight does not install the matrix target".into());
-    }
-    let windows_condition = "matrix.target == 'x86_64-pc-windows-msvc'";
-    for step_name in [
-        "Stabilize Windows Rust cache toolchain inputs",
-        "Configure rust-lld linker (Windows release preflight)",
-        "Mark Windows explicit target as nested Cargo cache",
-        "Install sqlite3 (Windows only)",
-        "Stage Windows release runtimes before smoke",
-    ] {
-        if job_step(&ci, "release-preflight", step_name).and_then(|step| step["if"].as_str())
-            != Some(windows_condition)
-        {
-            violations.push(format!(
-                "{step_name} is not restricted to the shipped Windows target"
-            ));
-        }
-    }
-    let native_smoke_condition = "matrix.target == 'x86_64-pc-windows-msvc' && !(github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu')";
-    if job_step(
-        &ci,
-        "release-preflight",
-        "Native ORT smoke (Windows release preflight)",
-    )
-    .and_then(|step| step["if"].as_str())
-        != Some(native_smoke_condition)
-    {
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    if build != "bash scripts/build-release-binaries.sh \"${{ matrix.target }}\"" {
         violations
-            .push("native ORT smoke is not replaced only by exact packaged-candidate smoke".into());
-    }
-    for (workflow, job_name, step_name, owner) in [
-        (
-            &ci,
-            "release-preflight",
-            "Configure rust-lld linker (Windows release preflight)",
-            "release-preflight",
-        ),
-        (
-            &release,
-            "release",
-            "Configure rust-lld linker (Windows)",
-            "tag release",
-        ),
-    ] {
-        let linker = job_step(workflow, job_name, step_name)
-            .and_then(|step| step["run"].as_str())
-            .unwrap_or_default();
-        if !linker.contains("rust-lld.exe")
-            || !linker.contains("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=")
-            || !linker.contains("RUSTFLAGS=")
-            || !linker.contains("$env:GITHUB_ENV")
-        {
-            violations.push(format!(
-                "{owner} does not configure rust-lld for target and host build artifacts on Windows"
-            ));
-        }
-    }
-    let sqlite = job_step(&ci, "release-preflight", "Install sqlite3 (Windows only)")
-        .and_then(|step| step["run"].as_str())
-        .unwrap_or_default();
-    if !sqlite.contains("vcpkg install sqlite3:x64-windows-static-md")
-        || !sqlite.contains("$env:GITHUB_ENV")
-    {
-        violations.push("release-preflight does not link the Windows sqlite dependency".into());
-    }
-    for (workflow, job_name) in [(&ci, "release-preflight"), (&release, "release")] {
-        let native_perl = job_step(
-            workflow,
-            job_name,
-            "Select native Perl for vendored OpenSSL",
-        );
-        let native_perl_run = native_perl
-            .and_then(|step| step["run"].as_str())
-            .unwrap_or_default();
-        if native_perl.and_then(|step| step["if"].as_str()) != Some(windows_condition)
-            || native_perl.and_then(|step| step["shell"].as_str()) != Some("pwsh")
-            || !native_perl_run.contains("Get-Command perl.exe")
-            || !native_perl_run.contains("-All")
-            || !native_perl_run.contains("candidate.Source -match")
-            || !native_perl_run.contains("[\\\\/]Git[\\\\/]")
-            || !native_perl_run.contains("Locale::Maketext::Simple")
-            || !native_perl_run.contains("OPENSSL_SRC_PERL=")
-            || !native_perl_run.contains("$env:GITHUB_ENV")
-        {
-            violations.push(format!(
-                "{job_name} does not select and validate native Windows Perl before vendored OpenSSL"
-            ));
-        }
-        let steps = workflow["jobs"][job_name]["steps"].as_sequence();
-        let native_perl_index = steps.and_then(|items| {
-            items.iter().position(|step| {
-                step["name"].as_str() == Some("Select native Perl for vendored OpenSSL")
-            })
-        });
-        let build_index = steps.and_then(|items| {
-            items.iter().position(|step| {
-                step["name"].as_str() == Some("Build and smoke shipped release binaries")
-            })
-        });
-        if !matches!(
-            (native_perl_index, build_index),
-            (Some(native_perl_index), Some(build_index)) if native_perl_index < build_index
-        ) {
-            violations.push(format!(
-                "{job_name} selects native Windows Perl after the release build"
-            ));
-        }
-    }
-    let marker_name = "Mark Windows explicit target as nested Cargo cache";
-    let mut marker_runs = Vec::new();
-    for (workflow, job_name, owner) in [
-        (&ci, "release-preflight", "release-preflight"),
-        (&release, "release", "tag release"),
-    ] {
-        let marker = job_step(workflow, job_name, marker_name);
-        let marker_run = marker
-            .and_then(|step| step["run"].as_str())
-            .unwrap_or_default();
-        if marker.and_then(|step| step["if"].as_str()) != Some(windows_condition)
-            || !marker_run.contains("CACHEDIR.TAG")
-            || !marker_run.contains("Signature: 8a477f597d28d172789f06886806bc55")
-        {
-            violations.push(format!(
-                "{owner} does not create a valid nested Cargo target marker"
-            ));
-        }
-        let steps = workflow["jobs"][job_name]["steps"].as_sequence();
-        let marker_index = steps.and_then(|items| {
-            items
-                .iter()
-                .position(|step| step["name"].as_str() == Some(marker_name))
-        });
-        let cache_index = steps.and_then(|items| {
-            items.iter().position(|step| {
-                step["uses"]
-                    .as_str()
-                    .is_some_and(|uses| uses.contains("Swatinem/rust-cache"))
-            })
-        });
-        if !matches!(
-            (marker_index, cache_index),
-            (Some(marker), Some(cache)) if marker < cache
-        ) {
-            violations.push(format!(
-                "{owner} creates the nested target marker after cache restore"
-            ));
-        }
-        marker_runs.push(marker_run);
-    }
-    if marker_runs.len() != 2 || marker_runs[0] != marker_runs[1] {
-        violations.push("producer/consumer nested target marker parity has drifted".into());
+            .push("release-preflight does not build and smoke the canonical archives once".into());
     }
     let cache = job_step_using(&ci, "release-preflight", "Swatinem/rust-cache");
-    if cache.and_then(|step| step["with"]["shared-key"].as_str())
-        != Some("release-v3-${{ matrix.target }}")
-        || cache.and_then(|step| step["with"]["cache-all-crates"].as_str()) != Some("true")
-        || cache.and_then(|step| step["with"]["cache-workspace-crates"].as_str()) != Some("false")
-        || cache.and_then(|step| step["with"]["cache-targets"].as_str())
-            != Some("${{ matrix.target == 'x86_64-pc-windows-msvc' }}")
-        || cache.and_then(|step| step["with"]["save-if"].as_str())
-            != Some("${{ github.ref == 'refs/heads/main' }}")
-    {
-        violations.push(
-            "release-preflight cache is not host+target coherent, capacity-bounded, and main-owned"
-                .into(),
-        );
-    }
     if cache.and_then(|step| step["with"]["workspaces"].as_str()) != Some(". -> target") {
-        violations.push(
-            "release-preflight cache must use one top-level target root; overlapping cache roots are forbidden"
-                .into(),
-        );
+        violations.push("release-preflight cache has overlapping cache roots".into());
     }
-    let release_cache = job_step_using(&release, "release", "Swatinem/rust-cache");
-    let windows_cache = "${{ matrix.target == 'x86_64-pc-windows-msvc' }}";
-    if release_cache.and_then(|step| step["with"]["shared-key"].as_str())
-        != cache.and_then(|step| step["with"]["shared-key"].as_str())
-        || release_cache.and_then(|step| step["with"]["cache-all-crates"].as_str())
-            != Some(windows_cache)
-        || release_cache.and_then(|step| step["with"]["cache-workspace-crates"].as_str())
-            != Some("false")
-        || release_cache.and_then(|step| step["with"]["cache-targets"].as_str())
-            != Some(windows_cache)
-        || release_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some("false")
-    {
-        violations.push(
-            "tag release cache does not restore the main-owned preflight key with a Windows-only footprint"
-                .into(),
-        );
-    }
-    if release_cache.and_then(|step| step["with"]["workspaces"].as_str()) != Some(". -> target") {
-        violations.push(
-            "tag release cache must use one top-level target root; overlapping cache roots are forbidden"
-                .into(),
-        );
-    }
-    if release_cache.and_then(|step| step["with"]["shared-key"].as_str())
-        != cache.and_then(|step| step["with"]["shared-key"].as_str())
-        || release_cache.and_then(|step| step["with"]["workspaces"].as_str())
-            != cache.and_then(|step| step["with"]["workspaces"].as_str())
-    {
-        violations.push("release cache producer/consumer parity has drifted".into());
-    }
-    let windows_runtime_stage = job_step(
-        &ci,
-        "release-preflight",
-        "Stage Windows release runtimes before smoke",
-    )
-    .and_then(|step| step["run"].as_str())
-    .unwrap_or_default();
-    if !windows_runtime_stage.contains("scripts/stage-onnxruntime-windows.ps1")
-        || !windows_runtime_stage.contains("scripts/stage-vulkan-loader-windows.ps1")
-        || !windows_runtime_stage.contains(r"target\${{ matrix.target }}\release")
-    {
-        violations.push(
-            "Windows release preflight omits adjacent runtime DLL staging before executable smoke"
-                .into(),
-        );
-    }
-    let windows_smoke = job_step(
-        &ci,
-        "release-preflight",
-        "Native ORT smoke (Windows release preflight)",
-    )
-    .and_then(|step| step["run"].as_str())
-    .unwrap_or_default();
-    if !windows_smoke.contains("scripts/smoke-windows.ps1")
-        || !windows_smoke.contains(r"target\${{ matrix.target }}\release")
-    {
-        violations.push("Windows release preflight omits the native ORT smoke".into());
-    }
-    let ci_steps = job["steps"].as_sequence();
-    let runtime_stage_index = ci_steps.and_then(|steps| {
-        steps.iter().position(|step| {
-            step["name"].as_str() == Some("Stage Windows release runtimes before smoke")
-        })
-    });
-    let build_index = ci_steps.and_then(|steps| {
-        steps.iter().position(|step| {
-            step["name"].as_str() == Some("Build and smoke shipped release binaries")
-        })
-    });
-    let smoke_index = ci_steps.and_then(|steps| {
-        steps.iter().position(|step| {
-            step["name"].as_str() == Some("Native ORT smoke (Windows release preflight)")
-        })
-    });
-    if !matches!(
-        (runtime_stage_index, build_index, smoke_index),
-        (Some(runtime_stage_index), Some(build_index), Some(smoke_index))
-            if runtime_stage_index < build_index && build_index < smoke_index
-    ) {
-        violations.push(
-            "Windows release preflight does not stage runtime DLLs before executable smoke".into(),
-        );
-    }
-    let release_steps = release["jobs"]["release"]["steps"].as_sequence();
-    let release_ort_index = release_steps.and_then(|steps| {
-        steps
-            .iter()
-            .position(|step| step["name"].as_str() == Some("Bundle onnxruntime.dll (Windows)"))
-    });
-    let release_vulkan_index = release_steps.and_then(|steps| {
-        steps
-            .iter()
-            .position(|step| step["name"].as_str() == Some("Set up Vulkan SDK (Windows only)"))
-    });
-    let release_build_index = release_steps.and_then(|steps| {
-        steps.iter().position(|step| {
-            step["name"].as_str() == Some("Build and smoke shipped release binaries")
-        })
-    });
-    if !matches!(
-        (release_ort_index, release_vulkan_index, release_build_index),
-        (Some(ort_index), Some(vulkan_index), Some(build_index))
-            if ort_index < build_index && vulkan_index < build_index
-    ) {
-        violations.push("tag release does not stage runtime DLLs before executable smoke".into());
-    }
-
-    for step in job["steps"].as_sequence().into_iter().flatten() {
+    for step in preflight["steps"].as_sequence().into_iter().flatten() {
         let name = step["name"]
             .as_str()
             .unwrap_or_default()
@@ -4635,11 +3886,7 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             .as_str()
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let uses = step["uses"]
-            .as_str()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let allowed_candidate_data_step = matches!(
+        let allowed_candidate_step = matches!(
             name.as_str(),
             "package canonical release candidate archives"
                 | "smoke exact release candidate archives"
@@ -4649,30 +3896,43 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
         if name.contains("publish")
             || run.contains("gh release")
             || run.contains("npm publish")
-            || (name.contains("package") && !allowed_candidate_data_step)
-            || (uses.contains("upload-artifact") && !allowed_candidate_data_step)
+            || (name.contains("package") && !allowed_candidate_step)
         {
             violations
                 .push("release-preflight contains an unauthorized publishing side effect".into());
         }
     }
-
+    if release["on"].get("workflow_dispatch").is_some() {
+        violations.push("tag release retains an unbound manual dispatch path".into());
+    }
+    if release["jobs"].get("release").is_some()
+        || release_workflow.contains("cargo build")
+        || release_workflow.contains("build-release-binaries")
+    {
+        violations
+            .push("tag release retains duplicate compilation of PR-validated binaries".into());
+    }
+    if job_needs(&release, "prepare-release") != ["resolve-promotion"]
+        || job_needs(&release, "promote-assets") != ["resolve-promotion", "prepare-release"]
+    {
+        violations.push("tag release artifact-promotion DAG bypasses receipt resolution".into());
+    }
+    let download = job_step(
+        &release,
+        "promote-assets",
+        "Download exact validated wrapper once",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    if !download.contains("scripts/release-promotion.py download-assets") {
+        violations.push("tag release does not download the exact validated asset wrapper".into());
+    }
     if !job_needs(&ci, "conclusion")
         .iter()
         .any(|need| need == "release-preflight")
     {
         violations.push("conclusion.needs omits release-preflight".into());
     }
-    let conclusion = workflow_step_run(&ci, "Aggregate expected CI results").unwrap_or_default();
-    if !conclusion.lines().map(str::trim).any(|line| {
-        line.starts_with("expect_job release-preflight ")
-            && line.contains("startsWith(github.head_ref, 'release-please--branches--')")
-            && line.contains("needs.detect-changes.outputs.release-preflight")
-            && line.contains("needs.release-preflight.result")
-    }) {
-        violations.push("conclusion does not fail closed on release-preflight".into());
-    }
-
     violations
 }
 
@@ -4772,26 +4032,23 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "          save-if: \"false\"",
             "          save-if: \"true\"",
         );
+    let release = release
+        .replace("  push:\n", "  workflow_dispatch:\n  push:\n")
+        .replace(
+            "scripts/release-promotion.py download-assets",
+            "scripts/build-release-binaries.sh",
+        )
+        .replace("    needs: resolve-promotion", "    needs: publish-crates");
     let violations = release_preflight_contract_violations(&ci, &release);
     for expected in [
-        "release-sensitive PRs and release backstops",
-        "bounded ordinary-PR matrix",
-        "canonical release matrix",
-        "bounded 90/60-minute",
-        "Docker DAG",
-        "shared shipped-binary",
-        "current main workflow ref",
-        "host+target coherent, capacity-bounded, and main-owned",
-        "Windows-only footprint",
-        "nested Cargo target marker",
-        "producer/consumer",
-        "truncated PR file inventory",
-        "native Windows Perl",
-        "target and host build artifacts",
-        "runtime DLLs before executable smoke",
-        "native ORT smoke",
+        "release-sensitive PRs and backstops",
+        "fail-fast canonical target matrix",
+        "canonical archives once",
         "unauthorized publishing side effect",
-        "conclusion does not fail closed",
+        "unbound manual dispatch",
+        "duplicate compilation",
+        "artifact-promotion DAG",
+        "exact validated asset wrapper",
     ] {
         assert!(
             violations
@@ -4957,7 +4214,7 @@ fn release_candidate_observer_contract_violations(
         || validated_upload.and_then(|step| step["with"]["compression-level"].as_u64())
             != Some(0)
         || validated_upload.and_then(|step| step["with"]["retention-days"].as_u64())
-            != Some(14)
+            != Some(30)
         || validated_upload.and_then(|step| step["with"]["if-no-files-found"].as_str())
             != Some("error")
         || validated_upload.and_then(|step| step["with"]["overwrite"].as_bool())
@@ -4972,10 +4229,14 @@ fn release_candidate_observer_contract_violations(
     if close.and_then(|step| step["name"].as_str())
         != Some("Close receipt over validated assets artifact")
         || !close_run.contains("close-receipt")
+        || close.and_then(|step| step["env"]["GH_TOKEN"].as_str()) != Some("${{ github.token }}")
+        || !close_run.contains("/actions/runs/$GITHUB_RUN_ID")
         || !close_run.contains("steps.validated-assets.outputs.artifact-id")
         || !close_run.contains("steps.validated-assets.outputs.artifact-digest")
         || !close_run.contains("--observer-run-id \"$GITHUB_RUN_ID\"")
         || !close_run.contains("--observer-run-attempt \"$GITHUB_RUN_ATTEMPT\"")
+        || !close_run.contains("--observer-workflow-id \"$observer_workflow_id\"")
+        || !close_run.contains("--observer-code-sha \"$GITHUB_WORKFLOW_SHA\"")
     {
         violations.push("receipt close step omits validated artifact identity".into());
     }
@@ -4986,14 +4247,14 @@ fn release_candidate_observer_contract_violations(
             != Some("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
         || closed_upload.and_then(|step| step["with"]["name"].as_str())
             != Some(
-                "validated-release-receipt-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}-${{ github.run_id }}-${{ github.run_attempt }}",
+                "validated-release-receipt-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}",
             )
         || closed_upload.and_then(|step| step["with"]["path"].as_str())
             != Some("${{ runner.temp }}/validated-release-receipt.json")
         || closed_upload.and_then(|step| step["with"]["compression-level"].as_u64())
             != Some(0)
         || closed_upload.and_then(|step| step["with"]["retention-days"].as_u64())
-            != Some(14)
+            != Some(30)
         || closed_upload.and_then(|step| step["with"]["if-no-files-found"].as_str())
             != Some("error")
         || closed_upload.and_then(|step| step["with"]["overwrite"].as_bool())
@@ -5197,6 +4458,15 @@ fn release_candidate_observer_contract_rejects_privilege_and_identity_drift() {
         .replace(
             "--summary \"$GITHUB_STEP_SUMMARY\"",
             "--summary \"$RUNNER_TEMP/summary\"",
+        )
+        .replace("          retention-days: 30", "          retention-days: 14")
+        .replace(
+            "name: validated-release-receipt-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}",
+            "name: validated-release-receipt-latest",
+        )
+        .replace(
+            "--observer-workflow-id \"$observer_workflow_id\"",
+            "--observer-workflow-id removed",
         );
     let validator = std::fs::read_to_string(root.join("scripts/validate-release-candidate.py"))
         .expect("read validator")
@@ -5243,69 +4513,204 @@ fn release_candidate_observer_contract_rejects_privilege_and_identity_drift() {
     }
 }
 
-fn windows_native_parallelism_violations(
+fn release_promotion_contract_violations(
     ci_workflow: &str,
+    release_please_workflow: &str,
     release_workflow: &str,
-    msvc_setup: &str,
+    promotion_script: &str,
 ) -> Vec<String> {
     let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
+    let release_please: serde_yaml::Value =
+        serde_yaml::from_str(release_please_workflow).expect("parse release-please.yml");
     let release: serde_yaml::Value =
         serde_yaml::from_str(release_workflow).expect("parse release.yml");
     let mut violations = Vec::new();
-    let windows_condition = "matrix.target == 'x86_64-pc-windows-msvc'";
-    for (workflow, job, step_name, owner) in [
-        (
-            &ci,
-            "release-preflight",
-            "Bound native build concurrency (Windows)",
-            "release preflight",
-        ),
-        (
-            &release,
-            "release",
-            "Cap Windows Cargo parallelism",
-            "tag release",
-        ),
+    let main_gate = job_step(&ci, "detect-changes", "Verify reusable release merge")
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    for required in [
+        "scripts/release-promotion.py gate-main",
+        "--wait-seconds 720",
+        "--main-run-id \"$GITHUB_RUN_ID\"",
+        "--main-run-attempt \"$GITHUB_RUN_ATTEMPT\"",
+        "--plan-output \"$RUNNER_TEMP/main-release-promotion-receipt.json\"",
     ] {
-        let step = job_step(workflow, job, step_name);
-        let run = step
-            .and_then(|candidate| candidate["run"].as_str())
-            .unwrap_or_default();
-        if step.and_then(|candidate| candidate["if"].as_str()) != Some(windows_condition)
-            || !run.contains("CARGO_BUILD_JOBS=2")
-            || run.contains("CARGO_BUILD_JOBS=1")
-        {
-            violations.push(format!(
-                "{owner} does not cap outer Windows Cargo work at exactly two jobs"
-            ));
-        }
-        let steps = workflow["jobs"][job]["steps"].as_sequence();
-        let cap_index = steps.and_then(|items| {
-            items
-                .iter()
-                .position(|candidate| candidate["name"].as_str() == Some(step_name))
-        });
-        let build_index = steps.and_then(|items| {
-            items.iter().position(|candidate| {
-                candidate["name"].as_str() == Some("Build and smoke shipped release binaries")
-            })
-        });
-        if !matches!((cap_index, build_index), (Some(cap), Some(build)) if cap < build) {
-            violations.push(format!("{owner} applies its Cargo cap after the build"));
+        if !main_gate.contains(required) {
+            violations.push(format!("main release gate omits {required:?}"));
         }
     }
-    if msvc_setup
-        .matches("$env:CMAKE_BUILD_PARALLEL_LEVEL = \"1\"")
-        .count()
-        != 1
-        || !msvc_setup.contains("\"CMAKE_BUILD_PARALLEL_LEVEL\"")
+    let main_receipt = job_step(
+        &ci,
+        "detect-changes",
+        "Upload main release promotion receipt",
+    );
+    if main_receipt.and_then(|step| step["if"].as_str())
+        != Some("steps.release-proof.outputs.release-gate-state == 'validated'")
+        || main_receipt.and_then(|step| step["with"]["retention-days"].as_u64()) != Some(30)
+        || main_receipt.and_then(|step| step["with"]["overwrite"].as_bool()) != Some(false)
+    {
+        violations.push(
+            "main promotion receipt is not validated-only, immutable, and retained 30 days".into(),
+        );
+    }
+    let trigger_names = release_please["on"]
+        .as_mapping()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, _)| name.as_str())
+        .collect::<BTreeSet<_>>();
+    if trigger_names != BTreeSet::from(["workflow_run"])
+        || release_please["jobs"].as_mapping().is_none_or(|jobs| {
+            jobs.keys()
+                .filter_map(serde_yaml::Value::as_str)
+                .collect::<BTreeSet<_>>()
+                != BTreeSet::from(["route-main", "maintain-release-pr", "create-validated-tag"])
+        })
+    {
+        violations.push("release-please hybrid trigger or job inventory drifted".into());
+    }
+    let route = job_step(
+        &release_please,
+        "route-main",
+        "Consume the exact main CI promotion receipt",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    if !route.contains("scripts/release-promotion.py consume-main-receipt") {
+        violations.push("release-please does not consume the exact main receipt".into());
+    }
+    if job_step_using(
+        &release_please,
+        "maintain-release-pr",
+        "googleapis/release-please-action",
+    )
+    .and_then(|step| step["with"]["skip-github-release"].as_bool())
+        != Some(true)
+    {
+        violations.push("ordinary main release-please is not PR-only".into());
+    }
+    if release["on"].get("workflow_dispatch").is_some()
+        || release["jobs"].get("release").is_some()
+        || release_workflow.contains("cargo build")
+        || release_workflow.contains("build-release-binaries")
+    {
+        violations.push("tag release has an unbound trigger or duplicate compilation lane".into());
+    }
+    let resolve = job_step(
+        &release,
+        "resolve-promotion",
+        "Resolve tag to the trusted observer receipt",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    if !resolve.contains("scripts/release-promotion.py consume-main-receipt")
+        || job_needs(&release, "prepare-release") != ["resolve-promotion"]
+        || job_needs(&release, "promote-assets") != ["resolve-promotion", "prepare-release"]
+    {
+        violations
+            .push("tag release does not resolve the main receipt before asset promotion".into());
+    }
+    let docker = &release["jobs"]["docker"];
+    let docker_text = serde_yaml::to_string(docker).unwrap_or_default();
+    if job_needs(&release, "docker") != ["promote-assets"]
+        || !docker_text.contains("docker/Dockerfile.release-runtime")
+        || !docker_text.contains("scripts/verify-release-runtime-image.py")
+        || docker_text.contains("docker/Dockerfile.daemon")
+    {
+        violations.push(
+            "Docker release does not reuse and smoke the exact validated Linux binary".into(),
+        );
+    }
+    for required in [
+        "MAX_RECEIPT_CANDIDATES = 20",
+        "latest trusted observer attempt",
+        "observer reruns produced conflicting release semantics",
+        "subparsers.add_parser(\"consume-main-receipt\")",
+        "subparsers.add_parser(\"download-assets\")",
+        "safe_extract_zip(wrapper, output_dir, expected)",
+    ] {
+        if !promotion_script.contains(required) {
+            violations.push(format!("promotion resolver omits {required:?}"));
+        }
+    }
+    violations
+}
+
+#[test]
+fn release_promotion_reuses_exact_archives_and_fails_closed() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci");
+    let release_please = std::fs::read_to_string(root.join(".github/workflows/release-please.yml"))
+        .expect("read release-please");
+    let release =
+        std::fs::read_to_string(root.join(".github/workflows/release.yml")).expect("read release");
+    let promotion = std::fs::read_to_string(root.join("scripts/release-promotion.py"))
+        .expect("read promotion resolver");
+    let violations =
+        release_promotion_contract_violations(&ci, &release_please, &release, &promotion);
+    assert!(
+        violations.is_empty(),
+        "hybrid release promotion contract drift:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci");
+    let release_please = std::fs::read_to_string(root.join(".github/workflows/release-please.yml"))
+        .expect("read release-please");
+    let release = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
+        .expect("read release")
+        .replace(
+            "scripts/release-promotion.py download-assets",
+            "cargo build --release",
+        );
+    let promotion = std::fs::read_to_string(root.join("scripts/release-promotion.py"))
+        .expect("read promotion resolver")
+        .replace(
+            "MAX_RECEIPT_CANDIDATES = 20",
+            "MAX_RECEIPT_CANDIDATES = 1000",
+        );
+    let violations =
+        release_promotion_contract_violations(&ci, &release_please, &release, &promotion);
+    for expected in ["duplicate compilation", "MAX_RECEIPT_CANDIDATES"] {
+        assert!(
+            violations.iter().any(|item| item.contains(expected)),
+            "mutation must exercise {expected:?}: {violations:?}"
+        );
+    }
+}
+
+fn windows_native_parallelism_violations(
+    ci_workflow: &str,
+    _release_workflow: &str,
+    msvc_setup: &str,
+) -> Vec<String> {
+    let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
+    let mut violations = Vec::new();
+    let step = job_step(
+        &ci,
+        "release-preflight",
+        "Bound native build concurrency (Windows)",
+    );
+    let run = step
+        .and_then(|candidate| candidate["run"].as_str())
+        .unwrap_or_default();
+    if step.and_then(|candidate| candidate["if"].as_str())
+        != Some("matrix.target == 'x86_64-pc-windows-msvc'")
+        || !run.contains("CARGO_BUILD_JOBS=2")
+        || run.contains("CARGO_BUILD_JOBS=1")
+    {
+        violations
+            .push("release preflight does not cap outer Windows Cargo at exactly two jobs".into());
+    }
+    if !msvc_setup.contains("$env:CMAKE_BUILD_PARALLEL_LEVEL = \"1\"")
         || msvc_setup.contains("$env:CMAKE_BUILD_PARALLEL_LEVEL = \"2\"")
         || msvc_setup.contains("CARGO_BUILD_JOBS")
     {
-        violations.push(
-            "MSVC Ninja setup does not keep nested CMake at one worker independently of Cargo"
-                .into(),
-        );
+        violations.push("MSVC Ninja setup does not keep nested CMake serialized".into());
     }
     violations
 }
@@ -5352,7 +4757,7 @@ jobs:
 "#;
     let setup = "$env:CMAKE_BUILD_PARALLEL_LEVEL = \"2\"\nCARGO_BUILD_JOBS=2";
     let violations = windows_native_parallelism_violations(ci, release, setup);
-    for expected in ["exactly two jobs", "after the build", "nested CMake"] {
+    for expected in ["exactly two jobs", "nested CMake"] {
         assert!(
             violations.iter().any(|item| item.contains(expected)),
             "fixture must exercise {expected:?}: {violations:?}"

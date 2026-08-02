@@ -12,7 +12,9 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
+  pull-requests: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -49,6 +51,7 @@ jobs:
       mcp-platform: ${{ steps.filter.outputs.mcp-platform }}
       workspace-platform: ${{ steps.filter.outputs.workspace-platform }}
       verified-release-merge: ${{ steps.release-proof.outputs.verified-release-merge }}
+      release-gate-state: ${{ steps.release-proof.outputs.release-gate-state }}
       test-plan: ${{ steps.test-plan.outputs.test-plan }}
       workspace-lib-required: ${{ steps.test-plan.outputs.workspace-lib-required }}
       cli-server-integration-required: ${{ steps.test-plan.outputs.cli-server-integration-required }}
@@ -412,24 +415,39 @@ jobs:
               - '.github/workflows/release.yml'
 
       - name: Test release merge proof
-        run: python3 scripts/verify-release-merge.test.py
-      # A release-please PR already proved its exact head. Reuse that proof on
-      # main only when GitHub independently confirms the associated PR, the
-      # required conclusion, the release-managed file inventory, and identical
-      # Git trees. Any missing/API evidence emits false and keeps the full main
-      # backstop.
+        run: |
+          python3 scripts/verify-release-merge.test.py
+          python3 scripts/release-promotion.test.py
+      # A release-please PR already proved and sealed its exact six archives.
+      # Main reuses that proof only after a bounded wait for the trusted
+      # observer's small closed receipt. An ordinary main push keeps the full
+      # backstop; a suspected release with missing or invalid evidence fails
+      # closed instead of silently rerunning or rebuilding.
       - name: Verify reusable release merge
         id: release-proof
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          python3 scripts/verify-release-merge.py \
+          python3 scripts/release-promotion.py gate-main \
             --repository "$GITHUB_REPOSITORY" \
-            --event-name "$GITHUB_EVENT_NAME" \
-            --ref "$GITHUB_REF" \
             --sha "$GITHUB_SHA" \
-            --github-output "$GITHUB_OUTPUT"
+            --temp-root "$RUNNER_TEMP" \
+            --wait-seconds 720 \
+            --main-run-id "$GITHUB_RUN_ID" \
+            --main-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --github-output "$GITHUB_OUTPUT" \
+            --plan-output "$RUNNER_TEMP/main-release-promotion-receipt.json"
+      - name: Upload main release promotion receipt
+        if: steps.release-proof.outputs.release-gate-state == 'validated'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: main-release-promotion-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/main-release-promotion-receipt.json
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: false
       - id: matrix
         run: |
           macos='{"os":"macos-14","label":"macos-14"}'

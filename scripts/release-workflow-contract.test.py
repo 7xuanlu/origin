@@ -14,6 +14,8 @@ RELEASE_PLEASE_PATH = REPO_ROOT / ".github" / "workflows" / "release-please.yml"
 OBSERVER_PATH = REPO_ROOT / ".github" / "workflows" / "release-candidate-observer.yml"
 VALIDATOR_PATH = REPO_ROOT / "scripts" / "validate-release-candidate.py"
 ARCHIVE_PATH = REPO_ROOT / "scripts" / "release_archive.py"
+PROMOTION_PATH = REPO_ROOT / "scripts" / "release-promotion.py"
+RUNTIME_IMAGE_PATH = REPO_ROOT / "scripts" / "verify-release-runtime-image.py"
 
 EXPECTED_NODE24_ACTIONS = {
     "actions/checkout": "d23441a48e516b6c34aea4fa41551a30e30af803",
@@ -46,67 +48,175 @@ def named_step_body(job: str, step_name: str) -> str:
     return match.group("body").strip() if match else ""
 
 
-def contract_violations(release: str, release_please: str) -> list[str]:
-    violations: list[str] = []
-    docker = job_body(release, "docker")
-    manifest = job_body(release, "docker-manifest")
-    finalize = job_body(release, "finalize-release")
-    prepare = job_body(release, "prepare-release")
-    homebrew = job_body(release, "update-homebrew")
+def contract_violations(
+    ci: str, release: str, release_please: str, promotion: str
+) -> list[str]:
+    """Keep release publication bound to the PR-built immutable archives."""
 
-    if "    needs: prepare-release" not in docker:
-        violations.append("Docker architecture builds no longer start after prepare-release")
-    required_manifest_needs = (
-        "    needs: [docker, release, publish-crates, publish-npm, update-homebrew]"
+    violations: list[str] = []
+    ci_gate = named_step_body(job_body(ci, "detect-changes"), "Verify reusable release merge")
+    for marker in [
+        "python3 scripts/release-promotion.py gate-main",
+        '--wait-seconds 720',
+        '--main-run-id "$GITHUB_RUN_ID"',
+        '--main-run-attempt "$GITHUB_RUN_ATTEMPT"',
+        '--plan-output "$RUNNER_TEMP/main-release-promotion-receipt.json"',
+    ]:
+        if marker not in ci_gate:
+            violations.append(f"main release gate omits thin receipt contract {marker!r}")
+    ci_receipt = named_step_body(
+        job_body(ci, "detect-changes"), "Upload main release promotion receipt"
     )
-    if required_manifest_needs not in manifest:
-        violations.append(
-            "GHCR promotion dependencies do not include every required publish channel"
-        )
+    for marker in [
+        "if: steps.release-proof.outputs.release-gate-state == 'validated'",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        "name: main-release-promotion-receipt-${{ github.run_id }}-${{ github.run_attempt }}",
+        "path: ${{ runner.temp }}/main-release-promotion-receipt.json",
+        "compression-level: 0",
+        "retention-days: 30",
+        "if-no-files-found: error",
+        "overwrite: false",
+    ]:
+        if marker not in ci_receipt:
+            violations.append(f"main promotion receipt upload omits {marker!r}")
+
+    if re.search(r"\n\s+(workflow_dispatch|push|pull_request):", release_please):
+        violations.append("release-please has a privileged trigger outside completed main CI")
+    for job in ["route-main", "maintain-release-pr", "create-validated-tag"]:
+        if not job_body(release_please, job):
+            violations.append(f"release-please omits hybrid route job {job!r}")
+    route = job_body(release_please, "route-main")
+    for marker in [
+        "github.event.workflow_run.event == 'push'",
+        "github.event.workflow_run.head_branch == 'main'",
+        "github.event.workflow_run.conclusion == 'success'",
+        "Verify observed main CI identity",
+        ".path == \".github/workflows/ci.yml\"",
+        "scripts/release-promotion.py consume-main-receipt",
+    ]:
+        if marker not in route:
+            violations.append(f"release-please main route omits {marker!r}")
+    maintain = job_body(release_please, "maintain-release-pr")
+    for marker in [
+        "needs.route-main.outputs.state == 'ordinary'",
+        "skip-github-release: true",
+        "contents: write",
+        "pull-requests: write",
+    ]:
+        if marker not in maintain:
+            violations.append(f"ordinary release-please path omits PR-only contract {marker!r}")
+    create_tag = job_body(release_please, "create-validated-tag")
+    for marker in [
+        "needs.route-main.outputs.state == 'validated'",
+        "GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}",
+        'if [[ "$pending" != true || "$tagged" != false ]]',
+        'if [[ "$existing_sha" != "$MAIN_SHA" ]]',
+        '-f ref="refs/tags/$RELEASE_TAG"',
+        '-f sha="$MAIN_SHA"',
+    ]:
+        if marker not in create_tag:
+            violations.append(f"validated tag creation omits {marker!r}")
+
+    if re.search(r"\n\s+workflow_dispatch:", release):
+        violations.append("tag release retains an unbound manual dispatch path")
+    if job_body(release, "release"):
+        violations.append("tag release retains the duplicate release build matrix")
+    if "cargo build" in release or "build-release-binaries" in release:
+        violations.append("tag release can recompile the PR-validated release binaries")
+    for job in [
+        "resolve-promotion",
+        "prepare-release",
+        "promote-assets",
+        "docker",
+        "docker-manifest",
+        "finalize-release",
+    ]:
+        if not job_body(release, job):
+            violations.append(f"tag release omits artifact-promotion job {job!r}")
+    if "    needs: resolve-promotion" not in job_body(release, "prepare-release"):
+        violations.append("release preparation can start before promotion identity is resolved")
+    if "    needs: [resolve-promotion, prepare-release]" not in job_body(
+        release, "promote-assets"
+    ):
+        violations.append("asset publication bypasses receipt resolution or prerelease gate")
+    resolve = job_body(release, "resolve-promotion")
+    for marker in [
+        "scripts/release-promotion.py consume-main-receipt",
+        "name: release-promotion-plan-${{ github.run_id }}-${{ github.run_attempt }}",
+        "retention-days: 30",
+        "overwrite: false",
+    ]:
+        if marker not in resolve:
+            violations.append(f"tag promotion resolver omits {marker!r}")
+    promote = job_body(release, "promote-assets")
+    for marker in [
+        "scripts/release-promotion.py download-assets",
+        "Download exact validated wrapper once",
+        "Existing release asset $name differs; refusing to clobber.",
+    ]:
+        if marker not in promote:
+            violations.append(f"validated asset promotion omits {marker!r}")
+
+    docker = job_body(release, "docker")
+    if "    needs: promote-assets" not in docker:
+        violations.append("runtime images can start before exact validated asset promotion")
+    for marker in [
+        "docker/Dockerfile.release-runtime",
+        "scripts/verify-release-runtime-image.py",
+    ]:
+        if marker not in docker:
+            violations.append(f"runtime image lane omits binary-reuse proof {marker!r}")
+    if "docker/Dockerfile.daemon" in docker or "cargo build" in docker:
+        violations.append("runtime image lane can compile a different server binary")
+    runtime_image = RUNTIME_IMAGE_PATH.read_text(encoding="utf-8")
+    for marker in [
+        '"--load"',
+        "_verify_copied_binary(",
+        "_semantic_smoke(",
+        "Linux archive bytes differ from the closed receipt",
+    ]:
+        if marker not in runtime_image:
+            violations.append(f"runtime image verifier omits {marker!r}")
+    manifest = job_body(release, "docker-manifest")
+    if (
+        "    needs: [docker, promote-assets, publish-crates, publish-npm, update-homebrew]"
+        not in manifest
+    ):
+        violations.append("GHCR promotion dependencies omit a required publish channel")
+    npm = job_body(release, "publish-npm")
+    if "    needs: promote-assets" not in npm or "needs: publish-crates" in npm:
+        violations.append("npm publishing is serialized behind crates.io propagation")
+    finalize = job_body(release, "finalize-release")
     if "    needs: docker-manifest" not in finalize:
         violations.append("GitHub release finalization bypasses the GHCR promotion barrier")
+    tagged = finalize.find('"labels":["autorelease: tagged"]')
+    pending = finalize.find("labels/autorelease%3A%20pending")
+    if tagged < 0 or pending <= tagged:
+        violations.append("release lifecycle does not add tagged before removing pending")
+    for marker in [
+        'index("autorelease: tagged") != null',
+        'index("autorelease: pending") == null',
+    ]:
+        if marker not in finalize:
+            violations.append("release lifecycle omits the final closed-state assertion")
+    if re.search(
+        r"labels/autorelease%3A%20pending[\s\S]{0,120}\|\| true", finalize
+    ):
+        violations.append("release lifecycle swallows a pending-label deletion failure")
 
     for marker in [
-        'docker buildx imagetools create -t "$IMG:$TAG"',
-        'if [[ "$TAG" == *-* ]]',
-        'docker buildx imagetools create -t "$IMG:latest"',
+        'expected_name = f"validated-release-receipt-{run_id}-{run_attempt}"',
+        "MAX_RECEIPT_CANDIDATES = 20",
+        "observer reruns produced conflicting release semantics",
+        "latest trusted observer attempt",
+        'subparsers.add_parser("consume-main-receipt")',
+        'subparsers.add_parser("download-assets")',
+        "validated assets wrapper size or digest mismatch",
+        "safe_extract_zip(wrapper, output_dir, expected)",
+        "safe_extract_archive(",
     ]:
-        if marker not in manifest:
-            violations.append(
-                "GHCR promotion does not preserve the version alias while protecting latest from prerelease tags"
-            )
-            break
-
-    gate_index = prepare.find("- name: Gate the release behind a prerelease")
-    tap_index = prepare.find("- name: Require a public Homebrew tap")
-    tap_markers = [
-        '[[ -z "$HOMEBREW_TAP_TOKEN" ]]',
-        "GIT_TERMINAL_PROMPT: \"0\"",
-        "git ls-remote https://github.com/7xuanlu/homebrew-tap.git HEAD",
-        "not anonymously readable",
-    ]
-    if (
-        gate_index < 0
-        or tap_index <= gate_index
-        or any(marker not in prepare for marker in tap_markers)
-    ):
-        violations.append(
-            "public Homebrew tap preflight is missing or runs before the release is safely demoted"
-        )
-
-    homebrew_markers = [
-        "    runs-on: macos-14",
-        "git clone https://github.com/7xuanlu/homebrew-tap.git public-tap",
-        "cmp tap/Formula/wenlan.rb public-tap/Formula/wenlan.rb",
-        "cmp tap/Formula/wenlan-mcp.rb public-tap/Formula/wenlan-mcp.rb",
-        "brew install 7xuanlu/tap/wenlan 7xuanlu/tap/wenlan-mcp",
-        "brew test 7xuanlu/tap/wenlan",
-        "brew test 7xuanlu/tap/wenlan-mcp",
-    ]
-    if any(marker not in homebrew for marker in homebrew_markers):
-        violations.append(
-            "Homebrew installation proof does not anonymously install and test both formulas on macOS arm64"
-        )
+        if marker not in promotion:
+            violations.append(f"release promotion resolver omits fail-closed evidence {marker!r}")
 
     action_documents = release + "\n" + release_please
     seen: set[str] = set()
@@ -119,10 +229,6 @@ def contract_violations(release: str, release_please: str) -> list[str]:
             violations.append(
                 f"Node 24 action {action} uses mutable or unexpected reference {reference}"
             )
-    missing = sorted(EXPECTED_NODE24_ACTIONS.keys() - seen)
-    if missing:
-        violations.append(f"required Node 24 action pins are absent: {', '.join(missing)}")
-
     return violations
 
 
@@ -407,7 +513,7 @@ def candidate_observer_contract_violations(
         "name: validated-release-assets-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}-${{ github.run_id }}-${{ github.run_attempt }}",
         "path: ${{ runner.temp }}/validated-release-assets/*",
         "compression-level: 0",
-        "retention-days: 14",
+        "retention-days: 30",
         "if-no-files-found: error",
         "overwrite: false",
     ]:
@@ -415,10 +521,10 @@ def candidate_observer_contract_violations(
             violations.append(f"validated assets upload omits closed contract {marker!r}")
     for marker in [
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-        "name: validated-release-receipt-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}-${{ github.run_id }}-${{ github.run_attempt }}",
+        "name: validated-release-receipt-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}",
         "path: ${{ runner.temp }}/validated-release-receipt.json",
         "compression-level: 0",
-        "retention-days: 14",
+        "retention-days: 30",
         "if-no-files-found: error",
         "overwrite: false",
     ]:
@@ -426,10 +532,14 @@ def candidate_observer_contract_violations(
             violations.append(f"closed receipt upload omits immutable contract {marker!r}")
     for marker in [
         "close-receipt",
+        "GH_TOKEN: ${{ github.token }}",
+        '"/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"',
         "steps.validated-assets.outputs.artifact-id",
         "steps.validated-assets.outputs.artifact-digest",
         '--observer-run-id "$GITHUB_RUN_ID"',
         '--observer-run-attempt "$GITHUB_RUN_ATTEMPT"',
+        '--observer-workflow-id "$observer_workflow_id"',
+        '--observer-code-sha "$GITHUB_WORKFLOW_SHA"',
     ]:
         if marker not in close_step:
             violations.append(f"receipt close step omits artifact binding {marker!r}")
@@ -501,21 +611,32 @@ def candidate_observer_contract_violations(
 
 
 def assert_mutation_detected(
+    ci: str,
     release: str,
     release_please: str,
+    promotion: str,
     old: str,
     new: str,
     expected: str,
     *,
-    mutate_release_please: bool = False,
+    owner: str,
 ) -> None:
-    source = release_please if mutate_release_please else release
+    documents = {
+        "ci": ci,
+        "release": release,
+        "release_please": release_please,
+        "promotion": promotion,
+    }
+    source = documents[owner]
     if old not in source:
         raise AssertionError(f"mutation fixture is stale; missing {old!r}")
-    mutated = source.replace(old, new, 1)
-    candidate_release = release if mutate_release_please else mutated
-    candidate_release_please = mutated if mutate_release_please else release_please
-    violations = contract_violations(candidate_release, candidate_release_please)
+    documents[owner] = source.replace(old, new, 1)
+    violations = contract_violations(
+        documents["ci"],
+        documents["release"],
+        documents["release_please"],
+        documents["promotion"],
+    )
     if not any(expected in violation for violation in violations):
         raise AssertionError(
             f"mutation did not exercise {expected!r}: {violations!r}"
@@ -529,113 +650,78 @@ def main() -> None:
     observer = OBSERVER_PATH.read_text(encoding="utf-8")
     validator = VALIDATOR_PATH.read_text(encoding="utf-8")
     archive = ARCHIVE_PATH.read_text(encoding="utf-8")
-    violations = contract_violations(release, release_please)
-    violations.extend(release_cache_contract_violations(ci, release))
+    promotion = PROMOTION_PATH.read_text(encoding="utf-8")
+    violations = contract_violations(ci, release, release_please, promotion)
     violations.extend(candidate_observer_contract_violations(ci, observer, validator, archive))
     if violations:
         raise AssertionError("release workflow contract drift:\n" + "\n".join(violations))
 
-    assert_mutation_detected(
-        release,
-        release_please,
-        "needs: [docker, release, publish-crates, publish-npm, update-homebrew]",
-        "needs: [docker, release]",
-        "promotion dependencies",
-    )
-    assert_mutation_detected(
-        release,
-        release_please,
-        'if [[ "$TAG" == *-* ]]',
-        "if false",
-        "protecting latest",
-    )
-    assert_mutation_detected(
-        release,
-        release_please,
-        "git ls-remote https://github.com/7xuanlu/homebrew-tap.git HEAD",
-        "git ls-remote authenticated-only",
-        "public Homebrew tap preflight",
-    )
-    assert_mutation_detected(
-        release,
-        release_please,
-        "brew test 7xuanlu/tap/wenlan-mcp",
-        "echo skipped-wenlan-mcp-test",
-        "Homebrew installation proof",
-    )
-    assert_mutation_detected(
-        release,
-        release_please,
-        "googleapis/release-please-action@0dfd8538845b8e92600d271a895a5372865d4062",
-        "googleapis/release-please-action@v5",
-        "mutable or unexpected",
-        mutate_release_please=True,
-    )
-    mutated_ci = ci.replace(
-        "          workspaces: . -> target",
-        "          workspaces: |\n            . -> target\n            . -> target/${{ matrix.target }}",
-        1,
-    )
-    cache_violations = release_cache_contract_violations(mutated_ci, release)
-    if not any("overlapping cache roots" in violation for violation in cache_violations):
-        raise AssertionError(
-            "mutation did not reject overlapping cache roots: "
-            f"{cache_violations!r}"
-        )
-    mutated_ci = ci.replace(
-        "Signature: 8a477f597d28d172789f06886806bc55",
-        "Signature: invalid",
-        1,
-    )
-    cache_violations = release_cache_contract_violations(mutated_ci, release)
-    if not any("nested Cargo target marker" in violation for violation in cache_violations):
-        raise AssertionError(
-            "mutation did not exercise nested target marker validation: "
-            f"{cache_violations!r}"
-        )
-    mutated_ci = ci.replace(
-        "[IO.File]::WriteAllText($marker, $contents, [Text.UTF8Encoding]::new($false))",
-        "[IO.File]::WriteAllText($marker, $contents)",
-        1,
-    )
-    cache_violations = release_cache_contract_violations(mutated_ci, release)
-    if not any("nested Cargo target marker" in violation for violation in cache_violations):
-        raise AssertionError(
-            "mutation did not exercise no-BOM marker write validation: "
-            f"{cache_violations!r}"
-        )
-    mutated_ci = ci.replace(
-        "if ($hostCount -eq 0 -and $targetCount -eq 0)",
-        "if ($hostCount -eq 0 -or $targetCount -eq 0)",
-        1,
-    )
-    cache_violations = release_cache_contract_violations(mutated_ci, release)
-    if not any("cache restore probe" in violation for violation in cache_violations):
-        raise AssertionError(
-            "mutation did not exercise partial-restore probe validation: "
-            f"{cache_violations!r}"
-        )
-    mutated_release = release.replace(
-        "shared-key: release-v3-${{ matrix.target }}",
-        "shared-key: release-v3-consumer-${{ matrix.target }}",
-        1,
-    )
-    cache_violations = release_cache_contract_violations(ci, mutated_release)
-    if not any("producer/consumer parity" in violation for violation in cache_violations):
-        raise AssertionError(
-            "mutation did not exercise release cache parity: "
-            f"{cache_violations!r}"
-        )
-    mutated_ci = ci.replace(
-        "$hostCount = @(Get-ChildItem -LiteralPath $hostDeps -Force -ErrorAction Stop).Count",
-        "$hostCount = 0 # receipt disabled",
-        1,
-    )
-    cache_violations = release_cache_contract_violations(mutated_ci, release)
-    if not any("cache layout receipt" in violation for violation in cache_violations):
-        raise AssertionError(
-            "mutation did not exercise Windows cache layout receipt validation: "
-            f"{cache_violations!r}"
+    release_mutations = [
+        (
+            "--wait-seconds 720",
+            "--wait-seconds 0",
+            "thin receipt contract",
+            "ci",
+        ),
+        (
+            "skip-github-release: true",
+            "skip-github-release: false",
+            "PR-only contract",
+            "release_please",
+        ),
+        (
+            "scripts/release-promotion.py consume-main-receipt",
+            "scripts/release-promotion.py gate-main",
+            "consume-main-receipt",
+            "release_please",
+        ),
+        (
+            "scripts/release-promotion.py download-assets",
+            "scripts/build-release-binaries.sh",
+            "recompile",
+            "release",
+        ),
+        (
+            "docker/Dockerfile.release-runtime",
+            "docker/Dockerfile.daemon",
+            "compile a different",
+            "release",
+        ),
+        (
+            "publish-npm:\n    name: Publish to npm\n    needs: promote-assets",
+            "publish-npm:\n    name: Publish to npm\n    needs: publish-crates",
+            "serialized behind crates.io",
+            "release",
+        ),
+        (
+            'index("autorelease: pending") == null',
+            'index("autorelease: pending") != null',
+            "closed-state assertion",
+            "release",
+        ),
+        (
+            "MAX_RECEIPT_CANDIDATES = 20",
+            "MAX_RECEIPT_CANDIDATES = 1000",
+            "MAX_RECEIPT_CANDIDATES",
+            "promotion",
+        ),
+        (
+            "observer reruns produced conflicting release semantics",
+            "observer reruns are accepted",
+            "conflicting release semantics",
+            "promotion",
+        ),
+    ]
+    for old, new, expected, owner in release_mutations:
+        assert_mutation_detected(
+            ci,
+            release,
+            release_please,
+            promotion,
+            old,
+            new,
+            expected,
+            owner=owner,
         )
     candidate_mutations = [
         (
@@ -645,14 +731,14 @@ def main() -> None:
             "ci",
         ),
         (
-            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-            "actions/upload-artifact@v7",
+            "name: release-candidate-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}",
+            "name: release-candidate-latest",
             "immutable contract",
             "ci",
         ),
         (
-            "overwrite: false",
-            "overwrite: true",
+            "path: dist/*",
+            "path: .",
             "immutable contract",
             "ci",
         ),
@@ -678,6 +764,24 @@ def main() -> None:
             "ref: ${{ github.sha }}",
             "ref: ${{ github.event.workflow_run.head_sha }}",
             "checkout is not the exact trusted",
+            "observer",
+        ),
+        (
+            "retention-days: 30",
+            "retention-days: 14",
+            "validated assets upload omits",
+            "observer",
+        ),
+        (
+            "name: validated-release-receipt-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}",
+            "name: validated-release-receipt-latest",
+            "closed receipt upload omits",
+            "observer",
+        ),
+        (
+            '--observer-workflow-id "$observer_workflow_id"',
+            "# observer workflow identity removed",
+            "artifact binding",
             "observer",
         ),
         (

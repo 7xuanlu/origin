@@ -320,6 +320,7 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
                 "id": 1,
                 "run_attempt": 1,
                 "workflow_id": 3,
+                "check_suite_id": 4,
                 "name": VALIDATOR.CI_WORKFLOW_NAME,
                 "event": "pull_request",
                 "status": "completed",
@@ -423,6 +424,8 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
                 artifact_digest="9" * 64,
                 observer_run_id=100,
                 observer_run_attempt=2,
+                observer_workflow_id=200,
+                observer_code_sha="a" * 40,
             )
             self.assertEqual(closed["receipt_state"], "closed")
             self.assertEqual(closed["validated_assets_artifact"]["id"], 99)
@@ -444,6 +447,8 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
                     artifact_digest="9" * 64,
                     observer_run_id=100,
                     observer_run_attempt=2,
+                    observer_workflow_id=200,
+                    observer_code_sha="a" * 40,
                 )
             summary = root / "summary.md"
             VALIDATOR.write_summary(summary, receipt)
@@ -559,6 +564,7 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
                 "id": 1,
                 "run_attempt": 1,
                 "workflow_id": 3,
+                "check_suite_id": 4,
                 "name": "CI",
                 "event": "pull_request",
                 "status": "completed",

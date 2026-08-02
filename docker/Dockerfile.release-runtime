@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1.7
+#
+# Runtime-only release image. The build context is intentionally tiny and is
+# assembled by scripts/verify-release-runtime-image.py from one observer-
+# validated Linux release archive. Never build or strip the binary here: the
+# bytes placed in this image must be the bytes that release CI already tested.
+#
+# Pin the multi-platform cc-debian13/nonroot index. BuildKit selects the child
+# manifest matching --platform (amd64 or arm64); changing this digest is a
+# reviewed runtime update, not an incidental release-time pull.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
+
+COPY --chown=0:0 --chmod=0755 wenlan-server /usr/local/bin/wenlan-server
+
+# The trusted preparation script creates this empty directory. Materializing
+# it with numeric ownership makes the anonymous /data volume writable by the
+# distroless nonroot account without relying on name lookup or a shell.
+COPY --chown=65532:65532 data/ /data/
+
+USER 65532:65532
+EXPOSE 7878
+ENV WENLAN_BIND_ADDR=0.0.0.0:7878
+ENV WENLAN_PORT=7878
+ENV WENLAN_DATA_DIR=/data
+VOLUME ["/data"]
+ENTRYPOINT ["/usr/local/bin/wenlan-server"]

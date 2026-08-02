@@ -702,6 +702,9 @@ def validate_candidate(
         event_run.get("run_attempt"), "event workflow run attempt"
     )
     workflow_id = _positive_int(event_run.get("workflow_id"), "event workflow id")
+    check_suite_id = _positive_int(
+        event_run.get("check_suite_id"), "event workflow check suite id"
+    )
     head_sha = _sha(event_run.get("head_sha"), "event workflow head SHA")
 
     repository_info = _mapping(
@@ -730,6 +733,7 @@ def validate_candidate(
     if (
         run.get("id") != run_id
         or run.get("run_attempt") != run_attempt
+        or run.get("check_suite_id") != check_suite_id
         or run.get("workflow_id") != workflow_id
         or workflow.get("id") != workflow_id
         or run.get("path") != CI_WORKFLOW_PATH
@@ -861,8 +865,10 @@ def validate_candidate(
     return {
         "status": "passed",
         "repository": repository,
+        "repository_id": repository_id,
         "run_id": run_id,
         "run_attempt": run_attempt,
+        "check_suite_id": check_suite_id,
         "workflow_id": workflow_id,
         "pr_number": pr_number,
         "pr_state": pr_state,
@@ -879,6 +885,7 @@ def validate_candidate(
 _VALIDATED_RECEIPT_KEYS = {
     "artifacts",
     "assets",
+    "check_suite_id",
     "head_sha",
     "merge_commit_sha",
     "paths",
@@ -886,6 +893,7 @@ _VALIDATED_RECEIPT_KEYS = {
     "pr_state",
     "receipt_state",
     "repository",
+    "repository_id",
     "run_attempt",
     "run_id",
     "schema_version",
@@ -919,6 +927,8 @@ def close_receipt(
     artifact_digest: str,
     observer_run_id: int,
     observer_run_attempt: int,
+    observer_workflow_id: int,
+    observer_code_sha: str,
 ) -> dict:
     if not path.is_file() or path.stat().st_size > MAX_SOURCE_BYTES:
         raise CandidateError("validated receipt file is missing or oversized")
@@ -946,6 +956,8 @@ def close_receipt(
         document.get("run_attempt"), "receipt source run attempt"
     )
     _positive_int(document.get("workflow_id"), "receipt source workflow id")
+    _positive_int(document.get("check_suite_id"), "receipt source check suite id")
+    _positive_int(document.get("repository_id"), "receipt repository id")
     _positive_int(document.get("pr_number"), "receipt pull request number")
     _sha(document.get("head_sha"), "receipt head SHA")
     _sha(document.get("tree_sha"), "receipt tree SHA")
@@ -1012,10 +1024,14 @@ def close_receipt(
         raise CandidateError("validated assets artifact digest is not canonical SHA-256")
     _positive_int(observer_run_id, "observer run id")
     _positive_int(observer_run_attempt, "observer run attempt")
+    _positive_int(observer_workflow_id, "observer workflow id")
+    _sha(observer_code_sha, "observer code SHA")
     document["receipt_state"] = "closed"
     document["observer"] = {
+        "code_sha": observer_code_sha,
         "run_attempt": observer_run_attempt,
         "run_id": observer_run_id,
+        "workflow_id": observer_workflow_id,
         "workflow_path": OBSERVER_WORKFLOW_PATH,
     }
     document["validated_assets_artifact"] = {
@@ -1026,6 +1042,89 @@ def close_receipt(
     path.write_text(
         json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    return document
+
+
+_CLOSED_RECEIPT_KEYS = _VALIDATED_RECEIPT_KEYS | {
+    "observer",
+    "validated_assets_artifact",
+}
+
+
+def read_closed_receipt(path: Path) -> dict:
+    """Strictly parse a receipt before any promotion consumer trusts it."""
+
+    if not path.is_file() or path.stat().st_size > MAX_SOURCE_BYTES:
+        raise CandidateError("closed receipt file is missing or oversized")
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CandidateError("closed receipt is not UTF-8 JSON") from error
+    if (
+        not isinstance(document, dict)
+        or set(document) != _CLOSED_RECEIPT_KEYS
+        or document.get("schema_version") != RECEIPT_SCHEMA_VERSION
+        or document.get("receipt_state") != "closed"
+        or document.get("status") != "passed"
+    ):
+        raise CandidateError("closed receipt schema is invalid")
+
+    # Reuse close_receipt's closed-world validation without permitting it to
+    # rewrite the consumer's file. The artifact arguments must match the
+    # already-closed fields exactly.
+    observer = _mapping(document.get("observer"), "receipt observer")
+    validated = _mapping(
+        document.get("validated_assets_artifact"),
+        "receipt validated assets artifact",
+    )
+    if set(observer) != {
+        "code_sha",
+        "run_attempt",
+        "run_id",
+        "workflow_id",
+        "workflow_path",
+    }:
+        raise CandidateError("receipt observer schema is not closed")
+    if observer.get("workflow_path") != OBSERVER_WORKFLOW_PATH:
+        raise CandidateError("receipt observer workflow path is invalid")
+    _positive_int(observer.get("run_id"), "receipt observer run id")
+    _positive_int(observer.get("run_attempt"), "receipt observer run attempt")
+    _positive_int(observer.get("workflow_id"), "receipt observer workflow id")
+    _sha(observer.get("code_sha"), "receipt observer code SHA")
+    if set(validated) != {"digest", "id", "name"}:
+        raise CandidateError("receipt validated artifact schema is not closed")
+    _positive_int(validated.get("id"), "receipt validated artifact id")
+    if WRAPPER_DIGEST_RE.fullmatch(str(validated.get("digest"))) is None:
+        raise CandidateError("receipt validated artifact digest is invalid")
+    expected_name = (
+        f"validated-release-assets-{document.get('run_id')}-{document.get('run_attempt')}-"
+        f"{observer['run_id']}-{observer['run_attempt']}"
+    )
+    if validated.get("name") != expected_name:
+        raise CandidateError("receipt validated artifact name is not exact")
+
+    # Validate every field that is otherwise checked while closing.
+    temporary = path.with_name(path.name + ".validate")
+    validated_document = {
+        key: value for key, value in document.items() if key in _VALIDATED_RECEIPT_KEYS
+    }
+    validated_document["receipt_state"] = "validated"
+    try:
+        temporary.write_text(
+            json.dumps(validated_document, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        close_receipt(
+            temporary,
+            artifact_name=validated["name"],
+            artifact_id=validated["id"],
+            artifact_digest=str(validated["digest"]).removeprefix("sha256:"),
+            observer_run_id=observer["run_id"],
+            observer_run_attempt=observer["run_attempt"],
+            observer_workflow_id=observer["workflow_id"],
+            observer_code_sha=observer["code_sha"],
+        )
+    finally:
+        temporary.unlink(missing_ok=True)
     return document
 
 
@@ -1091,6 +1190,8 @@ def _main(argv: list[str]) -> int:
         close_parser.add_argument("--artifact-digest", required=True)
         close_parser.add_argument("--observer-run-id", required=True, type=int)
         close_parser.add_argument("--observer-run-attempt", required=True, type=int)
+        close_parser.add_argument("--observer-workflow-id", required=True, type=int)
+        close_parser.add_argument("--observer-code-sha", required=True)
         arguments = close_parser.parse_args(argv[1:])
         try:
             closed = close_receipt(
@@ -1100,6 +1201,8 @@ def _main(argv: list[str]) -> int:
                 artifact_digest=arguments.artifact_digest,
                 observer_run_id=arguments.observer_run_id,
                 observer_run_attempt=arguments.observer_run_attempt,
+                observer_workflow_id=arguments.observer_workflow_id,
+                observer_code_sha=arguments.observer_code_sha,
             )
         except Exception as error:
             print(
