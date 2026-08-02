@@ -178,25 +178,6 @@ impl PreparedM5Snapshot {
     }
 }
 
-/// Open the page-size source through the exact read-only connection used by
-/// the exporter. The SQLite flag is the primary fence; `query_only` is a
-/// second, connection-local refusal that makes accidental DML/DDL fail loud.
-pub async fn open_page_size_db_read_only(path: &Path) -> Result<libsql::Connection> {
-    let database = libsql::Builder::new_local(path)
-        .flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .build()
-        .await
-        .context("open page-size database read-only")?;
-    let connection = database
-        .connect()
-        .context("connect page-size database read-only")?;
-    connection
-        .execute("PRAGMA query_only = ON", ())
-        .await
-        .context("enforce query-only page-size connection")?;
-    Ok(connection)
-}
-
 fn handle_for_dir(dir: &Dir) -> std::io::Result<Handle> {
     Handle::from_file(dir.try_clone()?.into_std_file())
 }

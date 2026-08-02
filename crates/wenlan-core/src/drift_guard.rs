@@ -1970,6 +1970,7 @@ fn ci_routing_contract_violations(
         "windows",
         "windows-lint",
         "macos-m4",
+        "m5-platform",
         "windows-llm-probe",
         "release-preflight",
         "mcp-platform",
@@ -2220,6 +2221,9 @@ fn ci_routing_contract_violations(
     let platform_macos_m4_files = platform_planner
         .and_then(|step| step["env"]["MACOS_M4_FILES_JSON"].as_str())
         .unwrap_or_default();
+    let platform_m5_files = platform_planner
+        .and_then(|step| step["env"]["M5_PLATFORM_FILES_JSON"].as_str())
+        .unwrap_or_default();
     let platform_windows_files = platform_planner
         .and_then(|step| step["env"]["WINDOWS_FILES_JSON"].as_str())
         .unwrap_or_default();
@@ -2240,12 +2244,15 @@ fn ci_routing_contract_violations(
         || !platform_planner_run.contains("--github-output \"$GITHUB_OUTPUT\"")
         || !platform_planner_run.contains("--argjson macos \"$MACOS_FILES_JSON\"")
         || !platform_planner_run.contains("--argjson macos_m4 \"$MACOS_M4_FILES_JSON\"")
+        || !platform_planner_run.contains("--argjson m5_platform \"$M5_PLATFORM_FILES_JSON\"")
         || !platform_planner_run.contains("--argjson windows \"$WINDOWS_FILES_JSON\"")
         || !platform_planner_run
-            .contains("(($macos - $macos_m4) + $windows) | unique")
+            .contains("(($macos - $macos_m4 - $m5_platform) + ($windows - $m5_platform)) | unique")
         || platform_macos_files != "${{ steps.filter.outputs.macos_files }}"
         || platform_macos_m4_files
             != "${{ steps.filter.outputs['macos-m4_files'] }}"
+        || platform_m5_files
+            != "${{ steps.filter.outputs['m5-platform_files'] }}"
         || platform_windows_files != "${{ steps.filter.outputs.windows_files }}"
         || platform_planner_run.contains("impact_files")
         || platform_event
@@ -2605,6 +2612,36 @@ fn ci_routing_contract_violations(
                  the generic platform plan or move that proof into the focused target"
             ));
         }
+    }
+
+    let m5_platform = detect_change_filter_paths(&ci, "m5-platform");
+    let m5_platform_target = "crates/wenlan-core/tests/m5_bench.rs";
+    if m5_platform != BTreeSet::from([m5_platform_target.to_string()]) {
+        violations.push("m5-platform focused-owner routing is not exact".into());
+    }
+    if !filter_routes_path(&macos_paths, m5_platform_target)
+        || !filter_routes_path(&windows_paths, m5_platform_target)
+    {
+        violations.push("the focused M5 target does not schedule both platform owners".into());
+    }
+    if !platform_sensitive_paths
+        .iter()
+        .any(|(path, platform, filter)| {
+            path == m5_platform_target && *platform == "unix" && *filter == "macos"
+        })
+    {
+        violations.push("the focused M5 target lost its real Unix cfg branch".into());
+    }
+    let m5_step = job_step(&ci, "test", "M5 bench platform controls");
+    let m5_condition = "(matrix.os == 'macos-14' || matrix.os == 'windows-2022') && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.m5-platform == 'true')";
+    if m5_step.and_then(|step| step["if"].as_str()) != Some(m5_condition)
+        || m5_step.and_then(|step| step["run"].as_str())
+            != Some("cargo nextest run -p wenlan-core --features eval-harness --test m5_bench")
+    {
+        violations.push(
+            "the focused M5 platform owners do not compile and run the target with eval-harness"
+                .into(),
+        );
     }
 
     let windows_llm = detect_change_filter_paths(&ci, "windows-llm-probe");
@@ -3265,7 +3302,7 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
             1,
         )
         .replacen(
-            "(($macos - $macos_m4) + $windows) | unique",
+            "(($macos - $macos_m4 - $m5_platform) + ($windows - $m5_platform)) | unique",
             "($macos + $windows) | unique",
             1,
         )
@@ -3277,6 +3314,11 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
         .replacen(
             "if [ \"${{ github.event_name }}\" = \"workflow_dispatch\" ]; then",
             "if [ \"${{ github.event_name }}\" != \"workflow_dispatch\" ]; then",
+            1,
+        )
+        .replacen(
+            "run: cargo nextest run -p wenlan-core --features eval-harness --test m5_bench",
+            "run: cargo nextest run -p wenlan-core --test m5_bench",
             1,
         );
     let planner = std::fs::read_to_string(root.join("scripts/ci_test_plan.py"))
@@ -3320,6 +3362,7 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
         "ordinary PR and main push on the same owner-driven route",
         "macos-m4 focused-owner allowlist has unreviewed path",
         "macos-m4 focused source crates/wenlan-core/src/db.rs acquired macos-specific cfg",
+        "focused M5 platform owners",
     ] {
         assert!(
             violations

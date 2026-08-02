@@ -309,20 +309,12 @@ async fn shared_page_size_connection_rejects_insert_and_ddl() {
     let directory = tempfile::tempdir().unwrap();
     let db_path = directory.path().join("read-only.db");
     create_pages_db(&db_path, &five_ascii_pages()).await;
-    let connection = wenlan_core::eval::m5_snapshot_io::open_page_size_db_read_only(&db_path)
+    let database = wenlan_core::db::M5PageSizeSnapshotDb::open(&db_path)
         .await
         .unwrap();
-    assert!(connection
-        .execute(
-            "INSERT INTO pages (id, content, status) VALUES ('attack', 'x', 'active')",
-            (),
-        )
-        .await
-        .is_err());
-    assert!(connection
-        .execute("CREATE TABLE attack (secret TEXT)", ())
-        .await
-        .is_err());
+    let probe = database.mutation_probe_for_test().await.unwrap();
+    assert!(probe.insert_refused);
+    assert!(probe.ddl_refused);
 }
 
 #[cfg(feature = "eval-harness")]
