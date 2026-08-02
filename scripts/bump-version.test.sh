@@ -30,7 +30,7 @@ wenlan-core  = { path = "crates/wenlan-core",  version = "0.4.1" }
 EOF
 
 cat > "$TMPDIR_TEST/crates/wenlan-mcp/npm/package.json" <<EOF
-{"name": "wenlan-mcp", "version": "0.4.1"}
+{"name": "wenlan-mcp", "version": "0.4.1", "scripts": {"version": "touch lifecycle-ran"}}
 EOF
 
 cat > "$TMPDIR_TEST/crates/wenlan-cli/npm/package.json" <<EOF
@@ -124,6 +124,7 @@ CODEX_PLUGIN_VER=$(jq -r .version "$TMPDIR_TEST/plugin-codex/.codex-plugin/plugi
 [[ "$WENLAN_CORE_DEP_VER" == "0.5.0" ]] || { echo "FAIL: wenlan-core dep not bumped (got $WENLAN_CORE_DEP_VER)"; exit 1; }
 [[ "$MCP_NPM_VER" == "0.5.0" ]]  || { echo "FAIL: wenlan-mcp npm not bumped (got $MCP_NPM_VER)"; exit 1; }
 [[ "$WENLAN_NPM_VER" == "0.5.0" ]]  || { echo "FAIL: wenlan npm not bumped (got $WENLAN_NPM_VER)"; exit 1; }
+[[ ! -e "$TMPDIR_TEST/crates/wenlan-mcp/npm/lifecycle-ran" ]] || { echo "FAIL: npm lifecycle script executed while syncing an untrusted candidate tree"; exit 1; }
 [[ "$PLUGIN_VER" == "0.5.0" ]] || { echo "FAIL: plugin not bumped (got $PLUGIN_VER)"; exit 1; }
 [[ "$CODEX_PLUGIN_VER" == "0.5.0+codex" ]] || { echo "FAIL: Codex plugin not bumped (got $CODEX_PLUGIN_VER)"; exit 1; }
 grep -q 'wenlan-mcp@\^0.5.0' "$TMPDIR_TEST/plugin/bin/wenlan-mcp-runner.sh" || { echo "FAIL: runner pin not bumped"; exit 1; }
