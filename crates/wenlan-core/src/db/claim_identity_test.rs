@@ -202,6 +202,12 @@ async fn a_zero_claim_page_can_carry_a_derivation_marker() {
 async fn derivation_jobs_dedupe_per_page_version() {
     let (db, _temp) = db_with_substrate().await;
     let conn = db.conn.lock().await;
+    // Since migration 105 the enqueue trigger has already queued p1 at its
+    // current version, so clear the queue first: this test is about the shape
+    // of the unique index, not about who filled the table.
+    conn.execute("DELETE FROM claim_derivation_jobs", ())
+        .await
+        .unwrap();
     conn.execute_batch(
         "INSERT INTO claim_derivation_jobs
             (job_id,page_id,page_version,status,created_at,updated_at)
@@ -695,6 +701,10 @@ const CLAIM_TEXT: &str = "Kestrels nest in old crow nests.";
 struct SupportScenario {
     claim_revision_id: String,
     memory_source_id: String,
+    /// The evidence's provenance root, resolved by the caller the way the
+    /// derivation worker resolves it. For a human delta the minter already
+    /// returns it; nothing has to parse it back out of the memory id.
+    root_id: String,
     verdict: super::claim_identity::SupportVerdict,
 }
 
@@ -752,7 +762,9 @@ async fn support_scenario_saving(db: &MemoryDB, page_id: &str, saved: &str) -> S
     SupportScenario {
         claim_revision_id,
         memory_source_id: minted.memory_source_id,
+        root_id: minted.root_id,
         verdict: super::claim_identity::SupportVerdict {
+            chunk_index: 0,
             source_version: 1,
             span_start: 0,
             span_end: ADDED_PROSE.len() as i64,
@@ -797,6 +809,7 @@ async fn a_faithful_verdict_writes_an_edge_that_names_its_span_and_its_judge() {
         .write_support_edge(
             &scenario.claim_revision_id,
             &scenario.memory_source_id,
+            &scenario.root_id,
             &scenario.verdict,
         )
         .await
@@ -863,6 +876,7 @@ async fn a_span_that_moved_invalidates_the_support_edge() {
         .write_support_edge(
             &scenario.claim_revision_id,
             &scenario.memory_source_id,
+            &scenario.root_id,
             &scenario.verdict,
         )
         .await;
@@ -892,6 +906,7 @@ async fn a_verdict_the_cache_never_recorded_cannot_be_cited() {
         db.write_support_edge(
             &scenario.claim_revision_id,
             &scenario.memory_source_id,
+            &scenario.root_id,
             &scenario.verdict,
         )
         .await
@@ -913,6 +928,7 @@ async fn a_score_the_cache_does_not_record_is_refused() {
         db.write_support_edge(
             &scenario.claim_revision_id,
             &scenario.memory_source_id,
+            &scenario.root_id,
             &scenario.verdict,
         )
         .await
@@ -924,6 +940,12 @@ async fn a_score_the_cache_does_not_record_is_refused() {
 /// Weakening: resolve a missing provenance root to some default rather than
 /// refusing. §5 requires root_id on every support edge, and inventing one
 /// would attribute evidence to a root that never produced it.
+///
+/// The weakening is unchanged; only the mechanism that guards it moved. PR-A
+/// enforced this by refusing any memory id without an `hed_` prefix, which
+/// guarded the rule by excluding almost all evidence. The root is now named by
+/// the caller, so the same weakening is guarded by checking that the named root
+/// exists at all.
 #[tokio::test]
 async fn evidence_with_no_provenance_root_is_refused_by_name() {
     let (db, _temp) = db_with_substrate().await;
@@ -932,14 +954,15 @@ async fn evidence_with_no_provenance_root_is_refused_by_name() {
     let error = db
         .write_support_edge(
             &scenario.claim_revision_id,
-            "mem_ordinary",
+            &scenario.memory_source_id,
+            "no-such-root",
             &scenario.verdict,
         )
         .await
-        .expect_err("a memory with no resolvable root cannot be cited");
+        .expect_err("a root that does not exist cannot back a claim");
     assert!(
-        format!("{error}").contains("support_evidence_has_no_root"),
-        "the refusal must name the gap rather than paper over it: {error}"
+        format!("{error}").contains("support_root_unknown"),
+        "the refusal must name the gap rather than surfacing as a foreign-key error: {error}"
     );
 }
 
@@ -955,6 +978,7 @@ async fn two_spans_of_one_memory_are_two_distinct_edges() {
         .write_support_edge(
             &scenario.claim_revision_id,
             &scenario.memory_source_id,
+            &scenario.root_id,
             &scenario.verdict,
         )
         .await
@@ -984,6 +1008,7 @@ async fn two_spans_of_one_memory_are_two_distinct_edges() {
         .write_support_edge(
             &scenario.claim_revision_id,
             &scenario.memory_source_id,
+            &scenario.root_id,
             &super::claim_identity::SupportVerdict {
                 span_end: short.len() as i64,
                 span_digest: short_digest,
@@ -1021,6 +1046,7 @@ async fn a_second_verdict_for_one_span_is_refused_rather_than_silently_dropped()
         .write_support_edge(
             &scenario.claim_revision_id,
             &scenario.memory_source_id,
+            &scenario.root_id,
             &scenario.verdict,
         )
         .await
@@ -1048,6 +1074,7 @@ async fn a_second_verdict_for_one_span_is_refused_rather_than_silently_dropped()
         .write_support_edge(
             &scenario.claim_revision_id,
             &scenario.memory_source_id,
+            &scenario.root_id,
             &super::claim_identity::SupportVerdict {
                 model_version: "v2".to_string(),
                 score: 0.83,
@@ -1105,6 +1132,7 @@ async fn a_verdict_that_failed_its_own_threshold_is_not_support() {
         .write_support_edge(
             &scenario.claim_revision_id,
             &scenario.memory_source_id,
+            &scenario.root_id,
             &super::claim_identity::SupportVerdict {
                 model_version: "v3".to_string(),
                 score: 0.55,
@@ -1198,6 +1226,7 @@ async fn a_verdict_naming_a_version_the_memory_has_moved_past_is_refused() {
         .write_support_edge(
             &scenario.claim_revision_id,
             &scenario.memory_source_id,
+            &scenario.root_id,
             &scenario.verdict,
         )
         .await
@@ -1249,6 +1278,7 @@ async fn the_same_sentence_twice_is_two_citations_not_a_superseding_verdict() {
         .write_support_edge(
             &scenario.claim_revision_id,
             &scenario.memory_source_id,
+            &scenario.root_id,
             &scenario.verdict,
         )
         .await
@@ -1257,6 +1287,7 @@ async fn the_same_sentence_twice_is_two_citations_not_a_superseding_verdict() {
         .write_support_edge(
             &scenario.claim_revision_id,
             &scenario.memory_source_id,
+            &scenario.root_id,
             &super::claim_identity::SupportVerdict {
                 span_start: second_start,
                 span_end: second_start + ADDED_PROSE.len() as i64,
@@ -1332,4 +1363,386 @@ async fn the_same_prose_in_a_second_space_is_refused_rather_than_aliased() {
         .unwrap();
     let space: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
     assert_eq!(space, "birds", "the refused save must change nothing");
+}
+
+const EVIDENCE_PROSE: &str = "Kestrels nest in old crow nests, usually reusing them.";
+
+/// Seed an ORDINARY evidence memory — one that arrived through ingest rather
+/// than through a human page edit — in `space`, and mint the content-addressed
+/// provenance root that identifies it. Returns `(memory_source_id, root_id)`.
+///
+/// This is the shape the derivation worker actually meets. `mint_human_edit_delta`
+/// produces the other shape, and PR-A could only resolve that one.
+async fn ordinary_evidence(db: &MemoryDB, source_id: &str, space: &str) -> (String, String) {
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO memories (id, content, source, source_id, title, chunk_index,
+                                   last_modified, chunk_type, space)
+             VALUES (?1, ?2, 'memory', ?3, 'evidence', 0, 0, 'text', ?4)",
+            libsql::params![format!("m_{source_id}"), EVIDENCE_PROSE, source_id, space],
+        )
+        .await
+        .unwrap();
+    }
+    let root_id = db
+        .acquire_provenance_root(
+            "document_ingest",
+            EVIDENCE_PROSE,
+            &crate::provenance::IndependenceSignals {
+                source_identity: Some("file:///evidence.txt"),
+                agent_turn: None,
+                import_batch: None,
+            },
+        )
+        .await
+        .expect("ordinary evidence must be able to acquire its own root");
+    (source_id.to_string(), root_id)
+}
+
+/// Seed a page, a claim revision on it, and the cache row recording the verdict
+/// that judged `EVIDENCE_PROSE` against that claim. Returns the verdict.
+async fn ordinary_scenario(
+    db: &MemoryDB,
+    page_id: &str,
+    space: &str,
+) -> super::claim_identity::SupportVerdict {
+    db.insert_page(
+        page_id,
+        page_id,
+        None,
+        BASE_PROSE,
+        None,
+        Some(space),
+        &[],
+        "2026-07-27T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    let claim_digest = crate::provenance::revision_content_digest(CLAIM_TEXT);
+    let span_digest = crate::provenance::revision_content_digest(EVIDENCE_PROSE);
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO claims (claim_id, page_id, created_at) VALUES (?1, ?2, 0)",
+            libsql::params![format!("c_{page_id}"), page_id],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claim_revisions (claim_revision_id, claim_id, predecessor_revision_id,
+                                          canonical_text, canonical_text_digest, claim_kind,
+                                          extractor_version, created_at)
+             VALUES (?1, ?2, '', ?3, ?4, 'observation', 1, 0)",
+            libsql::params![
+                format!("cr_{page_id}"),
+                format!("c_{page_id}"),
+                CLAIM_TEXT,
+                claim_digest.clone(),
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entailment_cache (claim_text_digest, source_span_digest, model_id,
+                                           model_version, prompt_version, score,
+                                           threshold_at_write, backend, scored_at)
+             VALUES (?1, ?2, 'qwen3-4b', 'v1', 'p1', 0.91, 0.7, 'on_device', 0)",
+            libsql::params![claim_digest, span_digest.clone()],
+        )
+        .await
+        .unwrap();
+    }
+    super::claim_identity::SupportVerdict {
+        chunk_index: 0,
+        source_version: 1,
+        span_start: 0,
+        span_end: EVIDENCE_PROSE.len() as i64,
+        span_digest,
+        model_id: "qwen3-4b".to_string(),
+        model_version: "v1".to_string(),
+        prompt_version: "p1".to_string(),
+        score: 0.91,
+        threshold_at_write: 0.7,
+    }
+}
+
+/// Weakening: refuse evidence that did not arrive through a human page edit.
+///
+/// This is the M5 blocker itself. PR-A resolved the evidence root by parsing an
+/// `hed_` prefix off the memory id, so the only citable evidence was prose the
+/// human typed into that page. A distilled page — synthesized from ingested
+/// memories — could never cite anything, which is why `support_status` matched
+/// zero rows on every install and why the cutover was a no-op by construction.
+///
+/// The root is now resolved by the caller and VERIFIED against the evidence's
+/// own bytes, so the binding is checked rather than trusted to a naming
+/// convention.
+#[tokio::test]
+async fn ordinary_ingested_evidence_can_back_a_claim() {
+    let (db, _temp) = db_with_substrate().await;
+    let verdict = ordinary_scenario(&db, "og1", "birds").await;
+    let (memory_source_id, root_id) = ordinary_evidence(&db, "mem_og1", "birds").await;
+
+    let edge_id = db
+        .write_support_edge("cr_og1", &memory_source_id, &root_id, &verdict)
+        .await
+        .expect("ingested evidence with a resolved root is citable");
+
+    let (grounded, lineage, stored_root, _) = edge_row(&db, &edge_id).await;
+    assert_eq!(
+        lineage, "evidence",
+        "§2 fixes the lineage of a support edge"
+    );
+    assert_eq!(
+        stored_root, root_id,
+        "§5: the edge carries the provenance root of the evidence it cites"
+    );
+    assert_eq!(
+        grounded, 0,
+        "§3: a support edge may never manufacture grounding"
+    );
+}
+
+/// Weakening: accept whatever root the caller names.
+///
+/// Dropping the `hed_` prefix removes a (narrow) structural guarantee, so
+/// something has to replace it or the caller could hand over any root at all and
+/// the edge would claim evidence it does not have. The replacement is stronger
+/// than what it replaces: the root's stored `identity_digest` must equal the
+/// digest recomputed from the cited memory's OWN bytes, so the binding is
+/// checked rather than asserted.
+#[tokio::test]
+async fn a_root_minted_over_other_content_is_not_this_evidences_root() {
+    let (db, _temp) = db_with_substrate().await;
+    let verdict = ordinary_scenario(&db, "og2", "birds").await;
+    let (memory_source_id, _) = ordinary_evidence(&db, "mem_og2", "birds").await;
+
+    // A real, active root — but minted over different prose entirely.
+    let foreign_root = db
+        .acquire_provenance_root(
+            "document_ingest",
+            "Peregrines stoop at over two hundred miles an hour.",
+            &crate::provenance::IndependenceSignals {
+                source_identity: Some("file:///unrelated.txt"),
+                agent_turn: None,
+                import_batch: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let error = db
+        .write_support_edge("cr_og2", &memory_source_id, &foreign_root, &verdict)
+        .await
+        .expect_err("a root minted over other content does not identify this evidence");
+    assert!(
+        format!("{error}").contains("support_root_not_evidence_root"),
+        "the refusal must name the broken binding: {error}"
+    );
+}
+
+/// Weakening: let a claim cite evidence filed in another space.
+///
+/// `the_same_prose_in_a_second_space_is_refused_rather_than_aliased` states in
+/// prose that the truth "emerges much later, when the space fence refuses a
+/// support edge" — but nothing anywhere asserted that it does. This is the
+/// constraint that decides which memories a page may cite at all, so the
+/// derivation worker's candidate query must encode it: a worker that gathers
+/// evidence across spaces would spend judge budget on candidates the fence
+/// rejects at the final step, and read the resulting zero as "no support found"
+/// rather than "the query was wrong".
+///
+/// The fence resolves a `claim_revision` source through its claim to the owning
+/// page's space (`edges_rebuild.rs` `FENCE_BODY`), while `write_support_edge`
+/// stamps the edge with the *evidence memory's* space. Those two agreeing is
+/// exactly the same-space condition; a mismatch aborts.
+#[tokio::test]
+async fn a_support_edge_may_not_cite_evidence_from_another_space() {
+    let (db, _temp) = db_with_substrate().await;
+    db.insert_page(
+        "xs1",
+        "xs1",
+        None,
+        BASE_PROSE,
+        None,
+        Some("birds"),
+        &[],
+        "2026-07-27T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    let base = crate::provenance::revision_content_digest(BASE_PROSE);
+    let minted = db
+        .mint_human_edit_delta("xs1", 1, &base, &format!("{BASE_PROSE}\n{ADDED_PROSE}"))
+        .await
+        .unwrap()
+        .expect("the scenario needs a real delta to cite");
+
+    let span_digest = crate::provenance::revision_content_digest(ADDED_PROSE);
+    let claim_digest = crate::provenance::revision_content_digest(CLAIM_TEXT);
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO claims (claim_id, page_id, created_at) VALUES ('c_xs1', 'xs1', 0)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claim_revisions (claim_revision_id, claim_id, predecessor_revision_id,
+                                          canonical_text, canonical_text_digest, claim_kind,
+                                          extractor_version, created_at)
+             VALUES ('cr_xs1', 'c_xs1', '', ?1, ?2, 'observation', 1, 0)",
+            libsql::params![CLAIM_TEXT, claim_digest.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entailment_cache (claim_text_digest, source_span_digest, model_id,
+                                           model_version, prompt_version, score,
+                                           threshold_at_write, backend, scored_at)
+             VALUES (?1, ?2, 'qwen3-4b', 'v1', 'p1', 0.91, 0.7, 'on_device', 0)",
+            libsql::params![claim_digest, span_digest.clone()],
+        )
+        .await
+        .unwrap();
+        // The evidence moves out from under the page. Nothing else about the
+        // verdict changes: same bytes, same cached score, same span.
+        conn.execute(
+            "UPDATE memories SET space = 'falconry' WHERE source_id = ?1",
+            libsql::params![minted.memory_source_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let verdict = super::claim_identity::SupportVerdict {
+        chunk_index: 0,
+        source_version: 1,
+        span_start: 0,
+        span_end: ADDED_PROSE.len() as i64,
+        span_digest,
+        model_id: "qwen3-4b".to_string(),
+        model_version: "v1".to_string(),
+        prompt_version: "p1".to_string(),
+        score: 0.91,
+        threshold_at_write: 0.7,
+    };
+    let error = db
+        .write_support_edge(
+            "cr_xs1",
+            &minted.memory_source_id,
+            &minted.root_id,
+            &verdict,
+        )
+        .await
+        .expect_err("evidence in another space may not back this page's claim");
+    assert!(
+        format!("{error}").contains("edges_space_fence"),
+        "the refusal must be the space fence, not an incidental failure: {error}"
+    );
+
+    // And nothing was left behind: a fence abort must not leave a half-written
+    // support edge that a later read would count as evidence.
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'supports' AND src_id = 'cr_xs1'",
+            (),
+        )
+        .await
+        .unwrap();
+    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(count, 0, "a fenced write leaves no edge behind");
+}
+
+/// Weakening: resolve evidence by document instead of by chunk.
+///
+/// `source_id` names a DOCUMENT, and one document is several `memories` rows
+/// sharing that id — `store_raw_import_memories_batch` writes exactly that
+/// shape. A lookup on `source_id` alone therefore resolves to whichever chunk
+/// the query happens to return, and BOTH §4a checks then run against text the
+/// verdict never read: the root digest is recomputed over the wrong bytes, and
+/// the span offsets index into the wrong string.
+///
+/// The failure is fail-closed — valid support becomes unwritable rather than
+/// wrong — which is the same dead-substrate reading this rung exists to end, one
+/// layer down: the worker sees zero support edges and reports "no evidence
+/// found" when the truth is "the write was refused". The edge also could not
+/// have said which chunk was ever verified.
+#[tokio::test]
+async fn support_resolves_the_chunk_the_verdict_names() {
+    let (db, _temp) = db_with_substrate().await;
+    let mut scenario = support_scenario(&db, "sp_chunked").await;
+    {
+        let conn = db.conn.lock().await;
+        // The real evidence becomes chunk 1; a decoy paragraph of the same
+        // document takes chunk 0 — the row a document-wide lookup reaches first.
+        conn.execute(
+            "UPDATE memories SET chunk_index = 1 WHERE source_id = ?1",
+            libsql::params![scenario.memory_source_id.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories (id, content, source, source_id, title, chunk_index,
+                                   last_modified, chunk_type, space)
+             SELECT 'decoy_' || id, 'A different paragraph of the same document.',
+                    source, source_id, title, 0, last_modified, chunk_type, space
+               FROM memories WHERE source_id = ?1 AND chunk_index = 1",
+            libsql::params![scenario.memory_source_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+    scenario.verdict.chunk_index = 1;
+
+    db.write_support_edge(
+        &scenario.claim_revision_id,
+        &scenario.memory_source_id,
+        &scenario.root_id,
+        &scenario.verdict,
+    )
+    .await
+    .expect("the chunk the verdict names is the chunk that must be verified");
+}
+
+/// And when the pair still cannot resolve to one row, refuse by name rather than
+/// pick. Nothing in the schema makes `(source_id, chunk_index)` unique — only a
+/// plain index on `source_id` exists — so the pair is a convention the rest of
+/// the tree keeps, not a guarantee this code may lean on. Choosing between two
+/// candidates would be the same silent arbitrary resolution the chunk index was
+/// added to remove.
+#[tokio::test]
+async fn support_refuses_evidence_that_resolves_to_two_rows() {
+    let (db, _temp) = db_with_substrate().await;
+    let scenario = support_scenario(&db, "sp_ambiguous").await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO memories (id, content, source, source_id, title, chunk_index,
+                                   last_modified, chunk_type, space)
+             SELECT 'twin_' || id, content, source, source_id, title, chunk_index,
+                    last_modified, chunk_type, space
+               FROM memories WHERE source_id = ?1",
+            libsql::params![scenario.memory_source_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let error = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &scenario.root_id,
+            &scenario.verdict,
+        )
+        .await
+        .expect_err("an unresolvable chunk is not something a verdict may cite");
+    assert!(
+        error.to_string().contains("support_evidence_ambiguous"),
+        "the refusal has to name the ambiguity: {error}"
+    );
 }

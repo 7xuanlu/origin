@@ -157,6 +157,14 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
 /// *verdict* does. An unjudged page (NULL) keeps full visibility by design, so
 /// seeding one here would quietly turn every hiding assertion below into a test
 /// of nothing.
+///
+/// The derivation marker goes in for the same reason: the read gate refuses to
+/// expose a verdict whose derivation cannot be shown to describe the live text,
+/// and finalization is what writes the marker in production. A truth row without
+/// one is a state the pipeline does not produce, and seeding it would leave
+/// every assertion below testing the missing-marker path instead of its subject.
+/// The digest is taken from the page's own content rather than hardcoded, so a
+/// test that rewrites the prose invalidates the marker exactly as an edit does.
 async fn set_truth(conn: &libsql::Connection, page_id: &str, status: &str) {
     conn.execute(
         "INSERT INTO page_truth_state
@@ -164,6 +172,29 @@ async fn set_truth(conn: &libsql::Connection, page_id: &str, status: &str) {
              evaluated_at)
          VALUES (?1,1,?2,0,1,1)",
         libsql::params![page_id, status],
+    )
+    .await
+    .unwrap();
+    let content: String = {
+        let mut rows = conn
+            .query(
+                "SELECT content FROM pages WHERE id = ?1",
+                libsql::params![page_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    conn.execute(
+        "INSERT OR REPLACE INTO claim_derivation_markers
+             (page_id, page_version, page_version_digest, extractor_version,
+              inventory_count, created_at)
+         VALUES (?1, 1, ?2, ?3, 1, 0)",
+        libsql::params![
+            page_id,
+            crate::provenance::revision_content_digest(&content),
+            crate::db::claim_derivation::EXTRACTOR_VERSION
+        ],
     )
     .await
     .unwrap();
@@ -763,15 +794,15 @@ fn the_projection_invariant_is_wired_into_the_daemon() {
     );
 }
 
-/// F1(b): a review is a statement about the text a person actually read, so it
-/// cannot outlive that text.
+/// F1(b): a review is a statement about the exact page version and text a
+/// person actually read, so it cannot outlive either.
 ///
 /// Nothing clears `human_reviewed` when a page is edited — the update bumps
 /// `version` and rewrites `content`, and the truth row is not in its reach. So
 /// the stored bit is a historical receipt, and whether a review is still *in
-/// force* has to be computed where truth is read: the recorded digest against
-/// the page's current content. An edited page falls back to unreviewed on its
-/// own, with no new write path and nothing to migrate.
+/// force* has to be computed where truth is read: the recorded version and
+/// digest against the current page. An edited page falls back to unreviewed on
+/// its own, with no new write path and nothing to migrate.
 ///
 /// Both consequences are checked here, because they come from one place: the
 /// axis the wire reports, and the visibility verdict that axis outranks.
@@ -826,18 +857,24 @@ async fn an_edit_after_a_review_retires_the_review() {
         .unwrap();
     }
 
+    let after_edit = db.page_truth_states(&ids).await.unwrap()[page];
     assert!(
-        !db.page_truth_states(&ids).await.unwrap()[page].human_reviewed,
-        "the review was of text that is no longer on the page"
+        !after_edit.human_reviewed,
+        "the review was of a version and text that are no longer current"
     );
-    assert_ne!(
+    assert_eq!(
+        after_edit.support,
+        crate::truth_contract::Support::Unevaluated,
+        "the machine verdict was also about the superseded page version"
+    );
+    assert_eq!(
         db.page_visibility(&grant, &ids).await.unwrap()[page],
         Visibility::Full,
-        "and with the review retired, the unsupported page stops being fully visible"
+        "the edited page remains visible because it is now unevaluated, not because the old review survived"
     );
 
-    // Put the text back and the receipt is good again: the check is on content,
-    // not on a version counter that only ever climbs.
+    // Putting the text back does not restore a review of an older page version.
+    // The truth-state contract binds approval to both exact version and digest.
     {
         let conn = db.conn.lock().await;
         conn.execute(
@@ -848,8 +885,8 @@ async fn an_edit_after_a_review_retires_the_review() {
         .unwrap();
     }
     assert!(
-        db.page_truth_states(&ids).await.unwrap()[page].human_reviewed,
-        "the exact text the human approved is back, so their approval is too"
+        !db.page_truth_states(&ids).await.unwrap()[page].human_reviewed,
+        "restoring bytes does not make an approval of page version 1 apply to version 2"
     );
 }
 
@@ -873,6 +910,19 @@ async fn an_unreviewed_page_is_unaffected_by_the_digest_check() {
         )
         .await
         .unwrap();
+        conn.execute(
+            "INSERT INTO claim_derivation_markers
+                 (page_id, page_version, page_version_digest, extractor_version,
+                  inventory_count, created_at)
+             VALUES (?1, 1, ?2, ?3, 1, 1700000000)",
+            libsql::params![
+                page,
+                crate::provenance::revision_content_digest("prose"),
+                crate::db::EXTRACTOR_VERSION
+            ],
+        )
+        .await
+        .unwrap();
     }
     let states = db.page_truth_states(&[page.to_string()]).await.unwrap();
     assert!(!states[page].human_reviewed);
@@ -880,5 +930,419 @@ async fn an_unreviewed_page_is_unaffected_by_the_digest_check() {
         states[page].support,
         crate::truth_contract::Support::Supported,
         "the machine axis is untouched by the review check"
+    );
+}
+
+/// Matrix row 8. A page edited after being judged carries a verdict about text
+/// it no longer holds. The enqueue trigger queues the WORK; until a worker runs
+/// — on a substrate whose producer does not exist yet, never — `supported` keeps
+/// the new prose readable on the strength of a judgement of the old.
+///
+/// Asserted in both directions, because the fail-safe has to cut both ways. A
+/// stale `supported` must stop granting, and a stale failed verdict must stop
+/// hiding: v1's refutation is not evidence about v2, and letting it stand would
+/// archive a page over a judgement nobody ever made of it.
+#[tokio::test]
+async fn a_verdict_about_a_superseded_version_does_not_answer_for_the_new_one() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let before = db.page_truth_states(&ids(&["p1", "p2"])).await.unwrap();
+    assert_eq!(
+        before.get("p1").unwrap().support,
+        crate::truth_contract::Support::Supported
+    );
+    assert_eq!(
+        before.get("p2").unwrap().support,
+        crate::truth_contract::Support::Unsupported
+    );
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("UPDATE pages SET version = 2 WHERE id IN ('p1','p2')", ())
+            .await
+            .unwrap();
+    }
+
+    let after = db.page_truth_states(&ids(&["p1", "p2"])).await.unwrap();
+    assert_eq!(
+        after.get("p1").unwrap().support,
+        crate::truth_contract::Support::Unevaluated,
+        "a v1 `supported` verdict may not answer for v2's prose"
+    );
+    assert_eq!(
+        after.get("p2").unwrap().support,
+        crate::truth_contract::Support::Unevaluated,
+        "and a v1 refutation may not archive v2 either"
+    );
+
+    // The same call through the gate every adapter actually uses: the page that
+    // was being hidden on a superseded verdict gets its prose back.
+    let visible = db
+        .page_visibility(&TruthGrant::Automatic, &ids(&["p2"]))
+        .await
+        .unwrap();
+    assert_eq!(visible.get("p2"), Some(&Visibility::Full));
+}
+
+/// The read gate's half of §1 condition 1: a verdict is readable only while the
+/// derivation it came out of still exists.
+///
+/// Defaulting a MISSING marker to agreement was the hole. `evaluate_page_support`
+/// calls a page with no marker `Unevaluated` — condition 1 unproven — so writer
+/// and reader disagreed about the same page and the reader was the lenient one.
+/// A marker that never landed, or was lost, therefore kept a stored `supported`
+/// readable indefinitely, and on a branch with no producer nothing would ever
+/// come along to disturb it.
+///
+/// Asserted in both directions, because a rule that hides everything is not a
+/// fail-safe. Losing the marker must stop `supported` granting AND stop a stored
+/// refutation hiding — the page falls back to unjudged, which keeps its file.
+#[tokio::test]
+async fn a_verdict_whose_derivation_marker_is_gone_stops_being_readable() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    let before = db.page_truth_states(&ids(&["p1", "p2"])).await.unwrap();
+    assert_eq!(
+        before.get("p1").unwrap().support,
+        crate::truth_contract::Support::Supported,
+        "the marker is present, so the stored verdict reads -- the change below \
+         is about losing it and nothing else"
+    );
+    assert_eq!(
+        before.get("p2").unwrap().support,
+        crate::truth_contract::Support::Unsupported
+    );
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "DELETE FROM claim_derivation_markers WHERE page_id IN ('p1','p2')",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let after = db.page_truth_states(&ids(&["p1", "p2"])).await.unwrap();
+    assert_eq!(
+        after.get("p1").unwrap().support,
+        crate::truth_contract::Support::Unevaluated,
+        "a `supported` with no derivation behind it may not answer for the page"
+    );
+    assert_eq!(
+        after.get("p2").unwrap().support,
+        crate::truth_contract::Support::Unevaluated,
+        "and the same rule must release the page it was hiding"
+    );
+    assert_eq!(
+        db.page_visibility(&TruthGrant::Automatic, &ids(&["p2"]))
+            .await
+            .unwrap()
+            .get("p2"),
+        Some(&Visibility::Full),
+        "falling back to unjudged keeps the file, which is the safe direction"
+    );
+}
+
+/// The read gate's half of the extractor clause. `claim_derivation_markers`
+/// records `extractor_version` because identical page text under a changed
+/// extractor yields a DIFFERENT claim set — so an old marker no longer describes
+/// the inventory the verdict was reached over, even though every digest matches.
+///
+/// Bumping `EXTRACTOR_VERSION` re-queues every page, and a queue entry is not a
+/// retraction: until this check, the stored `supported` went on being served for
+/// the entire time that queue took to drain, which on a vault with no producer is
+/// forever.
+#[tokio::test]
+async fn a_verdict_from_a_superseded_extractor_stops_being_readable() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    assert_eq!(
+        db.page_truth_states(&ids(&["p1"]))
+            .await
+            .unwrap()
+            .get("p1")
+            .unwrap()
+            .support,
+        crate::truth_contract::Support::Supported
+    );
+
+    {
+        // The page's text is untouched, so every digest still agrees. Only the
+        // extractor that produced the claim inventory has moved on.
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_markers SET extractor_version = ?1 WHERE page_id = 'p1'",
+            libsql::params![crate::db::claim_derivation::EXTRACTOR_VERSION - 1],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.page_truth_states(&ids(&["p1"]))
+            .await
+            .unwrap()
+            .get("p1")
+            .unwrap()
+            .support,
+        crate::truth_contract::Support::Unevaluated,
+        "a verdict over an inventory this binary would not extract is not a \
+         verdict about this page"
+    );
+}
+
+/// N2. The runtime backlog continuation WRITES, so it may not run in repair
+/// recovery, and no exhaustion loop may return to pre-serve startup.
+///
+/// Repair recovery opens the database through `open_for_repair` precisely so
+/// that startup performs no ordinary side effect: an operator inspecting a
+/// damaged database must see only what the repair itself does. The runtime
+/// sweep deletes stale `done` jobs and inserts pending ones, so an unfenced
+/// worker would put queue mutations into the one mode that promised none.
+///
+/// Startup must not call `drain_stale_derivation_jobs`: looping to exhaustion
+/// before `serve` has no wall-clock bound. `MemoryDB::new` does run migration
+/// 105's one-time, named 500-row seed before serving; the optional runtime
+/// worker continues that bounded exception one sweep per turn and yields under
+/// the existing repair-mode fence. The durable queue makes the continuation
+/// restart-safe.
+#[test]
+fn the_runtime_backlog_continuation_is_fenced_out_of_repair_mode() {
+    let sources = workspace_sources();
+    let startup = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("crates/wenlan-server/src/main/startup.rs"))
+        .map(|(_, body)| body.as_str())
+        .expect("startup.rs must be in the production source inventory");
+    let runtime = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("crates/wenlan-server/src/main/runtime.rs"))
+        .map(|(_, body)| body.as_str())
+        .expect("runtime.rs must be in the production source inventory");
+    let db = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("crates/wenlan-core/src/db.rs"))
+        .map(|(_, body)| body.as_str())
+        .expect("db.rs must be in the production source inventory");
+    let claim_derivation = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("crates/wenlan-core/src/db/claim_derivation.rs"))
+        .map(|(_, body)| body.as_str())
+        .expect("claim_derivation.rs must be in the production source inventory");
+
+    assert!(
+        !startup.contains("drain_stale_derivation_jobs(")
+            && !startup.contains("enqueue_stale_derivation_jobs("),
+        "startup.rs must not directly run data-sized backlog work"
+    );
+    assert!(
+        startup.contains("wenlan_core::db::MemoryDB::new("),
+        "the placement tooth must trace the normal constructor alias, not only direct calls"
+    );
+    assert!(
+        claim_derivation.contains("pub(super) const MIGRATION_105_BACKLOG_SEED_LIMIT: i64 = 500;"),
+        "migration 105's one permitted pre-serve queue write needs an explicit bounded contract"
+    );
+    assert!(
+        db.contains(
+            "enqueue_stale_derivation_jobs(claim_derivation::MIGRATION_105_BACKLOG_SEED_LIMIT)"
+        ),
+        "MemoryDB::new reaches migration 105, whose pre-serve queue seed must use the named bound"
+    );
+    let sweep_start = claim_derivation
+        .find("async fn sweep_stale_derivation_jobs(")
+        .expect("the bounded sweep implementation must exist");
+    let sweep_end = claim_derivation[sweep_start..]
+        .find("pub async fn drain_stale_derivation_jobs(")
+        .map(|offset| sweep_start + offset)
+        .expect("the drain must follow the bounded sweep");
+    let sweep = &claim_derivation[sweep_start..sweep_end];
+    let stale_capture = sweep
+        .find("INSERT INTO claim_derivation_backlog_batch")
+        .expect("stale-marker cleanup must first capture a bounded batch");
+    let drift_capture = sweep
+        .find("INSERT INTO claim_derivation_drift_batch")
+        .expect("drift cleanup must first capture a bounded batch");
+    let first_cleanup = sweep
+        .find("DELETE FROM claim_derivation_jobs")
+        .expect("the captured batches must replace stale done jobs");
+    assert!(
+        stale_capture < first_cleanup && drift_capture < first_cleanup,
+        "both bounded sets must be captured before any cleanup write can touch jobs"
+    );
+    for (batch, minimum_uses) in [
+        ("FROM claim_derivation_backlog_batch", 2),
+        ("FROM claim_derivation_drift_batch", 3),
+    ] {
+        assert!(
+            sweep.matches(batch).count() >= minimum_uses,
+            "{batch} must bind capture, done-job cleanup, and pending insertion/demotion"
+        );
+    }
+    let fence = runtime
+        .find("if optional_runtime_workers_allowed(repair_recovery_pending)")
+        .expect("repair recovery must fence optional runtime workers");
+    let continuation = runtime
+        .find("enqueue_stale_derivation_jobs(")
+        .expect("the runtime worker must continue migration 105's truncated backlog");
+    assert!(
+        fence < continuation,
+        "the backlog writer must remain inside the optional-worker repair fence"
+    );
+}
+
+/// Startup atomically opens the reconciliation frontier before serving. That
+/// gate WITHHOLDS a stored `supported` until the runtime evaluator re-proves it.
+/// If opening the gate errors, the daemon must refuse startup rather than serve
+/// exactly the stale `supported` the frontier exists to hide.
+///
+/// That is the failure this asserts against: a `warn!`-and-continue arm. The
+/// gate must be able to refuse the boot, which on this codebase means reaching
+/// `report_bootstrap_error` and returning an error, the same two moves the
+/// projection-invariant pass directly above it makes for the same reason.
+///
+/// The data-sized evaluator belongs only to the shutdown-aware runtime worker.
+/// A source scan establishes both placements; frontier behaviour tests pin the
+/// resulting `Unevaluated` reads.
+///
+/// The generation-0 carve-out inside the arm is deliberate and is not what this
+/// checks: below the cutover every adapter is pass-through and no truth state
+/// reaches a reader, so there is no restriction to fail closed on.
+#[test]
+fn a_failed_startup_reconciliation_refuses_to_serve() {
+    const GATE: &str = "begin_support_reconcile_pass(";
+
+    let mut checked = 0usize;
+    let mut runtime_continuations = 0usize;
+    for (path, body) in workspace_sources() {
+        let file_name = path.file_name().and_then(|name| name.to_str());
+        if file_name == Some("runtime.rs") {
+            runtime_continuations += body.matches("reconcile_supported_pages(").count();
+        }
+        if file_name != Some("startup.rs") {
+            continue;
+        }
+        assert!(
+            !body.contains("reconcile_supported_pages("),
+            "startup.rs must not run a page evaluator whose per-page work is unbounded"
+        );
+        let lines: Vec<&str> = body.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if !code.contains(GATE) || code.trim_start().starts_with("pub async fn") {
+                continue;
+            }
+            // The handling of this call's result, bounded generously. Anything
+            // further away than this is a different statement, and an arm that
+            // needed 80 lines to decide whether to serve would be its own
+            // finding.
+            let handler: String = lines[index..(index + 80).min(lines.len())].join("\n");
+            assert!(
+                handler.contains("report_bootstrap_error"),
+                "{}: the startup reconciliation gate is handled without ever reaching \
+                 `report_bootstrap_error`. If the frontier cannot open, stored support cannot \
+                 be served safely.",
+                path.display()
+            );
+            assert!(
+                handler.contains("return Err("),
+                "{}: the startup reconciliation gate is handled without ever returning an \
+                 error. Logging and serving anyway exposes the stale state it should withhold.",
+                path.display()
+            );
+            checked += 1;
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "no production startup call to {GATE}; without the frontier, stored `supported` is \
+         exposed before the runtime evaluator reaches it"
+    );
+    assert!(
+        runtime_continuations > 0,
+        "no runtime reconciliation continuation; the frontier would withhold support forever"
+    );
+}
+
+/// Blocker 4. Human approval outranks every machine verdict, so it is the one
+/// flag that must never be trusted raw.
+///
+/// A person approves a SPECIFIC text — the schema stores the version and digest
+/// they signed off, and the CHECK constraint guarantees both are present. Read
+/// as a bare boolean, that approval silently became perpetual: edit the prose
+/// afterwards and the page kept full visibility on the strength of a review of
+/// text it no longer holds, which is the human-axis twin of matrix row 8.
+///
+/// Asserted through `page_visibility`, the gate adapters actually call, because
+/// the flag's whole effect is that `visible_at` returns `Full` on it alone.
+#[tokio::test]
+async fn a_human_approval_of_older_text_stops_granting_visibility() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    // p2 is provisional with a stamped verdict: Unsupported, and hidden from an
+    // automatic reader unless a human approval overrides it.
+    let approved_digest = crate::provenance::revision_content_digest("");
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE page_truth_state
+                SET human_reviewed = 1, reviewed_page_version = 1,
+                    reviewed_page_digest = ?2
+              WHERE page_id = ?1",
+            libsql::params!["p2", approved_digest.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let granted = db.page_truth_states(&ids(&["p2"])).await.unwrap();
+    assert!(
+        granted.get("p2").unwrap().human_reviewed,
+        "an approval of the text the page actually holds must still grant"
+    );
+    assert_eq!(
+        db.page_visibility(&TruthGrant::Automatic, &ids(&["p2"]))
+            .await
+            .unwrap()
+            .get("p2"),
+        Some(&Visibility::Full),
+        "the approval is what keeps this unsupported page readable"
+    );
+
+    // Rewrite the prose. The version is deliberately left alone: a bumped
+    // version would be caught by the version comparison, and the hole being
+    // closed here is the one where the numbers still agree.
+    //
+    // The derivation marker moves with the text, standing in for a re-derivation
+    // that reached the same provisional verdict on the new prose. Without that
+    // the edit would stale the MACHINE verdict too, the page would read
+    // `Unevaluated`, and the final assertion would pass on the wrong axis —
+    // full visibility because nothing was judged, rather than the human axis
+    // being the thing under test.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("UPDATE pages SET content = 'rewritten' WHERE id = 'p2'", ())
+            .await
+            .unwrap();
+        conn.execute(
+            "UPDATE claim_derivation_markers SET page_version_digest = ?1
+              WHERE page_id = 'p2'",
+            libsql::params![crate::provenance::revision_content_digest("rewritten")],
+        )
+        .await
+        .unwrap();
+    }
+
+    let after = db.page_truth_states(&ids(&["p2"])).await.unwrap();
+    assert!(
+        !after.get("p2").unwrap().human_reviewed,
+        "an approval of superseded text may not go on granting authority"
+    );
+    assert_eq!(
+        db.page_visibility(&TruthGrant::Automatic, &ids(&["p2"]))
+            .await
+            .unwrap()
+            .get("p2"),
+        Some(&Visibility::Hidden),
+        "with the stale approval withdrawn the page falls back to its machine \
+         verdict, which is what an unsupported page is owed"
     );
 }

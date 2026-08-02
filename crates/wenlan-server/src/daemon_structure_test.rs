@@ -6,6 +6,8 @@ const MAIN_ROOT: &str = "crates/wenlan-server/src/main.rs";
 const SCHEDULER_ROOT: &str = "crates/wenlan-server/src/scheduler.rs";
 const MAIN_STARTUP_CHILD: &str = "crates/wenlan-server/src/main/startup.rs";
 const MAIN_RUNTIME_CHILD: &str = "crates/wenlan-server/src/main/runtime.rs";
+const CORE_DB_ROOT: &str = "crates/wenlan-core/src/db.rs";
+const CORE_CLAIM_DERIVATION: &str = "crates/wenlan-core/src/db/claim_derivation.rs";
 const SCHEDULER_AMBIENT_CHILD: &str = "crates/wenlan-server/src/scheduler/ambient.rs";
 const BIND_TESTS: &str = "crates/wenlan-server/src/bind_addr_tests.rs";
 const SCHEDULER_TESTS: &str = "crates/wenlan-server/src/scheduler/scheduler_tests.rs";
@@ -131,6 +133,9 @@ const RUNTIME_WORKER_ORDER: &[&str] = &[
     "wait_for_startup_model_admission(",
     "OnDeviceProvider::new_with_model(",
     "LLM_READINESS_HOOK.set(",
+    "let db_for_reconcile = db_arc.clone()",
+    "enqueue_stale_derivation_jobs(",
+    "reconcile_supported_pages(startup::SUPPORT_RECONCILE_BATCH)",
 ];
 
 const RUNTIME_OPTIONAL_WORKER_SCOPES: &[&str] = &[
@@ -157,8 +162,10 @@ const RUNTIME_REGISTER_SNAPSHOT_ORDER: &[&str] = &[
     "state.startup_model_load_reserved.clone()",
     "let mut load_shutdown = {",
     "state.shutdown.subscribe()",
-    "let maintenance_for_ready = {",
+    "let (maintenance_for_ready, shutdown_for_reconcile) = {",
     "state.maintenance_coordinator.clone()",
+    "state.shutdown.clone()",
+    "let mut reconcile_shutdown = shutdown_for_reconcile.subscribe()",
 ];
 
 const FACADE_SNAPSHOT_ORDER: &[&str] = &[
@@ -1968,6 +1975,76 @@ fn reviewer_mutations_reject_startup_runtime_and_drain_false_greens() {
             .iter()
             .any(|violation| violation.contains("immediately before")),
         "finish_recovery adjacency mutation must be rejected: {violations:?}"
+    );
+}
+
+/// The listener cannot have a real wall-clock startup bound while pre-serve
+/// code calls either an exhaustion loop or an evaluator whose work per page is
+/// unbounded. Startup may atomically open the fail-closed frontier; the durable
+/// backlog and reconciliation work itself belongs to the shutdown-aware
+/// runtime worker after `serve` can accept requests.
+#[test]
+fn truth_reconciliation_work_runs_only_in_the_runtime_worker() {
+    let root = repo_root();
+    let startup = read_source(&root, MAIN_STARTUP_CHILD);
+    let runtime = read_source(&root, MAIN_RUNTIME_CHILD);
+    let core_db = read_source(&root, CORE_DB_ROOT);
+    let claim_derivation = read_source(&root, CORE_CLAIM_DERIVATION);
+
+    assert!(
+        startup.contains("begin_support_reconcile_pass("),
+        "startup must open the read-gating frontier before serving"
+    );
+    for forbidden in ["drain_stale_derivation_jobs(", "reconcile_supported_pages("] {
+        assert!(
+            !startup.contains(forbidden),
+            "pre-serve startup must not call unbounded truth work: {forbidden}"
+        );
+    }
+    for required in [
+        "enqueue_stale_derivation_jobs(",
+        "reconcile_supported_pages(startup::SUPPORT_RECONCILE_BATCH)",
+        "lifecycle::sleep_or_shutdown(",
+    ] {
+        assert!(
+            runtime.contains(required),
+            "the shutdown-aware runtime continuation is missing {required}"
+        );
+    }
+    assert!(
+        startup.contains("wenlan_core::db::MemoryDB::new("),
+        "normal startup must keep the constructor alias visible to the placement tooth"
+    );
+    assert!(
+        claim_derivation.contains("pub(super) const MIGRATION_105_BACKLOG_SEED_LIMIT: i64 = 500;"),
+        "migration 105's constructor-time queue seed must stay explicitly bounded"
+    );
+    assert!(
+        core_db.contains(
+            "enqueue_stale_derivation_jobs(claim_derivation::MIGRATION_105_BACKLOG_SEED_LIMIT)"
+        ),
+        "the one bounded constructor-time exception must remain named and reviewable"
+    );
+    let sweep_start = claim_derivation
+        .find("async fn sweep_stale_derivation_jobs(")
+        .expect("the bounded sweep implementation must exist");
+    let sweep_end = claim_derivation[sweep_start..]
+        .find("pub async fn drain_stale_derivation_jobs(")
+        .map(|offset| sweep_start + offset)
+        .expect("the drain must follow the bounded sweep");
+    let sweep = &claim_derivation[sweep_start..sweep_end];
+    let backlog_capture = sweep
+        .find("INSERT INTO claim_derivation_backlog_batch")
+        .expect("constructor-time stale cleanup must have a captured bound");
+    let drift_capture = sweep
+        .find("INSERT INTO claim_derivation_drift_batch")
+        .expect("constructor-time drift cleanup must have a captured bound");
+    let first_cleanup = sweep
+        .find("DELETE FROM claim_derivation_jobs")
+        .expect("the sweep must replace selected done jobs");
+    assert!(
+        backlog_capture < first_cleanup && drift_capture < first_cleanup,
+        "no pre-serve cleanup write may run before both bounded batches are captured"
     );
 }
 

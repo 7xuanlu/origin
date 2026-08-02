@@ -155,10 +155,14 @@ pub(super) async fn register_optional_runtime_workers(
     // and use `handle.spawn(...)` from the closure instead.
     if optional_runtime_workers_allowed(repair_recovery_pending) {
         let db_for_ready = db_arc.clone();
-        let maintenance_for_ready = {
+        let (maintenance_for_ready, shutdown_for_reconcile) = {
             let state = shared.read().await;
-            state.maintenance_coordinator.clone()
+            (
+                state.maintenance_coordinator.clone(),
+                state.shutdown.clone(),
+            )
         };
+        let maintenance_for_reconcile = maintenance_for_ready.clone();
         let emitter_for_ready: Arc<dyn wenlan_core::events::EventEmitter> =
             Arc::new(wenlan_core::events::NoopEmitter);
         let handle = tokio::runtime::Handle::current();
@@ -175,6 +179,83 @@ pub(super) async fn register_optional_runtime_workers(
             });
         });
         let _ = wenlan_core::llm_provider::LLM_READINESS_HOOK.set(hook);
+
+        // Startup opens only the fail-closed frontier. Continue both data-sized
+        // truth jobs here, after the listener can serve: one bounded enqueue
+        // sweep and one bounded reconciliation batch per turn, yielding between
+        // turns. Queue rows plus the reconciliation cursor are durable, so a
+        // restart resumes instead of losing the tail.
+        let db_for_reconcile = db_arc.clone();
+        let mut reconcile_shutdown = shutdown_for_reconcile.subscribe();
+        tokio::spawn(async move {
+            if lifecycle::sleep_or_shutdown(
+                &mut reconcile_shutdown,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            {
+                return;
+            }
+
+            let mut backlog_complete = false;
+            loop {
+                let work = async {
+                    let _maintenance_guard = maintenance_for_reconcile.begin_background().await;
+                    let enqueued = if backlog_complete {
+                        0
+                    } else {
+                        db_for_reconcile
+                            .enqueue_stale_derivation_jobs(startup::SUPPORT_RECONCILE_BATCH as i64)
+                            .await?
+                    };
+                    if enqueued == 0 {
+                        backlog_complete = true;
+                    }
+                    let pass = db_for_reconcile
+                        .reconcile_supported_pages(startup::SUPPORT_RECONCILE_BATCH)
+                        .await?;
+                    Ok::<_, wenlan_core::WenlanError>((enqueued, pass))
+                }
+                .await;
+                match work {
+                    Ok((enqueued, pass)) if backlog_complete && pass.complete => {
+                        tracing::info!(
+                            "[truth] background derivation backlog and support reconciliation \
+                             completed; {enqueued} page(s) enqueued and {} page(s) demoted in \
+                             the final batch",
+                            pass.demoted,
+                        );
+                        return;
+                    }
+                    Ok((enqueued, pass)) => {
+                        if enqueued > 0 || pass.demoted > 0 {
+                            tracing::info!(
+                                "[truth] background truth maintenance enqueued {enqueued} page(s) \
+                                 and demoted {} page(s)",
+                                pass.demoted,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "[truth] background truth maintenance paused after an error; \
+                             unproved pages remain unevaluated and the durable backlog remains \
+                             resumable: {error}"
+                        );
+                        return;
+                    }
+                }
+
+                if lifecycle::sleep_or_shutdown(
+                    &mut reconcile_shutdown,
+                    std::time::Duration::from_millis(100),
+                )
+                .await
+                {
+                    return;
+                }
+            }
+        });
     }
 }
 

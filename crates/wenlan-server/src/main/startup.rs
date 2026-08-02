@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Keep each connection-holding reconciliation slice short enough for the
+/// post-serve continuation to yield between slices.
+pub(super) const SUPPORT_RECONCILE_BATCH: usize = 25;
+
 pub(super) struct PreparedStartupState {
     pub(super) server_state: ServerState,
     pub(super) db_arc: Arc<wenlan_core::db::MemoryDB>,
@@ -502,6 +506,42 @@ pub(super) async fn prepare_startup_state(
                     }
                 }
                 Err(e) => tracing::warn!("[reconcile] list_pages failed: {e}"),
+            }
+        }
+    }
+
+    // Open the truth read gate before serving, but do no data-sized work here.
+    // A single page can contain unbounded claims and candidates, so neither a
+    // page batch nor a deadline checked after evaluation is a real startup
+    // bound. The runtime worker continues both the durable derivation backlog
+    // and this reconciliation pass after `serve` can accept requests. Until it
+    // reaches a stored `supported`, the frontier makes that read `Unevaluated`;
+    // availability degrades without stale truth escaping.
+    //
+    // Repair recovery remains side-effect-free and therefore does not open a
+    // pass. The next ordinary start does, then the runtime worker resumes it.
+    if !repair_recovery_pending {
+        match db_arc.begin_support_reconcile_pass().await {
+            Ok(()) => {}
+            // Fail CLOSED, on the same rule and through the same helper as the
+            // projection invariant above. The frontier is what withholds each
+            // stored `supported` until the runtime pass re-proves it. If the
+            // gate cannot be opened, serving would expose exactly the stale
+            // state the pass exists to retract. At generation 0 every adapter
+            // is pass-through and no truth state reaches a reader, so the
+            // failure records the absence of a restriction that is not in
+            // force: `error!` and serve.
+            Err(e) => {
+                let live = db_arc.truth_cutover_generation().await.unwrap_or(1) != 0;
+                if live {
+                    let msg = format!(
+                        "[truth] claim-derivation reconciliation gate failed at cutover generation \
+                         >= 1; refusing to serve possibly-stale supported state: {e}"
+                    );
+                    report_bootstrap_error(&wenlan_root, &msg);
+                    return Err(anyhow::anyhow!(msg));
+                }
+                tracing::error!("[truth] claim-derivation reconciliation gate failed: {e}");
             }
         }
     }

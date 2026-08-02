@@ -77,6 +77,30 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
         )
         .await
         .unwrap();
+        // A verdict is only readable while the derivation it came out of still
+        // describes the page, so each of these rows needs the marker
+        // derivation would have written before finalizing. A truth row without
+        // one is a state
+        // the pipeline does not produce, and seeding it would leave every
+        // assertion below testing the missing-marker path instead of its
+        // subject. Digest over the page's actual prose and this build's
+        // extractor, so an edit or a version bump invalidates it exactly as it
+        // would in production.
+        for id in ["p1", "p2", "p3"] {
+            conn.execute(
+                "INSERT OR REPLACE INTO claim_derivation_markers
+                     (page_id, page_version, page_version_digest, extractor_version,
+                      inventory_count, created_at)
+                 VALUES (?1, 1, ?2, ?3, 1, 0)",
+                libsql::params![
+                    id,
+                    crate::provenance::revision_content_digest("the body prose"),
+                    crate::db::EXTRACTOR_VERSION
+                ],
+            )
+            .await
+            .unwrap();
+        }
     }
     db.set_truth_cutover_generation(1).await.unwrap();
     (db, temp)

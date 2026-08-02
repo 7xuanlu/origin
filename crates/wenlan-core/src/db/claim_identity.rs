@@ -65,6 +65,17 @@ pub struct HumanEditDelta {
 /// without anything noticing, which is the failure §4a is written to prevent.
 #[derive(Debug, Clone)]
 pub struct SupportVerdict {
+    /// Which chunk of the cited source the span was read from.
+    ///
+    /// A `source_id` names a *document*, and one document is several `memories`
+    /// rows sharing that id — `store_raw_import_memories_batch` writes exactly
+    /// that shape. Without this, resolving evidence by `source_id` alone picks
+    /// whichever row the query happens to return: verification recomputes the
+    /// span digest against the wrong chunk and refuses support that is perfectly
+    /// valid, and the stored edge cannot say which chunk was ever verified.
+    /// Fail-closed, so the visible symptom is unsupportable pages rather than
+    /// wrong support — the same dead-substrate reading this rung exists to end.
+    pub chunk_index: i64,
     /// The exact memory version the span was read from.
     pub source_version: i64,
     /// Byte offsets into that version, per `faithfulness::sentence_spans`.
@@ -270,6 +281,137 @@ impl MemoryDB {
             CREATE INDEX IF NOT EXISTS idx_entailment_cache_scored_at
                 ON entailment_cache(scored_at);
 
+            -- Which candidates THIS run had to weigh, and how far each got.
+            --
+            -- `entailment_cache` cannot answer that question and was never
+            -- meant to. It is keyed by content digests alone, so it is global
+            -- and timeless: a row means some judge once scored this text
+            -- against this span, with no way back to which run required it or
+            -- whether the run finished. Reading a cache hit as this-claim-has-
+            -- been-judged therefore lets a run that concluded on one candidate
+            -- and timed out on another read as fully judged -- and a claim that
+            -- is fully judged with no qualifying edge is Refuted, which costs
+            -- the page its file for evaluation that never finished.
+            --
+            -- The run is (page_id, page_version, run_generation), and the
+            -- generation is the load-bearing third of that. `(page_id,
+            -- page_version)` names a JOB, not a run attempt: an expired or
+            -- released lease reuses the same row, so rows written by an attempt
+            -- that crashed halfway sit beside rows written by the attempt that
+            -- replaced it, and the two read as one complete run. That is the
+            -- worst direction to be wrong in -- a claim that looks fully judged
+            -- with no qualifying edge is Refuted, which costs the page its
+            -- file. A generation is allocated per LEASE (see
+            -- `claim_run_generations`), so every attempt is its own run and
+            -- rows from two of them can never be combined.
+            --
+            -- The candidate is identified by its exact LOCATION, not by its
+            -- span digest. A digest alone is span CONTENT, and a document may
+            -- contain the same sentence twice: two genuinely distinct citations
+            -- then collide on one row, and concluding on one silently discharges
+            -- the obligation to conclude on the other. The columns mirror
+            -- `write_support_edge`'s span locator exactly -- source, chunk,
+            -- offsets, digest -- because matching an attempt row to the support
+            -- edge it produced is the whole point of recording it.
+            --
+            -- `outcome` is a whitelist of two, and 'deferred' deliberately
+            -- covers timed-out, errored, and malformed alike: they differ in
+            -- how they happened and not at all in what they mean here, which
+            -- is that this candidate has no conclusion. A third value would
+            -- add a distinction no reader acts on.
+            CREATE TABLE IF NOT EXISTS claim_judgment_attempts (
+                page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+                page_version INTEGER NOT NULL,
+                run_generation INTEGER NOT NULL,
+                claim_revision_id TEXT NOT NULL
+                    REFERENCES claim_revisions(claim_revision_id) ON DELETE CASCADE,
+                candidate_source_id TEXT NOT NULL,
+                candidate_chunk_index INTEGER NOT NULL,
+                candidate_span_start INTEGER NOT NULL,
+                candidate_span_end INTEGER NOT NULL,
+                candidate_digest TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN ('concluded','deferred')),
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (page_id, page_version, run_generation, claim_revision_id,
+                             candidate_source_id, candidate_chunk_index,
+                             candidate_span_start, candidate_span_end, candidate_digest)
+            );
+
+            -- What this run OWED a conclusion on, recorded before it judged.
+            --
+            -- `claim_judgment_attempts` and the live support edges are both
+            -- OUTPUTS of a run, and a run that dies mid-flight leaves neither
+            -- for the candidate it never reached. That is the hole they cannot
+            -- close between them: candidate A concludes, the worker dies before
+            -- writing candidate B's attempt row, and B produced no edge because
+            -- nothing ever scored it. Evaluation then sees one candidate, one
+            -- conclusion, and no evidence at all that a second obligation
+            -- existed -- so a run that covered half its inventory publishes as
+            -- if it had covered all of it, which is exactly what row 6 forbids.
+            --
+            -- The marker's `inventory_count` does not cover this. It counts
+            -- CLAIMS, and the missing thing is a CANDIDATE: B's claim is on the
+            -- membership roll and accounted for, with one of its two citations
+            -- silently dropped.
+            --
+            -- So the obligation is written down first and independently, and
+            -- evaluation compares outputs against it rather than against
+            -- themselves. Columns mirror `claim_judgment_attempts` exactly --
+            -- same locator, same run identity -- because the whole operation is
+            -- a set difference between the two.
+            CREATE TABLE IF NOT EXISTS claim_run_candidates (
+                page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+                page_version INTEGER NOT NULL,
+                run_generation INTEGER NOT NULL,
+                claim_revision_id TEXT NOT NULL
+                    REFERENCES claim_revisions(claim_revision_id) ON DELETE CASCADE,
+                candidate_source_id TEXT NOT NULL,
+                candidate_chunk_index INTEGER NOT NULL,
+                candidate_span_start INTEGER NOT NULL,
+                candidate_span_end INTEGER NOT NULL,
+                candidate_digest TEXT NOT NULL,
+                PRIMARY KEY (page_id, page_version, run_generation, claim_revision_id,
+                             candidate_source_id, candidate_chunk_index,
+                             candidate_span_start, candidate_span_end, candidate_digest)
+            );
+
+            -- The seal that says the row set above is COMPLETE for this run.
+            --
+            -- Without it the inventory has the defect it was built to fix, one
+            -- level up: a run that wrote A's inventory row and died before B's
+            -- leaves an inventory of one, and an inventory nobody can tell is
+            -- partial proves nothing. The seal and the rows go in under one
+            -- transaction, so the seal's presence IS the completeness claim.
+            --
+            -- It also separates the two absences that matter. A run with an
+            -- empty candidate set writes zero rows and a seal; a run that died
+            -- before recording anything writes zero rows and no seal. Row
+            -- counts cannot tell those apart and they land on opposite
+            -- verdicts.
+            CREATE TABLE IF NOT EXISTS claim_run_inventories (
+                page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+                page_version INTEGER NOT NULL,
+                run_generation INTEGER NOT NULL,
+                sealed_at INTEGER NOT NULL,
+                PRIMARY KEY (page_id, page_version, run_generation)
+            );
+
+            -- The run-generation allocator: one row, monotonically increasing.
+            --
+            -- Deliberately global rather than a counter on the job row. A job
+            -- row is DELETED and recreated by the backlog sweep whenever its
+            -- marker or its support goes stale, and a per-job counter would
+            -- restart at 0 there -- handing the next run a generation that
+            -- orphaned attempt rows from an earlier run already carry. A single
+            -- monotone source has no reset to reason about, and gaps (a lease
+            -- that allocated and then found nothing claimable) cost nothing.
+            CREATE TABLE IF NOT EXISTS claim_run_generations (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_generation INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO claim_run_generations (id, last_generation)
+                 VALUES (1, 0);
+
             -- The two truth axes, independent by construction. support_status
             -- is the machine axis and is a whitelist -- an unanticipated state
             -- is provisional by construction rather than by enumeration
@@ -303,6 +445,14 @@ impl MemoryDB {
 
             -- Durable derivation work. The lease columns make a crashed worker
             -- reclaimable instead of parking a page forever.
+            --
+            -- `run_generation` is the run this job is currently on, stamped
+            -- from `claim_run_generations` at every lease. It is what makes a
+            -- reclaimed or retried job a NEW run rather than a continuation of
+            -- the one that died: judgment rows carry the generation they were
+            -- written under, and evaluation reads only the generation the job
+            -- row names now. 0 is the never-leased value -- no run has happened
+            -- yet, and no allocated generation is ever 0.
             CREATE TABLE IF NOT EXISTS claim_derivation_jobs (
                 job_id TEXT PRIMARY KEY,
                 page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
@@ -312,6 +462,7 @@ impl MemoryDB {
                 lease_owner TEXT,
                 lease_expires_at INTEGER,
                 attempts INTEGER NOT NULL DEFAULT 0,
+                run_generation INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -808,17 +959,32 @@ impl MemoryDB {
     /// would be manufacturing grounding for evidence that has none, which is the
     /// one thing §3 names outright. 0 satisfies the "only if" honestly.
     ///
-    /// **Only a human-delta destination resolves today**, and that is §4a's own
-    /// "human-delta destination" case rather than a shortcut. The `supports`
-    /// CHECK requires `root_id IS NOT NULL`, §5 defines it as the provenance
-    /// root of the cited evidence, and the only memory→root link that exists is
-    /// the `hed_{root_id}` convention [`Self::mint_human_edit_delta`] writes.
-    /// Any other memory is refused by name instead of being given an invented
-    /// root — the gap is reported, not papered over.
+    /// **The evidence root is resolved by the caller and verified here.** §5
+    /// defines `root_id` as the provenance root of the cited evidence, and the
+    /// `supports` CHECK requires it to be non-NULL. PR-A derived it by parsing an
+    /// `hed_` prefix off the memory id, because that naming convention was the
+    /// only memory→root link in the schema. The cost of that shortcut was the
+    /// whole M5 blocker: only prose a human typed into the page itself was
+    /// citable, so a distilled page could never be supported and
+    /// `support_status = 'supported'` matched zero rows on every install.
+    ///
+    /// The convention is replaced by a check that is strictly stronger, not
+    /// weaker. Roots are content-addressed —
+    /// `identity_digest(root_kind, canonical_content)` — so the root a caller
+    /// names is confirmed against the cited memory's OWN bytes. A root minted
+    /// over any other content is refused. Where the old prefix was a promise
+    /// about a *name*, this is a proof about *content*, and it generalizes to
+    /// ingested evidence instead of excluding it.
+    ///
+    /// Still refuses rather than repairs: an unknown root, an inactive one, or a
+    /// root recorded under a different `identity_version` (whose digest this
+    /// code cannot recompute, so it cannot be checked) are all named refusals
+    /// rather than an invented or assumed link.
     pub async fn write_support_edge(
         &self,
         claim_revision_id: &str,
         memory_source_id: &str,
+        root_id: &str,
         verdict: &SupportVerdict,
     ) -> Result<String, WenlanError> {
         // A `supports` edge is what M5 reads as truth, so the verdict must
@@ -842,15 +1008,6 @@ impl MemoryDB {
             )));
         }
 
-        // §5: the evidence's provenance root. Derived from the delta memory's
-        // own id rather than looked up, because that convention IS the link.
-        let root_id = memory_source_id.strip_prefix("hed_").ok_or_else(|| {
-            WenlanError::Conflict(format!(
-                "support_evidence_has_no_root: {memory_source_id} carries no provenance root; \
-                 only human-delta evidence is resolvable in PR-A (artifact 3 §4a)"
-            ))
-        })?;
-
         let conn = self.conn.lock().await;
 
         let claim_text_digest: String = {
@@ -873,6 +1030,19 @@ impl MemoryDB {
                 .map_err(|error| WenlanError::VectorDb(format!("support claim decode: {error}")))?
         };
 
+        // The evidence row, addressed by CHUNK and not by document. `source_id`
+        // names a document; one document is many `memories` rows sharing that
+        // id, so a lookup on `source_id` alone resolves to an arbitrary chunk
+        // and the digest check below then answers about text the verdict never
+        // read.
+        //
+        // Nothing in the schema makes `(source_id, chunk_index)` unique -- only
+        // a plain index on `source_id` exists -- so the pair is a convention the
+        // rest of the tree keeps rather than a guarantee this code may lean on.
+        // A second row is therefore read for and REFUSED by name: an ambiguous
+        // corpus is a state this function cannot verify against, and picking one
+        // of two candidates would be exactly the silent arbitrary choice the
+        // chunk index was added to remove.
         let (content, space, live_version): (String, String, i64) = {
             let mut rows = conn
                 .query(
@@ -884,8 +1054,13 @@ impl MemoryDB {
                     // `memories.space` stays NOT NULL (migration 91), which is
                     // exactly why it has to be right rather than merely untested.
                     "SELECT content, COALESCE(space, ?2), COALESCE(version, 1)
-                     FROM memories WHERE source_id = ?1",
-                    libsql::params![memory_source_id, super::UNFILED_SPACE_ID],
+                     FROM memories WHERE source_id = ?1 AND chunk_index = ?3
+                     LIMIT 2",
+                    libsql::params![
+                        memory_source_id,
+                        super::UNFILED_SPACE_ID,
+                        verdict.chunk_index
+                    ],
                 )
                 .await
                 .map_err(|error| {
@@ -897,10 +1072,11 @@ impl MemoryDB {
                 .map_err(|error| WenlanError::VectorDb(format!("support memory decode: {error}")))?
                 .ok_or_else(|| {
                     WenlanError::Conflict(format!(
-                        "support_evidence_unknown: no memory {memory_source_id}"
+                        "support_evidence_unknown: no memory {memory_source_id} chunk {}",
+                        verdict.chunk_index
                     ))
                 })?;
-            (
+            let resolved = (
                 row.get(0).map_err(|error| {
                     WenlanError::VectorDb(format!("support memory decode: {error}"))
                 })?,
@@ -910,8 +1086,92 @@ impl MemoryDB {
                 row.get(2).map_err(|error| {
                     WenlanError::VectorDb(format!("support memory decode: {error}"))
                 })?,
-            )
+            );
+            if rows
+                .next()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("support memory decode: {error}")))?
+                .is_some()
+            {
+                return Err(WenlanError::Conflict(format!(
+                    "support_evidence_ambiguous: {memory_source_id} has more than one chunk {}; \
+                     a support edge may not name evidence that cannot be resolved to one row",
+                    verdict.chunk_index
+                )));
+            }
+            resolved
         };
+
+        // §5, and the replacement for PR-A's `hed_` prefix: prove the root the
+        // caller named actually identifies THIS evidence. The schema stores no
+        // memory->root column, but it does not have to -- roots are
+        // content-addressed, so the binding is RECOMPUTABLE from the evidence's
+        // own bytes even though it is not stored. That makes this a check rather
+        // than the trust the prefix convention asked for.
+        //
+        // The root must be minted over the cited memory row's content, which is
+        // what `acquire_provenance_root` converges on for identical bytes. A root
+        // minted over some larger document that merely CONTAINS this memory does
+        // not verify, and that refusal is correct: §4a's whole subject is the
+        // exact text a verdict read, and a whole-document root cannot answer for
+        // a chunk of it.
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT identity_version, identity_digest, root_kind, status
+                       FROM provenance_roots WHERE root_id = ?1",
+                    libsql::params![root_id],
+                )
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("support root lookup: {error}")))?;
+            let row = rows
+                .next()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("support root decode: {error}")))?
+                .ok_or_else(|| {
+                    WenlanError::Conflict(format!(
+                        "support_root_unknown: no provenance root {root_id}; a support edge may \
+                         not cite a root that does not exist"
+                    ))
+                })?;
+            let identity_version: i64 = row
+                .get(0)
+                .map_err(|error| WenlanError::VectorDb(format!("support root decode: {error}")))?;
+            let identity_digest: String = row
+                .get(1)
+                .map_err(|error| WenlanError::VectorDb(format!("support root decode: {error}")))?;
+            let root_kind: String = row
+                .get(2)
+                .map_err(|error| WenlanError::VectorDb(format!("support root decode: {error}")))?;
+            let status: String = row
+                .get(3)
+                .map_err(|error| WenlanError::VectorDb(format!("support root decode: {error}")))?;
+
+            if status != "active" {
+                return Err(WenlanError::Conflict(format!(
+                    "support_root_inactive: provenance root {root_id} is '{status}'; evidence \
+                     whose root is not active may not back a claim"
+                )));
+            }
+            // A digest written under a different identity scheme cannot be
+            // recomputed by this code, so the binding cannot be checked at all.
+            // Unknown is not true: refuse rather than accept it unverified.
+            if identity_version != crate::provenance::IDENTITY_VERSION {
+                return Err(WenlanError::Conflict(format!(
+                    "support_root_identity_version: root {root_id} was recorded under identity \
+                     version {identity_version}, which this code cannot recompute (it verifies \
+                     version {})",
+                    crate::provenance::IDENTITY_VERSION
+                )));
+            }
+            if crate::provenance::identity_digest(&root_kind, &content) != identity_digest {
+                return Err(WenlanError::Conflict(format!(
+                    "support_root_not_evidence_root: root {root_id} was minted over different \
+                     content than {memory_source_id}; a support edge may not cite a root that \
+                     does not identify the evidence it names"
+                )));
+            }
+        }
 
         // The payload records which VERSION the span was read from, and until
         // this check nothing made that number true -- the caller supplied it and
@@ -1010,9 +1270,15 @@ impl MemoryDB {
         // Offsets in, and the two axes separate cleanly: a different PLACE is a
         // different edge, while a re-judgment of the SAME place keeps the same
         // id and is caught by the conflict check as the verdict change it is.
+        //
+        // The chunk index leads, because "a place" in a multi-chunk document is
+        // a chunk AND an offset: offsets restart at 0 in every chunk, so two
+        // genuinely distinct citations in chunks 0 and 1 would otherwise collide
+        // on one edge id and the second would be refused as a superseding
+        // re-judgment of the first.
         let span_locator = format!(
-            "{}:{}:{}",
-            verdict.span_start, verdict.span_end, verdict.span_digest
+            "{}:{}:{}:{}",
+            verdict.chunk_index, verdict.span_start, verdict.span_end, verdict.span_digest
         );
         let edge_id = crate::provenance::compute_edge_id(
             "supports",
@@ -1023,6 +1289,7 @@ impl MemoryDB {
             &span_locator,
         );
         let payload = serde_json::json!({
+            "chunk_index": verdict.chunk_index,
             "source_version": verdict.source_version,
             "span_start": verdict.span_start,
             "span_end": verdict.span_end,
