@@ -7,6 +7,7 @@
 //! is retained only to fail visibly if the user-facing path is retargeted
 //! before the first write.
 
+use crate::db::M5PageSizeSnapshotDb;
 use anyhow::{bail, Context, Result};
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
@@ -16,13 +17,14 @@ use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub struct PreparedM5Snapshot {
     parent: Dir,
     parent_identity: Handle,
-    db_identity: Handle,
+    db_identity: Arc<Handle>,
     lexical_parent: PathBuf,
     target_name: OsString,
     overwrite: bool,
@@ -31,19 +33,11 @@ pub struct PreparedM5Snapshot {
 /// Prepare one snapshot publication against stable DB and output-parent file
 /// identities. No output file or temporary file is created by this step.
 pub fn prepare_m5_snapshot(
-    db: &Path,
+    database: &M5PageSizeSnapshotDb,
     output: &Path,
     overwrite: bool,
 ) -> Result<PreparedM5Snapshot> {
-    let db_file = std::fs::File::open(db).context("open snapshot database identity")?;
-    if !db_file
-        .metadata()
-        .context("inspect snapshot database identity")?
-        .is_file()
-    {
-        bail!("--db must name a regular file");
-    }
-    let db_identity = Handle::from_file(db_file).context("hold snapshot database identity")?;
+    let db_identity = database.source_identity();
 
     let target_name = output
         .file_name()
@@ -156,7 +150,7 @@ impl PreparedM5Snapshot {
             .context("open existing output target no-follow")?;
         let target_identity =
             Handle::from_file(target.into_std()).context("hold existing output identity")?;
-        if target_identity == self.db_identity {
+        if &target_identity == self.db_identity.as_ref() {
             bail!("--output must not alias --db");
         }
         Ok(())

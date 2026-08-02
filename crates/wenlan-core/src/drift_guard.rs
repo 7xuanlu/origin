@@ -2615,14 +2615,26 @@ fn ci_routing_contract_violations(
     }
 
     let m5_platform = detect_change_filter_paths(&ci, "m5-platform");
+    let m5_platform_inputs = BTreeSet::from([
+        "crates/wenlan-core/src/bin/m5_export_page_size_dist.rs".to_string(),
+        "crates/wenlan-core/src/db/m5_page_size_snapshot.rs".to_string(),
+        "crates/wenlan-core/src/eval/m5_bench_corpus.rs".to_string(),
+        "crates/wenlan-core/src/eval/m5_snapshot_io.rs".to_string(),
+        "crates/wenlan-core/tests/fixtures/m5_bench_corpus.sha256".to_string(),
+        "crates/wenlan-core/tests/fixtures/m5_judge_accuracy.jsonl".to_string(),
+        "crates/wenlan-core/tests/fixtures/m5_page_size_dist.json".to_string(),
+        "crates/wenlan-core/tests/m5_bench.rs".to_string(),
+    ]);
     let m5_platform_target = "crates/wenlan-core/tests/m5_bench.rs";
-    if m5_platform != BTreeSet::from([m5_platform_target.to_string()]) {
+    if m5_platform != m5_platform_inputs {
         violations.push("m5-platform focused-owner routing is not exact".into());
     }
-    if !filter_routes_path(&macos_paths, m5_platform_target)
-        || !filter_routes_path(&windows_paths, m5_platform_target)
-    {
-        violations.push("the focused M5 target does not schedule both platform owners".into());
+    for path in &m5_platform_inputs {
+        if !filter_routes_path(&macos_paths, path) || !filter_routes_path(&windows_paths, path) {
+            violations.push(format!(
+                "focused M5 platform input does not schedule both platform owners: {path}"
+            ));
+        }
     }
     if !platform_sensitive_paths
         .iter()
