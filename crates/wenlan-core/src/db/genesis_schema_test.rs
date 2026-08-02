@@ -149,7 +149,7 @@ async fn the_schema_version_constant_matches_what_the_chain_stamps() {
 /// Rebase integration tooth: Kind owns migration 107, so a database already
 /// stamped 107 must still run PR-A's additive genesis migration at 108.
 #[tokio::test]
-async fn schema_107_upgrades_through_genesis_migration_108() {
+async fn schema_107_upgrades_through_genesis_and_the_current_followup() {
     let (db, _tmp) = test_db().await;
     {
         let conn = db.conn.lock().await;
@@ -171,9 +171,9 @@ async fn schema_107_upgrades_through_genesis_migration_108() {
     );
     db.run_migrations(&crate::events::NoopEmitter)
         .await
-        .expect("schema 107 must advance through migration 108");
+        .expect("schema 107 must advance through migrations 108 and 109");
 
-    assert_eq!(user_version(&db).await, 108);
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
     for table in GENESIS_TABLES {
         assert!(object_exists(&db, "table", table).await, "{table} missing");
     }
@@ -409,9 +409,11 @@ async fn an_unknown_signal_kind_is_rejected() {
 #[tokio::test]
 async fn a_new_space_row_defaults_to_disabled_at_epoch_one() {
     let (db, _tmp) = test_db().await;
+    db.create_space("space-1", None, false).await.unwrap();
     let conn = db.conn.lock().await;
     conn.execute(
-        "INSERT INTO genesis_coverage_state (space, opened_at) VALUES ('space-1', unixepoch())",
+        "INSERT INTO genesis_coverage_state (space, opened_at, space_id)
+         SELECT name, unixepoch(), id FROM spaces WHERE name = 'space-1'",
         (),
     )
     .await

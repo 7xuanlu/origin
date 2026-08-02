@@ -7,6 +7,16 @@ finalization atomicity, and on the D12 writer manifest
 (`2026-08-01-m6-d12-writer-manifest.md`) for the enumeration of refresh writers.
 Gate: G7 (`m6_refresh_preserves_truth`).
 
+**Approved amendment (2026-08-02; D4=A, D7=A).** `queued` remains row-less and
+`generated` remains in memory. Lease acquisition atomically inserts or claims a
+durable `leased` row before model work, with the snapshot triple and the job's
+space, readiness epoch, schema version, and reason. The active-job unique
+predicate is exactly `state IN ('leased','retry')`. Finalization also replaces
+the page's exact durable `m6_refresh_dependencies` snapshot in its existing
+outer page/truth/history/receipt/outbox transaction. That snapshot records
+`(space, page_id, page_version, claim_revision_id, root_id)`; `root_id` has no
+cascade-away foreign key, so a missing root remains visible to readiness.
+
 **Grounding (rev 2, findings 2 and 15).** In-repo `file:line` citations were read
 on branch `kg-m6-stage0`, based on **`origin/main` `1c903bec`** — PR #418, *"close
 the M5 daemon gaps"*. Rev 1 was written against `e39048c7` (release 0.15.2), which
@@ -45,7 +55,7 @@ stateDiagram-v2
 |---|---|---|
 | `dirty` | `pages.stale_reason IS NOT NULL` | `set_page_stale` (`crates/wenlan-core/src/db.rs:46115`) |
 | `queued` | no row of its own — the page is in the sweep's selection | `list_stale_pages` (`crates/wenlan-core/src/db.rs:46351`); the sweep *is* the queue |
-| `leased` | `genesis_refresh_jobs` row holding the snapshot triple (PR-A-new) | §1.1 |
+| `leased` | `genesis_refresh_jobs` row holding the snapshot triple plus space/readiness-epoch/schema/reason (PR-A-new) | §1.1 |
 | `generated` | in-memory only; the model output is not durable until it anchors | — |
 | `anchoring` | in-memory; the claim map is computed before any write | §2 |
 | `finalized` | `pages` row advanced by the M5 finalizer | `try_update_page_content` (`crates/wenlan-core/src/db.rs:42422`) |
@@ -76,6 +86,10 @@ D10: *"Capture page version, dependency generation, and active-root-set digest."
 > job then holds a triple that never described a real state. Re-reading at
 > finalize rather than re-deriving means the finalize CAS compares stored values,
 > which is what makes a crash-restart test reproducible.
+
+The durable row stays `leased` while generation and anchoring happen. There is
+no durable `generated` transition: generated prose exists only in memory until
+the existing all-or-nothing finalizer commits it or the job moves to `retry`.
 
 ---
 
@@ -193,10 +207,39 @@ D10: *"Coalesce one active job/card per page and base version."*
 > **Decision S0-62 — the coalescing key is `(page_id, base_page_version)` and it
 > is enforced by a partial unique index on the job table, not by a
 > check-then-insert.** `CREATE UNIQUE INDEX … ON genesis_refresh_jobs(page_id,
-> base_page_version) WHERE state IN ('queued','leased','generated','retry')`. The
+> base_page_version) WHERE state IN ('leased','retry')`. The
 > index is the enforcement so a second sweep cannot open a duplicate job in the
 > window between a read and a write — the same hazard artifact 5's finding F1
 > found in the existing discovery-card path.
+
+This predicate is the amendment to the earlier four-state wording: `queued`
+cannot appear because selection is row-less, and `generated` cannot appear
+because the output remains in memory while its durable job remains `leased`.
+
+### 3.2.1 The durable dependency snapshot
+
+`m6_refresh_dependencies` is the current exact dependency snapshot for a page,
+not a view over current M5 support. Each row carries `space`, `page_id`,
+`page_version`, `claim_revision_id`, and `root_id`. Genesis and refresh
+finalization replace all rows for that page inside the same outer transaction
+that advances the page and writes truth, history, receipt, and outbox effects.
+There is no helper-owned commit, so a failed finalization rolls back the page and
+dependency replacement together.
+
+The `root_id` column intentionally does not reference `provenance_roots` with a
+delete cascade. PR-D precondition 5 is the fail-closed anti-join:
+
+```sql
+SELECT count(*)
+  FROM m6_refresh_dependencies d
+  LEFT JOIN provenance_roots r ON r.root_id = d.root_id
+ WHERE d.space = ?1
+   AND (r.root_id IS NULL OR r.status <> 'active');
+```
+
+Any non-zero result blocks cutover. A later successful finalization repairs the
+condition by atomically replacing the incompatible current snapshot with the
+new page-version/claim/root set.
 
 The revision card gets the same treatment: at most one open card per
 `(page_id, page_version)`. The card's structured payload already carries both
