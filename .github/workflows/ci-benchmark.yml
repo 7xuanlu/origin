@@ -16,6 +16,7 @@ on:
           - all
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -297,9 +298,45 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+  p6-fastembed:
+    name: P6 FastEmbed prerequisite
+    if: inputs.experiment == 'p6-release' || inputs.experiment == 'all'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      # Cache service availability is only an optimization. The pinned
+      # preparer verifies a hit or fills a miss before publishing one snapshot
+      # for the three Windows rows in this run.
+      - name: Restore P6 portable FastEmbed model
+        id: p6-fastembed-restore
+        continue-on-error: true
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          # actions/cache versions include path identity. This must exactly
+          # match the main CI writer; an absolute spelling is a different key.
+          path: .fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q-v3-portable
+          enableCrossOsArchive: "true"
+      - name: Prepare P6 portable FastEmbed model
+        run: python3 scripts/prepare-fastembed-cache.py --cache-dir .fastembed_cache
+      - name: Publish P6 portable FastEmbed model for this run
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: p6-fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
+          path: .fastembed_cache
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
+
   p6-release:
     name: P6 ${{ matrix.os }} ${{ matrix.profile }} ${{ matrix.cache_mode }}
     if: inputs.experiment == 'p6-release' || inputs.experiment == 'all'
+    needs: p6-fastembed
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -324,14 +361,20 @@ jobs:
         with:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
-      - name: Restore portable FastEmbed model for Windows smoke
+      - name: Download P6 portable FastEmbed model
         if: runner.os == 'Windows'
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        id: p6-fastembed-download
+        continue-on-error: true
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          path: ${{ env.FASTEMBED_CACHE_DIR }}
-          key: fastembed-bge-base-en-v1.5-q-v3-portable
-          enableCrossOsArchive: "true"
-          fail-on-cache-miss: "true"
+          name: p6-fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
+          path: .fastembed_cache
+      - name: Retry P6 portable FastEmbed model download
+        if: runner.os == 'Windows' && steps.p6-fastembed-download.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "p6-fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
       - name: Install sqlite3 (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
