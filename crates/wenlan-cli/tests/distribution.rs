@@ -114,13 +114,14 @@ fn npm_package_allowlists_match_release_generated_files() {
 }
 
 #[test]
-fn release_workflow_consumes_target_inventory_and_publishes_npm_packages() {
+fn release_workflow_promotes_target_inventory_and_publishes_npm_packages() {
     let workflow = fs::read_to_string(repo_root().join(".github/workflows/release.yml"))
         .expect("read release workflow");
     for needle in [
-        "Build & Publish ${{ matrix.target }}",
-        "matrix: ${{ fromJSON(needs.prepare-release.outputs.release-targets) }}",
-        "python3 .release-tools/scripts/release_targets.py matrix",
+        "Promote exact validated release assets",
+        "scripts/release-promotion.py consume-main-receipt",
+        "scripts/release-promotion.py download-assets",
+        "name: docker-runtime-inputs",
         "Publish wenlan-mcp",
         "Publish wenlan",
         "cp README.md crates/wenlan-mcp/npm/README.md",
