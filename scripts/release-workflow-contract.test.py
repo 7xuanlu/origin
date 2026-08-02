@@ -78,6 +78,10 @@ def contract_violations(
         violations.append("release-please package always-update is not exact true")
     if "- '.github/workflows/release-pr-maintenance.yml'" not in ci:
         violations.append("fast release maintenance cannot bootstrap its Rust contract")
+    if "associated_pulls=associated" not in promotion:
+        violations.append(
+            "main release gate does not reuse one commit association snapshot"
+        )
     ci_gate = named_step_body(job_body(ci, "detect-changes"), "Verify reusable release merge")
     for marker in [
         "python3 scripts/release-promotion.py gate-main",
@@ -1084,6 +1088,12 @@ def main() -> None:
         raise AssertionError("release workflow contract drift:\n" + "\n".join(violations))
 
     release_mutations = [
+        (
+            "associated_pulls=associated",
+            "associated_pulls=None",
+            "one commit association snapshot",
+            "promotion",
+        ),
         (
             "Start-Sleep -Seconds 25",
             "Start-Sleep -Seconds 5",

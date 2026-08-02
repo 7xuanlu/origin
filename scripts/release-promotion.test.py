@@ -36,6 +36,163 @@ class FakeApi:
 
 
 class ReleasePromotionTests(unittest.TestCase):
+    def test_release_context_reuses_the_association_snapshot(self) -> None:
+        main_sha = "2" * 40
+        head_sha = "3" * 40
+        association = {
+            "number": 430,
+            "base": {"ref": "main"},
+            "head": {"ref": PROMOTION.RELEASE_BRANCH, "sha": head_sha},
+        }
+        path = f"/repos/{REPOSITORY}/commits/{main_sha}/pulls"
+        api = FakeApi(
+            {
+                (path, (("per_page", 100),)): [association],
+            }
+        )
+        proof = mock.Mock(verified=True, pr_head_sha=head_sha)
+
+        with mock.patch.object(
+            PROMOTION.MERGE_PROOF,
+            "verify_release_merge",
+            return_value=proof,
+        ) as verify:
+            resolved, resolved_head = PROMOTION._release_context(
+                api, REPOSITORY, main_sha
+            )
+
+        self.assertIs(resolved, proof)
+        self.assertEqual(resolved_head, head_sha)
+        verify.assert_called_once_with(
+            api,
+            REPOSITORY,
+            event_name="push",
+            ref="refs/heads/main",
+            sha=main_sha,
+            associated_pulls=[association],
+        )
+        self.assertEqual(api.calls, [(path, (("per_page", 100),))])
+
+    def test_release_context_recovers_an_initially_missing_association(self) -> None:
+        main_sha = "2" * 40
+        head_sha = "3" * 40
+        association_path = f"/repos/{REPOSITORY}/commits/{main_sha}/pulls"
+        commit_path = f"/repos/{REPOSITORY}/git/commits/{main_sha}"
+        pr_path = f"/repos/{REPOSITORY}/pulls/430"
+        release_pr = {
+            "number": 430,
+            "state": "closed",
+            "merged_at": "2026-08-02T19:57:49Z",
+            "merge_commit_sha": main_sha,
+            "base": {"ref": "main"},
+            "head": {"ref": PROMOTION.RELEASE_BRANCH, "sha": head_sha},
+        }
+        api = FakeApi(
+            {
+                (association_path, (("per_page", 100),)): [],
+                (commit_path, ()): {
+                    "message": "chore(main): release 0.15.4 (#430)\n\nrelease body"
+                },
+                (pr_path, ()): release_pr,
+            }
+        )
+        proof = mock.Mock(verified=True, pr_head_sha=head_sha)
+
+        with mock.patch.object(
+            PROMOTION.MERGE_PROOF,
+            "verify_release_merge",
+            return_value=proof,
+        ) as verify:
+            resolved, resolved_head = PROMOTION._release_context(
+                api, REPOSITORY, main_sha
+            )
+
+        self.assertIs(resolved, proof)
+        self.assertEqual(resolved_head, head_sha)
+        verify.assert_called_once_with(
+            api,
+            REPOSITORY,
+            event_name="push",
+            ref="refs/heads/main",
+            sha=main_sha,
+            associated_pulls=[release_pr],
+        )
+
+    def test_release_context_does_not_delay_an_ordinary_main_commit(self) -> None:
+        main_sha = "2" * 40
+        association_path = f"/repos/{REPOSITORY}/commits/{main_sha}/pulls"
+        commit_path = f"/repos/{REPOSITORY}/git/commits/{main_sha}"
+        api = FakeApi(
+            {
+                (association_path, (("per_page", 100),)): [],
+                (commit_path, ()): {"message": "ci: ordinary main change"},
+            }
+        )
+
+        resolved, resolved_head = PROMOTION._release_context(api, REPOSITORY, main_sha)
+
+        self.assertIsNone(resolved)
+        self.assertIsNone(resolved_head)
+        self.assertEqual(
+            api.calls,
+            [
+                (association_path, (("per_page", 100),)),
+                (commit_path, ()),
+            ],
+        )
+
+    def test_release_context_fails_closed_on_a_spoofed_release_title(self) -> None:
+        main_sha = "2" * 40
+        association_path = f"/repos/{REPOSITORY}/commits/{main_sha}/pulls"
+        commit_path = f"/repos/{REPOSITORY}/git/commits/{main_sha}"
+        pr_path = f"/repos/{REPOSITORY}/pulls/430"
+        api = FakeApi(
+            {
+                (association_path, (("per_page", 100),)): [],
+                (commit_path, ()): {
+                    "message": "chore(main): release 0.15.4 (#430)"
+                },
+                (pr_path, ()): {
+                    "number": 430,
+                    "base": {"ref": "other"},
+                    "head": {"ref": PROMOTION.RELEASE_BRANCH},
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(
+            PROMOTION.PromotionError, "does not resolve to the release-please PR"
+        ):
+            PROMOTION._release_context(api, REPOSITORY, main_sha)
+
+    def test_release_context_rejects_an_old_release_pr_from_the_title(self) -> None:
+        main_sha = "2" * 40
+        association_path = f"/repos/{REPOSITORY}/commits/{main_sha}/pulls"
+        commit_path = f"/repos/{REPOSITORY}/git/commits/{main_sha}"
+        pr_path = f"/repos/{REPOSITORY}/pulls/430"
+        api = FakeApi(
+            {
+                (association_path, (("per_page", 100),)): [],
+                (commit_path, ()): {
+                    "message": "chore(main): release 0.15.4 (#430)"
+                },
+                (pr_path, ()): {
+                    "number": 430,
+                    "state": "closed",
+                    "merged_at": "2026-08-01T00:00:00Z",
+                    "merge_commit_sha": "4" * 40,
+                    "base": {"ref": "main"},
+                    "head": {"ref": PROMOTION.RELEASE_BRANCH, "sha": "3" * 40},
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(
+            PROMOTION.PromotionError,
+            "release merge proof failed: expected one associated merged release PR, found 0",
+        ):
+            PROMOTION._release_context(api, REPOSITORY, main_sha)
+
     def test_conclusion_check_suite_maps_to_exact_ci_run(self) -> None:
         path = f"/repos/{REPOSITORY}/actions/workflows/{PROMOTION.CI_WORKFLOW_FILE}/runs"
         params = {
