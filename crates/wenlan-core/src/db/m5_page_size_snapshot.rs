@@ -27,7 +27,7 @@ pub struct M5PageSizeSnapshotDb {
 
 /// Mutation-refusal evidence without exposing the underlying libSQL handle.
 pub struct M5MutationProbe {
-    pub insert_refused: bool,
+    pub dml_refused: bool,
     pub ddl_refused: bool,
 }
 
@@ -69,12 +69,9 @@ impl M5PageSizeSnapshotDb {
     }
 
     pub async fn mutation_probe_for_test(&self) -> Result<M5MutationProbe> {
-        let insert_refused = self
+        let dml_refused = self
             .connection
-            .execute(
-                "INSERT INTO pages (id, content, status) VALUES ('attack', 'x', 'active')",
-                (),
-            )
+            .execute("UPDATE pages SET content = content WHERE 0 = 1", ())
             .await
             .is_err();
         let ddl_refused = self
@@ -83,7 +80,7 @@ impl M5PageSizeSnapshotDb {
             .await
             .is_err();
         Ok(M5MutationProbe {
-            insert_refused,
+            dml_refused,
             ddl_refused,
         })
     }

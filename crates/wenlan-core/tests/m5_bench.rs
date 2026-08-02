@@ -305,7 +305,7 @@ async fn exporter_is_read_only_aggregate_only_atomic_and_no_clobber() {
 
 #[cfg(feature = "eval-harness")]
 #[tokio::test]
-async fn shared_page_size_connection_rejects_insert_and_ddl() {
+async fn shared_page_size_connection_rejects_dml_and_ddl() {
     let directory = tempfile::tempdir().unwrap();
     let db_path = directory.path().join("read-only.db");
     create_pages_db(&db_path, &five_ascii_pages()).await;
@@ -313,7 +313,7 @@ async fn shared_page_size_connection_rejects_insert_and_ddl() {
         .await
         .unwrap();
     let probe = database.mutation_probe_for_test().await.unwrap();
-    assert!(probe.insert_refused);
+    assert!(probe.dml_refused);
     assert!(probe.ddl_refused);
 }
 
