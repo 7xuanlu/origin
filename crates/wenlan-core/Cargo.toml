@@ -71,6 +71,7 @@ tempfile = { workspace = true }
 fs2 = { workspace = true }
 cap-std = { workspace = true }
 cap-fs-ext = { workspace = true }
+same-file = { workspace = true }
 
 # Benchmark binaries (model_benchmark, deep_distill, etc.)
 env_logger = "0.11"
