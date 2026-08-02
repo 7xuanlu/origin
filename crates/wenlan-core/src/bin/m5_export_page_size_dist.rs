@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{bail, Context, Result};
-use libsql::OpenFlags;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use wenlan_core::eval::m5_bench_corpus::distribution_from_fixed_counts;
+use wenlan_core::eval::m5_bench_corpus::{
+    distribution_from_fixed_counts, open_page_size_db_read_only,
+};
 
 const AGGREGATE_QUERY: &str = r#"
 SELECT
@@ -43,17 +44,9 @@ async fn run() -> Result<()> {
     if !args.db.is_file() {
         bail!("--db must name an existing database file");
     }
+    reject_database_output_alias(&args.db, &args.output)?;
 
-    let database = libsql::Builder::new_local(&args.db)
-        .flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .build()
-        .await
-        .context("open database read-only")?;
-    let connection = database.connect().context("connect read-only database")?;
-    connection
-        .execute("PRAGMA query_only = ON", ())
-        .await
-        .context("enforce query-only connection")?;
+    let connection = open_page_size_db_read_only(&args.db).await?;
     let mut rows = connection
         .query(AGGREGATE_QUERY, ())
         .await
@@ -78,6 +71,27 @@ async fn run() -> Result<()> {
         distribution.sample_size,
         distribution.buckets.len()
     );
+    Ok(())
+}
+
+fn reject_database_output_alias(db: &Path, output: &Path) -> Result<()> {
+    let canonical_db = std::fs::canonicalize(db).context("canonicalize --db")?;
+    let canonical_output = match std::fs::symlink_metadata(output) {
+        Ok(_) => std::fs::canonicalize(output).context("canonicalize existing --output")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let file_name = output
+                .file_name()
+                .context("--output must include a file name")?;
+            let parent = output.parent().unwrap_or_else(|| Path::new("."));
+            std::fs::canonicalize(parent)
+                .context("canonicalize --output parent")?
+                .join(file_name)
+        }
+        Err(error) => return Err(error).context("inspect --output"),
+    };
+    if canonical_db == canonical_output {
+        bail!("--output must not alias --db");
+    }
     Ok(())
 }
 
