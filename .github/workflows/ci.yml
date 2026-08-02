@@ -234,6 +234,7 @@ jobs:
               - 'crates/wenlan-core/src/edge_grounding.rs'
               - 'crates/wenlan-core/src/provenance.rs'
               - 'crates/wenlan-core/src/db.rs'
+              - 'crates/wenlan-core/src/db/m5_page_size_snapshot.rs'
               - 'crates/wenlan-core/src/db/community_grouping_state.rs'
               - 'crates/wenlan-core/src/refinery/mod.rs'
               - 'crates/wenlan-core/src/db/presence_review_test.rs'
@@ -249,6 +250,12 @@ jobs:
               - 'crates/wenlan-core/src/sources/directory.rs'
               - 'crates/wenlan-core/tests/m4_community_gates.rs'
               - 'crates/wenlan-core/tests/m5_bench.rs'
+              - 'crates/wenlan-core/src/bin/m5_export_page_size_dist.rs'
+              - 'crates/wenlan-core/src/eval/m5_bench_corpus.rs'
+              - 'crates/wenlan-core/src/eval/m5_snapshot_io.rs'
+              - 'crates/wenlan-core/tests/fixtures/m5_bench_corpus.sha256'
+              - 'crates/wenlan-core/tests/fixtures/m5_judge_accuracy.jsonl'
+              - 'crates/wenlan-core/tests/fixtures/m5_page_size_dist.json'
               - 'crates/**/*.c'
               - 'crates/**/*.cc'
               - 'crates/**/*.cpp'
@@ -297,6 +304,7 @@ jobs:
               - 'crates/wenlan-server/tests/graceful_shutdown.rs'
               - 'crates/wenlan-mcp/npm/install.js'
               - 'crates/wenlan-core/src/config.rs'
+              - 'crates/wenlan-core/src/db/m5_page_size_snapshot.rs'
               - 'crates/wenlan-core/src/db/presence_review_test.rs'
               - 'crates/wenlan-core/src/drift_guard.rs'
               - 'crates/wenlan-core/src/export/knowledge.rs'
@@ -308,6 +316,12 @@ jobs:
               - 'crates/wenlan-core/src/repair_plan/**'
               - 'crates/wenlan-core/src/sources/directory.rs'
               - 'crates/wenlan-core/tests/m5_bench.rs'
+              - 'crates/wenlan-core/src/bin/m5_export_page_size_dist.rs'
+              - 'crates/wenlan-core/src/eval/m5_bench_corpus.rs'
+              - 'crates/wenlan-core/src/eval/m5_snapshot_io.rs'
+              - 'crates/wenlan-core/tests/fixtures/m5_bench_corpus.sha256'
+              - 'crates/wenlan-core/tests/fixtures/m5_judge_accuracy.jsonl'
+              - 'crates/wenlan-core/tests/fixtures/m5_page_size_dist.json'
               - 'crates/**/*.c'
               - 'crates/**/*.cc'
               - 'crates/**/*.cpp'
@@ -365,9 +379,16 @@ jobs:
               - 'crates/wenlan-core/src/refinery/mod.rs'
               - 'crates/wenlan-core/tests/m4_community_gates.rs'
             m5-platform:
-              # m5_bench has Unix-only symlink-retarget controls. Keep their
-              # two-sided platform proof focused instead of widening every
-              # core integration target onto the generic platform plan.
+              # Exact M5-owned implementation inputs for the focused target.
+              # Every entry also schedules the platform owners without making
+              # shared module/manifest changes pay for the native M5 lane.
+              - 'crates/wenlan-core/src/bin/m5_export_page_size_dist.rs'
+              - 'crates/wenlan-core/src/db/m5_page_size_snapshot.rs'
+              - 'crates/wenlan-core/src/eval/m5_bench_corpus.rs'
+              - 'crates/wenlan-core/src/eval/m5_snapshot_io.rs'
+              - 'crates/wenlan-core/tests/fixtures/m5_bench_corpus.sha256'
+              - 'crates/wenlan-core/tests/fixtures/m5_judge_accuracy.jsonl'
+              - 'crates/wenlan-core/tests/fixtures/m5_page_size_dist.json'
               - 'crates/wenlan-core/tests/m5_bench.rs'
             nextest-config:
               # Repository config supports host/target-specific overrides.

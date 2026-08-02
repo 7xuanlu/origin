@@ -9,10 +9,10 @@ use std::process::Command;
 #[cfg(feature = "eval-harness")]
 use wenlan_core::eval::m5_bench_corpus::distribution_from_fixed_counts;
 use wenlan_core::eval::m5_bench_corpus::{
-    canonical_manifest_digest, corpus_summary, merge_sparse_buckets, parse_accuracy_jsonl,
-    verify_manifest_digest, write_corpus_stream, AccuracyCategory, PageSizeBucket,
-    PageSizeDistribution, M5_BENCH_MEMORY_COUNT, M5_BENCH_PAGE_COUNT, M5_BENCH_SEED,
-    M5_CORPUS_ENCODING, PAGE_SIZE_K_MIN, PAGE_SIZE_SCHEMA_VERSION,
+    corpus_summary, merge_sparse_buckets, parse_accuracy_jsonl, verify_manifest_digest,
+    write_corpus_stream, AccuracyCategory, PageSizeBucket, PageSizeDistribution,
+    M5_BENCH_MEMORY_COUNT, M5_BENCH_PAGE_COUNT, M5_BENCH_SEED, M5_CORPUS_ENCODING, PAGE_SIZE_K_MIN,
+    PAGE_SIZE_SCHEMA_VERSION,
 };
 
 const DISTRIBUTION_BYTES: &[u8] = include_bytes!("fixtures/m5_page_size_dist.json");
@@ -206,27 +206,34 @@ fn manifest_covers_generated_corpus_and_exact_fixture_bytes() {
     )
     .unwrap();
 
-    let expected =
-        canonical_manifest_digest(&corpus.sha256, DISTRIBUTION_BYTES, ACCURACY_BYTES).unwrap();
     let changed_corpus = "0".repeat(64);
-    assert_ne!(
-        canonical_manifest_digest(&changed_corpus, DISTRIBUTION_BYTES, ACCURACY_BYTES).unwrap(),
-        expected
-    );
+    assert!(verify_manifest_digest(
+        MANIFEST_DIGEST_BYTES,
+        &changed_corpus,
+        DISTRIBUTION_BYTES,
+        ACCURACY_BYTES,
+    )
+    .is_err());
 
     let mut changed_distribution = DISTRIBUTION_BYTES.to_vec();
     changed_distribution[0] ^= 1;
-    assert_ne!(
-        canonical_manifest_digest(&corpus.sha256, &changed_distribution, ACCURACY_BYTES).unwrap(),
-        expected
-    );
+    assert!(verify_manifest_digest(
+        MANIFEST_DIGEST_BYTES,
+        &corpus.sha256,
+        &changed_distribution,
+        ACCURACY_BYTES,
+    )
+    .is_err());
 
     let mut changed_accuracy = ACCURACY_BYTES.to_vec();
     changed_accuracy[0] ^= 1;
-    assert_ne!(
-        canonical_manifest_digest(&corpus.sha256, DISTRIBUTION_BYTES, &changed_accuracy).unwrap(),
-        expected
-    );
+    assert!(verify_manifest_digest(
+        MANIFEST_DIGEST_BYTES,
+        &corpus.sha256,
+        DISTRIBUTION_BYTES,
+        &changed_accuracy,
+    )
+    .is_err());
 }
 
 #[cfg(feature = "eval-harness")]
@@ -439,6 +446,9 @@ async fn snapshot_output_extension_is_json_case_insensitive_and_fail_closed() {
     let directory = tempfile::tempdir().unwrap();
     let db_path = directory.path().join("fixture.db");
     create_pages_db(&db_path, &five_ascii_pages()).await;
+    let database = wenlan_core::db::M5PageSizeSnapshotDb::open(&db_path)
+        .await
+        .unwrap();
 
     for invalid in [
         "missing-extension",
@@ -451,7 +461,7 @@ async fn snapshot_output_extension_is_json_case_insensitive_and_fail_closed() {
     ] {
         let output = directory.path().join(invalid);
         assert!(
-            wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&db_path, &output, true)
+            wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&database, &output, true)
                 .is_err(),
             "accepted invalid output extension: {invalid}"
         );
@@ -465,7 +475,7 @@ async fn snapshot_output_extension_is_json_case_insensitive_and_fail_closed() {
             .path()
             .join(std::ffi::OsString::from_vec(b"non-utf8.\xff".to_vec()));
         assert!(
-            wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&db_path, &output, true)
+            wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&database, &output, true)
                 .is_err()
         );
         assert!(!output.exists());
@@ -474,7 +484,7 @@ async fn snapshot_output_extension_is_json_case_insensitive_and_fail_closed() {
     for valid in ["ordinary.json", "uppercase.JSON"] {
         let output = directory.path().join(valid);
         let prepared =
-            wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&db_path, &output, true)
+            wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&database, &output, true)
                 .unwrap();
         prepared.write(b"safe\n").unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), b"safe\n");
@@ -491,6 +501,9 @@ async fn prepared_snapshot_refuses_parent_retarget_before_temp_creation() {
     std::fs::create_dir(&db_dir).unwrap();
     let db_path = db_dir.join("origin_memory.json");
     create_pages_db(&db_path, &five_ascii_pages()).await;
+    let database = wenlan_core::db::M5PageSizeSnapshotDb::open(&db_path)
+        .await
+        .unwrap();
     let db_bytes = std::fs::read(&db_path).unwrap();
     let db_metadata = std::fs::metadata(&db_path).unwrap();
     let parent_link = directory.path().join("parent-link");
@@ -498,7 +511,7 @@ async fn prepared_snapshot_refuses_parent_retarget_before_temp_creation() {
     let output = parent_link.join("origin_memory.json");
 
     let prepared =
-        wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&db_path, &output, true).unwrap();
+        wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&database, &output, true).unwrap();
     std::fs::remove_file(&parent_link).unwrap();
     std::os::unix::fs::symlink(&db_dir, &parent_link).unwrap();
 
@@ -509,6 +522,37 @@ async fn prepared_snapshot_refuses_parent_retarget_before_temp_creation() {
     assert_eq!(std::fs::read(&db_path).unwrap(), db_bytes);
     assert_eq!(std::fs::read_dir(&safe_dir).unwrap().count(), 0);
     assert_eq!(std::fs::read_dir(&db_dir).unwrap().count(), 1);
+}
+
+#[cfg(all(feature = "eval-harness", unix))]
+#[tokio::test]
+async fn snapshot_identity_follows_open_database_not_retargeted_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_db = directory.path().join("first.json");
+    let second_db = directory.path().join("second.json");
+    create_pages_db(&first_db, &five_ascii_pages()).await;
+    create_pages_db(&second_db, &[page("y".repeat(300), "active")]).await;
+    let first_before = std::fs::read(&first_db).unwrap();
+    let db_link = directory.path().join("database-link");
+    std::os::unix::fs::symlink(&first_db, &db_link).unwrap();
+
+    let database = wenlan_core::db::M5PageSizeSnapshotDb::open(&db_link)
+        .await
+        .unwrap();
+    assert_eq!(
+        database.fixed_counts().await.unwrap(),
+        [5, 0, 0, 0, 0, 0, 0, 0]
+    );
+    std::fs::remove_file(&db_link).unwrap();
+    std::os::unix::fs::symlink(&second_db, &db_link).unwrap();
+
+    let prepared =
+        wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&database, &first_db, true);
+    assert!(
+        prepared.is_err(),
+        "snapshot identity followed the retargeted path instead of the open database"
+    );
+    assert_eq!(std::fs::read(&first_db).unwrap(), first_before);
 }
 
 #[cfg(feature = "eval-harness")]
