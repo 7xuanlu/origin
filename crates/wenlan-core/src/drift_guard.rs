@@ -1125,6 +1125,16 @@ fn clippy_syntax_guard_forbids_direct_text_embedding_initializers() {
 fn fastembed_ci_cache_contract_detects_wrong_path_and_order() {
     let workflow = r#"
 jobs:
+  macos-nextest:
+    env:
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
+    steps:
+      - name: Run exact macOS archive partition
+      - name: Download portable FastEmbed model
+        uses: actions/download-artifact@bad
+        with:
+          path: .fastembed_cache
+          name: stale
   test:
     env:
       FASTEMBED_CACHE_DIR: /tmp/wrong-fastembed-cache
@@ -1169,6 +1179,13 @@ jobs:
             .iter()
             .any(|violation| violation.contains("after consumer")),
         "fixture must violate restore ordering: {violations:?}"
+    );
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("job macos-nextest downloads FastEmbed")
+                && violation.contains("after consumer")
+        }),
+        "fixture must keep the macOS archive consumer in restore-order coverage: {violations:?}"
     );
     assert!(
         violations
@@ -2765,10 +2782,10 @@ fn ci_routing_contract_violations(
         }
     }
     let differential_timeout =
-        "${{ (matrix.os == 'windows-2022' || github.event_name != 'pull_request') && 60 || 45 }}";
+        "${{ (matrix.os == 'windows-2022' || github.event_name != 'pull_request') && 60 || 30 }}";
     if ci["jobs"]["test"]["timeout-minutes"].as_str() != Some(differential_timeout) {
         violations.push(
-            "test does not enforce the 45-minute non-Windows PR budget while allowing a 60-minute Windows/non-PR backstop".into(),
+            "test does not enforce the 30-minute macOS PR budget while allowing a 60-minute Windows/non-PR backstop".into(),
         );
     }
     let release_preflight_condition = ci["jobs"]["release-preflight"]["if"]
@@ -2851,7 +2868,7 @@ fn ci_routing_contract_violations(
         );
     }
     let platform_condition = ci["jobs"]["test"]["if"].as_str().unwrap_or_default();
-    let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (needs.detect-changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true')) || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch')";
+    let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (github.event_name != 'pull_request' && needs.detect-changes.outputs.macos == 'true') || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch')";
     if platform_condition != expected_platform_condition {
         violations.push(
             "platform test job does not derive from rust-ci-required plus its platform owner"
@@ -2897,10 +2914,16 @@ fn ci_routing_contract_violations(
         r#"include="""#,
         r#"elif [ "${{ startsWith(github.head_ref, 'release-please--branches--') }}" = "true" ]; then"#,
         r#"include="${macos},${windows}""#,
-        r#"elif [ "${{ steps.filter.outputs.macos }}" = "true" ] && [ "${{ steps.filter.outputs.windows }}" = "true" ]; then"#,
+        r#"elif [ "${{ github.event_name }}" != "pull_request" ] && [ "${{ steps.filter.outputs.macos }}" = "true" ] && [ "${{ steps.filter.outputs.windows }}" = "true" ]; then"#,
         r#"include="${macos},${windows}""#,
-        r#"elif [ "${{ steps.filter.outputs.macos }}" = "true" ]; then"#,
+        r#"elif [ "${{ github.event_name }}" != "pull_request" ] && [ "${{ steps.filter.outputs.macos }}" = "true" ]; then"#,
         r#"include="$macos""#,
+        r#"elif [ "${{ steps.filter.outputs.m5-platform }}" = "true" ] || [ "${{ steps.filter.outputs.nextest-config }}" = "true" ]; then"#,
+        r#"if [ "${{ steps.filter.outputs.windows }}" = "true" ]; then"#,
+        r#"include="${macos},${windows}""#,
+        "else",
+        r#"include="$macos""#,
+        "fi",
         r#"elif [ "${{ steps.filter.outputs.windows }}" = "true" ]; then"#,
         r#"include="$windows""#,
         "else",
@@ -2910,8 +2933,8 @@ fn ci_routing_contract_violations(
     ];
     if matrix_lines != expected_matrix_lines {
         violations.push(
-            "dynamic OS matrix does not keep ordinary PR and main push on the same owner-driven \
-             route with workflow_dispatch as the only event-wide full-platform backstop"
+            "dynamic OS matrix does not reserve direct macOS PR runners for M5/nextest owners \
+             while preserving Windows routing and non-PR platform backstops"
                 .into(),
         );
     }
@@ -2951,7 +2974,7 @@ fn ci_routing_contract_violations(
     let run_fmt = "run_fmt='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.fmt-required == 'true' }}'";
     let run_clippy = "run_clippy='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.clippy-required == 'true' }}'";
     let run_macos_archive = "run_macos_archive='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.macos-archive-contract == 'true' || (needs.detect-changes.outputs.macos == 'true' && (needs.detect-changes.outputs.platform-workspace-lib-required == 'true' || needs.detect-changes.outputs.platform-cli-server-integration-required == 'true' || needs.detect-changes.outputs.macos-m4 == 'true')) || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--')) }}'";
-    let run_platform = "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (needs.detect-changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true')) || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch') }}'";
+    let run_platform = "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (github.event_name != 'pull_request' && needs.detect-changes.outputs.macos == 'true') || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch') }}'";
     for (name, expected) in [
         ("run_fmt", run_fmt),
         ("run_clippy", run_clippy),
@@ -3393,8 +3416,8 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
             1,
         )
         .replacen(
-            "if [ \"${{ github.event_name }}\" = \"workflow_dispatch\" ]; then",
-            "if [ \"${{ github.event_name }}\" != \"workflow_dispatch\" ]; then",
+            "elif [ \"${{ github.event_name }}\" != \"pull_request\" ] && [ \"${{ steps.filter.outputs.macos }}\" = \"true\" ] && [ \"${{ steps.filter.outputs.windows }}\" = \"true\" ]; then",
+            "elif [ \"${{ steps.filter.outputs.macos }}\" = \"true\" ] && [ \"${{ steps.filter.outputs.windows }}\" = \"true\" ]; then",
             1,
         )
         .replacen(
@@ -3442,7 +3465,7 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
         "exact generic macOS plus Windows filter inventories",
         "routes test-only drift_guard.rs into a native runner",
         "release-preflight is not isolated to release-sensitive changes",
-        "ordinary PR and main push on the same owner-driven route",
+        "reserve direct macOS PR runners for M5/nextest owners",
         "macos-m4 focused-owner allowlist has unreviewed path",
         "macos-m4 focused source crates/wenlan-core/src/db.rs acquired macos-specific cfg",
         "focused M5 platform owners",
@@ -3854,10 +3877,28 @@ fn ci_release_reuse_and_linux_shards_are_fail_closed() {
         ["slice:1/3", "slice:2/3", "slice:3/3"],
         "the shared Linux archive must fan out far enough to keep the PR tail below 20 minutes"
     );
+    let linux_command_helper = planner
+        .split("def command_groups_for")
+        .nth(1)
+        .and_then(|suffix| suffix.split("def _load_json_file").next())
+        .expect("Linux archive command helper");
+    let nextest_match_validator = planner
+        .split("def _require_nextest_match")
+        .nth(1)
+        .and_then(|suffix| suffix.split("def _require_filterset_match").next())
+        .expect("nextest match validator");
+    let linux_empty_shard_flags = linux_command_helper.matches("--no-tests=pass").count()
+        + nextest_match_validator.matches("--no-tests=pass").count();
     assert_eq!(
-        planner.matches("--no-tests=pass").count(),
+        linux_empty_shard_flags, 2,
+        "a globally non-empty Linux filterset may still leave one nextest slice empty; its run must allow that shard while list validation strips the run-only flag"
+    );
+    let linux_flag_mutation = linux_command_helper.replacen("--no-tests=pass", "", 1);
+    assert_ne!(
+        linux_flag_mutation.matches("--no-tests=pass").count()
+            + nextest_match_validator.matches("--no-tests=pass").count(),
         2,
-        "a globally non-empty filterset may still leave one nextest slice empty; the run must allow that shard while list validation strips the run-only flag"
+        "Linux archive empty-shard mutation unexpectedly passed"
     );
     let consumer_steps = ci["jobs"]["linux-nextest"]["steps"]
         .as_sequence()
@@ -4149,6 +4190,11 @@ fn macos_archive_contract_violations(ci_workflow: &str, planner: &str) -> Vec<St
             violations.push(format!("macOS archive runner omits {required:?}"));
         }
     }
+    if run_helper.matches("--no-tests=pass").count() != 2 {
+        violations.push(
+            "macOS integration and M4 archive runners do not each allow an empty slice".into(),
+        );
+    }
     violations
 }
 
@@ -4228,6 +4274,17 @@ fn macos_nextest_archive_contract_rejects_routing_and_execution_mutations() {
             .iter()
             .any(|violation| violation.contains("feature-specific")),
         "feature-graph mutation unexpectedly passed"
+    );
+    let empty_slice_mutation = planner.replacen(
+        "                \"--no-tests=pass\",\n                \"--partition\",",
+        "                \"--partition\",",
+        1,
+    );
+    assert!(
+        macos_archive_contract_violations(&workflow, &empty_slice_mutation)
+            .iter()
+            .any(|violation| violation.contains("each allow an empty slice")),
+        "macOS empty-slice mutation unexpectedly passed"
     );
 }
 
@@ -4600,7 +4657,7 @@ jobs:
         "nextest config",
         "release-profile-sensitive",
         "native/build-sensitive",
-        "45-minute non-Windows PR budget",
+        "30-minute macOS PR budget",
         "release-sensitive changes and explicit release backstops",
         "rust-lld",
         "debug runtime artifacts",
