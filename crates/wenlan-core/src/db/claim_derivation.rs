@@ -27,9 +27,9 @@
 //!
 //! Leases are the crash story. A worker takes a job with an expiry; if it dies,
 //! the expiry passes and another worker reclaims it. Every terminal transition
-//! is guarded on `lease_owner`, so a worker whose lease was reclaimed while it
-//! was stalled cannot finish the job out from under its new owner — it fails
-//! the guard and its write is a no-op.
+//! is guarded on the exact leased [`DerivationJob`], including its monotone run
+//! generation, so a worker whose lease was reclaimed while it was stalled
+//! cannot finish the successor even when both runs use the same owner string.
 
 use super::MemoryDB;
 use crate::WenlanError;
@@ -547,6 +547,11 @@ impl MemoryDB {
     /// One transaction makes the pair atomic: either the page is demoted and
     /// queued, or nothing changed and the error is the whole truth.
     pub async fn enqueue_stale_derivation_jobs(&self, limit: i64) -> Result<usize, WenlanError> {
+        if limit <= 0 {
+            return Err(WenlanError::Validation(format!(
+                "claim derivation sweep limit must be positive; got {limit}"
+            )));
+        }
         let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock().await;
         let tx = conn
@@ -575,74 +580,82 @@ impl MemoryDB {
         now: i64,
         limit: i64,
     ) -> Result<usize, WenlanError> {
-        // Freeze BOTH batches before any cleanup write. A `done` job is what
-        // makes stale completion block a new pending row, but deleting every
-        // stale `done` row before applying `limit` turns a nominal 25-page turn
-        // into a corpus-sized write. The connection-local temp tables bind job
-        // deletion, pending insertion, and drift demotion to the same captured
-        // sets. They participate in this transaction, so rollback loses the
-        // captures together with every queue and truth-state change.
+        // Freeze ONE distinct union before any cleanup write. A `done` job is
+        // what makes stale completion block a new pending row, but deleting
+        // every stale `done` row before applying `limit` turns a nominal
+        // 25-page turn into a corpus-sized write. Giving stale markers and
+        // drift separate limited tables is not bounded either: disjoint sets
+        // advance 2 * limit pages, while overlaps are counted twice. The one
+        // connection-local batch is the overall budget and carries the bit
+        // needed to demote only rows selected from the drift arm. It
+        // participates in this transaction, so rollback loses the capture
+        // together with every queue and truth-state change.
         conn.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS claim_derivation_backlog_batch (
+            "CREATE TEMP TABLE IF NOT EXISTS claim_derivation_sweep_batch (
                  page_id TEXT NOT NULL,
                  page_version INTEGER NOT NULL,
+                 needs_demotion INTEGER NOT NULL CHECK (needs_demotion IN (0, 1)),
                  PRIMARY KEY (page_id, page_version)
              ) WITHOUT ROWID;
-             CREATE TEMP TABLE IF NOT EXISTS claim_derivation_drift_batch (
-                 page_id TEXT NOT NULL,
-                 page_version INTEGER NOT NULL,
-                 PRIMARY KEY (page_id, page_version)
-             ) WITHOUT ROWID;
-             DELETE FROM claim_derivation_backlog_batch;
-             DELETE FROM claim_derivation_drift_batch;",
+             DELETE FROM claim_derivation_sweep_batch;",
         )
         .await
         .map_err(|error| WenlanError::VectorDb(format!("derivation batch setup: {error}")))?;
 
-        let stale = conn
-            .execute(
-                "INSERT INTO claim_derivation_backlog_batch (page_id, page_version)
-                 SELECT p.id, p.version
-                   FROM pages p
-                  WHERE p.status = 'active'
-                    AND p.kind <> 'entity'
-                    AND NOT EXISTS (
-                        SELECT 1 FROM claim_derivation_markers m
-                         WHERE m.page_id = p.id
-                           AND m.page_version = p.version
-                           AND m.extractor_version = ?1
-                    )
-                    AND (
-                        NOT EXISTS (
-                            SELECT 1 FROM claim_derivation_jobs j
-                             WHERE j.page_id = p.id AND j.page_version = p.version
-                        )
-                        OR EXISTS (
-                            SELECT 1 FROM claim_derivation_jobs j
-                             WHERE j.page_id = p.id AND j.page_version = p.version
-                               AND j.status = 'done'
-                        )
-                    )
-                  ORDER BY p.id
-                  LIMIT ?2",
-                libsql::params![EXTRACTOR_VERSION, limit],
-            )
-            .await
-            .map_err(|error| WenlanError::VectorDb(format!("derivation backlog batch: {error}")))?;
-
-        let drifted = conn
+        let captured = conn
             .execute(
                 &format!(
-                    "INSERT INTO claim_derivation_drift_batch (page_id, page_version)
-                     SELECT d.drifted_page_id, d.drifted_page_version
-                       FROM ({DRIFTED_SUPPORTED_PAGES}) d
-                      ORDER BY d.drifted_page_id
-                      LIMIT ?2"
+                    "INSERT INTO claim_derivation_sweep_batch
+                         (page_id, page_version, needs_demotion)
+                     WITH stale_candidates(page_id, page_version) AS (
+                         SELECT p.id, p.version
+                           FROM pages p
+                          WHERE p.status = 'active'
+                            AND p.kind <> 'entity'
+                            AND NOT EXISTS (
+                                SELECT 1 FROM claim_derivation_markers m
+                                 WHERE m.page_id = p.id
+                                   AND m.page_version = p.version
+                                   AND m.extractor_version = ?2
+                            )
+                            AND (
+                                NOT EXISTS (
+                                    SELECT 1 FROM claim_derivation_jobs j
+                                     WHERE j.page_id = p.id
+                                       AND j.page_version = p.version
+                                )
+                                OR EXISTS (
+                                    SELECT 1 FROM claim_derivation_jobs j
+                                     WHERE j.page_id = p.id
+                                       AND j.page_version = p.version
+                                       AND j.status = 'done'
+                                )
+                            )
+                     ),
+                     drift_candidates(page_id, page_version) AS (
+                         SELECT d.drifted_page_id, d.drifted_page_version
+                           FROM ({DRIFTED_SUPPORTED_PAGES}) d
+                     ),
+                     candidate_pages(page_id, page_version) AS (
+                         SELECT page_id, page_version FROM stale_candidates
+                         UNION
+                         SELECT page_id, page_version FROM drift_candidates
+                     )
+                     SELECT c.page_id,
+                            c.page_version,
+                            EXISTS (
+                                SELECT 1 FROM drift_candidates d
+                                 WHERE d.page_id = c.page_id
+                                   AND d.page_version = c.page_version
+                            )
+                       FROM candidate_pages c
+                      ORDER BY c.page_id, c.page_version
+                      LIMIT ?3"
                 ),
-                libsql::params![SUPPORT_THRESHOLD, limit],
+                libsql::params![SUPPORT_THRESHOLD, EXTRACTOR_VERSION, limit],
             )
             .await
-            .map_err(|error| WenlanError::VectorDb(format!("derivation drift batch: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("derivation batch capture: {error}")))?;
 
         // A selected `done` row is a stale claim of completion. Delete only
         // rows captured above; everything beyond the bound must remain byte-for-
@@ -652,7 +665,7 @@ impl MemoryDB {
               WHERE status = 'done'
                 AND (page_id, page_version) IN (
                     SELECT page_id, page_version
-                      FROM claim_derivation_backlog_batch
+                      FROM claim_derivation_sweep_batch
                 )",
             (),
         )
@@ -660,23 +673,11 @@ impl MemoryDB {
         .map_err(|error| WenlanError::VectorDb(format!("derivation backlog sweep: {error}")))?;
 
         conn.execute(
-            "DELETE FROM claim_derivation_jobs
-              WHERE status = 'done'
-                AND (page_id, page_version) IN (
-                    SELECT page_id, page_version
-                      FROM claim_derivation_drift_batch
-                )",
-            (),
-        )
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("derivation drift sweep: {error}")))?;
-
-        conn.execute(
             "INSERT INTO claim_derivation_jobs
                  (job_id, page_id, page_version, status, attempts, created_at, updated_at)
              SELECT b.page_id || ':' || b.page_version,
                     b.page_id, b.page_version, 'pending', 0, ?1, ?1
-               FROM claim_derivation_backlog_batch b
+               FROM claim_derivation_sweep_batch b
               WHERE NOT EXISTS (
                   SELECT 1 FROM claim_derivation_jobs j
                    WHERE j.page_id = b.page_id AND j.page_version = b.page_version
@@ -685,22 +686,6 @@ impl MemoryDB {
         )
         .await
         .map_err(|error| WenlanError::VectorDb(format!("derivation backlog enqueue: {error}")))?;
-
-        conn.execute(
-            "INSERT INTO claim_derivation_jobs
-                         (job_id, page_id, page_version, status, attempts, created_at, updated_at)
-             SELECT d.page_id || ':' || d.page_version,
-                    d.page_id, d.page_version, 'pending', 0, ?1, ?1
-               FROM claim_derivation_drift_batch d
-                      WHERE NOT EXISTS (
-                          SELECT 1 FROM claim_derivation_jobs j
-                   WHERE j.page_id = d.page_id
-                     AND j.page_version = d.page_version
-              )",
-            libsql::params![now],
-        )
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("derivation drift enqueue: {error}")))?;
 
         // Demote NOW, not when a worker eventually reaches the job just queued.
         // Queueing answers "when will we know again"; it does not answer "what
@@ -731,14 +716,15 @@ impl MemoryDB {
                   WHERE support_status = 'supported'
                     AND (page_id, page_version) IN (
                         SELECT page_id, page_version
-                          FROM claim_derivation_drift_batch
+                          FROM claim_derivation_sweep_batch
+                         WHERE needs_demotion = 1
                     )",
             libsql::params![now],
         )
         .await
         .map_err(|error| WenlanError::VectorDb(format!("derivation drift demotion: {error}")))?;
 
-        Ok((stale + drifted) as usize)
+        Ok(captured as usize)
     }
 
     /// Run [`Self::enqueue_stale_derivation_jobs`] until the backlog is drained,
@@ -763,7 +749,6 @@ impl MemoryDB {
     /// pages a personal vault holds; if one ever outgrows that, the fix is a
     /// keyset cursor on `p.id`, not a bigger batch.
     pub async fn drain_stale_derivation_jobs(&self, batch: i64) -> Result<usize, WenlanError> {
-        let batch = batch.max(1);
         let mut total = 0usize;
         loop {
             let created = self.enqueue_stale_derivation_jobs(batch).await?;
@@ -1396,15 +1381,16 @@ impl MemoryDB {
         }))
     }
 
-    /// Mark a job done. Returns false when the caller no longer holds the lease.
+    /// Mark one exact run done. Returns false when the caller no longer holds
+    /// that run's lease.
     ///
-    /// The `lease_owner` guard is the whole point: a worker that stalled past
-    /// its lease, had the job reclaimed, and then woke up must not be able to
-    /// declare the job finished — the new owner is mid-derivation and the old
-    /// worker's result describes a turn nobody is waiting for.
+    /// Owner alone is not an identity: a restarted worker commonly reuses its
+    /// configured owner string. The whole [`DerivationJob`] tuple, including
+    /// `run_generation`, is therefore the fence between a stale attempt and the
+    /// successor that reclaimed the same durable job.
     pub async fn finish_derivation_job(
         &self,
-        job_id: &str,
+        job: &DerivationJob,
         owner: &str,
     ) -> Result<bool, WenlanError> {
         let now = chrono::Utc::now().timestamp();
@@ -1417,8 +1403,20 @@ impl MemoryDB {
                         lease_expires_at = NULL,
                         last_error = NULL,
                         updated_at = ?1
-                  WHERE job_id = ?2 AND status = 'leased' AND lease_owner = ?3",
-                libsql::params![now, job_id, owner],
+                  WHERE job_id = ?2
+                    AND page_id = ?3
+                    AND page_version = ?4
+                    AND run_generation = ?5
+                    AND status = 'leased'
+                    AND lease_owner = ?6",
+                libsql::params![
+                    now,
+                    job.job_id.as_str(),
+                    job.page_id.as_str(),
+                    job.page_version,
+                    job.run_generation,
+                    owner
+                ],
             )
             .await
             .map_err(|error| WenlanError::VectorDb(format!("derivation finish: {error}")))?;
@@ -1432,7 +1430,7 @@ impl MemoryDB {
     /// once the attempts are exhausted.
     pub async fn release_derivation_job(
         &self,
-        job_id: &str,
+        job: &DerivationJob,
         owner: &str,
         error_text: &str,
     ) -> Result<bool, WenlanError> {
@@ -1446,8 +1444,21 @@ impl MemoryDB {
                         lease_expires_at = NULL,
                         last_error = ?1,
                         updated_at = ?2
-                  WHERE job_id = ?3 AND status = 'leased' AND lease_owner = ?4",
-                libsql::params![error_text, now, job_id, owner],
+                  WHERE job_id = ?3
+                    AND page_id = ?4
+                    AND page_version = ?5
+                    AND run_generation = ?6
+                    AND status = 'leased'
+                    AND lease_owner = ?7",
+                libsql::params![
+                    error_text,
+                    now,
+                    job.job_id.as_str(),
+                    job.page_id.as_str(),
+                    job.page_version,
+                    job.run_generation,
+                    owner
+                ],
             )
             .await
             .map_err(|error| WenlanError::VectorDb(format!("derivation release: {error}")))?;
@@ -2366,8 +2377,8 @@ impl MemoryDB {
     /// **Publication is bound to the lease, and to evidence that has not moved.**
     /// Two guards run inside the transaction, before anything is written:
     ///
-    /// 1. The job named by `job_id` must still be `leased` by `owner`. The
-    ///    `lease_owner` guard on [`Self::finish_derivation_job`] protected only
+    /// 1. The exact job run must still be `leased` by `owner`. The
+    ///    owner guard on [`Self::finish_derivation_job`] protected only
     ///    the *queue*, not the truth row: a worker that stalled past its lease
     ///    could be reclaimed, overtaken by a worker that reached the opposite
     ///    verdict, and still overwrite that published verdict on waking. Its
@@ -2390,7 +2401,7 @@ impl MemoryDB {
         &self,
         page_id: &str,
         page_version: i64,
-        job_id: &str,
+        job: &DerivationJob,
         owner: &str,
         outcome: &SupportOutcome,
     ) -> Result<bool, WenlanError> {
@@ -2405,16 +2416,26 @@ impl MemoryDB {
             .map_err(|error| WenlanError::VectorDb(format!("support finalize begin: {error}")))?;
 
         let published = async {
-            // Guard 1: the lease. `page_id`/`page_version` are matched too, so a
-            // job id cannot be spent against a different page than the one it
-            // names.
+            // Guard 1: the exact lease. Every field in `DerivationJob` is
+            // matched, especially the run generation: owner strings can be
+            // reused by a restarted worker after reclaim.
             let holds_lease = {
                 let mut rows = tx
                     .query(
                         "SELECT 1 FROM claim_derivation_jobs
-                          WHERE job_id = ?1 AND page_id = ?2 AND page_version = ?3
-                            AND status = 'leased' AND lease_owner = ?4",
-                        libsql::params![job_id, page_id, page_version, owner],
+                          WHERE job_id = ?1
+                            AND page_id = ?2
+                            AND page_version = ?3
+                            AND run_generation = ?4
+                            AND status = 'leased'
+                            AND lease_owner = ?5",
+                        libsql::params![
+                            job.job_id.as_str(),
+                            job.page_id.as_str(),
+                            job.page_version,
+                            job.run_generation,
+                            owner
+                        ],
                     )
                     .await
                     .map_err(|error| {
@@ -2428,6 +2449,9 @@ impl MemoryDB {
                     .is_some()
             };
             if !holds_lease {
+                return Ok(false);
+            }
+            if job.page_id != page_id || job.page_version != page_version {
                 return Ok(false);
             }
 

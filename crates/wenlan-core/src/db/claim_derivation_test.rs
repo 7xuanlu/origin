@@ -3,7 +3,8 @@
 //! guards; deleting the rule in the doc comment must turn the test RED.
 
 use super::claim_derivation::{
-    CandidateLocator, SupportOutcome, EXTRACTOR_VERSION, MAX_ATTEMPTS, SUPPORT_THRESHOLD,
+    CandidateLocator, DerivationJob, SupportOutcome, EXTRACTOR_VERSION, MAX_ATTEMPTS,
+    SUPPORT_THRESHOLD,
 };
 use super::tests::test_db;
 use super::MemoryDB;
@@ -318,20 +319,59 @@ async fn a_reclaimed_job_cannot_be_finished_by_its_old_owner() {
         .await
         .unwrap();
     }
-    db.lease_next_derivation_job("rescuer").await.unwrap();
+    let reclaimed = db
+        .lease_next_derivation_job("rescuer")
+        .await
+        .unwrap()
+        .unwrap();
 
     assert!(
-        !db.finish_derivation_job(&job.job_id, "zombie")
-            .await
-            .unwrap(),
+        !db.finish_derivation_job(&job, "zombie").await.unwrap(),
         "the old owner's finish must be a no-op"
     );
     assert_eq!(job_for(&db, "p1").await.unwrap().1, "leased");
     assert!(db
-        .finish_derivation_job(&job.job_id, "rescuer")
+        .finish_derivation_job(&reclaimed, "rescuer")
         .await
         .unwrap());
     assert_eq!(job_for(&db, "p1").await.unwrap().1, "done");
+}
+
+/// Owner names are labels, not run identities. A daemon may restart with the
+/// same configured owner after its old lease expires, so the successor needs a
+/// generation fence even though `lease_owner` did not change.
+#[tokio::test]
+async fn a_same_owner_reclaim_rejects_the_old_runs_finish() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+
+    let stale = db
+        .lease_next_derivation_job("worker")
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_jobs SET lease_expires_at = 1 WHERE job_id = ?1",
+            libsql::params![stale.job_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+    let current = db
+        .lease_next_derivation_job("worker")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(stale.run_generation, current.run_generation);
+
+    assert!(
+        !db.finish_derivation_job(&stale, "worker").await.unwrap(),
+        "the old run must not finish a same-owner successor"
+    );
+    assert_eq!(job_for(&db, "p1").await.unwrap().1, "leased");
+    assert!(db.finish_derivation_job(&current, "worker").await.unwrap());
 }
 
 /// Candidate inventory is an assertion about one exact run, so a worker whose
@@ -473,7 +513,7 @@ async fn a_job_that_keeps_crashing_its_worker_parks() {
             .await
             .unwrap()
             .expect("job must stay claimable until attempts run out");
-        db.release_derivation_job(&job.job_id, "worker", "boom")
+        db.release_derivation_job(&job, "worker", "boom")
             .await
             .unwrap();
     }
@@ -487,6 +527,49 @@ async fn a_job_that_keeps_crashing_its_worker_parks() {
     );
     assert_eq!(db.park_exhausted_derivation_jobs().await.unwrap(), 1);
     assert_eq!(job_for(&db, "poison").await.unwrap().1, "parked");
+}
+
+/// Release has the same causal fence as finish: a stale attempt from a daemon
+/// incarnation with the same owner string may not put the current run back on
+/// the queue or overwrite its error.
+#[tokio::test]
+async fn a_same_owner_reclaim_rejects_the_old_runs_release() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+
+    let stale = db
+        .lease_next_derivation_job("worker")
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_jobs SET lease_expires_at = 1 WHERE job_id = ?1",
+            libsql::params![stale.job_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+    let current = db
+        .lease_next_derivation_job("worker")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(stale.run_generation, current.run_generation);
+
+    assert!(
+        !db.release_derivation_job(&stale, "worker", "stale failure")
+            .await
+            .unwrap(),
+        "the old run must not release a same-owner successor"
+    );
+    assert_eq!(job_for(&db, "p1").await.unwrap().1, "leased");
+    assert!(db
+        .release_derivation_job(&current, "worker", "current failure")
+        .await
+        .unwrap());
+    assert_eq!(job_for(&db, "p1").await.unwrap().1, "pending");
 }
 
 /// A worker that cannot finish must never be the reason a page is called
@@ -1076,17 +1159,18 @@ async fn carry_seeded_judgements(db: &MemoryDB, page_id: &str, page_version: i64
     carry_attempts_forward(&conn, page_id, page_version, generation).await;
 }
 
-/// Put one page's job in the state a worker holds it in, and return its id.
+/// Put one page's job in the state a worker holds it in, and return its exact
+/// leased run handle.
 ///
 /// Publication is bound to the lease, so every test that finalizes has to hold
 /// one. Leasing by `(page_id, page_version)` rather than through
 /// `lease_next_derivation_job` keeps a multi-page test from having to guess the
 /// queue order, and keeps the version straight on a page that has jobs for two.
 /// The real lease path has its own teeth above; this is a fixture.
-async fn lease_page(db: &MemoryDB, page_id: &str, page_version: i64, owner: &str) -> String {
+async fn lease_page(db: &MemoryDB, page_id: &str, page_version: i64, owner: &str) -> DerivationJob {
     let conn = db.conn.lock().await;
     let generation = MemoryDB::allocate_run_generation(&conn).await.unwrap();
-    let job_id = {
+    let job = {
         let mut rows = conn
             .query(
                 "UPDATE claim_derivation_jobs
@@ -1094,7 +1178,7 @@ async fn lease_page(db: &MemoryDB, page_id: &str, page_version: i64, owner: &str
                         lease_expires_at = ?4, attempts = attempts + 1,
                         run_generation = ?5, updated_at = ?4
                   WHERE page_id = ?1 AND page_version = ?2
-                  RETURNING job_id",
+                  RETURNING job_id, page_id, page_version",
                 libsql::params![
                     page_id,
                     page_version,
@@ -1105,15 +1189,20 @@ async fn lease_page(db: &MemoryDB, page_id: &str, page_version: i64, owner: &str
             )
             .await
             .unwrap();
-        rows.next()
+        let row = rows
+            .next()
             .await
             .unwrap()
-            .expect("the page must have a queued job to lease")
-            .get::<String>(0)
-            .unwrap()
+            .expect("the page must have a queued job to lease");
+        DerivationJob {
+            job_id: row.get::<String>(0).unwrap(),
+            page_id: row.get::<String>(1).unwrap(),
+            page_version: row.get::<i64>(2).unwrap(),
+            run_generation: generation,
+        }
     };
     carry_attempts_forward(&conn, page_id, page_version, generation).await;
-    job_id
+    job
 }
 
 async fn truth_row(db: &MemoryDB, page_id: &str) -> Option<(String, Option<i64>, i64)> {
@@ -1689,12 +1778,12 @@ async fn a_reclaimed_job_cannot_publish_its_old_owners_verdict() {
         "got {fresh:?}"
     );
     assert!(db
-        .finalize_page_support("p1", 1, &reclaimed.job_id, "worker-b", &fresh)
+        .finalize_page_support("p1", 1, &reclaimed, "worker-b", &fresh)
         .await
         .unwrap());
 
     assert!(
-        !db.finalize_page_support("p1", 1, &job.job_id, "worker-a", &stale)
+        !db.finalize_page_support("p1", 1, &job, "worker-a", &stale)
             .await
             .unwrap(),
         "a worker whose lease was reclaimed must not publish over its successor"
@@ -1702,6 +1791,59 @@ async fn a_reclaimed_job_cannot_publish_its_old_owners_verdict() {
     let (status, evaluated, _) = truth_row(&db, "p1").await.unwrap();
     assert_eq!(status, "provisional", "worker B's verdict has to survive");
     assert!(evaluated.is_some());
+}
+
+/// The harder reclaim: both runs use the same stable owner string and the
+/// evidence stays byte-identical, so owner, job id, page version, and verdict
+/// all agree. Only the lease generation can distinguish the stale computation
+/// from the successor that currently holds the job.
+#[tokio::test]
+async fn a_same_owner_reclaim_rejects_the_old_runs_publication() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+
+    let stale = db
+        .lease_next_derivation_job("worker")
+        .await
+        .unwrap()
+        .unwrap();
+    carry_seeded_judgements(&db, "p1", 1).await;
+    let stale_outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert_eq!(stale_outcome, SupportOutcome::Supported);
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_jobs SET lease_expires_at = 1 WHERE job_id = ?1",
+            libsql::params![stale.job_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let current = db
+        .lease_next_derivation_job("worker")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(stale.run_generation, current.run_generation);
+    carry_seeded_judgements(&db, "p1", 1).await;
+    let current_outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert_eq!(current_outcome, stale_outcome);
+
+    assert!(
+        !db.finalize_page_support("p1", 1, &stale, "worker", &stale_outcome)
+            .await
+            .unwrap(),
+        "the old run must not publish through a same-owner successor's lease"
+    );
+    assert!(truth_row(&db, "p1").await.is_none());
+    assert!(db
+        .finalize_page_support("p1", 1, &current, "worker", &current_outcome)
+        .await
+        .unwrap());
+    assert_eq!(truth_row(&db, "p1").await.unwrap().0, "supported");
 }
 
 /// The lease guard, isolated. Here the evidence never changes, so the verdict
@@ -1737,7 +1879,7 @@ async fn a_parked_jobs_former_worker_cannot_publish() {
     assert_eq!(db.park_exhausted_derivation_jobs().await.unwrap(), 1);
 
     assert!(
-        !db.finalize_page_support("p1", 1, &job.job_id, "worker", &outcome)
+        !db.finalize_page_support("p1", 1, &job, "worker", &outcome)
             .await
             .unwrap(),
         "a parked job has no holder, so nobody may publish through it"
@@ -1780,7 +1922,7 @@ async fn evidence_that_moved_after_evaluation_is_not_published() {
     }
 
     assert!(
-        !db.finalize_page_support("p1", 1, &job.job_id, "worker", &outcome)
+        !db.finalize_page_support("p1", 1, &job, "worker", &outcome)
             .await
             .unwrap(),
         "a verdict whose evidence is gone must not be published on the strength \
@@ -1892,7 +2034,7 @@ async fn a_healthy_fifth_lease_is_not_parked() {
             .await
             .unwrap()
             .unwrap();
-        db.release_derivation_job(&job.job_id, "worker", "daemon restart")
+        db.release_derivation_job(&job, "worker", "daemon restart")
             .await
             .unwrap();
     }
@@ -1910,9 +2052,7 @@ async fn a_healthy_fifth_lease_is_not_parked() {
     );
     assert_eq!(job_for(&db, "p1").await.unwrap().1, "leased");
     assert!(
-        db.finish_derivation_job(&job.job_id, "worker")
-            .await
-            .unwrap(),
+        db.finish_derivation_job(&job, "worker").await.unwrap(),
         "and the healthy run's finish must still be accepted"
     );
 }
@@ -1931,7 +2071,7 @@ async fn an_expired_fifth_lease_still_parks() {
             .await
             .unwrap()
             .unwrap();
-        db.release_derivation_job(&job.job_id, "worker", "boom")
+        db.release_derivation_job(&job, "worker", "boom")
             .await
             .unwrap();
     }
@@ -2048,6 +2188,120 @@ async fn support_that_no_longer_clears_the_bar_is_re_enqueued() {
         "the scan has to see edge validity and the live bar, not only the marker"
     );
     assert_eq!(job_for(&db, "p1").await.unwrap().1, "pending");
+}
+
+/// A signed SQL LIMIT is not a bound: SQLite treats a negative value as "no
+/// limit", while zero can disguise a caller bug as a clean drain. Both are
+/// rejected before the transaction or its temp batch can mutate anything.
+#[tokio::test]
+async fn non_positive_sweep_limits_reject_without_mutation() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], SUPPORT_THRESHOLD + 0.02).await;
+    publish_supported(&db, "p1").await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE edges SET payload = json_set(payload, '$.score', ?1)
+              WHERE edge_type = 'supports'",
+            libsql::params![SUPPORT_THRESHOLD - 0.05],
+        )
+        .await
+        .unwrap();
+    }
+
+    let before_job = job_for(&db, "p1").await.unwrap();
+    let before_truth = truth_row(&db, "p1").await.unwrap();
+    for invalid in [-1, 0] {
+        assert!(
+            matches!(
+                db.enqueue_stale_derivation_jobs(invalid).await,
+                Err(crate::WenlanError::Validation(_))
+            ),
+            "limit {invalid} must be rejected"
+        );
+        assert_eq!(job_for(&db, "p1").await.unwrap(), before_job);
+        assert_eq!(truth_row(&db, "p1").await.unwrap(), before_truth);
+    }
+}
+
+/// Stale-marker and support-drift work share one overall budget. Capturing a
+/// full batch from each class would advance four pages under a limit of two;
+/// ordering the distinct union first advances exactly two and leaves both kinds
+/// of tail byte-for-byte ready for the next turn.
+#[tokio::test]
+async fn mixed_disjoint_work_shares_one_bound_and_leaves_the_tail_unchanged() {
+    let (db, _temp) = db_with_queue().await;
+    for page_id in ["a_stale", "c_stale"] {
+        add_page(&db, page_id).await;
+        mark_derived(&db, page_id, 1, EXTRACTOR_VERSION - 1).await;
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_jobs SET status = 'done' WHERE page_id = ?1",
+            libsql::params![page_id],
+        )
+        .await
+        .unwrap();
+    }
+    for page_id in ["b_drift", "d_drift"] {
+        add_page(&db, page_id).await;
+        let revisions = derive_page(&db, page_id, 1).await;
+        support_claim(&db, page_id, &revisions[0], SUPPORT_THRESHOLD + 0.02).await;
+        publish_supported(&db, page_id).await;
+    }
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE edges SET payload = json_set(payload, '$.score', ?1)
+              WHERE edge_type = 'supports'",
+            libsql::params![SUPPORT_THRESHOLD - 0.05],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(db.enqueue_stale_derivation_jobs(2).await.unwrap(), 2);
+    assert_eq!(job_for(&db, "a_stale").await.unwrap().1, "pending");
+    assert_eq!(job_for(&db, "b_drift").await.unwrap().1, "pending");
+    assert_eq!(truth_row(&db, "b_drift").await.unwrap().0, "provisional");
+
+    assert_eq!(job_for(&db, "c_stale").await.unwrap().1, "done");
+    assert_eq!(job_for(&db, "d_drift").await.unwrap().1, "done");
+    assert_eq!(truth_row(&db, "d_drift").await.unwrap().0, "supported");
+}
+
+/// One page may be stale by extractor marker and drifted by evidence at once.
+/// The batch and its return value count pages, not candidate-class matches.
+#[tokio::test]
+async fn overlapping_stale_and_drift_work_is_counted_once() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "overlap").await;
+    let revisions = derive_page(&db, "overlap", 1).await;
+    support_claim(&db, "overlap", &revisions[0], SUPPORT_THRESHOLD + 0.02).await;
+    publish_supported(&db, "overlap").await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_markers SET extractor_version = ?1
+              WHERE page_id = 'overlap'",
+            libsql::params![EXTRACTOR_VERSION - 1],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE edges SET payload = json_set(payload, '$.score', ?1)
+              WHERE edge_type = 'supports'",
+            libsql::params![SUPPORT_THRESHOLD - 0.05],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(db.enqueue_stale_derivation_jobs(1).await.unwrap(), 1);
+    assert_eq!(job_for(&db, "overlap").await.unwrap().1, "pending");
+    assert_eq!(truth_row(&db, "overlap").await.unwrap().0, "provisional");
+    assert_eq!(db.enqueue_stale_derivation_jobs(1).await.unwrap(), 0);
 }
 
 /// Row 15's runtime bound must constrain the SAME set for enqueue and
@@ -2837,7 +3091,7 @@ async fn a_retried_job_does_not_inherit_the_previous_runs_conclusions() {
         SupportOutcome::Supported
     );
 
-    db.release_derivation_job(&first.job_id, "worker-a", "daemon restart")
+    db.release_derivation_job(&first, "worker-a", "daemon restart")
         .await
         .unwrap();
     let retry = db
