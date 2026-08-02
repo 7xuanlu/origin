@@ -3259,8 +3259,14 @@ fn ci_release_reuse_and_linux_shards_are_fail_closed() {
     );
     let proof_run = proof["run"].as_str().unwrap_or_default();
     for required in [
-        "python3 scripts/verify-release-merge.py",
+        "python3 scripts/release-promotion.py gate-main",
+        "--repository \"$GITHUB_REPOSITORY\"",
+        "--sha \"$GITHUB_SHA\"",
+        "--wait-seconds 720",
+        "--main-run-id \"$GITHUB_RUN_ID\"",
+        "--main-run-attempt \"$GITHUB_RUN_ATTEMPT\"",
         "--github-output \"$GITHUB_OUTPUT\"",
+        "--plan-output \"$RUNNER_TEMP/main-release-promotion-receipt.json\"",
     ] {
         assert!(
             proof_run.contains(required),
