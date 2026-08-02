@@ -1,0 +1,6 @@
+{"case_id":"P1","category":"positive_exact","claim":"The alarm is armed.","span":"The alarm is armed.","entails":true}
+{"case_id":"P2","category":"positive_reflow","claim":"The deployment completed successfully.","span":"The deployment  completed\nsuccessfully.","entails":true}
+{"case_id":"N1","category":"negation_n1","claim":"The alarm is not armed.","span":"The alarm is armed.","entails":false}
+{"case_id":"N8","category":"quantifier_n8","claim":"All workers completed the migration.","span":"Some workers completed the migration.","entails":false}
+{"case_id":"N11","category":"terminator_n11","claim":"The alarm is armed?","span":"The alarm is armed.","entails":false}
+{"case_id":"N12","category":"acronym_case_n12","claim":"us policy changed.","span":"US policy changed.","entails":false}

@@ -123,6 +123,11 @@ name = "compare-baselines"
 path = "src/bin/compare_baselines.rs"
 required-features = ["eval-harness"]
 
+[[bin]]
+name = "m5_export_page_size_dist"
+path = "src/bin/m5_export_page_size_dist.rs"
+required-features = ["eval-harness"]
+
 [dev-dependencies]
 temp-env = { version = "0.3", features = ["async_closure"] }
 # test-util enables tokio::test(start_paused) for deterministic timeout tests
