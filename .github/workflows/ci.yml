@@ -51,6 +51,7 @@ jobs:
       release-preflight: ${{ steps.filter.outputs.release-preflight }}
       mcp-platform: ${{ steps.filter.outputs.mcp-platform }}
       workspace-platform: ${{ steps.filter.outputs.workspace-platform }}
+      macos-archive-contract: ${{ steps.filter.outputs.macos-archive-contract }}
       trusted-release-candidate: ${{ steps.release-candidate-trust.outputs.trusted-release-candidate }}
       verified-release-merge: ${{ steps.release-proof.outputs.verified-release-merge }}
       release-gate-state: ${{ steps.release-proof.outputs.release-gate-state }}
@@ -476,6 +477,12 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
+            macos-archive-contract:
+              # These files define the archive inventory and its fail-closed
+              # execution contract. Prove them on macOS without waking the
+              # unrelated Windows or MCP platform owners.
+              - 'scripts/ci_test_plan.py'
+              - 'scripts/ci_test_plan.test.py'
 
       - name: Test release merge proof
         run: |
@@ -859,7 +866,7 @@ jobs:
   macos-nextest-build:
     name: macos-nextest archive
     needs: [detect-changes]
-    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && ((needs.detect-changes.outputs.macos == 'true' && (needs.detect-changes.outputs.platform-workspace-lib-required == 'true' || needs.detect-changes.outputs.platform-cli-server-integration-required == 'true' || needs.detect-changes.outputs.macos-m4 == 'true')) || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--'))"
+    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.macos-archive-contract == 'true' || (needs.detect-changes.outputs.macos == 'true' && (needs.detect-changes.outputs.platform-workspace-lib-required == 'true' || needs.detect-changes.outputs.platform-cli-server-integration-required == 'true' || needs.detect-changes.outputs.macos-m4 == 'true')) || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--'))"
     runs-on: macos-14
     timeout-minutes: ${{ github.event_name == 'pull_request' && 25 || 60 }}
     env:
@@ -882,7 +889,9 @@ jobs:
           tool: cargo-nextest
       - name: Build exact macOS nextest archives
         env:
-          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.platform-test-plan }}
+          # Workspace/archive contract inputs use the canonical fail-closed
+          # plan; ordinary native behavior keeps the narrower platform plan.
+          CI_TEST_PLAN: ${{ (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.macos-archive-contract == 'true') && needs.detect-changes.outputs.test-plan || needs.detect-changes.outputs.platform-test-plan }}
           M4_REQUIRED: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true' }}
         run: |
           python3 scripts/ci_test_plan.py macos-archive \
@@ -902,7 +911,7 @@ jobs:
   macos-nextest:
     name: macos-nextest (${{ matrix.partition }})
     needs: [detect-changes, macos-nextest-build]
-    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && ((needs.detect-changes.outputs.macos == 'true' && (needs.detect-changes.outputs.platform-workspace-lib-required == 'true' || needs.detect-changes.outputs.platform-cli-server-integration-required == 'true' || needs.detect-changes.outputs.macos-m4 == 'true')) || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--'))"
+    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.macos-archive-contract == 'true' || (needs.detect-changes.outputs.macos == 'true' && (needs.detect-changes.outputs.platform-workspace-lib-required == 'true' || needs.detect-changes.outputs.platform-cli-server-integration-required == 'true' || needs.detect-changes.outputs.macos-m4 == 'true')) || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--'))"
     runs-on: macos-14
     timeout-minutes: ${{ github.event_name == 'pull_request' && 25 || 60 }}
     strategy:
@@ -940,7 +949,7 @@ jobs:
         run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
       - name: Run exact macOS archive partition
         env:
-          CI_TEST_PLAN: ${{ needs.detect-changes.outputs.platform-test-plan }}
+          CI_TEST_PLAN: ${{ (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.macos-archive-contract == 'true') && needs.detect-changes.outputs.test-plan || needs.detect-changes.outputs.platform-test-plan }}
           CI_TEST_PARTITION: ${{ matrix.partition }}
           M4_REQUIRED: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true' }}
         run: |
@@ -954,7 +963,7 @@ jobs:
   test:
     name: test (${{ matrix.label }})
     needs: [detect-changes]
-    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (needs.detect-changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true')) || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch')"
+    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (needs.detect-changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true')) || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch')"
     runs-on: ${{ matrix.os }}
     # Pull requests keep a hard wall-clock budget. Windows needs the full
     # backstop because its Vulkan/native bootstrap plus integration suite can
@@ -1159,12 +1168,10 @@ jobs:
         # PowerShell/native argv processing strips the JSON property's quote
         # characters. Read the compact plan directly from the environment.
         run: python3 scripts/ci_test_plan.py run --suite cli-server-integration --plan-env CI_TEST_PLAN
-      # When this OS already owns behavioral tests, keep platform compile proof
-      # in the same target directory instead of rebuilding the native graph in
-      # mcp-platform. When the Apple release preflight is already scheduled, its
-      # shipped-binary build and launch smoke own the stronger macOS proof.
+      # Windows keeps platform compile proof in its behavioral target directory.
+      # The build-once archive producer owns the equivalent macOS graph.
       - name: Build CLI/server contract binaries (test owner)
-        if: needs.detect-changes.outputs.workspace-platform == 'true' && !(matrix.os == 'macos-14' && needs.detect-changes.outputs.release-preflight == 'true')
+        if: matrix.os == 'windows-2022' && needs.detect-changes.outputs.workspace-platform == 'true'
         run: cargo build -p wenlan -p wenlan-server --bins
       # Ordinary Windows PR proof uses debug artifacts already warmed by the
       # integration suite. Stage both pinned runtime DLLs next to the daemon
@@ -1283,7 +1290,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       # Exact mirror of whether this OS appears in the behavioral test matrix.
       # When true, that job owns the Cargo proof and reuses its target directory.
-      TEST_OWNS_PLATFORM: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || (matrix.os == 'macos-14' && needs.detect-changes.outputs.macos == 'true') || (matrix.os == 'windows-2022' && needs.detect-changes.outputs.windows == 'true') }}
+      TEST_OWNS_PLATFORM: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || (matrix.os == 'macos-14' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.workspace-platform == 'true')) || (matrix.os == 'windows-2022' && needs.detect-changes.outputs.windows == 'true') }}
     strategy:
       fail-fast: true
       matrix:
@@ -2054,8 +2061,8 @@ jobs:
 
           run_fmt='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.fmt-required == 'true' }}'
           run_clippy='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.clippy-required == 'true' }}'
-          run_macos_archive='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && ((needs.detect-changes.outputs.macos == 'true' && (needs.detect-changes.outputs.platform-workspace-lib-required == 'true' || needs.detect-changes.outputs.platform-cli-server-integration-required == 'true' || needs.detect-changes.outputs.macos-m4 == 'true')) || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--')) }}'
-          run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (needs.detect-changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true')) || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch') }}'
+          run_macos_archive='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.macos-archive-contract == 'true' || (needs.detect-changes.outputs.macos == 'true' && (needs.detect-changes.outputs.platform-workspace-lib-required == 'true' || needs.detect-changes.outputs.platform-cli-server-integration-required == 'true' || needs.detect-changes.outputs.macos-m4 == 'true')) || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--')) }}'
+          run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (needs.detect-changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true')) || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch') }}'
           run_workspace_lib='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.workspace-lib-required == 'true' }}'
           run_canonical='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.canonical-acceptance-required == 'true' }}'
           run_contract='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.contract-integration-required == 'true' }}'

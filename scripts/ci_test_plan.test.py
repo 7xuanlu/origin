@@ -47,6 +47,10 @@ RUST_SUITE_OUTPUTS = (
     "canonical-acceptance-required",
     "rust-ci-required",
 )
+MACOS_ARCHIVE_CONTRACT_PATHS = (
+    "scripts/ci_test_plan.py",
+    "scripts/ci_test_plan.test.py",
+)
 
 
 def package(
@@ -419,6 +423,17 @@ class PlatformPlanTests(unittest.TestCase):
         self.assertEqual(plan["core_integration"], {"mode": "skip"})
         self.assertEqual(plan["contract_integration"], {"mode": "skip"})
         self.assertFalse(any(required_suite_outputs(plan).values()))
+
+    def test_archive_contract_uses_canonical_fail_closed_plan_only_when_routed(self) -> None:
+        canonical = plan_for(*MACOS_ARCHIVE_CONTRACT_PATHS)
+        platform = self.platform_plan_for(*MACOS_ARCHIVE_CONTRACT_PATHS)
+
+        self.assertEqual(canonical["mode"], "full")
+        self.assertEqual(canonical["workspace_lib"], {"mode": "full"})
+        self.assertEqual(canonical["cli_server_integration"], {"mode": "full"})
+        self.assertEqual(platform["workspace_lib"], {"mode": "skip"})
+        self.assertEqual(platform["cli_server_integration"], {"mode": "skip"})
+        self.assertFalse(any(required_suite_outputs(platform).values()))
 
     def test_m5_reader_inventory_diff_skips_platform_and_release_suites(self) -> None:
         plan = self.platform_plan_for(*M5_READER_PATHS)

@@ -2023,6 +2023,7 @@ fn ci_routing_contract_violations(
         "release-preflight",
         "mcp-platform",
         "workspace-platform",
+        "macos-archive-contract",
         "trusted-release-candidate",
         "test-plan",
         "workspace-lib-required",
@@ -2850,7 +2851,7 @@ fn ci_routing_contract_violations(
         );
     }
     let platform_condition = ci["jobs"]["test"]["if"].as_str().unwrap_or_default();
-    let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (needs.detect-changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true')) || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch')";
+    let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (needs.detect-changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true')) || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch')";
     if platform_condition != expected_platform_condition {
         violations.push(
             "platform test job does not derive from rust-ci-required plus its platform owner"
@@ -2949,8 +2950,8 @@ fn ci_routing_contract_violations(
     }
     let run_fmt = "run_fmt='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.fmt-required == 'true' }}'";
     let run_clippy = "run_clippy='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.clippy-required == 'true' }}'";
-    let run_macos_archive = "run_macos_archive='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && ((needs.detect-changes.outputs.macos == 'true' && (needs.detect-changes.outputs.platform-workspace-lib-required == 'true' || needs.detect-changes.outputs.platform-cli-server-integration-required == 'true' || needs.detect-changes.outputs.macos-m4 == 'true')) || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--')) }}'";
-    let run_platform = "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (needs.detect-changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true')) || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch') }}'";
+    let run_macos_archive = "run_macos_archive='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.macos-archive-contract == 'true' || (needs.detect-changes.outputs.macos == 'true' && (needs.detect-changes.outputs.platform-workspace-lib-required == 'true' || needs.detect-changes.outputs.platform-cli-server-integration-required == 'true' || needs.detect-changes.outputs.macos-m4 == 'true')) || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--')) }}'";
+    let run_platform = "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (needs.detect-changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true')) || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch') }}'";
     for (name, expected) in [
         ("run_fmt", run_fmt),
         ("run_clippy", run_clippy),
@@ -3142,7 +3143,7 @@ fn ci_routing_contract_violations(
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default();
     let mcp_rust_cache = job_step_using(&ci, "mcp-platform", "Swatinem/rust-cache");
-    let test_owner_formula = "${{ github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || (matrix.os == 'macos-14' && needs.detect-changes.outputs.macos == 'true') || (matrix.os == 'windows-2022' && needs.detect-changes.outputs.windows == 'true') }}";
+    let test_owner_formula = "${{ github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || (matrix.os == 'macos-14' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.workspace-platform == 'true')) || (matrix.os == 'windows-2022' && needs.detect-changes.outputs.windows == 'true') }}";
     let mcp_windows_linker = job_step(
         &ci,
         "mcp-platform",
@@ -3199,7 +3200,7 @@ fn ci_routing_contract_violations(
     )
     .is_some()
         || transferred_workspace.and_then(|step| step["if"].as_str())
-            != Some("needs.detect-changes.outputs.workspace-platform == 'true' && !(matrix.os == 'macos-14' && needs.detect-changes.outputs.release-preflight == 'true')")
+            != Some("matrix.os == 'windows-2022' && needs.detect-changes.outputs.workspace-platform == 'true'")
         || transferred_workspace
             .and_then(|step| step["run"].as_str())
             .is_none_or(|run| {
@@ -3933,8 +3934,22 @@ fn ci_release_reuse_and_linux_shards_are_fail_closed() {
 fn macos_archive_contract_violations(ci_workflow: &str, planner: &str) -> Vec<String> {
     let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
     let mut violations = Vec::new();
-    let condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && ((needs.detect-changes.outputs.macos == 'true' && (needs.detect-changes.outputs.platform-workspace-lib-required == 'true' || needs.detect-changes.outputs.platform-cli-server-integration-required == 'true' || needs.detect-changes.outputs.macos-m4 == 'true')) || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--'))";
+    let condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.macos-archive-contract == 'true' || (needs.detect-changes.outputs.macos == 'true' && (needs.detect-changes.outputs.platform-workspace-lib-required == 'true' || needs.detect-changes.outputs.platform-cli-server-integration-required == 'true' || needs.detect-changes.outputs.macos-m4 == 'true')) || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--'))";
+    let archive_plan = "${{ (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.macos-archive-contract == 'true') && needs.detect-changes.outputs.test-plan || needs.detect-changes.outputs.platform-test-plan }}";
     let m4_required = "${{ github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true' }}";
+
+    if ci["jobs"]["detect-changes"]["outputs"]["macos-archive-contract"].as_str()
+        != Some("${{ steps.filter.outputs.macos-archive-contract }}")
+        || detect_change_filter_paths(&ci, "macos-archive-contract")
+            != BTreeSet::from([
+                "scripts/ci_test_plan.py".to_string(),
+                "scripts/ci_test_plan.test.py".to_string(),
+            ])
+    {
+        violations.push(
+            "macOS archive contract inputs are not isolated from generic platform routing".into(),
+        );
+    }
 
     if job_needs(&ci, "macos-nextest-build") != ["detect-changes"]
         || ci["jobs"]["macos-nextest-build"]["if"].as_str() != Some(condition)
@@ -3978,8 +3993,7 @@ fn macos_archive_contract_violations(ci_workflow: &str, planner: &str) -> Vec<St
             violations.push(format!("macOS archive producer omits {required:?}"));
         }
     }
-    if build.and_then(|step| step["env"]["CI_TEST_PLAN"].as_str())
-        != Some("${{ needs.detect-changes.outputs.platform-test-plan }}")
+    if build.and_then(|step| step["env"]["CI_TEST_PLAN"].as_str()) != Some(archive_plan)
         || build.and_then(|step| step["env"]["M4_REQUIRED"].as_str()) != Some(m4_required)
         || build.is_some_and(|step| step.get("continue-on-error").is_some())
     {
@@ -4059,8 +4073,7 @@ fn macos_archive_contract_violations(ci_workflow: &str, planner: &str) -> Vec<St
             violations.push(format!("macOS archive consumer omits {required:?}"));
         }
     }
-    if run.and_then(|step| step["env"]["CI_TEST_PLAN"].as_str())
-        != Some("${{ needs.detect-changes.outputs.platform-test-plan }}")
+    if run.and_then(|step| step["env"]["CI_TEST_PLAN"].as_str()) != Some(archive_plan)
         || run.and_then(|step| step["env"]["CI_TEST_PARTITION"].as_str())
             != Some("${{ matrix.partition }}")
         || run.and_then(|step| step["env"]["M4_REQUIRED"].as_str()) != Some(m4_required)
@@ -4077,6 +4090,12 @@ fn macos_archive_contract_violations(ci_workflow: &str, planner: &str) -> Vec<St
         if job_step(&ci, "test", removed).is_some() {
             violations.push(format!("direct test job still duplicates {removed}"));
         }
+    }
+    if job_step(&ci, "test", "Build CLI/server contract binaries (test owner)")
+        .and_then(|step| step["if"].as_str())
+        != Some("matrix.os == 'windows-2022' && needs.detect-changes.outputs.workspace-platform == 'true'")
+    {
+        violations.push("direct macOS test owner still duplicates the archive compile graph".into());
     }
     if job_step(&ci, "test", "M5 bench platform controls").and_then(|step| step["run"].as_str())
         != Some("cargo nextest run -p wenlan-core --features eval-harness --test m5_bench")
@@ -4170,6 +4189,26 @@ fn macos_nextest_archive_contract_rejects_routing_and_execution_mutations() {
         workflow.replacen(
             "expect_job macos-nextest \"$run_macos_archive\"",
             "expect_job macos-nextest false",
+            1,
+        ),
+        workflow.replacen(
+            "needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.macos-archive-contract == 'true' ||",
+            "needs.detect-changes.outputs.macos-archive-contract == 'true' ||",
+            1,
+        ),
+        workflow.replacen(
+            "              - 'scripts/ci_test_plan.test.py'\n",
+            "",
+            1,
+        ),
+        workflow.replacen(
+            "${{ (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.macos-archive-contract == 'true') && needs.detect-changes.outputs.test-plan || needs.detect-changes.outputs.platform-test-plan }}",
+            "${{ needs.detect-changes.outputs.platform-test-plan }}",
+            1,
+        ),
+        workflow.replacen(
+            "matrix.os == 'windows-2022' && needs.detect-changes.outputs.workspace-platform == 'true'",
+            "needs.detect-changes.outputs.workspace-platform == 'true'",
             1,
         ),
     ];
