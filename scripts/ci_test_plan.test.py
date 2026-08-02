@@ -22,6 +22,8 @@ from ci_test_plan import (
     clippy_command_for,
     command_groups_for,
     local_test_commands_for,
+    macos_archive_commands_for,
+    macos_archive_run_commands_for,
     required_suite_outputs,
 )
 
@@ -125,6 +127,21 @@ def cargo_metadata() -> dict:
             ),
         ],
     }
+
+
+def macos_metadata() -> dict:
+    metadata = cargo_metadata()
+    core = next(
+        package for package in metadata["packages"] if package["name"] == "wenlan-core"
+    )
+    core["targets"].append(
+        {
+            "name": "m4_community_gates",
+            "kind": ["test"],
+            "src_path": f"{WORKSPACE_ROOT}/crates/wenlan-core/tests/m4_community_gates.rs",
+        }
+    )
+    return metadata
 
 
 def plan_for(
@@ -1505,6 +1522,109 @@ class CommandGenerationTests(unittest.TestCase):
                 "wenlan-server",
             ],
         )
+
+    def test_macos_archive_builds_each_no_feature_owner_once(self) -> None:
+        plan = plan_for("Cargo.lock")
+
+        commands = macos_archive_commands_for(
+            plan,
+            macos_metadata(),
+            archive_dir="/tmp/macos-nextest",
+            include_m4=True,
+        )
+
+        self.assertEqual(len(commands), 3)
+        self.assertEqual(
+            commands[0],
+            [
+                "cargo",
+                "nextest",
+                "archive",
+                "--archive-file",
+                str(Path("/tmp/macos-nextest/workspace-lib.tar.zst")),
+                "--workspace",
+                "--lib",
+                "--bin",
+                "wenlan-server",
+            ],
+        )
+        self.assertEqual(
+            commands[1],
+            [
+                "cargo",
+                "nextest",
+                "archive",
+                "--archive-file",
+                str(Path("/tmp/macos-nextest/cli-server-integration-1.tar.zst")),
+                "-p",
+                "wenlan",
+                "-p",
+                "wenlan-server",
+                "-E",
+                "kind(test)",
+            ],
+        )
+        self.assertEqual(
+            commands[2],
+            [
+                "cargo",
+                "nextest",
+                "archive",
+                "--archive-file",
+                str(Path("/tmp/macos-nextest/m4-community-gates.tar.zst")),
+                "-p",
+                "wenlan-core",
+                "--test",
+                "m4_community_gates",
+            ],
+        )
+        self.assertNotIn("--features", [argument for command in commands for argument in command])
+
+    def test_macos_archive_runs_every_owner_over_the_same_three_slices(self) -> None:
+        plan = plan_for("Cargo.lock")
+
+        commands = macos_archive_run_commands_for(
+            plan,
+            macos_metadata(),
+            archive_dir="/tmp/macos-nextest",
+            workspace_remap="/repo",
+            partition="slice:2/3",
+            include_m4=True,
+        )
+
+        self.assertEqual(len(commands), 3)
+        self.assertTrue(
+            all(command[-2:] == ["--partition", "slice:2/3"] for command in commands)
+        )
+        self.assertEqual(
+            [
+                Path(command[command.index("--archive-file") + 1]).name
+                for command in commands
+            ],
+            [
+                "workspace-lib.tar.zst",
+                "cli-server-integration-1.tar.zst",
+                "m4-community-gates.tar.zst",
+            ],
+        )
+        self.assertTrue(all("--workspace-remap" in command for command in commands))
+
+    def test_macos_archive_rejects_a_missing_m4_target(self) -> None:
+        metadata = macos_metadata()
+        core = next(
+            package for package in metadata["packages"] if package["name"] == "wenlan-core"
+        )
+        core["targets"] = [
+            target for target in core["targets"] if target["name"] != "m4_community_gates"
+        ]
+
+        with self.assertRaisesRegex(PlanError, "no m4_community_gates target"):
+            macos_archive_commands_for(
+                plan_for("Cargo.lock"),
+                metadata,
+                archive_dir="/tmp/macos-nextest",
+                include_m4=True,
+            )
 
     def test_package_archive_compiles_only_selected_package_libs(self) -> None:
         plan = plan_for("crates/wenlan-server/src/routes.rs")

@@ -127,12 +127,10 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
     const ARTIFACT_NAME: &str = "fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}";
     const JOBS: &[(&str, &[&str])] = &[
         ("linux-nextest", &["Run workspace-lib archive partition"]),
+        ("macos-nextest", &["Run exact macOS archive partition"]),
         (
             "test",
-            &[
-                "Workspace lib tests (macOS)",
-                "Integration tests wenlan-cli + wenlan-server (Windows)",
-            ],
+            &["Integration tests wenlan-cli + wenlan-server (Windows)"],
         ),
         (
             "canonical-acceptance",
@@ -2150,6 +2148,8 @@ fn ci_routing_contract_violations(
         "lint",
         "linux-nextest-build",
         "linux-nextest",
+        "macos-nextest-build",
+        "macos-nextest",
         "test",
         "mcp-platform",
         "canonical-acceptance",
@@ -2798,7 +2798,13 @@ fn ci_routing_contract_violations(
         violations.push("platform test matrix still owns a compiler-cache lane".into());
     }
     let main_owned_cache = "${{ github.ref == 'refs/heads/main' }}";
-    for job in ["lint", "test", "mcp-platform", "release-preflight"] {
+    for job in [
+        "lint",
+        "macos-nextest-build",
+        "test",
+        "mcp-platform",
+        "release-preflight",
+    ] {
         let rust_cache = job_step_using(&ci, job, "Swatinem/rust-cache");
         if rust_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some(main_owned_cache) {
             violations.push(format!("{job} cache writes are not restricted to main"));
@@ -2844,7 +2850,7 @@ fn ci_routing_contract_violations(
         );
     }
     let platform_condition = ci["jobs"]["test"]["if"].as_str().unwrap_or_default();
-    let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch')";
+    let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (needs.detect-changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true')) || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch')";
     if platform_condition != expected_platform_condition {
         violations.push(
             "platform test job does not derive from rust-ci-required plus its platform owner"
@@ -2943,10 +2949,12 @@ fn ci_routing_contract_violations(
     }
     let run_fmt = "run_fmt='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.fmt-required == 'true' }}'";
     let run_clippy = "run_clippy='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.clippy-required == 'true' }}'";
-    let run_platform = "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch') }}'";
+    let run_macos_archive = "run_macos_archive='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && ((needs.detect-changes.outputs.macos == 'true' && (needs.detect-changes.outputs.platform-workspace-lib-required == 'true' || needs.detect-changes.outputs.platform-cli-server-integration-required == 'true' || needs.detect-changes.outputs.macos-m4 == 'true')) || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--')) }}'";
+    let run_platform = "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.windows == 'true' || (needs.detect-changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.m5-platform == 'true' || needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.nextest-config == 'true')) || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch') }}'";
     for (name, expected) in [
         ("run_fmt", run_fmt),
         ("run_clippy", run_clippy),
+        ("run_macos_archive", run_macos_archive),
         ("run_platform", run_platform),
     ] {
         if !conclusion_run
@@ -2978,6 +2986,8 @@ fn ci_routing_contract_violations(
         "release-base-proof",
         "linux-nextest-build",
         "linux-nextest",
+        "macos-nextest-build",
+        "macos-nextest",
         "mcp-platform",
         "canonical-acceptance",
         "contract-integration",
@@ -2993,6 +3003,8 @@ fn ci_routing_contract_violations(
         ("lint", "\"$run_clippy\""),
         ("linux-nextest-build", "\"$run_workspace_lib\""),
         ("linux-nextest", "\"$run_workspace_lib\""),
+        ("macos-nextest-build", "\"$run_macos_archive\""),
+        ("macos-nextest", "\"$run_macos_archive\""),
         ("test", "\"$run_platform\""),
         (
             "mcp-platform",
@@ -3059,14 +3071,21 @@ fn ci_routing_contract_violations(
         );
     }
 
-    let m4_condition = "matrix.os == 'macos-14' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true')";
-    if job_step(&ci, "test", "M4 community gates (macOS-owned)")
-        .and_then(|step| step["if"].as_str())
-        != Some(m4_condition)
-    {
-        violations.push(
-            "macOS M4 gate is not focused to community/provenance inputs plus backstops".into(),
-        );
+    let m4_required = "${{ github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true' }}";
+    for (job, step_name) in [
+        ("macos-nextest-build", "Build exact macOS nextest archives"),
+        ("macos-nextest", "Run exact macOS archive partition"),
+    ] {
+        if job_step(&ci, job, step_name).and_then(|step| step["env"]["M4_REQUIRED"].as_str())
+            != Some(m4_required)
+        {
+            violations.push(format!(
+                "{job} M4 archive gate is not focused to community/provenance inputs plus backstops"
+            ));
+        }
+    }
+    if job_step(&ci, "test", "M4 community gates (macOS-owned)").is_some() {
+        violations.push("M4 still recompiles in the direct macOS platform job".into());
     }
     let windows_llm_condition = "matrix.os == 'windows-2022' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.windows-llm-probe == 'true')";
     for step_name in [
@@ -3197,20 +3216,6 @@ fn ci_routing_contract_violations(
     for (job, step_name, suite, plan_argument, expected_plan) in [
         (
             "test",
-            "Workspace lib tests (macOS)",
-            "workspace-lib",
-            "--plan-json \"$CI_TEST_PLAN\"",
-            "${{ needs.detect-changes.outputs.platform-test-plan }}",
-        ),
-        (
-            "test",
-            "Integration tests wenlan-cli + wenlan-server (macOS)",
-            "cli-server-integration",
-            "--plan-json \"$CI_TEST_PLAN\"",
-            "${{ needs.detect-changes.outputs.platform-test-plan }}",
-        ),
-        (
-            "test",
             "Integration tests wenlan-cli + wenlan-server (Windows)",
             "cli-server-integration",
             "--plan-env CI_TEST_PLAN",
@@ -3267,25 +3272,21 @@ fn ci_routing_contract_violations(
             ));
         }
     }
-    for (step_name, expected_condition) in [
-        (
-            "Workspace lib tests (macOS)",
-            "matrix.os == 'macos-14' && needs.detect-changes.outputs.platform-workspace-lib-required == 'true'",
-        ),
-        (
-            "Integration tests wenlan-cli + wenlan-server (macOS)",
-            "matrix.os == 'macos-14' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'",
-        ),
-        (
-            "Integration tests wenlan-cli + wenlan-server (Windows)",
-            "matrix.os == 'windows-2022' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'",
-        ),
+    let windows_integration = "Integration tests wenlan-cli + wenlan-server (Windows)";
+    if job_step(&ci, "test", windows_integration).and_then(|step| step["if"].as_str())
+        != Some("matrix.os == 'windows-2022' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'")
+    {
+        violations.push(format!(
+            "platform step {windows_integration} is not gated by its focused platform plan"
+        ));
+    }
+    for removed in [
+        "Workspace lib tests (macOS)",
+        "Integration tests wenlan-cli + wenlan-server (macOS)",
     ] {
-        if job_step(&ci, "test", step_name).and_then(|step| step["if"].as_str())
-            != Some(expected_condition)
-        {
+        if job_step(&ci, "test", removed).is_some() {
             violations.push(format!(
-                "platform step {step_name} is not gated by its focused platform plan"
+                "{removed} still recompiles instead of consuming the shared macOS archive"
             ));
         }
     }
@@ -3912,14 +3913,6 @@ fn ci_release_reuse_and_linux_shards_are_fail_closed() {
                 && !run.contains("nextest archive")),
         "Linux archive consumers must not compile"
     );
-    let macos_run = job_step(&ci, "test", "Workspace lib tests (macOS)")
-        .and_then(|step| step["run"].as_str())
-        .unwrap_or_default();
-    assert!(
-        !macos_run.contains("--partition"),
-        "macOS must retain its single complete test run"
-    );
-
     let conclusion =
         workflow_step_run(&ci, "Aggregate expected CI results").expect("conclusion script");
     assert!(
@@ -3935,6 +3928,268 @@ fn ci_release_reuse_and_linux_shards_are_fail_closed() {
             "conclusion does not fail closed on {job}"
         );
     }
+}
+
+fn macos_archive_contract_violations(ci_workflow: &str, planner: &str) -> Vec<String> {
+    let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
+    let mut violations = Vec::new();
+    let condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && ((needs.detect-changes.outputs.macos == 'true' && (needs.detect-changes.outputs.platform-workspace-lib-required == 'true' || needs.detect-changes.outputs.platform-cli-server-integration-required == 'true' || needs.detect-changes.outputs.macos-m4 == 'true')) || github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--'))";
+    let m4_required = "${{ github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true' }}";
+
+    if job_needs(&ci, "macos-nextest-build") != ["detect-changes"]
+        || ci["jobs"]["macos-nextest-build"]["if"].as_str() != Some(condition)
+        || ci["jobs"]["macos-nextest-build"]["runs-on"].as_str() != Some("macos-14")
+    {
+        violations
+            .push("macOS archive producer is not an independently routed native owner".into());
+    }
+    if job_needs(&ci, "macos-nextest") != ["detect-changes", "macos-nextest-build"]
+        || ci["jobs"]["macos-nextest"]["if"].as_str() != Some(condition)
+        || ci["jobs"]["macos-nextest"]["runs-on"].as_str() != Some("macos-14")
+    {
+        violations.push("macOS archive consumers do not wait for the exact producer".into());
+    }
+
+    let partitions = ci["jobs"]["macos-nextest"]["strategy"]["matrix"]["partition"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect::<Vec<_>>();
+    if partitions != ["slice:1/3", "slice:2/3", "slice:3/3"] {
+        violations.push("macOS archive does not fan out over exactly three balanced slices".into());
+    }
+
+    let build = job_step(
+        &ci,
+        "macos-nextest-build",
+        "Build exact macOS nextest archives",
+    );
+    let build_run = build
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    for required in [
+        "python3 scripts/ci_test_plan.py macos-archive",
+        "--plan-json \"$CI_TEST_PLAN\"",
+        "--archive-dir \"$RUNNER_TEMP/wenlan-macos-nextest-${GITHUB_RUN_ID}\"",
+        "--include-m4 \"$M4_REQUIRED\"",
+    ] {
+        if !build_run.contains(required) {
+            violations.push(format!("macOS archive producer omits {required:?}"));
+        }
+    }
+    if build.and_then(|step| step["env"]["CI_TEST_PLAN"].as_str())
+        != Some("${{ needs.detect-changes.outputs.platform-test-plan }}")
+        || build.and_then(|step| step["env"]["M4_REQUIRED"].as_str()) != Some(m4_required)
+        || build.is_some_and(|step| step.get("continue-on-error").is_some())
+    {
+        violations.push("macOS archive producer does not fail closed on the platform plan".into());
+    }
+    let producer_cache = job_step_using(&ci, "macos-nextest-build", "Swatinem/rust-cache");
+    if producer_cache.and_then(|step| step["with"]["shared-key"].as_str()) != Some("test")
+        || producer_cache.and_then(|step| step["with"]["cache-targets"].as_str()) != Some("true")
+        || producer_cache.and_then(|step| step["with"]["save-if"].as_str())
+            != Some("${{ github.ref == 'refs/heads/main' }}")
+    {
+        violations
+            .push("macOS archive producer does not reuse the native test target cache".into());
+    }
+
+    let publish = job_step(
+        &ci,
+        "macos-nextest-build",
+        "Publish exact macOS nextest archives",
+    );
+    if publish.and_then(|step| step["with"]["name"].as_str())
+        != Some("wenlan-macos-nextest-${{ github.run_id }}")
+        || publish.and_then(|step| step["with"]["compression-level"].as_u64()) != Some(0)
+        || publish.and_then(|step| step["with"]["retention-days"].as_u64()) != Some(1)
+        || publish.and_then(|step| step["with"]["if-no-files-found"].as_str()) != Some("error")
+        || publish.is_some_and(|step| step.get("continue-on-error").is_some())
+    {
+        violations.push("macOS archive publication is not exact and fail-closed".into());
+    }
+
+    let consumer_steps = ci["jobs"]["macos-nextest"]["steps"]
+        .as_sequence()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if consumer_steps
+        .iter()
+        .filter_map(|step| step["uses"].as_str())
+        .any(|uses| {
+            uses.contains("rust-cache")
+                || uses.contains("sccache")
+                || uses.starts_with("actions/cache")
+        })
+        || consumer_steps
+            .iter()
+            .filter_map(|step| step["run"].as_str())
+            .any(|run| {
+                run.contains("cargo build")
+                    || run.contains("cargo check")
+                    || run.contains("cargo test")
+                    || run.contains("nextest archive")
+            })
+    {
+        violations.push("macOS archive consumers compile instead of running artifacts only".into());
+    }
+    let download = job_step(
+        &ci,
+        "macos-nextest",
+        "Download exact macOS nextest archives",
+    );
+    if download.and_then(|step| step["with"]["name"].as_str())
+        != Some("wenlan-macos-nextest-${{ github.run_id }}")
+    {
+        violations.push("macOS archive consumer downloads a non-run-scoped artifact".into());
+    }
+    let run = job_step(&ci, "macos-nextest", "Run exact macOS archive partition");
+    let run_script = run
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    for required in [
+        "python3 scripts/ci_test_plan.py macos-run",
+        "--plan-json \"$CI_TEST_PLAN\"",
+        "--workspace-remap \"$GITHUB_WORKSPACE\"",
+        "--partition \"$CI_TEST_PARTITION\"",
+        "--include-m4 \"$M4_REQUIRED\"",
+    ] {
+        if !run_script.contains(required) {
+            violations.push(format!("macOS archive consumer omits {required:?}"));
+        }
+    }
+    if run.and_then(|step| step["env"]["CI_TEST_PLAN"].as_str())
+        != Some("${{ needs.detect-changes.outputs.platform-test-plan }}")
+        || run.and_then(|step| step["env"]["CI_TEST_PARTITION"].as_str())
+            != Some("${{ matrix.partition }}")
+        || run.and_then(|step| step["env"]["M4_REQUIRED"].as_str()) != Some(m4_required)
+        || run.is_some_and(|step| step.get("continue-on-error").is_some())
+    {
+        violations.push("macOS archive consumer does not fail closed on its exact slice".into());
+    }
+
+    for removed in [
+        "Workspace lib tests (macOS)",
+        "M4 community gates (macOS-owned)",
+        "Integration tests wenlan-cli + wenlan-server (macOS)",
+    ] {
+        if job_step(&ci, "test", removed).is_some() {
+            violations.push(format!("direct test job still duplicates {removed}"));
+        }
+    }
+    if job_step(&ci, "test", "M5 bench platform controls").and_then(|step| step["run"].as_str())
+        != Some("cargo nextest run -p wenlan-core --features eval-harness --test m5_bench")
+    {
+        violations.push("M5 no longer owns its separate eval-harness feature graph".into());
+    }
+
+    let conclusion = workflow_step_run(&ci, "Aggregate expected CI results").unwrap_or_default();
+    for job in ["macos-nextest-build", "macos-nextest"] {
+        if !job_needs(&ci, "conclusion")
+            .iter()
+            .any(|candidate| candidate == job)
+            || !conclusion.lines().any(|line| {
+                line.contains(&format!("expect_job {job} \"$run_macos_archive\""))
+                    && line.contains(&format!("needs.{job}.result"))
+            })
+        {
+            violations.push(format!("conclusion does not fail closed on {job}"));
+        }
+    }
+
+    let build_helper = planner
+        .split("def macos_archive_commands_for")
+        .nth(1)
+        .and_then(|suffix| suffix.split("def macos_archive_run_commands_for").next())
+        .unwrap_or_default();
+    for required in [
+        "archive_command_for(",
+        "\"cli-server-integration\"",
+        "\"m4_community_gates\"",
+    ] {
+        if !build_helper.contains(required) {
+            violations.push(format!("macOS archive planner omits {required:?}"));
+        }
+    }
+    if build_helper.contains("--features") {
+        violations.push("macOS shared archive mixes in a feature-specific graph".into());
+    }
+    let run_helper = planner
+        .split("def macos_archive_run_commands_for")
+        .nth(1)
+        .and_then(|suffix| suffix.split("def command_groups_for").next())
+        .unwrap_or_default();
+    for required in [
+        "command_groups_for(\n            \"workspace-lib\"",
+        "\"cli-server-integration\"",
+        "\"m4-community-gates.tar.zst\"",
+        "\"--no-tests=pass\"",
+    ] {
+        if !run_helper.contains(required) {
+            violations.push(format!("macOS archive runner omits {required:?}"));
+        }
+    }
+    violations
+}
+
+#[test]
+fn macos_nextest_archives_are_build_once_sharded_and_fail_closed() {
+    let root = repo_root();
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let planner = std::fs::read_to_string(root.join("scripts/ci_test_plan.py"))
+        .expect("read CI test planner");
+    let violations = macos_archive_contract_violations(&workflow, &planner);
+    assert!(
+        violations.is_empty(),
+        "macOS archive/shard contract drift:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn macos_nextest_archive_contract_rejects_routing_and_execution_mutations() {
+    let root = repo_root();
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let planner = std::fs::read_to_string(root.join("scripts/ci_test_plan.py"))
+        .expect("read CI test planner");
+    let mutations = [
+        workflow.replace("slice:3/3", "slice:2/3"),
+        workflow.replacen(
+            "      - name: Build exact macOS nextest archives\n",
+            "      - name: Build exact macOS nextest archives\n        continue-on-error: true\n",
+            1,
+        ),
+        workflow.replacen(
+            "python3 scripts/ci_test_plan.py macos-run",
+            "cargo test --workspace",
+            1,
+        ),
+        workflow.replacen(
+            "expect_job macos-nextest \"$run_macos_archive\"",
+            "expect_job macos-nextest false",
+            1,
+        ),
+    ];
+    for mutation in mutations {
+        assert!(
+            !macos_archive_contract_violations(&mutation, &planner).is_empty(),
+            "macOS archive mutation unexpectedly passed"
+        );
+    }
+    let feature_mutation = planner.replacen(
+        "\"--test\",\n                \"m4_community_gates\",",
+        "\"--features\",\n                \"eval-harness\",\n                \"--test\",\n                \"m4_community_gates\",",
+        1,
+    );
+    assert!(
+        macos_archive_contract_violations(&workflow, &feature_mutation)
+            .iter()
+            .any(|violation| violation.contains("feature-specific")),
+        "feature-graph mutation unexpectedly passed"
+    );
 }
 
 #[test]
@@ -6237,13 +6492,14 @@ fn canonical_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
     }
     let macos_integration = job_step(
         &ci,
-        "test",
-        "Integration tests wenlan-cli + wenlan-server (macOS)",
+        "macos-nextest-build",
+        "Build exact macOS nextest archives",
     );
-    if macos_integration.and_then(|step| step["if"].as_str())
-        != Some("matrix.os == 'macos-14' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'")
+    if macos_integration
+        .and_then(|step| step["run"].as_str())
+        .is_none_or(|run| !run.contains("scripts/ci_test_plan.py macos-archive"))
     {
-        violations.push("macOS lost its shared CLI/server integration owner".into());
+        violations.push("macOS lost its archived CLI/server integration owner".into());
     }
     for step_name in [
         "E2E CLI surface smoke (Linux)",
