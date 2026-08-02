@@ -5039,21 +5039,58 @@ fn canonical_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect::<BTreeSet<_>>();
+    let manager_probe_offset = systemd_run.find(
+        "run_bounded manager-probe 20s bash -c 'systemctl --user show-environment >/dev/null'",
+    );
+    let build_offset = systemd_run.find("run_bounded build 12m cargo build");
+    let trap_offset = systemd_run.find("trap cleanup EXIT");
+    let start_attempt_offset = systemd_run.find("start_attempted=true");
+    let start_offset = systemd_run.find("run_bounded start 45s");
     if systemd.and_then(|step| step["if"].as_str())
         != Some("needs.detect-changes.outputs.canonical-smokes-required == 'true'")
+        || systemd_run.contains("loginctl enable-linger")
+        || systemd_run.matches(r#"return "$status""#).count() < 2
+        || !matches!((manager_probe_offset, build_offset), (Some(probe), Some(build)) if probe < build)
+        || !matches!(
+            (trap_offset, start_attempt_offset, start_offset),
+            (Some(trap), Some(attempt), Some(start)) if trap < attempt && attempt < start
+        )
         || [
-            r#"sudo loginctl enable-linger "$(whoami)""#,
-            "cargo build -p wenlan -p wenlan-server",
-            "\"$STAGE/wenlan\" background on",
-            "systemctl --user is-enabled wenlan-server",
-            "\"$STAGE/wenlan\" background off",
-            r#"active_state="$(systemctl --user show wenlan-server --property=ActiveState --value)""#,
+            r#"if timeout --signal=TERM --kill-after=10s "$limit" "$@"; then"#,
+            r#"if timeout --signal=TERM --kill-after=5s 20s "$@"; then"#,
+            "return \"$status\"",
+            "run_bounded manager-probe 20s bash -c 'systemctl --user show-environment >/dev/null'",
+            "run_bounded build 12m cargo build -p wenlan -p wenlan-server",
+            "trap cleanup EXIT",
+            "start_attempted=false",
+            "start_attempted=true",
+            "run_bounded start 45s \"$STAGE/wenlan\" background on",
+            "run_bounded probe-enabled-after-start 20s systemctl --user is-enabled wenlan-server",
+            "if ! run_bounded health 90s bash -c '",
+            r#"until curl --connect-timeout 1 --max-time 2 -sf \"#,
+            "run_bounded stop 45s \"$STAGE/wenlan\" background off",
+            "run_bounded probe-enabled-after-stop 20s systemctl --user is-enabled wenlan-server",
+            r#"active_state="$(timeout --signal=TERM --kill-after=5s 20s \"#,
+            "systemctl --user show wenlan-server --property=ActiveState --value)\"",
             "test \"$active_state\" = \"inactive\"",
+            r#"if ! cleanup_bounded cleanup-stop "$STAGE/wenlan" background off; then"#,
+            r#"if [ "$start_attempted" = true ] && [ -x "$STAGE/wenlan" ]; then"#,
+            "if ! cleanup_bounded cleanup-disable systemctl --user disable --now wenlan-server.service; then",
+            r#"if ! cleanup_bounded cleanup-unit-remove bash -c 'rm -f -- "$1"' _ "$UNIT_PATH"; then"#,
+            "if ! cleanup_bounded cleanup-reload systemctl --user daemon-reload; then",
+            "local cleanup_status=0",
+            "cleanup_status=1",
+            "receipt cleanup fail",
+            "trap - EXIT",
+            "if [ \"$main_status\" -ne 0 ]; then",
+            "exit \"$main_status\"",
+            "exit \"$cleanup_status\"",
         ]
         .iter()
         .any(|command| !systemd_active_lines.contains(command))
     {
-        violations.push("Linux systemd acceptance command lost a lifecycle assertion".into());
+        violations
+            .push("Linux systemd acceptance command lost a bounded lifecycle assertion".into());
     }
     let lint_upload = job_step(
         &ci,
@@ -5253,8 +5290,8 @@ fn canonical_acceptance_contract_rejects_semantic_noops_and_secondary_writers() 
             "        if: \"false\"\n        run: bash scripts/smoke-folder-ingest.sh",
         )
         .replace(
-            "          test \"$active_state\" = \"inactive\"",
-            "          # test \"$active_state\" = \"inactive\"",
+            "          run_bounded stop 45s \"$STAGE/wenlan\" background off",
+            "          \"$STAGE/wenlan\" background off",
         )
         .replace(
             "      - name: Install cargo-nextest",
@@ -5278,6 +5315,36 @@ fn canonical_acceptance_contract_rejects_semantic_noops_and_secondary_writers() 
                 .iter()
                 .any(|violation| violation.contains(expected)),
             "semantic mutation must exercise {expected:?}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn canonical_acceptance_contract_rejects_missing_trap_or_fail_open_cleanup() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    for (mutation, expected) in [
+        (
+            ci.replace(
+                "          trap cleanup EXIT",
+                "          # trap cleanup EXIT",
+            ),
+            "missing EXIT trap",
+        ),
+        (
+            ci.replace(
+                "            exit \"$cleanup_status\"",
+                "            exit 0 # cleanup failure ignored",
+            ),
+            "fail-open cleanup",
+        ),
+    ] {
+        let violations = canonical_acceptance_contract_violations(&mutation);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("systemd acceptance command")),
+            "fixture must reject {expected}: {violations:?}"
         );
     }
 }

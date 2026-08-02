@@ -1168,42 +1168,118 @@ jobs:
         if: needs.detect-changes.outputs.canonical-smokes-required == 'true'
         run: |
           set -euo pipefail
-          sudo loginctl enable-linger "$(whoami)"
-          uid="$(id -u)"
-          export XDG_RUNTIME_DIR="/run/user/$uid"
-          cargo build -p wenlan -p wenlan-server
-          STAGE=$(mktemp -d)
-          UNIT_PATH="$HOME/.config/systemd/user/wenlan-server.service"
-          cp target/debug/wenlan target/debug/wenlan-server "$STAGE/"
-          cleanup() {
-            "$STAGE/wenlan" background off 2>/dev/null || true
-            systemctl --user disable --now wenlan-server.service >/dev/null 2>&1 || true
-            rm -f "$UNIT_PATH"
-            systemctl --user daemon-reload >/dev/null 2>&1 || true
-            rm -rf "$STAGE"
+          receipt() {
+            printf '    receipt phase=%s status=%s%s\n' "$1" "$2" "${3:+ timeout=$3}"
           }
+          run_bounded() {
+            local phase="$1"
+            local limit="$2"
+            shift 2
+            receipt "$phase" start "$limit"
+            # Keep timeout's process group so a deadline also stops child processes.
+            if timeout --signal=TERM --kill-after=10s "$limit" "$@"; then
+              receipt "$phase" pass "$limit"
+            else
+              local status=$?
+              receipt "$phase" "fail(exit=$status)" "$limit"
+              return "$status"
+            fi
+          }
+          cleanup_bounded() {
+            local phase="$1"
+            shift
+            receipt "$phase" start 20s
+            if timeout --signal=TERM --kill-after=5s 20s "$@"; then
+              receipt "$phase" pass 20s
+              return 0
+            else
+              local status=$?
+              receipt "$phase" "fail(exit=$status)" 20s
+              return "$status"
+            fi
+          }
+
+          uid="$(id -u)"
+          # This same-session smoke already has an active login. Linger is only
+          # needed to keep the user manager alive after logout or start it at boot.
+          export XDG_RUNTIME_DIR="/run/user/$uid"
+          STAGE=""
+          UNIT_PATH="$HOME/.config/systemd/user/wenlan-server.service"
+          start_attempted=false
+          cleanup() {
+            local main_status=$?
+            local cleanup_status=0
+            trap - EXIT
+            set +e
+            receipt cleanup start
+            if [ "$start_attempted" = true ] && [ -x "$STAGE/wenlan" ]; then
+              if ! cleanup_bounded cleanup-stop "$STAGE/wenlan" background off; then
+                cleanup_status=1
+              fi
+            fi
+            if ! cleanup_bounded cleanup-disable systemctl --user disable --now wenlan-server.service; then
+              cleanup_status=1
+            fi
+            if ! cleanup_bounded cleanup-unit-remove bash -c 'rm -f -- "$1"' _ "$UNIT_PATH"; then
+              cleanup_status=1
+            fi
+            if ! cleanup_bounded cleanup-reload systemctl --user daemon-reload; then
+              cleanup_status=1
+            fi
+            if [ -n "$STAGE" ]; then
+              if ! cleanup_bounded cleanup-stage-remove bash -c 'rm -rf -- "$1"' _ "$STAGE"; then
+                cleanup_status=1
+              fi
+            fi
+            if [ "$cleanup_status" -eq 0 ]; then
+              receipt cleanup pass
+            else
+              receipt cleanup fail
+            fi
+            if [ "$main_status" -ne 0 ]; then
+              exit "$main_status"
+            fi
+            if [ "$cleanup_status" -eq 0 ]; then
+              echo "    Linux background on/off round-trip PASS"
+            fi
+            exit "$cleanup_status"
+          }
+
+          run_bounded manager-probe 20s bash -c 'systemctl --user show-environment >/dev/null'
+          run_bounded build 12m cargo build -p wenlan -p wenlan-server
+          receipt stage start
+          STAGE="$(mktemp -d)"
+          cp target/debug/wenlan target/debug/wenlan-server "$STAGE/"
+          receipt stage pass
           trap cleanup EXIT
-          "$STAGE/wenlan" background on
+
+          start_attempted=true
+          run_bounded start 45s "$STAGE/wenlan" background on
+          receipt probe-registration start 20s
           test -f "$UNIT_PATH"
-          systemctl --user is-enabled wenlan-server
-          for i in $(seq 1 90); do
-            if curl -sf http://127.0.0.1:7878/api/health >/dev/null; then
-              echo "    daemon healthy after ${i}s"
-              break
-            fi
-            sleep 1
-            if [ "$i" = "90" ]; then
-              echo "FAIL: daemon did not start under systemd user service" >&2
-              journalctl --user -u wenlan-server --no-pager | tail -50 >&2 || true
-              exit 1
-            fi
-          done
-          "$STAGE/wenlan" background off
+          run_bounded probe-enabled-after-start 20s systemctl --user is-enabled wenlan-server
+          receipt probe-registration pass 20s
+
+          if ! run_bounded health 90s bash -c '
+            until curl --connect-timeout 1 --max-time 2 -sf \
+              http://127.0.0.1:7878/api/health >/dev/null; do
+              sleep 1
+            done
+          '; then
+            echo "FAIL: daemon did not start under systemd user service" >&2
+            timeout --signal=TERM --kill-after=5s 20s \
+              journalctl --user -u wenlan-server --no-pager -n 50 >&2 || true
+            exit 1
+          fi
+
+          run_bounded stop 45s "$STAGE/wenlan" background off
+          receipt probe-persistence start 20s
           test -f "$UNIT_PATH"
-          systemctl --user is-enabled wenlan-server
-          active_state="$(systemctl --user show wenlan-server --property=ActiveState --value)"
+          run_bounded probe-enabled-after-stop 20s systemctl --user is-enabled wenlan-server
+          active_state="$(timeout --signal=TERM --kill-after=5s 20s \
+            systemctl --user show wenlan-server --property=ActiveState --value)"
           test "$active_state" = "inactive"
-          echo "    Linux background on/off round-trip PASS"
+          receipt probe-persistence pass 20s
       - name: E2E folder ingest over HTTP (Linux)
         if: needs.detect-changes.outputs.canonical-smokes-required == 'true'
         run: bash scripts/smoke-folder-ingest.sh
