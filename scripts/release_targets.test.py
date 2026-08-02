@@ -76,7 +76,7 @@ class ReleaseTargetTests(unittest.TestCase):
             {"include": EXPECTED[:-1]},
         )
 
-    def test_ordinary_main_preflight_only_warms_windows(self) -> None:
+    def test_release_sensitive_main_preflight_only_warms_windows(self) -> None:
         self.assertEqual(
             release_preflight_matrix(
                 event_name="push",

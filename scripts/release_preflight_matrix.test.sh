@@ -24,7 +24,7 @@ assert_targets ordinary-pr "$non_windows" \
   --event-name pull_request \
   --ref refs/pull/431/merge \
   --head-ref codex/promote-release-artifacts
-assert_targets ordinary-main "x86_64-pc-windows-msvc" \
+assert_targets release-sensitive-main "x86_64-pc-windows-msvc" \
   --event-name push \
   --ref refs/heads/main
 assert_targets release-please "$all_targets" \

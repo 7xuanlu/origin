@@ -1842,6 +1842,12 @@ fn unix_only() {}
 }
 
 fn platform_sensitive_paths(root: &Path) -> Vec<(String, &'static str, &'static str)> {
+    let core_lib =
+        std::fs::read_to_string(root.join("crates/wenlan-core/src/lib.rs")).expect("read core lib");
+    assert!(
+        core_lib.contains("#[cfg(test)]\nmod drift_guard;"),
+        "drift_guard.rs exclusion is valid only while the whole module is test-only"
+    );
     let markers = native_platform_markers();
     let mut paths = BTreeSet::new();
     let mut native_sources = BTreeSet::new();
@@ -1850,10 +1856,9 @@ fn platform_sensitive_paths(root: &Path) -> Vec<(String, &'static str, &'static 
     ] {
         native_sources.extend(git_ls_files(root, pattern));
     }
-    for path in native_sources
-        .into_iter()
-        .filter(|path| path.starts_with("crates/"))
-    {
+    for path in native_sources.into_iter().filter(|path| {
+        path.starts_with("crates/") && path != "crates/wenlan-core/src/drift_guard.rs"
+    }) {
         let contents = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
         for (platform, filter) in source_platform_routes(&path, &contents, &markers) {
             paths.insert((path.clone(), platform, filter));
@@ -2498,6 +2503,13 @@ fn ci_routing_contract_violations(
     let windows_paths = detect_change_filter_paths(&ci, "windows");
     let macos_paths = detect_change_filter_paths(&ci, "macos");
     let mcp_platform = detect_change_filter_paths(&ci, "mcp-platform");
+    for (filter, paths) in [("macos", &macos_paths), ("windows", &windows_paths)] {
+        if paths.contains("crates/wenlan-core/src/drift_guard.rs") {
+            violations.push(format!(
+                "{filter} routes test-only drift_guard.rs into a native runner"
+            ));
+        }
+    }
     for (path, platform, filter) in platform_sensitive_paths {
         let routed =
             if path.starts_with("crates/wenlan-mcp/") || path.starts_with("crates/wenlan-types/") {
@@ -2759,16 +2771,12 @@ fn ci_routing_contract_violations(
     let release_preflight_condition = ci["jobs"]["release-preflight"]["if"]
         .as_str()
         .unwrap_or_default();
+    let expected_release_preflight_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true')";
     if job_needs(&ci, "release-preflight") != ["detect-changes"]
-        || !release_preflight_condition.contains("github.event_name != 'pull_request'")
-        || !release_preflight_condition
-            .contains("startsWith(github.head_ref, 'release-please--branches--')")
-        || !release_preflight_condition
-            .contains("needs.detect-changes.outputs.release-preflight == 'true'")
+        || release_preflight_condition != expected_release_preflight_condition
     {
         violations.push(
-            "release-preflight is not isolated to release-sensitive PRs and release backstops"
-                .into(),
+            "release-preflight is not isolated to release-sensitive changes and explicit release backstops".into(),
         );
     }
     for profile in ["DEV", "TEST"] {
@@ -2924,7 +2932,7 @@ fn ci_routing_contract_violations(
         "needs.detect-changes.outputs.macos",
         "needs.detect-changes.outputs.windows",
         "startsWith(github.head_ref, 'release-please--branches--')",
-        "github.event_name != 'pull_request'",
+        "github.event_name == 'workflow_dispatch'",
     ] {
         if !conclusion_run.contains(required) {
             violations.push(format!(
@@ -2953,6 +2961,14 @@ fn ci_routing_contract_violations(
     if conclusion_run.contains("github.event.head_commit.message") {
         violations.push(
             "conclusion can accept skipped non-PR backstops based on the head commit message"
+                .into(),
+        );
+    }
+    let release_expectation =
+        format!("expect_job release-preflight '${{{{ {expected_release_preflight_condition} }}}}'");
+    if !conclusion_run.contains(&release_expectation) {
+        violations.push(
+            "conclusion release-preflight expectation does not match its release-sensitive owner"
                 .into(),
         );
     }
@@ -3359,6 +3375,21 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
             1,
         )
         .replacen(
+            "            macos:\n              # macOS owns launchd/host-activity behavior and native code.",
+            "            macos:\n              - 'crates/wenlan-core/src/drift_guard.rs'\n              # macOS owns launchd/host-activity behavior and native code.",
+            1,
+        )
+        .replacen(
+            "            windows:\n              # Windows owns cfg-bearing CLI/server paths, native ORT/Vulkan,",
+            "            windows:\n              - 'crates/wenlan-core/src/drift_guard.rs'\n              # Windows owns cfg-bearing CLI/server paths, native ORT/Vulkan,",
+            1,
+        )
+        .replacen(
+            "if: \"needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true')\"",
+            "if: \"needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true')\"",
+            1,
+        )
+        .replacen(
             "if [ \"${{ github.event_name }}\" = \"workflow_dispatch\" ]; then",
             "if [ \"${{ github.event_name }}\" != \"workflow_dispatch\" ]; then",
             1,
@@ -3406,6 +3437,8 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
         "unknown paths",
         "platform test planner lost required contract",
         "exact generic macOS plus Windows filter inventories",
+        "routes test-only drift_guard.rs into a native runner",
+        "release-preflight is not isolated to release-sensitive changes",
         "ordinary PR and main push on the same owner-driven route",
         "macos-m4 focused-owner allowlist has unreviewed path",
         "macos-m4 focused source crates/wenlan-core/src/db.rs acquired macos-specific cfg",

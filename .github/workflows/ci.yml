@@ -227,7 +227,6 @@ jobs:
               - 'crates/wenlan-cli/src/commands/service.rs'
               - 'crates/wenlan-cli/src/commands/setup.rs'
               - 'crates/wenlan-cli/tests/cli_integration.rs'
-              - 'crates/wenlan-core/src/drift_guard.rs'
               - 'crates/wenlan-core/src/config.rs'
               - 'crates/wenlan-core/src/community_grouping.rs'
               - 'crates/wenlan-core/src/community_partition.rs'
@@ -305,7 +304,6 @@ jobs:
               - 'crates/wenlan-core/src/config.rs'
               - 'crates/wenlan-core/src/db/m5_page_size_snapshot.rs'
               - 'crates/wenlan-core/src/db/presence_review_test.rs'
-              - 'crates/wenlan-core/src/drift_guard.rs'
               - 'crates/wenlan-core/src/export/knowledge.rs'
               - 'crates/wenlan-core/src/export/projection_invariant_test.rs'
               - 'crates/wenlan-core/src/presence.rs'
@@ -1485,17 +1483,16 @@ jobs:
         run: bash scripts/smoke-mcp.sh
 
   # Build/smoke preflight for shipped release targets. Release-sensitive
-  # ordinary PRs prove the three non-Windows profiles while the existing
-  # Windows functional/platform lanes prove native linkage. Ordinary main runs
-  # retain only the expensive Windows release profile, which is the sole target
-  # cache this job can persist for the next candidate. Manual runs and the
-  # release-please PR retain the complete four-target release matrix.
+  # ordinary PRs and main pushes prove the event-bounded matrix; CI-only main
+  # pushes skip this release-profile work. Windows functional/platform lanes
+  # prove native linkage for ordinary PRs. Manual runs and the release-please
+  # PR retain the complete four-target release matrix.
   # Only the exact same-repository release-please candidate additionally emits
   # observe-only canonical archives for the read-only default-branch validator.
   release-preflight:
     name: release-preflight (${{ matrix.target }})
     needs: [detect-changes]
-    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true')"
+    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true')"
     runs-on: ${{ matrix.os }}
     # 30 minutes is the performance target, not a correctness timeout. Keep
     # non-Windows PR targets at 45 minutes and non-PR backstops at 60. Hosted
@@ -1506,8 +1503,8 @@ jobs:
       fail-fast: true
       # An ordinary PR already links and exercises Windows in `test` and
       # `mcp-platform`; compiling the same graph again in release profile is
-      # the measured >20-minute duplicate. Ordinary main does only the Windows
-      # cache-warming backstop; release-please and manual runs stay complete.
+      # the measured >20-minute duplicate. Release-sensitive main pushes retain
+      # the Windows cache-warming backstop; release-please and manual runs stay complete.
       matrix: ${{ fromJSON(needs.detect-changes.outputs.release-preflight-targets) }}
     env:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
@@ -1991,7 +1988,7 @@ jobs:
           expect_job mcp-platform '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.mcp-platform == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch') }}' '${{ needs.mcp-platform.result }}'
           expect_job canonical-acceptance "$run_canonical" '${{ needs.canonical-acceptance.result }}'
           expect_job contract-integration "$run_contract" '${{ needs.contract-integration.result }}'
-          expect_job release-preflight '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true') }}' '${{ needs.release-preflight.result }}'
+          expect_job release-preflight '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true') }}' '${{ needs.release-preflight.result }}'
           expect_job docs '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.docs == 'true' }}' '${{ needs.docs.result }}'
           expect_job plugin '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.plugin == 'true' }}' '${{ needs.plugin.result }}'
           expect_job plugin-rust-contract '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.plugin-rust-contract == 'true' }}' '${{ needs.plugin-rust-contract.result }}'
