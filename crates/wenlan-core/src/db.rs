@@ -172,7 +172,7 @@ fn push_read_scope_filter(
     }
 }
 
-/// Same as `push_read_scope_filter`, but for columns migrated by the space-sentinel
+/// CI routing canary: same as `push_read_scope_filter`, for space-sentinel columns;
 /// fold (`memories.space`, `chunks.space`, `pages.workspace`): unfiled rows are
 /// stored as `UNFILED_SPACE_ID`, not SQL NULL, so `Uncategorized` must match either.
 fn push_read_scope_filter_folded(

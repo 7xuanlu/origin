@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// CI routing canary: cross-platform M6 source remains on canonical Linux.
 //! D2/D3 plus J1 frontier-policy substrate for migration 109.
 //!
 //! This module deliberately owns no transaction. Migration setup and every
