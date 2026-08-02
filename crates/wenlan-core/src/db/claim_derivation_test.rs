@@ -547,6 +547,37 @@ async fn the_backlog_scan_respects_its_limit() {
     assert_eq!(db.enqueue_stale_derivation_jobs(2).await.unwrap(), 0);
 }
 
+/// Replacing stale `done` jobs is part of the same bounded scan. Cleanup must
+/// not delete a tail job before that page is captured for re-enqueue, or a
+/// nominally two-page constructor turn still mutates the whole vault.
+#[tokio::test]
+async fn stale_done_job_cleanup_respects_the_captured_batch() {
+    let (db, _temp) = db_with_queue().await;
+    for id in ["stale_0", "stale_1", "stale_2"] {
+        add_page(&db, id).await;
+        mark_derived(&db, id, 1, EXTRACTOR_VERSION - 1).await;
+    }
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("UPDATE claim_derivation_jobs SET status = 'done'", ())
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(db.enqueue_stale_derivation_jobs(2).await.unwrap(), 2);
+    assert_eq!(job_for(&db, "stale_0").await.unwrap().1, "pending");
+    assert_eq!(job_for(&db, "stale_1").await.unwrap().1, "pending");
+    assert_eq!(
+        job_for(&db, "stale_2").await.unwrap().1,
+        "done",
+        "the uncaptured tail job must remain untouched until its turn"
+    );
+
+    assert_eq!(db.enqueue_stale_derivation_jobs(2).await.unwrap(), 1);
+    assert_eq!(job_for(&db, "stale_2").await.unwrap().1, "pending");
+    assert_eq!(db.enqueue_stale_derivation_jobs(2).await.unwrap(), 0);
+}
+
 // ---------------------------------------------------------------------------
 // §1 predicate + phase-3 finalization
 // ---------------------------------------------------------------------------
@@ -2054,6 +2085,20 @@ async fn drifted_support_converges_past_the_runtime_batch_without_losing_the_tai
             .unwrap(),
         RUNTIME_BATCH as usize,
         "the first bounded turn may queue only its batch"
+    );
+
+    let untouched_tail = "drift_tail_25";
+    assert_eq!(
+        truth_row(&db, untouched_tail).await.unwrap().0,
+        "supported",
+        "the page outside the captured batch must keep its pre-turn truth state"
+    );
+    assert_eq!(
+        job_for(&db, untouched_tail)
+            .await
+            .map(|(_, status, _)| status),
+        Some("done".to_string()),
+        "the page outside the captured batch must keep its done job until its turn"
     );
 
     {

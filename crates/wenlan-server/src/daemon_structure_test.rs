@@ -2025,6 +2025,27 @@ fn truth_reconciliation_work_runs_only_in_the_runtime_worker() {
         ),
         "the one bounded constructor-time exception must remain named and reviewable"
     );
+    let sweep_start = claim_derivation
+        .find("async fn sweep_stale_derivation_jobs(")
+        .expect("the bounded sweep implementation must exist");
+    let sweep_end = claim_derivation[sweep_start..]
+        .find("pub async fn drain_stale_derivation_jobs(")
+        .map(|offset| sweep_start + offset)
+        .expect("the drain must follow the bounded sweep");
+    let sweep = &claim_derivation[sweep_start..sweep_end];
+    let backlog_capture = sweep
+        .find("INSERT INTO claim_derivation_backlog_batch")
+        .expect("constructor-time stale cleanup must have a captured bound");
+    let drift_capture = sweep
+        .find("INSERT INTO claim_derivation_drift_batch")
+        .expect("constructor-time drift cleanup must have a captured bound");
+    let first_cleanup = sweep
+        .find("DELETE FROM claim_derivation_jobs")
+        .expect("the sweep must replace selected done jobs");
+    assert!(
+        backlog_capture < first_cleanup && drift_capture < first_cleanup,
+        "no pre-serve cleanup write may run before both bounded batches are captured"
+    );
 }
 
 #[test]

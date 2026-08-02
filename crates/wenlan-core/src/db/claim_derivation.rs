@@ -529,7 +529,7 @@ impl MemoryDB {
         Ok(())
     }
 
-    /// Enqueue up to `limit` already-existing pages that carry no valid marker.
+    /// Advance bounded batches of stale extraction and drift work.
     ///
     /// Returns how many pages advanced into the durable queue/demotion batch. A
     /// zero from this function means there is no stale extraction or drift work
@@ -575,48 +575,34 @@ impl MemoryDB {
         now: i64,
         limit: i64,
     ) -> Result<usize, WenlanError> {
-        // A 'done' job whose marker no longer satisfies the current extractor
-        // is a stale claim of completion. Dropping it is what makes an
-        // EXTRACTOR_VERSION bump re-derive the vault: the marker check below
-        // already fails, but the job row would otherwise still say 'done' and
-        // block the re-enqueue.
-        conn.execute(
-            "DELETE FROM claim_derivation_jobs
-              WHERE status = 'done'
-                AND NOT EXISTS (
-                    SELECT 1 FROM claim_derivation_markers m
-                     WHERE m.page_id = claim_derivation_jobs.page_id
-                       AND m.page_version = claim_derivation_jobs.page_version
-                       AND m.extractor_version = ?1
-                )",
-            libsql::params![EXTRACTOR_VERSION],
+        // Freeze BOTH batches before any cleanup write. A `done` job is what
+        // makes stale completion block a new pending row, but deleting every
+        // stale `done` row before applying `limit` turns a nominal 25-page turn
+        // into a corpus-sized write. The connection-local temp tables bind job
+        // deletion, pending insertion, and drift demotion to the same captured
+        // sets. They participate in this transaction, so rollback loses the
+        // captures together with every queue and truth-state change.
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS claim_derivation_backlog_batch (
+                 page_id TEXT NOT NULL,
+                 page_version INTEGER NOT NULL,
+                 PRIMARY KEY (page_id, page_version)
+             ) WITHOUT ROWID;
+             CREATE TEMP TABLE IF NOT EXISTS claim_derivation_drift_batch (
+                 page_id TEXT NOT NULL,
+                 page_version INTEGER NOT NULL,
+                 PRIMARY KEY (page_id, page_version)
+             ) WITHOUT ROWID;
+             DELETE FROM claim_derivation_backlog_batch;
+             DELETE FROM claim_derivation_drift_batch;",
         )
         .await
-        .map_err(|error| WenlanError::VectorDb(format!("derivation backlog sweep: {error}")))?;
+        .map_err(|error| WenlanError::VectorDb(format!("derivation batch setup: {error}")))?;
 
-        // The same stale-completion argument as above, for the drift rows: a
-        // page whose support no longer clears the live bar has a `done` job
-        // occupying its unique (page_id, page_version) slot, and that row would
-        // block the re-enqueue below exactly the way a stale marker's does.
-        conn.execute(
-            &format!(
-                "DELETE FROM claim_derivation_jobs
-                  WHERE status = 'done'
-                    AND (page_id, page_version) IN (
-                        SELECT drifted_page_id, drifted_page_version
-                          FROM ({DRIFTED_SUPPORTED_PAGES})
-                    )"
-            ),
-            libsql::params![SUPPORT_THRESHOLD],
-        )
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("derivation drift sweep: {error}")))?;
-
-        let created = conn
+        let stale = conn
             .execute(
-                "INSERT INTO claim_derivation_jobs
-                     (job_id, page_id, page_version, status, attempts, created_at, updated_at)
-                 SELECT p.id || ':' || p.version, p.id, p.version, 'pending', 0, ?1, ?1
+                "INSERT INTO claim_derivation_backlog_batch (page_id, page_version)
+                 SELECT p.id, p.version
                    FROM pages p
                   WHERE p.status = 'active'
                     AND p.kind <> 'entity'
@@ -624,37 +610,25 @@ impl MemoryDB {
                         SELECT 1 FROM claim_derivation_markers m
                          WHERE m.page_id = p.id
                            AND m.page_version = p.version
-                           AND m.extractor_version = ?2
+                           AND m.extractor_version = ?1
                     )
-                    AND NOT EXISTS (
-                        SELECT 1 FROM claim_derivation_jobs j
-                         WHERE j.page_id = p.id AND j.page_version = p.version
+                    AND (
+                        NOT EXISTS (
+                            SELECT 1 FROM claim_derivation_jobs j
+                             WHERE j.page_id = p.id AND j.page_version = p.version
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM claim_derivation_jobs j
+                             WHERE j.page_id = p.id AND j.page_version = p.version
+                               AND j.status = 'done'
+                        )
                     )
                   ORDER BY p.id
-                  LIMIT ?3",
-                libsql::params![now, EXTRACTOR_VERSION, limit],
+                  LIMIT ?2",
+                libsql::params![EXTRACTOR_VERSION, limit],
             )
             .await
-            .map_err(|error| {
-                WenlanError::VectorDb(format!("derivation backlog enqueue: {error}"))
-            })?;
-
-        // Freeze the drift batch before either half mutates what the drift
-        // predicate can see. `support_status = 'supported'` is part of that
-        // predicate, so a second live SELECT after demotion cannot be trusted to
-        // name the same pages. The temp table is connection-local, is cleared
-        // on every pass, and participates in this transaction: rollback loses
-        // the captured batch together with its queue and truth-state changes.
-        conn.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS claim_derivation_drift_batch (
-                 page_id TEXT NOT NULL,
-                 page_version INTEGER NOT NULL,
-                 PRIMARY KEY (page_id, page_version)
-             ) WITHOUT ROWID;
-             DELETE FROM claim_derivation_drift_batch;",
-        )
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("derivation drift batch: {error}")))?;
+            .map_err(|error| WenlanError::VectorDb(format!("derivation backlog batch: {error}")))?;
 
         let drifted = conn
             .execute(
@@ -669,6 +643,48 @@ impl MemoryDB {
             )
             .await
             .map_err(|error| WenlanError::VectorDb(format!("derivation drift batch: {error}")))?;
+
+        // A selected `done` row is a stale claim of completion. Delete only
+        // rows captured above; everything beyond the bound must remain byte-for-
+        // byte discoverable for the next runtime turn.
+        conn.execute(
+            "DELETE FROM claim_derivation_jobs
+              WHERE status = 'done'
+                AND (page_id, page_version) IN (
+                    SELECT page_id, page_version
+                      FROM claim_derivation_backlog_batch
+                )",
+            (),
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("derivation backlog sweep: {error}")))?;
+
+        conn.execute(
+            "DELETE FROM claim_derivation_jobs
+              WHERE status = 'done'
+                AND (page_id, page_version) IN (
+                    SELECT page_id, page_version
+                      FROM claim_derivation_drift_batch
+                )",
+            (),
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("derivation drift sweep: {error}")))?;
+
+        conn.execute(
+            "INSERT INTO claim_derivation_jobs
+                 (job_id, page_id, page_version, status, attempts, created_at, updated_at)
+             SELECT b.page_id || ':' || b.page_version,
+                    b.page_id, b.page_version, 'pending', 0, ?1, ?1
+               FROM claim_derivation_backlog_batch b
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM claim_derivation_jobs j
+                   WHERE j.page_id = b.page_id AND j.page_version = b.page_version
+              )",
+            libsql::params![now],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("derivation backlog enqueue: {error}")))?;
 
         conn.execute(
             "INSERT INTO claim_derivation_jobs
@@ -722,7 +738,7 @@ impl MemoryDB {
         .await
         .map_err(|error| WenlanError::VectorDb(format!("derivation drift demotion: {error}")))?;
 
-        Ok((created + drifted) as usize)
+        Ok((stale + drifted) as usize)
     }
 
     /// Run [`Self::enqueue_stale_derivation_jobs`] until the backlog is drained,

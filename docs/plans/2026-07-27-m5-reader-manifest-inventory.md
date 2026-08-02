@@ -900,7 +900,7 @@ carrying the authority of agreement.
 | `core/db.rs:46571` | `get_stale_page_after` | `pub` | internal-only |
 | `core/db.rs:46608` | `list_stale_pages_scoped` | `pub` | **exposure** — `server/routes.rs:772` |
 | `core/db.rs:46648` | `find_stale_archived_pages` | `pub` | **exposure** — `server/cmd_backfill.rs:49` |
-| `core/db/claim_derivation.rs:1740` | `evaluate_support_on` | `private` | internal-only |
+| `core/db/claim_derivation.rs:1756` | `evaluate_support_on` | `private` | internal-only |
 | `core/db/maintenance_duplicate_reads.rs:35` | `embedding_near_duplicate_pairs` | `pub(crate)` | internal-only |
 | `core/db/maintenance_duplicate_reads.rs:108` | `scan_near_duplicate_slice` | `pub(crate)` | internal-only |
 | `core/db/maintenance_retro_scan.rs:17` | `scan_automatic_retro_stub_slice` | `pub(crate)` | internal-only |
@@ -951,9 +951,9 @@ carrying the authority of agreement.
 | `core/db.rs:43881` | `list_active_page_titles` | `pub` | `list_active_page_titles_scoped` |
 | `core/db.rs:44322` | `resolve_orphan_page_links` | `pub` | `find_unique_active_page_id_by_title_scoped` |
 | `core/db.rs:46561` | `list_stale_pages` | `pub` | `list_stale_pages_scoped` |
-| `core/db/claim_derivation.rs:943` | `reconcile_supported_pages` | `pub` | `evaluate_support_on` |
-| `core/db/claim_derivation.rs:1487` | `evaluate_page_support` | `pub` | `evaluate_support_on` |
-| `core/db/claim_derivation.rs:2373` | `finalize_page_support` | `pub` | `evaluate_support_on` |
+| `core/db/claim_derivation.rs:959` | `reconcile_supported_pages` | `pub` | `evaluate_support_on` |
+| `core/db/claim_derivation.rs:1503` | `evaluate_page_support` | `pub` | `evaluate_support_on` |
+| `core/db/claim_derivation.rs:2389` | `finalize_page_support` | `pub` | `evaluate_support_on` |
 | `core/db/presence_review.rs:112` | `review_in_txn` | `private` | `page_binding` |
 | `core/db/repair_page_rename.rs:622` | `rename_page_projection_matches_post` | `private` | `page_on_connection` |
 | `core/db/scoped_pages.rs:280` | `list_recent_pages_with_badges_scoped` | `pub` | `list_recent_pages_with_badges` |

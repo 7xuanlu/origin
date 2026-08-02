@@ -1147,6 +1147,36 @@ fn the_runtime_backlog_continuation_is_fenced_out_of_repair_mode() {
         ),
         "MemoryDB::new reaches migration 105, whose pre-serve queue seed must use the named bound"
     );
+    let sweep_start = claim_derivation
+        .find("async fn sweep_stale_derivation_jobs(")
+        .expect("the bounded sweep implementation must exist");
+    let sweep_end = claim_derivation[sweep_start..]
+        .find("pub async fn drain_stale_derivation_jobs(")
+        .map(|offset| sweep_start + offset)
+        .expect("the drain must follow the bounded sweep");
+    let sweep = &claim_derivation[sweep_start..sweep_end];
+    let stale_capture = sweep
+        .find("INSERT INTO claim_derivation_backlog_batch")
+        .expect("stale-marker cleanup must first capture a bounded batch");
+    let drift_capture = sweep
+        .find("INSERT INTO claim_derivation_drift_batch")
+        .expect("drift cleanup must first capture a bounded batch");
+    let first_cleanup = sweep
+        .find("DELETE FROM claim_derivation_jobs")
+        .expect("the captured batches must replace stale done jobs");
+    assert!(
+        stale_capture < first_cleanup && drift_capture < first_cleanup,
+        "both bounded sets must be captured before any cleanup write can touch jobs"
+    );
+    for (batch, minimum_uses) in [
+        ("FROM claim_derivation_backlog_batch", 2),
+        ("FROM claim_derivation_drift_batch", 3),
+    ] {
+        assert!(
+            sweep.matches(batch).count() >= minimum_uses,
+            "{batch} must bind capture, done-job cleanup, and pending insertion/demotion"
+        );
+    }
     let fence = runtime
         .find("if optional_runtime_workers_allowed(repair_recovery_pending)")
         .expect("repair recovery must fence optional runtime workers");
