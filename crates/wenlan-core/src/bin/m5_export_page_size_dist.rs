@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{bail, Context, Result};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use wenlan_core::eval::m5_bench_corpus::{
-    distribution_from_fixed_counts, open_page_size_db_read_only,
+use std::path::PathBuf;
+use wenlan_core::eval::{
+    m5_bench_corpus::distribution_from_fixed_counts,
+    m5_snapshot_io::{open_page_size_db_read_only, prepare_m5_snapshot},
 };
 
 const AGGREGATE_QUERY: &str = r#"
@@ -44,7 +44,7 @@ async fn run() -> Result<()> {
     if !args.db.is_file() {
         bail!("--db must name an existing database file");
     }
-    reject_database_output_alias(&args.db, &args.output)?;
+    let snapshot = prepare_m5_snapshot(&args.db, &args.output, args.overwrite)?;
 
     let connection = open_page_size_db_read_only(&args.db).await?;
     let mut rows = connection
@@ -65,33 +65,12 @@ async fn run() -> Result<()> {
 
     let distribution = distribution_from_fixed_counts(counts)?;
     let output = distribution.to_canonical_json_bytes()?;
-    atomic_write(&args.output, &output, args.overwrite)?;
+    snapshot.write(&output)?;
     println!(
         "wrote aggregate distribution: sample_size={} buckets={}",
         distribution.sample_size,
         distribution.buckets.len()
     );
-    Ok(())
-}
-
-fn reject_database_output_alias(db: &Path, output: &Path) -> Result<()> {
-    let canonical_db = std::fs::canonicalize(db).context("canonicalize --db")?;
-    let canonical_output = match std::fs::symlink_metadata(output) {
-        Ok(_) => std::fs::canonicalize(output).context("canonicalize existing --output")?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let file_name = output
-                .file_name()
-                .context("--output must include a file name")?;
-            let parent = output.parent().unwrap_or_else(|| Path::new("."));
-            std::fs::canonicalize(parent)
-                .context("canonicalize --output parent")?
-                .join(file_name)
-        }
-        Err(error) => return Err(error).context("inspect --output"),
-    };
-    if canonical_db == canonical_output {
-        bail!("--output must not alias --db");
-    }
     Ok(())
 }
 
@@ -125,30 +104,4 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Args
         output: output.context("--output is required")?,
         overwrite,
     })
-}
-
-fn atomic_write(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if !parent.is_dir() {
-        bail!("output parent directory does not exist");
-    }
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .context("create same-directory temporary output")?;
-    temporary
-        .write_all(bytes)
-        .context("write temporary aggregate output")?;
-    temporary
-        .as_file()
-        .sync_all()
-        .context("sync temporary aggregate output")?;
-    if overwrite {
-        temporary
-            .persist(path)
-            .context("atomically replace output")?;
-    } else {
-        temporary
-            .persist_noclobber(path)
-            .context("output exists; pass --overwrite to replace it")?;
-    }
-    Ok(())
 }

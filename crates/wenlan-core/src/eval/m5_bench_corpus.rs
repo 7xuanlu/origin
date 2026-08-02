@@ -17,7 +17,6 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
-use std::path::Path;
 
 pub const M5_BENCH_SEED: u64 = 0x4d35_0001;
 pub const M5_BENCH_MEMORY_COUNT: u64 = 100_000;
@@ -251,25 +250,6 @@ pub fn parse_accuracy_jsonl(bytes: &[u8]) -> Result<Vec<JudgeAccuracyCase>> {
         bail!("accuracy fixture contains no cases");
     }
     Ok(cases)
-}
-
-/// Open the page-size source through the exact read-only connection used by
-/// the exporter. The SQLite flag is the primary fence; `query_only` is a
-/// second, connection-local refusal that makes accidental DML/DDL fail loud.
-pub async fn open_page_size_db_read_only(path: &Path) -> Result<libsql::Connection> {
-    let database = libsql::Builder::new_local(path)
-        .flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .build()
-        .await
-        .context("open page-size database read-only")?;
-    let connection = database
-        .connect()
-        .context("connect page-size database read-only")?;
-    connection
-        .execute("PRAGMA query_only = ON", ())
-        .await
-        .context("enforce query-only page-size connection")?;
-    Ok(connection)
 }
 
 pub fn corpus_summary(distribution: &PageSizeDistribution) -> Result<CorpusSummary> {

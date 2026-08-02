@@ -309,7 +309,7 @@ async fn shared_page_size_connection_rejects_insert_and_ddl() {
     let directory = tempfile::tempdir().unwrap();
     let db_path = directory.path().join("read-only.db");
     create_pages_db(&db_path, &five_ascii_pages()).await;
-    let connection = wenlan_core::eval::m5_bench_corpus::open_page_size_db_read_only(&db_path)
+    let connection = wenlan_core::eval::m5_snapshot_io::open_page_size_db_read_only(&db_path)
         .await
         .unwrap();
     assert!(connection
@@ -349,6 +349,36 @@ async fn exporter_rejects_database_output_aliases_before_data_loss() {
         std::os::unix::fs::symlink(&symlink_db, &alias).unwrap();
         assert_collision_refused_and_preserved(&symlink_db, &alias);
     }
+}
+
+#[cfg(all(feature = "eval-harness", unix))]
+#[tokio::test]
+async fn prepared_snapshot_refuses_parent_retarget_before_temp_creation() {
+    let directory = tempfile::tempdir().unwrap();
+    let safe_dir = directory.path().join("safe");
+    let db_dir = directory.path().join("db");
+    std::fs::create_dir(&safe_dir).unwrap();
+    std::fs::create_dir(&db_dir).unwrap();
+    let db_path = db_dir.join("origin_memory.db");
+    create_pages_db(&db_path, &five_ascii_pages()).await;
+    let db_bytes = std::fs::read(&db_path).unwrap();
+    let db_metadata = std::fs::metadata(&db_path).unwrap();
+    let parent_link = directory.path().join("parent-link");
+    std::os::unix::fs::symlink(&safe_dir, &parent_link).unwrap();
+    let output = parent_link.join("origin_memory.db");
+
+    let prepared =
+        wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&db_path, &output, true).unwrap();
+    std::fs::remove_file(&parent_link).unwrap();
+    std::os::unix::fs::symlink(&db_dir, &parent_link).unwrap();
+
+    assert!(prepared.write(b"replacement\n").is_err());
+    let after = std::fs::metadata(&db_path).unwrap();
+    assert_eq!(after.len(), db_metadata.len());
+    assert_eq!(after.modified().unwrap(), db_metadata.modified().unwrap());
+    assert_eq!(std::fs::read(&db_path).unwrap(), db_bytes);
+    assert_eq!(std::fs::read_dir(&safe_dir).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&db_dir).unwrap().count(), 1);
 }
 
 #[cfg(feature = "eval-harness")]

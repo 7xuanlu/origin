@@ -97,6 +97,7 @@ toml = "0.8"
 fs2 = "0.4"
 cap-std = "=4.0.2"
 cap-fs-ext = "=4.0.2"
+same-file = "1.0"
 
 # Release profile tuned for CI throughput. Cargo's non-incremental default is
 # already `codegen-units = 16`; keep it explicit as a measured build contract.
