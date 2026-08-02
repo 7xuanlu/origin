@@ -5264,7 +5264,7 @@ fn canonical_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
         || !preserve_run.contains("if [[ ! -f \"$receipt\" ]]")
         || !preserve_run.contains("${{ steps.page-lint-scale.outcome }}")
         || lint_upload.and_then(|step| step["if"].as_str())
-        != Some("always() && needs.detect-changes.outputs.canonical-smokes-required == 'true'")
+            != Some("always() && needs.detect-changes.outputs.canonical-smokes-required == 'true'")
         || lint_upload
             .and_then(|step| step["uses"].as_str())
             .is_none_or(|uses| !uses.starts_with("actions/upload-artifact@"))
