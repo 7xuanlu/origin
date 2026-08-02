@@ -514,6 +514,7 @@ jobs:
       - name: Test release target inventory
         run: |
           python3 scripts/release_targets.test.py
+          bash scripts/release_preflight_matrix.test.sh
           python3 scripts/release_archive.test.py
           python3 scripts/package-release-artifacts.test.py
           python3 scripts/smoke-release-archive.test.py
@@ -523,19 +524,14 @@ jobs:
       - name: Emit release target matrix
         id: release-targets
         run: python3 scripts/release_targets.py matrix --github-output "$GITHUB_OUTPUT"
-      - name: Emit bounded PR release preflight matrix
+      - name: Emit event-bounded release preflight matrix
         id: release-preflight-targets
-        shell: bash
-        run: |
-          args=(
-            matrix
-            --github-output "$GITHUB_OUTPUT"
-            --output-name release-preflight-targets
-          )
-          if [[ "$GITHUB_EVENT_NAME" == "pull_request" && "$GITHUB_HEAD_REF" != release-please--branches--* ]]; then
-            args+=(--exclude-target x86_64-pc-windows-msvc)
-          fi
-          python3 scripts/release_targets.py "${args[@]}"
+        run: >-
+          python3 scripts/release_targets.py preflight-matrix
+          --event-name "$GITHUB_EVENT_NAME"
+          --ref "$GITHUB_REF"
+          --head-ref "$GITHUB_HEAD_REF"
+          --github-output "$GITHUB_OUTPUT"
       - name: Test artifact download retry
         run: bash scripts/download-run-artifact.test.sh
       - name: Test FastEmbed cache preparation
@@ -1364,8 +1360,10 @@ jobs:
 
   # Build/smoke preflight for shipped release targets. Release-sensitive
   # ordinary PRs prove the three non-Windows profiles while the existing
-  # Windows functional/platform lanes prove native linkage. Main/manual runs
-  # and the release-please PR retain the complete four-target release matrix.
+  # Windows functional/platform lanes prove native linkage. Ordinary main runs
+  # retain only the expensive Windows release profile, which is the sole target
+  # cache this job can persist for the next candidate. Manual runs and the
+  # release-please PR retain the complete four-target release matrix.
   # Only the exact same-repository release-please candidate additionally emits
   # observe-only canonical archives for the read-only default-branch validator.
   release-preflight:
@@ -1382,7 +1380,8 @@ jobs:
       fail-fast: true
       # An ordinary PR already links and exercises Windows in `test` and
       # `mcp-platform`; compiling the same graph again in release profile is
-      # the measured >20-minute duplicate. Full release backstops keep it.
+      # the measured >20-minute duplicate. Ordinary main does only the Windows
+      # cache-warming backstop; release-please and manual runs stay complete.
       matrix: ${{ fromJSON(needs.detect-changes.outputs.release-preflight-targets) }}
     env:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache

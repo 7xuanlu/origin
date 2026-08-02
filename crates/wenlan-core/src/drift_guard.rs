@@ -3959,7 +3959,7 @@ jobs:
     }
 }
 
-// ── Teeth #9: release preflight mirrors every shipped target without publishing ──
+// ── Teeth #9: release preflight preserves event-bounded shipped-target proof ──
 
 fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &str) -> Vec<String> {
     let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
@@ -3983,6 +3983,34 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             != Some("${{ fromJSON(needs.detect-changes.outputs.release-preflight-targets) }}")
     {
         violations.push("release-preflight is not a fail-fast canonical target matrix".into());
+    }
+    let matrix_plan = job_step(
+        &ci,
+        "detect-changes",
+        "Emit event-bounded release preflight matrix",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    for marker in [
+        "scripts/release_targets.py preflight-matrix",
+        "--event-name \"$GITHUB_EVENT_NAME\"",
+        "--ref \"$GITHUB_REF\"",
+        "--head-ref \"$GITHUB_HEAD_REF\"",
+        "--github-output \"$GITHUB_OUTPUT\"",
+    ] {
+        if !matrix_plan.contains(marker) {
+            violations.push(format!(
+                "release-preflight event matrix omits fail-closed planner input {marker:?}"
+            ));
+        }
+    }
+    let inventory_test = job_step(&ci, "detect-changes", "Test release target inventory")
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if !inventory_test.contains("bash scripts/release_preflight_matrix.test.sh") {
+        violations.push(
+            "release-preflight event matrix is not exercised through its shell contract".into(),
+        );
     }
     let build = job_step(
         &ci,
@@ -4067,8 +4095,9 @@ fn release_preflight_is_release_gated_and_non_publishing() {
     let violations = release_preflight_contract_violations(&ci, &release);
     assert!(
         violations.is_empty(),
-        "release-preflight contract drift — preflight must mirror every shipped release \
-         target without publishing side effects beyond immutable candidate data, and run only for release-sensitive changes. \
+        "release-preflight contract drift — ordinary PR/main matrices must remain bounded, \
+         release-please/manual matrices must mirror every shipped target, and no lane may publish \
+         beyond immutable candidate data. \
          Fix .github/workflows/ci.yml and release.yml; an intentional contract change also \
          updates release_preflight_contract_violations() and its positive control:\n{}",
         violations.join("\n")
@@ -4102,6 +4131,11 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         .replace(
             "        run: bash scripts/build-release-binaries.sh \"${{ matrix.target }}\"",
             "        run: gh release create unsafe",
+        )
+        .replace("preflight-matrix", "matrix")
+        .replace(
+            "          bash scripts/release_preflight_matrix.test.sh",
+            "          echo release preflight matrix shell contract removed",
         )
         .replace(
             "          expect_job release-preflight '${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true' }}' '${{ needs.release-preflight.result }}'",
@@ -4165,6 +4199,8 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
     for expected in [
         "release-sensitive PRs and backstops",
         "fail-fast canonical target matrix",
+        "event matrix omits fail-closed planner input",
+        "event matrix is not exercised through its shell contract",
         "canonical archives once",
         "unauthorized publishing side effect",
         "unbound manual dispatch",

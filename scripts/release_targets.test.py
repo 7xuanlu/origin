@@ -5,7 +5,13 @@ from __future__ import annotations
 
 import unittest
 
-from release_targets import TargetError, release_assets, release_matrix, require_target
+from release_targets import (
+    TargetError,
+    release_assets,
+    release_matrix,
+    release_preflight_matrix,
+    require_target,
+)
 
 
 EXPECTED = [
@@ -59,6 +65,55 @@ class ReleaseTargetTests(unittest.TestCase):
             release_matrix(exclude_targets=["x86_64-pc-windows-msvc"]),
             {"include": EXPECTED[:-1]},
         )
+
+    def test_ordinary_pr_preflight_excludes_windows(self) -> None:
+        self.assertEqual(
+            release_preflight_matrix(
+                event_name="pull_request",
+                ref="refs/pull/431/merge",
+                head_ref="codex/promote-release-artifacts",
+            ),
+            {"include": EXPECTED[:-1]},
+        )
+
+    def test_ordinary_main_preflight_only_warms_windows(self) -> None:
+        self.assertEqual(
+            release_preflight_matrix(
+                event_name="push",
+                ref="refs/heads/main",
+                head_ref="",
+            ),
+            {"include": EXPECTED[-1:]},
+        )
+
+    def test_release_please_and_manual_preflight_keep_every_target(self) -> None:
+        release_please = release_preflight_matrix(
+            event_name="pull_request",
+            ref="refs/pull/430/merge",
+            head_ref="release-please--branches--main",
+        )
+        manual = release_preflight_matrix(
+            event_name="workflow_dispatch",
+            ref="refs/heads/main",
+            head_ref="",
+        )
+
+        self.assertEqual(release_please, {"include": EXPECTED})
+        self.assertEqual(manual, {"include": EXPECTED})
+
+    def test_preflight_matrix_rejects_unowned_events_and_push_refs(self) -> None:
+        with self.assertRaisesRegex(TargetError, "does not accept event"):
+            release_preflight_matrix(
+                event_name="schedule",
+                ref="refs/heads/main",
+                head_ref="",
+            )
+        with self.assertRaisesRegex(TargetError, "does not accept push ref"):
+            release_preflight_matrix(
+                event_name="push",
+                ref="refs/heads/not-main",
+                head_ref="",
+            )
 
     def test_matrix_rejects_unknown_exclusions(self) -> None:
         with self.assertRaisesRegex(TargetError, "unknown shipped targets"):
