@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import io
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -845,6 +847,239 @@ class ReleasePromotionTests(unittest.TestCase):
             discovery_api, REPOSITORY, 2, "3" * 40, None, None
         )
         self.assertEqual(discovered["run_attempt"], 3)
+
+    def test_verify_main_ci_waits_for_the_exact_run_then_succeeds(self) -> None:
+        main_sha = "3" * 40
+        list_path = (
+            f"/repos/{REPOSITORY}/actions/workflows/"
+            f"{PROMOTION.CI_WORKFLOW_FILE}/runs"
+        )
+        run_path = f"/repos/{REPOSITORY}/actions/runs/100"
+        workflow_path = f"/repos/{REPOSITORY}/actions/workflows/9"
+        run = {
+            "id": 100,
+            "run_attempt": 2,
+            "workflow_id": 9,
+            "path": PROMOTION.CI_WORKFLOW_PATH,
+            "event": "push",
+            "status": "completed",
+            "conclusion": "success",
+            "head_branch": "main",
+            "head_sha": main_sha,
+            "repository": {"id": 2, "full_name": REPOSITORY},
+            "head_repository": {
+                "id": 2,
+                "full_name": REPOSITORY,
+                "fork": False,
+            },
+        }
+        pending = {**run, "status": "in_progress", "conclusion": None}
+        states = [pending, run]
+        inventories = [
+            {"total_count": 0, "workflow_runs": []},
+            {"total_count": 1, "workflow_runs": [{"id": 100}]},
+            {"total_count": 1, "workflow_runs": [{"id": 100}]},
+        ]
+
+        def get_json(path, *, params=None):
+            if path == f"/repos/{REPOSITORY}":
+                return {"id": 2, "full_name": REPOSITORY}
+            if path == list_path:
+                self.assertEqual(
+                    params,
+                    {
+                        "event": "push",
+                        "head_sha": main_sha,
+                        "per_page": 100,
+                    },
+                )
+                return inventories.pop(0)
+            if path == run_path:
+                return states.pop(0)
+            if path == workflow_path:
+                return {
+                    "id": 9,
+                    "path": PROMOTION.CI_WORKFLOW_PATH,
+                    "state": "active",
+                }
+            self.fail(f"unexpected API path: {path}")
+
+        api = mock.Mock()
+        api.get_json.side_effect = get_json
+        clock = [0.0]
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock[0] += seconds
+
+        resolved = PROMOTION.verify_main_ci(
+            api,
+            REPOSITORY,
+            main_sha,
+            wait_seconds=45,
+            sleep=sleep,
+            monotonic=lambda: clock[0],
+        )
+
+        self.assertEqual(resolved["id"], 100)
+        self.assertEqual(resolved["run_attempt"], 2)
+        self.assertEqual(sleeps, [15, 15])
+
+    def test_verify_main_ci_rejects_ambiguity_and_terminal_failure(self) -> None:
+        main_sha = "3" * 40
+        list_path = (
+            f"/repos/{REPOSITORY}/actions/workflows/"
+            f"{PROMOTION.CI_WORKFLOW_FILE}/runs"
+        )
+        params = {"event": "push", "head_sha": main_sha, "per_page": 100}
+        ambiguous = FakeApi(
+            {
+                (f"/repos/{REPOSITORY}", ()): {
+                    "id": 2,
+                    "full_name": REPOSITORY,
+                },
+                (list_path, tuple(sorted(params.items()))): {
+                    "total_count": 2,
+                    "workflow_runs": [{"id": 100}, {"id": 101}],
+                },
+            }
+        )
+        with self.assertRaisesRegex(PROMOTION.PromotionError, "exactly one"):
+            PROMOTION.verify_main_ci(ambiguous, REPOSITORY, main_sha)
+
+        failed_run = {
+            "id": 100,
+            "run_attempt": 1,
+            "workflow_id": 9,
+            "path": PROMOTION.CI_WORKFLOW_PATH,
+            "event": "push",
+            "status": "completed",
+            "conclusion": "failure",
+            "head_branch": "main",
+            "head_sha": main_sha,
+            "repository": {"id": 2, "full_name": REPOSITORY},
+            "head_repository": {
+                "id": 2,
+                "full_name": REPOSITORY,
+                "fork": False,
+            },
+        }
+        terminal = FakeApi(
+            {
+                (f"/repos/{REPOSITORY}", ()): {
+                    "id": 2,
+                    "full_name": REPOSITORY,
+                },
+                (list_path, tuple(sorted(params.items()))): {
+                    "total_count": 1,
+                    "workflow_runs": [{"id": 100}],
+                },
+                (f"/repos/{REPOSITORY}/actions/runs/100", ()): failed_run,
+                (f"/repos/{REPOSITORY}/actions/workflows/9", ()): {
+                    "id": 9,
+                    "path": PROMOTION.CI_WORKFLOW_PATH,
+                    "state": "active",
+                },
+            }
+        )
+        with self.assertRaisesRegex(PROMOTION.PromotionError, "conclusion 'failure'"):
+            PROMOTION.verify_main_ci(terminal, REPOSITORY, main_sha, wait_seconds=30)
+
+    def test_verify_main_ci_rejects_repository_head_and_workflow_drift(self) -> None:
+        main_sha = "3" * 40
+        list_path = (
+            f"/repos/{REPOSITORY}/actions/workflows/"
+            f"{PROMOTION.CI_WORKFLOW_FILE}/runs"
+        )
+        params = {"event": "push", "head_sha": main_sha, "per_page": 100}
+        run = {
+            "id": 100,
+            "run_attempt": 1,
+            "workflow_id": 9,
+            "path": PROMOTION.CI_WORKFLOW_PATH,
+            "event": "push",
+            "status": "completed",
+            "conclusion": "success",
+            "head_branch": "main",
+            "head_sha": main_sha,
+            "repository": {"id": 2, "full_name": REPOSITORY},
+            "head_repository": {
+                "id": 2,
+                "full_name": REPOSITORY,
+                "fork": False,
+            },
+        }
+        cases = [
+            (
+                "repository",
+                {**run, "repository": {"id": 3, "full_name": REPOSITORY}},
+                {"id": 9, "path": PROMOTION.CI_WORKFLOW_PATH, "state": "active"},
+                "main CI repository differs",
+            ),
+            (
+                "head repository",
+                {**run, "head_repository": {"id": 3, "full_name": REPOSITORY, "fork": False}},
+                {"id": 9, "path": PROMOTION.CI_WORKFLOW_PATH, "state": "active"},
+                "main CI head repository differs",
+            ),
+            (
+                "workflow",
+                run,
+                {"id": 9, "path": PROMOTION.CI_WORKFLOW_PATH, "state": "disabled_manually"},
+                "control-plane identity mismatch",
+            ),
+        ]
+        for label, candidate, workflow, expected in cases:
+            with self.subTest(label=label):
+                api = FakeApi(
+                    {
+                        (f"/repos/{REPOSITORY}", ()): {
+                            "id": 2,
+                            "full_name": REPOSITORY,
+                        },
+                        (list_path, tuple(sorted(params.items()))): {
+                            "total_count": 1,
+                            "workflow_runs": [{"id": 100}],
+                        },
+                        (f"/repos/{REPOSITORY}/actions/runs/100", ()): candidate,
+                        (f"/repos/{REPOSITORY}/actions/workflows/9", ()): workflow,
+                    }
+                )
+                with self.assertRaisesRegex(PROMOTION.PromotionError, expected):
+                    PROMOTION.verify_main_ci(api, REPOSITORY, main_sha)
+
+    def test_verify_main_ci_cli_prints_validated_run_identity(self) -> None:
+        run = {
+            "id": 100,
+            "run_attempt": 3,
+            "head_sha": "3" * 40,
+        }
+        with mock.patch.object(PROMOTION.VALIDATOR, "GitHubApi"), mock.patch.object(
+            PROMOTION, "verify_main_ci", return_value=run
+        ), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            result = PROMOTION._main(
+                [
+                    "verify-main-ci",
+                    "--repository",
+                    REPOSITORY,
+                    "--sha",
+                    "3" * 40,
+                    "--wait-seconds",
+                    "1200",
+                ]
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "head_sha": "3" * 40,
+                "run_attempt": 3,
+                "run_id": 100,
+                "status": "validated",
+                "workflow_path": PROMOTION.CI_WORKFLOW_PATH,
+            },
+        )
 
 
 if __name__ == "__main__":

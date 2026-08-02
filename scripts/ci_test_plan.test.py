@@ -36,6 +36,15 @@ M5_READER_FILTERSET = (
     "package(wenlan-core) & "
     "test(/^drift_guard::m5_reader_inventory_matches_current_tree$/)"
 )
+RUST_SUITE_OUTPUTS = (
+    "workspace-lib-required",
+    "cli-server-integration-required",
+    "core-integration-required",
+    "contract-integration-required",
+    "canonical-smokes-required",
+    "canonical-acceptance-required",
+    "rust-ci-required",
+)
 
 
 def package(
@@ -118,11 +127,15 @@ def cargo_metadata() -> dict:
     }
 
 
-def plan_for(*paths: str, existing_paths: set[str] | None = None) -> dict:
+def plan_for(
+    *paths: str,
+    existing_paths: set[str] | None = None,
+    event_name: str = "pull_request",
+) -> dict:
     return build_plan(
         list(paths),
         cargo_metadata(),
-        event_name="pull_request",
+        event_name=event_name,
         existing_paths=set(paths) if existing_paths is None else existing_paths,
     )
 
@@ -472,7 +485,7 @@ class PlatformPlanTests(unittest.TestCase):
         self.assertEqual(plan["mode"], "differential")
         self.assertFalse(any(required_suite_outputs(plan).values()))
 
-    def test_non_pr_platform_plan_keeps_full_backstop(self) -> None:
+    def test_push_platform_plan_uses_differential_routing(self) -> None:
         plan = build_platform_plan(
             self.INFRASTRUCTURE_PATHS,
             cargo_metadata(),
@@ -480,8 +493,8 @@ class PlatformPlanTests(unittest.TestCase):
             existing_paths=set(self.INFRASTRUCTURE_PATHS),
         )
 
-        self.assertEqual(plan["mode"], "full")
-        self.assertTrue(all(required_suite_outputs(plan).values()))
+        self.assertEqual(plan["mode"], "differential")
+        self.assertFalse(any(required_suite_outputs(plan).values()))
 
     def test_filtered_m4_only_pr_inventory_skips_generic_platform_suites(
         self,
@@ -499,10 +512,19 @@ class PlatformPlanTests(unittest.TestCase):
         )
         self.assertFalse(any(required_suite_outputs(plan).values()))
 
-    def test_empty_non_pr_and_release_platform_inventory_keeps_full_backstop(
+    def test_empty_push_platform_inventory_fails_closed(self) -> None:
+        with self.assertRaisesRegex(PlanError, "changed path inventory is empty"):
+            build_platform_plan(
+                [],
+                cargo_metadata(),
+                event_name="push",
+                existing_paths=set(),
+            )
+
+    def test_release_manual_and_unknown_platform_events_keep_full_backstop(
         self,
     ) -> None:
-        for event_name in ("push", "release-please"):
+        for event_name in ("release-please", "workflow_dispatch", "schedule"):
             with self.subTest(event_name=event_name):
                 plan = build_platform_plan(
                     [],
@@ -546,7 +568,10 @@ class NarrowOwnerTests(unittest.TestCase):
         plan = plan_for(M5_READER_PATHS[0], existing_paths=set())
 
         self.assertEqual(plan["mode"], "full")
-        self.assertTrue(all(required_suite_outputs(plan).values()))
+        outputs = required_suite_outputs(plan)
+        self.assertTrue(all(outputs[name] for name in RUST_SUITE_OUTPUTS))
+        self.assertFalse(outputs["fmt-required"])
+        self.assertTrue(outputs["clippy-required"])
 
     def test_broad_core_change_overrides_exact_m5_reader_filter(self) -> None:
         core_path = "crates/wenlan-core/src/search.rs"
@@ -593,14 +618,20 @@ class NarrowOwnerTests(unittest.TestCase):
                 plan = plan_for(path, existing_paths=set())
 
                 self.assertEqual(plan["mode"], "full")
-                self.assertTrue(all(required_suite_outputs(plan).values()))
+                outputs = required_suite_outputs(plan)
+                self.assertTrue(all(outputs[name] for name in RUST_SUITE_OUTPUTS))
+                self.assertFalse(outputs["fmt-required"])
+                self.assertTrue(outputs["clippy-required"])
 
     def test_unknown_r4_manifest_sibling_stays_fail_closed(self) -> None:
         path = "crates/wenlan-core/src/drift_guard/new_manifest.txt"
         plan = plan_for(path)
 
         self.assertEqual(plan["mode"], "full")
-        self.assertTrue(all(required_suite_outputs(plan).values()))
+        outputs = required_suite_outputs(plan)
+        self.assertTrue(all(outputs[name] for name in RUST_SUITE_OUTPUTS))
+        self.assertFalse(outputs["fmt-required"])
+        self.assertTrue(outputs["clippy-required"])
 
     def test_explicit_isolated_test_module_selects_its_real_prefix(self) -> None:
         path = "crates/wenlan-core/src/lint/pages/security_test.rs"
@@ -746,6 +777,15 @@ class NonRustOwnerTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assert_non_rust_owner(path)
 
+    def test_git_hook_contract_paths_have_no_rust_suites(self) -> None:
+        for path in (
+            ".githooks/pre-commit",
+            ".githooks/pre-push",
+            "scripts/git-hooks.test.sh",
+        ):
+            with self.subTest(path=path):
+                self.assert_non_rust_owner(path)
+
     def test_docs_npm_and_plugin_only_diff_stays_on_fast_lanes(self) -> None:
         self.assert_non_rust_owner(
             "docs/windows-vulkan.md",
@@ -790,6 +830,8 @@ class SuiteOutputTests(unittest.TestCase):
         self.assertEqual(
             outputs,
             {
+                "fmt-required": True,
+                "clippy-required": True,
                 "workspace-lib-required": True,
                 "cli-server-integration-required": True,
                 "core-integration-required": False,
@@ -827,10 +869,100 @@ class SuiteOutputTests(unittest.TestCase):
         self.assertFalse(isolated["canonical-acceptance-required"])
         self.assertFalse(any(plugin.values()))
 
-    def test_full_plan_requires_every_suite(self) -> None:
-        self.assertTrue(
-            all(required_suite_outputs(plan_for("Cargo.lock")).values())
+    def test_full_cargo_plan_requires_every_suite_and_only_relevant_daily_gate(
+        self,
+    ) -> None:
+        outputs = required_suite_outputs(plan_for("Cargo.lock"))
+
+        self.assertTrue(all(outputs[name] for name in RUST_SUITE_OUTPUTS))
+        self.assertFalse(outputs["fmt-required"])
+        self.assertTrue(outputs["clippy-required"])
+
+    def test_daily_gate_routes_exact_input_classes(self) -> None:
+        cases = {
+            "crates/wenlan-server/src/routes.rs": (True, True),
+            "Cargo.toml": (False, True),
+            "Cargo.lock": (False, True),
+            "rust-toolchain.toml": (False, True),
+            "clippy.toml": (False, True),
+            "crates/wenlan-core/Cargo.toml": (False, True),
+            "crates/wenlan-core/build.rs": (True, True),
+            "crates/wenlan-core/native/bridge.cpp": (False, True),
+            M5_READER_PATHS[0]: (False, False),
+            ".config/nextest.toml": (False, False),
+            ".github/workflows/ci.yml": (False, False),
+            "scripts/ci_test_plan.py": (False, False),
+            ".githooks/pre-commit": (False, False),
+            ".githooks/pre-push": (False, False),
+            "scripts/git-hooks.test.sh": (False, False),
+            "docs/windows-vulkan.md": (False, False),
+            "plugin-codex/skills/setup/SKILL.md": (False, False),
+            "crates/wenlan-mcp/npm/install.js": (False, False),
+        }
+
+        for event_name in ("pull_request", "push"):
+            for path, (fmt_required, clippy_required) in cases.items():
+                with self.subTest(event_name=event_name, path=path):
+                    outputs = required_suite_outputs(
+                        plan_for(path, event_name=event_name)
+                    )
+                    self.assertEqual(outputs["fmt-required"], fmt_required)
+                    self.assertEqual(outputs["clippy-required"], clippy_required)
+
+    def test_mixed_contract_and_rust_source_requires_both_daily_gates(self) -> None:
+        outputs = required_suite_outputs(
+            plan_for(M5_READER_PATHS[0], "crates/wenlan-core/src/search.rs")
         )
+
+        self.assertTrue(outputs["fmt-required"])
+        self.assertTrue(outputs["clippy-required"])
+
+    def test_deleted_rust_and_non_rust_fallbacks_keep_clippy_fail_closed(
+        self,
+    ) -> None:
+        cases = (
+            (M5_READER_PATHS[0], set(), False),
+            ("config/new-ci-input.json", {"config/new-ci-input.json"}, False),
+            ("crates/wenlan-server/tests/graceful_shutdown.rs", set(), True),
+        )
+
+        for path, existing_paths, fmt_required in cases:
+            with self.subTest(path=path):
+                outputs = required_suite_outputs(
+                    plan_for(path, existing_paths=existing_paths)
+                )
+                self.assertEqual(outputs["fmt-required"], fmt_required)
+                self.assertTrue(outputs["clippy-required"])
+
+    def test_daily_gate_output_fields_reject_missing_or_non_boolean_mutations(
+        self,
+    ) -> None:
+        for field, mutation in (
+            ("fmt_required", None),
+            ("fmt_required", "true"),
+            ("clippy_required", None),
+            ("clippy_required", 1),
+        ):
+            with self.subTest(field=field, mutation=mutation):
+                plan = plan_for("crates/wenlan-core/src/search.rs")
+                if mutation is None:
+                    plan.pop(field)
+                else:
+                    plan[field] = mutation
+                with self.assertRaisesRegex(PlanError, "has no boolean"):
+                    required_suite_outputs(plan)
+
+    def test_non_pr_empty_inventory_keeps_both_daily_gate_backstops(self) -> None:
+        plan = build_plan(
+            [],
+            cargo_metadata(),
+            event_name="workflow_dispatch",
+            existing_paths=set(),
+        )
+
+        outputs = required_suite_outputs(plan)
+        self.assertTrue(outputs["fmt-required"])
+        self.assertTrue(outputs["clippy-required"])
 
     def test_plan_command_writes_each_required_suite_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -860,15 +992,11 @@ class SuiteOutputTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             output = output_path.read_text(encoding="utf-8")
             for name in (
-                "workspace-lib-required",
-                "cli-server-integration-required",
-                "core-integration-required",
-                "contract-integration-required",
-                "canonical-smokes-required",
-                "canonical-acceptance-required",
-                "rust-ci-required",
+                *RUST_SUITE_OUTPUTS,
+                "clippy-required",
             ):
                 self.assertIn(f"{name}=true\n", output)
+            self.assertIn("fmt-required=false\n", output)
 
 class FailClosedTests(unittest.TestCase):
     def test_deleted_integration_target_falls_back_to_owning_package_suite(self) -> None:
@@ -899,7 +1027,10 @@ class FailClosedTests(unittest.TestCase):
 
         self.assertEqual(plan["mode"], "full")
         self.assertEqual(plan["canonical_smokes"], {"mode": "full"})
-        self.assertTrue(all(required_suite_outputs(plan).values()))
+        outputs = required_suite_outputs(plan)
+        self.assertTrue(all(outputs[name] for name in RUST_SUITE_OUTPUTS))
+        self.assertFalse(outputs["fmt-required"])
+        self.assertTrue(outputs["clippy-required"])
 
     def test_cargo_build_native_and_ci_inputs_fall_back_to_all_suites(self) -> None:
         for path in [
@@ -914,34 +1045,52 @@ class FailClosedTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(plan_for(path)["mode"], "full")
 
-    def test_non_pr_event_always_runs_full_backstop(self) -> None:
-        plan = build_plan(
-            ["crates/wenlan-server/src/routes.rs"],
-            cargo_metadata(),
-            event_name="push",
-            existing_paths={"crates/wenlan-server/src/routes.rs"},
-        )
+    def test_push_uses_the_same_differential_plan_as_pull_request(self) -> None:
+        path = "crates/wenlan-server/src/routes.rs"
+        pull_request = plan_for(path)
+        push = plan_for(path, event_name="push")
 
-        self.assertEqual(plan["mode"], "full")
+        self.assertEqual(push, pull_request)
+        self.assertEqual(push["mode"], "differential")
 
-    def test_non_pr_event_without_diff_inventory_runs_full_backstop(self) -> None:
-        plan = build_plan(
-            [],
-            cargo_metadata(),
-            event_name="workflow_dispatch",
-            existing_paths=set(),
-        )
+    def test_release_manual_and_unknown_events_keep_full_backstop(self) -> None:
+        for event_name in ("release-please", "workflow_dispatch", "schedule"):
+            with self.subTest(event_name=event_name):
+                plan = build_plan(
+                    [],
+                    cargo_metadata(),
+                    event_name=event_name,
+                    existing_paths=set(),
+                )
 
-        self.assertEqual(plan["mode"], "full")
+                self.assertEqual(plan["mode"], "full")
+                self.assertTrue(all(required_suite_outputs(plan).values()))
 
-    def test_pr_without_diff_inventory_fails_closed(self) -> None:
-        with self.assertRaisesRegex(PlanError, "changed path inventory is empty"):
-            build_plan(
-                [],
-                cargo_metadata(),
-                event_name="pull_request",
-                existing_paths=set(),
-            )
+    def test_differential_event_without_diff_inventory_fails_closed(self) -> None:
+        for event_name in ("pull_request", "push"):
+            with self.subTest(event_name=event_name):
+                with self.assertRaisesRegex(
+                    PlanError, "changed path inventory is empty"
+                ):
+                    build_plan(
+                        [],
+                        cargo_metadata(),
+                        event_name=event_name,
+                        existing_paths=set(),
+                    )
+
+    def test_push_deletions_and_unknown_paths_stay_fail_closed_full(self) -> None:
+        for path, existing_paths in (
+            (M5_READER_PATHS[0], set()),
+            ("config/new-ci-input.json", {"config/new-ci-input.json"}),
+        ):
+            with self.subTest(path=path):
+                plan = plan_for(
+                    path,
+                    existing_paths=existing_paths,
+                    event_name="push",
+                )
+                self.assertEqual(plan["mode"], "full")
 
     def test_malformed_metadata_fails_instead_of_emitting_empty_plan(self) -> None:
         with self.assertRaises(PlanError):
