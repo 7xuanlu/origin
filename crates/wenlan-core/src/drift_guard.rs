@@ -8272,7 +8272,8 @@ fn cfg_stripping_preserves_production_after_nested_attribute_positions() {
         "UTF-8 before a cfg span must not move blanking onto an earlier production comparison"
     );
 
-    let utf8_before_insert = "fn create() { let 測試測試測試測試測試測試 = 0; \
+    let utf8_before_insert =
+        "fn create() { let 測試測試測試測試測試測試測試測試測試測試測試測試 = 0; \
          tx.execute(\"INSERT INTO pages (id, title) VALUES (?1, ?2)\", ()); \
          #[cfg(test)] let _probe = [0; 64]; }";
     syn::parse_file(utf8_before_insert).expect("the UTF-8 INSERT control must be valid Rust");
