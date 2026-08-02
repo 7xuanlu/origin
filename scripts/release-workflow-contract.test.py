@@ -34,6 +34,15 @@ def job_body(workflow: str, job_name: str) -> str:
     return match.group("body") if match else ""
 
 
+def named_step_body(job: str, step_name: str) -> str:
+    match = re.search(
+        rf"^      - name: {re.escape(step_name)}\n(?P<body>.*?)(?=^      - (?:name:|uses:)|^      #|^  #|\Z)",
+        job,
+        re.MULTILINE | re.DOTALL,
+    )
+    return match.group("body").strip() if match else ""
+
+
 def contract_violations(release: str, release_please: str) -> list[str]:
     violations: list[str] = []
     docker = job_body(release, "docker")
@@ -121,9 +130,9 @@ def release_cache_contract_violations(ci: str, release: str) -> list[str]:
     producer = job_body(ci, "release-preflight")
     consumer = job_body(release, "release")
     shared_markers = [
+        "id: windows-release-cache",
         "uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32",
-        "shared-key: release-v2-${{ matrix.target }}",
-        "workspaces: . -> target/${{ matrix.target }}",
+        "shared-key: release-v3-${{ matrix.target }}",
         'cache-workspace-crates: "false"',
     ]
     for owner, body in (("CI producer", producer), ("tag consumer", consumer)):
@@ -132,6 +141,102 @@ def release_cache_contract_violations(ci: str, release: str) -> list[str]:
             violations.append(
                 f"{owner} Windows release cache contract is incomplete: {', '.join(missing)}"
             )
+
+    marker_name = "Mark Windows explicit target as nested Cargo cache"
+    producer_marker = named_step_body(producer, marker_name)
+    consumer_marker = named_step_body(consumer, marker_name)
+    marker_contract = [
+        "if: matrix.target == 'x86_64-pc-windows-msvc'",
+        "shell: pwsh",
+        '$targetRoot = "target\\${{ matrix.target }}"',
+        'Join-Path $targetRoot "CACHEDIR.TAG"',
+        '$contents = @"\n          Signature: 8a477f597d28d172789f06886806bc55',
+        "[IO.File]::WriteAllText($marker, $contents, [Text.UTF8Encoding]::new($false))",
+    ]
+    for owner, body, marker in (
+        ("CI producer", producer, producer_marker),
+        ("tag consumer", consumer, consumer_marker),
+    ):
+        if any(item not in marker for item in marker_contract):
+            violations.append(
+                f"{owner} does not create a valid nested Cargo target marker"
+            )
+        marker_index = body.find(f"- name: {marker_name}")
+        cache_index = body.find("uses: Swatinem/rust-cache@")
+        if marker_index < 0 or cache_index < 0 or marker_index >= cache_index:
+            violations.append(f"{owner} creates the nested target marker after cache restore")
+
+    if producer_marker != consumer_marker:
+        violations.append("producer/consumer nested target marker parity has drifted")
+
+    probe_name = "Probe Windows host and target cache restore"
+    producer_probe = named_step_body(producer, probe_name)
+    consumer_probe = named_step_body(consumer, probe_name)
+    probe_contract = [
+        "if: matrix.target == 'x86_64-pc-windows-msvc'",
+        "shell: pwsh",
+        '$marker = "target\\${{ matrix.target }}\\CACHEDIR.TAG"',
+        '$hostDeps = "target\\release\\deps"',
+        '$targetDeps = "target\\${{ matrix.target }}\\release\\deps"',
+        "$exactHit = '${{ steps.windows-release-cache.outputs.cache-hit }}'",
+        "if ($hostCount -eq 0 -and $targetCount -eq 0)",
+        "elseif ($hostCount -gt 0 -and $targetCount -gt 0)",
+        "partial Windows cache restore:",
+        'if ($exactHit -eq "true" -and $state -ne "warm-or-fallback-restore")',
+        "Windows cache restore receipt: action_exact=$exactHit state=$state host_deps=$hostCount target_deps=$targetCount marker=present",
+    ]
+    for owner, body, probe in (
+        ("CI producer", producer, producer_probe),
+        ("tag consumer", consumer, consumer_probe),
+    ):
+        if any(item not in probe for item in probe_contract):
+            violations.append(f"{owner} omits the fail-loud Windows cache restore probe")
+        cache_index = body.find("uses: Swatinem/rust-cache@")
+        tail = body[cache_index:] if cache_index >= 0 else ""
+        next_step = re.search(r"^      - name: (.+)$", tail, re.MULTILINE)
+        if next_step is None or next_step.group(1) != probe_name:
+            violations.append(f"{owner} does not probe the Windows cache immediately after restore")
+    if producer_probe != consumer_probe:
+        violations.append("producer/consumer Windows cache restore probe parity has drifted")
+
+    receipt_name = "Verify Windows host and target cache layout"
+    producer_receipt = named_step_body(producer, receipt_name)
+    consumer_receipt = named_step_body(consumer, receipt_name)
+    receipt_contract = [
+        "if: matrix.target == 'x86_64-pc-windows-msvc'",
+        "shell: pwsh",
+        '$marker = "target\\${{ matrix.target }}\\CACHEDIR.TAG"',
+        '$hostDeps = "target\\release\\deps"',
+        '$targetDeps = "target\\${{ matrix.target }}\\release\\deps"',
+        "Get-ChildItem -LiteralPath $hostDeps",
+        "Get-ChildItem -LiteralPath $targetDeps",
+        "if ($hostCount -eq 0 -or $targetCount -eq 0)",
+        "Windows cache layout receipt:",
+    ]
+    for owner, body, receipt, proof_name in (
+        ("CI producer", producer, producer_receipt, "Native ORT smoke (Windows release preflight)"),
+        ("tag consumer", consumer, consumer_receipt, "Build and smoke shipped release binaries"),
+    ):
+        if any(item not in receipt for item in receipt_contract):
+            violations.append(f"{owner} omits the fail-loud Windows cache layout receipt")
+        proof_index = body.find(f"- name: {proof_name}")
+        receipt_index = body.find(f"- name: {receipt_name}")
+        if proof_index < 0 or receipt_index <= proof_index:
+            violations.append(f"{owner} records its cache layout receipt before build/smoke proof")
+    if producer_receipt != consumer_receipt:
+        violations.append("producer/consumer Windows cache layout receipt parity has drifted")
+
+    cache_configs: list[tuple[list[str], list[str]]] = []
+    for owner, body in (("CI producer", producer), ("tag consumer", consumer)):
+        keys = re.findall(r"^\s+shared-key:\s*(.+)$", body, re.MULTILINE)
+        workspaces = re.findall(r"^\s+workspaces:\s*(.*)$", body, re.MULTILINE)
+        cache_configs.append((keys, workspaces))
+        if workspaces != [". -> target"]:
+            violations.append(
+                f"{owner} must use one top-level target root; overlapping cache roots are forbidden"
+            )
+    if cache_configs[0] != cache_configs[1]:
+        violations.append("release cache producer/consumer parity has drifted")
 
     producer_markers = [
         'cache-all-crates: "true"',
@@ -220,14 +325,69 @@ def main() -> None:
         mutate_release_please=True,
     )
     mutated_ci = ci.replace(
-        "workspaces: . -> target/${{ matrix.target }}",
-        "workspaces: . -> target",
+        "          workspaces: . -> target",
+        "          workspaces: |\n            . -> target\n            . -> target/${{ matrix.target }}",
         1,
     )
     cache_violations = release_cache_contract_violations(mutated_ci, release)
-    if not any("CI producer" in violation for violation in cache_violations):
+    if not any("overlapping cache roots" in violation for violation in cache_violations):
         raise AssertionError(
-            "mutation did not exercise explicit-target cache mapping: "
+            "mutation did not reject overlapping cache roots: "
+            f"{cache_violations!r}"
+        )
+    mutated_ci = ci.replace(
+        "Signature: 8a477f597d28d172789f06886806bc55",
+        "Signature: invalid",
+        1,
+    )
+    cache_violations = release_cache_contract_violations(mutated_ci, release)
+    if not any("nested Cargo target marker" in violation for violation in cache_violations):
+        raise AssertionError(
+            "mutation did not exercise nested target marker validation: "
+            f"{cache_violations!r}"
+        )
+    mutated_ci = ci.replace(
+        "[IO.File]::WriteAllText($marker, $contents, [Text.UTF8Encoding]::new($false))",
+        "[IO.File]::WriteAllText($marker, $contents)",
+        1,
+    )
+    cache_violations = release_cache_contract_violations(mutated_ci, release)
+    if not any("nested Cargo target marker" in violation for violation in cache_violations):
+        raise AssertionError(
+            "mutation did not exercise no-BOM marker write validation: "
+            f"{cache_violations!r}"
+        )
+    mutated_ci = ci.replace(
+        "if ($hostCount -eq 0 -and $targetCount -eq 0)",
+        "if ($hostCount -eq 0 -or $targetCount -eq 0)",
+        1,
+    )
+    cache_violations = release_cache_contract_violations(mutated_ci, release)
+    if not any("cache restore probe" in violation for violation in cache_violations):
+        raise AssertionError(
+            "mutation did not exercise partial-restore probe validation: "
+            f"{cache_violations!r}"
+        )
+    mutated_release = release.replace(
+        "shared-key: release-v3-${{ matrix.target }}",
+        "shared-key: release-v3-consumer-${{ matrix.target }}",
+        1,
+    )
+    cache_violations = release_cache_contract_violations(ci, mutated_release)
+    if not any("producer/consumer parity" in violation for violation in cache_violations):
+        raise AssertionError(
+            "mutation did not exercise release cache parity: "
+            f"{cache_violations!r}"
+        )
+    mutated_ci = ci.replace(
+        "$hostCount = @(Get-ChildItem -LiteralPath $hostDeps -Force -ErrorAction Stop).Count",
+        "$hostCount = 0 # receipt disabled",
+        1,
+    )
+    cache_violations = release_cache_contract_violations(mutated_ci, release)
+    if not any("cache layout receipt" in violation for violation in cache_violations):
+        raise AssertionError(
+            "mutation did not exercise Windows cache layout receipt validation: "
             f"{cache_violations!r}"
         )
     print("PASS: release promotion, Homebrew, and Node 24 action contracts")

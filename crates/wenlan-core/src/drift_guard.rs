@@ -538,11 +538,11 @@ fn release_rust_cache_violations(workflow: &str) -> Vec<String> {
     if rust_cache.is_none() {
         violations.push("release job removed its target-level rust-cache fallback".into());
     }
+    let windows_condition = "matrix.target == 'x86_64-pc-windows-msvc'";
     let windows_only = "${{ matrix.target == 'x86_64-pc-windows-msvc' }}";
     if rust_cache.and_then(|step| step["with"]["shared-key"].as_str())
-        != Some("release-v2-${{ matrix.target }}")
-        || rust_cache.and_then(|step| step["with"]["workspaces"].as_str())
-            != Some(". -> target/${{ matrix.target }}")
+        != Some("release-v3-${{ matrix.target }}")
+        || rust_cache.and_then(|step| step["with"]["workspaces"].as_str()) != Some(". -> target")
         || rust_cache.and_then(|step| step["with"]["cache-all-crates"].as_str())
             != Some(windows_only)
         || rust_cache.and_then(|step| step["with"]["cache-workspace-crates"].as_str())
@@ -551,22 +551,44 @@ fn release_rust_cache_violations(workflow: &str) -> Vec<String> {
         || rust_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some("false")
     {
         violations.push(
-            "release target cache is not restore-only, target-scoped, and capacity-bounded to Windows"
+            "release target cache is not restore-only, host+target coherent, and capacity-bounded to Windows"
+                .into(),
+        );
+    }
+    let marker_name = "Mark Windows explicit target as nested Cargo cache";
+    let marker = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some(marker_name));
+    let marker_run = marker
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if marker.and_then(|step| step["if"].as_str()) != Some(windows_condition)
+        || !marker_run.contains("CACHEDIR.TAG")
+        || !marker_run.contains("Signature: 8a477f597d28d172789f06886806bc55")
+    {
+        violations.push(
+            "release does not create a valid nested Cargo target marker before cache restore"
                 .into(),
         );
     }
     let stabilizer_index = steps.iter().position(|step| {
         step["name"].as_str() == Some("Stabilize Windows Rust cache toolchain inputs")
     });
+    let marker_index = steps
+        .iter()
+        .position(|step| step["name"].as_str() == Some(marker_name));
     let cache_index = steps.iter().position(|step| {
         step["uses"]
             .as_str()
             .is_some_and(|uses| uses.contains("Swatinem/rust-cache"))
     });
-    if !matches!((stabilizer_index, cache_index), (Some(stabilizer), Some(cache)) if stabilizer < cache)
-    {
+    if !matches!(
+        (stabilizer_index, marker_index, cache_index),
+        (Some(stabilizer), Some(marker), Some(cache)) if stabilizer < marker && marker < cache
+    ) {
         violations.push(
-            "release does not stabilize Windows toolchain inputs before cache restore".into(),
+            "release does not stabilize Windows toolchain inputs and mark the nested target before cache restore"
+                .into(),
         );
     }
     if parsed["jobs"]["release"]["timeout-minutes"].as_str()
@@ -753,6 +775,7 @@ jobs:
         "rust-cache fallback",
         "capacity-bounded",
         "stabilize Windows toolchain inputs",
+        "nested Cargo target marker",
         "90/60-minute timeout",
     ] {
         assert!(
@@ -4324,6 +4347,7 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     for step_name in [
         "Stabilize Windows Rust cache toolchain inputs",
         "Configure rust-lld linker (Windows release preflight)",
+        "Mark Windows explicit target as nested Cargo cache",
         "Install sqlite3 (Windows only)",
         "Stage Windows release runtimes before smoke",
         "Native ORT smoke (Windows release preflight)",
@@ -4414,11 +4438,53 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             ));
         }
     }
+    let marker_name = "Mark Windows explicit target as nested Cargo cache";
+    let mut marker_runs = Vec::new();
+    for (workflow, job_name, owner) in [
+        (&ci, "release-preflight", "release-preflight"),
+        (&release, "release", "tag release"),
+    ] {
+        let marker = job_step(workflow, job_name, marker_name);
+        let marker_run = marker
+            .and_then(|step| step["run"].as_str())
+            .unwrap_or_default();
+        if marker.and_then(|step| step["if"].as_str()) != Some(windows_condition)
+            || !marker_run.contains("CACHEDIR.TAG")
+            || !marker_run.contains("Signature: 8a477f597d28d172789f06886806bc55")
+        {
+            violations.push(format!(
+                "{owner} does not create a valid nested Cargo target marker"
+            ));
+        }
+        let steps = workflow["jobs"][job_name]["steps"].as_sequence();
+        let marker_index = steps.and_then(|items| {
+            items
+                .iter()
+                .position(|step| step["name"].as_str() == Some(marker_name))
+        });
+        let cache_index = steps.and_then(|items| {
+            items.iter().position(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.contains("Swatinem/rust-cache"))
+            })
+        });
+        if !matches!(
+            (marker_index, cache_index),
+            (Some(marker), Some(cache)) if marker < cache
+        ) {
+            violations.push(format!(
+                "{owner} creates the nested target marker after cache restore"
+            ));
+        }
+        marker_runs.push(marker_run);
+    }
+    if marker_runs.len() != 2 || marker_runs[0] != marker_runs[1] {
+        violations.push("producer/consumer nested target marker parity has drifted".into());
+    }
     let cache = job_step_using(&ci, "release-preflight", "Swatinem/rust-cache");
     if cache.and_then(|step| step["with"]["shared-key"].as_str())
-        != Some("release-v2-${{ matrix.target }}")
-        || cache.and_then(|step| step["with"]["workspaces"].as_str())
-            != Some(". -> target/${{ matrix.target }}")
+        != Some("release-v3-${{ matrix.target }}")
         || cache.and_then(|step| step["with"]["cache-all-crates"].as_str()) != Some("true")
         || cache.and_then(|step| step["with"]["cache-workspace-crates"].as_str()) != Some("false")
         || cache.and_then(|step| step["with"]["cache-targets"].as_str())
@@ -4427,15 +4493,20 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             != Some("${{ github.ref == 'refs/heads/main' }}")
     {
         violations.push(
-            "release-preflight cache is not target-scoped, capacity-bounded, and main-owned".into(),
+            "release-preflight cache is not host+target coherent, capacity-bounded, and main-owned"
+                .into(),
+        );
+    }
+    if cache.and_then(|step| step["with"]["workspaces"].as_str()) != Some(". -> target") {
+        violations.push(
+            "release-preflight cache must use one top-level target root; overlapping cache roots are forbidden"
+                .into(),
         );
     }
     let release_cache = job_step_using(&release, "release", "Swatinem/rust-cache");
     let windows_cache = "${{ matrix.target == 'x86_64-pc-windows-msvc' }}";
     if release_cache.and_then(|step| step["with"]["shared-key"].as_str())
         != cache.and_then(|step| step["with"]["shared-key"].as_str())
-        || release_cache.and_then(|step| step["with"]["workspaces"].as_str())
-            != cache.and_then(|step| step["with"]["workspaces"].as_str())
         || release_cache.and_then(|step| step["with"]["cache-all-crates"].as_str())
             != Some(windows_cache)
         || release_cache.and_then(|step| step["with"]["cache-workspace-crates"].as_str())
@@ -4448,6 +4519,19 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             "tag release cache does not restore the main-owned preflight key with a Windows-only footprint"
                 .into(),
         );
+    }
+    if release_cache.and_then(|step| step["with"]["workspaces"].as_str()) != Some(". -> target") {
+        violations.push(
+            "tag release cache must use one top-level target root; overlapping cache roots are forbidden"
+                .into(),
+        );
+    }
+    if release_cache.and_then(|step| step["with"]["shared-key"].as_str())
+        != cache.and_then(|step| step["with"]["shared-key"].as_str())
+        || release_cache.and_then(|step| step["with"]["workspaces"].as_str())
+            != cache.and_then(|step| step["with"]["workspaces"].as_str())
+    {
+        violations.push("release cache producer/consumer parity has drifted".into());
     }
     let windows_runtime_stage = job_step(
         &ci,
@@ -4607,6 +4691,10 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "          save-if: \"true\"",
         )
         .replace(
+            "          shared-key: release-v3-${{ matrix.target }}",
+            "          shared-key: release-v3-ci-only-${{ matrix.target }}",
+        )
+        .replace(
             "        run: bash scripts/build-release-binaries.sh \"${{ matrix.target }}\"",
             "        run: gh release create unsafe",
         )
@@ -4625,6 +4713,10 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         .replace(
             "      - name: Select native Perl for vendored OpenSSL",
             "      - name: Native Perl removed",
+        )
+        .replace(
+            "      - name: Mark Windows explicit target as nested Cargo cache",
+            "      - name: Nested Cargo target marker removed",
         )
         .replace(
             "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=",
@@ -4666,8 +4758,10 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         "Docker DAG",
         "shared shipped-binary",
         "current main workflow ref",
-        "target-scoped, capacity-bounded, and main-owned",
+        "host+target coherent, capacity-bounded, and main-owned",
         "Windows-only footprint",
+        "nested Cargo target marker",
+        "producer/consumer",
         "truncated PR file inventory",
         "native Windows Perl",
         "target and host build artifacts",
@@ -4686,13 +4780,13 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
 }
 
 #[test]
-fn release_preflight_contract_rejects_implicit_cross_target_cache_root() {
+fn release_preflight_contract_rejects_overlapping_cache_roots() {
     let root = repo_root();
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
         .expect("read ci.yml")
         .replace(
-            "          workspaces: . -> target/${{ matrix.target }}",
             "          workspaces: . -> target",
+            "          workspaces: |\n            . -> target\n            . -> target/${{ matrix.target }}",
         );
     let release =
         std::fs::read_to_string(root.join(".github/workflows/release.yml")).expect("read release");
@@ -4700,8 +4794,8 @@ fn release_preflight_contract_rejects_implicit_cross_target_cache_root() {
     assert!(
         violations
             .iter()
-            .any(|violation| violation.contains("target-scoped, capacity-bounded, and main-owned")),
-        "mutation must reject an implicit cross-target cache root: {violations:?}"
+            .any(|violation| violation.contains("overlapping cache roots")),
+        "mutation must reject overlapping cache roots: {violations:?}"
     );
 }
 

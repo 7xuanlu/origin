@@ -1287,15 +1287,28 @@ jobs:
           "OPENSSL_SRC_PERL=$nativePerl" |
             Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "OPENSSL_SRC_PERL=$nativePerl"
+      - name: Mark Windows explicit target as nested Cargo cache
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $targetRoot = "target\${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $targetRoot | Out-Null
+          $marker = Join-Path $targetRoot "CACHEDIR.TAG"
+          $contents = @"
+          Signature: 8a477f597d28d172789f06886806bc55
+          # This file is a cache directory tag created by Cargo.
+          # For information about cache directory tags see https://bford.info/cachedir/
+          "@
+          [IO.File]::WriteAllText($marker, $contents, [Text.UTF8Encoding]::new($false))
       - name: Cache release artifacts (main-owned)
+        id: windows-release-cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          # `cargo --target` writes below target/<triple>/release. Point the
-          # cache cleaner at that triple root explicitly; otherwise it treats
-          # the triple as a Cargo profile and removes the release directory.
-          # v2 rotates the immutable cache that was saved after that cleanup.
-          shared-key: release-v2-${{ matrix.target }}
-          workspaces: . -> target/${{ matrix.target }}
+          # The nested CACHEDIR.TAG makes rust-cache preserve the explicit
+          # target while this top-level root also carries host build artifacts.
+          # v3 rotates the immutable cache to the coherent host+target layout.
+          shared-key: release-v3-${{ matrix.target }}
+          workspaces: . -> target
           cache-all-crates: "true"
           cache-workspace-crates: "false"
           # The repository cache is already at its 10 GB ceiling. Preserve the
@@ -1303,6 +1316,34 @@ jobs:
           # inputs without adding three more large target archives.
           cache-targets: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Probe Windows host and target cache restore
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $marker = "target\${{ matrix.target }}\CACHEDIR.TAG"
+          $hostDeps = "target\release\deps"
+          $targetDeps = "target\${{ matrix.target }}\release\deps"
+          $exactHit = '${{ steps.windows-release-cache.outputs.cache-hit }}'
+          if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+            throw "nested Cargo cache marker missing after restore: $marker"
+          }
+          $hostCount = if (Test-Path -LiteralPath $hostDeps -PathType Container) {
+            @(Get-ChildItem -LiteralPath $hostDeps -Force).Count
+          } else { 0 }
+          $targetCount = if (Test-Path -LiteralPath $targetDeps -PathType Container) {
+            @(Get-ChildItem -LiteralPath $targetDeps -Force).Count
+          } else { 0 }
+          if ($hostCount -eq 0 -and $targetCount -eq 0) {
+            $state = "cold-miss"
+          } elseif ($hostCount -gt 0 -and $targetCount -gt 0) {
+            $state = "warm-or-fallback-restore"
+          } else {
+            throw "partial Windows cache restore: exact=$exactHit host=$hostCount target=$targetCount"
+          }
+          if ($exactHit -eq "true" -and $state -ne "warm-or-fallback-restore") {
+            throw "exact cache hit restored no coherent host+target artifacts"
+          }
+          Write-Host "Windows cache restore receipt: action_exact=$exactHit state=$state host_deps=$hostCount target_deps=$targetCount marker=present"
       - name: Install sqlite3 (Windows only)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
@@ -1359,6 +1400,22 @@ jobs:
         run: |
           & scripts/smoke-windows.ps1 `
             -ExePath "target\${{ matrix.target }}\release\wenlan-server.exe"
+      - name: Verify Windows host and target cache layout
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $marker = "target\${{ matrix.target }}\CACHEDIR.TAG"
+          $hostDeps = "target\release\deps"
+          $targetDeps = "target\${{ matrix.target }}\release\deps"
+          if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+            throw "nested Cargo cache marker missing: $marker"
+          }
+          $hostCount = @(Get-ChildItem -LiteralPath $hostDeps -Force -ErrorAction Stop).Count
+          $targetCount = @(Get-ChildItem -LiteralPath $targetDeps -Force -ErrorAction Stop).Count
+          if ($hostCount -eq 0 -or $targetCount -eq 0) {
+            throw "incomplete Windows cache layout: host=$hostCount target=$targetCount"
+          }
+          Write-Host "Windows cache layout receipt: marker=present host_deps=$hostCount target_deps=$targetCount"
 
   # Required contract integrations for wenlan-mcp / wenlan-types. The planner
   # selects affected packages through reverse dependency closure, or an exact
