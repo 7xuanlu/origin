@@ -3211,7 +3211,10 @@ fn release_version_sync_never_runs_package_lifecycle_scripts() {
     let npm_version_lines = bump
         .lines()
         .chain(release.lines())
-        .filter(|line| line.contains("npm version"))
+        .filter(|line| {
+            let line = line.trim();
+            line.starts_with("npm version ") || line.contains("&& npm version ")
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         npm_version_lines.len(),
