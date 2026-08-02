@@ -512,14 +512,55 @@ class PlatformPlanTests(unittest.TestCase):
         )
         self.assertFalse(any(required_suite_outputs(plan).values()))
 
-    def test_empty_push_platform_inventory_fails_closed(self) -> None:
-        with self.assertRaisesRegex(PlanError, "changed path inventory is empty"):
-            build_platform_plan(
-                [],
-                cargo_metadata(),
-                event_name="push",
-                existing_paths=set(),
-            )
+    def test_filtered_empty_push_inventory_skips_platform_suites(self) -> None:
+        plan = build_platform_plan(
+            [],
+            cargo_metadata(),
+            event_name="push",
+            existing_paths=set(),
+        )
+
+        self.assertEqual(plan["mode"], "differential")
+        self.assertEqual(
+            plan["reasons"], ["no generic platform behavioral inputs changed"]
+        )
+        self.assertFalse(any(required_suite_outputs(plan).values()))
+
+    def test_canonical_plan_guards_the_filtered_platform_projection(self) -> None:
+        workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+        workflow = workflow_path.read_text(encoding="utf-8")
+        canonical_marker = "      - name: Plan affected Rust tests\n"
+        platform_marker = "      - name: Plan affected platform behavior tests\n"
+        next_marker = "      - name: Test release target inventory\n"
+
+        canonical_index = workflow.index(canonical_marker)
+        platform_index = workflow.index(platform_marker)
+        next_index = workflow.index(next_marker, platform_index)
+        canonical_body = workflow[canonical_index:platform_index]
+        platform_body = workflow[platform_index:next_index]
+        release_guard = (
+            "if: steps.release-proof.outputs.verified-release-merge != 'true'"
+        )
+
+        self.assertLess(canonical_index, platform_index)
+        self.assertIn(
+            "CHANGED_FILES_JSON: ${{ steps.filter.outputs.impact_files }}",
+            canonical_body,
+        )
+        self.assertIn(release_guard, canonical_body)
+        self.assertIn(release_guard, platform_body)
+        self.assertNotIn("continue-on-error:", canonical_body)
+        for status_override in ("always()", "failure()", "!cancelled()"):
+            self.assertNotIn(status_override, platform_body)
+        for marker in (
+            "MACOS_FILES_JSON: ${{ steps.filter.outputs.macos_files }}",
+            "MACOS_M4_FILES_JSON: ${{ steps.filter.outputs['macos-m4_files'] }}",
+            "M5_PLATFORM_FILES_JSON: ${{ steps.filter.outputs['m5-platform_files'] }}",
+            "WINDOWS_FILES_JSON: ${{ steps.filter.outputs.windows_files }}",
+            "'(($macos - $macos_m4 - $m5_platform) "
+            "+ ($windows - $m5_platform)) | unique'",
+        ):
+            self.assertIn(marker, platform_body)
 
     def test_release_manual_and_unknown_platform_events_keep_full_backstop(
         self,
@@ -997,6 +1038,40 @@ class SuiteOutputTests(unittest.TestCase):
             ):
                 self.assertIn(f"{name}=true\n", output)
             self.assertIn("fmt-required=false\n", output)
+
+    def test_platform_plan_command_accepts_empty_filtered_push_inventory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            metadata_path = Path(directory) / "metadata.json"
+            output_path = Path(directory) / "github-output.txt"
+            metadata_path.write_text(json.dumps(cargo_metadata()), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("ci_test_plan.py")),
+                    "plan",
+                    "--scope",
+                    "platform",
+                    "--changed-files-json",
+                    "[]",
+                    "--metadata-file",
+                    str(metadata_path),
+                    "--event-name",
+                    "push",
+                    "--github-output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=Path(__file__).parent.parent,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = output_path.read_text(encoding="utf-8")
+            for name in (*RUST_SUITE_OUTPUTS, "fmt-required", "clippy-required"):
+                self.assertIn(f"{name}=false\n", output)
 
 class FailClosedTests(unittest.TestCase):
     def test_deleted_integration_target_falls_back_to_owning_package_suite(self) -> None:

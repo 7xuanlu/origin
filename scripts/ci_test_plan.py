@@ -665,8 +665,10 @@ def build_platform_plan(
             existing_paths=existing_paths,
         )
     if not paths:
-        if event_name == "push":
-            raise PlanError("changed path inventory is empty")
+        # This inventory is already restricted to platform-owned paths by the
+        # workflow. An empty filtered inventory is therefore a proven skip,
+        # not a missing canonical diff. build_plan keeps the fail-closed guard
+        # for an empty repository-wide inventory on both PRs and pushes.
         return _skip_plan("no generic platform behavioral inputs changed")
 
     # Linux owns repository/workflow/planner contracts. Platform behavior is
