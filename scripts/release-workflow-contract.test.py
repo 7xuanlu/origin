@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -23,6 +25,7 @@ ARCHIVE_PATH = REPO_ROOT / "scripts" / "release_archive.py"
 PROMOTION_PATH = REPO_ROOT / "scripts" / "release-promotion.py"
 SYNC_RELEASE_PR_PATH = REPO_ROOT / "scripts" / "sync-release-pr.py"
 RUNTIME_IMAGE_PATH = REPO_ROOT / "scripts" / "verify-release-runtime-image.py"
+PUBLISH_CRATE_TEST_PATH = REPO_ROOT / "scripts" / "publish-crate.test.py"
 
 EXPECTED_NODE24_ACTIONS = {
     "actions/checkout": "d23441a48e516b6c34aea4fa41551a30e30af803",
@@ -311,20 +314,42 @@ def contract_violations(
         violations.append("tag release retains the duplicate release build matrix")
     if "cargo build" in release or "build-release-binaries" in release:
         violations.append("tag release can recompile the PR-validated release binaries")
-    if "cargo publish -p wenlan-types --dry-run" in release:
+    if "--dry-run" in job_body(release, "publish-crates"):
         violations.append("tag release duplicates Cargo publish verification")
     crates = job_body(release, "publish-crates")
     for marker in [
-        'if [[ -z "$CARGO_REGISTRY_TOKEN" ]]',
-        "CARGO_REGISTRY_TOKEN is required because wenlan-types",
-        "CARGO_REGISTRY_TOKEN is required because wenlan-mcp",
-        "name: Require wenlan-mcp on crates.io",
-        "wenlan-mcp ${VERSION} not visible on sparse index after 10 min",
+        "python3 scripts/publish-crate.py",
+        "--package wenlan-types",
+        "--package wenlan-mcp",
+        '--version "$VERSION"',
     ]:
         if marker not in crates:
-            violations.append(f"crates.io publication omits fail-closed proof {marker!r}")
+            violations.append(f"crates.io publication bypasses publish helper {marker!r}")
+    if crates.count("python3 scripts/publish-crate.py") != 2:
+        violations.append("crates.io publication does not call the helper exactly twice")
+    for forbidden in ["seq 1 60", "sleep 10", "--no-verify"]:
+        if forbidden in crates:
+            violations.append(
+                f"crates.io publication retains unsafe or serial polling {forbidden!r}"
+            )
     if "if: env.CARGO_REGISTRY_TOKEN != ''" in crates:
         violations.append("crates.io publication can silently skip a missing credential")
+    for job, timeout in {
+        "prepare-release": 10,
+        "publish-crates": 15,
+        "publish-npm": 10,
+        "update-homebrew": 20,
+        "docker-manifest": 10,
+        "finalize-release": 10,
+    }.items():
+        if not re.search(
+            rf"^    timeout-minutes: {timeout}\s*$",
+            job_body(release, job),
+            re.MULTILINE,
+        ):
+            violations.append(
+                f"release job {job!r} does not keep its {timeout}-minute bound"
+            )
     for job in [
         "resolve-promotion",
         "prepare-release",
@@ -1027,6 +1052,12 @@ def assert_mutation_detected(
 
 
 def main() -> None:
+    publish_helper_tests = subprocess.run(
+        [sys.executable, str(PUBLISH_CRATE_TEST_PATH)],
+        check=False,
+    )
+    if publish_helper_tests.returncode != 0:
+        raise AssertionError("crates.io publish helper contracts failed")
     ci = CI_PATH.read_text(encoding="utf-8")
     release = RELEASE_PATH.read_text(encoding="utf-8")
     release_please = RELEASE_PLEASE_PATH.read_text(encoding="utf-8")
@@ -1237,15 +1268,29 @@ def main() -> None:
             "release",
         ),
         (
-            "cargo publish -p wenlan-types",
-            "cargo publish -p wenlan-types --dry-run",
-            "duplicates Cargo publish verification",
+            "--package wenlan-types",
+            "--package unverified-types",
+            "bypasses publish helper",
             "release",
         ),
         (
-            "CARGO_REGISTRY_TOKEN is required because wenlan-mcp",
-            "missing token accepted for wenlan-mcp",
-            "crates.io publication omits fail-closed proof",
+            "--package wenlan-mcp",
+            "--package unverified-mcp",
+            "bypasses publish helper",
+            "release",
+        ),
+        (
+            "  publish-crates:\n"
+            "    name: Publish crates.io (wenlan-types + wenlan-mcp)\n"
+            "    needs: promote-assets\n"
+            "    runs-on: ubuntu-latest\n"
+            "    timeout-minutes: 15",
+            "  publish-crates:\n"
+            "    name: Publish crates.io (wenlan-types + wenlan-mcp)\n"
+            "    needs: promote-assets\n"
+            "    runs-on: ubuntu-latest\n"
+            "    timeout-minutes: 150",
+            "15-minute bound",
             "release",
         ),
         (

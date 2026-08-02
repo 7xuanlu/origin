@@ -2783,26 +2783,40 @@ fn ci_routing_contract_violations(
         .find(|step| step["id"].as_str() == Some("matrix"))
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default();
-    for required in [
-        "github.event_name",
-        "pull_request",
-        "workflow_dispatch",
-        "steps.release-candidate-trust.outputs.trusted-release-candidate",
-        "startsWith(github.head_ref, 'release-please--branches--')",
-        "steps.filter.outputs.macos",
-        "steps.filter.outputs.windows",
-    ] {
-        if !matrix_run.contains(required) {
-            violations.push(format!(
-                "dynamic OS matrix is missing differential/backstop routing marker {required:?}"
-            ));
-        }
+    let matrix_lines = matrix_run
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    let expected_matrix_lines = [
+        r#"macos='{"os":"macos-14","label":"macos-14"}'"#,
+        r#"windows='{"os":"windows-2022","label":"windows-2022"}'"#,
+        r#"if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then"#,
+        r#"include="${macos},${windows}""#,
+        r#"elif [ "${{ steps.release-candidate-trust.outputs.trusted-release-candidate }}" = "true" ]; then"#,
+        r#"include="""#,
+        r#"elif [ "${{ startsWith(github.head_ref, 'release-please--branches--') }}" = "true" ]; then"#,
+        r#"include="${macos},${windows}""#,
+        r#"elif [ "${{ steps.filter.outputs.macos }}" = "true" ] && [ "${{ steps.filter.outputs.windows }}" = "true" ]; then"#,
+        r#"include="${macos},${windows}""#,
+        r#"elif [ "${{ steps.filter.outputs.macos }}" = "true" ]; then"#,
+        r#"include="$macos""#,
+        r#"elif [ "${{ steps.filter.outputs.windows }}" = "true" ]; then"#,
+        r#"include="$windows""#,
+        "else",
+        r#"include="""#,
+        "fi",
+        r#"echo "json={\"include\":[${include}]}" >> "$GITHUB_OUTPUT""#,
+    ];
+    if matrix_lines != expected_matrix_lines {
+        violations.push(
+            "dynamic OS matrix does not keep ordinary PR and main push on the same owner-driven \
+             route with workflow_dispatch as the only event-wide full-platform backstop"
+                .into(),
+        );
     }
     if matrix_run.contains("ubuntu-24.04") {
         violations.push("dynamic platform matrix still contains a duplicate Linux compiler".into());
-    }
-    if matrix_run.contains("github.event_name }}\" != \"pull_request") {
-        violations.push("main push still widens the platform matrix unconditionally".into());
     }
 
     let conclusion_run =
@@ -3262,7 +3276,7 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
         )
         .replacen(
             "if [ \"${{ github.event_name }}\" = \"workflow_dispatch\" ]; then",
-            "if [ \"${{ github.event_name }}\" != \"pull_request\" ]; then",
+            "if [ \"${{ github.event_name }}\" != \"workflow_dispatch\" ]; then",
             1,
         );
     let planner = std::fs::read_to_string(root.join("scripts/ci_test_plan.py"))
@@ -3303,7 +3317,7 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
         "unknown paths",
         "platform test planner lost required contract",
         "exact generic macOS plus Windows filter inventories",
-        "main push still widens the platform matrix unconditionally",
+        "ordinary PR and main push on the same owner-driven route",
         "macos-m4 focused-owner allowlist has unreviewed path",
         "macos-m4 focused source crates/wenlan-core/src/db.rs acquired macos-specific cfg",
     ] {
@@ -5261,19 +5275,47 @@ fn release_promotion_contract_violations(
     {
         violations.push("tag release has an unbound trigger or duplicate compilation lane".into());
     }
-    if release_workflow.contains("cargo publish -p wenlan-types --dry-run") {
+    let crates_text = serde_yaml::to_string(&release["jobs"]["publish-crates"]).unwrap_or_default();
+    if crates_text.contains("--dry-run") {
         violations.push("tag release duplicates Cargo publish verification".into());
     }
-    let crates_text = serde_yaml::to_string(&release["jobs"]["publish-crates"]).unwrap_or_default();
+    for (job, timeout) in [
+        ("prepare-release", 10),
+        ("publish-crates", 15),
+        ("publish-npm", 10),
+        ("update-homebrew", 20),
+        ("docker-manifest", 10),
+        ("finalize-release", 10),
+    ] {
+        if release["jobs"][job]["timeout-minutes"].as_i64() != Some(timeout) {
+            violations.push(format!(
+                "release job {job:?} does not keep its {timeout}-minute bound"
+            ));
+        }
+    }
     for required in [
-        "CARGO_REGISTRY_TOKEN is required because wenlan-types",
-        "CARGO_REGISTRY_TOKEN is required because wenlan-mcp",
-        "Require wenlan-mcp on crates.io",
-        "wenlan-mcp ${VERSION} not visible on sparse index after 10 min",
+        "python3 scripts/publish-crate.py",
+        "--package wenlan-types",
+        "--package wenlan-mcp",
+        "--version \"$VERSION\"",
     ] {
         if !crates_text.contains(required) {
             violations.push(format!(
-                "crates.io publication omits fail-closed proof {required:?}"
+                "crates.io publication bypasses publish helper {required:?}"
+            ));
+        }
+    }
+    if crates_text
+        .matches("python3 scripts/publish-crate.py")
+        .count()
+        != 2
+    {
+        violations.push("crates.io publication does not call the helper exactly twice".into());
+    }
+    for forbidden in ["seq 1 60", "sleep 10", "--no-verify"] {
+        if crates_text.contains(forbidden) {
+            violations.push(format!(
+                "crates.io publication retains unsafe or serial polling {forbidden:?}"
             ));
         }
     }
@@ -5568,28 +5610,48 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
             "{label} synchronizer mutation must fail closed: {sync_violations:?}"
         );
     }
-    let duplicate_publish_verification =
+    let bypassed_publish_helper =
         std::fs::read_to_string(root.join(".github/workflows/release.yml"))
             .expect("read release")
-            .replace(
-                "cargo publish -p wenlan-types",
-                "cargo publish -p wenlan-types --dry-run",
-            );
-    let duplicate_publish_violations = release_promotion_contract_violations(
+            .replace("--package wenlan-types", "--package unverified-types");
+    let bypassed_publish_violations = release_promotion_contract_violations(
         &ci,
         &release_please,
         &release_please_config,
         &fast_maintenance,
-        &duplicate_publish_verification,
+        &bypassed_publish_helper,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
             .expect("read promotion resolver"),
         &sync_release_pr,
     );
     assert!(
-        duplicate_publish_violations
+        bypassed_publish_violations
             .iter()
-            .any(|item| item.contains("duplicates Cargo publish verification")),
-        "mutation must reject duplicate Cargo publish verification: {duplicate_publish_violations:?}"
+            .any(|item| item.contains("bypasses publish helper")),
+        "mutation must reject bypassing the publish helper: {bypassed_publish_violations:?}"
+    );
+    let unbounded_crates_release =
+        std::fs::read_to_string(root.join(".github/workflows/release.yml"))
+            .expect("read release")
+            .replace(
+                "  publish-crates:\n    name: Publish crates.io (wenlan-types + wenlan-mcp)\n    needs: promote-assets\n    runs-on: ubuntu-latest\n    timeout-minutes: 15",
+                "  publish-crates:\n    name: Publish crates.io (wenlan-types + wenlan-mcp)\n    needs: promote-assets\n    runs-on: ubuntu-latest\n    timeout-minutes: 150",
+            );
+    let unbounded_crates_violations = release_promotion_contract_violations(
+        &ci,
+        &release_please,
+        &release_please_config,
+        &fast_maintenance,
+        &unbounded_crates_release,
+        &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
+            .expect("read promotion resolver"),
+        &sync_release_pr,
+    );
+    assert!(
+        unbounded_crates_violations
+            .iter()
+            .any(|item| item.contains("publish-crates") && item.contains("15-minute bound")),
+        "mutation must reject an unbounded crates.io job: {unbounded_crates_violations:?}"
     );
     let retry_unsafe_release = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
         .expect("read release")
