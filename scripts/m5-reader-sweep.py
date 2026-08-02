@@ -7,6 +7,8 @@ produced three different counts because the predicate lived in prose and each
 implementation interpreted it differently. The predicate now lives here, and the
 number is whatever this script says.
 
+CI routes edits to this executable contract to its exact drift-guard test.
+
 PREDICATE (exact, and the only one that counts):
 
   A function is an internal page-prose reader iff its brace-matched body
