@@ -22,8 +22,6 @@ pub mod lifecycle;
 pub mod locomo;
 pub mod longmemeval;
 pub mod m5_bench_corpus;
-#[cfg(feature = "eval-harness")]
-pub mod m5_snapshot_io;
 pub mod metrics;
 pub mod page_faithfulness;
 pub mod paired;

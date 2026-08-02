@@ -6,8 +6,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "eval-harness")]
 use std::process::Command;
-#[cfg(feature = "eval-harness")]
-use wenlan_core::eval::m5_bench_corpus::distribution_from_fixed_counts;
 use wenlan_core::eval::m5_bench_corpus::{
     corpus_summary, merge_sparse_buckets, parse_accuracy_jsonl, verify_manifest_digest,
     write_corpus_stream, AccuracyCategory, PageSizeBucket, PageSizeDistribution,
@@ -238,7 +236,30 @@ fn manifest_covers_generated_corpus_and_exact_fixture_bytes() {
 
 #[cfg(feature = "eval-harness")]
 #[tokio::test]
-async fn exporter_is_read_only_aggregate_only_atomic_and_no_clobber() {
+async fn exporter_emits_canonical_aggregate_to_stdout() {
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("source.db");
+    create_pages_db(&db_path, &five_ascii_pages()).await;
+
+    let result = Command::new(env!("CARGO_BIN_EXE_m5_export_page_size_dist"))
+        .arg("--db")
+        .arg(&db_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = PageSizeDistribution::from_json_bytes(&result.stdout).unwrap();
+    assert_eq!(output.sample_size, 5);
+    assert_eq!(output.buckets, vec![bucket(0, 256, 5)]);
+}
+
+#[cfg(feature = "eval-harness")]
+#[tokio::test]
+async fn exporter_is_read_only_and_emits_only_aggregate_bytes() {
     let directory = tempfile::tempdir().unwrap();
     let db_path = directory.path().join("fixture.db");
     create_pages_db(
@@ -266,27 +287,19 @@ async fn exporter_is_read_only_aggregate_only_atomic_and_no_clobber() {
     )
     .await;
     let db_before = std::fs::read(&db_path).unwrap();
-    let output_path = directory.path().join("distribution.json");
-
-    let first = run_exporter(&db_path, &output_path);
+    let first = run_exporter(&db_path);
     assert!(
         first.status.success(),
         "{}",
         String::from_utf8_lossy(&first.stderr)
     );
     assert_eq!(std::fs::read(&db_path).unwrap(), db_before);
-    let output_before = std::fs::read(&output_path).unwrap();
-    let exported = PageSizeDistribution::from_json_bytes(&output_before).unwrap();
+    let exported = PageSizeDistribution::from_json_bytes(&first.stdout).unwrap();
     assert_eq!(exported.sample_size, 17);
     assert_eq!(
         exported.buckets,
         vec![bucket(0, 256, 5), bucket(256, 1024, 12)]
     );
-
-    let no_clobber = run_exporter(&db_path, &output_path);
-    assert!(!no_clobber.status.success());
-    assert_eq!(std::fs::read(&output_path).unwrap(), output_before);
-    assert_eq!(std::fs::read(&db_path).unwrap(), db_before);
 
     let too_small_db = directory.path().join("too-small.db");
     create_pages_db(
@@ -299,10 +312,9 @@ async fn exporter_is_read_only_aggregate_only_atomic_and_no_clobber() {
         ],
     )
     .await;
-    let refused_path = directory.path().join("refused.json");
-    let refused = run_exporter(&too_small_db, &refused_path);
+    let refused = run_exporter(&too_small_db);
     assert!(!refused.status.success());
-    assert!(!refused_path.exists());
+    assert!(refused.stdout.is_empty());
 }
 
 #[cfg(feature = "eval-harness")]
@@ -321,93 +333,48 @@ async fn shared_page_size_connection_rejects_dml_and_ddl() {
 
 #[cfg(feature = "eval-harness")]
 #[tokio::test]
-async fn exporter_rejects_sqlite_outputs_before_data_loss() {
-    let directory = tempfile::tempdir().unwrap();
-    let nested = directory.path().join("nested");
-    std::fs::create_dir(&nested).unwrap();
-
-    let exact_db = directory.path().join("exact.json");
-    create_pages_db(&exact_db, &five_ascii_pages()).await;
-    assert_collision_refused_and_preserved(&exact_db, &exact_db);
-
-    let distinct_db = directory.path().join("distinct.json");
-    create_pages_db(&distinct_db, &[page("y".repeat(300), "active")]).await;
-    let distinct_before = std::fs::read(&distinct_db).unwrap();
-    let distinct_result = run_exporter(&exact_db, &distinct_db);
-    assert!(
-        !distinct_result.status.success(),
-        "an existing SQLite output was overwritten"
-    );
-    assert!(
-        String::from_utf8_lossy(&distinct_result.stderr)
-            .contains("output exists; choose a new --output path"),
-        "{}",
-        String::from_utf8_lossy(&distinct_result.stderr)
-    );
-    assert_eq!(std::fs::read(&distinct_db).unwrap(), distinct_before);
-
-    let dotdot_db = directory.path().join("dotdot.json");
-    create_pages_db(&dotdot_db, &five_ascii_pages()).await;
-    let dotdot_alias = nested.join("..").join("dotdot.json");
-    assert_collision_refused_and_preserved(&dotdot_db, &dotdot_alias);
-
-    #[cfg(unix)]
-    {
-        let symlink_target = directory.path().join("symlink-target.json");
-        create_pages_db(&symlink_target, &five_ascii_pages()).await;
-        let symlink_db = directory.path().join("symlink-db.json");
-        std::os::unix::fs::symlink(&symlink_target, &symlink_db).unwrap();
-        assert_collision_refused_and_preserved(&symlink_db, &symlink_target);
-    }
-
-    let hardlink_db = directory.path().join("hardlink-db.json");
-    create_pages_db(&hardlink_db, &five_ascii_pages()).await;
-    let hardlink_alias = directory.path().join("hardlink-alias.json");
-    std::fs::hard_link(&hardlink_db, &hardlink_alias).unwrap();
-    assert_collision_refused_and_preserved(&hardlink_db, &hardlink_alias);
-}
-
-#[cfg(feature = "eval-harness")]
-#[tokio::test]
-async fn exporter_refuses_overwrite_flag_without_replacing_existing_output() {
+async fn exporter_rejects_file_output_arguments_without_touching_files() {
     let directory = tempfile::tempdir().unwrap();
     let db_path = directory.path().join("source.db");
     create_pages_db(&db_path, &five_ascii_pages()).await;
     let output = directory.path().join("existing.json");
-    std::fs::write(&output, b"existing\n").unwrap();
+    create_pages_db(&output, &[page("y".repeat(300), "active")]).await;
+    let before = std::fs::read(&output).unwrap();
 
-    let result = exporter_command(&db_path, &output)
+    let output_result = exporter_command(&db_path)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    let overwrite_result = exporter_command(&db_path)
         .arg("--overwrite")
         .output()
         .unwrap();
 
-    assert!(!result.status.success(), "--overwrite remained enabled");
-    assert!(
-        String::from_utf8_lossy(&result.stderr).contains("usage: m5_export_page_size_dist"),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    assert_eq!(std::fs::read(&output).unwrap(), b"existing\n");
+    for result in [output_result, overwrite_result] {
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr)
+            .contains("usage: m5_export_page_size_dist --db PATH"));
+    }
+    assert_eq!(std::fs::read(&output).unwrap(), before);
 }
 
 #[cfg(feature = "eval-harness")]
 #[tokio::test]
-async fn exporter_refuses_live_wal_sidecar_and_preserves_uncheckpointed_commit() {
+async fn exporter_reads_live_wal_without_mutating_source() {
     let directory = tempfile::tempdir().unwrap();
     let db_path = directory.path().join("live.db");
     let (database, connection, wal_before) = create_live_wal_db(&db_path).await;
     let wal_path = wal_path(&db_path);
 
-    let nested = directory.path().join("nested");
-    std::fs::create_dir(&nested).unwrap();
-    let wal_alias = nested.join("..").join("live.db-wal");
-    let result = run_exporter(&db_path, &wal_alias);
-    assert!(!result.status.success());
+    let result = run_exporter(&db_path);
     assert!(
-        String::from_utf8_lossy(&result.stderr).contains("output extension must be .json"),
+        result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    let output = PageSizeDistribution::from_json_bytes(&result.stdout).unwrap();
+    assert_eq!(output.sample_size, 5);
     assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
 
     let observer = wenlan_core::db::M5PageSizeSnapshotDb::open(&db_path)
@@ -420,152 +387,6 @@ async fn exporter_refuses_live_wal_sidecar_and_preserves_uncheckpointed_commit()
 
     drop(connection);
     drop(database);
-}
-
-#[cfg(all(feature = "eval-harness", unix))]
-#[tokio::test]
-async fn exporter_refuses_symlink_target_wal_basename_bypass() {
-    let directory = tempfile::tempdir().unwrap();
-    let db_path = directory.path().join("live.db");
-    let (database, connection, wal_before) = create_live_wal_db(&db_path).await;
-    let db_alias = directory.path().join("alias.db");
-    std::os::unix::fs::symlink("live.db", &db_alias).unwrap();
-    let wal_path = wal_path(&db_path);
-
-    let result = run_exporter(&db_alias, &wal_path);
-    assert!(!result.status.success());
-    assert!(
-        String::from_utf8_lossy(&result.stderr).contains("output extension must be .json"),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
-    assert_live_wal_queryable(&db_path).await;
-
-    drop(connection);
-    drop(database);
-}
-
-#[cfg(feature = "eval-harness")]
-#[tokio::test]
-async fn exporter_refuses_case_folded_live_wal_alias_on_case_insensitive_filesystem() {
-    let directory = tempfile::tempdir().unwrap();
-    if !filesystem_is_ascii_case_insensitive(directory.path()) {
-        eprintln!("SKIP: temporary filesystem is case-sensitive; extension controls cover case");
-        return;
-    }
-
-    let db_path = directory.path().join("case.db");
-    let (database, connection, wal_before) = create_live_wal_db(&db_path).await;
-    let wal_path = wal_path(&db_path);
-    let case_folded_wal = directory.path().join("CASE.DB-WAL");
-
-    let result = run_exporter(&db_path, &case_folded_wal);
-    assert!(!result.status.success());
-    assert!(
-        String::from_utf8_lossy(&result.stderr).contains("output extension must be .json"),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
-    assert_live_wal_queryable(&db_path).await;
-
-    drop(connection);
-    drop(database);
-}
-
-#[cfg(feature = "eval-harness")]
-#[tokio::test]
-async fn snapshot_output_extension_is_json_case_insensitive_and_fail_closed() {
-    let directory = tempfile::tempdir().unwrap();
-    let db_path = directory.path().join("fixture.db");
-    create_pages_db(&db_path, &five_ascii_pages()).await;
-
-    for invalid in [
-        "missing-extension",
-        "distribution.txt",
-        "distribution.jsonl",
-        "fixture.db-wal",
-        "fixture.db-shm",
-        "fixture.db-journal",
-        "fixture.db-mj123456789",
-    ] {
-        let output = directory.path().join(invalid);
-        assert!(
-            wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&output).is_err(),
-            "accepted invalid output extension: {invalid}"
-        );
-        assert!(!output.exists());
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-        let output = directory
-            .path()
-            .join(std::ffi::OsString::from_vec(b"non-utf8.\xff".to_vec()));
-        assert!(wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&output).is_err());
-        assert!(!output.exists());
-    }
-
-    for valid in ["ordinary.json", "uppercase.JSON"] {
-        let output = directory.path().join(valid);
-        let prepared = wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&output).unwrap();
-        prepared.write(b"safe\n").unwrap();
-        assert_eq!(std::fs::read(&output).unwrap(), b"safe\n");
-    }
-}
-
-#[cfg(all(feature = "eval-harness", unix))]
-#[tokio::test]
-async fn prepared_snapshot_refuses_parent_retarget_before_temp_creation() {
-    let directory = tempfile::tempdir().unwrap();
-    let safe_dir = directory.path().join("safe");
-    let db_dir = directory.path().join("db");
-    std::fs::create_dir(&safe_dir).unwrap();
-    std::fs::create_dir(&db_dir).unwrap();
-    let db_path = db_dir.join("origin_memory.json");
-    create_pages_db(&db_path, &five_ascii_pages()).await;
-    let db_bytes = std::fs::read(&db_path).unwrap();
-    let db_metadata = std::fs::metadata(&db_path).unwrap();
-    let parent_link = directory.path().join("parent-link");
-    std::os::unix::fs::symlink(&safe_dir, &parent_link).unwrap();
-    let output = parent_link.join("origin_memory.json");
-
-    let prepared = wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&output).unwrap();
-    std::fs::remove_file(&parent_link).unwrap();
-    std::os::unix::fs::symlink(&db_dir, &parent_link).unwrap();
-
-    assert!(prepared.write(b"replacement\n").is_err());
-    let after = std::fs::metadata(&db_path).unwrap();
-    assert_eq!(after.len(), db_metadata.len());
-    assert_eq!(after.modified().unwrap(), db_metadata.modified().unwrap());
-    assert_eq!(std::fs::read(&db_path).unwrap(), db_bytes);
-    assert_eq!(std::fs::read_dir(&safe_dir).unwrap().count(), 0);
-    assert_eq!(std::fs::read_dir(&db_dir).unwrap().count(), 1);
-}
-
-#[cfg(feature = "eval-harness")]
-#[tokio::test]
-async fn concurrent_export_is_complete_for_no_clobber() {
-    let directory = tempfile::tempdir().unwrap();
-    let first_db = directory.path().join("first.db");
-    create_pages_db(&first_db, &five_ascii_pages()).await;
-    let first_expected = distribution_from_fixed_counts([5, 0, 0, 0, 0, 0, 0, 0])
-        .unwrap()
-        .to_canonical_json_bytes()
-        .unwrap();
-
-    let no_clobber_output = directory.path().join("no-clobber.json");
-    let left = spawn_exporter(&first_db, &no_clobber_output);
-    let right = spawn_exporter(&first_db, &no_clobber_output);
-    let left = left.wait_with_output().unwrap();
-    let right = right.wait_with_output().unwrap();
-    assert_eq!(
-        usize::from(left.status.success()) + usize::from(right.status.success()),
-        1
-    );
-    assert_eq!(std::fs::read(&no_clobber_output).unwrap(), first_expected);
 }
 
 fn bucket(min_inclusive: u64, max_exclusive: u64, count: u64) -> PageSizeBucket {
@@ -677,17 +498,6 @@ async fn create_live_wal_db(path: &Path) -> (libsql::Database, libsql::Connectio
 }
 
 #[cfg(feature = "eval-harness")]
-async fn assert_live_wal_queryable(db_path: &Path) {
-    let observer = wenlan_core::db::M5PageSizeSnapshotDb::open(db_path)
-        .await
-        .unwrap();
-    assert_eq!(
-        observer.fixed_counts().await.unwrap(),
-        [5, 0, 0, 0, 0, 0, 0, 0]
-    );
-}
-
-#[cfg(feature = "eval-harness")]
 fn wal_path(db_path: &Path) -> PathBuf {
     let mut path = db_path.as_os_str().to_os_string();
     path.push("-wal");
@@ -695,49 +505,15 @@ fn wal_path(db_path: &Path) -> PathBuf {
 }
 
 #[cfg(feature = "eval-harness")]
-fn filesystem_is_ascii_case_insensitive(directory: &Path) -> bool {
-    let lowercase = directory.join("case-probe");
-    let uppercase = directory.join("CASE-PROBE");
-    std::fs::write(&lowercase, b"probe").unwrap();
-    let is_case_insensitive = uppercase.exists();
-    std::fs::remove_file(lowercase).unwrap();
-    is_case_insensitive
-}
-
-#[cfg(feature = "eval-harness")]
-fn exporter_command(db: &Path, output: &Path) -> Command {
+fn exporter_command(db: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_m5_export_page_size_dist"));
-    command.arg("--db").arg(db).arg("--output").arg(output);
+    command.arg("--db").arg(db);
     command
 }
 
 #[cfg(feature = "eval-harness")]
-fn run_exporter(db: &Path, output: &Path) -> std::process::Output {
-    exporter_command(db, output).output().unwrap()
-}
-
-#[cfg(feature = "eval-harness")]
-fn spawn_exporter(db: &Path, output: &Path) -> std::process::Child {
-    exporter_command(db, output).spawn().unwrap()
-}
-
-#[cfg(feature = "eval-harness")]
-fn assert_collision_refused_and_preserved(db: &Path, output_alias: &Path) {
-    let bytes = std::fs::read(db).unwrap();
-    let metadata = std::fs::metadata(db).unwrap();
-    let modified = metadata.modified().unwrap();
-    let result = run_exporter(db, output_alias);
-    assert!(!result.status.success());
-    assert!(
-        String::from_utf8_lossy(&result.stderr)
-            .contains("output exists; choose a new --output path"),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    let after = std::fs::metadata(db).unwrap();
-    assert_eq!(after.len(), metadata.len());
-    assert_eq!(after.modified().unwrap(), modified);
-    assert_eq!(std::fs::read(db).unwrap(), bytes);
+fn run_exporter(db: &Path) -> std::process::Output {
+    exporter_command(db).output().unwrap()
 }
 
 #[derive(Default)]

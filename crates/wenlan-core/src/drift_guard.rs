@@ -2634,13 +2634,11 @@ fn ci_routing_contract_violations(
         "crates/wenlan-core/src/bin/m5_export_page_size_dist.rs".to_string(),
         "crates/wenlan-core/src/db/m5_page_size_snapshot.rs".to_string(),
         "crates/wenlan-core/src/eval/m5_bench_corpus.rs".to_string(),
-        "crates/wenlan-core/src/eval/m5_snapshot_io.rs".to_string(),
         "crates/wenlan-core/tests/fixtures/m5_bench_corpus.sha256".to_string(),
         "crates/wenlan-core/tests/fixtures/m5_judge_accuracy.jsonl".to_string(),
         "crates/wenlan-core/tests/fixtures/m5_page_size_dist.json".to_string(),
         "crates/wenlan-core/tests/m5_bench.rs".to_string(),
     ]);
-    let m5_platform_target = "crates/wenlan-core/tests/m5_bench.rs";
     if m5_platform != m5_platform_inputs {
         violations.push("m5-platform focused-owner routing is not exact".into());
     }
@@ -2650,14 +2648,6 @@ fn ci_routing_contract_violations(
                 "focused M5 platform input does not schedule both platform owners: {path}"
             ));
         }
-    }
-    if !platform_sensitive_paths
-        .iter()
-        .any(|(path, platform, filter)| {
-            path == m5_platform_target && *platform == "unix" && *filter == "macos"
-        })
-    {
-        violations.push("the focused M5 target lost its real Unix cfg branch".into());
     }
     let m5_step = job_step(&ci, "test", "M5 bench platform controls");
     let m5_condition = "(matrix.os == 'macos-14' || matrix.os == 'windows-2022') && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.m5-platform == 'true')";
