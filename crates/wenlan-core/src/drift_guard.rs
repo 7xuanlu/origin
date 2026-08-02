@@ -4215,7 +4215,7 @@ jobs:
         "root installer",
         "changed-file inventory as JSON",
         "repository catch-all",
-        "test the impact planner",
+        "both impact planners before use",
         "every non-reused CI run",
         "derive its test plan",
         "rust-ci-required output",
@@ -7832,6 +7832,35 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
     .and_then(|step| step["run"].as_str())
     .unwrap_or_default();
     let windows_build_name = "Measure release profile (Windows required-proof layout)";
+    let native_build_name = "Measure release profile (Linux/macOS artifact layout)";
+    let native_build_step = job_step(&benchmark, "p6-release", native_build_name);
+    let windows_build_step = job_step(&benchmark, "p6-release", windows_build_name);
+    let native_build = native_build_step
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    let prior_step_persists_offline = step_position(native_build_name).is_some_and(|position| {
+        p6_steps[..position].iter().any(|step| {
+            step["run"]
+                .as_str()
+                .is_some_and(|run| run.contains("CARGO_NET_OFFLINE") && run.contains("GITHUB_ENV"))
+        })
+    });
+    if benchmark["env"]["CARGO_NET_OFFLINE"].as_str().is_some()
+        || p6_job["env"]["CARGO_NET_OFFLINE"].as_str().is_some()
+        || native_build_step
+            .and_then(|step| step["env"]["CARGO_NET_OFFLINE"].as_str())
+            .is_some()
+        || native_build.contains("CARGO_NET_OFFLINE")
+        || native_build.contains("--offline")
+        || prior_step_persists_offline
+        || windows_build_step.and_then(|step| step["env"]["CARGO_NET_OFFLINE"].as_str())
+            != Some("true")
+    {
+        violations.push(
+            "P6 native static-ORT build must stay online while the staged Windows build stays Cargo-offline"
+                .into(),
+        );
+    }
     if !runtime_stage.contains("scripts/stage-vulkan-loader-windows.ps1")
         || !runtime_stage.contains("scripts/stage-onnxruntime-windows.ps1")
         || !runtime_stage.contains(r#"target\${{ matrix.target }}\release"#)
@@ -7842,10 +7871,7 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
         violations
             .push("P6 Windows runtime staging does not precede the explicit-target build".into());
     }
-    for build_name in [
-        "Measure release profile (Linux/macOS artifact layout)",
-        windows_build_name,
-    ] {
+    for build_name in [native_build_name, windows_build_name] {
         let build = job_step(&benchmark, "p6-release", build_name)
             .and_then(|step| step["run"].as_str())
             .unwrap_or_default();
@@ -8235,6 +8261,44 @@ fn ci_benchmark_contract_rejects_stale_release_execution() {
             "stale P6 fixture must exercise {expected:?}: {violations:?}"
         );
     }
+}
+
+#[test]
+fn ci_benchmark_contract_rejects_offline_static_ort_measurement() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
+        .expect("read benchmark workflow")
+        .replace(
+            "    env:\n      BENCH_REQUESTED_RUNNER: ${{ matrix.os }}\n      FASTEMBED_CACHE_DIR:",
+            "    env:\n      CARGO_NET_OFFLINE: \"true\"\n      BENCH_REQUESTED_RUNNER: ${{ matrix.os }}\n      FASTEMBED_CACHE_DIR:",
+        );
+    let violations = ci_benchmark_contract_violations(&ci, &benchmark);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("native static-ORT build must stay online")),
+        "offline native ORT mutation must fail the benchmark contract: {violations:?}"
+    );
+}
+
+#[test]
+fn ci_benchmark_contract_rejects_native_static_ort_offline_flag() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
+        .expect("read benchmark workflow")
+        .replace(
+            "            --hash \"target/${{ matrix.target }}/release/wenlan\" \\\n            -- cargo build --locked --release \\",
+            "            --hash \"target/${{ matrix.target }}/release/wenlan\" \\\n            -- cargo build --offline --locked --release \\",
+        );
+    let violations = ci_benchmark_contract_violations(&ci, &benchmark);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("native static-ORT build must stay online")),
+        "native cargo --offline mutation must fail the benchmark contract: {violations:?}"
+    );
 }
 
 fn workflow_action_pin_violations(workflow_name: &str, workflow: &str) -> Vec<String> {
