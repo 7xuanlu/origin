@@ -409,11 +409,10 @@ jobs:
               # Keep release-profile builds off ordinary shared-code PRs,
               # while native linkage, build tooling, and packaged entrypoints
               # still prove three shipped profiles before merge. Windows PRs
-              # use the functional + linked-binary lanes; main and the
-              # release-please PR retain the full Windows release build.
-              # Cargo.lock and
-              # broad crate manifests are intentionally excluded: their full
-              # accumulated graph is proved on main and the release-please PR.
+              # use the functional + linked-binary lanes; release-sensitive
+              # main pushes and the release-please PR retain the Windows release build.
+              # Cargo.lock and broad crate manifests are intentionally excluded:
+              # their full accumulated graph is proved by the release-please PR.
               - 'Cargo.toml'
               - 'rust-toolchain.toml'
               - 'crates/wenlan-core/Cargo.toml'

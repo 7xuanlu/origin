@@ -2506,7 +2506,7 @@ fn ci_routing_contract_violations(
     let macos_paths = detect_change_filter_paths(&ci, "macos");
     let mcp_platform = detect_change_filter_paths(&ci, "mcp-platform");
     for (filter, paths) in [("macos", &macos_paths), ("windows", &windows_paths)] {
-        if paths.contains("crates/wenlan-core/src/drift_guard.rs") {
+        if filter_routes_path(paths, "crates/wenlan-core/src/drift_guard.rs") {
             violations.push(format!(
                 "{filter} routes test-only drift_guard.rs into a native runner"
             ));
