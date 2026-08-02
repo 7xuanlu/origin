@@ -566,6 +566,21 @@ fn nextest_whole_core_serialization_violations(config: &str) -> Vec<String> {
     violations
 }
 
+fn nextest_drift_priority_violations(config: &str) -> Vec<String> {
+    let parsed: toml::Value = toml::from_str(config).expect("parse nextest.toml");
+    let Some(overrides) = parsed["profile"]["default"]["overrides"].as_array() else {
+        return vec!["nextest has no default-profile overrides".into()];
+    };
+    if overrides.iter().any(|override_| {
+        override_["filter"].as_str() == Some("test(/^drift_guard::/)")
+            && override_["priority"].as_integer() == Some(100)
+    }) {
+        Vec::new()
+    } else {
+        vec!["nextest does not run drift guards at highest priority".into()]
+    }
+}
+
 fn text_embedding_initializer_sites(path: &str, source: &str) -> Vec<String> {
     source
         .lines()
@@ -873,6 +888,35 @@ fn nextest_does_not_serialize_the_entire_core_package() {
          .config/nextest.toml; an intentional contract change also updates \
          nextest_whole_core_serialization_violations() and its positive control:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn nextest_runs_drift_guards_before_database_heavy_tests() {
+    let config = std::fs::read_to_string(repo_root().join(".config/nextest.toml"))
+        .expect("read nextest.toml");
+    let violations = nextest_drift_priority_violations(&config);
+    assert!(
+        violations.is_empty(),
+        "nextest drift-guard priority contract failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nextest_drift_priority_contract_rejects_default_order() {
+    let violations = nextest_drift_priority_violations(
+        r#"
+[[profile.default.overrides]]
+filter = 'test(/^drift_guard::/)'
+priority = 0
+"#,
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("highest priority")),
+        "fixture must reject default drift-guard order: {violations:?}"
     );
 }
 
