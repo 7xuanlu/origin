@@ -42,6 +42,8 @@ mod kg_quality_duplicate_candidates;
 mod kg_quality_embedding_refresh;
 mod kg_quality_vocabulary;
 mod lint_snapshot;
+#[cfg(feature = "eval-harness")]
+mod m5_page_size_snapshot;
 mod maintenance_duplicate_reads;
 mod maintenance_queue;
 mod maintenance_retro_scan;
@@ -71,6 +73,8 @@ pub(crate) use eval_temporal_seed::EvalTemporalSeed;
 pub(crate) use kg_quality_diagnostics::ContradictionObservationCount;
 pub(crate) use kg_quality_duplicate_candidates::{DuplicateNameGroup, MinHashEntityInput};
 pub(crate) use kg_quality_embedding_refresh::StaleEntityEmbeddingCandidate;
+#[cfg(feature = "eval-harness")]
+pub use m5_page_size_snapshot::{M5MutationProbe, M5PageSizeSnapshotDb};
 pub(crate) use maintenance_duplicate_reads::{NearDuplicatePairRead, NearDuplicateSliceReader};
 pub(crate) use maintenance_retro_scan::AutomaticRetroPageScan;
 pub(crate) use memory_point_reads::PendingMemoryRevisionPayload;

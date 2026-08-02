@@ -555,8 +555,10 @@ class PlatformPlanTests(unittest.TestCase):
         for marker in (
             "MACOS_FILES_JSON: ${{ steps.filter.outputs.macos_files }}",
             "MACOS_M4_FILES_JSON: ${{ steps.filter.outputs['macos-m4_files'] }}",
+            "M5_PLATFORM_FILES_JSON: ${{ steps.filter.outputs['m5-platform_files'] }}",
             "WINDOWS_FILES_JSON: ${{ steps.filter.outputs.windows_files }}",
-            "'(($macos - $macos_m4) + $windows) | unique'",
+            "'(($macos - $macos_m4 - $m5_platform) "
+            "+ ($windows - $m5_platform)) | unique'",
         ):
             self.assertIn(marker, platform_body)
 
