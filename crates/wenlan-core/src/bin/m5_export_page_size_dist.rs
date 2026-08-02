@@ -2,27 +2,9 @@
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
-use wenlan_core::eval::{
-    m5_bench_corpus::distribution_from_fixed_counts,
-    m5_snapshot_io::{open_page_size_db_read_only, prepare_m5_snapshot},
-};
-
-const AGGREGATE_QUERY: &str = r#"
-SELECT
-  COALESCE(SUM(CASE WHEN byte_len < 256 THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN byte_len >= 256 AND byte_len < 512 THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN byte_len >= 512 AND byte_len < 1024 THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN byte_len >= 1024 AND byte_len < 2048 THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN byte_len >= 2048 AND byte_len < 4096 THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN byte_len >= 4096 AND byte_len < 8192 THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN byte_len >= 8192 AND byte_len < 16384 THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN byte_len >= 16384 THEN 1 ELSE 0 END), 0)
-FROM (
-  SELECT length(CAST(content AS BLOB)) AS byte_len
-  FROM pages
-  WHERE status = 'active'
-)
-"#;
+use wenlan_core::db::M5PageSizeSnapshotDb;
+use wenlan_core::eval::m5_bench_corpus::distribution_from_fixed_counts;
+use wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot;
 
 #[derive(Debug)]
 struct Args {
@@ -46,22 +28,8 @@ async fn run() -> Result<()> {
     }
     let snapshot = prepare_m5_snapshot(&args.db, &args.output, args.overwrite)?;
 
-    let connection = open_page_size_db_read_only(&args.db).await?;
-    let mut rows = connection
-        .query(AGGREGATE_QUERY, ())
-        .await
-        .context("query fixed page-size aggregate")?;
-    let row = rows
-        .next()
-        .await
-        .context("read aggregate result")?
-        .context("aggregate query returned no row")?;
-
-    let mut counts = [0_u64; 8];
-    for (index, count) in counts.iter_mut().enumerate() {
-        let value: i64 = row.get(index as i32).context("read aggregate count")?;
-        *count = u64::try_from(value).context("aggregate count was negative")?;
-    }
+    let database = M5PageSizeSnapshotDb::open(&args.db).await?;
+    let counts = database.fixed_counts().await?;
 
     let distribution = distribution_from_fixed_counts(counts)?;
     let output = distribution.to_canonical_json_bytes()?;

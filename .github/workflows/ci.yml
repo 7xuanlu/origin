@@ -45,6 +45,7 @@ jobs:
       windows: ${{ steps.filter.outputs.windows }}
       windows-lint: ${{ steps.filter.outputs.windows-lint }}
       macos-m4: ${{ steps.filter.outputs.macos-m4 }}
+      m5-platform: ${{ steps.filter.outputs.m5-platform }}
       windows-llm-probe: ${{ steps.filter.outputs.windows-llm-probe }}
       nextest-config: ${{ steps.filter.outputs.nextest-config }}
       release-preflight: ${{ steps.filter.outputs.release-preflight }}
@@ -247,6 +248,7 @@ jobs:
               - 'crates/wenlan-core/src/repair_plan/**'
               - 'crates/wenlan-core/src/sources/directory.rs'
               - 'crates/wenlan-core/tests/m4_community_gates.rs'
+              - 'crates/wenlan-core/tests/m5_bench.rs'
               - 'crates/**/*.c'
               - 'crates/**/*.cc'
               - 'crates/**/*.cpp'
@@ -305,6 +307,7 @@ jobs:
               - 'crates/wenlan-core/src/repair/**'
               - 'crates/wenlan-core/src/repair_plan/**'
               - 'crates/wenlan-core/src/sources/directory.rs'
+              - 'crates/wenlan-core/tests/m5_bench.rs'
               - 'crates/**/*.c'
               - 'crates/**/*.cc'
               - 'crates/**/*.cpp'
@@ -361,6 +364,11 @@ jobs:
               - 'crates/wenlan-core/src/provenance.rs'
               - 'crates/wenlan-core/src/refinery/mod.rs'
               - 'crates/wenlan-core/tests/m4_community_gates.rs'
+            m5-platform:
+              # m5_bench has Unix-only symlink-retarget controls. Keep their
+              # two-sided platform proof focused instead of widening every
+              # core integration target onto the generic platform plan.
+              - 'crates/wenlan-core/tests/m5_bench.rs'
             nextest-config:
               # Repository config supports host/target-specific overrides.
               # Exercise the real parser and scheduler once on each platform
@@ -552,6 +560,7 @@ jobs:
         env:
           MACOS_FILES_JSON: ${{ steps.filter.outputs.macos_files }}
           MACOS_M4_FILES_JSON: ${{ steps.filter.outputs['macos-m4_files'] }}
+          M5_PLATFORM_FILES_JSON: ${{ steps.filter.outputs['m5-platform_files'] }}
           WINDOWS_FILES_JSON: ${{ steps.filter.outputs.windows_files }}
           # Release-please is the pre-release backstop, so it keeps the full
           # platform plan even though it arrives as a pull_request event.
@@ -565,8 +574,9 @@ jobs:
             jq -cn \
               --argjson macos "$MACOS_FILES_JSON" \
               --argjson macos_m4 "$MACOS_M4_FILES_JSON" \
+              --argjson m5_platform "$M5_PLATFORM_FILES_JSON" \
               --argjson windows "$WINDOWS_FILES_JSON" \
-              '(($macos - $macos_m4) + $windows) | unique'
+              '(($macos - $macos_m4 - $m5_platform) + ($windows - $m5_platform)) | unique'
           )"
           python3 scripts/ci_test_plan.py plan \
             --scope platform \
@@ -970,6 +980,11 @@ jobs:
         # core-integration plan; this focused leg compiles and runs the actual
         # macOS branches whenever its fail-closed owner filter schedules macOS.
         run: cargo nextest run -p wenlan-core --test m4_community_gates
+      - name: M5 bench platform controls
+        if: "(matrix.os == 'macos-14' || matrix.os == 'windows-2022') && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.m5-platform == 'true')"
+        # The cfg(unix) retarget control executes on macOS and compiles out on
+        # Windows; eval-harness is required for the target's exporter tests.
+        run: cargo nextest run -p wenlan-core --features eval-harness --test m5_bench
       - name: Page lint scale gate (Windows functional)
         if: matrix.os == 'windows-2022' && (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.windows-lint == 'true')
         shell: pwsh
@@ -1032,10 +1047,11 @@ jobs:
       # Integration tests for wenlan-cli + wenlan-server. We deliberately do
       # NOT use `--workspace --tests` because that pulls in wenlan-core's
       # `eval_harness.rs` which requires `ANTHROPIC_API_KEY` (not in CI).
-      # wenlan-core integration tests run via the Linux-only nextest step
-      # below. The drift guard inventories crates/wenlan-core/tests/*.rs so a
-      # newly added integration target fails closed into this canonical lane
-      # unless it is explicitly classified as manual-only with a reason.
+      # Generic wenlan-core integration tests run via the Linux-only nextest
+      # step below; focused cfg-bearing targets above retain native execution.
+      # The drift guard inventories crates/wenlan-core/tests/*.rs so a newly
+      # added integration target fails closed into the canonical lane unless
+      # it is explicitly classified as manual-only with a reason.
       - name: Integration tests wenlan-cli + wenlan-server (macOS)
         if: matrix.os == 'macos-14' && needs.detect-changes.outputs.platform-cli-server-integration-required == 'true'
         env:
