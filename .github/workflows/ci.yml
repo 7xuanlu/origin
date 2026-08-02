@@ -131,6 +131,7 @@ jobs:
               - '.github/workflows/release-candidate-observer.yml'
               - '.github/workflows/ci-benchmark.yml'
               - '.github/workflows/coverage.yml'
+              - '.github/workflows/release-pr-maintenance.yml'
               - '.github/workflows/release-please.yml'
               - '.github/workflows/release.yml'
               - 'docker/**'

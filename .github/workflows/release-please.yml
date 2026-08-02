@@ -90,6 +90,10 @@ jobs:
     needs: route-main
     if: needs.route-main.outputs.state == 'ordinary'
     runs-on: ubuntu-24.04
+    concurrency:
+      group: release-pr-maintenance-main
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: write
       pull-requests: write

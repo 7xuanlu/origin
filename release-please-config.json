@@ -2,6 +2,7 @@
   "packages": {
     ".": {
       "release-type": "simple",
+      "always-update": true,
       "versioning": "always-bump-patch"
     }
   },

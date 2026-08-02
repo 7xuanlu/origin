@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -11,6 +12,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CI_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
 RELEASE_PLEASE_PATH = REPO_ROOT / ".github" / "workflows" / "release-please.yml"
+RELEASE_PLEASE_CONFIG_PATH = REPO_ROOT / "release-please-config.json"
+FAST_MAINTENANCE_PATH = (
+    REPO_ROOT / ".github" / "workflows" / "release-pr-maintenance.yml"
+)
 OBSERVER_PATH = REPO_ROOT / ".github" / "workflows" / "release-candidate-observer.yml"
 VALIDATOR_PATH = REPO_ROOT / "scripts" / "validate-release-candidate.py"
 ARCHIVE_PATH = REPO_ROOT / "scripts" / "release_archive.py"
@@ -49,11 +54,24 @@ def named_step_body(job: str, step_name: str) -> str:
 
 
 def contract_violations(
-    ci: str, release: str, release_please: str, promotion: str
+    ci: str,
+    release: str,
+    release_please: str,
+    release_please_config: str,
+    fast_maintenance: str,
+    promotion: str,
 ) -> list[str]:
     """Keep release publication bound to the PR-built immutable archives."""
 
     violations: list[str] = []
+    try:
+        config = json.loads(release_please_config)
+    except json.JSONDecodeError:
+        config = {}
+    if config.get("packages", {}).get(".", {}).get("always-update") is not True:
+        violations.append("release-please package always-update is not exact true")
+    if "- '.github/workflows/release-pr-maintenance.yml'" not in ci:
+        violations.append("fast release maintenance cannot bootstrap its Rust contract")
     ci_gate = named_step_body(job_body(ci, "detect-changes"), "Verify reusable release merge")
     for marker in [
         "python3 scripts/release-promotion.py gate-main",
@@ -82,6 +100,12 @@ def contract_violations(
 
     if re.search(r"\n\s+(workflow_dispatch|push|pull_request):", release_please):
         violations.append("release-please has a privileged trigger outside completed main CI")
+    for marker in [
+        "group: release-please-main",
+        "cancel-in-progress: false",
+    ]:
+        if marker not in release_please:
+            violations.append(f"release-please concurrency omits {marker!r}")
     for job in ["route-main", "maintain-release-pr", "create-validated-tag"]:
         if not job_body(release_please, job):
             violations.append(f"release-please omits hybrid route job {job!r}")
@@ -99,6 +123,9 @@ def contract_violations(
     maintain = job_body(release_please, "maintain-release-pr")
     for marker in [
         "needs.route-main.outputs.state == 'ordinary'",
+        "group: release-pr-maintenance-main",
+        "cancel-in-progress: false",
+        "queue: max",
         "skip-github-release: true",
         "contents: write",
         "pull-requests: write",
@@ -109,6 +136,7 @@ def contract_violations(
     for marker in [
         "needs.route-main.outputs.state == 'validated'",
         "GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}",
+        "MAIN_SHA: ${{ github.event.workflow_run.head_sha }}",
         'if [[ "$pending" != true || "$tagged" != false ]]',
         'if [[ "$existing_sha" != "$MAIN_SHA" ]]',
         '-f ref="refs/tags/$RELEASE_TAG"',
@@ -116,6 +144,81 @@ def contract_violations(
     ]:
         if marker not in create_tag:
             violations.append(f"validated tag creation omits {marker!r}")
+
+    trigger = re.search(
+        r"^on:\n(?P<body>.*?)(?=^concurrency:)",
+        fast_maintenance,
+        re.MULTILINE | re.DOTALL,
+    )
+    trigger_lines = (
+        []
+        if trigger is None
+        else [
+            line
+            for line in trigger.group("body").splitlines()
+            if line and not line.startswith("#")
+        ]
+    )
+    if trigger_lines != ["  push:", "    branches: [main]"]:
+        violations.append("fast release maintenance trigger is not exact main push")
+    fast_job = job_body(fast_maintenance, "maintain-release-pr")
+    fast_jobs = fast_maintenance.partition("\njobs:\n")[2]
+    if not fast_job or len(re.findall(r"^  [A-Za-z0-9_-]+:\n", fast_jobs, re.MULTILINE)) != 1:
+        violations.append("fast release maintenance job inventory is not exactly PR-only")
+    for marker in [
+        "group: release-pr-maintenance-main",
+        "cancel-in-progress: false",
+        "queue: max",
+        "github.event_name == 'push' && github.ref == 'refs/heads/main'",
+        "timeout-minutes: 5",
+        "contents: read",
+        "pull-requests: read",
+        "contents: write",
+        "pull-requests: write",
+        "googleapis/release-please-action@0dfd8538845b8e92600d271a895a5372865d4062",
+        "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        "skip-github-release: true",
+        "manifest-file: .release-please-manifest.json",
+        "config-file: release-please-config.json",
+        "target-branch: main",
+        "ref: release-please--branches--main",
+        "bash scripts/bump-version.sh",
+        "git push origin HEAD",
+    ]:
+        if marker not in fast_maintenance:
+            violations.append(f"fast release maintenance omits {marker!r}")
+    for forbidden in [
+        "workflow_run:",
+        "workflow_dispatch:",
+        "pull_request:",
+        "create-validated-tag",
+        "release-promotion.py",
+        "refs/tags/",
+        "/git/refs",
+        "git tag",
+        "gh release",
+        "autorelease:",
+        "/issues/",
+        "--method POST",
+        "git push --force",
+        "git push -f",
+    ]:
+        if forbidden in fast_maintenance:
+            violations.append(
+                f"fast release maintenance contains publishing or unsafe path {forbidden!r}"
+            )
+    push_commands = [
+        line.strip()
+        for line in fast_job.splitlines()
+        if line.strip().startswith("git push")
+    ]
+    if push_commands != ["git push origin HEAD"]:
+        violations.append(
+            f"fast release maintenance push is not exact non-force sync: {push_commands!r}"
+        )
+    for uses in re.findall(r"\buses:\s+([^\s#]+)", fast_maintenance):
+        if re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", uses) is None:
+            violations.append(f"fast release maintenance action is not SHA-pinned: {uses!r}")
 
     if re.search(r"\n\s+workflow_dispatch:", release):
         violations.append("tag release retains an unbound manual dispatch path")
@@ -693,6 +796,8 @@ def assert_mutation_detected(
     ci: str,
     release: str,
     release_please: str,
+    release_please_config: str,
+    fast_maintenance: str,
     promotion: str,
     old: str,
     new: str,
@@ -704,6 +809,8 @@ def assert_mutation_detected(
         "ci": ci,
         "release": release,
         "release_please": release_please,
+        "release_please_config": release_please_config,
+        "fast_maintenance": fast_maintenance,
         "promotion": promotion,
     }
     source = documents[owner]
@@ -714,6 +821,8 @@ def assert_mutation_detected(
         documents["ci"],
         documents["release"],
         documents["release_please"],
+        documents["release_please_config"],
+        documents["fast_maintenance"],
         documents["promotion"],
     )
     if not any(expected in violation for violation in violations):
@@ -726,11 +835,15 @@ def main() -> None:
     ci = CI_PATH.read_text(encoding="utf-8")
     release = RELEASE_PATH.read_text(encoding="utf-8")
     release_please = RELEASE_PLEASE_PATH.read_text(encoding="utf-8")
+    release_please_config = RELEASE_PLEASE_CONFIG_PATH.read_text(encoding="utf-8")
+    fast_maintenance = FAST_MAINTENANCE_PATH.read_text(encoding="utf-8")
     observer = OBSERVER_PATH.read_text(encoding="utf-8")
     validator = VALIDATOR_PATH.read_text(encoding="utf-8")
     archive = ARCHIVE_PATH.read_text(encoding="utf-8")
     promotion = PROMOTION_PATH.read_text(encoding="utf-8")
-    violations = contract_violations(ci, release, release_please, promotion)
+    violations = contract_violations(
+        ci, release, release_please, release_please_config, fast_maintenance, promotion
+    )
     violations.extend(candidate_observer_contract_violations(ci, observer, validator, archive))
     if violations:
         raise AssertionError("release workflow contract drift:\n" + "\n".join(violations))
@@ -743,9 +856,75 @@ def main() -> None:
             "ci",
         ),
         (
+            "- '.github/workflows/release-pr-maintenance.yml'",
+            "- '.github/workflows/release-pr-maintenance-disabled.yml'",
+            "bootstrap its Rust contract",
+            "ci",
+        ),
+        (
             "skip-github-release: true",
             "skip-github-release: false",
             "PR-only contract",
+            "release_please",
+        ),
+        (
+            '"always-update": true',
+            '"always-update": false',
+            "always-update is not exact true",
+            "release_please_config",
+        ),
+        (
+            '      "always-update": true,\n',
+            "",
+            "always-update is not exact true",
+            "release_please_config",
+        ),
+        (
+            "  push:\n    branches: [main]",
+            "  workflow_dispatch:\n    branches: [main]",
+            "exact main push",
+            "fast_maintenance",
+        ),
+        (
+            "skip-github-release: true",
+            "skip-github-release: false",
+            "fast release maintenance omits",
+            "fast_maintenance",
+        ),
+        (
+            "run: bash scripts/bump-version.sh",
+            "run: gh api /git/refs",
+            "publishing or unsafe path",
+            "fast_maintenance",
+        ),
+        (
+            "git push origin HEAD",
+            "git push --force origin HEAD",
+            "publishing or unsafe path",
+            "fast_maintenance",
+        ),
+        (
+            "group: release-pr-maintenance-main",
+            "group: release-please-main",
+            "fast release maintenance omits",
+            "fast_maintenance",
+        ),
+        (
+            "queue: max",
+            "queue: single",
+            "fast release maintenance omits",
+            "fast_maintenance",
+        ),
+        (
+            "github.event.workflow_run.conclusion == 'success'",
+            "github.event.workflow_run.conclusion != 'success'",
+            "release-please main route omits",
+            "release_please",
+        ),
+        (
+            "MAIN_SHA: ${{ github.event.workflow_run.head_sha }}",
+            "MAIN_SHA: ${{ github.sha }}",
+            "validated tag creation omits",
             "release_please",
         ),
         (
@@ -808,6 +987,8 @@ def main() -> None:
             ci,
             release,
             release_please,
+            release_please_config,
+            fast_maintenance,
             promotion,
             old,
             new,
