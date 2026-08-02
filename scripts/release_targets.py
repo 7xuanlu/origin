@@ -45,6 +45,52 @@ _TARGETS = (
     },
 )
 
+_ASSETS = (
+    {
+        "name": "wenlan-darwin-arm64.tar.gz",
+        "target": "aarch64-apple-darwin",
+        "archive": "tar.gz",
+        "members": ["wenlan", "wenlan-server", "wenlan-mcp"],
+    },
+    {
+        "name": "wenlan-cli-darwin-arm64.tar.gz",
+        "target": "aarch64-apple-darwin",
+        "archive": "tar.gz",
+        "members": ["wenlan"],
+    },
+    {
+        "name": "wenlan-mcp-darwin-arm64.tar.gz",
+        "target": "aarch64-apple-darwin",
+        "archive": "tar.gz",
+        "members": ["wenlan-mcp"],
+    },
+    {
+        "name": "wenlan-linux-arm64.tar.gz",
+        "target": "aarch64-unknown-linux-gnu",
+        "archive": "tar.gz",
+        "members": ["wenlan", "wenlan-server", "wenlan-mcp"],
+    },
+    {
+        "name": "wenlan-linux-x64.tar.gz",
+        "target": "x86_64-unknown-linux-gnu",
+        "archive": "tar.gz",
+        "members": ["wenlan", "wenlan-server", "wenlan-mcp"],
+    },
+    {
+        "name": "wenlan-windows-x64.zip",
+        "target": "x86_64-pc-windows-msvc",
+        "archive": "zip",
+        "members": [
+            "wenlan.exe",
+            "wenlan-server.exe",
+            "wenlan-mcp.exe",
+            "onnxruntime.dll",
+            "vulkan-1.dll",
+            "VulkanRT-License.txt",
+        ],
+    },
+)
+
 
 def release_matrix(*, exclude_targets: Iterable[str] = ()) -> dict:
     """Return a caller-owned matrix, optionally excluding validated targets."""
@@ -70,6 +116,15 @@ def require_target(target: str) -> dict:
     raise TargetError(f"{target!r} is not a shipped release target")
 
 
+def release_assets(*, target: str | None = None) -> list[dict]:
+    """Return the exact caller-owned release payload inventory."""
+
+    if target is not None:
+        require_target(target)
+    assets = [entry for entry in _ASSETS if target is None or entry["target"] == target]
+    return copy.deepcopy(assets)
+
+
 def _write_github_output(path: str, output_name: str, matrix_json: str) -> None:
     if "\n" in matrix_json or "\r" in matrix_json:
         raise TargetError("compact release matrix unexpectedly contains a newline")
@@ -91,10 +146,22 @@ def _main(argv: list[str]) -> int:
     check_parser = subparsers.add_parser("check")
     check_parser.add_argument("--target", required=True)
 
+    assets_parser = subparsers.add_parser("assets")
+    assets_parser.add_argument("--target")
+
     arguments = parser.parse_args(argv)
     if arguments.command == "check":
         entry = require_target(arguments.target)
         print(json.dumps(entry, separators=(",", ":"), sort_keys=True))
+        return 0
+    if arguments.command == "assets":
+        print(
+            json.dumps(
+                release_assets(target=arguments.target),
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
         return 0
 
     matrix_json = json.dumps(

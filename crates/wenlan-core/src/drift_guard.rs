@@ -4355,7 +4355,6 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
         "Mark Windows explicit target as nested Cargo cache",
         "Install sqlite3 (Windows only)",
         "Stage Windows release runtimes before smoke",
-        "Native ORT smoke (Windows release preflight)",
     ] {
         if job_step(&ci, "release-preflight", step_name).and_then(|step| step["if"].as_str())
             != Some(windows_condition)
@@ -4364,6 +4363,18 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
                 "{step_name} is not restricted to the shipped Windows target"
             ));
         }
+    }
+    let native_smoke_condition = "matrix.target == 'x86_64-pc-windows-msvc' && !(github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu')";
+    if job_step(
+        &ci,
+        "release-preflight",
+        "Native ORT smoke (Windows release preflight)",
+    )
+    .and_then(|step| step["if"].as_str())
+        != Some(native_smoke_condition)
+    {
+        violations
+            .push("native ORT smoke is not replaced only by exact packaged-candidate smoke".into());
     }
     for (workflow, job_name, step_name, owner) in [
         (
@@ -4628,14 +4639,21 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
             .as_str()
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if name.contains("package")
-            || name.contains("publish")
+        let allowed_candidate_data_step = matches!(
+            name.as_str(),
+            "package canonical release candidate archives"
+                | "smoke exact release candidate archives"
+                | "write untrusted release candidate claim manifest"
+                | "upload immutable release candidate artifact"
+        );
+        if name.contains("publish")
             || run.contains("gh release")
             || run.contains("npm publish")
-            || uses.contains("upload-artifact")
+            || (name.contains("package") && !allowed_candidate_data_step)
+            || (uses.contains("upload-artifact") && !allowed_candidate_data_step)
         {
             violations
-                .push("release-preflight contains a publishing or packaging side effect".into());
+                .push("release-preflight contains an unauthorized publishing side effect".into());
         }
     }
 
@@ -4659,7 +4677,7 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
 }
 
 #[test]
-fn release_preflight_is_release_gated_and_read_only() {
+fn release_preflight_is_release_gated_and_non_publishing() {
     let root = repo_root();
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
     let release =
@@ -4668,7 +4686,7 @@ fn release_preflight_is_release_gated_and_read_only() {
     assert!(
         violations.is_empty(),
         "release-preflight contract drift — preflight must mirror every shipped release \
-         target without publishing side effects, and run only for release-sensitive changes. \
+         target without publishing side effects beyond immutable candidate data, and run only for release-sensitive changes. \
          Fix .github/workflows/ci.yml and release.yml; an intentional contract change also \
          updates release_preflight_contract_violations() and its positive control:\n{}",
         violations.join("\n")
@@ -4772,7 +4790,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         "target and host build artifacts",
         "runtime DLLs before executable smoke",
         "native ORT smoke",
-        "publishing or packaging side effect",
+        "unauthorized publishing side effect",
         "conclusion does not fail closed",
     ] {
         assert!(
@@ -4805,6 +4823,425 @@ fn release_preflight_contract_rejects_overlapping_cache_roots() {
 }
 
 // ── Teeth #10: canonical acceptance runs beside the long workspace-lib lane ──
+
+fn release_candidate_observer_contract_violations(
+    ci_workflow: &str,
+    observer_workflow: &str,
+    validator_script: &str,
+    archive_script: &str,
+) -> Vec<String> {
+    let ci: serde_yaml::Value = serde_yaml::from_str(ci_workflow).expect("parse ci.yml");
+    let observer: serde_yaml::Value =
+        serde_yaml::from_str(observer_workflow).unwrap_or(serde_yaml::Value::Null);
+    let mut violations = Vec::new();
+    let workflows = observer["on"]["workflow_run"]["workflows"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect::<Vec<_>>();
+    let types = observer["on"]["workflow_run"]["types"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect::<Vec<_>>();
+    let branches = observer["on"]["workflow_run"]["branches"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect::<Vec<_>>();
+    if workflows != ["CI"]
+        || types != ["completed"]
+        || branches != ["release-please--branches--main"]
+        || observer["on"].as_mapping().is_none_or(|on| on.len() != 1)
+    {
+        violations.push(
+            "release candidate observer trigger is not exact release-branch completed CI".into(),
+        );
+    }
+    if observer["permissions"]["actions"].as_str() != Some("read")
+        || observer["permissions"]["contents"].as_str() != Some("read")
+        || observer["permissions"]["pull-requests"].as_str() != Some("read")
+        || observer["permissions"]
+            .as_mapping()
+            .is_none_or(|values| values.len() != 3)
+    {
+        violations.push("release candidate observer permissions are not exactly read-only".into());
+    }
+    if observer["jobs"]
+        .as_mapping()
+        .is_none_or(|jobs| jobs.len() != 1)
+        || observer["jobs"]["validate"]["runs-on"].as_str() != Some("ubuntu-24.04")
+        || observer["jobs"]["validate"]["timeout-minutes"].as_u64() != Some(15)
+    {
+        violations
+            .push("release candidate observer is not one bounded hosted validation job".into());
+    }
+    let steps = observer["jobs"]["validate"]["steps"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let uses = steps
+        .iter()
+        .filter_map(|step| step["uses"].as_str())
+        .collect::<Vec<_>>();
+    if steps.len() != 5
+        || uses
+            != [
+                "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+                "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+                "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+            ]
+    {
+        violations
+            .push("release candidate observer must have exactly five closed-receipt steps".into());
+    }
+    let checkout = steps.first().copied();
+    if checkout.and_then(|step| step["uses"].as_str())
+        != Some("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803")
+        || checkout
+            .and_then(|step| step.as_mapping())
+            .is_none_or(|step| step.len() != 2)
+        || checkout
+            .and_then(|step| step["with"].as_mapping())
+            .is_none_or(|with| with.len() != 3)
+        || checkout.and_then(|step| step["with"]["ref"].as_str()) != Some("${{ github.sha }}")
+        || checkout.and_then(|step| step["with"]["fetch-depth"].as_u64()) != Some(1)
+        || checkout.and_then(|step| step["with"]["persist-credentials"].as_bool()) != Some(false)
+    {
+        violations.push(
+            "release candidate observer checkout is not the exact trusted default-branch step"
+                .into(),
+        );
+    }
+    let validator = steps.get(1).copied();
+    let expected_run = r#"python3 scripts/validate-release-candidate.py \
+  --event "$GITHUB_EVENT_PATH" \
+  --repository "$GITHUB_REPOSITORY" \
+  --temp-root "$RUNNER_TEMP" \
+  --summary "$GITHUB_STEP_SUMMARY" \
+  --validated-assets-dir "$RUNNER_TEMP/validated-release-assets" \
+  --receipt "$RUNNER_TEMP/validated-release-receipt.json""#;
+    if validator.and_then(|step| step["name"].as_str())
+        != Some("Validate release candidate as untrusted data")
+        || validator
+            .and_then(|step| step.as_mapping())
+            .is_none_or(|step| step.len() != 3)
+        || validator
+            .and_then(|step| step["env"].as_mapping())
+            .is_none_or(|env| env.len() != 1)
+        || validator.and_then(|step| step["env"]["GITHUB_TOKEN"].as_str())
+            != Some("${{ github.token }}")
+        || validator
+            .and_then(|step| step["run"].as_str())
+            .map(str::trim_end)
+            != Some(expected_run)
+    {
+        violations.push("release candidate observer validator env or command is not exact".into());
+    }
+    let validated_upload = steps.get(2).copied();
+    if validated_upload.and_then(|step| step["name"].as_str())
+        != Some("Upload exact validated release assets")
+        || validated_upload.and_then(|step| step["id"].as_str()) != Some("validated-assets")
+        || validated_upload.and_then(|step| step["uses"].as_str())
+            != Some("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+        || validated_upload.and_then(|step| step["with"]["name"].as_str())
+            != Some(
+                "validated-release-assets-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}-${{ github.run_id }}-${{ github.run_attempt }}",
+            )
+        || validated_upload.and_then(|step| step["with"]["path"].as_str())
+            != Some("${{ runner.temp }}/validated-release-assets/*")
+        || validated_upload.and_then(|step| step["with"]["compression-level"].as_u64())
+            != Some(0)
+        || validated_upload.and_then(|step| step["with"]["retention-days"].as_u64())
+            != Some(14)
+        || validated_upload.and_then(|step| step["with"]["if-no-files-found"].as_str())
+            != Some("error")
+        || validated_upload.and_then(|step| step["with"]["overwrite"].as_bool())
+            != Some(false)
+    {
+        violations.push("validated assets upload is not immutable and source-run scoped".into());
+    }
+    let close = steps.get(3).copied();
+    let close_run = close
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if close.and_then(|step| step["name"].as_str())
+        != Some("Close receipt over validated assets artifact")
+        || !close_run.contains("close-receipt")
+        || !close_run.contains("steps.validated-assets.outputs.artifact-id")
+        || !close_run.contains("steps.validated-assets.outputs.artifact-digest")
+        || !close_run.contains("--observer-run-id \"$GITHUB_RUN_ID\"")
+        || !close_run.contains("--observer-run-attempt \"$GITHUB_RUN_ATTEMPT\"")
+    {
+        violations.push("receipt close step omits validated artifact identity".into());
+    }
+    let closed_upload = steps.get(4).copied();
+    if closed_upload.and_then(|step| step["name"].as_str())
+        != Some("Upload closed validation receipt")
+        || closed_upload.and_then(|step| step["uses"].as_str())
+            != Some("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+        || closed_upload.and_then(|step| step["with"]["name"].as_str())
+            != Some(
+                "validated-release-receipt-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}-${{ github.run_id }}-${{ github.run_attempt }}",
+            )
+        || closed_upload.and_then(|step| step["with"]["path"].as_str())
+            != Some("${{ runner.temp }}/validated-release-receipt.json")
+        || closed_upload.and_then(|step| step["with"]["compression-level"].as_u64())
+            != Some(0)
+        || closed_upload.and_then(|step| step["with"]["retention-days"].as_u64())
+            != Some(14)
+        || closed_upload.and_then(|step| step["with"]["if-no-files-found"].as_str())
+            != Some("error")
+        || closed_upload.and_then(|step| step["with"]["overwrite"].as_bool())
+            != Some(false)
+    {
+        violations.push("closed receipt upload is not immutable and source-run scoped".into());
+    }
+    for forbidden in [
+        "workflow_dispatch",
+        "id-token",
+        "attestations",
+        "actions/cache",
+        "rust-cache",
+        "download-artifact",
+        "actions/attest",
+        "${{ secrets.",
+    ] {
+        if observer_workflow.contains(forbidden) {
+            violations.push(format!(
+                "release candidate observer contains forbidden capability {forbidden:?}"
+            ));
+        }
+    }
+    if !detect_change_filter_paths(&ci, "rust")
+        .contains(".github/workflows/release-candidate-observer.yml")
+    {
+        violations.push("Rust routing omits the release candidate observer teeth".into());
+    }
+    let exact_gate = "github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu'";
+    for step_name in [
+        "Package canonical release candidate archives",
+        "Smoke exact release candidate archives",
+        "Write untrusted release candidate claim manifest",
+        "Upload immutable release candidate artifact",
+    ] {
+        if job_step(&ci, "release-preflight", step_name).and_then(|step| step["if"].as_str())
+            != Some(exact_gate)
+        {
+            violations.push(format!(
+                "release candidate producer step {step_name:?} lacks the exact same-repository gate"
+            ));
+        }
+    }
+    let upload = job_step(
+        &ci,
+        "release-preflight",
+        "Upload immutable release candidate artifact",
+    );
+    if upload.and_then(|step| step["uses"].as_str())
+        != Some("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+        || upload.and_then(|step| step["with"]["name"].as_str())
+            != Some(
+                "release-candidate-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}",
+            )
+        || upload.and_then(|step| step["with"]["path"].as_str()) != Some("dist/*")
+        || upload.and_then(|step| step["with"]["compression-level"].as_u64()) != Some(0)
+        || upload.and_then(|step| step["with"]["retention-days"].as_u64()) != Some(14)
+        || upload.and_then(|step| step["with"]["if-no-files-found"].as_str()) != Some("error")
+        || upload.and_then(|step| step["with"]["overwrite"].as_bool()) != Some(false)
+    {
+        violations
+            .push("release candidate producer artifact is not immutable and run-attempt scoped".into());
+    }
+    let producer_names = ci["jobs"]["release-preflight"]["steps"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(|step| step["name"].as_str())
+        .filter(|name| name.contains("release candidate"))
+        .collect::<Vec<_>>();
+    if producer_names
+        != [
+            "Package canonical release candidate archives",
+            "Smoke exact release candidate archives",
+            "Write untrusted release candidate claim manifest",
+            "Upload immutable release candidate artifact",
+        ]
+    {
+        violations.push(
+            "release candidate producer does not package, smoke, manifest, then upload".into(),
+        );
+    }
+    for required in [
+        "CI_WORKFLOW_PATH = \".github/workflows/ci.yml\"",
+        "REQUIRED_RELEASE_PATHS = RELEASE_MANAGED_PATHS",
+        "class _CredentialStrippingRedirect",
+        "redirected.remove_header(\"Authorization\")",
+        "/actions/runs/{run_id}",
+        "/actions/workflows/{workflow_id}",
+        "/commits/{head_sha}/pulls",
+        "/actions/runs/{run_id}/artifacts",
+        "/actions/artifacts/{artifact_id}/zip",
+        "payload.get(\"total_count\")",
+        "safe_extract_zip(wrapper, extracted, outer_names)",
+        "safe_extract_archive(",
+        "base_records, head_records = _validate_release_tree_modes(",
+        "new != old.replace(old_version, new_version)",
+        "_release_version_policy(",
+        "Darwin standalone archive bytes differ",
+        "merged candidate tree differs",
+        "/issues/{pr_number}/events",
+        "| Canonical inner asset |",
+        "def write_validated_receipt(",
+        "def close_receipt(",
+        "document[\"receipt_state\"] = \"closed\"",
+        "validated_assets_artifact",
+        "This receipt is observe-only",
+    ] {
+        if !validator_script.contains(required) {
+            violations.push(format!(
+                "release candidate validator omits evidence {required:?}"
+            ));
+        }
+    }
+    for required in [
+        "def _validate_zip_structure(",
+        "compression_method not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}",
+        "def _decompress_canonical_gzip(",
+        "zlib.decompressobj(wbits=31)",
+        "expanded_size = _decompress_canonical_gzip(path, raw_path)",
+        "decompressor.unused_data",
+        "def _validate_tar_termination(",
+        "def _validate_raw_tar(",
+        "raw_records = _validate_raw_tar(raw_path)",
+        "tar extensions and special entries are forbidden",
+        "tar.gz has hidden data after its last member",
+    ] {
+        if !archive_script.contains(required) {
+            violations.push(format!(
+                "release archive parser omits hostile-input bound {required:?}"
+            ));
+        }
+    }
+    for forbidden in [
+        "subprocess.",
+        ".chmod(",
+        "GITHUB_ENV",
+        "GITHUB_PATH",
+        "GITHUB_OUTPUT",
+    ] {
+        if validator_script.contains(forbidden) {
+            violations.push(format!(
+                "release candidate validator may execute or route untrusted bytes via {forbidden:?}"
+            ));
+        }
+    }
+    violations
+}
+
+#[test]
+fn release_candidate_observer_is_read_only_and_observe_only() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci");
+    let observer =
+        std::fs::read_to_string(root.join(".github/workflows/release-candidate-observer.yml"))
+            .unwrap_or_default();
+    let validator = std::fs::read_to_string(root.join("scripts/validate-release-candidate.py"))
+        .unwrap_or_default();
+    let archive =
+        std::fs::read_to_string(root.join("scripts/release_archive.py")).unwrap_or_default();
+    let violations =
+        release_candidate_observer_contract_violations(&ci, &observer, &validator, &archive);
+    assert!(
+        violations.is_empty(),
+        "release candidate observe-only contract drift:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn release_candidate_observer_contract_rejects_privilege_and_identity_drift() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("read ci")
+        .replace(
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            "true",
+        )
+        .replace("          overwrite: false", "          overwrite: true");
+    let observer =
+        std::fs::read_to_string(root.join(".github/workflows/release-candidate-observer.yml"))
+            .expect("read observer")
+            .replace("  actions: read", "  actions: write")
+        .replace(
+            "ref: ${{ github.sha }}",
+            "ref: ${{ github.event.workflow_run.head_sha }}",
+        )
+        .replace("  workflow_run:", "  workflow_dispatch:\n  workflow_run:")
+        .replace(
+            "    branches: [release-please--branches--main]",
+            "    branches: [main]",
+        )
+        .replace(
+            "      - name: Validate release candidate as untrusted data",
+            "      - name: Unexpected third step\n        run: echo no\n      - name: Validate release candidate as untrusted data",
+        )
+        .replace(
+            "          GITHUB_TOKEN: ${{ github.token }}",
+            "          EXTRA: value\n          GITHUB_TOKEN: ${{ github.token }}",
+        )
+        .replace(
+            "--summary \"$GITHUB_STEP_SUMMARY\"",
+            "--summary \"$RUNNER_TEMP/summary\"",
+        );
+    let validator = std::fs::read_to_string(root.join("scripts/validate-release-candidate.py"))
+        .expect("read validator")
+        .replace(
+            "safe_extract_zip(wrapper, extracted, outer_names)",
+            "# outer validation removed",
+        )
+        .replace(
+            "base_records, head_records = _validate_release_tree_modes(",
+            "base_records, head_records = _release_tree_modes_removed(",
+        )
+        .replace("new != old.replace(old_version, new_version)", "new == old")
+        .replace(
+            "| Canonical inner asset |",
+            "| Missing inner asset receipt |",
+        );
+    let archive = std::fs::read_to_string(root.join("scripts/release_archive.py"))
+        .expect("read archive")
+        .replace(
+            "expanded_size = _decompress_canonical_gzip(path, raw_path)",
+            "expanded_size = 0 # gzip preflight removed",
+        )
+        .replace(
+            "raw_records = _validate_raw_tar(raw_path)",
+            "raw_records = Vec::new() # hostile preflight removed",
+        );
+    let violations =
+        release_candidate_observer_contract_violations(&ci, &observer, &validator, &archive);
+    for expected in [
+        "trigger is not exact",
+        "exactly read-only",
+        "exact trusted default-branch",
+        "exactly five closed-receipt steps",
+        "env or command is not exact",
+        "exact same-repository gate",
+        "not immutable",
+        "omits evidence",
+        "hostile-input bound",
+    ] {
+        assert!(
+            violations.iter().any(|item| item.contains(expected)),
+            "mutation must exercise {expected:?}: {violations:?}"
+        );
+    }
+}
 
 fn windows_native_parallelism_violations(
     ci_workflow: &str,

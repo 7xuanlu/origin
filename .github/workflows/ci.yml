@@ -125,6 +125,7 @@ jobs:
               - '.github/workflows/ci.yml'
               - '.github/workflows/main-canary.yml'
               - '.github/workflows/ci-observer.yml'
+              - '.github/workflows/release-candidate-observer.yml'
               - '.github/workflows/ci-benchmark.yml'
               - '.github/workflows/coverage.yml'
               - '.github/workflows/release-please.yml'
@@ -491,6 +492,11 @@ jobs:
       - name: Test release target inventory
         run: |
           python3 scripts/release_targets.test.py
+          python3 scripts/release_archive.test.py
+          python3 scripts/package-release-artifacts.test.py
+          python3 scripts/smoke-release-archive.test.py
+          python3 scripts/release-candidate-manifest.test.py
+          python3 scripts/validate-release-candidate.test.py
           bash scripts/build-release-binaries.test.sh
       - name: Emit release target matrix
         id: release-targets
@@ -1294,11 +1300,12 @@ jobs:
         if: needs.detect-changes.outputs.canonical-smokes-required == 'true' && github.event_name != 'pull_request'
         run: bash scripts/smoke-mcp.sh
 
-  # Build-only preflight for shipped release targets. Release-sensitive ordinary
-  # PRs prove the three non-Windows profiles while the existing Windows
-  # functional/platform lanes prove native linkage. Main/manual runs and the
-  # release-please PR retain the complete four-target release matrix, including
-  # the measured 25-55 minute cold Windows release build.
+  # Build/smoke preflight for shipped release targets. Release-sensitive
+  # ordinary PRs prove the three non-Windows profiles while the existing
+  # Windows functional/platform lanes prove native linkage. Main/manual runs
+  # and the release-please PR retain the complete four-target release matrix.
+  # Only the exact same-repository release-please candidate additionally emits
+  # observe-only canonical archives for the read-only default-branch validator.
   release-preflight:
     name: release-preflight (${{ matrix.target }})
     needs: [detect-changes]
@@ -1319,6 +1326,13 @@ jobs:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Only the exact same-repository release-please candidate produces
+          # promotable-shaped archives. Build that immutable PR head rather
+          # than GitHub's synthetic merge ref so the observer can reconcile
+          # the candidate tree. All other lanes retain their current SHA.
+          ref: ${{ (github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu') && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
@@ -1469,7 +1483,7 @@ jobs:
         shell: bash
         run: bash scripts/build-release-binaries.sh "${{ matrix.target }}"
       - name: Native ORT smoke (Windows release preflight)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: matrix.target == 'x86_64-pc-windows-msvc' && !(github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu')
         shell: pwsh
         env:
           WENLAN_TEST_FASTEMBED_CACHE: ${{ env.FASTEMBED_CACHE_DIR }}
@@ -1492,6 +1506,56 @@ jobs:
             throw "incomplete Windows cache layout: host=$hostCount target=$targetCount"
           }
           Write-Host "Windows cache layout receipt: marker=present host_deps=$hostCount target_deps=$targetCount"
+      - name: Package canonical release candidate archives
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu'
+        shell: bash
+        run: |
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
+          "$py" scripts/package-release-artifacts.py \
+            --target "${{ matrix.target }}" \
+            --binary-dir "target/${{ matrix.target }}/release" \
+            --output-dir dist \
+            --source-date-epoch "$source_date_epoch"
+      - name: Smoke exact release candidate archives
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu'
+        shell: bash
+        env:
+          WENLAN_TEST_FASTEMBED_CACHE: ${{ env.FASTEMBED_CACHE_DIR }}
+        run: |
+          if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
+          "$py" scripts/smoke-release-archive.py \
+            --target "${{ matrix.target }}" \
+            --dist-dir dist
+      - name: Write untrusted release candidate claim manifest
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu'
+        shell: bash
+        run: |
+          tree_sha="$(git rev-parse HEAD^{tree})"
+          version="$(tr -d '\r\n' < version.txt)"
+          if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
+          "$py" scripts/release-candidate-manifest.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "${{ github.repository_id }}" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --pr-number "${{ github.event.pull_request.number }}" \
+            --pr-author "${{ github.event.pull_request.user.login }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --tree-sha "$tree_sha" \
+            --version "$version" \
+            --target "${{ matrix.target }}" \
+            --dist-dir dist
+      - name: Upload immutable release candidate artifact
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-candidate-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
+          path: dist/*
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+          overwrite: false
 
   # Required contract integrations for wenlan-mcp / wenlan-types. The planner
   # selects affected packages through reverse dependency closure, or an exact

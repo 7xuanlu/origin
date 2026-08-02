@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from release_targets import TargetError, release_matrix, require_target
+from release_targets import TargetError, release_assets, release_matrix, require_target
 
 
 EXPECTED = [
@@ -33,6 +33,15 @@ EXPECTED = [
         "archive": "zip",
         "artifact_name": "wenlan-windows-x64",
     },
+]
+
+EXPECTED_ASSET_NAMES = [
+    "wenlan-darwin-arm64.tar.gz",
+    "wenlan-cli-darwin-arm64.tar.gz",
+    "wenlan-mcp-darwin-arm64.tar.gz",
+    "wenlan-linux-arm64.tar.gz",
+    "wenlan-linux-x64.tar.gz",
+    "wenlan-windows-x64.zip",
 ]
 
 
@@ -63,7 +72,31 @@ class ReleaseTargetTests(unittest.TestCase):
         first = release_matrix()
         first["include"].clear()
 
+        assets = release_assets()
+        assets[0]["members"].clear()
+
         self.assertEqual(release_matrix(), {"include": EXPECTED})
+        self.assertEqual(
+            [asset["name"] for asset in release_assets()], EXPECTED_ASSET_NAMES
+        )
+
+    def test_asset_inventory_is_exact_unique_and_target_owned(self) -> None:
+        assets = release_assets()
+        self.assertEqual([asset["name"] for asset in assets], EXPECTED_ASSET_NAMES)
+        self.assertEqual(len({asset["name"] for asset in assets}), 6)
+        self.assertEqual(
+            [asset["name"] for asset in release_assets(target="aarch64-apple-darwin")],
+            EXPECTED_ASSET_NAMES[:3],
+        )
+        for target in [entry["target"] for entry in EXPECTED[1:]]:
+            with self.subTest(target=target):
+                owned = release_assets(target=target)
+                self.assertEqual(len(owned), 1)
+                self.assertEqual(owned[0]["target"], target)
+
+    def test_asset_inventory_rejects_unknown_target(self) -> None:
+        with self.assertRaisesRegex(TargetError, "not a shipped release target"):
+            release_assets(target="x86_64-apple-darwin")
 
 
 if __name__ == "__main__":
