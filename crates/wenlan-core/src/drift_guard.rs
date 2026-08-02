@@ -7208,15 +7208,29 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
     }
     let current_rows = p6_entries
         .iter()
-        .filter(|entry| entry["profile"].as_str() == Some("current"));
-    if current_rows.count() != 6
-        || p6_entries.iter().any(|entry| {
-            entry["lto"].as_str() != Some("off")
-                || !matches!(entry["cgu"].as_str(), Some("16" | "256"))
-                || entry["profile"].as_str() == Some("no-lto")
+        .filter(|entry| entry["profile"].as_str() == Some("current"))
+        .collect::<Vec<_>>();
+    let alternate_rows = p6_entries
+        .iter()
+        .filter(|entry| entry["profile"].as_str() != Some("current"))
+        .collect::<Vec<_>>();
+    let has_one_cold_alternative = alternate_rows.len() == 1
+        && alternate_rows[0]["os"].as_str() == Some("windows-2022")
+        && alternate_rows[0]["target"].as_str() == Some("x86_64-pc-windows-msvc")
+        && alternate_rows[0]["profile"].as_str() == Some("cgu-256")
+        && alternate_rows[0]["cache_mode"].as_str() == Some("cold")
+        && alternate_rows[0]["cgu"].as_str() == Some("256")
+        && alternate_rows[0]["lto"].as_str() == Some("off");
+    if current_rows.len() != 6
+        || current_rows.iter().any(|entry| {
+            entry["cgu"].as_str() != Some("16") || entry["lto"].as_str() != Some("off")
         })
+        || !has_one_cold_alternative
     {
-        violations.push("P6 matrix does not match the shipped no-LTO release profiles".into());
+        violations.push(
+            "P6 matrix does not match shipped no-LTO profiles with one cold-only alternative"
+                .into(),
+        );
     }
 
     let production_cache = job_step(
@@ -7297,11 +7311,7 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
     let expected_cache_logic = [
         r#"requested_mode = "${{ matrix.cache_mode }}""#,
         r#"profile = "${{ matrix.profile }}""#,
-        "effective_cache = (",
-        r#""profile-invalidated-cold""#,
-        r#"if requested_mode == "production-restore" and profile != "current""#,
-        r#"else os.environ.get("WINDOWS_CACHE_STATE") or requested_mode"#,
-        ")",
+        r#"effective_cache = os.environ.get("WINDOWS_CACHE_STATE") or requested_mode"#,
     ];
     let has_exact_cache_logic = active_receipt_lines
         .windows(expected_cache_logic.len())
@@ -7318,12 +7328,36 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
         || !active_receipt_lines
             .contains(&r#""windows_cache_jobs": os.environ.get("WINDOWS_CACHE_JOBS", ""),"#)
     {
-        violations
-            .push("P6 cache receipt does not expose measured cache state or profile-invalidated restores as cold".into());
+        violations.push("P6 cache receipt does not expose the measured cache state".into());
     }
     let toolchain = job_step_using(&benchmark, "p6-release", "dtolnay/rust-toolchain");
     if toolchain.and_then(|step| step["with"]["targets"].as_str()) != Some("${{ matrix.target }}") {
         violations.push("P6 toolchain does not install its explicit production target".into());
+    }
+    let p6_job = &benchmark["jobs"]["p6-release"];
+    let fastembed_restore = job_step(
+        &benchmark,
+        "p6-release",
+        "Restore portable FastEmbed model for Windows smoke",
+    );
+    if p6_job["env"]["FASTEMBED_CACHE_DIR"].as_str()
+        != Some("${{ github.workspace }}/.fastembed_cache")
+        || fastembed_restore
+            .and_then(|step| step["uses"].as_str())
+            .is_none_or(|uses| !uses.starts_with("actions/cache/restore@"))
+        || fastembed_restore.and_then(|step| step["if"].as_str()) != Some("runner.os == 'Windows'")
+        || fastembed_restore.and_then(|step| step["with"]["path"].as_str())
+            != Some("${{ env.FASTEMBED_CACHE_DIR }}")
+        || fastembed_restore.and_then(|step| step["with"]["key"].as_str())
+            != Some("fastembed-bge-base-en-v1.5-q-v3-portable")
+        || fastembed_restore.and_then(|step| step["with"]["enableCrossOsArchive"].as_str())
+            != Some("true")
+        || fastembed_restore.and_then(|step| step["with"]["fail-on-cache-miss"].as_str())
+            != Some("true")
+    {
+        violations.push(
+            "P6 Windows smoke does not fail closed on the portable FastEmbed prerequisite".into(),
+        );
     }
     for prerequisite in [
         "Select native Perl for vendored OpenSSL",
@@ -7394,6 +7428,13 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
     {
         violations
             .push("P6 smoke does not execute exactly the three shipped target binaries".into());
+    }
+    let windows_smoke = job_step(&benchmark, "p6-release", "Smoke Windows release daemon");
+    if windows_smoke.and_then(|step| step["env"]["WENLAN_TEST_FASTEMBED_CACHE"].as_str())
+        != Some("${{ env.FASTEMBED_CACHE_DIR }}")
+        || windows_smoke.and_then(|step| step["env"]["HF_HUB_OFFLINE"].as_str()) != Some("1")
+    {
+        violations.push("P6 Windows smoke can fetch a model outside the timed prerequisite".into());
     }
     let drives = benchmark["jobs"]["p5-windows-drive"]["strategy"]["matrix"]["drive"]
         .as_sequence()
@@ -7662,6 +7703,10 @@ fn ci_benchmark_contract_rejects_stale_release_execution() {
             "      - name: Removed nested Cargo cache marker",
         )
         .replace(
+            "      - name: Restore portable FastEmbed model for Windows smoke",
+            "      - name: Removed portable FastEmbed model for Windows smoke",
+        )
+        .replace(
             "profile: cgu-256, cache_mode: cold, cgu: \"256\"",
             "profile: no-lto, cache_mode: cold, cgu: \"16\"",
         )
@@ -7673,9 +7718,10 @@ fn ci_benchmark_contract_rejects_stale_release_execution() {
         .replace("          \"./${root}/wenlan-mcp${suffix}\" --help\n", "");
     let violations = ci_benchmark_contract_violations(&ci, &benchmark);
     for expected in [
-        "shipped no-LTO release profiles",
+        "shipped no-LTO profiles with one cold-only alternative",
         "release-preflight cache input",
         "nested Windows target before cache restore",
+        "portable FastEmbed prerequisite",
         "omits production marker",
         "three shipped target binaries",
     ] {

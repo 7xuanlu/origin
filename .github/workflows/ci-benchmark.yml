@@ -313,9 +313,9 @@ jobs:
           - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: current, cache_mode: cold, cgu: "16", lto: "off" }
           - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: current, cache_mode: production-restore, cgu: "16", lto: "off" }
           - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: cgu-256, cache_mode: cold, cgu: "256", lto: "off" }
-          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: cgu-256, cache_mode: production-restore, cgu: "256", lto: "off" }
     env:
       BENCH_REQUESTED_RUNNER: ${{ matrix.os }}
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -324,6 +324,14 @@ jobs:
         with:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
+      - name: Restore portable FastEmbed model for Windows smoke
+        if: runner.os == 'Windows'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.FASTEMBED_CACHE_DIR }}
+          key: fastembed-bge-base-en-v1.5-q-v3-portable
+          enableCrossOsArchive: "true"
+          fail-on-cache-miss: "true"
       - name: Install sqlite3 (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -517,6 +525,9 @@ jobs:
       - name: Smoke Windows release daemon
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          HF_HUB_OFFLINE: "1"
+          WENLAN_TEST_FASTEMBED_CACHE: ${{ env.FASTEMBED_CACHE_DIR }}
         run: |
           & scripts/smoke-windows.ps1 `
             -ExePath "target\${{ matrix.target }}\release\wenlan-server.exe"
@@ -535,11 +546,7 @@ jobs:
           from pathlib import Path
           requested_mode = "${{ matrix.cache_mode }}"
           profile = "${{ matrix.profile }}"
-          effective_cache = (
-              "profile-invalidated-cold"
-              if requested_mode == "production-restore" and profile != "current"
-              else os.environ.get("WINDOWS_CACHE_STATE") or requested_mode
-          )
+          effective_cache = os.environ.get("WINDOWS_CACHE_STATE") or requested_mode
           Path("benchmark-receipts/cache.json").write_text(json.dumps({
               "requested_mode": requested_mode,
               "effective_cache": effective_cache,
