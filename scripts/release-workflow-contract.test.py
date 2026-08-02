@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -23,6 +25,7 @@ ARCHIVE_PATH = REPO_ROOT / "scripts" / "release_archive.py"
 PROMOTION_PATH = REPO_ROOT / "scripts" / "release-promotion.py"
 SYNC_RELEASE_PR_PATH = REPO_ROOT / "scripts" / "sync-release-pr.py"
 RUNTIME_IMAGE_PATH = REPO_ROOT / "scripts" / "verify-release-runtime-image.py"
+PUBLISH_CRATE_TEST_PATH = REPO_ROOT / "scripts" / "publish-crate.test.py"
 
 EXPECTED_NODE24_ACTIONS = {
     "actions/checkout": "d23441a48e516b6c34aea4fa41551a30e30af803",
@@ -311,20 +314,42 @@ def contract_violations(
         violations.append("tag release retains the duplicate release build matrix")
     if "cargo build" in release or "build-release-binaries" in release:
         violations.append("tag release can recompile the PR-validated release binaries")
-    if "cargo publish -p wenlan-types --dry-run" in release:
+    if "--dry-run" in job_body(release, "publish-crates"):
         violations.append("tag release duplicates Cargo publish verification")
     crates = job_body(release, "publish-crates")
     for marker in [
-        'if [[ -z "$CARGO_REGISTRY_TOKEN" ]]',
-        "CARGO_REGISTRY_TOKEN is required because wenlan-types",
-        "CARGO_REGISTRY_TOKEN is required because wenlan-mcp",
-        "name: Require wenlan-mcp on crates.io",
-        "wenlan-mcp ${VERSION} not visible on sparse index after 10 min",
+        "python3 scripts/publish-crate.py",
+        "--package wenlan-types",
+        "--package wenlan-mcp",
+        '--version "$VERSION"',
     ]:
         if marker not in crates:
-            violations.append(f"crates.io publication omits fail-closed proof {marker!r}")
+            violations.append(f"crates.io publication bypasses publish helper {marker!r}")
+    if crates.count("python3 scripts/publish-crate.py") != 2:
+        violations.append("crates.io publication does not call the helper exactly twice")
+    for forbidden in ["seq 1 60", "sleep 10", "--no-verify"]:
+        if forbidden in crates:
+            violations.append(
+                f"crates.io publication retains unsafe or serial polling {forbidden!r}"
+            )
     if "if: env.CARGO_REGISTRY_TOKEN != ''" in crates:
         violations.append("crates.io publication can silently skip a missing credential")
+    for job, timeout in {
+        "prepare-release": 10,
+        "publish-crates": 15,
+        "publish-npm": 10,
+        "update-homebrew": 20,
+        "docker-manifest": 10,
+        "finalize-release": 10,
+    }.items():
+        if not re.search(
+            rf"^    timeout-minutes: {timeout}\s*$",
+            job_body(release, job),
+            re.MULTILINE,
+        ):
+            violations.append(
+                f"release job {job!r} does not keep its {timeout}-minute bound"
+            )
     for job in [
         "resolve-promotion",
         "prepare-release",
@@ -850,7 +875,7 @@ def candidate_observer_contract_violations(
 def trusted_candidate_gate_violations(
     ci: str, classifier: str, validator: str
 ) -> list[str]:
-    """Only a semantically closed Release PR may omit duplicate platform tests."""
+    """Only a semantically closed Release PR with green base CI may omit duplicates."""
 
     violations: list[str] = []
     detect = job_body(ci, "detect-changes")
@@ -907,24 +932,63 @@ def trusted_candidate_gate_violations(
     ):
         violations.append("trusted candidate matrix is not fail-closed against lookalike branches")
 
-    test_if = re.search(
-        r"^  test:\n.*?^    if: (?P<value>.+)$", ci, re.MULTILINE | re.DOTALL
-    )
-    test_condition = test_if.group("value") if test_if else ""
-    if (
-        ci.count("needs.detect-changes.outputs.trusted-release-candidate != 'true'")
-        != 2
-        or "needs.detect-changes.outputs.trusted-release-candidate != 'true'"
-        not in test_condition
-        or "startsWith(github.head_ref, 'release-please--branches--')" not in test_condition
-    ):
-        violations.append("platform test skip is not bound to semantic candidate trust")
+    trust_guard = "needs.detect-changes.outputs.trusted-release-candidate != 'true'"
+    for job in [
+        "fmt",
+        "lint",
+        "linux-nextest-build",
+        "linux-nextest",
+        "test",
+        "mcp-platform",
+        "canonical-acceptance",
+        "contract-integration",
+    ]:
+        body = job_body(ci, job)
+        condition = re.search(r"^    if: (?P<value>.+)$", body, re.MULTILINE)
+        if condition is None or trust_guard not in condition.group("value"):
+            violations.append(
+                f"trusted candidate duplicate base test skip omits {job}"
+            )
+
+    base_proof = job_body(ci, "release-base-proof")
+    proof_checkout = named_step_body(base_proof, "Checkout trusted main CI verifier")
+    proof_run = named_step_body(base_proof, "Verify exact base main CI succeeded")
+    for marker in [
+        "needs: [detect-changes]",
+        "trusted-release-candidate == 'true'",
+        "timeout-minutes: 20",
+        "actions: read",
+        "contents: read",
+    ]:
+        if marker not in base_proof:
+            violations.append(f"trusted candidate base CI proof omits {marker!r}")
+    for marker in [
+        "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        "ref: ${{ github.event.pull_request.base.sha }}",
+        "path: trusted-main-ci-proof",
+        "fetch-depth: 1",
+        "persist-credentials: false",
+    ]:
+        if marker not in proof_checkout:
+            violations.append(f"trusted candidate base CI checkout omits {marker!r}")
+    for marker in [
+        "GITHUB_TOKEN: ${{ github.token }}",
+        "trusted-main-ci-proof/scripts/release-promotion.py verify-main-ci",
+        '--repository "$GITHUB_REPOSITORY"',
+        '--sha "${{ github.event.pull_request.base.sha }}"',
+        "--wait-seconds 1080",
+    ]:
+        if marker not in proof_run:
+            violations.append(f"trusted candidate base CI proof omits {marker!r}")
     conclusion = job_body(ci, "conclusion")
     if (
         "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true'"
         not in conclusion
+        or "expect_job release-base-proof '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate == 'true' }}'"
+        not in conclusion
+        or "release-base-proof" not in conclusion
     ):
-        violations.append("conclusion does not mirror the semantic candidate test skip")
+        violations.append("conclusion does not require the semantic candidate base CI proof")
 
     for marker in [
         "VALIDATOR.validate_trusted_release_candidate(",
@@ -988,6 +1052,12 @@ def assert_mutation_detected(
 
 
 def main() -> None:
+    publish_helper_tests = subprocess.run(
+        [sys.executable, str(PUBLISH_CRATE_TEST_PATH)],
+        check=False,
+    )
+    if publish_helper_tests.returncode != 0:
+        raise AssertionError("crates.io publish helper contracts failed")
     ci = CI_PATH.read_text(encoding="utf-8")
     release = RELEASE_PATH.read_text(encoding="utf-8")
     release_please = RELEASE_PLEASE_PATH.read_text(encoding="utf-8")
@@ -1198,15 +1268,29 @@ def main() -> None:
             "release",
         ),
         (
-            "cargo publish -p wenlan-types",
-            "cargo publish -p wenlan-types --dry-run",
-            "duplicates Cargo publish verification",
+            "--package wenlan-types",
+            "--package unverified-types",
+            "bypasses publish helper",
             "release",
         ),
         (
-            "CARGO_REGISTRY_TOKEN is required because wenlan-mcp",
-            "missing token accepted for wenlan-mcp",
-            "crates.io publication omits fail-closed proof",
+            "--package wenlan-mcp",
+            "--package unverified-mcp",
+            "bypasses publish helper",
+            "release",
+        ),
+        (
+            "  publish-crates:\n"
+            "    name: Publish crates.io (wenlan-types + wenlan-mcp)\n"
+            "    needs: promote-assets\n"
+            "    runs-on: ubuntu-latest\n"
+            "    timeout-minutes: 15",
+            "  publish-crates:\n"
+            "    name: Publish crates.io (wenlan-types + wenlan-mcp)\n"
+            "    needs: promote-assets\n"
+            "    runs-on: ubuntu-latest\n"
+            "    timeout-minutes: 150",
+            "15-minute bound",
             "release",
         ),
         (
@@ -1258,7 +1342,13 @@ def main() -> None:
         (
             "needs.detect-changes.outputs.trusted-release-candidate != 'true'",
             "true",
-            "platform test skip is not bound",
+            "duplicate base test skip",
+            "ci",
+        ),
+        (
+            "trusted-main-ci-proof/scripts/release-promotion.py verify-main-ci",
+            "trusted-main-ci-proof/scripts/release-promotion.py skipped-main-ci-proof",
+            "base CI proof omits",
             "ci",
         ),
         (

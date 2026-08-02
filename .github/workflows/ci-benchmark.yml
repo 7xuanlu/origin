@@ -546,18 +546,30 @@ jobs:
           from pathlib import Path
           requested_mode = "${{ matrix.cache_mode }}"
           profile = "${{ matrix.profile }}"
-          effective_cache = os.environ.get("WINDOWS_CACHE_STATE") or requested_mode
+          rust_cache_hit = os.environ.get("RUST_CACHE_HIT", "")
+          windows_cache_state = os.environ.get("WINDOWS_CACHE_STATE", "")
+          # rust-cache exposes only an exact-key hit. Non-Windows production
+          # restores are registry-only, so a non-hit is intentionally reported
+          # as ambiguous instead of being mislabeled from the requested mode.
+          if windows_cache_state:
+              effective_cache = windows_cache_state
+          elif requested_mode == "cold":
+              effective_cache = "cold-miss"
+          elif rust_cache_hit == "true":
+              effective_cache = "exact-restore"
+          else:
+              effective_cache = "fallback-or-miss"
           Path("benchmark-receipts/cache.json").write_text(json.dumps({
               "requested_mode": requested_mode,
               "effective_cache": effective_cache,
               "profile": profile,
               "profile_codegen_units": "${{ matrix.cgu }}",
               "profile_lto": "${{ matrix.lto }}",
-              "rust_cache_hit": os.environ.get("RUST_CACHE_HIT", ""),
+              "rust_cache_hit": rust_cache_hit,
               "rust_cache_shared_key": "release-v4-${{ matrix.target }}",
               "windows_cache_exact": os.environ.get("WINDOWS_CACHE_EXACT", ""),
               "windows_cache_jobs": os.environ.get("WINDOWS_CACHE_JOBS", ""),
-              "windows_cache_state": os.environ.get("WINDOWS_CACHE_STATE", ""),
+              "windows_cache_state": windows_cache_state,
           }, sort_keys=True) + "\n")
           PY
       - name: Upload P6 receipt

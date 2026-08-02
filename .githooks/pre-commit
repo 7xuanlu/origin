@@ -34,11 +34,18 @@ if [ "$HAS_RUST_INPUT" = "yes" ]; then
             exit 1
         }
     else
-        echo "  Checking Rust compilation..."
-        cargo check --workspace 2>&1 || {
-            echo "FAIL: Rust compilation errors. Fix before committing."
-            exit 1
-        }
+        # Shared graph/toolchain/Clippy inputs have no honest single-crate
+        # owner. Keep commit-time feedback cheap; the fail-closed pre-push
+        # planner expands these inputs to the complete workspace checks.
+        if echo "$STAGED_FILES" | grep -Eq '((^|/)Cargo\.toml$|^Cargo\.lock$)'; then
+            echo "  Validating Cargo metadata; full graph checks run pre-push..."
+            cargo metadata --format-version 1 --locked --no-deps >/dev/null 2>&1 || {
+                echo "FAIL: Cargo metadata is invalid. Fix before committing."
+                exit 1
+            }
+        else
+            echo "  Shared Rust configuration changed; full checks run pre-push."
+        fi
     fi
 fi
 

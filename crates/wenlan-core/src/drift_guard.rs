@@ -1982,6 +1982,8 @@ fn ci_routing_contract_violations(
         "contract-integration-required",
         "canonical-smokes-required",
         "canonical-acceptance-required",
+        "fmt-required",
+        "clippy-required",
         "rust-ci-required",
         "platform-test-plan",
         "platform-workspace-lib-required",
@@ -2046,6 +2048,68 @@ fn ci_routing_contract_violations(
             "release candidate test skip is not bound to the fail-closed semantic classifier"
                 .into(),
         );
+    }
+    let base_proof = &ci["jobs"]["release-base-proof"];
+    let base_proof_checkout = job_step(
+        &ci,
+        "release-base-proof",
+        "Checkout trusted main CI verifier",
+    );
+    let base_proof_run = job_step(
+        &ci,
+        "release-base-proof",
+        "Verify exact base main CI succeeded",
+    );
+    let base_proof_command = base_proof_run
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if job_needs(&ci, "release-base-proof") != ["detect-changes"]
+        || base_proof["if"].as_str()
+            != Some(
+                "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate == 'true'",
+            )
+        || base_proof["timeout-minutes"].as_u64() != Some(20)
+        || base_proof["permissions"]["actions"].as_str() != Some("read")
+        || base_proof["permissions"]["contents"].as_str() != Some("read")
+        || base_proof_checkout.and_then(|step| step["uses"].as_str())
+            != Some("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803")
+        || base_proof_checkout.and_then(|step| step["with"]["ref"].as_str())
+            != Some("${{ github.event.pull_request.base.sha }}")
+        || base_proof_checkout.and_then(|step| step["with"]["path"].as_str())
+            != Some("trusted-main-ci-proof")
+        || base_proof_checkout.and_then(|step| step["with"]["fetch-depth"].as_u64())
+            != Some(1)
+        || base_proof_checkout.and_then(|step| step["with"]["persist-credentials"].as_bool())
+            != Some(false)
+        || base_proof_run.and_then(|step| step["env"]["GITHUB_TOKEN"].as_str())
+            != Some("${{ github.token }}")
+        || !base_proof_command
+            .contains("trusted-main-ci-proof/scripts/release-promotion.py verify-main-ci")
+        || !base_proof_command.contains("--repository \"$GITHUB_REPOSITORY\"")
+        || !base_proof_command.contains("--sha \"${{ github.event.pull_request.base.sha }}\"")
+        || !base_proof_command.contains("--wait-seconds 1080")
+    {
+        violations.push(
+            "trusted release candidate skip is not backed by exact successful base main CI"
+                .into(),
+        );
+    }
+    for job in [
+        "fmt",
+        "lint",
+        "linux-nextest-build",
+        "linux-nextest",
+        "test",
+        "mcp-platform",
+        "canonical-acceptance",
+        "contract-integration",
+    ] {
+        let condition = ci["jobs"][job]["if"].as_str().unwrap_or_default();
+        if !condition.contains("needs.detect-changes.outputs.trusted-release-candidate != 'true'") {
+            violations.push(format!(
+                "trusted release candidate still repeats base-owned job {job}"
+            ));
+        }
     }
     let planner_setup = job_step(
         &ci,
@@ -2127,6 +2191,8 @@ fn ci_routing_contract_violations(
         "contract-integration-required",
         "canonical-smokes-required",
         "canonical-acceptance-required",
+        "fmt-required",
+        "clippy-required",
         "rust-ci-required",
     ] {
         let expected = format!("${{{{ steps.test-plan.outputs.{output} }}}}");
@@ -2669,15 +2735,15 @@ fn ci_routing_contract_violations(
             violations.push(format!("{job} sccache mode is not read-only"));
         }
     }
-    let rust_ci_job_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true'";
-    for job in ["fmt", "lint"] {
-        if ci["jobs"][job]["if"].as_str() != Some(rust_ci_job_condition) {
-            violations.push(format!(
-                "required Rust job {job} does not derive exactly from rust-ci-required"
-            ));
-        }
+    let fmt_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.fmt-required == 'true'";
+    if ci["jobs"]["fmt"]["if"].as_str() != Some(fmt_condition) {
+        violations.push("fmt does not derive exactly from its source-class owner".into());
     }
-    let contract_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.contract-integration-required == 'true'";
+    let clippy_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.clippy-required == 'true'";
+    if ci["jobs"]["lint"]["if"].as_str() != Some(clippy_condition) {
+        violations.push("Clippy does not derive exactly from its compiler-input owner".into());
+    }
+    let contract_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.contract-integration-required == 'true'";
     if ci["jobs"]["contract-integration"]["if"].as_str() != Some(contract_condition) {
         violations.push(
             "required contract integration job does not derive exactly from its planner output"
@@ -2685,7 +2751,7 @@ fn ci_routing_contract_violations(
         );
     }
     let platform_condition = ci["jobs"]["test"]["if"].as_str().unwrap_or_default();
-    let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request')";
+    let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch')";
     if platform_condition != expected_platform_condition {
         violations.push(
             "platform test job does not derive from rust-ci-required plus its platform owner"
@@ -2698,7 +2764,7 @@ fn ci_routing_contract_violations(
         "needs.detect-changes.outputs.macos",
         "needs.detect-changes.outputs.windows",
         "startsWith(github.head_ref, 'release-please--branches--')",
-        "github.event_name != 'pull_request'",
+        "github.event_name == 'workflow_dispatch'",
     ] {
         if !platform_condition.contains(required) {
             violations.push(format!(
@@ -2717,19 +2783,37 @@ fn ci_routing_contract_violations(
         .find(|step| step["id"].as_str() == Some("matrix"))
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default();
-    for required in [
-        "github.event_name",
-        "pull_request",
-        "steps.release-candidate-trust.outputs.trusted-release-candidate",
-        "startsWith(github.head_ref, 'release-please--branches--')",
-        "steps.filter.outputs.macos",
-        "steps.filter.outputs.windows",
-    ] {
-        if !matrix_run.contains(required) {
-            violations.push(format!(
-                "dynamic OS matrix is missing differential/backstop routing marker {required:?}"
-            ));
-        }
+    let matrix_lines = matrix_run
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    let expected_matrix_lines = [
+        r#"macos='{"os":"macos-14","label":"macos-14"}'"#,
+        r#"windows='{"os":"windows-2022","label":"windows-2022"}'"#,
+        r#"if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then"#,
+        r#"include="${macos},${windows}""#,
+        r#"elif [ "${{ steps.release-candidate-trust.outputs.trusted-release-candidate }}" = "true" ]; then"#,
+        r#"include="""#,
+        r#"elif [ "${{ startsWith(github.head_ref, 'release-please--branches--') }}" = "true" ]; then"#,
+        r#"include="${macos},${windows}""#,
+        r#"elif [ "${{ steps.filter.outputs.macos }}" = "true" ] && [ "${{ steps.filter.outputs.windows }}" = "true" ]; then"#,
+        r#"include="${macos},${windows}""#,
+        r#"elif [ "${{ steps.filter.outputs.macos }}" = "true" ]; then"#,
+        r#"include="$macos""#,
+        r#"elif [ "${{ steps.filter.outputs.windows }}" = "true" ]; then"#,
+        r#"include="$windows""#,
+        "else",
+        r#"include="""#,
+        "fi",
+        r#"echo "json={\"include\":[${include}]}" >> "$GITHUB_OUTPUT""#,
+    ];
+    if matrix_lines != expected_matrix_lines {
+        violations.push(
+            "dynamic OS matrix does not keep ordinary PR and main push on the same owner-driven \
+             route with workflow_dispatch as the only event-wide full-platform backstop"
+                .into(),
+        );
     }
     if matrix_run.contains("ubuntu-24.04") {
         violations.push("dynamic platform matrix still contains a duplicate Linux compiler".into());
@@ -2743,8 +2827,15 @@ fn ci_routing_contract_violations(
                 .into(),
         );
     }
+    if !conclusion_run.contains(
+        "expect_job release-base-proof '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate == 'true' }}'",
+    ) {
+        violations.push("conclusion does not require trusted release base main CI proof".into());
+    }
     for required in [
         "needs.detect-changes.outputs.rust-ci-required",
+        "needs.detect-changes.outputs.fmt-required",
+        "needs.detect-changes.outputs.clippy-required",
         "needs.detect-changes.outputs.trusted-release-candidate != 'true'",
         "needs.detect-changes.outputs.macos",
         "needs.detect-changes.outputs.windows",
@@ -2757,16 +2848,21 @@ fn ci_routing_contract_violations(
             ));
         }
     }
-    let run_rust = "run_rust='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' }}'";
-    let run_platform = "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request') }}'";
-    for (name, expected) in [("run_rust", run_rust), ("run_platform", run_platform)] {
+    let run_fmt = "run_fmt='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.fmt-required == 'true' }}'";
+    let run_clippy = "run_clippy='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.clippy-required == 'true' }}'";
+    let run_platform = "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch') }}'";
+    for (name, expected) in [
+        ("run_fmt", run_fmt),
+        ("run_clippy", run_clippy),
+        ("run_platform", run_platform),
+    ] {
         if !conclusion_run
             .lines()
             .map(str::trim)
             .any(|line| line == expected)
         {
             violations.push(format!(
-                "conclusion {name} does not derive exactly from rust-ci-required"
+                "conclusion {name} does not derive exactly from its test owner"
             ));
         }
     }
@@ -2778,6 +2874,7 @@ fn ci_routing_contract_violations(
     }
     let conclusion_needs = job_needs(&ci, "conclusion");
     for job in [
+        "release-base-proof",
         "linux-nextest-build",
         "linux-nextest",
         "mcp-platform",
@@ -2791,8 +2888,8 @@ fn ci_routing_contract_violations(
         }
     }
     for (job, expected) in [
-        ("fmt", "\"$run_rust\""),
-        ("lint", "\"$run_rust\""),
+        ("fmt", "\"$run_fmt\""),
+        ("lint", "\"$run_clippy\""),
         ("linux-nextest-build", "\"$run_workspace_lib\""),
         ("linux-nextest", "\"$run_workspace_lib\""),
         ("test", "\"$run_platform\""),
@@ -2853,15 +2950,15 @@ fn ci_routing_contract_violations(
         .and_then(|step| step["if"].as_str())
         .unwrap_or_default();
     if !windows_lint_condition.contains("needs.detect-changes.outputs.windows-lint == 'true'")
-        || !windows_lint_condition.contains("github.event_name != 'pull_request'")
+        || !windows_lint_condition.contains("github.event_name == 'workflow_dispatch'")
     {
         violations.push(
-            "Windows page-lint proof is not gated to lint-sensitive PRs plus non-PR backstops"
+            "Windows page-lint proof is not gated to lint-sensitive changes plus manual backstops"
                 .into(),
         );
     }
 
-    let m4_condition = "matrix.os == 'macos-14' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true')";
+    let m4_condition = "matrix.os == 'macos-14' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true')";
     if job_step(&ci, "test", "M4 community gates (macOS-owned)")
         .and_then(|step| step["if"].as_str())
         != Some(m4_condition)
@@ -2870,7 +2967,7 @@ fn ci_routing_contract_violations(
             "macOS M4 gate is not focused to community/provenance inputs plus backstops".into(),
         );
     }
-    let windows_llm_condition = "matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.windows-llm-probe == 'true')";
+    let windows_llm_condition = "matrix.os == 'windows-2022' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.windows-llm-probe == 'true')";
     for step_name in [
         "Validate Windows smoke harness",
         "Validate Windows LLM probe",
@@ -2925,7 +3022,7 @@ fn ci_routing_contract_violations(
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default();
     let mcp_rust_cache = job_step_using(&ci, "mcp-platform", "Swatinem/rust-cache");
-    let test_owner_formula = "${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || (matrix.os == 'macos-14' && needs.detect-changes.outputs.macos == 'true') || (matrix.os == 'windows-2022' && needs.detect-changes.outputs.windows == 'true') }}";
+    let test_owner_formula = "${{ github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || (matrix.os == 'macos-14' && needs.detect-changes.outputs.macos == 'true') || (matrix.os == 'windows-2022' && needs.detect-changes.outputs.windows == 'true') }}";
     let mcp_windows_linker = job_step(
         &ci,
         "mcp-platform",
@@ -2938,10 +3035,12 @@ fn ci_routing_contract_violations(
         .filter_map(serde_yaml::Value::as_str)
         .collect::<BTreeSet<_>>();
     if mcp_oses != BTreeSet::from(["macos-14", "windows-2022"])
+        || !mcp_condition
+            .contains("needs.detect-changes.outputs.trusted-release-candidate != 'true'")
         || !mcp_condition.contains("needs.detect-changes.outputs.workspace-platform == 'true'")
         || !mcp_condition.contains("needs.detect-changes.outputs.mcp-platform == 'true'")
         || !mcp_condition.contains("startsWith(github.head_ref, 'release-please--branches--')")
-        || !mcp_condition.contains("github.event_name != 'pull_request'")
+        || !mcp_condition.contains("github.event_name == 'workflow_dispatch'")
         || !mcp_run.contains("cargo check -p wenlan-mcp --lib --bins")
         || mcp_run.contains("--all-targets")
         || mcp_compile.and_then(|step| step["if"].as_str())
@@ -3156,7 +3255,7 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
             1,
         )
         .replacen(
-            "if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true'",
+            "if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.fmt-required == 'true'",
             "if: needs.detect-changes.outputs.rust == 'true'",
             1,
         )
@@ -3173,6 +3272,11 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
         .replacen(
             "            macos-m4:\n              - 'crates/wenlan-core/src/community_grouping.rs'",
             "            macos-m4:\n              - 'crates/wenlan-core/src/community_grouping.rs'\n              - 'crates/wenlan-core/src/unreviewed_m4.rs'",
+            1,
+        )
+        .replacen(
+            "if [ \"${{ github.event_name }}\" = \"workflow_dispatch\" ]; then",
+            "if [ \"${{ github.event_name }}\" != \"workflow_dispatch\" ]; then",
             1,
         );
     let planner = std::fs::read_to_string(root.join("scripts/ci_test_plan.py"))
@@ -3206,13 +3310,14 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
     violations.extend(fastembed_ci_cache_violations(&workflow));
     for expected in [
         "every non-reused CI run",
-        "required Rust job fmt",
+        "fmt does not derive exactly",
         "canonical rust-ci-required planner output",
         "rust-ci-required output is not the union",
         "non-Rust fast-owner",
         "unknown paths",
         "platform test planner lost required contract",
         "exact generic macOS plus Windows filter inventories",
+        "ordinary PR and main push on the same owner-driven route",
         "macos-m4 focused-owner allowlist has unreviewed path",
         "macos-m4 focused source crates/wenlan-core/src/db.rs acquired macos-specific cfg",
     ] {
@@ -3548,7 +3653,7 @@ fn ci_release_reuse_and_linux_shards_are_fail_closed() {
         );
     }
 
-    let archive_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.workspace-lib-required == 'true'";
+    let archive_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.workspace-lib-required == 'true'";
     assert_eq!(
         job_needs(&ci, "linux-nextest-build"),
         ["detect-changes"],
@@ -3742,6 +3847,10 @@ fn ci_manifest_and_lockfile_changes_get_focused_platform_compile_proof() {
     assert!(
         condition.contains("needs.detect-changes.outputs.workspace-platform == 'true'"),
         "focused platform job does not schedule workspace dependency changes"
+    );
+    assert!(
+        condition.contains("needs.detect-changes.outputs.trusted-release-candidate != 'true'"),
+        "trusted release candidates must not repeat the platform compile"
     );
     let workspace = job_step(&ci, "mcp-platform", "Build workspace contract binaries")
         .expect("workspace platform build step");
@@ -4066,7 +4175,7 @@ jobs:
         "reusable target cache",
         "restore-only target-free rust-cache",
         "sccache mode is not read-only",
-        "required Rust job",
+        "fmt does not derive",
         "coverage workflow",
         "release-please workflow",
         "clippy configuration",
@@ -5166,19 +5275,47 @@ fn release_promotion_contract_violations(
     {
         violations.push("tag release has an unbound trigger or duplicate compilation lane".into());
     }
-    if release_workflow.contains("cargo publish -p wenlan-types --dry-run") {
+    let crates_text = serde_yaml::to_string(&release["jobs"]["publish-crates"]).unwrap_or_default();
+    if crates_text.contains("--dry-run") {
         violations.push("tag release duplicates Cargo publish verification".into());
     }
-    let crates_text = serde_yaml::to_string(&release["jobs"]["publish-crates"]).unwrap_or_default();
+    for (job, timeout) in [
+        ("prepare-release", 10),
+        ("publish-crates", 15),
+        ("publish-npm", 10),
+        ("update-homebrew", 20),
+        ("docker-manifest", 10),
+        ("finalize-release", 10),
+    ] {
+        if release["jobs"][job]["timeout-minutes"].as_i64() != Some(timeout) {
+            violations.push(format!(
+                "release job {job:?} does not keep its {timeout}-minute bound"
+            ));
+        }
+    }
     for required in [
-        "CARGO_REGISTRY_TOKEN is required because wenlan-types",
-        "CARGO_REGISTRY_TOKEN is required because wenlan-mcp",
-        "Require wenlan-mcp on crates.io",
-        "wenlan-mcp ${VERSION} not visible on sparse index after 10 min",
+        "python3 scripts/publish-crate.py",
+        "--package wenlan-types",
+        "--package wenlan-mcp",
+        "--version \"$VERSION\"",
     ] {
         if !crates_text.contains(required) {
             violations.push(format!(
-                "crates.io publication omits fail-closed proof {required:?}"
+                "crates.io publication bypasses publish helper {required:?}"
+            ));
+        }
+    }
+    if crates_text
+        .matches("python3 scripts/publish-crate.py")
+        .count()
+        != 2
+    {
+        violations.push("crates.io publication does not call the helper exactly twice".into());
+    }
+    for forbidden in ["seq 1 60", "sleep 10", "--no-verify"] {
+        if crates_text.contains(forbidden) {
+            violations.push(format!(
+                "crates.io publication retains unsafe or serial polling {forbidden:?}"
             ));
         }
     }
@@ -5473,28 +5610,48 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
             "{label} synchronizer mutation must fail closed: {sync_violations:?}"
         );
     }
-    let duplicate_publish_verification =
+    let bypassed_publish_helper =
         std::fs::read_to_string(root.join(".github/workflows/release.yml"))
             .expect("read release")
-            .replace(
-                "cargo publish -p wenlan-types",
-                "cargo publish -p wenlan-types --dry-run",
-            );
-    let duplicate_publish_violations = release_promotion_contract_violations(
+            .replace("--package wenlan-types", "--package unverified-types");
+    let bypassed_publish_violations = release_promotion_contract_violations(
         &ci,
         &release_please,
         &release_please_config,
         &fast_maintenance,
-        &duplicate_publish_verification,
+        &bypassed_publish_helper,
         &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
             .expect("read promotion resolver"),
         &sync_release_pr,
     );
     assert!(
-        duplicate_publish_violations
+        bypassed_publish_violations
             .iter()
-            .any(|item| item.contains("duplicates Cargo publish verification")),
-        "mutation must reject duplicate Cargo publish verification: {duplicate_publish_violations:?}"
+            .any(|item| item.contains("bypasses publish helper")),
+        "mutation must reject bypassing the publish helper: {bypassed_publish_violations:?}"
+    );
+    let unbounded_crates_release =
+        std::fs::read_to_string(root.join(".github/workflows/release.yml"))
+            .expect("read release")
+            .replace(
+                "  publish-crates:\n    name: Publish crates.io (wenlan-types + wenlan-mcp)\n    needs: promote-assets\n    runs-on: ubuntu-latest\n    timeout-minutes: 15",
+                "  publish-crates:\n    name: Publish crates.io (wenlan-types + wenlan-mcp)\n    needs: promote-assets\n    runs-on: ubuntu-latest\n    timeout-minutes: 150",
+            );
+    let unbounded_crates_violations = release_promotion_contract_violations(
+        &ci,
+        &release_please,
+        &release_please_config,
+        &fast_maintenance,
+        &unbounded_crates_release,
+        &std::fs::read_to_string(root.join("scripts/release-promotion.py"))
+            .expect("read promotion resolver"),
+        &sync_release_pr,
+    );
+    assert!(
+        unbounded_crates_violations
+            .iter()
+            .any(|item| item.contains("publish-crates") && item.contains("15-minute bound")),
+        "mutation must reject an unbounded crates.io job: {unbounded_crates_violations:?}"
     );
     let retry_unsafe_release = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
         .expect("read release")
@@ -5756,7 +5913,7 @@ fn canonical_acceptance_contract_violations(ci_workflow: &str) -> Vec<String> {
     }
     if job["if"].as_str()
         != Some(
-            "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.canonical-acceptance-required == 'true'",
+            "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.canonical-acceptance-required == 'true'",
         )
     {
         violations.push(
@@ -7300,7 +7457,8 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
     {
         violations.push("P6 does not record coherent cache state and Cargo job bounds".into());
     }
-    let p6_cache_receipt = job_step(&benchmark, "p6-release", "Record release cache evidence")
+    let p6_cache_receipt_step = job_step(&benchmark, "p6-release", "Record release cache evidence");
+    let p6_cache_receipt = p6_cache_receipt_step
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default();
     let active_receipt_lines = p6_cache_receipt
@@ -7311,22 +7469,29 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
     let expected_cache_logic = [
         r#"requested_mode = "${{ matrix.cache_mode }}""#,
         r#"profile = "${{ matrix.profile }}""#,
-        r#"effective_cache = os.environ.get("WINDOWS_CACHE_STATE") or requested_mode"#,
+        r#"rust_cache_hit = os.environ.get("RUST_CACHE_HIT", "")"#,
+        r#"windows_cache_state = os.environ.get("WINDOWS_CACHE_STATE", "")"#,
+        "if windows_cache_state:",
+        "effective_cache = windows_cache_state",
+        r#"elif requested_mode == "cold":"#,
+        r#"effective_cache = "cold-miss""#,
+        r#"elif rust_cache_hit == "true":"#,
+        r#"effective_cache = "exact-restore""#,
+        "else:",
+        r#"effective_cache = "fallback-or-miss""#,
     ];
     let has_exact_cache_logic = active_receipt_lines
         .windows(expected_cache_logic.len())
         .any(|window| window == expected_cache_logic);
-    let effective_cache_assignments = active_receipt_lines
-        .iter()
-        .filter(|line| line.starts_with("effective_cache ="))
-        .count();
     if !has_exact_cache_logic
-        || effective_cache_assignments != 1
+        || active_receipt_lines.contains(&"effective_cache = requested_mode")
         || !active_receipt_lines.contains(&r#""effective_cache": effective_cache,"#)
-        || !active_receipt_lines
-            .contains(&r#""windows_cache_state": os.environ.get("WINDOWS_CACHE_STATE", ""),"#)
+        || !active_receipt_lines.contains(&r#""rust_cache_hit": rust_cache_hit,"#)
+        || !active_receipt_lines.contains(&r#""windows_cache_state": windows_cache_state,"#)
         || !active_receipt_lines
             .contains(&r#""windows_cache_jobs": os.environ.get("WINDOWS_CACHE_JOBS", ""),"#)
+        || p6_cache_receipt_step.and_then(|step| step["env"]["RUST_CACHE_HIT"].as_str())
+            != Some("${{ steps.rust-cache.outputs.cache-hit }}")
     {
         violations.push("P6 cache receipt does not expose the measured cache state".into());
     }
@@ -7651,8 +7816,8 @@ fn ci_benchmark_contract_rejects_unmeasured_cache_state() {
     let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
         .expect("read benchmark workflow");
     let benchmark = benchmark.replace(
-        r#"effective_cache = os.environ.get("WINDOWS_CACHE_STATE") or requested_mode"#,
-        "effective_cache = requested_mode",
+        r#"elif rust_cache_hit == "true":"#,
+        r#"elif requested_mode == "production-restore":"#,
     );
     let violations = ci_benchmark_contract_violations(&ci, &benchmark);
     assert!(
@@ -7660,6 +7825,44 @@ fn ci_benchmark_contract_rejects_unmeasured_cache_state() {
             .iter()
             .any(|violation| violation.contains("measured cache state")),
         "unmeasured cache state must fail the benchmark contract: {violations:?}"
+    );
+}
+
+#[test]
+fn ci_benchmark_contract_rejects_requested_mode_masquerade() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
+        .expect("read benchmark workflow");
+    let benchmark = benchmark.replace(
+        r#"effective_cache = "fallback-or-miss""#,
+        "effective_cache = requested_mode",
+    );
+    let violations = ci_benchmark_contract_violations(&ci, &benchmark);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("measured cache state")),
+        "requested cache mode must not masquerade as measured state: {violations:?}"
+    );
+}
+
+#[test]
+fn ci_benchmark_contract_requires_rust_cache_observation_wiring() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
+        .expect("read benchmark workflow");
+    let benchmark = benchmark.replace(
+        "RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}",
+        "RUST_CACHE_HIT: ''",
+    );
+    let violations = ci_benchmark_contract_violations(&ci, &benchmark);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("measured cache state")),
+        "unwired rust-cache observation must fail the benchmark contract: {violations:?}"
     );
 }
 

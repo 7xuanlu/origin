@@ -18,6 +18,9 @@ class PlanError(ValueError):
     """Planner input is malformed and CI must stop."""
 
 
+DIFFERENTIAL_EVENTS = frozenset({"pull_request", "push"})
+
+
 ISOLATED_UNIT_MODULES = {
     "crates/wenlan-core/src/drift_guard/r4_test_support_api_manifest.txt": (
         "wenlan-core",
@@ -56,6 +59,24 @@ FULL_INPUTS = {
     ".github/workflows/release.yml",
     "scripts/ci_test_plan.py",
     "scripts/ci_test_plan.test.py",
+}
+
+CLIPPY_INPUTS = {
+    "Cargo.lock",
+    "clippy.toml",
+    "rust-toolchain.toml",
+}
+
+NON_CLIPPY_CONTRACT_INPUTS = {
+    ".config/nextest.toml",
+    "scripts/ci_test_plan.py",
+    "scripts/ci_test_plan.test.py",
+}
+
+DETECT_CONTRACT_INPUTS = {
+    ".githooks/pre-commit",
+    ".githooks/pre-push",
+    "scripts/git-hooks.test.sh",
 }
 
 # Repository contracts are executable Rust tests, but they do not exercise
@@ -136,6 +157,8 @@ def _full_plan(reason: str) -> dict:
         "version": 1,
         "mode": "full",
         "reasons": [reason],
+        "fmt_required": True,
+        "clippy_required": True,
         "workspace_lib": {"mode": "full"},
         "cli_server_integration": {"mode": "full"},
         "core_integration": {"mode": "full"},
@@ -149,6 +172,8 @@ def _skip_plan(reason: str) -> dict:
         "version": 1,
         "mode": "differential",
         "reasons": [reason],
+        "fmt_required": False,
+        "clippy_required": False,
         "workspace_lib": {"mode": "skip"},
         "cli_server_integration": {"mode": "skip"},
         "core_integration": {"mode": "skip"},
@@ -287,6 +312,57 @@ def _docs_job_owns(path: str) -> bool:
     return path.endswith(".md") and not _rust_fixture_owns(path)
 
 
+def _is_clippy_input(path: str) -> bool:
+    if _plugin_job_owns(path) or _npm_job_owns(path) or _docs_job_owns(path):
+        return False
+    suffix = PurePosixPath(path).suffix.lower()
+    return (
+        path in CLIPPY_INPUTS
+        or path.endswith("/Cargo.toml")
+        or path.endswith("/build.rs")
+        or suffix == ".rs"
+        or suffix in NATIVE_SUFFIXES
+    )
+
+
+def _is_non_clippy_contract_input(path: str, existing: set[str]) -> bool:
+    if _plugin_job_owns(path) or _npm_job_owns(path) or _docs_job_owns(path):
+        return True
+    if (
+        path.startswith(".github/workflows/")
+        or path in NON_CLIPPY_CONTRACT_INPUTS
+        or path in DETECT_CONTRACT_INPUTS
+    ):
+        return True
+    return path in existing and (
+        path in ISOLATED_UNIT_TESTS or path in ISOLATED_UNIT_MODULES
+    )
+
+
+def _daily_gate_requirements(
+    plan: dict,
+    paths: list[str],
+    *,
+    event_name: str,
+    existing: set[str],
+) -> tuple[bool, bool]:
+    # PRs and ordinary main pushes pay only for gates that can observe their
+    # inputs. Manual, release, and unknown events retain the full backstop. A
+    # full differential fallback remains conservative unless every path has an
+    # explicit non-Clippy contract owner.
+    if event_name not in DIFFERENTIAL_EVENTS:
+        return True, True
+    fmt_required = any(PurePosixPath(path).suffix.lower() == ".rs" for path in paths)
+    clippy_required = any(_is_clippy_input(path) for path in paths)
+    if (
+        not clippy_required
+        and plan.get("mode") == "full"
+        and any(not _is_non_clippy_contract_input(path, existing) for path in paths)
+    ):
+        clippy_required = True
+    return fmt_required, clippy_required
+
+
 def _integration_targets(package: dict) -> set[str]:
     targets = set()
     for target in package["targets"]:
@@ -329,19 +405,19 @@ def _workspace_lib_plan(
     return {"mode": "packages", "packages": sorted(broad_packages)}
 
 
-def build_plan(
+def _build_test_plan(
     changed_paths: Iterable[object],
     cargo_metadata: object,
     *,
     event_name: str,
     existing_paths: set[str] | None = None,
 ) -> dict:
-    """Return a deterministic test plan or raise PlanError for malformed input."""
+    """Return the suite portion of a deterministic test plan."""
 
     packages, directories = _workspace(cargo_metadata)
     reverse = _reverse_dependencies(packages)
     paths = [_normalize_path(path) for path in changed_paths]
-    if event_name != "pull_request":
+    if event_name not in DIFFERENTIAL_EVENTS:
         return _full_plan(f"{event_name} keeps the full backstop")
     if not paths:
         raise PlanError("changed path inventory is empty")
@@ -376,6 +452,10 @@ def build_plan(
 
         if _docs_job_owns(path):
             reasons.append(f"docs contract job owns changed path: {path}")
+            continue
+
+        if path in DETECT_CONTRACT_INPUTS:
+            reasons.append(f"detect contract job owns changed path: {path}")
             continue
 
         if (
@@ -533,6 +613,40 @@ def build_plan(
     }
 
 
+def build_plan(
+    changed_paths: Iterable[object],
+    cargo_metadata: object,
+    *,
+    event_name: str,
+    existing_paths: set[str] | None = None,
+) -> dict:
+    """Return a deterministic test and daily-gate plan or raise PlanError."""
+
+    raw_paths = list(changed_paths)
+    plan = _build_test_plan(
+        raw_paths,
+        cargo_metadata,
+        event_name=event_name,
+        existing_paths=existing_paths,
+    )
+    paths = [_normalize_path(path) for path in raw_paths]
+    if event_name not in DIFFERENTIAL_EVENTS:
+        existing = set()
+    elif existing_paths is None:
+        existing = {path for path in paths if Path(path).exists()}
+    else:
+        existing = {_normalize_path(path) for path in existing_paths}
+    fmt_required, clippy_required = _daily_gate_requirements(
+        plan,
+        paths,
+        event_name=event_name,
+        existing=existing,
+    )
+    plan["fmt_required"] = fmt_required
+    plan["clippy_required"] = clippy_required
+    return plan
+
+
 def build_platform_plan(
     changed_paths: Iterable[object],
     cargo_metadata: object,
@@ -543,7 +657,7 @@ def build_platform_plan(
     """Plan platform behavior without letting CI infrastructure widen it."""
 
     paths = [_normalize_path(path) for path in changed_paths]
-    if event_name != "pull_request":
+    if event_name not in DIFFERENTIAL_EVENTS:
         return build_plan(
             paths,
             cargo_metadata,
@@ -551,6 +665,8 @@ def build_platform_plan(
             existing_paths=existing_paths,
         )
     if not paths:
+        if event_name == "push":
+            raise PlanError("changed path inventory is empty")
         return _skip_plan("no generic platform behavioral inputs changed")
 
     # Linux owns repository/workflow/planner contracts. Platform behavior is
@@ -629,6 +745,14 @@ def required_suite_outputs(plan: object) -> dict[str, bool]:
     if not isinstance(plan, dict) or plan.get("version") != 1:
         raise PlanError("unsupported or malformed test plan")
     required: dict[str, bool] = {}
+    for output_name, field_name in (
+        ("fmt-required", "fmt_required"),
+        ("clippy-required", "clippy_required"),
+    ):
+        value = plan.get(field_name)
+        if not isinstance(value, bool):
+            raise PlanError(f"test plan has no boolean {field_name!r}")
+        required[output_name] = value
     for output_name, suite_name in SUITE_OUTPUT_KEYS.items():
         suite = plan.get(suite_name)
         if not isinstance(suite, dict):

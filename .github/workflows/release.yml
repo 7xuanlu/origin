@@ -21,6 +21,7 @@ jobs:
     name: Create GitHub Release
     needs: resolve-promotion
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -415,6 +416,7 @@ jobs:
     # than mutable staging tags and expose them only after every channel passes.
     needs: [docker, promote-assets, publish-crates, publish-npm, update-homebrew]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       actions: read
       contents: read
@@ -503,6 +505,7 @@ jobs:
     name: Publish crates.io (wenlan-types + wenlan-mcp)
     needs: promote-assets
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -539,11 +542,10 @@ jobs:
           echo "Workspace version: $VERSION"
 
       - name: Publish wenlan-types to crates.io
-        # Source-of-truth registry check uses the sparse index (same as the
-        # downstream `Wait for ... available` step). The v1 web API lags
-        # behind by minutes-to-hours under load and gave false "not
-        # published" answers that caused cargo publish to attempt a
-        # duplicate upload, failing the job.
+        # Cargo publish performs the packaged-crate build verification and then
+        # polls the index itself. The helper preserves that verification, adds
+        # an exact sparse-index precheck, and reconciles Cargo's documented
+        # post-upload timeout without another ten-minute workflow loop.
         run: |
           set -euo pipefail
           tag_sha="$(gh api --method GET \
@@ -555,49 +557,16 @@ jobs:
             exit 1
           fi
           VERSION="${{ steps.version.outputs.value }}"
-          if curl -sf "https://index.crates.io/we/nl/wenlan-types" | grep -q "\"vers\":\"$VERSION\""; then
-            echo "wenlan-types ${VERSION} already on sparse index, skipping publish"
-          else
-            if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
-              echo "ERROR: CARGO_REGISTRY_TOKEN is required because wenlan-types ${VERSION} is not published."
-              exit 1
-            fi
-            cargo publish -p wenlan-types
-          fi
+          python3 scripts/publish-crate.py \
+            --package wenlan-types \
+            --version "$VERSION"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           GH_TOKEN: ${{ github.token }}
-
-      - name: Wait for wenlan-types to be available on crates.io
-        # Poll the sparse index (https://index.crates.io) â€” that's what
-        # the wenlan-mcp publish step reads to resolve its
-        # `wenlan-types = "^X.Y.Z"` dep. The v1 web API
-        # (`crates.io/api/v1/crates/<name>/<version>`) lags behind the
-        # sparse index by minutes-to-hours during load, which caused
-        # false negatives (publish succeeded, web API still 404). The
-        # sparse index path for any crate `name` is
-        # `/<prefix>/<name>` where prefix depends on name length;
-        # for 4+ chars: `<first2>/<chars 3-4>/<name>`. `wenlan-types`
-        # â†’ `we/nl/wenlan-types`. The index returns NDJSON, one record
-        # per published version.
-        run: |
-          VERSION="${{ steps.version.outputs.value }}"
-          INDEX_URL="https://index.crates.io/we/nl/wenlan-types"
-          for i in $(seq 1 60); do
-            if curl -sf "$INDEX_URL" | grep -q "\"vers\":\"$VERSION\""; then
-              echo "wenlan-types ${VERSION} visible on sparse index"; exit 0
-            fi
-            echo "Waiting for sparse index to publish wenlan-types ${VERSION}... ($i/60)"
-            sleep 10
-          done
-          echo "ERROR: wenlan-types ${VERSION} not visible on sparse index after 10 min"
-          echo "Last index response:"
-          curl -s "$INDEX_URL" | tail -5
-          exit 1
 
       - name: Publish wenlan-mcp to crates.io
-        # Sparse index check (see wenlan-types step) avoids the v1 web API
-        # propagation lag that previously caused duplicate-publish failures.
+        # The successful wenlan-types helper return includes a short exact
+        # sparse-index visibility proof, so Cargo can resolve that dependency.
         run: |
           set -euo pipefail
           tag_sha="$(gh api --method GET \
@@ -609,39 +578,18 @@ jobs:
             exit 1
           fi
           VERSION="${{ steps.version.outputs.value }}"
-          if curl -sf "https://index.crates.io/we/nl/wenlan-mcp" | grep -q "\"vers\":\"$VERSION\""; then
-            echo "wenlan-mcp ${VERSION} already on sparse index, skipping publish"
-          else
-            if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
-              echo "ERROR: CARGO_REGISTRY_TOKEN is required because wenlan-mcp ${VERSION} is not published."
-              exit 1
-            fi
-            cargo publish -p wenlan-mcp
-          fi
+          python3 scripts/publish-crate.py \
+            --package wenlan-mcp \
+            --version "$VERSION"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           GH_TOKEN: ${{ github.token }}
-
-      - name: Require wenlan-mcp on crates.io
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.version.outputs.value }}"
-          INDEX_URL="https://index.crates.io/we/nl/wenlan-mcp"
-          for i in $(seq 1 60); do
-            if curl -sf "$INDEX_URL" | grep -q "\"vers\":\"$VERSION\""; then
-              echo "wenlan-mcp ${VERSION} visible on sparse index"; exit 0
-            fi
-            echo "Waiting for sparse index to publish wenlan-mcp ${VERSION}... ($i/60)"
-            sleep 10
-          done
-          echo "ERROR: wenlan-mcp ${VERSION} not visible on sparse index after 10 min"
-          curl -s "$INDEX_URL" | tail -5
-          exit 1
 
   publish-npm:
     name: Publish to npm
     needs: promote-assets
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       id-token: write    # OIDC trusted publishing
@@ -746,6 +694,7 @@ jobs:
     # The tap ships macOS arm64 archives. Validate the formulas with the real
     # Homebrew client on the same architecture instead of stopping at `ruby -c`.
     runs-on: macos-14
+    timeout-minutes: 20
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -880,6 +829,7 @@ jobs:
     # required channel; only after it publishes the aliases may GitHub's
     # prerelease become the latest stable release.
     needs: docker-manifest
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
       contents: write
