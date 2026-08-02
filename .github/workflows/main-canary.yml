@@ -105,10 +105,13 @@ jobs:
               if case.get("filter-match", {}).get("status") == "matches"
               and case.get("ignored") is True
           }
-          if matched != expected or payload.get("test-count") != 2:
+          # nextest's top-level test-count is the full discovered inventory,
+          # not the number left after the filter expression.
+          if matched != expected or len(matched) != 2:
               raise SystemExit(
                   f"main canary inventory drift: expected={sorted(expected)!r} "
-                  f"matched={sorted(matched)!r} count={payload.get('test-count')!r}"
+                  f"matched={sorted(matched)!r} matched_count={len(matched)!r} "
+                  f"discovered_count={payload.get('test-count')!r}"
               )
           PY
       - name: Run embedding-only eval
