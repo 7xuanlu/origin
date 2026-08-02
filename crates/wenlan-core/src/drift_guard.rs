@@ -414,7 +414,7 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
 fn coverage_fastembed_cache_violations(workflow: &str) -> Vec<String> {
     const CACHE_STEP: &str = "Restore portable FastEmbed model";
     const CACHE_DIR: &str = "${{ github.workspace }}/.fastembed_cache";
-    const CACHE_PATH: &str = "${{ env.FASTEMBED_CACHE_DIR }}";
+    const CACHE_PATH: &str = ".fastembed_cache";
     const CACHE_KEY: &str = "fastembed-bge-base-en-v1.5-q-v3-portable";
 
     let parsed: serde_yaml::Value = serde_yaml::from_str(workflow).expect("parse coverage.yml");
@@ -461,6 +461,10 @@ fn coverage_fastembed_cache_violations(workflow: &str) -> Vec<String> {
     {
         violations
             .push("coverage does not restore the cross-OS portable FastEmbed v3 cache".into());
+    }
+    if cache_step["with"]["fail-on-cache-miss"].as_str() != Some("true") {
+        violations
+            .push("coverage FastEmbed cache restore is not fail-closed on a cache miss".into());
     }
     if steps.iter().any(|step| {
         step["uses"].as_str().is_some_and(|uses| {
@@ -698,6 +702,7 @@ jobs:
         "coverage caches",
         "cache key",
         "cross-OS portable FastEmbed v3",
+        "fail-closed",
         "FastEmbed cache writer",
     ] {
         assert!(
@@ -707,6 +712,31 @@ jobs:
             "fixture must exercise {expected:?}: {violations:?}"
         );
     }
+}
+
+#[test]
+fn coverage_fastembed_cache_contract_rejects_absolute_action_path() {
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/coverage.yml"))
+        .expect("read coverage.yml");
+    let mutated = workflow.replacen(
+        "          path: .fastembed_cache",
+        "          path: ${{ env.FASTEMBED_CACHE_DIR }}",
+        1,
+    );
+    assert_ne!(
+        mutated, workflow,
+        "fixture must mutate the cache action path"
+    );
+    let violations = coverage_fastembed_cache_violations(&mutated);
+    assert_eq!(
+        violations.len(),
+        1,
+        "absolute cache action path must be the only mutation: {violations:?}"
+    );
+    assert!(
+        violations[0].contains("coverage caches"),
+        "absolute cache action path must fail the shared-version contract: {violations:?}"
+    );
 }
 
 #[test]
@@ -1812,6 +1842,12 @@ fn unix_only() {}
 }
 
 fn platform_sensitive_paths(root: &Path) -> Vec<(String, &'static str, &'static str)> {
+    let core_lib =
+        std::fs::read_to_string(root.join("crates/wenlan-core/src/lib.rs")).expect("read core lib");
+    assert!(
+        core_lib.contains("#[cfg(test)]\nmod drift_guard;"),
+        "drift_guard.rs exclusion is valid only while the whole module is test-only"
+    );
     let markers = native_platform_markers();
     let mut paths = BTreeSet::new();
     let mut native_sources = BTreeSet::new();
@@ -1820,10 +1856,9 @@ fn platform_sensitive_paths(root: &Path) -> Vec<(String, &'static str, &'static 
     ] {
         native_sources.extend(git_ls_files(root, pattern));
     }
-    for path in native_sources
-        .into_iter()
-        .filter(|path| path.starts_with("crates/"))
-    {
+    for path in native_sources.into_iter().filter(|path| {
+        path.starts_with("crates/") && path != "crates/wenlan-core/src/drift_guard.rs"
+    }) {
         let contents = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
         for (platform, filter) in source_platform_routes(&path, &contents, &markers) {
             paths.insert((path.clone(), platform, filter));
@@ -1966,6 +2001,8 @@ fn filter_routes_path(patterns: &BTreeSet<String>, path: &str) -> bool {
                 })
         })
 }
+
+const RELEASE_PREFLIGHT_CONDITION: &str = "needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true')";
 
 fn ci_routing_contract_violations(
     workflow: &str,
@@ -2468,6 +2505,13 @@ fn ci_routing_contract_violations(
     let windows_paths = detect_change_filter_paths(&ci, "windows");
     let macos_paths = detect_change_filter_paths(&ci, "macos");
     let mcp_platform = detect_change_filter_paths(&ci, "mcp-platform");
+    for (filter, paths) in [("macos", &macos_paths), ("windows", &windows_paths)] {
+        if filter_routes_path(paths, "crates/wenlan-core/src/drift_guard.rs") {
+            violations.push(format!(
+                "{filter} routes test-only drift_guard.rs into a native runner"
+            ));
+        }
+    }
     for (path, platform, filter) in platform_sensitive_paths {
         let routed =
             if path.starts_with("crates/wenlan-mcp/") || path.starts_with("crates/wenlan-types/") {
@@ -2730,15 +2774,10 @@ fn ci_routing_contract_violations(
         .as_str()
         .unwrap_or_default();
     if job_needs(&ci, "release-preflight") != ["detect-changes"]
-        || !release_preflight_condition.contains("github.event_name != 'pull_request'")
-        || !release_preflight_condition
-            .contains("startsWith(github.head_ref, 'release-please--branches--')")
-        || !release_preflight_condition
-            .contains("needs.detect-changes.outputs.release-preflight == 'true'")
+        || release_preflight_condition != RELEASE_PREFLIGHT_CONDITION
     {
         violations.push(
-            "release-preflight is not isolated to release-sensitive PRs and release backstops"
-                .into(),
+            "release-preflight is not isolated to release-sensitive changes and explicit release backstops".into(),
         );
     }
     for profile in ["DEV", "TEST"] {
@@ -2894,7 +2933,7 @@ fn ci_routing_contract_violations(
         "needs.detect-changes.outputs.macos",
         "needs.detect-changes.outputs.windows",
         "startsWith(github.head_ref, 'release-please--branches--')",
-        "github.event_name != 'pull_request'",
+        "github.event_name == 'workflow_dispatch'",
     ] {
         if !conclusion_run.contains(required) {
             violations.push(format!(
@@ -2923,6 +2962,14 @@ fn ci_routing_contract_violations(
     if conclusion_run.contains("github.event.head_commit.message") {
         violations.push(
             "conclusion can accept skipped non-PR backstops based on the head commit message"
+                .into(),
+        );
+    }
+    let release_expectation =
+        format!("expect_job release-preflight '${{{{ {RELEASE_PREFLIGHT_CONDITION} }}}}'");
+    if !conclusion_run.contains(&release_expectation) {
+        violations.push(
+            "conclusion release-preflight expectation does not match its release-sensitive owner"
                 .into(),
         );
     }
@@ -3329,6 +3376,21 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
             1,
         )
         .replacen(
+            "            macos:\n              # macOS owns launchd/host-activity behavior and native code.",
+            "            macos:\n              - 'crates/wenlan-core/src/drift_guard.rs'\n              # macOS owns launchd/host-activity behavior and native code.",
+            1,
+        )
+        .replacen(
+            "            windows:\n              # Windows owns cfg-bearing CLI/server paths, native ORT/Vulkan,",
+            "            windows:\n              - 'crates/wenlan-core/src/drift_guard.rs'\n              # Windows owns cfg-bearing CLI/server paths, native ORT/Vulkan,",
+            1,
+        )
+        .replacen(
+            "if: \"needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true')\"",
+            "if: \"needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true')\"",
+            1,
+        )
+        .replacen(
             "if [ \"${{ github.event_name }}\" = \"workflow_dispatch\" ]; then",
             "if [ \"${{ github.event_name }}\" != \"workflow_dispatch\" ]; then",
             1,
@@ -3376,6 +3438,8 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
         "unknown paths",
         "platform test planner lost required contract",
         "exact generic macOS plus Windows filter inventories",
+        "routes test-only drift_guard.rs into a native runner",
+        "release-preflight is not isolated to release-sensitive changes",
         "ordinary PR and main push on the same owner-driven route",
         "macos-m4 focused-owner allowlist has unreviewed path",
         "macos-m4 focused source crates/wenlan-core/src/db.rs acquired macos-specific cfg",
@@ -3507,14 +3571,9 @@ fn ordinary_pr_required_path_excludes_release_and_unowned_platform_backstops() {
         .as_str()
         .expect("release-preflight condition");
     assert!(
-        release_condition.contains("github.event_name != 'pull_request'")
-            && release_condition
-                .contains("startsWith(github.head_ref, 'release-please--branches--')")
-            && release_condition
-                .contains("needs.detect-changes.outputs.release-preflight == 'true'"),
-        "release preflight must run for release-sensitive PRs, release-please PRs, and non-PR \
-         backstops: \
-         {release_condition}"
+        release_condition == RELEASE_PREFLIGHT_CONDITION,
+        "release preflight must run only for release-sensitive changes, release-please PRs, and \
+         explicit manual backstops: {release_condition}"
     );
 
     let matrix = ci["jobs"]["detect-changes"]["steps"]
@@ -4248,7 +4307,7 @@ jobs:
         "release-profile-sensitive",
         "native/build-sensitive",
         "45-minute non-Windows PR budget",
-        "release-sensitive PRs and release backstops",
+        "release-sensitive changes and explicit release backstops",
         "rust-lld",
         "debug runtime artifacts",
         "differentially compile every wenlan-mcp target",
@@ -4288,14 +4347,11 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     let mut violations = Vec::new();
     let preflight = &ci["jobs"]["release-preflight"];
     if job_needs(&ci, "release-preflight") != ["detect-changes"]
-        || preflight["if"].as_str().is_none_or(|condition| {
-            !condition.contains("github.event_name != 'pull_request'")
-                || !condition.contains("startsWith(github.head_ref, 'release-please--branches--')")
-                || !condition.contains("needs.detect-changes.outputs.release-preflight == 'true'")
-        })
+        || preflight["if"].as_str() != Some(RELEASE_PREFLIGHT_CONDITION)
     {
         violations.push(
-            "release-preflight is not isolated to release-sensitive PRs and backstops".into(),
+            "release-preflight is not isolated to release-sensitive changes and explicit backstops"
+                .into(),
         );
     }
     if preflight["strategy"]["fail-fast"].as_bool() != Some(true)
@@ -4416,6 +4472,16 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     {
         violations.push("conclusion.needs omits release-preflight".into());
     }
+    let release_expectation =
+        format!("expect_job release-preflight '${{{{ {RELEASE_PREFLIGHT_CONDITION} }}}}'");
+    if workflow_step_run(&ci, "Aggregate expected CI results")
+        .is_none_or(|run| !run.contains(&release_expectation))
+    {
+        violations.push(
+            "release-preflight conclusion expectation does not match its release-sensitive owner"
+                .into(),
+        );
+    }
     violations
 }
 
@@ -4471,7 +4537,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "          echo release preflight matrix shell contract removed",
         )
         .replace(
-            "          expect_job release-preflight '${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true' }}' '${{ needs.release-preflight.result }}'",
+            "          expect_job release-preflight '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name == 'workflow_dispatch' || false || needs.detect-changes.outputs.release-preflight == 'true') }}' '${{ needs.release-preflight.result }}'",
             "          echo release-preflight skipped",
         )
         .replace(
@@ -4530,7 +4596,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         .replace("    needs: resolve-promotion", "    needs: publish-crates");
     let violations = release_preflight_contract_violations(&ci, &release);
     for expected in [
-        "release-sensitive PRs and backstops",
+        "release-sensitive changes and explicit backstops",
         "fail-fast canonical target matrix",
         "event matrix omits fail-closed planner input",
         "event matrix is not exercised through its shell contract",
@@ -4540,6 +4606,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         "duplicate compilation",
         "artifact-promotion DAG",
         "exact validated asset wrapper",
+        "conclusion expectation does not match",
     ] {
         assert!(
             violations
@@ -6780,7 +6847,7 @@ fn main_canary_contract_violations(ci_workflow: &str, canary_workflow: &str) -> 
         .and_then(|step| step["uses"].as_str())
         .is_none_or(|uses| !uses.contains("actions/cache/restore@"))
         || fastembed_restore.and_then(|step| step["with"]["path"].as_str())
-            != Some("${{ env.FASTEMBED_CACHE_DIR }}")
+            != Some(".fastembed_cache")
         || fastembed_restore.and_then(|step| step["with"]["key"].as_str())
             != Some("fastembed-bge-base-en-v1.5-q-v3-portable")
         || fastembed_restore.and_then(|step| step["with"]["enableCrossOsArchive"].as_str())
@@ -6789,6 +6856,12 @@ fn main_canary_contract_violations(ci_workflow: &str, canary_workflow: &str) -> 
         violations.push(
             "main canary FastEmbed cache is not the restore-only cross-OS portable v3 cache".into(),
         );
+    }
+    if fastembed_restore.and_then(|step| step["with"]["fail-on-cache-miss"].as_str())
+        != Some("true")
+    {
+        violations
+            .push("main canary FastEmbed cache restore is not fail-closed on a cache miss".into());
     }
     if canary_steps
         .clone()
@@ -6940,6 +7013,7 @@ jobs:
         "FastEmbed cache directory",
         "rust-cache is not restore-only",
         "portable v3 cache",
+        "fail-closed",
         "FastEmbed cache writer",
         "exact two-test ignored inventory",
         "exact two-test eval contract",
@@ -6952,6 +7026,30 @@ jobs:
             "fixture must exercise {expected:?}: {violations:?}"
         );
     }
+}
+
+#[test]
+fn main_canary_contract_rejects_absolute_cache_action_path() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let canary = std::fs::read_to_string(root.join(".github/workflows/main-canary.yml"))
+        .expect("read main-canary.yml");
+    let mutated = canary.replacen(
+        "          path: .fastembed_cache",
+        "          path: ${{ env.FASTEMBED_CACHE_DIR }}",
+        1,
+    );
+    assert_ne!(mutated, canary, "fixture must mutate the cache action path");
+    let violations = main_canary_contract_violations(&ci, &mutated);
+    assert_eq!(
+        violations.len(),
+        1,
+        "absolute cache action path must be the only mutation: {violations:?}"
+    );
+    assert!(
+        violations[0].contains("portable v3 cache"),
+        "absolute cache action path must fail the shared-version contract: {violations:?}"
+    );
 }
 
 #[test]
