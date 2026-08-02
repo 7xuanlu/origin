@@ -1,0 +1,84 @@
+name: Release Candidate Observer
+run-name: release-candidate-observer source ${{ github.event.workflow_run.id }}/${{ github.event.workflow_run.run_attempt }}
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [release-please--branches--main]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: release-candidate-observer-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: validate untrusted candidate artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # workflow_run executes trusted default-branch code. Never checkout the
+      # observed head SHA: candidate identity comes from the Actions/PR APIs,
+      # while every downloaded byte remains untrusted and non-executable.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate release candidate as untrusted data
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/validate-release-candidate.py \
+            --event "$GITHUB_EVENT_PATH" \
+            --repository "$GITHUB_REPOSITORY" \
+            --temp-root "$RUNNER_TEMP" \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --validated-assets-dir "$RUNNER_TEMP/validated-release-assets" \
+            --receipt "$RUNNER_TEMP/validated-release-receipt.json"
+      - name: Upload exact validated release assets
+        id: validated-assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: validated-release-assets-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/validated-release-assets/*
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: false
+      - name: Close receipt over validated assets artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          observer_workflow_id="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --jq '.workflow_id')"
+          python3 scripts/validate-release-candidate.py close-receipt \
+            --receipt "$RUNNER_TEMP/validated-release-receipt.json" \
+            --artifact-name "validated-release-assets-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --artifact-id "${{ steps.validated-assets.outputs.artifact-id }}" \
+            --artifact-digest "${{ steps.validated-assets.outputs.artifact-digest }}" \
+            --observer-run-id "$GITHUB_RUN_ID" \
+            --observer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --observer-workflow-id "$observer_workflow_id" \
+            --observer-code-sha "$GITHUB_WORKFLOW_SHA"
+      - name: Upload closed validation receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          # Source-only name is a locator, never proof. Consumers inspect every
+          # returned artifact and bind its owning observer run plus closed receipt.
+          # A workflow rerun replaces this locator with a new immutable ID so
+          # upload-artifact's same-run unique-name rule cannot block recovery.
+          name: validated-release-receipt-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          path: ${{ runner.temp }}/validated-release-receipt.json
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true

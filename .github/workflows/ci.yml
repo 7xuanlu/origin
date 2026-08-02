@@ -12,6 +12,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -45,10 +46,12 @@ jobs:
       windows-lint: ${{ steps.filter.outputs.windows-lint }}
       macos-m4: ${{ steps.filter.outputs.macos-m4 }}
       windows-llm-probe: ${{ steps.filter.outputs.windows-llm-probe }}
+      nextest-config: ${{ steps.filter.outputs.nextest-config }}
       release-preflight: ${{ steps.filter.outputs.release-preflight }}
       mcp-platform: ${{ steps.filter.outputs.mcp-platform }}
       workspace-platform: ${{ steps.filter.outputs.workspace-platform }}
       verified-release-merge: ${{ steps.release-proof.outputs.verified-release-merge }}
+      release-gate-state: ${{ steps.release-proof.outputs.release-gate-state }}
       test-plan: ${{ steps.test-plan.outputs.test-plan }}
       workspace-lib-required: ${{ steps.test-plan.outputs.workspace-lib-required }}
       cli-server-integration-required: ${{ steps.test-plan.outputs.cli-server-integration-required }}
@@ -125,6 +128,7 @@ jobs:
               - '.github/workflows/ci.yml'
               - '.github/workflows/main-canary.yml'
               - '.github/workflows/ci-observer.yml'
+              - '.github/workflows/release-candidate-observer.yml'
               - '.github/workflows/ci-benchmark.yml'
               - '.github/workflows/coverage.yml'
               - '.github/workflows/release-please.yml'
@@ -321,6 +325,10 @@ jobs:
               - 'crates/wenlan-core/src/provenance.rs'
               - 'crates/wenlan-core/src/refinery/mod.rs'
               - 'crates/wenlan-core/tests/m4_community_gates.rs'
+            nextest-config:
+              # Repository config supports host/target-specific overrides.
+              # Exercise the real parser and scheduler once on each platform
+              # without repeating the complete cross-platform library suite.
               - '.config/nextest.toml'
             windows-llm-probe:
               - 'crates/wenlan-core/src/engine.rs'
@@ -411,24 +419,39 @@ jobs:
               - '.github/workflows/release.yml'
 
       - name: Test release merge proof
-        run: python3 scripts/verify-release-merge.test.py
-      # A release-please PR already proved its exact head. Reuse that proof on
-      # main only when GitHub independently confirms the associated PR, the
-      # required conclusion, the release-managed file inventory, and identical
-      # Git trees. Any missing/API evidence emits false and keeps the full main
-      # backstop.
+        run: |
+          python3 scripts/verify-release-merge.test.py
+          python3 scripts/release-promotion.test.py
+      # A release-please PR already proved and sealed its exact six archives.
+      # Main reuses that proof only after a bounded wait for the trusted
+      # observer's small closed receipt. An ordinary main push keeps the full
+      # backstop; a suspected release with missing or invalid evidence fails
+      # closed instead of silently rerunning or rebuilding.
       - name: Verify reusable release merge
         id: release-proof
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          python3 scripts/verify-release-merge.py \
+          python3 scripts/release-promotion.py gate-main \
             --repository "$GITHUB_REPOSITORY" \
-            --event-name "$GITHUB_EVENT_NAME" \
-            --ref "$GITHUB_REF" \
             --sha "$GITHUB_SHA" \
-            --github-output "$GITHUB_OUTPUT"
+            --temp-root "$RUNNER_TEMP" \
+            --wait-seconds 720 \
+            --main-run-id "$GITHUB_RUN_ID" \
+            --main-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --github-output "$GITHUB_OUTPUT" \
+            --plan-output "$RUNNER_TEMP/main-release-promotion-receipt.json"
+      - name: Upload main release promotion receipt
+        if: steps.release-proof.outputs.release-gate-state == 'validated'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: main-release-promotion-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/main-release-promotion-receipt.json
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: false
       - id: matrix
         run: |
           macos='{"os":"macos-14","label":"macos-14"}'
@@ -491,6 +514,11 @@ jobs:
       - name: Test release target inventory
         run: |
           python3 scripts/release_targets.test.py
+          python3 scripts/release_archive.test.py
+          python3 scripts/package-release-artifacts.test.py
+          python3 scripts/smoke-release-archive.test.py
+          python3 scripts/release-candidate-manifest.test.py
+          python3 scripts/validate-release-candidate.test.py
           bash scripts/build-release-binaries.test.sh
       - name: Emit release target matrix
         id: release-targets
@@ -508,6 +536,8 @@ jobs:
             args+=(--exclude-target x86_64-pc-windows-msvc)
           fi
           python3 scripts/release_targets.py "${args[@]}"
+      - name: Test artifact download retry
+        run: bash scripts/download-run-artifact.test.sh
       - name: Test FastEmbed cache preparation
         run: python3 scripts/prepare-fastembed-cache.test.py
       - name: Restore portable FastEmbed model
@@ -684,10 +714,18 @@ jobs:
           name: wenlan-workspace-lib-nextest-${{ github.run_id }}
           path: ${{ runner.temp }}/wenlan-nextest-archive
       - name: Download portable FastEmbed model
+        id: fastembed-download
+        continue-on-error: true
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
+      - name: Retry portable FastEmbed model download
+        if: steps.fastembed-download.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
       - name: Run workspace-lib archive partition
         env:
           CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
@@ -806,14 +844,25 @@ jobs:
         uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
         with:
           tool: cargo-nextest
+      - name: Validate nextest config on platform
+        if: needs.detect-changes.outputs.nextest-config == 'true'
+        run: cargo nextest run -p wenlan-types --lib -E 'test(/^brand::tests::brand_is_wenlan$/)' --no-tests=fail
       # detect-changes prepares one revision- and SHA-pinned snapshot before
       # the matrix starts. Each platform downloads that run-scoped artifact without
       # contending on the repository cache API.
       - name: Download portable FastEmbed model
+        id: fastembed-download
+        continue-on-error: true
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
+      - name: Retry portable FastEmbed model download
+        if: steps.fastembed-download.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
       # Workspace lib tests skipped on Windows — Linux + macOS catch the
       # same cross-platform unit logic in ~5-15min vs 25min on Windows.
       # Windows-specific behavior (paths, mcp_add, schtasks) is covered
@@ -913,9 +962,10 @@ jobs:
         run: python3 scripts/ci_test_plan.py run --suite cli-server-integration --plan-env CI_TEST_PLAN
       # When this OS already owns behavioral tests, keep platform compile proof
       # in the same target directory instead of rebuilding the native graph in
-      # mcp-platform. That job remains the owner for OSes absent from this matrix.
+      # mcp-platform. When the Apple release preflight is already scheduled, its
+      # shipped-binary build and launch smoke own the stronger macOS proof.
       - name: Build CLI/server contract binaries (test owner)
-        if: needs.detect-changes.outputs.workspace-platform == 'true'
+        if: needs.detect-changes.outputs.workspace-platform == 'true' && !(matrix.os == 'macos-14' && needs.detect-changes.outputs.release-preflight == 'true')
         run: cargo build -p wenlan -p wenlan-server --bins
       # Ordinary Windows PR proof uses debug artifacts already warmed by the
       # integration suite. Stage both pinned runtime DLLs next to the daemon
@@ -1136,13 +1186,31 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Download portable FastEmbed model
+        id: fastembed-download
+        continue-on-error: true
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
+      - name: Retry portable FastEmbed model download
+        if: steps.fastembed-download.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
       - name: Page lint scale gate (Linux time + RSS)
+        id: page-lint-scale
         if: needs.detect-changes.outputs.canonical-smokes-required == 'true'
         run: bash scripts/lint-scale-gate.sh "$RUNNER_TEMP/task-19-memory-lint-debugger-linux.txt"
+      - name: Preserve Page lint diagnostic on prerequisite failure
+        if: always() && needs.detect-changes.outputs.canonical-smokes-required == 'true'
+        shell: bash
+        run: |
+          receipt="$RUNNER_TEMP/task-19-memory-lint-debugger-linux.txt"
+          if [[ ! -f "$receipt" ]]; then
+            printf 'task=19 diagnostic scale gate\nstatus=not-run\nstep_outcome=%s\n' \
+              '${{ steps.page-lint-scale.outcome }}' > "$receipt"
+          fi
       - name: Upload Page lint scale receipt (Linux)
         if: always() && needs.detect-changes.outputs.canonical-smokes-required == 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -1294,11 +1362,12 @@ jobs:
         if: needs.detect-changes.outputs.canonical-smokes-required == 'true' && github.event_name != 'pull_request'
         run: bash scripts/smoke-mcp.sh
 
-  # Build-only preflight for shipped release targets. Release-sensitive ordinary
-  # PRs prove the three non-Windows profiles while the existing Windows
-  # functional/platform lanes prove native linkage. Main/manual runs and the
-  # release-please PR retain the complete four-target release matrix, including
-  # the measured 25-55 minute cold Windows release build.
+  # Build/smoke preflight for shipped release targets. Release-sensitive
+  # ordinary PRs prove the three non-Windows profiles while the existing
+  # Windows functional/platform lanes prove native linkage. Main/manual runs
+  # and the release-please PR retain the complete four-target release matrix.
+  # Only the exact same-repository release-please candidate additionally emits
+  # observe-only canonical archives for the read-only default-branch validator.
   release-preflight:
     name: release-preflight (${{ matrix.target }})
     needs: [detect-changes]
@@ -1319,6 +1388,13 @@ jobs:
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Only the exact same-repository release-please candidate produces
+          # promotable-shaped archives. Build that immutable PR head rather
+          # than GitHub's synthetic merge ref so the observer can reconcile
+          # the candidate tree. All other lanes retain their current SHA.
+          ref: ${{ (github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu') && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
@@ -1461,15 +1537,23 @@ jobs:
       # detect-changes so health does not depend on a cold Hugging Face fetch.
       - name: Download portable FastEmbed model
         if: matrix.target == 'x86_64-pc-windows-msvc'
+        id: fastembed-download
+        continue-on-error: true
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
+      - name: Retry portable FastEmbed model download
+        if: matrix.target == 'x86_64-pc-windows-msvc' && steps.fastembed-download.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
       - name: Build and smoke shipped release binaries
         shell: bash
         run: bash scripts/build-release-binaries.sh "${{ matrix.target }}"
       - name: Native ORT smoke (Windows release preflight)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: matrix.target == 'x86_64-pc-windows-msvc' && !(github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu')
         shell: pwsh
         env:
           WENLAN_TEST_FASTEMBED_CACHE: ${{ env.FASTEMBED_CACHE_DIR }}
@@ -1492,6 +1576,56 @@ jobs:
             throw "incomplete Windows cache layout: host=$hostCount target=$targetCount"
           }
           Write-Host "Windows cache layout receipt: marker=present host_deps=$hostCount target_deps=$targetCount"
+      - name: Package canonical release candidate archives
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu'
+        shell: bash
+        run: |
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
+          "$py" scripts/package-release-artifacts.py \
+            --target "${{ matrix.target }}" \
+            --binary-dir "target/${{ matrix.target }}/release" \
+            --output-dir dist \
+            --source-date-epoch "$source_date_epoch"
+      - name: Smoke exact release candidate archives
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu'
+        shell: bash
+        env:
+          WENLAN_TEST_FASTEMBED_CACHE: ${{ env.FASTEMBED_CACHE_DIR }}
+        run: |
+          if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
+          "$py" scripts/smoke-release-archive.py \
+            --target "${{ matrix.target }}" \
+            --dist-dir dist
+      - name: Write untrusted release candidate claim manifest
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu'
+        shell: bash
+        run: |
+          tree_sha="$(git rev-parse HEAD^{tree})"
+          version="$(tr -d '\r\n' < version.txt)"
+          if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
+          "$py" scripts/release-candidate-manifest.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "${{ github.repository_id }}" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --pr-number "${{ github.event.pull_request.number }}" \
+            --pr-author "${{ github.event.pull_request.user.login }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --tree-sha "$tree_sha" \
+            --version "$version" \
+            --target "${{ matrix.target }}" \
+            --dist-dir dist
+      - name: Upload immutable release candidate artifact
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.ref == 'release-please--branches--main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false && github.event.pull_request.user.login == '7xuanlu'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-candidate-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
+          path: dist/*
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+          overwrite: false
 
   # Required contract integrations for wenlan-mcp / wenlan-types. The planner
   # selects affected packages through reverse dependency closure, or an exact
@@ -1529,10 +1663,18 @@ jobs:
       # real_router.rs boots a real MemoryDB. detect-changes owns the only cold
       # fetch; this lane must fail closed if the prepared snapshot is absent.
       - name: Download portable FastEmbed model
+        id: fastembed-download
+        continue-on-error: true
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fastembed-bge-base-en-v1.5-q-v3-portable-${{ github.run_id }}
           path: .fastembed_cache
+      - name: Retry portable FastEmbed model download
+        if: steps.fastembed-download.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
       - name: Affected wenlan-mcp + wenlan-types integrations
         env:
           CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}

@@ -3,6 +3,13 @@
 #
 # https://nexte.st/docs/configuration/
 
+# Static workflow and repository contracts are fast and high signal. Run them
+# before database-heavy tests so routing/config drift fails near the start of
+# its shard instead of after hundreds of unrelated tests.
+[[profile.default.overrides]]
+filter = 'test(/^drift_guard::/)'
+priority = 100
+
 # Full-daemon process tests synchronously initialize FastEmbed before the
 # child publishes its port. The cross-process model-cache lock prevents
 # corruption, but under nextest concurrency it can also make these children
