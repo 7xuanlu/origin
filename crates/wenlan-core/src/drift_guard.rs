@@ -2002,6 +2002,8 @@ fn filter_routes_path(patterns: &BTreeSet<String>, path: &str) -> bool {
         })
 }
 
+const RELEASE_PREFLIGHT_CONDITION: &str = "needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true')";
+
 fn ci_routing_contract_violations(
     workflow: &str,
     planner_source: &str,
@@ -2771,9 +2773,8 @@ fn ci_routing_contract_violations(
     let release_preflight_condition = ci["jobs"]["release-preflight"]["if"]
         .as_str()
         .unwrap_or_default();
-    let expected_release_preflight_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true')";
     if job_needs(&ci, "release-preflight") != ["detect-changes"]
-        || release_preflight_condition != expected_release_preflight_condition
+        || release_preflight_condition != RELEASE_PREFLIGHT_CONDITION
     {
         violations.push(
             "release-preflight is not isolated to release-sensitive changes and explicit release backstops".into(),
@@ -2965,7 +2966,7 @@ fn ci_routing_contract_violations(
         );
     }
     let release_expectation =
-        format!("expect_job release-preflight '${{{{ {expected_release_preflight_condition} }}}}'");
+        format!("expect_job release-preflight '${{{{ {RELEASE_PREFLIGHT_CONDITION} }}}}'");
     if !conclusion_run.contains(&release_expectation) {
         violations.push(
             "conclusion release-preflight expectation does not match its release-sensitive owner"
@@ -3570,14 +3571,9 @@ fn ordinary_pr_required_path_excludes_release_and_unowned_platform_backstops() {
         .as_str()
         .expect("release-preflight condition");
     assert!(
-        release_condition.contains("github.event_name != 'pull_request'")
-            && release_condition
-                .contains("startsWith(github.head_ref, 'release-please--branches--')")
-            && release_condition
-                .contains("needs.detect-changes.outputs.release-preflight == 'true'"),
-        "release preflight must run for release-sensitive PRs, release-please PRs, and non-PR \
-         backstops: \
-         {release_condition}"
+        release_condition == RELEASE_PREFLIGHT_CONDITION,
+        "release preflight must run only for release-sensitive changes, release-please PRs, and \
+         explicit manual backstops: {release_condition}"
     );
 
     let matrix = ci["jobs"]["detect-changes"]["steps"]
@@ -4351,14 +4347,11 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     let mut violations = Vec::new();
     let preflight = &ci["jobs"]["release-preflight"];
     if job_needs(&ci, "release-preflight") != ["detect-changes"]
-        || preflight["if"].as_str().is_none_or(|condition| {
-            !condition.contains("github.event_name != 'pull_request'")
-                || !condition.contains("startsWith(github.head_ref, 'release-please--branches--')")
-                || !condition.contains("needs.detect-changes.outputs.release-preflight == 'true'")
-        })
+        || preflight["if"].as_str() != Some(RELEASE_PREFLIGHT_CONDITION)
     {
         violations.push(
-            "release-preflight is not isolated to release-sensitive PRs and backstops".into(),
+            "release-preflight is not isolated to release-sensitive changes and explicit backstops"
+                .into(),
         );
     }
     if preflight["strategy"]["fail-fast"].as_bool() != Some(true)
@@ -4479,6 +4472,16 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     {
         violations.push("conclusion.needs omits release-preflight".into());
     }
+    let release_expectation =
+        format!("expect_job release-preflight '${{{{ {RELEASE_PREFLIGHT_CONDITION} }}}}'");
+    if workflow_step_run(&ci, "Aggregate expected CI results")
+        .is_none_or(|run| !run.contains(&release_expectation))
+    {
+        violations.push(
+            "release-preflight conclusion expectation does not match its release-sensitive owner"
+                .into(),
+        );
+    }
     violations
 }
 
@@ -4534,7 +4537,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "          echo release preflight matrix shell contract removed",
         )
         .replace(
-            "          expect_job release-preflight '${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true' }}' '${{ needs.release-preflight.result }}'",
+            "          expect_job release-preflight '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name == 'workflow_dispatch' || false || needs.detect-changes.outputs.release-preflight == 'true') }}' '${{ needs.release-preflight.result }}'",
             "          echo release-preflight skipped",
         )
         .replace(
@@ -4593,7 +4596,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         .replace("    needs: resolve-promotion", "    needs: publish-crates");
     let violations = release_preflight_contract_violations(&ci, &release);
     for expected in [
-        "release-sensitive PRs and backstops",
+        "release-sensitive changes and explicit backstops",
         "fail-fast canonical target matrix",
         "event matrix omits fail-closed planner input",
         "event matrix is not exercised through its shell contract",
@@ -4603,6 +4606,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
         "duplicate compilation",
         "artifact-promotion DAG",
         "exact validated asset wrapper",
+        "conclusion expectation does not match",
     ] {
         assert!(
             violations
