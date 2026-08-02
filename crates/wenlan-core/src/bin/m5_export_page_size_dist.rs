@@ -27,7 +27,7 @@ async fn run() -> Result<()> {
         bail!("--db must name an existing database file");
     }
     let database = M5PageSizeSnapshotDb::open(&args.db).await?;
-    let snapshot = prepare_m5_snapshot(&database, &args.output, args.overwrite)?;
+    let snapshot = prepare_m5_snapshot(&args.output, args.overwrite)?;
     let counts = database.fixed_counts().await?;
 
     let distribution = distribution_from_fixed_counts(counts)?;

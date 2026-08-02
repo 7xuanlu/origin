@@ -326,7 +326,7 @@ async fn shared_page_size_connection_rejects_dml_and_ddl() {
 
 #[cfg(feature = "eval-harness")]
 #[tokio::test]
-async fn exporter_rejects_database_output_aliases_before_data_loss() {
+async fn exporter_rejects_sqlite_outputs_before_data_loss() {
     let directory = tempfile::tempdir().unwrap();
     let nested = directory.path().join("nested");
     std::fs::create_dir(&nested).unwrap();
@@ -334,6 +334,22 @@ async fn exporter_rejects_database_output_aliases_before_data_loss() {
     let exact_db = directory.path().join("exact.json");
     create_pages_db(&exact_db, &five_ascii_pages()).await;
     assert_collision_refused_and_preserved(&exact_db, &exact_db);
+
+    let distinct_db = directory.path().join("distinct.json");
+    create_pages_db(&distinct_db, &[page("y".repeat(300), "active")]).await;
+    let distinct_before = std::fs::read(&distinct_db).unwrap();
+    let distinct_result = run_exporter(&exact_db, &distinct_db, true);
+    assert!(
+        !distinct_result.status.success(),
+        "an existing SQLite output was overwritten"
+    );
+    assert!(
+        String::from_utf8_lossy(&distinct_result.stderr)
+            .contains("existing --output must not be a SQLite database"),
+        "{}",
+        String::from_utf8_lossy(&distinct_result.stderr)
+    );
+    assert_eq!(std::fs::read(&distinct_db).unwrap(), distinct_before);
 
     let dotdot_db = directory.path().join("dotdot.json");
     create_pages_db(&dotdot_db, &five_ascii_pages()).await;
@@ -446,9 +462,6 @@ async fn snapshot_output_extension_is_json_case_insensitive_and_fail_closed() {
     let directory = tempfile::tempdir().unwrap();
     let db_path = directory.path().join("fixture.db");
     create_pages_db(&db_path, &five_ascii_pages()).await;
-    let database = wenlan_core::db::M5PageSizeSnapshotDb::open(&db_path)
-        .await
-        .unwrap();
 
     for invalid in [
         "missing-extension",
@@ -461,8 +474,7 @@ async fn snapshot_output_extension_is_json_case_insensitive_and_fail_closed() {
     ] {
         let output = directory.path().join(invalid);
         assert!(
-            wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&database, &output, true)
-                .is_err(),
+            wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&output, true).is_err(),
             "accepted invalid output extension: {invalid}"
         );
         assert!(!output.exists());
@@ -474,18 +486,14 @@ async fn snapshot_output_extension_is_json_case_insensitive_and_fail_closed() {
         let output = directory
             .path()
             .join(std::ffi::OsString::from_vec(b"non-utf8.\xff".to_vec()));
-        assert!(
-            wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&database, &output, true)
-                .is_err()
-        );
+        assert!(wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&output, true).is_err());
         assert!(!output.exists());
     }
 
     for valid in ["ordinary.json", "uppercase.JSON"] {
         let output = directory.path().join(valid);
         let prepared =
-            wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&database, &output, true)
-                .unwrap();
+            wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&output, true).unwrap();
         prepared.write(b"safe\n").unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), b"safe\n");
     }
@@ -501,17 +509,13 @@ async fn prepared_snapshot_refuses_parent_retarget_before_temp_creation() {
     std::fs::create_dir(&db_dir).unwrap();
     let db_path = db_dir.join("origin_memory.json");
     create_pages_db(&db_path, &five_ascii_pages()).await;
-    let database = wenlan_core::db::M5PageSizeSnapshotDb::open(&db_path)
-        .await
-        .unwrap();
     let db_bytes = std::fs::read(&db_path).unwrap();
     let db_metadata = std::fs::metadata(&db_path).unwrap();
     let parent_link = directory.path().join("parent-link");
     std::os::unix::fs::symlink(&safe_dir, &parent_link).unwrap();
     let output = parent_link.join("origin_memory.json");
 
-    let prepared =
-        wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&database, &output, true).unwrap();
+    let prepared = wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&output, true).unwrap();
     std::fs::remove_file(&parent_link).unwrap();
     std::os::unix::fs::symlink(&db_dir, &parent_link).unwrap();
 
@@ -522,37 +526,6 @@ async fn prepared_snapshot_refuses_parent_retarget_before_temp_creation() {
     assert_eq!(std::fs::read(&db_path).unwrap(), db_bytes);
     assert_eq!(std::fs::read_dir(&safe_dir).unwrap().count(), 0);
     assert_eq!(std::fs::read_dir(&db_dir).unwrap().count(), 1);
-}
-
-#[cfg(all(feature = "eval-harness", unix))]
-#[tokio::test]
-async fn snapshot_identity_follows_open_database_not_retargeted_input() {
-    let directory = tempfile::tempdir().unwrap();
-    let first_db = directory.path().join("first.json");
-    let second_db = directory.path().join("second.json");
-    create_pages_db(&first_db, &five_ascii_pages()).await;
-    create_pages_db(&second_db, &[page("y".repeat(300), "active")]).await;
-    let first_before = std::fs::read(&first_db).unwrap();
-    let db_link = directory.path().join("database-link");
-    std::os::unix::fs::symlink(&first_db, &db_link).unwrap();
-
-    let database = wenlan_core::db::M5PageSizeSnapshotDb::open(&db_link)
-        .await
-        .unwrap();
-    assert_eq!(
-        database.fixed_counts().await.unwrap(),
-        [5, 0, 0, 0, 0, 0, 0, 0]
-    );
-    std::fs::remove_file(&db_link).unwrap();
-    std::os::unix::fs::symlink(&second_db, &db_link).unwrap();
-
-    let prepared =
-        wenlan_core::eval::m5_snapshot_io::prepare_m5_snapshot(&database, &first_db, true);
-    assert!(
-        prepared.is_err(),
-        "snapshot identity followed the retargeted path instead of the open database"
-    );
-    assert_eq!(std::fs::read(&first_db).unwrap(), first_before);
 }
 
 #[cfg(feature = "eval-harness")]
@@ -766,7 +739,8 @@ fn assert_collision_refused_and_preserved(db: &Path, output_alias: &Path) {
     let result = run_exporter(db, output_alias, true);
     assert!(!result.status.success());
     assert!(
-        String::from_utf8_lossy(&result.stderr).contains("--output must not alias --db"),
+        String::from_utf8_lossy(&result.stderr)
+            .contains("existing --output must not be a SQLite database"),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
