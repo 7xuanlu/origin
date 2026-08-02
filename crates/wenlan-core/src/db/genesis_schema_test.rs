@@ -146,6 +146,42 @@ async fn the_schema_version_constant_matches_what_the_chain_stamps() {
     );
 }
 
+/// Rebase integration tooth: Kind owns migration 107, so a database already
+/// stamped 107 must still run PR-A's additive genesis migration at 108.
+#[tokio::test]
+async fn schema_107_upgrades_through_genesis_migration_108() {
+    let (db, _tmp) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute_batch(
+            "DROP TABLE genesis_candidate_roots;
+             DROP TABLE genesis_candidates;
+             DROP TABLE genesis_coverage_state;
+             DROP TABLE genesis_group_coverage;
+             DROP TABLE genesis_frontier;
+             PRAGMA user_version = 107;",
+        )
+        .await
+        .expect("restore the post-Kind, pre-genesis schema boundary");
+    }
+
+    assert!(
+        !object_exists(&db, "table", "genesis_candidates").await,
+        "the control did not remove the genesis substrate"
+    );
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("schema 107 must advance through migration 108");
+
+    assert_eq!(user_version(&db).await, 108);
+    for table in GENESIS_TABLES {
+        assert!(object_exists(&db, "table", table).await, "{table} missing");
+    }
+    for index in GENESIS_INDEXES {
+        assert!(object_exists(&db, "index", index).await, "{index} missing");
+    }
+}
+
 /// Both indexes must keep their predicates. An index that lost its `WHERE`
 /// would still exist under the same name, and would then forbid the witness
 /// coexistence D4 requires — so existence alone is not the assertion.

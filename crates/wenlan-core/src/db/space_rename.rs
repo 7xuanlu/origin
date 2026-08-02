@@ -77,7 +77,7 @@ const CLOSURE: &[(&str, bool)] = &[
     ("community_reader_space_proof", true),
     ("community_publication_receipts", true),
     ("edges", false),
-    // PR-A's own genesis substrate (migration 107). Empty in this build, but
+    // PR-A's own genesis substrate (migration 108). Empty in this build, but
     // the postcondition is stated over M6-reachable rows and these are the most
     // M6-reachable rows there are; leaving them out would mean the rung that
     // starts writing them has to remember to come back.
