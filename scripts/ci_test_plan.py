@@ -18,6 +18,9 @@ class PlanError(ValueError):
     """Planner input is malformed and CI must stop."""
 
 
+DIFFERENTIAL_EVENTS = frozenset({"pull_request", "push"})
+
+
 ISOLATED_UNIT_MODULES = {
     "crates/wenlan-core/src/drift_guard/r4_test_support_api_manifest.txt": (
         "wenlan-core",
@@ -333,11 +336,11 @@ def _daily_gate_requirements(
     event_name: str,
     existing: set[str],
 ) -> tuple[bool, bool]:
-    # Main and manual runs retain the documented full backstop even when their
-    # change inventory is empty. PRs pay only for gates that can observe their
-    # inputs; a full fallback remains conservative unless every path has an
+    # PRs and ordinary main pushes pay only for gates that can observe their
+    # inputs. Manual, release, and unknown events retain the full backstop. A
+    # full differential fallback remains conservative unless every path has an
     # explicit non-Clippy contract owner.
-    if event_name != "pull_request":
+    if event_name not in DIFFERENTIAL_EVENTS:
         return True, True
     fmt_required = any(PurePosixPath(path).suffix.lower() == ".rs" for path in paths)
     clippy_required = any(_is_clippy_input(path) for path in paths)
@@ -404,7 +407,7 @@ def _build_test_plan(
     packages, directories = _workspace(cargo_metadata)
     reverse = _reverse_dependencies(packages)
     paths = [_normalize_path(path) for path in changed_paths]
-    if event_name != "pull_request":
+    if event_name not in DIFFERENTIAL_EVENTS:
         return _full_plan(f"{event_name} keeps the full backstop")
     if not paths:
         raise PlanError("changed path inventory is empty")
@@ -613,7 +616,7 @@ def build_plan(
         existing_paths=existing_paths,
     )
     paths = [_normalize_path(path) for path in raw_paths]
-    if event_name != "pull_request":
+    if event_name not in DIFFERENTIAL_EVENTS:
         existing = set()
     elif existing_paths is None:
         existing = {path for path in paths if Path(path).exists()}
@@ -640,7 +643,7 @@ def build_platform_plan(
     """Plan platform behavior without letting CI infrastructure widen it."""
 
     paths = [_normalize_path(path) for path in changed_paths]
-    if event_name != "pull_request":
+    if event_name not in DIFFERENTIAL_EVENTS:
         return build_plan(
             paths,
             cargo_metadata,
@@ -648,6 +651,8 @@ def build_platform_plan(
             existing_paths=existing_paths,
         )
     if not paths:
+        if event_name == "push":
+            raise PlanError("changed path inventory is empty")
         return _skip_plan("no generic platform behavioral inputs changed")
 
     # Linux owns repository/workflow/planner contracts. Platform behavior is

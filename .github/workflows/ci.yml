@@ -18,7 +18,7 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # PRs: cancel superseded pushes to save runner time. main: never cancel, so
-  # every full-platform backstop runs to completion. The L6 eval canary has its
+  # every fail-closed differential verification runs to completion. The L6 eval canary has its
   # own non-cancelling workflow and never extends this required critical path.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
@@ -493,7 +493,7 @@ jobs:
         run: |
           macos='{"os":"macos-14","label":"macos-14"}'
           windows='{"os":"windows-2022","label":"windows-2022"}'
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             include="${macos},${windows}"
           elif [ "${{ steps.release-candidate-trust.outputs.trusted-release-candidate }}" = "true" ]; then
             # Exact-base main CI plus the four shipped-target release preflights
@@ -664,10 +664,10 @@ jobs:
           --sha "${{ github.event.pull_request.base.sha }}"
           --wait-seconds 1080
 
-  # On PRs, Rust fmt + lint only run when their exact source classes changed.
-  # Docs/image-only PRs should still get the required aggregate `conclusion`
-  # check, but they should not spend runners on Cargo jobs. Non-PR runs keep the
-  # full backstop. The fail-open surface is closed by `conclusion`, which
+  # On PRs and main pushes, Rust fmt + lint run only when their exact source
+  # classes changed. Non-Rust changes still get the required aggregate
+  # `conclusion` without spending runners on Cargo jobs; manual dispatch keeps
+  # the full backstop. The fail-open surface is closed by `conclusion`, which
   # explicitly fails if `detect-changes` itself fails.
   fmt:
     name: fmt
@@ -703,7 +703,7 @@ jobs:
           # small files otherwise; cached restore is ~2-3min faster.
           cache-all-crates: "true"
           # PR-scoped caches cannot serve main or another PR. Keep the stable
-          # non-PR backstop as the only producer so required PRs never churn
+          # main as the only producer so required PRs never churn
           # the repository cache budget.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy affected dependency closure
@@ -825,7 +825,7 @@ jobs:
   test:
     name: test (${{ matrix.label }})
     needs: [detect-changes]
-    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request')"
+    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch')"
     runs-on: ${{ matrix.os }}
     # Pull requests keep a hard wall-clock budget. Windows needs the full
     # backstop because its Vulkan/native bootstrap plus integration suite can
@@ -961,13 +961,13 @@ jobs:
           CI_TEST_PLAN: ${{ needs.detect-changes.outputs.platform-test-plan }}
         run: python3 scripts/ci_test_plan.py run --suite workspace-lib --plan-json "$CI_TEST_PLAN"
       - name: M4 community gates (macOS-owned)
-        if: "matrix.os == 'macos-14' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true')"
+        if: "matrix.os == 'macos-14' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true')"
         # This target contains cfg(macos) RSS probes. Linux owns the complete
         # core-integration plan; this focused leg compiles and runs the actual
         # macOS branches whenever its fail-closed owner filter schedules macOS.
         run: cargo nextest run -p wenlan-core --test m4_community_gates
       - name: Page lint scale gate (Windows functional)
-        if: matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-lint == 'true')
+        if: matrix.os == 'windows-2022' && (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.windows-lint == 'true')
         shell: pwsh
         run: |
           # Functional portability only; the Linux leg owns time and RSS thresholds.
@@ -997,7 +997,7 @@ jobs:
           "exit_code=$gateCode" | Add-Content -Path $receipt
           if ($gateCode -ne 0) { throw "Windows functional scale gate failed" }
       - name: Upload Page lint scale receipt (Windows)
-        if: always() && matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.windows-lint == 'true')
+        if: always() && matrix.os == 'windows-2022' && (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.windows-lint == 'true')
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: task-19-lint-scale-${{ matrix.os }}-${{ github.sha }}
@@ -1008,7 +1008,7 @@ jobs:
       # compilation. Run them before the long Windows Cargo steps so a broken
       # release harness fails in seconds rather than near the end of the job.
       - name: Validate Windows smoke harness
-        if: "matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.windows-llm-probe == 'true')"
+        if: "matrix.os == 'windows-2022' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.windows-llm-probe == 'true')"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1068,7 +1068,7 @@ jobs:
             -DestinationDirectory "target\debug"
 
       - name: Validate Windows LLM probe
-        if: "matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.windows-llm-probe == 'true')"
+        if: "matrix.os == 'windows-2022' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.windows-llm-probe == 'true')"
         shell: pwsh
         run: cargo test -p wenlan-core --bin model_probe
 
@@ -1158,7 +1158,7 @@ jobs:
   mcp-platform:
     name: platform-compile (${{ matrix.os }})
     needs: [detect-changes]
-    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.mcp-platform == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request')"
+    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.mcp-platform == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch')"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
@@ -1168,7 +1168,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       # Exact mirror of whether this OS appears in the behavioral test matrix.
       # When true, that job owns the Cargo proof and reuses its target directory.
-      TEST_OWNS_PLATFORM: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || (matrix.os == 'macos-14' && needs.detect-changes.outputs.macos == 'true') || (matrix.os == 'windows-2022' && needs.detect-changes.outputs.windows == 'true') }}
+      TEST_OWNS_PLATFORM: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || (matrix.os == 'macos-14' && needs.detect-changes.outputs.macos == 'true') || (matrix.os == 'windows-2022' && needs.detect-changes.outputs.windows == 'true') }}
     strategy:
       fail-fast: true
       matrix:
@@ -1940,7 +1940,7 @@ jobs:
 
           run_fmt='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.fmt-required == 'true' }}'
           run_clippy='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.clippy-required == 'true' }}'
-          run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request') }}'
+          run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch') }}'
           run_workspace_lib='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.workspace-lib-required == 'true' }}'
           run_canonical='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.canonical-acceptance-required == 'true' }}'
           run_contract='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.contract-integration-required == 'true' }}'
@@ -1950,7 +1950,7 @@ jobs:
           expect_job linux-nextest-build "$run_workspace_lib" '${{ needs.linux-nextest-build.result }}'
           expect_job linux-nextest "$run_workspace_lib" '${{ needs.linux-nextest.result }}'
           expect_job test "$run_platform" '${{ needs.test.result }}'
-          expect_job mcp-platform '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.mcp-platform == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request') }}' '${{ needs.mcp-platform.result }}'
+          expect_job mcp-platform '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && (needs.detect-changes.outputs.workspace-platform == 'true' || needs.detect-changes.outputs.mcp-platform == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch') }}' '${{ needs.mcp-platform.result }}'
           expect_job canonical-acceptance "$run_canonical" '${{ needs.canonical-acceptance.result }}'
           expect_job contract-integration "$run_contract" '${{ needs.contract-integration.result }}'
           expect_job release-preflight '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true') }}' '${{ needs.release-preflight.result }}'

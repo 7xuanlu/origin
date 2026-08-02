@@ -127,11 +127,15 @@ def cargo_metadata() -> dict:
     }
 
 
-def plan_for(*paths: str, existing_paths: set[str] | None = None) -> dict:
+def plan_for(
+    *paths: str,
+    existing_paths: set[str] | None = None,
+    event_name: str = "pull_request",
+) -> dict:
     return build_plan(
         list(paths),
         cargo_metadata(),
-        event_name="pull_request",
+        event_name=event_name,
         existing_paths=set(paths) if existing_paths is None else existing_paths,
     )
 
@@ -481,7 +485,7 @@ class PlatformPlanTests(unittest.TestCase):
         self.assertEqual(plan["mode"], "differential")
         self.assertFalse(any(required_suite_outputs(plan).values()))
 
-    def test_non_pr_platform_plan_keeps_full_backstop(self) -> None:
+    def test_push_platform_plan_uses_differential_routing(self) -> None:
         plan = build_platform_plan(
             self.INFRASTRUCTURE_PATHS,
             cargo_metadata(),
@@ -489,8 +493,8 @@ class PlatformPlanTests(unittest.TestCase):
             existing_paths=set(self.INFRASTRUCTURE_PATHS),
         )
 
-        self.assertEqual(plan["mode"], "full")
-        self.assertTrue(all(required_suite_outputs(plan).values()))
+        self.assertEqual(plan["mode"], "differential")
+        self.assertFalse(any(required_suite_outputs(plan).values()))
 
     def test_filtered_m4_only_pr_inventory_skips_generic_platform_suites(
         self,
@@ -508,10 +512,19 @@ class PlatformPlanTests(unittest.TestCase):
         )
         self.assertFalse(any(required_suite_outputs(plan).values()))
 
-    def test_empty_non_pr_and_release_platform_inventory_keeps_full_backstop(
+    def test_empty_push_platform_inventory_fails_closed(self) -> None:
+        with self.assertRaisesRegex(PlanError, "changed path inventory is empty"):
+            build_platform_plan(
+                [],
+                cargo_metadata(),
+                event_name="push",
+                existing_paths=set(),
+            )
+
+    def test_release_manual_and_unknown_platform_events_keep_full_backstop(
         self,
     ) -> None:
-        for event_name in ("push", "release-please"):
+        for event_name in ("release-please", "workflow_dispatch", "schedule"):
             with self.subTest(event_name=event_name):
                 plan = build_platform_plan(
                     [],
@@ -875,11 +888,14 @@ class SuiteOutputTests(unittest.TestCase):
             "crates/wenlan-mcp/npm/install.js": (False, False),
         }
 
-        for path, (fmt_required, clippy_required) in cases.items():
-            with self.subTest(path=path):
-                outputs = required_suite_outputs(plan_for(path))
-                self.assertEqual(outputs["fmt-required"], fmt_required)
-                self.assertEqual(outputs["clippy-required"], clippy_required)
+        for event_name in ("pull_request", "push"):
+            for path, (fmt_required, clippy_required) in cases.items():
+                with self.subTest(event_name=event_name, path=path):
+                    outputs = required_suite_outputs(
+                        plan_for(path, event_name=event_name)
+                    )
+                    self.assertEqual(outputs["fmt-required"], fmt_required)
+                    self.assertEqual(outputs["clippy-required"], clippy_required)
 
     def test_mixed_contract_and_rust_source_requires_both_daily_gates(self) -> None:
         outputs = required_suite_outputs(
@@ -1017,34 +1033,52 @@ class FailClosedTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(plan_for(path)["mode"], "full")
 
-    def test_non_pr_event_always_runs_full_backstop(self) -> None:
-        plan = build_plan(
-            ["crates/wenlan-server/src/routes.rs"],
-            cargo_metadata(),
-            event_name="push",
-            existing_paths={"crates/wenlan-server/src/routes.rs"},
-        )
+    def test_push_uses_the_same_differential_plan_as_pull_request(self) -> None:
+        path = "crates/wenlan-server/src/routes.rs"
+        pull_request = plan_for(path)
+        push = plan_for(path, event_name="push")
 
-        self.assertEqual(plan["mode"], "full")
+        self.assertEqual(push, pull_request)
+        self.assertEqual(push["mode"], "differential")
 
-    def test_non_pr_event_without_diff_inventory_runs_full_backstop(self) -> None:
-        plan = build_plan(
-            [],
-            cargo_metadata(),
-            event_name="workflow_dispatch",
-            existing_paths=set(),
-        )
+    def test_release_manual_and_unknown_events_keep_full_backstop(self) -> None:
+        for event_name in ("release-please", "workflow_dispatch", "schedule"):
+            with self.subTest(event_name=event_name):
+                plan = build_plan(
+                    [],
+                    cargo_metadata(),
+                    event_name=event_name,
+                    existing_paths=set(),
+                )
 
-        self.assertEqual(plan["mode"], "full")
+                self.assertEqual(plan["mode"], "full")
+                self.assertTrue(all(required_suite_outputs(plan).values()))
 
-    def test_pr_without_diff_inventory_fails_closed(self) -> None:
-        with self.assertRaisesRegex(PlanError, "changed path inventory is empty"):
-            build_plan(
-                [],
-                cargo_metadata(),
-                event_name="pull_request",
-                existing_paths=set(),
-            )
+    def test_differential_event_without_diff_inventory_fails_closed(self) -> None:
+        for event_name in ("pull_request", "push"):
+            with self.subTest(event_name=event_name):
+                with self.assertRaisesRegex(
+                    PlanError, "changed path inventory is empty"
+                ):
+                    build_plan(
+                        [],
+                        cargo_metadata(),
+                        event_name=event_name,
+                        existing_paths=set(),
+                    )
+
+    def test_push_deletions_and_unknown_paths_stay_fail_closed_full(self) -> None:
+        for path, existing_paths in (
+            (M5_READER_PATHS[0], set()),
+            ("config/new-ci-input.json", {"config/new-ci-input.json"}),
+        ):
+            with self.subTest(path=path):
+                plan = plan_for(
+                    path,
+                    existing_paths=existing_paths,
+                    event_name="push",
+                )
+                self.assertEqual(plan["mode"], "full")
 
     def test_malformed_metadata_fails_instead_of_emitting_empty_plan(self) -> None:
         with self.assertRaises(PlanError):

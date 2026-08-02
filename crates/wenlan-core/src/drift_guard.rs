@@ -2751,7 +2751,7 @@ fn ci_routing_contract_violations(
         );
     }
     let platform_condition = ci["jobs"]["test"]["if"].as_str().unwrap_or_default();
-    let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request')";
+    let expected_platform_condition = "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch')";
     if platform_condition != expected_platform_condition {
         violations.push(
             "platform test job does not derive from rust-ci-required plus its platform owner"
@@ -2764,7 +2764,7 @@ fn ci_routing_contract_violations(
         "needs.detect-changes.outputs.macos",
         "needs.detect-changes.outputs.windows",
         "startsWith(github.head_ref, 'release-please--branches--')",
-        "github.event_name != 'pull_request'",
+        "github.event_name == 'workflow_dispatch'",
     ] {
         if !platform_condition.contains(required) {
             violations.push(format!(
@@ -2786,6 +2786,7 @@ fn ci_routing_contract_violations(
     for required in [
         "github.event_name",
         "pull_request",
+        "workflow_dispatch",
         "steps.release-candidate-trust.outputs.trusted-release-candidate",
         "startsWith(github.head_ref, 'release-please--branches--')",
         "steps.filter.outputs.macos",
@@ -2799,6 +2800,9 @@ fn ci_routing_contract_violations(
     }
     if matrix_run.contains("ubuntu-24.04") {
         violations.push("dynamic platform matrix still contains a duplicate Linux compiler".into());
+    }
+    if matrix_run.contains("github.event_name }}\" != \"pull_request") {
+        violations.push("main push still widens the platform matrix unconditionally".into());
     }
 
     let conclusion_run =
@@ -2832,7 +2836,7 @@ fn ci_routing_contract_violations(
     }
     let run_fmt = "run_fmt='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.fmt-required == 'true' }}'";
     let run_clippy = "run_clippy='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.clippy-required == 'true' }}'";
-    let run_platform = "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request') }}'";
+    let run_platform = "run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name == 'workflow_dispatch') }}'";
     for (name, expected) in [
         ("run_fmt", run_fmt),
         ("run_clippy", run_clippy),
@@ -2932,15 +2936,15 @@ fn ci_routing_contract_violations(
         .and_then(|step| step["if"].as_str())
         .unwrap_or_default();
     if !windows_lint_condition.contains("needs.detect-changes.outputs.windows-lint == 'true'")
-        || !windows_lint_condition.contains("github.event_name != 'pull_request'")
+        || !windows_lint_condition.contains("github.event_name == 'workflow_dispatch'")
     {
         violations.push(
-            "Windows page-lint proof is not gated to lint-sensitive PRs plus non-PR backstops"
+            "Windows page-lint proof is not gated to lint-sensitive changes plus manual backstops"
                 .into(),
         );
     }
 
-    let m4_condition = "matrix.os == 'macos-14' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true')";
+    let m4_condition = "matrix.os == 'macos-14' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.macos-m4 == 'true')";
     if job_step(&ci, "test", "M4 community gates (macOS-owned)")
         .and_then(|step| step["if"].as_str())
         != Some(m4_condition)
@@ -2949,7 +2953,7 @@ fn ci_routing_contract_violations(
             "macOS M4 gate is not focused to community/provenance inputs plus backstops".into(),
         );
     }
-    let windows_llm_condition = "matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.windows-llm-probe == 'true')";
+    let windows_llm_condition = "matrix.os == 'windows-2022' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.windows-llm-probe == 'true')";
     for step_name in [
         "Validate Windows smoke harness",
         "Validate Windows LLM probe",
@@ -3004,7 +3008,7 @@ fn ci_routing_contract_violations(
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default();
     let mcp_rust_cache = job_step_using(&ci, "mcp-platform", "Swatinem/rust-cache");
-    let test_owner_formula = "${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || (matrix.os == 'macos-14' && needs.detect-changes.outputs.macos == 'true') || (matrix.os == 'windows-2022' && needs.detect-changes.outputs.windows == 'true') }}";
+    let test_owner_formula = "${{ github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || (matrix.os == 'macos-14' && needs.detect-changes.outputs.macos == 'true') || (matrix.os == 'windows-2022' && needs.detect-changes.outputs.windows == 'true') }}";
     let mcp_windows_linker = job_step(
         &ci,
         "mcp-platform",
@@ -3022,7 +3026,7 @@ fn ci_routing_contract_violations(
         || !mcp_condition.contains("needs.detect-changes.outputs.workspace-platform == 'true'")
         || !mcp_condition.contains("needs.detect-changes.outputs.mcp-platform == 'true'")
         || !mcp_condition.contains("startsWith(github.head_ref, 'release-please--branches--')")
-        || !mcp_condition.contains("github.event_name != 'pull_request'")
+        || !mcp_condition.contains("github.event_name == 'workflow_dispatch'")
         || !mcp_run.contains("cargo check -p wenlan-mcp --lib --bins")
         || mcp_run.contains("--all-targets")
         || mcp_compile.and_then(|step| step["if"].as_str())
@@ -3255,6 +3259,11 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
             "            macos-m4:\n              - 'crates/wenlan-core/src/community_grouping.rs'",
             "            macos-m4:\n              - 'crates/wenlan-core/src/community_grouping.rs'\n              - 'crates/wenlan-core/src/unreviewed_m4.rs'",
             1,
+        )
+        .replacen(
+            "if [ \"${{ github.event_name }}\" = \"workflow_dispatch\" ]; then",
+            "if [ \"${{ github.event_name }}\" != \"pull_request\" ]; then",
+            1,
         );
     let planner = std::fs::read_to_string(root.join("scripts/ci_test_plan.py"))
         .expect("read CI test planner")
@@ -3294,6 +3303,7 @@ fn ci_planner_routing_rejects_optional_and_fail_open_mutations() {
         "unknown paths",
         "platform test planner lost required contract",
         "exact generic macOS plus Windows filter inventories",
+        "main push still widens the platform matrix unconditionally",
         "macos-m4 focused-owner allowlist has unreviewed path",
         "macos-m4 focused source crates/wenlan-core/src/db.rs acquired macos-specific cfg",
     ] {
