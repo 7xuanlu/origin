@@ -17,6 +17,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
+use std::path::Path;
 
 pub const M5_BENCH_SEED: u64 = 0x4d35_0001;
 pub const M5_BENCH_MEMORY_COUNT: u64 = 100_000;
@@ -252,6 +253,25 @@ pub fn parse_accuracy_jsonl(bytes: &[u8]) -> Result<Vec<JudgeAccuracyCase>> {
     Ok(cases)
 }
 
+/// Open the page-size source through the exact read-only connection used by
+/// the exporter. The SQLite flag is the primary fence; `query_only` is a
+/// second, connection-local refusal that makes accidental DML/DDL fail loud.
+pub async fn open_page_size_db_read_only(path: &Path) -> Result<libsql::Connection> {
+    let database = libsql::Builder::new_local(path)
+        .flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .build()
+        .await
+        .context("open page-size database read-only")?;
+    let connection = database
+        .connect()
+        .context("connect page-size database read-only")?;
+    connection
+        .execute("PRAGMA query_only = ON", ())
+        .await
+        .context("enforce query-only page-size connection")?;
+    Ok(connection)
+}
+
 pub fn corpus_summary(distribution: &PageSizeDistribution) -> Result<CorpusSummary> {
     distribution.validate()?;
     let mut writer = DigestWriter(Sha256::new());
@@ -337,11 +357,21 @@ fn draw_page_size(distribution: &PageSizeDistribution, rng: &mut SplitMix64) -> 
     for bucket in &distribution.buckets {
         cumulative += bucket.count;
         if target < cumulative {
-            let max = bucket
-                .max_exclusive
-                .context("open-ended bucket cannot drive frozen corpus generation")?;
-            let width = max - bucket.min_inclusive;
-            return Ok(bucket.min_inclusive + rng.next_u64() % width);
+            let (lower, upper) = match bucket.max_exclusive {
+                Some(max) => (bucket.min_inclusive, max),
+                None => {
+                    // Corpus encoding v1 gives an open tail a finite,
+                    // deterministic synthetic draw range wholly inside it:
+                    // [max(min, 1), 2 * max(min, 1)). Checked doubling refuses
+                    // an unrepresentable tail instead of wrapping.
+                    let lower = bucket.min_inclusive.max(1);
+                    let upper = lower
+                        .checked_mul(2)
+                        .context("open page-size bucket synthetic range overflow")?;
+                    (lower, upper)
+                }
+            };
+            return Ok(lower + rng.next_u64() % (upper - lower));
         }
     }
     bail!("page-size distribution selection fell outside cumulative count")
