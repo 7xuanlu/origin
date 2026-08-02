@@ -4837,6 +4837,12 @@ fn release_promotion_contract_violations(
         "maintain-release-pr",
         "googleapis/release-please-action",
     );
+    if fast_action.and_then(|step| step["with"]["skip-github-release"].as_bool()) != Some(true) {
+        violations.push(
+            "fast release maintenance contains publishing or lifecycle mutation \"skip-github-release: false\""
+                .into(),
+        );
+    }
     if fast_job["if"].as_str()
         != Some("github.event_name == 'push' && github.ref == 'refs/heads/main'")
         || fast_job["timeout-minutes"].as_u64() != Some(5)
