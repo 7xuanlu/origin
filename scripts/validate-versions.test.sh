@@ -157,13 +157,40 @@ if 'git rev-parse HEAD' not in verify.group("body") or 'git rev-list -n1 "refs/t
 PY
 }
 
-for job in prepare-release release docker publish-crates publish-npm; do
+for job in prepare-release publish-crates publish-npm; do
     if ! assert_release_job_pins_tag "$REPO_ROOT/.github/workflows/release.yml" "$job"; then
         echo "FAIL test 10: $job must checkout and verify RELEASE_TAG"
         exit 1
     fi
 done
-echo "PASS test 10: release-producing jobs checkout and verify RELEASE_TAG"
+if ! python3 - "$REPO_ROOT/.github/workflows/release.yml" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+workflow = Path(sys.argv[1]).read_text()
+match = re.search(
+    r"^  resolve-promotion:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+    workflow,
+    re.MULTILINE | re.DOTALL,
+)
+if not match:
+    raise SystemExit(1)
+body = match.group("body")
+for marker in [
+    "ref: refs/tags/${{ env.RELEASE_TAG }}",
+    'tag_sha="$(git rev-list -n1 "refs/tags/$RELEASE_TAG")"',
+    "scripts/release-promotion.py consume-main-receipt",
+    "Tag does not match the validated release version.",
+]:
+    if marker not in body:
+        raise SystemExit(1)
+PY
+then
+    echo "FAIL test 10: release resolver must bind RELEASE_TAG to the main promotion receipt"
+    exit 1
+fi
+echo "PASS test 10: release jobs pin the receipt-derived RELEASE_TAG"
 
 python3 "$REPO_ROOT/scripts/release-workflow-contract.test.py"
 echo "PASS test 11: release promotion and public install contracts"
