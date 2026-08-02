@@ -3248,7 +3248,8 @@ fn ci_release_reuse_and_linux_shards_are_fail_closed() {
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default();
     assert_eq!(
-        proof_test, "python3 scripts/verify-release-merge.test.py",
+        proof_test,
+        "python3 scripts/verify-release-merge.test.py\npython3 scripts/release-promotion.test.py\n",
         "release proof tests must run before routing"
     );
     assert_eq!(
