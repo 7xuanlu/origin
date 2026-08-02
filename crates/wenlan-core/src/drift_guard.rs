@@ -4174,6 +4174,19 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     if cache.and_then(|step| step["with"]["workspaces"].as_str()) != Some(". -> target") {
         violations.push("release-preflight cache has overlapping cache roots".into());
     }
+    let retry_cache = job_step(
+        &ci,
+        "release-preflight",
+        "Retry Windows release cache restore once",
+    );
+    if cache.and_then(|step| step["with"]["shared-key"].as_str())
+        != Some("release-v4-${{ matrix.target }}")
+        || retry_cache.and_then(|step| step["with"]["shared-key"].as_str())
+            != Some("release-v4-${{ matrix.target }}")
+    {
+        violations
+            .push("release-preflight immutable cache schema is not v4 on both restores".into());
+    }
     for step in preflight["steps"].as_sequence().into_iter().flatten() {
         let name = step["name"]
             .as_str()
@@ -4272,8 +4285,8 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "          save-if: \"true\"",
         )
         .replace(
-            "          shared-key: release-v3-${{ matrix.target }}",
-            "          shared-key: release-v3-ci-only-${{ matrix.target }}",
+            "          shared-key: release-v4-${{ matrix.target }}",
+            "          shared-key: release-v4-ci-only-${{ matrix.target }}",
         )
         .replace(
             "        run: bash scripts/build-release-binaries.sh \"${{ matrix.target }}\"",
@@ -7193,6 +7206,86 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
             "P6 cache_mode must use both exact cold and production-restore vocabulary".into(),
         );
     }
+    let current_rows = p6_entries
+        .iter()
+        .filter(|entry| entry["profile"].as_str() == Some("current"));
+    if current_rows.count() != 6
+        || p6_entries.iter().any(|entry| {
+            entry["lto"].as_str() != Some("off")
+                || !matches!(entry["cgu"].as_str(), Some("16" | "256"))
+                || entry["profile"].as_str() == Some("no-lto")
+        })
+    {
+        violations.push("P6 matrix does not match the shipped no-LTO release profiles".into());
+    }
+
+    let production_cache = job_step(
+        &ci,
+        "release-preflight",
+        "Cache release artifacts (main-owned)",
+    );
+    let benchmark_cache = job_step(&benchmark, "p6-release", "Restore production release cache");
+    for input in [
+        "shared-key",
+        "workspaces",
+        "cache-all-crates",
+        "cache-workspace-crates",
+        "cache-targets",
+    ] {
+        if benchmark_cache.and_then(|step| step["with"][input].as_str())
+            != production_cache.and_then(|step| step["with"][input].as_str())
+        {
+            violations.push(format!(
+                "P6 production restore does not mirror release-preflight cache input {input:?}"
+            ));
+        }
+    }
+    if benchmark_cache.and_then(|step| step["uses"].as_str())
+        != production_cache.and_then(|step| step["uses"].as_str())
+        || benchmark_cache.and_then(|step| step["with"]["save-if"].as_str()) != Some("false")
+    {
+        violations
+            .push("P6 production restore is not the pinned restore-only production cache".into());
+    }
+    let p6_steps = benchmark["jobs"]["p6-release"]["steps"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let step_position = |name: &str| {
+        p6_steps
+            .iter()
+            .position(|step| step["name"].as_str() == Some(name))
+    };
+    if step_position("Mark Windows explicit target as nested Cargo cache")
+        .zip(step_position("Restore production release cache"))
+        .is_none_or(|(marker, restore)| marker >= restore)
+    {
+        violations.push("P6 does not mark the nested Windows target before cache restore".into());
+    }
+    let p6_cache_sample = job_step(
+        &benchmark,
+        "p6-release",
+        "Classify Windows release cache sample",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    if ![
+        "partial Windows cache restore:",
+        "$state = \"cold-miss\"",
+        "$jobs = 2",
+        "$state = \"exact-restore\"",
+        "$jobs = 4",
+        "$state = \"fallback-restore\"",
+        "$jobs = 3",
+        "CARGO_BUILD_JOBS=$jobs",
+        "exact=$exactHit",
+    ]
+    .iter()
+    .all(|marker| p6_cache_sample.contains(marker))
+    {
+        violations.push("P6 does not record coherent cache state and Cargo job bounds".into());
+    }
     let p6_cache_receipt = job_step(&benchmark, "p6-release", "Record release cache evidence")
         .and_then(|step| step["run"].as_str())
         .unwrap_or_default();
@@ -7207,7 +7300,7 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
         "effective_cache = (",
         r#""profile-invalidated-cold""#,
         r#"if requested_mode == "production-restore" and profile != "current""#,
-        "else requested_mode",
+        r#"else os.environ.get("WINDOWS_CACHE_STATE") or requested_mode"#,
         ")",
     ];
     let has_exact_cache_logic = active_receipt_lines
@@ -7220,9 +7313,87 @@ fn ci_benchmark_contract_violations(ci_workflow: &str, benchmark_workflow: &str)
     if !has_exact_cache_logic
         || effective_cache_assignments != 1
         || !active_receipt_lines.contains(&r#""effective_cache": effective_cache,"#)
+        || !active_receipt_lines
+            .contains(&r#""windows_cache_state": os.environ.get("WINDOWS_CACHE_STATE", ""),"#)
+        || !active_receipt_lines
+            .contains(&r#""windows_cache_jobs": os.environ.get("WINDOWS_CACHE_JOBS", ""),"#)
     {
         violations
-            .push("P6 cache receipt does not expose profile-invalidated restores as cold".into());
+            .push("P6 cache receipt does not expose measured cache state or profile-invalidated restores as cold".into());
+    }
+    let toolchain = job_step_using(&benchmark, "p6-release", "dtolnay/rust-toolchain");
+    if toolchain.and_then(|step| step["with"]["targets"].as_str()) != Some("${{ matrix.target }}") {
+        violations.push("P6 toolchain does not install its explicit production target".into());
+    }
+    for prerequisite in [
+        "Select native Perl for vendored OpenSSL",
+        "Set up Vulkan SDK (Windows)",
+        "Configure MSVC Ninja (Windows)",
+    ] {
+        if job_step(&benchmark, "p6-release", prerequisite).is_none() {
+            violations.push(format!(
+                "P6 Windows production build omits prerequisite {prerequisite:?}"
+            ));
+        }
+    }
+    let runtime_stage = job_step(
+        &benchmark,
+        "p6-release",
+        "Stage Windows release runtimes before smoke",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    let windows_build_name = "Measure release profile (Windows required-proof layout)";
+    if !runtime_stage.contains("scripts/stage-vulkan-loader-windows.ps1")
+        || !runtime_stage.contains("scripts/stage-onnxruntime-windows.ps1")
+        || !runtime_stage.contains(r#"target\${{ matrix.target }}\release"#)
+        || step_position("Stage Windows release runtimes before smoke")
+            .zip(step_position(windows_build_name))
+            .is_none_or(|(stage, build)| stage >= build)
+    {
+        violations
+            .push("P6 Windows runtime staging does not precede the explicit-target build".into());
+    }
+    for build_name in [
+        "Measure release profile (Linux/macOS artifact layout)",
+        windows_build_name,
+    ] {
+        let build = job_step(&benchmark, "p6-release", build_name)
+            .and_then(|step| step["run"].as_str())
+            .unwrap_or_default();
+        for marker in [
+            "cargo build --locked --release",
+            "-p wenlan -p wenlan-server -p wenlan-mcp",
+            "--target \"${{ matrix.target }}\"",
+            "target/${{ matrix.target }}/release/wenlan",
+        ] {
+            if !build.contains(marker) {
+                violations.push(format!(
+                    "P6 build {build_name:?} omits production marker {marker:?}"
+                ));
+            }
+        }
+        if build.contains("-p wenlan-core") || build.contains("model_probe") {
+            violations.push(format!(
+                "P6 build {build_name:?} includes a non-shipped executable owner"
+            ));
+        }
+    }
+    let shipped_smoke = job_step(&benchmark, "p6-release", "Smoke release binaries")
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    if ![
+        "wenlan${suffix}",
+        "wenlan-server${suffix}",
+        "wenlan-mcp${suffix}",
+    ]
+    .iter()
+    .all(|binary| shipped_smoke.contains(binary))
+        || !shipped_smoke.contains(r#"root="target/${{ matrix.target }}/release""#)
+        || shipped_smoke.contains(r#"root="target/release""#)
+    {
+        violations
+            .push("P6 smoke does not execute exactly the three shipped target binaries".into());
     }
     let drives = benchmark["jobs"]["p5-windows-drive"]["strategy"]["matrix"]["drive"]
         .as_sequence()
@@ -7473,6 +7644,48 @@ fn ci_benchmark_contract_rejects_unused_effective_cache_value() {
             .any(|violation| violation.contains("profile-invalidated restores")),
         "unused effective cache logic must fail the benchmark contract: {violations:?}"
     );
+}
+
+#[test]
+fn ci_benchmark_contract_rejects_stale_release_execution() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let benchmark = std::fs::read_to_string(root.join(".github/workflows/ci-benchmark.yml"))
+        .expect("read benchmark workflow")
+        .replacen("lto: \"off\"", "lto: thin", 1)
+        .replace(
+            "shared-key: release-v4-${{ matrix.target }}",
+            "shared-key: release-v3-${{ matrix.target }}",
+        )
+        .replace(
+            "      - name: Mark Windows explicit target as nested Cargo cache",
+            "      - name: Removed nested Cargo cache marker",
+        )
+        .replace(
+            "profile: cgu-256, cache_mode: cold, cgu: \"256\"",
+            "profile: no-lto, cache_mode: cold, cgu: \"16\"",
+        )
+        .replace(
+            "--hash \"target/${{ matrix.target }}/release/wenlan.exe\"",
+            "--hash \"target/release/wenlan.exe\"",
+        )
+        .replace("--target \"${{ matrix.target }}\"", "--target removed")
+        .replace("          \"./${root}/wenlan-mcp${suffix}\" --help\n", "");
+    let violations = ci_benchmark_contract_violations(&ci, &benchmark);
+    for expected in [
+        "shipped no-LTO release profiles",
+        "release-preflight cache input",
+        "nested Windows target before cache restore",
+        "omits production marker",
+        "three shipped target binaries",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "stale P6 fixture must exercise {expected:?}: {violations:?}"
+        );
+    }
 }
 
 fn workflow_action_pin_violations(workflow_name: &str, workflow: &str) -> Vec<String> {

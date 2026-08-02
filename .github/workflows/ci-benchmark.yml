@@ -306,16 +306,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, profile: current, cache_mode: cold, cgu: "16", lto: thin }
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, profile: current, cache_mode: production-restore, cgu: "16", lto: thin }
-          - { os: macos-14, target: aarch64-apple-darwin, profile: current, cache_mode: cold, cgu: "16", lto: thin }
-          - { os: macos-14, target: aarch64-apple-darwin, profile: current, cache_mode: production-restore, cgu: "16", lto: thin }
-          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: current, cache_mode: cold, cgu: "16", lto: thin }
-          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: current, cache_mode: production-restore, cgu: "16", lto: thin }
-          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: no-lto, cache_mode: cold, cgu: "16", lto: "off" }
-          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: no-lto, cache_mode: production-restore, cgu: "16", lto: "off" }
-          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: parallel-no-lto, cache_mode: cold, cgu: "256", lto: "off" }
-          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: parallel-no-lto, cache_mode: production-restore, cgu: "256", lto: "off" }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, profile: current, cache_mode: cold, cgu: "16", lto: "off" }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, profile: current, cache_mode: production-restore, cgu: "16", lto: "off" }
+          - { os: macos-14, target: aarch64-apple-darwin, profile: current, cache_mode: cold, cgu: "16", lto: "off" }
+          - { os: macos-14, target: aarch64-apple-darwin, profile: current, cache_mode: production-restore, cgu: "16", lto: "off" }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: current, cache_mode: cold, cgu: "16", lto: "off" }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: current, cache_mode: production-restore, cgu: "16", lto: "off" }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: cgu-256, cache_mode: cold, cgu: "256", lto: "off" }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, profile: cgu-256, cache_mode: production-restore, cgu: "256", lto: "off" }
     env:
       BENCH_REQUESTED_RUNNER: ${{ matrix.os }}
     steps:
@@ -325,6 +323,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
         with:
           toolchain: 1.95.0
+          targets: ${{ matrix.target }}
       - name: Install sqlite3 (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -348,14 +347,98 @@ jobs:
             Out-File -FilePath $env:GITHUB_ENV -Append
           "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
             Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Select native Perl for vendored OpenSSL
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $nativePerl = $null
+          foreach ($candidate in Get-Command perl.exe -CommandType Application -All) {
+            if ($candidate.Source -match '[\\/]Git[\\/]') {
+              continue
+            }
+            & $candidate.Source "-MLocale::Maketext::Simple" "-e" "1"
+            if ($LASTEXITCODE -eq 0) {
+              $nativePerl = $candidate.Source
+              break
+            }
+          }
+          if (-not $nativePerl) {
+            throw "No native Perl can load Locale::Maketext::Simple"
+          }
+          "OPENSSL_SRC_PERL=$nativePerl" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Mark Windows explicit target as nested Cargo cache
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $targetRoot = "target\${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $targetRoot | Out-Null
+          $marker = Join-Path $targetRoot "CACHEDIR.TAG"
+          $contents = @"
+          Signature: 8a477f597d28d172789f06886806bc55
+          # This file is a cache directory tag created by Cargo.
+          # For information about cache directory tags see https://bford.info/cachedir/
+          "@
+          [IO.File]::WriteAllText($marker, $contents, [Text.UTF8Encoding]::new($false))
       - name: Restore production release cache
         if: matrix.cache_mode == 'production-restore'
         id: rust-cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: ${{ runner.os == 'Windows' && 'windows-release' || format('release-{0}', matrix.target) }}
+          shared-key: release-v4-${{ matrix.target }}
+          workspaces: . -> target
           cache-all-crates: "true"
+          cache-workspace-crates: "false"
+          cache-targets: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
           save-if: "false"
+      # Required CI owns the bounded 25-second retry. This manual benchmark
+      # samples the first production restore and records its real state.
+      - name: Classify Windows release cache sample
+        id: windows-cache-sample
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $marker = "target\${{ matrix.target }}\CACHEDIR.TAG"
+          $hostDeps = "target\release\deps"
+          $targetDeps = "target\${{ matrix.target }}\release\deps"
+          $requestedMode = '${{ matrix.cache_mode }}'
+          $exactHit = '${{ steps.rust-cache.outputs.cache-hit }}'
+          if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+            throw "nested Cargo cache marker missing after restore: $marker"
+          }
+          $hostCount = if (Test-Path -LiteralPath $hostDeps -PathType Container) {
+            @(Get-ChildItem -LiteralPath $hostDeps -Force).Count
+          } else { 0 }
+          $targetCount = if (Test-Path -LiteralPath $targetDeps -PathType Container) {
+            @(Get-ChildItem -LiteralPath $targetDeps -Force).Count
+          } else { 0 }
+          if ($requestedMode -eq "cold" -and '${{ steps.rust-cache.outcome }}' -ne "skipped") {
+            throw "cold benchmark unexpectedly restored a cache"
+          }
+          if ($hostCount -eq 0 -and $targetCount -eq 0) {
+            $state = "cold-miss"
+            $jobs = 2
+          } elseif ($hostCount -gt 0 -and $targetCount -gt 0) {
+            if ($exactHit -eq "true") {
+              $state = "exact-restore"
+              $jobs = 4
+            } else {
+              $state = "fallback-restore"
+              $jobs = 3
+            }
+          } else {
+            throw "partial Windows cache restore: exact=$exactHit host=$hostCount target=$targetCount"
+          }
+          if ($exactHit -eq "true" -and $state -ne "exact-restore") {
+            throw "exact cache hit restored no coherent host+target artifacts"
+          }
+          if ($requestedMode -eq "cold" -and $state -ne "cold-miss") {
+            throw "cold benchmark inherited unexpected Cargo artifacts"
+          }
+          "state=$state" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "jobs=$jobs" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "exact=$exactHit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "CARGO_BUILD_JOBS=$jobs" | Out-File -FilePath $env:GITHUB_ENV -Append
       # Restore before setting alternate profile variables. rust-cache hashes
       # CARGO_* inputs, so the current arm must match the production key.
       - name: Configure alternate release profile
@@ -368,6 +451,27 @@ jobs:
             echo "CARGO_PROFILE_RELEASE_STRIP=debuginfo"
             echo "CARGO_PROFILE_RELEASE_INCREMENTAL=false"
           } >> "$GITHUB_ENV"
+      - name: Set up Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & scripts/setup-vulkan-sdk-windows.test.ps1
+          & scripts/setup-vulkan-sdk-windows.ps1
+      - name: Configure MSVC Ninja (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & scripts/setup-msvc-ninja-windows.test.ps1
+          & scripts/setup-msvc-ninja-windows.ps1
+      - name: Stage Windows release runtimes before smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & scripts/stage-vulkan-loader-windows.test.ps1
+          & scripts/stage-vulkan-loader-windows.ps1 `
+            -DestinationDirectory "target\${{ matrix.target }}\release"
+          & scripts/stage-onnxruntime-windows.ps1 `
+            -DestinationDirectory "target\${{ matrix.target }}\release"
       - name: Fetch locked dependencies outside timed region
         run: cargo fetch --locked
       - name: Measure release profile (Linux/macOS artifact layout)
@@ -395,10 +499,10 @@ jobs:
           python3 scripts/ci-timed-command.py `
             --label "p6-release-${{ matrix.os }}-${{ matrix.profile }}-${{ matrix.cache_mode }}" `
             --output "benchmark-receipts/p6-${{ matrix.os }}-${{ matrix.profile }}-${{ matrix.cache_mode }}.json" `
-            --hash "target/release/wenlan.exe" `
+            --hash "target/${{ matrix.target }}/release/wenlan.exe" `
             -- cargo build --locked --release `
-              -p wenlan -p wenlan-server -p wenlan-mcp -p wenlan-core `
-              --bin wenlan --bin wenlan-server --bin wenlan-mcp --bin model_probe
+              -p wenlan -p wenlan-server -p wenlan-mcp `
+              --target "${{ matrix.target }}"
       - name: Smoke release binaries
         shell: bash
         run: |
@@ -406,23 +510,24 @@ jobs:
           root="target/${{ matrix.target }}/release"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             suffix=".exe"
-            root="target/release"
           fi
           "./${root}/wenlan${suffix}" --help
           "./${root}/wenlan-server${suffix}" --help
-      - name: Stage ONNX Runtime and smoke Windows release
+          "./${root}/wenlan-mcp${suffix}" --help
+      - name: Smoke Windows release daemon
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & scripts/stage-onnxruntime-windows.ps1 `
-            -DestinationDirectory "target\release"
           & scripts/smoke-windows.ps1 `
-            -ExePath "target\release\wenlan-server.exe"
+            -ExePath "target\${{ matrix.target }}\release\wenlan-server.exe"
       - name: Record release cache evidence
         if: always()
         shell: bash
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          WINDOWS_CACHE_EXACT: ${{ steps.windows-cache-sample.outputs.exact }}
+          WINDOWS_CACHE_JOBS: ${{ steps.windows-cache-sample.outputs.jobs }}
+          WINDOWS_CACHE_STATE: ${{ steps.windows-cache-sample.outputs.state }}
         run: |
           mkdir -p benchmark-receipts
           python3 - <<'PY'
@@ -433,14 +538,19 @@ jobs:
           effective_cache = (
               "profile-invalidated-cold"
               if requested_mode == "production-restore" and profile != "current"
-              else requested_mode
+              else os.environ.get("WINDOWS_CACHE_STATE") or requested_mode
           )
           Path("benchmark-receipts/cache.json").write_text(json.dumps({
               "requested_mode": requested_mode,
               "effective_cache": effective_cache,
               "profile": profile,
+              "profile_codegen_units": "${{ matrix.cgu }}",
+              "profile_lto": "${{ matrix.lto }}",
               "rust_cache_hit": os.environ.get("RUST_CACHE_HIT", ""),
-              "rust_cache_shared_key": "${{ runner.os == 'Windows' && 'windows-release' || format('release-{0}', matrix.target) }}",
+              "rust_cache_shared_key": "release-v4-${{ matrix.target }}",
+              "windows_cache_exact": os.environ.get("WINDOWS_CACHE_EXACT", ""),
+              "windows_cache_jobs": os.environ.get("WINDOWS_CACHE_JOBS", ""),
+              "windows_cache_state": os.environ.get("WINDOWS_CACHE_STATE", ""),
           }, sort_keys=True) + "\n")
           PY
       - name: Upload P6 receipt
