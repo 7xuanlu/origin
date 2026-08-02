@@ -108,6 +108,13 @@ belongs to the app/secret-store rung rather than this database migration.
 | scoped Clippy (`-D warnings`) | passed |
 | rust-analyzer diagnostics on every changed Rust file | zero errors/warnings; one expected test-only inactive-code hint |
 | fresh independent Sol round 5 | `CLOSED` |
+| latest-main integration base | rebased cleanly onto `28ecda6d` |
+| reader inventory regeneration | `scripts/m5-reader-sweep.py --update-inventory`; 285 rows, mechanical line-number changes only |
+| first post-rebase workspace attempt | infrastructure-aborted during link: `No space left on device (os error 28)`; no test verdict claimed |
+| completed post-rebase workspace discovery run | 3751 core tests passed, 2 R4 test-support guards failed because the six new test-only libSQL helpers were absent from the frozen manifest/census |
+| R4 blocker focused repair | 35/35 R4 test-support guards passed; fmt/diff check, strict scoped Clippy, and LSP passed |
+| fresh independent Sol post-suite blocker review | `CLOSED`; exact 13-row census and six path/owner/shape/ordinal additions preserve the fail-closed guard |
+| final post-rebase full workspace suite | `cargo test --workspace --quiet` exited 0; core 3753 passed, 0 failed, 33 ignored; every remaining workspace target passed |
 
 Round 1 returned `FIX`: decreasing `INSERT OR REPLACE` bypassed the two
 update-only monotonicity triggers; genesis provenance was mutable and nullable;
@@ -146,6 +153,8 @@ proves a new `spaces.id` cannot adopt retained proof.
 
 Round 5 returned `CLOSED`: the stable-ID binding closes delete-keep,
 space-ID swap, same-name recreation, replace/delete/reset, migration replay,
-and canonical rename paths within this schema-first rung. Latest-main rebase,
-inventory regeneration, and the one post-rebase full workspace suite remain
-pending at this receipt boundary.
+and canonical rename paths within this schema-first rung. The branch then
+rebased cleanly onto latest main, regenerated the reader inventory, repaired
+the fail-closed R4 test-support census exposed by the completed workspace run,
+received a fresh independent Sol `CLOSED` on that bounded repair, and finished
+with a green full workspace suite. Required PR CI remains the final gate.
