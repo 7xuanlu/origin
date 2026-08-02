@@ -134,7 +134,7 @@ Wenlan runs across several layers. The split is driven by three questions: **(1)
 |---|---|---|---|---|---|
 | **L1 dev loop** | rust-analyzer / IDE | Local | Every save | <1s | No |
 | **L2 pre-commit** | `cargo fmt --all`; Clippy on directly changed crates only | Local | `git commit` | ~5s | Yes |
-| **L3 pre-push** | Planner-selected Clippy + lib tests over the affected reverse-dependency closure; a directly edited integration target runs alone | Local | `git push` | change-dependent | Yes |
+| **L3 pre-push** | Planner-selected Clippy + lib tests over the affected reverse-dependency closure; directly edited integration targets and isolated unit-test owners run alone | Local | `git push` | change-dependent | Yes |
 | **L4 CI on PR** | Fail-closed differential plan: affected lib, integration, contract, platform, and HTTP smoke owners only; aggregate `conclusion` verifies every expected job. Pushes to `main` retain full workspace/platform coverage plus the Windows release-profile cache warmer; the release-please PR owns the complete four-target release proof. | GitHub (`ci.yml`) | Every PR | target ≤20min | Yes (required) |
 | **L5 coverage** | `cargo llvm-cov` on wenlan-core + wenlan-server only | GitHub (`coverage.yml`) | Push to `main` or manual dispatch | ~10min | **No (informational)** |
 | **L6 main canary** | Embedding-only eval (`cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval`) | GitHub (`main-canary.yml`) | Push to `main` | ~10min | No (post-merge) |
@@ -192,7 +192,7 @@ Main branch has: required CI (`conclusion` — aggregate gate over `fmt` + `lint
 Manual setup: `bash scripts/setup-hooks.sh`. Hooks live under `.githooks/`.
 
 - **Pre-commit:** auto-formats Rust (`cargo fmt --all`, re-stages changed files) + Clippy on changed crates. Formatting issues can never reach CI.
-- **Pre-push:** planner-selected Clippy + library tests for affected packages and reverse dependents. Direct integration-test edits run only that target. No coverage gate (see above).
+- **Pre-push:** planner-selected Clippy + library tests for affected packages and reverse dependents. Direct integration-test edits and isolated unit-test owners run only that target/module. No coverage gate (see above).
 
 ### Drift-defense (doc/flag/config drift)
 
