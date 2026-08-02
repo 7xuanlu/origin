@@ -523,13 +523,15 @@ jobs:
             -DestinationDirectory "target\${{ matrix.target }}\release"
           & scripts/stage-onnxruntime-windows.ps1 `
             -DestinationDirectory "target\${{ matrix.target }}\release"
+      # Cargo fetch cannot prefetch ONNX Runtime: ort-sys downloads that
+      # native archive from its build script. Keep the non-Windows timed build
+      # online so a cold row matches the real release-preflight path. Windows
+      # uses the explicitly staged dynamic runtime and remains Cargo-offline.
       - name: Fetch locked dependencies outside timed region
         run: cargo fetch --locked
       - name: Measure release profile (Linux/macOS artifact layout)
         if: runner.os != 'Windows'
         shell: bash
-        env:
-          CARGO_NET_OFFLINE: "true"
         run: |
           set -euo pipefail
           mkdir -p benchmark-receipts

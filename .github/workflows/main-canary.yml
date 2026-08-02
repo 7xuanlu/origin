@@ -12,10 +12,41 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  measure-plan:
+    name: route main measurements
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      main-canary-required: ${{ steps.plan.outputs.main-canary-required }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Plan main measurements
+        id: plan
+        env:
+          MEASURE_EVENT_NAME: ${{ github.event_name }}
+          MEASURE_BEFORE: ${{ github.event.before }}
+          MEASURE_HEAD: ${{ github.sha }}
+        run: |
+          python3 scripts/ci_measure_plan.py \
+            --event-name "$MEASURE_EVENT_NAME" \
+            --before "$MEASURE_BEFORE" \
+            --head "$MEASURE_HEAD" \
+            --github-output "$GITHUB_OUTPUT"
+
   main-canary:
     name: embedding eval
+    needs: measure-plan
+    if: >-
+      always() &&
+      (needs.measure-plan.result != 'success' ||
+       needs.measure-plan.outputs.main-canary-required == 'true')
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 20
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -49,15 +80,43 @@ jobs:
           path: ${{ env.FASTEMBED_CACHE_DIR }}
           key: fastembed-bge-base-en-v1.5-q-v3-portable
           enableCrossOsArchive: "true"
+      - name: Verify exact canary inventory
+        env:
+          CANARY_FILTER: test(=eval::retrieval::tests::test_run_quality_cost_eval_basic) | test(=eval::retrieval_drift::tests::ranking_drift_vs_golden)
+        run: |
+          cargo nextest list -p wenlan-core --lib \
+            --run-ignored=only \
+            --ignore-default-filter \
+            -E "$CANARY_FILTER" \
+            --message-format json > "$RUNNER_TEMP/main-canary-tests.json"
+          python3 - "$RUNNER_TEMP/main-canary-tests.json" <<'PY'
+          import json
+          import sys
+
+          expected = {
+              "eval::retrieval::tests::test_run_quality_cost_eval_basic",
+              "eval::retrieval_drift::tests::ranking_drift_vs_golden",
+          }
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          matched = {
+              name
+              for suite in payload.get("rust-suites", {}).values()
+              for name, case in suite.get("testcases", {}).items()
+              if case.get("filter-match", {}).get("status") == "matches"
+              and case.get("ignored") is True
+          }
+          if matched != expected or payload.get("test-count") != 2:
+              raise SystemExit(
+                  f"main canary inventory drift: expected={sorted(expected)!r} "
+                  f"matched={sorted(matched)!r} count={payload.get('test-count')!r}"
+              )
+          PY
       - name: Run embedding-only eval
         env:
-          EVAL_BASELINES_DIR: ${{ runner.temp }}/origin-eval-canary
-        run: cargo nextest run -p wenlan-core --lib --run-ignored=only eval::retrieval
-      - name: Upload eval canary baseline
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: eval-canary-baseline-${{ github.sha }}
-          path: ${{ runner.temp }}/origin-eval-canary/*.json
-          retention-days: 30
-          if-no-files-found: warn
+          CANARY_FILTER: test(=eval::retrieval::tests::test_run_quality_cost_eval_basic) | test(=eval::retrieval_drift::tests::ranking_drift_vs_golden)
+        run: |
+          cargo nextest run -p wenlan-core --lib \
+            --run-ignored=only \
+            --ignore-default-filter \
+            --no-tests=fail \
+            -E "$CANARY_FILTER"
