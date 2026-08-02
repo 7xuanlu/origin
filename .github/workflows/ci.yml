@@ -50,6 +50,7 @@ jobs:
       release-preflight: ${{ steps.filter.outputs.release-preflight }}
       mcp-platform: ${{ steps.filter.outputs.mcp-platform }}
       workspace-platform: ${{ steps.filter.outputs.workspace-platform }}
+      trusted-release-candidate: ${{ steps.release-candidate-trust.outputs.trusted-release-candidate }}
       verified-release-merge: ${{ steps.release-proof.outputs.verified-release-merge }}
       release-gate-state: ${{ steps.release-proof.outputs.release-gate-state }}
       test-plan: ${{ steps.test-plan.outputs.test-plan }}
@@ -70,6 +71,35 @@ jobs:
       test-matrix: ${{ steps.matrix.outputs.json }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      # This is a semantic proof, not a branch-name shortcut. The shared
+      # release validator requires exact same-repository identity, current
+      # main as the base, the closed release-managed path set, and canonical
+      # version-only transforms. Run it from the immutable base, never from
+      # candidate-controlled code. Any API or parsing uncertainty emits false.
+      - name: Checkout trusted release candidate classifier
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: trusted-release-gate
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Classify trusted release candidate
+        id: release-candidate-trust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          classifier=trusted-release-gate/scripts/classify-release-candidate.py
+          if [ -f "$classifier" ]; then
+            python3 "$classifier" \
+              --event "$GITHUB_EVENT_PATH" \
+              --event-name "$GITHUB_EVENT_NAME" \
+              --repository "$GITHUB_REPOSITORY" \
+              --github-output "$GITHUB_OUTPUT"
+          else
+            # One-time bootstrap: the introducing PR's base predates this
+            # trusted script, so it receives the complete platform matrix.
+            echo "trusted-release-candidate=false" >> "$GITHUB_OUTPUT"
+          fi
       # dorny/paths-filter reads pull-request files through the REST API, whose
       # response is capped at 3,000 files. Reject a larger PR before routing a
       # silently truncated inventory.
@@ -461,7 +491,16 @@ jobs:
         run: |
           macos='{"os":"macos-14","label":"macos-14"}'
           windows='{"os":"windows-2022","label":"windows-2022"}'
-          if [ "${{ github.event_name }}" != "pull_request" ] || [ "${{ startsWith(github.head_ref, 'release-please--branches--') }}" = "true" ]; then
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            include="${macos},${windows}"
+          elif [ "${{ steps.release-candidate-trust.outputs.trusted-release-candidate }}" = "true" ]; then
+            # Linux canonical acceptance plus the four shipped-target
+            # release-preflight builds retain the candidate proof. Avoid
+            # compiling that exact metadata-only tree twice in debug profile.
+            include=""
+          elif [ "${{ startsWith(github.head_ref, 'release-please--branches--') }}" = "true" ]; then
+            # A same-looking but untrusted branch must get more work, never a
+            # security-sensitive skip.
             include="${macos},${windows}"
           elif [ "${{ steps.filter.outputs.macos }}" = "true" ] && [ "${{ steps.filter.outputs.windows }}" = "true" ]; then
             include="${macos},${windows}"
@@ -755,7 +794,7 @@ jobs:
   test:
     name: test (${{ matrix.label }})
     needs: [detect-changes]
-    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request')"
+    if: "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request')"
     runs-on: ${{ matrix.os }}
     # Pull requests keep a hard wall-clock budget. Windows needs the full
     # backstop because its Vulkan/native bootstrap plus integration suite can
@@ -1485,7 +1524,8 @@ jobs:
           # inputs without adding three more large target archives.
           cache-targets: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Probe Windows host and target cache restore
+      - name: Probe initial Windows release cache restore
+        id: windows-cache-probe
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
@@ -1505,14 +1545,94 @@ jobs:
           if ($hostCount -eq 0 -and $targetCount -eq 0) {
             $state = "cold-miss"
           } elseif ($hostCount -gt 0 -and $targetCount -gt 0) {
-            $state = "warm-or-fallback-restore"
+            $state = if ($exactHit -eq "true") { "exact-restore" } else { "fallback-restore" }
           } else {
             throw "partial Windows cache restore: exact=$exactHit host=$hostCount target=$targetCount"
           }
-          if ($exactHit -eq "true" -and $state -ne "warm-or-fallback-restore") {
+          if ($exactHit -eq "true" -and $state -ne "exact-restore") {
             throw "exact cache hit restored no coherent host+target artifacts"
           }
-          Write-Host "Windows cache restore receipt: action_exact=$exactHit state=$state host_deps=$hostCount target_deps=$targetCount marker=present"
+          "exact=$exactHit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "state=$state" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "host-count=$hostCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "target-count=$targetCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Initial Windows cache receipt: action_exact=$exactHit state=$state host_deps=$hostCount target_deps=$targetCount marker=present"
+      - name: Back off before one Windows cache retry
+        if: matrix.target == 'x86_64-pc-windows-msvc' && steps.windows-cache-probe.outputs.state == 'cold-miss'
+        shell: pwsh
+        run: |
+          Write-Host "Initial Windows release cache restore was cold; retrying once after 25 seconds"
+          Start-Sleep -Seconds 25
+      - name: Retry Windows release cache restore once
+        id: windows-release-cache-retry
+        if: matrix.target == 'x86_64-pc-windows-msvc' && steps.windows-cache-probe.outputs.state == 'cold-miss'
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-v3-${{ matrix.target }}
+          workspaces: . -> target
+          cache-all-crates: "true"
+          cache-workspace-crates: "false"
+          cache-targets: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+          save-if: "false"
+      - name: Finalize Windows release cache state
+        id: windows-cache-final
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $marker = "target\${{ matrix.target }}\CACHEDIR.TAG"
+          $hostDeps = "target\release\deps"
+          $targetDeps = "target\${{ matrix.target }}\release\deps"
+          $initialState = '${{ steps.windows-cache-probe.outputs.state }}'
+          $initialExact = '${{ steps.windows-release-cache.outputs.cache-hit }}'
+          $retryOutcome = '${{ steps.windows-release-cache-retry.outcome }}'
+          $retryExact = '${{ steps.windows-release-cache-retry.outputs.cache-hit }}'
+          if ($initialState -eq "cold-miss") {
+            if ($retryOutcome -ne "success") {
+              throw "Windows cache retry did not complete: outcome=$retryOutcome"
+            }
+            $source = "retry"
+            $exactHit = $retryExact
+          } else {
+            if ($retryOutcome -ne "skipped") {
+              throw "Windows cache retry ran without a measured cold miss: initial=$initialState outcome=$retryOutcome"
+            }
+            $source = "initial"
+            $exactHit = $initialExact
+          }
+          if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+            throw "nested Cargo cache marker missing after final restore: $marker"
+          }
+          $hostCount = if (Test-Path -LiteralPath $hostDeps -PathType Container) {
+            @(Get-ChildItem -LiteralPath $hostDeps -Force).Count
+          } else { 0 }
+          $targetCount = if (Test-Path -LiteralPath $targetDeps -PathType Container) {
+            @(Get-ChildItem -LiteralPath $targetDeps -Force).Count
+          } else { 0 }
+          if ($hostCount -eq 0 -and $targetCount -eq 0) {
+            $state = "cold-miss"
+            $jobs = 2
+          } elseif ($hostCount -gt 0 -and $targetCount -gt 0) {
+            if ($exactHit -eq "true") {
+              $state = "exact-restore"
+              $jobs = 4
+            } else {
+              $state = "fallback-restore"
+              $jobs = 3
+            }
+          } else {
+            throw "partial Windows cache restore after retry: exact=$exactHit host=$hostCount target=$targetCount"
+          }
+          if ($exactHit -eq "true" -and $state -ne "exact-restore") {
+            throw "exact cache hit restored no coherent host+target artifacts after retry"
+          }
+          "state=$state" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "jobs=$jobs" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "source=$source" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "exact=$exactHit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "host-count=$hostCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "target-count=$targetCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "CARGO_BUILD_JOBS=$jobs" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Final Windows cache receipt: source=$source action_exact=$exactHit state=$state host_deps=$hostCount target_deps=$targetCount cargo_jobs=$jobs marker=present"
       - name: Install sqlite3 (Windows only)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
@@ -1532,12 +1652,6 @@ jobs:
         run: |
           & scripts/setup-msvc-ninja-windows.test.ps1
           & scripts/setup-msvc-ninja-windows.ps1
-      # Cap Cargo at two concurrent units while Ninja keeps its own native
-      # parallelism at one for llama.cpp's memory-heavy Vulkan build.
-      - name: Bound native build concurrency (Windows)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: '"CARGO_BUILD_JOBS=2" | Out-File -FilePath $env:GITHUB_ENV -Append'
       # The shared build script launches each shipped executable immediately
       # after linking it. Stage load-time DLLs first; a later PATH update cannot
       # rescue process startup under Git Bash or Task Scheduler.
@@ -1793,7 +1907,7 @@ jobs:
           fi
 
           run_rust='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' }}'
-          run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request') }}'
+          run_platform='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.rust-ci-required == 'true' && (needs.detect-changes.outputs.macos == 'true' || needs.detect-changes.outputs.windows == 'true' || startsWith(github.head_ref, 'release-please--branches--') || github.event_name != 'pull_request') }}'
           run_workspace_lib='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.workspace-lib-required == 'true' }}'
           run_canonical='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.canonical-acceptance-required == 'true' }}'
           run_contract='${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.contract-integration-required == 'true' }}'

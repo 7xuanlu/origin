@@ -98,14 +98,13 @@ fs2 = "0.4"
 cap-std = "=4.0.2"
 cap-fs-ext = "=4.0.2"
 
-# Release profile tuned for CI throughput. Default is `codegen-units = 1`
-# + no `lto`, optimized for runtime perf at the cost of long link times.
-# Wenlan's bottleneck is build time, not the last 5% of release-binary
-# perf. `codegen-units = 16` lets rustc fan out across cores; `lto =
-# "thin"` keeps the LTO pass cheap but still inlines hot paths. Net:
-# ~30-50% off link time on Linux/Windows, binary ~5-10% larger.
+# Release profile tuned for CI throughput. Cargo's non-incremental default is
+# already `codegen-units = 16`; keep it explicit as a measured build contract.
+# `lto = "off"` is the only setting that fully disables LTO: `false` still
+# performs thin local LTO, while `"thin"` adds cross-crate link work. See
+# https://doc.rust-lang.org/cargo/reference/profiles.html#lto.
 [profile.release]
 codegen-units = 16
-lto = "thin"
+lto = "off"
 strip = "debuginfo"
 incremental = false
