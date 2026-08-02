@@ -108,8 +108,8 @@ belongs to the app/secret-store rung rather than this database migration.
 | scoped Clippy (`-D warnings`) | passed |
 | rust-analyzer diagnostics on every changed Rust file | zero errors/warnings; one expected test-only inactive-code hint |
 | fresh independent Sol round 5 | `CLOSED` |
-| latest-main integration base | rebased cleanly onto `28ecda6d` |
-| reader inventory regeneration | `scripts/m5-reader-sweep.py --update-inventory`; 285 rows, mechanical line-number changes only |
+| latest-main integration base | rebased cleanly onto `9bc89a46` after the earlier `28ecda6d` receipt was invalidated by main advancing |
+| reader inventory regeneration | `scripts/m5-reader-sweep.py --update-inventory`; 285 rows, mechanical line-number changes only; unchanged on the final rebase |
 | first post-rebase workspace attempt | infrastructure-aborted during link: `No space left on device (os error 28)`; no test verdict claimed |
 | completed post-rebase workspace discovery run | 3751 core tests passed, 2 R4 test-support guards failed because the six new test-only libSQL helpers were absent from the frozen manifest/census |
 | R4 blocker focused repair | 35/35 R4 test-support guards passed; fmt/diff check, strict scoped Clippy, and LSP passed |
@@ -157,4 +157,7 @@ and canonical rename paths within this schema-first rung. The branch then
 rebased cleanly onto latest main, regenerated the reader inventory, repaired
 the fail-closed R4 test-support census exposed by the completed workspace run,
 received a fresh independent Sol `CLOSED` on that bounded repair, and finished
-with a green full workspace suite. Required PR CI remains the final gate.
+with a green full workspace suite. When main advanced again during the gate,
+the branch rebased a second time, regenerated the unchanged inventory, and
+repeated the full workspace suite successfully. Required PR CI remains the
+final gate.
