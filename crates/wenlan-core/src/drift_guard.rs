@@ -6764,7 +6764,8 @@ fn main_canary_contract_violations(ci_workflow: &str, canary_workflow: &str) -> 
         || !inventory_run.contains("--ignore-default-filter")
         || !inventory_run.contains("-E \"$CANARY_FILTER\"")
         || !inventory_run.contains("--message-format json")
-        || !inventory_run.contains("payload.get(\"test-count\") != 2")
+        || !inventory_run.contains("len(matched) != 2")
+        || inventory_run.contains("payload.get(\"test-count\") != 2")
         || !inventory_run.contains("case.get(\"ignored\") is True")
         || !inventory_run.contains("eval::retrieval::tests::test_run_quality_cost_eval_basic")
         || !inventory_run.contains("eval::retrieval_drift::tests::ranking_drift_vs_golden")
@@ -6968,6 +6969,22 @@ fn main_canary_contract_rejects_eval_inside_conclusion_itself() {
             .iter()
             .any(|violation| violation.contains("required CI test critical path")),
         "fixture must reject an eval step inside conclusion itself: {violations:?}"
+    );
+}
+
+#[test]
+fn main_canary_contract_rejects_discovery_count_as_filter_count() {
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let canary = std::fs::read_to_string(root.join(".github/workflows/main-canary.yml"))
+        .expect("read main-canary.yml")
+        .replace("len(matched) != 2", "payload.get(\"test-count\") != 2");
+    let violations = main_canary_contract_violations(&ci, &canary);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("exact two-test ignored inventory")),
+        "top-level discovery count must not masquerade as the filtered inventory: {violations:?}"
     );
 }
 
