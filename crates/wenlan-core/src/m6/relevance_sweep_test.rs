@@ -1314,6 +1314,322 @@ async fn seed_sparse_space(db: &GenesisDb) {
     }
 }
 
+/// Assert the space's whole pair table equals a full recomputation at the pin,
+/// and return it so a caller can make its own non-vacuity claims.
+async fn assert_equals_full_recomputation(
+    db: &GenesisDb,
+    space: &str,
+    reference: i64,
+    what: &str,
+) -> Vec<(String, String, PairStatsValues)> {
+    let stored = stored_pair_rows(db, space).await;
+    let full = full_recompute_rows(db, space, reference).await;
+    assert_eq!(
+        digest_of(&stored),
+        digest_of(&full),
+        "the stored table and a full recomputation disagree after {what}\n\
+         stored: {stored:#?}\nfull: {full:#?}"
+    );
+    stored
+}
+
+/// The claim `run_relevance_sweep` relies on when it refreshes a marginal but
+/// leaves `N` pinned: a support change moves the space total only above the
+/// hub cap.
+///
+/// `hub_weight(d) = 1` for every `d <= 64`, so a group under the cut
+/// contributes the same whether it touches two pages or sixty. Above it the
+/// weight is `64/d` and the contribution really does move, which is the one
+/// case where a bounded turn leaves `N` stale until the next full
+/// re-reference -- the bounded, queryable staleness Q1's pin sanctions.
+#[test]
+fn a_support_change_moves_the_space_total_only_above_the_hub_cap() {
+    let created_at = 1_800_000_000;
+    let group = |degree: usize| GroupSupport {
+        group_id: "g".to_string(),
+        degree: degree as i64,
+        newest_root_created_at: created_at,
+        pages: (0..degree.min(MAX_NEIGHBORS_PER_ENDPOINT))
+            .map(|index| format!("p{index}"))
+            .collect(),
+    };
+    let total = |degree: usize| SpaceMass::from_groups(&[group(degree)], created_at).total;
+
+    assert_eq!(
+        total(2),
+        total(MAX_NEIGHBORS_PER_ENDPOINT),
+        "under the cut the weight is 1 regardless of degree, so a support \
+         change cannot move N"
+    );
+    assert!(
+        total(MAX_NEIGHBORS_PER_ENDPOINT + 1) < total(MAX_NEIGHBORS_PER_ENDPOINT),
+        "crossing the cut must lower the contribution, which is what leaves N \
+         stale until the next full re-reference"
+    );
+}
+
+/// S0-91 mutation: root activation.
+///
+/// A group that was not in the eligible universe joins it. That is the
+/// applier's case rather than the sweep's -- the space total counts each
+/// eligible group once, so only a path that owns `N` may add one.
+#[tokio::test]
+async fn a_root_activation_leaves_the_table_equal_to_a_full_recomputation() {
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    seed_sparse_space(&db).await;
+
+    let pass = rereference(&db, "space-id-a", "space-a", 7).await;
+    let reference = pass.decay_reference;
+    let before = stored_pair_rows(&db, "space-a").await;
+
+    // g4 arrives already active over two pages that already have other support.
+    for page in ["p1", "p2"] {
+        seed_page_support(
+            &db,
+            &format!("r-g4-{page}"),
+            "space-a",
+            "g4",
+            page,
+            1_800_000_000,
+        )
+        .await;
+    }
+
+    let tx = db.tx().await;
+    let group = group_support(&tx, "space-a", "g4")
+        .await
+        .expect("group support")
+        .expect("g4 is eligible once its roots exist");
+    tx.commit().await.expect("commit read");
+
+    let tx = db.tx().await;
+    apply_group_mutation(
+        &tx,
+        "space-a",
+        &group,
+        reference,
+        crate::m6::relevance::EligibilityChange::Reactivated,
+    )
+    .await
+    .expect("apply activation");
+    tx.commit().await.expect("commit mutation");
+
+    let stored =
+        assert_equals_full_recomputation(&db, "space-a", reference, "a root activation").await;
+    let group_count = |rows: &[(String, String, PairStatsValues)]| {
+        rows.iter()
+            .find(|(page_a, page_b, _)| page_a == "p1" && page_b == "p2")
+            .map(|(_, _, values)| values.distinct_group_count)
+            .expect("(p1, p2) exists")
+    };
+    assert_eq!(
+        group_count(&stored),
+        group_count(&before) + 1,
+        "activating a group must raise the pair's distinct-group count"
+    );
+}
+
+/// S0-91 mutation: page support gain.
+///
+/// `g1` gains `p3`, which it did not support before. Reached through the
+/// sweep: the group was already in the universe, so `N` does not move, and
+/// `g1` stays under the top-64 cut so its own contribution does not either.
+#[tokio::test]
+async fn a_support_gain_leaves_the_table_equal_to_a_full_recomputation() {
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    seed_sparse_space(&db).await;
+
+    let pass = rereference(&db, "space-id-a", "space-a", 7).await;
+    let reference = pass.decay_reference;
+    let before = stored_pair_rows(&db, "space-a").await;
+
+    seed_page_support(&db, "r-g1-p3", "space-a", "g1", "p3", 1_800_000_000).await;
+    drain_bounded(&db, "space-id-a", "space-a", 8).await;
+
+    let stored =
+        assert_equals_full_recomputation(&db, "space-a", reference, "a support gain").await;
+    let count_of = |rows: &[(String, String, PairStatsValues)], a: &str, b: &str| {
+        rows.iter()
+            .find(|(page_a, page_b, _)| page_a == a && page_b == b)
+            .map(|(_, _, values)| values.distinct_group_count)
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        count_of(&stored, "p1", "p3"),
+        count_of(&before, "p1", "p3") + 1,
+        "the newly co-supported pair must gain a group"
+    );
+}
+
+/// S0-91 mutation: community rebinding.
+///
+/// Rebinding advances the grouping generation without touching any evidence.
+/// The pair table is keyed on pages and independence groups, so its *values*
+/// must come back identical -- only the generation stamp may move. A sweep
+/// that let community membership leak into a cell would show up here.
+#[tokio::test]
+async fn a_community_rebinding_changes_no_pair_value() {
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    seed_sparse_space(&db).await;
+
+    let pass = rereference(&db, "space-id-a", "space-a", 7).await;
+    let reference = pass.decay_reference;
+    let before = digest_of(&stored_pair_rows(&db, "space-a").await);
+
+    let (turns, _) = drain_bounded(&db, "space-id-a", "space-a", 8).await;
+    assert!(turns > 0, "the rebinding must actually re-derive something");
+
+    let stored =
+        assert_equals_full_recomputation(&db, "space-a", reference, "a community rebinding").await;
+    assert_eq!(
+        digest_of(&stored),
+        before,
+        "a rebinding carries no evidence change, so no cell may move"
+    );
+    let behind = db
+        .scalar(
+            "SELECT COUNT(*) FROM m6_pair_stats
+              WHERE space = 'space-a' AND updated_generation < 8",
+            (),
+        )
+        .await;
+    assert_eq!(
+        behind, 0,
+        "every pair must be restamped at the new generation"
+    );
+}
+
+/// S0-91 mutation: page deletion.
+#[tokio::test]
+async fn a_page_deletion_leaves_the_table_equal_to_a_full_recomputation() {
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    seed_sparse_space(&db).await;
+
+    let pass = rereference(&db, "space-id-a", "space-a", 7).await;
+    let reference = pass.decay_reference;
+    assert!(
+        stored_pair_rows(&db, "space-a")
+            .await
+            .iter()
+            .any(|(page_a, page_b, _)| page_a == "p3" || page_b == "p3"),
+        "the page about to be deleted must carry pairs first"
+    );
+
+    db.exec("DELETE FROM edges WHERE src_id = 'p3'", ()).await;
+    db.exec("DELETE FROM pages WHERE id = 'p3'", ()).await;
+    drain_bounded(&db, "space-id-a", "space-a", 8).await;
+
+    let stored =
+        assert_equals_full_recomputation(&db, "space-a", reference, "a page deletion").await;
+    assert!(
+        !stored
+            .iter()
+            .any(|(page_a, page_b, _)| page_a == "p3" || page_b == "p3"),
+        "no pair may reference a deleted page"
+    );
+}
+
+/// S0-91 mutation: space move.
+///
+/// From the source space this looks like a deletion, and it must not leave the
+/// moved page's pairs behind -- a stale pair keyed on a page that now lives
+/// elsewhere is a cross-space leak into whatever reads the table next.
+#[tokio::test]
+async fn a_space_move_leaves_the_source_space_equal_to_a_full_recomputation() {
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    db.seed_space("space-id-b", "space-b").await;
+    seed_sparse_space(&db).await;
+
+    let pass = rereference(&db, "space-id-a", "space-a", 7).await;
+    let reference = pass.decay_reference;
+
+    db.exec("UPDATE pages SET space = 'space-b' WHERE id = 'p3'", ())
+        .await;
+    db.exec("UPDATE edges SET space = 'space-b' WHERE src_id = 'p3'", ())
+        .await;
+    drain_bounded(&db, "space-id-a", "space-a", 8).await;
+
+    let stored = assert_equals_full_recomputation(&db, "space-a", reference, "a space move").await;
+    assert!(
+        !stored
+            .iter()
+            .any(|(page_a, page_b, _)| page_a == "p3" || page_b == "p3"),
+        "the source space must not keep pairs for a page that moved away"
+    );
+}
+
+/// S0-91's closing requirement: the eight mutations interleaved.
+///
+/// Fixed order rather than a seeded shuffle -- the point is that the paths
+/// compose, and a randomized order that only ever runs once is a fixed order
+/// that nobody can reproduce from the failure message.
+#[tokio::test]
+async fn interleaved_mutations_leave_the_table_equal_to_a_full_recomputation() {
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    db.seed_space("space-id-b", "space-b").await;
+    seed_sparse_space(&db).await;
+
+    let pass = rereference(&db, "space-id-a", "space-a", 7).await;
+    let reference = pass.decay_reference;
+    let mut generation = 8;
+
+    // support gain, then a retraction through the applier, then a deletion,
+    // then a reactivation, then a move -- alternating the two mechanisms so a
+    // path that corrupted the other's state would not survive the sequence.
+    seed_page_support(&db, "r-g1-p3", "space-a", "g1", "p3", 1_800_000_000).await;
+    drain_bounded(&db, "space-id-a", "space-a", generation).await;
+    generation += 1;
+
+    let tx = db.tx().await;
+    let g3 = group_support(&tx, "space-a", "g3")
+        .await
+        .expect("group support")
+        .expect("g3 eligible");
+    tx.commit().await.expect("commit read");
+    for change in [
+        crate::m6::relevance::EligibilityChange::Retracted,
+        crate::m6::relevance::EligibilityChange::Reactivated,
+    ] {
+        let tx = db.tx().await;
+        apply_group_mutation(&tx, "space-a", &g3, reference, change)
+            .await
+            .expect("apply mutation");
+        tx.commit().await.expect("commit mutation");
+    }
+
+    db.exec("DELETE FROM edges WHERE src_id = 'p4'", ()).await;
+    db.exec("DELETE FROM pages WHERE id = 'p4'", ()).await;
+    drain_bounded(&db, "space-id-a", "space-a", generation).await;
+    generation += 1;
+
+    db.exec("UPDATE pages SET space = 'space-b' WHERE id = 'p5'", ())
+        .await;
+    db.exec("UPDATE edges SET space = 'space-b' WHERE src_id = 'p5'", ())
+        .await;
+    drain_bounded(&db, "space-id-a", "space-a", generation).await;
+
+    let stored =
+        assert_equals_full_recomputation(&db, "space-a", reference, "an interleaved sequence")
+            .await;
+    assert!(
+        !stored.is_empty(),
+        "the sequence must not empty the table, or the equality is vacuous"
+    );
+    assert!(
+        !stored.iter().any(
+            |(page_a, page_b, _)| ["p4", "p5"].contains(&page_a.as_str())
+                || ["p4", "p5"].contains(&page_b.as_str())
+        ),
+        "neither the deleted page nor the moved one may survive"
+    );
+}
+
 /// S0-91 mutation: page support loss.
 ///
 /// `g0` is the only group co-supporting `(p1, p3)`, so retiring its `p3` edge
