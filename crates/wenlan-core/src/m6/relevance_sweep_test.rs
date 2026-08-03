@@ -5,10 +5,12 @@
 //! integration test would not be guaranteed in L3/L4.
 
 use super::relevance_sweep::{
-    advance_decay_reference, decay_reference, decayed_contribution, group_support, hub_weight,
-    COUNTER_RELEVANCE_DECAY_REFERENCE, DECAY_HALF_LIFE_DAYS,
+    advance_decay_reference, decay_reference, decayed_contribution, eligible_groups, group_support,
+    hub_weight, recompute_pair_stats, GroupSupport, COUNTER_RELEVANCE_DECAY_REFERENCE,
+    DECAY_HALF_LIFE_DAYS,
 };
 use crate::m6::genesis_test_support::GenesisDb;
+use crate::m6::relevance::{qualified_co_citation, MAX_NEIGHBORS_PER_ENDPOINT};
 
 const SECONDS_PER_DAY: i64 = 86_400;
 
@@ -358,6 +360,182 @@ async fn support_selects_over_exactly_d1s_eligible_edges() {
         support.pages
     );
     assert_eq!(support.degree, 1);
+}
+
+/// A group whose pages all share one instant, at full hub weight.
+fn group(id: &str, pages: &[&str], created_at: i64) -> GroupSupport {
+    GroupSupport {
+        group_id: id.to_string(),
+        degree: pages.len() as i64,
+        newest_root_created_at: created_at,
+        pages: pages.iter().map(|page| page.to_string()).collect(),
+    }
+}
+
+#[tokio::test]
+async fn the_four_cells_always_sum_to_the_spaces_total_mass() {
+    // This identity is why n00 can be derived instead of accumulated, and
+    // deriving it is what keeps the incremental path bounded — a stored n00
+    // would have to be rewritten for every pair in the space each time one
+    // group's eligibility changed.
+    let reference = 1_800_000_000_i64;
+    let groups = [
+        group("g1", &["page-a", "page-b"], reference),
+        group(
+            "g2",
+            &["page-a", "page-c"],
+            reference - 90 * SECONDS_PER_DAY,
+        ),
+        group("g3", &["page-d"], reference - 360 * SECONDS_PER_DAY),
+        group("g4", &["page-b", "page-c", "page-a"], reference),
+    ];
+    // N accumulated independently of the function under test.
+    let total: f64 = groups
+        .iter()
+        .map(|g| decayed_contribution(hub_weight(g.degree), g.newest_root_created_at, reference))
+        .sum();
+
+    let stats = recompute_pair_stats(&groups, reference);
+    assert!(!stats.is_empty(), "these groups form pairs");
+    for (pair, values) in &stats {
+        let sum = values.n11 + values.n10 + values.n01 + values.n00;
+        assert!(
+            (sum - total).abs() < 1e-9,
+            "{pair:?} cells sum to {sum}, not the space total {total}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_pair_counts_each_group_once_however_many_pages_it_shares() {
+    // D1's collapse rule at the pair level: `distinct_group_count` counts
+    // groups, so one document split across many roots of one group cannot
+    // manufacture a floor-clearing pair.
+    let reference = 1_800_000_000_i64;
+    let groups = [
+        group("g1", &["page-a", "page-b"], reference),
+        group("g2", &["page-a", "page-b"], reference),
+        group("g3", &["page-a", "page-b"], reference),
+    ];
+    let stats = recompute_pair_stats(&groups, reference);
+    let pair = stats
+        .get(&("page-a".to_string(), "page-b".to_string()))
+        .expect("the pair exists");
+
+    assert_eq!(
+        pair.distinct_group_count, 3,
+        "three groups, counted once each"
+    );
+    assert!(
+        qualified_co_citation(pair),
+        "three distinct groups clears D1's floor"
+    );
+    // Nothing supports only one side, so n10 and n01 are empty.
+    assert!(pair.n10.abs() < 1e-12 && pair.n01.abs() < 1e-12);
+    assert!(pair.n00.abs() < 1e-12, "every group supports both");
+}
+
+#[tokio::test]
+async fn the_floor_is_derived_at_read_time_not_stored() {
+    // G6's D1 row: a retraction below three groups must read `false`
+    // immediately. `qualified_co_citation` recomputes from the stored count,
+    // so there is no cached bit that could stay true.
+    let reference = 1_800_000_000_i64;
+    let three = [
+        group("g1", &["page-a", "page-b"], reference),
+        group("g2", &["page-a", "page-b"], reference),
+        group("g3", &["page-a", "page-b"], reference),
+    ];
+    let key = ("page-a".to_string(), "page-b".to_string());
+    assert!(qualified_co_citation(
+        recompute_pair_stats(&three, reference).get(&key).unwrap()
+    ));
+
+    // Drop one group — the same pair, now below the floor.
+    let two = &three[..2];
+    let below = recompute_pair_stats(two, reference);
+    let pair = below.get(&key).unwrap();
+    assert_eq!(pair.distinct_group_count, 2);
+    assert!(
+        !qualified_co_citation(pair),
+        "two groups must read as not qualified the moment the third goes"
+    );
+}
+
+#[tokio::test]
+async fn a_hub_group_forms_at_most_two_thousand_and_sixteen_pairs() {
+    // G6.7. C(64,2) = 2016, and it must follow from capping the *selection*:
+    // an implementation that caps only the weight still forms C(5000,2) pairs.
+    let reference = 1_800_000_000_i64;
+    let pages: Vec<String> = (0..MAX_NEIGHBORS_PER_ENDPOINT)
+        .map(|index| format!("page-{index:04}"))
+        .collect();
+    let hub = GroupSupport {
+        group_id: "hub".to_string(),
+        // A real 5000-page hub, cut to its top 64.
+        degree: 5_000,
+        newest_root_created_at: reference,
+        pages,
+    };
+
+    let stats = recompute_pair_stats(std::slice::from_ref(&hub), reference);
+    assert_eq!(stats.len(), 2_016, "C(64,2)");
+    let contribution = decayed_contribution(hub_weight(5_000), reference, reference);
+    assert!(
+        (contribution - 0.0128).abs() < 1e-12,
+        "and each of those pairs carries the hub-damped weight, not 1.0"
+    );
+    for values in stats.values() {
+        assert!((values.n11 - 0.0128).abs() < 1e-12);
+    }
+}
+
+#[tokio::test]
+async fn an_older_group_contributes_less_to_the_same_pair() {
+    let reference = 1_800_000_000_i64;
+    let fresh = recompute_pair_stats(&[group("g", &["page-a", "page-b"], reference)], reference);
+    let aged = recompute_pair_stats(
+        &[group(
+            "g",
+            &["page-a", "page-b"],
+            reference - (DECAY_HALF_LIFE_DAYS as i64) * SECONDS_PER_DAY,
+        )],
+        reference,
+    );
+    let key = ("page-a".to_string(), "page-b".to_string());
+    assert!((fresh.get(&key).unwrap().n11 - 1.0).abs() < 1e-12);
+    assert!((aged.get(&key).unwrap().n11 - 0.5).abs() < 1e-12);
+    assert_eq!(
+        aged.get(&key).unwrap().distinct_group_count,
+        1,
+        "decay never touches the undecayed floor count"
+    );
+}
+
+#[tokio::test]
+async fn the_full_recompute_reads_groups_in_independence_group_order() {
+    // S0-92. The order comes from the query, so this asserts the query's
+    // ORDER BY rather than a Rust-side sort — there is one place it can be
+    // wrong and this is it.
+    let db = GenesisDb::new().await;
+    for (root, group_id, page) in [
+        ("root-3", "g-c", "page-x"),
+        ("root-1", "g-a", "page-y"),
+        ("root-2", "g-b", "page-z"),
+    ] {
+        seed_page_support(&db, root, "space-a", group_id, page, 1_000).await;
+    }
+
+    let tx = db.tx().await;
+    let groups = eligible_groups(&tx, "space-a").await.expect("read groups");
+    tx.commit().await.expect("commit");
+
+    let ids: Vec<&str> = groups.iter().map(|g| g.group_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["g-a", "g-b", "g-c"],
+        "groups arrive in independence_group_id ASC, whatever order they were written"
+    );
 }
 
 #[tokio::test]

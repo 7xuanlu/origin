@@ -40,8 +40,9 @@
 
 use super::evidence::read_counter;
 use super::independence::ELIGIBLE_EVIDENCE_PREDICATE;
-use super::relevance::MAX_NEIGHBORS_PER_ENDPOINT;
+use super::relevance::{PairStatsValues, MAX_NEIGHBORS_PER_ENDPOINT};
 use crate::WenlanError;
+use std::collections::BTreeMap;
 
 /// Q1's per-space decay reference: the `unixepoch()` at which this space's pair
 /// table was last re-referenced.
@@ -243,4 +244,174 @@ pub async fn group_support(
         newest_root_created_at,
         pages,
     }))
+}
+
+/// Every eligible group in the space, each with its bounded page set, ordered
+/// `independence_group_id ASC`.
+///
+/// The order is S0-92's, and it is produced by the query rather than sorted
+/// afterwards so there is one place it can be wrong. `ROW_NUMBER()` applies
+/// S0-89's top-64 per group while `COUNT(*) OVER (PARTITION BY …)` reports each
+/// group's true degree, the same split [`group_support`] makes for one group.
+///
+/// This is the **full** side of the oracle and is deliberately unbounded in
+/// group count: it is the re-reference pass, not the bounded slice. The ≤512
+/// materialization budget applies to a route evaluation.
+pub async fn eligible_groups(
+    tx: &libsql::Transaction,
+    space: &str,
+) -> Result<Vec<GroupSupport>, WenlanError> {
+    let sql = format!(
+        "WITH page_edges AS (
+             SELECT e.*, e.src_id AS page_id FROM edges e WHERE e.src_kind = 'page'
+             UNION ALL
+             SELECT e.*, e.dst_id AS page_id FROM edges e WHERE e.dst_kind = 'page'
+         ),
+         support AS (
+             SELECT r.independence_group_id AS gid,
+                    e.page_id                AS page_id,
+                    MAX(r.created_at)        AS support_recency
+               FROM page_edges e
+               JOIN provenance_roots r ON r.root_id = e.root_id
+              WHERE e.space = ?1
+                AND {ELIGIBLE_EVIDENCE_PREDICATE}
+              GROUP BY gid, e.page_id
+         ),
+         ranked AS (
+             SELECT gid, page_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY gid ORDER BY support_recency DESC, page_id ASC
+                    )                                        AS rank_in_group,
+                    COUNT(*)   OVER (PARTITION BY gid)       AS degree,
+                    MAX(support_recency) OVER (PARTITION BY gid) AS newest
+               FROM support
+         )
+         SELECT gid, page_id, degree, newest
+           FROM ranked
+          WHERE rank_in_group <= {MAX_NEIGHBORS_PER_ENDPOINT}
+          ORDER BY gid ASC, rank_in_group ASC"
+    );
+
+    let mut rows = tx
+        .query(&sql, libsql::params![space])
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 eligible groups: {error}")))?;
+
+    let mut groups: Vec<GroupSupport> = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 eligible groups row: {error}")))?
+    {
+        let gid = row
+            .get::<String>(0)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 eligible groups gid: {error}")))?;
+        let page = row
+            .get::<String>(1)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 eligible groups page: {error}")))?;
+        let degree = row.get::<i64>(2).map_err(|error| {
+            WenlanError::VectorDb(format!("m6 eligible groups degree: {error}"))
+        })?;
+        let newest = row
+            .get::<i64>(3)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 eligible groups age: {error}")))?;
+
+        match groups.last_mut() {
+            Some(last) if last.group_id == gid => last.pages.push(page),
+            _ => groups.push(GroupSupport {
+                group_id: gid,
+                degree,
+                newest_root_created_at: newest,
+                pages: vec![page],
+            }),
+        }
+    }
+    Ok(groups)
+}
+
+/// The whole space's pair table at a fixed decay reference — the **full** side
+/// of S0-91's oracle.
+///
+/// # Why `n00` is derived rather than accumulated
+///
+/// The artifacts define `n00` as "groups supporting neither" and store it as a
+/// column, but never say how it is *maintained*. Accumulating it per pair makes
+/// the incremental path unbounded: retracting one group changes "supports
+/// neither" for **every** pair in the space, not only the pairs that group
+/// touches — so an implementation that stores `n00` as an independent sum must
+/// rewrite the entire table on every eligibility change, and S0-91's negative
+/// control (the incremental path stayed within its row-visit bound) could never
+/// pass.
+///
+/// It does not have to be independent. §2.2 uses `n00` only through
+/// `Ñ = ñ11 + ñ10 + ñ01 + ñ00 = N + 2.0`, and `N` — the total decayed mass of
+/// the space's eligible groups — is a **per-space** scalar, identical for every
+/// pair. Every eligible group falls in exactly one of the four cells, so
+///
+/// ```text
+/// n00(A,B) = N - n11(A,B) - n10(A,B) - n01(A,B)
+/// ```
+///
+/// is an identity, not an approximation. `n00` is therefore derived data that
+/// happens to be materialized, which keeps the incremental path bounded to the
+/// pairs a group actually forms. Deriving it here — in the one function every
+/// consumer goes through — is what makes the stored column a cache rather than
+/// a second source of truth.
+///
+/// Accumulation is in `independence_group_id ASC` (S0-92), which `groups`
+/// already carries from [`eligible_groups`]; `n10`/`n01`/`n00` are then single
+/// subtractions off deterministic sums, so the whole table is reproducible.
+pub fn recompute_pair_stats(
+    groups: &[GroupSupport],
+    reference: i64,
+) -> BTreeMap<(String, String), PairStatsValues> {
+    let mut total_mass = 0.0_f64;
+    let mut page_mass: BTreeMap<&str, f64> = BTreeMap::new();
+    // n11 and the undecayed distinct-group count, accumulated together so a
+    // pair can never gain decayed co-support without gaining a group.
+    let mut co_support: BTreeMap<(&str, &str), (f64, i64)> = BTreeMap::new();
+
+    for group in groups {
+        let contribution = decayed_contribution(
+            hub_weight(group.degree),
+            group.newest_root_created_at,
+            reference,
+        );
+        total_mass += contribution;
+        for page in &group.pages {
+            *page_mass.entry(page.as_str()).or_insert(0.0) += contribution;
+        }
+
+        // `page_a < page_b` is the table's CHECK, so the pair key is built from
+        // a lexicographically sorted copy rather than the recency order the
+        // selection returned.
+        let mut ordered: Vec<&str> = group.pages.iter().map(String::as_str).collect();
+        ordered.sort_unstable();
+        for (index, page_a) in ordered.iter().enumerate() {
+            for page_b in &ordered[index + 1..] {
+                let cell = co_support.entry((page_a, page_b)).or_insert((0.0, 0));
+                cell.0 += contribution;
+                cell.1 += 1;
+            }
+        }
+    }
+
+    co_support
+        .into_iter()
+        .map(|((page_a, page_b), (n11, distinct_group_count))| {
+            let mass_a = page_mass.get(page_a).copied().unwrap_or(0.0);
+            let mass_b = page_mass.get(page_b).copied().unwrap_or(0.0);
+            // Each cell is clamped at zero: the table's CHECKs forbid a
+            // negative, and the only way to reach one here is float error in
+            // the last bits of a subtraction that is exact in real arithmetic.
+            let values = PairStatsValues {
+                n11,
+                n10: (mass_a - n11).max(0.0),
+                n01: (mass_b - n11).max(0.0),
+                n00: (total_mass - mass_a - mass_b + n11).max(0.0),
+                distinct_group_count,
+            };
+            ((page_a.to_string(), page_b.to_string()), values)
+        })
+        .collect()
 }
