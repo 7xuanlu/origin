@@ -176,6 +176,15 @@ class RuntimeImageTests(unittest.TestCase):
         self.assertIn("COPY --chown=65532:65532 data/ /data/", final)
         self.assertIn("USER 65532:65532", final)
         self.assertIn('VOLUME ["/data"]', final)
+        # The image verifier rejects any image whose Env lacks an entry in
+        # REQUIRED_ENV, so the Dockerfile and that constant are one contract in
+        # two files. Assert they agree entry for entry: editing only the
+        # Dockerfile builds an image its own verifier then refuses, which is a
+        # release-time failure for something both files already state.
+        self.assertEqual(
+            {line[len("ENV ") :] for line in final if line.startswith("ENV ")},
+            set(self.module.REQUIRED_ENV),
+        )
         # The daemon writes its data-root lock to the root's PARENT, so the
         # data root must be nested strictly inside the writable volume. A root
         # of exactly /data puts the lock at / and the daemon cannot start.

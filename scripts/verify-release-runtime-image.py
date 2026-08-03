@@ -56,7 +56,11 @@ ARCHIVE_MEMBERS = ["wenlan", "wenlan-server", "wenlan-mcp"]
 REQUIRED_ENV = {
     "WENLAN_BIND_ADDR=0.0.0.0:7878",
     "WENLAN_PORT=7878",
-    "WENLAN_DATA_DIR=/data",
+    # Nested one level inside the volume: the daemon writes its data-root lock
+    # to the root's PARENT, so a root of /data puts the lock at / where the
+    # nonroot account cannot create it. Must stay identical to the Dockerfile's
+    # ENV lines — the contract test asserts the two agree entry for entry.
+    "WENLAN_DATA_DIR=/data/wenlan",
 }
 
 
