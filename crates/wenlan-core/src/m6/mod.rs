@@ -33,9 +33,17 @@ pub(crate) mod relevance;
 pub(crate) mod remaining_substrate;
 
 #[cfg(test)]
+mod candidates_test;
+#[cfg(test)]
+mod catalog_test;
+#[cfg(test)]
 mod digest_test;
 #[cfg(test)]
 mod frontier_policy_test;
+#[cfg(test)]
+mod frontier_test;
+#[cfg(test)]
+mod genesis_test_support;
 #[cfg(test)]
 mod identity_test;
 #[cfg(test)]
@@ -43,9 +51,15 @@ mod independence_test;
 #[cfg(test)]
 mod label_key_test;
 #[cfg(test)]
+mod leases_test;
+#[cfg(test)]
+mod mutation_oracle_test;
+#[cfg(test)]
 mod oracle_test;
 #[cfg(test)]
 mod overview_subscriptions_test;
+#[cfg(test)]
+mod recovery_test;
 #[cfg(test)]
 mod refresh_readiness_test;
 #[cfg(test)]

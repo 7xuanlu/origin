@@ -6,6 +6,7 @@ crates/wenlan-core/src/lint/pages/diagnostic_scale_test.rs|crate::lint::pages::d
 crates/wenlan-core/src/lint/pages/link_checks_test/orphans.rs|crate::lint::pages::link_checks::tests::orphans::query_failure_propagates_without_a_mutating_fallback|StandaloneLibsqlOrigin|1
 crates/wenlan-core/src/lint/test_support_tests.rs|crate::lint::test_support::tests::semantic_fingerprint_detects_same_count_mutation_in_every_catalogued_table|StandaloneLibsqlOrigin|1
 crates/wenlan-core/src/m6/frontier_policy_test.rs|crate::m6::frontier_policy_test::TestDb::new|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/m6/genesis_test_support.rs|crate::m6::genesis_test_support::GenesisDb::new|StandaloneLibsqlOrigin|1
 crates/wenlan-core/src/m6/independence_test.rs|crate::m6::independence_test::TestDb::new|StandaloneLibsqlOrigin|1
 crates/wenlan-core/src/m6/oracle_test.rs|crate::m6::oracle_test::TestDb::new|StandaloneLibsqlOrigin|1
 crates/wenlan-core/src/m6/overview_subscriptions_test.rs|crate::m6::overview_subscriptions_test::test_connection|StandaloneLibsqlOrigin|1

@@ -199,7 +199,7 @@ async fn empty_install_recomputes_empty() {
     let db = TestDb::new().await;
     db.seed_space("space-id-a", "space-a").await;
     let tx = db.tx().await;
-    let snapshot = recompute_full(&tx, "space-id-a", true).await.unwrap();
+    let snapshot = recompute_full(&tx, "space-id-a", 1, true).await.unwrap();
     assert!(snapshot.proposals.is_empty());
     assert!(diff(&snapshot, &GenesisSnapshot::default()).is_empty());
 }
@@ -214,7 +214,7 @@ async fn recompute_full_matches_the_signal_reader() {
     seed_three_admitting_groups(&db, "space-a").await;
 
     let tx = db.tx().await;
-    let snapshot = recompute_full(&tx, "space-id-a", false).await.unwrap();
+    let snapshot = recompute_full(&tx, "space-id-a", 1, false).await.unwrap();
     assert_eq!(snapshot.proposals.len(), 1);
     let proposal = &snapshot.proposals[0];
     assert_eq!(proposal.signal_kind, SignalKind::SpaceOverview);
@@ -240,7 +240,7 @@ async fn recompute_full_wires_community_signals_only_when_durable() {
     }
 
     let tx = db.tx().await;
-    let undurable = recompute_full(&tx, "space-id-a", false).await.unwrap();
+    let undurable = recompute_full(&tx, "space-id-a", 1, false).await.unwrap();
     let kinds: Vec<_> = undurable.proposals.iter().map(|p| p.signal_kind).collect();
     assert_eq!(
         kinds,
@@ -249,7 +249,7 @@ async fn recompute_full_wires_community_signals_only_when_durable() {
          even though the underlying evidence otherwise qualifies"
     );
 
-    let durable = recompute_full(&tx, "space-id-a", true).await.unwrap();
+    let durable = recompute_full(&tx, "space-id-a", 1, true).await.unwrap();
     let mut kinds: Vec<_> = durable.proposals.iter().map(|p| p.signal_kind).collect();
     kinds.sort_by_key(|k| format!("{k:?}"));
     assert_eq!(
@@ -267,6 +267,7 @@ async fn recompute_full_wires_community_signals_only_when_durable() {
 async fn diff_is_empty_for_identical_snapshots() {
     let a = GenesisSnapshot {
         proposals: vec![sample_proposal(3)],
+        ..Default::default()
     };
     let b = a.clone();
     assert!(diff(&a, &b).is_empty());
@@ -278,9 +279,11 @@ async fn diff_is_empty_for_identical_snapshots() {
 async fn diff_detects_field_level_divergence() {
     let a = GenesisSnapshot {
         proposals: vec![sample_proposal(3)],
+        ..Default::default()
     };
     let b = GenesisSnapshot {
         proposals: vec![sample_proposal(4)],
+        ..Default::default()
     };
     let divergences = diff(&a, &b);
     assert_eq!(divergences.len(), 1);
@@ -298,12 +301,14 @@ async fn diff_detects_added_and_removed_proposals() {
 
     let a = GenesisSnapshot {
         proposals: vec![sample_proposal(3)],
+        ..Default::default()
     };
     let b = GenesisSnapshot {
         proposals: vec![sample_proposal(3), extra],
+        ..Default::default()
     };
     let divergences = diff(&a, &b);
     assert_eq!(divergences.len(), 1);
-    assert_eq!(divergences[0].slot_id, "slot-b");
+    assert_eq!(divergences[0].key, "slot-b");
     assert!(divergences[0].detail.contains("absent in a"));
 }
