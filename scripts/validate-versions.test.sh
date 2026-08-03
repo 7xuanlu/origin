@@ -204,7 +204,9 @@ import sys
 from pathlib import Path
 
 workflow = Path(sys.argv[1]).read_text()
-for job in ["prepare-release", "promote-assets", "docker", "publish-crates", "publish-npm"]:
+
+
+def job_body(job):
     match = re.search(
         rf"^  {re.escape(job)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
         workflow,
@@ -212,7 +214,21 @@ for job in ["prepare-release", "promote-assets", "docker", "publish-crates", "pu
     )
     if not match:
         raise SystemExit(1)
-    body = match.group("body")
+    return match.group("body")
+
+
+# promote-assets runs the same promotion resolver as resolve-promotion, so it
+# is control plane: pinning it to the release commit would run the release's
+# own copy of the tooling, and a resolver fix could never reach a recovery of
+# that release. It still revalidates the receipt-derived tag.
+promote = job_body("promote-assets")
+if "ref: ${{ github.sha }}" not in promote or "ref: ${{ env.RELEASE_SHA }}" in promote:
+    raise SystemExit(1)
+if "/git/ref/tags/$RELEASE_TAG" not in promote or "RELEASE_SHA" not in promote:
+    raise SystemExit(1)
+
+for job in ["prepare-release", "docker", "publish-crates", "publish-npm"]:
+    body = job_body(job)
     if "ref: ${{ env.RELEASE_SHA }}" not in body or "ref: ${{ github.sha }}" in body:
         raise SystemExit(1)
     if "/git/ref/tags/$RELEASE_TAG" not in body or "RELEASE_SHA" not in body:
@@ -222,7 +238,7 @@ then
     echo "FAIL test 10: every release source/publish job must use RELEASE_SHA and revalidate the live tag"
     exit 1
 fi
-echo "PASS test 10: resolver keeps immutable main control code; source/publish jobs pin RELEASE_SHA and verify RELEASE_TAG"
+echo "PASS test 10: promotion keeps immutable main control code; source/publish jobs pin RELEASE_SHA and verify RELEASE_TAG"
 
 python3 "$REPO_ROOT/scripts/release-workflow-contract.test.py"
 echo "PASS test 11: release promotion and public install contracts"

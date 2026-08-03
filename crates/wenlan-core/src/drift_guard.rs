@@ -913,9 +913,15 @@ fn release_please_trigger_violations(workflow: &str) -> Vec<String> {
     if create["if"].as_str() != Some("needs.route-main.outputs.state == 'validated'")
         || !create_run.contains("refs/tags/$RELEASE_TAG")
         || !create_run.contains("sha=\"$MAIN_SHA\"")
+        || !create_run.contains("tag_lookup_status=$?")
+        || !create_run.contains("'.status | tostring'")
+        || !create_run.contains("[[ \"$tag_api_status\" != 404 ]]")
+        || create_run.contains("|| true")
     {
-        violations
-            .push("validated release route does not create only the exact receipt tag".into());
+        violations.push(
+            "validated release route does not fail closed before creating the exact receipt tag"
+                .into(),
+        );
     }
     violations
 }
@@ -5964,13 +5970,18 @@ fn release_promotion_contract_violations(
             "release resolver is not pinned to its immutable read-only main control plane".into(),
         );
     }
-    for job_name in [
-        "prepare-release",
-        "promote-assets",
-        "docker",
-        "publish-crates",
-        "publish-npm",
-    ] {
+    // Promotion runs the same resolver as resolve-promotion, so it is control
+    // plane too. Pinning it to the release commit would run the release's own
+    // copy of the promotion tooling, so a resolver fix could never reach a
+    // recovery of that release.
+    let promote_text =
+        serde_yaml::to_string(&release["jobs"]["promote-assets"]).unwrap_or_default();
+    if !promote_text.contains("ref: ${{ github.sha }}")
+        || promote_text.contains("ref: ${{ env.RELEASE_SHA }}")
+    {
+        violations.push("asset promotion is not pinned to its immutable main control plane".into());
+    }
+    for job_name in ["prepare-release", "docker", "publish-crates", "publish-npm"] {
         let job_text = serde_yaml::to_string(&release["jobs"][job_name]).unwrap_or_default();
         if !job_text.contains("ref: ${{ env.RELEASE_SHA }}")
             || job_text.contains("ref: ${{ github.sha }}")
@@ -6119,6 +6130,9 @@ fn release_promotion_contract_violations(
         if !promotion_script.contains(required) {
             violations.push(format!("promotion resolver omits {required:?}"));
         }
+    }
+    if promotion_script.contains("output_dir.mkdir(parents=True, exist_ok=False)") {
+        violations.push("promotion resolver pre-creates the safe extraction destination".into());
     }
     violations
 }

@@ -200,6 +200,9 @@ def contract_violations(
         "needs.route-main.outputs.state == 'validated'",
         "GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}",
         "MAIN_SHA: ${{ github.event.workflow_run.head_sha }}",
+        "tag_lookup_status=$?",
+        "'.status | tostring'",
+        'if [[ "$tag_api_status" != 404 ]]',
         'if [[ "$pending" != true || "$tagged" != false ]]',
         'if [[ "$existing_sha" != "$MAIN_SHA" ]]',
         '-f ref="refs/tags/$RELEASE_TAG"',
@@ -207,6 +210,8 @@ def contract_violations(
     ]:
         if marker not in create_tag:
             violations.append(f"validated tag creation omits {marker!r}")
+    if re.search(r"git/ref/tags/\$RELEASE_TAG[\s\S]{0,240}\|\| true", create_tag):
+        violations.append("validated tag lookup swallows an API failure")
 
     trigger = re.search(
         r"^on:\n(?P<body>.*?)(?=^concurrency:)",
@@ -332,9 +337,18 @@ def contract_violations(
         or "ref: ${{ env.RELEASE_SHA }}" in resolver_checkout
     ):
         violations.append("release resolver is not pinned to its immutable main control SHA")
+    # Promotion runs the same resolver as resolve-promotion, so it is control
+    # plane too. Pinning it to the release commit would run the release's own
+    # copy of the promotion tooling, so a resolver fix could never reach a
+    # recovery of that release.
+    promote_checkout = job_body(release, "promote-assets")
+    if (
+        "ref: ${{ github.sha }}" not in promote_checkout
+        or "ref: ${{ env.RELEASE_SHA }}" in promote_checkout
+    ):
+        violations.append("asset promotion is not pinned to its immutable main control SHA")
     for job_name in [
         "prepare-release",
-        "promote-assets",
         "docker",
         "publish-crates",
         "publish-npm",
@@ -539,6 +553,18 @@ def contract_violations(
     ):
         violations.append("release lifecycle swallows a pending-label deletion failure")
 
+    # A swallowed tag listing yields an empty highest-tag, which silently drops
+    # the latest promotion while still reporting success.
+    for label, body in (("GHCR", manifest), ("GitHub release", finalize)):
+        if "tag_list_status=$?" not in body:
+            violations.append(
+                f"{label} latest decision does not branch on the tag listing exit status"
+            )
+        if re.search(r"matching-refs/tags/v[\s\S]{0,200}\|\| true", body):
+            violations.append(f"{label} latest decision swallows a tag listing failure")
+        if 'if [[ -z "$highest" ]]' not in body:
+            violations.append(f"{label} latest decision accepts an empty tag list")
+
     for marker in [
         'expected_name = f"validated-release-receipt-{run_id}-{run_attempt}"',
         "MAX_RECEIPT_CANDIDATES = 20",
@@ -556,6 +582,8 @@ def contract_violations(
     ]:
         if marker not in promotion:
             violations.append(f"release promotion resolver omits fail-closed evidence {marker!r}")
+    if "output_dir.mkdir(parents=True, exist_ok=False)" in promotion:
+        violations.append("release promotion pre-creates the safe extraction destination")
 
     action_documents = release + "\n" + release_please
     seen: set[str] = set()
