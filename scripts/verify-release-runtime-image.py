@@ -127,10 +127,14 @@ def prepare_context(
     server_sha = sha256_file(server)
 
     build_context = context_dir / "context"
-    data_dir = build_context / "data"
+    # The daemon keeps its data-root lock in the root's PARENT, so the data
+    # root must be nested one level inside the volume: with a data root of
+    # /data the lock lands at /.wenlan-daemon-*.lock, which the nonroot
+    # account cannot create. Nesting puts the lock in /data, which it owns.
+    data_dir = build_context / "data" / "wenlan"
     data_dir.mkdir(parents=True)
-    # Keep the directory in BuildKit's context tar so COPY can materialize it
-    # with numeric nonroot ownership. This file is harmless inside /data.
+    # Keep both directories in BuildKit's context tar so COPY can materialize
+    # them with numeric nonroot ownership. This file is harmless inside /data.
     (data_dir / ".volume-seed").write_bytes(b"")
     destination = build_context / "wenlan-server"
     shutil.copyfile(server, destination)
