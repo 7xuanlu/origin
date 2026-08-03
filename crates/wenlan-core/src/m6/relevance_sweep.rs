@@ -88,10 +88,16 @@ pub const SWEEP_CANDIDATE_WINDOW: usize = 8;
 ///
 /// S0-95 is explicit that these are runtime counters or they are nothing: a
 /// textual `LIMIT 512` on an unindexed predicate visits the whole table and
-/// still reports 512 rows, and `EXPLAIN QUERY PLAN` reports the plan, not the
-/// work. The other two instruments (`FULLSCAN_STEP`, `SQLITE_SCANSTAT_NVISIT`)
-/// need a build this crate does not produce; §8.7 records them as declared
-/// deferrals, discharged by the local bench receipt.
+/// still reports 512 rows.
+///
+/// Of S0-95's other two, instrument 3 (`FULLSCAN_STEP`) needs the
+/// `SQLITE_ENABLE_STMT_SCANSTATUS` build this crate does not produce, and
+/// instrument 4 (`EXPLAIN QUERY PLAN`) is not gated by S0-95's own reasoning —
+/// it reports the plan, not the work, so an index range scan over a 5,000-degree
+/// hub is a passing EQP assertion and an unbounded traversal. S0-157's
+/// `SQLITE_SCANSTAT_NVISIT` is a fifth, bench-only, and not one of the four.
+/// §8.7 records the ungated ones as declared deferrals, discharged by the local
+/// bench receipt.
 ///
 /// Exceeding a bound is an error, not a truncation — a sweep that silently did
 /// less work would look identical to one that stayed in budget.

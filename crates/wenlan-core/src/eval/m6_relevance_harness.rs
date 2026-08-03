@@ -32,13 +32,22 @@ use anyhow::{Context, Result};
 
 use super::m6_bench_corpus::{write_corpus_stream, M6_ROOT_AGE_MAX_DAYS};
 
-/// One sweep turn's S0-95 instrument readings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One sweep turn's S0-95 instrument readings, plus its wall clock.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SweepTurnReceipt {
     pub kind: &'static str,
     pub endpoints_considered: usize,
     pub queries: u32,
     pub rows: u32,
+    /// Wall clock for the turn, transaction included.
+    ///
+    /// **Not `R-BENCH-MAX`.** That limit times the *route evaluation* — S0-96's
+    /// queries (a)-(d) over `m6_adjacency` and `m6_pair_stats` — and C1 builds
+    /// the writers of those two tables, not the reader. Timing the writer and
+    /// reporting it under the reader's name would be a number that looks like
+    /// a gate result and answers a different question. Recorded, never gated,
+    /// per §8.6's determinism split.
+    pub elapsed_ms: f64,
 }
 
 /// What one bench run observed.
@@ -64,6 +73,32 @@ impl RelevanceBudgetReceipt {
 
     pub fn peak_rows(&self) -> u32 {
         self.bounded_turns.iter().map(|t| t.rows).max().unwrap_or(0)
+    }
+
+    /// Slowest bounded turn, in milliseconds.
+    pub fn max_turn_ms(&self) -> f64 {
+        self.bounded_turns
+            .iter()
+            .map(|turn| turn.elapsed_ms)
+            .fold(0.0, f64::max)
+    }
+
+    /// Median bounded turn, lower of the two middles on an even count — the
+    /// receipt is a record, not an estimator, so interpolating would invent a
+    /// value no turn actually took.
+    pub fn p50_turn_ms(&self) -> f64 {
+        if self.bounded_turns.is_empty() {
+            return 0.0;
+        }
+        let mut sorted: Vec<f64> = self.bounded_turns.iter().map(|t| t.elapsed_ms).collect();
+        sorted.sort_by(f64::total_cmp);
+        sorted[(sorted.len() - 1) / 2]
+    }
+
+    /// What the numbers above were measured on. A timing without its machine
+    /// is not evidence (§8.6).
+    pub fn machine(&self) -> String {
+        format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
     }
 }
 
@@ -373,13 +408,16 @@ pub async fn run_relevance_budget_bench(
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
             .context("begin bounded turn")?;
+        let started = std::time::Instant::now();
         let turn = run_relevance_sweep(&tx, &space_id, &space_name, 8, attempt as i64 + 2).await;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let receipt = match &turn {
             Ok(RelevanceTurn::Swept(sweep)) => SweepTurnReceipt {
                 kind: "swept",
                 endpoints_considered: sweep.endpoints_considered,
                 queries: sweep.budget.queries,
                 rows: sweep.budget.rows,
+                elapsed_ms,
             },
             Ok(RelevanceTurn::Idle) => {
                 let _ = tx.commit().await;

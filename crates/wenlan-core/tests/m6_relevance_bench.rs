@@ -20,6 +20,35 @@
 //! §8.6 rules the count limits into CI and leaves the timing ones to a local
 //! receipt under S0-98's specified conditions (warm cache, one evaluation at a
 //! time, no concurrent refinery turn), which a hosted runner does not provide.
+//! The `sweep_turn_*_ms` fields the receipt prints are also not `R-BENCH-MAX`:
+//! that limit times the *route evaluation* over `m6_adjacency`/`m6_pair_stats`,
+//! and C1 builds those tables' writer, not their reader.
+//!
+//! ## Open: the row budget holds and the work does not (C1 measurement)
+//!
+//! Local receipt, `aarch64-macos`, release profile, corpus `06f0ee5c62d5e40c`:
+//!
+//! ```text
+//! space-0  2,000 pages  10,795 groups  60 turns  3 queries  459 rows  p50 1355ms  max 1912ms
+//! space-7    105 pages   1,874 groups   8 turns  3 queries  163 rows  p50  122ms  max  127ms
+//! ```
+//!
+//! Both count gates pass with room to spare, and a bounded turn still costs
+//! over a second. That gap is the defect S0-95 names in its own text — "a
+//! query that scans a million rows and returns 512" — and it is why that
+//! decision made `FULLSCAN_STEP` normative for *visited work* rather than the
+//! decoded-row counter. `candidate_endpoints` builds its `support` and
+//! `group_size` CTEs over the whole space before `stale`'s `LIMIT` cuts the
+//! result to a handful of endpoints, so per-turn cost tracks corpus size while
+//! the instrument that gates it does not.
+//!
+//! It is recorded rather than fixed here because nothing C1 ships runs on its
+//! own: the lane that would hold the single `MemoryDB` connection mutex for
+//! that second is C3's, and §12 orders C3 last for exactly this kind of reason.
+//! It is a real precondition for that lane, not a footnote — `WENLAN_ENABLE_
+//! ENTITY_PAGE_RECONCILE` is default-OFF today over the same failure mode at a
+//! larger constant. Per S0-99 this is an amendment question, and the number
+//! above is the evidence it needs.
 
 use std::io::{self, Write};
 use wenlan_core::eval::m6_bench_corpus::{
@@ -310,7 +339,8 @@ fn the_bounded_sweep_stays_inside_the_frozen_count_budgets() {
             .collect();
         println!(
             "[m6-relevance-bench] corpus={} space={} pages={} groups={} pairs={} turns={} \
-             endpoints={} width={:?}..{:?} peak_queries={} peak_rows={}",
+             endpoints={} width={:?}..{:?} peak_queries={} peak_rows={} \
+             sweep_turn_max_ms={:.1} sweep_turn_p50_ms={:.1} machine={}",
             &summary.sha256[..16],
             receipt.space,
             receipt.pages_in_space,
@@ -322,6 +352,15 @@ fn the_bounded_sweep_stays_inside_the_frozen_count_budgets() {
             widths.iter().max(),
             receipt.peak_queries(),
             receipt.peak_rows(),
+            // Recorded, never asserted. These time the sweep turn -- the
+            // writer C1 builds -- and are deliberately not named after
+            // `R-BENCH-MAX`, which times the route evaluation that reads the
+            // two tables the sweep writes. S0-99 binds the ungated half too:
+            // a number here that looks wrong is a contract amendment
+            // question, not a constant to relax.
+            receipt.max_turn_ms(),
+            receipt.p50_turn_ms(),
+            receipt.machine(),
         );
 
         assert!(
