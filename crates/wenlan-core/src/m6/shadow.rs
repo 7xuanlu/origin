@@ -18,8 +18,16 @@
 //!
 //! Steps 2–4 are tried against **one space per turn**, chosen round-robin, so a
 //! turn's cost is bounded by one space's differential query rather than by the
-//! store's space count. A turn that finds no work in its space advances the
-//! rotation and reports [`GenesisTurn::Idle`].
+//! store's space count. A turn that does no durable work in its space advances
+//! the rotation, so a space that is merely busy cannot starve the others.
+//!
+//! **Priority 3 refusing on the pending cap does not skip priority 4.** Step 4
+//! is the only step that moves a candidate out of a pending state, so it is the
+//! only step that can drain the cap that refused step 3. Ordering the two the
+//! other way — refuse, return, retry — is a livelock, not backpressure: the
+//! condition blocks the work that would clear the condition. The rule the
+//! ordering encodes is that *"I cannot take on more work" never preempts
+//! "finish the work I have"*.
 //!
 //! **Nothing runs while `genesis_enabled = 0`, and nothing here can change
 //! that.** Not one statement in this module writes `genesis_enabled`; the flag
@@ -88,8 +96,14 @@ pub enum GenesisTurn {
 impl GenesisTurn {
     /// Did this turn do durable work? The loop's adaptive delay reads this:
     /// 100ms when true, 1s when false (§4.1 point 5).
+    ///
+    /// **`RefusedBudget` is not work.** It is the pending cap saying "I cannot
+    /// take on more", which by S0-9 is not even a retry — and a turn that wrote
+    /// nothing must not buy the 100ms cadence. Counting it as work is what turns
+    /// a full cap into a 10 Hz spin on the shared connection mutex, because the
+    /// condition that produced the refusal is not one the refusal can clear.
     pub fn did_work(&self) -> bool {
-        !matches!(self, GenesisTurn::Idle)
+        !matches!(self, GenesisTurn::Idle | GenesisTurn::RefusedBudget)
     }
 }
 
@@ -173,16 +187,35 @@ pub async fn run_genesis_shadow_turn(
         return Ok(turn);
     }
     // Priority 3 — one candidate prepare for this space.
-    if let Some(turn) = prepare(conn, &space_id, &space, coverage.coverage_epoch).await? {
-        return Ok(turn);
-    }
+    //
+    // **A budget refusal must not short-circuit priority 4.** "I cannot take on
+    // more work" is not a reason to skip finishing the work already held — it is
+    // the strongest possible reason not to, because finalization is the only
+    // step that drains the pending cap. Returning here on `RefusedBudget` gives
+    // a full space no way out: the cap blocks the prepare, the prepare blocks
+    // the drain, and the cap stays full for the life of the process. So the
+    // refusal is remembered and the turn falls through.
+    let refused_budget = match prepare(conn, &space_id, &space, coverage.coverage_epoch).await? {
+        Some(GenesisTurn::RefusedBudget) => true,
+        Some(turn) => return Ok(turn),
+        None => false,
+    };
     // Priority 4 — one dry-run finalization.
     if let Some(turn) = finalize_one(conn, &space_id, &space).await? {
         return Ok(turn);
     }
 
+    // **Rotate on any turn that did no durable work, not only on `Idle`.**
+    // Keeping a productive space is the point of the round-robin; a space that
+    // just refused a prepare and had nothing to finalize is not productive, and
+    // holding the rotation on it starves every other space for as long as the
+    // condition lasts.
     state.rotation = state.rotation.wrapping_add(1);
-    Ok(GenesisTurn::Idle)
+    Ok(if refused_budget {
+        GenesisTurn::RefusedBudget
+    } else {
+        GenesisTurn::Idle
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +314,12 @@ async fn reconcile(
 /// the prepare is what E-1 verifies at finalization. Releasing it between turns
 /// would make E-1 unfalsifiable — it would refuse every candidate, and a gate
 /// that always refuses tests nothing.
+///
+/// `Some(GenesisTurn::RefusedBudget)` stops the proposal scan because the
+/// pending cap is per **space**: once it is full, every remaining proposal
+/// refuses for the same reason, so continuing would just re-derive the same
+/// answer sixteen times. It does **not** stop the *turn* — the caller treats it
+/// as a fall-through to priority 4, which is the step that drains the cap.
 async fn prepare(
     conn: &libsql::Connection,
     space_id: &str,

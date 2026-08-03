@@ -554,3 +554,413 @@ async fn the_loop_records_the_shadow_statistics() {
     assert_eq!(stats.suppressed, 0);
     assert_eq!(stats.quarantined, 0);
 }
+
+// ---------------------------------------------------------------------------
+// G4.9 — liveness: backpressure must never preempt draining
+// ---------------------------------------------------------------------------
+//
+// **Everything above this line is a safety gate, and safety gates pass
+// trivially on a wedged loop.** A shadow that spins forever without progressing
+// writes nothing outside M6, never moves `m6_mutation_count`, binds no card,
+// writes no suppression, and reports exactly one unit of work per turn — so all
+// twelve of the tests above stay green while the lane makes no progress at all
+// and holds the shared connection mutex ten times a second. The gates below are
+// the other half: the loop must *get somewhere*, and no space may starve
+// another.
+//
+// The defect they were written against: `prepare` refusing on the D8 pending
+// cap used to return from the whole turn, which skipped priority 4 — the only
+// step that moves a candidate out of a pending state. The cap blocked the
+// prepare, the prepare blocked the drain, and nothing cleared the cap. The
+// refusal also counted as work (100ms cadence) and left the rotation pinned to
+// the wedged space. Three individually-correct pieces, composed into a
+// livelock; only a driver-level test can see it.
+
+/// Fill `space` with pending filler candidates until the D8 cap would refuse.
+///
+/// Written directly rather than through `observe_candidate` because the point is
+/// to reach the cap, not to re-test the cap — `candidates_test.rs:269` already
+/// proves `observe_candidate` refuses at 128 and `frontier_test.rs:300` proves
+/// the refused group keeps its frontier row. `observed` is the cheapest of the
+/// five `PENDING_STATES` to fabricate and counts identically.
+async fn fill_pending_to_cap(db: &GenesisDb, space: &str) {
+    let live: i64 = db
+        .scalar(
+            "SELECT COUNT(*) FROM genesis_candidates
+              WHERE space = ?1
+                AND state IN ('observed','prepared','inferencing','validating','retry_wait')",
+            libsql::params![space],
+        )
+        .await;
+    for filler in live..super::constants::PENDING_CANDIDATES_PER_SPACE_CAP as i64 {
+        db.exec(
+            "INSERT INTO genesis_candidates (
+                 candidate_id, slot_id, page_id, space, signal_kind,
+                 coverage_epoch, input_generation, active_root_digest,
+                 state, attempt, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 'space-overview',
+                       1, 0, 'digest', 'observed', 0, unixepoch(), unixepoch())",
+            libsql::params![
+                format!("filler-cand-{filler}"),
+                format!("filler-slot-{filler}"),
+                // Distinct per filler: D4's exclusive concept claims are partial
+                // unique indexes, and 127 rows sharing one page id would be
+                // refused by an invariant this fixture is not trying to test.
+                format!("filler-page-{filler}"),
+                space
+            ],
+        )
+        .await;
+    }
+}
+
+/// Tick until a candidate is prepared, leaving `state` mid-rotation so the
+/// caller keeps ticking the same loop rather than a fresh one.
+async fn drive_to_prepared(db: &GenesisDb, state: &mut ShadowState, max_turns: usize) -> String {
+    for _ in 0..max_turns {
+        let turn = run_genesis_shadow_turn(&db.connection, state)
+            .await
+            .expect("shadow turn");
+        if let GenesisTurn::Prepared { candidate_id } = turn {
+            return candidate_id;
+        }
+    }
+    panic!("no candidate was prepared in {max_turns} turns");
+}
+
+/// Advance the space's coverage epoch — the shipped way a slot re-proposes.
+///
+/// `candidate_id` is `identity::candidate_id(slot_id, coverage_epoch)`, so a new
+/// epoch mints a *different* id for the same slot. This matters because
+/// `observe_candidate` checks "does this id already exist" **before** it checks
+/// the cap: re-proposing an unchanged slot returns `AlreadyPresent` and never
+/// reaches the cap at all. Without an epoch advance, a "capped space" test is
+/// vacuous — the prepare returns `None` for want of new work rather than
+/// refusing, and finalization is reached whether or not the livelock is fixed.
+async fn advance_coverage_epoch(db: &GenesisDb, space_id: &str) {
+    db.exec(
+        "UPDATE genesis_coverage_state SET coverage_epoch = coverage_epoch + 1
+          WHERE space_id = ?1",
+        libsql::params![space_id],
+    )
+    .await;
+}
+
+/// Candidate rows the space has minted at or past `epoch` — the observable
+/// witness for whether a prepare inserted anything.
+async fn candidates_at_epoch(db: &GenesisDb, space: &str, epoch: i64) -> i64 {
+    db.scalar(
+        "SELECT COUNT(*) FROM genesis_candidates WHERE space = ?1 AND coverage_epoch >= ?2",
+        libsql::params![space, epoch],
+    )
+    .await
+}
+
+/// **G4.9.1 — a space at the pending cap still reaches finalization.**
+///
+/// The scene is the one the M5 shadow measured, not a contrivance: 13 of 98
+/// evaluated pages were `supported`, so ~87% of page-mediated candidates refuse
+/// at E-8 and requeue into `retry_wait` — a pending state. The cap fills with
+/// the refusals of the work it is refusing to replace.
+///
+/// The three conditions the livelock needs must hold *simultaneously*, and each
+/// is asserted rather than assumed: the space is at the cap, a **fresh** proposal
+/// is arriving (so the cap genuinely refuses instead of returning
+/// `AlreadyPresent`), and a prepared candidate is due. The refusal is observed
+/// through its effect — no candidate row appears at the new epoch — and
+/// [`a_fresh_proposal_below_the_cap_does_mint_a_row`] is the paired control that
+/// makes that zero mean *refused* rather than *never proposed*.
+///
+/// RED control (source mutation, run by hand — a control-flow defect has no data
+/// mutation that reproduces it): restore `Some(GenesisTurn::RefusedBudget)` as
+/// an early `return` from `run_genesis_shadow_turn` and this test fails, because
+/// the turn never reaches priority 4 and the envelope keeps its `None` verdict.
+#[tokio::test]
+async fn a_capped_space_still_finalizes_the_work_it_holds() {
+    let db = scene().await;
+    let mut state = ShadowState::default();
+    let candidate_id = drive_to_prepared(&db, &mut state, 64).await;
+
+    // Precondition 1: the candidate is finalizable — stamped, no verdict.
+    let tx = db.tx().await;
+    let envelope = super::finalize::read_envelope(&tx, &candidate_id)
+        .await
+        .expect("read envelope")
+        .expect("the prepare stamped an envelope");
+    tx.commit().await.unwrap();
+    assert!(
+        envelope.verdict.is_none(),
+        "precondition: the candidate has not been finalized yet"
+    );
+
+    // Precondition 2: the space is at the D8 cap.
+    fill_pending_to_cap(&db, SPACE).await;
+    assert_eq!(
+        db.scalar(
+            "SELECT COUNT(*) FROM genesis_candidates
+              WHERE space = ?1
+                AND state IN ('observed','prepared','inferencing','validating','retry_wait')",
+            libsql::params![SPACE],
+        )
+        .await,
+        super::constants::PENDING_CANDIDATES_PER_SPACE_CAP as i64,
+        "precondition: the space is at the D8 cap"
+    );
+
+    // Precondition 3: new work is arriving, so the cap has something to refuse.
+    advance_coverage_epoch(&db, SPACE_ID).await;
+    assert_eq!(
+        candidates_at_epoch(&db, SPACE, 2).await,
+        0,
+        "precondition: the re-proposal has not been minted yet"
+    );
+
+    // Drive past the recovery scan and the frontier slices the epoch advance
+    // dirtied. The loop does one unit of work per turn by design (§4.2), so the
+    // property under test is that finalization is *reached*, not that it lands
+    // on any particular turn. With the livelock present this loop breaks on the
+    // first `RefusedBudget` and the assertions below fail — which is the point.
+    let mut turn = GenesisTurn::Idle;
+    for _ in 0..64 {
+        turn = run_genesis_shadow_turn(&db.connection, &mut state)
+            .await
+            .expect("shadow turn");
+        if !matches!(turn, GenesisTurn::Idle | GenesisTurn::Frontier { .. }) {
+            break;
+        }
+    }
+
+    assert_eq!(
+        candidates_at_epoch(&db, SPACE, 2).await,
+        0,
+        "the cap must still have refused the arriving proposal"
+    );
+    assert!(
+        matches!(
+            &turn,
+            GenesisTurn::DryRunPassed { candidate_id: id } | GenesisTurn::DryRunRefused { candidate_id: id, .. }
+            if id == &candidate_id
+        ),
+        "a full cap must not preempt finalization; got {turn:?}"
+    );
+    let tx = db.tx().await;
+    let after = super::finalize::read_envelope(&tx, &candidate_id)
+        .await
+        .expect("read envelope")
+        .expect("envelope still present");
+    tx.commit().await.unwrap();
+    assert!(
+        after.verdict.is_some(),
+        "the turn must have recorded a verdict — durable progress, not a retry"
+    );
+}
+
+/// The paired control for G4.9.1's "no row at the new epoch" assertion.
+///
+/// Identical scene and identical epoch advance, minus the cap fill. A row *does*
+/// appear, which is what proves the arriving proposal is real and admitted — so
+/// G4.9.1's zero is the cap refusing new work, not a space with nothing to say.
+#[tokio::test]
+async fn a_fresh_proposal_below_the_cap_does_mint_a_row() {
+    let db = scene().await;
+    let mut state = ShadowState::default();
+    drive_to_prepared(&db, &mut state, 64).await;
+    advance_coverage_epoch(&db, SPACE_ID).await;
+    assert_eq!(candidates_at_epoch(&db, SPACE, 2).await, 0);
+
+    for _ in 0..8 {
+        run_genesis_shadow_turn(&db.connection, &mut state)
+            .await
+            .expect("shadow turn");
+    }
+
+    assert!(
+        candidates_at_epoch(&db, SPACE, 2).await > 0,
+        "a fresh proposal below the cap must mint a candidate row"
+    );
+}
+
+/// **G4.9.2 — a budget refusal is not durable work.**
+///
+/// Mechanical control for the second fix. `did_work` drives the loop's cadence,
+/// so a `RefusedBudget` counted as work is a 10 Hz poll on the shared connection
+/// mutex for as long as the cap stays full. S0-9 already says a budget refusal
+/// is not a retry; it is not work either.
+///
+/// RED control: restore `!matches!(self, GenesisTurn::Idle)` and this fails.
+#[tokio::test]
+async fn a_budget_refusal_is_not_durable_work() {
+    assert!(
+        !GenesisTurn::RefusedBudget.did_work(),
+        "a turn that wrote nothing must take the idle delay"
+    );
+    assert!(!GenesisTurn::Idle.did_work());
+    // Positive control, or the two above pass on a `did_work` that is always
+    // false — which would peg the loop at 1s and look like a fix.
+    assert!(GenesisTurn::Prepared {
+        candidate_id: "c".into()
+    }
+    .did_work());
+    assert!(GenesisTurn::DryRunPassed {
+        candidate_id: "c".into()
+    }
+    .did_work());
+}
+
+/// **G4.9.3 — a real backpressure turn reports no durable work.**
+///
+/// The cap is filled *before* the proposal's candidate is ever observed, which
+/// is the only shape that produces a genuine refusal: `observe_candidate` checks
+/// "does this `candidate_id` already exist" before it checks the cap, so a
+/// candidate the loop already minted comes back `AlreadyPresent` and never
+/// reaches the cap at all. Filling first is therefore not a contrivance — it is
+/// the arrival of new work at a full space, which is exactly the M5-measured
+/// case where refusals accumulate as `retry_wait` faster than they drain.
+///
+/// This also proves `RefusedBudget` is **reachable from the driver**, without
+/// which G4.9.2 would be asserting a property of a value nothing produces.
+#[tokio::test]
+async fn a_capped_space_refusing_new_work_reports_no_durable_work() {
+    let db = scene().await;
+    fill_pending_to_cap(&db, SPACE).await;
+
+    // Drive past the recovery scan and the frontier repairs; the first turn that
+    // is neither is the prepare, and it must refuse on the cap.
+    let mut state = ShadowState::default();
+    let mut turn = GenesisTurn::Idle;
+    for _ in 0..64 {
+        turn = run_genesis_shadow_turn(&db.connection, &mut state)
+            .await
+            .expect("shadow turn");
+        if !matches!(turn, GenesisTurn::Idle | GenesisTurn::Frontier { .. }) {
+            break;
+        }
+    }
+
+    assert_eq!(
+        turn,
+        GenesisTurn::RefusedBudget,
+        "new work arriving at a full cap is backpressure"
+    );
+    assert!(
+        !turn.did_work(),
+        "backpressure must take the 1s delay, not the 100ms one"
+    );
+}
+
+/// **G4.9.4 — a space below the cap still prepares.**
+///
+/// The discriminating positive control (S0-155). Without it, "the capped space
+/// reaches finalization" is also satisfied by a fix that simply stopped
+/// enforcing the cap, which would be a worse defect than the one being fixed.
+#[tokio::test]
+async fn a_space_below_the_cap_still_prepares_and_the_cap_still_refuses() {
+    let db = scene().await;
+    let turns = drive(&db, 64).await;
+    assert!(
+        turns
+            .iter()
+            .any(|turn| matches!(turn, GenesisTurn::Prepared { .. })),
+        "below the cap, a prepare must still happen: {turns:?}"
+    );
+    // And the cap is still a cap: fill it and the next observe refuses.
+    fill_pending_to_cap(&db, SPACE).await;
+    let tx = db.tx().await;
+    let outcome = super::candidates::observe_candidate(
+        &tx,
+        &super::candidates::ObservedCandidate {
+            candidate_id: "past-the-cap",
+            slot_id: "past-the-cap-slot",
+            page_id: "",
+            space: SPACE,
+            signal_kind: super::identity::SignalKind::SpaceOverview,
+            coverage_epoch: 1,
+            input_generation: 0,
+            active_root_digest: "digest",
+        },
+    )
+    .await
+    .expect("observe");
+    tx.commit().await.unwrap();
+    assert_eq!(
+        outcome,
+        super::candidates::ObserveOutcome::RefusedPendingCap,
+        "the fix must not have disabled the cap"
+    );
+}
+
+/// **G4.9.5 — vacuous case (S0-137): a full cap with no admitted proposal.**
+///
+/// Nothing to refuse, nothing to finalize. The turn must report idle and the
+/// rotation must advance, rather than the cap manufacturing a `RefusedBudget`
+/// out of a space that never proposed anything.
+#[tokio::test]
+async fn a_capped_space_with_no_proposal_is_idle_and_rotates() {
+    let db = GenesisDb::new().await;
+    db.seed_space(SPACE_ID, SPACE).await;
+    // No evidence at all: below D1's three-group independence floor, so no
+    // signal admits and `prepare` never reaches `observe_candidate`.
+    fill_pending_to_cap(&db, SPACE).await;
+
+    let mut state = ShadowState::default();
+    let mut turns = Vec::new();
+    for _ in 0..4 {
+        turns.push(
+            run_genesis_shadow_turn(&db.connection, &mut state)
+                .await
+                .expect("shadow turn"),
+        );
+    }
+
+    assert!(
+        turns[1..].iter().all(|turn| turn == &GenesisTurn::Idle),
+        "a capped space with nothing to propose is idle, not refusing: {turns:?}"
+    );
+}
+
+/// **G4.9.6 — one busy space cannot starve the rotation.**
+///
+/// The property `state.rotation` advancing only on `Idle` silently broke. Three
+/// spaces, the first permanently at the cap with a proposal it cannot observe;
+/// every other space must still get a turn. Asserted by observable effect —
+/// each space's coverage row is opened by the turn that visits it — rather than
+/// by reading the private rotation counter.
+#[tokio::test]
+async fn a_busy_space_cannot_starve_the_rotation() {
+    let db = GenesisDb::new().await;
+    // `spaces()` orders by name, so "space-a" is visited first and is the one
+    // held at the cap.
+    for (id, name) in [
+        (SPACE_ID, SPACE),
+        ("space-id-b", "space-b"),
+        ("space-id-c", "space-c"),
+    ] {
+        db.seed_space(id, name).await;
+        for group in 0..3 {
+            for slot in 0..2 {
+                db.seed_evidence(
+                    &format!("{name}-root-{group}-{slot}"),
+                    name,
+                    &format!("{name}-group-{group}"),
+                    &format!("{name}-entity-{group}-{slot}"),
+                )
+                .await;
+            }
+        }
+    }
+    fill_pending_to_cap(&db, SPACE).await;
+
+    let mut state = ShadowState::default();
+    for _ in 0..32 {
+        run_genesis_shadow_turn(&db.connection, &mut state)
+            .await
+            .expect("shadow turn");
+    }
+
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM genesis_coverage_state", ())
+            .await,
+        3,
+        "every space must have been visited; a wedged first space starves the rest"
+    );
+}
