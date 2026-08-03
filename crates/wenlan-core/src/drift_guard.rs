@@ -5973,15 +5973,21 @@ fn release_promotion_contract_violations(
     // Promotion runs the same resolver as resolve-promotion, so it is control
     // plane too. Pinning it to the release commit would run the release's own
     // copy of the promotion tooling, so a resolver fix could never reach a
-    // recovery of that release.
-    let promote_text =
-        serde_yaml::to_string(&release["jobs"]["promote-assets"]).unwrap_or_default();
-    if !promote_text.contains("ref: ${{ github.sha }}")
-        || promote_text.contains("ref: ${{ env.RELEASE_SHA }}")
-    {
-        violations.push("asset promotion is not pinned to its immutable main control plane".into());
+    // recovery of that release. Docker packaging has the same shape: its
+    // checkout supplies only the runtime Dockerfile and the image verifier,
+    // while the bytes placed in the image come from the validated artifact and
+    // are checked against the closed receipt by size and SHA-256.
+    for job_name in ["promote-assets", "docker"] {
+        let job_text = serde_yaml::to_string(&release["jobs"][job_name]).unwrap_or_default();
+        if !job_text.contains("ref: ${{ github.sha }}")
+            || job_text.contains("ref: ${{ env.RELEASE_SHA }}")
+        {
+            violations.push(format!(
+                "release packaging job {job_name:?} is not pinned to its main control plane"
+            ));
+        }
     }
-    for job_name in ["prepare-release", "docker", "publish-crates", "publish-npm"] {
+    for job_name in ["prepare-release", "publish-crates", "publish-npm"] {
         let job_text = serde_yaml::to_string(&release["jobs"][job_name]).unwrap_or_default();
         if !job_text.contains("ref: ${{ env.RELEASE_SHA }}")
             || job_text.contains("ref: ${{ github.sha }}")

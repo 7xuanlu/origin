@@ -221,13 +221,20 @@ def job_body(job):
 # is control plane: pinning it to the release commit would run the release's
 # own copy of the tooling, and a resolver fix could never reach a recovery of
 # that release. It still revalidates the receipt-derived tag.
-promote = job_body("promote-assets")
-if "ref: ${{ github.sha }}" not in promote or "ref: ${{ env.RELEASE_SHA }}" in promote:
-    raise SystemExit(1)
-if "/git/ref/tags/$RELEASE_TAG" not in promote or "RELEASE_SHA" not in promote:
-    raise SystemExit(1)
+# The docker job is the same shape: its checkout supplies only the runtime
+# Dockerfile and the image verifier, while the bytes placed in the image come
+# from the receipt-verified artifact.
+for job in ["promote-assets", "docker"]:
+    packaging = job_body(job)
+    if (
+        "ref: ${{ github.sha }}" not in packaging
+        or "ref: ${{ env.RELEASE_SHA }}" in packaging
+    ):
+        raise SystemExit(1)
+    if "/git/ref/tags/$RELEASE_TAG" not in packaging or "RELEASE_SHA" not in packaging:
+        raise SystemExit(1)
 
-for job in ["prepare-release", "docker", "publish-crates", "publish-npm"]:
+for job in ["prepare-release", "publish-crates", "publish-npm"]:
     body = job_body(job)
     if "ref: ${{ env.RELEASE_SHA }}" not in body or "ref: ${{ github.sha }}" in body:
         raise SystemExit(1)
