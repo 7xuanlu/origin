@@ -1350,8 +1350,19 @@ Until C3, C1's and C2's modules have no production caller and their tests are
 the only drivers — the same shape PR-B's B1/B2 had, and the reason
 `#[allow(dead_code)]` at `mod.rs:33`–`:39` exists. C3 removes the attribute
 from `frontier_policy`? **No** — §5.4 leaves those three writers unwired, so
-`frontier_policy` keeps its attribute. `relevance` and `refresh_readiness` lose
-theirs in C1 and C2 respectively.
+`frontier_policy` keeps its attribute.
+
+**Correction (C1, measured):** `relevance` and `refresh_readiness` cannot lose
+theirs in C1 and C2. The two halves of this paragraph contradict each other —
+if C1's and C2's modules have no production caller until C3, then neither does
+anything they call. rustc's dead-code pass is reachability-based, so an item in
+`relevance` reached only from `relevance_sweep` is dead for exactly as long as
+`relevance_sweep` is, and `#[allow(dead_code)]` silences the report rather than
+conferring liveness. C1 verified this against `cargo clippy --all-targets`:
+with the attribute removed, every item of `relevance`'s estimator and mutation
+surface is reported unused even though `relevance_sweep::apply_group_mutation`
+calls into it. All three modules lose the attribute together in C3, when
+`runtime.rs` spawns the lane that drives them.
 
 ---
 

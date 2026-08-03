@@ -11,9 +11,20 @@ use crate::m6::digest::m6_digest_owned;
 use crate::WenlanError;
 
 /// D1's undecayed, unsmoothed distinct-group floor (S0-88).
+///
+/// Its reader is the §2.2 estimator, which C1 does not build — C1 produces the
+/// table the estimator will read. The allow is on this item rather than on the
+/// module (§12) so that the next unused item in `relevance` fails the build
+/// instead of being absorbed by a blanket.
+#[allow(dead_code)]
 pub const QUALIFIED_CO_CITATION_GROUP_FLOOR: i64 = 3;
 
 /// S0-91's frozen normalized-snapshot domain.
+///
+/// Transitively test-only: `normalized_pair_stats_digest` is the oracle the
+/// mutation tests compare through, and nothing in production digests the pair
+/// table. Same targeted-allow reasoning as the floor above.
+#[allow(dead_code)]
 pub const PAIR_STATS_DIGEST_DOMAIN: &str = "m6-pairstats-v1";
 
 /// D9's hard caps for query (c).
@@ -55,6 +66,23 @@ pub async fn ensure_relevance_tables(tx: &libsql::Transaction) -> Result<(), Wen
         );
         CREATE INDEX IF NOT EXISTS idx_m6_adjacency_space_neighbor
             ON m6_adjacency(space, neighbor_id);
+
+        -- The marginals `n10`/`n01`/`n00` are derived from, not stored in,
+        -- `m6_pair_stats`. They range over every eligible group in the space,
+        -- so maintaining them per pair would make one root activation rewrite
+        -- the whole table -- which is what `R-HUB-MAXPAIRS` (2016 pairs per
+        -- group) exists to forbid. Only `n11` and `distinct_group_count` are
+        -- properties of a pair; the rest of the estimator lives here.
+        CREATE TABLE IF NOT EXISTS m6_page_mass (
+            space   TEXT NOT NULL,
+            page_id TEXT NOT NULL,
+            mass    REAL NOT NULL CHECK (mass >= 0),
+            PRIMARY KEY(space, page_id)
+        );
+        CREATE TABLE IF NOT EXISTS m6_space_mass (
+            space TEXT PRIMARY KEY,
+            total REAL NOT NULL CHECK (total >= 0)
+        );
         ",
     )
     .await
@@ -81,15 +109,6 @@ pub struct PairStatsSnapshotRow<'a> {
     pub values: PairStatsValues,
 }
 
-/// Which estimator cell a group currently contributes to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PairCell {
-    Both,
-    LeftOnly,
-    RightOnly,
-    Neither,
-}
-
 /// A group-level eligibility transition after all roots in the group collapse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EligibilityChange {
@@ -106,11 +125,18 @@ pub fn qualified_co_citation(values: &PairStatsValues) -> bool {
 ///
 /// Callers must invoke this only when a group as a whole becomes ineligible or
 /// eligible, not for each root: several roots in one independence group still
-/// count once. Retraction and reactivation update the decayed cell and the raw
-/// count together; only an `n11` group participates in D1's co-support floor.
+/// count once.
+///
+/// Only `n11` and the raw count move. This function once took a `PairCell`
+/// naming which of the four estimator cells to charge, and that parameter is
+/// gone rather than unused: `n10`/`n01`/`n00` are *derived* from
+/// `m6_page_mass`/`m6_space_mass` at read time (see
+/// [`super::relevance_sweep::pair_stats_snapshot`]), so charging a marginal
+/// here would count the same transition twice — once in the stored cell and
+/// again in the mass the reader subtracts. The mutation applier updates mass
+/// separately; a cell selector would only offer a way to get that wrong.
 pub fn apply_group_eligibility_change(
     values: &mut PairStatsValues,
-    cell: PairCell,
     decayed_contribution: f64,
     change: EligibilityChange,
 ) -> Result<(), &'static str> {
@@ -118,38 +144,27 @@ pub fn apply_group_eligibility_change(
         return Err("decayed contribution must be finite and non-negative");
     }
 
-    let target = match cell {
-        PairCell::Both => &mut values.n11,
-        PairCell::LeftOnly => &mut values.n10,
-        PairCell::RightOnly => &mut values.n01,
-        PairCell::Neither => &mut values.n00,
-    };
-
     match change {
         EligibilityChange::Retracted => {
-            if *target < decayed_contribution {
+            if values.n11 < decayed_contribution {
                 return Err("retraction would make a decayed cell negative");
             }
-            if cell == PairCell::Both && values.distinct_group_count == 0 {
+            if values.distinct_group_count == 0 {
                 return Err("retraction would make the distinct-group count negative");
             }
-            *target -= decayed_contribution;
-            if cell == PairCell::Both {
-                values.distinct_group_count -= 1;
-            }
+            values.n11 -= decayed_contribution;
+            values.distinct_group_count -= 1;
         }
         EligibilityChange::Reactivated => {
-            if cell == PairCell::Both && values.distinct_group_count == i64::MAX {
+            if values.distinct_group_count == i64::MAX {
                 return Err("reactivation would overflow the distinct-group count");
             }
-            let reactivated = *target + decayed_contribution;
+            let reactivated = values.n11 + decayed_contribution;
             if !reactivated.is_finite() {
                 return Err("reactivation would make a decayed cell non-finite");
             }
-            *target = reactivated;
-            if cell == PairCell::Both {
-                values.distinct_group_count += 1;
-            }
+            values.n11 = reactivated;
+            values.distinct_group_count += 1;
         }
     }
     Ok(())

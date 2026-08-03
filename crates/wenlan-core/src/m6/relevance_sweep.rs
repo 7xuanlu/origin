@@ -726,20 +726,15 @@ pub async fn pinned_space_mass(
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(", ");
+    // One row per requested page plus the space total, so the whole marginal
+    // set costs a single query and the reader never has to reconstruct `N`
+    // from a pair row's four cells.
     let sql = format!(
-        "WITH marginals AS (
-             SELECT page_a AS page, n11 + n10 AS mass,
-                    n11 + n10 + n01 + n00 AS total
-               FROM m6_pair_stats WHERE space = ?1
-             UNION ALL
-             SELECT page_b, n11 + n01, n11 + n10 + n01 + n00
-               FROM m6_pair_stats WHERE space = ?1
-         )
-         SELECT page, MAX(mass), MAX(total)
-           FROM marginals
-          WHERE page IN ({placeholders})
-          GROUP BY page
-          ORDER BY page"
+        "SELECT m.page_id, m.mass, (SELECT total FROM m6_space_mass WHERE space = ?1)
+           FROM m6_page_mass m
+          WHERE m.space = ?1
+            AND m.page_id IN ({placeholders})
+          ORDER BY m.page_id"
     );
 
     let mut params = Vec::with_capacity(1 + pages.len());
@@ -770,6 +765,37 @@ pub async fn pinned_space_mass(
         mass.per_page.insert(page, page_mass);
     }
     Ok(mass)
+}
+
+/// Persist the pinned marginals the pair table no longer carries.
+///
+/// Written only by the full re-reference pass and by a mutation, both of
+/// which know the whole space's mass. A bounded sweep turn reads these and
+/// never writes them: it sees only the groups touching its own candidates, so
+/// any marginal it computed would be a fragment of the real one.
+pub async fn write_space_mass(
+    tx: &libsql::Transaction,
+    space: &str,
+    mass: &SpaceMass,
+) -> Result<usize, WenlanError> {
+    tx.execute(
+        "INSERT INTO m6_space_mass (space, total) VALUES (?1, ?2)
+         ON CONFLICT(space) DO UPDATE SET total = excluded.total",
+        libsql::params![space, mass.total],
+    )
+    .await
+    .map_err(|error| WenlanError::VectorDb(format!("m6 space mass write: {error}")))?;
+
+    for (page, page_mass) in &mass.per_page {
+        tx.execute(
+            "INSERT INTO m6_page_mass (space, page_id, mass) VALUES (?1, ?2, ?3)
+             ON CONFLICT(space, page_id) DO UPDATE SET mass = excluded.mass",
+            libsql::params![space, page.clone(), *page_mass],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 page mass write: {error}")))?;
+    }
+    Ok(mass.per_page.len())
 }
 
 /// The whole space's pair table at a fixed decay reference — the **full** side
@@ -1054,6 +1080,7 @@ async fn run_full_rereference(
 
     let reference = advance_decay_reference(tx, space_id, space).await?;
     let mass = SpaceMass::from_groups(&groups, reference);
+    write_space_mass(tx, space, &mass).await?;
     let stats = recompute_pair_stats(&groups, reference, &mass);
     let pairs_written = write_pair_stats(tx, space, grouping_generation, &stats).await?;
 
@@ -1164,4 +1191,226 @@ async fn rewrite_adjacency(
         }
     }
     Ok(written)
+}
+
+/// Read the pair table as S0-91's normalized snapshot, deriving the marginals.
+///
+/// `n11` and `distinct_group_count` come from `m6_pair_stats`, which is where
+/// they belong: they are properties of the pair. `n10`, `n01` and `n00` are
+/// computed here from the pinned marginals, because they are not — they range
+/// over the space's whole eligible group universe (contract line 236). Storing
+/// them per pair is what made one root activation a full-table rewrite.
+///
+/// This is the reader the digest must go through. A caller that read the
+/// stored cells directly would be reading a cache that a bounded mutation
+/// deliberately does not refresh, and would see a difference the estimator
+/// does not have.
+pub async fn pair_stats_snapshot(
+    tx: &libsql::Transaction,
+    space: &str,
+) -> Result<Vec<(String, String, PairStatsValues)>, WenlanError> {
+    let mut rows = tx
+        .query(
+            "SELECT s.page_a, s.page_b, s.n11, s.distinct_group_count,
+                    COALESCE(ma.mass, 0.0), COALESCE(mb.mass, 0.0),
+                    COALESCE((SELECT total FROM m6_space_mass WHERE space = ?1), 0.0)
+               FROM m6_pair_stats s
+               LEFT JOIN m6_page_mass ma ON ma.space = ?1 AND ma.page_id = s.page_a
+               LEFT JOIN m6_page_mass mb ON mb.space = ?1 AND mb.page_id = s.page_b
+              WHERE s.space = ?1
+              ORDER BY s.page_a ASC, s.page_b ASC",
+            libsql::params![space],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 pair snapshot: {error}")))?;
+
+    let mut snapshot = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 pair snapshot row: {error}")))?
+    {
+        let decode = |index: i32, what: &str| -> Result<f64, WenlanError> {
+            row.get::<f64>(index)
+                .map_err(|error| WenlanError::VectorDb(format!("m6 pair snapshot {what}: {error}")))
+        };
+        let page_a = row
+            .get::<String>(0)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 pair snapshot a: {error}")))?;
+        let page_b = row
+            .get::<String>(1)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 pair snapshot b: {error}")))?;
+        let n11 = decode(2, "n11")?;
+        let distinct_group_count = row
+            .get::<i64>(3)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 pair snapshot count: {error}")))?;
+        let mass_a = decode(4, "mass a")?;
+        let mass_b = decode(5, "mass b")?;
+        let total = decode(6, "total")?;
+        snapshot.push((
+            page_a,
+            page_b,
+            PairStatsValues {
+                n11,
+                n10: (mass_a - n11).max(0.0),
+                n01: (mass_b - n11).max(0.0),
+                n00: (total - mass_a - mass_b + n11).max(0.0),
+                distinct_group_count,
+            },
+        ));
+    }
+    Ok(snapshot)
+}
+
+/// What one group-eligibility mutation touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MutationReceipt {
+    pub pages_touched: usize,
+    pub pairs_touched: usize,
+}
+
+/// Apply one group's eligibility transition incrementally.
+///
+/// The whole point of deriving the marginals: this touches `1` space-total
+/// row, at most `R-HUB-TOPK` (64) page-mass rows, and at most
+/// `R-HUB-MAXPAIRS` (2016) pair rows — never the rest of the table, however
+/// many pairs the space has. That is the bound S0-91's negative control
+/// asserts, and it is only reachable because `n00` is not stored per pair.
+pub async fn apply_group_mutation(
+    tx: &libsql::Transaction,
+    space: &str,
+    group: &GroupSupport,
+    reference: i64,
+    change: super::relevance::EligibilityChange,
+) -> Result<MutationReceipt, WenlanError> {
+    use super::relevance::{apply_group_eligibility_change, EligibilityChange};
+
+    let contribution = decayed_contribution(
+        hub_weight(group.degree),
+        group.newest_root_created_at,
+        reference,
+    );
+
+    let mut ordered: Vec<&str> = group.pages.iter().map(String::as_str).collect();
+    ordered.sort_unstable();
+    ordered.dedup();
+    ordered.truncate(MAX_NEIGHBORS_PER_ENDPOINT);
+
+    let signed = match change {
+        EligibilityChange::Retracted => -contribution,
+        EligibilityChange::Reactivated => contribution,
+    };
+
+    // The space total moves once, not once per pair.
+    tx.execute(
+        "UPDATE m6_space_mass SET total = MAX(0.0, total + ?2) WHERE space = ?1",
+        libsql::params![space, signed],
+    )
+    .await
+    .map_err(|error| WenlanError::VectorDb(format!("m6 mutation total: {error}")))?;
+
+    for page in &ordered {
+        tx.execute(
+            "INSERT INTO m6_page_mass (space, page_id, mass) VALUES (?1, ?2, MAX(0.0, ?3))
+             ON CONFLICT(space, page_id) DO UPDATE SET mass = MAX(0.0, mass + ?3)",
+            libsql::params![space, *page, signed],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 mutation page mass: {error}")))?;
+    }
+
+    let mut pairs_touched = 0usize;
+    for (index, page_a) in ordered.iter().enumerate() {
+        for page_b in &ordered[index + 1..] {
+            let mut values = read_pair_cells(tx, space, page_a, page_b).await?;
+            apply_group_eligibility_change(&mut values, contribution, change).map_err(
+                |reason| {
+                    WenlanError::VectorDb(format!("m6 mutation pair {page_a}/{page_b}: {reason}"))
+                },
+            )?;
+            if values.distinct_group_count == 0 {
+                // The pair's last supporting group just left. A full
+                // recomputation would not emit this pair at all, so leaving a
+                // zeroed row behind would make the incremental digest differ
+                // by exactly the rows nobody supports any more.
+                tx.execute(
+                    "DELETE FROM m6_pair_stats
+                      WHERE space = ?1 AND page_a = ?2 AND page_b = ?3",
+                    libsql::params![space, *page_a, *page_b],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("m6 mutation pair delete: {error}"))
+                })?;
+            } else {
+                tx.execute(
+                    "INSERT INTO m6_pair_stats
+                         (space, page_a, page_b, n11, n10, n01, n00,
+                          distinct_group_count, updated_generation)
+                     VALUES (?1, ?2, ?3, ?4, 0, 0, 0, ?5, 0)
+                     ON CONFLICT(space, page_a, page_b) DO UPDATE
+                         SET n11 = excluded.n11,
+                             distinct_group_count = excluded.distinct_group_count",
+                    libsql::params![
+                        space,
+                        *page_a,
+                        *page_b,
+                        values.n11,
+                        values.distinct_group_count
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("m6 mutation pair write: {error}"))
+                })?;
+            }
+            pairs_touched += 1;
+        }
+    }
+
+    Ok(MutationReceipt {
+        pages_touched: ordered.len(),
+        pairs_touched,
+    })
+}
+
+/// The two authoritative cells of one pair, defaulting to an absent pair.
+async fn read_pair_cells(
+    tx: &libsql::Transaction,
+    space: &str,
+    page_a: &str,
+    page_b: &str,
+) -> Result<PairStatsValues, WenlanError> {
+    let mut rows = tx
+        .query(
+            "SELECT n11, distinct_group_count FROM m6_pair_stats
+              WHERE space = ?1 AND page_a = ?2 AND page_b = ?3",
+            libsql::params![space, page_a, page_b],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 pair cells: {error}")))?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 pair cells row: {error}")))?;
+    match row {
+        Some(row) => Ok(PairStatsValues {
+            n11: row
+                .get::<f64>(0)
+                .map_err(|error| WenlanError::VectorDb(format!("m6 pair cells n11: {error}")))?,
+            n10: 0.0,
+            n01: 0.0,
+            n00: 0.0,
+            distinct_group_count: row
+                .get::<i64>(1)
+                .map_err(|error| WenlanError::VectorDb(format!("m6 pair cells count: {error}")))?,
+        }),
+        None => Ok(PairStatsValues {
+            n11: 0.0,
+            n10: 0.0,
+            n01: 0.0,
+            n00: 0.0,
+            distinct_group_count: 0,
+        }),
+    }
 }

@@ -6,8 +6,8 @@
 
 use super::relevance::{
     apply_group_eligibility_change, common_neighbor_counts, ensure_relevance_tables,
-    normalized_pair_stats_digest, qualified_co_citation, EligibilityChange, PairCell,
-    PairStatsSnapshotRow, PairStatsValues,
+    normalized_pair_stats_digest, qualified_co_citation, EligibilityChange, PairStatsSnapshotRow,
+    PairStatsValues,
 };
 
 async fn relevance_db() -> (libsql::Database, libsql::Connection) {
@@ -81,13 +81,8 @@ fn d1_three_unequal_weighted_groups_qualify_then_retract_and_reactivate() {
         "three currently eligible groups must clear the raw floor"
     );
 
-    apply_group_eligibility_change(
-        &mut stats,
-        PairCell::Both,
-        0.25,
-        EligibilityChange::Retracted,
-    )
-    .expect("retract one currently eligible group");
+    apply_group_eligibility_change(&mut stats, 0.25, EligibilityChange::Retracted)
+        .expect("retract one currently eligible group");
     assert_eq!(stats.distinct_group_count, 2);
     assert_eq!(stats.n11, 0.625);
     assert!(
@@ -95,13 +90,8 @@ fn d1_three_unequal_weighted_groups_qualify_then_retract_and_reactivate() {
         "retraction must immediately remove the group from floor eligibility"
     );
 
-    apply_group_eligibility_change(
-        &mut stats,
-        PairCell::Both,
-        0.25,
-        EligibilityChange::Reactivated,
-    )
-    .expect("reactivate the same group");
+    apply_group_eligibility_change(&mut stats, 0.25, EligibilityChange::Reactivated)
+        .expect("reactivate the same group");
     assert_eq!(stats.distinct_group_count, 3);
     assert_eq!(stats.n11, 0.875);
     assert!(
@@ -138,8 +128,18 @@ fn d1_normalized_digest_includes_distinct_group_count() {
     );
 }
 
+/// The marginals are derived from mass, so the pair-level applier must not
+/// touch them.
+///
+/// This replaces an earlier test that retracted and reactivated the
+/// `LeftOnly`/`RightOnly`/`Neither` cells and asserted the raw count did not
+/// move. Those cells no longer exist — the applier cannot reach a marginal, so
+/// that assertion is now structural. The hazard that remains is a future edit
+/// re-introducing a marginal write here while `pair_stats_snapshot` keeps
+/// deriving the same quantity from `m6_page_mass`, which would count one
+/// transition twice. That is what this asserts.
 #[test]
-fn d1_only_current_both_groups_change_the_raw_floor_count() {
+fn d1_the_pair_applier_leaves_the_derived_marginals_alone() {
     let mut stats = PairStatsValues {
         n11: 1.0,
         n10: 2.0,
@@ -147,31 +147,19 @@ fn d1_only_current_both_groups_change_the_raw_floor_count() {
         n00: 4.0,
         distinct_group_count: 1,
     };
-    for (cell, contribution) in [
-        (PairCell::LeftOnly, 0.5),
-        (PairCell::RightOnly, 0.25),
-        (PairCell::Neither, 0.125),
-    ] {
-        apply_group_eligibility_change(
-            &mut stats,
-            cell,
-            contribution,
-            EligibilityChange::Retracted,
-        )
-        .expect("retract non-co-supporting group");
-        apply_group_eligibility_change(
-            &mut stats,
-            cell,
-            contribution,
-            EligibilityChange::Reactivated,
-        )
-        .expect("reactivate non-co-supporting group");
-    }
+
+    apply_group_eligibility_change(&mut stats, 0.5, EligibilityChange::Reactivated)
+        .expect("reactivate a co-supporting group");
+    apply_group_eligibility_change(&mut stats, 0.5, EligibilityChange::Retracted)
+        .expect("retract it again");
 
     assert_eq!(stats.distinct_group_count, 1);
+    assert_eq!(stats.n11, 1.0);
     assert_eq!(
-        (stats.n11, stats.n10, stats.n01, stats.n00),
-        (1.0, 2.0, 3.0, 4.0)
+        (stats.n10, stats.n01, stats.n00),
+        (2.0, 3.0, 4.0),
+        "n10/n01/n00 are derived from m6_page_mass; the pair applier must not \
+         write them, or the transition is counted twice"
     );
 }
 

@@ -5,11 +5,12 @@
 //! integration test would not be guaranteed in L3/L4.
 
 use super::relevance_sweep::{
-    advance_decay_reference, candidate_endpoints, decay_reference, decayed_contribution,
-    eligible_groups, group_support, hub_weight, pack_within_budget, recompute_pair_stats,
-    run_relevance_sweep, CandidateEndpoint, GroupSupport, QueryBudget, RelevanceRereference,
-    RelevanceTurn, SpaceMass, COUNTER_RELEVANCE_DECAY_REFERENCE, DECAY_HALF_LIFE_DAYS,
-    MAX_QUERIES_PER_EVALUATION, MAX_ROWS_PER_EVALUATION, SWEEP_CANDIDATE_WINDOW,
+    advance_decay_reference, apply_group_mutation, candidate_endpoints, decay_reference,
+    decayed_contribution, eligible_groups, group_support, hub_weight, pack_within_budget,
+    pair_stats_snapshot, recompute_pair_stats, run_relevance_sweep, CandidateEndpoint,
+    GroupSupport, QueryBudget, RelevanceRereference, RelevanceTurn, SpaceMass,
+    COUNTER_RELEVANCE_DECAY_REFERENCE, DECAY_HALF_LIFE_DAYS, MAX_QUERIES_PER_EVALUATION,
+    MAX_ROWS_PER_EVALUATION, SWEEP_CANDIDATE_WINDOW,
 };
 use crate::m6::genesis_test_support::GenesisDb;
 use crate::m6::relevance::{
@@ -1010,30 +1011,17 @@ async fn adjacency_ranks_are_contiguous_from_one_and_ordered_by_recency() {
 
 /// The space's stored pair table, in the digest's input shape.
 async fn stored_pair_rows(db: &GenesisDb, space: &str) -> Vec<(String, String, PairStatsValues)> {
-    let mut rows = db
-        .connection
-        .query(
-            "SELECT page_a, page_b, n11, n10, n01, n00, distinct_group_count
-               FROM m6_pair_stats WHERE space = ?1 ORDER BY page_a, page_b",
-            libsql::params![space],
-        )
+    // Deliberately the production snapshot reader, not a direct SELECT of the
+    // stored cells. `n10`/`n01`/`n00` are derived from the pinned marginals;
+    // a test that read the columns would be asserting against a cache the
+    // bounded mutation path does not refresh, and would pass while the
+    // estimator the readers actually see was wrong.
+    let tx = db.tx().await;
+    let rows = pair_stats_snapshot(&tx, space)
         .await
-        .expect("query stored pair stats");
-    let mut out = Vec::new();
-    while let Some(row) = rows.next().await.expect("stored pair row") {
-        out.push((
-            row.get::<String>(0).expect("page_a"),
-            row.get::<String>(1).expect("page_b"),
-            PairStatsValues {
-                n11: row.get::<f64>(2).expect("n11"),
-                n10: row.get::<f64>(3).expect("n10"),
-                n01: row.get::<f64>(4).expect("n01"),
-                n00: row.get::<f64>(5).expect("n00"),
-                distinct_group_count: row.get::<i64>(6).expect("count"),
-            },
-        ));
-    }
-    out
+        .expect("pair stats snapshot");
+    tx.commit().await.expect("commit snapshot read");
+    rows
 }
 
 fn digest_of(rows: &[(String, String, PairStatsValues)]) -> String {
@@ -1269,4 +1257,133 @@ fn packing_takes_every_endpoint_that_fits() {
         &budget,
     );
     assert_eq!(chosen.len(), 3, "60 reserved rows fit inside 512 easily");
+}
+
+/// Four groups over three pages, so every pair keeps support after one group
+/// leaves and the comparison is about *values*, not about rows vanishing.
+async fn seed_mutable_space(db: &GenesisDb) {
+    let base = 1_800_000_000;
+    for (group, pages) in [
+        ("g0", vec!["p1", "p2", "p3"]),
+        ("g1", vec!["p1", "p2"]),
+        ("g2", vec!["p2", "p3"]),
+        ("g3", vec!["p1", "p3"]),
+    ] {
+        for page in pages {
+            seed_page_support(
+                db,
+                &format!("r-{group}-{page}"),
+                "space-a",
+                group,
+                page,
+                base,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_retraction_leaves_the_table_equal_to_a_full_recomputation() {
+    // S0-91's oracle for the retraction mutation: the incremental path and a
+    // full recomputation must agree byte-for-byte on the normalized digest at
+    // a fixed relevance generation.
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    seed_mutable_space(&db).await;
+
+    let pass = rereference(&db, "space-id-a", "space-a", 7).await;
+    let reference = pass.decay_reference;
+
+    let tx = db.tx().await;
+    let group = group_support(&tx, "space-a", "g0")
+        .await
+        .expect("group support")
+        .expect("g0 is eligible before the mutation");
+    tx.commit().await.expect("commit read");
+
+    // The mutation itself: g0's roots stop being eligible. The incremental
+    // path is told about it separately, which is exactly the seam under test.
+    db.exec(
+        "UPDATE provenance_roots SET status = 'retracted'
+          WHERE independence_group_id = 'g0'",
+        (),
+    )
+    .await;
+
+    let tx = db.tx().await;
+    let receipt = apply_group_mutation(
+        &tx,
+        "space-a",
+        &group,
+        reference,
+        crate::m6::relevance::EligibilityChange::Retracted,
+    )
+    .await
+    .expect("apply retraction");
+    tx.commit().await.expect("commit mutation");
+
+    let incremental = stored_pair_rows(&db, "space-a").await;
+    let full = full_recompute_rows(&db, "space-a", reference).await;
+    // An empty-vs-empty digest comparison passes for the wrong reason.
+    assert_eq!(
+        incremental.len(),
+        3,
+        "three pages leave three pairs standing"
+    );
+    assert_eq!(full.len(), 3);
+    assert!(
+        incremental.iter().all(|(_, _, values)| values.n11 > 0.0),
+        "every surviving pair must still carry support from g1/g2/g3"
+    );
+    assert_eq!(
+        digest_of(&incremental),
+        digest_of(&full),
+        "the incremental retraction and a full recomputation disagree\n\
+         incremental: {incremental:#?}\nfull: {full:#?}"
+    );
+
+    // S0-91's negative control: the mutation touched its own group's pairs,
+    // not the table. Three pages form three pairs, well inside R-HUB-MAXPAIRS.
+    assert_eq!(receipt.pages_touched, 3);
+    assert_eq!(receipt.pairs_touched, 3);
+    assert!(
+        receipt.pairs_touched <= 2016,
+        "R-HUB-MAXPAIRS: a mutation may not exceed one group's pair count"
+    );
+}
+
+#[tokio::test]
+async fn a_reactivation_restores_the_pre_retraction_digest() {
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    seed_mutable_space(&db).await;
+
+    let pass = rereference(&db, "space-id-a", "space-a", 7).await;
+    let reference = pass.decay_reference;
+    let before = digest_of(&stored_pair_rows(&db, "space-a").await);
+
+    let tx = db.tx().await;
+    let group = group_support(&tx, "space-a", "g0")
+        .await
+        .expect("group support")
+        .expect("g0 eligible");
+    tx.commit().await.expect("commit read");
+
+    for change in [
+        crate::m6::relevance::EligibilityChange::Retracted,
+        crate::m6::relevance::EligibilityChange::Reactivated,
+    ] {
+        let tx = db.tx().await;
+        apply_group_mutation(&tx, "space-a", &group, reference, change)
+            .await
+            .expect("apply mutation");
+        tx.commit().await.expect("commit mutation");
+    }
+
+    assert_eq!(
+        digest_of(&stored_pair_rows(&db, "space-a").await),
+        before,
+        "retract-then-reactivate is not the identity on the pair table"
+    );
 }

@@ -35,6 +35,12 @@ pub(crate) mod frontier_policy;
 pub(crate) mod overview_subscriptions;
 #[allow(dead_code)]
 pub(crate) mod refresh_readiness;
+// Spec §12 expected this attribute to come off in C1, on the reasoning that
+// C1's `relevance_sweep` becomes `relevance`'s production caller. It cannot:
+// rustc's dead-code pass is reachability-based, and `relevance_sweep` has no
+// driver until C3's maintenance turn, so an item reached only from it is still
+// dead. `#[allow]` silences the report; it does not confer liveness. Both
+// modules lose the attribute together in C3, when `runtime.rs` spawns the lane.
 #[allow(dead_code)]
 pub(crate) mod relevance;
 #[allow(dead_code)]
