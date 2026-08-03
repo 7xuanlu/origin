@@ -563,6 +563,34 @@ review at the integrated boundary still owns the final word.
 - **Q7 → agreed, PR-C.** Stale candidate fingerprints are refresh-readiness
   territory; noted, not claimed here.
 
+### 7.2 Q3 reversed — the follow-up ships with no migration
+
+**Q3 is overturned. Take the zero-migration option §4 already offers.** I read
+the three sites the seeded row would have to matter at, and it matters at none
+of them:
+
+- `set_community_reader_cutover` (`db.rs:15002`) is an `INSERT ... ON
+  CONFLICT(consumer) DO UPDATE`, so the eventual cutover needs no pre-existing
+  row.
+- `community_reader_durable_gate_sql` joins `community_reader_cutover` and
+  requires `cutover.enabled=1`, so an absent row and an `enabled=0` row both
+  fail closed, identically.
+- `community_reader_parity_needs_reconcile` tests `EXISTS(... enabled=1)`, so
+  neither state schedules reconciliation.
+
+The row is therefore inert in the strict sense — no query can distinguish it
+from absence. Its only claimed value was fencing a future reader who extends
+the `enabled = 1` seed loop (`db.rs:11393`) by pattern-match, and the Q4
+list-agreement test already covers that reader far more directly: it fails when
+the consumer lists disagree, which is the actual hazard, rather than relying on
+a bystander noticing a seeded row.
+
+That drops the heaviest review unit in the slice. **Gap A needs no migration
+(§2.4), and Gap B now needs none either — the entire PR-A follow-up is pure
+Rust.** `PRAGMA user_version` stays at 110 and migration 111 remains unclaimed
+for whatever genuinely needs schema. Revise §8's estimate down by the ~25-line
+migration row.
+
 ---
 
 ## 8. Size estimate
