@@ -4887,7 +4887,19 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
                 .push("release-preflight contains an unauthorized publishing side effect".into());
         }
     }
-    if release["on"].get("workflow_dispatch").is_some() {
+    let dispatch_inputs = &release["on"]["workflow_dispatch"]["inputs"];
+    let dispatch_is_bound = [
+        "release_sha",
+        "release_tag",
+        "source_run_id",
+        "source_run_attempt",
+    ]
+    .into_iter()
+    .all(|name| {
+        dispatch_inputs[name]["required"].as_bool() == Some(true)
+            && dispatch_inputs[name]["type"].as_str() == Some("string")
+    });
+    if !dispatch_is_bound {
         violations.push("tag release retains an unbound manual dispatch path".into());
     }
     if release["jobs"].get("release").is_some()
@@ -4897,8 +4909,10 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
         violations
             .push("tag release retains duplicate compilation of PR-validated binaries".into());
     }
-    if job_needs(&release, "prepare-release") != ["resolve-promotion"]
-        || job_needs(&release, "promote-assets") != ["resolve-promotion", "prepare-release"]
+    if job_needs(&release, "bind-release-tag") != ["resolve-promotion"]
+        || job_needs(&release, "prepare-release") != ["resolve-promotion", "bind-release-tag"]
+        || job_needs(&release, "promote-assets")
+            != ["resolve-promotion", "bind-release-tag", "prepare-release"]
     {
         violations.push("tag release artifact-promotion DAG bypasses receipt resolution".into());
     }
@@ -5034,7 +5048,7 @@ fn release_preflight_contract_rejects_drift_and_side_effects() {
             "          save-if: \"true\"",
         );
     let release = release
-        .replace("  push:\n", "  workflow_dispatch:\n  push:\n")
+        .replace("      release_sha:\n", "      unsafe_release_sha:\n")
         .replace(
             "scripts/release-promotion.py download-assets",
             "scripts/build-release-binaries.sh",
