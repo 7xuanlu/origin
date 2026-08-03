@@ -1,32 +1,53 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact merged release commit to promote
+        required: true
+        type: string
+      release_tag:
+        description: Exact vX.Y.Z tag bound to the merged release commit
+        required: true
+        type: string
+      source_run_id:
+        description: Successful release-PR CI run that produced the closed receipt
+        required: true
+        type: string
+      source_run_attempt:
+        description: Exact successful attempt of source_run_id
+        required: true
+        type: string
   push:
     tags:
       - 'v*'
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE_TAG: ${{ github.ref_name }}
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  RELEASE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.release_sha || github.sha }}
 
 jobs:
   prepare-release:
     name: Create GitHub Release
-    needs: resolve-promotion
+    needs: [resolve-promotion, bind-release-tag]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 0
           fetch-tags: true
 
@@ -41,8 +62,8 @@ jobs:
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-          if [[ "$checkout_sha" != "$GITHUB_SHA" || "$tag_sha" != "$GITHUB_SHA" ]]; then
-            echo "ERROR: immutable event SHA $GITHUB_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
+          if [[ "$checkout_sha" != "$RELEASE_SHA" || "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: release SHA $RELEASE_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
             exit 1
           fi
 
@@ -122,8 +143,8 @@ jobs:
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
-            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
             exit 1
           fi
           if state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
@@ -176,6 +197,10 @@ jobs:
     name: Resolve validated release promotion
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      release-gate-state: ${{ steps.release-gate.outputs.release-gate-state }}
+      release-tag: ${{ steps.release-gate.outputs.release-tag }}
+      release-pr-number: ${{ steps.release-gate.outputs.release-pr-number }}
     permissions:
       actions: read
       contents: read
@@ -187,30 +212,85 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
-      - name: Resolve tag to the trusted observer receipt
+      - name: Resolve release SHA to the trusted observer receipt
         id: release-gate
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          RELEASE_SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
         run: |
           set -euo pipefail
-          tag_sha="$(gh api --method GET \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-          if [[ "$tag_sha" != "$GITHUB_SHA" || "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
-            echo "ERROR: release tag or checkout differs from immutable event SHA $GITHUB_SHA."
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+              echo "ERROR: recovery dispatch must use the default main control plane."
+              exit 1
+            }
+            [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]] || {
+              echo "ERROR: recovery resolver checkout does not match its immutable main control SHA."
+              exit 1
+            }
+            [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "ERROR: release_sha must be a canonical lowercase SHA."
+              exit 1
+            }
+            [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
+              echo "ERROR: release_tag must be a canonical v-version."
+              exit 1
+            }
+            [[ "$RELEASE_SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ && "$RELEASE_SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || {
+              echo "ERROR: source run identity must be positive integers."
+              exit 1
+            }
+            [[ "$(gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY" --jq '.default_branch')" == "main" ]] || {
+              echo "ERROR: recovery control plane is no longer the repository default branch."
+              exit 1
+            }
+            python3 scripts/release-promotion.py gate-main \
+              --repository "$GITHUB_REPOSITORY" \
+              --sha "$RELEASE_SHA" \
+              --temp-root "$RUNNER_TEMP" \
+              --github-output "$GITHUB_OUTPUT" \
+              --plan-output "$RUNNER_TEMP/release-promotion-plan.json"
+            jq -e \
+              --arg sha "$RELEASE_SHA" \
+              --arg tag "$RELEASE_TAG" \
+              --argjson source_run_id "$RELEASE_SOURCE_RUN_ID" \
+              --argjson source_run_attempt "$RELEASE_SOURCE_RUN_ATTEMPT" \
+              '.main_sha == $sha and .main_run == null and
+               .receipt.run_id == $source_run_id and
+               .receipt.run_attempt == $source_run_attempt and
+               .main_tree_sha == .receipt.tree_sha and
+               ("v" + .receipt.version) == $tag' \
+              "$RUNNER_TEMP/release-promotion-plan.json" >/dev/null || {
+                echo "ERROR: fresh recovery gate does not exactly match dispatch inputs."
+                exit 1
+              }
+          elif [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            tag_sha="$(gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+            if [[ "$tag_sha" != "$RELEASE_SHA" || "$(git rev-parse HEAD)" != "$RELEASE_SHA" ]]; then
+              echo "ERROR: release tag or checkout differs from immutable release SHA $RELEASE_SHA."
+              exit 1
+            fi
+            python3 scripts/release-promotion.py consume-main-receipt \
+              --repository "$GITHUB_REPOSITORY" \
+              --sha "$RELEASE_SHA" \
+              --temp-root "$RUNNER_TEMP" \
+              --github-output "$GITHUB_OUTPUT" \
+              --plan-output "$RUNNER_TEMP/release-promotion-plan.json"
+          else
+            echo "ERROR: unsupported release trigger $GITHUB_EVENT_NAME."
             exit 1
           fi
-          python3 scripts/release-promotion.py consume-main-receipt \
-            --repository "$GITHUB_REPOSITORY" \
-            --sha "$GITHUB_SHA" \
-            --temp-root "$RUNNER_TEMP" \
-            --github-output "$GITHUB_OUTPUT" \
-            --plan-output "$RUNNER_TEMP/release-promotion-plan.json"
       - name: Require exact receipt-derived tag
         run: |
-          if [[ "${{ steps.release-gate.outputs.release-tag }}" != "$RELEASE_TAG" ]]; then
+          if [[ "${{ steps.release-gate.outputs.release-gate-state }}" != "validated" || "${{ steps.release-gate.outputs.release-tag }}" != "$RELEASE_TAG" ]]; then
             echo "Tag does not match the validated release version."
             exit 1
           fi
@@ -228,9 +308,76 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
+  bind-release-tag:
+    name: Bind exact release tag
+    needs: resolve-promotion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      issues: read
+    steps:
+      - name: Create or verify the lightweight receipt-derived tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_STATE: ${{ needs.resolve-promotion.outputs.release-gate-state }}
+          GATE_TAG: ${{ needs.resolve-promotion.outputs.release-tag }}
+          RELEASE_PR_NUMBER: ${{ needs.resolve-promotion.outputs.release-pr-number }}
+        run: |
+          set -euo pipefail
+          [[ "$GATE_STATE" == "validated" && "$GATE_TAG" == "$RELEASE_TAG" ]] || {
+            echo "ERROR: resolver did not produce the requested validated tag."
+            exit 1
+          }
+          [[ "$RELEASE_PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
+            echo "ERROR: resolver did not produce a canonical release PR number."
+            exit 1
+          }
+          labels="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/issues/$RELEASE_PR_NUMBER/labels?per_page=100")"
+          jq -e \
+            '([.[].name] | index("autorelease: pending") != null) and
+             ([.[].name] | index("autorelease: tagged") == null)' \
+            <<<"$labels" >/dev/null || {
+              echo "ERROR: release PR lifecycle is no longer pending and untagged."
+              exit 1
+            }
+          tag_sha=""
+          if tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha' 2>/dev/null)"; then
+            [[ "$tag_sha" == "$RELEASE_SHA" ]] || {
+              echo "ERROR: existing $RELEASE_TAG points at $tag_sha, not $RELEASE_SHA."
+              exit 1
+            }
+            exit 0
+          fi
+          [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]] || {
+            echo "ERROR: tag-push release requires its existing immutable event tag."
+            exit 1
+          }
+          if ! gh api --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/refs" \
+            -f "ref=refs/tags/$RELEASE_TAG" \
+            -f "sha=$RELEASE_SHA" >/dev/null; then
+            tag_sha="$(gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+            [[ "$tag_sha" == "$RELEASE_SHA" ]] || {
+              echo "ERROR: concurrent tag bind does not match $RELEASE_SHA."
+              exit 1
+            }
+          fi
+
   promote-assets:
     name: Promote exact validated release assets
-    needs: [resolve-promotion, prepare-release]
+    needs: [resolve-promotion, bind-release-tag, prepare-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -239,7 +386,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 1
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -266,8 +413,8 @@ jobs:
               -H 'Accept: application/vnd.github+json' \
               -H 'X-GitHub-Api-Version: 2026-03-10' \
               "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-            if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
-              echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+            if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+              echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
               exit 1
             fi
             name="$(basename "$asset")"
@@ -316,7 +463,7 @@ jobs:
     # Package the exact observer-validated server bytes. The semantic smoke
     # runs before registry login, so candidate code never executes with the
     # GHCR write credential in its environment.
-    needs: promote-assets
+    needs: [promote-assets, bind-release-tag]
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 12
     permissions:
@@ -338,7 +485,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 1
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -370,8 +517,8 @@ jobs:
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
-            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
             exit 1
           fi
       # No untrusted binary runs after this point.
@@ -414,7 +561,7 @@ jobs:
     name: Combine Docker Manifest (multi-arch)
     # Public aliases are promotion outputs. Consume registry digests rather
     # than mutable staging tags and expose them only after every channel passes.
-    needs: [docker, promote-assets, publish-crates, publish-npm, update-homebrew]
+    needs: [docker, promote-assets, publish-crates, publish-npm, update-homebrew, bind-release-tag]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -437,8 +584,8 @@ jobs:
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
-            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
             exit 1
           fi
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -455,8 +602,8 @@ jobs:
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
-            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
             exit 1
           fi
           TAG="${{ env.RELEASE_TAG }}"
@@ -503,7 +650,7 @@ jobs:
 
   publish-crates:
     name: Publish crates.io (wenlan-types + wenlan-mcp)
-    needs: promote-assets
+    needs: [promote-assets, bind-release-tag]
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -511,7 +658,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 0
           fetch-tags: true
 
@@ -526,8 +673,8 @@ jobs:
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-          if [[ "$checkout_sha" != "$GITHUB_SHA" || "$tag_sha" != "$GITHUB_SHA" ]]; then
-            echo "ERROR: immutable event SHA $GITHUB_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
+          if [[ "$checkout_sha" != "$RELEASE_SHA" || "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: release SHA $RELEASE_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
             exit 1
           fi
 
@@ -552,8 +699,8 @@ jobs:
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
-            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
             exit 1
           fi
           VERSION="${{ steps.version.outputs.value }}"
@@ -573,8 +720,8 @@ jobs:
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
-            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
             exit 1
           fi
           VERSION="${{ steps.version.outputs.value }}"
@@ -587,7 +734,7 @@ jobs:
 
   publish-npm:
     name: Publish to npm
-    needs: promote-assets
+    needs: [promote-assets, bind-release-tag]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -596,7 +743,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 0
           fetch-tags: true
       - name: Verify release checkout
@@ -610,8 +757,8 @@ jobs:
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-          if [[ "$checkout_sha" != "$GITHUB_SHA" || "$tag_sha" != "$GITHUB_SHA" ]]; then
-            echo "ERROR: immutable event SHA $GITHUB_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
+          if [[ "$checkout_sha" != "$RELEASE_SHA" || "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: release SHA $RELEASE_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
             exit 1
           fi
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -655,8 +802,8 @@ jobs:
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
-            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
             exit 1
           fi
           VERSION="${RELEASE_TAG#v}"
@@ -675,8 +822,8 @@ jobs:
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
-            echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
             exit 1
           fi
           VERSION="${RELEASE_TAG#v}"
@@ -690,7 +837,7 @@ jobs:
 
   update-homebrew:
     name: Update Homebrew tap
-    needs: promote-assets
+    needs: [promote-assets, bind-release-tag]
     # The tap ships macOS arm64 archives. Validate the formulas with the real
     # Homebrew client on the same architecture instead of stopping at `ruby -c`.
     runs-on: macos-14
@@ -713,8 +860,8 @@ jobs:
               -H 'Accept: application/vnd.github+json' \
               -H 'X-GitHub-Api-Version: 2026-03-10' \
               "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-            if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
-              echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $tag_sha."
+            if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+              echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
               exit 1
             fi
           }
@@ -828,7 +975,7 @@ jobs:
     # docker-manifest is itself the fail-closed promotion barrier over every
     # required channel; only after it publishes the aliases may GitHub's
     # prerelease become the latest stable release.
-    needs: docker-manifest
+    needs: [docker-manifest, bind-release-tag]
     timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
@@ -844,8 +991,8 @@ jobs:
               -H 'Accept: application/vnd.github+json' \
               -H 'X-GitHub-Api-Version: 2026-03-10' \
               "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-            if [[ "$current" != "$GITHUB_SHA" ]]; then
-              echo "ERROR: $RELEASE_TAG moved from event SHA $GITHUB_SHA to $current." >&2
+            if [[ "$current" != "$RELEASE_SHA" ]]; then
+              echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $current." >&2
               exit 1
             fi
             printf '%s' "$current"

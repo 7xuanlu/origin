@@ -304,14 +304,61 @@ def contract_violations(
         if forbidden in sync_release_pr:
             violations.append(f"release PR synchronizer contains unsafe mutation {forbidden!r}")
 
-    if re.search(r"\n\s+workflow_dispatch:", release):
-        violations.append("tag release retains an unbound manual dispatch path")
+    for marker in [
+        "workflow_dispatch:",
+        "release_sha:",
+        "release_tag:",
+        "source_run_id:",
+        "source_run_attempt:",
+        "release-pr-number: ${{ steps.release-gate.outputs.release-pr-number }}",
+        "required: true",
+        "group: release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}",
+    ]:
+        if marker not in release:
+            violations.append(f"release recovery dispatch omits {marker!r}")
     checkout_refs = re.findall(
         r"uses: actions/checkout@[0-9a-f]{40}[^\n]*\n\s+with:\n(?:\s+[^\n]+\n)*?\s+ref: ([^\n]+)",
         release,
     )
-    if not checkout_refs or any(ref.strip() != "${{ github.sha }}" for ref in checkout_refs):
-        violations.append("tag release checkout is not pinned to the immutable event SHA")
+    if not checkout_refs or any(
+        ref.strip() not in {"${{ github.sha }}", "${{ env.RELEASE_SHA }}"}
+        for ref in checkout_refs
+    ) or "ref: ${{ env.RELEASE_SHA }}" not in release:
+        violations.append("release checkout is not pinned to the immutable control or resolved release SHA")
+    resolver_checkout = job_body(release, "resolve-promotion")
+    if (
+        "ref: ${{ github.sha }}" not in resolver_checkout
+        or "git rev-parse HEAD)\" == \"$GITHUB_SHA" not in resolver_checkout
+        or "ref: ${{ env.RELEASE_SHA }}" in resolver_checkout
+    ):
+        violations.append("release resolver is not pinned to its immutable main control SHA")
+    for job_name in [
+        "prepare-release",
+        "promote-assets",
+        "docker",
+        "publish-crates",
+        "publish-npm",
+    ]:
+        job = job_body(release, job_name)
+        if "ref: ${{ env.RELEASE_SHA }}" not in job or "ref: ${{ github.sha }}" in job:
+            violations.append(f"release source job {job_name!r} is not pinned to RELEASE_SHA")
+    bind = job_body(release, "bind-release-tag")
+    if (
+        "contents: write" not in bind
+        or "issues: read" not in bind
+        or "actions/checkout@" in bind
+        or "/git/refs" not in bind
+        or "GATE_STATE" not in bind
+        or "RELEASE_PR_NUMBER" not in bind
+        or 'index("autorelease: pending") != null' not in bind
+        or 'index("autorelease: tagged") == null' not in bind
+    ):
+        violations.append("receipt-derived tag binding lacks isolated write authority")
+    if any(
+        marker not in resolver_checkout
+        for marker in ["actions: read", "contents: read", "pull-requests: read"]
+    ) or "contents: write" in resolver_checkout:
+        violations.append("release resolver does not retain read-only token authority")
     if "ref: refs/tags/${{ env.RELEASE_TAG }}" in release:
         violations.append("tag release can checkout a mutable tag ref")
     if job_body(release, "release"):
@@ -356,6 +403,7 @@ def contract_violations(
             )
     for job in [
         "resolve-promotion",
+        "bind-release-tag",
         "prepare-release",
         "promote-assets",
         "docker",
@@ -364,16 +412,21 @@ def contract_violations(
     ]:
         if not job_body(release, job):
             violations.append(f"tag release omits artifact-promotion job {job!r}")
-    if "    needs: resolve-promotion" not in job_body(release, "prepare-release"):
-        violations.append("release preparation can start before promotion identity is resolved")
-    if "    needs: [resolve-promotion, prepare-release]" not in job_body(
+    if "    needs: [resolve-promotion, bind-release-tag]" not in job_body(release, "prepare-release"):
+        violations.append("release preparation can start before receipt-derived tag binding")
+    if "    needs: [resolve-promotion, bind-release-tag, prepare-release]" not in job_body(
         release, "promote-assets"
     ):
-        violations.append("asset publication bypasses receipt resolution or prerelease gate")
+        violations.append("asset publication bypasses receipt resolution, tag binding, or prerelease gate")
     resolve = job_body(release, "resolve-promotion")
     for marker in [
+        "scripts/release-promotion.py gate-main",
         "scripts/release-promotion.py consume-main-receipt",
-        '--sha "$GITHUB_SHA"',
+        '--sha "$RELEASE_SHA"',
+        ".main_sha == $sha and .main_run == null",
+        ".receipt.run_id == $source_run_id",
+        ".receipt.run_attempt == $source_run_attempt",
+        '"$GITHUB_REF" == "refs/heads/main"',
         "name: release-promotion-plan-${{ github.run_id }}",
         "retention-days: 30",
         "overwrite: true",
@@ -383,6 +436,7 @@ def contract_violations(
     for job_name in [
         "prepare-release",
         "resolve-promotion",
+        "bind-release-tag",
         "promote-assets",
         "docker",
         "docker-manifest",
@@ -392,7 +446,7 @@ def contract_violations(
         "finalize-release",
     ]:
         job = job_body(release, job_name)
-        for marker in ["/git/ref/tags/$RELEASE_TAG", "GITHUB_SHA"]:
+        for marker in ["/git/ref/tags/$RELEASE_TAG", "RELEASE_SHA"]:
             if marker not in job:
                 violations.append(
                     f"publication job {job_name!r} omits immutable tag check {marker!r}"
@@ -417,7 +471,7 @@ def contract_violations(
             violations.append(f"validated asset promotion omits {marker!r}")
 
     docker = job_body(release, "docker")
-    if "    needs: promote-assets" not in docker:
+    if "    needs: [promote-assets, bind-release-tag]" not in docker:
         violations.append("runtime images can start before exact validated asset promotion")
     for marker in [
         "docker/Dockerfile.release-runtime",
@@ -452,15 +506,15 @@ def contract_violations(
             violations.append(f"runtime image verifier omits {marker!r}")
     manifest = job_body(release, "docker-manifest")
     if (
-        "    needs: [docker, promote-assets, publish-crates, publish-npm, update-homebrew]"
+        "    needs: [docker, promote-assets, publish-crates, publish-npm, update-homebrew, bind-release-tag]"
         not in manifest
     ):
         violations.append("GHCR promotion dependencies omit a required publish channel")
     npm = job_body(release, "publish-npm")
-    if "    needs: promote-assets" not in npm or "needs: publish-crates" in npm:
+    if "    needs: [promote-assets, bind-release-tag]" not in npm or "needs: publish-crates" in npm:
         violations.append("npm publishing is serialized behind crates.io propagation")
     finalize = job_body(release, "finalize-release")
-    if "    needs: docker-manifest" not in finalize:
+    if "    needs: [docker-manifest, bind-release-tag]" not in finalize:
         violations.append("GitHub release finalization bypasses the GHCR promotion barrier")
     tagged = finalize.find('"labels":["autorelease: tagged"]')
     pending = finalize.find("labels/autorelease%3A%20pending")
@@ -1292,12 +1346,12 @@ def main() -> None:
         (
             "  publish-crates:\n"
             "    name: Publish crates.io (wenlan-types + wenlan-mcp)\n"
-            "    needs: promote-assets\n"
+            "    needs: [promote-assets, bind-release-tag]\n"
             "    runs-on: ubuntu-latest\n"
             "    timeout-minutes: 15",
             "  publish-crates:\n"
             "    name: Publish crates.io (wenlan-types + wenlan-mcp)\n"
-            "    needs: promote-assets\n"
+            "    needs: [promote-assets, bind-release-tag]\n"
             "    runs-on: ubuntu-latest\n"
             "    timeout-minutes: 150",
             "15-minute bound",
@@ -1310,7 +1364,7 @@ def main() -> None:
             "release",
         ),
         (
-            "publish-npm:\n    name: Publish to npm\n    needs: promote-assets",
+            "publish-npm:\n    name: Publish to npm\n    needs: [promote-assets, bind-release-tag]",
             "publish-npm:\n    name: Publish to npm\n    needs: publish-crates",
             "serialized behind crates.io",
             "release",

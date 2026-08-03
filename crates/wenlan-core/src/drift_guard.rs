@@ -5845,12 +5845,21 @@ fn release_promotion_contract_violations(
     {
         violations.push("ordinary main release-please is not PR-only".into());
     }
-    if release["on"].get("workflow_dispatch").is_some()
+    let dispatch = &release["on"]["workflow_dispatch"]["inputs"];
+    if dispatch["release_sha"]["required"].as_bool() != Some(true)
+        || dispatch["release_tag"]["required"].as_bool() != Some(true)
+        || dispatch["source_run_id"]["required"].as_bool() != Some(true)
+        || dispatch["source_run_attempt"]["required"].as_bool() != Some(true)
+        || !release_workflow.contains(
+            "group: release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}",
+        )
+        || release["jobs"]["resolve-promotion"]["outputs"]["release-pr-number"].as_str()
+            != Some("${{ steps.release-gate.outputs.release-pr-number }}")
         || release["jobs"].get("release").is_some()
         || release_workflow.contains("cargo build")
         || release_workflow.contains("build-release-binaries")
     {
-        violations.push("tag release has an unbound trigger or duplicate compilation lane".into());
+        violations.push("release recovery dispatch is not receipt-bound or retains a duplicate compilation lane".into());
     }
     let crates_text = serde_yaml::to_string(&release["jobs"]["publish-crates"]).unwrap_or_default();
     if crates_text.contains("--dry-run") {
@@ -5913,9 +5922,13 @@ fn release_promotion_contract_violations(
                 .is_some_and(|uses| uses.starts_with("actions/checkout@"))
             {
                 checkout_count += 1;
-                if step["with"]["ref"].as_str() != Some("${{ github.sha }}") {
+                if !matches!(
+                    step["with"]["ref"].as_str(),
+                    Some("${{ github.sha }}") | Some("${{ env.RELEASE_SHA }}")
+                ) {
                     violations.push(
-                        "tag release checkout is not pinned to the immutable event SHA".into(),
+                        "release checkout is not pinned to its immutable control or release SHA"
+                            .into(),
                     );
                 }
             }
@@ -5924,9 +5937,52 @@ fn release_promotion_contract_violations(
     if checkout_count == 0 || release_workflow.contains("ref: refs/tags/${{ env.RELEASE_TAG }}") {
         violations.push("tag release retains a mutable tag-ref checkout".into());
     }
+    let resolver_job = &release["jobs"]["resolve-promotion"];
+    let resolver_text = serde_yaml::to_string(resolver_job).unwrap_or_default();
+    if !resolver_text.contains("ref: ${{ github.sha }}")
+        || resolver_text.contains("ref: ${{ env.RELEASE_SHA }}")
+        || !resolver_text.contains("git rev-parse HEAD)\" == \"$GITHUB_SHA")
+        || resolver_job["permissions"]["actions"].as_str() != Some("read")
+        || resolver_job["permissions"]["contents"].as_str() != Some("read")
+        || resolver_job["permissions"]["pull-requests"].as_str() != Some("read")
+    {
+        violations.push(
+            "release resolver is not pinned to its immutable read-only main control plane".into(),
+        );
+    }
+    for job_name in [
+        "prepare-release",
+        "promote-assets",
+        "docker",
+        "publish-crates",
+        "publish-npm",
+    ] {
+        let job_text = serde_yaml::to_string(&release["jobs"][job_name]).unwrap_or_default();
+        if !job_text.contains("ref: ${{ env.RELEASE_SHA }}")
+            || job_text.contains("ref: ${{ github.sha }}")
+        {
+            violations.push(format!(
+                "release source job {job_name:?} is not pinned to the resolved release SHA"
+            ));
+        }
+    }
+    let bind_job = &release["jobs"]["bind-release-tag"];
+    let bind_text = serde_yaml::to_string(bind_job).unwrap_or_default();
+    if bind_job["permissions"]["contents"].as_str() != Some("write")
+        || bind_job["permissions"]["issues"].as_str() != Some("read")
+        || bind_text.contains("actions/checkout@")
+        || !bind_text.contains("/git/refs")
+        || !bind_text.contains("GATE_STATE")
+        || !bind_text.contains("RELEASE_PR_NUMBER")
+        || !bind_text.contains("index(\"autorelease: pending\") != null")
+        || !bind_text.contains("index(\"autorelease: tagged\") == null")
+    {
+        violations.push("receipt-derived tag binding lacks isolated write authority".into());
+    }
     for job_name in [
         "prepare-release",
         "resolve-promotion",
+        "bind-release-tag",
         "promote-assets",
         "docker",
         "docker-manifest",
@@ -5936,9 +5992,9 @@ fn release_promotion_contract_violations(
         "finalize-release",
     ] {
         let job_text = serde_yaml::to_string(&release["jobs"][job_name]).unwrap_or_default();
-        if !job_text.contains("/git/ref/tags/$RELEASE_TAG") || !job_text.contains("GITHUB_SHA") {
+        if !job_text.contains("/git/ref/tags/$RELEASE_TAG") || !job_text.contains("RELEASE_SHA") {
             violations.push(format!(
-                "publication job {job_name:?} does not revalidate the immutable event tag"
+                "publication job {job_name:?} does not revalidate the immutable receipt-derived tag"
             ));
         }
     }
@@ -5953,13 +6009,16 @@ fn release_promotion_contract_violations(
     let resolve = job_step(
         &release,
         "resolve-promotion",
-        "Resolve tag to the trusted observer receipt",
+        "Resolve release SHA to the trusted observer receipt",
     )
     .and_then(|step| step["run"].as_str())
     .unwrap_or_default();
-    if !resolve.contains("scripts/release-promotion.py consume-main-receipt")
-        || job_needs(&release, "prepare-release") != ["resolve-promotion"]
-        || job_needs(&release, "promote-assets") != ["resolve-promotion", "prepare-release"]
+    if !resolve.contains("scripts/release-promotion.py gate-main")
+        || !resolve.contains("scripts/release-promotion.py consume-main-receipt")
+        || !resolve.contains(".main_sha == $sha and .main_run == null")
+        || job_needs(&release, "prepare-release") != ["resolve-promotion", "bind-release-tag"]
+        || job_needs(&release, "promote-assets")
+            != ["resolve-promotion", "bind-release-tag", "prepare-release"]
     {
         violations
             .push("tag release does not resolve the main receipt before asset promotion".into());
@@ -6005,7 +6064,7 @@ fn release_promotion_contract_violations(
     }
     let docker = &release["jobs"]["docker"];
     let docker_text = serde_yaml::to_string(docker).unwrap_or_default();
-    if job_needs(&release, "docker") != ["promote-assets"]
+    if job_needs(&release, "docker") != ["promote-assets", "bind-release-tag"]
         || !docker_text.contains("docker/Dockerfile.release-runtime")
         || !docker_text.contains("scripts/verify-release-runtime-image.py")
         || docker_text.contains("docker/Dockerfile.daemon")
@@ -6211,8 +6270,8 @@ fn release_promotion_contract_rejects_rebuild_and_unbounded_receipts() {
         std::fs::read_to_string(root.join(".github/workflows/release.yml"))
             .expect("read release")
             .replace(
-                "  publish-crates:\n    name: Publish crates.io (wenlan-types + wenlan-mcp)\n    needs: promote-assets\n    runs-on: ubuntu-latest\n    timeout-minutes: 15",
-                "  publish-crates:\n    name: Publish crates.io (wenlan-types + wenlan-mcp)\n    needs: promote-assets\n    runs-on: ubuntu-latest\n    timeout-minutes: 150",
+                "  publish-crates:\n    name: Publish crates.io (wenlan-types + wenlan-mcp)\n    needs: [promote-assets, bind-release-tag]\n    runs-on: ubuntu-latest\n    timeout-minutes: 15",
+                "  publish-crates:\n    name: Publish crates.io (wenlan-types + wenlan-mcp)\n    needs: [promote-assets, bind-release-tag]\n    runs-on: ubuntu-latest\n    timeout-minutes: 150",
             );
     let unbounded_crates_violations = release_promotion_contract_violations(
         &ci,
