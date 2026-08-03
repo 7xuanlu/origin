@@ -252,18 +252,24 @@ fn text(value: impl Into<String>) -> libsql::Value {
 ///
 /// `space_index` selects from `M6_SPACE_SPLIT_PERCENT`; index 0 is the 40%
 /// space, the worst case and the one `R-BENCH-HUB` cares about.
+///
+/// The caller owns the connection, and that is not a style choice:
+/// `repository_module_graph_matches_r4_25_group_6_census`
+/// forbids a raw `libsql` origin anywhere under `crates/*/src` that is not
+/// behind `#[cfg(test)]`, and this module is behind a cargo feature instead --
+/// which the guard does not accept, and should not, since a feature can be
+/// switched on in a shipped build. The bench target lives outside `src`, so
+/// building the database there keeps the invariant intact rather than widening
+/// the guard to admit a new exemption.
 pub async fn run_relevance_budget_bench(
+    connection: &libsql::Connection,
     space_index: usize,
     max_turns: usize,
 ) -> Result<RelevanceBudgetReceipt> {
     let corpus = parse_corpus()?;
     debug_assert!(corpus.memories_seen > 0);
 
-    let database = libsql::Builder::new_local(":memory:")
-        .build()
-        .await
-        .context("build in-memory database")?;
-    let connection = database.connect().context("connect")?;
+    let connection = connection.clone();
     install_schema(&connection).await?;
 
     let space_name = format!("space-{space_index}");
@@ -322,13 +328,21 @@ pub async fn run_relevance_budget_bench(
                 text(format!("p{index}")),
                 text(format!("Page {index}")),
                 text(format!("space-{space}")),
+                // Named rather than left to the NOT NULL DEFAULT, per
+                // `every_production_page_insert_names_kind`. The corpus stands
+                // in for ordinary distilled pages, which is what
+                // `page_kind_for` returns for any creation kind it does not
+                // recognise -- and the sweep's own eligibility predicate drops
+                // pages titled `overview`, so a corpus that minted them would
+                // be measuring a filtered-out population.
+                text("concept".to_string()),
             ]
         })
         .collect();
     insert_batched(
         &connection,
-        "INSERT INTO pages (id, title, space)",
-        3,
+        "INSERT INTO pages (id, title, space, kind)",
+        4,
         &page_rows,
     )
     .await?;

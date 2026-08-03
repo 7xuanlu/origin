@@ -329,8 +329,22 @@ fn the_bounded_sweep_stays_inside_the_frozen_count_budgets() {
         .expect("runtime");
 
     for (space_index, max_turns, drains) in [(0usize, 60usize, false), (7, 4096, true)] {
+        // The database is built here, not inside the harness:
+        // `repository_module_graph_matches_r4_25_group_6_census` requires every
+        // raw `libsql` origin under `crates/*/src` to be `#[cfg(test)]`-gated,
+        // and the harness is behind a cargo feature instead -- which the guard
+        // does not accept, and should not, since a feature can be switched on
+        // in a shipped build. This target lives outside `src`, so owning the
+        // connection here keeps the invariant intact.
         let receipt = runtime
-            .block_on(run_relevance_budget_bench(space_index, max_turns))
+            .block_on(async {
+                let database = libsql::Builder::new_local(":memory:")
+                    .build()
+                    .await
+                    .expect("build in-memory database");
+                let connection = database.connect().expect("connect");
+                run_relevance_budget_bench(&connection, space_index, max_turns).await
+            })
             .expect("relevance budget bench");
         let widths: Vec<usize> = receipt
             .bounded_turns

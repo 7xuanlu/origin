@@ -24,6 +24,18 @@ Both halves must hold INSIDE THE SAME string literal. An earlier version tested
 (a) and (b) anywhere in the function body, which counted `list_tags_scoped`
 (selects tags, merely checks page existence) and `tally` (no page SQL at all).
 
+CONSTS: a `&str` const's literal counts as if it were written inline in every
+body that names the const. Without this, hoisting a query into a shared
+constant deletes its readers from the inventory -- silently, and in the
+direction that under-reports. It is a real hole, not a hypothetical: four
+constants in the tree carry page SQL today, and `ELIGIBLE_EVIDENCE_PREDICATE`
+(m6/independence.rs) is shared by two modules precisely so the two cannot
+drift, which is the opposite of a reason to hide it. The const's literal stays
+ONE literal, so the same-literal rule above is unweakened -- an inline half and
+a const half still do not combine. Const names resolve repo-wide by name, the
+same over-matching resolution the caller edges use; here it over-matches toward
+LISTING a reader, which is the safe direction for an inventory.
+
 Function bodies are brace-matched. An earlier version delimited a body by the
 next `fn` match, which merged adjacent functions and inflated the set.
 
@@ -96,6 +108,11 @@ FN = re.compile(
 )
 PROSE = re.compile(r'\b(content|title|summary|excerpt|body|snippet)\b')
 SQLBLK = re.compile(r'"[^"]*(?:FROM|JOIN)\s+pages\b[^"]*"', re.I | re.S)
+# Matched against the MASKED structure, where a literal's own bytes are blanked
+# — so the `=` this finds is the declaration's, never one inside a string.
+CONST_STR = re.compile(
+    r'\b(?:const|static)\s+(\w+)\s*:\s*&\s*(?:\'\w+\s+)?str\s*=', re.M
+)
 RAW_STRING_START = re.compile(r'r(#{0,255})"')
 CHAR_LITERAL = re.compile(
     r"""'(?:\\(?:[nrt0\\'"]|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]{1,6}\})|[^'\\])'"""
@@ -338,6 +355,24 @@ def _validate_call_ownership(index, names):
             )
 
 
+def _const_literals(raw_text, code_text):
+    """Map each `&str` const's name to its initializer, as written.
+
+    `code_text` is the masked structure, so the terminating `;` is found on a
+    view where a `;` *inside* the literal has been blanked — the slice taken
+    from `raw_text` at those offsets is therefore the whole initializer, even
+    for the multi-line SQL strings this exists to see. Both views are
+    character-aligned by construction (masking replaces, never resizes).
+    """
+    found = {}
+    for match in CONST_STR.finditer(code_text):
+        end = code_text.find(';', match.end())
+        if end < 0:
+            continue
+        found.setdefault(match.group(1), []).append(raw_text[match.end():end])
+    return found
+
+
 def build_index(sources):
     """Index functions and calls once; retain lines only for diagnostics."""
     normalized = {
@@ -347,6 +382,7 @@ def build_index(sources):
     functions = []
     declared = {}
     per_file = {}
+    const_literals = {}
 
     for path in sorted(normalized):
         lines, structure = strip_test(
@@ -356,6 +392,10 @@ def build_index(sources):
         offsets = _line_offsets(structure)
         file_functions = []
         definition_offsets = set()
+
+        for name, values in _const_literals(
+                '\n'.join(lines), code_text).items():
+            const_literals.setdefault(name, []).extend(values)
 
         for line_index, structural in enumerate(structure):
             match = FN.match(structural)
@@ -420,6 +460,7 @@ def build_index(sources):
     return {
         'functions': functions,
         'by_locator': {function['locator']: function for function in functions},
+        'const_literals': const_literals,
         'declared': declared,
         'calls_by_locator': calls_by_locator,
         'callers_by_name': callers_by_name,
@@ -460,9 +501,17 @@ def _read_sources():
 def sweep(sources=None, index=None):
     if index is None:
         index = build_index(_read_sources() if sources is None else sources)
+    consts = {
+        name: [query for value in values for query in SQLBLK.findall(value)]
+        for name, values in index.get('const_literals', {}).items()
+    }
+    consts = {name: queries for name, queries in consts.items() if queries}
     readers = []
     for function in index['functions']:
         sqls = SQLBLK.findall(function['body'])
+        for name, queries in consts.items():
+            if re.search(r'\b%s\b' % re.escape(name), function['body']):
+                sqls.extend(queries)
         if sqls and any(PROSE.search(query) for query in sqls):
             readers.append(_public_row(function, 0, index))
 
@@ -828,6 +877,53 @@ fn wrapper() {
     }
     assert not sweep(split_predicate), \
         'SQL and prose in different string literals must not qualify'
+
+    hoisted = {
+        core_path: '''const SHARED: &str = "SELECT p.title
+     FROM pages p
+    WHERE p.id = ?1";
+
+fn reads_via_const() {
+    let query = format!("{SHARED} AND p.space = ?2");
+}
+
+fn names_nothing() {
+    let query = "SELECT id FROM entities";
+}
+''',
+    }
+    hoisted_rows = sweep(hoisted)
+    assert [row['fn'] for row in hoisted_rows] == ['reads_via_const'], \
+        'a query hoisted into a `&str` const hid its reader from the inventory'
+    inlined = {core_path: hoisted[core_path].replace('{SHARED} AND p.space = ?2', '')}
+    assert rendered(hoisted) != rendered(inlined), \
+        'dropping the only reference to a page-SQL const must fail exact equality'
+
+    # The const path must not become a back door around the same-literal rule:
+    # each half is legal on its own and the pair still must not qualify.
+    const_halves = {
+        core_path: '''const TABLE: &str = "FROM pages";
+
+fn still_not_a_reader() {
+    let query = format!("SELECT content {TABLE}");
+}
+''',
+    }
+    assert not sweep(const_halves), \
+        'a const supplied one half of the predicate and the other came inline'
+
+    # A `;` inside the literal must not end the initializer early, or a
+    # multi-statement SQL const is truncated before its prose column.
+    semicolon = {
+        core_path: '''const MULTI: &str = "PRAGMA x; SELECT title FROM pages";
+
+fn reads_multi() {
+    let query = MULTI;
+}
+''',
+    }
+    assert [row['fn'] for row in sweep(semicolon)] == ['reads_multi'], \
+        'a semicolon inside a const literal truncated the initializer'
 
     masked_calls = dict(direct)
     masked_calls[server_path] = '''pub fn handle_one() {

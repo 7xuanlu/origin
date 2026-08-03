@@ -91,6 +91,16 @@ const CLOSURE: &[(&str, bool)] = &[
     // permanent and are fenced below before any destination cleanup occurs.
     ("m6_pair_stats", true),
     ("m6_adjacency", true),
+    // The marginals the pair reader subtracts. Same class as the two above and
+    // for the same reason — re-derivable from the eligible groups, `space` in
+    // the primary key — but they must move *with* them, not merely alongside:
+    // a pair's `n10`/`n01`/`n00` are computed as `mass(a)`, `mass(b)`, and
+    // `total` minus the stored `n11`, so a rename that carried the pair rows
+    // over and left the mass behind would leave every derived cell reading
+    // against a zero marginal rather than a missing one, and the sweep would
+    // publish those numbers instead of refusing them.
+    ("m6_page_mass", true),
+    ("m6_space_mass", true),
     ("genesis_refresh_jobs", false),
     ("m6_refresh_dependencies", true),
     ("m6_readiness", true),

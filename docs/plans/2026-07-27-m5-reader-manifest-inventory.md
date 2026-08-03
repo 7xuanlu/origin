@@ -914,6 +914,7 @@ carrying the authority of agreement.
 | `core/db/claim_derivation.rs::derive_leased_page_claims` | `pub(super)` | no | no | — | — |
 | `core/db/claim_derivation.rs::evaluate_support_on` | `private` | no | no | — | — |
 | `core/db/claim_derivation.rs::load_linked_memory_chunks` | `private` | no | no | — | — |
+| `core/db/m5_page_size_snapshot.rs::fixed_counts` | `pub` | no | no | — | — |
 | `core/db/maintenance_duplicate_reads.rs::embedding_near_duplicate_pairs` | `pub(crate)` | no | no | — | — |
 | `core/db/maintenance_duplicate_reads.rs::scan_near_duplicate_slice` | `pub(crate)` | no | no | — | — |
 | `core/db/maintenance_retro_scan.rs::scan_automatic_retro_stub_slice` | `pub(crate)` | no | no | — | — |
@@ -934,6 +935,10 @@ carrying the authority of agreement.
 | `core/lint/semantic_candidates.rs::load_pages` | `private` | yes | no | — | — |
 | `core/lint/serving/query.rs::load` | `pub(super)` | yes | no | — | — |
 | `core/m6/independence.rs::distinct_group_count` | `pub` | no | no | — | — |
+| `core/m6/relevance_sweep.rs::candidate_endpoints` | `pub` | no | no | — | — |
+| `core/m6/relevance_sweep.rs::eligible_groups` | `pub` | yes | no | — | — |
+| `core/m6/relevance_sweep.rs::group_support` | `pub` | no | no | — | — |
+| `core/m6/relevance_sweep.rs::groups_touching` | `pub` | no | no | — | — |
 | `core/m6/signals.rs::containing_revisions` | `private` | no | no | — | — |
 | `core/m6/signals.rs::orphan_candidate_pages` | `private` | no | no | — | — |
 | `core/m6/signals.rs::scoped_group_ids` | `private` | no | no | — | — |
@@ -952,6 +957,7 @@ carrying the authority of agreement.
 
 | Reader | Visibility | Ambiguous | Exposure | External callers | Reaches prose via |
 |---|---|---|---|---|---|
+| `core/bin/m5_export_page_size_dist.rs::run` | `private` | yes | no | — | `core/db/m5_page_size_snapshot.rs::fixed_counts` |
 | `core/db.rs::accept_page_merge` | `pub` | no | no | — | `core/db.rs::page_merge_row` |
 | `core/db.rs::augment_with_graph_gated` | `private` | no | no | — | `core/db/scoped_entities.rs::search_entities_by_vector_scoped` |
 | `core/db.rs::find_best_overlapping_page` | `pub` | no | no | — | `core/db.rs::load_page_source_index` |
@@ -980,6 +986,7 @@ carrying the authority of agreement.
 | `core/export/knowledge.rs::plan_truth_cutover` | `pub` | no | **yes** | `server/cmd_cutover.rs::run` | `core/db/truth_exposure.rs::page_truth_states` |
 | `core/lint/deep.rs::run` | `pub(super)` | yes | no | — | `core/lint/deep.rs::page_body_result`, `core/lint/deep.rs::page_duplicates` |
 | `core/lint/pages/db_checks.rs::run` | `pub(crate)` | yes | no | — | `core/lint/pages/db_checks.rs::load_rows` |
+| `core/m6/relevance_sweep.rs::run_relevance_sweep` | `pub` | no | no | — | `core/m6/relevance_sweep.rs::candidate_endpoints`, `core/m6/relevance_sweep.rs::groups_touching` |
 | `core/m6/signals.rs::community_overview` | `pub` | no | no | — | `core/m6/independence.rs::distinct_group_count`, `core/m6/signals.rs::scoped_root_ids` |
 | `core/m6/signals.rs::evidence_cluster` | `pub` | no | no | — | `core/m6/independence.rs::distinct_group_count`, `core/m6/signals.rs::scoped_group_ids`, `core/m6/signals.rs::scoped_root_ids` |
 | `core/m6/signals.rs::orphan_wikilink` | `pub` | no | no | — | `core/m6/signals.rs::orphan_candidate_pages` |
@@ -1055,6 +1062,7 @@ carrying the authority of agreement.
 | `core/eval/context_path.rs::run_context_path_eval` | `pub` | no | no | — | `core/db.rs::new_with_shared_embedder` |
 | `core/eval/context_path.rs::run_context_path_eval_longmemeval` | `pub` | no | no | — | `core/db.rs::new_with_shared_embedder` |
 | `core/eval/longmemeval.rs::run_longmemeval_rerank_pool_probe` | `pub` | no | no | — | `core/db.rs::new_with_shared_embedder` |
+| `core/eval/m6_relevance_harness.rs::run_relevance_budget_bench` | `pub` | no | no | — | `core/m6/relevance_sweep.rs::run_relevance_sweep` |
 | `core/eval/pipeline.rs::run_locomo_pipeline_eval` | `pub` | no | no | — | `core/db.rs::new_with_shared_embedder` |
 | `core/eval/pipeline.rs::run_longmemeval_pipeline_eval` | `pub` | no | no | — | `core/db.rs::new_with_shared_embedder` |
 | `core/eval/retrieval.rs::run_memory_layer_comparison` | `pub` | no | no | — | `core/db.rs::new_with_shared_embedder` |

@@ -157,6 +157,17 @@ async fn seed_substrate(conn: &libsql::Connection, space: &str) {
              VALUES (?1, 'page', 'page-a', 'neighbor-a', 1)",
             vec![space.into()],
         ),
+        // The marginals the row above derives `n10`/`n01`/`n00` against. One
+        // page row, not two, because the closure is checked one row per table.
+        (
+            "INSERT INTO m6_page_mass (space, page_id, mass)
+             VALUES (?1, 'page-a', 1.0)",
+            vec![space.into()],
+        ),
+        (
+            "INSERT INTO m6_space_mass (space, total) VALUES (?1, 2.0)",
+            vec![space.into()],
+        ),
         (
             "INSERT INTO genesis_refresh_jobs
                  (job_id, page_id, base_page_version, base_source_revision, space,
