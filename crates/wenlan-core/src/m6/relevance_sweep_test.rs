@@ -518,12 +518,17 @@ async fn the_full_recompute_reads_groups_in_independence_group_order() {
     // ORDER BY rather than a Rust-side sort — there is one place it can be
     // wrong and this is it.
     let db = GenesisDb::new().await;
-    for (root, group_id, page) in [
-        ("root-3", "g-c", "page-x"),
-        ("root-1", "g-a", "page-y"),
-        ("root-2", "g-b", "page-z"),
+    // The recency of each group runs *opposite* to its id, so ordering by
+    // anything time-shaped produces a different sequence than ordering by id.
+    // With all three at one instant the two orderings coincide and the test
+    // passes under a recency-ordered implementation — verified: that fixture
+    // survived the RED mutation, which is what a fixture must never do.
+    for (root, group_id, page, created_at) in [
+        ("root-3", "g-c", "page-x", 3_000),
+        ("root-1", "g-a", "page-y", 1_000),
+        ("root-2", "g-b", "page-z", 2_000),
     ] {
-        seed_page_support(&db, root, "space-a", group_id, page, 1_000).await;
+        seed_page_support(&db, root, "space-a", group_id, page, created_at).await;
     }
 
     let tx = db.tx().await;
