@@ -314,12 +314,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
-      contents: write
+      actions: write
+      contents: read
       issues: read
     steps:
       - name: Create or verify the lightweight receipt-derived tag
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_READ_TOKEN: ${{ github.token }}
+          GH_TAG_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           GATE_STATE: ${{ needs.resolve-promotion.outputs.release-gate-state }}
           GATE_TAG: ${{ needs.resolve-promotion.outputs.release-tag }}
           RELEASE_PR_NUMBER: ${{ needs.resolve-promotion.outputs.release-pr-number }}
@@ -333,7 +335,7 @@ jobs:
             echo "ERROR: resolver did not produce a canonical release PR number."
             exit 1
           }
-          labels="$(gh api --method GET \
+          labels="$(GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/issues/$RELEASE_PR_NUMBER/labels?per_page=100")"
@@ -345,7 +347,7 @@ jobs:
               exit 1
             }
           tag_sha=""
-          if tag_sha="$(gh api --method GET \
+          if tag_sha="$(GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha' 2>/dev/null)"; then
@@ -359,13 +361,35 @@ jobs:
             echo "ERROR: tag-push release requires its existing immutable event tag."
             exit 1
           }
-          if ! gh api --method POST \
+          [[ -n "$GH_TAG_TOKEN" ]] || {
+            echo "ERROR: RELEASE_TOKEN is required for historical workflow tag recovery."
+            exit 1
+          }
+
+          # A historical release commit changes workflow files relative to the
+          # default branch. GitHub therefore rejects GITHUB_TOKEN for the ref
+          # write and requires a token with Workflows write. Such a token also
+          # emits a push event, so take ownership of exactly one resulting
+          # legacy Release run and cancel it before publication may continue.
+          legacy_runs() {
+            GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?event=push&head_sha=$RELEASE_SHA&per_page=100" \
+              --jq ".workflow_runs[] | select(.event == \"push\" and .head_sha == \"$RELEASE_SHA\" and .head_branch == \"$RELEASE_TAG\" and .path == \".github/workflows/release.yml\") | .id"
+          }
+          if [[ -n "$(legacy_runs)" ]]; then
+            echo "ERROR: a tag-push Release run already exists before recovery binds the absent tag."
+            exit 1
+          fi
+
+          if ! GH_TOKEN="$GH_TAG_TOKEN" gh api --method POST \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/refs" \
             -f "ref=refs/tags/$RELEASE_TAG" \
             -f "sha=$RELEASE_SHA" >/dev/null; then
-            tag_sha="$(gh api --method GET \
+            tag_sha="$(GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
               -H 'Accept: application/vnd.github+json' \
               -H 'X-GitHub-Api-Version: 2026-03-10' \
               "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
@@ -374,6 +398,43 @@ jobs:
               exit 1
             }
           fi
+
+          legacy_run_id=""
+          for _ in $(seq 1 60); do
+            matching="$(legacy_runs)"
+            count="$(sed '/^$/d' <<<"$matching" | wc -l | tr -d ' ')"
+            if [[ "$count" == "1" ]]; then
+              legacy_run_id="$matching"
+              break
+            fi
+            if [[ "$count" != "0" ]]; then
+              echo "ERROR: tag recovery triggered $count matching legacy Release runs."
+              exit 1
+            fi
+            sleep 2
+          done
+          [[ "$legacy_run_id" =~ ^[1-9][0-9]*$ ]] || {
+            echo "ERROR: no unique legacy tag-push Release run appeared after recovery tag creation."
+            exit 1
+          }
+          GH_TOKEN="$GH_READ_TOKEN" gh api --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/actions/runs/$legacy_run_id/cancel" >/dev/null
+          for _ in $(seq 1 30); do
+            state="$(GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/actions/runs/$legacy_run_id" \
+              --jq '[.status, (.conclusion // "")] | @tsv')"
+            if [[ "$state" == $'completed\tcancelled' ]]; then
+              echo "Cancelled duplicate legacy tag-push Release run $legacy_run_id."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ERROR: legacy tag-push Release run $legacy_run_id did not reach cancelled."
+          exit 1
 
   promote-assets:
     name: Promote exact validated release assets
@@ -384,9 +445,13 @@ jobs:
       actions: read
       contents: write
     steps:
+      # Promotion tooling is control plane, not product: check out the same ref
+      # resolve-promotion uses so both run one promotion resolver. The promoted
+      # bytes come from the validated artifact and are verified against the
+      # closed receipt by size and SHA-256, never from this checkout.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ env.RELEASE_SHA }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -443,14 +508,23 @@ jobs:
           # Internal retry locator. The uploaded archives are still the exact
           # receipt-validated bytes, and every rerun creates a fresh artifact ID.
           overwrite: true
+      # upload-artifact roots the archive at the common ancestor of its paths,
+      # so listing promoted-assets/ and promotion-plan/ together nests both
+      # under the runner temp root while the Docker job reads them flat. Stage
+      # one directory so the producer and the consumer agree on the layout.
+      - name: Stage exact Docker runtime inputs
+        run: |
+          set -euo pipefail
+          staged="$RUNNER_TEMP/docker-runtime-staging"
+          mkdir -p "$staged"
+          cp "$RUNNER_TEMP/promoted-assets/wenlan-linux-x64.tar.gz" "$staged/"
+          cp "$RUNNER_TEMP/promoted-assets/wenlan-linux-arm64.tar.gz" "$staged/"
+          cp "$RUNNER_TEMP/promotion-plan/release-promotion-plan.json" "$staged/"
       - name: Publish exact Docker runtime inputs for this run
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: docker-runtime-inputs
-          path: |
-            ${{ runner.temp }}/promoted-assets/wenlan-linux-x64.tar.gz
-            ${{ runner.temp }}/promoted-assets/wenlan-linux-arm64.tar.gz
-            ${{ runner.temp }}/promotion-plan/release-promotion-plan.json
+          path: ${{ runner.temp }}/docker-runtime-staging
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
@@ -483,9 +557,15 @@ jobs:
             tag-suffix: arm64
             target: aarch64-unknown-linux-gnu
     steps:
+      # This checkout supplies only tooling — the runtime Dockerfile and the
+      # verifier. The bytes that reach the image come from the validated
+      # artifact and are checked against the closed receipt by size and
+      # SHA-256, so packaging is control plane exactly like promotion is.
+      # Pinning it to the release commit would strand image fixes behind the
+      # very release that needs them, which is how v0.15.4 shipped no image.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ env.RELEASE_SHA }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -635,12 +715,24 @@ jobs:
             echo "$TAG is a prerelease tag; latest remains unchanged."
             exit 0
           fi
-          tags="$(gh api --paginate \
+          set +e
+          refs="$(gh api --paginate \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" \
-            --jq '.[].ref' | sed 's#^refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+            --jq '.[].ref')"
+          tag_list_status=$?
+          set -e
+          if [[ "$tag_list_status" -ne 0 ]]; then
+            echo "Unable to list release tags; refusing to decide latest."
+            exit 1
+          fi
+          tags="$(printf '%s\n' "$refs" | sed 's#^refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
           highest="$(printf '%s\n' "$tags" | sed '/^$/d' | sort -V | tail -1)"
+          if [[ -z "$highest" ]]; then
+            echo "No stable release tags resolved; refusing to decide latest."
+            exit 1
+          fi
           if [[ "$highest" != "$TAG" ]]; then
             echo "$TAG is not the highest stable tag ($highest); latest remains unchanged."
             exit 0
@@ -901,8 +993,13 @@ jobs:
           end
           FORMULA
 
-          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" tap/Formula/wenlan-mcp.rb
-          sed -i "s/SHA_PLACEHOLDER/${SHA_MCP_DARWIN_ARM64}/g" tap/Formula/wenlan-mcp.rb
+          # This job runs on macOS, whose sed reads `-i` as the backup suffix
+          # and would swallow the script. perl -pi edits in place identically
+          # on BSD and GNU hosts, and reading the values from the environment
+          # keeps a SHA or version out of the expression itself.
+          VERSION="$VERSION" SHA="$SHA_MCP_DARWIN_ARM64" perl -pi \
+            -e 's/VERSION_PLACEHOLDER/$ENV{VERSION}/g; s/SHA_PLACEHOLDER/$ENV{SHA}/g' \
+            tap/Formula/wenlan-mcp.rb
 
           cat > tap/Formula/wenlan.rb << 'FORMULA'
           class Wenlan < Formula
@@ -932,8 +1029,9 @@ jobs:
           end
           FORMULA
 
-          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" tap/Formula/wenlan.rb
-          sed -i "s/SHA_PLACEHOLDER/${SHA_CLI_DARWIN_ARM64}/g" tap/Formula/wenlan.rb
+          VERSION="$VERSION" SHA="$SHA_CLI_DARWIN_ARM64" perl -pi \
+            -e 's/VERSION_PLACEHOLDER/$ENV{VERSION}/g; s/SHA_PLACEHOLDER/$ENV{SHA}/g' \
+            tap/Formula/wenlan.rb
 
           cd tap
           git config user.name "github-actions[bot]"
@@ -981,6 +1079,12 @@ jobs:
     permissions:
       contents: write
       issues: write
+      # Finding the merged release PR uses GET /commits/{sha}/pulls, which is a
+      # pull-requests read. An explicit permissions block sets every unlisted
+      # scope to none, so omitting this returned 403 after the release had
+      # already been promoted, leaving v0.15.4 stable but still labelled
+      # pending. Labels themselves are the issues scope above.
+      pull-requests: read
     steps:
       - name: Promote
         run: |
@@ -1001,12 +1105,24 @@ jobs:
           if [[ "$RELEASE_TAG" == *-* ]]; then
             echo "$RELEASE_TAG is a prerelease tag; leaving it unpromoted."
           else
-            tags="$(gh api --paginate \
+            set +e
+            refs="$(gh api --paginate \
               -H 'Accept: application/vnd.github+json' \
               -H 'X-GitHub-Api-Version: 2026-03-10' \
               "/repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" \
-              --jq '.[].ref' | sed 's#^refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+              --jq '.[].ref')"
+            tag_list_status=$?
+            set -e
+            if [[ "$tag_list_status" -ne 0 ]]; then
+              echo "Unable to list release tags; refusing to decide latest." >&2
+              exit 1
+            fi
+            tags="$(printf '%s\n' "$refs" | sed 's#^refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
             highest="$(printf '%s\n' "$tags" | sed '/^$/d' | sort -V | tail -1)"
+            if [[ -z "$highest" ]]; then
+              echo "No stable release tags resolved; refusing to decide latest." >&2
+              exit 1
+            fi
             latest_args=()
             if [[ "$highest" == "$RELEASE_TAG" ]]; then
               latest_args+=(--latest)

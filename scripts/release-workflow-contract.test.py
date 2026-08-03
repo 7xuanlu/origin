@@ -200,6 +200,9 @@ def contract_violations(
         "needs.route-main.outputs.state == 'validated'",
         "GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}",
         "MAIN_SHA: ${{ github.event.workflow_run.head_sha }}",
+        "tag_lookup_status=$?",
+        "'.status | tostring'",
+        'if [[ "$tag_api_status" != 404 ]]',
         'if [[ "$pending" != true || "$tagged" != false ]]',
         'if [[ "$existing_sha" != "$MAIN_SHA" ]]',
         '-f ref="refs/tags/$RELEASE_TAG"',
@@ -207,6 +210,8 @@ def contract_violations(
     ]:
         if marker not in create_tag:
             violations.append(f"validated tag creation omits {marker!r}")
+    if re.search(r"git/ref/tags/\$RELEASE_TAG[\s\S]{0,240}\|\| true", create_tag):
+        violations.append("validated tag lookup swallows an API failure")
 
     trigger = re.search(
         r"^on:\n(?P<body>.*?)(?=^concurrency:)",
@@ -332,10 +337,24 @@ def contract_violations(
         or "ref: ${{ env.RELEASE_SHA }}" in resolver_checkout
     ):
         violations.append("release resolver is not pinned to its immutable main control SHA")
+    # Promotion runs the same resolver as resolve-promotion, so it is control
+    # plane too. Pinning it to the release commit would run the release's own
+    # copy of the promotion tooling, so a resolver fix could never reach a
+    # recovery of that release.
+    # Docker packaging is the same shape: its checkout supplies only the
+    # runtime Dockerfile and the image verifier, while the bytes placed in the
+    # image come from the receipt-verified artifact.
+    for job_name in ["promote-assets", "docker"]:
+        packaging = job_body(release, job_name)
+        if (
+            "ref: ${{ github.sha }}" not in packaging
+            or "ref: ${{ env.RELEASE_SHA }}" in packaging
+        ):
+            violations.append(
+                f"release packaging job {job_name!r} is not pinned to its main control SHA"
+            )
     for job_name in [
         "prepare-release",
-        "promote-assets",
-        "docker",
         "publish-crates",
         "publish-npm",
     ]:
@@ -344,16 +363,24 @@ def contract_violations(
             violations.append(f"release source job {job_name!r} is not pinned to RELEASE_SHA")
     bind = job_body(release, "bind-release-tag")
     if (
-        "contents: write" not in bind
+        "actions: write" not in bind
+        or "contents: read" not in bind
         or "issues: read" not in bind
         or "actions/checkout@" in bind
         or "/git/refs" not in bind
+        or "GH_TAG_TOKEN: ${{ secrets.RELEASE_TOKEN }}" not in bind
+        or "event=push&head_sha=$RELEASE_SHA" not in bind
+        or '.head_branch == \\"$RELEASE_TAG\\"' not in bind
+        or "/actions/runs/$legacy_run_id/cancel" not in bind
+        or "$'completed\\tcancelled'" not in bind
         or "GATE_STATE" not in bind
         or "RELEASE_PR_NUMBER" not in bind
         or 'index("autorelease: pending") != null' not in bind
         or 'index("autorelease: tagged") == null' not in bind
     ):
         violations.append("receipt-derived tag binding lacks isolated write authority")
+    if release.count("secrets.RELEASE_TOKEN") != 1:
+        violations.append("release recovery token is not confined to the exact tag bind")
     if any(
         marker not in resolver_checkout
         for marker in ["actions: read", "contents: read", "pull-requests: read"]
@@ -481,6 +508,11 @@ def contract_violations(
             violations.append(f"runtime image lane omits binary-reuse proof {marker!r}")
     if "docker/Dockerfile.daemon" in docker or "cargo build" in docker:
         violations.append("runtime image lane can compile a different server binary")
+    # The verifier also accepts a published-release-asset digest so CI can smoke
+    # the image on a PR. That source is immutable but it is not a receipt, and a
+    # release must bind its bytes to the receipt that validated them.
+    if "--receipt" not in docker or "--published-digest" in docker:
+        violations.append("release runtime image lane does not bind bytes to the closed receipt")
     for job_name, artifact_name in [
         ("promote-assets", "homebrew-artifacts"),
         ("promote-assets", "docker-runtime-inputs"),
@@ -516,6 +548,28 @@ def contract_violations(
     finalize = job_body(release, "finalize-release")
     if "    needs: [docker-manifest, bind-release-tag]" not in finalize:
         violations.append("GitHub release finalization bypasses the GHCR promotion barrier")
+    # The lifecycle step resolves the merged release PR through
+    # GET /commits/{sha}/pulls, a pull-requests read. An explicit permissions
+    # block sets every unlisted scope to none, so dropping this scope returns
+    # 403 only AFTER `gh release edit` has already promoted the release —
+    # stable but still labelled pending, with no way to retry the half that
+    # ran. Assert every scope the step actually exercises.
+    finalize_permissions = re.search(
+        r"    permissions:\n(?P<body>(?:      [^\n]+\n)+)", finalize
+    )
+    granted = {
+        line.strip()
+        for line in (
+            finalize_permissions.group("body") if finalize_permissions else ""
+        ).splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    for scope in ["contents: write", "issues: write", "pull-requests: read"]:
+        if scope not in granted:
+            violations.append(
+                f"release finalization does not grant {scope!r} for the lifecycle step"
+            )
+
     tagged = finalize.find('"labels":["autorelease: tagged"]')
     pending = finalize.find("labels/autorelease%3A%20pending")
     if tagged < 0 or pending <= tagged:
@@ -530,6 +584,18 @@ def contract_violations(
         r"labels/autorelease%3A%20pending[\s\S]{0,120}\|\| true", finalize
     ):
         violations.append("release lifecycle swallows a pending-label deletion failure")
+
+    # A swallowed tag listing yields an empty highest-tag, which silently drops
+    # the latest promotion while still reporting success.
+    for label, body in (("GHCR", manifest), ("GitHub release", finalize)):
+        if "tag_list_status=$?" not in body:
+            violations.append(
+                f"{label} latest decision does not branch on the tag listing exit status"
+            )
+        if re.search(r"matching-refs/tags/v[\s\S]{0,200}\|\| true", body):
+            violations.append(f"{label} latest decision swallows a tag listing failure")
+        if 'if [[ -z "$highest" ]]' not in body:
+            violations.append(f"{label} latest decision accepts an empty tag list")
 
     for marker in [
         'expected_name = f"validated-release-receipt-{run_id}-{run_attempt}"',
@@ -548,6 +614,8 @@ def contract_violations(
     ]:
         if marker not in promotion:
             violations.append(f"release promotion resolver omits fail-closed evidence {marker!r}")
+    if "output_dir.mkdir(parents=True, exist_ok=False)" in promotion:
+        violations.append("release promotion pre-creates the safe extraction destination")
 
     action_documents = release + "\n" + release_please
     seen: set[str] = set()
@@ -1329,6 +1397,24 @@ def main() -> None:
             "scripts/release-promotion.py download-assets",
             "scripts/build-release-binaries.sh",
             "recompile",
+            "release",
+        ),
+        (
+            "GH_TAG_TOKEN: ${{ secrets.RELEASE_TOKEN }}",
+            "GH_TAG_TOKEN: ${{ github.token }}",
+            "isolated write authority",
+            "release",
+        ),
+        (
+            "event=push&head_sha=$RELEASE_SHA",
+            "event=push",
+            "isolated write authority",
+            "release",
+        ),
+        (
+            "/actions/runs/$legacy_run_id/cancel",
+            "/actions/runs/$GITHUB_RUN_ID/cancel",
+            "isolated write authority",
             "release",
         ),
         (

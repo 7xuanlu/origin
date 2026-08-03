@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import importlib.util
 import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -36,6 +38,101 @@ class FakeApi:
 
 
 class ReleasePromotionTests(unittest.TestCase):
+    ASSET_NAME = "wenlan-test.zip"
+    ASSET_BYTES = b"exact validated release asset"
+
+    def _validated_assets_fixture(self) -> tuple[object, dict, dict]:
+        """Build an exact single-asset promotion plan and its download API."""
+
+        artifact_id = 77
+        wrapper_buffer = io.BytesIO()
+        with zipfile.ZipFile(wrapper_buffer, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr(self.ASSET_NAME, self.ASSET_BYTES)
+        wrapper_bytes = wrapper_buffer.getvalue()
+        wrapper_digest = hashlib.sha256(wrapper_bytes).hexdigest()
+        asset_digest = hashlib.sha256(self.ASSET_BYTES).hexdigest()
+
+        class DownloadApi:
+            def get_json(self, path: str, *, params=None):
+                self.assert_path = path
+                return {
+                    "id": artifact_id,
+                    "name": "validated-release-assets-100-1",
+                    "digest": f"sha256:{wrapper_digest}",
+                    "expired": False,
+                    "size_in_bytes": len(wrapper_bytes),
+                }
+
+            def download(self, path: str, destination: Path, maximum_bytes: int):
+                self.download_path = path
+                self.maximum_bytes = maximum_bytes
+                destination.write_bytes(wrapper_bytes)
+                return len(wrapper_bytes), wrapper_digest
+
+        plan = {
+            "receipt": {
+                "validated_assets_artifact": {
+                    "id": artifact_id,
+                    "name": "validated-release-assets-100-1",
+                    "digest": f"sha256:{wrapper_digest}",
+                },
+                "assets": [
+                    {
+                        "name": self.ASSET_NAME,
+                        "size": len(self.ASSET_BYTES),
+                        "sha256": asset_digest,
+                    }
+                ],
+            }
+        }
+        definition = {
+            "name": self.ASSET_NAME,
+            "archive": "zip",
+            "members": ["wenlan.exe"],
+        }
+        return DownloadApi(), plan, definition
+
+    def test_download_validated_assets_lets_safe_extractor_create_destination(self) -> None:
+        api, plan, definition = self._validated_assets_fixture()
+
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            PROMOTION, "release_assets", return_value=[definition]
+        ), mock.patch.object(PROMOTION, "safe_extract_archive") as inspect:
+            output_dir = Path(raw) / "promoted-assets"
+            paths = PROMOTION.download_validated_assets(
+                api, REPOSITORY, plan, output_dir
+            )
+
+            self.assertEqual(paths, [output_dir / self.ASSET_NAME])
+            self.assertEqual(
+                (output_dir / self.ASSET_NAME).read_bytes(), self.ASSET_BYTES
+            )
+            inspect.assert_called_once_with(
+                output_dir / self.ASSET_NAME,
+                output_dir.parent / f"inspect-{self.ASSET_NAME}",
+                "zip",
+                ["wenlan.exe"],
+            )
+
+    def test_download_validated_assets_fails_closed_on_existing_destination(self) -> None:
+        api, plan, definition = self._validated_assets_fixture()
+
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            PROMOTION, "release_assets", return_value=[definition]
+        ), mock.patch.object(PROMOTION, "safe_extract_archive") as inspect:
+            output_dir = Path(raw) / "promoted-assets"
+            output_dir.mkdir()
+
+            # The safe extractor owns the destination, so a destination that
+            # already exists is an anomaly that must still refuse to promote.
+            with self.assertRaises(FileExistsError):
+                PROMOTION.download_validated_assets(
+                    api, REPOSITORY, plan, output_dir
+                )
+
+            self.assertEqual(list(output_dir.iterdir()), [])
+            inspect.assert_not_called()
+
     def test_release_context_scopes_compatibility_client_to_pr_proof(self) -> None:
         main_sha = "2" * 40
         head_sha = "3" * 40

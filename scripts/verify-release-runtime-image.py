@@ -56,7 +56,11 @@ ARCHIVE_MEMBERS = ["wenlan", "wenlan-server", "wenlan-mcp"]
 REQUIRED_ENV = {
     "WENLAN_BIND_ADDR=0.0.0.0:7878",
     "WENLAN_PORT=7878",
-    "WENLAN_DATA_DIR=/data",
+    # Nested one level inside the volume: the daemon writes its data-root lock
+    # to the root's PARENT, so a root of /data puts the lock at / where the
+    # nonroot account cannot create it. Must stay identical to the Dockerfile's
+    # ENV lines — the contract test asserts the two agree entry for entry.
+    "WENLAN_DATA_DIR=/data/wenlan",
 }
 
 
@@ -127,10 +131,14 @@ def prepare_context(
     server_sha = sha256_file(server)
 
     build_context = context_dir / "context"
-    data_dir = build_context / "data"
+    # The daemon keeps its data-root lock in the root's PARENT, so the data
+    # root must be nested one level inside the volume: with a data root of
+    # /data the lock lands at /.wenlan-daemon-*.lock, which the nonroot
+    # account cannot create. Nesting puts the lock in /data, which it owns.
+    data_dir = build_context / "data" / "wenlan"
     data_dir.mkdir(parents=True)
-    # Keep the directory in BuildKit's context tar so COPY can materialize it
-    # with numeric nonroot ownership. This file is harmless inside /data.
+    # Keep both directories in BuildKit's context tar so COPY can materialize
+    # them with numeric nonroot ownership. This file is harmless inside /data.
     (data_dir / ".volume-seed").write_bytes(b"")
     destination = build_context / "wenlan-server"
     shutil.copyfile(server, destination)
@@ -227,6 +235,20 @@ def _semantic_smoke(image: str) -> None:
             ],
             timeout=30,
         )
+        # A container that dies during startup publishes no port, so `docker
+        # port` fails with a message that describes the symptom and hides the
+        # cause. Check liveness first and surface the container's own output.
+        state = _run(
+            ["docker", "inspect", "--format", "{{.State.Running}} {{.State.ExitCode}}", name],
+            timeout=30,
+            check=False,
+        ).stdout.strip()
+        if not state.startswith("true"):
+            logs = _run(["docker", "logs", name], timeout=30, check=False).stdout
+            raise RuntimeImageError(
+                f"runtime image exited before serving (state: {state or 'unknown'})\n"
+                f"{(logs or '')[-4000:]}"
+            )
         port_result = _run(["docker", "port", name, "7878/tcp"], timeout=30)
         binding = port_result.stdout.strip().splitlines()[0]
         try:
@@ -268,13 +290,13 @@ def _semantic_smoke(image: str) -> None:
 
 
 def verify_runtime_image(
-    receipt_path: Path,
+    receipt: dict,
     assets_dir: Path,
     target: str,
     image: str,
     dockerfile: Path,
+    provenance: str,
 ) -> dict:
-    receipt = VALIDATOR.read_closed_receipt(receipt_path)
     if not dockerfile.is_file() or dockerfile.is_symlink():
         raise RuntimeImageError("release runtime Dockerfile is missing or not regular")
     with tempfile.TemporaryDirectory(prefix="wenlan-release-runtime-") as raw:
@@ -302,12 +324,25 @@ def verify_runtime_image(
         _semantic_smoke(image)
         return {
             key: value for key, value in evidence.items() if key != "build_context"
-        } | {"image": image, "image_id": image_info["Id"], "status": "passed"}
+        } | {
+            "image": image,
+            "image_id": image_info["Id"],
+            "provenance": provenance,
+            "status": "passed",
+        }
 
 
 def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--receipt", required=True, type=Path)
+    # Exactly one provenance source. --receipt is the release path and binds the
+    # archive to a closed validation receipt. --published-digest is the CI
+    # regression path: it binds the archive to the digest GitHub itself reports
+    # for an already-published release asset, which is immutable and needs no
+    # receipt to be minted outside a release. Neither path can be inferred, so
+    # a caller that supplies both or neither is rejected rather than defaulted.
+    parser.add_argument("--receipt", type=Path)
+    parser.add_argument("--published-digest")
+    parser.add_argument("--published-size", type=int)
     parser.add_argument("--assets-dir", required=True, type=Path)
     parser.add_argument("--target", required=True, choices=sorted(TARGETS))
     parser.add_argument("--image", required=True)
@@ -316,8 +351,42 @@ def _main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if args.output.exists() or not args.output.parent.is_dir():
         raise RuntimeImageError("output must be a new file in an existing directory")
+    published = args.published_digest is not None or args.published_size is not None
+    if (args.receipt is None) == (not published):
+        raise RuntimeImageError(
+            "pass exactly one of --receipt or --published-digest/--published-size"
+        )
+    if published:
+        if args.published_digest is None or args.published_size is None:
+            raise RuntimeImageError(
+                "--published-digest and --published-size must be given together"
+            )
+        digest = args.published_digest.removeprefix("sha256:")
+        if len(digest) != 64 or not all(c in "0123456789abcdef" for c in digest):
+            raise RuntimeImageError("published digest is not a lowercase sha256 hex")
+        # Shaped exactly like the receipt's asset claim so prepare_context runs
+        # one comparison path for both provenance sources.
+        receipt = {
+            "assets": [
+                {
+                    "name": TARGETS[args.target]["archive"],
+                    "sha256": digest,
+                    "size": args.published_size,
+                    "target": args.target,
+                }
+            ]
+        }
+        provenance = "published-release-asset"
+    else:
+        receipt = VALIDATOR.read_closed_receipt(args.receipt)
+        provenance = "closed-receipt"
     result = verify_runtime_image(
-        args.receipt, args.assets_dir, args.target, args.image, args.dockerfile
+        receipt,
+        args.assets_dir,
+        args.target,
+        args.image,
+        args.dockerfile,
+        provenance,
     )
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(result, sort_keys=True))
