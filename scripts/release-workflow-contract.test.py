@@ -508,6 +508,11 @@ def contract_violations(
             violations.append(f"runtime image lane omits binary-reuse proof {marker!r}")
     if "docker/Dockerfile.daemon" in docker or "cargo build" in docker:
         violations.append("runtime image lane can compile a different server binary")
+    # The verifier also accepts a published-release-asset digest so CI can smoke
+    # the image on a PR. That source is immutable but it is not a receipt, and a
+    # release must bind its bytes to the receipt that validated them.
+    if "--receipt" not in docker or "--published-digest" in docker:
+        violations.append("release runtime image lane does not bind bytes to the closed receipt")
     for job_name, artifact_name in [
         ("promote-assets", "homebrew-artifacts"),
         ("promote-assets", "docker-runtime-inputs"),
