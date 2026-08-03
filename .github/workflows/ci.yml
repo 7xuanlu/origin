@@ -565,6 +565,7 @@ jobs:
           python3 scripts/ci-timed-command.test.py
           python3 scripts/verify-ort-source-pin.test.py
           python3 scripts/verify-ort-source-pin.py
+          python3 scripts/stale-safe-merge.test.py
       - name: Verify local hook routing contracts
         run: bash scripts/git-hooks.test.sh
       - name: Set up Rust for affected-test planning
