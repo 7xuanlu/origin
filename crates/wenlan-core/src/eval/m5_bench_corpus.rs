@@ -357,11 +357,11 @@ fn draw_page_size(distribution: &PageSizeDistribution, rng: &mut SplitMix64) -> 
     bail!("page-size distribution selection fell outside cumulative count")
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn validate_sha256_hex(value: &str) -> Result<()> {
+pub(crate) fn validate_sha256_hex(value: &str) -> Result<()> {
     if value.len() != 64
         || !value
             .bytes()
@@ -373,16 +373,19 @@ fn validate_sha256_hex(value: &str) -> Result<()> {
 }
 
 /// Small fixed PRNG whose algorithm is part of corpus encoding v1.
-struct SplitMix64 {
+///
+/// `pub(crate)` so M6's sibling corpus reuses the freeze machinery rather than
+/// re-deriving it; the algorithm is frozen for both encodings.
+pub(crate) struct SplitMix64 {
     state: u64,
 }
 
 impl SplitMix64 {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut value = self.state;
         value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -391,7 +394,7 @@ impl SplitMix64 {
     }
 }
 
-struct DigestWriter(Sha256);
+pub(crate) struct DigestWriter(pub(crate) Sha256);
 
 impl io::Write for DigestWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {

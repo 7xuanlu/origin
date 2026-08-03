@@ -46,6 +46,7 @@ jobs:
       windows-lint: ${{ steps.filter.outputs.windows-lint }}
       macos-m4: ${{ steps.filter.outputs.macos-m4 }}
       m5-platform: ${{ steps.filter.outputs.m5-platform }}
+      m6-platform: ${{ steps.filter.outputs.m6-platform }}
       windows-llm-probe: ${{ steps.filter.outputs.windows-llm-probe }}
       nextest-config: ${{ steps.filter.outputs.nextest-config }}
       release-preflight: ${{ steps.filter.outputs.release-preflight }}
@@ -255,6 +256,9 @@ jobs:
               - 'crates/wenlan-core/tests/fixtures/m5_bench_corpus.sha256'
               - 'crates/wenlan-core/tests/fixtures/m5_judge_accuracy.jsonl'
               - 'crates/wenlan-core/tests/fixtures/m5_page_size_dist.json'
+              - 'crates/wenlan-core/src/eval/m6_bench_corpus.rs'
+              - 'crates/wenlan-core/tests/fixtures/m6_bench_corpus.sha256'
+              - 'crates/wenlan-core/tests/m6_relevance_bench.rs'
               - 'crates/**/*.c'
               - 'crates/**/*.cc'
               - 'crates/**/*.cpp'
@@ -319,6 +323,9 @@ jobs:
               - 'crates/wenlan-core/tests/fixtures/m5_bench_corpus.sha256'
               - 'crates/wenlan-core/tests/fixtures/m5_judge_accuracy.jsonl'
               - 'crates/wenlan-core/tests/fixtures/m5_page_size_dist.json'
+              - 'crates/wenlan-core/src/eval/m6_bench_corpus.rs'
+              - 'crates/wenlan-core/tests/fixtures/m6_bench_corpus.sha256'
+              - 'crates/wenlan-core/tests/m6_relevance_bench.rs'
               - 'crates/**/*.c'
               - 'crates/**/*.cc'
               - 'crates/**/*.cpp'
@@ -386,6 +393,16 @@ jobs:
               - 'crates/wenlan-core/tests/fixtures/m5_judge_accuracy.jsonl'
               - 'crates/wenlan-core/tests/fixtures/m5_page_size_dist.json'
               - 'crates/wenlan-core/tests/m5_bench.rs'
+            m6-platform:
+              # A separate filter from m5-platform, not a fold into it. The M5
+              # step's `run` is pinned verbatim to `--test m5_bench` by a
+              # drift_guard tooth, so one filter cannot drive two bench
+              # targets without either unpinning that run — which is the
+              # tooth's entire content — or running the wrong bench on every
+              # M6 change. The fold is structurally unavailable, not untidy.
+              - 'crates/wenlan-core/src/eval/m6_bench_corpus.rs'
+              - 'crates/wenlan-core/tests/fixtures/m6_bench_corpus.sha256'
+              - 'crates/wenlan-core/tests/m6_relevance_bench.rs'
             nextest-config:
               # Repository config supports host/target-specific overrides.
               # Exercise the real parser and scheduler once on each platform
@@ -1108,6 +1125,13 @@ jobs:
         # The cfg(unix) retarget control executes on macOS and compiles out on
         # Windows; eval-harness is required for the target's exporter tests.
         run: cargo nextest run -p wenlan-core --features eval-harness --test m5_bench
+      - name: M6 bench platform controls
+        if: "(matrix.os == 'macos-14' || matrix.os == 'windows-2022') && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.m6-platform == 'true')"
+        # The M6 corpus is frozen by an integer-only recipe precisely so both
+        # platform owners reproduce it byte-for-byte; this step is what proves
+        # that claim rather than assuming it. No eval-harness: unlike m5_bench,
+        # this target has no feature-gated imports.
+        run: cargo nextest run -p wenlan-core --test m6_relevance_bench
       - name: Page lint scale gate (Windows functional)
         if: matrix.os == 'windows-2022' && (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.windows-lint == 'true')
         shell: pwsh

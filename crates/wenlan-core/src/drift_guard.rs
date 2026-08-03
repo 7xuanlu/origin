@@ -2723,6 +2723,39 @@ fn ci_routing_contract_violations(
         );
     }
 
+    // M6's platform routing is a SEPARATE filter from M5's, and this tooth is
+    // purely additive: `m5_platform_inputs` above keeps its exact seven paths
+    // and its `!=` comparison. Folding M6's paths into `m5-platform` would
+    // route an M6 corpus edit to a step whose `run` names `--test m5_bench`,
+    // and that `run` is pinned above — so the fold is structurally
+    // unavailable, not merely untidy.
+    let m6_platform = detect_change_filter_paths(&ci, "m6-platform");
+    let m6_platform_inputs = BTreeSet::from([
+        "crates/wenlan-core/src/eval/m6_bench_corpus.rs".to_string(),
+        "crates/wenlan-core/tests/fixtures/m6_bench_corpus.sha256".to_string(),
+        "crates/wenlan-core/tests/m6_relevance_bench.rs".to_string(),
+    ]);
+    if m6_platform != m6_platform_inputs {
+        violations.push("m6-platform focused-owner routing is not exact".into());
+    }
+    for path in &m6_platform_inputs {
+        if !filter_routes_path(&macos_paths, path) || !filter_routes_path(&windows_paths, path) {
+            violations.push(format!(
+                "focused M6 platform input does not schedule both platform owners: {path}"
+            ));
+        }
+    }
+    let m6_step = job_step(&ci, "test", "M6 bench platform controls");
+    let m6_condition = "(matrix.os == 'macos-14' || matrix.os == 'windows-2022') && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.m6-platform == 'true')";
+    if m6_step.and_then(|step| step["if"].as_str()) != Some(m6_condition)
+        || m6_step.and_then(|step| step["run"].as_str())
+            != Some("cargo nextest run -p wenlan-core --test m6_relevance_bench")
+    {
+        violations.push(
+            "the focused M6 platform owners do not compile and run the frozen-corpus target".into(),
+        );
+    }
+
     let windows_llm = detect_change_filter_paths(&ci, "windows-llm-probe");
     for path in [
         "crates/wenlan-core/src/engine.rs",
