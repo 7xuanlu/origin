@@ -101,8 +101,97 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
             .await
             .unwrap();
         }
+
+        // `supported` is a materialized receipt, not authority by itself. The
+        // read gate also requires the current claim inventory and one live edge
+        // from an eligible judge triple, so the positive p1 fixture must carry
+        // that real substrate.
+        conn.execute(
+            "INSERT INTO claims (claim_id, page_id, created_at)
+             VALUES ('claim_p1', 'p1', 0)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claim_revisions
+                 (claim_revision_id, claim_id, predecessor_revision_id,
+                  canonical_text, canonical_text_digest, claim_kind,
+                  extractor_version, created_at)
+             VALUES ('revision_p1', 'claim_p1', '', 'claim', ?1, 'factual', ?2, 0)",
+            libsql::params![
+                crate::provenance::revision_content_digest("claim"),
+                crate::db::EXTRACTOR_VERSION
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO page_version_claims
+                 (page_id, page_version, claim_revision_id, ordinal)
+             VALUES ('p1', 1, 'revision_p1', 0)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claim_judge_eligibility
+                 (model_id, model_version, prompt_version, state, threshold, generation)
+             VALUES ('adapter-judge', 'v1', 'p1', 'active', 0.75, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories
+                 (id, content, source, source_id, title, chunk_index,
+                  last_modified, chunk_type, space)
+             VALUES ('adapter_memory_p1', 'evidence', 'memory',
+                     'adapter_memory_p1', 'evidence', 0, 0, 'text', ?1)",
+            libsql::params![crate::db::UNFILED_SPACE_ID],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provenance_roots
+                 (root_id, identity_version, identity_digest, root_kind,
+                  independence_group_id, status, created_at)
+             VALUES ('adapter_root_p1', ?1, ?2, 'document_ingest',
+                     'adapter_group_p1', 'active', 0)",
+            libsql::params![
+                crate::provenance::IDENTITY_VERSION,
+                crate::provenance::identity_digest("document_ingest", "evidence")
+            ],
+        )
+        .await
+        .unwrap();
+        let payload = serde_json::json!({
+            "model_id": "adapter-judge",
+            "model_version": "v1",
+            "prompt_version": "p1",
+            "score": 0.9,
+            "threshold_at_write": 0.75,
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO edges
+                 (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                  lineage, grounded, root_id, space, payload, created_at,
+                  superseded_by, valid_until)
+             VALUES ('adapter_edge_p1', 'revision_p1', 'claim_revision',
+                     'adapter_memory_p1', 'memory', 'supports', 'evidence', 0,
+                     'adapter_root_p1', ?1, ?2, 0, NULL, NULL)",
+            libsql::params![crate::db::UNFILED_SPACE_ID, payload],
+        )
+        .await
+        .unwrap();
     }
     db.set_truth_cutover_generation(1).await.unwrap();
+    // These tests exercise the strict adapter contract. Production promoter
+    // results remain advisory unless this independent switch is explicit.
+    db.set_app_metadata("claim_promoter_enforcement", "1")
+        .await
+        .unwrap();
     (db, temp)
 }
 

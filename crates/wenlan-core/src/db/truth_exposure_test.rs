@@ -124,11 +124,9 @@ async fn a_refused_call_is_recorded_as_such() {
 
 // ---- the read path, exercised against the real table --------------------
 //
-// Every other test in this file sits at generation 0, where `page_visibility`
-// short-circuits and `page_truth_states` never runs. That is the production
-// configuration, which is exactly why these exist: without them the only SQL
-// that matters after the PR-C cutover would ship unexecuted, and a misspelled
-// column would surface as a live disclosure rather than a red build.
+// Strict-policy tests explicitly enable both the cutover and machine
+// enforcement. The shadow control removes only the latter and proves the same
+// durable verdict cannot hide a page by default.
 
 /// `p1` supported, `p2` provisional, `p3` with no truth row at all -- the
 /// post-migration shape, where most pages have no row yet.
@@ -148,6 +146,11 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
         set_truth(&conn, "p2", "provisional").await;
     }
     db.set_truth_cutover_generation(1).await.unwrap();
+    // Most tests below exercise the strict policy itself. Production keeps
+    // promoter results advisory until this separate switch is explicitly on.
+    db.set_app_metadata("claim_promoter_enforcement", "1")
+        .await
+        .unwrap();
     (db, temp)
 }
 
@@ -198,10 +201,161 @@ async fn set_truth(conn: &libsql::Connection, page_id: &str, status: &str) {
     )
     .await
     .unwrap();
+
+    if status == "supported" {
+        seed_live_support(conn, page_id).await;
+    }
+}
+
+/// The smallest real substrate a stored `supported` row must still be able to
+/// prove at read time: one current claim, one live support edge, and the exact
+/// judge triple registered under its current threshold.
+async fn seed_live_support(conn: &libsql::Connection, page_id: &str) {
+    let claim_id = format!("claim_{page_id}");
+    let revision_id = format!("revision_{page_id}");
+    let memory_id = format!("support_{page_id}");
+    let edge_id = format!("edge_{page_id}");
+    let space: String = {
+        let mut rows = conn
+            .query(
+                "SELECT space FROM pages WHERE id = ?1",
+                libsql::params![page_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+
+    conn.execute(
+        "INSERT INTO claims (claim_id, page_id, created_at) VALUES (?1, ?2, 0)",
+        libsql::params![claim_id.clone(), page_id],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO claim_revisions
+             (claim_revision_id, claim_id, predecessor_revision_id, canonical_text,
+              canonical_text_digest, claim_kind, extractor_version, created_at)
+         VALUES (?1, ?2, '', 'claim', ?3, 'factual', ?4, 0)",
+        libsql::params![
+            revision_id.clone(),
+            claim_id,
+            crate::provenance::revision_content_digest("claim"),
+            crate::db::claim_derivation::EXTRACTOR_VERSION
+        ],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO page_version_claims
+             (page_id, page_version, claim_revision_id, ordinal)
+         VALUES (?1, 1, ?2, 0)",
+        libsql::params![page_id, revision_id.clone()],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO memories
+             (id, content, source, source_id, title, chunk_index, last_modified,
+              chunk_type, space)
+         VALUES (?1, 'evidence', 'memory', ?1, 'evidence', 0, 0, 'text', ?2)",
+        libsql::params![memory_id.clone(), space.clone()],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO provenance_roots
+             (root_id, identity_version, identity_digest, root_kind,
+              independence_group_id, status, created_at)
+         VALUES ('truth_read_root', ?1, ?2, 'document_ingest',
+                 'truth_read_group', 'active', 0)",
+        libsql::params![
+            crate::provenance::IDENTITY_VERSION,
+            crate::provenance::identity_digest("document_ingest", "evidence")
+        ],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO claim_judge_eligibility
+             (model_id, model_version, prompt_version, state, threshold, generation)
+         VALUES ('truth-read-judge', 'v1', 'p1', 'active', 0.75, 1)
+         ON CONFLICT(model_id, model_version, prompt_version) DO UPDATE SET
+             state = excluded.state,
+             threshold = excluded.threshold,
+             generation = excluded.generation",
+        (),
+    )
+    .await
+    .unwrap();
+    let payload = serde_json::json!({
+        "model_id": "truth-read-judge",
+        "model_version": "v1",
+        "prompt_version": "p1",
+        "score": 0.9,
+        "threshold_at_write": 0.75,
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO edges
+             (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+              grounded, root_id, space, payload, created_at, superseded_by, valid_until)
+         VALUES (?1, ?2, 'claim_revision', ?3, 'memory', 'supports', 'evidence',
+                 0, 'truth_read_root', ?4, ?5, 0, NULL, NULL)",
+        libsql::params![edge_id, revision_id, memory_id, space, payload],
+    )
+    .await
+    .unwrap();
+}
+
+async fn stored_support_status(conn: &libsql::Connection, page_id: &str) -> String {
+    let mut rows = conn
+        .query(
+            "SELECT support_status FROM page_truth_state WHERE page_id = ?1",
+            libsql::params![page_id],
+        )
+        .await
+        .unwrap();
+    rows.next().await.unwrap().unwrap().get(0).unwrap()
 }
 
 fn ids(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_string()).collect()
+}
+
+#[test]
+fn truth_reader_binds_frontier_enforcement_and_registry_to_one_connection_guard() {
+    let source = include_str!("truth_exposure.rs");
+    let start = source
+        .find("pub async fn page_truth_states(")
+        .expect("page_truth_states entry point");
+    let end = source[start..]
+        .find("pub async fn page_visibility(")
+        .map(|offset| start + offset)
+        .expect("page_visibility follows page_truth_states");
+    let body = &source[start..end];
+    let guard = body
+        .find("let conn = self.conn.lock().await;")
+        .expect("truth reader must take the one DB connection guard");
+    let frontier = body
+        .find("SUPPORT_RECONCILE_FRONTIER_KEY")
+        .expect("frontier must be read directly under that guard");
+    let enforcement = body
+        .find("CLAIM_PROMOTER_ENFORCEMENT_KEY")
+        .expect("shadow/enforcement state must be read under that guard");
+    let registry = body
+        .find("SELECT t.page_id, t.support_status")
+        .expect("truth and eligibility rows must be read under that guard");
+
+    assert!(
+        guard < frontier && frontier < registry && guard < enforcement && enforcement < registry,
+        "frontier/enforcement and the registry-backed truth query must share one locked snapshot"
+    );
+    assert!(
+        !body[..guard].contains("support_reconcile_frontier().await")
+            && !body[..guard].contains("claim_promoter_enforcement_enabled().await"),
+        "self-locking control reads before the row query create a torn snapshot"
+    );
 }
 
 /// The default reader, post-cutover. Supported prose flows, a failed judgement
@@ -231,6 +385,185 @@ async fn an_automatic_reader_sees_only_supported_pages_after_the_cutover() {
         Visibility::Full,
         "a page with no truth row has not been judged, and an unjudged page keeps its prose"
     );
+}
+
+#[tokio::test]
+async fn promoter_results_default_to_advisory_on_an_existing_cutover() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "DELETE FROM app_metadata WHERE key = 'claim_promoter_enforcement'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let states = db.page_truth_states(&ids(&["p2"])).await.unwrap();
+    assert_eq!(
+        states["p2"].support,
+        crate::truth_contract::Support::Unevaluated,
+        "an evaluated provisional row remains measurable but must not enforce by default"
+    );
+    let seen = db
+        .page_visibility(&TruthGrant::Automatic, &ids(&["p2"]))
+        .await
+        .unwrap();
+    assert_eq!(
+        seen["p2"],
+        Visibility::Full,
+        "shadow promotion must not hide prose or archive its projection"
+    );
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT support_status, evaluated_at IS NOT NULL
+               FROM page_truth_state WHERE page_id = 'p2'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "provisional");
+    assert_eq!(row.get::<i64>(1).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn retiring_the_exact_judge_triple_is_visible_on_the_next_read() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_judge_eligibility SET state = 'retired'
+              WHERE model_id = 'truth-read-judge'
+                AND model_version = 'v1' AND prompt_version = 'p1'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.page_truth_states(&ids(&["p1"])).await.unwrap()["p1"].support,
+        crate::truth_contract::Support::Unevaluated
+    );
+    let conn = db.conn.lock().await;
+    assert_eq!(stored_support_status(&conn, "p1").await, "supported");
+}
+
+#[tokio::test]
+async fn raising_the_live_threshold_is_visible_on_the_next_read() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_judge_eligibility SET threshold = 0.95
+              WHERE model_id = 'truth-read-judge'
+                AND model_version = 'v1' AND prompt_version = 'p1'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.page_truth_states(&ids(&["p1"])).await.unwrap()["p1"].support,
+        crate::truth_contract::Support::Unevaluated
+    );
+    let conn = db.conn.lock().await;
+    assert_eq!(stored_support_status(&conn, "p1").await, "supported");
+}
+
+#[tokio::test]
+async fn a_draining_judge_remains_eligible_on_the_next_read() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_judge_eligibility SET state = 'draining'
+              WHERE model_id = 'truth-read-judge'
+                AND model_version = 'v1' AND prompt_version = 'p1'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.page_truth_states(&ids(&["p1"])).await.unwrap()["p1"].support,
+        crate::truth_contract::Support::Supported
+    );
+    let conn = db.conn.lock().await;
+    assert_eq!(stored_support_status(&conn, "p1").await, "supported");
+}
+
+#[tokio::test]
+async fn an_unregistered_judge_triple_is_unevaluated_on_the_next_read() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE edges
+                SET payload = json_set(payload, '$.model_version', 'unregistered')
+              WHERE edge_type = 'supports' AND src_id = 'revision_p1'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.page_truth_states(&ids(&["p1"])).await.unwrap()["p1"].support,
+        crate::truth_contract::Support::Unevaluated
+    );
+    let conn = db.conn.lock().await;
+    assert_eq!(stored_support_status(&conn, "p1").await, "supported");
+}
+
+#[tokio::test]
+async fn a_zero_claim_marker_is_unevaluated_on_the_next_read() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_markers SET inventory_count = 0
+              WHERE page_id = 'p1' AND page_version = 1",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.page_truth_states(&ids(&["p1"])).await.unwrap()["p1"].support,
+        crate::truth_contract::Support::Unevaluated
+    );
+    let conn = db.conn.lock().await;
+    assert_eq!(stored_support_status(&conn, "p1").await, "supported");
+}
+
+#[tokio::test]
+async fn a_partial_claim_inventory_is_unevaluated_on_the_next_read() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_markers SET inventory_count = 2
+              WHERE page_id = 'p1' AND page_version = 1",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.page_truth_states(&ids(&["p1"])).await.unwrap()["p1"].support,
+        crate::truth_contract::Support::Unevaluated
+    );
+    let conn = db.conn.lock().await;
+    assert_eq!(stored_support_status(&conn, "p1").await, "supported");
 }
 
 /// The collection carve-out: a page whose judgement failed may be *listed* with
@@ -923,6 +1256,7 @@ async fn an_unreviewed_page_is_unaffected_by_the_digest_check() {
         )
         .await
         .unwrap();
+        seed_live_support(&conn, page).await;
     }
     let states = db.page_truth_states(&[page.to_string()]).await.unwrap();
     assert!(!states[page].human_reviewed);
@@ -1193,7 +1527,7 @@ fn the_runtime_backlog_continuation_is_fenced_out_of_repair_mode() {
     assert!(
         sweep.contains("UNION")
             && sweep.contains("ORDER BY c.page_id, c.page_version")
-            && sweep.contains("LIMIT ?3"),
+            && sweep.contains("LIMIT ?2"),
         "the distinct stale/drift union needs one deterministic overall bound"
     );
     assert_eq!(

@@ -134,8 +134,12 @@ const RUNTIME_WORKER_ORDER: &[&str] = &[
     "OnDeviceProvider::new_with_model(",
     "LLM_READINESS_HOOK.set(",
     "let db_for_reconcile = db_arc.clone()",
+    "let shared_for_reconcile = shared.clone()",
+    "let truth_provider = {",
+    "state.llm.clone()",
     "enqueue_stale_derivation_jobs(",
     "reconcile_supported_pages(startup::SUPPORT_RECONCILE_BATCH)",
+    "run_page_linked_truth_promotion_turn(",
 ];
 
 const RUNTIME_OPTIONAL_WORKER_SCOPES: &[&str] = &[
@@ -166,6 +170,9 @@ const RUNTIME_REGISTER_SNAPSHOT_ORDER: &[&str] = &[
     "state.maintenance_coordinator.clone()",
     "state.shutdown.clone()",
     "let mut reconcile_shutdown = shutdown_for_reconcile.subscribe()",
+    "let truth_provider = {",
+    "shared_for_reconcile.read().await",
+    "state.llm.clone()",
 ];
 
 const FACADE_SNAPSHOT_ORDER: &[&str] = &[
@@ -2042,6 +2049,87 @@ fn truth_reconciliation_work_runs_only_in_the_runtime_worker() {
     assert!(
         capture < first_cleanup,
         "no pre-serve cleanup write may run before the unified bounded batch is captured"
+    );
+}
+
+/// Truth promotion shares the bounded runtime-maintenance loop so a model that
+/// finishes loading after startup is still observed. The loop must neither
+/// become a 10Hz idle poll nor let shutdown race ahead while an inference
+/// future continues writing.
+#[test]
+fn truth_promotion_runtime_resnapshots_once_per_shutdown_aware_turn() {
+    let root = repo_root();
+    let runtime = read_source(&root, MAIN_RUNTIME_CHILD);
+    let worker_start = runtime
+        .find("let mut backlog_complete = false;")
+        .expect("truth-maintenance worker state");
+    let worker_end = runtime[worker_start..]
+        .find("pub(super) async fn serve_and_drain(")
+        .map(|offset| worker_start + offset)
+        .expect("runtime worker must precede serve_and_drain");
+    let worker = &runtime[worker_start..worker_end];
+
+    let loop_start = worker.find("loop {").expect("truth-maintenance loop");
+    let snapshot_start = worker
+        .find("let truth_provider = {")
+        .expect("per-turn provider snapshot");
+    let promotion_start = worker
+        .find("run_page_linked_truth_promotion_turn(")
+        .expect("page-linked truth promotion call");
+    assert!(
+        loop_start < snapshot_start && snapshot_start < promotion_start,
+        "the on-device provider must be re-snapshotted inside every runtime turn"
+    );
+    assert_eq!(
+        worker
+            .matches("run_page_linked_truth_promotion_turn(")
+            .count(),
+        1,
+        "one runtime turn may attempt at most one promotion job"
+    );
+    for required in [
+        "shared_for_reconcile.read().await",
+        "state.llm.clone()",
+        "Some(tokio::select! {",
+        "_ = lifecycle::wait_for_shutdown(reconcile_shutdown.clone())",
+        "result = db_for_reconcile.run_page_linked_truth_promotion_turn(",
+        "promotion.as_ref()",
+        "std::time::Duration::from_secs(1)",
+        "std::time::Duration::from_secs(5)",
+        "lifecycle::sleep_or_shutdown(&mut reconcile_shutdown, next_delay)",
+    ] {
+        assert!(
+            worker.contains(required),
+            "truth-promotion runtime contract is missing {required}"
+        );
+    }
+    assert!(
+        !worker[..promotion_start].contains("snapshot_m5_claim_judge("),
+        "provider eligibility belongs to the core gate, not the runtime"
+    );
+
+    let completion_start = worker
+        .find("if backlog_complete && pass.complete && !completion_logged")
+        .expect("one-shot backlog completion observation");
+    let completion_end = worker[completion_start..]
+        .find("if enqueued > 0 || pass.demoted > 0")
+        .map(|offset| completion_start + offset)
+        .expect("maintenance activity observation");
+    assert!(
+        !worker[completion_start..completion_end].contains("return;"),
+        "backlog completion must not terminate the late-model promotion worker"
+    );
+
+    let error_start = worker
+        .find("Err(error) => {")
+        .expect("transient maintenance error branch");
+    let error_backoff = worker[error_start..]
+        .find("std::time::Duration::from_secs(5)")
+        .map(|offset| error_start + offset)
+        .expect("transient error backoff");
+    assert!(
+        !worker[error_start..error_backoff].contains("return;"),
+        "a transient maintenance error must back off instead of killing promotion"
     );
 }
 

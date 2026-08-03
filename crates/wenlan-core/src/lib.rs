@@ -15,6 +15,7 @@ pub mod cache;
 pub mod chat_import;
 pub mod chunker;
 pub mod citations;
+pub mod claim_judge;
 pub mod classify;
 pub mod community_grouping;
 pub mod community_partition;
