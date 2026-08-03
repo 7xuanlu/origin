@@ -1319,10 +1319,11 @@ impl MemoryDB {
         //
         // No TOCTOU: `conn` is the single writer's one connection and this
         // guard has been held unbroken since the top of the function.
-        let existing: Option<String> = {
+        let existing: Option<(String, Option<String>, Option<i64>)> = {
             let mut rows = conn
                 .query(
-                    "SELECT payload FROM edges WHERE edge_id = ?1",
+                    "SELECT payload, superseded_by, valid_until
+                       FROM edges WHERE edge_id = ?1",
                     libsql::params![edge_id.clone()],
                 )
                 .await
@@ -1332,14 +1333,39 @@ impl MemoryDB {
             match rows.next().await.map_err(|error| {
                 WenlanError::VectorDb(format!("support edge conflict decode: {error}"))
             })? {
-                Some(row) => Some(row.get(0).map_err(|error| {
-                    WenlanError::VectorDb(format!("support edge conflict decode: {error}"))
-                })?),
+                Some(row) => Some((
+                    row.get(0).map_err(|error| {
+                        WenlanError::VectorDb(format!("support edge conflict decode: {error}"))
+                    })?,
+                    row.get(1).map_err(|error| {
+                        WenlanError::VectorDb(format!("support edge conflict decode: {error}"))
+                    })?,
+                    row.get(2).map_err(|error| {
+                        WenlanError::VectorDb(format!("support edge conflict decode: {error}"))
+                    })?,
+                )),
                 None => None,
             }
         };
-        if let Some(stored) = existing {
+        if let Some((stored, superseded_by, valid_until)) = existing {
             if stored == payload {
+                // A lifecycle retraction leaves the exact edge id and payload
+                // but no superseding edge. Reassert that same verified verdict
+                // when the endpoint is back in scope. Judge replacement sets
+                // `superseded_by`, and that historical row must remain dead.
+                if valid_until.is_some() && superseded_by.is_none() {
+                    conn.execute(
+                        "UPDATE edges
+                            SET valid_until = NULL, superseded_by = NULL
+                          WHERE edge_id = ?1 AND payload = ?2
+                            AND valid_until IS NOT NULL AND superseded_by IS NULL",
+                        libsql::params![edge_id.clone(), payload.clone()],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("support edge reactivation: {error}"))
+                    })?;
+                }
                 return Ok(edge_id);
             }
             return Err(WenlanError::Conflict(format!(

@@ -728,7 +728,11 @@ async fn a_job_that_keeps_crashing_its_worker_parks() {
             .is_none(),
         "an exhausted job is no longer claimable"
     );
-    assert_eq!(db.park_exhausted_derivation_jobs().await.unwrap(), 1);
+    assert_eq!(
+        db.park_exhausted_derivation_jobs().await.unwrap(),
+        0,
+        "lease acquisition already parks exhausted pending jobs"
+    );
     assert_eq!(job_for(&db, "poison").await.unwrap().1, "parked");
 }
 
@@ -2447,6 +2451,46 @@ async fn an_expired_fifth_lease_still_parks() {
     }
 
     assert_eq!(db.park_exhausted_derivation_jobs().await.unwrap(), 1);
+    assert_eq!(job_for(&db, "p1").await.unwrap().1, "parked");
+}
+
+#[tokio::test]
+async fn an_expired_final_lease_is_auto_parked_before_reclaim() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    for _ in 0..MAX_ATTEMPTS - 1 {
+        let job = db
+            .lease_next_derivation_job("worker")
+            .await
+            .unwrap()
+            .unwrap();
+        db.release_derivation_job(&job, "worker", "daemon restart")
+            .await
+            .unwrap();
+    }
+    let final_lease = db
+        .lease_next_derivation_job("worker")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job_for(&db, "p1").await.unwrap().2, MAX_ATTEMPTS);
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_jobs SET lease_expires_at = 1 WHERE job_id = ?1",
+            libsql::params![final_lease.job_id.as_str()],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(
+        db.lease_next_derivation_job("rescuer")
+            .await
+            .unwrap()
+            .is_none(),
+        "an expired max-attempt lease must be parked, not handed to a new run"
+    );
     assert_eq!(job_for(&db, "p1").await.unwrap().1, "parked");
 }
 
@@ -4226,6 +4270,104 @@ async fn production_judge_rejects_unapproved_snapshot_without_writes_or_lease() 
 }
 
 #[tokio::test]
+async fn public_judge_rollover_drains_old_prompts_and_requeues_supported_done_pages() {
+    let (db, _temp) = db_with_queue().await;
+    let page_id = "public-rollover-supported";
+    let evidence = "The Alpha project launched successfully.";
+    add_producer_page(&db, page_id, evidence, "space-a").await;
+    add_producer_memory(
+        &db,
+        "public-rollover-evidence",
+        evidence,
+        "space-a",
+        "folder",
+    )
+    .await;
+    link_page_evidence(&db, page_id, "public-rollover-evidence").await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_jobs SET status = 'done' WHERE page_id = ?1",
+            libsql::params![page_id],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO page_truth_state
+                 (page_id, page_version, support_status, evaluated_at,
+                  human_reviewed, updated_at)
+             SELECT id, version, 'supported', 1, 0, 1 FROM pages WHERE id = ?1
+             ON CONFLICT(page_id) DO UPDATE SET
+                 page_version = excluded.page_version,
+                 support_status = excluded.support_status,
+                 evaluated_at = excluded.evaluated_at,
+                 updated_at = excluded.updated_at",
+            libsql::params![page_id],
+        )
+        .await
+        .unwrap();
+    }
+    let before_generation = test_eligibility_generation(&db).await;
+
+    let turn = db
+        .run_page_linked_truth_promotion_turn(&ProducerJudge::malformed(&db), "producer-worker")
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            &turn,
+            PromotionTurn::Requeued {
+                page_id: id, ..
+            } if id == page_id
+        ),
+        "unexpected rollover turn: {turn:?}"
+    );
+    let generation = test_eligibility_generation(&db).await;
+    assert_eq!(generation, before_generation + 1);
+    assert_eq!(
+        job_for(&db, page_id).await.unwrap().1,
+        "pending",
+        "public activation must reopen the completed supported page; malformed judge then releases it"
+    );
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT state FROM claim_judge_eligibility
+              WHERE model_id = 'judge' AND model_version = 'v1' AND prompt_version = 'p1'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap(),
+        "draining"
+    );
+    let mut metadata = conn
+        .query(
+            "SELECT value FROM app_metadata WHERE key = 'support_reconcile_frontier'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap(),
+        ""
+    );
+}
+
+#[tokio::test]
 async fn first_production_judge_activation_drains_old_and_resets_reconcile_atomically() {
     let (db, _temp) = db_with_queue().await;
     authorize_producer_judge_version(&db, "future-old-weights", "active").await;
@@ -4945,6 +5087,88 @@ async fn producer_observation_human_evidence_without_human_root_does_not_mint_ge
         row.get::<i64>(2).unwrap(),
         0,
         "fixture must have no pre-existing human root"
+    );
+}
+
+#[tokio::test]
+async fn producer_observation_human_evidence_with_existing_generated_root_does_not_vote() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    let evidence = "A human observation about Alpha.";
+    add_producer_page(&db, "human-observation-collision-page", evidence, "space-a").await;
+    add_producer_memory(
+        &db,
+        "human-observation-collision-memory",
+        evidence,
+        "space-a",
+        "human",
+    )
+    .await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET memory_type = 'observation'
+              WHERE source_id = 'human-observation-collision-memory'",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provenance_roots
+                 (root_id, identity_version, identity_digest, root_kind,
+                  independence_group_id, status, created_at)
+             VALUES ('human-observation-generated-root', ?1, ?2, 'generated',
+                     'machine:fixture', 'active', 0)",
+            libsql::params![
+                crate::provenance::IDENTITY_VERSION,
+                crate::provenance::identity_digest("generated", evidence),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    link_page_evidence(
+        &db,
+        "human-observation-collision-page",
+        "human-observation-collision-memory",
+    )
+    .await;
+
+    let judge = ProducerJudge::pinned(&db);
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { ref page_id, .. }
+            if page_id == "human-observation-collision-page"
+    ));
+    assert_eq!(
+        judge.calls.load(Ordering::SeqCst),
+        0,
+        "a generated root must not make human observation evidence vote"
+    );
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT
+                 (SELECT COUNT(*) FROM claim_run_candidates
+                   WHERE page_id = 'human-observation-collision-page'),
+                 (SELECT COUNT(*) FROM provenance_roots
+                   WHERE root_kind = 'generated' AND identity_digest = ?1)",
+            libsql::params![crate::provenance::identity_digest("generated", evidence)],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(
+        row.get::<i64>(0).unwrap(),
+        0,
+        "human observation may vote only through an eligible human root"
+    );
+    assert_eq!(
+        row.get::<i64>(1).unwrap(),
+        1,
+        "the pre-existing generated root must remain but never be reused"
     );
 }
 

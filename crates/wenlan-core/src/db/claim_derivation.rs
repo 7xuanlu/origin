@@ -1595,14 +1595,58 @@ impl MemoryDB {
                 .transpose()?
         };
 
-        if let Some((state, threshold)) = existing {
-            return Ok(state == "active" && threshold == M5_PRODUCTION_JUDGE_THRESHOLD);
+        let exact_row_exists = existing.is_some();
+        if let Some((state, threshold)) = existing.as_ref() {
+            if state != "active" || *threshold != M5_PRODUCTION_JUDGE_THRESHOLD {
+                return Ok(false);
+            }
+
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM claim_judge_eligibility
+                      WHERE state = 'active'
+                        AND NOT (model_id = ?1 AND model_version = ?2 AND prompt_version = ?3)",
+                    libsql::params![
+                        M5_PRODUCTION_JUDGE_MODEL_ID,
+                        M5_PRODUCTION_JUDGE_MODEL_VERSION,
+                        crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION,
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "M5 production judge active predecessor lookup: {error}"
+                    ))
+                })?;
+            let count = rows
+                .next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "M5 production judge active predecessor row: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    WenlanError::VectorDb(
+                        "M5 production judge active predecessor count is missing".to_string(),
+                    )
+                })?
+                .get::<i64>(0)
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "M5 production judge active predecessor count: {error}"
+                    ))
+                })?;
+            if count == 0 {
+                return Ok(true);
+            }
         }
 
         // The exact-row read and this transaction share the same connection
         // guard, so no other operation on this MemoryDB can create or mutate
-        // the row between them. Existing rows take the read-only fast path;
-        // only a first activation acquires SQLite's immediate write lock.
+        // the row between them. A settled exact row takes the read-only fast
+        // path; first activation and legacy multi-active repair acquire the
+        // immediate write lock.
         let tx = conn
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
@@ -1642,9 +1686,12 @@ impl MemoryDB {
             tx.execute(
                 "UPDATE claim_judge_eligibility
                     SET state = 'draining', generation = ?1
-                  WHERE prompt_version = ?2 AND state = 'active'",
+                  WHERE state = 'active'
+                    AND NOT (model_id = ?2 AND model_version = ?3 AND prompt_version = ?4)",
                 libsql::params![
                     generation,
+                    M5_PRODUCTION_JUDGE_MODEL_ID,
+                    M5_PRODUCTION_JUDGE_MODEL_VERSION,
                     crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION,
                 ],
             )
@@ -1652,21 +1699,66 @@ impl MemoryDB {
             .map_err(|error| {
                 WenlanError::VectorDb(format!("M5 production judge drain old: {error}"))
             })?;
+            if exact_row_exists {
+                tx.execute(
+                    "UPDATE claim_judge_eligibility
+                        SET generation = ?4
+                      WHERE model_id = ?1 AND model_version = ?2 AND prompt_version = ?3",
+                    libsql::params![
+                        M5_PRODUCTION_JUDGE_MODEL_ID,
+                        M5_PRODUCTION_JUDGE_MODEL_VERSION,
+                        crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION,
+                        generation,
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("M5 production judge refresh: {error}"))
+                })?;
+            } else {
+                tx.execute(
+                    "INSERT INTO claim_judge_eligibility
+                         (model_id, model_version, prompt_version, state, threshold, generation)
+                     VALUES (?1, ?2, ?3, 'active', ?4, ?5)",
+                    libsql::params![
+                        M5_PRODUCTION_JUDGE_MODEL_ID,
+                        M5_PRODUCTION_JUDGE_MODEL_VERSION,
+                        crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION,
+                        M5_PRODUCTION_JUDGE_THRESHOLD,
+                        generation,
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("M5 production judge insert: {error}"))
+                })?;
+            }
+
+            let now = chrono::Utc::now().timestamp();
             tx.execute(
-                "INSERT INTO claim_judge_eligibility
-                     (model_id, model_version, prompt_version, state, threshold, generation)
-                 VALUES (?1, ?2, ?3, 'active', ?4, ?5)",
-                libsql::params![
-                    M5_PRODUCTION_JUDGE_MODEL_ID,
-                    M5_PRODUCTION_JUDGE_MODEL_VERSION,
-                    crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION,
-                    M5_PRODUCTION_JUDGE_THRESHOLD,
-                    generation,
-                ],
+                "INSERT INTO claim_derivation_jobs
+                     (job_id, page_id, page_version, status, attempts, created_at, updated_at)
+                 SELECT p.id || ':' || p.version, p.id, p.version,
+                        'pending', 0, ?1, ?1
+                   FROM pages p
+                   JOIN page_truth_state t
+                     ON t.page_id = p.id AND t.page_version = p.version
+                  WHERE p.status = 'active'
+                    AND p.kind <> 'entity'
+                    AND t.support_status = 'supported'
+                 ON CONFLICT(job_id) DO UPDATE SET
+                     status = 'pending',
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     attempts = 0,
+                     last_error = NULL,
+                     updated_at = ?1
+                 WHERE claim_derivation_jobs.status IN ('done', 'parked')",
+                libsql::params![now],
             )
             .await
             .map_err(|error| {
-                WenlanError::VectorDb(format!("M5 production judge insert: {error}"))
+                WenlanError::VectorDb(format!("M5 production judge requeue supported: {error}"))
             })?;
 
             let ruleset = support_reconcile_ruleset(generation);
@@ -1820,13 +1912,13 @@ impl MemoryDB {
                         })
                 })
                 .filter(|value| !value.trim().is_empty());
+            let is_human = source_agent.as_deref() == Some("human");
             let root_kind = if source_agent.as_deref() == Some("folder") {
                 "document_ingest"
             } else {
                 "generated"
             };
-            let human_non_observation = source_agent.as_deref() == Some("human")
-                && memory_type.as_deref() != Some("observation");
+            let human_non_observation = is_human && memory_type.as_deref() != Some("observation");
             let expected_digest = crate::provenance::identity_digest(root_kind, &content);
             let document_digest = crate::provenance::identity_digest("document_ingest", &content);
             let human_capture_digest =
@@ -1845,9 +1937,10 @@ impl MemoryDB {
                               OR (root_kind = 'human_capture' AND identity_digest = ?3)
                               OR (root_kind = 'human_edit_delta' AND identity_digest = ?4)
                               OR (root_kind = 'generated' AND identity_digest = ?5))
+                            AND (?6 = 0 OR root_kind IN ('human_capture', 'human_edit_delta'))
                           ORDER BY CASE
                                      WHEN root_kind IN ('human_capture', 'human_edit_delta') THEN 0
-                                     WHEN root_kind = ?6 AND identity_digest = ?7 THEN 1
+                                     WHEN root_kind = ?7 AND identity_digest = ?8 THEN 1
                                      ELSE 2
                                    END,
                                    root_kind, root_id
@@ -1858,6 +1951,7 @@ impl MemoryDB {
                             human_capture_digest,
                             human_delta_digest,
                             generated_digest,
+                            i64::from(is_human),
                             root_kind,
                             expected_digest,
                         ],
@@ -1881,10 +1975,10 @@ impl MemoryDB {
                     })?
             };
             let human_root_is_non_voting = human_non_observation
-                || existing_root.as_ref().is_some_and(|(_, kind)| {
-                    matches!(kind.as_str(), "human_capture" | "human_edit_delta")
-                        && memory_type.as_deref() != Some("observation")
-                });
+                || (is_human
+                    && !existing_root.as_ref().is_some_and(|(_, kind)| {
+                        matches!(kind.as_str(), "human_capture" | "human_edit_delta")
+                    }));
             chunks.push(LinkedMemoryChunk {
                 row_id,
                 source_id: source_id.clone(),
@@ -3284,6 +3378,27 @@ impl MemoryDB {
         let now = chrono::Utc::now().timestamp();
         let expires = now + LEASE_SECS;
         let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_jobs
+                SET status = 'parked',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    last_error = COALESCE(
+                        last_error,
+                        'derivation lease expired after maximum attempts'
+                    ),
+                    updated_at = ?1
+              WHERE attempts >= ?2
+                AND (status = 'pending'
+                     OR (status = 'leased'
+                         AND lease_expires_at IS NOT NULL
+                         AND lease_expires_at <= ?1))",
+            libsql::params![now, MAX_ATTEMPTS],
+        )
+        .await
+        .map_err(|error| {
+            WenlanError::VectorDb(format!("derivation reap exhausted leases: {error}"))
+        })?;
         let generation = Self::allocate_run_generation(&conn).await?;
         let eligibility_generation = Self::current_eligibility_generation(&conn).await?;
 

@@ -1543,6 +1543,7 @@ async fn a_new_judge_triple_atomically_supersedes_the_same_locator() {
         .write_support_edge("cr_rolling", &memory_source_id, &root_id, &first_verdict)
         .await
         .unwrap();
+    let first_verdict_for_replay = first_verdict.clone();
 
     let second_verdict = super::claim_identity::SupportVerdict {
         model_version: "v2".to_string(),
@@ -1588,6 +1589,18 @@ async fn a_new_judge_triple_atomically_supersedes_the_same_locator() {
         first_edge, second_edge,
         "judge triple is replacement identity"
     );
+    assert_eq!(
+        db.write_support_edge(
+            "cr_rolling",
+            &memory_source_id,
+            &root_id,
+            &first_verdict_for_replay,
+        )
+        .await
+        .unwrap(),
+        first_edge,
+        "replaying the superseded judge keeps its historical edge id"
+    );
 
     let conn = db.conn.lock().await;
     let mut rows = conn
@@ -1616,6 +1629,85 @@ async fn a_new_judge_triple_atomically_supersedes_the_same_locator() {
     );
     assert!(state.get(&first_edge).unwrap().1.is_some());
     assert_eq!(state.get(&second_edge).unwrap(), &(None, None));
+}
+
+/// A lifecycle retraction is not a new verdict. When the claim page leaves its
+/// space and returns, retrying the identical cached verdict must reactivate the
+/// same deterministic edge instead of returning its id while it remains dead.
+#[tokio::test]
+async fn an_identical_support_retry_reactivates_after_page_scope_round_trip() {
+    let (db, _temp) = db_with_substrate().await;
+    let verdict = ordinary_scenario(&db, "sp_reactivate", "birds").await;
+    let (memory_source_id, root_id) = ordinary_evidence(&db, "mem_reactivate", "birds").await;
+
+    let edge_id = db
+        .write_support_edge("cr_sp_reactivate", &memory_source_id, &root_id, &verdict)
+        .await
+        .unwrap();
+
+    // This is the production page-scope mutation. It retracts the support
+    // edge, but does not change the page version or the evidence verdict.
+    db.set_page_workspace("sp_reactivate", Some("falconry"))
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT valid_until, superseded_by FROM edges WHERE edge_id = ?1",
+                libsql::params![edge_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("the edge must survive retraction");
+        assert!(
+            row.get::<Option<i64>>(0).unwrap().is_some(),
+            "the scope move must soft-retract the support"
+        );
+        assert!(
+            row.get::<Option<String>>(1).unwrap().is_none(),
+            "a lifecycle retraction is not judge supersession"
+        );
+    }
+
+    db.set_page_workspace("sp_reactivate", Some("birds"))
+        .await
+        .unwrap();
+
+    let retry = db
+        .write_support_edge("cr_sp_reactivate", &memory_source_id, &root_id, &verdict)
+        .await
+        .unwrap();
+    assert_eq!(
+        retry, edge_id,
+        "the exact locator/judge must keep one edge id"
+    );
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT valid_until, superseded_by FROM edges WHERE edge_id = ?1",
+            libsql::params![edge_id],
+        )
+        .await
+        .unwrap();
+    let row = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("the edge must remain present");
+    assert!(
+        row.get::<Option<i64>>(0).unwrap().is_none(),
+        "an identical verdict after the endpoint returns must clear valid_until"
+    );
+    assert!(
+        row.get::<Option<String>>(1).unwrap().is_none(),
+        "reactivation must leave superseded_by clear"
+    );
 }
 
 /// Weakening: accept whatever root the caller names.
