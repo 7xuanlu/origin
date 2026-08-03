@@ -21,6 +21,9 @@ const FOLLOWUP_TABLES: [&str; 14] = [
     "m6_counters",
 ];
 
+/// Migration 111's tables — the relevance marginals C1 added after 109 shipped.
+const MARGINAL_TABLES: [&str; 2] = ["m6_page_mass", "m6_space_mass"];
+
 async fn table_exists(db: &MemoryDB, table: &str) -> bool {
     let conn = db.conn.lock().await;
     let mut rows = conn
@@ -56,7 +59,7 @@ async fn user_version(db: &MemoryDB) -> i64 {
 #[tokio::test]
 async fn migrated_database_carries_all_fourteen_followup_tables_and_counter() {
     let (db, _temp) = test_db().await;
-    assert_eq!(SCHEMA_VERSION, 110);
+    assert_eq!(SCHEMA_VERSION, 111);
     assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
     for table in FOLLOWUP_TABLES {
         assert!(
@@ -98,6 +101,55 @@ async fn schema_108_upgrades_through_the_whole_followup_inventory() {
         assert!(
             table_exists(&db, table).await,
             "{table} missing after upgrade"
+        );
+    }
+}
+
+/// The two relevance marginal tables must arrive on a database that already
+/// ran migration 109, which every shipped database has.
+///
+/// This is the fixture whose absence let the bug ship green. C1 added
+/// `m6_page_mass`/`m6_space_mass` to `ensure_relevance_tables`, reached only
+/// from migration 109 behind `if version < 109`; a database at 110 skips it
+/// forever. Every other test builds a fresh database or calls
+/// `ensure_relevance_tables` directly, so all of them had the tables and none
+/// of them could see that an upgraded database would not. The first relevance
+/// write on a real install would have failed with
+/// `no such table: m6_space_mass`.
+///
+/// Dropping the tables and winding the version back to 110 reproduces exactly
+/// that database: migration 109 already applied, the later DDL never seen.
+#[tokio::test]
+async fn schema_110_upgrades_into_the_relevance_marginal_tables() {
+    let (db, _temp) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        for table in MARGINAL_TABLES {
+            conn.execute(&format!("DROP TABLE {table}"), ())
+                .await
+                .unwrap_or_else(|error| panic!("drop {table}: {error}"));
+        }
+        conn.execute("PRAGMA user_version = 110", ())
+            .await
+            .expect("restore a database that ran 109 before the marginals existed");
+    }
+
+    for table in MARGINAL_TABLES {
+        assert!(
+            !table_exists(&db, table).await,
+            "{table} still present, so the upgrade below proves nothing"
+        );
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("schema 110 must advance through migration 111");
+
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+    for table in MARGINAL_TABLES {
+        assert!(
+            table_exists(&db, table).await,
+            "{table} missing after upgrading from 110"
         );
     }
 }
