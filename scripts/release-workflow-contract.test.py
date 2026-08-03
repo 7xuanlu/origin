@@ -544,6 +544,18 @@ def contract_violations(
     ):
         violations.append("release lifecycle swallows a pending-label deletion failure")
 
+    # A swallowed tag listing yields an empty highest-tag, which silently drops
+    # the latest promotion while still reporting success.
+    for label, body in (("GHCR", manifest), ("GitHub release", finalize)):
+        if "tag_list_status=$?" not in body:
+            violations.append(
+                f"{label} latest decision does not branch on the tag listing exit status"
+            )
+        if re.search(r"matching-refs/tags/v[\s\S]{0,200}\|\| true", body):
+            violations.append(f"{label} latest decision swallows a tag listing failure")
+        if 'if [[ -z "$highest" ]]' not in body:
+            violations.append(f"{label} latest decision accepts an empty tag list")
+
     for marker in [
         'expected_name = f"validated-release-receipt-{run_id}-{run_attempt}"',
         "MAX_RECEIPT_CANDIDATES = 20",

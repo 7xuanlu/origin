@@ -696,12 +696,24 @@ jobs:
             echo "$TAG is a prerelease tag; latest remains unchanged."
             exit 0
           fi
-          tags="$(gh api --paginate \
+          set +e
+          refs="$(gh api --paginate \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" \
-            --jq '.[].ref' | sed 's#^refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+            --jq '.[].ref')"
+          tag_list_status=$?
+          set -e
+          if [[ "$tag_list_status" -ne 0 ]]; then
+            echo "Unable to list release tags; refusing to decide latest."
+            exit 1
+          fi
+          tags="$(printf '%s\n' "$refs" | sed 's#^refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
           highest="$(printf '%s\n' "$tags" | sed '/^$/d' | sort -V | tail -1)"
+          if [[ -z "$highest" ]]; then
+            echo "No stable release tags resolved; refusing to decide latest."
+            exit 1
+          fi
           if [[ "$highest" != "$TAG" ]]; then
             echo "$TAG is not the highest stable tag ($highest); latest remains unchanged."
             exit 0
@@ -1062,12 +1074,24 @@ jobs:
           if [[ "$RELEASE_TAG" == *-* ]]; then
             echo "$RELEASE_TAG is a prerelease tag; leaving it unpromoted."
           else
-            tags="$(gh api --paginate \
+            set +e
+            refs="$(gh api --paginate \
               -H 'Accept: application/vnd.github+json' \
               -H 'X-GitHub-Api-Version: 2026-03-10' \
               "/repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" \
-              --jq '.[].ref' | sed 's#^refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+              --jq '.[].ref')"
+            tag_list_status=$?
+            set -e
+            if [[ "$tag_list_status" -ne 0 ]]; then
+              echo "Unable to list release tags; refusing to decide latest." >&2
+              exit 1
+            fi
+            tags="$(printf '%s\n' "$refs" | sed 's#^refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
             highest="$(printf '%s\n' "$tags" | sed '/^$/d' | sort -V | tail -1)"
+            if [[ -z "$highest" ]]; then
+              echo "No stable release tags resolved; refusing to decide latest." >&2
+              exit 1
+            fi
             latest_args=()
             if [[ "$highest" == "$RELEASE_TAG" ]]; then
               latest_args+=(--latest)
