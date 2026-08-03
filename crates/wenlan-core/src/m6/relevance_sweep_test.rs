@@ -5,13 +5,15 @@
 //! integration test would not be guaranteed in L3/L4.
 
 use super::relevance_sweep::{
-    advance_decay_reference, decay_reference, decayed_contribution, eligible_groups, group_support,
-    hub_weight, recompute_pair_stats, run_relevance_sweep, GroupSupport, RelevanceTurn,
-    COUNTER_RELEVANCE_DECAY_REFERENCE, DECAY_HALF_LIFE_DAYS, MAX_QUERIES_PER_EVALUATION,
-    MAX_ROWS_PER_EVALUATION,
+    advance_decay_reference, candidate_endpoints, decay_reference, decayed_contribution,
+    eligible_groups, group_support, hub_weight, recompute_pair_stats, run_relevance_sweep,
+    GroupSupport, QueryBudget, RelevanceTurn, COUNTER_RELEVANCE_DECAY_REFERENCE,
+    DECAY_HALF_LIFE_DAYS, MAX_QUERIES_PER_EVALUATION, MAX_ROWS_PER_EVALUATION,
 };
 use crate::m6::genesis_test_support::GenesisDb;
-use crate::m6::relevance::{qualified_co_citation, MAX_NEIGHBORS_PER_ENDPOINT};
+use crate::m6::relevance::{
+    qualified_co_citation, MAX_CANDIDATE_ENDPOINTS, MAX_NEIGHBORS_PER_ENDPOINT,
+};
 
 const SECONDS_PER_DAY: i64 = 86_400;
 
@@ -780,6 +782,46 @@ async fn a_candidate_set_that_hits_its_cap_is_recorded_as_truncated() {
     assert!(
         sweep.endpoints_truncated,
         "40 stale pages against a 32 cap is a truncated set and must say so"
+    );
+}
+
+#[tokio::test]
+async fn the_candidate_cap_is_enforced_by_the_query_not_by_a_later_truncate() {
+    // G6.8's break is a post-hoc `Vec::truncate`: the returned length and the
+    // truncated flag both still pass while the query reads the whole table, so
+    // neither of those is evidence about the cap. The decoded-row count is —
+    // it is the one observation that distinguishes "the database stopped at
+    // 33" from "the database returned everything and Rust threw the rest
+    // away". Exactly `MAX_CANDIDATE_ENDPOINTS + 1`: the cap, plus the single
+    // extra row that makes truncation observable without a second query.
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    for index in 0..20 {
+        seed_pair(
+            &db,
+            "space-a",
+            &format!("page-{:03}", index * 2),
+            &format!("page-{:03}", index * 2 + 1),
+            3,
+        )
+        .await;
+    }
+
+    let tx = db.tx().await;
+    let mut budget = QueryBudget::default();
+    let (endpoints, truncated) = candidate_endpoints(&tx, "space-a", 7, &mut budget)
+        .await
+        .expect("candidate endpoints");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(endpoints.len(), MAX_CANDIDATE_ENDPOINTS);
+    assert!(truncated);
+    assert_eq!(
+        budget.rows as usize,
+        MAX_CANDIDATE_ENDPOINTS + 1,
+        "the candidate query decoded {} rows over a 40-page space; the cap \
+         must be the LIMIT, not a truncate afterwards",
+        budget.rows
     );
 }
 
