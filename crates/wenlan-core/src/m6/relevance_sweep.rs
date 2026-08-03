@@ -383,10 +383,19 @@ pub async fn eligible_groups(
 /// Pages this sweep should re-reference, capped at 32 **at the query** (S0-90).
 ///
 /// Staleness is `m6_pair_stats.updated_generation` behind the current grouping
-/// generation, which is what that column is for; a page with no pair row at all
-/// is stale too. That makes the sweep drain — each turn advances 32 pages to
-/// the current generation and the next turn takes the following 32 — rather
-/// than re-sweeping one arbitrary prefix forever.
+/// generation, which is what that column is for. The test is **any** row naming
+/// the page being behind, not the absence of a current one: a turn writes every
+/// pair incident to its endpoints, so a page picks up current rows as a *co*-
+/// page of somebody else's sweep long before its own remaining pairs are
+/// re-derived. Reading one current row as "this page is done" retires it early
+/// and strands the rest of its pairs at the old generation forever — a silent
+/// loss, because the table still looks fully populated.
+///
+/// A page with no rows at all is therefore not a candidate. That is the same
+/// rule, not an exception: nothing about it is behind. Pages first acquire rows
+/// in the full re-reference pass, and a page with no eligible support never
+/// acquires any — which is what stops the sweep spinning on pages that can
+/// never produce a pair.
 ///
 /// The cap is in the `LIMIT`, not a `Vec::truncate` afterwards: G6.8's break is
 /// exactly a post-hoc truncate, which leaves the returned count passing while
@@ -406,9 +415,9 @@ pub async fn candidate_endpoints(
             "SELECT p.id FROM pages p
               WHERE p.space = ?1
                 AND lower(p.title) <> 'overview'
-                AND NOT EXISTS (
+                AND EXISTS (
                     SELECT 1 FROM m6_pair_stats s
-                     WHERE s.space = ?1 AND s.updated_generation >= ?2
+                     WHERE s.space = ?1 AND s.updated_generation < ?2
                        AND (s.page_a = p.id OR s.page_b = p.id)
                 )
               ORDER BY p.id ASC
@@ -538,6 +547,139 @@ pub async fn groups_touching(
     Ok(groups)
 }
 
+/// The decayed marginals a pair table's cells are measured against: `total` is
+/// `N`, the space's whole eligible mass, and `per_page` each page's share of it.
+///
+/// # Why `N` is pinned rather than recomputed
+///
+/// `n00(A,B) = N - mass(A) - mass(B) + n11(A,B)`, so `N` reaches every cell in
+/// the space. Activating one root moves `N`, which moves `n00` for **every**
+/// stored pair — including every pair that root does not touch. An
+/// implementation that keeps `n00` exact against a live `N` therefore has to
+/// rewrite the whole table on each eligibility change, which S0-91's negative
+/// control (the incremental path stayed within its row-visit bound) exists to
+/// forbid. Exact-and-live and bounded-incremental cannot both hold; that is a
+/// property of the definition, not of any particular implementation.
+///
+/// The resolution is the one Q1 already applies to the decay reference: `N` is
+/// **part of the same pin**. It is established by the full re-reference pass
+/// (`RelevanceTurn::Rereferenced`) and held constant until the next one, so a
+/// bounded turn's rows agree exactly with a full recomputation *at that pin*.
+/// Between passes `N` is stale by a bounded, queryable amount, exactly as the
+/// decay is, and for the same reason.
+///
+/// Pinning it needs no new column: `N` is already in every row of the table as
+/// `n11 + n10 + n01 + n00`, and `mass(A)` as `n11 + n10` — the identity gated by
+/// `the_four_cells_always_sum_to_the_spaces_total_mass`. [`pinned_space_mass`]
+/// reads them back. The spec left this open — Q1 pins the *instant* and never
+/// says `N` belongs to the same pin — so this is C1 adjudicating it, and the
+/// oracle is what holds the adjudication honest.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct SpaceMass {
+    pub total: f64,
+    pub per_page: BTreeMap<String, f64>,
+}
+
+impl SpaceMass {
+    /// Sum the marginals from a group set. Correct **only** when `groups` is
+    /// every eligible group in the space, which is why a bounded turn calls
+    /// [`pinned_space_mass`] instead of reusing the groups it scanned.
+    pub fn from_groups(groups: &[GroupSupport], reference: i64) -> SpaceMass {
+        let mut mass = SpaceMass::default();
+        for group in groups {
+            let contribution = decayed_contribution(
+                hub_weight(group.degree),
+                group.newest_root_created_at,
+                reference,
+            );
+            mass.total += contribution;
+            for page in &group.pages {
+                *mass.per_page.entry(page.clone()).or_insert(0.0) += contribution;
+            }
+        }
+        mass
+    }
+
+    /// A page with no eligible support has no mass, so an absent key reads as
+    /// zero rather than erroring — the same value the sums would have produced.
+    pub fn page(&self, page: &str) -> f64 {
+        self.per_page.get(page).copied().unwrap_or(0.0)
+    }
+}
+
+/// Read the pinned `N` and the named pages' marginals back out of the stored
+/// pair table.
+///
+/// Every row carries `N` as the sum of its four cells and each of its pages'
+/// marginal as `n11 + n10` / `n11 + n01`, so one statement recovers the pin for
+/// as many pages as were asked for. `MAX` is an arbitrary pick among rows that
+/// the four-cells identity makes equal; it is a total function, so the choice
+/// cannot vary between runs.
+///
+/// An empty result means the space has no pair rows, which is the state the
+/// full re-reference pass handles — a bounded turn reaching it has nothing to
+/// measure against and writes nothing.
+pub async fn pinned_space_mass(
+    tx: &libsql::Transaction,
+    space: &str,
+    pages: &[String],
+    budget: &mut QueryBudget,
+) -> Result<SpaceMass, WenlanError> {
+    if pages.is_empty() {
+        return Ok(SpaceMass::default());
+    }
+    budget.charge_query()?;
+
+    let placeholders = (2..2 + pages.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH marginals AS (
+             SELECT page_a AS page, n11 + n10 AS mass,
+                    n11 + n10 + n01 + n00 AS total
+               FROM m6_pair_stats WHERE space = ?1
+             UNION ALL
+             SELECT page_b, n11 + n01, n11 + n10 + n01 + n00
+               FROM m6_pair_stats WHERE space = ?1
+         )
+         SELECT page, MAX(mass), MAX(total)
+           FROM marginals
+          WHERE page IN ({placeholders})
+          GROUP BY page
+          ORDER BY page"
+    );
+
+    let mut params = Vec::with_capacity(1 + pages.len());
+    params.push(libsql::Value::Text(space.to_string()));
+    params.extend(pages.iter().map(|page| libsql::Value::Text(page.clone())));
+
+    let mut rows = tx
+        .query(&sql, libsql::params_from_iter(params))
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 pinned mass: {error}")))?;
+
+    let mut mass = SpaceMass::default();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 pinned mass row: {error}")))?
+    {
+        budget.charge_row()?;
+        let page = row
+            .get::<String>(0)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 pinned mass page: {error}")))?;
+        let page_mass = row
+            .get::<f64>(1)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 pinned mass value: {error}")))?;
+        mass.total = row
+            .get::<f64>(2)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 pinned mass total: {error}")))?;
+        mass.per_page.insert(page, page_mass);
+    }
+    Ok(mass)
+}
+
 /// The whole space's pair table at a fixed decay reference — the **full** side
 /// of S0-91's oracle.
 ///
@@ -570,12 +712,30 @@ pub async fn groups_touching(
 /// Accumulation is in `independence_group_id ASC` (S0-92), which `groups`
 /// already carries from [`eligible_groups`]; `n10`/`n01`/`n00` are then single
 /// subtractions off deterministic sums, so the whole table is reproducible.
+///
+/// # Why the marginals arrive as an argument
+///
+/// Only `n11` and the distinct-group count are properties of the *pair*. A
+/// group contributes to them exactly when it supports both pages, so the groups
+/// touching one endpoint are all the evidence they need. `mass(A)`, `mass(B)`
+/// and `N` are not pair-local — they range over every eligible group in the
+/// space — and a bounded turn scans only the groups touching its ≤32 candidate
+/// endpoints. Summing them over that subset gives any page whose groups were
+/// only partly scanned too small a marginal, and the error lands in
+/// `n10`/`n01`/`n00` where S0-91's digest catches it.
+///
+/// So [`SpaceMass`] is supplied by the caller, and each path gets it the way it
+/// can afford: the full re-reference pass sums the groups it already holds
+/// ([`SpaceMass::from_groups`]), and a bounded turn reads the pinned values back
+/// out of the table ([`pinned_space_mass`]). That both routes agree is exactly
+/// what the oracle tests, which is why the marginals are not quietly re-derived
+/// here from whatever `groups` happens to contain.
 pub fn recompute_pair_stats(
     groups: &[GroupSupport],
     reference: i64,
+    mass: &SpaceMass,
 ) -> BTreeMap<(String, String), PairStatsValues> {
-    let mut total_mass = 0.0_f64;
-    let mut page_mass: BTreeMap<&str, f64> = BTreeMap::new();
+    let total_mass = mass.total;
     // n11 and the undecayed distinct-group count, accumulated together so a
     // pair can never gain decayed co-support without gaining a group.
     let mut co_support: BTreeMap<(&str, &str), (f64, i64)> = BTreeMap::new();
@@ -586,10 +746,6 @@ pub fn recompute_pair_stats(
             group.newest_root_created_at,
             reference,
         );
-        total_mass += contribution;
-        for page in &group.pages {
-            *page_mass.entry(page.as_str()).or_insert(0.0) += contribution;
-        }
 
         // `page_a < page_b` is the table's CHECK, so the pair key is built from
         // a lexicographically sorted copy rather than the recency order the
@@ -608,8 +764,8 @@ pub fn recompute_pair_stats(
     co_support
         .into_iter()
         .map(|((page_a, page_b), (n11, distinct_group_count))| {
-            let mass_a = page_mass.get(page_a).copied().unwrap_or(0.0);
-            let mass_b = page_mass.get(page_b).copied().unwrap_or(0.0);
+            let mass_a = mass.page(page_a);
+            let mass_b = mass.page(page_b);
             // Each cell is clamped at zero: the table's CHECKs forbid a
             // negative, and the only way to reach one here is float error in
             // the last bits of a subtraction that is exact in real arithmetic.
@@ -625,9 +781,25 @@ pub fn recompute_pair_stats(
         .collect()
 }
 
+/// What the full re-reference pass did. No [`QueryBudget`]: this is the pass
+/// the incremental bound explicitly does not apply to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelevanceRereference {
+    pub groups_read: usize,
+    pub pages_referenced: usize,
+    pub pairs_written: usize,
+    pub adjacency_rows_written: usize,
+    pub decay_reference: i64,
+}
+
 /// What one relevance turn did, in the shape the maintenance driver reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelevanceTurn {
+    /// The full re-reference pass, which establishes the pin every bounded turn
+    /// afterwards measures against. Its own variant rather than a flag on
+    /// [`RelevanceSweep`], so the incremental row bound cannot be asserted
+    /// against it by accident — it is the one turn the bound does not describe.
+    Rereferenced(RelevanceRereference),
     /// Nothing was stale; the sweep found no work.
     Idle,
     /// Another holder owns `(relevance, space, grouping_generation)` — C2's
@@ -678,6 +850,21 @@ pub async fn run_relevance_sweep(
         None => return Ok(RelevanceTurn::LeaseHeld),
     };
 
+    // A space with no pin yet gets the full re-reference pass, which is the
+    // only thing allowed to establish one. Everything after it is bounded.
+    let Some(reference) = decay_reference(tx, space_id).await? else {
+        let outcome = run_full_rereference(tx, space_id, space, grouping_generation).await?;
+        super::leases::release(
+            tx,
+            super::leases::LeasePhase::Relevance,
+            space,
+            grouping_generation,
+            &token,
+        )
+        .await?;
+        return Ok(outcome);
+    };
+
     let mut budget = QueryBudget::default();
     let (endpoints, endpoints_truncated) =
         candidate_endpoints(tx, space, grouping_generation, &mut budget).await?;
@@ -693,19 +880,108 @@ pub async fn run_relevance_sweep(
         return Ok(RelevanceTurn::Idle);
     }
 
-    // The reference is established on the first pass and then held: every row
-    // this slice writes decays to the same instant as every row already
-    // written, which is what makes incremental and full agree exactly.
-    let reference = match decay_reference(tx, space_id).await? {
-        Some(reference) => reference,
-        None => advance_decay_reference(tx, space_id, space).await?,
-    };
-
     let groups = groups_touching(tx, space, &endpoints, &mut budget).await?;
-    let stats = recompute_pair_stats(&groups, reference);
+    // Every page the scanned groups touch, not just the candidates: a pair is
+    // written for each co-occurring page, and its marginal has to be the pinned
+    // space-wide one even when that page was not itself a candidate.
+    let involved: Vec<String> = groups
+        .iter()
+        .flat_map(|group| group.pages.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mass = pinned_space_mass(tx, space, &involved, &mut budget).await?;
+    let stats = recompute_pair_stats(&groups, reference, &mass);
 
+    // Only the pairs this turn computed *completely*. A candidate endpoint's
+    // groups are all in `groups`, so every group supporting both pages of a
+    // candidate-incident pair was scanned and its cells are exact. A pair whose
+    // two pages are merely co-members of one scanned group is not: the groups
+    // supporting it through some *other* page were never read, so writing it
+    // would store a partial count — and stamp it current, which is worse than
+    // leaving it stale.
+    let endpoint_set: std::collections::BTreeSet<&str> =
+        endpoints.iter().map(String::as_str).collect();
+    let complete: BTreeMap<(String, String), PairStatsValues> = stats
+        .into_iter()
+        .filter(|((page_a, page_b), _)| {
+            endpoint_set.contains(page_a.as_str()) || endpoint_set.contains(page_b.as_str())
+        })
+        .collect();
+
+    let pairs_written = write_pair_stats(tx, space, grouping_generation, &complete).await?;
+    let adjacency_rows_written = rewrite_adjacency(tx, space, &endpoints, &groups).await?;
+
+    // Same transaction as the last write (§5.1.2 step 6).
+    super::leases::release(
+        tx,
+        super::leases::LeasePhase::Relevance,
+        space,
+        grouping_generation,
+        &token,
+    )
+    .await?;
+
+    Ok(RelevanceTurn::Swept(RelevanceSweep {
+        endpoints_considered: endpoints.len(),
+        endpoints_truncated,
+        pairs_written,
+        adjacency_rows_written,
+        decay_reference: reference,
+        budget,
+    }))
+}
+
+/// The full re-reference pass: read every eligible group, advance the decay
+/// reference, and rewrite the whole space's pair table against it.
+///
+/// This is the one deliberately unbounded read in the module. Q1 sanctions it —
+/// "the reference advances only in a full re-reference pass, which rewrites
+/// every pair row for the space in one transaction" — and it is what makes the
+/// pin exist for every bounded turn afterwards. It carries no [`QueryBudget`]
+/// for that reason: charging the incremental bound against the pass that
+/// establishes the baseline would only invite the bound to be loosened until a
+/// full scan fit inside it, which is the failure S0-99 names.
+async fn run_full_rereference(
+    tx: &libsql::Transaction,
+    space_id: &str,
+    space: &str,
+    grouping_generation: i64,
+) -> Result<RelevanceTurn, WenlanError> {
+    let groups = eligible_groups(tx, space).await?;
+    if groups.is_empty() {
+        // No pin is established: a space with no eligible support has no mass
+        // to reference, and pinning zero would make the next turn measure real
+        // groups against an `N` of nothing.
+        return Ok(RelevanceTurn::Idle);
+    }
+
+    let reference = advance_decay_reference(tx, space_id, space).await?;
+    let mass = SpaceMass::from_groups(&groups, reference);
+    let stats = recompute_pair_stats(&groups, reference, &mass);
+    let pairs_written = write_pair_stats(tx, space, grouping_generation, &stats).await?;
+
+    let endpoints: Vec<String> = mass.per_page.keys().cloned().collect();
+    let adjacency_rows_written = rewrite_adjacency(tx, space, &endpoints, &groups).await?;
+
+    Ok(RelevanceTurn::Rereferenced(RelevanceRereference {
+        groups_read: groups.len(),
+        pages_referenced: endpoints.len(),
+        pairs_written,
+        adjacency_rows_written,
+        decay_reference: reference,
+    }))
+}
+
+/// UPSERT the computed cells, stamping the generation they were computed under.
+async fn write_pair_stats(
+    tx: &libsql::Transaction,
+    space: &str,
+    grouping_generation: i64,
+    stats: &BTreeMap<(String, String), PairStatsValues>,
+) -> Result<usize, WenlanError> {
     let mut pairs_written = 0usize;
-    for ((page_a, page_b), values) in &stats {
+    for ((page_a, page_b), values) in stats {
         tx.execute(
             "INSERT INTO m6_pair_stats
                  (space, page_a, page_b, n11, n10, n01, n00,
@@ -732,27 +1008,7 @@ pub async fn run_relevance_sweep(
         .map_err(|error| WenlanError::VectorDb(format!("m6 pair stats upsert: {error}")))?;
         pairs_written += 1;
     }
-
-    let adjacency_rows_written = rewrite_adjacency(tx, space, &endpoints, &groups).await?;
-
-    // Same transaction as the last write (§5.1.2 step 6).
-    super::leases::release(
-        tx,
-        super::leases::LeasePhase::Relevance,
-        space,
-        grouping_generation,
-        &token,
-    )
-    .await?;
-
-    Ok(RelevanceTurn::Swept(RelevanceSweep {
-        endpoints_considered: endpoints.len(),
-        endpoints_truncated,
-        pairs_written,
-        adjacency_rows_written,
-        decay_reference: reference,
-        budget,
-    }))
+    Ok(pairs_written)
 }
 
 /// Rewrite each swept endpoint's `m6_adjacency` rows: ranks 1..=64 ordered

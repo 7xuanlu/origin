@@ -7,12 +7,14 @@
 use super::relevance_sweep::{
     advance_decay_reference, candidate_endpoints, decay_reference, decayed_contribution,
     eligible_groups, group_support, hub_weight, recompute_pair_stats, run_relevance_sweep,
-    GroupSupport, QueryBudget, RelevanceTurn, COUNTER_RELEVANCE_DECAY_REFERENCE,
-    DECAY_HALF_LIFE_DAYS, MAX_QUERIES_PER_EVALUATION, MAX_ROWS_PER_EVALUATION,
+    GroupSupport, QueryBudget, RelevanceRereference, RelevanceTurn, SpaceMass,
+    COUNTER_RELEVANCE_DECAY_REFERENCE, DECAY_HALF_LIFE_DAYS, MAX_QUERIES_PER_EVALUATION,
+    MAX_ROWS_PER_EVALUATION,
 };
 use crate::m6::genesis_test_support::GenesisDb;
 use crate::m6::relevance::{
-    qualified_co_citation, MAX_CANDIDATE_ENDPOINTS, MAX_NEIGHBORS_PER_ENDPOINT,
+    normalized_pair_stats_digest, qualified_co_citation, PairStatsSnapshotRow, PairStatsValues,
+    MAX_CANDIDATE_ENDPOINTS, MAX_NEIGHBORS_PER_ENDPOINT,
 };
 
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -398,7 +400,11 @@ async fn the_four_cells_always_sum_to_the_spaces_total_mass() {
         .map(|g| decayed_contribution(hub_weight(g.degree), g.newest_root_created_at, reference))
         .sum();
 
-    let stats = recompute_pair_stats(&groups, reference);
+    let stats = recompute_pair_stats(
+        &groups,
+        reference,
+        &SpaceMass::from_groups(&groups, reference),
+    );
     assert!(!stats.is_empty(), "these groups form pairs");
     for (pair, values) in &stats {
         let sum = values.n11 + values.n10 + values.n01 + values.n00;
@@ -420,7 +426,11 @@ async fn a_pair_counts_each_group_once_however_many_pages_it_shares() {
         group("g2", &["page-a", "page-b"], reference),
         group("g3", &["page-a", "page-b"], reference),
     ];
-    let stats = recompute_pair_stats(&groups, reference);
+    let stats = recompute_pair_stats(
+        &groups,
+        reference,
+        &SpaceMass::from_groups(&groups, reference),
+    );
     let pair = stats
         .get(&("page-a".to_string(), "page-b".to_string()))
         .expect("the pair exists");
@@ -451,12 +461,18 @@ async fn the_floor_is_derived_at_read_time_not_stored() {
     ];
     let key = ("page-a".to_string(), "page-b".to_string());
     assert!(qualified_co_citation(
-        recompute_pair_stats(&three, reference).get(&key).unwrap()
+        recompute_pair_stats(
+            &three,
+            reference,
+            &SpaceMass::from_groups(&three, reference)
+        )
+        .get(&key)
+        .unwrap()
     ));
 
     // Drop one group — the same pair, now below the floor.
     let two = &three[..2];
-    let below = recompute_pair_stats(two, reference);
+    let below = recompute_pair_stats(two, reference, &SpaceMass::from_groups(two, reference));
     let pair = below.get(&key).unwrap();
     assert_eq!(pair.distinct_group_count, 2);
     assert!(
@@ -481,7 +497,11 @@ async fn a_hub_group_forms_at_most_two_thousand_and_sixteen_pairs() {
         pages,
     };
 
-    let stats = recompute_pair_stats(std::slice::from_ref(&hub), reference);
+    let stats = recompute_pair_stats(
+        std::slice::from_ref(&hub),
+        reference,
+        &SpaceMass::from_groups(std::slice::from_ref(&hub), reference),
+    );
     assert_eq!(stats.len(), 2_016, "C(64,2)");
     let contribution = decayed_contribution(hub_weight(5_000), reference, reference);
     assert!(
@@ -496,14 +516,21 @@ async fn a_hub_group_forms_at_most_two_thousand_and_sixteen_pairs() {
 #[tokio::test]
 async fn an_older_group_contributes_less_to_the_same_pair() {
     let reference = 1_800_000_000_i64;
-    let fresh = recompute_pair_stats(&[group("g", &["page-a", "page-b"], reference)], reference);
-    let aged = recompute_pair_stats(
-        &[group(
-            "g",
-            &["page-a", "page-b"],
-            reference - (DECAY_HALF_LIFE_DAYS as i64) * SECONDS_PER_DAY,
-        )],
+    let fresh_groups = [group("g", &["page-a", "page-b"], reference)];
+    let fresh = recompute_pair_stats(
+        &fresh_groups,
         reference,
+        &SpaceMass::from_groups(&fresh_groups, reference),
+    );
+    let aged_groups = [group(
+        "g",
+        &["page-a", "page-b"],
+        reference - (DECAY_HALF_LIFE_DAYS as i64) * SECONDS_PER_DAY,
+    )];
+    let aged = recompute_pair_stats(
+        &aged_groups,
+        reference,
+        &SpaceMass::from_groups(&aged_groups, reference),
     );
     let key = ("page-a".to_string(), "page-b".to_string());
     assert!((fresh.get(&key).unwrap().n11 - 1.0).abs() < 1e-12);
@@ -590,14 +617,39 @@ async fn seed_pair(db: &GenesisDb, space: &str, page_a: &str, page_b: &str, grou
     }
 }
 
+/// Run the full re-reference pass that establishes the space's pin, returning
+/// what it did. Every bounded turn measures against this, so a test that wants
+/// to exercise the incremental path runs this first and then moves the
+/// generation on — which is the only thing that makes a page stale again.
+async fn rereference(
+    db: &GenesisDb,
+    space_id: &str,
+    space: &str,
+    generation: i64,
+) -> RelevanceRereference {
+    let tx = db.tx().await;
+    let turn = run_relevance_sweep(&tx, space_id, space, generation, 1)
+        .await
+        .expect("re-reference pass");
+    tx.commit().await.expect("commit re-reference");
+    db.exec("DELETE FROM grouping_leases", ()).await;
+    match turn {
+        RelevanceTurn::Rereferenced(pass) => pass,
+        other => panic!("expected the full re-reference pass, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn a_sweep_writes_both_tables_and_releases_its_lease() {
     let db = GenesisDb::new().await;
     db.seed_space("space-id-a", "space-a").await;
     seed_pair(&db, "space-a", "page-a", "page-b", 3).await;
 
+    // Establish the pin, then move the generation on so the same pages are
+    // stale again and the bounded path is what runs.
+    rereference(&db, "space-id-a", "space-a", 7).await;
     let tx = db.tx().await;
-    let turn = run_relevance_sweep(&tx, "space-id-a", "space-a", 7, 1)
+    let turn = run_relevance_sweep(&tx, "space-id-a", "space-a", 8, 1)
         .await
         .expect("sweep");
     tx.commit().await.expect("commit");
@@ -765,8 +817,9 @@ async fn a_candidate_set_that_hits_its_cap_is_recorded_as_truncated() {
         .await;
     }
 
+    rereference(&db, "space-id-a", "space-a", 7).await;
     let tx = db.tx().await;
-    let turn = run_relevance_sweep(&tx, "space-id-a", "space-a", 7, 1)
+    let turn = run_relevance_sweep(&tx, "space-id-a", "space-a", 8, 1)
         .await
         .expect("sweep");
     tx.commit().await.expect("commit");
@@ -807,9 +860,12 @@ async fn the_candidate_cap_is_enforced_by_the_query_not_by_a_later_truncate() {
         .await;
     }
 
+    // Staleness is measured against existing rows, so the pin has to exist
+    // before any page can be behind it.
+    rereference(&db, "space-id-a", "space-a", 7).await;
     let tx = db.tx().await;
     let mut budget = QueryBudget::default();
-    let (endpoints, truncated) = candidate_endpoints(&tx, "space-a", 7, &mut budget)
+    let (endpoints, truncated) = candidate_endpoints(&tx, "space-a", 8, &mut budget)
         .await
         .expect("candidate endpoints");
     tx.commit().await.expect("commit");
@@ -843,8 +899,9 @@ async fn a_sweep_stays_inside_the_query_and_row_budget() {
         .await;
     }
 
+    rereference(&db, "space-id-a", "space-a", 7).await;
     let tx = db.tx().await;
-    let turn = run_relevance_sweep(&tx, "space-id-a", "space-a", 7, 1)
+    let turn = run_relevance_sweep(&tx, "space-id-a", "space-a", 8, 1)
         .await
         .expect("sweep");
     tx.commit().await.expect("commit");
@@ -943,5 +1000,187 @@ async fn adjacency_ranks_are_contiguous_from_one_and_ordered_by_recency() {
         .await,
         3,
         "a rewrite replaces the endpoint's rows rather than adding to them"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S0-91 — the incremental-equals-full oracle, and its negative control.
+// ---------------------------------------------------------------------------
+
+/// The space's stored pair table, in the digest's input shape.
+async fn stored_pair_rows(db: &GenesisDb, space: &str) -> Vec<(String, String, PairStatsValues)> {
+    let mut rows = db
+        .connection
+        .query(
+            "SELECT page_a, page_b, n11, n10, n01, n00, distinct_group_count
+               FROM m6_pair_stats WHERE space = ?1 ORDER BY page_a, page_b",
+            libsql::params![space],
+        )
+        .await
+        .expect("query stored pair stats");
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.expect("stored pair row") {
+        out.push((
+            row.get::<String>(0).expect("page_a"),
+            row.get::<String>(1).expect("page_b"),
+            PairStatsValues {
+                n11: row.get::<f64>(2).expect("n11"),
+                n10: row.get::<f64>(3).expect("n10"),
+                n01: row.get::<f64>(4).expect("n01"),
+                n00: row.get::<f64>(5).expect("n00"),
+                distinct_group_count: row.get::<i64>(6).expect("count"),
+            },
+        ));
+    }
+    out
+}
+
+fn digest_of(rows: &[(String, String, PairStatsValues)]) -> String {
+    let snapshot: Vec<PairStatsSnapshotRow<'_>> = rows
+        .iter()
+        .map(|(page_a, page_b, values)| PairStatsSnapshotRow {
+            page_a,
+            page_b,
+            values: *values,
+        })
+        .collect();
+    normalized_pair_stats_digest(&snapshot).expect("digest the snapshot")
+}
+
+/// The oracle's right-hand side: what a full recomputation of the whole space
+/// produces at `reference`. Deliberately the unbounded read — every eligible
+/// group, which is exactly what a bounded turn may not do.
+async fn full_recompute_rows(
+    db: &GenesisDb,
+    space: &str,
+    reference: i64,
+) -> Vec<(String, String, PairStatsValues)> {
+    let tx = db.tx().await;
+    let groups = eligible_groups(&tx, space).await.expect("eligible groups");
+    tx.commit().await.expect("commit full read");
+    let mass = SpaceMass::from_groups(&groups, reference);
+    recompute_pair_stats(&groups, reference, &mass)
+        .into_iter()
+        .map(|((page_a, page_b), values)| (page_a, page_b, values))
+        .collect()
+}
+
+/// Run **bounded** turns until the sweep reports `Idle`, returning the turn
+/// count and the largest per-turn decoded-row count. Reaching the full
+/// re-reference pass here is a failure: the caller establishes the pin first,
+/// so a second pass would mean the incremental path silently re-referenced.
+async fn drain_bounded(
+    db: &GenesisDb,
+    space_id: &str,
+    space: &str,
+    generation: i64,
+) -> (usize, u32) {
+    let mut turns = 0;
+    let mut peak_rows = 0;
+    loop {
+        let tx = db.tx().await;
+        let turn = run_relevance_sweep(&tx, space_id, space, generation, 1)
+            .await
+            .expect("sweep turn");
+        tx.commit().await.expect("commit sweep turn");
+        db.exec("DELETE FROM grouping_leases", ()).await;
+        match turn {
+            RelevanceTurn::Idle => return (turns, peak_rows),
+            RelevanceTurn::LeaseHeld => panic!("nothing else holds the lease in this test"),
+            RelevanceTurn::Rereferenced(pass) => {
+                panic!("the incremental path re-referenced the whole space: {pass:?}")
+            }
+            RelevanceTurn::Swept(sweep) => {
+                peak_rows = peak_rows.max(sweep.budget.rows);
+                turns += 1;
+                assert!(turns < 64, "the sweep must drain, not spin");
+            }
+        }
+    }
+}
+
+/// 60 pages over 30 overlapping groups. The page count is deliberately past
+/// `MAX_CANDIDATE_ENDPOINTS`, so the bounded path needs several turns and no
+/// single turn sees every group — the only configuration in which a marginal
+/// summed over one turn's own subset can diverge from the space-wide one. A
+/// fixture that fits in a single turn passes this vacuously.
+async fn seed_overlapping_space(db: &GenesisDb) {
+    db.seed_space("space-id-a", "space-a").await;
+    for index in 0..30 {
+        let group = format!("g-{index:02}");
+        for offset in 0..4 {
+            let page = format!("page-{:02}", (index * 2 + offset) % 60);
+            seed_page_support(
+                db,
+                &format!("root-{group}-{page}"),
+                "space-a",
+                &group,
+                &page,
+                1_700_000_000 + index as i64 * 1_000,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_bounded_sweep_reproduces_a_full_recomputation() {
+    // S0-91's oracle. Byte equality of the digest, not a per-cell float
+    // tolerance: the reference and `N` are both pinned, so the two paths agree
+    // exactly or the design is wrong.
+    let db = GenesisDb::new().await;
+    seed_overlapping_space(&db).await;
+
+    let pass = rereference(&db, "space-id-a", "space-a", 7).await;
+    assert_eq!(
+        pass.pages_referenced, 60,
+        "the pass references the whole space"
+    );
+
+    // Moving the generation on makes every page stale again, so the bounded
+    // path rewrites from scratch what the full pass wrote — the comparison is
+    // only meaningful because the incremental path really did the work.
+    let (turns, peak_rows) = drain_bounded(&db, "space-id-a", "space-a", 8).await;
+    assert!(
+        turns >= 2,
+        "60 pages against a 32 cap must take more than one bounded turn, took {turns}"
+    );
+
+    let reference = {
+        let tx = db.tx().await;
+        let reference = decay_reference(&tx, "space-id-a")
+            .await
+            .expect("read reference")
+            .expect("the pass established a reference");
+        tx.commit().await.expect("commit");
+        reference
+    };
+
+    let stored = stored_pair_rows(&db, "space-a").await;
+    let full = full_recompute_rows(&db, "space-a", reference).await;
+    assert_eq!(
+        stored.len(),
+        full.len(),
+        "the two paths wrote different pairs"
+    );
+    // Compared through the digest, not cell-by-cell: the two paths reach the
+    // same cells by different association orders (the bounded path's marginals
+    // come back through storage), so they can differ in the last bit. S0-92's
+    // 9-dp rounding is the contract's own answer to that, and asserting raw f64
+    // equality would be a stricter gate than the artifact specifies.
+    assert_eq!(
+        digest_of(&stored),
+        digest_of(&full),
+        "the bounded sweep's table must be byte-identical to a full \
+         recomputation at the same pin"
+    );
+
+    // The negative control. An implementation that reached the same digest by
+    // re-referencing the whole space on every turn fails here rather than
+    // passing as a correct incremental one.
+    assert!(
+        peak_rows <= MAX_ROWS_PER_EVALUATION,
+        "a bounded turn decoded {peak_rows} rows; the incremental bound is \
+         {MAX_ROWS_PER_EVALUATION}"
     );
 }
