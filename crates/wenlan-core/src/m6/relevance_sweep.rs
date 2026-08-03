@@ -660,12 +660,18 @@ pub async fn groups_touching(
 /// Between passes `N` is stale by a bounded, queryable amount, exactly as the
 /// decay is, and for the same reason.
 ///
-/// Pinning it needs no new column: `N` is already in every row of the table as
-/// `n11 + n10 + n01 + n00`, and `mass(A)` as `n11 + n10` — the identity gated by
-/// `the_four_cells_always_sum_to_the_spaces_total_mass`. [`pinned_space_mass`]
-/// reads them back. The spec left this open — Q1 pins the *instant* and never
-/// says `N` belongs to the same pin — so this is C1 adjudicating it, and the
-/// oracle is what holds the adjudication honest.
+/// The marginals live in `m6_space_mass` and `m6_page_mass` rather than being
+/// recovered from a pair row's cells. They *are* recoverable — `N` is
+/// `n11 + n10 + n01 + n00` and `mass(A)` is `n11 + n10`, the identity gated by
+/// `the_four_cells_always_sum_to_the_spaces_total_mass` — and C1 read them
+/// back that way at first. Dedicated tables replaced it because `n00` is not
+/// stored any more: deriving it needs the marginals, so recovering the
+/// marginals from it would be circular. The identity still holds over what a
+/// reader assembles, which is why that test still gates it.
+///
+/// The spec left this open — Q1 pins the *instant* and never says `N` belongs
+/// to the same pin — so this is C1 adjudicating it, and the oracle is what
+/// holds the adjudication honest.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct SpaceMass {
     pub total: f64,
@@ -699,18 +705,13 @@ impl SpaceMass {
     }
 }
 
-/// Read the pinned `N` and the named pages' marginals back out of the stored
-/// pair table.
+/// Read the pinned `N` and the named pages' marginals out of `m6_space_mass`
+/// and `m6_page_mass`.
 ///
-/// Every row carries `N` as the sum of its four cells and each of its pages'
-/// marginal as `n11 + n10` / `n11 + n01`, so one statement recovers the pin for
-/// as many pages as were asked for. `MAX` is an arbitrary pick among rows that
-/// the four-cells identity makes equal; it is a total function, so the choice
-/// cannot vary between runs.
-///
-/// An empty result means the space has no pair rows, which is the state the
-/// full re-reference pass handles — a bounded turn reaching it has nothing to
-/// measure against and writes nothing.
+/// One statement for as many pages as were asked for, plus the space total as
+/// a correlated scalar. An empty result means the space has no mass rows,
+/// which is the state the full re-reference pass handles — a bounded turn
+/// reaching it has nothing to measure against and writes nothing.
 pub async fn pinned_space_mass(
     tx: &libsql::Transaction,
     space: &str,
@@ -935,6 +936,10 @@ pub struct RelevanceSweep {
     /// attachment decision made over it can be reconstructed.
     pub endpoints_truncated: bool,
     pub pairs_written: usize,
+    /// Pairs incident to a swept endpoint that no longer have any supporting
+    /// group. Reported rather than silent: this is the only write in the turn
+    /// that removes information.
+    pub pairs_removed: usize,
     pub adjacency_rows_written: usize,
     pub decay_reference: i64,
     pub budget: QueryBudget,
@@ -1012,7 +1017,16 @@ pub async fn run_relevance_sweep(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    let mass = pinned_space_mass(tx, space, &involved, &mut budget).await?;
+    let mut mass = pinned_space_mass(tx, space, &involved, &mut budget).await?;
+    // A support change moves the *page's* marginal but not the space total:
+    // `total` sums each eligible group once, so a group that gains or loses a
+    // page is still exactly one eligible group. A group leaving the universe
+    // altogether is the other case, and it goes through `apply_group_mutation`,
+    // which owns the total. That split is what lets a bounded turn refresh
+    // marginals at all -- it read every group touching its own endpoints, so
+    // those it can compute exactly, and every other page's stays pinned until
+    // that page is itself swept.
+    refresh_endpoint_mass(tx, space, &endpoints, &groups, reference, &mut mass).await?;
     let stats = recompute_pair_stats(&groups, reference, &mass);
 
     // Only the pairs this turn computed *completely*. A candidate endpoint's
@@ -1031,6 +1045,17 @@ pub async fn run_relevance_sweep(
         })
         .collect();
 
+    // A pair vanishes when its last co-supporting group does, and an upsert
+    // cannot say that. The row would keep its stale cells *and* its stale
+    // generation, which leaves its endpoints permanently stale: the sweep
+    // re-selects them every turn, never advances them, and never reaches
+    // `Idle`. That is a livelock, not a wrong number.
+    //
+    // Delete-then-insert over exactly the pairs this turn owns, the same shape
+    // `rewrite_adjacency` uses, and sound for the same reason `complete` is:
+    // every group touching a swept endpoint was read this turn, so a stored
+    // pair incident to one and absent from `complete` has no support left.
+    let pairs_removed = delete_pairs_incident_to(tx, space, &endpoints).await?;
     let pairs_written = write_pair_stats(tx, space, grouping_generation, &complete).await?;
     let adjacency_rows_written = rewrite_adjacency(tx, space, &endpoints, &groups).await?;
 
@@ -1048,6 +1073,7 @@ pub async fn run_relevance_sweep(
         endpoints_considered: endpoints.len(),
         endpoints_truncated,
         pairs_written,
+        pairs_removed,
         adjacency_rows_written,
         decay_reference: reference,
         budget,
@@ -1097,6 +1123,86 @@ async fn run_full_rereference(
 }
 
 /// UPSERT the computed cells, stamping the generation they were computed under.
+/// Recompute this turn's endpoints' marginals from the groups it read, store
+/// them, and fold them into `mass` so the pairs written below use the fresh
+/// value rather than the pinned one.
+///
+/// Exact, not approximate: [`groups_touching`] returns every eligible group
+/// touching a swept endpoint, and `mass(p)` is the sum of those groups'
+/// contributions. The top-64 page cap applies identically here and in
+/// [`SpaceMass::from_groups`], so the two paths truncate the same groups.
+async fn refresh_endpoint_mass(
+    tx: &libsql::Transaction,
+    space: &str,
+    endpoints: &[String],
+    groups: &[GroupSupport],
+    reference: i64,
+    mass: &mut SpaceMass,
+) -> Result<(), WenlanError> {
+    for endpoint in endpoints {
+        let refreshed: f64 = groups
+            .iter()
+            .filter(|group| group.pages.iter().any(|page| page == endpoint))
+            .map(|group| {
+                decayed_contribution(
+                    hub_weight(group.degree),
+                    group.newest_root_created_at,
+                    reference,
+                )
+            })
+            .sum();
+        tx.execute(
+            "INSERT INTO m6_page_mass (space, page_id, mass) VALUES (?1, ?2, MAX(0.0, ?3))
+             ON CONFLICT(space, page_id) DO UPDATE SET mass = excluded.mass",
+            libsql::params![space, endpoint.as_str(), refreshed],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 endpoint mass write: {error}")))?;
+        mass.per_page.insert(endpoint.clone(), refreshed);
+    }
+    Ok(())
+}
+
+/// Drop every stored pair incident to one of this turn's endpoints.
+///
+/// Paired with the `write_pair_stats` that follows it: together they replace
+/// the turn's owned slice of the table rather than merging into it. A write,
+/// so it is not charged against [`QueryBudget`] -- the budget's two instruments
+/// count statements that *decode rows* and the rows they decode, and this
+/// statement returns none.
+async fn delete_pairs_incident_to(
+    tx: &libsql::Transaction,
+    space: &str,
+    endpoints: &[String],
+) -> Result<usize, WenlanError> {
+    if endpoints.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = (2..2 + endpoints.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "DELETE FROM m6_pair_stats
+          WHERE space = ?1
+            AND (page_a IN ({placeholders}) OR page_b IN ({placeholders}))"
+    );
+
+    let mut params = Vec::with_capacity(1 + endpoints.len());
+    params.push(libsql::Value::Text(space.to_string()));
+    params.extend(
+        endpoints
+            .iter()
+            .map(|endpoint| libsql::Value::Text(endpoint.clone())),
+    );
+
+    let removed = tx
+        .execute(&sql, libsql::params_from_iter(params))
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 pair stats delete: {error}")))?;
+    Ok(removed as usize)
+}
+
 async fn write_pair_stats(
     tx: &libsql::Transaction,
     space: &str,

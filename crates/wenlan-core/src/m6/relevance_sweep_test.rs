@@ -1314,6 +1314,53 @@ async fn seed_sparse_space(db: &GenesisDb) {
     }
 }
 
+/// S0-91 mutation: page support loss.
+///
+/// `g0` is the only group co-supporting `(p1, p3)`, so retiring its `p3` edge
+/// must remove that pair. The sweep reaches it through generation staleness
+/// rather than through [`apply_group_mutation`] -- losing an edge is a
+/// substrate change, not a group-eligibility transition.
+#[tokio::test]
+async fn a_support_loss_that_empties_a_pair_still_equals_a_full_recomputation() {
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    seed_sparse_space(&db).await;
+
+    let pass = rereference(&db, "space-id-a", "space-a", 7).await;
+    let reference = pass.decay_reference;
+
+    let before = stored_pair_rows(&db, "space-a").await;
+    assert!(
+        before
+            .iter()
+            .any(|(page_a, page_b, _)| page_a == "p1" && page_b == "p3"),
+        "the pair about to lose its only supporting group must exist first"
+    );
+
+    db.exec(
+        "UPDATE edges SET valid_until = 1 WHERE root_id = 'r-g0-p3'",
+        (),
+    )
+    .await;
+
+    drain_bounded(&db, "space-id-a", "space-a", 8).await;
+
+    let stored = stored_pair_rows(&db, "space-a").await;
+    let full = full_recompute_rows(&db, "space-a", reference).await;
+    assert!(
+        !stored
+            .iter()
+            .any(|(page_a, page_b, _)| page_a == "p1" && page_b == "p3"),
+        "a pair whose last supporting edge retired must not survive the sweep"
+    );
+    assert_eq!(
+        digest_of(&stored),
+        digest_of(&full),
+        "the swept table and a full recomputation disagree after a support loss\n\
+         stored: {stored:#?}\nfull: {full:#?}"
+    );
+}
+
 /// S0-91's oracle over the cells [`seed_mutable_space`] cannot reach.
 ///
 /// Retracting `g2` takes the last group off `(p3, p4)`, so the incremental
