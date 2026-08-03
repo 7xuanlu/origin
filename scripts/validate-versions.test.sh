@@ -132,7 +132,7 @@ if ! printf '%s\n' "$output" | grep -q "Codex plugin release pin missing"; then
 fi
 echo "PASS test 9: Codex README runner pin missing detected"
 
-assert_release_job_pins_event_sha() {
+assert_release_job_pins_release_sha() {
     local workflow="$1"
     local job="$2"
     python3 - "$workflow" "$job" <<'PY'
@@ -147,19 +147,19 @@ if not match:
     raise SystemExit(1)
 body = match.group("body")
 checkout = re.search(r"^      - (?:name: Checkout\n        )?uses: actions/checkout@[^\n]+\n(?P<body>.*?)(?=^      - |\Z)", body, re.MULTILINE | re.DOTALL)
-if not checkout or not re.search(r"^          ref: \$\{\{ github\.sha \}\}\s*$", checkout.group("body"), re.MULTILINE):
+if not checkout or not re.search(r"^          ref: \$\{\{ env\.RELEASE_SHA \}\}\s*$", checkout.group("body"), re.MULTILINE):
     raise SystemExit(1)
 verify = re.search(r"^      - name: Verify release checkout\n(?P<body>.*?)(?=^      - |\Z)", body, re.MULTILINE | re.DOTALL)
 if not verify or not re.search(r"^        shell: bash\s*$", verify.group("body"), re.MULTILINE):
     raise SystemExit(1)
-if any(marker not in verify.group("body") for marker in ['git rev-parse HEAD', 'GITHUB_SHA', '/git/ref/tags/$RELEASE_TAG']):
+if any(marker not in verify.group("body") for marker in ['git rev-parse HEAD', 'RELEASE_SHA', '/git/ref/tags/$RELEASE_TAG']):
     raise SystemExit(1)
 PY
 }
 
 for job in prepare-release publish-crates publish-npm; do
-    if ! assert_release_job_pins_event_sha "$REPO_ROOT/.github/workflows/release.yml" "$job"; then
-        echo "FAIL test 10: $job must checkout the immutable event SHA and verify RELEASE_TAG"
+    if ! assert_release_job_pins_release_sha "$REPO_ROOT/.github/workflows/release.yml" "$job"; then
+        echo "FAIL test 10: $job must checkout the resolved release SHA and verify RELEASE_TAG"
         exit 1
     fi
 done
@@ -177,21 +177,52 @@ match = re.search(
 if not match:
     raise SystemExit(1)
 body = match.group("body")
+if "ref: ${{ github.sha }}" not in body or "ref: ${{ env.RELEASE_SHA }}" in body:
+    raise SystemExit(1)
 for marker in [
-    "ref: ${{ github.sha }}",
+    'git rev-parse HEAD)" == "$GITHUB_SHA',
     '/git/ref/tags/$RELEASE_TAG',
-    '--sha "$GITHUB_SHA"',
+    '--sha "$RELEASE_SHA"',
+    "scripts/release-promotion.py gate-main",
     "scripts/release-promotion.py consume-main-receipt",
+    '"$GITHUB_REF" == "refs/heads/main"',
+    ".main_sha == $sha and .main_run == null",
+    ".receipt.run_id == $source_run_id",
+    ".receipt.run_attempt == $source_run_attempt",
     "Tag does not match the validated release version.",
 ]:
     if marker not in body:
         raise SystemExit(1)
 PY
 then
-    echo "FAIL test 10: release resolver must bind RELEASE_TAG to the main promotion receipt"
+    echo "FAIL test 10: release resolver must keep main control-plane code while binding RELEASE_TAG to the exact receipt"
     exit 1
 fi
-echo "PASS test 10: release jobs pin the event SHA and verify the receipt-derived RELEASE_TAG"
+if ! python3 - "$REPO_ROOT/.github/workflows/release.yml" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+workflow = Path(sys.argv[1]).read_text()
+for job in ["prepare-release", "promote-assets", "docker", "publish-crates", "publish-npm"]:
+    match = re.search(
+        rf"^  {re.escape(job)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+        workflow,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        raise SystemExit(1)
+    body = match.group("body")
+    if "ref: ${{ env.RELEASE_SHA }}" not in body or "ref: ${{ github.sha }}" in body:
+        raise SystemExit(1)
+    if "/git/ref/tags/$RELEASE_TAG" not in body or "RELEASE_SHA" not in body:
+        raise SystemExit(1)
+PY
+then
+    echo "FAIL test 10: every release source/publish job must use RELEASE_SHA and revalidate the live tag"
+    exit 1
+fi
+echo "PASS test 10: resolver keeps immutable main control code; source/publish jobs pin RELEASE_SHA and verify RELEASE_TAG"
 
 python3 "$REPO_ROOT/scripts/release-workflow-contract.test.py"
 echo "PASS test 11: release promotion and public install contracts"

@@ -36,6 +36,56 @@ class FakeApi:
 
 
 class ReleasePromotionTests(unittest.TestCase):
+    def test_release_context_scopes_compatibility_client_to_pr_proof(self) -> None:
+        main_sha = "2" * 40
+        head_sha = "3" * 40
+        association_path = f"/repos/{REPOSITORY}/commits/{main_sha}/pulls"
+        compatibility = FakeApi(
+            {
+                (
+                    association_path,
+                    (("per_page", 100),),
+                ): [
+                    {
+                        "number": 430,
+                        "base": {"ref": "main"},
+                        "head": {"ref": PROMOTION.RELEASE_BRANCH, "sha": head_sha},
+                        "merge_commit_sha": main_sha,
+                    }
+                ]
+            }
+        )
+        modern = FakeApi({})
+        proof = mock.Mock(verified=True, pr_head_sha=head_sha)
+
+        with mock.patch.object(
+            PROMOTION.MERGE_PROOF,
+            "verify_release_merge",
+            return_value=proof,
+        ) as verify:
+            resolved, resolved_head = PROMOTION._release_context(
+                modern, REPOSITORY, main_sha, pr_api=compatibility
+            )
+
+        self.assertIs(resolved, proof)
+        self.assertEqual(resolved_head, head_sha)
+        self.assertEqual(modern.calls, [])
+        self.assertEqual(
+            compatibility.calls,
+            [(association_path, (("per_page", 100),))],
+        )
+        verify.assert_called_once_with(
+            modern,
+            REPOSITORY,
+            event_name="push",
+            ref="refs/heads/main",
+            sha=main_sha,
+            associated_pulls=compatibility.responses[
+                (association_path, (("per_page", 100),))
+            ],
+            pr_api=compatibility,
+        )
+
     def test_release_context_reuses_the_association_snapshot(self) -> None:
         main_sha = "2" * 40
         head_sha = "3" * 40
@@ -70,6 +120,7 @@ class ReleasePromotionTests(unittest.TestCase):
             ref="refs/heads/main",
             sha=main_sha,
             associated_pulls=[association],
+            pr_api=api,
         )
         self.assertEqual(api.calls, [(path, (("per_page", 100),))])
 
@@ -116,6 +167,7 @@ class ReleasePromotionTests(unittest.TestCase):
             ref="refs/heads/main",
             sha=main_sha,
             associated_pulls=[release_pr],
+            pr_api=api,
         )
 
     def test_release_context_does_not_delay_an_ordinary_main_commit(self) -> None:
@@ -189,7 +241,7 @@ class ReleasePromotionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             PROMOTION.PromotionError,
-            "release merge proof failed: expected one associated merged release PR, found 0",
+            "release merge proof failed",
         ):
             PROMOTION._release_context(api, REPOSITORY, main_sha)
 

@@ -8,6 +8,7 @@ import importlib.util
 import os
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 
@@ -136,6 +137,67 @@ class VerifyReleaseMergeTests(unittest.TestCase):
         self.assertEqual(proof.pr_head_sha, HEAD_SHA)
         self.assertEqual(proof.tree_sha, TREE_SHA)
 
+    def test_compatibility_pr_api_recovers_null_modern_merge_sha(self) -> None:
+        modern_responses = deepcopy(self.responses)
+        modern_responses[self.paths["pulls"]][0]["merge_commit_sha"] = None
+        modern_responses[self.paths["pr"]]["merge_commit_sha"] = None
+        modern = FakeApi(modern_responses)
+        compatibility = FakeApi(
+            {
+                self.paths["pulls"]: deepcopy(self.responses[self.paths["pulls"]]),
+                self.paths["pr"]: deepcopy(self.responses[self.paths["pr"]]),
+                self.paths["files"]: deepcopy(self.responses[self.paths["files"]]),
+            }
+        )
+
+        proof = self.module.verify_release_merge(
+            modern,
+            REPOSITORY,
+            event_name="push",
+            ref="refs/heads/main",
+            sha=CURRENT_SHA,
+            pr_api=compatibility,
+        )
+
+        self.assertTrue(proof.verified, proof.reason)
+        self.assertEqual(
+            [path for path, _query in compatibility.calls],
+            [self.paths["pulls"], self.paths["pr"], self.paths["files"]],
+        )
+        self.assertNotIn(
+            self.paths["pulls"], [path for path, _query in modern.calls]
+        )
+
+    def test_compatibility_pr_api_still_rejects_mismatch_and_ambiguity(self) -> None:
+        for label, mutate in {
+            "mismatch": lambda responses: responses[self.paths["pr"]].update(
+                merge_commit_sha="0" * 40
+            ),
+            "ambiguous": lambda responses: responses[self.paths["pulls"]].append(
+                {**responses[self.paths["pulls"]][0], "number": 377}
+            ),
+        }.items():
+            with self.subTest(label=label):
+                self.setUp()
+                modern = FakeApi(deepcopy(self.responses))
+                compatibility_responses = {
+                    self.paths["pulls"]: deepcopy(self.responses[self.paths["pulls"]]),
+                    self.paths["pr"]: deepcopy(self.responses[self.paths["pr"]]),
+                    self.paths["files"]: deepcopy(self.responses[self.paths["files"]]),
+                }
+                mutate(compatibility_responses)
+
+                proof = self.module.verify_release_merge(
+                    modern,
+                    REPOSITORY,
+                    event_name="push",
+                    ref="refs/heads/main",
+                    sha=CURRENT_SHA,
+                    pr_api=FakeApi(compatibility_responses),
+                )
+
+                self.assertFalse(proof.verified, proof.reason)
+
     def test_reuses_caller_provided_association_snapshot(self) -> None:
         api = FakeApi(
             {
@@ -188,7 +250,7 @@ class VerifyReleaseMergeTests(unittest.TestCase):
             "wrong branch": lambda: self.responses[self.paths["pulls"]][0][
                 "head"
             ].update(ref="topic"),
-            "wrong merge SHA": lambda: self.responses[self.paths["pulls"]][0].update(
+            "wrong merge SHA": lambda: self.responses[self.paths["pr"]].update(
                 merge_commit_sha="0" * 40
             ),
             "failed check": lambda: self.responses[self.paths["checks"]][
