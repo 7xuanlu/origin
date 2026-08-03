@@ -12,6 +12,16 @@ use wenlan_core::eval::m5_bench_corpus::{
     M5_BENCH_MEMORY_COUNT, M5_BENCH_PAGE_COUNT, M5_BENCH_SEED, M5_CORPUS_ENCODING, PAGE_SIZE_K_MIN,
     PAGE_SIZE_SCHEMA_VERSION,
 };
+#[cfg(feature = "eval-harness")]
+use wenlan_core::{
+    claim_judge::{
+        build_m5_claim_entailment_batch_user_prompt, parse_m5_claim_entailment_batch_scores,
+        snapshot_m5_claim_judge, M5ClaimEntailmentItem, M5_CLAIM_ENTAILMENT_SYSTEM_PROMPT,
+        M5_CLAIM_JUDGE_MAX_BATCH_ITEMS,
+    },
+    llm_provider::{LlmProvider, LlmRequest, OnDeviceProvider},
+    on_device_models::{get_model, is_cached},
+};
 
 const DISTRIBUTION_BYTES: &[u8] = include_bytes!("fixtures/m5_page_size_dist.json");
 const ACCURACY_BYTES: &[u8] = include_bytes!("fixtures/m5_judge_accuracy.jsonl");
@@ -232,6 +242,158 @@ fn manifest_covers_generated_corpus_and_exact_fixture_bytes() {
         &changed_accuracy,
     )
     .is_err());
+}
+
+#[cfg(feature = "eval-harness")]
+#[tokio::test]
+#[ignore = "requires a cached on-device model and local inference runtime"]
+async fn live_m5_claim_judge_activation_receipt() {
+    const THRESHOLD: f64 = 0.75;
+    const MODEL_ENV: &str = "WENLAN_M5_JUDGE_MODEL";
+
+    let corpus = corpus_summary(&distribution()).unwrap();
+    verify_manifest_digest(
+        MANIFEST_DIGEST_BYTES,
+        &corpus.sha256,
+        DISTRIBUTION_BYTES,
+        ACCURACY_BYTES,
+    )
+    .unwrap();
+    let cases = parse_accuracy_jsonl(ACCURACY_BYTES).unwrap();
+    assert_eq!(M5_CLAIM_JUDGE_MAX_BATCH_ITEMS, 25);
+
+    let requested_model = std::env::var(MODEL_ENV).unwrap_or_else(|_| "qwen3-4b".to_string());
+    let selected_model = get_model(&requested_model)
+        .unwrap_or_else(|| panic!("{MODEL_ENV} must name a registered on-device model"));
+    assert!(
+        is_cached(selected_model),
+        "{MODEL_ENV} model {requested_model} is not present in the local hf-hub cache"
+    );
+    let started = std::time::Instant::now();
+    let constructor_model = requested_model.clone();
+    let provider = tokio::task::spawn_blocking(move || {
+        OnDeviceProvider::new_with_model(Some(&constructor_model))
+    })
+    .await
+    .expect("join on-device M5 judge construction")
+    .expect("construct cached on-device M5 judge");
+    let provider_init_ms = started.elapsed().as_millis();
+    let snapshot = snapshot_m5_claim_judge(&provider).expect("snapshot pinned on-device M5 judge");
+    assert_eq!(
+        snapshot.model_id, requested_model,
+        "{MODEL_ENV} must name the exact resolved model rather than a fallback"
+    );
+
+    let item_ids: Vec<String> = (0..M5_CLAIM_JUDGE_MAX_BATCH_ITEMS)
+        .map(|index| {
+            let case = &cases[index % cases.len()];
+            format!("{}-copy-{}", case.case_id, index / cases.len())
+        })
+        .collect();
+    let items: Vec<_> = item_ids
+        .iter()
+        .enumerate()
+        .map(|(index, item_id)| {
+            let case = &cases[index % cases.len()];
+            M5ClaimEntailmentItem {
+                item_id,
+                claim: &case.claim,
+                evidence: &case.span,
+            }
+        })
+        .collect();
+    let user_prompt = build_m5_claim_entailment_batch_user_prompt(&items)
+        .expect("build the exact production-size M5 judge batch");
+
+    let inference_started = std::time::Instant::now();
+    let raw = provider
+        .generate(LlmRequest {
+            system_prompt: Some(M5_CLAIM_ENTAILMENT_SYSTEM_PROMPT.to_string()),
+            user_prompt,
+            max_tokens: 2048,
+            temperature: 0.0,
+            label: Some("m5_claim_entailment_activation_gate".to_string()),
+            timeout_secs: None,
+        })
+        .await
+        .expect("run on-device M5 claim-entailment batch");
+    let inference_ms = inference_started.elapsed().as_millis();
+    let scores = parse_m5_claim_entailment_batch_scores(&raw, &item_ids)
+        .expect("strictly parse the complete production M5 judge response");
+
+    let mut true_positive = 0_u64;
+    let mut true_negative = 0_u64;
+    let mut false_positive = 0_u64;
+    let mut false_negative = 0_u64;
+    let mut hard_vetoes = Vec::new();
+    let per_case: Vec<_> = scores
+        .iter()
+        .enumerate()
+        .map(|(index, scored)| {
+            let case = &cases[index % cases.len()];
+            let predicted_entails = scored.score >= THRESHOLD;
+            match (case.entails, predicted_entails) {
+                (true, true) => true_positive += 1,
+                (false, false) => true_negative += 1,
+                (false, true) => false_positive += 1,
+                (true, false) => false_negative += 1,
+            }
+            if matches!(case.case_id.as_str(), "N1" | "N8") && predicted_entails {
+                hard_vetoes.push(scored.item_id.clone());
+            }
+            serde_json::json!({
+                "item_id": scored.item_id,
+                "case_id": case.case_id,
+                "category": case.category,
+                "expected_entails": case.entails,
+                "score": scored.score,
+                "predicted_entails": predicted_entails,
+            })
+        })
+        .collect();
+
+    let total = scores.len() as f64;
+    let accuracy = (true_positive + true_negative) as f64 / total;
+    let precision = if true_positive + false_positive == 0 {
+        0.0
+    } else {
+        true_positive as f64 / (true_positive + false_positive) as f64
+    };
+    let recall = if true_positive + false_negative == 0 {
+        0.0
+    } else {
+        true_positive as f64 / (true_positive + false_negative) as f64
+    };
+    let receipt = serde_json::json!({
+        "schema": "wenlan-m5-judge-activation-receipt-v1",
+        "internal_activation_receipt": true,
+        "manifest_sha256": std::str::from_utf8(&MANIFEST_DIGEST_BYTES[..64]).unwrap(),
+        "corpus_sha256": corpus.sha256,
+        "model_id": snapshot.model_id,
+        "model_version": snapshot.model_version,
+        "prompt_version": snapshot.prompt_version,
+        "threshold": THRESHOLD,
+        "batch_size": scores.len(),
+        "provider_init_ms": provider_init_ms,
+        "inference_ms": inference_ms,
+        "elapsed_ms": started.elapsed().as_millis(),
+        "true_positive": true_positive,
+        "true_negative": true_negative,
+        "false_positive": false_positive,
+        "false_negative": false_negative,
+        "hard_veto_passed": hard_vetoes.is_empty(),
+        "hard_veto_item_ids": hard_vetoes,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "cases": per_case,
+    });
+    println!("{}", serde_json::to_string(&receipt).unwrap());
+
+    assert!(
+        hard_vetoes.is_empty(),
+        "N1/N8 hard-veto copies scored at or above {THRESHOLD}: {hard_vetoes:?}"
+    );
 }
 
 #[cfg(feature = "eval-harness")]

@@ -548,7 +548,10 @@ async fn a_machine_verdict_never_sets_the_human_axis() {
     }
     let states = db.page_truth_states(&[PAGE.to_string()]).await.unwrap();
     let truth = states.get(PAGE).unwrap();
-    assert_eq!(truth.support, crate::truth_contract::Support::Supported);
+    // This fixture intentionally has no claim/membership/support-edge substrate;
+    // the reader must therefore fail closed to Unevaluated. The load-bearing
+    // assertion is that this machine row still cannot confer human review.
+    assert_eq!(truth.support, crate::truth_contract::Support::Unevaluated);
     assert!(
         !truth.human_reviewed,
         "a machine verdict must not confer human review"

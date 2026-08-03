@@ -3229,9 +3229,9 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        979,
+        989,
         "PR-D integration must expose the frozen 968 support calls, the 6 PR-D test identities, \
-         and the 5 M5 derivation-marker fixture calls"
+         the 5 M5 derivation-marker fixture calls, and the 10 M6 shadow-promoter fixture calls"
     );
 }
 

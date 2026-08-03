@@ -905,7 +905,10 @@ crates/wenlan-core/src/synthesis/distill.rs|crate::synthesis::distill::tests::re
 crates/wenlan-core/src/synthesis/distill.rs|crate::synthesis::distill::tests::resolve_distill_target_ignores_unregistered_memory_space|TestDbSession::execute|1
 crates/wenlan-core/src/synthesis/distill.rs|crate::synthesis::distill::tests::resolve_distill_target_ignores_unregistered_memory_space|test_primary_session|1
 crates/wenlan-core/src/synthesis/distill_truth_test.rs|crate::synthesis::distill::distill_truth_test::refresh_page_skips_re_distill_for_a_page_the_automatic_reader_may_not_see|TestDbSession::execute|1
+crates/wenlan-core/src/synthesis/distill_truth_test.rs|crate::synthesis::distill::distill_truth_test::refresh_page_skips_re_distill_for_a_page_the_automatic_reader_may_not_see|TestDbSession::execute|2
+crates/wenlan-core/src/synthesis/distill_truth_test.rs|crate::synthesis::distill::distill_truth_test::refresh_page_skips_re_distill_for_a_page_the_automatic_reader_may_not_see|TestDbSession::execute|3
 crates/wenlan-core/src/synthesis/distill_truth_test.rs|crate::synthesis::distill::distill_truth_test::refresh_page_skips_re_distill_for_a_page_the_automatic_reader_may_not_see|test_primary_session|1
+crates/wenlan-core/src/synthesis/distill_truth_test.rs|crate::synthesis::distill::distill_truth_test::refresh_page_skips_re_distill_for_a_page_the_automatic_reader_may_not_see|test_primary_session|2
 crates/wenlan-core/src/synthesis/refinement_queue.rs|crate::synthesis::refinement_queue::tests::apply_refinement_cross_space_discovery_pick_space_creates_page_in_selected_space|TestDbSession::execute|1
 crates/wenlan-core/src/synthesis/refinement_queue.rs|crate::synthesis::refinement_queue::tests::apply_refinement_cross_space_discovery_pick_space_creates_page_in_selected_space|test_primary_session|1
 crates/wenlan-core/src/synthesis/refinement_queue.rs|crate::synthesis::refinement_queue::tests::apply_refinement_detect_contradiction_does_not_quarantine|TestDbRow::get|1
@@ -976,4 +979,11 @@ crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_wit
 crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|TestDbSession::execute|2
 crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|TestDbSession::execute|3
 crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|TestDbSession::execute|4
+crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|TestDbSession::execute|5
+crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|TestDbSession::execute|6
+crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|TestDbSession::execute|7
+crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|TestDbSession::execute|8
+crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|TestDbSession::execute|9
+crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|TestDbSession::execute|10
+crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|TestDbSession::execute|11
 crates/wenlan-core/src/truth_adapter_test.rs|crate::truth_adapter::tests::db_with_truth_rows|test_primary_session|1
