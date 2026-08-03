@@ -543,6 +543,28 @@ def contract_violations(
     finalize = job_body(release, "finalize-release")
     if "    needs: [docker-manifest, bind-release-tag]" not in finalize:
         violations.append("GitHub release finalization bypasses the GHCR promotion barrier")
+    # The lifecycle step resolves the merged release PR through
+    # GET /commits/{sha}/pulls, a pull-requests read. An explicit permissions
+    # block sets every unlisted scope to none, so dropping this scope returns
+    # 403 only AFTER `gh release edit` has already promoted the release —
+    # stable but still labelled pending, with no way to retry the half that
+    # ran. Assert every scope the step actually exercises.
+    finalize_permissions = re.search(
+        r"    permissions:\n(?P<body>(?:      [^\n]+\n)+)", finalize
+    )
+    granted = {
+        line.strip()
+        for line in (
+            finalize_permissions.group("body") if finalize_permissions else ""
+        ).splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    for scope in ["contents: write", "issues: write", "pull-requests: read"]:
+        if scope not in granted:
+            violations.append(
+                f"release finalization does not grant {scope!r} for the lifecycle step"
+            )
+
     tagged = finalize.find('"labels":["autorelease: tagged"]')
     pending = finalize.find("labels/autorelease%3A%20pending")
     if tagged < 0 or pending <= tagged:

@@ -1079,6 +1079,12 @@ jobs:
     permissions:
       contents: write
       issues: write
+      # Finding the merged release PR uses GET /commits/{sha}/pulls, which is a
+      # pull-requests read. An explicit permissions block sets every unlisted
+      # scope to none, so omitting this returned 403 after the release had
+      # already been promoted, leaving v0.15.4 stable but still labelled
+      # pending. Labels themselves are the issues scope above.
+      pull-requests: read
     steps:
       - name: Promote
         run: |
