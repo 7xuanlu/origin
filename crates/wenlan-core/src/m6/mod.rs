@@ -37,6 +37,8 @@ pub(crate) mod overview_subscriptions;
 pub(crate) mod refresh_readiness;
 #[allow(dead_code)]
 pub(crate) mod relevance;
+#[allow(dead_code)]
+pub(crate) mod relevance_sweep;
 pub(crate) mod remaining_substrate;
 
 #[cfg(test)]
@@ -73,6 +75,8 @@ mod overview_subscriptions_test;
 mod recovery_test;
 #[cfg(test)]
 mod refresh_readiness_test;
+#[cfg(test)]
+mod relevance_sweep_test;
 #[cfg(test)]
 mod relevance_test;
 #[cfg(test)]

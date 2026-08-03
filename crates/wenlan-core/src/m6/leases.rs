@@ -27,30 +27,39 @@
 //! Every clock is SQLite `unixepoch()` evaluated in-statement (S0-11) — no
 //! Rust-side `now` is passed as a parameter anywhere in this module.
 
-use super::constants::{FRONTIER_LEASE_TTL_SECONDS, GENESIS_LEASE_TTL_SECONDS};
+use super::constants::{
+    FRONTIER_LEASE_TTL_SECONDS, GENESIS_LEASE_TTL_SECONDS, RELEVANCE_LEASE_TTL_SECONDS,
+};
 use crate::WenlanError;
 
-/// The M6 phases PR-B2 drives. `relevance` and `refresh` are reserved by S0-3
-/// and land with PR-C; they are absent here rather than declared unused,
-/// because a phase value with no acquirer is a value nothing checks.
+/// The M6 phases PR-B2 and PR-C drive. `refresh` is still reserved by S0-3 and
+/// lands with C2; it is absent here rather than declared unused, because a
+/// phase value with no acquirer is a value nothing checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeasePhase {
     /// Candidate prepare through finalize (900s).
     Genesis,
     /// Frontier reconciliation scan (120s).
     Frontier,
+    /// Bounded relevance sweep (300s).
+    Relevance,
 }
 
 impl LeasePhase {
     /// Every phase M6 owns, and therefore the only rows M6 may reap.
     /// `grouping_leases` is shared with M4's `community` phase.
-    pub const ALL: [LeasePhase; 2] = [LeasePhase::Genesis, LeasePhase::Frontier];
+    pub const ALL: [LeasePhase; 3] = [
+        LeasePhase::Genesis,
+        LeasePhase::Frontier,
+        LeasePhase::Relevance,
+    ];
 
     /// The stored `grouping_leases.phase` value.
     pub fn as_str(self) -> &'static str {
         match self {
             LeasePhase::Genesis => "genesis",
             LeasePhase::Frontier => "frontier",
+            LeasePhase::Relevance => "relevance",
         }
     }
 
@@ -59,6 +68,7 @@ impl LeasePhase {
         match self {
             LeasePhase::Genesis => GENESIS_LEASE_TTL_SECONDS,
             LeasePhase::Frontier => FRONTIER_LEASE_TTL_SECONDS,
+            LeasePhase::Relevance => RELEVANCE_LEASE_TTL_SECONDS,
         }
     }
 }

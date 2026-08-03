@@ -101,6 +101,13 @@ pub const GENESIS_LEASE_TTL_SECONDS: i64 = 900;
 /// query, so a crashed scan should be retryable within one refinery interval.
 pub const FRONTIER_LEASE_TTL_SECONDS: i64 = 120;
 
+/// `relevance` phase TTL (S0-3). One bounded sweep: ≤32 endpoints, ≤4 queries,
+/// ≤512 materialized rows, no model call. Like the genesis TTL this is
+/// **un-re-derived** — S0-3's binding rule (TTL > model timeout + finalize
+/// budget) is vacuously satisfied in shadow because PR-C makes no model call,
+/// and must be re-derived before PR-E. Spec §11 Q9.
+pub const RELEVANCE_LEASE_TTL_SECONDS: i64 = 300;
+
 // ---------------------------------------------------------------------------
 // S0-2 retry backoff and S0-151 stale re-entry delays, in seconds
 // ---------------------------------------------------------------------------
