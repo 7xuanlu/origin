@@ -557,9 +557,15 @@ jobs:
             tag-suffix: arm64
             target: aarch64-unknown-linux-gnu
     steps:
+      # This checkout supplies only tooling — the runtime Dockerfile and the
+      # verifier. The bytes that reach the image come from the validated
+      # artifact and are checked against the closed receipt by size and
+      # SHA-256, so packaging is control plane exactly like promotion is.
+      # Pinning it to the release commit would strand image fixes behind the
+      # very release that needs them, which is how v0.15.4 shipped no image.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ env.RELEASE_SHA }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

@@ -227,6 +227,20 @@ def _semantic_smoke(image: str) -> None:
             ],
             timeout=30,
         )
+        # A container that dies during startup publishes no port, so `docker
+        # port` fails with a message that describes the symptom and hides the
+        # cause. Check liveness first and surface the container's own output.
+        state = _run(
+            ["docker", "inspect", "--format", "{{.State.Running}} {{.State.ExitCode}}", name],
+            timeout=30,
+            check=False,
+        ).stdout.strip()
+        if not state.startswith("true"):
+            logs = _run(["docker", "logs", name], timeout=30, check=False).stdout
+            raise RuntimeImageError(
+                f"runtime image exited before serving (state: {state or 'unknown'})\n"
+                f"{(logs or '')[-4000:]}"
+            )
         port_result = _run(["docker", "port", name, "7878/tcp"], timeout=30)
         binding = port_result.stdout.strip().splitlines()[0]
         try:

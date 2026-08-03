@@ -341,15 +341,20 @@ def contract_violations(
     # plane too. Pinning it to the release commit would run the release's own
     # copy of the promotion tooling, so a resolver fix could never reach a
     # recovery of that release.
-    promote_checkout = job_body(release, "promote-assets")
-    if (
-        "ref: ${{ github.sha }}" not in promote_checkout
-        or "ref: ${{ env.RELEASE_SHA }}" in promote_checkout
-    ):
-        violations.append("asset promotion is not pinned to its immutable main control SHA")
+    # Docker packaging is the same shape: its checkout supplies only the
+    # runtime Dockerfile and the image verifier, while the bytes placed in the
+    # image come from the receipt-verified artifact.
+    for job_name in ["promote-assets", "docker"]:
+        packaging = job_body(release, job_name)
+        if (
+            "ref: ${{ github.sha }}" not in packaging
+            or "ref: ${{ env.RELEASE_SHA }}" in packaging
+        ):
+            violations.append(
+                f"release packaging job {job_name!r} is not pinned to its main control SHA"
+            )
     for job_name in [
         "prepare-release",
-        "docker",
         "publish-crates",
         "publish-npm",
     ]:
