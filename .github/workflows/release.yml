@@ -314,12 +314,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
-      contents: write
+      actions: write
+      contents: read
       issues: read
     steps:
       - name: Create or verify the lightweight receipt-derived tag
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_READ_TOKEN: ${{ github.token }}
+          GH_TAG_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           GATE_STATE: ${{ needs.resolve-promotion.outputs.release-gate-state }}
           GATE_TAG: ${{ needs.resolve-promotion.outputs.release-tag }}
           RELEASE_PR_NUMBER: ${{ needs.resolve-promotion.outputs.release-pr-number }}
@@ -333,7 +335,7 @@ jobs:
             echo "ERROR: resolver did not produce a canonical release PR number."
             exit 1
           }
-          labels="$(gh api --method GET \
+          labels="$(GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/issues/$RELEASE_PR_NUMBER/labels?per_page=100")"
@@ -345,7 +347,7 @@ jobs:
               exit 1
             }
           tag_sha=""
-          if tag_sha="$(gh api --method GET \
+          if tag_sha="$(GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha' 2>/dev/null)"; then
@@ -359,13 +361,35 @@ jobs:
             echo "ERROR: tag-push release requires its existing immutable event tag."
             exit 1
           }
-          if ! gh api --method POST \
+          [[ -n "$GH_TAG_TOKEN" ]] || {
+            echo "ERROR: RELEASE_TOKEN is required for historical workflow tag recovery."
+            exit 1
+          }
+
+          # A historical release commit changes workflow files relative to the
+          # default branch. GitHub therefore rejects GITHUB_TOKEN for the ref
+          # write and requires a token with Workflows write. Such a token also
+          # emits a push event, so take ownership of exactly one resulting
+          # legacy Release run and cancel it before publication may continue.
+          legacy_runs() {
+            GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?event=push&head_sha=$RELEASE_SHA&per_page=100" \
+              --jq ".workflow_runs[] | select(.event == \"push\" and .head_sha == \"$RELEASE_SHA\" and .head_branch == \"$RELEASE_TAG\" and .path == \".github/workflows/release.yml\") | .id"
+          }
+          if [[ -n "$(legacy_runs)" ]]; then
+            echo "ERROR: a tag-push Release run already exists before recovery binds the absent tag."
+            exit 1
+          fi
+
+          if ! GH_TOKEN="$GH_TAG_TOKEN" gh api --method POST \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/$GITHUB_REPOSITORY/git/refs" \
             -f "ref=refs/tags/$RELEASE_TAG" \
             -f "sha=$RELEASE_SHA" >/dev/null; then
-            tag_sha="$(gh api --method GET \
+            tag_sha="$(GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
               -H 'Accept: application/vnd.github+json' \
               -H 'X-GitHub-Api-Version: 2026-03-10' \
               "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
@@ -374,6 +398,43 @@ jobs:
               exit 1
             }
           fi
+
+          legacy_run_id=""
+          for _ in $(seq 1 60); do
+            matching="$(legacy_runs)"
+            count="$(sed '/^$/d' <<<"$matching" | wc -l | tr -d ' ')"
+            if [[ "$count" == "1" ]]; then
+              legacy_run_id="$matching"
+              break
+            fi
+            if [[ "$count" != "0" ]]; then
+              echo "ERROR: tag recovery triggered $count matching legacy Release runs."
+              exit 1
+            fi
+            sleep 2
+          done
+          [[ "$legacy_run_id" =~ ^[1-9][0-9]*$ ]] || {
+            echo "ERROR: no unique legacy tag-push Release run appeared after recovery tag creation."
+            exit 1
+          }
+          GH_TOKEN="$GH_READ_TOKEN" gh api --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/actions/runs/$legacy_run_id/cancel" >/dev/null
+          for _ in $(seq 1 30); do
+            state="$(GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/actions/runs/$legacy_run_id" \
+              --jq '[.status, (.conclusion // "")] | @tsv')"
+            if [[ "$state" == $'completed\tcancelled' ]]; then
+              echo "Cancelled duplicate legacy tag-push Release run $legacy_run_id."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ERROR: legacy tag-push Release run $legacy_run_id did not reach cancelled."
+          exit 1
 
   promote-assets:
     name: Promote exact validated release assets

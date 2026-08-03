@@ -5982,16 +5982,33 @@ fn release_promotion_contract_violations(
     }
     let bind_job = &release["jobs"]["bind-release-tag"];
     let bind_text = serde_yaml::to_string(bind_job).unwrap_or_default();
-    if bind_job["permissions"]["contents"].as_str() != Some("write")
+    let bind_run = job_step(
+        &release,
+        "bind-release-tag",
+        "Create or verify the lightweight receipt-derived tag",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    if bind_job["permissions"]["actions"].as_str() != Some("write")
+        || bind_job["permissions"]["contents"].as_str() != Some("read")
         || bind_job["permissions"]["issues"].as_str() != Some("read")
         || bind_text.contains("actions/checkout@")
-        || !bind_text.contains("/git/refs")
+        || bind_job["steps"][0]["env"]["GH_TAG_TOKEN"].as_str()
+            != Some("${{ secrets.RELEASE_TOKEN }}")
+        || !bind_run.contains("/git/refs")
+        || !bind_run.contains("event=push&head_sha=$RELEASE_SHA")
+        || !bind_run.contains(r#".head_branch == \"$RELEASE_TAG\""#)
+        || !bind_run.contains("/actions/runs/$legacy_run_id/cancel")
+        || !bind_run.contains("completed\\tcancelled")
         || !bind_text.contains("GATE_STATE")
         || !bind_text.contains("RELEASE_PR_NUMBER")
         || !bind_text.contains("index(\"autorelease: pending\") != null")
         || !bind_text.contains("index(\"autorelease: tagged\") == null")
     {
         violations.push("receipt-derived tag binding lacks isolated write authority".into());
+    }
+    if release_workflow.matches("secrets.RELEASE_TOKEN").count() != 1 {
+        violations.push("release recovery token is not confined to the exact tag bind".into());
     }
     for job_name in [
         "prepare-release",
