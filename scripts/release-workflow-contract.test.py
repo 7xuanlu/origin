@@ -344,16 +344,24 @@ def contract_violations(
             violations.append(f"release source job {job_name!r} is not pinned to RELEASE_SHA")
     bind = job_body(release, "bind-release-tag")
     if (
-        "contents: write" not in bind
+        "actions: write" not in bind
+        or "contents: read" not in bind
         or "issues: read" not in bind
         or "actions/checkout@" in bind
         or "/git/refs" not in bind
+        or "GH_TAG_TOKEN: ${{ secrets.RELEASE_TOKEN }}" not in bind
+        or "event=push&head_sha=$RELEASE_SHA" not in bind
+        or '.head_branch == \\"$RELEASE_TAG\\"' not in bind
+        or "/actions/runs/$legacy_run_id/cancel" not in bind
+        or "$'completed\\tcancelled'" not in bind
         or "GATE_STATE" not in bind
         or "RELEASE_PR_NUMBER" not in bind
         or 'index("autorelease: pending") != null' not in bind
         or 'index("autorelease: tagged") == null' not in bind
     ):
         violations.append("receipt-derived tag binding lacks isolated write authority")
+    if release.count("secrets.RELEASE_TOKEN") != 1:
+        violations.append("release recovery token is not confined to the exact tag bind")
     if any(
         marker not in resolver_checkout
         for marker in ["actions: read", "contents: read", "pull-requests: read"]
@@ -1329,6 +1337,24 @@ def main() -> None:
             "scripts/release-promotion.py download-assets",
             "scripts/build-release-binaries.sh",
             "recompile",
+            "release",
+        ),
+        (
+            "GH_TAG_TOKEN: ${{ secrets.RELEASE_TOKEN }}",
+            "GH_TAG_TOKEN: ${{ github.token }}",
+            "isolated write authority",
+            "release",
+        ),
+        (
+            "event=push&head_sha=$RELEASE_SHA",
+            "event=push",
+            "isolated write authority",
+            "release",
+        ),
+        (
+            "/actions/runs/$legacy_run_id/cancel",
+            "/actions/runs/$GITHUB_RUN_ID/cancel",
+            "isolated write authority",
             "release",
         ),
         (
