@@ -9,12 +9,16 @@
 //! normative for everything here; `S0-NN` references in doc comments point at
 //! their decision numbers.
 
+pub mod candidates;
 pub mod constants;
 pub mod digest;
+pub mod frontier;
 pub mod identity;
 pub mod independence;
 pub mod label_key;
+pub mod leases;
 pub mod oracle;
+pub mod recovery;
 pub mod signals;
 // Migration 109 is schema-first: PR-B/PR-C wire these transaction-scoped
 // writers. Keep the staged APIs crate-private without exposing speculative

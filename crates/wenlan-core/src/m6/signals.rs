@@ -603,7 +603,7 @@ async fn containing_revisions(
 /// `m6_overview_subscriptions`) keys on the name, not the id, so a reader
 /// that only receives the id resolves it once, here, rather than every
 /// caller repeating the join.
-async fn resolve_space_name(
+pub(super) async fn resolve_space_name(
     tx: &libsql::Transaction,
     space_id: &str,
 ) -> Result<String, WenlanError> {

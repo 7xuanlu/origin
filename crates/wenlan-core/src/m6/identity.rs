@@ -21,7 +21,7 @@ use super::constants::{
 use super::digest::{int_part, m6_digest_owned, sorted_set, ABSENT_PART};
 
 /// The four D5 signals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SignalKind {
     /// Evidence cluster — keyed on the *initial* independence-group set.
     EvidenceCluster,
@@ -42,6 +42,20 @@ impl SignalKind {
             SignalKind::OrphanWikilink => SIGNAL_TAG_ORPHAN_WIKILINK,
             SignalKind::CommunityOverview => SIGNAL_TAG_COMMUNITY_OVERVIEW,
             SignalKind::SpaceOverview => SIGNAL_TAG_SPACE_OVERVIEW,
+        }
+    }
+
+    /// Inverse of [`SignalKind::tag`]. `genesis_candidates.signal_kind` stores
+    /// the tag, and the CHECK constraint there is what keeps a fifth value from
+    /// reaching this — an unknown tag is a contract change, not a value change,
+    /// so it returns `None` rather than defaulting to a signal.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            SIGNAL_TAG_EVIDENCE_CLUSTER => Some(SignalKind::EvidenceCluster),
+            SIGNAL_TAG_ORPHAN_WIKILINK => Some(SignalKind::OrphanWikilink),
+            SIGNAL_TAG_COMMUNITY_OVERVIEW => Some(SignalKind::CommunityOverview),
+            SIGNAL_TAG_SPACE_OVERVIEW => Some(SignalKind::SpaceOverview),
+            _ => None,
         }
     }
 }

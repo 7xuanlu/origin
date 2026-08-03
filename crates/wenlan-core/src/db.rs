@@ -38,6 +38,10 @@ mod eval_pipeline_reads;
 mod eval_substrate_guard;
 mod eval_temporal_seed;
 mod genesis_schema;
+/// Migration 108's shipped DDL, re-exported so the M6 fixtures install the
+/// real substrate. Text, not a `libsql` handle — see the constant's own note.
+#[cfg(test)]
+pub(crate) use genesis_schema::GENESIS_SUBSTRATE_DDL;
 mod kg_quality_diagnostics;
 mod kg_quality_duplicate_candidates;
 mod kg_quality_embedding_refresh;
@@ -10514,11 +10518,14 @@ impl MemoryDB {
         Ok(())
     }
 
-    async fn ensure_community_substrate_tables(
-        conn: &libsql::Connection,
-    ) -> Result<(), WenlanError> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS communities (
+    /// M4's community substrate, as the bytes both the migration and the M6
+    /// fixtures execute. `grouping_leases` is the ONE durable lease registry
+    /// (D6, I-6) and `m6::leases` is a facade over it, so a fixture that
+    /// created its own copy of the table could not notice a second lease
+    /// system — which is the thing the facade exists to prevent. Shipped as
+    /// text because R4 forbids a DB-owned item from handing out a `libsql`
+    /// handle at crate visibility.
+    pub(crate) const COMMUNITY_SUBSTRATE_DDL: &str = "CREATE TABLE IF NOT EXISTS communities (
                 community_id TEXT PRIMARY KEY,
                 space TEXT NOT NULL,
                 display_name TEXT,
@@ -10559,12 +10566,16 @@ impl MemoryDB {
                 expires_at INTEGER NOT NULL,
                 attempt INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(phase, space, input_generation)
-            );",
-        )
-        .await
-        .map_err(|error| {
-            WenlanError::VectorDb(format!("ensure community substrate tables: {error}"))
-        })?;
+            );";
+
+    async fn ensure_community_substrate_tables(
+        conn: &libsql::Connection,
+    ) -> Result<(), WenlanError> {
+        conn.execute_batch(Self::COMMUNITY_SUBSTRATE_DDL)
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("ensure community substrate tables: {error}"))
+            })?;
 
         // Replay an interrupted development build of migration 95 that may
         // have created the first table shape before grouping_generation was
