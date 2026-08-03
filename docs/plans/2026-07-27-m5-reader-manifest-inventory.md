@@ -1070,6 +1070,7 @@ carrying the authority of agreement.
 | `core/export/knowledge.rs::run_truth_cutover` | `pub` | no | **yes** | `server/cmd_cutover.rs::run` | `core/export/knowledge.rs::plan_truth_cutover` |
 | `core/lint/semantic.rs::run_agent_submit` | `private` | no | no | — | `core/truth_adapter.rs::verdicts` |
 | `core/m6/oracle.rs::recompute_full` | `pub` | no | no | — | `core/m6/signals.rs::community_overview`, `core/m6/signals.rs::evidence_cluster`, `core/m6/signals.rs::orphan_wikilink`, `core/m6/signals.rs::space_overview` |
+| `core/m6/shadow.rs::admitted_proposals` | `private` | no | no | — | `core/m6/signals.rs::community_overview`, `core/m6/signals.rs::evidence_cluster`, `core/m6/signals.rs::orphan_wikilink`, `core/m6/signals.rs::space_overview` |
 | `core/maintenance.rs::list_distilled_stub_pages` | `private` | no | no | — | `core/db.rs::list_pages` |
 | `core/maintenance.rs::run_maintenance_tick` | `pub` | no | no | — | `core/db.rs::list_stale_pages` |
 | `core/maintenance/duplicates.rs::detect_all_near_duplicate_pages` | `pub(super)` | no | no | — | `core/maintenance/duplicates.rs::detect_near_duplicate_pages_inner` |
@@ -1146,6 +1147,8 @@ carrying the authority of agreement.
 | `core/export/knowledge.rs::write_page_gated#2` | `pub` | yes | no | — | `core/truth_adapter.rs::page_write_permit` |
 | `core/ingest.rs::run_canonical_enrichment` | `pub` | no | no | — | `core/post_ingest.rs::run_post_ingest_enrichment` |
 | `core/lint/semantic.rs::run` | `pub(super)` | yes | no | — | `core/lint/semantic.rs::run_agent_submit` |
+| `core/m6/shadow.rs::prepare` | `private` | yes | no | — | `core/m6/shadow.rs::admitted_proposals` |
+| `core/m6/shadow.rs::sample_oracle` | `private` | no | no | — | `core/m6/oracle.rs::recompute_full` |
 | `core/maintenance.rs::collect_retro_candidates` | `private` | no | no | — | `core/maintenance.rs::list_distilled_stub_pages`, `core/maintenance/duplicates.rs::detect_all_near_duplicate_pages` |
 | `core/maintenance/duplicates.rs::source_overlap_pairs` | `private` | no | no | — | `core/maintenance/duplicates.rs::list_page_source_sets` |
 | `core/maintenance/page_merge_order.rs::order_survivor` | `pub(super)` | no | no | — | `core/maintenance/page_merge_order.rs::load_candidate` |
