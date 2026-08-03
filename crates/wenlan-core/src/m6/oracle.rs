@@ -68,13 +68,13 @@ pub struct Divergence {
 /// Structural diff between two snapshots. Empty iff they agree.
 ///
 /// Field census (§6.1's "the field list is itself asserted by a test"):
-/// this function is the field list — every comparable field on
-/// [`CandidateProposal`] (`slot_id`, `page_id`, `signal_kind`, `root_ids`,
-/// `group_count`) is named below by construction, not derived from
-/// `#[derive(PartialEq)]`, so adding a field to `CandidateProposal` without
-/// adding it here is a compile-time reminder at the call site, not a
-/// silent skip: the added field would be unused in this function and the
-/// crate denies warnings in CI.
+/// every comparable field on [`CandidateProposal`] (`slot_id`, `page_id`,
+/// `signal_kind`, `root_ids`, `group_count`) is compared, and the census is
+/// enforced by [`field_divergences`] destructuring the struct exhaustively
+/// rather than reaching for fields by name — a new field makes that pattern
+/// non-exhaustive and the crate stops compiling. Reporting agreement over a
+/// field it never read is the one failure this oracle cannot be allowed to
+/// have, so the guarantee is structural rather than a convention.
 pub fn diff(a: &GenesisSnapshot, b: &GenesisSnapshot) -> Vec<Divergence> {
     let mut divergences = Vec::new();
     let mut b_by_slot: std::collections::HashMap<&str, &CandidateProposal> = b
@@ -104,30 +104,42 @@ pub fn diff(a: &GenesisSnapshot, b: &GenesisSnapshot) -> Vec<Divergence> {
 }
 
 fn field_divergences(a: &CandidateProposal, b: &CandidateProposal) -> Vec<Divergence> {
+    // The census is this destructuring, not a convention: a new field on
+    // `CandidateProposal` makes both patterns non-exhaustive and the crate
+    // stops compiling until it is compared below.
+    let CandidateProposal {
+        slot_id,
+        page_id,
+        signal_kind,
+        root_ids,
+        group_count,
+    } = a;
+    let CandidateProposal {
+        slot_id: _,
+        page_id: b_page_id,
+        signal_kind: b_signal_kind,
+        root_ids: b_root_ids,
+        group_count: b_group_count,
+    } = b;
+
     let mut divergences = Vec::new();
     let mut note = |detail: String| {
         divergences.push(Divergence {
-            slot_id: a.slot_id.clone(),
+            slot_id: slot_id.clone(),
             detail,
         });
     };
-    if a.page_id != b.page_id {
-        note(format!("page_id: {} vs {}", a.page_id, b.page_id));
+    if page_id != b_page_id {
+        note(format!("page_id: {page_id} vs {b_page_id}"));
     }
-    if a.signal_kind != b.signal_kind {
-        note(format!(
-            "signal_kind: {:?} vs {:?}",
-            a.signal_kind, b.signal_kind
-        ));
+    if signal_kind != b_signal_kind {
+        note(format!("signal_kind: {signal_kind:?} vs {b_signal_kind:?}"));
     }
-    if a.root_ids != b.root_ids {
-        note(format!("root_ids: {:?} vs {:?}", a.root_ids, b.root_ids));
+    if root_ids != b_root_ids {
+        note(format!("root_ids: {root_ids:?} vs {b_root_ids:?}"));
     }
-    if a.group_count != b.group_count {
-        note(format!(
-            "group_count: {} vs {}",
-            a.group_count, b.group_count
-        ));
+    if group_count != b_group_count {
+        note(format!("group_count: {group_count} vs {b_group_count}"));
     }
     divergences
 }
