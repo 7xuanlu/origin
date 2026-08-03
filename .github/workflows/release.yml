@@ -508,14 +508,23 @@ jobs:
           # Internal retry locator. The uploaded archives are still the exact
           # receipt-validated bytes, and every rerun creates a fresh artifact ID.
           overwrite: true
+      # upload-artifact roots the archive at the common ancestor of its paths,
+      # so listing promoted-assets/ and promotion-plan/ together nests both
+      # under the runner temp root while the Docker job reads them flat. Stage
+      # one directory so the producer and the consumer agree on the layout.
+      - name: Stage exact Docker runtime inputs
+        run: |
+          set -euo pipefail
+          staged="$RUNNER_TEMP/docker-runtime-staging"
+          mkdir -p "$staged"
+          cp "$RUNNER_TEMP/promoted-assets/wenlan-linux-x64.tar.gz" "$staged/"
+          cp "$RUNNER_TEMP/promoted-assets/wenlan-linux-arm64.tar.gz" "$staged/"
+          cp "$RUNNER_TEMP/promotion-plan/release-promotion-plan.json" "$staged/"
       - name: Publish exact Docker runtime inputs for this run
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: docker-runtime-inputs
-          path: |
-            ${{ runner.temp }}/promoted-assets/wenlan-linux-x64.tar.gz
-            ${{ runner.temp }}/promoted-assets/wenlan-linux-arm64.tar.gz
-            ${{ runner.temp }}/promotion-plan/release-promotion-plan.json
+          path: ${{ runner.temp }}/docker-runtime-staging
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
@@ -978,8 +987,13 @@ jobs:
           end
           FORMULA
 
-          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" tap/Formula/wenlan-mcp.rb
-          sed -i "s/SHA_PLACEHOLDER/${SHA_MCP_DARWIN_ARM64}/g" tap/Formula/wenlan-mcp.rb
+          # This job runs on macOS, whose sed reads `-i` as the backup suffix
+          # and would swallow the script. perl -pi edits in place identically
+          # on BSD and GNU hosts, and reading the values from the environment
+          # keeps a SHA or version out of the expression itself.
+          VERSION="$VERSION" SHA="$SHA_MCP_DARWIN_ARM64" perl -pi \
+            -e 's/VERSION_PLACEHOLDER/$ENV{VERSION}/g; s/SHA_PLACEHOLDER/$ENV{SHA}/g' \
+            tap/Formula/wenlan-mcp.rb
 
           cat > tap/Formula/wenlan.rb << 'FORMULA'
           class Wenlan < Formula
@@ -1009,8 +1023,9 @@ jobs:
           end
           FORMULA
 
-          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" tap/Formula/wenlan.rb
-          sed -i "s/SHA_PLACEHOLDER/${SHA_CLI_DARWIN_ARM64}/g" tap/Formula/wenlan.rb
+          VERSION="$VERSION" SHA="$SHA_CLI_DARWIN_ARM64" perl -pi \
+            -e 's/VERSION_PLACEHOLDER/$ENV{VERSION}/g; s/SHA_PLACEHOLDER/$ENV{SHA}/g' \
+            tap/Formula/wenlan.rb
 
           cd tap
           git config user.name "github-actions[bot]"
