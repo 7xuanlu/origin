@@ -79,7 +79,9 @@ class RuntimeImageTests(unittest.TestCase):
             self.assertEqual(
                 evidence["server_sha256"], sha256(context / "wenlan-server")
             )
-            self.assertTrue((context / "data" / ".volume-seed").is_file())
+            # Nested so the daemon's data-root lock lands in /data, which the
+            # nonroot account owns, rather than at the filesystem root.
+            self.assertTrue((context / "data" / "wenlan" / ".volume-seed").is_file())
             self.assertTrue(os.access(context / "wenlan-server", os.X_OK))
 
     def test_prepare_context_rejects_archive_digest_mismatch(self) -> None:
@@ -174,6 +176,16 @@ class RuntimeImageTests(unittest.TestCase):
         self.assertIn("COPY --chown=65532:65532 data/ /data/", final)
         self.assertIn("USER 65532:65532", final)
         self.assertIn('VOLUME ["/data"]', final)
+        # The daemon writes its data-root lock to the root's PARENT, so the
+        # data root must be nested strictly inside the writable volume. A root
+        # of exactly /data puts the lock at / and the daemon cannot start.
+        data_root = next(
+            line.split("=", 1)[1]
+            for line in final
+            if line.startswith("ENV WENLAN_DATA_DIR=")
+        )
+        self.assertTrue(data_root.startswith("/data/"), data_root)
+        self.assertNotEqual(data_root.rstrip("/"), "/data")
         forbidden = ("RUN ", "ADD ", "cargo", "strip", "libonnxruntime")
         for marker in forbidden:
             self.assertFalse(any(marker in line for line in final), marker)

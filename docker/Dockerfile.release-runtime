@@ -35,8 +35,8 @@ COPY --from=libgomp --chown=0:0 /staged/ /
 
 COPY --chown=0:0 --chmod=0755 wenlan-server /usr/local/bin/wenlan-server
 
-# The trusted preparation script creates this empty directory. Materializing
-# it with numeric ownership makes the anonymous /data volume writable by the
+# The trusted preparation script creates these empty directories. Materializing
+# them with numeric ownership makes the anonymous /data volume writable by the
 # distroless nonroot account without relying on name lookup or a shell.
 COPY --chown=65532:65532 data/ /data/
 
@@ -44,6 +44,9 @@ USER 65532:65532
 EXPOSE 7878
 ENV WENLAN_BIND_ADDR=0.0.0.0:7878
 ENV WENLAN_PORT=7878
-ENV WENLAN_DATA_DIR=/data
+# Nested one level inside the volume on purpose: the daemon writes its
+# data-root lock to the root's PARENT, so a root of /data would put the lock
+# at /.wenlan-daemon-*.lock, which the nonroot account cannot create.
+ENV WENLAN_DATA_DIR=/data/wenlan
 VOLUME ["/data"]
 ENTRYPOINT ["/usr/local/bin/wenlan-server"]
