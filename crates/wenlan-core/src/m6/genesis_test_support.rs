@@ -20,6 +20,7 @@ use crate::db::{MemoryDB, GENESIS_SUBSTRATE_DDL};
 use crate::m6::candidates;
 use crate::m6::frontier_policy::ensure_frontier_policy_tables;
 use crate::m6::refresh_readiness::ensure_refresh_readiness_tables;
+use crate::m6::relevance::ensure_relevance_tables;
 use crate::m6::remaining_substrate::ensure_remaining_substrate;
 
 pub(super) struct GenesisDb {
@@ -48,7 +49,12 @@ impl GenesisDb {
                      root_id                TEXT PRIMARY KEY,
                      root_kind              TEXT NOT NULL,
                      independence_group_id  TEXT NOT NULL,
-                     status                 TEXT NOT NULL
+                     status                 TEXT NOT NULL,
+                     -- Production has this NOT NULL with no default
+                     -- (`db.rs`, migration 81). The default is the fixture's,
+                     -- so the pre-C1 seeders that predate the decay clock keep
+                     -- working; C1's own seeder always passes it explicitly.
+                     created_at             INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE TABLE edges (
                      edge_id      TEXT PRIMARY KEY,
@@ -130,6 +136,13 @@ impl GenesisDb {
         ensure_refresh_readiness_tables(&tx)
             .await
             .expect("install the migration-109 refresh readiness substrate");
+        // Added in PR-C1: `relevance_sweep` writes `m6_pair_stats` and
+        // `m6_adjacency`, whose CHECKs and partial-unique shape are the gates
+        // (rank BETWEEN 1 AND 64, page_a < page_b) — hand-copying them here
+        // would let those gates pass against a substrate production never runs.
+        ensure_relevance_tables(&tx)
+            .await
+            .expect("install the migration-109 relevance substrate");
         ensure_remaining_substrate(&tx)
             .await
             .expect("install the rest of migration 109");

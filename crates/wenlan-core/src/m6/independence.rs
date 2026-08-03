@@ -31,6 +31,30 @@ use crate::WenlanError;
 /// distinct independence groups over its supporting evidence.
 pub const INDEPENDENCE_GROUP_FLOOR: i64 = 3;
 
+/// R1-R5 as one string, so a second reader of the eligibility spine cannot
+/// drift from the count.
+///
+/// This module's header says there is no second count anywhere in the M6 tree.
+/// C1's relevance sweep is not a second *count* — it reads the (group, page)
+/// support relation rather than `COUNT(DISTINCT …)` — but it must select over
+/// exactly the same eligible edges, or a group could be independent enough to
+/// clear D1's floor and simultaneously contribute nothing to a pair cell. The
+/// predicate lives here rather than being spelled twice, because two spellings
+/// that must agree forever is the shape the header warns about.
+///
+/// References only `e` (`edges`) and `r` (`provenance_roots`), the same
+/// contract [`GroupCountScope`] carries.
+pub const ELIGIBLE_EVIDENCE_PREDICATE: &str = "e.grounded = 1
+            AND e.valid_until IS NULL
+            AND r.status = 'active'
+            AND r.root_kind <> 'generated'
+            AND NOT EXISTS (
+                SELECT 1 FROM pages p
+                 WHERE ((e.src_kind = 'page' AND p.id = e.src_id)
+                        OR (e.dst_kind = 'page' AND p.id = e.dst_id))
+                   AND lower(p.title) = 'overview'
+            )";
+
 /// A per-signal narrowing of the canonical count, ANDed onto R1-R5.
 ///
 /// `predicate` may reference only `e` (`edges`) and `r` (`provenance_roots`)
@@ -67,16 +91,7 @@ pub async fn distinct_group_count(
         "SELECT COUNT(DISTINCT r.independence_group_id)
            FROM edges e
            JOIN provenance_roots r ON r.root_id = e.root_id
-          WHERE e.grounded = 1
-            AND e.valid_until IS NULL
-            AND r.status = 'active'
-            AND r.root_kind <> 'generated'
-            AND NOT EXISTS (
-                SELECT 1 FROM pages p
-                 WHERE ((e.src_kind = 'page' AND p.id = e.src_id)
-                        OR (e.dst_kind = 'page' AND p.id = e.dst_id))
-                   AND lower(p.title) = 'overview'
-            )
+          WHERE {ELIGIBLE_EVIDENCE_PREDICATE}
             AND ({predicate})",
         predicate = scope.predicate,
     );

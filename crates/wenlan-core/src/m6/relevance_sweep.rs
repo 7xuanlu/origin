@@ -39,6 +39,8 @@
 //! stored once rather than read per row.
 
 use super::evidence::read_counter;
+use super::independence::ELIGIBLE_EVIDENCE_PREDICATE;
+use super::relevance::MAX_NEIGHBORS_PER_ENDPOINT;
 use crate::WenlanError;
 
 /// Q1's per-space decay reference: the `unixepoch()` at which this space's pair
@@ -111,4 +113,134 @@ pub fn decayed_contribution(hub_weight: f64, root_created_at: i64, reference: i6
     }
     let age_days = ((reference - root_created_at) as f64 / SECONDS_PER_DAY).max(0.0);
     hub_weight * 0.5_f64.powf(age_days / DECAY_HALF_LIFE_DAYS)
+}
+
+/// `R-HUB-WEIGHT`: `min(1, 64/d)`, where `d` is the pages the group touches.
+///
+/// Reference points from the contract's §3 table: `d=32 → 1.0`, `d=64 → 1.0`,
+/// `d=128 → 0.5`, `d=5000 → 0.0128`. The last is the one G6.10 gates — a hub
+/// that touches everything must not contribute like a group that touches two
+/// things, or one over-connected document dominates every pair in the space.
+///
+/// `d` here is the **true** degree, counted before the top-64 cut. Weighting by
+/// the post-cut count would make every hub weigh `64/64 = 1.0` — capping the
+/// selection and the weight with one number, which is exactly the G6.7-vs-G6.10
+/// split: those are two caps and each needs its own.
+pub fn hub_weight(pages_touched: i64) -> f64 {
+    if pages_touched <= 0 {
+        // A group touching nothing forms no pairs, so this weight is never
+        // multiplied into a cell. Zero rather than one so that if it ever is,
+        // it adds nothing instead of a full unit of phantom support.
+        return 0.0;
+    }
+    if pages_touched <= MAX_NEIGHBORS_PER_ENDPOINT as i64 {
+        return 1.0;
+    }
+    MAX_NEIGHBORS_PER_ENDPOINT as f64 / pages_touched as f64
+}
+
+/// One independence group's bounded support within a space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupSupport {
+    pub group_id: String,
+    /// Pages the group touches, counted **before** the top-64 cut, so
+    /// [`hub_weight`] sees the real degree.
+    pub degree: i64,
+    /// The group's most recent contributing root's `created_at`, which is what
+    /// §2.1 measures `age_days` from.
+    pub newest_root_created_at: i64,
+    /// At most 64 pages, ordered `(support_recency DESC, page_id ASC)` per
+    /// S0-89. Deduplicated by the `GROUP BY`, so a page supported by several
+    /// roots of the group appears once.
+    pub pages: Vec<String>,
+}
+
+impl GroupSupport {
+    /// Whether the top-64 cut dropped pages this group actually touches.
+    ///
+    /// S0-90's rule for candidate sets — a truncated set is recorded as
+    /// truncated — read across to hub selection: `degree > 64` means the pair
+    /// set is a deterministic sample, not the whole group.
+    pub fn truncated(&self) -> bool {
+        self.degree > MAX_NEIGHBORS_PER_ENDPOINT as i64
+    }
+}
+
+/// Read one group's top-64 supported pages, its true degree, and its decay age.
+///
+/// One statement, at most 64 decoded rows. `COUNT(*) OVER ()` and
+/// `MAX(…) OVER ()` are evaluated over the full grouped set *before* the
+/// `LIMIT`, which is what lets a single query return a bounded page list beside
+/// an unbounded-degree count. Computing the degree from the returned rows
+/// instead would silently read every hub as `d=64` — the G6.10 break.
+///
+/// The eligibility predicate is [`ELIGIBLE_EVIDENCE_PREDICATE`], shared verbatim
+/// with D1's count, so a group cannot be independent enough to clear the floor
+/// while contributing nothing here.
+pub async fn group_support(
+    tx: &libsql::Transaction,
+    space: &str,
+    group_id: &str,
+) -> Result<Option<GroupSupport>, WenlanError> {
+    // An edge with a page on both ends supports both, so the page column is a
+    // UNION ALL over the two endpoint positions rather than a CASE, which would
+    // silently keep only the source side.
+    let sql = format!(
+        "WITH page_edges AS (
+             SELECT e.*, e.src_id AS page_id FROM edges e WHERE e.src_kind = 'page'
+             UNION ALL
+             SELECT e.*, e.dst_id AS page_id FROM edges e WHERE e.dst_kind = 'page'
+         ),
+         support AS (
+             SELECT e.page_id AS page_id, MAX(r.created_at) AS support_recency
+               FROM page_edges e
+               JOIN provenance_roots r ON r.root_id = e.root_id
+              WHERE e.space = ?1
+                AND r.independence_group_id = ?2
+                AND {ELIGIBLE_EVIDENCE_PREDICATE}
+              GROUP BY e.page_id
+         )
+         SELECT page_id,
+                COUNT(*) OVER ()            AS degree,
+                MAX(support_recency) OVER () AS newest_root_created_at
+           FROM support
+          ORDER BY support_recency DESC, page_id ASC
+          LIMIT {MAX_NEIGHBORS_PER_ENDPOINT}"
+    );
+
+    let mut rows = tx
+        .query(&sql, libsql::params![space, group_id])
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 group support: {error}")))?;
+
+    let mut pages = Vec::new();
+    let mut degree = 0i64;
+    let mut newest_root_created_at = 0i64;
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 group support row: {error}")))?
+    {
+        pages.push(
+            row.get::<String>(0).map_err(|error| {
+                WenlanError::VectorDb(format!("m6 group support page: {error}"))
+            })?,
+        );
+        degree = row
+            .get::<i64>(1)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 group support degree: {error}")))?;
+        newest_root_created_at = row
+            .get::<i64>(2)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 group support age: {error}")))?;
+    }
+
+    if pages.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(GroupSupport {
+        group_id: group_id.to_string(),
+        degree,
+        newest_root_created_at,
+        pages,
+    }))
 }
