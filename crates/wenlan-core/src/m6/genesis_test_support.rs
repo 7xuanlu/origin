@@ -19,6 +19,7 @@
 use crate::db::{MemoryDB, GENESIS_SUBSTRATE_DDL};
 use crate::m6::candidates;
 use crate::m6::frontier_policy::ensure_frontier_policy_tables;
+use crate::m6::refresh_readiness::ensure_refresh_readiness_tables;
 use crate::m6::remaining_substrate::ensure_remaining_substrate;
 
 pub(super) struct GenesisDb {
@@ -123,6 +124,12 @@ impl GenesisDb {
         ensure_frontier_policy_tables(&tx)
             .await
             .expect("install the migration-109 frontier policy substrate");
+        // Same order the migration itself uses (`db.rs`, migration 109), so the
+        // fixture cannot pass against a table layout production never builds.
+        // Added in PR-B3: `evidence::note_shadow_readiness` writes `m6_readiness`.
+        ensure_refresh_readiness_tables(&tx)
+            .await
+            .expect("install the migration-109 refresh readiness substrate");
         ensure_remaining_substrate(&tx)
             .await
             .expect("install the rest of migration 109");

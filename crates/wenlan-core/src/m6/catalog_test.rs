@@ -32,10 +32,12 @@ enum Coverage {
 
 /// The registry. Every catalog ID appears here exactly once.
 ///
-/// The G3 rows about publication (`G3.3`, `G3.4`) are machine E's: PR-B2 writes
-/// no receipt and no coverage row, so a "gate" over them could only assert that
-/// nothing happened — which passes against an empty implementation and against a
-/// broken one alike.
+/// `G3.3` was PR-B2's second deferral and is bound as of PR-B3: machine E mints
+/// the receipt, so "a duplicate retry writes a second receipt" is now a
+/// falsifiable claim about running code. `G3.4` stays deferred — it is a
+/// property **of publication**, and PR-B publishes nothing, so a gate over it
+/// could only assert that nothing happened, which passes against an empty
+/// implementation and a broken one alike.
 const REGISTRY: [(&str, Coverage); 14] = [
     (
         "G3.1",
@@ -45,13 +47,12 @@ const REGISTRY: [(&str, Coverage); 14] = [
         "G3.2",
         Coverage::Gate("page_id_is_a_function_of_the_slot_alone"),
     ),
-    (
-        "G3.3",
-        Coverage::Deferred("receipts are machine E's — PR-B3"),
-    ),
+    ("G3.3", Coverage::Gate("a_retry_reuses_the_same_receipt")),
     (
         "G3.4",
-        Coverage::Deferred("publication writes coverage — machine E, PR-B3"),
+        Coverage::Deferred(
+            "coverage is written by publication, and PR-B's dry run publishes nothing — PR-C",
+        ),
     ),
     (
         "G3.5",
@@ -226,8 +227,8 @@ async fn deferrals_are_declared_and_bounded() {
         .collect();
     assert_eq!(
         deferred.len(),
-        2,
-        "the PR-B2 deferral budget is G3.3 and G3.4 only: {deferred:?}"
+        1,
+        "the PR-B3 deferral budget is G3.4 alone: {deferred:?}"
     );
     assert!(deferred.iter().all(|(_, reason)| !reason.trim().is_empty()));
 }

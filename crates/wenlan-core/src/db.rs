@@ -49,6 +49,7 @@ mod kg_quality_vocabulary;
 mod lint_snapshot;
 #[cfg(feature = "eval-harness")]
 mod m5_page_size_snapshot;
+mod m6_shadow;
 mod maintenance_duplicate_reads;
 mod maintenance_queue;
 mod maintenance_retro_scan;

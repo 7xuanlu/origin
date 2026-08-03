@@ -12,6 +12,8 @@
 pub mod candidates;
 pub mod constants;
 pub mod digest;
+pub mod evidence;
+pub mod finalize;
 pub mod frontier;
 pub mod identity;
 pub mod independence;
@@ -19,11 +21,10 @@ pub mod label_key;
 pub mod leases;
 pub mod oracle;
 pub mod recovery;
+pub mod shadow;
 pub mod signals;
-// PR-B3 is the seam's first caller — it decides what the shadow loop passes as
-// `community_partition_durable`. Kept crate-private with the same reasoning as
-// the staged writers below.
-#[allow(dead_code)]
+// PR-B3 is the seam's first caller — `shadow::admitted_proposals` and
+// `finalize`'s E-7 both take `community_partition_durable` from it.
 pub(crate) mod community_gate;
 
 // Migration 109 is schema-first: PR-B/PR-C wire these transaction-scoped
@@ -44,6 +45,10 @@ mod candidates_test;
 mod catalog_test;
 #[cfg(test)]
 mod digest_test;
+#[cfg(test)]
+mod evidence_test;
+#[cfg(test)]
+mod finalize_test;
 #[cfg(test)]
 mod frontier_policy_test;
 #[cfg(test)]
@@ -72,5 +77,7 @@ mod refresh_readiness_test;
 mod relevance_test;
 #[cfg(test)]
 mod remaining_substrate_test;
+#[cfg(test)]
+mod shadow_test;
 #[cfg(test)]
 mod signals_test;
