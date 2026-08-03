@@ -933,6 +933,11 @@ carrying the authority of agreement.
 | `core/lint/pages/link_checks/orphans.rs::load` | `pub(super)` | yes | no | — | — |
 | `core/lint/semantic_candidates.rs::load_pages` | `private` | yes | no | — | — |
 | `core/lint/serving/query.rs::load` | `pub(super)` | yes | no | — | — |
+| `core/m6/independence.rs::distinct_group_count` | `pub` | no | no | — | — |
+| `core/m6/signals.rs::containing_revisions` | `private` | no | no | — | — |
+| `core/m6/signals.rs::orphan_candidate_pages` | `private` | no | no | — | — |
+| `core/m6/signals.rs::scoped_group_ids` | `private` | no | no | — | — |
+| `core/m6/signals.rs::scoped_root_ids` | `private` | no | no | — | — |
 | `core/repair.rs::capture_rename_page_row_on_snapshot` | `private` | no | no | — | — |
 | `core/repair.rs::prepare_rename_page_title` | `private` | no | no | — | — |
 | `core/repair.rs::projection_page_receipt_sql` | `private` | no | no | — | — |
@@ -975,6 +980,11 @@ carrying the authority of agreement.
 | `core/export/knowledge.rs::plan_truth_cutover` | `pub` | no | **yes** | `server/cmd_cutover.rs::run` | `core/db/truth_exposure.rs::page_truth_states` |
 | `core/lint/deep.rs::run` | `pub(super)` | yes | no | — | `core/lint/deep.rs::page_body_result`, `core/lint/deep.rs::page_duplicates` |
 | `core/lint/pages/db_checks.rs::run` | `pub(crate)` | yes | no | — | `core/lint/pages/db_checks.rs::load_rows` |
+| `core/m6/signals.rs::community_overview` | `pub` | no | no | — | `core/m6/independence.rs::distinct_group_count`, `core/m6/signals.rs::scoped_root_ids` |
+| `core/m6/signals.rs::evidence_cluster` | `pub` | no | no | — | `core/m6/independence.rs::distinct_group_count`, `core/m6/signals.rs::scoped_group_ids`, `core/m6/signals.rs::scoped_root_ids` |
+| `core/m6/signals.rs::orphan_wikilink` | `pub` | no | no | — | `core/m6/signals.rs::orphan_candidate_pages` |
+| `core/m6/signals.rs::orphan_wikilink_slot` | `private` | no | no | — | `core/m6/independence.rs::distinct_group_count`, `core/m6/signals.rs::containing_revisions`, `core/m6/signals.rs::scoped_root_ids` |
+| `core/m6/signals.rs::space_overview` | `pub` | no | no | — | `core/m6/independence.rs::distinct_group_count`, `core/m6/signals.rs::scoped_root_ids` |
 | `core/maintenance.rs::run_maintenance_stage_slice` | `pub` | no | **yes** | `server/scheduler.rs::fire_maintenance_stage_safe` | `core/db.rs::get_stale_page_after`, `core/db/maintenance_duplicate_reads.rs::scan_near_duplicate_slice`, `core/db/maintenance_retro_scan.rs::scan_automatic_retro_stub_slice` |
 | `core/maintenance/duplicates.rs::detect_near_duplicate_pages_inner` | `private` | no | no | — | `core/db/maintenance_duplicate_reads.rs::embedding_near_duplicate_pairs` |
 | `core/onboarding.rs::check_after_refinery_pass` | `pub` | no | no | — | `core/db.rs::oldest_active_page` |
@@ -1059,6 +1069,7 @@ carrying the authority of agreement.
 | `core/export/knowledge.rs::enforce_projection_directory_invariant#1` | `pub` | yes | no | — | `core/db/truth_exposure.rs::page_visibility` |
 | `core/export/knowledge.rs::run_truth_cutover` | `pub` | no | **yes** | `server/cmd_cutover.rs::run` | `core/export/knowledge.rs::plan_truth_cutover` |
 | `core/lint/semantic.rs::run_agent_submit` | `private` | no | no | — | `core/truth_adapter.rs::verdicts` |
+| `core/m6/oracle.rs::recompute_full` | `pub` | no | no | — | `core/m6/signals.rs::community_overview`, `core/m6/signals.rs::evidence_cluster`, `core/m6/signals.rs::orphan_wikilink`, `core/m6/signals.rs::space_overview` |
 | `core/maintenance.rs::list_distilled_stub_pages` | `private` | no | no | — | `core/db.rs::list_pages` |
 | `core/maintenance.rs::run_maintenance_tick` | `pub` | no | no | — | `core/db.rs::list_stale_pages` |
 | `core/maintenance/duplicates.rs::detect_all_near_duplicate_pages` | `pub(super)` | no | no | — | `core/maintenance/duplicates.rs::detect_near_duplicate_pages_inner` |
