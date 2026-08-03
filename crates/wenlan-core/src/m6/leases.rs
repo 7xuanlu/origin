@@ -42,6 +42,10 @@ pub enum LeasePhase {
 }
 
 impl LeasePhase {
+    /// Every phase M6 owns, and therefore the only rows M6 may reap.
+    /// `grouping_leases` is shared with M4's `community` phase.
+    pub const ALL: [LeasePhase; 2] = [LeasePhase::Genesis, LeasePhase::Frontier];
+
     /// The stored `grouping_leases.phase` value.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -157,19 +161,41 @@ pub async fn release(
 }
 
 /// C8 — the startup recovery scan's step 1 (S0-5): delete every expired lease
-/// row across **all** phases.
+/// row belonging to a phase M6 owns.
 ///
-/// Phase-agnostic on purpose, and the one statement in this module that is. The
-/// acquire-time reap must stay phase-scoped so it cannot touch another phase's
-/// live row; this one runs before the first turn, when no phase holds anything
-/// it should keep, and M4's lazy reap-at-acquire is not sufficient for M6
-/// because M6 reads *reservations* to decide whether a group has a durable
-/// reason — a reservation orphaned by a killed process would otherwise hide its
-/// group from the frontier forever.
-pub async fn reap_expired_all_phases(tx: &libsql::Transaction) -> Result<u64, WenlanError> {
+/// Broader than the acquire-time reap, which is scoped to one space so it
+/// cannot touch another space's live row; this one runs before the first turn,
+/// when M6 holds nothing it should keep. M4's lazy reap-at-acquire is not
+/// sufficient for M6, because M6 reads *reservations* to decide whether a group
+/// has a durable reason — a reservation orphaned by a killed process would
+/// otherwise hide its group from the frontier forever.
+///
+/// **Scoped to [`LeasePhase::ALL`], amending S0-5's "across all phases".**
+/// `grouping_leases` is shared with M4, whose four delete statements are every
+/// one of them scoped `WHERE phase = 'community'`. The justification above
+/// reaches only M6's own reservations; M6 never reads a community-phase lease,
+/// so reaping one buys nothing. It is harmless against M4 *as written today*
+/// — M4's finalize ignores the delete's rowcount and its prepare reaps expired
+/// rows unconditionally anyway — but that is a fact about M4's current code
+/// rather than a contract, and a shadow subsystem should not silently depend on
+/// it. One predicate removes the coupling.
+pub async fn reap_expired_m6_phases(tx: &libsql::Transaction) -> Result<u64, WenlanError> {
+    // Placeholders are generated digits, never phase text, so the phase values
+    // stay bound parameters.
+    let placeholders = (1..=LeasePhase::ALL.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let phases = LeasePhase::ALL
+        .iter()
+        .map(|phase| libsql::Value::from(phase.as_str()))
+        .collect::<Vec<_>>();
     tx.execute(
-        "DELETE FROM grouping_leases WHERE expires_at <= unixepoch()",
-        (),
+        &format!(
+            "DELETE FROM grouping_leases
+              WHERE expires_at <= unixepoch() AND phase IN ({placeholders})"
+        ),
+        phases,
     )
     .await
     .map_err(|error| WenlanError::VectorDb(format!("m6 lease startup reap: {error}")))

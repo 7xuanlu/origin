@@ -956,6 +956,37 @@ written.
 one honest review, and the split keeps the zero-mutation proof in the same PR as
 the loop that could break it.
 
+### 11.2 Amendment (2026-08-03) — S0-5's startup reap is scoped to M6's phases
+
+**§4.4 step 1 said "Delete expired leases across all phases." It now reads
+"across every phase M6 owns" — `LeasePhase::ALL`, i.e. `genesis` and
+`frontier`.** `grouping_leases` is shared with M4's `community` phase, and M4
+scopes all four of its delete statements `WHERE phase = 'community'`
+(`db.rs:13891`, `:14214`, `:14595`, `db/community_grouping_state.rs:67`). An
+unscoped M6 reaper broke that symmetry in one direction only: M4 leaves M6's
+rows alone, M6 deleted M4's.
+
+The justification for a startup reap that is broader than the acquire-time one
+is that M6 reads *reservations* to decide whether a group already has a durable
+reason, so a reservation orphaned by a killed process hides its group from the
+frontier forever. That argument reaches M6's own phases and stops there — M6
+never reads a community-phase lease, so reaping one buys nothing.
+
+It was also harmless, which is why it is worth writing down rather than just
+fixing: M4's finalize ignores its lease delete's rowcount (the CAS that guards
+it is the `space_graph_state ... dirty=1` update, `db.rs:14570`), and M4's
+prepare reaps expired rows for its target space unconditionally, so no
+concurrency existed that M4 did not already permit. But that is a fact about
+M4's implementation today, not a contract it publishes. A future rowcount check
+in M4's finalize would have broken silently, at a distance, in a subsystem whose
+author had no reason to look at M6. One `AND phase IN (...)` predicate removes
+the coupling.
+
+Teeth: `leases_test::the_startup_reap_spares_an_expired_lease_of_a_foreign_phase`
+seeds an expired `community` row beside an expired `genesis` row and asserts
+only the latter is reaped. Verified by mutation — relaxing the predicate to `OR`
+fails it (`left: 2, right: 1`).
+
 ---
 
 ## 12. Size estimate and slicing

@@ -57,7 +57,7 @@ pub async fn scan(conn: &libsql::Connection) -> Result<RecoveryReport, WenlanErr
     // Step 1 — reap every expired lease, all phases, in its own transaction so
     // step 2 reads a settled registry rather than one it is still changing.
     let tx = begin(conn).await?;
-    report.leases_reaped = leases::reap_expired_all_phases(&tx).await?;
+    report.leases_reaped = leases::reap_expired_m6_phases(&tx).await?;
     commit(tx).await?;
 
     // Step 2 — one transaction per candidate.

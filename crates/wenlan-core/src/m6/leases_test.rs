@@ -206,8 +206,7 @@ async fn release_is_token_scoped() {
     assert_eq!(lease_rows(&db).await, 0);
 }
 
-/// C8 — the startup reap is phase-agnostic, and it is the only statement in the
-/// module that is.
+/// C8 — the startup reap crosses M6's own phases, and only those.
 #[tokio::test]
 async fn the_startup_reap_crosses_phases_and_spares_live_rows() {
     let db = db().await;
@@ -228,7 +227,7 @@ async fn the_startup_reap_crosses_phases_and_spares_live_rows() {
     .await;
 
     let tx = db.tx().await;
-    let reaped = leases::reap_expired_all_phases(&tx).await.unwrap();
+    let reaped = leases::reap_expired_m6_phases(&tx).await.unwrap();
     tx.commit().await.unwrap();
     assert_eq!(reaped, 1);
     assert_eq!(
@@ -242,13 +241,58 @@ async fn the_startup_reap_crosses_phases_and_spares_live_rows() {
     );
 }
 
+/// `grouping_leases` is shared with M4. The startup reap amends S0-5's "across
+/// all phases" to M6's own phases, so an expired M4 row survives it — M6 never
+/// reads a community reservation, and M4's own reap is scoped to its phase.
+/// This is the teeth on that scoping: drop the `phase IN (...)` predicate and
+/// this test fails.
+#[tokio::test]
+async fn the_startup_reap_spares_an_expired_lease_of_a_foreign_phase() {
+    let db = db().await;
+    let tx = db.tx().await;
+    leases::acquire(&tx, LeasePhase::Genesis, "space-a", 7, 0)
+        .await
+        .unwrap()
+        .expect("genesis lease");
+    tx.commit().await.unwrap();
+    // M4's own row, expired exactly like M6's, written directly because M6 has
+    // no acquirer for a phase it does not own.
+    db.exec(
+        "INSERT INTO grouping_leases
+             (phase, space, input_generation, token, expires_at, attempt)
+         VALUES ('community', 'space-a', 7, 'm4-token', unixepoch() - 1, 0)",
+        (),
+    )
+    .await;
+    db.exec(
+        "UPDATE grouping_leases SET expires_at = unixepoch() - 1 WHERE phase = 'genesis'",
+        (),
+    )
+    .await;
+
+    let tx = db.tx().await;
+    let reaped = leases::reap_expired_m6_phases(&tx).await.unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(reaped, 1, "only M6's own expired row is reaped");
+    assert_eq!(
+        db.scalar(
+            "SELECT COUNT(*) FROM grouping_leases WHERE phase = 'community'",
+            ()
+        )
+        .await,
+        1,
+        "an expired lease belonging to another milestone's phase is left alone"
+    );
+}
+
 /// Vacuous case (S0-137): a startup reap over an empty registry deletes nothing
 /// and reports zero, rather than erroring or reporting work it did not do.
 #[tokio::test]
 async fn the_startup_reap_is_zero_on_an_empty_registry() {
     let db = db().await;
     let tx = db.tx().await;
-    assert_eq!(leases::reap_expired_all_phases(&tx).await.unwrap(), 0);
+    assert_eq!(leases::reap_expired_m6_phases(&tx).await.unwrap(), 0);
     tx.commit().await.unwrap();
     assert_eq!(lease_rows(&db).await, 0);
 }
