@@ -337,9 +337,18 @@ def contract_violations(
         or "ref: ${{ env.RELEASE_SHA }}" in resolver_checkout
     ):
         violations.append("release resolver is not pinned to its immutable main control SHA")
+    # Promotion runs the same resolver as resolve-promotion, so it is control
+    # plane too. Pinning it to the release commit would run the release's own
+    # copy of the promotion tooling, so a resolver fix could never reach a
+    # recovery of that release.
+    promote_checkout = job_body(release, "promote-assets")
+    if (
+        "ref: ${{ github.sha }}" not in promote_checkout
+        or "ref: ${{ env.RELEASE_SHA }}" in promote_checkout
+    ):
+        violations.append("asset promotion is not pinned to its immutable main control SHA")
     for job_name in [
         "prepare-release",
-        "promote-assets",
         "docker",
         "publish-crates",
         "publish-npm",

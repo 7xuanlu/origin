@@ -445,9 +445,13 @@ jobs:
       actions: read
       contents: write
     steps:
+      # Promotion tooling is control plane, not product: check out the same ref
+      # resolve-promotion uses so both run one promotion resolver. The promoted
+      # bytes come from the validated artifact and are verified against the
+      # closed receipt by size and SHA-256, never from this checkout.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ env.RELEASE_SHA }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

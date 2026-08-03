@@ -5970,13 +5970,18 @@ fn release_promotion_contract_violations(
             "release resolver is not pinned to its immutable read-only main control plane".into(),
         );
     }
-    for job_name in [
-        "prepare-release",
-        "promote-assets",
-        "docker",
-        "publish-crates",
-        "publish-npm",
-    ] {
+    // Promotion runs the same resolver as resolve-promotion, so it is control
+    // plane too. Pinning it to the release commit would run the release's own
+    // copy of the promotion tooling, so a resolver fix could never reach a
+    // recovery of that release.
+    let promote_text =
+        serde_yaml::to_string(&release["jobs"]["promote-assets"]).unwrap_or_default();
+    if !promote_text.contains("ref: ${{ github.sha }}")
+        || promote_text.contains("ref: ${{ env.RELEASE_SHA }}")
+    {
+        violations.push("asset promotion is not pinned to its immutable main control plane".into());
+    }
+    for job_name in ["prepare-release", "docker", "publish-crates", "publish-npm"] {
         let job_text = serde_yaml::to_string(&release["jobs"][job_name]).unwrap_or_default();
         if !job_text.contains("ref: ${{ env.RELEASE_SHA }}")
             || job_text.contains("ref: ${{ github.sha }}")
