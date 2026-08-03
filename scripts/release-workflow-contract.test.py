@@ -200,6 +200,9 @@ def contract_violations(
         "needs.route-main.outputs.state == 'validated'",
         "GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}",
         "MAIN_SHA: ${{ github.event.workflow_run.head_sha }}",
+        "tag_lookup_status=$?",
+        "'.status | tostring'",
+        'if [[ "$tag_api_status" != 404 ]]',
         'if [[ "$pending" != true || "$tagged" != false ]]',
         'if [[ "$existing_sha" != "$MAIN_SHA" ]]',
         '-f ref="refs/tags/$RELEASE_TAG"',
@@ -207,6 +210,8 @@ def contract_violations(
     ]:
         if marker not in create_tag:
             violations.append(f"validated tag creation omits {marker!r}")
+    if re.search(r"git/ref/tags/\$RELEASE_TAG[\s\S]{0,240}\|\| true", create_tag):
+        violations.append("validated tag lookup swallows an API failure")
 
     trigger = re.search(
         r"^on:\n(?P<body>.*?)(?=^concurrency:)",
@@ -556,6 +561,8 @@ def contract_violations(
     ]:
         if marker not in promotion:
             violations.append(f"release promotion resolver omits fail-closed evidence {marker!r}")
+    if "output_dir.mkdir(parents=True, exist_ok=False)" in promotion:
+        violations.append("release promotion pre-creates the safe extraction destination")
 
     action_documents = release + "\n" + release_please
     seen: set[str] = set()
