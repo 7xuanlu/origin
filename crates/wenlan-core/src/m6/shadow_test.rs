@@ -366,6 +366,54 @@ async fn a_turn_reports_exactly_one_unit_of_work() {
     assert_eq!(finalized, 1, "one dry run, on its own turn: {turns:?}");
 }
 
+/// **The §7.3 benchmark's regression gate.** A space whose frontier exceeds one
+/// scan slice must still reach quiescence.
+///
+/// This is the shape that made the loop sweep forever: `scan_slice` returns a
+/// cursor whenever it fills, the sweep wraps, and the next visit starts over —
+/// so counting a cursor advance as work pinned a large space at the 100ms
+/// cadence permanently. `drive` panics if quiescence is not reached, so the
+/// assertion is the call itself; 520 groups is one row past
+/// `FRONTIER_SCAN_SLICE_ROWS`, which is the smallest corpus that reproduces it.
+#[tokio::test]
+async fn a_frontier_larger_than_one_scan_slice_reaches_quiescence() {
+    let db = GenesisDb::new().await;
+    db.seed_space(SPACE_ID, SPACE).await;
+    // Bulk-generated rather than 520 calls to `seed_evidence`: the shape under
+    // test is the row count, and a thousand round trips would make the gate
+    // slow enough that someone would delete it.
+    db.exec(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 519)
+         INSERT INTO provenance_roots (root_id, root_kind, independence_group_id, status)
+         SELECT 'root-' || i, 'document_ingest', 'group-' || i, 'active' FROM n",
+        (),
+    )
+    .await;
+    db.exec(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 519)
+         INSERT INTO edges (edge_id, src_kind, src_id, dst_kind, dst_id,
+                            grounded, root_id, space, valid_until)
+         SELECT 'root-' || i, 'entity', 'entity-' || i, 'entity', 'peer',
+                1, 'root-' || i, ?1, NULL FROM n",
+        libsql::params![SPACE],
+    )
+    .await;
+
+    let turns = drive(&db, 64).await;
+
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM genesis_frontier", ()).await,
+        520,
+        "the corpus must exceed one 512-row slice, or the gate is vacuous"
+    );
+    assert!(
+        turns
+            .iter()
+            .any(|turn| matches!(turn, GenesisTurn::Frontier { .. })),
+        "the sweep must have reported repair work at least once: {turns:?}"
+    );
+}
+
 /// §4.3 — the `genesis` lease spans prepare *and* finalize, and is released
 /// when finalization completes. A quiescent shadow holds nothing, so a restart
 /// waits on no TTL.

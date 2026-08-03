@@ -191,10 +191,10 @@ pub async fn run_genesis_shadow_turn(
 
 /// One space's differential reconciliation plus one cursor-resumed scan slice.
 ///
-/// Returns `None` when the pass found nothing to repair and the cursor was
-/// already at the start — i.e. the space is quiescent and the turn should fall
-/// through to a lower priority. Returning `Some` for a no-op pass would make
-/// the loop spin at the did-work delay forever on an idle store.
+/// Returns `None` when the pass repaired nothing — i.e. the space is quiescent
+/// and the turn should fall through to a lower priority. Returning `Some` for a
+/// no-op pass would make the loop spin at the did-work delay forever on an idle
+/// store.
 async fn reconcile(
     conn: &libsql::Connection,
     space_id: &str,
@@ -227,7 +227,17 @@ async fn reconcile(
         )
         .await?;
     }
-    let did_work = repaired > 0 || outcome.lapsed_suppressions > 0 || cursor.is_some();
+    // **Only a repair counts as work; advancing the scan cursor does not.**
+    // The §7.3 benchmark is what settled this. With `cursor.is_some()` in the
+    // disjunction, any space holding more than `FRONTIER_SCAN_SLICE_ROWS` (512)
+    // frontier rows pinned the loop at the 100ms did-work cadence forever: the
+    // sweep wraps, the cursor clears, the next visit starts a fresh sweep, and
+    // three of every four turns report work again. Measured at 2000 groups, the
+    // loop was still sweeping after 134s and 170 counted turns, each ~700ms
+    // because `reconcile_space` re-runs its whole differential every turn.
+    // A slice that repaired nothing found nothing; it is bookkeeping, and the
+    // sweep still advances one slice per idle-cadence tick.
+    let did_work = repaired > 0 || outcome.lapsed_suppressions > 0;
     if did_work {
         evidence::bump(&tx, space_id, space, evidence::COUNTER_TURNS, 1).await?;
     }
