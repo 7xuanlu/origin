@@ -23,6 +23,8 @@ pub mod locomo;
 pub mod longmemeval;
 pub mod m5_bench_corpus;
 pub mod m6_bench_corpus;
+#[cfg(feature = "eval-harness")]
+pub mod m6_relevance_harness;
 pub mod metrics;
 pub mod page_faithfulness;
 pub mod paired;

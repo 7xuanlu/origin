@@ -40,7 +40,7 @@
 
 use super::evidence::read_counter;
 use super::independence::ELIGIBLE_EVIDENCE_PREDICATE;
-use super::relevance::{PairStatsValues, MAX_CANDIDATE_ENDPOINTS, MAX_NEIGHBORS_PER_ENDPOINT};
+use super::relevance::{PairStatsValues, MAX_NEIGHBORS_PER_ENDPOINT};
 use crate::WenlanError;
 use std::collections::BTreeMap;
 
@@ -59,6 +59,29 @@ pub const MAX_QUERIES_PER_EVALUATION: u32 = 4;
 /// `R-BUDGET-ROWS` (S0-95 instrument 1): rows *materialized* per evaluation.
 /// D9's word is "materializes", so this counts rows decoded from a cursor.
 pub const MAX_ROWS_PER_EVALUATION: u32 = 512;
+
+/// How many stale endpoints one turn *looks at* before packing.
+///
+/// Not how many it sweeps: the turn takes the longest prefix of this window
+/// whose projected fan-out fits what is left of `R-BUDGET-ROWS`. A fixed
+/// swept-count cannot hold that bound — groups-per-page has a tail, and the
+/// benchmark found a breach at turn 102 of the frozen corpus with a slice of
+/// four. The bound has to be enforced by construction or it is not a bound.
+///
+/// **Not** [`super::relevance::MAX_CANDIDATE_ENDPOINTS`]. That constant is
+/// `R-CAND-CAP`, D9's cap
+/// on the *route evaluation's* query (c) — a read over `m6_adjacency` whose
+/// materialization is 32 rows by the precomputed table's shape (S0-96: "the
+/// route evaluation never touches `edges` directly"). This sweep is the
+/// adjacency *rebuild*, which does read `edges`, and there one endpoint drags
+/// in every group touching it (~19 on the S0-97 corpus) and every page those
+/// groups touch. Borrowing 32 here spends the same `R-BUDGET-ROWS` budget on
+/// roughly sixty times the rows.
+///
+/// Set from the benchmark, never the other way round: S0-99 forbids answering
+/// a budget breach by tuning a constant, and 512 is the frozen one. This is
+/// the parameter the contract left free, so this is the one that moves.
+pub const SWEEP_CANDIDATE_WINDOW: usize = 8;
 
 /// The two CI-gated budget instruments, enforced at the read rather than
 /// measured after it.
@@ -105,6 +128,15 @@ impl QueryBudget {
 }
 
 /// This space's stored decay reference, or `None` before the first pass.
+/// A stale endpoint, with the number of rows sweeping it would materialize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateEndpoint {
+    pub page_id: String,
+    /// The `(group, page)` rows `groups_touching` decodes for this endpoint
+    /// alone, computed by the same top-64 cap that query applies.
+    pub projected_rows: i64,
+}
+
 pub async fn decay_reference(
     tx: &libsql::Transaction,
     space_id: &str,
@@ -408,11 +440,30 @@ pub async fn candidate_endpoints(
     space: &str,
     grouping_generation: i64,
     budget: &mut QueryBudget,
-) -> Result<(Vec<String>, bool), WenlanError> {
+) -> Result<(Vec<CandidateEndpoint>, bool), WenlanError> {
     budget.charge_query()?;
-    let mut rows = tx
-        .query(
-            "SELECT p.id FROM pages p
+    let sql = format!(
+        "WITH page_edges AS (
+             SELECT e.*, e.src_id AS page_id FROM edges e WHERE e.src_kind = 'page'
+             UNION ALL
+             SELECT e.*, e.dst_id AS page_id FROM edges e WHERE e.dst_kind = 'page'
+         ),
+         support AS (
+             SELECT r.independence_group_id AS gid, e.page_id AS page_id
+               FROM page_edges e
+               JOIN provenance_roots r ON r.root_id = e.root_id
+              WHERE e.space = ?1
+                AND {ELIGIBLE_EVIDENCE_PREDICATE}
+              GROUP BY gid, e.page_id
+         ),
+         group_size AS (
+             -- Capped exactly where `groups_touching` caps, so the projection
+             -- is that query's row count and not an estimate of it.
+             SELECT gid, MIN(COUNT(*), {MAX_NEIGHBORS_PER_ENDPOINT}) AS pages
+               FROM support GROUP BY gid
+         ),
+         stale AS (
+             SELECT p.id AS id FROM pages p
               WHERE p.space = ?1
                 AND lower(p.title) <> 'overview'
                 AND EXISTS (
@@ -421,11 +472,22 @@ pub async fn candidate_endpoints(
                        AND (s.page_a = p.id OR s.page_b = p.id)
                 )
               ORDER BY p.id ASC
-              LIMIT ?3",
+              LIMIT ?3
+         )
+         SELECT st.id, COALESCE(SUM(gs.pages), 0)
+           FROM stale st
+           LEFT JOIN support s  ON s.page_id = st.id
+           LEFT JOIN group_size gs ON gs.gid = s.gid
+          GROUP BY st.id
+          ORDER BY st.id ASC"
+    );
+    let mut rows = tx
+        .query(
+            &sql,
             libsql::params![
                 space,
                 grouping_generation,
-                MAX_CANDIDATE_ENDPOINTS as i64 + 1
+                SWEEP_CANDIDATE_WINDOW as i64 + 1
             ],
         )
         .await
@@ -438,14 +500,44 @@ pub async fn candidate_endpoints(
         .map_err(|error| WenlanError::VectorDb(format!("m6 candidate endpoints row: {error}")))?
     {
         budget.charge_row()?;
-        endpoints.push(row.get::<String>(0).map_err(|error| {
-            WenlanError::VectorDb(format!("m6 candidate endpoints decode: {error}"))
-        })?);
+        endpoints.push(CandidateEndpoint {
+            page_id: row.get::<String>(0).map_err(|error| {
+                WenlanError::VectorDb(format!("m6 candidate endpoints decode: {error}"))
+            })?,
+            projected_rows: row.get::<i64>(1).map_err(|error| {
+                WenlanError::VectorDb(format!("m6 candidate projection decode: {error}"))
+            })?,
+        });
     }
 
-    let truncated = endpoints.len() > MAX_CANDIDATE_ENDPOINTS;
-    endpoints.truncate(MAX_CANDIDATE_ENDPOINTS);
+    let truncated = endpoints.len() > SWEEP_CANDIDATE_WINDOW;
+    endpoints.truncate(SWEEP_CANDIDATE_WINDOW);
     Ok((endpoints, truncated))
+}
+
+/// The longest prefix of `candidates` whose projected cost fits `budget`.
+///
+/// Cost is counted twice per projected row: once for the `groups_touching`
+/// row itself, once for the `pinned_space_mass` row that row's page can add.
+/// The union of two endpoints' groups is at most the sum, and the distinct
+/// pages are at most the rows, so this can only over-reserve — which is the
+/// direction a budget may err in.
+///
+/// Always returns at least one endpoint when any exist: a turn that reserves
+/// its way to zero work makes no progress and the sweep never converges.
+pub fn pack_within_budget(candidates: &[CandidateEndpoint], budget: &QueryBudget) -> Vec<String> {
+    let remaining = i64::from(MAX_ROWS_PER_EVALUATION) - i64::from(budget.rows);
+    let mut chosen = Vec::new();
+    let mut reserved = 0i64;
+    for candidate in candidates {
+        let cost = candidate.projected_rows.saturating_mul(2);
+        if !chosen.is_empty() && reserved + cost > remaining {
+            break;
+        }
+        chosen.push(candidate.page_id.clone());
+        reserved += cost;
+    }
+    chosen
 }
 
 /// The eligible groups supporting **any** of `endpoints`, each with its bounded
@@ -866,8 +958,12 @@ pub async fn run_relevance_sweep(
     };
 
     let mut budget = QueryBudget::default();
-    let (endpoints, endpoints_truncated) =
+    let (candidates, endpoints_truncated) =
         candidate_endpoints(tx, space, grouping_generation, &mut budget).await?;
+    // The window says what is stale; the packing says what fits. Doing this
+    // after the candidate query is what lets the reservation be exact rather
+    // than a guess made before anything was read.
+    let endpoints = pack_within_budget(&candidates, &budget);
     if endpoints.is_empty() {
         super::leases::release(
             tx,

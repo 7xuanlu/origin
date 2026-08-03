@@ -40,7 +40,11 @@ mod eval_temporal_seed;
 mod genesis_schema;
 /// Migration 108's shipped DDL, re-exported so the M6 fixtures install the
 /// real substrate. Text, not a `libsql` handle — see the constant's own note.
-#[cfg(test)]
+///
+/// `eval-harness` is in the gate alongside `test` because the M6 relevance
+/// bench loads the frozen corpus into this same substrate, and it is an
+/// integration target rather than a unit test.
+#[cfg(any(test, feature = "eval-harness"))]
 pub(crate) use genesis_schema::GENESIS_SUBSTRATE_DDL;
 mod kg_quality_diagnostics;
 mod kg_quality_duplicate_candidates;

@@ -1,13 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Frozen-corpus gate for the M6 relevance benchmark.
 //!
-//! C0 ships the corpus and this target only. The relevance sweep it will
-//! measure does not exist yet — that is C1 — and the ordering is deliberate:
-//! §8.6's count limits are hard pass/fail gates, and a gate that arrives after
-//! the code it gates has never once failed. The single proof this target
-//! carries is **corpus reproducibility**: a reviewer regenerates the corpus
-//! byte-for-byte, and a mismatch makes the bench refuse to run rather than
-//! report a number nobody can compare against.
+//! C0 shipped the corpus and this target's reproducibility proof; C1 adds the
+//! two count gates that consume it. The ordering was deliberate: §8.6's count
+//! limits are hard pass/fail gates, and a gate that arrives after the code it
+//! gates has never once failed. The proof C0 carries is **corpus
+//! reproducibility**: a reviewer regenerates the corpus byte-for-byte, and a
+//! mismatch makes the bench refuse to run rather than report a number nobody
+//! can compare against.
+//!
+//! **S0-99 governs every number below: a benchmark failure stops for a
+//! Sol-reviewed contract amendment and may not be answered by tuning a
+//! constant.** `R-BENCH-Q` (4) and `R-BENCH-ROWS` (512) are frozen. If a sweep
+//! breaches them, the thing that moves is the sweep — `SWEEP_ENDPOINTS_PER_TURN`
+//! is the parameter the contract left free, and it exists precisely so the
+//! frozen ones never have to.
+//!
+//! `R-BENCH-MAX`/`P50`/`P99` are wall-clock and are **not** asserted here:
+//! §8.6 rules the count limits into CI and leaves the timing ones to a local
+//! receipt under S0-98's specified conditions (warm cache, one evaluation at a
+//! time, no concurrent refinery turn), which a hosted runner does not provide.
 
 use std::io::{self, Write};
 use wenlan_core::eval::m6_bench_corpus::{
@@ -16,6 +28,8 @@ use wenlan_core::eval::m6_bench_corpus::{
     M6_MEMORY_COUNT, M6_PAGES_PER_GROUP_MEAN, M6_PAGE_COUNT, M6_RETRACTED_EDGE_PERCENT,
     M6_ROOT_AGE_MAX_DAYS, M6_SPACE_SPLIT_PERCENT, M6_ZIPF_TRUNCATION,
 };
+#[cfg(feature = "eval-harness")]
+use wenlan_core::eval::m6_relevance_harness::run_relevance_budget_bench;
 
 const MANIFEST_DIGEST_BYTES: &[u8] = include_bytes!("fixtures/m6_bench_corpus.sha256");
 
@@ -247,5 +261,93 @@ impl Write for RecordCounter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// `R-BENCH-Q` and `R-BENCH-ROWS` over the frozen corpus.
+///
+/// The unit fixtures already assert both counters, but on a dozen pages, where
+/// one turn sees every group and the fan-out that actually spends the budget
+/// never happens. This is the same assertion against the corpus D9 states the
+/// budget over — 5,000 pages, 12,000 groups, a Zipf degree tail.
+///
+/// **Two legs, because neither alone is the gate.** The dense 40% space is
+/// where the budget is actually spent, and draining its 2,000 pages takes
+/// ~400 turns at ~3.5s each — too slow to be a required check. The 2% space
+/// drains completely and cheaply, but its pages are sparse. So: sample the
+/// dense space deep enough to hit real fan-out, and drain the small one to
+/// exhaustion so at least one leg proves the invariant holds all the way to
+/// `Idle` rather than for a prefix.
+///
+/// What the sampled leg does **not** prove is a maximum. It could not: an
+/// earlier fixed-slice design passed 24 turns and breached at turn 102, which
+/// is exactly why the bound is now enforced by `pack_within_budget` rather
+/// than hoped for. The residual case the packing cannot avoid — a single
+/// endpoint whose own fan-out exceeds the remaining budget, which the turn
+/// takes anyway so the sweep can make progress — is asserted directly in
+/// `relevance_sweep_test.rs`, not left to drain luck.
+#[cfg(feature = "eval-harness")]
+#[test]
+fn the_bounded_sweep_stays_inside_the_frozen_count_budgets() {
+    // The corpus must be the committed one, or the numbers are incomparable.
+    let summary = summarize_corpus().expect("corpus");
+    verify_manifest_digest(MANIFEST_DIGEST_BYTES, &summary.sha256)
+        .expect("corpus digest does not match the committed manifest; the bench refuses to run");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    for (space_index, max_turns, drains) in [(0usize, 60usize, false), (7, 4096, true)] {
+        let receipt = runtime
+            .block_on(run_relevance_budget_bench(space_index, max_turns))
+            .expect("relevance budget bench");
+        let widths: Vec<usize> = receipt
+            .bounded_turns
+            .iter()
+            .map(|turn| turn.endpoints_considered)
+            .collect();
+        println!(
+            "[m6-relevance-bench] corpus={} space={} pages={} groups={} pairs={} turns={} \
+             endpoints={} width={:?}..{:?} peak_queries={} peak_rows={}",
+            &summary.sha256[..16],
+            receipt.space,
+            receipt.pages_in_space,
+            receipt.groups_in_space,
+            receipt.rereference_pairs,
+            receipt.bounded_turns.len(),
+            widths.iter().sum::<usize>(),
+            widths.iter().min(),
+            widths.iter().max(),
+            receipt.peak_queries(),
+            receipt.peak_rows(),
+        );
+
+        assert!(
+            !receipt.bounded_turns.is_empty(),
+            "space {space_index} ran no bounded turn, so neither budget was \
+             exercised; a vacuous pass is what this gate exists to prevent"
+        );
+        if drains {
+            assert!(
+                receipt.bounded_turns.len() < max_turns,
+                "space {space_index} never reached Idle in {max_turns} turns, so \
+                 the draining leg proved nothing about convergence"
+            );
+        }
+        assert!(
+            receipt.peak_queries() <= 4,
+            "R-BENCH-Q: a bounded turn on space {space_index} issued {} queries \
+             against the frozen corpus; the cap is 4 and S0-99 forbids relaxing it",
+            receipt.peak_queries(),
+        );
+        assert!(
+            receipt.peak_rows() <= 512,
+            "R-BENCH-ROWS: a bounded turn on space {space_index} materialized {} \
+             rows against the frozen corpus; the cap is 512 and S0-99 forbids \
+             relaxing it",
+            receipt.peak_rows(),
+        );
     }
 }

@@ -6,15 +6,15 @@
 
 use super::relevance_sweep::{
     advance_decay_reference, candidate_endpoints, decay_reference, decayed_contribution,
-    eligible_groups, group_support, hub_weight, recompute_pair_stats, run_relevance_sweep,
-    GroupSupport, QueryBudget, RelevanceRereference, RelevanceTurn, SpaceMass,
-    COUNTER_RELEVANCE_DECAY_REFERENCE, DECAY_HALF_LIFE_DAYS, MAX_QUERIES_PER_EVALUATION,
-    MAX_ROWS_PER_EVALUATION,
+    eligible_groups, group_support, hub_weight, pack_within_budget, recompute_pair_stats,
+    run_relevance_sweep, CandidateEndpoint, GroupSupport, QueryBudget, RelevanceRereference,
+    RelevanceTurn, SpaceMass, COUNTER_RELEVANCE_DECAY_REFERENCE, DECAY_HALF_LIFE_DAYS,
+    MAX_QUERIES_PER_EVALUATION, MAX_ROWS_PER_EVALUATION, SWEEP_CANDIDATE_WINDOW,
 };
 use crate::m6::genesis_test_support::GenesisDb;
 use crate::m6::relevance::{
     normalized_pair_stats_digest, qualified_co_citation, PairStatsSnapshotRow, PairStatsValues,
-    MAX_CANDIDATE_ENDPOINTS, MAX_NEIGHBORS_PER_ENDPOINT,
+    MAX_NEIGHBORS_PER_ENDPOINT,
 };
 
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -829,12 +829,13 @@ async fn a_candidate_set_that_hits_its_cap_is_recorded_as_truncated() {
         other => panic!("expected a swept slice, got {other:?}"),
     };
     assert_eq!(
-        sweep.endpoints_considered, 32,
-        "the cap is applied at the query"
+        sweep.endpoints_considered, SWEEP_CANDIDATE_WINDOW,
+        "the slice is applied at the query"
     );
     assert!(
         sweep.endpoints_truncated,
-        "40 stale pages against a 32 cap is a truncated set and must say so"
+        "40 stale pages against a {SWEEP_CANDIDATE_WINDOW} slice is a \
+         truncated set and must say so"
     );
 }
 
@@ -845,7 +846,7 @@ async fn the_candidate_cap_is_enforced_by_the_query_not_by_a_later_truncate() {
     // neither of those is evidence about the cap. The decoded-row count is —
     // it is the one observation that distinguishes "the database stopped at
     // 33" from "the database returned everything and Rust threw the rest
-    // away". Exactly `MAX_CANDIDATE_ENDPOINTS + 1`: the cap, plus the single
+    // away". Exactly `SWEEP_CANDIDATE_WINDOW + 1`: the slice, plus the single
     // extra row that makes truncation observable without a second query.
     let db = GenesisDb::new().await;
     db.seed_space("space-id-a", "space-a").await;
@@ -870,12 +871,12 @@ async fn the_candidate_cap_is_enforced_by_the_query_not_by_a_later_truncate() {
         .expect("candidate endpoints");
     tx.commit().await.expect("commit");
 
-    assert_eq!(endpoints.len(), MAX_CANDIDATE_ENDPOINTS);
+    assert_eq!(endpoints.len(), SWEEP_CANDIDATE_WINDOW);
     assert!(truncated);
     assert_eq!(
         budget.rows as usize,
-        MAX_CANDIDATE_ENDPOINTS + 1,
-        "the candidate query decoded {} rows over a 40-page space; the cap \
+        SWEEP_CANDIDATE_WINDOW + 1,
+        "the candidate query decoded {} rows over a 40-page space; the slice \
          must be the LIMIT, not a truncate afterwards",
         budget.rows
     );
@@ -1100,7 +1101,7 @@ async fn drain_bounded(
 }
 
 /// 60 pages over 30 overlapping groups. The page count is deliberately past
-/// `MAX_CANDIDATE_ENDPOINTS`, so the bounded path needs several turns and no
+/// `SWEEP_CANDIDATE_WINDOW`, so the bounded path needs several turns and no
 /// single turn sees every group — the only configuration in which a marginal
 /// summed over one turn's own subset can diverge from the space-wide one. A
 /// fixture that fits in a single turn passes this vacuously.
@@ -1202,4 +1203,70 @@ async fn the_bounded_sweep_reproduces_a_full_recomputation() {
         "a bounded turn decoded {peak_rows} rows; the incremental bound is \
          {MAX_ROWS_PER_EVALUATION}"
     );
+}
+
+fn candidate(page: &str, projected_rows: i64) -> CandidateEndpoint {
+    CandidateEndpoint {
+        page_id: page.to_string(),
+        projected_rows,
+    }
+}
+
+#[test]
+fn packing_stops_before_it_would_spend_the_row_budget() {
+    // Each endpoint reserves twice its projection (the `groups_touching` row
+    // plus the `pinned_space_mass` row its page can add), so 150 projected
+    // rows reserves 300 and two of them cannot both fit under 512.
+    let budget = QueryBudget {
+        queries: 1,
+        rows: 9,
+    };
+    let chosen = pack_within_budget(
+        &[candidate("page-a", 150), candidate("page-b", 150)],
+        &budget,
+    );
+    assert_eq!(
+        chosen,
+        vec!["page-a".to_string()],
+        "two 300-row reservations do not fit in what is left of 512; the \
+         second endpoint must wait for the next turn"
+    );
+}
+
+#[test]
+fn packing_always_takes_one_endpoint_even_when_it_does_not_fit() {
+    // The progress guarantee. A turn that reserves its way to zero endpoints
+    // writes nothing, so the page stays stale, so the next turn sees exactly
+    // the same candidate and also writes nothing — the sweep would never
+    // converge and the staleness would be permanent. Taking the endpoint and
+    // letting the row counter report the overrun is the honest failure: it is
+    // loud, and it names the one case `pack_within_budget` cannot avoid.
+    let budget = QueryBudget {
+        queries: 1,
+        rows: 9,
+    };
+    let chosen = pack_within_budget(&[candidate("page-huge", 100_000)], &budget);
+    assert_eq!(
+        chosen,
+        vec!["page-huge".to_string()],
+        "an endpoint too big for the whole budget must still be attempted, or \
+         the sweep stalls on it forever"
+    );
+}
+
+#[test]
+fn packing_takes_every_endpoint_that_fits() {
+    let budget = QueryBudget {
+        queries: 1,
+        rows: 9,
+    };
+    let chosen = pack_within_budget(
+        &[
+            candidate("page-a", 10),
+            candidate("page-b", 10),
+            candidate("page-c", 10),
+        ],
+        &budget,
+    );
+    assert_eq!(chosen.len(), 3, "60 reserved rows fit inside 512 easily");
 }
