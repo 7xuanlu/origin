@@ -1146,6 +1146,25 @@ async fn the_bounded_sweep_reproduces_a_full_recomputation() {
         "60 pages against a 32 cap must take more than one bounded turn, took {turns}"
     );
 
+    // The drain is only finished when *every* pair is at the new generation.
+    // Values alone cannot show this: the re-reference pass already wrote them
+    // correctly, so a page retired before its own sweep leaves rows that are
+    // right but stamped stale — and they stay wrong the moment the underlying
+    // groups next change. The generation is the only observation that
+    // separates "re-derived" from "left behind".
+    let behind = db
+        .scalar(
+            "SELECT COUNT(*) FROM m6_pair_stats
+              WHERE space = 'space-a' AND updated_generation < 8",
+            (),
+        )
+        .await;
+    assert_eq!(
+        behind, 0,
+        "the drain reported Idle with {behind} pairs still at an older \
+         generation; a page was retired before its own pairs were re-derived"
+    );
+
     let reference = {
         let tx = db.tx().await;
         let reference = decay_reference(&tx, "space-id-a")
