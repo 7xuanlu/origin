@@ -1,0 +1,120 @@
+name: Stale-safe merge
+
+# `main` requires branches to be up to date, so each merge invalidates the
+# green of every other open pull request. Where the landed merge and the pull
+# request left behind share no changed file, the re-run proves nothing new.
+#
+# This workflow finds that case and reports it. It merges only when the
+# repository supplies ADMIN_MERGE_TOKEN, because bypassing branch protection
+# requires an administrator and GITHUB_TOKEN is not one. Without that secret it
+# still comments the exact command, so the judgement is never lost.
+on:
+  push:
+    branches: [main]
+
+# One evaluation at a time. Each merge pushes main again and re-triggers this
+# workflow, which is what keeps the decision honest for the next pull request.
+concurrency:
+  group: stale-safe-merge
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    name: evaluate stale pull requests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Evaluate and act
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_MERGE_TOKEN }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+
+          # Files the merge that just landed touched. A created ref reports an
+          # all-zero "before"; treat that as unknown and stop rather than
+          # computing an empty overlap that would look like "safe".
+          if [[ "$BEFORE" =~ ^0+$ ]]; then
+            echo "no previous main commit to compare against; nothing to decide"
+            exit 0
+          fi
+          pushed="$(gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$AFTER" \
+            --jq '[.files[].filename]')"
+          echo "landed merge touched $(jq length <<<"$pushed") file(s)"
+
+          numbers="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+            --label admin-merge-when-safe --json number --jq '.[].number')"
+          if [[ -z "$numbers" ]]; then
+            echo "no pull request carries the opt-in label"
+            exit 0
+          fi
+
+          for number in $numbers; do
+            pull="$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" \
+              --json number,mergeable,mergeStateStatus,headRefOid,isDraft,labels,files)"
+            # mergeStateStatus is computed lazily and reads UNKNOWN for a moment
+            # after any base change. One bounded retry, then let it be UNKNOWN
+            # and fail closed.
+            if [[ "$(jq -r .mergeStateStatus <<<"$pull")" == "UNKNOWN" ]]; then
+              sleep 10
+              pull="$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" \
+                --json number,mergeable,mergeStateStatus,headRefOid,isDraft,labels,files)"
+            fi
+            pull="$(jq '.files = [.files[].path]' <<<"$pull")"
+            head="$(jq -r .headRefOid <<<"$pull")"
+
+            # The aggregate gate's own result on this exact head commit. An
+            # absent run yields empty, which the decision treats as not-success.
+            conclusion="$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/check-runs" \
+              --jq '[.check_runs[] | select(.name=="conclusion")] | sort_by(.started_at)
+                    | last | .conclusion // ""')"
+
+            verdict="$(python3 scripts/stale-safe-merge.py \
+              --pull "$pull" --pushed-files "$pushed" \
+              --check-conclusion "${conclusion:-}")"
+            reason="$(jq -r .reason <<<"$verdict")"
+            if [[ "$(jq -r .safe <<<"$verdict")" != "true" ]]; then
+              echo "#$number: leaving alone — $reason"
+              continue
+            fi
+
+            if [[ -n "${ADMIN_TOKEN:-}" ]]; then
+              echo "#$number: merging — $reason"
+              GH_TOKEN="$ADMIN_TOKEN" gh pr merge "$number" \
+                --repo "$GITHUB_REPOSITORY" --squash --admin
+              # Merging moved main again. Stop here and let the resulting push
+              # re-evaluate, so two pull requests that overlap each other are
+              # never merged against the same stale comparison.
+              exit 0
+            fi
+
+            echo "#$number: safe but no ADMIN_MERGE_TOKEN — reporting instead"
+            # printf, not a YAML block scalar: continuation lines in a block
+            # keep their extra indentation, which markdown would render as
+            # code. Building the body explicitly keeps the comment flush.
+            body="$(printf '%s\n' \
+              "Stale only because \`main\` moved: ${reason}." \
+              "" \
+              "No file overlap with the merge that landed, so re-running the full matrix would re-prove the previous run. Merge without waiting:" \
+              "" \
+              '```' \
+              "gh pr merge ${number} --squash --admin" \
+              '```' \
+              "" \
+              "\`--admin\` bypasses required checks, so this is only safe because this run verified the aggregate check succeeded on \`${head}\`. Set \`ADMIN_MERGE_TOKEN\` (a PAT for a repository administrator) to have it done automatically.")"
+            gh pr comment "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+            exit 0
+          done

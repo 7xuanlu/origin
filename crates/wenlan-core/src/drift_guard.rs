@@ -913,9 +913,15 @@ fn release_please_trigger_violations(workflow: &str) -> Vec<String> {
     if create["if"].as_str() != Some("needs.route-main.outputs.state == 'validated'")
         || !create_run.contains("refs/tags/$RELEASE_TAG")
         || !create_run.contains("sha=\"$MAIN_SHA\"")
+        || !create_run.contains("tag_lookup_status=$?")
+        || !create_run.contains("'.status | tostring'")
+        || !create_run.contains("[[ \"$tag_api_status\" != 404 ]]")
+        || create_run.contains("|| true")
     {
-        violations
-            .push("validated release route does not create only the exact receipt tag".into());
+        violations.push(
+            "validated release route does not fail closed before creating the exact receipt tag"
+                .into(),
+        );
     }
     violations
 }
@@ -5964,13 +5970,24 @@ fn release_promotion_contract_violations(
             "release resolver is not pinned to its immutable read-only main control plane".into(),
         );
     }
-    for job_name in [
-        "prepare-release",
-        "promote-assets",
-        "docker",
-        "publish-crates",
-        "publish-npm",
-    ] {
+    // Promotion runs the same resolver as resolve-promotion, so it is control
+    // plane too. Pinning it to the release commit would run the release's own
+    // copy of the promotion tooling, so a resolver fix could never reach a
+    // recovery of that release. Docker packaging has the same shape: its
+    // checkout supplies only the runtime Dockerfile and the image verifier,
+    // while the bytes placed in the image come from the validated artifact and
+    // are checked against the closed receipt by size and SHA-256.
+    for job_name in ["promote-assets", "docker"] {
+        let job_text = serde_yaml::to_string(&release["jobs"][job_name]).unwrap_or_default();
+        if !job_text.contains("ref: ${{ github.sha }}")
+            || job_text.contains("ref: ${{ env.RELEASE_SHA }}")
+        {
+            violations.push(format!(
+                "release packaging job {job_name:?} is not pinned to its main control plane"
+            ));
+        }
+    }
+    for job_name in ["prepare-release", "publish-crates", "publish-npm"] {
         let job_text = serde_yaml::to_string(&release["jobs"][job_name]).unwrap_or_default();
         if !job_text.contains("ref: ${{ env.RELEASE_SHA }}")
             || job_text.contains("ref: ${{ github.sha }}")
@@ -5982,16 +5999,33 @@ fn release_promotion_contract_violations(
     }
     let bind_job = &release["jobs"]["bind-release-tag"];
     let bind_text = serde_yaml::to_string(bind_job).unwrap_or_default();
-    if bind_job["permissions"]["contents"].as_str() != Some("write")
+    let bind_run = job_step(
+        &release,
+        "bind-release-tag",
+        "Create or verify the lightweight receipt-derived tag",
+    )
+    .and_then(|step| step["run"].as_str())
+    .unwrap_or_default();
+    if bind_job["permissions"]["actions"].as_str() != Some("write")
+        || bind_job["permissions"]["contents"].as_str() != Some("read")
         || bind_job["permissions"]["issues"].as_str() != Some("read")
         || bind_text.contains("actions/checkout@")
-        || !bind_text.contains("/git/refs")
+        || bind_job["steps"][0]["env"]["GH_TAG_TOKEN"].as_str()
+            != Some("${{ secrets.RELEASE_TOKEN }}")
+        || !bind_run.contains("/git/refs")
+        || !bind_run.contains("event=push&head_sha=$RELEASE_SHA")
+        || !bind_run.contains(r#".head_branch == \"$RELEASE_TAG\""#)
+        || !bind_run.contains("/actions/runs/$legacy_run_id/cancel")
+        || !bind_run.contains("completed\\tcancelled")
         || !bind_text.contains("GATE_STATE")
         || !bind_text.contains("RELEASE_PR_NUMBER")
         || !bind_text.contains("index(\"autorelease: pending\") != null")
         || !bind_text.contains("index(\"autorelease: tagged\") == null")
     {
         violations.push("receipt-derived tag binding lacks isolated write authority".into());
+    }
+    if release_workflow.matches("secrets.RELEASE_TOKEN").count() != 1 {
+        violations.push("release recovery token is not confined to the exact tag bind".into());
     }
     for job_name in [
         "prepare-release",
@@ -6102,6 +6136,9 @@ fn release_promotion_contract_violations(
         if !promotion_script.contains(required) {
             violations.push(format!("promotion resolver omits {required:?}"));
         }
+    }
+    if promotion_script.contains("output_dir.mkdir(parents=True, exist_ok=False)") {
+        violations.push("promotion resolver pre-creates the safe extraction destination".into());
     }
     violations
 }

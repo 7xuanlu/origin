@@ -52,6 +52,7 @@ jobs:
       mcp-platform: ${{ steps.filter.outputs.mcp-platform }}
       workspace-platform: ${{ steps.filter.outputs.workspace-platform }}
       macos-archive-contract: ${{ steps.filter.outputs.macos-archive-contract }}
+      runtime-image: ${{ steps.filter.outputs.runtime-image }}
       trusted-release-candidate: ${{ steps.release-candidate-trust.outputs.trusted-release-candidate }}
       verified-release-merge: ${{ steps.release-proof.outputs.verified-release-merge }}
       release-gate-state: ${{ steps.release-proof.outputs.release-gate-state }}
@@ -489,6 +490,16 @@ jobs:
               - 'crates/wenlan-server/tests/port_discovery.rs'
               - 'crates/wenlan-server/tests/port_taken_no_db_init.rs'
 
+            runtime-image:
+              # The release runtime image is assembled and smoked only by
+              # release.yml, so every packaging defect in it used to surface
+              # mid-release, one per release round-trip. These files decide
+              # whether the shipped image starts and serves; prove them here.
+              - 'docker/Dockerfile.release-runtime'
+              - 'scripts/verify-release-runtime-image.py'
+              - 'scripts/verify-release-runtime-image.test.py'
+              - 'scripts/release_archive.py'
+
       - name: Test release merge proof
         run: |
           python3 scripts/verify-release-merge.test.py
@@ -565,6 +576,11 @@ jobs:
           python3 scripts/ci-timed-command.test.py
           python3 scripts/verify-ort-source-pin.test.py
           python3 scripts/verify-ort-source-pin.py
+      # Its own step on purpose: the CI-measurement step above is pinned to an
+      # exact line list by drift_guard, so appending here would fail a contract
+      # about a workflow this change never touches.
+      - name: Verify stale-safe merge contract
+        run: python3 scripts/stale-safe-merge.test.py
       - name: Verify local hook routing contracts
         run: bash scripts/git-hooks.test.sh
       - name: Set up Rust for affected-test planning
@@ -2036,6 +2052,58 @@ jobs:
           python3 scripts/update-readme-eval.test.py
           bash scripts/validate-versions.test.sh
 
+  runtime-image:
+    name: runtime image smoke
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.runtime-image == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      # The image needs a real wenlan-server, and PR CI has no validated
+      # release archive. Take the newest published release's Linux x64 asset
+      # and bind it to the digest GitHub reports for that asset: immutable,
+      # already public, and never a receipt, so nothing here can mint release
+      # provenance. amd64 only — arm64 under QEMU costs far more than the
+      # coverage adds, and both arches carry identical DT_NEEDED sets.
+      - name: Resolve newest published release asset
+        id: asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          read -r digest size < <(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" \
+            --jq '.assets[] | select(.name=="wenlan-linux-x64.tar.gz") | "\(.digest) \(.size)"')
+          if [[ -z "${digest:-}" || -z "${size:-}" || "$digest" != sha256:* ]]; then
+            echo "no digest for wenlan-linux-x64.tar.gz on $tag"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/assets"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern wenlan-linux-x64.tar.gz --dir "$RUNNER_TEMP/assets"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+          echo "size=$size" >>"$GITHUB_OUTPUT"
+      - name: Build and smoke the runtime image
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-release-runtime-image.py \
+            --published-digest '${{ steps.asset.outputs.digest }}' \
+            --published-size '${{ steps.asset.outputs.size }}' \
+            --assets-dir "$RUNNER_TEMP/assets" \
+            --target x86_64-unknown-linux-gnu \
+            --image "wenlan-runtime-ci:${{ github.sha }}" \
+            --dockerfile docker/Dockerfile.release-runtime \
+            --output "$RUNNER_TEMP/runtime-image-evidence.json"
+      - name: Test the runtime image contracts
+        run: python3 scripts/verify-release-runtime-image.test.py
+
   # Aggregate gate for branch protection. `if: always()` lets docs-only PRs
   # (where the test matrix skips via detect-changes) report success instead
   # of stalling forever on a never-run required check.
@@ -2046,7 +2114,7 @@ jobs:
   # with no matching diff must be skipped.
   conclusion:
     name: conclusion
-    needs: [detect-changes, release-base-proof, fmt, lint, linux-nextest-build, linux-nextest, macos-nextest-build, macos-nextest, test, mcp-platform, canonical-acceptance, contract-integration, release-preflight, docs, plugin, plugin-rust-contract, npm]
+    needs: [detect-changes, release-base-proof, fmt, lint, linux-nextest-build, linux-nextest, macos-nextest-build, macos-nextest, test, mcp-platform, canonical-acceptance, contract-integration, release-preflight, docs, plugin, plugin-rust-contract, npm, runtime-image]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     steps:
@@ -2096,6 +2164,7 @@ jobs:
           expect_job plugin '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.plugin == 'true' }}' '${{ needs.plugin.result }}'
           expect_job plugin-rust-contract '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.plugin-rust-contract == 'true' }}' '${{ needs.plugin-rust-contract.result }}'
           expect_job npm '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.npm == 'true' }}' '${{ needs.npm.result }}'
+          expect_job runtime-image '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.runtime-image == 'true' }}' '${{ needs.runtime-image.result }}'
 
   plugin:
     needs: detect-changes

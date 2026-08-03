@@ -1,10 +1,11 @@
 # Changelog
 
-## [0.15.4](https://github.com/7xuanlu/wenlan/compare/v0.15.3...v0.15.4) (2026-08-02)
+## [0.15.4](https://github.com/7xuanlu/wenlan/compare/v0.15.3...v0.15.4) (2026-08-03)
 
 
 ### Features
 
+* add shadow claim support promoter ([#457](https://github.com/7xuanlu/wenlan/issues/457)) ([c620d7e](https://github.com/7xuanlu/wenlan/commit/c620d7e2a4977bb7b332851469314c022b52e283))
 * complete M6 migration 109 substrate follow-up ([#437](https://github.com/7xuanlu/wenlan/issues/437)) ([247185b](https://github.com/7xuanlu/wenlan/commit/247185ba215d3426a4a1f2b97ad76d924fd1b30d))
 * enforce truth-aware page exposure ([#429](https://github.com/7xuanlu/wenlan/issues/429)) ([5141f7b](https://github.com/7xuanlu/wenlan/commit/5141f7bf21586aee75a1204607651b1eba484c42))
 * land M6 deterministic identity primitives and genesis substrate ([#433](https://github.com/7xuanlu/wenlan/issues/433)) ([aa77814](https://github.com/7xuanlu/wenlan/commit/aa77814c6a736e8ffef128e013ece56357f33481))

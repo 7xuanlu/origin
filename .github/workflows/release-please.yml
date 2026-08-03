@@ -166,18 +166,34 @@ jobs:
             "/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels?per_page=100")"
           pending="$(jq '[.[].name == "autorelease: pending"] | any' <<<"$labels")"
           tagged="$(jq '[.[].name == "autorelease: tagged"] | any' <<<"$labels")"
-          existing_sha="$(gh api --method GET \
+          set +e
+          tag_response="$(gh api --method GET \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
-            --jq '.object.sha' 2>/dev/null || true)"
-          if [[ -n "$existing_sha" ]]; then
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" 2>/dev/null)"
+          tag_lookup_status=$?
+          set -e
+          if [[ "$tag_lookup_status" -eq 0 ]]; then
+            if ! existing_sha="$(jq -er \
+              '.object.sha | strings | select(test("^[0-9a-f]{40}$"))' \
+              <<<"$tag_response")"; then
+              echo "Existing $RELEASE_TAG response has no canonical commit SHA."
+              exit 1
+            fi
             if [[ "$existing_sha" != "$MAIN_SHA" ]]; then
               echo "Existing $RELEASE_TAG points to $existing_sha, expected $MAIN_SHA."
               exit 1
             fi
             echo "$RELEASE_TAG already points to the exact validated merge commit."
             exit 0
+          fi
+          if ! tag_api_status="$(jq -er '.status | tostring' <<<"$tag_response" 2>/dev/null)"; then
+            echo "Unable to determine whether $RELEASE_TAG exists."
+            exit 1
+          fi
+          if [[ "$tag_api_status" != 404 ]]; then
+            echo "Tag lookup failed with API status $tag_api_status."
+            exit 1
           fi
           if [[ "$pending" != true || "$tagged" != false ]]; then
             echo "Release PR lifecycle is not exactly pending-before-tag."

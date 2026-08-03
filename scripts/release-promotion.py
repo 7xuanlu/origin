@@ -1176,7 +1176,6 @@ def download_validated_assets(
     size = _positive_int(metadata.get("size_in_bytes"), "validated assets size")
     if size > MAX_ARCHIVE_BYTES:
         raise PromotionError("validated assets wrapper exceeds the archive bound")
-    output_dir.mkdir(parents=True, exist_ok=False)
     wrapper = output_dir.parent / f"validated-assets-{artifact_id}.zip"
     downloaded_size, downloaded_digest = api.download(
         f"/repos/{repository}/actions/artifacts/{artifact_id}/zip",
