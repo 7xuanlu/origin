@@ -31,3 +31,19 @@ job is not automatically a flake, and a green rerun is not automatically a fix.
    CI route caused the failure; otherwise fix or quarantine the failing test.
    PR #401 exposed two existing timing races after a toolchain cache rotation;
    PR #403 fixed the tests instead of reverting the trigger.
+
+## Multiple merge-ready PRs
+
+When several PRs are ready together, freeze their dependency order, merge every
+predecessor, then update the follower once against the final base. Use stacked
+PR bases only for real code dependencies. Let the workflow's
+[concurrency group](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency)
+cancel superseded heads, and never rerun a stale SHA. Keep
+[strict required checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches):
+repeated builds are the cost of proving each new merge result, not a reason to
+accept an untested combination.
+
+If this personal repository later moves to an eligible GitHub organization,
+prefer a [merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
+and add the `merge_group` trigger to every required workflow. GitHub's native
+merge queue is not available to personal-owned repositories today.

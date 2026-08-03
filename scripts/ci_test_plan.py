@@ -1040,6 +1040,146 @@ def archive_command_for(
     raise PlanError(f"unknown workspace-lib mode: {mode!r}")
 
 
+def macos_archive_commands_for(
+    plan: object,
+    cargo_metadata: object,
+    *,
+    archive_dir: str,
+    include_m4: bool,
+) -> list[list[str]]:
+    """Build the exact no-feature macOS inventory into reusable archives."""
+
+    packages, _directories = _workspace(cargo_metadata)
+    directory = Path(
+        _validated_path_argument(archive_dir, name="archive-dir")
+    )
+    commands: list[list[str]] = []
+
+    workspace_archive = str(directory / "workspace-lib.tar.zst")
+    workspace = archive_command_for(
+        plan,
+        cargo_metadata,
+        archive_file=workspace_archive,
+    )
+    if workspace:
+        commands.append(workspace)
+
+    integrations = command_groups_for(
+        "cli-server-integration",
+        plan,
+        cargo_metadata,
+    )
+    for index, run_command in enumerate(integrations, start=1):
+        if run_command[:3] != ["cargo", "nextest", "run"]:
+            raise PlanError("CLI/server integration command is not a nextest run")
+        commands.append(
+            [
+                "cargo",
+                "nextest",
+                "archive",
+                "--archive-file",
+                str(directory / f"cli-server-integration-{index}.tar.zst"),
+                *run_command[3:],
+            ]
+        )
+
+    if include_m4:
+        if "wenlan-core" not in packages or "m4_community_gates" not in _integration_targets(
+            packages["wenlan-core"]
+        ):
+            raise PlanError("Cargo metadata has no m4_community_gates target")
+        commands.append(
+            [
+                "cargo",
+                "nextest",
+                "archive",
+                "--archive-file",
+                str(directory / "m4-community-gates.tar.zst"),
+                "-p",
+                "wenlan-core",
+                "--test",
+                "m4_community_gates",
+            ]
+        )
+    return commands
+
+
+def macos_archive_run_commands_for(
+    plan: object,
+    cargo_metadata: object,
+    *,
+    archive_dir: str,
+    workspace_remap: str,
+    partition: str,
+    include_m4: bool,
+) -> list[list[str]]:
+    """Run each archived macOS suite once across the shared partition set."""
+
+    packages, _directories = _workspace(cargo_metadata)
+    match = re.fullmatch(r"slice:([1-9][0-9]*)/([1-9][0-9]*)", partition)
+    if match is None or int(match.group(1)) > int(match.group(2)):
+        raise PlanError(f"invalid nextest partition: {partition!r}")
+    directory = Path(
+        _validated_path_argument(archive_dir, name="archive-dir")
+    )
+    remap = _validated_path_argument(workspace_remap, name="workspace-remap")
+    commands: list[list[str]] = []
+
+    workspace_archive = str(directory / "workspace-lib.tar.zst")
+    commands.extend(
+        command_groups_for(
+            "workspace-lib",
+            plan,
+            cargo_metadata,
+            partition=partition,
+            archive_file=workspace_archive,
+            workspace_remap=remap,
+        )
+    )
+
+    integrations = command_groups_for(
+        "cli-server-integration",
+        plan,
+        cargo_metadata,
+    )
+    for index, _run_command in enumerate(integrations, start=1):
+        commands.append(
+            [
+                "cargo",
+                "nextest",
+                "run",
+                "--archive-file",
+                str(directory / f"cli-server-integration-{index}.tar.zst"),
+                "--workspace-remap",
+                remap,
+                "--no-tests=pass",
+                "--partition",
+                partition,
+            ]
+        )
+
+    if include_m4:
+        if "wenlan-core" not in packages or "m4_community_gates" not in _integration_targets(
+            packages["wenlan-core"]
+        ):
+            raise PlanError("Cargo metadata has no m4_community_gates target")
+        commands.append(
+            [
+                "cargo",
+                "nextest",
+                "run",
+                "--archive-file",
+                str(directory / "m4-community-gates.tar.zst"),
+                "--workspace-remap",
+                remap,
+                "--no-tests=pass",
+                "--partition",
+                partition,
+            ]
+        )
+    return commands
+
+
 def command_groups_for(
     suite_name: str,
     plan: object,
@@ -1311,7 +1451,7 @@ def _cargo_metadata() -> object:
         raise PlanError("cargo metadata emitted invalid JSON") from error
 
 
-def _require_filterset_match(command: list[str]) -> None:
+def _require_nextest_match(command: list[str], *, label: str) -> None:
     if command[:3] != ["cargo", "nextest", "run"]:
         raise PlanError(f"cannot validate non-nextest command: {command!r}")
     unpartitioned = command
@@ -1359,11 +1499,12 @@ def _require_filterset_match(command: list[str]) -> None:
                 for testcase in testcases.values()
             )
     if matched == 0:
-        raise PlanError(
-            "workspace-lib filterset selected zero tests; "
-            "isolated module ownership has drifted"
-        )
-    print(f"workspace-lib filterset matched {matched} tests")
+        raise PlanError(f"{label} selected zero tests; archived ownership has drifted")
+    print(f"{label} matched {matched} tests")
+
+
+def _require_filterset_match(command: list[str]) -> None:
+    _require_nextest_match(command, label="workspace-lib filterset")
 
 
 def _write_github_output(path: str, plan: object, plan_json: str) -> None:
@@ -1392,6 +1533,22 @@ def _main(argv: list[str]) -> int:
     archive_parser = subparsers.add_parser("archive")
     archive_parser.add_argument("--plan-json", required=True)
     archive_parser.add_argument("--archive-file", required=True)
+
+    macos_archive_parser = subparsers.add_parser("macos-archive")
+    macos_archive_parser.add_argument("--plan-json", required=True)
+    macos_archive_parser.add_argument("--archive-dir", required=True)
+    macos_archive_parser.add_argument(
+        "--include-m4", choices=("true", "false"), required=True
+    )
+
+    macos_run_parser = subparsers.add_parser("macos-run")
+    macos_run_parser.add_argument("--plan-json", required=True)
+    macos_run_parser.add_argument("--archive-dir", required=True)
+    macos_run_parser.add_argument("--workspace-remap", required=True)
+    macos_run_parser.add_argument("--partition", required=True)
+    macos_run_parser.add_argument(
+        "--include-m4", choices=("true", "false"), required=True
+    )
 
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument(
@@ -1490,6 +1647,42 @@ def _main(argv: list[str]) -> int:
         executable_command = _executable_command(command)
         print("+", " ".join(executable_command), flush=True)
         subprocess.run(executable_command, check=True)
+        return 0
+    if arguments.command == "macos-archive":
+        archive_dir = _validated_path_argument(
+            arguments.archive_dir,
+            name="archive-dir",
+        )
+        Path(archive_dir).mkdir(parents=True, exist_ok=True)
+        commands = macos_archive_commands_for(
+            plan,
+            metadata,
+            archive_dir=archive_dir,
+            include_m4=arguments.include_m4 == "true",
+        )
+        if not commands:
+            raise PlanError("macOS archive route selected no tests")
+        for command in commands:
+            executable_command = _executable_command(command)
+            print("+", " ".join(executable_command), flush=True)
+            subprocess.run(executable_command, check=True)
+        return 0
+    if arguments.command == "macos-run":
+        commands = macos_archive_run_commands_for(
+            plan,
+            metadata,
+            archive_dir=arguments.archive_dir,
+            workspace_remap=arguments.workspace_remap,
+            partition=arguments.partition,
+            include_m4=arguments.include_m4 == "true",
+        )
+        if not commands:
+            raise PlanError("macOS archive route selected no tests")
+        for index, command in enumerate(commands, start=1):
+            _require_nextest_match(command, label=f"macOS archive {index}")
+            executable_command = _executable_command(command)
+            print("+", " ".join(executable_command), flush=True)
+            subprocess.run(executable_command, check=True)
         return 0
 
     commands = command_groups_for(
