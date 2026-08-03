@@ -40,7 +40,7 @@
 
 use super::evidence::read_counter;
 use super::independence::ELIGIBLE_EVIDENCE_PREDICATE;
-use super::relevance::{PairStatsValues, MAX_NEIGHBORS_PER_ENDPOINT};
+use super::relevance::{PairStatsValues, MAX_CANDIDATE_ENDPOINTS, MAX_NEIGHBORS_PER_ENDPOINT};
 use crate::WenlanError;
 use std::collections::BTreeMap;
 
@@ -52,6 +52,57 @@ pub const COUNTER_RELEVANCE_DECAY_REFERENCE: &str = "relevance_decay_reference";
 pub const DECAY_HALF_LIFE_DAYS: f64 = 180.0;
 
 const SECONDS_PER_DAY: f64 = 86_400.0;
+
+/// `R-BUDGET-QUERIES` (S0-95 instrument 2): statements per evaluation.
+pub const MAX_QUERIES_PER_EVALUATION: u32 = 4;
+
+/// `R-BUDGET-ROWS` (S0-95 instrument 1): rows *materialized* per evaluation.
+/// D9's word is "materializes", so this counts rows decoded from a cursor.
+pub const MAX_ROWS_PER_EVALUATION: u32 = 512;
+
+/// The two CI-gated budget instruments, enforced at the read rather than
+/// measured after it.
+///
+/// S0-95 is explicit that these are runtime counters or they are nothing: a
+/// textual `LIMIT 512` on an unindexed predicate visits the whole table and
+/// still reports 512 rows, and `EXPLAIN QUERY PLAN` reports the plan, not the
+/// work. The other two instruments (`FULLSCAN_STEP`, `SQLITE_SCANSTAT_NVISIT`)
+/// need a build this crate does not produce; §8.7 records them as declared
+/// deferrals, discharged by the local bench receipt.
+///
+/// Exceeding a bound is an error, not a truncation — a sweep that silently did
+/// less work would look identical to one that stayed in budget.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct QueryBudget {
+    pub queries: u32,
+    pub rows: u32,
+}
+
+impl QueryBudget {
+    /// Charge one statement, before it is issued.
+    pub fn charge_query(&mut self) -> Result<(), WenlanError> {
+        self.queries += 1;
+        if self.queries > MAX_QUERIES_PER_EVALUATION {
+            return Err(WenlanError::VectorDb(format!(
+                "M6 relevance evaluation issued {} queries; cap is {MAX_QUERIES_PER_EVALUATION}",
+                self.queries
+            )));
+        }
+        Ok(())
+    }
+
+    /// Charge one decoded row, as it is decoded.
+    pub fn charge_row(&mut self) -> Result<(), WenlanError> {
+        self.rows += 1;
+        if self.rows > MAX_ROWS_PER_EVALUATION {
+            return Err(WenlanError::VectorDb(format!(
+                "M6 relevance evaluation materialized {} rows; cap is {MAX_ROWS_PER_EVALUATION}",
+                self.rows
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// This space's stored decay reference, or `None` before the first pass.
 pub async fn decay_reference(
@@ -329,6 +380,164 @@ pub async fn eligible_groups(
     Ok(groups)
 }
 
+/// Pages this sweep should re-reference, capped at 32 **at the query** (S0-90).
+///
+/// Staleness is `m6_pair_stats.updated_generation` behind the current grouping
+/// generation, which is what that column is for; a page with no pair row at all
+/// is stale too. That makes the sweep drain — each turn advances 32 pages to
+/// the current generation and the next turn takes the following 32 — rather
+/// than re-sweeping one arbitrary prefix forever.
+///
+/// The cap is in the `LIMIT`, not a `Vec::truncate` afterwards: G6.8's break is
+/// exactly a post-hoc truncate, which leaves the returned count passing while
+/// the query still reads the whole table. One extra row is requested so
+/// truncation is *observable* without a second counting query — S0-90 requires
+/// a truncated candidate set to be recorded as truncated, and a set that
+/// silently filled its cap is a decision whose inputs cannot be reconstructed.
+pub async fn candidate_endpoints(
+    tx: &libsql::Transaction,
+    space: &str,
+    grouping_generation: i64,
+    budget: &mut QueryBudget,
+) -> Result<(Vec<String>, bool), WenlanError> {
+    budget.charge_query()?;
+    let mut rows = tx
+        .query(
+            "SELECT p.id FROM pages p
+              WHERE p.space = ?1
+                AND lower(p.title) <> 'overview'
+                AND NOT EXISTS (
+                    SELECT 1 FROM m6_pair_stats s
+                     WHERE s.space = ?1 AND s.updated_generation >= ?2
+                       AND (s.page_a = p.id OR s.page_b = p.id)
+                )
+              ORDER BY p.id ASC
+              LIMIT ?3",
+            libsql::params![
+                space,
+                grouping_generation,
+                MAX_CANDIDATE_ENDPOINTS as i64 + 1
+            ],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 candidate endpoints: {error}")))?;
+
+    let mut endpoints = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 candidate endpoints row: {error}")))?
+    {
+        budget.charge_row()?;
+        endpoints.push(row.get::<String>(0).map_err(|error| {
+            WenlanError::VectorDb(format!("m6 candidate endpoints decode: {error}"))
+        })?);
+    }
+
+    let truncated = endpoints.len() > MAX_CANDIDATE_ENDPOINTS;
+    endpoints.truncate(MAX_CANDIDATE_ENDPOINTS);
+    Ok((endpoints, truncated))
+}
+
+/// The eligible groups supporting **any** of `endpoints`, each with its bounded
+/// page set, ordered `independence_group_id ASC` (S0-92).
+///
+/// This is the bounded counterpart of [`eligible_groups`]: same shape, same
+/// shared eligibility predicate, restricted to the groups a turn can affect.
+pub async fn groups_touching(
+    tx: &libsql::Transaction,
+    space: &str,
+    endpoints: &[String],
+    budget: &mut QueryBudget,
+) -> Result<Vec<GroupSupport>, WenlanError> {
+    if endpoints.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (2..2 + endpoints.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH page_edges AS (
+             SELECT e.*, e.src_id AS page_id FROM edges e WHERE e.src_kind = 'page'
+             UNION ALL
+             SELECT e.*, e.dst_id AS page_id FROM edges e WHERE e.dst_kind = 'page'
+         ),
+         support AS (
+             SELECT r.independence_group_id AS gid,
+                    e.page_id                AS page_id,
+                    MAX(r.created_at)        AS support_recency
+               FROM page_edges e
+               JOIN provenance_roots r ON r.root_id = e.root_id
+              WHERE e.space = ?1
+                AND {ELIGIBLE_EVIDENCE_PREDICATE}
+              GROUP BY gid, e.page_id
+         ),
+         touched AS (
+             SELECT DISTINCT gid FROM support WHERE page_id IN ({placeholders})
+         ),
+         ranked AS (
+             SELECT s.gid, s.page_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.gid ORDER BY s.support_recency DESC, s.page_id ASC
+                    )                                              AS rank_in_group,
+                    COUNT(*) OVER (PARTITION BY s.gid)             AS degree,
+                    MAX(s.support_recency) OVER (PARTITION BY s.gid) AS newest
+               FROM support s
+               JOIN touched t ON t.gid = s.gid
+         )
+         SELECT gid, page_id, degree, newest
+           FROM ranked
+          WHERE rank_in_group <= {MAX_NEIGHBORS_PER_ENDPOINT}
+          ORDER BY gid ASC, rank_in_group ASC"
+    );
+
+    let mut params: Vec<libsql::Value> = Vec::with_capacity(1 + endpoints.len());
+    params.push(libsql::Value::Text(space.to_string()));
+    params.extend(
+        endpoints
+            .iter()
+            .map(|page| libsql::Value::Text(page.clone())),
+    );
+
+    budget.charge_query()?;
+    let mut rows = tx
+        .query(&sql, libsql::params_from_iter(params))
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 groups touching: {error}")))?;
+
+    let mut groups: Vec<GroupSupport> = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 groups touching row: {error}")))?
+    {
+        budget.charge_row()?;
+        let gid = row
+            .get::<String>(0)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 groups touching gid: {error}")))?;
+        let page = row
+            .get::<String>(1)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 groups touching page: {error}")))?;
+        let degree = row.get::<i64>(2).map_err(|error| {
+            WenlanError::VectorDb(format!("m6 groups touching degree: {error}"))
+        })?;
+        let newest = row
+            .get::<i64>(3)
+            .map_err(|error| WenlanError::VectorDb(format!("m6 groups touching age: {error}")))?;
+        match groups.last_mut() {
+            Some(last) if last.group_id == gid => last.pages.push(page),
+            _ => groups.push(GroupSupport {
+                group_id: gid,
+                degree,
+                newest_root_created_at: newest,
+                pages: vec![page],
+            }),
+        }
+    }
+    Ok(groups)
+}
+
 /// The whole space's pair table at a fixed decay reference — the **full** side
 /// of S0-91's oracle.
 ///
@@ -414,4 +623,193 @@ pub fn recompute_pair_stats(
             ((page_a.to_string(), page_b.to_string()), values)
         })
         .collect()
+}
+
+/// What one relevance turn did, in the shape the maintenance driver reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelevanceTurn {
+    /// Nothing was stale; the sweep found no work.
+    Idle,
+    /// Another holder owns `(relevance, space, grouping_generation)` — C2's
+    /// `LeaseHeld` signal, and **not** work.
+    LeaseHeld,
+    /// A slice ran. Carries S0-90's truncation record and S0-95's counters.
+    Swept(RelevanceSweep),
+}
+
+/// The receipt for one swept slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelevanceSweep {
+    pub endpoints_considered: usize,
+    /// S0-90: a candidate set that hit its cap is recorded as truncated, so an
+    /// attachment decision made over it can be reconstructed.
+    pub endpoints_truncated: bool,
+    pub pairs_written: usize,
+    pub adjacency_rows_written: usize,
+    pub decay_reference: i64,
+    pub budget: QueryBudget,
+}
+
+/// One bounded relevance slice (spec §5.1.2).
+///
+/// Ordering is the spec's: acquire, select, read, recompute, write, release —
+/// with the release in the same transaction as the last write, so a slice that
+/// dies mid-write cannot leave the lease released over a half-written table.
+///
+/// The caller owns the transaction and the commit. Nothing here calls a model:
+/// the sweep is four indexed reads and two writes.
+pub async fn run_relevance_sweep(
+    tx: &libsql::Transaction,
+    space_id: &str,
+    space: &str,
+    grouping_generation: i64,
+    attempt: i64,
+) -> Result<RelevanceTurn, WenlanError> {
+    let token = match super::leases::acquire(
+        tx,
+        super::leases::LeasePhase::Relevance,
+        space,
+        grouping_generation,
+        attempt,
+    )
+    .await?
+    {
+        Some(token) => token,
+        None => return Ok(RelevanceTurn::LeaseHeld),
+    };
+
+    let mut budget = QueryBudget::default();
+    let (endpoints, endpoints_truncated) =
+        candidate_endpoints(tx, space, grouping_generation, &mut budget).await?;
+    if endpoints.is_empty() {
+        super::leases::release(
+            tx,
+            super::leases::LeasePhase::Relevance,
+            space,
+            grouping_generation,
+            &token,
+        )
+        .await?;
+        return Ok(RelevanceTurn::Idle);
+    }
+
+    // The reference is established on the first pass and then held: every row
+    // this slice writes decays to the same instant as every row already
+    // written, which is what makes incremental and full agree exactly.
+    let reference = match decay_reference(tx, space_id).await? {
+        Some(reference) => reference,
+        None => advance_decay_reference(tx, space_id, space).await?,
+    };
+
+    let groups = groups_touching(tx, space, &endpoints, &mut budget).await?;
+    let stats = recompute_pair_stats(&groups, reference);
+
+    let mut pairs_written = 0usize;
+    for ((page_a, page_b), values) in &stats {
+        tx.execute(
+            "INSERT INTO m6_pair_stats
+                 (space, page_a, page_b, n11, n10, n01, n00,
+                  distinct_group_count, updated_generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(space, page_a, page_b) DO UPDATE SET
+                 n11 = excluded.n11, n10 = excluded.n10,
+                 n01 = excluded.n01, n00 = excluded.n00,
+                 distinct_group_count = excluded.distinct_group_count,
+                 updated_generation   = excluded.updated_generation",
+            libsql::params![
+                space,
+                page_a.as_str(),
+                page_b.as_str(),
+                values.n11,
+                values.n10,
+                values.n01,
+                values.n00,
+                values.distinct_group_count,
+                grouping_generation
+            ],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 pair stats upsert: {error}")))?;
+        pairs_written += 1;
+    }
+
+    let adjacency_rows_written = rewrite_adjacency(tx, space, &endpoints, &groups).await?;
+
+    // Same transaction as the last write (§5.1.2 step 6).
+    super::leases::release(
+        tx,
+        super::leases::LeasePhase::Relevance,
+        space,
+        grouping_generation,
+        &token,
+    )
+    .await?;
+
+    Ok(RelevanceTurn::Swept(RelevanceSweep {
+        endpoints_considered: endpoints.len(),
+        endpoints_truncated,
+        pairs_written,
+        adjacency_rows_written,
+        decay_reference: reference,
+        budget,
+    }))
+}
+
+/// Rewrite each swept endpoint's `m6_adjacency` rows: ranks 1..=64 ordered
+/// `(support_recency DESC, page_id ASC)` per S0-89.
+///
+/// Delete-then-insert rather than upsert, because rank is part of the primary
+/// key: a neighbour that moved from rank 3 to rank 5 would otherwise leave its
+/// old row behind and the endpoint would carry two rows for one neighbour,
+/// which the `UNIQUE(space, endpoint_kind, endpoint_id, neighbor_id)` index
+/// would reject only on the second insert — after the first had already
+/// corrupted the ranking.
+async fn rewrite_adjacency(
+    tx: &libsql::Transaction,
+    space: &str,
+    endpoints: &[String],
+    groups: &[GroupSupport],
+) -> Result<usize, WenlanError> {
+    let mut written = 0usize;
+    for endpoint in endpoints {
+        // Neighbours are the pages co-supported with this endpoint, each
+        // carrying the most recent group recency that connects them — the same
+        // ordering key the top-64 selection uses.
+        let mut recency: BTreeMap<&str, i64> = BTreeMap::new();
+        for group in groups {
+            if !group.pages.iter().any(|page| page == endpoint) {
+                continue;
+            }
+            for page in &group.pages {
+                if page == endpoint {
+                    continue;
+                }
+                let entry = recency.entry(page.as_str()).or_insert(i64::MIN);
+                *entry = (*entry).max(group.newest_root_created_at);
+            }
+        }
+
+        tx.execute(
+            "DELETE FROM m6_adjacency
+              WHERE space = ?1 AND endpoint_kind = 'page' AND endpoint_id = ?2",
+            libsql::params![space, endpoint.as_str()],
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m6 adjacency clear: {error}")))?;
+
+        let mut ranked: Vec<(&str, i64)> = recency.into_iter().collect();
+        ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+        for (rank, (neighbor, _)) in ranked.iter().take(MAX_NEIGHBORS_PER_ENDPOINT).enumerate() {
+            tx.execute(
+                "INSERT INTO m6_adjacency
+                     (space, endpoint_kind, endpoint_id, neighbor_id, rank)
+                 VALUES (?1, 'page', ?2, ?3, ?4)",
+                libsql::params![space, endpoint.as_str(), *neighbor, rank as i64 + 1],
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m6 adjacency insert: {error}")))?;
+            written += 1;
+        }
+    }
+    Ok(written)
 }

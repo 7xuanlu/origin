@@ -6,8 +6,9 @@
 
 use super::relevance_sweep::{
     advance_decay_reference, decay_reference, decayed_contribution, eligible_groups, group_support,
-    hub_weight, recompute_pair_stats, GroupSupport, COUNTER_RELEVANCE_DECAY_REFERENCE,
-    DECAY_HALF_LIFE_DAYS,
+    hub_weight, recompute_pair_stats, run_relevance_sweep, GroupSupport, RelevanceTurn,
+    COUNTER_RELEVANCE_DECAY_REFERENCE, DECAY_HALF_LIFE_DAYS, MAX_QUERIES_PER_EVALUATION,
+    MAX_ROWS_PER_EVALUATION,
 };
 use crate::m6::genesis_test_support::GenesisDb;
 use crate::m6::relevance::{qualified_co_citation, MAX_NEIGHBORS_PER_ENDPOINT};
@@ -567,4 +568,338 @@ async fn a_nonfinite_or_negative_hub_weight_contributes_nothing() {
             "hub weight {weight} must contribute zero, never poison a cell"
         );
     }
+}
+
+/// Two pages co-supported by `groups` distinct groups, so the pair clears D1.
+async fn seed_pair(db: &GenesisDb, space: &str, page_a: &str, page_b: &str, groups: usize) {
+    for index in 0..groups {
+        let group = format!("g-{page_a}-{page_b}-{index}");
+        for page in [page_a, page_b] {
+            seed_page_support(
+                db,
+                &format!("root-{group}-{page}"),
+                space,
+                &group,
+                page,
+                1_700_000_000 + index as i64,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_sweep_writes_both_tables_and_releases_its_lease() {
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    seed_pair(&db, "space-a", "page-a", "page-b", 3).await;
+
+    let tx = db.tx().await;
+    let turn = run_relevance_sweep(&tx, "space-id-a", "space-a", 7, 1)
+        .await
+        .expect("sweep");
+    tx.commit().await.expect("commit");
+
+    let sweep = match turn {
+        RelevanceTurn::Swept(sweep) => sweep,
+        other => panic!("expected a swept slice, got {other:?}"),
+    };
+    assert_eq!(sweep.endpoints_considered, 2);
+    assert!(!sweep.endpoints_truncated);
+    assert_eq!(sweep.pairs_written, 1, "one pair from two pages");
+    assert_eq!(sweep.adjacency_rows_written, 2, "each page names the other");
+
+    assert_eq!(
+        db.scalar(
+            "SELECT COUNT(*) FROM m6_pair_stats WHERE space = 'space-a'",
+            ()
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        db.scalar(
+            "SELECT distinct_group_count FROM m6_pair_stats
+              WHERE page_a = 'page-a' AND page_b = 'page-b'",
+            ()
+        )
+        .await,
+        3,
+        "three independent groups co-support the pair"
+    );
+    assert_eq!(
+        db.scalar(
+            "SELECT COUNT(*) FROM grouping_leases WHERE phase = 'relevance'",
+            ()
+        )
+        .await,
+        0,
+        "the lease is released in the same transaction as the last write"
+    );
+}
+
+#[tokio::test]
+async fn a_sweep_whose_lease_is_held_reports_lease_held_and_writes_nothing() {
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    seed_pair(&db, "space-a", "page-a", "page-b", 3).await;
+
+    // A live lease for the same (phase, space, generation), as a concurrent
+    // holder would leave it.
+    db.exec(
+        "INSERT INTO grouping_leases
+             (phase, space, input_generation, token, expires_at, attempt)
+         VALUES ('relevance', 'space-a', 7, 'other-worker', unixepoch() + 300, 1)",
+        (),
+    )
+    .await;
+
+    let tx = db.tx().await;
+    let turn = run_relevance_sweep(&tx, "space-id-a", "space-a", 7, 1)
+        .await
+        .expect("sweep");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(turn, RelevanceTurn::LeaseHeld);
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM m6_pair_stats", ()).await,
+        0,
+        "a refused turn writes nothing"
+    );
+    assert_eq!(
+        db.scalar(
+            "SELECT COUNT(*) FROM grouping_leases WHERE token = 'other-worker'",
+            ()
+        )
+        .await,
+        1,
+        "and never releases the other holder's lease"
+    );
+}
+
+#[tokio::test]
+async fn a_space_with_nothing_stale_sweeps_idle() {
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+
+    let tx = db.tx().await;
+    let turn = run_relevance_sweep(&tx, "space-id-a", "space-a", 7, 1)
+        .await
+        .expect("sweep");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(turn, RelevanceTurn::Idle);
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM grouping_leases", ()).await,
+        0,
+        "an idle turn still releases, or the next turn is locked out for a TTL"
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_drains_instead_of_re_sweeping_one_prefix() {
+    // Liveness. `updated_generation` is what makes a swept page stop being
+    // stale; without it every turn re-sweeps the same lexicographic prefix and
+    // the tail is never reached, which every safety gate would still pass.
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    // 40 pages > the 32 cap, so it takes more than one turn.
+    for index in 0..20 {
+        seed_pair(
+            &db,
+            "space-a",
+            &format!("page-{:03}", index * 2),
+            &format!("page-{:03}", index * 2 + 1),
+            3,
+        )
+        .await;
+    }
+
+    let mut turns = 0;
+    loop {
+        let tx = db.tx().await;
+        let turn = run_relevance_sweep(&tx, "space-id-a", "space-a", 7, 1)
+            .await
+            .expect("sweep");
+        tx.commit().await.expect("commit");
+        turns += 1;
+        if turn == RelevanceTurn::Idle {
+            break;
+        }
+        assert!(
+            turns < 10,
+            "the sweep is not draining; it re-swept a prefix"
+        );
+    }
+
+    // Every page ended up covered by at least one pair row.
+    let covered = db
+        .scalar(
+            "SELECT COUNT(DISTINCT id) FROM pages p
+              WHERE p.space = 'space-a'
+                AND EXISTS (SELECT 1 FROM m6_pair_stats s
+                             WHERE s.space = 'space-a'
+                               AND (s.page_a = p.id OR s.page_b = p.id))",
+            (),
+        )
+        .await;
+    assert_eq!(covered, 40, "every page was reached, not just the first 32");
+}
+
+#[tokio::test]
+async fn a_candidate_set_that_hits_its_cap_is_recorded_as_truncated() {
+    // S0-90: an attachment decision made over a silently truncated candidate
+    // set is a decision whose inputs cannot be reconstructed.
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    for index in 0..20 {
+        seed_pair(
+            &db,
+            "space-a",
+            &format!("page-{:03}", index * 2),
+            &format!("page-{:03}", index * 2 + 1),
+            3,
+        )
+        .await;
+    }
+
+    let tx = db.tx().await;
+    let turn = run_relevance_sweep(&tx, "space-id-a", "space-a", 7, 1)
+        .await
+        .expect("sweep");
+    tx.commit().await.expect("commit");
+
+    let sweep = match turn {
+        RelevanceTurn::Swept(sweep) => sweep,
+        other => panic!("expected a swept slice, got {other:?}"),
+    };
+    assert_eq!(
+        sweep.endpoints_considered, 32,
+        "the cap is applied at the query"
+    );
+    assert!(
+        sweep.endpoints_truncated,
+        "40 stale pages against a 32 cap is a truncated set and must say so"
+    );
+}
+
+#[tokio::test]
+async fn a_sweep_stays_inside_the_query_and_row_budget() {
+    // G6.11b and G6.11c. Both counters are runtime counts, not SQL text: a
+    // `LIMIT 512` on an unindexed predicate visits the whole table and still
+    // reports 512 rows, which is why S0-95 makes the counter normative.
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    for index in 0..20 {
+        seed_pair(
+            &db,
+            "space-a",
+            &format!("page-{:03}", index * 2),
+            &format!("page-{:03}", index * 2 + 1),
+            3,
+        )
+        .await;
+    }
+
+    let tx = db.tx().await;
+    let turn = run_relevance_sweep(&tx, "space-id-a", "space-a", 7, 1)
+        .await
+        .expect("sweep");
+    tx.commit().await.expect("commit");
+
+    let sweep = match turn {
+        RelevanceTurn::Swept(sweep) => sweep,
+        other => panic!("expected a swept slice, got {other:?}"),
+    };
+    assert!(
+        sweep.budget.queries <= MAX_QUERIES_PER_EVALUATION,
+        "{} queries exceeds the cap of {MAX_QUERIES_PER_EVALUATION}",
+        sweep.budget.queries
+    );
+    assert!(
+        sweep.budget.rows <= MAX_ROWS_PER_EVALUATION,
+        "{} rows exceeds the cap of {MAX_ROWS_PER_EVALUATION}",
+        sweep.budget.rows
+    );
+    assert!(
+        sweep.budget.queries > 0 && sweep.budget.rows > 0,
+        "a budget of zero would pass every bound without reading anything"
+    );
+}
+
+#[tokio::test]
+async fn adjacency_ranks_are_contiguous_from_one_and_ordered_by_recency() {
+    // S0-89 plus the table's `rank BETWEEN 1 AND 64` CHECK. A rewrite that
+    // upserted instead of deleting first would leave a neighbour at its old
+    // rank and the endpoint would carry two rows for one neighbour.
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    // One group over four pages, so page-hub gets three ranked neighbours.
+    for (page, created_at) in [
+        ("page-hub", 1_000),
+        ("page-old", 1_000),
+        ("page-mid", 1_000),
+        ("page-new", 1_000),
+    ] {
+        seed_page_support(
+            &db,
+            &format!("root-{page}"),
+            "space-a",
+            "g-one",
+            page,
+            created_at,
+        )
+        .await;
+    }
+
+    let tx = db.tx().await;
+    run_relevance_sweep(&tx, "space-id-a", "space-a", 7, 1)
+        .await
+        .expect("sweep");
+    tx.commit().await.expect("commit");
+
+    let rows = db
+        .scalar(
+            "SELECT COUNT(*) FROM m6_adjacency
+              WHERE space = 'space-a' AND endpoint_id = 'page-hub'",
+            (),
+        )
+        .await;
+    assert_eq!(rows, 3, "three neighbours");
+    assert_eq!(
+        db.scalar(
+            "SELECT MIN(rank) FROM m6_adjacency WHERE endpoint_id = 'page-hub'",
+            ()
+        )
+        .await,
+        1,
+        "ranks start at 1, which the CHECK requires"
+    );
+    assert_eq!(
+        db.scalar(
+            "SELECT COUNT(DISTINCT rank) FROM m6_adjacency WHERE endpoint_id = 'page-hub'",
+            ()
+        )
+        .await,
+        3,
+        "and are contiguous, never duplicated"
+    );
+
+    // Re-sweeping the same endpoint must not accumulate rows.
+    db.exec("UPDATE m6_pair_stats SET updated_generation = 0", ())
+        .await;
+    let tx = db.tx().await;
+    run_relevance_sweep(&tx, "space-id-a", "space-a", 7, 2)
+        .await
+        .expect("second sweep");
+    tx.commit().await.expect("commit");
+    assert_eq!(
+        db.scalar(
+            "SELECT COUNT(*) FROM m6_adjacency WHERE endpoint_id = 'page-hub'",
+            ()
+        )
+        .await,
+        3,
+        "a rewrite replaces the endpoint's rows rather than adding to them"
+    );
 }
