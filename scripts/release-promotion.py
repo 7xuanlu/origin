@@ -130,10 +130,19 @@ def _tree_sha(api: PromotionApi, repository: str, commit_sha: str) -> str:
 
 
 def _release_context(
-    api: PromotionApi, repository: str, main_sha: str
+    api: PromotionApi,
+    repository: str,
+    main_sha: str,
+    *,
+    pr_api: MERGE_PROOF.JsonApi | None = None,
 ) -> tuple[object | None, str | None]:
+    # GitHub's current REST version can omit merge_commit_sha for historical
+    # squash merges. Keep the compatibility API deliberately confined to PR
+    # endpoints; the modern client continues to authenticate Actions artifacts
+    # and their digest metadata below.
+    proof_pr_api = pr_api or api
     associated = _array(
-        api.get_json(
+        proof_pr_api.get_json(
             f"/repos/{repository}/commits/{main_sha}/pulls",
             params={"per_page": 100},
         ),
@@ -171,7 +180,7 @@ def _release_context(
             return None, None
         pr_number = int(match.group(1))
         fallback = _mapping(
-            api.get_json(f"/repos/{repository}/pulls/{pr_number}"),
+            proof_pr_api.get_json(f"/repos/{repository}/pulls/{pr_number}"),
             f"pull request {pr_number}",
         )
         fallback_head = _mapping(fallback.get("head"), "release title pull request head")
@@ -198,10 +207,11 @@ def _release_context(
         ref="refs/heads/main",
         sha=main_sha,
         # GitHub's commit-to-PR association can be briefly inconsistent just
-        # after a squash merge. Reuse the snapshot that already identified the
-        # release branch instead of issuing an immediate second lookup that can
-        # transiently return an empty list.
+        # after a squash merge. Reuse the compatibility snapshot that already
+        # identified the release branch instead of issuing an immediate second
+        # lookup that can transiently return an empty list.
         associated_pulls=associated,
+        pr_api=proof_pr_api,
     )
     if not proof.verified:
         raise PromotionError(f"release merge proof failed: {proof.reason}")
@@ -576,6 +586,7 @@ def verify_main(
     *,
     wait_seconds: int = 0,
     sleep=time.sleep,
+    pr_api: MERGE_PROOF.JsonApi | None = None,
 ) -> GateResult:
     _sha(main_sha, "main SHA")
     if re.fullmatch(r"[^/\s]+/[^/\s]+", repository) is None:
@@ -587,7 +598,7 @@ def verify_main(
         repository_id = _positive_int(repository_info.get("id"), "repository id")
         if repository_info.get("full_name") != repository:
             raise PromotionError("repository metadata differs from workflow scope")
-        proof, head_sha = _release_context(api, repository, main_sha)
+        proof, head_sha = _release_context(api, repository, main_sha, pr_api=pr_api)
         if proof is None or head_sha is None:
             return GateResult(
                 "ordinary",
@@ -1091,8 +1102,9 @@ def consume_main_receipt(
     *,
     main_run_id: int | None = None,
     main_run_attempt: int | None = None,
+    pr_api: MERGE_PROOF.JsonApi | None = None,
 ) -> tuple[GateResult, dict | None]:
-    result = verify_main(api, repository, main_sha, temp_root)
+    result = verify_main(api, repository, main_sha, temp_root, pr_api=pr_api)
     if result.state != "validated":
         return result, None
     try:
@@ -1263,6 +1275,17 @@ def _main(argv: list[str]) -> int:
         os.environ.get("GITHUB_TOKEN", ""),
         os.environ.get("GITHUB_API_URL", "https://api.github.com"),
     )
+    def compatibility_pr_api() -> MERGE_PROOF.JsonApi:
+        # The release-candidate validator deliberately uses the current REST
+        # API because artifact digests are part of its trust boundary. Merge
+        # proof is narrower: GitHub's 2026 API can return a null
+        # merge_commit_sha for an otherwise immutable historical squash merge,
+        # so PR endpoints alone use the compatibility version. The verifier
+        # still requires that exact SHA.
+        return MERGE_PROOF.GitHubApi(
+            os.environ.get("GITHUB_TOKEN", ""),
+            api_url=os.environ.get("GITHUB_API_URL", "https://api.github.com"),
+        )
     if args.command == "verify-main-ci":
         try:
             run = verify_main_ci(
@@ -1292,12 +1315,14 @@ def _main(argv: list[str]) -> int:
         return 0
 
     if args.command == "gate-main":
+        pr_api = compatibility_pr_api()
         result = verify_main(
             api,
             args.repository,
             args.sha,
             args.temp_root,
             wait_seconds=max(args.wait_seconds, 0),
+            pr_api=pr_api,
         )
         if result.state == "validated" and args.main_run_id is not None:
             result.main_run_id = _positive_int(args.main_run_id, "main run id")
@@ -1311,6 +1336,7 @@ def _main(argv: list[str]) -> int:
         return 0 if result.state != "blocked" else 2
 
     if args.command == "consume-main-receipt":
+        pr_api = compatibility_pr_api()
         result, plan = consume_main_receipt(
             api,
             args.repository,
@@ -1318,6 +1344,7 @@ def _main(argv: list[str]) -> int:
             args.temp_root,
             main_run_id=args.main_run_id,
             main_run_attempt=args.main_run_attempt,
+            pr_api=pr_api,
         )
         _write_outputs(args.github_output, result)
         if result.state == "validated" and args.plan_output is not None:

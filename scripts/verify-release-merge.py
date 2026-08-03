@@ -150,7 +150,6 @@ def _release_pr_candidates(pulls: object, sha: str) -> list[dict]:
         if (
             pr.get("state") == "closed"
             and isinstance(pr.get("merged_at"), str)
-            and pr.get("merge_commit_sha") == sha
             and base.get("ref") == "main"
             and head.get("ref") == RELEASE_BRANCH
         ):
@@ -175,6 +174,8 @@ def _release_files(
     repository: str,
     pr_number: int,
     changed_files: int,
+    *,
+    pr_api: JsonApi | None = None,
 ) -> set[str]:
     if changed_files < 1 or changed_files > MAX_PR_FILES:
         raise ApiError(
@@ -184,7 +185,7 @@ def _release_files(
     page = 1
     while len(filenames) < changed_files:
         raw_files = _list(
-            api.get_json(
+            (pr_api or api).get_json(
                 f"/repos/{repository}/pulls/{pr_number}/files",
                 params={"per_page": 100, "page": page},
             ),
@@ -251,6 +252,7 @@ def verify_release_merge(
     ref: str,
     sha: str,
     associated_pulls: object | None = None,
+    pr_api: JsonApi | None = None,
 ) -> ReleaseProof:
     if event_name != "push" or ref != MAIN_REF:
         return ReleaseProof(False, "event is not a push to refs/heads/main")
@@ -262,7 +264,7 @@ def verify_release_merge(
     try:
         pulls = associated_pulls
         if pulls is None:
-            pulls = api.get_json(
+            pulls = (pr_api or api).get_json(
                 f"/repos/{repository}/commits/{sha}/pulls",
                 params={"per_page": 100},
             )
@@ -277,7 +279,7 @@ def verify_release_merge(
         if not isinstance(pr_number, int) or pr_number < 1:
             raise ApiError("release PR number is invalid")
         pr = _mapping(
-            api.get_json(f"/repos/{repository}/pulls/{pr_number}"),
+            (pr_api or api).get_json(f"/repos/{repository}/pulls/{pr_number}"),
             f"pull request {pr_number}",
         )
         base = _mapping(pr.get("base"), "pull request base")
@@ -298,7 +300,7 @@ def verify_release_merge(
         if not isinstance(head_sha, str) or not SHA_RE.fullmatch(head_sha):
             raise ApiError("release PR head SHA is invalid")
 
-        _release_files(api, repository, pr_number, changed_files)
+        _release_files(api, repository, pr_number, changed_files, pr_api=pr_api)
         if not _has_successful_conclusion(api, repository, head_sha):
             return ReleaseProof(
                 False,
