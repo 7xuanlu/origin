@@ -3,6 +3,48 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use tempfile::tempdir;
 
+/// The five community-reader membership lists must agree.
+///
+/// They are deliberately not collapsed into one lookup — the gate SQL survived
+/// four independent review rounds, and re-opening it to prevent a drift that
+/// has not happened would buy speculative safety with real review risk. This is
+/// the cheaper half of that trade: a consumer present in
+/// `COMMUNITY_READER_CONSUMERS` but missing from the gate's own match would be
+/// permanently dark and *silent*, because the gate fails closed by returning
+/// `0=1`. Silence is the whole hazard, so it gets a test rather than a comment.
+#[tokio::test]
+async fn community_reader_consumer_lists_agree() {
+    let (db, _dir) = test_db().await;
+
+    for consumer in COMMUNITY_READER_CONSUMERS {
+        assert_ne!(
+            community_reader_durable_gate_sql(consumer),
+            "0=1",
+            "{consumer} is a listed consumer but the gate SQL fails it closed as unknown"
+        );
+        // `set_community_reader_cutover` rejects an unknown consumer, so a
+        // successful call proves membership in `is_known_community_reader`
+        // without making that private predicate public.
+        db.set_community_reader_cutover(consumer, false)
+            .await
+            .unwrap_or_else(|error| panic!("{consumer} is not a known community reader: {error}"));
+    }
+
+    // The reverse direction, so the agreement above is not vacuously true of
+    // every string that happens to be passed in.
+    assert_eq!(
+        community_reader_durable_gate_sql("not_a_consumer"),
+        "0=1",
+        "an unlisted consumer must fail closed"
+    );
+    assert!(
+        db.set_community_reader_cutover("not_a_consumer", true)
+            .await
+            .is_err(),
+        "an unlisted consumer must not be able to record cutover intent"
+    );
+}
+
 pub(crate) mod community_grouping_test_hooks {
     use super::*;
 

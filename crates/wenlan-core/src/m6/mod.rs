@@ -20,6 +20,12 @@ pub mod leases;
 pub mod oracle;
 pub mod recovery;
 pub mod signals;
+// PR-B3 is the seam's first caller — it decides what the shadow loop passes as
+// `community_partition_durable`. Kept crate-private with the same reasoning as
+// the staged writers below.
+#[allow(dead_code)]
+pub(crate) mod community_gate;
+
 // Migration 109 is schema-first: PR-B/PR-C wire these transaction-scoped
 // writers. Keep the staged APIs crate-private without exposing speculative
 // public surface solely to satisfy dead-code linting.

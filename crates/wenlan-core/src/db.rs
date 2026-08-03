@@ -2512,6 +2512,25 @@ pub struct RefinementProposal {
 
 pub(crate) const COMMUNITY_SUMMARY_BUCKETS_CONSUMER: &str = "summary_buckets";
 pub(crate) const COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER: &str = "summary_eligibility";
+/// M6's genesis reader. Named for what it reads, not for the milestone that
+/// introduced it — the other two consumers carry no milestone prefix, and the
+/// stored value is permanent from its first write while "M6" becomes history.
+pub(crate) const COMMUNITY_GENESIS_CANDIDATES_CONSUMER: &str = "genesis_candidates";
+
+/// Every community reader the durable gate knows about.
+///
+/// The five membership lists below (this one, the gate SQL's match, the
+/// known-reader match, the reconcile loop, and the `output_delta` branch) are
+/// deliberately NOT collapsed into one lookup: `community_reader_durable_gate_sql`
+/// survived four independent review rounds and is not worth re-opening to
+/// prevent a drift that has not happened. `consumer_lists_agree` is the teeth
+/// instead — a consumer known to one list and missing from the gate would be
+/// permanently dark and silent, and that test fails loudly instead.
+pub(crate) const COMMUNITY_READER_CONSUMERS: [&str; 3] = [
+    COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+    COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+    COMMUNITY_GENESIS_CANDIDATES_CONSUMER,
+];
 
 fn community_relevant_spaces_digest(spaces: impl IntoIterator<Item = String>) -> String {
     let mut spaces = spaces.into_iter().collect::<Vec<_>>();
@@ -2667,7 +2686,9 @@ pub(crate) fn community_consumer_contract_version() -> String {
 pub(crate) fn community_reader_durable_gate_sql(consumer: &str) -> String {
     if !matches!(
         consumer,
-        COMMUNITY_SUMMARY_BUCKETS_CONSUMER | COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER
+        COMMUNITY_SUMMARY_BUCKETS_CONSUMER
+            | COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER
+            | COMMUNITY_GENESIS_CANDIDATES_CONSUMER
     ) {
         // Fail closed rather than interpolate an unvetted string into SQL.
         return "0=1".to_string();
@@ -15030,7 +15051,9 @@ impl MemoryDB {
     fn is_known_community_reader(consumer: &str) -> bool {
         matches!(
             consumer,
-            COMMUNITY_SUMMARY_BUCKETS_CONSUMER | COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER
+                | COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER
+                | COMMUNITY_GENESIS_CANDIDATES_CONSUMER
         )
     }
 
@@ -15094,10 +15117,7 @@ impl MemoryDB {
     /// their read gate remains fail-closed until these current receipts exist.
     pub async fn reconcile_pending_community_readers(&self) -> Result<usize, WenlanError> {
         let mut spaces_checked = 0usize;
-        for consumer in [
-            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
-            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
-        ] {
+        for consumer in COMMUNITY_READER_CONSUMERS {
             if self
                 .community_reader_parity_needs_reconcile(consumer)
                 .await?
@@ -15405,7 +15425,14 @@ impl MemoryDB {
         let source_coverage_delta = legacy_sources
             .symmetric_difference(&durable_sources)
             .count();
-        let output_delta = if consumer == COMMUNITY_SUMMARY_BUCKETS_CONSUMER {
+        // Genesis reads the partition itself, exactly as summary_buckets does —
+        // whole-group membership, not the min-members eligibility cut. The
+        // eligibility arm would report permanent drift against a structurally
+        // empty legacy side.
+        let output_delta = if matches!(
+            consumer,
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER | COMMUNITY_GENESIS_CANDIDATES_CONSUMER
+        ) {
             let legacy_partitions = legacy.iter().cloned().collect::<BTreeSet<_>>();
             let durable_partitions = durable.iter().cloned().collect::<BTreeSet<_>>();
             legacy_partitions
