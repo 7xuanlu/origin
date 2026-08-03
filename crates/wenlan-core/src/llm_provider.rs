@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -125,12 +126,44 @@ pub trait LlmProvider: Send + Sync {
     fn model_id(&self) -> String {
         "unknown".to_string()
     }
+    /// Immutable model artifact version when the provider can prove one.
+    fn model_version(&self) -> Option<String> {
+        None
+    }
     /// Runtime backend selected for an on-device provider. Non-local
     /// providers return `None`; callers can expose this as optional status
     /// without downcasting the trait object.
     fn inference_runtime_info(&self) -> Option<wenlan_types::responses::OnDeviceInferenceStatus> {
         None
     }
+}
+
+/// Build an immutable model version from the hf-hub snapshot path that was loaded.
+pub(crate) fn hf_snapshot_model_version(repo_id: &str, model_path: &Path) -> Option<String> {
+    if repo_id.trim().is_empty() {
+        return None;
+    }
+
+    for snapshot_dir in model_path.ancestors() {
+        let snapshots_dir = snapshot_dir.parent()?;
+        if snapshots_dir.file_name()? != "snapshots" {
+            continue;
+        }
+
+        let snapshot_hash = snapshot_dir.file_name()?.to_str()?;
+        let filename = model_path
+            .strip_prefix(snapshot_dir)
+            .ok()?
+            .to_str()?
+            .replace('\\', "/");
+        if snapshot_hash.is_empty() || filename.is_empty() {
+            return None;
+        }
+
+        return Some(format!("hf:{repo_id}@{snapshot_hash}/{filename}"));
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +397,7 @@ pub struct OnDeviceProvider {
     model_context_size: u32,
     model_max_output: u32,
     resolved_model_id: String,
+    resolved_model_version: String,
     runtime_info: wenlan_types::responses::OnDeviceInferenceStatus,
 }
 
@@ -412,6 +446,13 @@ impl OnDeviceProvider {
         );
         let model_path =
             LlmEngine::download_model_by_spec(model_spec.repo_id, model_spec.filename)?;
+        let resolved_model_version = hf_snapshot_model_version(model_spec.repo_id, &model_path)
+            .ok_or_else(|| {
+                crate::error::WenlanError::Llm(format!(
+                    "model path is not an hf-hub snapshot artifact: {}",
+                    model_path.display()
+                ))
+            })?;
         let prompts =
             crate::prompts::PromptRegistry::load(&crate::prompts::PromptRegistry::override_dir());
 
@@ -889,6 +930,7 @@ impl OnDeviceProvider {
             model_context_size: model_spec.context_size,
             model_max_output: model_spec.max_output_tokens,
             resolved_model_id: model_spec.id.to_string(),
+            resolved_model_version,
             runtime_info,
         })
     }
@@ -961,6 +1003,10 @@ impl LlmProvider for OnDeviceProvider {
 
     fn model_id(&self) -> String {
         self.resolved_model_id.clone()
+    }
+
+    fn model_version(&self) -> Option<String> {
+        Some(self.resolved_model_version.clone())
     }
 
     fn recommended_max_output(&self) -> u32 {
@@ -1682,6 +1728,21 @@ impl LlmProvider for CannedLlmProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hf_snapshot_model_version_includes_repo_snapshot_and_filename() {
+        let path = Path::new(
+            "/cache/huggingface/hub/models--Qwen--Qwen3/snapshots/012345abcdef/models/qwen.gguf",
+        );
+
+        assert_eq!(
+            hf_snapshot_model_version("Qwen/Qwen3", path).as_deref(),
+            Some("hf:Qwen/Qwen3@012345abcdef/models/qwen.gguf")
+        );
+        assert!(
+            hf_snapshot_model_version("Qwen/Qwen3", Path::new("/cache/blobs/qwen.gguf")).is_none()
+        );
+    }
 
     #[tokio::test]
     async fn canned_llm_returns_by_prompt() {

@@ -16,11 +16,16 @@
 //! control, which is why `truth_guard` has a test that goes RED when the write
 //! is removed.
 //!
-//! **The cutover generation** is why PR-B changes no behavior. Every adapter is
-//! installed and mutation-tested against a generation the tests advance
-//! themselves; in production it stays 0 and every adapter is pass-through. PR-C
-//! advances it once, through the fenced ceremony -- the same shape as the M4
-//! reader cutover, deliberately.
+//! **The cutover generation** is the durable result of the prior reader
+//! ceremony. `0` keeps every adapter pass-through; a committed nonzero value is
+//! forward-only and is not rolled back when a later machine policy returns to
+//! shadow mode.
+//!
+//! **Machine enforcement is separate from promotion.** Existing installations
+//! may already have a committed cutover generation, but M6 claim promotion must
+//! first run shadow/advisory against the real corpus. Its scores and evaluated
+//! outcomes stay durable while `claim_promoter_enforcement` is absent; only the
+//! exact value `1` lets an evaluated machine failure affect whole-page exposure.
 //!
 //! **The fence** is what makes "advances it once" true rather than aspirational.
 //! Pages are projected at runtime, so a page written while the ceremony is
@@ -37,6 +42,11 @@ use std::collections::HashMap;
 /// `app_metadata` key holding the durable cutover generation. Absent or `0`
 /// means every truth adapter is inert.
 pub const TRUTH_CUTOVER_GENERATION_KEY: &str = "truth_cutover_generation";
+
+/// Separate switch for enforcing machine claim verdicts against whole-page
+/// visibility. Absent (and every value except `"1"`) keeps promoter output in
+/// shadow/advisory mode while preserving its durable scores and outcomes.
+const CLAIM_PROMOTER_ENFORCEMENT_KEY: &str = "claim_promoter_enforcement";
 
 /// `app_metadata` key holding the durable cutover fence, as `"<epoch>:<phase>"`.
 /// Absent is the initial fence: epoch 0, phase off.
@@ -304,8 +314,9 @@ impl MemoryDB {
         Ok(out)
     }
 
-    /// The durable cutover generation. `0` -- the production value throughout
-    /// PR-B -- means every truth adapter is pass-through.
+    /// The durable cutover generation. `0` means every truth adapter is
+    /// pass-through. A nonzero generation does not, by itself, enforce M6 claim
+    /// promoter failures; that policy has its own default-off switch.
     ///
     /// ponytail: one indexed `app_metadata` read per request. Cache it on
     /// `MemoryDB` behind an atomic if it ever shows up in a profile; a
@@ -326,6 +337,11 @@ impl MemoryDB {
     /// that absence is the normal case, so reading it as "unsupported" would
     /// condemn every page. `evaluated_at` is what separates the two, and it is
     /// NULL for every row migration 99's backfill wrote.
+    ///
+    /// An evaluated provisional row is likewise exposed as `Unevaluated` while
+    /// the promoter-enforcement switch is off. The raw evaluated row remains in
+    /// place for corpus measurement; only its page-visibility consequence is
+    /// shadowed.
     ///
     /// `human_reviewed` is **computed, not read**. The stored bit is a
     /// historical receipt — "somebody approved this page, at this version, with
@@ -377,16 +393,46 @@ impl MemoryDB {
         if page_ids.is_empty() {
             return Ok(out);
         }
-        // How far the startup reconciliation pass has re-proved, read once for
-        // the whole batch. The pass is bounded per batch so a large vault does
-        // not hold the port shut, and bounding it is only safe if the part it
-        // has not reached stops being asserted -- otherwise truncating the scan
-        // serves exactly the stale `supported` the pass exists to retract.
-        //
-        // Taken before the connection lock, like `truth_cutover_generation`
-        // above it, because `get_app_metadata` acquires the same mutex.
-        let unproved_after = self.support_reconcile_frontier().await?;
         let conn = self.conn.lock().await;
+        // Read the reconciliation frontier, shadow switch, truth rows, and
+        // eligibility registry under one connection guard. Judge activation
+        // atomically changes the registry generation and resets the frontier;
+        // releasing the guard between those reads would permit a torn snapshot
+        // that combines the new registry with a stale completed frontier.
+        let (unproved_after, enforce_promoter) = {
+            let mut rows = conn
+                .query(
+                    "SELECT key, value FROM app_metadata WHERE key IN (?1, ?2)",
+                    libsql::params![
+                        super::claim_derivation::SUPPORT_RECONCILE_FRONTIER_KEY,
+                        CLAIM_PROMOTER_ENFORCEMENT_KEY,
+                    ],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("truth read controls: {e}")))?;
+            let mut frontier = None;
+            let mut enforce = false;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("truth read controls next: {e}")))?
+            {
+                let key: String = row
+                    .get(0)
+                    .map_err(|e| WenlanError::VectorDb(format!("truth read controls key: {e}")))?;
+                let value: String = row.get(1).map_err(|e| {
+                    WenlanError::VectorDb(format!("truth read controls value: {e}"))
+                })?;
+                if key == super::claim_derivation::SUPPORT_RECONCILE_FRONTIER_KEY {
+                    if value != super::claim_derivation::SUPPORT_RECONCILE_COMPLETE {
+                        frontier = Some(value);
+                    }
+                } else if key == CLAIM_PROMOTER_ENFORCEMENT_KEY {
+                    enforce = value.trim() == "1";
+                }
+            }
+            (frontier, enforce)
+        };
         // Chunked because SQLite caps bound parameters, and a page list comes
         // from a response payload whose length nobody here controls.
         for chunk in page_ids.chunks(400) {
@@ -398,7 +444,36 @@ impl MemoryDB {
                 "SELECT t.page_id, t.support_status, t.human_reviewed, t.evaluated_at,
                         t.page_version, p.version, p.content,
                         t.reviewed_page_version, t.reviewed_page_digest,
-                        m.page_version_digest, m.extractor_version
+                        m.page_version_digest, m.extractor_version,
+                        m.inventory_count > 0
+                        AND (
+                            SELECT COUNT(*)
+                              FROM page_version_claims membership
+                             WHERE membership.page_id = t.page_id
+                               AND membership.page_version = t.page_version
+                        ) = m.inventory_count
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM page_version_claims pvc
+                             WHERE pvc.page_id = t.page_id
+                               AND pvc.page_version = t.page_version
+                               AND NOT EXISTS (
+                                   SELECT 1
+                                     FROM edges e
+                                     JOIN claim_judge_eligibility j
+                                       ON j.model_id = json_extract(e.payload, '$.model_id')
+                                      AND j.model_version = json_extract(e.payload, '$.model_version')
+                                      AND j.prompt_version = json_extract(e.payload, '$.prompt_version')
+                                    WHERE e.edge_type = 'supports'
+                                      AND e.src_kind = 'claim_revision'
+                                      AND e.src_id = pvc.claim_revision_id
+                                      AND e.valid_until IS NULL
+                                      AND e.superseded_by IS NULL
+                                      AND j.state IN ('active', 'draining')
+                                      AND json_type(e.payload, '$.score') IN ('integer', 'real')
+                                      AND json_extract(e.payload, '$.score') >= j.threshold
+                               )
+                        ) AS live_support_eligible
                    FROM page_truth_state t
                    LEFT JOIN pages p ON p.id = t.page_id
                    LEFT JOIN claim_derivation_markers m
@@ -452,6 +527,7 @@ impl MemoryDB {
                 // holds, and the numbers still agree.
                 let marker_digest: Option<String> = row.get(9).unwrap_or(None);
                 let marker_extractor: Option<i64> = row.get(10).unwrap_or(None);
+                let live_support_eligible: i64 = row.get(11).unwrap_or(0);
                 let live_digest = live_content
                     .as_deref()
                     .map(crate::provenance::revision_content_digest);
@@ -503,8 +579,20 @@ impl MemoryDB {
                     // every other unknown here does -- the page keeps its file
                     // and stops being asserted as supported.
                     ("supported", _) if !reconciled => crate::truth_contract::Support::Unevaluated,
+                    // Materialized reconciliation is deliberately bounded, but
+                    // registry changes take effect immediately. Every claim in
+                    // this exact page version must still have a live support
+                    // edge whose exact judge triple is eligible at its current
+                    // threshold; the stored row remains a reconciliation receipt.
+                    ("supported", _) if live_support_eligible != 1 => {
+                        crate::truth_contract::Support::Unevaluated
+                    }
                     ("supported", _) => crate::truth_contract::Support::Supported,
-                    (_, Some(_)) => crate::truth_contract::Support::Unsupported,
+                    (_, Some(_)) if enforce_promoter => crate::truth_contract::Support::Unsupported,
+                    // Keep the durable evaluated outcome for corpus measurement,
+                    // but do not let it hide or archive the whole page while the
+                    // promoter is running shadow/advisory.
+                    (_, Some(_)) => crate::truth_contract::Support::Unevaluated,
                     (_, None) => crate::truth_contract::Support::Unevaluated,
                 };
                 // Human approval outranks every machine verdict

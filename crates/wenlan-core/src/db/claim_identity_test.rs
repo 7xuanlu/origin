@@ -1024,22 +1024,15 @@ async fn two_spans_of_one_memory_are_two_distinct_edges() {
     );
 }
 
-/// Weakening: keep `ON CONFLICT(edge_id) DO NOTHING` as the whole conflict
-/// story, and let a re-judged span return `Ok` while the stored edge still
-/// names the verdict it replaced.
+/// Weakening: let the same exact judge triple rewrite its score while the
+/// stored edge still names the verdict it replaced.
 ///
-/// Review found this one. `compute_edge_id` deliberately does NOT hash the
-/// judge — one span of one memory is one support edge, not one per model that
-/// ever looked at it — which is right, and which is exactly what makes a bare
-/// `DO NOTHING` a silent discard. `entailment_cache`'s five-part key admits a
-/// second row for the same span under a new `model_version`, so both §4a
-/// invariants pass on the second write: the live bytes still match the span
-/// digest, and the cache genuinely records that verdict. The edge id is
-/// byte-identical, the insert does nothing, and the caller is told it
-/// succeeded. Three records disagreeing with nothing forcing them to agree is
-/// the drift §4a exists to close, so the conflict is read and refused.
+/// Rolling upgrades deliberately put the judge triple in the edge id so a new
+/// approved triple can supersede the old audit record atomically. Score stays
+/// outside the id: a score change under the same triple is a conflicting
+/// rewrite, not a rolling upgrade, and must still be refused.
 #[tokio::test]
-async fn a_second_verdict_for_one_span_is_refused_rather_than_silently_dropped() {
+async fn a_changed_score_under_one_judge_triple_is_refused() {
     let (db, _temp) = db_with_substrate().await;
     let scenario = support_scenario(&db, "sp7").await;
     let first = db
@@ -1052,15 +1045,16 @@ async fn a_second_verdict_for_one_span_is_refused_rather_than_silently_dropped()
         .await
         .unwrap();
 
-    // Re-judged: same claim, same span, a newer model and a lower score. The
-    // cache records it honestly, so nothing upstream objects.
+    // Simulate a changed cached score under the same exact judge triple. The
+    // edge identity is unchanged, so the writer must refuse the rewrite.
     {
         let conn = db.conn.lock().await;
         conn.execute(
-            "INSERT INTO entailment_cache (claim_text_digest, source_span_digest, model_id,
-                                           model_version, prompt_version, score,
-                                           threshold_at_write, backend, scored_at)
-             VALUES (?1, ?2, 'qwen3-4b', 'v2', 'p1', 0.83, 0.7, 'on_device', 0)",
+            "UPDATE entailment_cache
+                SET score = 0.83
+              WHERE claim_text_digest = ?1 AND source_span_digest = ?2
+                AND model_id = 'qwen3-4b' AND model_version = 'v1'
+                AND prompt_version = 'p1'",
             libsql::params![
                 crate::provenance::revision_content_digest(CLAIM_TEXT),
                 scenario.verdict.span_digest.clone(),
@@ -1076,7 +1070,6 @@ async fn a_second_verdict_for_one_span_is_refused_rather_than_silently_dropped()
             &scenario.memory_source_id,
             &scenario.root_id,
             &super::claim_identity::SupportVerdict {
-                model_version: "v2".to_string(),
                 score: 0.83,
                 ..scenario.verdict.clone()
             },
@@ -1145,6 +1138,43 @@ async fn a_verdict_that_failed_its_own_threshold_is_not_support() {
     assert!(
         format!("{error}").contains("support_verdict_below_threshold"),
         "the refusal must name the threshold: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_non_on_device_cache_row_cannot_authorize_a_support_edge() {
+    let (db, _temp) = db_with_substrate().await;
+    let scenario = support_scenario(&db, "sp_backend").await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE entailment_cache SET backend = 'api'
+              WHERE claim_text_digest = ?1 AND source_span_digest = ?2
+                AND model_id = ?3 AND model_version = ?4 AND prompt_version = ?5",
+            libsql::params![
+                crate::provenance::revision_content_digest(CLAIM_TEXT),
+                scenario.verdict.span_digest.clone(),
+                scenario.verdict.model_id.clone(),
+                scenario.verdict.model_version.clone(),
+                scenario.verdict.prompt_version.clone(),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    let error = db
+        .write_support_edge(
+            &scenario.claim_revision_id,
+            &scenario.memory_source_id,
+            &scenario.root_id,
+            &scenario.verdict,
+        )
+        .await
+        .expect_err("a non-on-device cache row cannot authorize support");
+    assert!(
+        format!("{error}").contains("support_verdict_uncached"),
+        "the backend mismatch must fail closed as an unusable cache row: {error}"
     );
 }
 
@@ -1502,6 +1532,90 @@ async fn ordinary_ingested_evidence_can_back_a_claim() {
         grounded, 0,
         "§3: a support edge may never manufacture grounding"
     );
+}
+
+#[tokio::test]
+async fn a_new_judge_triple_atomically_supersedes_the_same_locator() {
+    let (db, _temp) = db_with_substrate().await;
+    let first_verdict = ordinary_scenario(&db, "rolling", "birds").await;
+    let (memory_source_id, root_id) = ordinary_evidence(&db, "mem_rolling", "birds").await;
+    let first_edge = db
+        .write_support_edge("cr_rolling", &memory_source_id, &root_id, &first_verdict)
+        .await
+        .unwrap();
+
+    let second_verdict = super::claim_identity::SupportVerdict {
+        model_version: "v2".to_string(),
+        prompt_version: "p2".to_string(),
+        score: 0.94,
+        ..first_verdict
+    };
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT canonical_text_digest FROM claim_revisions
+                  WHERE claim_revision_id = 'cr_rolling'",
+                (),
+            )
+            .await
+            .unwrap();
+        let claim_digest: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        conn.execute(
+            "INSERT INTO entailment_cache
+                 (claim_text_digest, source_span_digest, model_id, model_version,
+                  prompt_version, score, threshold_at_write, backend, scored_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'on_device', 0)",
+            libsql::params![
+                claim_digest,
+                second_verdict.span_digest.clone(),
+                second_verdict.model_id.clone(),
+                second_verdict.model_version.clone(),
+                second_verdict.prompt_version.clone(),
+                second_verdict.score,
+                second_verdict.threshold_at_write,
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    let second_edge = db
+        .write_support_edge("cr_rolling", &memory_source_id, &root_id, &second_verdict)
+        .await
+        .unwrap();
+    assert_ne!(
+        first_edge, second_edge,
+        "judge triple is replacement identity"
+    );
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT edge_id, superseded_by, valid_until
+               FROM edges
+              WHERE edge_id IN (?1, ?2)
+              ORDER BY edge_id",
+            libsql::params![first_edge.clone(), second_edge.clone()],
+        )
+        .await
+        .unwrap();
+    let mut state = std::collections::HashMap::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        state.insert(
+            row.get::<String>(0).unwrap(),
+            (
+                row.get::<Option<String>>(1).unwrap(),
+                row.get::<Option<i64>>(2).unwrap(),
+            ),
+        );
+    }
+    assert_eq!(
+        state.get(&first_edge).unwrap().0.as_deref(),
+        Some(second_edge.as_str())
+    );
+    assert!(state.get(&first_edge).unwrap().1.is_some());
+    assert_eq!(state.get(&second_edge).unwrap(), &(None, None));
 }
 
 /// Weakening: accept whatever root the caller names.

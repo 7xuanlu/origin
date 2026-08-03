@@ -463,6 +463,7 @@ impl MemoryDB {
                 lease_expires_at INTEGER,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 run_generation INTEGER NOT NULL DEFAULT 0,
+                eligibility_generation INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -1220,13 +1221,15 @@ impl MemoryDB {
                 .query(
                     "SELECT score, threshold_at_write FROM entailment_cache
                      WHERE claim_text_digest = ?1 AND source_span_digest = ?2
-                       AND model_id = ?3 AND model_version = ?4 AND prompt_version = ?5",
+                       AND model_id = ?3 AND model_version = ?4 AND prompt_version = ?5
+                       AND backend = ?6",
                     libsql::params![
                         claim_text_digest,
                         verdict.span_digest.clone(),
                         verdict.model_id.clone(),
                         verdict.model_version.clone(),
                         verdict.prompt_version.clone(),
+                        crate::claim_judge::M5_CLAIM_ENTAILMENT_CACHE_BACKEND,
                     ],
                 )
                 .await
@@ -1280,13 +1283,20 @@ impl MemoryDB {
             "{}:{}:{}:{}",
             verdict.chunk_index, verdict.span_start, verdict.span_end, verdict.span_digest
         );
+        let judgment_locator = serde_json::json!([
+            span_locator,
+            verdict.model_id,
+            verdict.model_version,
+            verdict.prompt_version,
+        ])
+        .to_string();
         let edge_id = crate::provenance::compute_edge_id(
             "supports",
             "claim_revision",
             claim_revision_id,
             "memory",
             memory_source_id,
-            &span_locator,
+            &judgment_locator,
         );
         let payload = serde_json::json!({
             "chunk_index": verdict.chunk_index,
@@ -1302,15 +1312,10 @@ impl MemoryDB {
         })
         .to_string();
 
-        // The judge is deliberately NOT part of `edge_id` -- one span of one
-        // memory is one support edge, not one per model that ever looked at it.
-        // But that makes `ON CONFLICT DO NOTHING` alone a silent discard:
-        // re-judge the same span with a new model or a new score, and the write
-        // would return Ok while the stored edge still names the OLD verdict.
-        // Three records disagreeing with nothing forcing them to agree is the
-        // exact drift §4a exists to close, so the conflict is read rather than
-        // swallowed. Same-verdict rewrites stay idempotent; a CHANGED verdict
-        // refuses, because this function refuses rather than repairs.
+        // Judge identity participates in the edge id so a rolling upgrade can
+        // replace a draining judgment without overwriting its audit record.
+        // Score deliberately does not: changing a score under the SAME exact
+        // judge triple is still a conflicting rewrite and must be explicit.
         //
         // No TOCTOU: `conn` is the single writer's one connection and this
         // guard has been held unbroken since the top of the function.
@@ -1344,25 +1349,73 @@ impl MemoryDB {
             )));
         }
 
-        conn.execute(
+        let now = chrono::Utc::now().timestamp();
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("support edge transaction begin: {error}"))
+            })?;
+        let written = async {
+            tx.execute(
             "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
                                 grounded, root_id, space, weight, payload, provenance,
                                 operation_id, created_at, superseded_by, valid_until)
              VALUES (?1, ?2, 'claim_revision', ?3, 'memory', 'supports', 'evidence',
-                     0, ?4, ?5, NULL, ?6, NULL, NULL, ?7, NULL, NULL)
-             ON CONFLICT(edge_id) DO NOTHING",
+                     0, ?4, ?5, NULL, ?6, NULL, NULL, ?7, NULL, NULL)",
             libsql::params![
                 edge_id.clone(),
                 claim_revision_id,
                 memory_source_id,
                 root_id,
                 space,
-                payload,
-                chrono::Utc::now().timestamp(),
+                payload.clone(),
+                now,
             ],
         )
         .await
         .map_err(|error| WenlanError::VectorDb(format!("support edge write: {error}")))?;
+
+            // The new row must exist before old rows point at it. Both writes
+            // commit together, so readers see either the prior active verdict
+            // or the replacement, never a gap between them.
+            tx.execute(
+                "UPDATE edges
+                    SET superseded_by = ?1, valid_until = ?2
+                  WHERE edge_type = 'supports'
+                    AND src_kind = 'claim_revision' AND src_id = ?3
+                    AND dst_kind = 'memory' AND dst_id = ?4
+                    AND edge_id <> ?1 AND valid_until IS NULL
+                    AND superseded_by IS NULL
+                    AND json_extract(payload, '$.chunk_index') = ?5
+                    AND json_extract(payload, '$.span_start') = ?6
+                    AND json_extract(payload, '$.span_end') = ?7
+                    AND json_extract(payload, '$.span_digest') = ?8",
+                libsql::params![
+                    edge_id.clone(),
+                    now,
+                    claim_revision_id,
+                    memory_source_id,
+                    verdict.chunk_index,
+                    verdict.span_start,
+                    verdict.span_end,
+                    verdict.span_digest.clone(),
+                ],
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("support edge supersede: {error}")))?;
+            Ok::<_, WenlanError>(())
+        }
+        .await;
+        match written {
+            Ok(()) => tx.commit().await.map_err(|error| {
+                WenlanError::VectorDb(format!("support edge transaction commit: {error}"))
+            })?,
+            Err(error) => {
+                let _ = tx.rollback().await;
+                return Err(error);
+            }
+        }
 
         Ok(edge_id)
     }

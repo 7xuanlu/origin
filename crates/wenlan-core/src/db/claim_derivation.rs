@@ -32,7 +32,11 @@
 //! cannot finish the successor even when both runs use the same owner string.
 
 use super::MemoryDB;
+use crate::llm_provider::{LlmProvider, LlmRequest};
 use crate::WenlanError;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use unicode_normalization::UnicodeNormalization;
 
 /// Version of the claim extractor whose output a marker describes.
 ///
@@ -59,6 +63,184 @@ pub const LEASE_SECS: i64 = 600;
 /// its failure handler, so counting failures would let a hard-crashing page
 /// retry without limit.
 pub const MAX_ATTEMPTS: i64 = 5;
+
+/// Hard safety ceilings from the frozen M5 entailment budget.
+pub const MAX_CLAIMS_PER_PAGE: usize = 200;
+pub const MAX_CANDIDATES_PER_CLAIM: usize = 8;
+pub const MAX_MODEL_CALLS_PER_PAGE: usize = 200;
+pub const MAX_JUDGE_TOKENS_PER_PAGE: usize = 250_000;
+const M5_JUDGE_MAX_OUTPUT_TOKENS: usize = 2048;
+
+/// The one measured on-device judge Wenlan is allowed to activate in
+/// production. Eligibility is deliberately compiled, not inferred from an
+/// arbitrary locally pinned model: a snapshot that did not pass the frozen M5
+/// benchmark cannot authorize itself merely by being available.
+pub(super) const M5_PRODUCTION_JUDGE_MODEL_ID: &str = "qwen3-4b";
+pub(super) const M5_PRODUCTION_JUDGE_MODEL_VERSION: &str =
+    "hf:unsloth/Qwen3-4B-Instruct-2507-GGUF@a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
+pub(super) const M5_PRODUCTION_JUDGE_THRESHOLD: f64 = 0.75;
+
+/// One bounded, observable promoter turn. A turn leases at most one page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromotionTurn {
+    Idle,
+    RefusedProvider,
+    Completed {
+        page_id: String,
+        page_version: i64,
+    },
+    Requeued {
+        page_id: String,
+        page_version: i64,
+        reason: String,
+    },
+    Parked {
+        page_id: String,
+        page_version: i64,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DerivedClaim {
+    revision_id: String,
+    canonical_text: String,
+    canonical_text_digest: String,
+}
+
+#[derive(Debug, Clone)]
+struct LinkedMemoryChunk {
+    row_id: String,
+    source_id: String,
+    chunk_index: i64,
+    content: String,
+    source_version: i64,
+    source_agent: Option<String>,
+    source_identity: String,
+    agent_turn: Option<String>,
+    import_batch: String,
+    root_id: Option<String>,
+    root_mint_allowed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RankedCandidate {
+    claim_revision_id: String,
+    claim_text: String,
+    claim_text_digest: String,
+    locator: CandidateLocator,
+    evidence_text: String,
+    source_version: i64,
+    root_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DerivationWrite {
+    Written,
+    StaleLease,
+    TooManyClaims,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlignmentKeyMatch {
+    Absent,
+    Unique(usize),
+    Ambiguous,
+}
+
+fn canonical_claim_text(raw: &str) -> String {
+    let nfc: String = raw.nfc().collect();
+    let mut canonical = nfc.split_whitespace().collect::<Vec<_>>().join(" ");
+    if canonical.ends_with('.') {
+        canonical.pop();
+    }
+    canonical
+}
+
+fn content_digest(raw: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn claim_revision_id(
+    claim_id: &str,
+    predecessor_revision_id: &str,
+    canonical_text_digest: &str,
+    claim_kind: &str,
+) -> String {
+    let encoded = serde_json::json!([
+        claim_id,
+        predecessor_revision_id,
+        canonical_text_digest,
+        claim_kind
+    ])
+    .to_string();
+    format!("crv_{}", content_digest(&encoded))
+}
+
+/// Strip numeric page markers while retaining a byte-boundary map back to the
+/// exact page text. Whitespace is copied byte-for-byte; only `[N]` is removed.
+fn marker_free_body_with_offset_map(body: &str) -> (String, Vec<usize>, Vec<usize>) {
+    let bytes = body.as_bytes();
+    let mut bare = Vec::with_capacity(bytes.len());
+    let mut start_offsets = Vec::with_capacity(bytes.len() + 1);
+    let mut end_offsets = Vec::with_capacity(bytes.len() + 1);
+    start_offsets.push(0);
+    end_offsets.push(0);
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'[' {
+            let mut close = index + 1;
+            while close < bytes.len() && bytes[close].is_ascii_digit() {
+                close += 1;
+            }
+            if close > index + 1 && close < bytes.len() && bytes[close] == b']' {
+                index = close + 1;
+                // The same bare boundary has two honest meanings around a
+                // removed marker: an ending span stops before it, while a
+                // starting span begins after it.
+                *start_offsets
+                    .last_mut()
+                    .expect("the zero boundary is always present") = index;
+                continue;
+            }
+        }
+        bare.push(bytes[index]);
+        index += 1;
+        start_offsets.push(index);
+        end_offsets.push(index);
+    }
+    (
+        String::from_utf8(bare).expect("marker removal preserves UTF-8 bytes"),
+        start_offsets,
+        end_offsets,
+    )
+}
+
+pub(super) fn m5_judge_budget_allows(batch_prompt_bytes: &[usize]) -> bool {
+    let system_bytes = crate::claim_judge::M5_CLAIM_ENTAILMENT_SYSTEM_PROMPT.len();
+    batch_prompt_bytes
+        .iter()
+        .try_fold(0usize, |spent, prompt_bytes| {
+            spent
+                .checked_add(system_bytes)?
+                .checked_add(*prompt_bytes)?
+                .checked_add(M5_JUDGE_MAX_OUTPUT_TOKENS)
+                .filter(|total| *total <= MAX_JUDGE_TOKENS_PER_PAGE)
+        })
+        .is_some()
+}
+
+fn lexical_relevance(claim: &str, evidence: &str) -> usize {
+    let evidence: HashSet<String> = crate::faithfulness::content_tokens(evidence)
+        .into_iter()
+        .collect();
+    crate::faithfulness::content_tokens(claim)
+        .into_iter()
+        .filter(|token| evidence.contains(token))
+        .count()
+}
 
 /// Where a judged candidate lives, to the byte.
 ///
@@ -96,16 +278,70 @@ pub struct DerivationJob {
     /// worker writes must carry it, and evaluation reads only rows that do —
     /// see [`MemoryDB::lease_next_derivation_job`].
     pub run_generation: i64,
+    /// The judge-eligibility rules this lease began under. Finalization refuses
+    /// if the global generation has moved, even when recomputation happens to
+    /// reach the same verdict under the new rules.
+    pub eligibility_generation: i64,
 }
 
-/// The score a stored entailment verdict must clear *now*.
-///
-/// Deliberately compared against the live constant rather than the edge's own
-/// `threshold_at_write`. Row 15 of the truth-state matrix requires that raising
-/// the bar demotes pages whose evidence no longer clears it; comparing each edge
-/// to the threshold it was written under would make every stored verdict
-/// permanently self-certifying.
+/// Legacy default retained for public compatibility and fixture readability.
+/// Support evaluation reads the exact judge triple's current registry threshold
+/// instead; there is no global threshold in the M5 predicate.
 pub const SUPPORT_THRESHOLD: f64 = 0.75;
+
+impl MemoryDB {
+    /// Create the policy-independent judge-eligibility substrate.
+    ///
+    /// The registry starts empty, which is deliberately fail-closed: no stored
+    /// support edge counts until its exact judge triple has been authorized.
+    pub(super) async fn ensure_judge_eligibility_tables(
+        tx: &libsql::Transaction,
+    ) -> Result<(), WenlanError> {
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS claim_judge_eligibility (
+                 model_id TEXT NOT NULL,
+                 model_version TEXT NOT NULL,
+                 prompt_version TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK (state IN ('active','draining','retired')),
+                 threshold REAL NOT NULL CHECK (threshold >= 0.0 AND threshold <= 1.0),
+                 generation INTEGER NOT NULL CHECK (generation >= 0),
+                 PRIMARY KEY (model_id, model_version, prompt_version)
+             );
+             CREATE TABLE IF NOT EXISTS claim_judge_eligibility_generation (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 last_generation INTEGER NOT NULL CHECK (last_generation >= 0)
+             );
+             INSERT OR IGNORE INTO claim_judge_eligibility_generation
+                 (id, last_generation) VALUES (1, 0);",
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m110 judge eligibility DDL: {error}")))?;
+        Ok(())
+    }
+
+    async fn current_eligibility_generation(conn: &libsql::Connection) -> Result<i64, WenlanError> {
+        let mut rows = conn
+            .query(
+                "SELECT last_generation FROM claim_judge_eligibility_generation WHERE id = 1",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("eligibility generation read: {error}"))
+            })?;
+        let Some(row) = rows.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("eligibility generation row: {error}"))
+        })?
+        else {
+            return Err(WenlanError::VectorDb(
+                "judge eligibility generation row is missing".to_string(),
+            ));
+        };
+        row.get::<i64>(0).map_err(|error| {
+            WenlanError::VectorDb(format!("eligibility generation decode: {error}"))
+        })
+    }
+}
 
 /// The one bounded claim-derivation write migration 105 may perform while
 /// `MemoryDB::new` is still on the pre-serve startup path. Runtime continuation
@@ -278,7 +514,7 @@ const REASON_RECONCILE_UNPROVEN: &str =
 /// A page ID (the last one re-proved), the empty string (a pass has begun and
 /// re-proved nothing yet), or [`SUPPORT_RECONCILE_COMPLETE`]. Absent means no
 /// pass has ever run here.
-const SUPPORT_RECONCILE_FRONTIER_KEY: &str = "support_reconcile_frontier";
+pub(super) const SUPPORT_RECONCILE_FRONTIER_KEY: &str = "support_reconcile_frontier";
 
 /// Which implementation of the whole support predicate the durable frontier
 /// was proved under. Bump the first component whenever reconciliation semantics
@@ -288,13 +524,10 @@ const SUPPORT_RECONCILE_RULESET_VERSION: i64 = 2;
 
 /// The frontier value meaning the pass finished. Not a page ID, and it cannot
 /// collide with one: page IDs are `page_`-prefixed and never contain a space.
-const SUPPORT_RECONCILE_COMPLETE: &str = "complete pass";
+pub(super) const SUPPORT_RECONCILE_COMPLETE: &str = "complete pass";
 
-fn support_reconcile_ruleset() -> String {
-    format!(
-        "{SUPPORT_RECONCILE_RULESET_VERSION}:{EXTRACTOR_VERSION}:{:016x}",
-        SUPPORT_THRESHOLD.to_bits()
-    )
+pub(super) fn support_reconcile_ruleset(eligibility_generation: i64) -> String {
+    format!("{SUPPORT_RECONCILE_RULESET_VERSION}:{EXTRACTOR_VERSION}:{eligibility_generation}")
 }
 
 /// One batch of [`MemoryDB::reconcile_supported_pages`].
@@ -370,13 +603,9 @@ fn support_demotion_body(affected_pages: &str) -> String {
 /// This is the reconciliation half of rows 13 and 15. A marker check cannot see
 /// either of them: the marker is about *extraction*, and both rows are about
 /// evidence that stopped qualifying afterwards — an edge retracted when its
-/// memory was deleted, or a threshold constant that rose under an edge nobody
-/// touched. A page in that state has a current marker AND a `done` job, so the
+/// memory was deleted, or a registry threshold/state that changed under an edge
+/// nobody touched. A page in that state has a current marker AND a `done` job, so the
 /// marker-only scan skipped it and it stayed `supported` forever.
-///
-/// `?1` is the live threshold, deliberately, for the same reason
-/// [`SUPPORT_THRESHOLD`] is compared live everywhere else: comparing each edge
-/// to the bar it was written under makes every stored verdict self-certifying.
 const DRIFTED_SUPPORTED_PAGES: &str = "
     SELECT p.id AS drifted_page_id, p.version AS drifted_page_version
       FROM pages p
@@ -390,12 +619,18 @@ const DRIFTED_SUPPORTED_PAGES: &str = "
             WHERE pvc.page_id = p.id AND pvc.page_version = p.version
               AND NOT EXISTS (
                   SELECT 1 FROM edges e
+                  JOIN claim_judge_eligibility j
+                    ON j.model_id = json_extract(e.payload, '$.model_id')
+                   AND j.model_version = json_extract(e.payload, '$.model_version')
+                   AND j.prompt_version = json_extract(e.payload, '$.prompt_version')
                    WHERE e.edge_type = 'supports'
                      AND e.src_kind = 'claim_revision'
                      AND e.src_id = pvc.claim_revision_id
                      AND e.valid_until IS NULL
                      AND e.superseded_by IS NULL
-                     AND json_extract(e.payload, '$.score') >= ?1
+                     AND j.state IN ('active', 'draining')
+                     AND json_type(e.payload, '$.score') IN ('integer', 'real')
+                     AND json_extract(e.payload, '$.score') >= j.threshold
               )
        )
 ";
@@ -616,7 +851,7 @@ impl MemoryDB {
                                 SELECT 1 FROM claim_derivation_markers m
                                  WHERE m.page_id = p.id
                                    AND m.page_version = p.version
-                                   AND m.extractor_version = ?2
+                                   AND m.extractor_version = ?1
                             )
                             AND (
                                 NOT EXISTS (
@@ -650,9 +885,9 @@ impl MemoryDB {
                             )
                        FROM candidate_pages c
                       ORDER BY c.page_id, c.page_version
-                      LIMIT ?3"
+                      LIMIT ?2"
                 ),
-                libsql::params![SUPPORT_THRESHOLD, EXTRACTOR_VERSION, limit],
+                libsql::params![EXTRACTOR_VERSION, limit],
             )
             .await
             .map_err(|error| WenlanError::VectorDb(format!("derivation batch capture: {error}")))?;
@@ -755,6 +990,1729 @@ impl MemoryDB {
             total += created;
             if created < batch as usize {
                 return Ok(total);
+            }
+        }
+    }
+
+    /// Deterministically derive the exact leased page version and persist its
+    /// full claim inventory atomically. The completion marker is deliberately
+    /// the final statement in the transaction.
+    pub(super) async fn derive_leased_page_claims(
+        &self,
+        job: &DerivationJob,
+        owner: &str,
+    ) -> Result<(DerivationWrite, Vec<DerivedClaim>), WenlanError> {
+        #[derive(Clone)]
+        struct CutClaim {
+            raw_start: usize,
+            raw_end: usize,
+            raw_digest: String,
+            canonical_text: String,
+            canonical_digest: String,
+        }
+        #[derive(Clone)]
+        struct PriorClaim {
+            claim_id: String,
+            revision_id: String,
+            canonical_digest: String,
+            claim_kind: String,
+            anchor_digests: Vec<String>,
+        }
+
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("claim derivation begin: {error}")))?;
+        let result = async {
+            let holds_lease = {
+                let mut rows = tx
+                    .query(
+                        "SELECT 1 FROM claim_derivation_jobs
+                          WHERE job_id = ?1 AND page_id = ?2 AND page_version = ?3
+                            AND run_generation = ?4 AND eligibility_generation = ?5
+                            AND status = 'leased' AND lease_owner = ?6",
+                        libsql::params![
+                            job.job_id.as_str(),
+                            job.page_id.as_str(),
+                            job.page_version,
+                            job.run_generation,
+                            job.eligibility_generation,
+                            owner,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("claim derivation lease: {error}"))
+                    })?;
+                rows.next()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("claim derivation lease row: {error}"))
+                    })?
+                    .is_some()
+            };
+            if !holds_lease {
+                return Ok((DerivationWrite::StaleLease, Vec::new()));
+            }
+
+            let content = {
+                let mut rows = tx
+                    .query(
+                        "SELECT p.content
+                           FROM pages p
+                           JOIN page_history h ON h.page_id = p.id AND h.version = p.version
+                          WHERE p.id = ?1 AND p.version = ?2
+                            AND p.status = 'active' AND p.kind <> 'entity'
+                            AND h.content = p.content",
+                        libsql::params![job.page_id.as_str(), job.page_version],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("claim derivation page: {error}"))
+                    })?;
+                rows.next()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("claim derivation page row: {error}"))
+                    })?
+                    .ok_or_else(|| {
+                        WenlanError::Conflict(format!(
+                            "claim_derivation_stale_page: {} is no longer active at version {}",
+                            job.page_id, job.page_version
+                        ))
+                    })?
+                    .get::<String>(0)
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("claim derivation page decode: {error}"))
+                    })?
+            };
+            let page_digest = crate::provenance::revision_content_digest(&content);
+
+            // A released run may retry after derivation succeeded but judging
+            // did not. Reuse the exact immutable inventory instead of trying to
+            // insert it a second time.
+            let marker_matches = {
+                let mut rows = tx
+                    .query(
+                        "SELECT 1 FROM claim_derivation_markers
+                          WHERE page_id = ?1 AND page_version = ?2
+                            AND page_version_digest = ?3 AND extractor_version = ?4",
+                        libsql::params![
+                            job.page_id.as_str(),
+                            job.page_version,
+                            page_digest.clone(),
+                            EXTRACTOR_VERSION
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("claim derivation marker read: {error}"))
+                    })?;
+                rows.next()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("claim derivation marker row: {error}"))
+                    })?
+                    .is_some()
+            };
+            if marker_matches {
+                let mut rows = tx
+                    .query(
+                        "SELECT cr.claim_revision_id, cr.canonical_text,
+                                cr.canonical_text_digest
+                           FROM page_version_claims pvc
+                           JOIN claim_revisions cr
+                             ON cr.claim_revision_id = pvc.claim_revision_id
+                          WHERE pvc.page_id = ?1 AND pvc.page_version = ?2
+                          ORDER BY pvc.ordinal, cr.claim_revision_id",
+                        libsql::params![job.page_id.as_str(), job.page_version],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("claim derivation reuse: {error}"))
+                    })?;
+                let mut claims = Vec::new();
+                while let Some(row) = rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("claim derivation reuse row: {error}"))
+                })? {
+                    claims.push(DerivedClaim {
+                        revision_id: row.get(0).map_err(|error| {
+                            WenlanError::VectorDb(format!("claim derivation reuse decode: {error}"))
+                        })?,
+                        canonical_text: row.get(1).map_err(|error| {
+                            WenlanError::VectorDb(format!("claim derivation reuse decode: {error}"))
+                        })?,
+                        canonical_text_digest: row.get(2).map_err(|error| {
+                            WenlanError::VectorDb(format!("claim derivation reuse decode: {error}"))
+                        })?,
+                    });
+                }
+                return Ok((DerivationWrite::Written, claims));
+            }
+
+            let (bare, raw_start_offsets, raw_end_offsets) =
+                marker_free_body_with_offset_map(&content);
+            let cuts: Vec<CutClaim> = crate::faithfulness::sentence_spans(&bare)
+                .into_iter()
+                .filter_map(|(start, end)| {
+                    let claim_text = bare.get(start..end)?;
+                    if claim_text.trim().is_empty() {
+                        return None;
+                    }
+                    let raw_start = *raw_start_offsets.get(start)?;
+                    let raw_end = *raw_end_offsets.get(end)?;
+                    let raw = content.get(raw_start..raw_end)?;
+                    let canonical_text = canonical_claim_text(claim_text);
+                    let canonical_digest = content_digest(&canonical_text);
+                    Some(CutClaim {
+                        raw_start,
+                        raw_end,
+                        raw_digest: crate::provenance::revision_content_digest(raw),
+                        canonical_text,
+                        canonical_digest,
+                    })
+                })
+                .collect();
+            if cuts.len() > MAX_CLAIMS_PER_PAGE {
+                return Ok((DerivationWrite::TooManyClaims, Vec::new()));
+            }
+
+            let mut prior = Vec::<PriorClaim>::new();
+            if job.page_version > 1 {
+                let previous_version = job.page_version - 1;
+                let previous_content = {
+                    let mut rows = tx
+                        .query(
+                            "SELECT content FROM page_history
+                              WHERE page_id = ?1 AND version = ?2",
+                            libsql::params![job.page_id.as_str(), previous_version],
+                        )
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!("claim alignment history: {error}"))
+                        })?;
+                    rows.next()
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!("claim alignment history row: {error}"))
+                        })?
+                        .map(|row| row.get::<String>(0))
+                        .transpose()
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "claim alignment history decode: {error}"
+                            ))
+                        })?
+                };
+                let mut rows = tx
+                    .query(
+                        "SELECT cr.claim_id, cr.claim_revision_id,
+                                cr.canonical_text_digest, cr.claim_kind,
+                                ca.span_start, ca.span_end, ca.span_digest
+                           FROM page_version_claims pvc
+                           JOIN claim_revisions cr
+                             ON cr.claim_revision_id = pvc.claim_revision_id
+                           LEFT JOIN claim_anchors ca
+                             ON ca.claim_revision_id = cr.claim_revision_id
+                            AND ca.source_doc_id = ?1 AND ca.source_version = ?2
+                          WHERE pvc.page_id = ?1 AND pvc.page_version = ?2
+                          ORDER BY pvc.ordinal, cr.claim_revision_id",
+                        libsql::params![job.page_id.as_str(), previous_version],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("claim alignment prior: {error}"))
+                    })?;
+                let mut by_revision = BTreeMap::<String, PriorClaim>::new();
+                while let Some(row) = rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("claim alignment prior row: {error}"))
+                })? {
+                    let revision_id: String = row.get(1).map_err(|error| {
+                        WenlanError::VectorDb(format!("claim alignment prior decode: {error}"))
+                    })?;
+                    let entry = by_revision
+                        .entry(revision_id.clone())
+                        .or_insert(PriorClaim {
+                            claim_id: row.get(0).map_err(|error| {
+                                WenlanError::VectorDb(format!(
+                                    "claim alignment prior decode: {error}"
+                                ))
+                            })?,
+                            revision_id,
+                            canonical_digest: row.get(2).map_err(|error| {
+                                WenlanError::VectorDb(format!(
+                                    "claim alignment prior decode: {error}"
+                                ))
+                            })?,
+                            claim_kind: row.get(3).map_err(|error| {
+                                WenlanError::VectorDb(format!(
+                                    "claim alignment prior decode: {error}"
+                                ))
+                            })?,
+                            anchor_digests: Vec::new(),
+                        });
+                    if let (Some(previous_content), Some(start), Some(end), Some(digest)) = (
+                        previous_content.as_deref(),
+                        row.get::<Option<i64>>(4).map_err(|error| {
+                            WenlanError::VectorDb(format!("claim alignment anchor decode: {error}"))
+                        })?,
+                        row.get::<Option<i64>>(5).map_err(|error| {
+                            WenlanError::VectorDb(format!("claim alignment anchor decode: {error}"))
+                        })?,
+                        row.get::<Option<String>>(6).map_err(|error| {
+                            WenlanError::VectorDb(format!("claim alignment anchor decode: {error}"))
+                        })?,
+                    ) {
+                        let start = usize::try_from(start).unwrap_or(usize::MAX);
+                        let end = usize::try_from(end).unwrap_or(usize::MAX);
+                        if previous_content.get(start..end).is_some_and(|span| {
+                            crate::provenance::revision_content_digest(span) == digest
+                        }) {
+                            entry.anchor_digests.push(digest);
+                        }
+                    }
+                }
+                prior.extend(by_revision.into_values());
+            }
+
+            let mut prior_by_text = HashMap::<String, Vec<usize>>::new();
+            let mut prior_by_anchor = HashMap::<String, Vec<usize>>::new();
+            for (index, item) in prior.iter().enumerate() {
+                prior_by_text
+                    .entry(item.canonical_digest.clone())
+                    .or_default()
+                    .push(index);
+                for digest in &item.anchor_digests {
+                    prior_by_anchor
+                        .entry(digest.clone())
+                        .or_default()
+                        .push(index);
+                }
+            }
+            let mut current_by_text = HashMap::<String, Vec<usize>>::new();
+            let mut current_by_anchor = HashMap::<String, Vec<usize>>::new();
+            for (index, item) in cuts.iter().enumerate() {
+                current_by_text
+                    .entry(item.canonical_digest.clone())
+                    .or_default()
+                    .push(index);
+                current_by_anchor
+                    .entry(item.raw_digest.clone())
+                    .or_default()
+                    .push(index);
+            }
+
+            tx.execute(
+                "DELETE FROM page_version_claims WHERE page_id = ?1 AND page_version = ?2",
+                libsql::params![job.page_id.as_str(), job.page_version],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("claim derivation replace membership: {error}"))
+            })?;
+            tx.execute(
+                "DELETE FROM claim_derivation_markers WHERE page_id = ?1 AND page_version = ?2",
+                libsql::params![job.page_id.as_str(), job.page_version],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("claim derivation replace marker: {error}"))
+            })?;
+
+            let now = chrono::Utc::now().timestamp();
+            let mut derived = Vec::with_capacity(cuts.len());
+            for (ordinal, cut) in cuts.iter().enumerate() {
+                let text_match = match (
+                    prior_by_text.get(&cut.canonical_digest),
+                    current_by_text.get(&cut.canonical_digest),
+                ) {
+                    (None, _) => AlignmentKeyMatch::Absent,
+                    (Some(p), Some(c)) if p.len() == 1 && c.len() == 1 => {
+                        AlignmentKeyMatch::Unique(p[0])
+                    }
+                    _ => AlignmentKeyMatch::Ambiguous,
+                };
+                let anchor_match = match (
+                    prior_by_anchor.get(&cut.raw_digest),
+                    current_by_anchor.get(&cut.raw_digest),
+                ) {
+                    (None, _) => AlignmentKeyMatch::Absent,
+                    (Some(p), Some(c)) if p.len() == 1 && c.len() == 1 => {
+                        AlignmentKeyMatch::Unique(p[0])
+                    }
+                    _ => AlignmentKeyMatch::Ambiguous,
+                };
+                let aligned = match (text_match, anchor_match) {
+                    (AlignmentKeyMatch::Unique(text), AlignmentKeyMatch::Unique(anchor))
+                        if text == anchor && prior[text].claim_kind == "fact" =>
+                    {
+                        Some(text)
+                    }
+                    (AlignmentKeyMatch::Unique(index), AlignmentKeyMatch::Absent)
+                    | (AlignmentKeyMatch::Absent, AlignmentKeyMatch::Unique(index))
+                        if prior[index].claim_kind == "fact" =>
+                    {
+                        Some(index)
+                    }
+                    _ => None,
+                };
+                let (claim_id, predecessor_revision_id) = aligned
+                    .map(|index| {
+                        (
+                            prior[index].claim_id.clone(),
+                            prior[index].revision_id.clone(),
+                        )
+                    })
+                    .unwrap_or_else(|| (format!("clm_{}", uuid::Uuid::new_v4()), String::new()));
+                let revision_id = if let Some(index) = aligned {
+                    if prior[index].canonical_digest == cut.canonical_digest {
+                        prior[index].revision_id.clone()
+                    } else {
+                        claim_revision_id(
+                            &claim_id,
+                            &predecessor_revision_id,
+                            &cut.canonical_digest,
+                            "fact",
+                        )
+                    }
+                } else {
+                    claim_revision_id(&claim_id, "", &cut.canonical_digest, "fact")
+                };
+
+                tx.execute(
+                    "INSERT OR IGNORE INTO claims (claim_id, page_id, created_at)
+                     VALUES (?1, ?2, ?3)",
+                    libsql::params![claim_id.clone(), job.page_id.as_str(), now],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("claim derivation claim write: {error}"))
+                })?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO claim_revisions
+                         (claim_revision_id, claim_id, predecessor_revision_id,
+                          canonical_text, canonical_text_digest, claim_kind,
+                          extractor_version, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'fact', ?6, ?7)",
+                    libsql::params![
+                        revision_id.clone(),
+                        claim_id,
+                        if revision_id == predecessor_revision_id {
+                            ""
+                        } else {
+                            predecessor_revision_id.as_str()
+                        },
+                        cut.canonical_text.clone(),
+                        cut.canonical_digest.clone(),
+                        EXTRACTOR_VERSION,
+                        now,
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("claim derivation revision write: {error}"))
+                })?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO claim_anchors
+                         (claim_revision_id, source_doc_id, source_version,
+                          span_start, span_end, span_digest, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    libsql::params![
+                        revision_id.clone(),
+                        job.page_id.as_str(),
+                        job.page_version,
+                        cut.raw_start as i64,
+                        cut.raw_end as i64,
+                        cut.raw_digest.clone(),
+                        now,
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("claim derivation anchor write: {error}"))
+                })?;
+                tx.execute(
+                    "INSERT INTO page_version_claims
+                         (page_id, page_version, claim_revision_id, ordinal)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    libsql::params![
+                        job.page_id.as_str(),
+                        job.page_version,
+                        revision_id.clone(),
+                        ordinal as i64,
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("claim derivation membership write: {error}"))
+                })?;
+                derived.push(DerivedClaim {
+                    revision_id,
+                    canonical_text: cut.canonical_text.clone(),
+                    canonical_text_digest: cut.canonical_digest.clone(),
+                });
+            }
+
+            // Last statement: its presence means every claim/revision/anchor
+            // and membership row above committed with it.
+            tx.execute(
+                "INSERT INTO claim_derivation_markers
+                     (page_id, page_version, page_version_digest, extractor_version,
+                      inventory_count, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                libsql::params![
+                    job.page_id.as_str(),
+                    job.page_version,
+                    page_digest,
+                    EXTRACTOR_VERSION,
+                    derived.len() as i64,
+                    now,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("claim derivation marker write: {error}"))
+            })?;
+            Ok((DerivationWrite::Written, derived))
+        }
+        .await;
+
+        match result {
+            Ok((DerivationWrite::Written, claims)) => {
+                tx.commit().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("claim derivation commit: {error}"))
+                })?;
+                Ok((DerivationWrite::Written, claims))
+            }
+            Ok(other) => {
+                let _ = tx.rollback().await;
+                Ok(other)
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) async fn active_judge_policy(
+        &self,
+        snapshot: &crate::claim_judge::M5ClaimJudgeSnapshot,
+    ) -> Result<Option<(f64, i64)>, WenlanError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT j.threshold, g.last_generation
+                   FROM claim_judge_eligibility j
+                   JOIN claim_judge_eligibility_generation g ON g.id = 1
+                  WHERE j.model_id = ?1 AND j.model_version = ?2 AND j.prompt_version = ?3
+                    AND j.state = 'active'",
+                libsql::params![
+                    snapshot.model_id.as_str(),
+                    snapshot.model_version.as_str(),
+                    snapshot.prompt_version,
+                ],
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("active M5 judge lookup: {error}")))?;
+        rows.next()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("active M5 judge row: {error}")))?
+            .map(|row| {
+                Ok((
+                    row.get::<f64>(0).map_err(|error| {
+                        WenlanError::VectorDb(format!("active M5 judge decode: {error}"))
+                    })?,
+                    row.get::<i64>(1).map_err(|error| {
+                        WenlanError::VectorDb(format!("active M5 generation decode: {error}"))
+                    })?,
+                ))
+            })
+            .transpose()
+    }
+
+    fn is_approved_m5_claim_judge(snapshot: &crate::claim_judge::M5ClaimJudgeSnapshot) -> bool {
+        snapshot.backend == crate::llm_provider::LlmBackend::OnDevice
+            && snapshot.model_id == M5_PRODUCTION_JUDGE_MODEL_ID
+            && snapshot.model_version == M5_PRODUCTION_JUDGE_MODEL_VERSION
+            && snapshot.prompt_version == crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION
+    }
+
+    /// Idempotently activate the one benchmark-approved M5 judge.
+    ///
+    /// `false` is fail-closed: the snapshot is not the compiled approval, or
+    /// the exact row has already entered draining/retired (or was retuned out
+    /// of contract). Those cases perform no writes and cannot auto-reactivate
+    /// or silently repair policy. The first activation advances the global
+    /// generation, drains every older active row for this prompt, installs the
+    /// exact measured threshold, and opens a fresh support-reconciliation pass
+    /// in one transaction.
+    pub(super) async fn activate_approved_m5_claim_judge(
+        &self,
+        snapshot: &crate::claim_judge::M5ClaimJudgeSnapshot,
+    ) -> Result<bool, WenlanError> {
+        if !Self::is_approved_m5_claim_judge(snapshot) {
+            return Ok(false);
+        }
+
+        let conn = self.conn.lock().await;
+        let existing = {
+            let mut rows = conn
+                .query(
+                    "SELECT state, threshold
+                       FROM claim_judge_eligibility
+                      WHERE model_id = ?1 AND model_version = ?2 AND prompt_version = ?3",
+                    libsql::params![
+                        M5_PRODUCTION_JUDGE_MODEL_ID,
+                        M5_PRODUCTION_JUDGE_MODEL_VERSION,
+                        crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION,
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("M5 production judge activation lookup: {error}"))
+                })?;
+            rows.next()
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("M5 production judge activation row: {error}"))
+                })?
+                .map(|row| {
+                    Ok::<_, WenlanError>((
+                        row.get::<String>(0).map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "M5 production judge activation state: {error}"
+                            ))
+                        })?,
+                        row.get::<f64>(1).map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "M5 production judge activation threshold: {error}"
+                            ))
+                        })?,
+                    ))
+                })
+                .transpose()?
+        };
+
+        if let Some((state, threshold)) = existing {
+            return Ok(state == "active" && threshold == M5_PRODUCTION_JUDGE_THRESHOLD);
+        }
+
+        // The exact-row read and this transaction share the same connection
+        // guard, so no other operation on this MemoryDB can create or mutate
+        // the row between them. Existing rows take the read-only fast path;
+        // only a first activation acquires SQLite's immediate write lock.
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("M5 production judge activation begin: {error}"))
+            })?;
+
+        let activated = async {
+            let generation = {
+                let mut rows = tx
+                    .query(
+                        "UPDATE claim_judge_eligibility_generation
+                            SET last_generation = last_generation + 1
+                          WHERE id = 1
+                          RETURNING last_generation",
+                        (),
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "M5 production judge generation advance: {error}"
+                        ))
+                    })?;
+                let Some(row) = rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("M5 production judge generation row: {error}"))
+                })?
+                else {
+                    return Err(WenlanError::VectorDb(
+                        "M5 production judge generation singleton is missing".to_string(),
+                    ));
+                };
+                row.get::<i64>(0).map_err(|error| {
+                    WenlanError::VectorDb(format!("M5 production judge generation decode: {error}"))
+                })?
+            };
+
+            tx.execute(
+                "UPDATE claim_judge_eligibility
+                    SET state = 'draining', generation = ?1
+                  WHERE prompt_version = ?2 AND state = 'active'",
+                libsql::params![
+                    generation,
+                    crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("M5 production judge drain old: {error}"))
+            })?;
+            tx.execute(
+                "INSERT INTO claim_judge_eligibility
+                     (model_id, model_version, prompt_version, state, threshold, generation)
+                 VALUES (?1, ?2, ?3, 'active', ?4, ?5)",
+                libsql::params![
+                    M5_PRODUCTION_JUDGE_MODEL_ID,
+                    M5_PRODUCTION_JUDGE_MODEL_VERSION,
+                    crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION,
+                    M5_PRODUCTION_JUDGE_THRESHOLD,
+                    generation,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("M5 production judge insert: {error}"))
+            })?;
+
+            let ruleset = support_reconcile_ruleset(generation);
+            for (key, value) in [
+                (SUPPORT_RECONCILE_RULESET_KEY, ruleset.as_str()),
+                (SUPPORT_RECONCILE_FRONTIER_KEY, ""),
+            ] {
+                tx.execute(
+                    "INSERT INTO app_metadata (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    libsql::params![key, value],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("M5 production judge reconcile reset: {error}"))
+                })?;
+            }
+            Ok::<(), WenlanError>(())
+        }
+        .await;
+
+        match activated {
+            Ok(()) => {
+                tx.commit().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("M5 production judge activation commit: {error}"))
+                })?;
+                Ok(true)
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Read only explicitly linked, same-Space evidence. This intentionally
+    /// has no join to page_sources, source_memory_ids, FTS, or vector indexes.
+    async fn load_linked_memory_chunks(
+        &self,
+        job: &DerivationJob,
+        owner: &str,
+    ) -> Result<Option<Vec<LinkedMemoryChunk>>, WenlanError> {
+        let conn = self.conn.lock().await;
+        let mut lease = conn
+            .query(
+                "SELECT 1 FROM claim_derivation_jobs
+                  WHERE job_id = ?1 AND page_id = ?2 AND page_version = ?3
+                    AND run_generation = ?4 AND eligibility_generation = ?5
+                    AND status = 'leased' AND lease_owner = ?6",
+                libsql::params![
+                    job.job_id.as_str(),
+                    job.page_id.as_str(),
+                    job.page_version,
+                    job.run_generation,
+                    job.eligibility_generation,
+                    owner,
+                ],
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("linked evidence lease: {error}")))?;
+        if lease
+            .next()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("linked evidence lease row: {error}")))?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        drop(lease);
+
+        let mut rows = conn
+            .query(
+                "WITH linked(source_id) AS (
+                     SELECT locator
+                       FROM page_evidence
+                      WHERE page_id = ?1 AND source_kind = 'memory'
+                        AND locator IS NOT NULL
+                     UNION
+                     SELECT dst_id
+                       FROM edges
+                      WHERE src_id = ?1 AND src_kind = 'page'
+                        AND dst_kind = 'memory' AND edge_type = 'cites'
+                        AND valid_until IS NULL AND superseded_by IS NULL
+                 )
+                 SELECT DISTINCT m.source_id, m.chunk_index, m.content,
+                        COALESCE(m.version, 1), m.source_agent,
+                        COALESCE(NULLIF(m.url, ''), m.source_id),
+                        m.structured_fields, m.memory_type, m.id
+                   FROM linked l
+                   JOIN memories m ON m.source_id = l.source_id OR m.id = l.source_id
+                   JOIN pages p ON p.id = ?1 AND p.version = ?2
+                  WHERE m.pending_revision = 0
+                    AND COALESCE(m.space, ?3) = COALESCE(p.space, ?3)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM memories newer
+                         WHERE newer.supersedes = m.id AND newer.pending_revision = 0
+                    )
+                  ORDER BY m.source_id, m.chunk_index, m.id",
+                libsql::params![
+                    job.page_id.as_str(),
+                    job.page_version,
+                    super::UNFILED_SPACE_ID,
+                ],
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("linked evidence scan: {error}")))?;
+        let mut chunks = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("linked evidence scan row: {error}")))?
+        {
+            let source_id: String = row.get(0).map_err(|error| {
+                WenlanError::VectorDb(format!("linked evidence decode: {error}"))
+            })?;
+            let chunk_index: i64 = row.get(1).map_err(|error| {
+                WenlanError::VectorDb(format!("linked evidence decode: {error}"))
+            })?;
+            let content: String = row.get(2).map_err(|error| {
+                WenlanError::VectorDb(format!("linked evidence decode: {error}"))
+            })?;
+            let source_version: i64 = row.get(3).map_err(|error| {
+                WenlanError::VectorDb(format!("linked evidence decode: {error}"))
+            })?;
+            let source_agent: Option<String> = row.get(4).map_err(|error| {
+                WenlanError::VectorDb(format!("linked evidence decode: {error}"))
+            })?;
+            let source_identity: String = row.get(5).map_err(|error| {
+                WenlanError::VectorDb(format!("linked evidence decode: {error}"))
+            })?;
+            let structured: Option<String> = row.get(6).map_err(|error| {
+                WenlanError::VectorDb(format!("linked evidence decode: {error}"))
+            })?;
+            let memory_type: Option<String> = row.get(7).map_err(|error| {
+                WenlanError::VectorDb(format!("linked evidence decode: {error}"))
+            })?;
+            let row_id: String = row.get(8).map_err(|error| {
+                WenlanError::VectorDb(format!("linked evidence decode: {error}"))
+            })?;
+            let agent_turn = structured
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|value| {
+                    ["agent_turn_id", "agent_turn", "session_id"]
+                        .into_iter()
+                        .find_map(|key| {
+                            value
+                                .get(key)
+                                .and_then(|item| item.as_str())
+                                .map(str::to_owned)
+                        })
+                })
+                .filter(|value| !value.trim().is_empty());
+            let root_kind = if source_agent.as_deref() == Some("folder") {
+                "document_ingest"
+            } else {
+                "generated"
+            };
+            let human_non_observation = source_agent.as_deref() == Some("human")
+                && memory_type.as_deref() != Some("observation");
+            let expected_digest = crate::provenance::identity_digest(root_kind, &content);
+            let document_digest = crate::provenance::identity_digest("document_ingest", &content);
+            let human_capture_digest =
+                crate::provenance::identity_digest("human_capture", &content);
+            let human_delta_digest =
+                crate::provenance::identity_digest("human_edit_delta", &content);
+            let generated_digest = crate::provenance::identity_digest("generated", &content);
+            let existing_root = if human_non_observation {
+                None
+            } else {
+                let mut roots = conn
+                    .query(
+                        "SELECT root_id, root_kind FROM provenance_roots
+                          WHERE identity_version = ?1 AND status = 'active'
+                            AND ((root_kind = 'document_ingest' AND identity_digest = ?2)
+                              OR (root_kind = 'human_capture' AND identity_digest = ?3)
+                              OR (root_kind = 'human_edit_delta' AND identity_digest = ?4)
+                              OR (root_kind = 'generated' AND identity_digest = ?5))
+                          ORDER BY CASE
+                                     WHEN root_kind IN ('human_capture', 'human_edit_delta') THEN 0
+                                     WHEN root_kind = ?6 AND identity_digest = ?7 THEN 1
+                                     ELSE 2
+                                   END,
+                                   root_kind, root_id
+                          LIMIT 1",
+                        libsql::params![
+                            crate::provenance::IDENTITY_VERSION,
+                            document_digest,
+                            human_capture_digest,
+                            human_delta_digest,
+                            generated_digest,
+                            root_kind,
+                            expected_digest,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("linked evidence root: {error}"))
+                    })?;
+                roots
+                    .next()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("linked evidence root row: {error}"))
+                    })?
+                    .map(|root| -> Result<(String, String), libsql::Error> {
+                        Ok((root.get::<String>(0)?, root.get::<String>(1)?))
+                    })
+                    .transpose()
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("linked evidence root decode: {error}"))
+                    })?
+            };
+            let human_root_is_non_voting = human_non_observation
+                || existing_root.as_ref().is_some_and(|(_, kind)| {
+                    matches!(kind.as_str(), "human_capture" | "human_edit_delta")
+                        && memory_type.as_deref() != Some("observation")
+                });
+            chunks.push(LinkedMemoryChunk {
+                row_id,
+                source_id: source_id.clone(),
+                chunk_index,
+                content,
+                source_version,
+                source_agent,
+                source_identity,
+                agent_turn,
+                import_batch: format!(
+                    "m5-linked-memory:{source_id}:{chunk_index}:{source_version}"
+                ),
+                root_id: existing_root.map(|(root_id, _)| root_id),
+                root_mint_allowed: !human_root_is_non_voting,
+            });
+        }
+        let mut locator_rows = HashMap::<(String, i64), HashSet<String>>::new();
+        for chunk in &chunks {
+            locator_rows
+                .entry((chunk.source_id.clone(), chunk.chunk_index))
+                .or_default()
+                .insert(chunk.row_id.clone());
+        }
+        chunks.retain(|chunk| {
+            locator_rows
+                .get(&(chunk.source_id.clone(), chunk.chunk_index))
+                .is_some_and(|rows| rows.len() == 1)
+        });
+        Ok(Some(chunks))
+    }
+
+    /// Mint only roots for explicitly linked evidence that lacked an active,
+    /// verifiable content-addressed root. Each acquisition owns its own short
+    /// DB transaction; this function is never called under `self.conn`.
+    async fn attach_candidate_roots(
+        &self,
+        chunks: &mut Vec<LinkedMemoryChunk>,
+    ) -> Result<(), WenlanError> {
+        for chunk in chunks.iter_mut().filter(|chunk| {
+            chunk.root_id.is_none()
+                && chunk.root_mint_allowed
+                && chunk.source_agent.as_deref() != Some("human")
+        }) {
+            let root_kind = if chunk.source_agent.as_deref() == Some("folder") {
+                "document_ingest"
+            } else {
+                "generated"
+            };
+            let signals = if root_kind == "document_ingest" {
+                crate::provenance::IndependenceSignals {
+                    source_identity: Some(chunk.source_identity.as_str()),
+                    agent_turn: None,
+                    import_batch: None,
+                }
+            } else {
+                crate::provenance::IndependenceSignals {
+                    source_identity: None,
+                    agent_turn: chunk.agent_turn.as_deref(),
+                    import_batch: chunk
+                        .agent_turn
+                        .is_none()
+                        .then_some(chunk.import_batch.as_str()),
+                }
+            };
+            let root_id = self
+                .acquire_provenance_root(root_kind, &chunk.content, &signals)
+                .await?;
+
+            // `acquire` converges on an inactive row too. Verification in
+            // `write_support_edge` would refuse it later, but filtering it
+            // here keeps an unusable locator out of the sealed inventory.
+            let active = {
+                let conn = self.conn.lock().await;
+                let mut rows = conn
+                    .query(
+                        "SELECT 1 FROM provenance_roots
+                          WHERE root_id = ?1 AND status = 'active'",
+                        libsql::params![root_id.clone()],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("M5 root active lookup: {error}"))
+                    })?;
+                rows.next()
+                    .await
+                    .map_err(|error| WenlanError::VectorDb(format!("M5 root active row: {error}")))?
+                    .is_some()
+            };
+            if active {
+                chunk.root_id = Some(root_id);
+            }
+        }
+        chunks.retain(|chunk| chunk.root_id.is_some() && chunk.root_mint_allowed);
+        Ok(())
+    }
+
+    fn rank_linked_candidates(
+        claims: &[DerivedClaim],
+        chunks: &[LinkedMemoryChunk],
+    ) -> Vec<RankedCandidate> {
+        let mut spans = BTreeMap::<(String, i64, i64, i64, String), (String, i64, String)>::new();
+        for chunk in chunks {
+            for (start, end) in crate::faithfulness::sentence_spans(&chunk.content) {
+                let Some(text) = chunk.content.get(start..end) else {
+                    continue;
+                };
+                if text.trim().is_empty() || crate::faithfulness::content_tokens(text).is_empty() {
+                    continue;
+                }
+                let digest = crate::provenance::revision_content_digest(text);
+                spans
+                    .entry((
+                        chunk.source_id.clone(),
+                        chunk.chunk_index,
+                        start as i64,
+                        end as i64,
+                        digest,
+                    ))
+                    .or_insert_with(|| {
+                        (
+                            text.to_string(),
+                            chunk.source_version,
+                            chunk
+                                .root_id
+                                .clone()
+                                .expect("unrooted chunks were filtered"),
+                        )
+                    });
+            }
+        }
+
+        let mut ranked = Vec::new();
+        for claim in claims {
+            // Persisted but deliberately unjudgeable: an empty token set must
+            // keep the page provisional, never win vacuously.
+            if crate::faithfulness::content_tokens(&claim.canonical_text).is_empty() {
+                continue;
+            }
+            let mut candidates: Vec<_> = spans
+                .iter()
+                .map(
+                    |((source_id, chunk, start, end, digest), (text, version, root_id))| {
+                        (
+                            lexical_relevance(&claim.canonical_text, text),
+                            RankedCandidate {
+                                claim_revision_id: claim.revision_id.clone(),
+                                claim_text: claim.canonical_text.clone(),
+                                claim_text_digest: claim.canonical_text_digest.clone(),
+                                locator: CandidateLocator {
+                                    source_id: source_id.clone(),
+                                    chunk_index: *chunk,
+                                    span_start: *start,
+                                    span_end: *end,
+                                    span_digest: digest.clone(),
+                                },
+                                evidence_text: text.clone(),
+                                source_version: *version,
+                                root_id: root_id.clone(),
+                            },
+                        )
+                    },
+                )
+                .collect();
+            candidates.sort_by(|(left_score, left), (right_score, right)| {
+                right_score.cmp(left_score).then_with(|| {
+                    (
+                        left.locator.source_id.as_str(),
+                        left.locator.chunk_index,
+                        left.locator.span_start,
+                        left.locator.span_end,
+                        left.locator.span_digest.as_str(),
+                    )
+                        .cmp(&(
+                            right.locator.source_id.as_str(),
+                            right.locator.chunk_index,
+                            right.locator.span_start,
+                            right.locator.span_end,
+                            right.locator.span_digest.as_str(),
+                        ))
+                })
+            });
+            ranked.extend(
+                candidates
+                    .into_iter()
+                    .take(MAX_CANDIDATES_PER_CLAIM)
+                    .map(|(_, candidate)| candidate),
+            );
+        }
+        ranked
+    }
+
+    async fn cached_candidate_scores(
+        &self,
+        snapshot: &crate::claim_judge::M5ClaimJudgeSnapshot,
+        candidates: &[RankedCandidate],
+    ) -> Result<Vec<Option<(f64, f64)>>, WenlanError> {
+        let conn = self.conn.lock().await;
+        let mut by_key = HashMap::<(String, String), (f64, f64)>::new();
+        for candidate in candidates {
+            let key = (
+                candidate.claim_text_digest.clone(),
+                candidate.locator.span_digest.clone(),
+            );
+            if by_key.contains_key(&key) {
+                continue;
+            }
+            let mut rows = conn
+                .query(
+                    "SELECT score, threshold_at_write FROM entailment_cache
+                      WHERE claim_text_digest = ?1 AND source_span_digest = ?2
+                        AND model_id = ?3 AND model_version = ?4 AND prompt_version = ?5
+                        AND backend = ?6",
+                    libsql::params![
+                        key.0.as_str(),
+                        key.1.as_str(),
+                        snapshot.model_id.as_str(),
+                        snapshot.model_version.as_str(),
+                        snapshot.prompt_version,
+                        crate::claim_judge::M5_CLAIM_ENTAILMENT_CACHE_BACKEND,
+                    ],
+                )
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("M5 cache lookup: {error}")))?;
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("M5 cache row: {error}")))?
+            {
+                by_key.insert(
+                    key,
+                    (
+                        row.get(0).map_err(|error| {
+                            WenlanError::VectorDb(format!("M5 cache decode: {error}"))
+                        })?,
+                        row.get(1).map_err(|error| {
+                            WenlanError::VectorDb(format!("M5 cache decode: {error}"))
+                        })?,
+                    ),
+                );
+            }
+        }
+        Ok(candidates
+            .iter()
+            .map(|candidate| {
+                by_key
+                    .get(&(
+                        candidate.claim_text_digest.clone(),
+                        candidate.locator.span_digest.clone(),
+                    ))
+                    .copied()
+            })
+            .collect())
+    }
+
+    /// Atomically bind every complete score to this run. Cache hits go through
+    /// the same attempt write as misses, so this-run completeness never depends
+    /// on when a global cache row was first created.
+    async fn persist_run_judgments(
+        &self,
+        job: &DerivationJob,
+        owner: &str,
+        snapshot: &crate::claim_judge::M5ClaimJudgeSnapshot,
+        candidates: &[RankedCandidate],
+        scores: &[(f64, f64, bool)],
+    ) -> Result<bool, WenlanError> {
+        if candidates.len() != scores.len() {
+            return Err(WenlanError::Conflict(
+                "M5 judgment output is incomplete".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("M5 judgment begin: {error}")))?;
+        let result = async {
+            let holds_lease = {
+                let mut rows = tx
+                    .query(
+                        "SELECT 1 FROM claim_derivation_jobs
+                          WHERE job_id = ?1 AND page_id = ?2 AND page_version = ?3
+                            AND run_generation = ?4 AND eligibility_generation = ?5
+                            AND status = 'leased' AND lease_owner = ?6",
+                        libsql::params![
+                            job.job_id.as_str(),
+                            job.page_id.as_str(),
+                            job.page_version,
+                            job.run_generation,
+                            job.eligibility_generation,
+                            owner,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("M5 judgment lease: {error}"))
+                    })?;
+                rows.next()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("M5 judgment lease row: {error}"))
+                    })?
+                    .is_some()
+            };
+            if !holds_lease
+                || Self::current_eligibility_generation(&tx).await? != job.eligibility_generation
+            {
+                return Ok(false);
+            }
+            let now = chrono::Utc::now().timestamp();
+            for (candidate, (score, threshold_at_write, cache_miss)) in
+                candidates.iter().zip(scores)
+            {
+                if *cache_miss {
+                    tx.execute(
+                        "INSERT INTO entailment_cache
+                             (claim_text_digest, source_span_digest, model_id, model_version,
+                              prompt_version, score, threshold_at_write, backend, scored_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                         ON CONFLICT(claim_text_digest, source_span_digest, model_id,
+                                     model_version, prompt_version) DO UPDATE SET
+                             score = excluded.score,
+                             threshold_at_write = excluded.threshold_at_write,
+                             backend = excluded.backend,
+                             scored_at = excluded.scored_at
+                           WHERE entailment_cache.backend <> excluded.backend",
+                        libsql::params![
+                            candidate.claim_text_digest.as_str(),
+                            candidate.locator.span_digest.as_str(),
+                            snapshot.model_id.as_str(),
+                            snapshot.model_version.as_str(),
+                            snapshot.prompt_version,
+                            *score,
+                            *threshold_at_write,
+                            crate::claim_judge::M5_CLAIM_ENTAILMENT_CACHE_BACKEND,
+                            now,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| WenlanError::VectorDb(format!("M5 cache write: {error}")))?;
+                }
+                tx.execute(
+                    "INSERT OR REPLACE INTO claim_judgment_attempts
+                         (page_id, page_version, run_generation, claim_revision_id,
+                          candidate_source_id, candidate_chunk_index,
+                          candidate_span_start, candidate_span_end, candidate_digest,
+                          outcome, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'concluded', ?10)",
+                    libsql::params![
+                        job.page_id.as_str(),
+                        job.page_version,
+                        job.run_generation,
+                        candidate.claim_revision_id.as_str(),
+                        candidate.locator.source_id.as_str(),
+                        candidate.locator.chunk_index,
+                        candidate.locator.span_start,
+                        candidate.locator.span_end,
+                        candidate.locator.span_digest.as_str(),
+                        now,
+                    ],
+                )
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("M5 attempt write: {error}")))?;
+            }
+            Ok(true)
+        }
+        .await;
+        match result {
+            Ok(true) => {
+                tx.commit().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("M5 judgment commit: {error}"))
+                })?;
+                Ok(true)
+            }
+            Ok(false) => {
+                let _ = tx.rollback().await;
+                Ok(false)
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn persist_deferred_attempts(
+        &self,
+        job: &DerivationJob,
+        owner: &str,
+        candidates: &[RankedCandidate],
+    ) -> Result<bool, WenlanError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("M5 deferred begin: {error}")))?;
+        let result = async {
+            let mut rows = tx
+                .query(
+                    "SELECT 1 FROM claim_derivation_jobs
+                      WHERE job_id = ?1 AND page_id = ?2 AND page_version = ?3
+                        AND run_generation = ?4 AND eligibility_generation = ?5
+                        AND status = 'leased' AND lease_owner = ?6",
+                    libsql::params![
+                        job.job_id.as_str(),
+                        job.page_id.as_str(),
+                        job.page_version,
+                        job.run_generation,
+                        job.eligibility_generation,
+                        owner,
+                    ],
+                )
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("M5 deferred lease: {error}")))?;
+            if rows
+                .next()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("M5 deferred lease row: {error}")))?
+                .is_none()
+                || Self::current_eligibility_generation(&tx).await? != job.eligibility_generation
+            {
+                return Ok(false);
+            }
+            let now = chrono::Utc::now().timestamp();
+            for candidate in candidates {
+                tx.execute(
+                    "INSERT OR REPLACE INTO claim_judgment_attempts
+                         (page_id, page_version, run_generation, claim_revision_id,
+                          candidate_source_id, candidate_chunk_index,
+                          candidate_span_start, candidate_span_end, candidate_digest,
+                          outcome, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'deferred', ?10)",
+                    libsql::params![
+                        job.page_id.as_str(),
+                        job.page_version,
+                        job.run_generation,
+                        candidate.claim_revision_id.as_str(),
+                        candidate.locator.source_id.as_str(),
+                        candidate.locator.chunk_index,
+                        candidate.locator.span_start,
+                        candidate.locator.span_end,
+                        candidate.locator.span_digest.as_str(),
+                        now,
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("M5 deferred attempt write: {error}"))
+                })?;
+            }
+            Ok(true)
+        }
+        .await;
+        match result {
+            Ok(true) => {
+                tx.commit().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("M5 deferred commit: {error}"))
+                })?;
+                Ok(true)
+            }
+            Ok(false) => {
+                let _ = tx.rollback().await;
+                Ok(false)
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn park_leased_derivation_job(
+        &self,
+        job: &DerivationJob,
+        owner: &str,
+        reason: &str,
+    ) -> Result<bool, WenlanError> {
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE claim_derivation_jobs
+                    SET status = 'parked', lease_owner = NULL, lease_expires_at = NULL,
+                        last_error = ?1, updated_at = ?2
+                  WHERE job_id = ?3 AND page_id = ?4 AND page_version = ?5
+                    AND run_generation = ?6 AND eligibility_generation = ?7
+                    AND status = 'leased' AND lease_owner = ?8",
+                libsql::params![
+                    reason,
+                    chrono::Utc::now().timestamp(),
+                    job.job_id.as_str(),
+                    job.page_id.as_str(),
+                    job.page_version,
+                    job.run_generation,
+                    job.eligibility_generation,
+                    owner,
+                ],
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("derivation park: {error}")))?;
+        Ok(changed > 0)
+    }
+
+    pub(super) async fn run_leased_page_linked_truth_promotion(
+        &self,
+        provider: &dyn LlmProvider,
+        snapshot: &crate::claim_judge::M5ClaimJudgeSnapshot,
+        threshold: f64,
+        expected_eligibility_generation: i64,
+        job: &DerivationJob,
+        owner: &str,
+    ) -> Result<PromotionTurn, WenlanError> {
+        if job.eligibility_generation != expected_eligibility_generation {
+            return Ok(PromotionTurn::Requeued {
+                page_id: job.page_id.clone(),
+                page_version: job.page_version,
+                reason: "judge eligibility moved before the page lease".to_string(),
+            });
+        }
+        let (derivation, claims) = self.derive_leased_page_claims(job, owner).await?;
+        match derivation {
+            DerivationWrite::StaleLease => {
+                return Ok(PromotionTurn::Requeued {
+                    page_id: job.page_id.clone(),
+                    page_version: job.page_version,
+                    reason: "lease moved before claim derivation".to_string(),
+                });
+            }
+            DerivationWrite::TooManyClaims => {
+                let reason = format!(
+                    "claim inventory exceeds the {MAX_CLAIMS_PER_PAGE}-claim safety ceiling"
+                );
+                self.park_leased_derivation_job(job, owner, &reason).await?;
+                return Ok(PromotionTurn::Parked {
+                    page_id: job.page_id.clone(),
+                    page_version: job.page_version,
+                    reason,
+                });
+            }
+            DerivationWrite::Written => {}
+        }
+
+        let Some(mut chunks) = self.load_linked_memory_chunks(job, owner).await? else {
+            return Ok(PromotionTurn::Requeued {
+                page_id: job.page_id.clone(),
+                page_version: job.page_version,
+                reason: "lease moved before linked evidence enumeration".to_string(),
+            });
+        };
+        self.attach_candidate_roots(&mut chunks).await?;
+        let candidates = Self::rank_linked_candidates(&claims, &chunks);
+        let inventory: Vec<_> = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.claim_revision_id.clone(),
+                    candidate.locator.clone(),
+                )
+            })
+            .collect();
+        if !self
+            .record_run_candidate_inventory(job, owner, &inventory)
+            .await?
+        {
+            return Ok(PromotionTurn::Requeued {
+                page_id: job.page_id.clone(),
+                page_version: job.page_version,
+                reason: "lease moved before candidate inventory seal".to_string(),
+            });
+        }
+
+        let cached = self.cached_candidate_scores(snapshot, &candidates).await?;
+        let mut complete_scores = vec![None; candidates.len()];
+        let mut misses = BTreeMap::<(String, String), Vec<usize>>::new();
+        for (index, hit) in cached.into_iter().enumerate() {
+            if let Some((score, cached_threshold)) = hit {
+                complete_scores[index] = Some((score, cached_threshold, false));
+            } else {
+                misses
+                    .entry((
+                        candidates[index].claim_text_digest.clone(),
+                        candidates[index].locator.span_digest.clone(),
+                    ))
+                    .or_default()
+                    .push(index);
+            }
+        }
+
+        let unique_misses: Vec<Vec<usize>> = misses.into_values().collect();
+        let call_count = unique_misses
+            .len()
+            .div_ceil(crate::claim_judge::M5_CLAIM_JUDGE_MAX_BATCH_ITEMS);
+        if call_count > MAX_MODEL_CALLS_PER_PAGE {
+            return Err(WenlanError::Conflict(format!(
+                "M5 model-call ceiling exceeded: {call_count} > {MAX_MODEL_CALLS_PER_PAGE}"
+            )));
+        }
+        let mut batch_plans = Vec::with_capacity(call_count);
+        for (batch_index, batch) in unique_misses
+            .chunks(crate::claim_judge::M5_CLAIM_JUDGE_MAX_BATCH_ITEMS)
+            .enumerate()
+        {
+            let item_ids: Vec<String> = (0..batch.len())
+                .map(|item| format!("m5-{batch_index}-{item}"))
+                .collect();
+            let items: Vec<_> = batch
+                .iter()
+                .zip(&item_ids)
+                .map(|(indexes, item_id)| {
+                    let candidate = &candidates[indexes[0]];
+                    crate::claim_judge::M5ClaimEntailmentItem {
+                        item_id,
+                        claim: candidate.claim_text.as_str(),
+                        evidence: candidate.evidence_text.as_str(),
+                    }
+                })
+                .collect();
+            let prompt = crate::claim_judge::build_m5_claim_entailment_batch_user_prompt(&items)
+                .ok_or_else(|| {
+                    WenlanError::Conflict("M5 judge refused a bounded batch".to_string())
+                })?;
+            batch_plans.push((batch.to_vec(), item_ids, prompt));
+        }
+        let prompt_bytes: Vec<usize> = batch_plans
+            .iter()
+            .map(|(_, _, prompt)| prompt.len())
+            .collect();
+        if !m5_judge_budget_allows(&prompt_bytes) {
+            let reason = format!(
+                "M5 judge input exceeds the {MAX_JUDGE_TOKENS_PER_PAGE}-token safety ceiling"
+            );
+            self.park_leased_derivation_job(job, owner, &reason).await?;
+            return Ok(PromotionTurn::Parked {
+                page_id: job.page_id.clone(),
+                page_version: job.page_version,
+                reason,
+            });
+        }
+
+        for (batch, item_ids, prompt) in batch_plans {
+            // Load-bearing placement: all DB guards and transactions have been
+            // dropped before inference begins.
+            let raw = match provider
+                .generate(LlmRequest {
+                    system_prompt: Some(
+                        crate::claim_judge::M5_CLAIM_ENTAILMENT_SYSTEM_PROMPT.to_string(),
+                    ),
+                    user_prompt: prompt,
+                    max_tokens: M5_JUDGE_MAX_OUTPUT_TOKENS as u32,
+                    temperature: 0.0,
+                    label: Some("m5_claim_entailment".to_string()),
+                    timeout_secs: None,
+                })
+                .await
+            {
+                Ok(raw) => raw,
+                Err(error) => {
+                    self.persist_deferred_attempts(job, owner, &candidates)
+                        .await?;
+                    return Err(WenlanError::Conflict(format!(
+                        "M5 judge inference failed: {error}"
+                    )));
+                }
+            };
+            let Some(parsed) =
+                crate::claim_judge::parse_m5_claim_entailment_batch_scores(&raw, &item_ids)
+            else {
+                self.persist_deferred_attempts(job, owner, &candidates)
+                    .await?;
+                return Err(WenlanError::Conflict(
+                    "M5 judge returned malformed or incomplete output".to_string(),
+                ));
+            };
+            for (indexes, score) in batch.iter().zip(parsed) {
+                for index in indexes {
+                    complete_scores[*index] = Some((score.score, threshold, true));
+                }
+            }
+        }
+        let complete_scores: Vec<(f64, f64, bool)> = complete_scores
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| WenlanError::Conflict("M5 judgment set is incomplete".to_string()))?;
+        if !self
+            .persist_run_judgments(job, owner, snapshot, &candidates, &complete_scores)
+            .await?
+        {
+            return Ok(PromotionTurn::Requeued {
+                page_id: job.page_id.clone(),
+                page_version: job.page_version,
+                reason: "lease or eligibility moved before judgment persistence".to_string(),
+            });
+        }
+
+        for (candidate, (score, threshold_at_write, _)) in candidates.iter().zip(&complete_scores) {
+            if *score < threshold {
+                continue;
+            }
+            self.write_support_edge(
+                &candidate.claim_revision_id,
+                &candidate.locator.source_id,
+                &candidate.root_id,
+                &super::claim_identity::SupportVerdict {
+                    chunk_index: candidate.locator.chunk_index,
+                    source_version: candidate.source_version,
+                    span_start: candidate.locator.span_start,
+                    span_end: candidate.locator.span_end,
+                    span_digest: candidate.locator.span_digest.clone(),
+                    model_id: snapshot.model_id.clone(),
+                    model_version: snapshot.model_version.clone(),
+                    prompt_version: snapshot.prompt_version.to_string(),
+                    score: *score,
+                    threshold_at_write: *threshold_at_write,
+                },
+            )
+            .await?;
+        }
+
+        let outcome = self
+            .evaluate_page_support(&job.page_id, job.page_version)
+            .await?;
+        if matches!(outcome, SupportOutcome::NoPublish { .. })
+            || !self
+                .finalize_page_support(&job.page_id, job.page_version, job, owner, &outcome)
+                .await?
+        {
+            return Err(WenlanError::Conflict(
+                "M5 finalization refused an incomplete or stale run".to_string(),
+            ));
+        }
+        if !self.finish_derivation_job(job, owner).await? {
+            return Err(WenlanError::Conflict(
+                "M5 job completion lost its lease".to_string(),
+            ));
+        }
+        Ok(PromotionTurn::Completed {
+            page_id: job.page_id.clone(),
+            page_version: job.page_version,
+        })
+    }
+
+    /// Run at most one page-linked M5 truth-promotion turn.
+    pub async fn run_page_linked_truth_promotion_turn(
+        &self,
+        provider: &dyn LlmProvider,
+        owner: &str,
+    ) -> Result<PromotionTurn, WenlanError> {
+        let Some(snapshot) = crate::claim_judge::snapshot_m5_claim_judge(provider) else {
+            return Ok(PromotionTurn::RefusedProvider);
+        };
+        if !self.activate_approved_m5_claim_judge(&snapshot).await? {
+            return Ok(PromotionTurn::RefusedProvider);
+        }
+        let Some((threshold, eligibility_generation)) = self.active_judge_policy(&snapshot).await?
+        else {
+            return Ok(PromotionTurn::RefusedProvider);
+        };
+        let Some(job) = self.lease_next_derivation_job(owner).await? else {
+            return Ok(PromotionTurn::Idle);
+        };
+
+        match self
+            .run_leased_page_linked_truth_promotion(
+                provider,
+                &snapshot,
+                threshold,
+                eligibility_generation,
+                &job,
+                owner,
+            )
+            .await
+        {
+            Ok(PromotionTurn::Requeued {
+                page_id,
+                page_version,
+                reason,
+            }) => {
+                if self.release_derivation_job(&job, owner, &reason).await? {
+                    self.park_exhausted_derivation_jobs().await?;
+                }
+                Ok(PromotionTurn::Requeued {
+                    page_id,
+                    page_version,
+                    reason,
+                })
+            }
+            Ok(turn) => Ok(turn),
+            Err(error) => {
+                let reason = error.to_string();
+                let released = self.release_derivation_job(&job, owner, &reason).await?;
+                if released {
+                    self.park_exhausted_derivation_jobs().await?;
+                }
+                let parked = {
+                    let conn = self.conn.lock().await;
+                    let mut rows = conn
+                        .query(
+                            "SELECT status FROM claim_derivation_jobs WHERE job_id = ?1",
+                            libsql::params![job.job_id.as_str()],
+                        )
+                        .await
+                        .map_err(|db_error| {
+                            WenlanError::VectorDb(format!("M5 failure status: {db_error}"))
+                        })?;
+                    rows.next()
+                        .await
+                        .map_err(|db_error| {
+                            WenlanError::VectorDb(format!("M5 failure status row: {db_error}"))
+                        })?
+                        .map(|row| row.get::<String>(0))
+                        .transpose()
+                        .map_err(|db_error| {
+                            WenlanError::VectorDb(format!("M5 failure status decode: {db_error}"))
+                        })?
+                        .as_deref()
+                        == Some("parked")
+                };
+                Ok(if parked {
+                    PromotionTurn::Parked {
+                        page_id: job.page_id,
+                        page_version: job.page_version,
+                        reason,
+                    }
+                } else {
+                    PromotionTurn::Requeued {
+                        page_id: job.page_id,
+                        page_version: job.page_version,
+                        reason,
+                    }
+                })
             }
         }
     }
@@ -1089,7 +3047,6 @@ impl MemoryDB {
     /// every stored `supported` above the cursor reads `Unevaluated`, so no old
     /// verdict is asserted before the current process re-earns it.
     pub async fn begin_support_reconcile_pass(&self) -> Result<(), WenlanError> {
-        let ruleset = support_reconcile_ruleset();
         let conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
@@ -1097,6 +3054,7 @@ impl MemoryDB {
             .map_err(|error| {
                 WenlanError::VectorDb(format!("support reconcile pass begin: {error}"))
             })?;
+        let ruleset = support_reconcile_ruleset(Self::current_eligibility_generation(&tx).await?);
         let reset = async {
             let frontier = {
                 let mut rows = tx
@@ -1327,6 +3285,7 @@ impl MemoryDB {
         let expires = now + LEASE_SECS;
         let conn = self.conn.lock().await;
         let generation = Self::allocate_run_generation(&conn).await?;
+        let eligibility_generation = Self::current_eligibility_generation(&conn).await?;
 
         let mut rows = conn
             .query(
@@ -1336,6 +3295,7 @@ impl MemoryDB {
                         lease_expires_at = ?2,
                         attempts = attempts + 1,
                         run_generation = ?5,
+                        eligibility_generation = ?6,
                         updated_at = ?3
                   WHERE job_id = (
                       SELECT job_id FROM claim_derivation_jobs
@@ -1348,7 +3308,14 @@ impl MemoryDB {
                        LIMIT 1
                   )
                   RETURNING job_id, page_id, page_version",
-                libsql::params![owner, expires, now, MAX_ATTEMPTS, generation],
+                libsql::params![
+                    owner,
+                    expires,
+                    now,
+                    MAX_ATTEMPTS,
+                    generation,
+                    eligibility_generation
+                ],
             )
             .await
             .map_err(|error| WenlanError::VectorDb(format!("derivation lease: {error}")))?;
@@ -1378,6 +3345,7 @@ impl MemoryDB {
                 WenlanError::VectorDb(format!("derivation lease page_version: {error}"))
             })?,
             run_generation: generation,
+            eligibility_generation,
         }))
     }
 
@@ -1504,13 +3472,6 @@ impl MemoryDB {
     ///    finished and succeeded. §1 condition 4 is a property of the RUN, not
     ///    of whether some candidate happened to work out.
     ///
-    /// **Known gap, condition 3.** The matrix also requires the supporting edge
-    /// to come from a "currently-eligible model version" (row 14). No model
-    /// eligibility registry exists anywhere in the tree yet, so that clause is
-    /// unimplementable today and this function does not pretend otherwise: it
-    /// accepts a qualifying score from any judge. The gap is not currently
-    /// reachable — nothing writes support edges in production — but it must be
-    /// closed before one does.
     pub async fn evaluate_page_support(
         &self,
         page_id: &str,
@@ -2049,14 +4010,20 @@ impl MemoryDB {
                                 json_extract(e.payload, '$.span_end'),
                                 json_extract(e.payload, '$.span_digest')
                            FROM edges e
+                           JOIN claim_judge_eligibility j
+                             ON j.model_id = json_extract(e.payload, '$.model_id')
+                            AND j.model_version = json_extract(e.payload, '$.model_version')
+                            AND j.prompt_version = json_extract(e.payload, '$.prompt_version')
                           WHERE e.edge_type = 'supports'
                             AND e.src_kind = 'claim_revision'
                             AND e.dst_kind = 'memory'
                             AND e.src_id = ?1
                             AND e.valid_until IS NULL
                             AND e.superseded_by IS NULL
-                            AND json_extract(e.payload, '$.score') >= ?2",
-                        libsql::params![claim_revision_id.clone(), SUPPORT_THRESHOLD],
+                            AND j.state IN ('active', 'draining')
+                            AND json_type(e.payload, '$.score') IN ('integer', 'real')
+                            AND json_extract(e.payload, '$.score') >= j.threshold",
+                        libsql::params![claim_revision_id.clone()],
                     )
                     .await
                     .map_err(|error| {
@@ -2355,8 +4322,8 @@ impl MemoryDB {
             return Ok(SupportOutcome::Refuted {
                 reason: format!(
                     "candidates judged and fell short: {judged_short} of {inventory_count} \
-                     claim(s) have no active support edge at or above threshold \
-                     {SUPPORT_THRESHOLD}"
+                     claim(s) have no support edge from an eligible judge at or above its \
+                     registered threshold"
                 ),
             });
         }
@@ -2386,7 +4353,7 @@ impl MemoryDB {
     ///    A parked job's former worker had the same opening.
     /// 2. The verdict is **recomputed here** and must equal the one handed in.
     ///    Re-reading the page version cannot close this: a support edge can be
-    ///    retracted, a marker can be superseded, and the threshold constant can
+    ///    retracted, a marker can be superseded, and a registry threshold can
     ///    rise, all without the page version moving. Recomputing under the same
     ///    transaction that writes is the only comparison that covers every input
     ///    at once, and it costs one extra read of rows this function was already
@@ -2427,13 +4394,15 @@ impl MemoryDB {
                             AND page_id = ?2
                             AND page_version = ?3
                             AND run_generation = ?4
+                            AND eligibility_generation = ?5
                             AND status = 'leased'
-                            AND lease_owner = ?5",
+                            AND lease_owner = ?6",
                         libsql::params![
                             job.job_id.as_str(),
                             job.page_id.as_str(),
                             job.page_version,
                             job.run_generation,
+                            job.eligibility_generation,
                             owner
                         ],
                     )
@@ -2452,6 +4421,13 @@ impl MemoryDB {
                 return Ok(false);
             }
             if job.page_id != page_id || job.page_version != page_version {
+                return Ok(false);
+            }
+
+            // Eligibility is a CAS input in its own right. Recomputing is not
+            // a substitute: active -> draining can leave the verdict Supported
+            // while still invalidating the regime this worker leased under.
+            if Self::current_eligibility_generation(&tx).await? != job.eligibility_generation {
                 return Ok(false);
             }
 

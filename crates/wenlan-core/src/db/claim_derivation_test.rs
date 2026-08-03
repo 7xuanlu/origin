@@ -3,11 +3,16 @@
 //! guards; deleting the rule in the doc comment must turn the test RED.
 
 use super::claim_derivation::{
-    CandidateLocator, DerivationJob, SupportOutcome, EXTRACTOR_VERSION, MAX_ATTEMPTS,
-    SUPPORT_THRESHOLD,
+    CandidateLocator, DerivationJob, DerivationWrite, PromotionTurn, SupportOutcome,
+    EXTRACTOR_VERSION, M5_PRODUCTION_JUDGE_MODEL_ID, M5_PRODUCTION_JUDGE_MODEL_VERSION,
+    M5_PRODUCTION_JUDGE_THRESHOLD, MAX_ATTEMPTS, SUPPORT_THRESHOLD,
 };
 use super::tests::test_db;
 use super::MemoryDB;
+use crate::llm_provider::{LlmBackend, LlmError, LlmProvider, LlmRequest};
+use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// A fully migrated database with NO pages. `test_db` runs the real migration
 /// chain, so migration 105 has already installed the triggers here — re-running
@@ -18,11 +23,15 @@ async fn db_with_queue() -> (MemoryDB, tempfile::TempDir) {
         let conn = db.conn.lock().await;
         let tx = conn.transaction().await.unwrap();
         MemoryDB::ensure_claim_identity_tables(&tx).await.unwrap();
+        MemoryDB::ensure_judge_eligibility_tables(&tx)
+            .await
+            .unwrap();
         MemoryDB::ensure_claim_derivation_triggers(&tx)
             .await
             .unwrap();
         tx.commit().await.unwrap();
     }
+    set_test_judge_eligibility(&db, "active", SUPPORT_THRESHOLD).await;
     (db, temp)
 }
 
@@ -44,7 +53,201 @@ async fn db_before_the_worker() -> (MemoryDB, tempfile::TempDir) {
             .await
             .unwrap();
     }
+    set_test_judge_eligibility(&db, "active", SUPPORT_THRESHOLD).await;
     (db, temp)
+}
+
+/// Change the test judge's policy-independent eligibility row and advance the
+/// one global generation in the same transaction. This is the storage shape a
+/// later policy-owning transition API must preserve.
+async fn set_test_judge_eligibility(db: &MemoryDB, state: &str, threshold: f64) -> i64 {
+    let conn = db.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    let generation = {
+        let mut rows = tx
+            .query(
+                "UPDATE claim_judge_eligibility_generation
+                    SET last_generation = last_generation + 1
+                  WHERE id = 1
+                  RETURNING last_generation",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .expect("the eligibility generation singleton must exist")
+            .get::<i64>(0)
+            .unwrap()
+    };
+    tx.execute(
+        "INSERT INTO claim_judge_eligibility
+             (model_id, model_version, prompt_version, state, threshold, generation)
+         VALUES ('judge', 'v1', 'p1', ?1, ?2, ?3)
+         ON CONFLICT(model_id, model_version, prompt_version) DO UPDATE SET
+             state = excluded.state,
+             threshold = excluded.threshold,
+             generation = excluded.generation",
+        libsql::params![state, threshold, generation],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    generation
+}
+
+async fn test_eligibility_generation(db: &MemoryDB) -> i64 {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT last_generation FROM claim_judge_eligibility_generation WHERE id = 1",
+            (),
+        )
+        .await
+        .unwrap();
+    rows.next().await.unwrap().unwrap().get(0).unwrap()
+}
+
+async fn eligibility_schema_fingerprint(conn: &libsql::Connection) -> (Vec<String>, i64, i64, i64) {
+    let ddl = {
+        let mut rows = conn
+            .query(
+                "SELECT sql FROM sqlite_schema
+                  WHERE type = 'table'
+                    AND name IN ('claim_judge_eligibility',
+                                 'claim_judge_eligibility_generation')
+                  ORDER BY name",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut ddl = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            ddl.push(row.get::<String>(0).unwrap());
+        }
+        ddl
+    };
+    let job_column = {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM pragma_table_info('claim_derivation_jobs')
+                  WHERE name = 'eligibility_generation' AND type = 'INTEGER'
+                    AND \"notnull\" = 1 AND dflt_value = '0'",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    let generation = {
+        let mut rows = conn
+            .query(
+                "SELECT last_generation FROM claim_judge_eligibility_generation WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    let registry_rows = {
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM claim_judge_eligibility", ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    (ddl, job_column, generation, registry_rows)
+}
+
+#[tokio::test]
+async fn migration_110_from_104_installs_eligibility_before_the_105_drift_scan() {
+    let (db, _temp) = test_db().await;
+    let fresh = {
+        let conn = db.conn.lock().await;
+        eligibility_schema_fingerprint(&conn).await
+    };
+    {
+        let conn = db.conn.lock().await;
+        conn.execute_batch(
+            "DROP TABLE claim_judge_eligibility;
+             DROP TABLE claim_judge_eligibility_generation;
+             ALTER TABLE claim_derivation_jobs DROP COLUMN eligibility_generation;
+             ALTER TABLE claim_derivation_jobs DROP COLUMN run_generation;
+             PRAGMA user_version = 104;",
+        )
+        .await
+        .unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
+
+    let conn = db.conn.lock().await;
+    let user_version: i64 = {
+        let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(user_version, 110);
+    assert_eq!(eligibility_schema_fingerprint(&conn).await, fresh);
+}
+
+#[tokio::test]
+async fn migration_110_from_109_converges_with_the_fresh_schema() {
+    let (db, _temp) = test_db().await;
+    let fresh = {
+        let conn = db.conn.lock().await;
+        let fresh = eligibility_schema_fingerprint(&conn).await;
+        assert_eq!(fresh.0.len(), 2);
+        assert_eq!(fresh.1, 1);
+        assert_eq!(fresh.2, 0);
+        assert_eq!(fresh.3, 0, "a fresh registry must fail closed");
+        fresh
+    };
+    {
+        let conn = db.conn.lock().await;
+        conn.execute_batch(
+            "DROP TABLE claim_judge_eligibility;
+             DROP TABLE claim_judge_eligibility_generation;
+             ALTER TABLE claim_derivation_jobs DROP COLUMN eligibility_generation;
+             PRAGMA user_version = 109;",
+        )
+        .await
+        .unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
+
+    let conn = db.conn.lock().await;
+    let user_version: i64 = {
+        let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(user_version, 110);
+    let upgraded = eligibility_schema_fingerprint(&conn).await;
+    assert_eq!(upgraded, fresh, "fresh and 109 -> 110 must converge");
+    assert!(conn
+        .execute(
+            "INSERT INTO claim_judge_eligibility
+                 VALUES ('judge', 'v1', 'p1', 'unknown', 0.75, 1)",
+            (),
+        )
+        .await
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT INTO claim_judge_eligibility
+                 VALUES ('judge', 'v1', 'p1', 'active', 1.01, 1)",
+            (),
+        )
+        .await
+        .is_err());
 }
 
 async fn install_triggers(db: &MemoryDB) {
@@ -882,8 +1085,12 @@ async fn attempt_on(db: &MemoryDB, revision_id: &str, candidate: &Candidate, out
         "INSERT OR IGNORE INTO entailment_cache
              (claim_text_digest, source_span_digest, model_id, model_version,
               prompt_version, score, threshold_at_write, backend, scored_at)
-         VALUES (?1, ?2, 'judge', 'v1', 'p1', 0.1, 0.75, 'test', 0)",
-        libsql::params![digest, candidate.span_digest.clone()],
+         VALUES (?1, ?2, 'judge', 'v1', 'p1', 0.1, 0.75, ?3, 0)",
+        libsql::params![
+            digest,
+            candidate.span_digest.clone(),
+            crate::claim_judge::M5_CLAIM_ENTAILMENT_CACHE_BACKEND,
+        ],
     )
     .await
     .unwrap();
@@ -1170,13 +1377,24 @@ async fn carry_seeded_judgements(db: &MemoryDB, page_id: &str, page_version: i64
 async fn lease_page(db: &MemoryDB, page_id: &str, page_version: i64, owner: &str) -> DerivationJob {
     let conn = db.conn.lock().await;
     let generation = MemoryDB::allocate_run_generation(&conn).await.unwrap();
+    let eligibility_generation = {
+        let mut rows = conn
+            .query(
+                "SELECT last_generation FROM claim_judge_eligibility_generation WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    };
     let job = {
         let mut rows = conn
             .query(
                 "UPDATE claim_derivation_jobs
                     SET status = 'leased', lease_owner = ?3,
                         lease_expires_at = ?4, attempts = attempts + 1,
-                        run_generation = ?5, updated_at = ?4
+                        run_generation = ?5, eligibility_generation = ?6,
+                        updated_at = ?4
                   WHERE page_id = ?1 AND page_version = ?2
                   RETURNING job_id, page_id, page_version",
                 libsql::params![
@@ -1184,7 +1402,8 @@ async fn lease_page(db: &MemoryDB, page_id: &str, page_version: i64, owner: &str
                     page_version,
                     owner,
                     chrono::Utc::now().timestamp() + 600,
-                    generation
+                    generation,
+                    eligibility_generation
                 ],
             )
             .await
@@ -1199,6 +1418,7 @@ async fn lease_page(db: &MemoryDB, page_id: &str, page_version: i64, owner: &str
             page_id: row.get::<String>(1).unwrap(),
             page_version: row.get::<i64>(2).unwrap(),
             run_generation: generation,
+            eligibility_generation,
         }
     };
     carry_attempts_forward(&conn, page_id, page_version, generation).await;
@@ -1247,6 +1467,142 @@ async fn a_fully_supported_page_is_supported() {
     assert_eq!(reviewed, 0, "machine support never manufactures review");
 }
 
+/// A production writer makes the judge identity reachable, so the evaluator
+/// may no longer accept every well-formed support edge indiscriminately. The
+/// M5 contract requires eligibility to be keyed by the exact
+/// `(model_id, model_version, prompt_version)` triple; an unknown triple is
+/// evidence from a judge this install has never authorized and must fail
+/// closed even when its stored score clears the numeric threshold.
+#[tokio::test]
+async fn an_unregistered_judge_cannot_make_a_page_supported() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE entailment_cache
+                SET model_id = 'unregistered-judge',
+                    model_version = 'unregistered-version',
+                    prompt_version = 'unregistered-prompt'",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE edges
+                SET payload = json_set(
+                    payload,
+                    '$.model_id', 'unregistered-judge',
+                    '$.model_version', 'unregistered-version',
+                    '$.prompt_version', 'unregistered-prompt'
+                )
+              WHERE edge_type = 'supports'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(matches!(
+        db.evaluate_page_support("p1", 1).await.unwrap(),
+        SupportOutcome::Refuted { .. }
+    ));
+}
+
+/// Rolling upgrades keep old evidence live while its judge drains. Treating
+/// draining as retired would mass-demote pages before replacement judgments
+/// have had time to arrive.
+#[tokio::test]
+async fn a_draining_judge_remains_eligible_for_existing_support() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+
+    set_test_judge_eligibility(&db, "draining", SUPPORT_THRESHOLD).await;
+
+    assert_eq!(
+        db.evaluate_page_support("p1", 1).await.unwrap(),
+        SupportOutcome::Supported
+    );
+}
+
+#[tokio::test]
+async fn a_retired_judge_cannot_support_a_page() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+
+    set_test_judge_eligibility(&db, "retired", SUPPORT_THRESHOLD).await;
+
+    assert!(matches!(
+        db.evaluate_page_support("p1", 1).await.unwrap(),
+        SupportOutcome::Refuted { .. }
+    ));
+}
+
+#[tokio::test]
+async fn raising_a_judges_threshold_demotes_stored_support() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+    let job = lease_page(&db, "p1", 1, "worker").await;
+    let supported = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert_eq!(supported, SupportOutcome::Supported);
+    assert!(db
+        .finalize_page_support("p1", 1, &job, "worker", &supported)
+        .await
+        .unwrap());
+
+    set_test_judge_eligibility(&db, "active", 0.95).await;
+
+    assert!(matches!(
+        db.evaluate_page_support("p1", 1).await.unwrap(),
+        SupportOutcome::Refuted { .. }
+    ));
+    assert_eq!(db.reconcile_supported_pages(100).await.unwrap().demoted, 1);
+    assert_eq!(truth_row(&db, "p1").await.unwrap().0, "provisional");
+}
+
+#[tokio::test]
+async fn eligibility_generation_change_between_lease_and_finalize_writes_nothing() {
+    let (db, _temp) = db_with_queue().await;
+    add_page(&db, "p1").await;
+    let revisions = derive_page(&db, "p1", 1).await;
+    support_claim(&db, "p1", &revisions[0], 0.9).await;
+    let leased_under = test_eligibility_generation(&db).await;
+    let job = db
+        .lease_next_derivation_job("worker")
+        .await
+        .unwrap()
+        .expect("the page must be claimable");
+    assert_eq!(job.eligibility_generation, leased_under);
+    carry_seeded_judgements(&db, "p1", 1).await;
+    let outcome = db.evaluate_page_support("p1", 1).await.unwrap();
+    assert_eq!(outcome, SupportOutcome::Supported);
+    let before = truth_row(&db, "p1").await;
+
+    let changed_generation = set_test_judge_eligibility(&db, "draining", SUPPORT_THRESHOLD).await;
+    assert!(changed_generation > job.eligibility_generation);
+    assert_eq!(test_eligibility_generation(&db).await, changed_generation);
+    assert_eq!(
+        db.evaluate_page_support("p1", 1).await.unwrap(),
+        SupportOutcome::Supported,
+        "the generation CAS must bite even when the new rules reach the same verdict"
+    );
+
+    assert!(!db
+        .finalize_page_support("p1", 1, &job, "worker", &outcome)
+        .await
+        .unwrap());
+    assert_eq!(truth_row(&db, "p1").await, before);
+}
+
 /// Weakening: let "unfiled" be spelled two ways.
 ///
 /// Every other test here reads an edge the fixture seeded, and a fixture that
@@ -1285,9 +1641,13 @@ async fn an_unfiled_page_can_be_supported_by_unfiled_evidence() {
             "INSERT INTO entailment_cache
                  (claim_text_digest, source_span_digest, model_id, model_version,
                   prompt_version, score, threshold_at_write, backend, scored_at)
-             SELECT canonical_text_digest, ?2, 'judge', 'v1', 'p1', 0.91, 0.75, 'test', 0
+             SELECT canonical_text_digest, ?2, 'judge', 'v1', 'p1', 0.91, 0.75, ?3, 0
                FROM claim_revisions WHERE claim_revision_id = ?1",
-            libsql::params![revisions[0].clone(), span_digest.clone()],
+            libsql::params![
+                revisions[0].clone(),
+                span_digest.clone(),
+                crate::claim_judge::M5_CLAIM_ENTAILMENT_CACHE_BACKEND,
+            ],
         )
         .await
         .unwrap();
@@ -3684,4 +4044,1567 @@ async fn a_same_id_rebind_has_no_database_side_effects() {
         after_missing, after,
         "a missing same-ID lookup is read-only"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Production page-linked truth promoter
+// ---------------------------------------------------------------------------
+
+struct ProducerJudge {
+    backend: LlmBackend,
+    model_id: &'static str,
+    model_version: &'static str,
+    malformed: bool,
+    calls: AtomicUsize,
+    saw_unlocked_db: AtomicBool,
+    conn: Arc<tokio::sync::Mutex<libsql::Connection>>,
+}
+
+impl ProducerJudge {
+    fn pinned(db: &MemoryDB) -> Self {
+        Self {
+            backend: LlmBackend::OnDevice,
+            model_id: M5_PRODUCTION_JUDGE_MODEL_ID,
+            model_version: M5_PRODUCTION_JUDGE_MODEL_VERSION,
+            malformed: false,
+            calls: AtomicUsize::new(0),
+            saw_unlocked_db: AtomicBool::new(true),
+            conn: Arc::clone(&db.conn),
+        }
+    }
+
+    fn malformed(db: &MemoryDB) -> Self {
+        Self {
+            malformed: true,
+            ..Self::pinned(db)
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ProducerJudge {
+    async fn generate(&self, request: LlmRequest) -> Result<String, LlmError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.conn.try_lock().is_err() {
+            self.saw_unlocked_db.store(false, Ordering::SeqCst);
+        }
+        if self.malformed {
+            return Ok("{\"scores\":[]}".to_string());
+        }
+        let payload = request
+            .user_prompt
+            .strip_prefix("UNTRUSTED_JSON_DATA:\n")
+            .expect("producer always uses the fixed M5 prompt envelope");
+        let input: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let scores: Vec<_> = input["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "item_id": item["item_id"].as_str().unwrap(),
+                    "score": 0.95,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "scores": scores }).to_string())
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn name(&self) -> &str {
+        "producer-test"
+    }
+
+    fn backend(&self) -> LlmBackend {
+        self.backend
+    }
+
+    fn model_id(&self) -> String {
+        self.model_id.to_string()
+    }
+
+    fn model_version(&self) -> Option<String> {
+        Some(self.model_version.to_string())
+    }
+}
+
+async fn authorize_producer_judge(db: &MemoryDB) {
+    let judge = ProducerJudge::pinned(db);
+    let snapshot = crate::claim_judge::snapshot_m5_claim_judge(&judge).unwrap();
+    assert!(db
+        .activate_approved_m5_claim_judge(&snapshot)
+        .await
+        .unwrap());
+}
+
+async fn authorize_producer_judge_version(db: &MemoryDB, model_version: &str, state: &str) {
+    force_producer_judge_policy(db, model_version, state, M5_PRODUCTION_JUDGE_THRESHOLD).await;
+}
+
+async fn force_producer_judge_policy(
+    db: &MemoryDB,
+    model_version: &str,
+    state: &str,
+    threshold: f64,
+) {
+    let conn = db.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    let generation: i64 = {
+        let mut rows = tx
+            .query(
+                "UPDATE claim_judge_eligibility_generation
+                    SET last_generation = last_generation + 1
+                  WHERE id = 1 RETURNING last_generation",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    tx.execute(
+        "INSERT INTO claim_judge_eligibility
+             (model_id, model_version, prompt_version, state, threshold, generation)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(model_id, model_version, prompt_version) DO UPDATE SET
+             state = excluded.state, threshold = excluded.threshold,
+             generation = excluded.generation",
+        libsql::params![
+            M5_PRODUCTION_JUDGE_MODEL_ID,
+            model_version,
+            crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION,
+            state,
+            threshold,
+            generation,
+        ],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn production_judge_rejects_unapproved_snapshot_without_writes_or_lease() {
+    let (db, _temp) = db_with_queue().await;
+    add_producer_page(&db, "unapproved-page", "Alpha is true.", "space-a").await;
+    let judge = ProducerJudge {
+        model_version: "hf:unapproved/model@deadbeef/model.gguf",
+        ..ProducerJudge::pinned(&db)
+    };
+    let before_generation = test_eligibility_generation(&db).await;
+    let before_changes = {
+        let conn = db.conn.lock().await;
+        conn.total_changes()
+    };
+
+    assert_eq!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::RefusedProvider
+    );
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(test_eligibility_generation(&db).await, before_generation);
+    let conn = db.conn.lock().await;
+    assert_eq!(conn.total_changes(), before_changes);
+    let mut rows = conn
+        .query(
+            "SELECT status, attempts FROM claim_derivation_jobs
+              WHERE page_id = 'unapproved-page'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "pending");
+    assert_eq!(row.get::<i64>(1).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn first_production_judge_activation_drains_old_and_resets_reconcile_atomically() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge_version(&db, "future-old-weights", "active").await;
+    db.set_app_metadata("support_reconcile_ruleset", "old-ruleset")
+        .await
+        .unwrap();
+    db.set_app_metadata("support_reconcile_frontier", "complete pass")
+        .await
+        .unwrap();
+    let before_generation = test_eligibility_generation(&db).await;
+    let judge = ProducerJudge::pinned(&db);
+    let snapshot = crate::claim_judge::snapshot_m5_claim_judge(&judge).unwrap();
+
+    assert!(db
+        .activate_approved_m5_claim_judge(&snapshot)
+        .await
+        .unwrap());
+    let generation = test_eligibility_generation(&db).await;
+    assert_eq!(generation, before_generation + 1);
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT model_version, state, threshold, generation
+               FROM claim_judge_eligibility
+              WHERE model_id = ?1 AND prompt_version = ?2
+              ORDER BY CASE WHEN model_version = ?3 THEN 0 ELSE 1 END, model_version",
+            libsql::params![
+                M5_PRODUCTION_JUDGE_MODEL_ID,
+                crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION,
+                M5_PRODUCTION_JUDGE_MODEL_VERSION,
+            ],
+        )
+        .await
+        .unwrap();
+    let mut policies = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        policies.push((
+            row.get::<String>(0).unwrap(),
+            row.get::<String>(1).unwrap(),
+            row.get::<f64>(2).unwrap(),
+            row.get::<i64>(3).unwrap(),
+        ));
+    }
+    assert_eq!(
+        policies,
+        vec![
+            (
+                M5_PRODUCTION_JUDGE_MODEL_VERSION.to_string(),
+                "active".to_string(),
+                M5_PRODUCTION_JUDGE_THRESHOLD,
+                generation,
+            ),
+            (
+                "future-old-weights".to_string(),
+                "draining".to_string(),
+                M5_PRODUCTION_JUDGE_THRESHOLD,
+                generation,
+            ),
+        ]
+    );
+    drop(rows);
+    let mut metadata = conn
+        .query(
+            "SELECT key, value FROM app_metadata
+              WHERE key IN ('support_reconcile_ruleset', 'support_reconcile_frontier')
+              ORDER BY key",
+            (),
+        )
+        .await
+        .unwrap();
+    let frontier = metadata.next().await.unwrap().unwrap();
+    assert_eq!(
+        frontier.get::<String>(0).unwrap(),
+        "support_reconcile_frontier"
+    );
+    assert_eq!(frontier.get::<String>(1).unwrap(), "");
+    let ruleset = metadata.next().await.unwrap().unwrap();
+    assert_eq!(
+        ruleset.get::<String>(0).unwrap(),
+        "support_reconcile_ruleset"
+    );
+    assert_eq!(
+        ruleset.get::<String>(1).unwrap(),
+        super::claim_derivation::support_reconcile_ruleset(generation)
+    );
+    let mut enforcement = conn
+        .query(
+            "SELECT value FROM app_metadata
+              WHERE key = 'claim_promoter_enforcement'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(
+        enforcement.next().await.unwrap().is_none(),
+        "judge activation must not activate whole-page visibility enforcement"
+    );
+}
+
+#[tokio::test]
+async fn repeated_exact_production_judge_activation_is_a_write_free_noop() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    let judge = ProducerJudge::pinned(&db);
+    let snapshot = crate::claim_judge::snapshot_m5_claim_judge(&judge).unwrap();
+    let before_generation = test_eligibility_generation(&db).await;
+    let before_changes = {
+        let conn = db.conn.lock().await;
+        conn.total_changes()
+    };
+
+    assert!(db
+        .activate_approved_m5_claim_judge(&snapshot)
+        .await
+        .unwrap());
+    assert_eq!(test_eligibility_generation(&db).await, before_generation);
+    let conn = db.conn.lock().await;
+    assert_eq!(conn.total_changes(), before_changes);
+}
+
+#[tokio::test]
+async fn production_judge_never_reactivates_draining_or_retired_exact_row() {
+    for state in ["draining", "retired"] {
+        let (db, _temp) = db_with_queue().await;
+        authorize_producer_judge_version(&db, M5_PRODUCTION_JUDGE_MODEL_VERSION, state).await;
+        let judge = ProducerJudge::pinned(&db);
+        let snapshot = crate::claim_judge::snapshot_m5_claim_judge(&judge).unwrap();
+        let before_generation = test_eligibility_generation(&db).await;
+        let before_changes = {
+            let conn = db.conn.lock().await;
+            conn.total_changes()
+        };
+
+        assert!(!db
+            .activate_approved_m5_claim_judge(&snapshot)
+            .await
+            .unwrap());
+        assert_eq!(test_eligibility_generation(&db).await, before_generation);
+        let conn = db.conn.lock().await;
+        assert_eq!(conn.total_changes(), before_changes);
+        let mut rows = conn
+            .query(
+                "SELECT state FROM claim_judge_eligibility
+                  WHERE model_id = ?1 AND model_version = ?2 AND prompt_version = ?3",
+                libsql::params![
+                    M5_PRODUCTION_JUDGE_MODEL_ID,
+                    M5_PRODUCTION_JUDGE_MODEL_VERSION,
+                    crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION,
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+            state
+        );
+    }
+}
+
+#[tokio::test]
+async fn production_judge_refuses_exact_active_row_with_wrong_threshold() {
+    let (db, _temp) = db_with_queue().await;
+    force_producer_judge_policy(&db, M5_PRODUCTION_JUDGE_MODEL_VERSION, "active", 0.74).await;
+    let judge = ProducerJudge::pinned(&db);
+    let snapshot = crate::claim_judge::snapshot_m5_claim_judge(&judge).unwrap();
+    let before_generation = test_eligibility_generation(&db).await;
+    let before_changes = {
+        let conn = db.conn.lock().await;
+        conn.total_changes()
+    };
+
+    assert!(!db
+        .activate_approved_m5_claim_judge(&snapshot)
+        .await
+        .unwrap());
+    assert_eq!(test_eligibility_generation(&db).await, before_generation);
+    let conn = db.conn.lock().await;
+    assert_eq!(conn.total_changes(), before_changes);
+}
+
+async fn add_producer_page(db: &MemoryDB, page_id: &str, content: &str, space: &str) {
+    db.insert_page(
+        page_id,
+        page_id,
+        None,
+        content,
+        None,
+        Some(space),
+        &[],
+        "2026-08-02T00:00:00Z",
+    )
+    .await
+    .unwrap();
+}
+
+async fn add_producer_memory(
+    db: &MemoryDB,
+    source_id: &str,
+    content: &str,
+    space: &str,
+    source_agent: &str,
+) {
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO memories
+             (id, content, source, source_id, title, chunk_index, last_modified,
+              chunk_type, source_agent, space, pending_revision, version)
+         VALUES (?1, ?2, 'memory', ?3, ?3, 0, 0, 'text', ?4, ?5, 0, 1)",
+        libsql::params![
+            format!("row_{source_id}"),
+            content,
+            source_id,
+            source_agent,
+            space,
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+async fn link_page_evidence(db: &MemoryDB, page_id: &str, source_id: &str) {
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO page_evidence
+             (page_id, source_kind, locator, title, linked_at, link_reason)
+         VALUES (?1, 'memory', ?2, NULL, 0, 'producer-test')",
+        libsql::params![page_id, source_id],
+    )
+    .await
+    .unwrap();
+}
+
+async fn link_active_cite(db: &MemoryDB, page_id: &str, source_id: &str, space: &str) {
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO edges
+             (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+              grounded, root_id, space, created_at, superseded_by, valid_until)
+         VALUES (?1, ?2, 'page', ?3, 'memory', 'cites', 'evidence',
+                 0, NULL, ?4, 0, NULL, NULL)",
+        libsql::params![
+            format!("cite_{page_id}_{source_id}"),
+            page_id,
+            source_id,
+            space,
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn producer_promotes_from_only_linked_same_space_evidence_and_reuses_exact_cache() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    add_producer_memory(
+        &db,
+        "good-evidence",
+        "The Alpha project launched successfully.",
+        "space-a",
+        "folder",
+    )
+    .await;
+    add_producer_memory(
+        &db,
+        "other-space",
+        "The Alpha project launched successfully.",
+        "space-b",
+        "folder",
+    )
+    .await;
+    add_producer_memory(
+        &db,
+        "unlinked",
+        "The Alpha project launched successfully.",
+        "space-a",
+        "folder",
+    )
+    .await;
+    let id_linked_content = "The Alpha project launched successfully with records.";
+    add_producer_memory(&db, "id-linked", id_linked_content, "space-a", "folder").await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET memory_type = 'observation'
+              WHERE source_id = 'id-linked'",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provenance_roots
+                 (root_id, identity_version, identity_digest, root_kind,
+                  independence_group_id, status, created_at)
+             VALUES ('id-linked-human-root', ?1, ?2, 'human_capture',
+                     'human:local', 'active', 0)",
+            libsql::params![
+                crate::provenance::IDENTITY_VERSION,
+                crate::provenance::identity_digest("human_capture", id_linked_content),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    add_producer_page(
+        &db,
+        "producer-p1",
+        "The Alpha project launched successfully.",
+        "space-a",
+    )
+    .await;
+    link_page_evidence(&db, "producer-p1", "good-evidence").await;
+    link_page_evidence(&db, "producer-p1", "other-space").await;
+    link_page_evidence(&db, "producer-p1", "row_id-linked").await;
+    // The same exact locator through the second sanctioned link source must
+    // dedupe rather than become two obligations.
+    link_active_cite(&db, "producer-p1", "good-evidence", "space-a").await;
+
+    let judge = ProducerJudge::pinned(&db);
+    assert_eq!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed {
+            page_id: "producer-p1".to_string(),
+            page_version: 1,
+        }
+    );
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 1);
+    assert!(judge.saw_unlocked_db.load(Ordering::SeqCst));
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT candidate_source_id, COUNT(*)
+                   FROM claim_run_candidates
+                  WHERE page_id = 'producer-p1'
+                  GROUP BY candidate_source_id",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut sources = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            sources.push((row.get::<String>(0).unwrap(), row.get::<i64>(1).unwrap()));
+        }
+        assert_eq!(
+            sources,
+            vec![
+                ("good-evidence".to_string(), 1),
+                ("id-linked".to_string(), 1)
+            ]
+        );
+        let mut roots = conn
+            .query(
+                "SELECT root_id FROM edges
+                  WHERE edge_type = 'supports' AND dst_id = 'id-linked'
+                    AND valid_until IS NULL",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            roots
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+            "id-linked-human-root"
+        );
+    }
+
+    // Same canonical claim and exact evidence span on another page: no model
+    // call, but a fresh attempt row for this run is still mandatory.
+    add_producer_page(
+        &db,
+        "producer-p2",
+        "The Alpha project launched successfully.",
+        "space-a",
+    )
+    .await;
+    link_page_evidence(&db, "producer-p2", "good-evidence").await;
+    link_page_evidence(&db, "producer-p2", "row_id-linked").await;
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { ref page_id, .. } if page_id == "producer-p2"
+    ));
+    assert_eq!(
+        judge.calls.load(Ordering::SeqCst),
+        1,
+        "an exact five-part hit must spend no model call"
+    );
+    let attempts: i64 = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM claim_judgment_attempts
+                  WHERE page_id = 'producer-p2'",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(attempts, 2, "cache hits still belong to this run");
+}
+
+#[tokio::test]
+async fn producer_malformed_output_requeues_without_attempt_or_publication() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    add_producer_memory(
+        &db,
+        "malformed-evidence",
+        "The launch happened in May.",
+        "space-a",
+        "folder",
+    )
+    .await;
+    add_producer_page(
+        &db,
+        "malformed-page",
+        "The launch happened in May.",
+        "space-a",
+    )
+    .await;
+    link_page_evidence(&db, "malformed-page", "malformed-evidence").await;
+
+    let turn = db
+        .run_page_linked_truth_promotion_turn(&ProducerJudge::malformed(&db), "producer-worker")
+        .await
+        .unwrap();
+    assert!(matches!(turn, PromotionTurn::Requeued { .. }));
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT
+                 (SELECT COUNT(*) FROM claim_judgment_attempts
+                   WHERE page_id = 'malformed-page'),
+                 (SELECT COUNT(*) FROM page_truth_state
+                   WHERE page_id = 'malformed-page' AND evaluated_at IS NOT NULL),
+                 (SELECT status FROM claim_derivation_jobs
+                   WHERE page_id = 'malformed-page')",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    let deferred: String = {
+        let mut attempts = conn
+            .query(
+                "SELECT outcome FROM claim_judgment_attempts
+                  WHERE page_id = 'malformed-page'",
+                (),
+            )
+            .await
+            .unwrap();
+        attempts.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(deferred, "deferred");
+    assert_eq!(row.get::<i64>(1).unwrap(), 0);
+    assert_eq!(row.get::<String>(2).unwrap(), "pending");
+}
+
+#[tokio::test]
+async fn producer_candidate_inventory_keeps_locations_excludes_empty_and_caps_by_rank() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    add_producer_page(&db, "rank-page", "Alpha evidence repeats.", "space-a").await;
+    add_producer_memory(
+        &db,
+        "a-repeat",
+        "Alpha evidence repeats. Alpha evidence repeats. ",
+        "space-a",
+        "folder",
+    )
+    .await;
+    link_page_evidence(&db, "rank-page", "a-repeat").await;
+    for index in 0..9 {
+        let source_id = format!("a{index}");
+        add_producer_memory(
+            &db,
+            &source_id,
+            "Alpha evidence repeats.",
+            "space-a",
+            "folder",
+        )
+        .await;
+        link_page_evidence(&db, "rank-page", &source_id).await;
+    }
+    add_producer_memory(&db, "z-empty", "It is what it is.", "space-a", "folder").await;
+    link_page_evidence(&db, "rank-page", "z-empty").await;
+
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&ProducerJudge::malformed(&db), "producer-worker",)
+            .await
+            .unwrap(),
+        PromotionTurn::Requeued { .. }
+    ));
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT candidate_source_id, candidate_span_start,
+                    candidate_span_end, candidate_digest
+               FROM claim_run_candidates
+              WHERE page_id = 'rank-page'
+              ORDER BY candidate_source_id, candidate_span_start",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut locators = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        locators.push((
+            row.get::<String>(0).unwrap(),
+            row.get::<i64>(1).unwrap(),
+            row.get::<i64>(2).unwrap(),
+            row.get::<String>(3).unwrap(),
+        ));
+    }
+    assert_eq!(
+        locators.len(),
+        super::claim_derivation::MAX_CANDIDATES_PER_CLAIM
+    );
+    let repeats: Vec<_> = locators
+        .iter()
+        .filter(|(source, ..)| source == "a-repeat")
+        .collect();
+    assert_eq!(repeats.len(), 2);
+    assert_ne!((repeats[0].1, repeats[0].2), (repeats[1].1, repeats[1].2));
+    assert_eq!(
+        repeats[0].3, repeats[1].3,
+        "digest is content, not location"
+    );
+    assert!(locators.iter().all(|(source, ..)| source != "z-empty"));
+    assert!(locators.iter().all(|(source, ..)| source != "a6"));
+    assert!(locators.iter().all(|(source, ..)| source != "a7"));
+    assert!(locators.iter().all(|(source, ..)| source != "a8"));
+}
+
+#[tokio::test]
+async fn producer_excludes_ambiguous_live_locators_before_sealing() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    add_producer_page(&db, "ambiguous-memory-page", "Alpha fact.", "space-a").await;
+    add_producer_memory(&db, "ambiguous-source", "Alpha fact.", "space-a", "folder").await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO memories
+                 (id, content, source, source_id, title, chunk_index, last_modified,
+                  chunk_type, source_agent, space, pending_revision, version)
+             VALUES ('ambiguous-row-2', 'Different alpha fact.', 'memory',
+                     'ambiguous-source', 'ambiguous', 0, 0, 'text', 'folder',
+                     'space-a', 0, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    link_page_evidence(&db, "ambiguous-memory-page", "ambiguous-source").await;
+    let judge = ProducerJudge::pinned(&db);
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { .. }
+    ));
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM claim_run_candidates
+              WHERE page_id = 'ambiguous-memory-page'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn producer_does_not_launder_non_observation_human_evidence_through_another_root_kind() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    let evidence = "A human preference about Alpha.";
+    add_producer_page(&db, "human-kind-page", evidence, "space-a").await;
+    add_producer_memory(&db, "human-kind-memory", evidence, "space-a", "human").await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET memory_type = 'preference'
+              WHERE source_id = 'human-kind-memory'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    link_page_evidence(&db, "human-kind-page", "human-kind-memory").await;
+    let judge = ProducerJudge::pinned(&db);
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { .. }
+    ));
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM claim_run_candidates
+              WHERE page_id = 'human-kind-page'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0
+    );
+    let mut roots = conn
+        .query(
+            "SELECT COUNT(*) FROM provenance_roots
+              WHERE identity_digest = ?1 AND root_kind = 'generated'",
+            libsql::params![crate::provenance::identity_digest("generated", evidence)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        roots.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0,
+        "a human preference must not be relabelled as generated to gain a vote"
+    );
+}
+
+#[tokio::test]
+async fn producer_observation_human_evidence_without_human_root_does_not_mint_generated_root() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    let evidence = "A human observation about Alpha.";
+    add_producer_page(&db, "human-observation-page", evidence, "space-a").await;
+    add_producer_memory(
+        &db,
+        "human-observation-memory",
+        evidence,
+        "space-a",
+        "human",
+    )
+    .await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET memory_type = 'observation'
+              WHERE source_id = 'human-observation-memory'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    link_page_evidence(&db, "human-observation-page", "human-observation-memory").await;
+
+    let judge = ProducerJudge::pinned(&db);
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { .. }
+    ));
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT
+                 (SELECT COUNT(*) FROM claim_run_candidates
+                   WHERE page_id = 'human-observation-page'),
+                 (SELECT COUNT(*) FROM provenance_roots
+                   WHERE root_kind = 'generated'
+                     AND identity_digest = ?1),
+                 (SELECT COUNT(*) FROM provenance_roots
+                   WHERE root_kind IN ('human_capture', 'human_edit_delta')
+                     AND identity_digest IN (?2, ?3))",
+            libsql::params![
+                crate::provenance::identity_digest("generated", evidence),
+                crate::provenance::identity_digest("human_capture", evidence),
+                crate::provenance::identity_digest("human_edit_delta", evidence),
+            ],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(
+        row.get::<i64>(0).unwrap(),
+        0,
+        "human observation is non-voting without a human root"
+    );
+    assert_eq!(
+        row.get::<i64>(1).unwrap(),
+        0,
+        "promoter must not mint a generated root for human evidence"
+    );
+    assert_eq!(
+        row.get::<i64>(2).unwrap(),
+        0,
+        "fixture must have no pre-existing human root"
+    );
+}
+
+#[tokio::test]
+async fn producer_root_acquisition_error_requeues_before_sealing_absence() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    add_producer_page(&db, "root-error-page", "Alpha is factual.", "space-a").await;
+    add_producer_memory(
+        &db,
+        "root-error-memory",
+        "Alpha is factual.",
+        "space-a",
+        "folder",
+    )
+    .await;
+    link_page_evidence(&db, "root-error-page", "root-error-memory").await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute_batch(
+            "CREATE TRIGGER fail_promoter_root
+             BEFORE INSERT ON provenance_roots
+             WHEN NEW.root_kind = 'document_ingest'
+             BEGIN SELECT RAISE(ABORT, 'injected root acquisition failure'); END;",
+        )
+        .await
+        .unwrap();
+    }
+
+    let judge = ProducerJudge::pinned(&db);
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Requeued { .. }
+    ));
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT
+                 (SELECT COUNT(*) FROM claim_run_inventories
+                   WHERE page_id = 'root-error-page'),
+                 (SELECT COUNT(*) FROM claim_run_candidates
+                   WHERE page_id = 'root-error-page')",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(
+        (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()),
+        (0, 0),
+        "an operational root error is retryable, not a durable empty inventory"
+    );
+}
+
+#[tokio::test]
+async fn producer_refuses_non_on_device_before_leasing() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    add_producer_page(&db, "api-page", "A factual claim.", "space-a").await;
+    let judge = ProducerJudge {
+        backend: LlmBackend::Api,
+        ..ProducerJudge::pinned(&db)
+    };
+
+    assert_eq!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::RefusedProvider
+    );
+    assert_eq!(job_for(&db, "api-page").await.unwrap().2, 0);
+}
+
+#[tokio::test]
+async fn producer_rejudges_a_non_on_device_cache_row_before_supporting() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    let text = "Cached claim.";
+    add_producer_page(&db, "cache-backend-page", text, "space-a").await;
+    add_producer_memory(&db, "cache-backend-memory", text, "space-a", "folder").await;
+    link_page_evidence(&db, "cache-backend-page", "cache-backend-memory").await;
+    {
+        let conn = db.conn.lock().await;
+        let claim_digest = crate::provenance::revision_content_digest("Cached claim");
+        let span_digest = crate::provenance::revision_content_digest(text);
+        conn.execute(
+            "INSERT INTO entailment_cache
+                 (claim_text_digest, source_span_digest, model_id, model_version,
+                  prompt_version, score, threshold_at_write, backend, scored_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0.99, 0.75, 'api', 0)",
+            libsql::params![
+                claim_digest,
+                span_digest,
+                M5_PRODUCTION_JUDGE_MODEL_ID,
+                M5_PRODUCTION_JUDGE_MODEL_VERSION,
+                crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION,
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    let judge = ProducerJudge::pinned(&db);
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { .. }
+    ));
+    assert_eq!(
+        judge.calls.load(Ordering::SeqCst),
+        1,
+        "a cache row from a non-on-device backend must not bypass live judging"
+    );
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT backend FROM entailment_cache
+              WHERE model_id = ?1 AND model_version = ?2 AND prompt_version = ?3",
+            libsql::params![
+                M5_PRODUCTION_JUDGE_MODEL_ID,
+                M5_PRODUCTION_JUDGE_MODEL_VERSION,
+                crate::claim_judge::M5_CLAIM_ENTAILMENT_PROMPT_VERSION,
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap(),
+        "on_device"
+    );
+}
+
+#[tokio::test]
+async fn producer_stale_lease_derivation_writes_neither_rows_nor_marker() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    add_producer_page(&db, "stale-producer", "A factual sentence.", "space-a").await;
+    let job = db
+        .lease_next_derivation_job("stale-worker")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db
+        .release_derivation_job(&job, "stale-worker", "test reclaim")
+        .await
+        .unwrap());
+
+    let (write, claims) = db
+        .derive_leased_page_claims(&job, "stale-worker")
+        .await
+        .unwrap();
+    assert_eq!(write, DerivationWrite::StaleLease);
+    assert!(claims.is_empty());
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT
+                 (SELECT COUNT(*) FROM claims WHERE page_id = 'stale-producer'),
+                 (SELECT COUNT(*) FROM claim_derivation_markers
+                   WHERE page_id = 'stale-producer')",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(
+        (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()),
+        (0, 0)
+    );
+}
+
+#[tokio::test]
+async fn producer_derivation_is_atomic_and_oversize_pages_park_without_marker() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    add_producer_page(&db, "atomic-page", "One factual sentence.", "space-a").await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute_batch(
+            "CREATE TRIGGER fail_producer_marker
+             BEFORE INSERT ON claim_derivation_markers
+             WHEN NEW.page_id = 'atomic-page'
+             BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END;",
+        )
+        .await
+        .unwrap();
+    }
+    let judge = ProducerJudge::pinned(&db);
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Requeued { .. }
+    ));
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT
+                     (SELECT COUNT(*) FROM claims WHERE page_id = 'atomic-page'),
+                     (SELECT COUNT(*) FROM claim_derivation_markers
+                       WHERE page_id = 'atomic-page')",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()),
+            (0, 0)
+        );
+        conn.execute_batch(
+            "DROP TRIGGER fail_producer_marker;
+             UPDATE claim_derivation_jobs SET status = 'parked'
+              WHERE page_id = 'atomic-page';",
+        )
+        .await
+        .unwrap();
+    }
+
+    let oversized = (0..=super::claim_derivation::MAX_CLAIMS_PER_PAGE)
+        .map(|index| format!("Claim number {index} is independently stated."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    add_producer_page(&db, "oversized-page", &oversized, "space-a").await;
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Parked { ref page_id, .. } if page_id == "oversized-page"
+    ));
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT
+                 (SELECT COUNT(*) FROM claims WHERE page_id = 'oversized-page'),
+                 (SELECT COUNT(*) FROM claim_derivation_markers
+                   WHERE page_id = 'oversized-page'),
+                 (SELECT status FROM claim_derivation_jobs
+                   WHERE page_id = 'oversized-page')",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
+    assert_eq!(row.get::<i64>(1).unwrap(), 0);
+    assert_eq!(row.get::<String>(2).unwrap(), "parked");
+}
+
+#[tokio::test]
+async fn producer_canonicalizes_conservatively_and_ambiguous_duplicates_mint_new_ids() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    add_producer_page(
+        &db,
+        "identity-page",
+        "Cafe\u{301} is open.[1] Über is ready. It is what it is.",
+        "space-a",
+    )
+    .await;
+    let judge = ProducerJudge::pinned(&db);
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { .. }
+    ));
+    let first_ids: Vec<String> = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT cr.claim_id, cr.canonical_text, ca.span_start, ca.span_end,
+                        ca.span_digest
+                   FROM page_version_claims pvc
+                   JOIN claim_revisions cr ON cr.claim_revision_id = pvc.claim_revision_id
+                   JOIN claim_anchors ca ON ca.claim_revision_id = pvc.claim_revision_id
+                    AND ca.source_doc_id = pvc.page_id AND ca.source_version = pvc.page_version
+                  WHERE pvc.page_id = 'identity-page' AND pvc.page_version = 1
+                  ORDER BY pvc.ordinal",
+                (),
+            )
+            .await
+            .unwrap();
+        let first = rows.next().await.unwrap().unwrap();
+        let first_id: String = first.get(0).unwrap();
+        assert_eq!(first.get::<String>(1).unwrap(), "Café is open");
+        let raw = "Cafe\u{301} is open.[1] Über is ready. It is what it is.";
+        let start = first.get::<i64>(2).unwrap() as usize;
+        let end = first.get::<i64>(3).unwrap() as usize;
+        assert_eq!(&raw[start..end], "Cafe\u{301} is open");
+        assert_eq!(end, raw.find(".[1]").unwrap());
+        assert_eq!(
+            crate::provenance::revision_content_digest(&raw[start..end]),
+            first.get::<String>(4).unwrap(),
+            "marker stripping must map the bare sentence back to exact page bytes"
+        );
+        let second = rows.next().await.unwrap().unwrap();
+        let second_id: String = second.get(0).unwrap();
+        assert_eq!(second.get::<String>(1).unwrap(), "Über is ready");
+        let second_start = second.get::<i64>(2).unwrap() as usize;
+        let second_end = second.get::<i64>(3).unwrap() as usize;
+        assert_eq!(&raw[second_start..second_end], "Über is ready");
+        assert!(second_start >= raw.find("] Über").unwrap() + 2);
+        let third = rows.next().await.unwrap().unwrap();
+        let third_id: String = third.get(0).unwrap();
+        assert_eq!(third.get::<String>(1).unwrap(), "It is what it is");
+        assert!(rows.next().await.unwrap().is_none());
+        vec![first_id, second_id, third_id]
+    };
+
+    db.update_page_content(
+        "identity-page",
+        "Café is open. Café is open.",
+        &[],
+        "producer-test",
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed {
+            page_version: 2,
+            ..
+        }
+    ));
+    let duplicate_ids: Vec<String> = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT cr.claim_id
+                   FROM page_version_claims pvc
+                   JOIN claim_revisions cr ON cr.claim_revision_id = pvc.claim_revision_id
+                  WHERE pvc.page_id = 'identity-page' AND pvc.page_version = 2
+                  ORDER BY pvc.ordinal",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            ids.push(row.get(0).unwrap());
+        }
+        ids
+    };
+    assert_eq!(duplicate_ids.len(), 2);
+    assert_ne!(duplicate_ids[0], duplicate_ids[1]);
+    assert!(duplicate_ids.iter().all(|id| !first_ids.contains(id)));
+}
+
+#[tokio::test]
+async fn producer_same_version_digest_change_replaces_inventory_and_marker_atomically() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    add_producer_page(&db, "same-version-page", "Alpha was first.", "space-a").await;
+    let judge = ProducerJudge::pinned(&db);
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { .. }
+    ));
+
+    let replacement = "Beta is now the only claim.";
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE page_history SET content = ?1
+              WHERE page_id = 'same-version-page' AND version = 1",
+            libsql::params![replacement],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE pages SET content = ?1 WHERE id = 'same-version-page'",
+            libsql::params![replacement],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE claim_derivation_jobs
+                SET status = 'pending', attempts = 0, lease_owner = NULL,
+                    lease_expires_at = NULL, last_error = NULL
+              WHERE page_id = 'same-version-page'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed {
+            page_version: 1,
+            ..
+        }
+    ));
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT m.page_version_digest, m.inventory_count, cr.canonical_text
+               FROM claim_derivation_markers m
+               JOIN page_version_claims pvc
+                 ON pvc.page_id = m.page_id AND pvc.page_version = m.page_version
+               JOIN claim_revisions cr ON cr.claim_revision_id = pvc.claim_revision_id
+              WHERE m.page_id = 'same-version-page'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(
+        row.get::<String>(0).unwrap(),
+        crate::provenance::revision_content_digest(replacement)
+    );
+    assert_eq!(row.get::<i64>(1).unwrap(), 1);
+    assert_eq!(row.get::<String>(2).unwrap(), "Beta is now the only claim");
+    assert!(rows.next().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn producer_requeues_if_judge_generation_moves_between_policy_read_and_lease() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    add_producer_page(&db, "generation-race-page", "Alpha is true.", "space-a").await;
+    let judge = ProducerJudge::pinned(&db);
+    let snapshot = crate::claim_judge::snapshot_m5_claim_judge(&judge).unwrap();
+    let (threshold, stale_generation) = db.active_judge_policy(&snapshot).await.unwrap().unwrap();
+    authorize_producer_judge_version(&db, M5_PRODUCTION_JUDGE_MODEL_VERSION, "active").await;
+    let job = db
+        .lease_next_derivation_job("generation-worker")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(job.eligibility_generation, stale_generation);
+
+    let turn = db
+        .run_leased_page_linked_truth_promotion(
+            &judge,
+            &snapshot,
+            threshold,
+            stale_generation,
+            &job,
+            "generation-worker",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(turn, PromotionTurn::Requeued { .. }));
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT
+                     (SELECT COUNT(*) FROM claims WHERE page_id = 'generation-race-page'),
+                     (SELECT COUNT(*) FROM claim_derivation_markers
+                       WHERE page_id = 'generation-race-page')",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()),
+            (0, 0)
+        );
+    }
+    assert!(db
+        .release_derivation_job(&job, "generation-worker", "test cleanup")
+        .await
+        .unwrap());
+}
+
+#[test]
+fn producer_judge_budget_accepts_the_boundary_and_rejects_one_more_byte() {
+    let fixed = crate::claim_judge::M5_CLAIM_ENTAILMENT_SYSTEM_PROMPT.len() + 2048;
+    let remaining = super::claim_derivation::MAX_JUDGE_TOKENS_PER_PAGE - fixed;
+    assert!(super::claim_derivation::m5_judge_budget_allows(&[
+        remaining
+    ]));
+    assert!(!super::claim_derivation::m5_judge_budget_allows(&[
+        remaining + 1
+    ]));
+}
+
+#[tokio::test]
+async fn producer_mints_new_identity_when_text_is_unique_but_anchor_is_ambiguous() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    let content = "Alpha is true. Beta is true.";
+    add_producer_page(&db, "ambiguous-alignment-page", content, "space-a").await;
+    let judge = ProducerJudge::pinned(&db);
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { .. }
+    ));
+
+    let (alpha_claim_id, beta_revision, alpha_end, alpha_digest) = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT cr.claim_id, cr.claim_revision_id, ca.span_start,
+                        ca.span_end, ca.span_digest
+                   FROM page_version_claims pvc
+                   JOIN claim_revisions cr ON cr.claim_revision_id = pvc.claim_revision_id
+                   JOIN claim_anchors ca ON ca.claim_revision_id = pvc.claim_revision_id
+                    AND ca.source_doc_id = pvc.page_id AND ca.source_version = pvc.page_version
+                  WHERE pvc.page_id = 'ambiguous-alignment-page' AND pvc.page_version = 1
+                  ORDER BY pvc.ordinal",
+                (),
+            )
+            .await
+            .unwrap();
+        let alpha = rows.next().await.unwrap().unwrap();
+        let beta = rows.next().await.unwrap().unwrap();
+        (
+            alpha.get::<String>(0).unwrap(),
+            beta.get::<String>(1).unwrap(),
+            alpha.get::<i64>(3).unwrap(),
+            alpha.get::<String>(4).unwrap(),
+        )
+    };
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO claim_anchors
+                 (claim_revision_id, source_doc_id, source_version,
+                  span_start, span_end, span_digest, created_at)
+             VALUES (?1, 'ambiguous-alignment-page', 1, 0, ?2, ?3, 0)",
+            libsql::params![beta_revision, alpha_end, alpha_digest],
+        )
+        .await
+        .unwrap();
+    }
+    db.update_page_content("ambiguous-alignment-page", content, &[], "producer-test")
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed {
+            page_version: 2,
+            ..
+        }
+    ));
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT cr.claim_id
+               FROM page_version_claims pvc
+               JOIN claim_revisions cr ON cr.claim_revision_id = pvc.claim_revision_id
+              WHERE pvc.page_id = 'ambiguous-alignment-page' AND pvc.page_version = 2
+                AND pvc.ordinal = 0",
+            (),
+        )
+        .await
+        .unwrap();
+    let new_alpha_claim_id: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_ne!(new_alpha_claim_id, alpha_claim_id);
+}
+
+#[tokio::test]
+async fn producer_rolling_judge_upgrade_replaces_edge_without_losing_supported_state() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    let evidence = "Alpha launched successfully.";
+    add_producer_memory(&db, "rolling-source", evidence, "space-a", "folder").await;
+    add_producer_page(&db, "rolling-page", evidence, "space-a").await;
+    link_page_evidence(&db, "rolling-page", "rolling-source").await;
+    let v1 = ProducerJudge::pinned(&db);
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&v1, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { .. }
+    ));
+    assert_eq!(truth_row(&db, "rolling-page").await.unwrap().0, "supported");
+
+    authorize_producer_judge_version(&db, M5_PRODUCTION_JUDGE_MODEL_VERSION, "draining").await;
+    authorize_producer_judge_version(&db, "future-weights-v2", "active").await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE claim_derivation_jobs
+                SET status = 'pending', attempts = 0, lease_owner = NULL,
+                    lease_expires_at = NULL, last_error = NULL
+              WHERE page_id = 'rolling-page'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    let v2 = ProducerJudge {
+        model_version: "future-weights-v2",
+        ..ProducerJudge::pinned(&db)
+    };
+    let v2_snapshot = crate::claim_judge::snapshot_m5_claim_judge(&v2).unwrap();
+    let (v2_threshold, v2_generation) =
+        db.active_judge_policy(&v2_snapshot).await.unwrap().unwrap();
+    let v2_job = db
+        .lease_next_derivation_job("producer-worker")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        db.run_leased_page_linked_truth_promotion(
+            &v2,
+            &v2_snapshot,
+            v2_threshold,
+            v2_generation,
+            &v2_job,
+            "producer-worker",
+        )
+        .await
+        .unwrap(),
+        PromotionTurn::Completed { .. }
+    ));
+    assert_eq!(truth_row(&db, "rolling-page").await.unwrap().0, "supported");
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT json_extract(payload, '$.model_version'),
+                    superseded_by IS NOT NULL, valid_until IS NOT NULL
+              FROM edges
+             WHERE edge_type = 'supports' AND dst_id = 'rolling-source'
+              ORDER BY valid_until IS NULL",
+            (),
+        )
+        .await
+        .unwrap();
+    let old = rows.next().await.unwrap().unwrap();
+    assert_eq!(
+        old.get::<String>(0).unwrap(),
+        M5_PRODUCTION_JUDGE_MODEL_VERSION
+    );
+    assert_eq!(
+        (old.get::<i64>(1).unwrap(), old.get::<i64>(2).unwrap()),
+        (1, 1)
+    );
+    let new = rows.next().await.unwrap().unwrap();
+    assert_eq!(new.get::<String>(0).unwrap(), "future-weights-v2");
+    assert_eq!(
+        (new.get::<i64>(1).unwrap(), new.get::<i64>(2).unwrap()),
+        (0, 0)
+    );
+    assert!(rows.next().await.unwrap().is_none());
 }

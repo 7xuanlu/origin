@@ -183,9 +183,12 @@ pub(super) async fn register_optional_runtime_workers(
         // Startup opens only the fail-closed frontier. Continue both data-sized
         // truth jobs here, after the listener can serve: one bounded enqueue
         // sweep and one bounded reconciliation batch per turn, yielding between
-        // turns. Queue rows plus the reconciliation cursor are durable, so a
-        // restart resumes instead of losing the tail.
+        // turns. The same task also runs at most one page-linked truth-promotion
+        // job per turn once an eligible on-device provider appears. Queue rows,
+        // leases, and the reconciliation cursor are durable, so a restart
+        // resumes instead of losing the tail.
         let db_for_reconcile = db_arc.clone();
+        let shared_for_reconcile = shared.clone();
         let mut reconcile_shutdown = shutdown_for_reconcile.subscribe();
         tokio::spawn(async move {
             if lifecycle::sleep_or_shutdown(
@@ -198,7 +201,16 @@ pub(super) async fn register_optional_runtime_workers(
             }
 
             let mut backlog_complete = false;
+            let mut completion_logged = false;
+            let mut last_error = None;
             loop {
+                // The on-device model may finish loading after this worker has
+                // started. Re-snapshot every turn and end the read guard before
+                // any database or inference await.
+                let truth_provider = {
+                    let state = shared_for_reconcile.read().await;
+                    state.llm.clone()
+                };
                 let work = async {
                     let _maintenance_guard = maintenance_for_reconcile.begin_background().await;
                     let enqueued = if backlog_complete {
@@ -214,20 +226,45 @@ pub(super) async fn register_optional_runtime_workers(
                     let pass = db_for_reconcile
                         .reconcile_supported_pages(startup::SUPPORT_RECONCILE_BATCH)
                         .await?;
-                    Ok::<_, wenlan_core::WenlanError>((enqueued, pass))
+                    let promotion = if let Some(provider) = truth_provider {
+                        // Dropping this future on shutdown prevents the worker
+                        // from making any later writes. The durable lease is
+                        // intentionally left for a later process to reclaim.
+                        Some(tokio::select! {
+                            biased;
+                            _ = lifecycle::wait_for_shutdown(reconcile_shutdown.clone()) => {
+                                return Ok::<_, wenlan_core::WenlanError>((enqueued, pass, None));
+                            }
+                            result = db_for_reconcile.run_page_linked_truth_promotion_turn(
+                                provider.as_ref(),
+                                "wenlan-server-truth-maintenance",
+                            ) => result,
+                        }?)
+                    } else {
+                        None
+                    };
+                    Ok::<_, wenlan_core::WenlanError>((enqueued, pass, promotion))
                 }
                 .await;
-                match work {
-                    Ok((enqueued, pass)) if backlog_complete && pass.complete => {
-                        tracing::info!(
-                            "[truth] background derivation backlog and support reconciliation \
-                             completed; {enqueued} page(s) enqueued and {} page(s) demoted in \
-                             the final batch",
-                            pass.demoted,
-                        );
-                        return;
-                    }
-                    Ok((enqueued, pass)) => {
+                let next_delay = match work {
+                    Ok((enqueued, pass, promotion)) => {
+                        if lifecycle::shutdown_requested(&reconcile_shutdown) {
+                            return;
+                        }
+                        if last_error.take().is_some() {
+                            tracing::info!("[truth] background truth maintenance resumed");
+                        }
+                        if backlog_complete && pass.complete && !completion_logged {
+                            tracing::info!(
+                                "[truth] background derivation backlog and support reconciliation \
+                                 completed; {enqueued} page(s) enqueued and {} page(s) demoted in \
+                                 the final batch; truth promotion remains available until shutdown",
+                                pass.demoted,
+                            );
+                            completion_logged = true;
+                        } else if !pass.complete {
+                            completion_logged = false;
+                        }
                         if enqueued > 0 || pass.demoted > 0 {
                             tracing::info!(
                                 "[truth] background truth maintenance enqueued {enqueued} page(s) \
@@ -235,23 +272,41 @@ pub(super) async fn register_optional_runtime_workers(
                                 pass.demoted,
                             );
                         }
+                        let promotion_idle = matches!(
+                            promotion.as_ref(),
+                            None | Some(wenlan_core::db::PromotionTurn::Idle)
+                                | Some(wenlan_core::db::PromotionTurn::RefusedProvider)
+                        );
+                        if let Some(wenlan_core::db::PromotionTurn::Completed {
+                            page_id,
+                            page_version,
+                        }) = promotion
+                        {
+                            tracing::info!(
+                                "[truth] promoted page {page_id} version {page_version}"
+                            );
+                        }
+                        if backlog_complete && pass.complete && promotion_idle {
+                            std::time::Duration::from_secs(1)
+                        } else {
+                            std::time::Duration::from_millis(100)
+                        }
                     }
                     Err(error) => {
-                        tracing::warn!(
-                            "[truth] background truth maintenance paused after an error; \
-                             unproved pages remain unevaluated and the durable backlog remains \
-                             resumable: {error}"
-                        );
-                        return;
+                        let error = error.to_string();
+                        if last_error.as_deref() != Some(error.as_str()) {
+                            tracing::warn!(
+                                "[truth] background truth maintenance backing off after an error; \
+                                 unproved pages remain unevaluated and the durable backlog remains \
+                                 resumable: {error}"
+                            );
+                            last_error = Some(error);
+                        }
+                        std::time::Duration::from_secs(5)
                     }
-                }
+                };
 
-                if lifecycle::sleep_or_shutdown(
-                    &mut reconcile_shutdown,
-                    std::time::Duration::from_millis(100),
-                )
-                .await
-                {
+                if lifecycle::sleep_or_shutdown(&mut reconcile_shutdown, next_delay).await {
                     return;
                 }
             }

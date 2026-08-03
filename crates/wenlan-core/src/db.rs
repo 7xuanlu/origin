@@ -23,7 +23,8 @@ mod brief;
 pub use brief::LegacyBriefItem;
 mod claim_derivation;
 pub use claim_derivation::{
-    DerivationJob, SupportOutcome, EXTRACTOR_VERSION, LEASE_SECS, MAX_ATTEMPTS, SUPPORT_THRESHOLD,
+    DerivationJob, PromotionTurn, SupportOutcome, EXTRACTOR_VERSION, LEASE_SECS, MAX_ATTEMPTS,
+    SUPPORT_THRESHOLD,
 };
 mod claim_identity;
 mod community_grouping_state;
@@ -701,9 +702,9 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-/// Migration 109 completes M6 PR-A's additive substrate after the user-ratified
-/// D1-D8 contract amendment. It follows the partial genesis substrate at 108.
-pub const SCHEMA_VERSION: u32 = 109;
+/// Migration 110 adds M5's policy-independent judge-eligibility registry and
+/// generation fence. It follows the inert M6 substrate at 109.
+pub const SCHEMA_VERSION: u32 = 110;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8446,6 +8447,13 @@ impl MemoryDB {
             if version < 109 {
                 self.migrate_109_m6_substrate_followup(version).await?;
             }
+
+            // Migration 110 (M5 truth safety): exact judge-triple eligibility,
+            // per-triple thresholds, and the generation captured by every
+            // derivation lease. The registry intentionally starts empty.
+            if version < 110 {
+                self.migrate_110_judge_eligibility(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -11759,6 +11767,10 @@ impl MemoryDB {
                 .await
                 .map_err(|error| WenlanError::VectorDb(format!("m98 begin: {error}")))?;
             Self::ensure_claim_identity_tables(&tx).await?;
+            // Fresh databases need the fail-closed registry before migration
+            // 105's first drift scan can reference it. Existing 109 databases
+            // reach the same DDL through migration 110 below.
+            Self::ensure_judge_eligibility_tables(&tx).await?;
             Self::rebuild_edges_widened(&tx).await?;
 
             // Scoped to `edges` on purpose. The bare pragma walks every foreign
@@ -11947,6 +11959,11 @@ impl MemoryDB {
             // `claim_judgment_attempts` onto one that passed 98 before that
             // table existed.
             Self::ensure_claim_identity_tables(&tx).await?;
+            // A real database may arrive here from any version 98..104, before
+            // migration 110 created the registry. The backlog sweep below now
+            // joins it, so install the idempotent fail-closed DDL before that
+            // first query rather than relying on the later version bump.
+            Self::ensure_judge_eligibility_tables(&tx).await?;
             Self::ensure_claim_derivation_triggers(&tx).await?;
             Self::ensure_support_invalidation_triggers(&tx).await?;
             tx.commit()
@@ -12232,6 +12249,57 @@ impl MemoryDB {
             .await
             .map_err(|error| WenlanError::VectorDb(format!("m109 bump: {error}")))?;
         log::info!("[migration] Migration 109 applied: M6 substrate follow-up (inert)");
+        Ok(())
+    }
+
+    /// Migration 110: make judge eligibility an explicit, fail-closed input to
+    /// M5 support evaluation.
+    async fn migrate_110_judge_eligibility(&self, _prior: i64) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m110 begin: {error}")))?;
+
+        Self::ensure_judge_eligibility_tables(&tx).await?;
+        let has_eligibility_generation: i64 = {
+            let mut rows = tx
+                .query(
+                    "SELECT COUNT(*) FROM pragma_table_info('claim_derivation_jobs')
+                      WHERE name = 'eligibility_generation'",
+                    (),
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("m110 job column probe: {error}"))
+                })?;
+            rows.next()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m110 job column row: {error}")))?
+                .map(|row| row.get::<i64>(0))
+                .transpose()
+                .map_err(|error| WenlanError::VectorDb(format!("m110 job column decode: {error}")))?
+                .unwrap_or(0)
+        };
+        if has_eligibility_generation == 0 {
+            tx.execute(
+                "ALTER TABLE claim_derivation_jobs
+                 ADD COLUMN eligibility_generation INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("m110 job eligibility generation: {error}"))
+            })?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m110 commit: {error}")))?;
+        conn.execute("PRAGMA user_version = 110", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m110 bump: {error}")))?;
+        log::info!("[migration] Migration 110 applied: M5 judge eligibility safety fence");
         Ok(())
     }
 

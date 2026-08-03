@@ -60,6 +60,11 @@ async fn db_with_truth_rows() -> (MemoryDB, tempfile::TempDir) {
         set_truth(&conn, "p2", "provisional").await;
         set_truth(&conn, "p3", "provisional").await;
     }
+    // This file proves the strict projection invariant. Production promoter
+    // verdicts remain advisory unless this separate switch is explicit.
+    db.set_app_metadata("claim_promoter_enforcement", "1")
+        .await
+        .unwrap();
     (db, temp)
 }
 
