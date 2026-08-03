@@ -12,7 +12,10 @@
 pub mod constants;
 pub mod digest;
 pub mod identity;
+pub mod independence;
 pub mod label_key;
+pub mod oracle;
+pub mod signals;
 // Migration 109 is schema-first: PR-B/PR-C wire these transaction-scoped
 // writers. Keep the staged APIs crate-private without exposing speculative
 // public surface solely to satisfy dead-code linting.
@@ -32,7 +35,11 @@ mod frontier_policy_test;
 #[cfg(test)]
 mod identity_test;
 #[cfg(test)]
+mod independence_test;
+#[cfg(test)]
 mod label_key_test;
+#[cfg(test)]
+mod oracle_test;
 #[cfg(test)]
 mod overview_subscriptions_test;
 #[cfg(test)]
@@ -41,3 +48,5 @@ mod refresh_readiness_test;
 mod relevance_test;
 #[cfg(test)]
 mod remaining_substrate_test;
+#[cfg(test)]
+mod signals_test;

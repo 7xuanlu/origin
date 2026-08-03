@@ -64,3 +64,16 @@ pub const LABEL_KEY_MIN_SCALARS: usize = 1;
 
 /// R3 upper bound, measured after normalization (artifact 4 §6.1 step 7).
 pub const LABEL_KEY_MAX_SCALARS: usize = 128;
+
+// ---------------------------------------------------------------------------
+// D8 hard caps (artifact 4 §6, spec §3.6) — enforced at the read that
+// produces the bounded set, never by truncating after the fact.
+// ---------------------------------------------------------------------------
+
+/// Roots per candidate. A signal's supporting root set is bounded with a
+/// SQL `LIMIT` on the query that produces it, not by collecting every root
+/// and truncating the `Vec` afterward (§3.6: caps are enforced at the read).
+/// What happens to the excess (staying frontier-visible rather than lost,
+/// §3.6's "no cap may terminalize") is machine F's concern, not this
+/// reader's — PR-B1 makes no frontier writes.
+pub const ROOTS_PER_CANDIDATE_CAP: usize = 64;

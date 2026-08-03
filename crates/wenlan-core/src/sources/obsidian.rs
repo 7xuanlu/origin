@@ -150,8 +150,24 @@ pub struct Wikilink {
     pub is_embed: bool,
 }
 
-/// Extract all `[[wikilinks]]` from content, skipping those inside code blocks.
-pub fn extract_wikilinks(content: &str) -> Vec<Wikilink> {
+/// A parsed `[[wikilink]]` carrying the target capture's byte range in the
+/// source content. The M6 orphan-wikilink signal (`m6::signals`) uses the
+/// range to test whether an occurrence falls inside a claim revision's
+/// anchored span (`docs/plans/2026-08-03-m6-pr-a-followup-2-scope.md` §2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WikilinkWithSpan {
+    pub target: String,
+    pub target_range: Range<usize>,
+    pub heading: Option<String>,
+    pub display: Option<String>,
+    pub is_embed: bool,
+}
+
+/// Extract all `[[wikilinks]]` from content, skipping those inside code
+/// blocks, carrying each target's byte range in `content`. The one regex and
+/// code-block filter here also back [`extract_wikilinks`], so the write path
+/// and M6 read the same occurrences.
+pub fn extract_wikilinks_with_spans(content: &str) -> Vec<WikilinkWithSpan> {
     let code_ranges = code_block_ranges(content);
 
     WIKILINK_RE
@@ -160,11 +176,28 @@ pub fn extract_wikilinks(content: &str) -> Vec<Wikilink> {
             let m = cap.get(0).unwrap();
             !in_code_block(m.start(), &code_ranges)
         })
-        .map(|cap| Wikilink {
-            is_embed: &cap[1] == "!",
-            target: cap[2].to_string(),
-            heading: cap.get(3).map(|m| m.as_str().to_string()),
-            display: cap.get(4).map(|m| m.as_str().to_string()),
+        .map(|cap| {
+            let target = cap.get(2).unwrap();
+            WikilinkWithSpan {
+                is_embed: &cap[1] == "!",
+                target: target.as_str().to_string(),
+                target_range: target.start()..target.end(),
+                heading: cap.get(3).map(|m| m.as_str().to_string()),
+                display: cap.get(4).map(|m| m.as_str().to_string()),
+            }
+        })
+        .collect()
+}
+
+/// Extract all `[[wikilinks]]` from content, skipping those inside code blocks.
+pub fn extract_wikilinks(content: &str) -> Vec<Wikilink> {
+    extract_wikilinks_with_spans(content)
+        .into_iter()
+        .map(|w| Wikilink {
+            target: w.target,
+            heading: w.heading,
+            display: w.display,
+            is_embed: w.is_embed,
         })
         .collect()
 }
@@ -486,6 +519,22 @@ mod tests {
         assert!(links[0].is_embed);
         assert_eq!(links[0].target, "image.png");
         assert!(links[1].is_embed);
+    }
+
+    #[test]
+    fn test_extract_wikilinks_with_spans_basic() {
+        let content = "See [[Project Alpha]] and [[Beta#heading|display text]].";
+        let links = extract_wikilinks_with_spans(content);
+        assert_eq!(links.len(), 2);
+        assert_eq!(&content[links[0].target_range.clone()], "Project Alpha");
+        assert_eq!(&content[links[1].target_range.clone()], "Beta");
+        // extract_wikilinks must report the identical occurrences, since it
+        // is now expressed in terms of this function.
+        let plain = extract_wikilinks(content);
+        assert_eq!(plain.len(), links.len());
+        for (p, s) in plain.iter().zip(links.iter()) {
+            assert_eq!(p.target, s.target);
+        }
     }
 
     #[test]
