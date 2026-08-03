@@ -1763,6 +1763,39 @@ fn community_leiden_enabled_value(value: Option<&str>) -> bool {
     })
 }
 
+/// Gate for the M6 genesis shadow lane (spec §4.1). Opt-in: default OFF; enable
+/// with WENLAN_ENABLE_GENESIS_SHADOW=1/true/yes/on. Read once by
+/// `wenlan-server`'s runtime, which does not spawn the lane's task at all when
+/// it is false — the loop is absent rather than idling, so an OFF daemon pays
+/// nothing.
+///
+/// **Default OFF because the lane is unmeasured, not because it is unsafe.**
+/// The turn writes only `genesis_*` state, never `genesis_enabled`, and has no
+/// publish path; that is a safety argument and safety is not the question here.
+/// The question is contention: a turn polls every 1s idle / 100ms working and
+/// takes the single `MemoryDB` connection mutex each time, and neither its RSS
+/// nor its foreground-request-latency cost has been measured on a real corpus.
+/// The sibling ambient lanes ([`edges_reconcile_enabled`],
+/// [`entity_page_reconcile_enabled`], [`edge_grounding_promote_enabled`]) are
+/// default-OFF for exactly this reason at 30-minute cadences; this one polls
+/// three orders of magnitude faster.
+///
+/// It is also what makes spec §10.3's rollback executable: PR-B rollback is
+/// "a flag flip plus a lease sweep", and with no flag there is no flip.
+pub fn genesis_shadow_enabled() -> bool {
+    let value = std::env::var("WENLAN_ENABLE_GENESIS_SHADOW").ok();
+    genesis_shadow_enabled_value(value.as_deref())
+}
+
+fn genesis_shadow_enabled_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// True iff `WENLAN_RERANK_SKIP_PREFERENCE` is truthy. OPT-IN, default OFF.
 ///
 /// When ON, preference/recommendation-seeking queries (per

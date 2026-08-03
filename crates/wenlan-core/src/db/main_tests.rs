@@ -36496,6 +36496,41 @@ fn community_leiden_enabled_is_explicit_opt_in() {
     }
 }
 
+#[test]
+fn genesis_shadow_enabled_is_explicit_opt_in() {
+    // Unset is the case that matters most: it is what every install that never
+    // heard of M6 evaluates, and it must leave the sub-second lane unspawned.
+    for value in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("false"),
+        Some("no"),
+        Some("off"),
+        Some("garbage"),
+    ] {
+        assert!(
+            !genesis_shadow_enabled_value(value),
+            "{value:?} must leave the M6 genesis shadow lane unspawned"
+        );
+    }
+    // `on` is accepted here although the sibling lane flags do not take it —
+    // it is the natural partner of the `off` the falsey list already rejects.
+    for value in [
+        Some("1"),
+        Some("true"),
+        Some("yes"),
+        Some("on"),
+        Some(" TRUE "),
+        Some("On"),
+    ] {
+        assert!(
+            genesis_shadow_enabled_value(value),
+            "{value:?} must enable the M6 genesis shadow lane"
+        );
+    }
+}
+
 #[tokio::test]
 async fn migration_68_adds_citations_column_null_for_legacy() {
     let (db, _dir) = test_db().await;
