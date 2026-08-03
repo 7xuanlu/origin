@@ -1283,6 +1283,114 @@ async fn seed_mutable_space(db: &GenesisDb) {
     }
 }
 
+/// A space whose groups do **not** all touch all pages.
+///
+/// [`seed_mutable_space`] is degenerate for two cells: every group touches
+/// every page, so `n00` is identically zero (each pair's `total - mass_a -
+/// mass_b + n11` cancels) and no pair can lose its last supporting group.
+/// Two RED controls -- dropping `+ n11` from the `n00` derivation, and never
+/// deleting a pair whose count reaches zero -- both stayed green against it.
+/// Here `g3` touches neither `p1` nor `p2`, so that pair carries real `n00`
+/// mass, and `g2` is the sole supporter of `(p3, p4)`.
+async fn seed_sparse_space(db: &GenesisDb) {
+    let base = 1_800_000_000;
+    for (group, pages) in [
+        ("g0", vec!["p1", "p2", "p3"]),
+        ("g1", vec!["p1", "p2"]),
+        ("g2", vec!["p3", "p4"]),
+        ("g3", vec!["p5", "p6"]),
+    ] {
+        for page in pages {
+            seed_page_support(
+                db,
+                &format!("r-{group}-{page}"),
+                "space-a",
+                group,
+                page,
+                base,
+            )
+            .await;
+        }
+    }
+}
+
+/// S0-91's oracle over the cells [`seed_mutable_space`] cannot reach.
+///
+/// Retracting `g2` takes the last group off `(p3, p4)`, so the incremental
+/// path must *delete* that row rather than zero it -- a full recomputation
+/// emits no row at all. The surviving pairs keep non-zero `n00`, so the
+/// derivation is compared against a real quantity instead of a clamped zero.
+#[tokio::test]
+async fn a_retraction_that_empties_a_pair_still_equals_a_full_recomputation() {
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    seed_sparse_space(&db).await;
+
+    let pass = rereference(&db, "space-id-a", "space-a", 7).await;
+    let reference = pass.decay_reference;
+
+    let before = stored_pair_rows(&db, "space-a").await;
+    assert!(
+        before
+            .iter()
+            .any(|(page_a, page_b, _)| page_a == "p3" && page_b == "p4"),
+        "the pair about to lose its last group must exist first"
+    );
+
+    let tx = db.tx().await;
+    let group = group_support(&tx, "space-a", "g2")
+        .await
+        .expect("group support")
+        .expect("g2 is eligible before the mutation");
+    tx.commit().await.expect("commit read");
+
+    db.exec(
+        "UPDATE provenance_roots SET status = 'retracted'
+          WHERE independence_group_id = 'g2'",
+        (),
+    )
+    .await;
+
+    let tx = db.tx().await;
+    let receipt = apply_group_mutation(
+        &tx,
+        "space-a",
+        &group,
+        reference,
+        crate::m6::relevance::EligibilityChange::Retracted,
+    )
+    .await
+    .expect("apply retraction");
+    tx.commit().await.expect("commit mutation");
+
+    let incremental = stored_pair_rows(&db, "space-a").await;
+    let full = full_recompute_rows(&db, "space-a", reference).await;
+
+    // Non-vacuity, both directions: the emptied pair is gone, and what remains
+    // exercises the derivation rather than a clamped zero. Without the second
+    // assert a future fixture edit could re-degenerate `n00` and the digest
+    // comparison would pass for the wrong reason.
+    assert!(
+        !incremental
+            .iter()
+            .any(|(page_a, page_b, _)| page_a == "p3" && page_b == "p4"),
+        "the pair whose last group retracted must be deleted, not zeroed"
+    );
+    assert!(
+        incremental.iter().any(|(_, _, values)| values.n00 > 0.0),
+        "a sparse space must leave groups supporting neither page of some pair"
+    );
+    assert_eq!(
+        digest_of(&incremental),
+        digest_of(&full),
+        "the incremental retraction and a full recomputation disagree\n\
+         incremental: {incremental:#?}\nfull: {full:#?}"
+    );
+
+    assert_eq!(receipt.pages_touched, 2);
+    assert_eq!(receipt.pairs_touched, 1);
+}
+
 #[tokio::test]
 async fn a_retraction_leaves_the_table_equal_to_a_full_recomputation() {
     // S0-91's oracle for the retraction mutation: the incremental path and a
