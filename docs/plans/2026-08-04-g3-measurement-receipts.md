@@ -147,3 +147,27 @@ consumer flipped yet.
 
 Soak window between each flip; drift must stay zero (the weekly sweep plus the
 parity gate's own predicate). Rollback per flip is the same lever back to 0.
+
+## 7. G6 restore-drill rehearsal (2026-08-04)
+
+G6's gate requires a pre-migration SQLite online-backup plus a rehearsed
+restore drill. Rehearsed end-to-end against the live daemon:
+
+1. **Online backup with the daemon live:** `sqlite3 <live> ".backup <dest>"`
+   completed in **1.2s** for the 376 MB database, no daemon pause.
+2. **Backup verified:** row counts identical to live (memories 5,968, edges
+   4,932, entities 885, pages 1,084; `user_version=110`). `PRAGMA quick_check`
+   flags the three libSQL vector indexes — a plain-sqlite3 tooling artifact
+   (it cannot parse libSQL's vector index format), adjudicated by the next step.
+3. **Restore served by the production binary** (`wenlan-server 0.15.4`),
+   isolated on all three axes (`WENLAN_PORT=7879`, `WENLAN_DATA_DIR=<scratch>`,
+   `config.json` `knowledge_path=<scratch>/pages`, confirmed via
+   `GET /api/knowledge/path`): health ok, `files_indexed=5968`, search returns
+   real content. The isolated daemon projected pages into the scratch vault —
+   confirming the three-axes isolation rule is load-bearing for any future drill.
+4. **Teardown clean:** drill daemon killed; the live daemon on :7878 was never
+   disturbed (healthy before, during, after).
+
+The drill validates the restore PATH. The real G6 ceremony takes a fresh
+backup immediately before the retirement migration runs; this receipt does not
+substitute for that backup.
