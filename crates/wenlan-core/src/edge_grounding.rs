@@ -11,8 +11,11 @@
 //!    the source memory's CURRENT `memories.content`. Absent/altered → stay
 //!    `grounded=0` (closes the pure-hallucination vector; stored offsets are
 //!    never trusted — the quote is re-located).
-//! 2. **External-origin gate** (§5.2): require `source_agent='folder'`. Agent
-//!    captures are `generated` and never groundable (invariants #11/#13).
+//! 2. **External-origin gate** (§5.2): require the daemon-recorded
+//!    `memories.origin_class = 'document_ingest'` ([`crate::origin`]) — every
+//!    document-ingest connector, not one hardcoded string, and nothing a wire
+//!    request can select. Agent captures are `generated` and never groundable
+//!    (invariants #11/#13).
 //! 3. **Mandatory independent entailment** (§3, Q-G3): a separate schema-
 //!    constrained LLM pass asks "does this source text support `(from,
 //!    relation_type, to)`?" — NOT the extractor grading its own output. Span
@@ -33,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use crate::db::MemoryDB;
 use crate::llm_provider::{LlmBackend, LlmProvider, LlmRequest};
+use crate::origin::OriginClass;
 use crate::prompts::PromptRegistry;
 use crate::provenance::IndependenceSignals;
 
@@ -53,8 +57,9 @@ pub const EDGE_GROUNDING_ENTAILMENT_THRESHOLD: f64 = 0.5;
 /// change to [`crate::prompts::defaults::GROUNDING_ENTAILMENT`] so scores from
 /// different prompt versions are never compared under one threshold.
 pub const EDGE_GROUNDING_ENTAILMENT_PROMPT_VERSION: &str = "m3g-entailment-v3";
-/// The external-origin predicate (§5.2): only folder-ingested memories ground.
-const EXTERNAL_SOURCE_AGENT: &str = "folder";
+/// The external-origin predicate (§5.2) is [`OriginClass::DocumentIngest`] —
+/// see [`crate::origin`] for why it is a daemon-recorded classification and
+/// not the literal `source_agent = 'folder'` this used to compare against.
 /// Durable cursor + poison state key in `app_metadata`.
 pub(crate) const EDGE_GROUNDING_CURSOR_KEY: &str = "edge_grounding_cursor";
 
@@ -81,8 +86,11 @@ pub struct EdgeGroundingCandidate {
     /// Chunk-0 source memory content — the span/entailment evidence. `None` when
     /// the source memory is absent (LEFT JOIN miss).
     pub mem_content: Option<String>,
-    /// `memories.source_agent` — the external-origin gate reads this.
-    pub mem_source_agent: Option<String>,
+    /// `memories.origin_class` — the daemon's own verdict on where the source
+    /// memory came from (migration 112), which the external-origin gate reads.
+    /// `None` only for a LEFT JOIN miss or a row older than the migration;
+    /// both fail closed to `generated` via [`OriginClass::from_stored`].
+    pub mem_origin_class: Option<String>,
     /// Document-source identity for the root's independence signal (§5.3):
     /// `url` when present, else `source_id`.
     pub mem_source_identity: Option<String>,
@@ -433,7 +441,8 @@ async fn run_edge_grounding_with_budget(
         }
 
         // --- external-origin gate (§5.2, free) ---
-        if cand.mem_source_agent.as_deref() != Some(EXTERNAL_SOURCE_AGENT) {
+        if OriginClass::from_stored(cand.mem_origin_class.as_deref()) != OriginClass::DocumentIngest
+        {
             advance_cursor(&mut state, rowid);
             continue;
         }
@@ -1101,6 +1110,124 @@ mod tests {
             "works_on",
             "space_a",
             "cap_1",
+            Some("Alice works on ProjectX"),
+            content,
+        )
+        .await;
+        let (_p, llm) = scripted(&[], 0.99);
+
+        let report = run_edge_grounding_tick(&db, &llm, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert_eq!(report.promoted, 0);
+        assert_eq!(
+            report.entailment_calls, 0,
+            "origin gate rejects before entailment"
+        );
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge["grounded"], 0);
+    }
+
+    /// Seed a memory the way one named ingest path would, and return the
+    /// origin class the daemon recorded for it.
+    async fn seed_memory_as(db: &MemoryDB, source_id: &str, content: &str, agent: &str) {
+        db.upsert_documents(vec![RawDocument {
+            source: "memory".to_string(),
+            source_id: source_id.to_string(),
+            title: source_id.to_string(),
+            content: content.to_string(),
+            last_modified: 1,
+            space: Some("space_a".to_string()),
+            source_agent: Some(agent.to_string()),
+            confirmed: Some(true),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn obsidian_import_is_external_origin_and_promotes() {
+        // The narrowing this replaces: an Obsidian vault import is a genuine
+        // document ingest, and under the old `source_agent = 'folder'` literal
+        // it could never ground no matter how well the evidence entailed.
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let content = "The vault note records that Alice works on ProjectX.";
+        seed_memory_as(&db, "vault_1", content, "obsidian").await;
+        let edge_id = seed_edge(
+            &db,
+            "Alice",
+            "ProjectX",
+            "works_on",
+            "space_a",
+            "vault_1",
+            Some("Alice works on ProjectX"),
+            content,
+        )
+        .await;
+        let (_p, llm) = scripted(&[], 0.95);
+
+        let report = run_edge_grounding_tick(&db, &llm, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.entailment_calls, 1,
+            "an obsidian document must reach the entailment gate, not be cut at the origin gate"
+        );
+        assert_eq!(report.promoted, 1);
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge["grounded"], 1);
+    }
+
+    #[tokio::test]
+    async fn spoofed_origin_string_written_below_the_wire_still_grounds() {
+        // Companion to the server-side guard test: this asserts the DIVISION of
+        // labour, so neither half is silently doing the other's job. Reaching
+        // `upsert_documents` with `source_agent = "folder"` IS a document
+        // ingest — that is what the folder watcher itself does — so the row is
+        // classified `document_ingest` and grounds. What stops an agent from
+        // getting here is the wire guard in `handle_store_memory`, not this
+        // classifier; if that guard is ever removed, the server test fails
+        // while this one keeps passing, which is the correct attribution.
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let content = "The file states that Alice works on ProjectX.";
+        seed_memory_as(&db, "doc_spoof", content, "folder").await;
+        let edge_id = seed_edge(
+            &db,
+            "Alice",
+            "ProjectX",
+            "works_on",
+            "space_a",
+            "doc_spoof",
+            Some("Alice works on ProjectX"),
+            content,
+        )
+        .await;
+        let (_p, llm) = scripted(&[], 0.95);
+
+        let report = run_edge_grounding_tick(&db, &llm, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert_eq!(report.promoted, 1);
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge["grounded"], 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_revision_is_generated_and_never_grounds() {
+        // A doc-reconcile revision is LLM-rewritten prose ABOUT a document, not
+        // the document. It is `generated`, so it stays grounded=0 even though
+        // page genesis already treats it like a document for seeding purposes.
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let content = "Alice works on ProjectX, per the reconciled note.";
+        seed_memory_as(&db, "rev_1", content, "reconcile").await;
+        let edge_id = seed_edge(
+            &db,
+            "Alice",
+            "ProjectX",
+            "works_on",
+            "space_a",
+            "rev_1",
             Some("Alice works on ProjectX"),
             content,
         )

@@ -447,6 +447,29 @@ pub async fn handle_store_memory(
         "hide".to_string()
     };
 
+    // Origin-honesty guard (spec §5.6; close plan Part A item 2). `source_agent`
+    // is origin-bearing: a value in `origin::DOCUMENT_INGEST_SOURCE_AGENTS`
+    // makes the row's relations promotion-eligible, exempts it from page
+    // genesis, and lets doc-reconcile treat it as the authoritative document in
+    // a contradiction. None of that may be selectable by a request, so a
+    // reserved claim is dropped here and logged. Normalising rather than
+    // rejecting keeps existing clients working.
+    //
+    // Deliberately applied to the PERSISTED value only, not to the agent
+    // identity resolved above: `extract_agent_name` treats an absent agent as a
+    // local first-party write and grants FULL trust, so blanking the claim
+    // before that resolution would turn a spoof attempt into a trust upgrade.
+    // Identity keeps judging the raw claim; the row keeps no false origin.
+    let (persisted_source_agent, rejected_origin_claim) =
+        wenlan_core::origin::normalize_wire_source_agent(req.source_agent);
+    if let Some(claimed) = rejected_origin_claim {
+        tracing::warn!(
+            "[origin-guard] /api/memory/store request claimed reserved source_agent \
+             '{claimed}' (resolved agent '{resolved_agent}'); dropped — origin is \
+             daemon-authoritative and no wire request may select it"
+        );
+    }
+
     let final_domain = resolved_write_space.space_name.clone();
     let doc = RawDocument {
         source: "memory".to_string(),
@@ -459,7 +482,7 @@ pub async fn handle_store_memory(
         metadata: HashMap::new(),
         memory_type: Some(memory_type_str.clone()),
         space: final_domain.clone(),
-        source_agent: req.source_agent,
+        source_agent: persisted_source_agent,
         confidence: Some(effective_confidence),
         confirmed,
         stability: Some(stability.to_string()),
@@ -2012,6 +2035,135 @@ mod store_scheduler_handoff_tests {
             "the HTTP store path must never forward an enrichment inference"
         );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Close plan Part A item 2 / spec §5.6: `source_agent` is origin-bearing,
+    /// so a wire request may not select one of the values that decide
+    /// grounding. Before this guard, any MCP agent could send
+    /// `source_agent: "folder"` and have its own extracted relations become
+    /// promotion-eligible.
+    ///
+    /// The eligibility half of the claim is proven where it lives:
+    /// `origin::classify_origin(None) == Generated` (unit test in
+    /// `wenlan-core/src/origin.rs`) and a `generated` source never grounds
+    /// (`edge_grounding::tests::non_external_source_stays_grounded_zero`).
+    /// What this test owns is the one link those cannot see — that the row
+    /// reaches storage with the spoofed string gone.
+    #[tokio::test]
+    async fn store_drops_a_spoofed_origin_bearing_source_agent() {
+        let _lock = crate::TEST_DATA_DIR_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let _env = DataDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            wenlan_core::db::MemoryDB::new(dir.path(), Arc::new(wenlan_core::events::NoopEmitter))
+                .await
+                .unwrap(),
+        );
+        let gate = wenlan_core::quality_gate::QualityGate::new(wenlan_core::tuning::GateConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db.clone()),
+            quality_gate: gate,
+            ..Default::default()
+        }));
+        wenlan_core::config::save_config(&wenlan_core::config::Config::default()).unwrap();
+
+        for claimed in ["folder", "obsidian", "  FOLDER "] {
+            let content = format!(
+                "An agent claiming to be '{claimed}' asserts that Alice works on ProjectX."
+            );
+            let response = handle_store_memory(
+                State(state.clone()),
+                HeaderMap::new(),
+                crate::space_header::SpaceHeader(None),
+                Json(StoreMemoryRequest {
+                    content: content.clone(),
+                    memory_type: None,
+                    space: (None).into(),
+                    source_agent: Some(claimed.to_string()),
+                    title: None,
+                    confidence: None,
+                    supersedes: None,
+                    entity: None,
+                    entity_id: None,
+                    structured_fields: None,
+                    retrieval_cue: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+            let stored = db
+                .get_memory_detail(&response.0.source_id)
+                .await
+                .unwrap()
+                .expect("the store must still succeed — the claim is normalized, not rejected");
+            assert_eq!(
+                stored.source_agent, None,
+                "claimed '{claimed}' must not be persisted: it would also buy \
+                 page-genesis and doc-reconcile document privileges"
+            );
+        }
+    }
+
+    /// The guard must be narrow: an ordinary agent name is origin-neutral and
+    /// survives untouched, so attribution keeps working.
+    #[tokio::test]
+    async fn store_keeps_an_ordinary_source_agent() {
+        let _lock = crate::TEST_DATA_DIR_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let _env = DataDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            wenlan_core::db::MemoryDB::new(dir.path(), Arc::new(wenlan_core::events::NoopEmitter))
+                .await
+                .unwrap(),
+        );
+        let gate = wenlan_core::quality_gate::QualityGate::new(wenlan_core::tuning::GateConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db.clone()),
+            quality_gate: gate,
+            ..Default::default()
+        }));
+        wenlan_core::config::save_config(&wenlan_core::config::Config::default()).unwrap();
+
+        let response = handle_store_memory(
+            State(state),
+            HeaderMap::new(),
+            crate::space_header::SpaceHeader(None),
+            Json(StoreMemoryRequest {
+                content: "Alice prefers the ranking work over the ingest work.".to_string(),
+                memory_type: None,
+                space: (None).into(),
+                source_agent: Some("claude-code".to_string()),
+                title: None,
+                confidence: None,
+                supersedes: None,
+                entity: None,
+                entity_id: None,
+                structured_fields: None,
+                retrieval_cue: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_memory_detail(&response.0.source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.source_agent.as_deref(), Some("claude-code"));
     }
 
     #[tokio::test]

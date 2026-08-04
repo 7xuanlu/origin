@@ -710,7 +710,7 @@ pub const EMBEDDING_DIM: usize = 768;
 /// Migration 111 repairs the edges-parity damage the ambient entity-enrichment
 /// lane did while it wrote `relations` without their `edges` twin. It follows
 /// M5's judge-eligibility registry and generation fence at 110.
-pub const SCHEMA_VERSION: u32 = 111;
+pub const SCHEMA_VERSION: u32 = 112;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8525,6 +8525,14 @@ impl MemoryDB {
             if version < 111 {
                 self.migrate_111_ambient_edge_parity_repair(version).await?;
             }
+
+            // Migration 112 (KG close plan G2): the daemon-authoritative
+            // `memories.origin_class` column plus its one-time backfill, so
+            // grounding stops asking a spoofable string where a memory came
+            // from. See migrate_112_origin_class.
+            if version < 112 {
+                self.migrate_112_origin_class(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -12662,6 +12670,184 @@ impl MemoryDB {
         Ok(())
     }
 
+    /// Migration 112 (KG close plan G2, Part A item 1): give every memory a
+    /// daemon-authoritative origin class.
+    ///
+    /// Adds `memories.origin_class` and backfills it ONCE from `source_agent`.
+    /// After this migration the grounding sweep reads the column instead of
+    /// string-matching `source_agent = 'folder'`, which both widens the gate to
+    /// every document-ingest connector and takes it out of a client's reach.
+    ///
+    /// **The backfill grants `document_ingest` to `folder` rows ONLY, and the
+    /// set is frozen — it deliberately does NOT read
+    /// [`crate::origin::DOCUMENT_INGEST_SOURCE_AGENTS`].** Two separate reasons,
+    /// and both point the same way:
+    ///
+    /// * *Frozen:* this UPDATE only ever sees rows written before 112, so the
+    ///   set is a historical fact, not a live list. A connector added later
+    ///   cannot have pre-112 rows — it classifies its own writes at insert
+    ///   time — so tracking the runtime list would only ever widen the backfill
+    ///   to strings that could not have been written honestly.
+    /// * *`obsidian` is excluded on purpose,* even though it IS a document
+    ///   ingest at runtime. Pre-112 an `obsidian` row could never ground, so
+    ///   granting it `document_ingest` here would RAISE historical trust above
+    ///   what the pre-112 daemon extended. Worse, in the common setup where
+    ///   `knowledge_path` sits inside a watched vault, some of those rows are
+    ///   Wenlan's own projected pages re-ingested, and nothing in the row can
+    ///   identify them: `note_to_documents` stores the frontmatter-stripped
+    ///   body (`sources/obsidian.rs`), so the `origin_id` marker is gone from
+    ///   `content`, and the page/file mapping lives on disk in `state.json`,
+    ///   not in any table this migration could join. Promoting them would hand
+    ///   the graph its own output (invariant #11). They fall through to
+    ///   `generated`, and a re-sync reclassifies them correctly for free —
+    ///   `upsert_documents` deletes by `(source, source_id)` and re-inserts, so
+    ///   the fresh row gets the real class and the new frontmatter skip keeps
+    ///   an actual projection out entirely.
+    ///
+    /// **Historical honesty caveat.** The backfill can only infer origin from
+    /// `source_agent`, and before this migration that field was client-writable
+    /// on `/api/memory/store`. A pre-112 row where an agent claimed `folder` is
+    /// therefore backfilled as `document_ingest` — the migration cannot tell a
+    /// spoof from a real ingest after the fact, and inventing a heuristic would
+    /// only launder the guess. That case is a wash rather than a regression:
+    /// the pre-112 gate promoted exactly the same rows, because it matched the
+    /// same string. The guard closes the vector going forward; historical rows
+    /// are trusted exactly as much as the pre-112 daemon trusted them, no more.
+    ///
+    /// A data migration that rewrites existing rows, so it takes the §6.9
+    /// restore point first (mirroring migration 111). Re-run safe: the ALTER
+    /// is skipped when the column already exists, and the two backfill UPDATEs
+    /// are scoped to `origin_class IS NULL`, so a second pass touches nothing.
+    ///
+    /// **The backfill runs with M4's memory-update parity trigger suspended.**
+    /// `m4_parity_input_memory_update` is an UNQUALIFIED `AFTER UPDATE ON
+    /// memories` that bumps `community_parity_input_state.generation` once per
+    /// row touched. Leaving it armed would be wrong twice: `origin_class` is a
+    /// derived provenance label, not a community-parity input, so the
+    /// generation must not move at all; and on a store whose parity tables are
+    /// still in a pre-M96 shape the trigger's target does not exist yet — the
+    /// `repair_community_*` passes run AFTER the version-gated block — so the
+    /// whole migration would abort with `no such table`. The trigger's own
+    /// definition is read back from `sqlite_master` and re-executed verbatim
+    /// rather than copied here, so it cannot drift from the real one, and the
+    /// drop + restore share this migration's transaction (SQLite DDL is
+    /// transactional) so a crash cannot leave it missing.
+    async fn migrate_112_origin_class(&self, prior_version: i64) -> Result<(), WenlanError> {
+        self.backup_before_migration(112, prior_version).await?;
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m112 begin: {e}")))?;
+
+        let result: Result<(u64, u64), WenlanError> = async {
+            // Idempotency probe (mirrors m55/m56): a partially-applied run, or
+            // a test that rolled `user_version` back, must not fail on a
+            // duplicate column.
+            let already_added: bool = {
+                let mut rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM pragma_table_info('memories') \
+                         WHERE name = 'origin_class'",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m112 probe: {e}")))?;
+                match rows.next().await {
+                    Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) > 0,
+                    _ => false,
+                }
+            };
+            if !already_added {
+                conn.execute("ALTER TABLE memories ADD COLUMN origin_class TEXT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m112 add origin_class: {e}")))?;
+            }
+
+            // Suspend the parity trigger, keeping its own definition to restore.
+            let parity_trigger_sql: Option<String> = {
+                let mut rows = conn
+                    .query(
+                        "SELECT sql FROM sqlite_master \
+                         WHERE type = 'trigger' AND name = 'm4_parity_input_memory_update'",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m112 read trigger: {e}")))?;
+                match rows.next().await {
+                    Ok(Some(row)) => row.get::<Option<String>>(0).unwrap_or(None),
+                    _ => None,
+                }
+            };
+            if parity_trigger_sql.is_some() {
+                conn.execute("DROP TRIGGER m4_parity_input_memory_update", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m112 drop trigger: {e}")))?;
+            }
+
+            // Backfill. `'folder'` is written out rather than read from
+            // `DOCUMENT_INGEST_SOURCE_AGENTS` — the set is a frozen historical
+            // fact and `obsidian` is excluded on purpose. See the doc comment.
+            //
+            // Both UPDATEs run unbatched, unlike migration 80's chunked
+            // rewrite. The precedent does not transfer: m80 batched because it
+            // rewrote embeddings row by row from Rust, so each row cost real
+            // work and an unbounded run held the connection for minutes. These
+            // are two single statements SQLite plans and executes itself, with
+            // no per-row work on our side and no LLM anywhere near them, inside
+            // the transaction the migration already needs for the trigger
+            // suspension. Chunking them would add resumability the `origin_class
+            // IS NULL` scoping already provides.
+            let classified = conn
+                .execute(
+                    "UPDATE memories SET origin_class = ?1 \
+                     WHERE origin_class IS NULL \
+                       AND lower(trim(source_agent)) = 'folder'",
+                    libsql::params![crate::origin::OriginClass::DocumentIngest.as_str()],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("m112 backfill document_ingest: {e}"))
+                })?;
+            let defaulted = conn
+                .execute(
+                    "UPDATE memories SET origin_class = ?1 WHERE origin_class IS NULL",
+                    libsql::params![crate::origin::OriginClass::Generated.as_str()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m112 backfill generated: {e}")))?;
+
+            if let Some(sql) = parity_trigger_sql {
+                conn.execute(&sql, ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m112 restore trigger: {e}")))?;
+            }
+            Ok((classified, defaulted))
+        }
+        .await;
+
+        let (classified, defaulted) = match result {
+            Ok(value) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m112 commit: {e}")))?;
+                value
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+
+        conn.execute("PRAGMA user_version = 112", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m112 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 112 applied: memories.origin_class \
+             ({classified} rows classified document_ingest, {defaulted} generated)"
+        );
+        Ok(())
+    }
+
     async fn repair_community_cutover(&self) -> Result<(), WenlanError> {
         let conn = self.conn.lock().await;
         let tx = conn
@@ -13821,7 +14007,7 @@ impl MemoryDB {
     const EDGE_GROUNDING_CANDIDATE_SCAN_SQL: &'static str =
         "SELECT r.rowid, r.from_entity, r.to_entity, r.relation_type,
                         r.source_memory_id, fe.name, te.name,
-                        m.content, m.source_agent, m.source_id, m.url, r.id
+                        m.content, m.origin_class, m.source_id, m.url, r.id
                  FROM relations r
                  JOIN entities fe ON fe.id = r.from_entity
                  JOIN entities te ON te.id = r.to_entity
@@ -13857,7 +14043,7 @@ impl MemoryDB {
             relation_type: String,
             source_memory_id: Option<String>,
             mem_content: Option<String>,
-            mem_source_agent: Option<String>,
+            mem_origin_class: Option<String>,
             mem_source_identity: Option<String>,
         }
         let mut staged: Vec<Staged> = Vec::new();
@@ -13876,7 +14062,7 @@ impl MemoryDB {
             let from_name: String = row.get(5).unwrap_or_default();
             let to_name: String = row.get(6).unwrap_or_default();
             let mem_content: Option<String> = row.get::<Option<String>>(7).ok().flatten();
-            let mem_source_agent: Option<String> = row.get::<Option<String>>(8).ok().flatten();
+            let mem_origin_class: Option<String> = row.get::<Option<String>>(8).ok().flatten();
             let mem_source_id: Option<String> = row.get::<Option<String>>(9).ok().flatten();
             let mem_url: Option<String> = row.get::<Option<String>>(10).ok().flatten();
             let relation_id: String = row.get(11).unwrap_or_default();
@@ -13905,7 +14091,7 @@ impl MemoryDB {
                 relation_type,
                 source_memory_id,
                 mem_content,
-                mem_source_agent,
+                mem_origin_class,
                 mem_source_identity,
             });
         }
@@ -13960,7 +14146,7 @@ impl MemoryDB {
                     relation_type: s.relation_type,
                     source_memory_id: s.source_memory_id,
                     mem_content: s.mem_content,
-                    mem_source_agent: s.mem_source_agent,
+                    mem_origin_class: s.mem_origin_class,
                     mem_source_identity: s.mem_source_identity,
                     edge_grounded,
                     edge_valid_until,
@@ -21566,6 +21752,16 @@ impl MemoryDB {
             memory_type: Option<String>,
             space: Option<String>,
             source_agent: Option<String>,
+            /// The daemon's origin verdict for this row (`memories.origin_class`,
+            /// migration 112). Derived HERE from the writing path's own
+            /// `source_agent`, never carried in from a request — this is the
+            /// `RawDocument` ingest boundary, where every external document and
+            /// every agent capture enters, so classifying at it is what makes
+            /// the verdict daemon-authoritative. The other writers that INSERT
+            /// into `memories` (chat-export import, episode backfill, in-place
+            /// rewrite) pin the column explicitly at their own INSERT.
+            /// Promotion reads this.
+            origin_class: &'static str,
             confidence: Option<f32>,
             confirmed: Option<bool>,
             stability: Option<String>,
@@ -21684,6 +21880,8 @@ impl MemoryDB {
                     memory_type: doc.memory_type.clone(),
                     space: doc.space.clone(),
                     source_agent: doc.source_agent.clone(),
+                    origin_class: crate::origin::classify_origin(doc.source_agent.as_deref())
+                        .as_str(),
                     confidence: doc.confidence,
                     confirmed: doc.confirmed,
                     stability: doc.stability.clone(),
@@ -21760,6 +21958,10 @@ impl MemoryDB {
                     memory_type: doc.memory_type.clone(),
                     space: doc.space.clone(),
                     source_agent: doc.source_agent.clone(),
+                    // An episode is a verbatim slice of its parent, so it
+                    // inherits the parent's origin by construction.
+                    origin_class: crate::origin::classify_origin(doc.source_agent.as_deref())
+                        .as_str(),
                     confidence: doc.confidence,
                     confirmed: doc.confirmed,
                     stability: doc.stability.clone(),
@@ -22205,12 +22407,14 @@ impl MemoryDB {
                     stability, supersedes, pending_revision, word_count,
                     entity_id, enrichment_status, quality, is_recap, supersede_mode,
                     structured_fields, retrieval_cue, source_text,
-                    embedding, created_at, importance, episode_of, content_hash, version)
+                    embedding, created_at, importance, episode_of, content_hash, version,
+                    origin_class)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
                     ?24, ?25, ?26, ?27, ?28,
                     ?29, ?30, ?31,
-                    vector32(?32), ?33, ?34, ?35, ?36, ?37)",
+                    vector32(?32), ?33, ?34, ?35, ?36, ?37,
+                    ?38)",
                     libsql::params![
                         row.id,
                         row.content,
@@ -22248,7 +22452,8 @@ impl MemoryDB {
                         importance_val,
                         episode_of_val,
                         content_hash_val,
-                        replacement_version
+                        replacement_version,
+                        row.origin_class
                     ],
                 )
                 .await
@@ -28805,7 +29010,7 @@ impl MemoryDB {
                                     supersedes, pending_revision, word_count, entity_id,
                                     enrichment_status, quality, is_recap, supersede_mode,
                                     structured_fields, retrieval_cue, source_text, embedding,
-                                    created_at, importance, episode_of)
+                                    created_at, importance, episode_of, origin_class)
                                  VALUES (?1, ?2, 'episode', ?3, ?4,
                                     NULL, NULL, 0, ?5, 'text',
                                     NULL, NULL, NULL, NULL, ?6,
@@ -28813,7 +29018,7 @@ impl MemoryDB {
                                     NULL, ?12, ?13, NULL,
                                     'legacy', NULL, 0, ?14,
                                     NULL, NULL, NULL, vector32(?15),
-                                    ?16, NULL, ?17)",
+                                    ?16, NULL, ?17, ?18)",
                                 libsql::params![
                                     derivation.episode_id,
                                     derivation.verbatim,
@@ -28822,7 +29027,7 @@ impl MemoryDB {
                                     head.last_modified,
                                     effective_memory_type,
                                     effective_space,
-                                    head.source_agent,
+                                    head.source_agent.clone(),
                                     effective_confidence,
                                     effective_confirmed,
                                     effective_stability,
@@ -28831,7 +29036,12 @@ impl MemoryDB {
                                     head.supersede_mode,
                                     embedding,
                                     head.created_at,
-                                    source_id
+                                    source_id,
+                                    // Same rule as the co-write in
+                                    // `upsert_documents`: an episode inherits
+                                    // its parent's origin.
+                                    crate::origin::classify_origin(head.source_agent.as_deref())
+                                        .as_str()
                                 ],
                             )
                             .await
@@ -39032,6 +39242,15 @@ impl MemoryDB {
             memory_type: Option<String>,
             space: Option<String>,
             source_agent: Option<String>,
+            /// The parent's RECORDED `origin_class`, carried through verbatim.
+            /// An episode is a verbatim slice of its parent, so it inherits the
+            /// parent's origin by construction — matching the co-write in
+            /// `upsert_documents`. Read rather than re-derived from
+            /// `source_agent` on purpose: re-deriving would relabel a row that
+            /// migration 112 deliberately left `generated` (a pre-112 `obsidian`
+            /// row, which may be one of our own re-ingested projections), which
+            /// would launder that exclusion straight back out.
+            origin_class: Option<String>,
             confidence: Option<f64>,
             confirmed: Option<i64>,
             stability: Option<String>,
@@ -39050,7 +39269,7 @@ impl MemoryDB {
                 .query(
                     "SELECT source_id, source_text, content, title, memory_type, space,
                             source_agent, confidence, confirmed, stability, pending_revision,
-                            last_modified, supersede_mode
+                            last_modified, supersede_mode, origin_class
                      FROM memories
                      WHERE source = 'memory' AND chunk_index = 0",
                     (),
@@ -39083,6 +39302,7 @@ impl MemoryDB {
                         .get::<Option<String>>(12)
                         .unwrap_or(None)
                         .unwrap_or_else(|| "hide".to_string()),
+                    origin_class: r.get::<Option<String>>(13).unwrap_or(None),
                 });
             }
             out
@@ -39141,14 +39361,14 @@ impl MemoryDB {
                             stability, supersedes, pending_revision, word_count,
                             entity_id, enrichment_status, quality, is_recap, supersede_mode,
                             structured_fields, retrieval_cue, source_text,
-                            embedding, created_at, importance, episode_of)
+                            embedding, created_at, importance, episode_of, origin_class)
                          VALUES (?1, ?2, 'episode', ?3, ?4, NULL, NULL,
                             0, ?5, 'text', NULL, NULL, NULL,
                             NULL, ?6, ?7, ?8, ?9, ?10,
                             ?11, NULL, ?12, ?13,
                             NULL, 'legacy', NULL, 0, ?14,
                             NULL, NULL, NULL,
-                            vector32(?15), ?16, NULL, ?17)",
+                            vector32(?15), ?16, NULL, ?17, ?18)",
                         libsql::params![
                             ep.episode_id.as_str(),
                             ep.verbatim.as_str(),
@@ -39166,7 +39386,13 @@ impl MemoryDB {
                             p.supersede_mode.as_str(),
                             vec_str,
                             p.last_modified,
-                            p.source_id.as_str()
+                            p.source_id.as_str(),
+                            // Inherit the parent's recorded class. A parent
+                            // written before migration 112 has NULL here, and
+                            // NULL fails closed to `generated` on read
+                            // (`OriginClass::from_stored`), so the episode is
+                            // never more groundable than its parent.
+                            opt_text(&p.origin_class)
                         ],
                     )
                     .await
@@ -47669,6 +47895,10 @@ impl MemoryDB {
             created_at: i64,
             version: i64,
             changelog: String,
+            /// Carried through, not re-decided. This rewrites one memory's
+            /// content in place; where that memory CAME from does not change
+            /// because its text did, so the row keeps the class it already had.
+            origin_class: Option<String>,
         }
 
         let saved = {
@@ -47680,7 +47910,8 @@ impl MemoryDB {
                             enrichment_status, quality, is_recap,
                             structured_fields, retrieval_cue, source_text,
                             COALESCE(created_at, last_modified),
-                            COALESCE(version, 1), COALESCE(changelog, '[]')
+                            COALESCE(version, 1), COALESCE(changelog, '[]'),
+                            origin_class
                      FROM memories
                      WHERE source != 'episode' AND source_id = ?1 AND chunk_index = 0
                      LIMIT 1",
@@ -47726,6 +47957,7 @@ impl MemoryDB {
                     .unwrap_or_else(|_| chrono::Utc::now().timestamp()),
                 version: row.get::<i64>(18).unwrap_or(1),
                 changelog: row.get::<String>(19).unwrap_or_else(|_| "[]".to_string()),
+                origin_class: row.get::<Option<String>>(20).unwrap_or(None),
             }
         };
 
@@ -47801,7 +48033,7 @@ impl MemoryDB {
                     stability, supersedes, pending_revision, word_count,
                     entity_id, enrichment_status, quality, is_recap, supersede_mode,
                     structured_fields, retrieval_cue, source_text,
-                    embedding, created_at, version, changelog
+                    embedding, created_at, version, changelog, origin_class
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                     0, ?8, ?9, ?10, NULL, NULL,
@@ -47809,7 +48041,7 @@ impl MemoryDB {
                     ?16, NULL, 0, ?17,
                     ?18, ?19, ?20, ?21, 'hide',
                     ?22, ?23, ?24,
-                    vector32(?25), ?26, ?27, ?28
+                    vector32(?25), ?26, ?27, ?28, ?29
                 )";
 
                 conn.execute(
@@ -47842,7 +48074,12 @@ impl MemoryDB {
                         vec_sql,
                         saved.created_at,
                         new_version,
-                        changelog_json
+                        changelog_json,
+                        saved
+                            .origin_class
+                            .clone()
+                            .map(libsql::Value::from)
+                            .unwrap_or(libsql::Value::Null)
                     ],
                 )
                 .await
@@ -48563,8 +48800,12 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("store raw import begin: {e}")))?;
         if let Err(e) = conn.execute(
-            "INSERT INTO memories (id, content, source, source_id, title, chunk_index, last_modified, chunk_type, word_count, created_at)
-             VALUES (?1, ?2, 'memory', ?3, ?4, ?5, ?6, 'text', ?7, ?8)",
+            // `origin_class` is pinned, not defaulted: a chat export is a
+            // transcript of an agent conversation, so it is `generated` however
+            // it got here, and pinning it means the row does not depend on the
+            // NULL-fails-closed read to stay unpromotable.
+            "INSERT INTO memories (id, content, source, source_id, title, chunk_index, last_modified, chunk_type, word_count, created_at, origin_class)
+             VALUES (?1, ?2, 'memory', ?3, ?4, ?5, ?6, 'text', ?7, ?8, ?9)",
             libsql::params![
                 memory_id.clone(),
                 content.to_string(),
@@ -48574,6 +48815,7 @@ impl MemoryDB {
                 now_ts,
                 word_count,
                 created_ts,
+                crate::origin::OriginClass::Generated.as_str(),
             ],
         )
         .await {
@@ -48631,8 +48873,10 @@ impl MemoryDB {
             let word_count = content.split_whitespace().count() as i64;
 
             if let Err(e) = conn.execute(
-                "INSERT INTO memories (id, content, source, source_id, title, chunk_index, last_modified, chunk_type, word_count, created_at)
-                 VALUES (?1, ?2, 'memory', ?3, ?4, ?5, ?6, 'text', ?7, ?8)",
+                // `origin_class` pinned for the same reason as the single-row
+                // `store_raw_import_memory` above: a chat export is `generated`.
+                "INSERT INTO memories (id, content, source, source_id, title, chunk_index, last_modified, chunk_type, word_count, created_at, origin_class)
+                 VALUES (?1, ?2, 'memory', ?3, ?4, ?5, ?6, 'text', ?7, ?8, ?9)",
                 libsql::params![
                     memory_id,
                     content.clone(),
@@ -48642,6 +48886,7 @@ impl MemoryDB {
                     now_ts,
                     word_count,
                     created_ts,
+                    crate::origin::OriginClass::Generated.as_str(),
                 ],
             ).await {
                 let _ = conn.execute("ROLLBACK", ()).await;

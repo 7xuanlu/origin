@@ -64,6 +64,13 @@ impl NoteFrontmatter {
     pub fn get_str(&self, key: &str) -> Option<&str> {
         self.fields.get(key).and_then(|v| v.as_str())
     }
+
+    /// Whether the key is present at all, whatever its YAML type. Used for the
+    /// self-recapture check, where a hand-mangled `origin_id: 12` must still
+    /// count as "this file is our own projection".
+    pub fn has(&self, key: &str) -> bool {
+        self.fields.contains_key(key)
+    }
 }
 
 /// Parse YAML frontmatter delimited by `---`. Returns the parsed frontmatter
@@ -282,6 +289,37 @@ pub fn detect_note_type(path: &Path, content: &str) -> NoteType {
 /// Directories to skip when scanning a vault.
 const SKIP_DIRS: &[&str] = &[".obsidian", ".trash", ".git", "templates"];
 
+/// Frontmatter key that marks a `.md` file as one of Wenlan's own projected
+/// pages (written by `export::knowledge::KnowledgeWriter::write_page`). Any
+/// file carrying it is skipped on ingest — see `note_to_documents`.
+const PROJECTED_PAGE_FRONTMATTER_KEY: &str = "origin_id";
+
+/// Second, parser-independent look for the projection marker.
+///
+/// `extract_frontmatter` runs the block through `serde_yaml` and falls back to
+/// an EMPTY map on any parse error, so ONE malformed line anywhere in the
+/// frontmatter — a stray tab, an unquoted `: ` in a title — makes
+/// `NoteFrontmatter::has` answer "no `origin_id` here" for a file that plainly
+/// has one. That failure is fail-OPEN in the direction that matters: the
+/// projection gets ingested. Meanwhile `export::knowledge::read_origin_id`
+/// never parses YAML at all — it scans the block for a line starting with
+/// `origin_id:` — so the writer would still claim the same file. This mirrors
+/// that line-prefix scan so the two sides cannot disagree about what is ours.
+///
+/// Deliberately broader than `read_origin_id` in one place: that function
+/// discards an empty value, this one treats the key's mere presence as enough.
+/// A page whose `origin_id` got blanked is still our output, and the cost of
+/// being wrong here is one skipped note, not a poisoned graph.
+fn has_projection_marker_line(content: &str) -> bool {
+    let mut lines = content.lines();
+    if lines.next() != Some("---") {
+        return false;
+    }
+    lines
+        .take_while(|line| *line != "---")
+        .any(|line| line.starts_with(&format!("{PROJECTED_PAGE_FRONTMATTER_KEY}:")))
+}
+
 /// Check if a path should be skipped (any component matches a skip directory).
 pub fn should_skip(path: &Path) -> bool {
     path.components().any(|c| {
@@ -366,6 +404,13 @@ fn has_any_markdown_recursive(root: &Path, dir: &Path) -> bool {
 /// A future refactor should rename: source → kind, source_agent → source,
 /// source_id → external_id. Until then, new source connectors should follow
 /// this pattern: `source = "memory"` + distinctive `source_agent`.
+///
+/// A connector's distinctive string is no longer enough on its own: a
+/// document-ingest connector must also add that string to
+/// `origin::DOCUMENT_INGEST_SOURCE_AGENTS`, which is what makes its documents
+/// groundable and simultaneously bars a wire request from claiming the value.
+/// The old "invent a new string" guidance silently broke the grounding gate
+/// for every connector after `folder`, including this one.
 pub fn note_to_documents(
     source_id: &str,
     path: &Path,
@@ -378,6 +423,36 @@ pub fn note_to_documents(
     }
 
     let (frontmatter, body) = extract_frontmatter(content);
+
+    // Self-recapture exclusion (close plan Part A item 1, rider). A `.md` file
+    // carrying `origin_id` frontmatter is one of OUR projected pages —
+    // `KnowledgeWriter::write_page` stamps it, and `read_origin_id` reads it
+    // back to re-attribute files. Re-ingesting one would turn the system's own
+    // distilled prose into a "document ingest", which the grounding gate
+    // promotes: the graph would end up voting for its own output.
+    //
+    // `is_reserved_ingest_root` only refuses the pages directory as a source
+    // ROOT. It cannot see a projection nested inside a watched vault (the
+    // common setup when `knowledge_path` points into the vault), a parent
+    // directory registered as a source, or a page file someone copied
+    // elsewhere. The frontmatter travels with the file, so checking it here
+    // closes all of those — and it sits on the shared path, so the folder
+    // watcher's markdown branch (`directory::file_to_documents`) is covered by
+    // the same three lines.
+    // Two detections, because the YAML parse is fail-open on malformed
+    // frontmatter — see `has_projection_marker_line`.
+    if frontmatter.has(PROJECTED_PAGE_FRONTMATTER_KEY) || has_projection_marker_line(content) {
+        // Say so. A silent skip is indistinguishable from a broken watcher to
+        // the user whose note never showed up, and this is the one skip that
+        // can fire on a file they wrote by hand (they pasted our frontmatter,
+        // or their vault holds a copied projection).
+        log::info!(
+            "[ingest] skipping {} — carries `{PROJECTED_PAGE_FRONTMATTER_KEY}` frontmatter, \
+             so it is one of Wenlan's own projected pages, not a source document",
+            path.display()
+        );
+        return Vec::new();
+    }
 
     // Map frontmatter to memory fields
     let space = frontmatter.tags().into_iter().next();
@@ -658,6 +733,74 @@ mod tests {
         assert_eq!(docs.len(), 1);
         assert!(docs[0].space.is_none());
         assert!(docs[0].memory_type.is_none());
+    }
+
+    #[test]
+    fn projected_page_is_skipped_by_the_scanner() {
+        // A page Wenlan projected into the vault carries `origin_id`. Ingesting
+        // it would let the system's own distilled prose come back as a
+        // "document ingest" and ground — the graph believing its own output.
+        let content = "---\ntitle: \"Alice\"\norigin_id: page_abc123\norigin_version: 3\n---\n\nAlice works on ProjectX. She joined in 2024 and leads the ranking work.\n";
+        let path = Path::new("/vault/alice.md");
+        let docs = note_to_documents("obsidian-main", path, content, 1712678400);
+        assert!(
+            docs.is_empty(),
+            "a projected page must never be re-ingested as an external document"
+        );
+    }
+
+    #[test]
+    fn projected_page_is_skipped_through_the_folder_watcher_too() {
+        // The folder watcher's markdown branch funnels through the same
+        // `note_to_documents`, so the exclusion covers a projection sitting
+        // inside any watched directory, not just a registered vault.
+        let dir = tempfile::TempDir::new().unwrap();
+        let page = dir.path().join("projected.md");
+        std::fs::write(
+            &page,
+            "---\norigin_id: page_abc123\n---\n\nAlice works on ProjectX and leads ranking.\n",
+        )
+        .unwrap();
+
+        let outcome = crate::sources::directory::file_to_documents("folder-src", &page, None);
+        assert!(
+            matches!(outcome, crate::sources::directory::FileOutcome::Skipped(_)),
+            "expected the projected page to be skipped, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_string_origin_id_still_counts_as_projected() {
+        // The check is presence, not type: a hand-mangled `origin_id` must not
+        // become a re-ingestion loophole.
+        let content = "---\norigin_id: 12345\n---\n\nAlice works on ProjectX and leads ranking.\n";
+        let docs = note_to_documents("src1", Path::new("/vault/n.md"), content, 1712678400);
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn malformed_frontmatter_does_not_reopen_the_projection_loophole() {
+        // `extract_frontmatter` swallows a YAML error into an EMPTY map, so the
+        // parsed check alone answers "no origin_id" for a file that visibly has
+        // one — fail-open, and exactly the direction that poisons the graph.
+        // `export::knowledge::read_origin_id` scans lines instead of parsing, so
+        // it would still claim this file as ours; the two must not disagree.
+        //
+        // The unbalanced quote is what breaks the parse. Assert that first, so
+        // this test fails loudly if serde_yaml ever starts accepting it and the
+        // case stops exercising the fallback at all.
+        let content = "---\ntitle: \"unclosed\norigin_id: page_abc123\n---\n\nAlice works on ProjectX and leads the ranking work.\n";
+        let (frontmatter, _) = extract_frontmatter(content);
+        assert!(
+            !frontmatter.has(PROJECTED_PAGE_FRONTMATTER_KEY),
+            "the YAML parse must actually be failing here, or this test proves nothing"
+        );
+
+        let docs = note_to_documents("src1", Path::new("/vault/n.md"), content, 1712678400);
+        assert!(
+            docs.is_empty(),
+            "the line-prefix fallback must catch what the parser dropped"
+        );
     }
 
     #[test]
