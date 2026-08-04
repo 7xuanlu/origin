@@ -186,7 +186,14 @@ async fn install_schema(connection: &libsql::Connection) -> Result<()> {
                  content TEXT NOT NULL DEFAULT '',
                  version INTEGER NOT NULL DEFAULT 1,
                  space   TEXT NOT NULL DEFAULT '',
-                 status  TEXT NOT NULL DEFAULT 'active'
+                 status  TEXT NOT NULL DEFAULT 'active',
+                 -- `every_production_page_insert_names_kind` requires the seed
+                 -- insert below to name `kind`, so the column has to exist
+                 -- here. Without it the whole count-budget gate dies on
+                 -- `no such column` before it measures anything -- which is a
+                 -- gate that cannot fail, the exact thing §8.6 orders C0 ahead
+                 -- of C1 to avoid.
+                 kind    TEXT NOT NULL DEFAULT 'page'
              );
              CREATE INDEX idx_edges_active_grounded_space_type
                  ON edges(space, edge_type) WHERE valid_until IS NULL AND grounded = 1;

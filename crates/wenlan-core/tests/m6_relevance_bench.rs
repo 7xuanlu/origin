@@ -24,31 +24,44 @@
 //! that limit times the *route evaluation* over `m6_adjacency`/`m6_pair_stats`,
 //! and C1 builds those tables' writer, not their reader.
 //!
-//! ## Open: the row budget holds and the work does not (C1 measurement)
+//! ## STOP: `R-BENCH-ROWS` is breached, and this is an S0-99 amendment
 //!
-//! Local receipt, `aarch64-macos`, release profile, corpus `06f0ee5c62d5e40c`:
+//! The prior receipt in this comment was measured against a corpus whose hub
+//! groups could not reach the top-64 cut: `M6_HUB_DEGREES` set each hub's root
+//! count while `hub_weight(d)` reads pages touched, so every group's page
+//! degree came from a fanout drawn `1..=15`, `hub_weight` returned exactly
+//! `1.0` for all 12,000 groups, and the `64/d` branch never executed. Those
+//! numbers measured a sweep that never met a hub. They are withdrawn, not
+//! updated.
+//!
+//! Against the corrected corpus the count gate does not pass:
 //!
 //! ```text
-//! space-0  2,000 pages  10,795 groups  60 turns  3 queries  459 rows  p50 1355ms  max 1912ms
-//! space-7    105 pages   1,874 groups   8 turns  3 queries  163 rows  p50  122ms  max  127ms
+//! bounded turn 46 breached its budget:
+//!   M6 relevance evaluation materialized 513 rows; cap is 512
 //! ```
 //!
-//! Both count gates pass with room to spare, and a bounded turn still costs
-//! over a second. That gap is the defect S0-95 names in its own text — "a
-//! query that scans a million rows and returns 512" — and it is why that
-//! decision made `FULLSCAN_STEP` normative for *visited work* rather than the
-//! decoded-row counter. `candidate_endpoints` builds its `support` and
-//! `group_size` CTEs over the whole space before `stale`'s `LIMIT` cuts the
-//! result to a handful of endpoints, so per-turn cost tracks corpus size while
-//! the instrument that gates it does not.
+//! **Per S0-99 the response is not to move 512.** It is also not to lower
+//! `SWEEP_CANDIDATE_WINDOW`, the parameter the contract left free, and the
+//! margin is what says so: one row over, from a turn that packed a single
+//! endpoint. `pack_within_budget` always returns at least one endpoint — a
+//! turn that reserves its way to zero work never converges — so an endpoint
+//! whose own groups project past the whole budget is admitted regardless of
+//! the window, and shrinking the window cannot exclude it. Bounding one
+//! endpoint's work is a design change, which is exactly the amendment S0-99
+//! reserves to a reviewed decision rather than to whoever is holding the
+//! failing test.
 //!
-//! It is recorded rather than fixed here because nothing C1 ships runs on its
-//! own: the lane that would hold the single `MemoryDB` connection mutex for
-//! that second is C3's, and §12 orders C3 last for exactly this kind of reason.
-//! It is a real precondition for that lane, not a footnote — `WENLAN_ENABLE_
-//! ENTITY_PAGE_RECONCILE` is default-OFF today over the same failure mode at a
-//! larger constant. Per S0-99 this is an amendment question, and the number
-//! above is the evidence it needs.
+//! The scan gap the withdrawn receipt described is still real and still
+//! unfixed in `candidate_endpoints`: it builds `support` over the whole space
+//! before `stale`'s `LIMIT` cuts to a handful of endpoints, so per-turn cost
+//! tracks corpus size while the decoded-row instrument that gates it does not
+//! — the defect S0-95 names in its own text, "a query that scans a million
+//! rows and returns 512". That pass is now load-bearing rather than merely
+//! unoptimized: selecting a co-supported page that has no pair row at all is
+//! what closes the incremental-≠-full hole, and it cannot be answered from an
+//! index on `m6_pair_stats`. `groups_touching` did take the pushdown, since
+//! its endpoints are already known.
 
 use std::io::{self, Write};
 use wenlan_core::eval::m6_bench_corpus::{
