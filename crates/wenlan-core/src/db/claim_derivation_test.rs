@@ -192,7 +192,7 @@ async fn migration_110_from_104_installs_eligibility_before_the_105_drift_scan()
         let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
         rows.next().await.unwrap().unwrap().get(0).unwrap()
     };
-    assert_eq!(user_version, 110);
+    assert_eq!(user_version, i64::from(crate::db::SCHEMA_VERSION));
     assert_eq!(eligibility_schema_fingerprint(&conn).await, fresh);
 }
 
@@ -229,7 +229,7 @@ async fn migration_110_from_109_converges_with_the_fresh_schema() {
         let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
         rows.next().await.unwrap().unwrap().get(0).unwrap()
     };
-    assert_eq!(user_version, 110);
+    assert_eq!(user_version, i64::from(crate::db::SCHEMA_VERSION));
     let upgraded = eligibility_schema_fingerprint(&conn).await;
     assert_eq!(upgraded, fresh, "fresh and 109 -> 110 must converge");
     assert!(conn

@@ -707,9 +707,10 @@ pub const EMBEDDING_DIM: usize = 768;
 
 /// Current DB schema version (highest `PRAGMA user_version` applied by `migrate()`).
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
-/// Migration 110 adds M5's policy-independent judge-eligibility registry and
-/// generation fence. It follows the inert M6 substrate at 109.
-pub const SCHEMA_VERSION: u32 = 110;
+/// Migration 111 repairs the edges-parity damage the ambient entity-enrichment
+/// lane did while it wrote `relations` without their `edges` twin. It follows
+/// M5's judge-eligibility registry and generation fence at 110.
+pub const SCHEMA_VERSION: u32 = 111;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8513,6 +8514,17 @@ impl MemoryDB {
             if version < 110 {
                 self.migrate_110_judge_eligibility(version).await?;
             }
+
+            // Migration 111 (KG close plan G1): repair the parity damage the
+            // ambient entity-enrichment lane did while it wrote `relations`
+            // without their `edges` twin — re-run the relations backfill,
+            // retire the orphan edges its hard DELETE left active, retire every
+            // pre-repair parity watermark, and reset the grounding cursor once
+            // so relations it skipped get rescanned. See
+            // migrate_111_ambient_edge_parity_repair.
+            if version < 111 {
+                self.migrate_111_ambient_edge_parity_repair(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -12366,6 +12378,287 @@ impl MemoryDB {
             .await
             .map_err(|error| WenlanError::VectorDb(format!("m110 bump: {error}")))?;
         log::info!("[migration] Migration 110 applied: M5 judge eligibility safety fence");
+        Ok(())
+    }
+
+    /// Migration 111: repair the edges-parity damage the ambient
+    /// entity-enrichment lane caused, and un-blind the grounding sweep to it.
+    ///
+    /// `commit_entity_enrichment_at_version` wrote `relations` rows through a
+    /// raw INSERT with no `edges` twin, and hard-DELETEd competing relation rows
+    /// without retracting theirs. Both halves are fixed at the writer; this is
+    /// the one-time repair of what already shipped, in four steps:
+    ///
+    ///   1. Mint the edges `relations` implies but `edges` does not hold
+    ///      ACTIVE. "Hole" is defined the way the parity oracle defines it —
+    ///      `reconcile_edges_parity` compares against `WHERE valid_until IS
+    ///      NULL`, so a retracted edge is as absent to the sweep as a missing
+    ///      one, and both must be holes here or the migration reports clean
+    ///      while the sweep reports drift forever. The two shapes take
+    ///      different repairs. NEVER WRITTEN goes through
+    ///      [`Self::backfill_edges_from_relations`], the same helper migration
+    ///      81 used, whose inserts are `ON CONFLICT(edge_id) DO NOTHING` over a
+    ///      content-addressed id, so re-running it only fills genuine holes.
+    ///      WRITTEN THEN RETRACTED cannot be healed that way — `DO NOTHING`
+    ///      never un-retracts — so those go through the LIVE writer
+    ///      `dual_write_edge_with_payload`, whose conflict rule clears
+    ///      `valid_until` and re-derives fence-safe lineage from the CURRENT
+    ///      endpoint spaces. That shape is reachable whenever a canonical
+    ///      delete retracted the pair and the OLD ambient lane then
+    ///      re-extracted the same triple, raw-INSERTing the relation with no
+    ///      edge write.
+    ///   2. Retract every ACTIVE `relates` edge with no `relations` row behind
+    ///      it. `relations` is the sole producer of `relates`, and the canonical
+    ///      delete path (`supersede_relation`) already retracts its edge, so an
+    ///      orphan active edge is exactly the damage step 1 cannot undo — and
+    ///      the parity sweep counts it as drift forever. Soft-invalidated the
+    ///      same way `supersede_relation` does; never hard-deleted.
+    ///   3. Bump the dual-write epoch IF steps 1 or 2 found damage, retiring
+    ///      every parity watermark taken while coverage was lapsed so no reader
+    ///      can flip until a fresh reconcile re-proves parity. A database that
+    ///      was whole (a fresh install; a store the ambient lane never touched)
+    ///      never lapsed, so it keeps its epoch and any clean watermark.
+    ///   4. Drop the durable `edge_grounding_cursor` IF step 1 changed anything. The
+    ///      sweep permanently advances past a relation with no edge row, so
+    ///      everything step 1 backfilled sits behind the watermark and would
+    ///      never be scanned. Tying the reset to a migration number (not to
+    ///      boot) makes it fire at most once — a startup reset would re-spend
+    ///      the whole entailment backlog on every daemon launch.
+    ///
+    /// Fence-safe: the backfill only ever emits `assertion` when both endpoint
+    /// spaces are present and equal (stamping that same space), and `legacy`
+    /// otherwise — and `legacy` is exempt from `edges_space_fence`.
+    async fn migrate_111_ambient_edge_parity_repair(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        // A data repair that retracts existing rows, like migration 107 — take
+        // the §6.9 restore point first.
+        self.backup_before_migration(111, prior_version).await?;
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m111 begin: {e}")))?;
+
+        let result: Result<(usize, usize, usize, Vec<CommunityGenerationUpdate>), WenlanError> =
+            async {
+                // What `relations` implies -- each id carried with the
+                // classification a canonical write would give it -- and what
+                // `edges` actually holds. Everything is read BEFORE any write so
+                // "did this database lapse?" is answered by the damage found,
+                // not by the fact a migration ran. The endpoint-space join and
+                // the three-way classification are the SAME ones
+                // `backfill_edges_from_relations` and `create_relation_with_span`
+                // apply, so an edge healed here is indistinguishable from a
+                // canonically-written one.
+                let mut expected: HashMap<String, (String, String, String, &str, String, bool)> =
+                    HashMap::new();
+                let mut rows = conn
+                    .query(
+                        "SELECT r.from_entity, r.to_entity, r.relation_type, \
+                                fe.space, te.space \
+                         FROM relations r \
+                         LEFT JOIN entities fe ON fe.id = r.from_entity \
+                         LEFT JOIN entities te ON te.id = r.to_entity",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m111 select relations: {e}")))?;
+                while let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m111 relations row: {e}")))?
+                {
+                    let from: String = row.get(0).unwrap_or_default();
+                    let to: String = row.get(1).unwrap_or_default();
+                    let relation_type: String = row.get(2).unwrap_or_default();
+                    let from_space: Option<String> = row.get(3).unwrap_or(None);
+                    let to_space: Option<String> = row.get(4).unwrap_or(None);
+                    let (lineage, space, cross_space_downgrade) = match (&from_space, &to_space) {
+                        (Some(fs), Some(ts)) if fs == ts => ("assertion", fs.clone(), false),
+                        _ => (
+                            "legacy",
+                            from_space
+                                .clone()
+                                .or(to_space)
+                                .unwrap_or_else(|| UNFILED_SPACE_ID.to_string()),
+                            true,
+                        ),
+                    };
+                    let edge_id = crate::provenance::compute_edge_id(
+                        "relates",
+                        "entity",
+                        &from,
+                        "entity",
+                        &to,
+                        &relation_type,
+                    );
+                    expected.insert(
+                        edge_id,
+                        (
+                            from,
+                            to,
+                            relation_type,
+                            lineage,
+                            space,
+                            cross_space_downgrade,
+                        ),
+                    );
+                }
+                drop(rows);
+
+                let mut active: HashSet<String> = HashSet::new();
+                let mut retracted: HashSet<String> = HashSet::new();
+                let mut orphans: Vec<String> = Vec::new();
+                let mut edge_rows = conn
+                    .query(
+                        "SELECT edge_id, valid_until FROM edges WHERE edge_type = 'relates'",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m111 select edges: {e}")))?;
+                while let Some(row) = edge_rows
+                    .next()
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m111 edges row: {e}")))?
+                {
+                    let edge_id: String = row.get(0).unwrap_or_default();
+                    if row.get::<Option<i64>>(1).unwrap_or(None).is_none() {
+                        if !expected.contains_key(&edge_id) {
+                            orphans.push(edge_id.clone());
+                        }
+                        active.insert(edge_id);
+                    } else {
+                        retracted.insert(edge_id);
+                    }
+                }
+                drop(edge_rows);
+
+                // Step 1a: relations whose edge was never written at all.
+                let absent = expected
+                    .keys()
+                    .filter(|id| !active.contains(*id) && !retracted.contains(*id))
+                    .count();
+                if absent > 0 {
+                    let counts = Self::backfill_edges_from_relations(&conn).await?;
+                    log::info!(
+                        "[migration] m111 relations backfill: {absent} absent edge(s) over \
+                         classifiable={}, unknown={}",
+                        counts.classifiable,
+                        counts.unknown_inserted
+                    );
+                }
+
+                // Step 1b: relations whose edge exists but is retracted. The
+                // backfill above could not touch these (`DO NOTHING`); the live
+                // writer's conflict rule un-retracts them.
+                let mut graph_changes = Vec::new();
+                let mut healed = 0usize;
+                for (edge_id, (from, to, relation_type, lineage, space, downgrade)) in &expected {
+                    if !retracted.contains(edge_id) {
+                        continue;
+                    }
+                    let (_, changes) = Self::dual_write_edge_with_payload(
+                        &conn,
+                        "relates",
+                        "entity",
+                        from,
+                        "entity",
+                        to,
+                        relation_type,
+                        lineage,
+                        space,
+                        *downgrade,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("m111 reactivate retracted edge: {e}"))
+                    })?;
+                    graph_changes.extend(changes);
+                    healed += 1;
+                }
+
+                // Step 2: retract the edges its hard DELETE stranded.
+                for edge_id in &orphans {
+                    if let Some(change) = Self::dual_write_invalidate_edge(&conn, edge_id, None)
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m111 retract orphan: {e}")))?
+                    {
+                        graph_changes.push(change);
+                    }
+                }
+                let generation_updates =
+                    Self::bump_community_graph_generations(&conn, graph_changes)
+                        .await
+                        .map_err(|e| {
+                            WenlanError::VectorDb(format!("m111 repair generation: {e}"))
+                        })?;
+
+                // Step 3: coverage lapsed on this database -- retire its watermarks.
+                let minted = absent + healed;
+                if minted > 0 || !orphans.is_empty() {
+                    let affected = conn
+                        .execute(
+                            "UPDATE edges_migration_state SET epoch = epoch + 1 WHERE id = 1",
+                            (),
+                        )
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m111 epoch bump: {e}")))?;
+                    // Same rule `bump_dual_write_epoch` enforces: a zero-row
+                    // UPDATE means the state row is gone, so nothing was
+                    // retired and a stale watermark would keep looking current.
+                    // (That method takes the connection lock itself, so it
+                    // cannot be called from inside this transaction.)
+                    if affected == 0 {
+                        return Err(WenlanError::VectorDb(
+                            "m111 epoch bump: no edges_migration_state row to bump".to_string(),
+                        ));
+                    }
+                }
+
+                // Step 4: edges minted by either half of step 1 sit behind the
+                // sweep's watermark -- it advanced past their relations while
+                // no ACTIVE edge backed them.
+                if minted > 0 {
+                    conn.execute(
+                        "DELETE FROM app_metadata WHERE key = ?1",
+                        libsql::params![crate::edge_grounding::EDGE_GROUNDING_CURSOR_KEY],
+                    )
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("m111 grounding cursor reset: {e}"))
+                    })?;
+                }
+
+                Ok((absent, healed, orphans.len(), generation_updates))
+            }
+            .await;
+
+        let (backfilled, healed, orphans_retracted, generation_updates) = match result {
+            Ok(value) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m111 commit: {e}")))?;
+                value
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+        self.record_community_dirty_nodes(generation_updates);
+
+        conn.execute("PRAGMA user_version = 111", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m111 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 111 applied: ambient edges-parity repair \
+             ({backfilled} absent relates edges backfilled, \
+             {healed} retracted relates edges reactivated, \
+             {orphans_retracted} orphan relates edges retracted)"
+        );
         Ok(())
     }
 
@@ -31841,11 +32134,16 @@ impl MemoryDB {
     /// transaction. The LLM parse is intentionally complete before this method
     /// runs; no KG row becomes visible unless the source is still current and
     /// non-pending when the receipt is written.
+    /// `content` is the exact memory text `kg_results` was extracted from --
+    /// threaded through (never re-fetched) so each relation's `span` quote is
+    /// located against the string the model actually saw, matching
+    /// `create_relation_with_span`'s contract.
     async fn commit_entity_enrichment_at_version(
         &self,
         source_id: &str,
         expected_version: i64,
         kg_results: &[crate::extract::KgExtractionResult],
+        content: &str,
     ) -> Result<bool, WenlanError> {
         // Avoid CPU-heavy embedding/minhash preparation when inference already
         // returned after the source became stale. The transaction below still
@@ -31935,6 +32233,7 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("entity enrichment begin: {e}")))?;
 
         let mut created_entities: Vec<(String, String)> = Vec::new();
+        let mut generation_updates: Vec<CommunityGenerationUpdate> = Vec::new();
         let result: Result<bool, WenlanError> = async {
             let mut current_rows = conn
                 .query(
@@ -31976,6 +32275,38 @@ impl MemoryDB {
                     "entity enrichment replace source observations: {e}"
                 ))
             })?;
+
+            // File newly-derived entities with the source memory's Space, the
+            // same rule the canonical extraction lane applies (`commit_kg` ->
+            // `post_write::create_entity`, whose `WriteSpaceTarget` comes from
+            // `get_memory_space`). This lane used to hardcode `space = NULL`,
+            // which made every relation it wrote classify `legacy` (both
+            // endpoints unresolved) instead of `assertion` like its canonical
+            // sibling. `memories.space` is NOT NULL since migration 91 and
+            // carries the reserved sentinel for an unfiled memory, so fold the
+            // sentinel back to NULL exactly as `get_memory_space` does.
+            let entity_space: Option<String> = {
+                let mut rows = conn
+                    .query(
+                        "SELECT space FROM memories WHERE source_id = ?1 AND source = 'memory' LIMIT 1",
+                        libsql::params![source_id],
+                    )
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("entity enrichment source space: {e}"))
+                    })?;
+                let space = match rows.next().await.map_err(|e| {
+                    WenlanError::VectorDb(format!("entity enrichment source space row: {e}"))
+                })? {
+                    Some(row) => row
+                        .get::<Option<String>>(0)
+                        .unwrap_or(None)
+                        .filter(|s| s != UNFILED_SPACE_ID),
+                    None => None,
+                };
+                drop(rows);
+                space
+            };
 
             let mut entity_ids: HashMap<String, String> = HashMap::new();
             let mut first_entity_id: Option<String> = None;
@@ -32087,14 +32418,18 @@ impl MemoryDB {
                             "INSERT INTO entities
                                  (id, name, entity_type, space, source_agent, confidence,
                                   confirmed, created_at, updated_at, embedding)
-                             VALUES (?1, ?2, ?3, NULL, 'post_ingest', NULL,
+                             VALUES (?1, ?2, ?3, ?6, 'post_ingest', NULL,
                                      0, ?4, ?4, vector32(?5))",
                             libsql::params![
                                 id.as_str(),
                                 name.as_str(),
                                 entity_type.as_str(),
                                 now,
-                                embedding.as_str()
+                                embedding.as_str(),
+                                entity_space
+                                    .as_deref()
+                                    .map(|s| libsql::Value::Text(s.to_string()))
+                                    .unwrap_or(libsql::Value::Null)
                             ],
                         )
                         .await
@@ -32273,6 +32608,129 @@ impl MemoryDB {
                     .map_err(|e| {
                         WenlanError::VectorDb(format!("entity enrichment relation insert: {e}"))
                     })?;
+
+                    // Dual-write the canonical `relates` edge in the SAME
+                    // transaction as the legacy `relations` row (M2 "one edge
+                    // store"). Classification mirrors
+                    // `create_relation_with_span` and
+                    // `backfill_edges_from_relations` exactly, so a live write,
+                    // a backfilled row, and this lane converge on one edge_id
+                    // AND one lineage.
+                    let mut endpoint_rows = conn
+                        .query(
+                            "SELECT fe.space, te.space FROM entities fe, entities te \
+                             WHERE fe.id = ?1 AND te.id = ?2",
+                            libsql::params![from_id.as_str(), to_id.as_str()],
+                        )
+                        .await
+                        .map_err(|e| {
+                            WenlanError::VectorDb(format!(
+                                "entity enrichment relation endpoint spaces: {e}"
+                            ))
+                        })?;
+                    let (from_space, to_space): (Option<String>, Option<String>) =
+                        match endpoint_rows.next().await.map_err(|e| {
+                            WenlanError::VectorDb(format!(
+                                "entity enrichment relation endpoint row: {e}"
+                            ))
+                        })? {
+                            Some(row) => (row.get(0).unwrap_or(None), row.get(1).unwrap_or(None)),
+                            None => (None, None),
+                        };
+                    drop(endpoint_rows);
+                    let (lineage, edge_space, cross_space_downgrade) =
+                        match (&from_space, &to_space) {
+                            (Some(fs), Some(ts)) if fs == ts => ("assertion", fs.clone(), false),
+                            _ => (
+                                "legacy",
+                                from_space
+                                    .clone()
+                                    .or_else(|| to_space.clone())
+                                    .unwrap_or_else(|| UNFILED_SPACE_ID.to_string()),
+                                true,
+                            ),
+                        };
+                    // M3g Stage A span capture: the quote is located in the
+                    // exact content the extractor read, never re-fetched.
+                    // `model_version` stays NULL -- this lane's `extract_fn` is
+                    // opaque about which provider ran, unlike `commit_kg`.
+                    let span_json = relation.span.as_deref().map(|quote| {
+                        let offsets = crate::extract::locate_span_chars(content, quote);
+                        serde_json::json!({
+                            "quote": quote,
+                            "char_start": offsets.map(|(start, _)| start),
+                            "char_end": offsets.map(|(_, end)| end),
+                        })
+                    });
+                    let payload = serde_json::json!({
+                        "source_memory_id": source_id,
+                        "span": span_json,
+                        "model_version": serde_json::Value::Null,
+                        "prompt_version":
+                            crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION,
+                    })
+                    .to_string();
+                    let (_, graph_changes) = Self::dual_write_edge_with_payload(
+                        &conn,
+                        "relates",
+                        "entity",
+                        from_id,
+                        "entity",
+                        to_id,
+                        canonical.as_str(),
+                        lineage,
+                        &edge_space,
+                        cross_space_downgrade,
+                        None,
+                        Some(payload.as_str()),
+                    )
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!(
+                            "entity enrichment relation dual-write: {e}"
+                        ))
+                    })?;
+                    generation_updates.extend(
+                        Self::bump_community_graph_generations(&conn, graph_changes)
+                            .await
+                            .map_err(|e| {
+                                WenlanError::VectorDb(format!(
+                                    "entity enrichment relation generation: {e}"
+                                ))
+                            })?,
+                    );
+
+                    // Retire the competing relations' edges BEFORE dropping the
+                    // rows, the same soft-supersession `supersede_relation`
+                    // applies on the canonical delete path. Without this the
+                    // hard DELETE below left an orphan ACTIVE edge, which the
+                    // parity sweep counts as drift forever.
+                    let mut losing_rows = conn
+                        .query(
+                            "SELECT relation_type FROM relations \
+                             WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type <> ?3",
+                            libsql::params![
+                                from_id.as_str(),
+                                to_id.as_str(),
+                                canonical.as_str()
+                            ],
+                        )
+                        .await
+                        .map_err(|e| {
+                            WenlanError::VectorDb(format!(
+                                "entity enrichment relation supersede scan: {e}"
+                            ))
+                        })?;
+                    let mut losing_types: Vec<String> = Vec::new();
+                    while let Some(row) = losing_rows.next().await.map_err(|e| {
+                        WenlanError::VectorDb(format!(
+                            "entity enrichment relation supersede row: {e}"
+                        ))
+                    })? {
+                        losing_types.push(row.get::<String>(0).unwrap_or_default());
+                    }
+                    drop(losing_rows);
+
                     conn.execute(
                         "DELETE FROM relations
                          WHERE from_entity = ?1 AND to_entity = ?2
@@ -32285,6 +32743,38 @@ impl MemoryDB {
                             "entity enrichment relation supersede: {e}"
                         ))
                     })?;
+
+                    let mut retired_changes = Vec::new();
+                    for losing_type in losing_types {
+                        let edge_id = crate::provenance::compute_edge_id(
+                            "relates",
+                            "entity",
+                            from_id,
+                            "entity",
+                            to_id,
+                            &losing_type,
+                        );
+                        if let Some(change) =
+                            Self::dual_write_invalidate_edge(&conn, &edge_id, None)
+                                .await
+                                .map_err(|e| {
+                                    WenlanError::VectorDb(format!(
+                                        "entity enrichment relation retract: {e}"
+                                    ))
+                                })?
+                        {
+                            retired_changes.push(change);
+                        }
+                    }
+                    generation_updates.extend(
+                        Self::bump_community_graph_generations(&conn, retired_changes)
+                            .await
+                            .map_err(|e| {
+                                WenlanError::VectorDb(format!(
+                                    "entity enrichment relation retract generation: {e}"
+                                ))
+                            })?,
+                    );
                 }
             }
 
@@ -32339,6 +32829,7 @@ impl MemoryDB {
                 conn.execute("COMMIT", ())
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("entity enrichment commit: {e}")))?;
+                self.record_community_dirty_nodes(generation_updates);
                 drop(conn);
                 if minhash_enabled {
                     for (entity_id, name) in created_entities {
@@ -32692,10 +33183,15 @@ impl MemoryDB {
             }
         }
 
-        match extract_fn(content).await {
+        match extract_fn(content.clone()).await {
             Ok(kg_results) => {
                 if !self
-                    .commit_entity_enrichment_at_version(&source_id, expected_version, &kg_results)
+                    .commit_entity_enrichment_at_version(
+                        &source_id,
+                        expected_version,
+                        &kg_results,
+                        &content,
+                    )
                     .await?
                 {
                     log::info!("[entity_enrichment_slice] dropped stale result for {source_id}");

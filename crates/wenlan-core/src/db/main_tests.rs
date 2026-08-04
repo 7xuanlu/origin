@@ -1307,15 +1307,40 @@ async fn migration_95_repairs_stamped_schema_and_bootstraps_existing_grounded_sp
              'm95-bootstrap-root', 1, 'm95-bootstrap-digest', 'generated',
              'm95-bootstrap-group', 'active', 1
          );
-         INSERT INTO edges (
+         INSERT INTO relations (
+             id, from_entity, to_entity, relation_type, source_agent, created_at
+         ) VALUES (
+             'm95-bootstrap-relation', 'm95-bootstrap-left', 'm95-bootstrap-right',
+             'related_to', 'test', 1
+         );",
+    )
+    .await
+    .unwrap();
+    // Content-addressed, and backed by the `relations` row above: `relations` is
+    // the sole producer of `relates`, so an edge with no relation behind it is
+    // parity drift that migration 111's repair retracts.
+    conn.execute(
+        "INSERT INTO edges (
              edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
              lineage, grounded, root_id, space, created_at
          ) VALUES (
-             'm95-bootstrap-edge', 'm95-bootstrap-left', 'entity',
+             ?1, 'm95-bootstrap-left', 'entity',
              'm95-bootstrap-right', 'entity', 'relates', 'assertion', 1,
              'm95-bootstrap-root', 'm95-bootstrap-space', 1
-         );
-         DROP TABLE community_members;
+         )",
+        libsql::params![crate::provenance::compute_edge_id(
+            "relates",
+            "entity",
+            "m95-bootstrap-left",
+            "entity",
+            "m95-bootstrap-right",
+            "related_to",
+        )],
+    )
+    .await
+    .unwrap();
+    conn.execute_batch(
+        "DROP TABLE community_members;
          DROP TABLE grouping_leases;
          DROP TABLE space_graph_state;
          DROP TABLE communities;
@@ -23660,6 +23685,7 @@ async fn test_upsert_memory_in_place_invalidates_entity_projection() {
             "mem_uip_entity",
             1,
             &extracted_entity("In-place Old Entity", "concept"),
+            "In-place Old Entity",
         )
         .await
         .unwrap());
@@ -24405,6 +24431,7 @@ async fn same_source_upsert_uses_old_version_plus_one() {
             "mem_replaced_generation",
             1,
             &extracted_entity("Original Replacement Entity", "concept"),
+            "Original Replacement Entity",
         )
         .await
         .unwrap());
@@ -24612,6 +24639,7 @@ async fn update_memory_invalidates_source_owned_kg_and_requeues_entity_enrichmen
                 "Old Beta",
                 "Old Alpha collaborates with Old Beta",
             ),
+            "Old Alpha collaborates with Old Beta",
         )
         .await
         .unwrap());
@@ -29491,27 +29519,23 @@ async fn entity_slice_auto_links_without_inference() {
     assert_eq!(linked.input_version, Some(1));
 }
 
-// I3 CHARACTERIZATION (pre-existing M2 parity gap, NOT introduced by M3g).
+// KG close plan G1 (was the I3 characterization of the M2 parity gap).
 //
 // The ambient Entity-enrichment lane the scheduler drives —
 // `run_entity_enrichment_slice_with_auto_link` ->
-// `commit_entity_enrichment_at_version` — writes `relations` through a raw
-// INSERT that neither consumes `relation.span` nor dual-writes to the unified
-// `edges` table. Contrast `create_relation_with_span`, which DOES dual-write a
-// payload-bearing `relates` edge. This lane is byte-identical on origin/main's
-// merge-base (M2 shipped it); the M3g Stage-A diff touches none of it.
+// `commit_entity_enrichment_at_version` — used to write `relations` through a
+// raw INSERT that neither consumed `relation.span` nor dual-wrote to the
+// unified `edges` table, so the canonical store was bypassed by the path that
+// runs most. It now dual-writes the SAME content-addressed `relates` edge
+// `create_relation_with_span` does, carrying the span payload, and files its
+// new entities with the source memory's Space so the edge classifies
+// `assertion` rather than `legacy` (both endpoints previously unresolved).
 //
-// Why this is SAFE for M3g and reported (not silently fixed) here: a relation
-// with no `edges` row is invisible to the grounding sweep — the sweep looks up
-// `edges` by edge_id and skips a missing row, so it can never false-ground a
-// relation this lane produced. The gap is a COVERAGE limitation on the unified
-// edges store, not an M3g correctness bug, and predates this branch.
-//
-// This test LOCKS IN the current (gap) behavior. When the M2 lane is routed
-// through the payload-bearing writer upstream, this test turns RED — the signal
-// to flip the assertion to expect a `relates` edge carrying the span payload.
+// This test is the inverted characterization: it asserts the dual-write, the
+// lineage, and the payload. Turning it red again means the lane fell back off
+// the canonical writer.
 #[tokio::test]
-async fn ambient_entity_sweep_writes_relation_without_edges_dual_write_pre_existing_m2_gap() {
+async fn ambient_entity_sweep_dual_writes_canonical_relates_edge() {
     let (db, _dir) = test_db().await;
     db.upsert_documents(vec![make_memory_doc(
         "mem_i3_entity_sweep",
@@ -29570,18 +29594,550 @@ async fn ambient_entity_sweep_writes_relation_without_edges_dual_write_pre_exist
     };
     assert_eq!(relation_count, 1, "the ambient sweep wrote the relation");
 
-    let relates_edges: i64 = {
+    let (lineage, space, payload_text, valid_until): (String, String, String, Option<i64>) = {
         let mut rows = conn
-            .query("SELECT COUNT(*) FROM edges WHERE edge_type = 'relates'", ())
+            .query(
+                "SELECT e.lineage, e.space, e.payload, e.valid_until FROM edges e \
+                 JOIN entities fe ON e.src_id = fe.id \
+                 JOIN entities te ON e.dst_id = te.id \
+                 WHERE e.edge_type = 'relates' AND fe.name = 'Alice' AND te.name = 'ProjectX'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("the ambient sweep must dual-write the canonical relates edge");
+        (
+            row.get(0).unwrap(),
+            row.get(1).unwrap(),
+            row.get::<Option<String>>(2)
+                .unwrap()
+                .expect("span payload must be captured"),
+            row.get::<Option<i64>>(3).unwrap(),
+        )
+    };
+    assert_eq!(
+        lineage, "assertion",
+        "both endpoints inherit the source memory's Space, so the edge is first-class"
+    );
+    assert_eq!(space, "work");
+    assert!(valid_until.is_none(), "a fresh edge is active");
+
+    let payload: serde_json::Value = serde_json::from_str(&payload_text).unwrap();
+    assert_eq!(
+        payload["source_memory_id"],
+        serde_json::json!("mem_i3_entity_sweep")
+    );
+    assert_eq!(
+        payload["span"]["quote"],
+        serde_json::json!("Alice works on ProjectX")
+    );
+    assert_eq!(payload["span"]["char_start"], serde_json::json!(0));
+}
+
+/// KG close plan G1: the ambient lane's dedup DELETE hard-removes every
+/// competing `relations` row between the same endpoints. It used to leave their
+/// dual-written edges ACTIVE, which the parity sweep counts as drift forever.
+/// The loser's edge must now be soft-invalidated the same way
+/// `supersede_relation` does on the canonical delete path.
+#[tokio::test]
+async fn ambient_dedup_delete_retracts_the_losing_edge() {
+    let (db, _dir) = test_db().await;
+    let content = "Alice works on ProjectX.";
+    db.upsert_documents(vec![make_memory_doc(
+        "mem_g1_dedup",
+        content,
+        "fact",
+        "work",
+        "folder",
+    )])
+    .await
+    .unwrap();
+
+    let graph = |relation_type: &str| {
+        vec![crate::extract::KgExtractionResult {
+            index: 0,
+            entities: vec![
+                crate::extract::ExtractedEntity {
+                    name: "Alice".to_string(),
+                    entity_type: "person".to_string(),
+                },
+                crate::extract::ExtractedEntity {
+                    name: "ProjectX".to_string(),
+                    entity_type: "project".to_string(),
+                },
+            ],
+            observations: Vec::new(),
+            relations: vec![crate::extract::ExtractedRelation {
+                from: "Alice".to_string(),
+                to: "ProjectX".to_string(),
+                relation_type: relation_type.to_string(),
+                confidence: Some(0.9),
+                explanation: None,
+                span: None,
+            }],
+        }]
+    };
+
+    assert!(db
+        .commit_entity_enrichment_at_version("mem_g1_dedup", 1, &graph("works_on"), content)
+        .await
+        .unwrap());
+    // A second extraction of the same memory proposes a different type between
+    // the same endpoints: the new row wins, the old row is DELETEd.
+    assert!(db
+        .commit_entity_enrichment_at_version("mem_g1_dedup", 1, &graph("related_to"), content)
+        .await
+        .unwrap());
+
+    let conn = db.conn.lock().await;
+    let surviving_types: Vec<String> = {
+        let mut rows = conn
+            .query("SELECT relation_type FROM relations", ())
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push(row.get::<String>(0).unwrap());
+        }
+        out
+    };
+    assert_eq!(
+        surviving_types,
+        vec!["related_to".to_string()],
+        "the dedup DELETE removed the losing relation row"
+    );
+
+    let mut active = 0i64;
+    let mut retracted = 0i64;
+    {
+        let mut rows = conn
+            .query(
+                "SELECT valid_until FROM edges WHERE edge_type = 'relates'",
+                (),
+            )
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            if row.get::<Option<i64>>(0).unwrap().is_some() {
+                retracted += 1;
+            } else {
+                active += 1;
+            }
+        }
+    }
+    assert_eq!(
+        active, 1,
+        "exactly the surviving relation keeps an active edge — no orphan"
+    );
+    assert_eq!(
+        retracted, 1,
+        "the deleted relation's edge is soft-invalidated, not left active or hard-deleted"
+    );
+}
+
+/// KG close plan G1 steps 2-4: migration 111 repairs what the ambient lane
+/// already wrote — backfills the missing edges, retracts the orphans its hard
+/// DELETE left behind, retires the pre-repair parity epoch, and resets the
+/// grounding cursor EXACTLY ONCE (a per-boot reset would re-spend the whole
+/// entailment backlog on every launch).
+#[tokio::test]
+async fn migration_111_repairs_ambient_parity_and_resets_the_grounding_cursor_once() {
+    let (db, _dir) = test_db().await;
+    db.create_space("work", None, false).await.unwrap();
+    let alice = db
+        .store_entity("Alice", "person", Some("work"), Some("post_ingest"), None)
+        .await
+        .unwrap();
+    let project = db
+        .store_entity(
+            "ProjectX",
+            "project",
+            Some("work"),
+            Some("post_ingest"),
+            None,
+        )
+        .await
+        .unwrap();
+    let orphan_src = db
+        .store_entity(
+            "Orphan Src",
+            "concept",
+            Some("work"),
+            Some("post_ingest"),
+            None,
+        )
+        .await
+        .unwrap();
+    let orphan_dst = db
+        .store_entity(
+            "Orphan Dst",
+            "concept",
+            Some("work"),
+            Some("post_ingest"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // (a) The shape the old ambient INSERT left: a relation with no edge twin.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO relations
+                 (id, from_entity, to_entity, relation_type, source_agent,
+                  confidence, explanation, source_memory_id, created_at)
+             VALUES ('rel_g1_bare', ?1, ?2, 'works_on', 'post_ingest', NULL, NULL, NULL, 1)",
+            libsql::params![alice.as_str(), project.as_str()],
+        )
+        .await
+        .unwrap();
+    }
+
+    // (b) The shape the old ambient DELETE left: an active edge with no
+    //     relation behind it. Built by dual-writing properly, then removing the
+    //     legacy row the way that lane did.
+    db.create_relation_with_span(
+        &orphan_src,
+        &orphan_dst,
+        "related_to",
+        Some("post_ingest"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let orphan_edge_id = crate::provenance::compute_edge_id(
+        "relates",
+        "entity",
+        &orphan_src,
+        "entity",
+        &orphan_dst,
+        "related_to",
+    );
+    let bare_edge_id = crate::provenance::compute_edge_id(
+        "relates", "entity", &alice, "entity", &project, "works_on",
+    );
+
+    let epoch_before: i64;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "DELETE FROM relations WHERE from_entity = ?1 AND to_entity = ?2",
+            libsql::params![orphan_src.as_str(), orphan_dst.as_str()],
+        )
+        .await
+        .unwrap();
+        let mut rows = conn
+            .query("SELECT epoch FROM edges_migration_state WHERE id = 1", ())
+            .await
+            .unwrap();
+        epoch_before = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    }
+
+    db.set_app_metadata(
+        crate::edge_grounding::EDGE_GROUNDING_CURSOR_KEY,
+        r#"{"cursor":9999,"stuck_rowid":null,"failures":0,"entailment_version":"v1|m"}"#,
+    )
+    .await
+    .unwrap();
+
+    // Wind back to the pre-repair boundary and run the chain.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("PRAGMA user_version = 110", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("migration 111 must apply");
+
+    let conn = db.conn.lock().await;
+    let bare_state: Option<(String, Option<i64>)> = {
+        let mut rows = conn
+            .query(
+                "SELECT lineage, valid_until FROM edges WHERE edge_id = ?1",
+                libsql::params![bare_edge_id.as_str()],
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .map(|row| (row.get(0).unwrap(), row.get::<Option<i64>>(1).unwrap()))
+    };
+    let (bare_lineage, bare_valid_until) =
+        bare_state.expect("the backfill must mint the missing edge");
+    assert_eq!(
+        bare_lineage, "assertion",
+        "both endpoints are in one Space, so the backfilled edge is first-class"
+    );
+    assert!(bare_valid_until.is_none(), "the backfilled edge is active");
+
+    let orphan_valid_until: Option<i64> = {
+        let mut rows = conn
+            .query(
+                "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                libsql::params![orphan_edge_id.as_str()],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert!(
+        orphan_valid_until.is_some(),
+        "an active edge with no relation behind it is retracted, not left as drift"
+    );
+
+    let epoch_after: i64 = {
+        let mut rows = conn
+            .query("SELECT epoch FROM edges_migration_state WHERE id = 1", ())
             .await
             .unwrap();
         rows.next().await.unwrap().unwrap().get(0).unwrap()
     };
     assert_eq!(
-        relates_edges, 0,
-        "PRE-EXISTING M2 GAP: the ambient Entity sweep writes a relation with no \
-         edges dual-write. When the lane is routed through the payload-bearing \
-         writer upstream, flip this to expect the relates edge + span payload."
+        epoch_after,
+        epoch_before + 1,
+        "the repair retires every parity watermark taken while coverage was lapsed"
+    );
+    drop(conn);
+
+    assert!(
+        db.get_app_metadata(crate::edge_grounding::EDGE_GROUNDING_CURSOR_KEY)
+            .await
+            .unwrap()
+            .is_none(),
+        "the grounding cursor is reset so backfilled relations get rescanned"
+    );
+
+    // Idempotence: the reset is tied to the migration number, not to boot. A
+    // cursor written after the repair survives every later startup.
+    db.set_app_metadata(
+        crate::edge_grounding::EDGE_GROUNDING_CURSOR_KEY,
+        r#"{"cursor":7,"stuck_rowid":null,"failures":0,"entailment_version":"v1|m"}"#,
+    )
+    .await
+    .unwrap();
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("a second startup is a no-op");
+    let cursor_after = db
+        .get_app_metadata(crate::edge_grounding::EDGE_GROUNDING_CURSOR_KEY)
+        .await
+        .unwrap();
+    assert!(
+        cursor_after.is_some_and(|value| value.contains("\"cursor\":7")),
+        "the reset must not re-fire on every startup"
+    );
+    let conn = db.conn.lock().await;
+    let epoch_final: i64 = {
+        let mut rows = conn
+            .query("SELECT epoch FROM edges_migration_state WHERE id = 1", ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(epoch_final, epoch_after, "and neither does the epoch bump");
+}
+
+/// The third damage shape: the relation is live but its edge is RETRACTED.
+/// Reachable because a canonical delete retracts the edge and drops the legacy
+/// row, and the OLD ambient lane then re-extracted the same triple and
+/// raw-INSERTed the relation with no edge write. `reconcile_edges_parity`
+/// compares against ACTIVE edges only, so this counts as drift to the sweep
+/// forever — and `insert_backfilled_edge` is `ON CONFLICT DO NOTHING`, so a
+/// backfill can never heal it. The repair must route these through the live
+/// writer instead. The settling assertion is the oracle itself: drift 0.
+#[tokio::test]
+async fn migration_111_reactivates_a_retracted_edge_and_settles_parity_at_zero() {
+    let (db, _dir) = test_db().await;
+    db.create_space("work", None, false).await.unwrap();
+    let src = db
+        .store_entity("Retracted Src", "concept", Some("work"), Some("test"), None)
+        .await
+        .unwrap();
+    let dst = db
+        .store_entity("Retracted Dst", "concept", Some("work"), Some("test"), None)
+        .await
+        .unwrap();
+
+    // Canonical write, then the canonical delete — which retracts the edge and
+    // hard-deletes the legacy row.
+    let relation_id = db
+        .create_relation_with_span(
+            &src,
+            &dst,
+            "related_to",
+            Some("test"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.supersede_relation(&relation_id, "some-other-relation")
+        .await
+        .unwrap()
+        .expect("the canonical delete must find the relation");
+
+    let edge_id =
+        crate::provenance::compute_edge_id("relates", "entity", &src, "entity", &dst, "related_to");
+    {
+        let conn = db.conn.lock().await;
+        let valid_until: Option<i64> = {
+            let mut rows = conn
+                .query(
+                    "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                    libsql::params![edge_id.as_str()],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert!(
+            valid_until.is_some(),
+            "fixture precondition: the canonical delete retracted the edge"
+        );
+
+        // Now the old ambient lane re-extracts the same triple: a bare relation
+        // INSERT with no edge write.
+        conn.execute(
+            "INSERT INTO relations
+                 (id, from_entity, to_entity, relation_type, source_agent,
+                  confidence, explanation, source_memory_id, created_at)
+             VALUES ('rel_g1_retracted', ?1, ?2, 'related_to', 'post_ingest', NULL, NULL, NULL, 1)",
+            libsql::params![src.as_str(), dst.as_str()],
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA user_version = 110", ()).await.unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("migration 111 must apply");
+
+    {
+        let conn = db.conn.lock().await;
+        let (lineage, valid_until): (String, Option<i64>) = {
+            let mut rows = conn
+                .query(
+                    "SELECT lineage, valid_until FROM edges WHERE edge_id = ?1",
+                    libsql::params![edge_id.as_str()],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            (row.get(0).unwrap(), row.get::<Option<i64>>(1).unwrap())
+        };
+        assert!(
+            valid_until.is_none(),
+            "a live relation's retracted edge must be reactivated, not left as drift"
+        );
+        assert_eq!(
+            lineage, "assertion",
+            "reactivation re-derives lineage from the CURRENT endpoint spaces"
+        );
+    }
+
+    let report = db.reconcile_edges_parity().await.unwrap();
+    assert_eq!(
+        report.drift_count, 0,
+        "the repair must settle the parity oracle at zero, not merely look clean \
+         to its own detector (missing={}, extra={}, corrupt={})",
+        report.missing_count, report.extra_count, report.corrupt_count
+    );
+}
+
+/// The damage gate is the detector, not the version number: an undamaged
+/// database that crosses 110 -> 111 must keep its epoch and its grounding
+/// cursor, or every healthy install pays a full entailment rescan and loses a
+/// clean parity watermark for a repair that had nothing to repair.
+#[tokio::test]
+async fn migration_111_is_a_no_op_on_an_undamaged_database() {
+    let (db, _dir) = test_db().await;
+    db.create_space("work", None, false).await.unwrap();
+    let src = db
+        .store_entity("Healthy Src", "concept", Some("work"), Some("test"), None)
+        .await
+        .unwrap();
+    let dst = db
+        .store_entity("Healthy Dst", "concept", Some("work"), Some("test"), None)
+        .await
+        .unwrap();
+    // Canonically written and left alone: relation live, edge active.
+    db.create_relation_with_span(
+        &src,
+        &dst,
+        "related_to",
+        Some("test"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    db.set_app_metadata(
+        crate::edge_grounding::EDGE_GROUNDING_CURSOR_KEY,
+        r#"{"cursor":42,"stuck_rowid":null,"failures":0,"entailment_version":"v1|m"}"#,
+    )
+    .await
+    .unwrap();
+
+    let epoch_before: i64;
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query("SELECT epoch FROM edges_migration_state WHERE id = 1", ())
+            .await
+            .unwrap();
+        epoch_before = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        drop(rows);
+        conn.execute("PRAGMA user_version = 110", ()).await.unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("migration 111 must apply");
+
+    let conn = db.conn.lock().await;
+    let epoch_after: i64 = {
+        let mut rows = conn
+            .query("SELECT epoch FROM edges_migration_state WHERE id = 1", ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(
+        epoch_after, epoch_before,
+        "a database that never lapsed keeps its epoch, so a clean watermark stays current"
+    );
+    drop(conn);
+
+    let cursor = db
+        .get_app_metadata(crate::edge_grounding::EDGE_GROUNDING_CURSOR_KEY)
+        .await
+        .unwrap();
+    assert!(
+        cursor.is_some_and(|value| value.contains("\"cursor\":42")),
+        "and keeps its grounding cursor, so it does not re-spend the entailment backlog"
     );
 }
 
@@ -29697,6 +30253,7 @@ async fn entity_reenrichment_replaces_only_source_owned_observations() {
                 "concept",
                 "old source-owned observation",
             ),
+            "old source-owned observation",
         )
         .await
         .unwrap());
@@ -29737,6 +30294,7 @@ async fn entity_reenrichment_replaces_only_source_owned_observations() {
                 "concept",
                 "new source-owned observation",
             ),
+            "new source-owned observation",
         )
         .await
         .unwrap());
@@ -29804,6 +30362,7 @@ async fn forget_removes_only_source_owned_observations() {
                 "concept",
                 "source-owned observation to forget",
             ),
+            "source-owned observation to forget",
         )
         .await
         .unwrap());
