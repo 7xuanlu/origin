@@ -471,11 +471,11 @@
       "relation_type": "leads",
       "source_id": "hv3_h2",
       "source_agent": "folder",
-      "content": "Onboarding file. That Delphine Aumont leads the Grid Authority was settled during last March's internal audit of our own records and has gone uncited ever since, the matter regarded as closed.",
+      "content": "Onboarding file. That Delphine Aumont leads the Grid Authority was settled during the knowledge graph's own earlier review of what it had already stored, and has gone uncited ever since, the matter regarded as closed.",
       "span": null,
       "as_backlog": true,
       "hermetic_score": 0.0,
-      "note": "Backlog (span null), leads. Declarative appeal to a prior INTERNAL verification event ('settled during last March's internal audit of our own records'): it cites a past audit as proof but produces no external documentary testimony of the relation itself; a claim that verification once happened is not the source attesting the fact -> grounded=0."
+      "note": "Backlog (span null), leads. Declarative appeal to a prior INTERNAL verification event where the verifier is THIS system ('the knowledge graph's own earlier review of what it had already stored'): the only warrant is the system re-reading its own belief, and a claim that verification once happened is not the source attesting the fact -> grounded=0. REVISED 2026-08-04: the prior wording ('settled during last March's internal audit of our own records') was ambiguous about WHOSE records -- in an onboarding file 'our own' most naturally reads as the organization's, i.e. genuine external attestation -- and it collided with the GROUNDING_ENTAILMENT rule that 'records show X is a member of Y' DOES entail, which 10 of the 57 gate2_positive cases depend on. The pinned model entailed it under prompt v3 and it was carried as a documented known limitation; the defect was the case, not the model. This wording puts the self-reference inside the existing self-reference rule (which already names 'its knowledge graph ... its prior records') so the leak closes without weakening the record-keeping rule the coverage gate needs. Register matches sibling HV3_H1, which the pinned model already rejects."
     },
     {
       "id": "HV3_H3",
