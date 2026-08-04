@@ -710,7 +710,7 @@ pub const EMBEDDING_DIM: usize = 768;
 /// Migration 111 repairs the edges-parity damage the ambient entity-enrichment
 /// lane did while it wrote `relations` without their `edges` twin. It follows
 /// M5's judge-eligibility registry and generation fence at 110.
-pub const SCHEMA_VERSION: u32 = 113;
+pub const SCHEMA_VERSION: u32 = 114;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8544,6 +8544,15 @@ impl MemoryDB {
             if version < 113 {
                 self.migrate_113_entity_shadow_page_repair(version).await?;
             }
+
+            // Migration 114 (KG close plan G5): blanket re-sync of mapped
+            // entity shadow pages — repairs shadows the pre-fix ambient sweep
+            // left STALE (alias upsert without the shadow re-sync), the
+            // `corrupt` sibling of the `missing` damage 113 repaired. See
+            // migrate_114_entity_shadow_resync.
+            if version < 114 {
+                self.migrate_114_entity_shadow_resync(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -12929,6 +12938,69 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("m113 bump: {e}")))?;
         log::info!("[migration] Migration 113 applied: {repaired} entity shadow pages backfilled");
+        Ok(())
+    }
+
+    // Migration 114 (KG close plan G5): re-sync every mapped entity shadow
+    // page from its live `entities` row. Migration 113 repaired MISSING
+    // shadows, but the pre-fix ambient sweep could also leave an EXISTING
+    // shadow stale: resolving a new mention onto an existing entity inserted
+    // an `entity_aliases` row without `update_entity_shadow_page`, so the
+    // shadow's `aliases` column (a mirrored field) drifted — `corrupt` in
+    // `entity_page_parity_watermark` (observed live 2026-08-04, corrupt=1,
+    // stale alias list). A blanket re-sync via the SAME helper the live
+    // mutators use is idempotent and repairs every stale mirrored column.
+    async fn migrate_114_entity_shadow_resync(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(114, prior_version).await?;
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m114 begin: {e}")))?;
+
+        let result: Result<u64, WenlanError> = async {
+            let mut rows = conn
+                .query("SELECT entity_id FROM entity_page_map", ())
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m114 scan: {e}")))?;
+            let mut mapped: Vec<String> = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m114 scan row: {e}")))?
+            {
+                if let Ok(id) = row.get::<String>(0) {
+                    mapped.push(id);
+                }
+            }
+
+            let now_iso = chrono::Utc::now().to_rfc3339();
+            for entity_id in &mapped {
+                Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+            }
+            Ok(mapped.len() as u64)
+        }
+        .await;
+
+        let resynced = match result {
+            Ok(value) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m114 commit: {e}")))?;
+                value
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+
+        conn.execute("PRAGMA user_version = 114", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m114 bump: {e}")))?;
+        log::info!("[migration] Migration 114 applied: {resynced} entity shadow pages re-synced");
         Ok(())
     }
 

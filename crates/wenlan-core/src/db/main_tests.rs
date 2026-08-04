@@ -29751,6 +29751,45 @@ async fn migration_113_backfills_missing_entity_shadow_pages() {
     );
 }
 
+/// KG close plan G5: migration 114 repairs shadows the pre-fix sweep left
+/// STALE — an alias inserted onto an existing entity without the shadow
+/// re-sync drifts the mirrored `aliases` column (`corrupt` in the parity
+/// report, observed live 2026-08-04). Simulate that damage, run the
+/// migration, and the parity sweep must come back clean.
+#[tokio::test]
+async fn migration_114_resyncs_stale_entity_shadow_pages() {
+    let (db, _dir) = test_db().await;
+    let eid = db
+        .store_entity("Quality Gate", "concept", Some("work"), None, None)
+        .await
+        .unwrap();
+    {
+        // A raw alias insert without update_entity_shadow_page — the exact
+        // pre-fix sweep behavior.
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) \
+             VALUES ('quality gates', ?1, unixepoch(), 'minhash')",
+            libsql::params![eid.clone()],
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        db.reconcile_entity_page_parity().await.unwrap().drift_count,
+        1,
+        "the stale shadow must register as corrupt drift"
+    );
+
+    db.migrate_114_entity_shadow_resync(113).await.unwrap();
+
+    let report = db.reconcile_entity_page_parity().await.unwrap();
+    assert_eq!(
+        report.drift_count, 0,
+        "migration 114 must re-sync the stale shadow (report={report:?})"
+    );
+}
+
 /// KG close plan G1: the ambient lane's dedup DELETE hard-removes every
 /// competing `relations` row between the same endpoints. It used to leave their
 /// dual-written edges ACTIVE, which the parity sweep counts as drift forever.
