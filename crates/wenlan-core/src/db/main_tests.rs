@@ -43019,6 +43019,83 @@ async fn reader_flips_only_after_clean_parity_and_reverts() {
     }
 }
 
+/// M5 claim edges (`supports` from a claim_revision, `attests` from a root)
+/// have no legacy-store counterpart. The sweep must fence them out of the
+/// actual set — otherwise every claim edge counts as "extra" and a post-M5
+/// database can never stamp a clean watermark (observed live 2026-08-04:
+/// 2,540 supports edges reported as drift on an otherwise-clean corpus).
+#[tokio::test]
+async fn reconcile_ignores_claim_lineage_edges() {
+    let (db, _dir) = test_db().await;
+    // Legacy world: one relation, dual-written.
+    let e1 = db
+        .create_entity("Alice", "person", Some("space_a"))
+        .await
+        .unwrap();
+    let e2 = db
+        .create_entity("Bob", "person", Some("space_a"))
+        .await
+        .unwrap();
+    db.create_relation(&e1, &e2, "knows", None, None, None, None)
+        .await
+        .unwrap();
+
+    // M5 world on the same database: a claim revision supported by an
+    // evidence memory, attested by a human root (the claim_edge_lifecycle
+    // seed shape).
+    db.insert_page(
+        "pg1",
+        "pg1",
+        None,
+        "",
+        None,
+        Some("space_a"),
+        &[],
+        "2026-07-27T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute_batch(
+            "INSERT INTO memories (id, content, source, source_id, title, chunk_index,
+                                   last_modified, chunk_type, space)
+             VALUES ('m1', 'evidence', 'memory', 'mem1', 'title', 0, 0, 'text', 'space_a');
+
+             INSERT INTO claims (claim_id, page_id, created_at) VALUES ('c1', 'pg1', 0);
+             INSERT INTO claim_revisions (claim_revision_id, claim_id, predecessor_revision_id,
+                                          canonical_text, canonical_text_digest, claim_kind,
+                                          extractor_version, created_at)
+             VALUES ('cr1', 'c1', '', 'a sentence', 'digest', 'observation', 1, 0);
+
+             INSERT INTO provenance_roots (root_id, identity_version, identity_digest,
+                                           root_kind, independence_group_id, created_at)
+             VALUES ('r1', 1, 'r1', 'human_capture', 'g', 0);
+
+             INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                lineage, grounded, root_id, space, created_at)
+             VALUES ('s1', 'cr1', 'claim_revision', 'mem1', 'memory', 'supports',
+                     'evidence', 1, 'r1', 'space_a', 0);
+             INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                lineage, grounded, root_id, space, created_at)
+             VALUES ('a1', 'r1', 'root', 'cr1', 'claim_revision', 'attests',
+                     'assertion', 0, 'r1', 'space_a', 0);",
+        )
+        .await
+        .unwrap();
+    }
+
+    let report = db.reconcile_edges_parity().await.unwrap();
+    assert_eq!(
+        report.drift_count, 0,
+        "claim-lineage edges must not count as drift: {report:?}"
+    );
+    assert_eq!(
+        report.extra_count, 0,
+        "supports/attests edges are outside the legacy-derivable universe"
+    );
+}
+
 #[tokio::test]
 async fn epoch_bump_retires_watermark_and_reblocks_reader() {
     let (db, _dir) = test_db().await;

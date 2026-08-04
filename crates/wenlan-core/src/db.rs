@@ -17709,9 +17709,13 @@ impl MemoryDB {
 
     /// Stage-(d) reconciliation sweep (spec v3 §7 M2 row). Recomputes the
     /// content-addressed `edge_id` set the five legacy stores imply and
-    /// diffs it against the live *active* edge set, asserting
-    /// `edges ≡ relations ∪ page_sources ∪ page_evidence ∪ pages.citations ∪
-    /// page_links`. Stamps `edges_parity_watermark` with the drift and the
+    /// diffs it against the live *active* edges in the legacy-derivable
+    /// universe, asserting `edges − claim-lineage ≡ relations ∪ page_sources ∪
+    /// page_evidence ∪ pages.citations ∪ page_links`. M5 claim edges
+    /// (claim_revision/root endpoints: `supports`, `attests`) are outside the
+    /// diff — no legacy store implies them, and the schema CHECK bars
+    /// `lineage='legacy'` from those endpoint kinds. Stamps
+    /// `edges_parity_watermark` with the drift and the
     /// current epoch; `reader_uses_edges` gates every cutover on that stamp.
     ///
     /// This RE-DERIVES the expected set independently -- it does NOT call the
@@ -17960,12 +17964,22 @@ impl MemoryDB {
         // actual: the live active edges, id -> stored structural columns. Reads
         // the SAME columns `detect_communities` (and every reader) consume, so a
         // corrupted endpoint is visible here even when the id set matches.
+        //
+        // Scoped to the legacy-derivable universe: M5 claim edges (`supports`
+        // from a claim_revision, `attests` from a root) have no legacy-store
+        // counterpart to diff against — the schema CHECK guarantees
+        // `lineage='legacy'` never touches a claim_revision/root endpoint, so
+        // the endpoint-kind fence excludes exactly the edges the five stores
+        // can never imply. Without it every M5 edge counts as "extra" and the
+        // watermark can never come clean on a post-M5 database.
         let mut actual: HashMap<String, (String, String, String, String, String)> = HashMap::new();
         {
             let mut rows = conn
                 .query(
                     "SELECT edge_id, edge_type, src_kind, src_id, dst_kind, dst_id \
-                     FROM edges WHERE valid_until IS NULL",
+                     FROM edges WHERE valid_until IS NULL \
+                       AND src_kind NOT IN ('claim_revision', 'root') \
+                       AND dst_kind NOT IN ('claim_revision', 'root')",
                     (),
                 )
                 .await
