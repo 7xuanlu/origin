@@ -1,0 +1,112 @@
+# G6 retirement program — retire the six legacy KG stores
+
+Status: authored 2026-08-04, after G5 completed (all three flips live, both parity
+watermarks drift 0, T1 ceremony committed at generation 1). This is the execution
+plan for the close plan's G6: *"delete the five old link-bookkeeping tables and the
+old entity table so there is exactly one source of truth."*
+
+Scope basis: a full non-test reference map of `crates/wenlan-core/src` +
+`crates/wenlan-server/src` (2026-08-04). Counts below are distinct functions, not
+lines.
+
+## The load-bearing finding
+
+The G5 reader-cutover flips gate exactly **two** consumers: `detect_communities`
+(`reader_uses_edges`, consumer `communities`) and the scoped-entity reads in
+`db/scoped_entities.rs` (`reader_uses_entity_pages`, consumer `scoped_entities`).
+**Every other reader in the product reads the legacy tables directly and ungated** —
+`handle_get_entity_detail`, `handle_list_recent_relations`, `handle_get_page_sources`,
+`handle_get_page`, `handle_search_pages`, the lint/kg-quality/repair tooling, and the
+retrieval helpers. Dropping any table today breaks them regardless of cutover state.
+G6 is therefore a reader-migration program with a drop at the end, not a drop with
+prep.
+
+## Stage 0 — close the dual-write gaps (do this FIRST, keeps parity honest)
+
+Writers that mutate legacy stores without the canonical `edges` dual-write.
+Each is the same training-serving-skew class as #473/#479, and each re-drifts
+parity the moment it runs. All sites below were verified at the code level on
+2026-08-04 (the original scope-sweep list contained one false positive).
+
+**Part 1 (this PR): the three primary-path gaps.**
+
+| Function | Gap | Fix |
+|---|---|---|
+| `fold_relation_type` (db.rs ~435) | UPDATE `relation_type` + collision DELETE, no edge retire/mint. `relation_type` is a structural field of the derived edge id — one vocabulary heal re-drifts parity (extra + missing per folded row). | Per folded row: mint the canonical-type edge (endpoint-space classification mirrors `create_relation_with_span`), then retire the old-type edge superseded-by the new one (mint first — `superseded_by` is an FK into `edges`). Community-graph generations bumped for any grounded assertions touched. |
+| `replace_page_sources` (db.rs ~46282) | Prunes `page_sources` + memory-kind `page_evidence` rows and NULLs `pages.citations`, no edge invalidation. **Likely root cause of the 2026-07-23 live damage** (3 stale active edges the 32-row repair retired). | Snapshot the pruned sids before the DELETEs, retire each one's cites edge in the same transaction. Kept sids re-assert through `insert_resolved_page_evidence`'s dual-write. |
+| `delete_page` (db.rs ~45109) | FK CASCADE drops the page's rows in all three link stores and NULLs inbound `page_links` targets (NULL targets derive no edge), no edge retirement. | Bulk-retire every active edge touching the page (`src_kind='page' AND src_id` OR `dst_kind='page' AND dst_id`) in the delete transaction — page edges are never grounded `relates` assertions, so the direct UPDATE is equivalent to per-edge invalidation (mirrors `replace_page_links`). |
+
+`link_page_source` (flagged by the sweep) is a **false positive**: it calls
+`insert_resolved_page_evidence`, which dual-writes the same content-addressed
+edge id the page_sources row derives to.
+
+**Part 2 (follow-up PR): secondary writers, verified 2026-08-04.**
+
+| Function | Gap | Status |
+|---|---|---|
+| `rebind_source_id_inner` (db.rs ~27860, incl. `rebind_source_page_in_transaction`) | Renames `page_sources.memory_source_id`, `page_evidence.locator`, and optionally the source page id — identity fields of the content-addressed edge id — with no edge rewrite. Every touching edge strands (extra) and its successor shows as missing. | CONFIRMED, unfixed. Fix must recompute edge ids while preserving grounding/payload/provenance, and chase `superseded_by` FKs. |
+| `replace_source_page_inner` (db.rs ~43093) | DELETEs ALL `page_sources` + `page_evidence` rows (external kinds included) then reinserts the new set; removed rows' edges never retired. | CONFIRMED, unfixed. Same fix shape as `replace_page_sources`, plus external-kind retire. |
+| `accept_page_merge` (db.rs ~44859) | Repoints inbound `page_links.target_page_id` loser→winner with a raw UPDATE; the loser-dst links edges stay active (extra), winner-dst edges show missing. (The loser's own source rows stay in place, so its cites edges remain consistently implied — archived pages are not filtered by the parity derivation.) | CONFIRMED (links repoint only), unfixed. Retire+mint per repointed row using `replace_page_links`'s space/lineage derivation. |
+| `resolve_orphan_page_links` (db.rs ~45684) | Sets `target_page_id` on a previously-orphan row (which derives no edge) without minting the now-implied links edge. | CONFIRMED, unfixed. Mint with `replace_page_links`'s derivation. |
+| `try_update_page_content` (db.rs ~43975) | Rewrites `pages.citations` wholesale without reconciling edges. Narrow: drifts only when a locator backed ONLY by citations (not by `page_sources`/`page_evidence`) drops out of the new value. | CONFIRMED (narrow), unfixed. Reconcile like `set_page_citations` does. |
+
+Exit: all fixes merged with regression tests (parity clean after driving each
+path); ambient watermarks stay drift 0 across a soak.
+
+## Stage 1 — migrate readers onto canonical stores, cheapest first
+
+Order by measured entanglement:
+
+1. **`page_links`** (~9 fns) — one dual-write-aware writer choke point
+   (`replace_page_links`), small reader fan-out (`get_page_outbound_links`,
+   `get_page_inbound_links`, orphan-label lint), no shared-struct entanglement.
+2. **`relations`** (~20 fns) — clear writer choke points, but readers include
+   product routes (`get_entity_detail`, `list_recent_relations`), k-hop expansion,
+   and lint/repair tooling. Entangled with `entities` via shared CRUD
+   (`merge_entities`, `commit_entity_enrichment_at_version`,
+   `delete_by_source_id_in_transaction`) — those functions change once, in this
+   stage, for both stores' read sides.
+3. **`page_sources` + `page_evidence`** (~30 fns, co-written pair) —
+   `insert_resolved_page_evidence` is the evidence choke point; `page_sources` has
+   no single choke point and needs one first.
+4. **`pages.citations`** (4 writer fns, 10+ readers) — hardest: a column in every
+   `Page` row mapper (db.rs + db/scoped_pages.rs). Retiring it is a struct/mapping
+   reshape, its own PR.
+5. **`entities` + `entity_aliases` + `observations`** (~25+ fns) — largest surface;
+   readers move to the `kind='entity'` shadow pages. Depends on stage 1.2's shared-
+   CRUD rework.
+
+Each store's migration is one PR: readers redirected to `edges`/shadow pages,
+behavior-equivalence tests, and the store's parity derivation dropped from
+`reconcile_edges_parity` in the SAME PR that removes its last legacy reader.
+
+Exit per store: zero non-test readers of the legacy store outside migrations and
+the parity sweep; ambient drift stays 0.
+
+## Stage 2 — writers go canonical-only, sweeps retire
+
+Only after Stage 1 empties the reader side: flip writers from dual-write to
+canonical-only, retire `reconcile_edges_parity` / `reconcile_entity_page_parity`
+and their watermarks/flags/plist entries, drop the `backfill_edges_from_*`
+machinery. The cutover-lever tables (`edges_reader_cutover`,
+`entity_reader_cutover`) retire with them.
+
+## Stage 3 — the retirement migration (the point of no return)
+
+One migration drops `relations`, `page_sources`, `page_evidence`, `page_links`,
+the `pages.citations` column, `entities`, `entity_aliases`, `observations`, and
+`entity_page_map`. Contract per the close plan:
+
+- Pre-migration SQLite online backup (the standard `backup_before_migration`), plus
+  an **operator-verified restore drill receipt** (drill already rehearsed 2026-08-04,
+  receipts doc §7 — re-verify against the pre-retirement backup specifically).
+- A **declared downgrade barrier**: daemon versions before this migration cannot
+  open the database afterward; `wenlan doctor` must say so plainly.
+- Export/import is NOT the safety net (debt register).
+- User confirms the point of no return before the migration ships in a release.
+
+## Rollback story per stage
+
+- Stage 0/1: normal PR reverts; legacy stores still authoritative-adjacent.
+- Stage 2: revert restores dual-write; canonical stores never stopped being written.
+- Stage 3: restore-from-backup only. That is the whole reason it goes last.
