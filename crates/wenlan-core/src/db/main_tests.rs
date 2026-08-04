@@ -44032,8 +44032,8 @@ async fn edge_grounding_scale_and_latency_bench() {
             conn.execute(
                 "INSERT INTO memories (id, content, source, source_id, title, chunk_index, \
                     last_modified, chunk_type, source_agent, space, confidence, confirmed, \
-                    memory_type, pending_revision) \
-                 VALUES (?1, ?2, 'memory', ?1, 't', 0, 1712707200, 'text', 'folder', 'space_a', 1.0, 1, 'fact', 0)",
+                    memory_type, pending_revision, origin_class) \
+                 VALUES (?1, ?2, 'memory', ?1, 't', 0, 1712707200, 'text', 'folder', 'space_a', 1.0, 1, 'fact', 0, 'document_ingest')",
                 libsql::params![format!("mem_{i}"), format!("Folder document {i}.")],
             )
             .await
