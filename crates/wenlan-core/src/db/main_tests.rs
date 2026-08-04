@@ -29638,6 +29638,119 @@ async fn ambient_entity_sweep_dual_writes_canonical_relates_edge() {
     assert_eq!(payload["span"]["char_start"], serde_json::json!(0));
 }
 
+/// KG close plan G5: #473 taught the ambient entity sweep to dual-write
+/// canonical `edges` but left its `entities` INSERT without the
+/// `kind='entity'` shadow-page twin `store_entity` writes (M3 PR-1
+/// invariant), so every sweep-created entity held the
+/// `reader_uses_entity_pages` cutover gate closed as `missing` parity drift
+/// (observed live 2026-08-04, drift=2). The sweep must now shadow-write in
+/// the same transaction, and the parity sweep must come back clean.
+#[tokio::test]
+async fn ambient_entity_sweep_dual_writes_shadow_pages() {
+    let (db, _dir) = test_db().await;
+    db.upsert_documents(vec![make_memory_doc(
+        "mem_g5_shadow",
+        "Alice works on ProjectX.",
+        "fact",
+        "work",
+        "folder",
+    )])
+    .await
+    .unwrap();
+
+    let kg = vec![crate::extract::KgExtractionResult {
+        index: 0,
+        entities: vec![
+            crate::extract::ExtractedEntity {
+                name: "Alice".to_string(),
+                entity_type: "person".to_string(),
+            },
+            crate::extract::ExtractedEntity {
+                name: "ProjectX".to_string(),
+                entity_type: "project".to_string(),
+            },
+        ],
+        observations: Vec::new(),
+        relations: Vec::new(),
+    }];
+
+    let selected =
+        db.run_entity_enrichment_slice_with_auto_link(0.05, move |_content: String| async move {
+            Ok(kg)
+        })
+        .await
+        .unwrap();
+    assert_eq!(selected, 1, "the sweep processed the seeded memory");
+
+    {
+        let conn = db.conn.lock().await;
+        let unmapped: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM entities \
+                     WHERE id NOT IN (SELECT entity_id FROM entity_page_map)",
+                    (),
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(
+            unmapped, 0,
+            "every sweep-created entity must have a shadow page mapped"
+        );
+    }
+
+    let report = db.reconcile_entity_page_parity().await.unwrap();
+    assert_eq!(
+        report.drift_count, 0,
+        "sweep-created entities must reconcile clean (report={report:?})"
+    );
+}
+
+/// KG close plan G5: migration 113 repairs the entities #473's sweep already
+/// wrote without shadow pages. Simulate the damage (a mapped-page-less
+/// entity, the live drift shape), run the migration, and the parity sweep
+/// must come back clean — the repaired shadow byte-identical in shape to a
+/// live dual-written one, aliases folded in.
+#[tokio::test]
+async fn migration_113_backfills_missing_entity_shadow_pages() {
+    let (db, _dir) = test_db().await;
+    let eid = db
+        .store_entity("Orphan", "concept", Some("work"), None, None)
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "DELETE FROM pages WHERE id = \
+             (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![eid.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "DELETE FROM entity_page_map WHERE entity_id = ?1",
+            libsql::params![eid.clone()],
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        db.reconcile_entity_page_parity().await.unwrap().drift_count,
+        1,
+        "the simulated damage must register as drift"
+    );
+
+    db.migrate_113_entity_shadow_page_repair(112).await.unwrap();
+
+    let report = db.reconcile_entity_page_parity().await.unwrap();
+    assert_eq!(
+        report.drift_count, 0,
+        "migration 113 must repair the missing shadow (report={report:?})"
+    );
+}
+
 /// KG close plan G1: the ambient lane's dedup DELETE hard-removes every
 /// competing `relations` row between the same endpoints. It used to leave their
 /// dual-written edges ACTIVE, which the parity sweep counts as drift forever.

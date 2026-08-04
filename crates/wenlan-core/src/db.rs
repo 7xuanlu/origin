@@ -710,7 +710,7 @@ pub const EMBEDDING_DIM: usize = 768;
 /// Migration 111 repairs the edges-parity damage the ambient entity-enrichment
 /// lane did while it wrote `relations` without their `edges` twin. It follows
 /// M5's judge-eligibility registry and generation fence at 110.
-pub const SCHEMA_VERSION: u32 = 112;
+pub const SCHEMA_VERSION: u32 = 113;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8533,6 +8533,17 @@ impl MemoryDB {
             if version < 112 {
                 self.migrate_112_origin_class(version).await?;
             }
+
+            // Migration 113 (KG close plan G5): repair the entity/page parity
+            // damage the ambient entity-enrichment lane did while it inserted
+            // `entities` rows without their `kind='entity'` shadow-page twin
+            // (the same skew class migration 111 repaired for `edges`; #473
+            // fixed the edge half of this path but missed the entity half).
+            // Backfills a shadow page + `entity_page_map` row for every entity
+            // that has none. See migrate_113_entity_shadow_page_repair.
+            if version < 113 {
+                self.migrate_113_entity_shadow_page_repair(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -12845,6 +12856,79 @@ impl MemoryDB {
             "[migration] Migration 112 applied: memories.origin_class \
              ({classified} rows classified document_ingest, {defaulted} generated)"
         );
+        Ok(())
+    }
+
+    // Migration 113 (KG close plan G5): backfill the `kind='entity'` shadow
+    // pages the ambient entity-enrichment lane failed to dual-write. #473
+    // taught `commit_entity_enrichment_at_version` to dual-write canonical
+    // `edges` but not entity shadow pages, so every entity it created since
+    // migration 92 violates the M3 PR-1 dual-write invariant and shows up as
+    // `missing` drift in `entity_page_parity_watermark` — permanently holding
+    // the `reader_uses_entity_pages` cutover gate closed. The companion code
+    // fix makes that path dual-write; this migration repairs the rows already
+    // written. Uses the SAME helpers as the live dual-write
+    // (`insert_entity_shadow_page` + `update_entity_shadow_page`, the
+    // migration-92 pattern), so a repaired entity is byte-identical in shape
+    // to a correctly created one, aliases folded in. Idempotent: scoped to
+    // entities with no `entity_page_map` row at all.
+    async fn migrate_113_entity_shadow_page_repair(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(113, prior_version).await?;
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m113 begin: {e}")))?;
+
+        let result: Result<u64, WenlanError> = async {
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM entities \
+                     WHERE id NOT IN (SELECT entity_id FROM entity_page_map)",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m113 scan: {e}")))?;
+            let mut unmapped: Vec<String> = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m113 scan row: {e}")))?
+            {
+                if let Ok(id) = row.get::<String>(0) {
+                    unmapped.push(id);
+                }
+            }
+
+            let now_iso = chrono::Utc::now().to_rfc3339();
+            for entity_id in &unmapped {
+                let page_id = crate::pages::new_page_id();
+                Self::insert_entity_shadow_page(&conn, entity_id, &page_id, &now_iso).await?;
+                Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+            }
+            Ok(unmapped.len() as u64)
+        }
+        .await;
+
+        let repaired = match result {
+            Ok(value) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m113 commit: {e}")))?;
+                value
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+
+        conn.execute("PRAGMA user_version = 113", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m113 bump: {e}")))?;
+        log::info!("[migration] Migration 113 applied: {repaired} entity shadow pages backfilled");
         Ok(())
     }
 
@@ -32451,6 +32535,7 @@ impl MemoryDB {
         }
 
         let now = chrono::Utc::now().timestamp();
+        let now_iso = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
         conn.execute("BEGIN", ())
             .await
@@ -32660,6 +32745,13 @@ impl MemoryDB {
                         .map_err(|e| {
                             WenlanError::VectorDb(format!("entity enrichment entity insert: {e}"))
                         })?;
+                        // M3 PR-1 dual-write invariant: every `entities` INSERT
+                        // creates its `kind='entity'` shadow page in the same
+                        // transaction (mirrors `store_entity`). This path missed
+                        // it when #473 added canonical-edge dual-writes here;
+                        // caught live by `reconcile_entity_page_parity`.
+                        let page_id = crate::pages::new_page_id();
+                        Self::insert_entity_shadow_page(&conn, &id, &page_id, &now_iso).await?;
                         created_entities.push((id.clone(), name.clone()));
                         id
                     }
@@ -32675,6 +32767,10 @@ impl MemoryDB {
                 .map_err(|e| {
                     WenlanError::VectorDb(format!("entity enrichment alias insert: {e}"))
                 })?;
+                // `aliases` is a shadow-mirrored column, so a (possibly new)
+                // alias on a resolved entity must re-sync the shadow too --
+                // same rule as `add_entity_alias`. No-op when nothing changed.
+                Self::update_entity_shadow_page(&conn, &entity_id, &now_iso).await?;
 
                 if first_entity_id.is_none() {
                     first_entity_id = Some(entity_id.clone());
