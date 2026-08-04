@@ -301,6 +301,30 @@ let root_id = db.acquire_provenance_root(
 
 ### 5.2 Deriving `root_kind` from origin
 
+> **SUPERSEDED 2026-08-04 (KG close plan G2) — the external predicate is no longer `source_agent = 'folder'`.**
+>
+> The rule below narrowed "external" to one literal string, which was wrong twice over. **Too narrow:** an Obsidian vault import (`source_agent='obsidian'`) is a genuine document ingest and could never ground, and every future connector re-broke the gate by design — the connector guide in `sources/obsidian.rs` told each one to invent its own string. **Spoofable:** `/api/memory/store` persisted the client-supplied `source_agent` verbatim, so any agent could send `"folder"` and make its own extracted relations promotion-eligible — a direct violation of §5.6's own rule that no wire request may select anything that decides grounding.
+>
+> **The predicate is now `memories.origin_class = 'document_ingest'`** — a daemon-authoritative classification (`document_ingest` / `human_capture` / `generated`) recorded at the ingest boundary by `upsert_documents`, the single INSERT into `memories`, and read by the sweep instead of any string match. `crates/wenlan-core/src/origin.rs` owns the classifier and the reserved list; migration 112 adds the column and backfills it once.
+>
+> Three consequences worth stating explicitly:
+>
+> - **Adding a connector is one edit.** A document-ingest connector adds its `source_agent` to `origin::DOCUMENT_INGEST_SOURCE_AGENTS`. That same edit makes its documents groundable *and* bars a wire request from claiming the value — the two can no longer drift apart.
+> - **The boundary is the defense.** `/api/memory/store` normalizes away a reserved `source_agent` and logs the attempt (`[origin-guard]`). Normalizing rather than rejecting keeps existing clients working. The claim is *dropped*, not merely ignored for grounding, because `source_agent='folder'` also buys page-genesis exemption (`db.rs` `can_seed_page`) and the authoritative-document role in doc-reconcile. The guard deliberately does not touch the *agent identity* resolution, which treats an absent agent as a full-trust local write — blanking the claim there would turn a spoof attempt into a trust upgrade.
+> - **`reconcile` is `generated`.** A doc-reconcile revision is LLM-rewritten prose *about* a document, not the document, so it is unpromotable — even though page genesis already treats it like a document for seeding purposes. `human_capture` is reserved and unminted: §5.6 makes every agent capture `generated`, and no human-authored surface exists yet.
+>
+> - **`obsidian` grounds, but it is not `folder`.** Post-G2 the two are equivalent for grounding and nothing else. Doc-reconcile still treats only `folder` as the authoritative document in a capture/document contradiction, and page genesis still keys its seed exemption on the `folder`/`reconcile` pair. That asymmetry is intentional and the wire guard protects both halves — but it means a later editor must not assume `obsidian == folder` everywhere the string is tested. Grep before widening.
+>
+> **Threat model.** The guard closes the cheap vector: a request can no longer *claim* an origin it does not have. It does not — and is not meant to — stop a local client that writes a file into a directory the user registered as a source, which then ingests as a genuine `document_ingest`. On a loopback, unauthenticated daemon that is by design: the local filesystem IS the user's documents, and treating a file the user's own machine placed in a watched folder as a document is the product. Mandatory independent entailment still applies to every edge that path produces.
+>
+> **Historical honesty caveat.** Migration 112's backfill can only infer origin from `source_agent`, and before it that field was client-writable. It grants `document_ingest` to `folder` rows only, and that set is frozen — a connector added later cannot have pre-112 rows, so the backfill deliberately does not read `DOCUMENT_INGEST_SOURCE_AGENTS`. A pre-112 row where an agent claimed `folder` is backfilled as `document_ingest`; the migration cannot tell a spoof from a real ingest after the fact, and a heuristic would only launder the guess. That case is a wash rather than a regression — the pre-112 gate matched the same string and promoted the same rows.
+>
+> **Pre-112 `obsidian` rows stay `generated`.** They could never ground before 112, so granting them `document_ingest` would raise historical trust above what the pre-112 daemon extended — and in the common `knowledge_path`-inside-the-vault setup, some of them are Wenlan's own projected pages that were re-ingested before the skip below existed. Nothing in the row identifies those: `note_to_documents` stores the frontmatter-stripped body, so the `origin_id` marker is gone from `content`, and the page↔file mapping lives in `state.json` on disk, not in any table the migration could join. Re-syncing a vault reclassifies them correctly for free (`upsert_documents` deletes by `(source, source_id)` and re-inserts), so the cost is deferred groundability for untouched historical vault notes, not permanent loss.
+>
+> Rider, same rung: vault and folder scanners now skip any `.md` file whose frontmatter carries `origin_id` — Wenlan's own projected pages. `is_reserved_ingest_root` only refuses the pages directory as a source *root*, so it could not see a projection nested inside a watched vault, under a registered parent directory, or copied elsewhere. Without the skip, re-ingesting a projection would make the system's own distilled prose a groundable "document ingest" (invariant #11).
+>
+> The paragraph below is kept for the record; `root_kind='document_ingest'` unconditionally is still correct, since only `document_ingest`-class memories reach the mint.
+
 M3g promotes ONLY externally-provenanced memories, so `root_kind='document_ingest'`
 (the `CHECK(root_kind IN ('document_ingest','human_capture','human_edit_delta',
 'generated'))` constraint at `db.rs:8514`) unconditionally. The external predicate is
@@ -342,6 +366,8 @@ compressed chunk ranges, §1/§6.4) and is NOT in M3g scope; it changes nothing 
 grounded bit M4 needs.
 
 ### 5.5 Edges whose source memory is NOT external-rooted
+
+> **2026-08-04:** read `source_agent != 'folder'` below as `origin_class != 'document_ingest'` per the §5.2 addendum. The reasoning is unchanged; only the predicate moved.
 
 They **stay `grounded=0`** (explicit, per goal prompt). An agent-captured memory
 (`source_agent != 'folder'`) is `generated(agent)` (§5.6, invariant #17); its extracted

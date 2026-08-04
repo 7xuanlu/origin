@@ -30141,6 +30141,291 @@ async fn migration_111_is_a_no_op_on_an_undamaged_database() {
     );
 }
 
+/// Seed one memory through the real write path, then strip its `origin_class`
+/// so the row looks the way a pre-112 database's rows look.
+async fn seed_pre_112_memory(db: &MemoryDB, source_id: &str, agent: Option<&str>) {
+    db.upsert_documents(vec![wenlan_types::RawDocument {
+        source: "memory".to_string(),
+        source_id: source_id.to_string(),
+        title: source_id.to_string(),
+        content: format!("Content for {source_id}, long enough to chunk cleanly."),
+        last_modified: 1,
+        space: Some("work".to_string()),
+        source_agent: agent.map(str::to_string),
+        confirmed: Some(true),
+        ..Default::default()
+    }])
+    .await
+    .unwrap();
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "UPDATE memories SET origin_class = NULL WHERE source_id = ?1",
+        libsql::params![source_id],
+    )
+    .await
+    .unwrap();
+}
+
+async fn community_parity_generation(db: &MemoryDB) -> i64 {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT generation FROM community_parity_input_state WHERE singleton = 1",
+            (),
+        )
+        .await
+        .unwrap();
+    rows.next().await.unwrap().unwrap().get(0).unwrap()
+}
+
+async fn origin_class_of(db: &MemoryDB, source_id: &str) -> Option<String> {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT origin_class FROM memories WHERE source_id = ?1 AND chunk_index = 0",
+            libsql::params![source_id],
+        )
+        .await
+        .unwrap();
+    rows.next()
+        .await
+        .unwrap()
+        .and_then(|row| row.get::<Option<String>>(0).unwrap_or(None))
+}
+
+/// KG close plan G2 / Part A item 1: migration 112 gives every historical row
+/// the daemon's origin verdict, derived by the same classifier the write path
+/// now applies — so a backfilled row and a freshly-written one are
+/// indistinguishable to the grounding gate.
+#[tokio::test]
+async fn migration_112_backfills_origin_class_from_the_ingest_path() {
+    let (db, _dir) = test_db().await;
+    db.create_space("work", None, false).await.unwrap();
+    seed_pre_112_memory(&db, "doc_folder", Some("folder")).await;
+    seed_pre_112_memory(&db, "doc_obsidian", Some("obsidian")).await;
+    seed_pre_112_memory(&db, "doc_obsidian_projection", Some("obsidian")).await;
+    seed_pre_112_memory(&db, "cap_agent", Some("claude-code")).await;
+    seed_pre_112_memory(&db, "rev_reconcile", Some("reconcile")).await;
+    seed_pre_112_memory(&db, "cap_anonymous", None).await;
+
+    let parity_generation_before = community_parity_generation(&db).await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("PRAGMA user_version = 111", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("migration 112 must apply");
+
+    // The backfill runs with `m4_parity_input_memory_update` suspended:
+    // `origin_class` is a derived provenance label, not a community-parity
+    // input, and an unqualified AFTER UPDATE trigger would otherwise bump the
+    // generation once per row and invalidate every parity proof.
+    assert_eq!(
+        community_parity_generation(&db).await,
+        parity_generation_before,
+        "classifying rows must not move the community parity generation"
+    );
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' \
+                 AND name = 'm4_parity_input_memory_update'",
+                (),
+            )
+            .await
+            .unwrap();
+        let restored: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(restored, 1, "the suspended trigger must be restored");
+    }
+
+    assert_eq!(
+        origin_class_of(&db, "doc_folder").await.as_deref(),
+        Some("document_ingest"),
+        "`folder` is the one class the pre-112 gate already promoted, so \
+         backfilling it changes nothing about what grounds"
+    );
+    for generated in [
+        "doc_obsidian",
+        "doc_obsidian_projection",
+        "cap_agent",
+        "rev_reconcile",
+        "cap_anonymous",
+    ] {
+        assert_eq!(
+            origin_class_of(&db, generated).await.as_deref(),
+            Some("generated"),
+            "{generated} must not become groundable"
+        );
+    }
+}
+
+/// The backfill must not hand `document_ingest` to a pre-112 `obsidian` row.
+///
+/// Some of those rows are Wenlan's own projected pages, re-ingested before the
+/// frontmatter skip existed — the `knowledge_path`-inside-the-vault setup that
+/// `sources/obsidian.rs` describes. Promoting them would let the graph ground
+/// on its own distilled prose (invariant #11). The migration cannot tell them
+/// apart from a genuine vault note: `note_to_documents` stores the
+/// frontmatter-STRIPPED body, so the `origin_id` marker never reaches
+/// `memories.content` (this test seeds it anyway, to pin that a content-based
+/// predicate would be the wrong instrument even if one were added), and the
+/// page↔file mapping lives in `state.json`, not in a joinable table.
+///
+/// So the whole class stays `generated` and a re-sync reclassifies. This test
+/// is the teeth on that decision: if someone later "fixes" the backfill to read
+/// `DOCUMENT_INGEST_SOURCE_AGENTS`, both assertions here fail.
+#[tokio::test]
+async fn migration_112_leaves_pre_112_obsidian_rows_generated() {
+    let (db, _dir) = test_db().await;
+    db.create_space("work", None, false).await.unwrap();
+    seed_pre_112_memory(&db, "vault_note", Some("obsidian")).await;
+    seed_pre_112_memory(&db, "reingested_projection", Some("obsidian")).await;
+    seed_pre_112_memory(&db, "real_document", Some("folder")).await;
+    // Shape the projection row the way a re-ingest would have, marker included.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET content = ?1 WHERE source_id = 'reingested_projection'",
+            libsql::params![
+                "---\norigin_id: page_abc\n---\n\nDistilled prose Wenlan wrote about ProjectX."
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA user_version = 111", ()).await.unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        origin_class_of(&db, "reingested_projection")
+            .await
+            .as_deref(),
+        Some("generated"),
+        "a re-ingested projection must never be backfilled groundable"
+    );
+    assert_eq!(
+        origin_class_of(&db, "vault_note").await.as_deref(),
+        Some("generated"),
+        "and the honest vault note goes with it — the migration cannot \
+         distinguish the two, so the whole pre-112 obsidian class waits for a \
+         re-sync rather than being trusted on a guess"
+    );
+    assert_eq!(
+        origin_class_of(&db, "real_document").await.as_deref(),
+        Some("document_ingest"),
+        "the exclusion must be scoped to obsidian, not blanket-deny the backfill"
+    );
+}
+
+/// Re-running the migration must not reclassify anything. The ALTER is skipped
+/// when the column exists and both backfills are scoped to `origin_class IS
+/// NULL`, so a second pass over a healthy database is a no-op — the same
+/// property migration 111 holds.
+#[tokio::test]
+async fn migration_112_is_a_no_op_on_a_second_pass() {
+    let (db, _dir) = test_db().await;
+    db.create_space("work", None, false).await.unwrap();
+    seed_pre_112_memory(&db, "doc_folder", Some("folder")).await;
+    seed_pre_112_memory(&db, "cap_agent", Some("claude-code")).await;
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("PRAGMA user_version = 111", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
+
+    // A row the daemon later reclassified by hand (the shape a future repair
+    // would leave): a second pass must leave it exactly as found, not
+    // re-derive it from the string.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET origin_class = 'generated' WHERE source_id = 'doc_folder'",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA user_version = 111", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("a second pass must apply cleanly, not fail on a duplicate column");
+
+    assert_eq!(
+        origin_class_of(&db, "doc_folder").await.as_deref(),
+        Some("generated"),
+        "the backfill only ever fills NULLs; it never overwrites a recorded verdict"
+    );
+    assert_eq!(
+        origin_class_of(&db, "cap_agent").await.as_deref(),
+        Some("generated")
+    );
+}
+
+/// The healthy-database property (mirrors
+/// `migration_111_is_a_no_op_on_an_undamaged_database`): a store whose rows
+/// were all written by a post-112 daemon already carries the column, so the
+/// migration classifies nothing and, in particular, does not disturb the
+/// grounding cursor — nothing here invalidates a decision the sweep made.
+#[tokio::test]
+async fn migration_112_is_a_no_op_on_an_already_classified_database() {
+    let (db, _dir) = test_db().await;
+    db.create_space("work", None, false).await.unwrap();
+    // Written by the current write path: origin_class already stamped.
+    db.upsert_documents(vec![wenlan_types::RawDocument {
+        source: "memory".to_string(),
+        source_id: "doc_healthy".to_string(),
+        title: "doc".to_string(),
+        content: "A document long enough to chunk, ingested by the folder watcher.".to_string(),
+        last_modified: 1,
+        space: Some("work".to_string()),
+        source_agent: Some("folder".to_string()),
+        confirmed: Some(true),
+        ..Default::default()
+    }])
+    .await
+    .unwrap();
+    assert_eq!(
+        origin_class_of(&db, "doc_healthy").await.as_deref(),
+        Some("document_ingest"),
+        "the write path stamps the class; the migration is only for history"
+    );
+
+    db.set_app_metadata(
+        crate::edge_grounding::EDGE_GROUNDING_CURSOR_KEY,
+        r#"{"cursor":42,"stuck_rowid":null,"failures":0,"entailment_version":"v1|m"}"#,
+    )
+    .await
+    .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("PRAGMA user_version = 111", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        origin_class_of(&db, "doc_healthy").await.as_deref(),
+        Some("document_ingest")
+    );
+    let cursor = db
+        .get_app_metadata(crate::edge_grounding::EDGE_GROUNDING_CURSOR_KEY)
+        .await
+        .unwrap();
+    assert!(
+        cursor.is_some_and(|value| value.contains("\"cursor\":42")),
+        "112 classifies rows; it does not invalidate grounding decisions"
+    );
+}
+
 #[tokio::test]
 async fn linked_new_generation_repairs_entity_receipt_without_inference() {
     use std::sync::atomic::{AtomicUsize, Ordering};
