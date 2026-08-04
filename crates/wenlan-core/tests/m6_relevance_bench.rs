@@ -203,11 +203,24 @@ impl RecordCounter {
         assert_eq!(self.space_memory_total, M6_MEMORY_COUNT, "R-CORPUS-SPACE");
         assert_eq!(self.edges, self.fanout_total, "every fanout emits an edge");
 
-        // R-CORPUS-FANOUT: mean pages per group is exactly 8.
+        // R-CORPUS-FANOUT: mean pages per group is 8 over the groups the
+        // balanced draw covers. The three hubs are not among them — a hub's
+        // page degree is its hub degree (R-CORPUS-HUB), which is what makes
+        // `hub_weight`'s `64/d` branch reachable at all — and 11,997 does not
+        // divide the fanout span, so the remainder is carried across the low
+        // values. 95,958 over 11,997 groups is a realized mean of 7.9985.
+        let hub_pages: u64 = M6_HUB_DEGREES.iter().sum();
+        let non_hub_groups = M6_GROUP_COUNT - M6_HUB_DEGREES.len() as u64;
+        assert_eq!(non_hub_groups, 11_997);
         assert_eq!(
             self.fanout_total,
-            M6_GROUP_COUNT * M6_PAGES_PER_GROUP_MEAN,
+            95_958 + hub_pages,
             "R-CORPUS-FANOUT mean drifted"
+        );
+        assert_eq!(
+            (95_958 * 10 + non_hub_groups / 2) / non_hub_groups,
+            M6_PAGES_PER_GROUP_MEAN * 10,
+            "the carried remainder must still round to R-CORPUS-FANOUT's mean"
         );
         // R-CORPUS-GENFRAC: exactly 15% of groups.
         assert_eq!(
