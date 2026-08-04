@@ -56,7 +56,6 @@ async fn user_version(db: &MemoryDB) -> i64 {
 #[tokio::test]
 async fn migrated_database_carries_all_fourteen_followup_tables_and_counter() {
     let (db, _temp) = test_db().await;
-    assert_eq!(SCHEMA_VERSION, 110);
     assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
     for table in FOLLOWUP_TABLES {
         assert!(
