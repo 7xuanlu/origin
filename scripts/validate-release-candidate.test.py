@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import shutil
 import tarfile
 import tempfile
@@ -16,6 +17,7 @@ import unittest
 import urllib.request
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 from release_targets import release_assets
 import release_archive
@@ -1003,6 +1005,67 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
         event = {"workflow_run": {"head_branch": "feature/not-a-release"}}
         receipt = VALIDATOR.validate_candidate(event, NoApi(), "7xuanlu/wenlan", Path("."))
         self.assertEqual(receipt["status"], "skipped")
+
+    def test_unsuccessful_candidate_ci_run_skips_without_api_access(self) -> None:
+        class NoApi:
+            def get_json(self, path: str, *, params=None):
+                raise AssertionError("unsuccessful CI run must not query candidate metadata")
+
+            def download(self, path: str, destination: Path, maximum: int):
+                raise AssertionError("unsuccessful CI run must not download artifacts")
+
+        for conclusion in ("cancelled", "failure", "timed_out", "action_required", None):
+            with self.subTest(conclusion=conclusion):
+                event = {
+                    "action": "completed",
+                    "workflow_run": {
+                        "head_branch": VALIDATOR.RELEASE_BRANCH,
+                        "conclusion": conclusion,
+                    },
+                }
+                receipt = VALIDATOR.validate_candidate(
+                    event, NoApi(), "7xuanlu/wenlan", Path(".")
+                )
+                self.assertEqual(receipt["status"], "skipped")
+
+    def test_skipped_candidate_writes_no_receipt_and_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            event_path = root / "event.json"
+            event_path.write_text(
+                json.dumps(
+                    {
+                        "action": "completed",
+                        "workflow_run": {
+                            "head_branch": VALIDATOR.RELEASE_BRANCH,
+                            "conclusion": "cancelled",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            receipt_path = root / "receipt.json"
+            summary_path = root / "summary.md"
+            with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "observer-token"}):
+                exit_code = VALIDATOR._main(
+                    [
+                        "--event",
+                        str(event_path),
+                        "--repository",
+                        "7xuanlu/wenlan",
+                        "--temp-root",
+                        str(root),
+                        "--summary",
+                        str(summary_path),
+                        "--validated-assets-dir",
+                        str(root / "validated-release-assets"),
+                        "--receipt",
+                        str(receipt_path),
+                    ]
+                )
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(receipt_path.exists())
+            self.assertIn("Status: **skipped**", summary_path.read_text(encoding="utf-8"))
 
     def test_candidate_trigger_name_cannot_replace_api_workflow_path_proof(self) -> None:
         repository = {"id": 2, "full_name": "7xuanlu/wenlan", "owner": {"login": "7xuanlu"}}

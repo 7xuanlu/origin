@@ -41,7 +41,12 @@ jobs:
             --summary "$GITHUB_STEP_SUMMARY" \
             --validated-assets-dir "$RUNNER_TEMP/validated-release-assets" \
             --receipt "$RUNNER_TEMP/validated-release-receipt.json"
+      # A CI run that did not succeed produced no candidate, so the validator
+      # skips and writes neither assets nor a receipt. These three steps carry
+      # the same condition so a superseded or failed run ends green and silent
+      # instead of failing on missing artifacts.
       - name: Upload exact validated release assets
+        if: github.event.workflow_run.conclusion == 'success'
         id: validated-assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -52,6 +57,7 @@ jobs:
           if-no-files-found: error
           overwrite: false
       - name: Close receipt over validated assets artifact
+        if: github.event.workflow_run.conclusion == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -70,6 +76,7 @@ jobs:
             --observer-workflow-id "$observer_workflow_id" \
             --observer-code-sha "$GITHUB_WORKFLOW_SHA"
       - name: Upload closed validation receipt
+        if: github.event.workflow_run.conclusion == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           # Source-only name is a locator, never proof. Consumers inspect every
