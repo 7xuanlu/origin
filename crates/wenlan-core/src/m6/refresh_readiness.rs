@@ -364,7 +364,10 @@ pub async fn readiness_fence(
     }))
 }
 
-fn transition_is_legal(from: ReadinessPhase, to: ReadinessPhase) -> bool {
+/// Public since PR-B3: `evidence::note_shadow_readiness` asks before moving,
+/// because an already-`preparing` space is a normal steady state rather than
+/// the error `transition_readiness` would raise (§7.1).
+pub fn transition_is_legal(from: ReadinessPhase, to: ReadinessPhase) -> bool {
     matches!(
         (from, to),
         (ReadinessPhase::Off, ReadinessPhase::Preparing)

@@ -64,3 +64,100 @@ pub const LABEL_KEY_MIN_SCALARS: usize = 1;
 
 /// R3 upper bound, measured after normalization (artifact 4 §6.1 step 7).
 pub const LABEL_KEY_MAX_SCALARS: usize = 128;
+
+// ---------------------------------------------------------------------------
+// D8 hard caps (artifact 4 §6, spec §3.6) — enforced at the read that
+// produces the bounded set, never by truncating after the fact.
+// ---------------------------------------------------------------------------
+
+/// Roots per candidate. A signal's supporting root set is bounded with a
+/// SQL `LIMIT` on the query that produces it, not by collecting every root
+/// and truncating the `Vec` afterward (§3.6: caps are enforced at the read).
+/// What happens to the excess (staying frontier-visible rather than lost,
+/// §3.6's "no cap may terminalize") is machine F's concern, not this
+/// reader's — PR-B1 makes no frontier writes.
+pub const ROOTS_PER_CANDIDATE_CAP: usize = 64;
+
+/// Pending (non-terminal) candidates per space (§3.6, artifact 5 §7). A hit
+/// refuses to *start* new work and writes nothing — S0-54 forbids a cap from
+/// terminalizing a candidate or retiring a frontier row.
+pub const PENDING_CANDIDATES_PER_SPACE_CAP: usize = 128;
+
+/// Candidate prepares per space per cycle (§3.6). Same S0-54 semantics as
+/// [`PENDING_CANDIDATES_PER_SPACE_CAP`]: the 17th group keeps its frontier row.
+pub const CANDIDATE_PREPARES_PER_CYCLE_CAP: usize = 16;
+
+// ---------------------------------------------------------------------------
+// D6 lease TTLs (S0-3), in seconds
+// ---------------------------------------------------------------------------
+
+/// `genesis` phase TTL. Spans one inference plus one entailment check in the
+/// eventual real path; vacuously long in the shadow, which makes no model call.
+/// S0-3's binding rule (TTL > model timeout + finalize budget) is still
+/// un-re-derived — spec §11 Q10.
+pub const GENESIS_LEASE_TTL_SECONDS: i64 = 900;
+
+/// `frontier` phase TTL. Shortest of the four: the scan is a pure differential
+/// query, so a crashed scan should be retryable within one refinery interval.
+pub const FRONTIER_LEASE_TTL_SECONDS: i64 = 120;
+
+// ---------------------------------------------------------------------------
+// S0-2 retry backoff and S0-151 stale re-entry delays, in seconds
+// ---------------------------------------------------------------------------
+
+/// `attempt` strictly greater than this is exhaustion (S0-2/S0-12): the
+/// candidate lands in `stale` carrying `retry_exhausted`, never an 11th state.
+pub const RETRY_ATTEMPT_LIMIT: i64 = 5;
+
+/// `delay = 60s * 4^(attempt-1)`, **no jitter** (S0-2). One daemon per data
+/// root means there is no herd to disperse, and a deterministic schedule is
+/// what lets a crash matrix assert a specific next-attempt time.
+pub const RETRY_BASE_DELAY_SECONDS: i64 = 60;
+
+/// The S0-2 backoff ceiling. The sequence is 60s, 4m, 16m, 64m, 4h.
+pub const RETRY_MAX_DELAY_SECONDS: i64 = 4 * 3_600;
+
+/// S0-151 delay for `reason = 'retry_exhausted'`: five model attempts were
+/// already burned, so a day is the cheapest delay that is obviously not a loop.
+pub const STALE_RETRY_EXHAUSTED_DELAY_SECONDS: i64 = 86_400;
+
+/// S0-151 delay for `reason = 'card_expired'`, matching F7's suppression
+/// window: a human saw the card and let it lapse.
+pub const STALE_CARD_EXPIRED_DELAY_SECONDS: i64 = 180 * 86_400;
+
+// ---------------------------------------------------------------------------
+// D7 frontier clocks and bounds, in seconds unless noted
+// ---------------------------------------------------------------------------
+
+/// S0-46: `next_scan_at` may never be set more than 24h ahead of
+/// `unixepoch()`, so the 7-day below-floor timer is evaluated at least seven
+/// times before it can fire and no path can defer a row past its own deadline.
+pub const NEXT_SCAN_MAX_AHEAD_SECONDS: i64 = 86_400;
+
+/// F3: below-floor evidence older than this surfaces one coalesced
+/// unformed-topic card per `(space, coverage_epoch)` (S0-47).
+pub const BELOW_FLOOR_SURFACING_SECONDS: i64 = 7 * 86_400;
+
+/// S0-10/S0-53: a terminal candidate's `payload` is nulled after this long and
+/// `payload_compacted_at` stamped. The row itself is never deleted.
+pub const PAYLOAD_COMPACTION_SECONDS: i64 = 90 * 86_400;
+
+/// Rows examined by one frontier reconciliation slice (spec §4.2). A cap on
+/// work per turn, never on what stays accounted for.
+pub const FRONTIER_SCAN_SLICE_ROWS: usize = 512;
+
+// ---------------------------------------------------------------------------
+// Unformed-topic card identity (artifact 5 §3.2)
+// ---------------------------------------------------------------------------
+
+/// Digest domain for the space component of an unformed-topic card ID.
+///
+/// **Disclosed gap-closure.** Artifact 5 §3.2 fixes the card ID as
+/// `m6_unformed_topic_<space-digest>_<epoch>` and says the space digest is "an
+/// `m6_digest`" so a space name never appears in an ID, but names no domain
+/// tag. PR-B2 picks this spelling to match the `m6-<thing>-v1` family. Nothing
+/// downstream has been built against another value.
+pub const DOMAIN_CARD_SPACE: &str = "m6-card-space-v1";
+
+/// Unformed-topic card ID prefix (artifact 5 §3.2).
+pub const CARD_ID_PREFIX: &str = "m6_unformed_topic_";

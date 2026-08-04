@@ -35,11 +35,17 @@
 use super::MemoryDB;
 use crate::WenlanError;
 
-impl MemoryDB {
-    /// Migration 108 DDL. Additive and idempotent.
-    pub(super) async fn ensure_genesis_tables(tx: &libsql::Transaction) -> Result<(), WenlanError> {
-        tx.execute_batch(
-            "
+/// Migration 108's DDL, as the bytes both the migration and the M6 fixtures
+/// execute.
+///
+/// The SQL sits in a constant rather than inside the `ensure_` function
+/// because R4 forbids a DB-owned item from handing a raw `libsql` handle to
+/// the rest of the crate, and the M6 gates must run against the SHIPPED
+/// substrate: the two partial unique indexes below are D4's entire exclusion
+/// mechanism, so a gate exercising a hand-copied index would prove nothing
+/// about the one production runs against. The text crosses the module
+/// boundary; the handle does not.
+pub(crate) const GENESIS_SUBSTRATE_DDL: &str = "
             -- Machine A (§4). One attempt at one slot. The row is STABLE
             -- across retries (I-8): `attempt`, `state`, and `next_attempt_at`
             -- move, identity does not.
@@ -170,10 +176,14 @@ impl MemoryDB {
             CREATE INDEX IF NOT EXISTS idx_genesis_frontier_scan
                 ON genesis_frontier(space, next_scan_at, first_seen_at,
                                     independence_group_id);
-            ",
-        )
-        .await
-        .map_err(|error| WenlanError::VectorDb(format!("m108 genesis tables: {error}")))?;
+            ";
+
+impl MemoryDB {
+    /// Migration 108 DDL. Additive and idempotent.
+    pub(super) async fn ensure_genesis_tables(tx: &libsql::Transaction) -> Result<(), WenlanError> {
+        tx.execute_batch(GENESIS_SUBSTRATE_DDL)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m108 genesis tables: {error}")))?;
         Ok(())
     }
 }

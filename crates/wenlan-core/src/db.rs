@@ -38,6 +38,10 @@ mod eval_pipeline_reads;
 mod eval_substrate_guard;
 mod eval_temporal_seed;
 mod genesis_schema;
+/// Migration 108's shipped DDL, re-exported so the M6 fixtures install the
+/// real substrate. Text, not a `libsql` handle — see the constant's own note.
+#[cfg(test)]
+pub(crate) use genesis_schema::GENESIS_SUBSTRATE_DDL;
 mod kg_quality_diagnostics;
 mod kg_quality_duplicate_candidates;
 mod kg_quality_embedding_refresh;
@@ -45,6 +49,7 @@ mod kg_quality_vocabulary;
 mod lint_snapshot;
 #[cfg(feature = "eval-harness")]
 mod m5_page_size_snapshot;
+mod m6_shadow;
 mod maintenance_duplicate_reads;
 mod maintenance_queue;
 mod maintenance_retro_scan;
@@ -1758,6 +1763,39 @@ fn community_leiden_enabled_value(value: Option<&str>) -> bool {
     })
 }
 
+/// Gate for the M6 genesis shadow lane (spec §4.1). Opt-in: default OFF; enable
+/// with WENLAN_ENABLE_GENESIS_SHADOW=1/true/yes/on. Read once by
+/// `wenlan-server`'s runtime, which does not spawn the lane's task at all when
+/// it is false — the loop is absent rather than idling, so an OFF daemon pays
+/// nothing.
+///
+/// **Default OFF because the lane is unmeasured, not because it is unsafe.**
+/// The turn writes only `genesis_*` state, never `genesis_enabled`, and has no
+/// publish path; that is a safety argument and safety is not the question here.
+/// The question is contention: a turn polls every 1s idle / 100ms working and
+/// takes the single `MemoryDB` connection mutex each time, and neither its RSS
+/// nor its foreground-request-latency cost has been measured on a real corpus.
+/// The sibling ambient lanes ([`edges_reconcile_enabled`],
+/// [`entity_page_reconcile_enabled`], [`edge_grounding_promote_enabled`]) are
+/// default-OFF for exactly this reason at 30-minute cadences; this one polls
+/// three orders of magnitude faster.
+///
+/// It is also what makes spec §10.3's rollback executable: PR-B rollback is
+/// "a flag flip plus a lease sweep", and with no flag there is no flip.
+pub fn genesis_shadow_enabled() -> bool {
+    let value = std::env::var("WENLAN_ENABLE_GENESIS_SHADOW").ok();
+    genesis_shadow_enabled_value(value.as_deref())
+}
+
+fn genesis_shadow_enabled_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// True iff `WENLAN_RERANK_SKIP_PREFERENCE` is truthy. OPT-IN, default OFF.
 ///
 /// When ON, preference/recommendation-seeking queries (per
@@ -2508,6 +2546,25 @@ pub struct RefinementProposal {
 
 pub(crate) const COMMUNITY_SUMMARY_BUCKETS_CONSUMER: &str = "summary_buckets";
 pub(crate) const COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER: &str = "summary_eligibility";
+/// M6's genesis reader. Named for what it reads, not for the milestone that
+/// introduced it — the other two consumers carry no milestone prefix, and the
+/// stored value is permanent from its first write while "M6" becomes history.
+pub(crate) const COMMUNITY_GENESIS_CANDIDATES_CONSUMER: &str = "genesis_candidates";
+
+/// Every community reader the durable gate knows about.
+///
+/// The five membership lists below (this one, the gate SQL's match, the
+/// known-reader match, the reconcile loop, and the `output_delta` branch) are
+/// deliberately NOT collapsed into one lookup: `community_reader_durable_gate_sql`
+/// survived four independent review rounds and is not worth re-opening to
+/// prevent a drift that has not happened. `consumer_lists_agree` is the teeth
+/// instead — a consumer known to one list and missing from the gate would be
+/// permanently dark and silent, and that test fails loudly instead.
+pub(crate) const COMMUNITY_READER_CONSUMERS: [&str; 3] = [
+    COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
+    COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+    COMMUNITY_GENESIS_CANDIDATES_CONSUMER,
+];
 
 fn community_relevant_spaces_digest(spaces: impl IntoIterator<Item = String>) -> String {
     let mut spaces = spaces.into_iter().collect::<Vec<_>>();
@@ -2663,7 +2720,9 @@ pub(crate) fn community_consumer_contract_version() -> String {
 pub(crate) fn community_reader_durable_gate_sql(consumer: &str) -> String {
     if !matches!(
         consumer,
-        COMMUNITY_SUMMARY_BUCKETS_CONSUMER | COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER
+        COMMUNITY_SUMMARY_BUCKETS_CONSUMER
+            | COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER
+            | COMMUNITY_GENESIS_CANDIDATES_CONSUMER
     ) {
         // Fail closed rather than interpolate an unvetted string into SQL.
         return "0=1".to_string();
@@ -10514,11 +10573,14 @@ impl MemoryDB {
         Ok(())
     }
 
-    async fn ensure_community_substrate_tables(
-        conn: &libsql::Connection,
-    ) -> Result<(), WenlanError> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS communities (
+    /// M4's community substrate, as the bytes both the migration and the M6
+    /// fixtures execute. `grouping_leases` is the ONE durable lease registry
+    /// (D6, I-6) and `m6::leases` is a facade over it, so a fixture that
+    /// created its own copy of the table could not notice a second lease
+    /// system — which is the thing the facade exists to prevent. Shipped as
+    /// text because R4 forbids a DB-owned item from handing out a `libsql`
+    /// handle at crate visibility.
+    pub(crate) const COMMUNITY_SUBSTRATE_DDL: &str = "CREATE TABLE IF NOT EXISTS communities (
                 community_id TEXT PRIMARY KEY,
                 space TEXT NOT NULL,
                 display_name TEXT,
@@ -10559,12 +10621,16 @@ impl MemoryDB {
                 expires_at INTEGER NOT NULL,
                 attempt INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(phase, space, input_generation)
-            );",
-        )
-        .await
-        .map_err(|error| {
-            WenlanError::VectorDb(format!("ensure community substrate tables: {error}"))
-        })?;
+            );";
+
+    async fn ensure_community_substrate_tables(
+        conn: &libsql::Connection,
+    ) -> Result<(), WenlanError> {
+        conn.execute_batch(Self::COMMUNITY_SUBSTRATE_DDL)
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("ensure community substrate tables: {error}"))
+            })?;
 
         // Replay an interrupted development build of migration 95 that may
         // have created the first table shape before grouping_generation was
@@ -15019,7 +15085,9 @@ impl MemoryDB {
     fn is_known_community_reader(consumer: &str) -> bool {
         matches!(
             consumer,
-            COMMUNITY_SUMMARY_BUCKETS_CONSUMER | COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER
+                | COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER
+                | COMMUNITY_GENESIS_CANDIDATES_CONSUMER
         )
     }
 
@@ -15083,10 +15151,7 @@ impl MemoryDB {
     /// their read gate remains fail-closed until these current receipts exist.
     pub async fn reconcile_pending_community_readers(&self) -> Result<usize, WenlanError> {
         let mut spaces_checked = 0usize;
-        for consumer in [
-            COMMUNITY_SUMMARY_BUCKETS_CONSUMER,
-            COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
-        ] {
+        for consumer in COMMUNITY_READER_CONSUMERS {
             if self
                 .community_reader_parity_needs_reconcile(consumer)
                 .await?
@@ -15394,7 +15459,14 @@ impl MemoryDB {
         let source_coverage_delta = legacy_sources
             .symmetric_difference(&durable_sources)
             .count();
-        let output_delta = if consumer == COMMUNITY_SUMMARY_BUCKETS_CONSUMER {
+        // Genesis reads the partition itself, exactly as summary_buckets does —
+        // whole-group membership, not the min-members eligibility cut. The
+        // eligibility arm would report permanent drift against a structurally
+        // empty legacy side.
+        let output_delta = if matches!(
+            consumer,
+            COMMUNITY_SUMMARY_BUCKETS_CONSUMER | COMMUNITY_GENESIS_CANDIDATES_CONSUMER
+        ) {
             let legacy_partitions = legacy.iter().cloned().collect::<BTreeSet<_>>();
             let durable_partitions = durable.iter().cloned().collect::<BTreeSet<_>>();
             legacy_partitions
