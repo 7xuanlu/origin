@@ -73,8 +73,23 @@ pub const M6_ZIPF_TRUNCATION: u64 = 5_000;
 /// **65 is the off-by-one boundary** — the smallest degree at which top-64
 /// selection actually truncates, and therefore the case an implementation with
 /// `>` instead of `>=` gets wrong. A corpus omitting 65 lets that bug pass.
+///
+/// The degree is the group's **page** degree, not its root count, because that
+/// is what the cap is taken over: `hub_weight(d)` reads `d` = pages the group
+/// touches, and `groups_touching` ranks and cuts pages. Setting only the root
+/// count leaves every group's page degree drawn from [`FANOUT_SPAN`], whose
+/// maximum is 15 — so `hub_weight` returns exactly `1.0` for all
+/// [`M6_GROUP_COUNT`] groups, the `64/d` branch never executes, and
+/// `R-HUB-TOPK` / `R-HUB-WEIGHT` / `R-HUB-MAXPAIRS` go untested by the very
+/// benchmark that names them. A hub therefore carries its degree in both
+/// places, and its page edges are emitted **distinct** (see
+/// [`write_corpus_stream`]): 65 probes the boundary only if it lands on
+/// exactly 65 pages, and sampling 65 of 5,000 with replacement lands on about
+/// 64.6.
 pub const M6_HUB_DEGREES: [u64; 3] = [5_000, 1_024, 65];
-/// `R-CORPUS-FANOUT` — mean pages per group.
+/// `R-CORPUS-FANOUT` — mean pages per group, over the non-hub groups. The three
+/// hubs are specified by `R-CORPUS-HUB` instead and are excluded from the
+/// balanced draw.
 pub const M6_PAGES_PER_GROUP_MEAN: u64 = 8;
 /// `R-CORPUS-AGE` — root age is uniform over `0..=720` days.
 pub const M6_ROOT_AGE_MAX_DAYS: u64 = 720;
@@ -203,15 +218,31 @@ fn build_groups(rng: &mut SplitMix64) -> Vec<Group> {
     //    realized total came out 95,464 rather than 96,000, which would make
     //    R-CORPUS-FANOUT checkable only to within sampling error. Exact by
     //    construction matches how R-CORPUS-RETFRAC is handled below.
-    debug_assert_eq!(M6_GROUP_COUNT % FANOUT_SPAN, 0);
-    let per_value = group_count / FANOUT_SPAN as usize;
+    //
+    //    The draw covers the non-hub groups only. A hub's page degree is its
+    //    hub degree (R-CORPUS-HUB), which is the whole point of a hub — see
+    //    `M6_HUB_DEGREES` — so it must not also take a value from this pool.
+    //    `group_count - hubs` does not divide `FANOUT_SPAN`, so the remainder
+    //    is carried across the low values, exactly as R-CORPUS-RETFRAC carries
+    //    below; the total stays exact rather than approximate.
+    let drawn = group_count - M6_HUB_DEGREES.len();
+    let per_value = drawn / FANOUT_SPAN as usize;
+    let carry = drawn - per_value * FANOUT_SPAN as usize;
     let mut fanouts: Vec<u64> = (1..=FANOUT_SPAN)
-        .flat_map(|value| std::iter::repeat_n(value, per_value))
+        .flat_map(|value| {
+            let extra = usize::from((value as usize) <= carry);
+            std::iter::repeat_n(value, per_value + extra)
+        })
         .collect();
+    debug_assert_eq!(fanouts.len(), drawn);
     for index in (1..fanouts.len()).rev() {
         let swap = (rng.next_u64() % (index as u64 + 1)) as usize;
         fanouts.swap(index, swap);
     }
+    // The hubs take the front slots, matching how `degrees` is laid out.
+    let mut fanouts_with_hubs = M6_HUB_DEGREES.to_vec();
+    fanouts_with_hubs.extend(fanouts);
+    let fanouts = fanouts_with_hubs;
 
     // 3. Root age, uniform over 0..=M6_ROOT_AGE_MAX_DAYS.
     let ages: Vec<u64> = (0..group_count)
@@ -302,11 +333,29 @@ pub fn write_corpus_stream<W: Write>(mut writer: W) -> Result<()> {
         writeln!(writer, "P\t{page}\t{space}")?;
     }
 
-    // Group -> page edges.
+    // Group -> page edges. A hub's edges are distinct pages; an ordinary
+    // group's are drawn with replacement.
+    //
+    // The distinction is not cosmetic. `support` collapses duplicates with
+    // `GROUP BY gid, page_id`, so the cap is taken over *distinct* pages, and
+    // drawing 65 of 5,000 with replacement lands on about 64.6 of them — which
+    // makes the 65-hub a coin flip about whether it sits above or below the
+    // top-64 cut rather than the exact boundary probe R-CORPUS-HUB specifies.
     for (index, group) in groups.iter().enumerate() {
-        for _ in 0..group.fanout {
-            let page = rng.next_u64() % M6_PAGE_COUNT;
-            writeln!(writer, "E\t{index}\t{page}")?;
+        if index < M6_HUB_DEGREES.len() {
+            let take = group.fanout.min(M6_PAGE_COUNT) as usize;
+            let mut deck: Vec<u64> = (0..M6_PAGE_COUNT).collect();
+            for slot in 0..take {
+                let swap = slot + (rng.next_u64() % (deck.len() - slot) as u64) as usize;
+                deck.swap(slot, swap);
+                let page = deck[slot];
+                writeln!(writer, "E\t{index}\t{page}")?;
+            }
+        } else {
+            for _ in 0..group.fanout {
+                let page = rng.next_u64() % M6_PAGE_COUNT;
+                writeln!(writer, "E\t{index}\t{page}")?;
+            }
         }
     }
 
@@ -469,18 +518,90 @@ mod tests {
     fn fanout_totals_exactly_the_frozen_mean_and_is_not_index_correlated() {
         let mut rng = SplitMix64::new(M6_BENCH_SEED);
         let groups = build_groups(&mut rng);
-        let total: u64 = groups.iter().map(|group| group.fanout).sum();
-        assert_eq!(total, M6_GROUP_COUNT * M6_PAGES_PER_GROUP_MEAN);
-        // Every value in the span is used exactly the same number of times.
+        let drawn = M6_GROUP_COUNT as usize - M6_HUB_DEGREES.len();
+        let per_value = drawn / FANOUT_SPAN as usize;
+        let carry = drawn - per_value * FANOUT_SPAN as usize;
+
+        // The balanced pool covers the non-hub groups; the remainder is
+        // carried across the low values, so this is exact, not approximate.
+        let non_hub = &groups[M6_HUB_DEGREES.len()..];
+        let total: u64 = non_hub.iter().map(|group| group.fanout).sum();
+        let expected: u64 = (1..=FANOUT_SPAN)
+            .map(|value| value * (per_value as u64 + u64::from((value as usize) <= carry)))
+            .sum();
+        // 95,958 over 11,997 groups — a realized mean of 7.9985, which rounds
+        // to R-CORPUS-FANOUT's 8. Exact by construction, so this is the whole
+        // claim; a tolerance band next to it would only be a second, looser
+        // statement of the same thing.
+        assert_eq!(total, expected);
         for value in 1..=FANOUT_SPAN {
-            let count = groups.iter().filter(|group| group.fanout == value).count();
-            assert_eq!(count as u64, M6_GROUP_COUNT / FANOUT_SPAN);
+            let count = non_hub.iter().filter(|group| group.fanout == value).count();
+            let extra = usize::from((value as usize) <= carry);
+            assert_eq!(count, per_value + extra);
         }
-        // Unshuffled, the first groups would all carry fanout 1.
+        // Unshuffled, the first non-hub groups would all carry fanout 1.
         assert!(
-            groups[..64].iter().any(|group| group.fanout != 1),
+            non_hub[..64].iter().any(|group| group.fanout != 1),
             "fanout assignment correlates with group index"
         );
+    }
+
+    /// The benchmark can only exercise the hub cap if some group's **page**
+    /// degree crosses it. Wiring `M6_HUB_DEGREES` to the root count alone left
+    /// every group's page degree inside `FANOUT_SPAN` (max 15), so
+    /// `hub_weight` returned exactly `1.0` for all 12,000 groups and the
+    /// `64/d` branch never ran — `R-HUB-TOPK` / `R-HUB-WEIGHT` /
+    /// `R-HUB-MAXPAIRS` were untested by the corpus that names them.
+    #[test]
+    fn the_hubs_carry_their_degree_as_pages_touched_and_cross_the_top_64_cut() {
+        let mut rng = SplitMix64::new(M6_BENCH_SEED);
+        let groups = build_groups(&mut rng);
+        for (index, expected) in M6_HUB_DEGREES.iter().enumerate() {
+            assert_eq!(
+                groups[index].fanout, *expected,
+                "hub {index} does not touch as many pages as its degree"
+            );
+        }
+        assert!(
+            M6_HUB_DEGREES.iter().all(|degree| *degree > 64),
+            "every hub must sit strictly above the top-64 cut"
+        );
+        assert!(
+            groups[M6_HUB_DEGREES.len()..]
+                .iter()
+                .all(|group| group.fanout <= FANOUT_SPAN),
+            "a non-hub group must not be silently promoted into the cap"
+        );
+    }
+
+    /// The 65-hub is the `>` vs `>=` probe, so it has to land on exactly 65
+    /// distinct pages. Drawn with replacement it lands on about 64.6 — right
+    /// where the boundary it exists to test is, which would make the probe
+    /// decide the question by luck of the seed.
+    #[test]
+    fn hub_page_edges_are_distinct_so_the_boundary_hub_lands_on_exactly_65() {
+        let mut corpus = Vec::new();
+        write_corpus_stream(&mut corpus).expect("corpus");
+        let text = String::from_utf8(corpus).expect("utf8");
+
+        for (index, degree) in M6_HUB_DEGREES.iter().enumerate() {
+            let prefix = format!("E\t{index}\t");
+            let pages: Vec<&str> = text
+                .lines()
+                .filter_map(|line| line.strip_prefix(prefix.as_str()))
+                .collect();
+            let distinct: std::collections::BTreeSet<&str> = pages.iter().copied().collect();
+            assert_eq!(
+                pages.len() as u64,
+                *degree,
+                "hub {index} emitted the wrong edge count"
+            );
+            assert_eq!(
+                distinct.len() as u64,
+                *degree,
+                "hub {index} repeated a page, so its page degree is below its hub degree"
+            );
+        }
     }
 
     #[test]
