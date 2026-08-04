@@ -1858,3 +1858,64 @@ async fn a_reactivation_restores_the_pre_retraction_digest() {
         "retract-then-reactivate is not the identity on the pair table"
     );
 }
+
+/// A group that gains a second page while staying eligible must produce that
+/// pair, even though neither page had a pair row to be stale.
+///
+/// This is the one support change no path owned. `apply_group_mutation` is the
+/// applier for a group *entering or leaving* the eligible universe, so a group
+/// that was eligible before and after never reaches it; the bounded sweep was
+/// the only other candidate, and it selected a page solely by that page having
+/// a `m6_pair_stats` row behind the generation. A group supporting exactly one
+/// page produces no pair, so its page has no row -- and when such a group gains
+/// a second page, neither endpoint is selectable and the pair is invisible
+/// forever. Not a stale number: a row a full recomputation emits and the
+/// incremental table never contains, which is the incremental-equals-full
+/// property itself.
+///
+/// `g-pairless` is deliberately the only support either page has, so the fix
+/// cannot be reached through some other group's staleness.
+#[tokio::test]
+async fn a_group_gaining_a_second_page_creates_that_pair_with_no_prior_pair_row() {
+    let db = GenesisDb::new().await;
+    db.seed_space("space-id-a", "space-a").await;
+    let base = 1_800_000_000;
+
+    // A conventional pair, so the space has eligible support and the pin gets
+    // established by the full pass rather than the sweep short-circuiting.
+    for page in ["p1", "p2"] {
+        seed_page_support(&db, &format!("r-g0-{page}"), "space-a", "g0", page, base).await;
+    }
+    // A group supporting exactly one page: eligible, contributes mass, and
+    // emits no pair — so `solo-a` ends the pass with no `m6_pair_stats` row.
+    seed_page_support(&db, "r-solo-a", "space-a", "g-pairless", "solo-a", base).await;
+
+    let pass = rereference(&db, "space-id-a", "space-a", 7).await;
+    let reference = pass.decay_reference;
+    assert!(
+        !stored_pair_rows(&db, "space-a")
+            .await
+            .iter()
+            .any(|(page_a, page_b, _)| page_a == "solo-a" || page_b == "solo-a"),
+        "the fixture is vacuous unless solo-a really ends the pass pairless"
+    );
+
+    // The mutation under test: the same, still-eligible group gains a page.
+    seed_page_support(&db, "r-solo-b", "space-a", "g-pairless", "solo-b", base).await;
+
+    drain_bounded(&db, "space-id-a", "space-a", 8).await;
+
+    let stored = assert_equals_full_recomputation(
+        &db,
+        "space-a",
+        reference,
+        "a still-eligible group gained a second page",
+    )
+    .await;
+    assert!(
+        stored
+            .iter()
+            .any(|(page_a, page_b, _)| page_a == "solo-a" && page_b == "solo-b"),
+        "the oracle must be non-vacuous: (solo-a, solo-b) is the row at issue"
+    );
+}

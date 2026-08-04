@@ -429,11 +429,26 @@ pub async fn eligible_groups(
 /// and strands the rest of its pairs at the old generation forever — a silent
 /// loss, because the table still looks fully populated.
 ///
-/// A page with no rows at all is therefore not a candidate. That is the same
-/// rule, not an exception: nothing about it is behind. Pages first acquire rows
-/// in the full re-reference pass, and a page with no eligible support never
-/// acquires any — which is what stops the sweep spinning on pages that can
-/// never produce a pair.
+/// A page with no rows at all needs the second test, and it is the one this
+/// query originally lacked. "Nothing about it is behind" is true only of a page
+/// that could not produce a pair anyway; a page that *shares a group with
+/// another page* and still has no row is behind by a whole row. That state is
+/// reachable and no other path repairs it: [`apply_group_mutation`] owns a
+/// group entering or leaving the eligible universe, so a group that was
+/// eligible before and after never reaches it, and a group supporting exactly
+/// one page emits no pair — so when it gains a second, neither endpoint has a
+/// row to be stale and the pair is invisible forever. That is not a stale
+/// number but a row a full recomputation emits and the incremental table never
+/// contains, which is the incremental-equals-full property itself.
+///
+/// The second test is `co_supported` below, and its two halves are both load-
+/// bearing. It fires only for a page with **no** row, so a page whose rows are
+/// current is not re-selected and the turn count still drains. And it counts
+/// only pages inside the top-64 cut, because that is the set
+/// [`groups_touching`] returns and therefore the only set from which a sweep
+/// can actually write a pair: selecting a page ranked past the cut would
+/// re-select it every turn while no turn could ever give it a row — a livelock,
+/// exactly the failure the delete-then-insert below exists to avoid.
 ///
 /// The cap is in the `LIMIT`, not a `Vec::truncate` afterwards: G6.8's break is
 /// exactly a post-hoc truncate, which leaves the returned count passing while
@@ -455,35 +470,65 @@ pub async fn candidate_endpoints(
              SELECT e.*, e.dst_id AS page_id FROM edges e WHERE e.dst_kind = 'page'
          ),
          support AS (
-             SELECT r.independence_group_id AS gid, e.page_id AS page_id
+             SELECT r.independence_group_id AS gid,
+                    e.page_id                AS page_id,
+                    MAX(r.created_at)        AS support_recency
                FROM page_edges e
                JOIN provenance_roots r ON r.root_id = e.root_id
               WHERE e.space = ?1
                 AND {ELIGIBLE_EVIDENCE_PREDICATE}
               GROUP BY gid, e.page_id
          ),
+         kept AS (
+             -- The top-64 cut, ordered exactly as `groups_touching` orders it,
+             -- so this is that query's row set rather than a superset of it.
+             SELECT gid, page_id FROM (
+                 SELECT gid, page_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY gid ORDER BY support_recency DESC, page_id ASC
+                        ) AS rank_in_group
+                   FROM support
+             ) WHERE rank_in_group <= {MAX_NEIGHBORS_PER_ENDPOINT}
+         ),
          group_size AS (
-             -- Capped exactly where `groups_touching` caps, so the projection
-             -- is that query's row count and not an estimate of it.
-             SELECT gid, MIN(COUNT(*), {MAX_NEIGHBORS_PER_ENDPOINT}) AS pages
-               FROM support GROUP BY gid
+             -- A plain COUNT now, not a MIN against the cap: `kept` is already
+             -- cut, so this is the projection `groups_touching` will return.
+             SELECT gid, COUNT(*) AS pages FROM kept GROUP BY gid
+         ),
+         co_supported AS (
+             -- Pages a sweep could write a pair for: inside the cut, in a group
+             -- that keeps at least one other page.
+             SELECT DISTINCT k.page_id AS page_id
+               FROM kept k
+               JOIN group_size gs ON gs.gid = k.gid
+              WHERE gs.pages >= 2
          ),
          stale AS (
              SELECT p.id AS id FROM pages p
               WHERE p.space = ?1
                 AND lower(p.title) <> 'overview'
-                AND EXISTS (
-                    SELECT 1 FROM m6_pair_stats s
-                     WHERE s.space = ?1 AND s.updated_generation < ?2
-                       AND (s.page_a = p.id OR s.page_b = p.id)
+                AND (
+                    EXISTS (
+                        SELECT 1 FROM m6_pair_stats s
+                         WHERE s.space = ?1 AND s.updated_generation < ?2
+                           AND (s.page_a = p.id OR s.page_b = p.id)
+                    )
+                    OR (
+                        EXISTS (SELECT 1 FROM co_supported c WHERE c.page_id = p.id)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM m6_pair_stats s
+                             WHERE s.space = ?1
+                               AND (s.page_a = p.id OR s.page_b = p.id)
+                        )
+                    )
                 )
               ORDER BY p.id ASC
               LIMIT ?3
          )
          SELECT st.id, COALESCE(SUM(gs.pages), 0)
            FROM stale st
-           LEFT JOIN support s  ON s.page_id = st.id
-           LEFT JOIN group_size gs ON gs.gid = s.gid
+           LEFT JOIN kept k ON k.page_id = st.id
+           LEFT JOIN group_size gs ON gs.gid = k.gid
           GROUP BY st.id
           ORDER BY st.id ASC"
     );
@@ -570,6 +615,19 @@ pub async fn groups_touching(
              UNION ALL
              SELECT e.*, e.dst_id AS page_id FROM edges e WHERE e.dst_kind = 'page'
          ),
+         touched AS (
+             -- The groups first, straight off the endpoint pages. Deriving
+             -- them from a space-wide `support` instead would build every
+             -- group in the space to keep the handful a turn can touch, and
+             -- the endpoints are already known here — unlike in
+             -- `candidate_endpoints`, where finding them is the question.
+             SELECT DISTINCT r.independence_group_id AS gid
+               FROM page_edges e
+               JOIN provenance_roots r ON r.root_id = e.root_id
+              WHERE e.space = ?1
+                AND {ELIGIBLE_EVIDENCE_PREDICATE}
+                AND e.page_id IN ({placeholders})
+         ),
          support AS (
              SELECT r.independence_group_id AS gid,
                     e.page_id                AS page_id,
@@ -578,10 +636,8 @@ pub async fn groups_touching(
                JOIN provenance_roots r ON r.root_id = e.root_id
               WHERE e.space = ?1
                 AND {ELIGIBLE_EVIDENCE_PREDICATE}
+                AND r.independence_group_id IN (SELECT gid FROM touched)
               GROUP BY gid, e.page_id
-         ),
-         touched AS (
-             SELECT DISTINCT gid FROM support WHERE page_id IN ({placeholders})
          ),
          ranked AS (
              SELECT s.gid, s.page_id,
@@ -591,7 +647,6 @@ pub async fn groups_touching(
                     COUNT(*) OVER (PARTITION BY s.gid)             AS degree,
                     MAX(s.support_recency) OVER (PARTITION BY s.gid) AS newest
                FROM support s
-               JOIN touched t ON t.gid = s.gid
          )
          SELECT gid, page_id, degree, newest
            FROM ranked
