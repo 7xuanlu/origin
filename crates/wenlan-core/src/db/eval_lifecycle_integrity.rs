@@ -81,9 +81,16 @@ impl MemoryDB {
             }
         };
 
+        // G6 Stage 1.5a: counts via `entity_page_map` (1:1 with `entities` by
+        // the shadow-page invariant) instead of `entities` directly.
         let entity_count = {
             let mut rows = conn
-                .query("SELECT COUNT(*) FROM entities", libsql::params![])
+                .query(
+                    "SELECT COUNT(*) FROM entity_page_map epm
+                     JOIN pages p ON p.id = epm.page_id
+                     WHERE p.kind = 'entity' AND p.status = 'active'",
+                    libsql::params![],
+                )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("count entities: {e}")))?;
             if let Ok(Some(row)) = rows.next().await {

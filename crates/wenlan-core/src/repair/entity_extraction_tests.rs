@@ -52,6 +52,17 @@ async fn entity_extraction_fixture() -> EntityExtractionFixture {
         )
         .await
         .unwrap();
+    // G6 Stage 1.5a review fix round fallout: `entities` is raw-SQL-seeded
+    // above (bypassing `store_entity`), so without a shadow page these three
+    // entities are invisible to the readers this stage migrated
+    // (`link_integrity`, `entity_integrity`, ...) -- `mem-entity`/
+    // `ent-existing`'s link would read as broken before this repair ever
+    // runs, corrupting the before/after lint comparison in
+    // `record_repair_verification`. Backfill the invariant the same way a
+    // real write would.
+    for entity_id in ["ent-existing", "ent-new", "ent-extra"] {
+        db.test_seed_entity_shadow_page(entity_id).await.unwrap();
+    }
 
     let occurrence = RepairDigest::parse(OCCURRENCE).unwrap();
     let review_id = format!("lint_review_{OCCURRENCE}");

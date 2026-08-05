@@ -135,6 +135,9 @@ async fn lifecycle_state_counts_preserve_all_four_legacy_queries() {
         .await
         .unwrap();
     }
+    // G6 Stage 1.5a: entity_count now reads the `kind='entity'` shadow page.
+    db.test_seed_entity_shadow_page("entity-1").await.unwrap();
+    db.test_seed_entity_shadow_page("entity-2").await.unwrap();
 
     for fixture in [
         MemoryFixture {

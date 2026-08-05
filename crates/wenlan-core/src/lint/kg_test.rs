@@ -65,6 +65,9 @@ async fn imported_document_entity_links_have_a_valid_memory_owner() {
         )
         .await
         .unwrap();
+    // G6 Stage 1.5a: link_integrity's entity-existence side now reads the
+    // `kind='entity'` shadow page.
+    db.test_seed_entity_shadow_page("entity-doc").await.unwrap();
 
     let report = run(&db, None, test_config(true)).await;
     assert_eq!(check(&report, LINKS).outcome(), LintOutcome::Pass);
@@ -253,12 +256,19 @@ async fn seed_valid_scoped_graph(db: &crate::db::MemoryDB) {
          INSERT INTO edges (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type) VALUES
              ('edge-rel-a','ent-a','entity','ent-b','entity','relates','legacy',0,'alpha',1,'related');"
     ).await.unwrap();
+    // G6 Stage 1.5a: aggregate_counts + link_integrity now read the
+    // `kind='entity'` shadow page.
+    db.test_seed_entity_shadow_page("ent-a").await.unwrap();
+    db.test_seed_entity_shadow_page("ent-b").await.unwrap();
 }
 
 async fn seed_advisory_graph(db: &crate::db::MemoryDB) {
     let conn = db.test_primary_session().await;
     conn.execute_batch("INSERT INTO entities (id,name,entity_type,confirmed,created_at,updated_at) VALUES ('hub','Shared','person',0,1,1),('dupe',' shared ','concept',0,1,1);").await.unwrap();
     drop(conn);
+    // G6 Stage 1.5a: advisory_metrics now reads the `kind='entity'` shadow page.
+    db.test_seed_entity_shadow_page("hub").await.unwrap();
+    db.test_seed_entity_shadow_page("dupe").await.unwrap();
     for index in 0..21 {
         let id = format!("mem-{index:02}");
         insert_memory(db, &id, None).await;

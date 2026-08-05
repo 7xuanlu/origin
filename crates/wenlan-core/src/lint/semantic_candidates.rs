@@ -828,6 +828,12 @@ async fn load_memory_entity_links(
     Ok(output)
 }
 
+// G6 Stage 1.5a carryover (2026-08-05): NOT migrated. `scope_clause` below
+// filters on `source.space` (the src-entity alias) directly against
+// `entities`; the shadow-page mirror folds NULL `entities.space` to the
+// `UNFILED_SPACE_ID` sentinel, so a migrated read would silently change
+// which rows a space-scoped query matches. Stays on `entities` until the
+// space-sentinel audit.
 async fn load_relations(context: &LintContext<'_, '_>) -> Result<Vec<Relation>, ()> {
     let (scope, params) = scope_clause(context.scope().filter(), "source.space");
     let mut rows = context.snapshot().query(

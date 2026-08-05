@@ -45,6 +45,14 @@ pub(super) async fn load(context: &LintContext<'_, '_>, hub_cap: u64) -> Result<
     })
 }
 
+// G6 Stage 1.5a carryover (2026-08-05): NOT migrated. The `e.space IS NOT
+// NULL AND NOT EXISTS(spaces…)` body below is not merely imprecise under the
+// shadow-page mirror -- it goes VACUOUSLY TRUE for every row. The mirror
+// folds NULL `entities.space` to the `UNFILED_SPACE_ID` sentinel on the page
+// row, so a shadow-page read would always see space as non-NULL, and the
+// sentinel never matches a real `spaces.name` row; every entity would flag
+// as a false integrity violation, not just a subtly different one. Stays on
+// `entities` until the space-sentinel audit (spec's 1.5b decision record).
 async fn entity_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (clause, params) = scope_clause(context.scope().filter(), "e", false);
     row_check(
@@ -63,6 +71,13 @@ async fn entity_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()>
     .await
 }
 
+// G6 Stage 1.5a carryover (2026-08-05): NOT migrated (entity-existence side
+// -- observation content itself is out of scope for this stage regardless,
+// see the spec's 1.5b observations ruling). `scope_clause` below filters on
+// `e.space`/`e.id` directly against `entities`; the shadow-page mirror folds
+// NULL `entities.space` to the `UNFILED_SPACE_ID` sentinel, so a migrated
+// read would silently change which rows a space-scoped query matches. Stays
+// on `entities` until the space-sentinel audit.
 async fn observation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (clause, params) = scope_clause(context.scope().filter(), "e", true);
     row_check(
@@ -80,6 +95,12 @@ async fn observation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck
     .await
 }
 
+// G6 Stage 1.5a carryover (2026-08-05): NOT migrated. `scope_clause` below
+// filters on `f.space`/`f.id` (the src-entity alias) directly against
+// `entities`; the shadow-page mirror folds NULL `entities.space` to the
+// `UNFILED_SPACE_ID` sentinel, so a migrated read would silently change
+// which rows a space-scoped query matches. Stays on `entities` until the
+// space-sentinel audit.
 async fn relation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (clause, params) = scope_clause(context.scope().filter(), "f", true);
     row_check(
@@ -97,17 +118,24 @@ async fn relation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, (
     .await
 }
 
+// G6 Stage 1.5a: the entity-existence side (`e.id IS NULL`) moved onto the
+// `kind='entity'` shadow page via `entity_page_map` -- safe because the
+// scope clause here filters on the memories-derived alias `m`, never on
+// `entities`/the entity side's space at all.
 async fn link_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (clause, params) = scope_clause(context.scope().filter(), "m", true);
     row_check(
         context,
         &format!(
-            "SELECT CASE WHEN m.source_id IS NULL OR e.id IS NULL THEN 1 ELSE 0 END
+            "SELECT CASE WHEN m.source_id IS NULL OR e.entity_id IS NULL THEN 1 ELSE 0 END
                FROM memory_entities me
                LEFT JOIN (SELECT source_id, MAX(id) AS id, MAX(space) AS space FROM memories
                            GROUP BY source_id) m
                  ON m.source_id=me.memory_id
-               LEFT JOIN entities e ON e.id=me.entity_id
+               LEFT JOIN (SELECT epm.entity_id FROM entity_page_map epm
+                          JOIN pages p ON p.id = epm.page_id
+                          WHERE p.kind = 'entity' AND p.status = 'active') e
+                 ON e.entity_id=me.entity_id
                {clause} ORDER BY me.memory_id, me.entity_id"
         ),
         params,

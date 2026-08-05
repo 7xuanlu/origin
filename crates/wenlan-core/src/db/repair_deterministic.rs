@@ -172,12 +172,21 @@ where
                     },
                 ) if memory_id == mutation_memory_id && entity_id == mutation_entity_id => conn
                     .execute(
+                        // G6 Stage 1.5a review fix: the planner
+                        // (`resolve_memory_entity_links`, repair_plan/deterministic.rs)
+                        // already reads the `kind='entity'` shadow page for this same
+                        // existence decision -- the applier's guard must read the same
+                        // store, or a raw-seeded `entities` row with no shadow page
+                        // would plan-delete but fail to apply.
                         "DELETE FROM memory_entities
                          WHERE memory_id=?1 AND entity_id=?2
                            AND (NOT EXISTS(
                                 SELECT 1 FROM memories m WHERE m.source_id=memory_entities.memory_id)
                              OR NOT EXISTS(
-                                SELECT 1 FROM entities e WHERE e.id=memory_entities.entity_id))",
+                                SELECT 1 FROM entity_page_map epm
+                                JOIN pages p ON p.id = epm.page_id
+                                WHERE epm.entity_id = memory_entities.entity_id
+                                  AND p.kind = 'entity' AND p.status = 'active'))",
                         libsql::params![memory_id.clone(), entity_id.clone()],
                     )
                     .await

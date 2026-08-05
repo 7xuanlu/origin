@@ -3229,10 +3229,11 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        996,
+        1005,
         "PR-D integration must expose the frozen 967 support calls, the 6 PR-D test identities, \
-         the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, and \
-         the 8 G6 BindPageLink repair-test calls"
+         the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, \
+         the 8 G6 BindPageLink repair-test calls, and the 9 G6 Stage 1.5a \
+         raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard calls"
     );
 }
 

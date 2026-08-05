@@ -4706,6 +4706,12 @@ fn decode_entity_extraction_space(encoded: &str) -> Result<Option<String>, Wenla
         .map_err(|_| WenlanError::Validation("repair_target_schema_mismatch".to_string()))
 }
 
+// G6 Stage 1.5a carryover (2026-08-05): NOT migrated. The `(?2 IS NULL AND
+// space IS NULL) OR space=?2` guard below distinguishes a literal NULL
+// `entities.space` from a registered space; the shadow-page mirror folds
+// NULL to the `UNFILED_SPACE_ID` sentinel, so a migrated read would silently
+// change which rows validate. Stays on `entities` until the space-sentinel
+// audit.
 async fn validate_selected_entities_on_snapshot(
     snapshot: &LintReadSnapshot<'_>,
     entity_ids: &[String],
@@ -4735,6 +4741,16 @@ async fn validate_selected_entities_on_snapshot(
     Ok(())
 }
 
+// G6 Stage 1.5a carryover (2026-08-05): NOT migrated, for two independent
+// reasons. (1) Same space-sentinel trap as the snapshot variant above -- the
+// `(?2 IS NULL AND space IS NULL) OR space=?2` guard distinguishes a literal
+// NULL `entities.space` from a registered space, which the shadow-page
+// mirror's NULL-to-sentinel fold would silently change. (2) This variant
+// runs on the shared-mutex connection inside the entity-extraction repair's
+// own `BEGIN IMMEDIATE` (`db/repair_memory_cas.rs`), re-verifying entities
+// that repair batch itself just wrote -- Stage-2 writer-batch alignment, NOT
+// connection-level coupling (the shared-mutex conn can never see uncommitted
+// foreign state from another writer). Flips with `store_entity` in Stage 2.
 pub(crate) async fn validate_selected_entities_on_connection(
     connection: &libsql::Connection,
     entity_ids: &[String],

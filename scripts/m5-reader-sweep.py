@@ -60,6 +60,14 @@ remain in --json only. Caller identities are the uniquely enclosing
 brace-matched function. A relevant name-resolvable call with no unique owner
 fails closed. The exact generated list retains duplicate multiplicity.
 
+KNOWN LIMITATION (2026-08-05): the SQLBLK scan in sweep() (~line 465) walks
+each function's brace-matched body only, so a SQL literal defined in an
+associated const at impl level -- outside any function body -- is invisible
+to the predicate. `db.rs::EDGE_GROUNDING_CANDIDATE_SCAN_SQL` is such a const;
+its consumer `db.rs::edge_grounding_candidates` is a genuine depth-0
+page-bearing reader missing from the inventory as a result. Not fixed here --
+the predicate would need to also walk associated-const initializers.
+
 Usage:
   python3 scripts/m5-reader-sweep.py [--json]
   python3 scripts/m5-reader-sweep.py --self-test

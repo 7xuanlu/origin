@@ -86,6 +86,12 @@ pub(super) async fn run(
     ]
 }
 
+// G6 Stage 1.5a carryover (2026-08-05): NOT migrated. The scope clause below
+// filters on `e.space` directly (nullable legacy `entities.space`); the
+// shadow-page mirror folds NULL to the `UNFILED_SPACE_ID` sentinel, so a
+// migrated read would silently change which rows a space-scoped query
+// matches. Stays on `entities` until the space-sentinel audit (spec's 1.5b
+// decision record).
 async fn alias_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (scope, params) = scope_clause(context.scope().filter(), "e.space", true);
     rows(
@@ -209,6 +215,13 @@ async fn structured_conflicts(context: &LintContext<'_, '_>) -> Result<RowCheck,
     .await
 }
 
+// G6 Stage 1.5a carryover (2026-08-05): NOT migrated (entity-existence side
+// -- observation content itself is out of scope for this stage regardless,
+// see the spec's 1.5b observations ruling). The scope clause below filters
+// on `e.space` directly; the shadow-page mirror folds NULL to the
+// `UNFILED_SPACE_ID` sentinel, so a migrated read would silently change
+// which rows a space-scoped query matches. Stays on `entities` until the
+// space-sentinel audit.
 async fn observation_duplicates(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (scope, params) = scope_clause(context.scope().filter(), "e.space", true);
     rows(
@@ -253,6 +266,12 @@ async fn page_duplicates(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> 
     .await
 }
 
+// G6 Stage 1.5a carryover (2026-08-05): NOT migrated. The scope clause below
+// filters on `f.space` directly (nullable legacy `entities.space` via the
+// src-entity alias); the shadow-page mirror folds NULL to the
+// `UNFILED_SPACE_ID` sentinel, so a migrated read would silently change
+// which rows a space-scoped query matches. Stays on `entities` until the
+// space-sentinel audit.
 async fn relation_vocabulary(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (scope, params) = scope_clause(context.scope().filter(), "f.space", true);
     rows(
