@@ -49,6 +49,13 @@ edge id the page_sources row derives to.
 | `accept_page_merge` (db.rs ~44859) | Repoints inbound `page_links.target_page_id` loser→winner with a raw UPDATE; the loser-dst links edges stay active (extra), winner-dst edges show missing. Also copies the absorbed page's external evidence rows without minting their edges. | FIXED. Per repointed row: mint the winner-dst links edge (replace_page_links derivation), retire the loser-dst edge superseded-by it. Copied external evidence rows mint their cites edges. |
 | `resolve_orphan_page_links` (db.rs ~45684) | Sets `target_page_id` on a previously-orphan row (which derives no edge) without minting the now-implied links edge. | FIXED. Mints with `replace_page_links`'s derivation in the same per-row transaction. |
 | `try_update_page_content` (db.rs ~43975) | Rewrites `pages.citations` wholesale without reconciling edges. Narrow: drifts only when a locator backed ONLY by citations (not by `page_sources`/`page_evidence`) drops out of the new value. | FIXED. Calls the shared `dual_write_page_citations` reconciler inside the CAS transaction (`set_page_citations_with_changelog_at_version` rewired onto the same helper). |
+| `apply_deterministic_repair_cas`, `RepairWriter::BindPageLink` arm (db/repair_deterministic.rs) | The repair tool's own orphan-bind — a second writer of `page_links.target_page_id` beside `resolve_orphan_page_links` — set the target with a raw UPDATE and no edge mint. Found by the Stage 1.1 scout (`docs/superpowers/g6-stage1-page-links-scout.md`). | FIXED. The arm mints the links edge in-transaction (same derivation as `resolve_orphan_page_links`); the mint's row changes are measured and allowed by the repair effect guard. |
+
+Residual (not Stage 0 scope, tracked): the generic repair **rollback** artifact
+restores legacy-store rows byte-wise (`rollback-v1.json` row restore) without
+edge reconciliation — rolling back a bind would re-orphan the row while its
+minted edge stays active. Operator-driven and rare; the parity sweep catches it.
+Fold into Stage 2 when repair writers go canonical-only.
 
 Known limitation (M5 follow-up, outside Stage 0 scope): M5 claim `supports`
 edges are fenced out of the parity universe, and a source-id rebind retracts
@@ -65,6 +72,15 @@ Order by measured entanglement:
 1. **`page_links`** (~9 fns) — one dual-write-aware writer choke point
    (`replace_page_links`), small reader fan-out (`get_page_outbound_links`,
    `get_page_inbound_links`, orphan-label lint), no shared-struct entanglement.
+   **Scout correction (2026-08-05, `docs/superpowers/g6-stage1-page-links-scout.md`):
+   this store cannot fully migrate onto `edges` as wired.** The `label` display
+   text is not stored on edge rows (label_key is only a hash input), and orphan
+   rows (`target_page_id IS NULL`) derive no edge at all — so the two product-route
+   readers behind `GET /api/pages/{id}/links` and all orphan-feed readers stay on
+   `page_links`. Only `load_link_counts` migrates cleanly today. Decision needed
+   before this store reaches Stage 3: carry the label in a `links` edge payload
+   (schema change), or keep `page_links` alive as a label+orphan side-table and
+   shrink the Stage 3 drop list accordingly.
 2. **`relations`** (~20 fns) — clear writer choke points, but readers include
    product routes (`get_entity_detail`, `list_recent_relations`), k-hop expansion,
    and lint/repair tooling. Entangled with `entities` via shared CRUD
