@@ -572,6 +572,15 @@ impl MemoryDB {
         Ok(proposals)
     }
 
+    /// G6 Stage 1.5a: scope-filters via the `kind='entity'` shadow page's
+    /// `space` column (through `entity_page_map`) instead of `entities.space`
+    /// directly. Safe under the space-sentinel fold: `ReadScope::Uncategorized`
+    /// matches `pages.space = UNFILED_SPACE_ID` (the NULL fold target), and
+    /// `ReadScope::Space(name)` only ever carries a name resolved through
+    /// `resolve_read_scope`/`db.get_space` against a REGISTERED space —
+    /// `create_space`/`update_space` reject `UNFILED_SPACE_ID` as a
+    /// user-supplied name (db.rs `UNFILED_SPACE_ID` doc comment), so the two
+    /// branches can never collide.
     pub(super) async fn filter_entity_ids_scoped(
         &self,
         entity_ids: &[String],
@@ -587,13 +596,20 @@ impl MemoryDB {
         let scope_index = entity_ids.len() + 1;
         let (scope_sql, scope_value) = match scope {
             ReadScope::Space(space) => (
-                format!("AND space = ?{scope_index}"),
+                format!("AND p.space = ?{scope_index}"),
                 Some(libsql::Value::Text(space.clone())),
             ),
-            ReadScope::Uncategorized => ("AND space IS NULL".to_string(), None),
+            ReadScope::Uncategorized => (
+                format!("AND p.space = ?{scope_index}"),
+                Some(libsql::Value::Text(crate::db::UNFILED_SPACE_ID.to_string())),
+            ),
             ReadScope::Global => unreachable!(),
         };
-        let sql = format!("SELECT id FROM entities WHERE id IN ({placeholders}) {scope_sql}");
+        let sql = format!(
+            "SELECT epm.entity_id FROM entity_page_map epm
+             JOIN pages p ON p.id = epm.page_id
+             WHERE epm.entity_id IN ({placeholders}) AND p.kind = 'entity' AND p.status = 'active' {scope_sql}"
+        );
         let mut params: Vec<libsql::Value> = entity_ids
             .iter()
             .map(|id| libsql::Value::Text(id.clone()))

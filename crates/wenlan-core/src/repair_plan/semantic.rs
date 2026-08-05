@@ -175,9 +175,15 @@ async fn load_record_inventory(
         &mut inventory,
     )
     .await?;
+    // G6 Stage 1.5a: id-only enumeration moved onto `entity_page_map` (1:1
+    // with `entities` by the shadow-page invariant); no space touch, order
+    // is by the entity id itself (not a name), so it is unaffected by the
+    // mirror-invariant name equivalence.
     load_simple_records(
         snapshot,
-        "SELECT id FROM entities ORDER BY id",
+        "SELECT epm.entity_id AS id FROM entity_page_map epm
+         JOIN pages p ON p.id = epm.page_id
+         WHERE p.kind = 'entity' AND p.status = 'active' ORDER BY epm.entity_id",
         "entity",
         RepairAffectedRecordKind::Entity,
         &mut inventory,

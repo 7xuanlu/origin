@@ -929,6 +929,93 @@ async fn imported_document_owner_with_missing_entity_prepares_and_applies_in_sco
     assert_eq!(owner_count, 1);
 }
 
+/// G6 Stage 1.5a review fix #3: the applier's `DeleteMemoryEntityLink` guard
+/// (`db/repair_deterministic.rs`) used to re-check legacy `entities`
+/// existence while the planner (`resolve_memory_entity_links`, above) already
+/// reads the `kind='entity'` shadow page. Under the old guard, a raw-seeded
+/// `entities` row with no shadow page still exists in `entities`, so the
+/// planner would propose a delete (no shadow page => looks orphaned) but the
+/// applier's WHERE clause would match zero rows (the legacy row is still
+/// there) and `apply_deterministic_repair_cas` would surface
+/// `repair_target_stale` instead of applying. This test seeds exactly that
+/// scenario -- a valid, present memory owner (so the memory-side branch is
+/// false) paired with a raw-seeded, shadow-page-less entity (so only the
+/// entity-side branch can trigger the delete) -- to isolate and pin the
+/// entity-side branch alone.
+///
+/// RED control (manual, not committed as code): temporarily reverting the
+/// guard's entity-side clause in `db/repair_deterministic.rs` back to
+/// `NOT EXISTS(SELECT 1 FROM entities e WHERE e.id=memory_entities.entity_id)`
+/// makes the `apply_repair` call below fail with `repair_target_stale`;
+/// restoring the shadow-page clause makes it pass again.
+#[tokio::test]
+async fn raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard() {
+    let (db, _dir) = test_db().await;
+    db.test_primary_session()
+        .await
+        .execute_batch(
+            "INSERT INTO memories
+                 (id,content,source,source_id,title,chunk_index,last_modified,chunk_type)
+             VALUES
+                 ('row_raw','Raw Entity Owner','local_files','/tmp/raw_entity.md','doc',0,1,'text');
+             PRAGMA foreign_keys=OFF;
+             INSERT INTO entities(id,name,entity_type,confirmed,created_at,updated_at)
+             VALUES ('entity_raw_no_shadow','Raw','concept',0,1,1);
+             INSERT INTO memory_entities(memory_id,entity_id)
+             VALUES ('/tmp/raw_entity.md','entity_raw_no_shadow');
+             PRAGMA foreign_keys=ON;",
+        )
+        .await
+        .unwrap();
+    let repair_root = tempfile::tempdir().unwrap();
+    let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
+    let manifest = prepared_manifest(&db, &store, RepairWriter::DeleteMemoryEntityLink).await;
+    assert!(matches!(
+        manifest.target(),
+        RepairTarget::MemoryEntityLink {
+            memory_id,
+            entity_id,
+            scope: RepairScope::Uncategorized,
+        } if memory_id == "/tmp/raw_entity.md" && entity_id == "entity_raw_no_shadow"
+    ));
+
+    let receipt =
+        crate::repair::apply_repair(&db, &store, exact_apply_request(&manifest), 1_721_000_002)
+            .await
+            .expect("planner and applier must read the same shadow-page existence store");
+    assert_eq!(receipt.writer(), RepairWriter::DeleteMemoryEntityLink);
+    let conn = db.test_primary_session().await;
+    let link_count = conn
+        .query(
+            "SELECT COUNT(*) FROM memory_entities
+             WHERE memory_id='/tmp/raw_entity.md' AND entity_id='entity_raw_no_shadow'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap();
+    let entity_row_count = conn
+        .query(
+            "SELECT COUNT(*) FROM entities WHERE id='entity_raw_no_shadow'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap();
+    assert_eq!(link_count, 0);
+    assert_eq!(entity_row_count, 1);
+}
+
 #[tokio::test]
 async fn orphan_revision_cas_rejects_scope_state_and_noop_then_changes_only_pending_revision() {
     let (db, _dir) = test_db().await;

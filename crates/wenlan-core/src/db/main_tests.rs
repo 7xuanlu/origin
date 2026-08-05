@@ -41295,14 +41295,32 @@ async fn migration_90_creates_entity_page_map_table() {
 #[tokio::test]
 async fn migration_90_entity_page_map_enforces_unique_entity_and_page() {
     let (db, _dir) = test_db().await;
-    let e1 = db.create_entity("Alice", "person", None).await.unwrap();
-    let e2 = db.create_entity("Bob", "person", None).await.unwrap();
     let conn = db.conn.lock().await;
+    // Raw-seeded, not `db.create_entity` -- since the G6 Stage 1.5a landmine
+    // fix, that helper also mints a shadow page + its own entity_page_map
+    // row, which would collide with the manual insert below before this
+    // test ever reaches the constraint it's checking. These three
+    // migration_90 tests exercise entity_page_map's own schema (UNIQUE +
+    // cascades) in isolation from the shadow-page mirror.
+    conn.execute(
+        "INSERT INTO entities (id, name, entity_type, created_at, updated_at) \
+         VALUES ('e1', 'Alice', 'person', 0, 0)",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO entities (id, name, entity_type, created_at, updated_at) \
+         VALUES ('e2', 'Bob', 'person', 0, 0)",
+        (),
+    )
+    .await
+    .unwrap();
     insert_test_page(&conn, "page_1").await;
     insert_test_page(&conn, "page_2").await;
     conn.execute(
-        "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, 'page_1', '2024-01-01T00:00:00Z')",
-        libsql::params![e1.clone()],
+        "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES ('e1', 'page_1', '2024-01-01T00:00:00Z')",
+        (),
     )
     .await
     .unwrap();
@@ -41310,8 +41328,8 @@ async fn migration_90_entity_page_map_enforces_unique_entity_and_page() {
     // Same entity_id, different page_id -> UNIQUE(entity_id) violation.
     let dup_entity = conn
         .execute(
-            "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, 'page_2', '2024-01-01T00:00:00Z')",
-            libsql::params![e1],
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES ('e1', 'page_2', '2024-01-01T00:00:00Z')",
+            (),
         )
         .await;
     assert!(dup_entity.is_err(), "duplicate entity_id must be rejected");
@@ -41319,8 +41337,8 @@ async fn migration_90_entity_page_map_enforces_unique_entity_and_page() {
     // Different entity_id, same page_id -> UNIQUE(page_id) violation.
     let dup_page = conn
         .execute(
-            "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, 'page_1', '2024-01-01T00:00:00Z')",
-            libsql::params![e2],
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES ('e2', 'page_1', '2024-01-01T00:00:00Z')",
+            (),
         )
         .await;
     assert!(dup_page.is_err(), "duplicate page_id must be rejected");
@@ -41329,26 +41347,34 @@ async fn migration_90_entity_page_map_enforces_unique_entity_and_page() {
 #[tokio::test]
 async fn migration_90_entity_page_map_cascades_on_entity_delete() {
     let (db, _dir) = test_db().await;
-    let e1 = db.create_entity("Alice", "person", None).await.unwrap();
     {
         let conn = db.conn.lock().await;
+        // Raw-seeded -- see the unique-constraint test above for why
+        // `db.create_entity` can't be used here.
+        conn.execute(
+            "INSERT INTO entities (id, name, entity_type, created_at, updated_at) \
+             VALUES ('e1', 'Alice', 'person', 0, 0)",
+            (),
+        )
+        .await
+        .unwrap();
         insert_test_page(&conn, "page_1").await;
         conn.execute(
-            "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, 'page_1', '2024-01-01T00:00:00Z')",
-            libsql::params![e1.clone()],
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES ('e1', 'page_1', '2024-01-01T00:00:00Z')",
+            (),
         )
         .await
         .unwrap();
     }
 
-    db.delete_entity(&e1).await.unwrap();
+    db.delete_entity("e1").await.unwrap();
 
     let conn = db.conn.lock().await;
     let remaining: i64 = {
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM entity_page_map WHERE entity_id = ?1",
-                libsql::params![e1],
+                libsql::params!["e1"],
             )
             .await
             .unwrap();
@@ -41360,12 +41386,20 @@ async fn migration_90_entity_page_map_cascades_on_entity_delete() {
 #[tokio::test]
 async fn migration_90_entity_page_map_cascades_on_page_delete() {
     let (db, _dir) = test_db().await;
-    let e1 = db.create_entity("Alice", "person", None).await.unwrap();
     let conn = db.conn.lock().await;
+    // Raw-seeded -- see the unique-constraint test above for why
+    // `db.create_entity` can't be used here.
+    conn.execute(
+        "INSERT INTO entities (id, name, entity_type, created_at, updated_at) \
+         VALUES ('e1', 'Alice', 'person', 0, 0)",
+        (),
+    )
+    .await
+    .unwrap();
     insert_test_page(&conn, "page_1").await;
     conn.execute(
-        "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, 'page_1', '2024-01-01T00:00:00Z')",
-        libsql::params![e1.clone()],
+        "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES ('e1', 'page_1', '2024-01-01T00:00:00Z')",
+        (),
     )
     .await
     .unwrap();
@@ -41378,7 +41412,7 @@ async fn migration_90_entity_page_map_cascades_on_page_delete() {
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM entity_page_map WHERE entity_id = ?1",
-                libsql::params![e1],
+                libsql::params!["e1"],
             )
             .await
             .unwrap();

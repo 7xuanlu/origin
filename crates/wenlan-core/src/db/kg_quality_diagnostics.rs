@@ -41,12 +41,17 @@ impl MemoryDB {
     pub(crate) async fn list_contradiction_observation_counts(
         &self,
     ) -> Result<Vec<ContradictionObservationCount>, WenlanError> {
+        // G6 Stage 1.5a: entity-name hydration moved onto the `kind='entity'`
+        // shadow page via `entity_page_map`; the observations content read
+        // itself is unchanged (out of scope -- see spec target #17).
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT e.name, COUNT(o.id) as obs_count
-                 FROM entities e JOIN observations o ON o.entity_id = e.id
-                 GROUP BY e.id, e.name HAVING obs_count >= 10
+                "SELECT p.title, COUNT(o.id) as obs_count
+                 FROM entity_page_map epm
+                 JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity' AND p.status = 'active'
+                 JOIN observations o ON o.entity_id = epm.entity_id
+                 GROUP BY epm.entity_id, p.title HAVING obs_count >= 10
                  ORDER BY obs_count DESC LIMIT 20",
                 (),
             )

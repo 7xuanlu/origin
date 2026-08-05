@@ -27,6 +27,17 @@ impl AggregateCounts {
     }
 }
 
+// G6 Stage 1.5a carryover (2026-08-05): NOT migrated. This is a space-count
+// partition, not a well-formedness check -- `KgEntitiesScoped` vs
+// `KgEntitiesUncategorized` IS the NULL-vs-non-NULL `entities.space` split.
+// The shadow-page mirror folds NULL to the `UNFILED_SPACE_ID` sentinel, so a
+// migrated read would see `pages.space` as never NULL and
+// `KgEntitiesUncategorized` would always report 0. Known transitional skew:
+// the `KgEntities` metric emitted here is legacy-derived (`COUNT(*) FROM
+// entities`), while `aggregate_counts` below emits the same metric code
+// shadow-derived (`entity_page_map` JOIN `pages`) -- the two only diverge if
+// the mirror invariant breaks. This function retires with the `entities`
+// store, not before.
 pub(super) async fn entity_partitions(
     context: &LintContext<'_, '_>,
 ) -> Result<Vec<LintMetric>, ()> {
@@ -51,10 +62,13 @@ pub(super) async fn entity_partitions(
     ])
 }
 
+// G6 Stage 1.5a: the `entities` count moved onto `entity_page_map` (1:1 with
+// `entities` by the shadow-page invariant); no space touch here.
 pub(super) async fn aggregate_counts(context: &LintContext<'_, '_>) -> Result<AggregateCounts, ()> {
     let values = scalar_row(
         context,
-        "SELECT (SELECT COUNT(*) FROM entities),
+        "SELECT (SELECT COUNT(*) FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
+                  WHERE p.kind = 'entity' AND p.status = 'active'),
                 (SELECT COUNT(*) FROM edges WHERE edge_type='relates' AND valid_until IS NULL),
                 (SELECT COUNT(*) FROM observations), (SELECT COUNT(*) FROM memory_entities)",
         libsql::params::Params::None,
@@ -74,12 +88,16 @@ pub(super) async fn advisory_metrics(
     hub_cap: u64,
 ) -> Result<Vec<LintMetric>, ()> {
     let cap = i64::try_from(hub_cap).map_err(|_| ())?;
+    // G6 Stage 1.5a: `e.id`/`e.name`/`e.entity_type` moved onto the
+    // `kind='entity'` shadow page via `entity_page_map`; no space touch.
     let values = scalar_row(
         context,
         "WITH degree AS (
-             SELECT e.id, LOWER(TRIM(e.name)) AS normalized_name,
-                    LOWER(TRIM(e.entity_type)) AS entity_type, COUNT(me.memory_id) AS links
-               FROM entities e LEFT JOIN memory_entities me ON me.entity_id=e.id GROUP BY e.id
+             SELECT e.entity_id AS id, LOWER(TRIM(p.title)) AS normalized_name,
+                    LOWER(TRIM(p.entity_type)) AS entity_type, COUNT(me.memory_id) AS links
+               FROM entity_page_map e
+               JOIN pages p ON p.id = e.page_id AND p.kind = 'entity' AND p.status = 'active'
+               LEFT JOIN memory_entities me ON me.entity_id=e.entity_id GROUP BY e.entity_id
          ), duplicate AS (
              SELECT COALESCE(SUM(amount-1),0) AS extras FROM (
                  SELECT COUNT(*) AS amount FROM degree GROUP BY normalized_name HAVING amount>1

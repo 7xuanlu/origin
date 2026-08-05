@@ -101,6 +101,8 @@ mod claim_identity_test;
 #[cfg(test)]
 mod edges_rebuild_test;
 #[cfg(test)]
+mod entity_clean_readers_test;
+#[cfg(test)]
 mod entity_page_adapter_test;
 #[cfg(test)]
 mod eval_lifecycle_integrity_test;
@@ -10089,6 +10091,23 @@ impl MemoryDB {
         Ok(())
     }
 
+    /// G6 Stage 1.5a test helper: backfills the `kind='entity'` shadow page
+    /// for a raw-SQL-seeded `entities` row (test fixtures that `INSERT INTO
+    /// entities` directly, bypassing `store_entity`, would otherwise be
+    /// invisible to every reader migrated in this stage). Call right after
+    /// the raw insert. Not for production use -- normal writes stay on
+    /// `store_entity`, which does this in the same transaction.
+    #[cfg(test)]
+    pub(crate) async fn test_seed_entity_shadow_page(
+        &self,
+        entity_id: &str,
+    ) -> Result<(), WenlanError> {
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let page_id = crate::pages::new_page_id();
+        let conn = self.conn.lock().await;
+        Self::insert_entity_shadow_page(&conn, entity_id, &page_id, &now_iso).await
+    }
+
     // Migration 92 (M3 PR-1, stage f): dual-write entities as `kind='entity'`
     // page shadows. Adds `pages.entity_type`/`pages.confidence`/
     // `pages.entity_confirmed` (mirroring the matching `entities` columns),
@@ -15055,13 +15074,22 @@ impl MemoryDB {
     /// selective `idx_memories_source_id` join. The scale bench (`db::tests`) pins
     /// this via `EXPLAIN QUERY PLAN` over THIS exact string, so stripping the `+`
     /// reddens by cause, not only by the p95 timing symptom.
+    /// G6 Stage 1.5a: `fe`/`te` hydrate only `name` (via the `kind='entity'`
+    /// shadow page, joined through `entity_page_map`), which does not touch
+    /// the `+m.source` memories access-path fix pinned by the `EXPLAIN QUERY
+    /// PLAN` scale-bench assertion above (`db/main_tests.rs`,
+    /// `edge_grounding_candidates` scale bench) — that assertion only checks
+    /// the `memories` LEFT JOIN's index selection, which this join is
+    /// independent of.
     const EDGE_GROUNDING_CANDIDATE_SCAN_SQL: &'static str =
         "SELECT r.rowid, r.from_entity, r.to_entity, r.relation_type,
-                        r.source_memory_id, fe.name, te.name,
+                        r.source_memory_id, pfe.title, pte.title,
                         m.content, m.origin_class, m.source_id, m.url, r.id
                  FROM relations r
-                 JOIN entities fe ON fe.id = r.from_entity
-                 JOIN entities te ON te.id = r.to_entity
+                 JOIN entity_page_map epmfe ON epmfe.entity_id = r.from_entity
+                 JOIN pages pfe ON pfe.id = epmfe.page_id AND pfe.kind = 'entity' AND pfe.status = 'active'
+                 JOIN entity_page_map epmte ON epmte.entity_id = r.to_entity
+                 JOIN pages pte ON pte.id = epmte.page_id AND pte.kind = 'entity' AND pte.status = 'active'
                  LEFT JOIN memories m
                         ON m.source_id = r.source_memory_id
                        AND +m.source = 'memory'
@@ -19605,6 +19633,15 @@ impl MemoryDB {
     /// consumer that flips onto this gate MUST strictly exclude
     /// cross-space legacy rows from its OWN flipped read (read-side
     /// exclusion only, never a row mutation).
+    ///
+    /// 2026-08-05, G6 Stage 1.5a: the 18 readers migrated in that stage
+    /// bypass this gate entirely -- by G6 program design, Stage 1 is an
+    /// unconditional hard cutover to the canonical shadow-page store, the
+    /// same contract 1.1-1.3 used for `edges` while the `reader_uses_edges`
+    /// gate + cutover lever still existed. This gate's only remaining
+    /// consumers are the `scoped_entities` vanguard hybrid reads
+    /// (`db/scoped_entities.rs`); this gate and `entity_reader_cutover`
+    /// retire together in Stage 2 when the writers cut over.
     async fn reader_uses_entity_pages(
         conn: &libsql::Connection,
         consumer: &str,
@@ -24713,8 +24750,15 @@ impl MemoryDB {
             .collect();
         if !entity_ids.is_empty() {
             let placeholders: Vec<String> = entity_ids.iter().map(|_| "?".to_string()).collect();
+            // G6 Stage 1.5a review fix #6: name-only, space-free hydration by
+            // id set -- CLEAN under the spec's own rule, moved onto the
+            // `kind='entity'` shadow page via `entity_page_map`, same join
+            // shape as `EDGE_GROUNDING_CANDIDATE_SCAN_SQL` above.
             let sql = format!(
-                "SELECT id, name FROM entities WHERE id IN ({})",
+                "SELECT epm.entity_id, p.title FROM entity_page_map epm
+                 JOIN pages p ON p.id = epm.page_id
+                 WHERE p.kind = 'entity' AND p.status = 'active'
+                   AND epm.entity_id IN ({})",
                 placeholders.join(",")
             );
             let params: Vec<libsql::Value> = entity_ids
@@ -26185,6 +26229,10 @@ impl MemoryDB {
     ///
     /// Returns the deduped, sorted expanded id set (always a superset of the
     /// non-empty seeds). Empty seeds -> empty (caller keeps the anchor set).
+    /// G6 Stage 1.5a: the endpoint scope-filter joins the `kind='entity'`
+    /// shadow page (via `entity_page_map`) instead of `entities` directly —
+    /// safe under the space-sentinel fold, same argument as
+    /// `filter_entity_ids_scoped`.
     async fn expand_anchor_entities_khop(
         &self,
         anchor_entity_ids: &[String],
@@ -26249,24 +26297,28 @@ impl MemoryDB {
             let (endpoint_scope, scope_value) = match scope {
                 ReadScope::Global => (String::new(), None),
                 ReadScope::Space(space) => (
-                    format!("AND ef.space = ?{scope_parameter} AND et.space = ?{scope_parameter}"),
+                    format!("AND pf.space = ?{scope_parameter} AND pt.space = ?{scope_parameter}"),
                     Some(libsql::Value::Text(space.clone())),
                 ),
                 ReadScope::Uncategorized => (
-                    "AND ef.space IS NULL AND et.space IS NULL".to_string(),
-                    None,
+                    format!("AND pf.space = ?{scope_parameter} AND pt.space = ?{scope_parameter}"),
+                    Some(libsql::Value::Text(crate::db::UNFILED_SPACE_ID.to_string())),
                 ),
             };
             let sql = format!(
                 "SELECT r.src_id, r.dst_id FROM edges r
-                 JOIN entities ef ON ef.id = r.src_id
-                 JOIN entities et ON et.id = r.dst_id
+                 JOIN entity_page_map epmf ON epmf.entity_id = r.src_id
+                 JOIN pages pf ON pf.id = epmf.page_id AND pf.kind = 'entity' AND pf.status = 'active'
+                 JOIN entity_page_map epmt ON epmt.entity_id = r.dst_id
+                 JOIN pages pt ON pt.id = epmt.page_id AND pt.kind = 'entity' AND pt.status = 'active'
                  WHERE r.edge_type='relates' AND r.valid_until IS NULL
                    AND r.src_id IN ({ph}) {endpoint_scope}
                  UNION
                  SELECT r.src_id, r.dst_id FROM edges r
-                 JOIN entities ef ON ef.id = r.src_id
-                 JOIN entities et ON et.id = r.dst_id
+                 JOIN entity_page_map epmf ON epmf.entity_id = r.src_id
+                 JOIN pages pf ON pf.id = epmf.page_id AND pf.kind = 'entity' AND pf.status = 'active'
+                 JOIN entity_page_map epmt ON epmt.entity_id = r.dst_id
+                 JOIN pages pt ON pt.id = epmt.page_id AND pt.kind = 'entity' AND pt.status = 'active'
                  WHERE r.edge_type='relates' AND r.valid_until IS NULL
                    AND r.dst_id IN ({ph}) {endpoint_scope}
                  ORDER BY src_id, dst_id",
@@ -26743,6 +26795,8 @@ impl MemoryDB {
             .await
     }
 
+    /// G6 Stage 1.5a: same shadow-page endpoint join as
+    /// `expand_anchor_entities_khop`.
     async fn expand_entities_khop_scoped(
         &self,
         seed_ids: &[String],
@@ -26785,24 +26839,28 @@ impl MemoryDB {
             let (endpoint_scope, scope_value) = match scope {
                 ReadScope::Global => (String::new(), None),
                 ReadScope::Space(space) => (
-                    format!("AND ef.space = ?{scope_parameter} AND et.space = ?{scope_parameter}"),
+                    format!("AND pf.space = ?{scope_parameter} AND pt.space = ?{scope_parameter}"),
                     Some(libsql::Value::Text(space.clone())),
                 ),
                 ReadScope::Uncategorized => (
-                    "AND ef.space IS NULL AND et.space IS NULL".to_string(),
-                    None,
+                    format!("AND pf.space = ?{scope_parameter} AND pt.space = ?{scope_parameter}"),
+                    Some(libsql::Value::Text(crate::db::UNFILED_SPACE_ID.to_string())),
                 ),
             };
             let sql = format!(
                 "SELECT r.dst_id FROM edges r
-                 JOIN entities ef ON ef.id = r.src_id
-                 JOIN entities et ON et.id = r.dst_id
+                 JOIN entity_page_map epmf ON epmf.entity_id = r.src_id
+                 JOIN pages pf ON pf.id = epmf.page_id AND pf.kind = 'entity' AND pf.status = 'active'
+                 JOIN entity_page_map epmt ON epmt.entity_id = r.dst_id
+                 JOIN pages pt ON pt.id = epmt.page_id AND pt.kind = 'entity' AND pt.status = 'active'
                  WHERE r.edge_type='relates' AND r.valid_until IS NULL
                    AND r.src_id IN ({ph}) {endpoint_scope}
                  UNION
                  SELECT r.src_id FROM edges r
-                 JOIN entities ef ON ef.id = r.src_id
-                 JOIN entities et ON et.id = r.dst_id
+                 JOIN entity_page_map epmf ON epmf.entity_id = r.src_id
+                 JOIN pages pf ON pf.id = epmf.page_id AND pf.kind = 'entity' AND pf.status = 'active'
+                 JOIN entity_page_map epmt ON epmt.entity_id = r.dst_id
+                 JOIN pages pt ON pt.id = epmt.page_id AND pt.kind = 'entity' AND pt.status = 'active'
                  WHERE r.edge_type='relates' AND r.valid_until IS NULL
                    AND r.dst_id IN ({ph}) {endpoint_scope}",
                 ph = ph
@@ -31494,6 +31552,13 @@ impl MemoryDB {
     // ===== Knowledge Graph Methods =====
 
     /// Create a new entity in the knowledge graph (simplified — no embedding, no source_agent/confidence).
+    /// Test-only: has zero production callers (the canonical write path is
+    /// `resolve_or_create_entity` -> `store_entity`, which dual-writes the
+    /// `kind='entity'` shadow page in the same transaction). Gated to keep it
+    /// from becoming a silent shadow-invariant violation if a future caller
+    /// picks it up; it now writes its own shadow page so test fixtures built
+    /// on it stay invariant-complete (G6 Stage 1.5a).
+    #[cfg(test)]
     pub async fn create_entity(
         &self,
         name: &str,
@@ -31502,21 +31567,46 @@ impl MemoryDB {
     ) -> Result<String, WenlanError> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
+        let now_iso = chrono::Utc::now().to_rfc3339();
 
         let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO entities (id, name, entity_type, space, confirmed, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
-            libsql::params![
-                id.clone(),
-                name.to_string(),
-                entity_type.to_string(),
-                space.map(|d| d.to_string()),
-                now
-            ],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("create_entity: {}", e)))?;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("create_entity begin: {}", e)))?;
+
+        let result: Result<(), WenlanError> = async {
+            conn.execute(
+                "INSERT INTO entities (id, name, entity_type, space, confirmed, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
+                libsql::params![
+                    id.clone(),
+                    name.to_string(),
+                    entity_type.to_string(),
+                    space.map(|d| d.to_string()),
+                    now
+                ],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("create_entity: {}", e)))?;
+
+            let page_id = crate::pages::new_page_id();
+            Self::insert_entity_shadow_page(&conn, &id, &page_id, &now_iso).await?;
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("create_entity commit: {}", e)))?;
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        }
 
         Ok(id)
     }
@@ -31785,6 +31875,10 @@ impl MemoryDB {
     /// the T16 MinHash cascade to apply the same-type guard on band candidates
     /// without loading the full `EntityDetail` (observations etc.). Returns
     /// `None` if the id does not exist.
+    /// G6 Stage 1.5a: reads the `kind='entity'` shadow page (title=name,
+    /// entity_type) via `entity_page_map` instead of `entities` directly —
+    /// both fields are mirrored 1:1 by `insert_entity_shadow_page`/
+    /// `update_entity_shadow_page`, and this reader never touches `space`.
     pub async fn get_entity_name_type(
         &self,
         entity_id: &str,
@@ -31792,7 +31886,9 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT name, entity_type FROM entities WHERE id = ?1",
+                "SELECT p.title, p.entity_type FROM entity_page_map epm
+                 JOIN pages p ON p.id = epm.page_id
+                 WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
                 libsql::params![entity_id.to_string()],
             )
             .await
@@ -33122,6 +33218,16 @@ impl MemoryDB {
         Ok(result)
     }
 
+    // G6 Stage 1.5a carryover (2026-08-05): NOT migrated. This guards relation
+    // writes (`post_write/entity_graph.rs`, both endpoints of a new relation)
+    // reading the exact store `store_entity`/`merge_entities` write -- the
+    // spec's WRITER-COUPLED shared-CRUD core, whose discovery reads flip with
+    // their writers in Stage 2, not ahead of them. The reason is Stage-2
+    // writer-BATCH alignment (this check and its writer move as one unit so
+    // the migration doesn't split a single logical write path across two
+    // stores mid-flight), not connection-level coupling -- the shared-mutex
+    // `conn` below can never observe another writer's uncommitted rows
+    // regardless of which store it queries, so that argument never held.
     pub async fn entity_exists(&self, entity_id: &str) -> Result<bool, WenlanError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
@@ -33417,13 +33523,25 @@ impl MemoryDB {
     }
 
     /// Resolve entity by name: exact match → LIKE substring → vector search → None.
+    /// G6 Stage 1.5a: steps A/B migrated onto the `kind='entity'` shadow
+    /// page's `title` (mirrors `entities.name`), joined via `entity_page_map`.
+    /// Step C (vector similarity) is unchanged — it stays legacy, BLOCKED for
+    /// 1.5b per spec.
     pub async fn resolve_entity_by_name(&self, name: &str) -> Result<Option<String>, WenlanError> {
         {
             let conn = self.conn.lock().await;
-            // Step A: exact case-insensitive match
+            // Step A: exact case-insensitive match. G6 Stage 1.5a review fix
+            // #5: an ambiguous name (two active entity pages with the same
+            // title) has equal title match quality by construction, so the
+            // ORDER BY below is purely for a stable winner across access
+            // paths -- not a relevance ranking.
             let mut rows = conn
                 .query(
-                    "SELECT id FROM entities WHERE LOWER(name) = LOWER(?1) LIMIT 1",
+                    "SELECT epm.entity_id FROM entity_page_map epm
+                     JOIN pages p ON p.id = epm.page_id
+                     WHERE p.kind = 'entity' AND p.status = 'active'
+                       AND LOWER(p.title) = LOWER(?1)
+                     ORDER BY p.title ASC, epm.entity_id ASC LIMIT 1",
                     libsql::params![name],
                 )
                 .await
@@ -33432,10 +33550,16 @@ impl MemoryDB {
                 let id: String = row.get(0).unwrap();
                 return Ok(Some(id));
             }
-            // Step B: fuzzy LIKE substring match
+            // Step B: fuzzy LIKE substring match. Same determinism fix as
+            // step A -- the ORDER BY gives a stable winner among equally
+            // matching titles, not a relevance ranking.
             let mut rows = conn
                 .query(
-                    "SELECT id FROM entities WHERE name LIKE '%' || ?1 || '%' LIMIT 1",
+                    "SELECT epm.entity_id FROM entity_page_map epm
+                     JOIN pages p ON p.id = epm.page_id
+                     WHERE p.kind = 'entity' AND p.status = 'active'
+                       AND p.title LIKE '%' || ?1 || '%'
+                     ORDER BY p.title ASC, epm.entity_id ASC LIMIT 1",
                     libsql::params![name],
                 )
                 .await
@@ -37002,10 +37126,17 @@ impl MemoryDB {
     }
 
     /// Count rows in the `entities` table (knowledge-graph nodes).
+    /// G6 Stage 1.5a: counts via `entity_page_map` (1:1 with `entities` by
+    /// the shadow-page invariant) instead of `entities` directly.
     pub async fn count_entities(&self) -> Result<i64, WenlanError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
-            .query("SELECT COUNT(*) FROM entities", ())
+            .query(
+                "SELECT COUNT(*) FROM entity_page_map epm
+                 JOIN pages p ON p.id = epm.page_id
+                 WHERE p.kind = 'entity' AND p.status = 'active'",
+                (),
+            )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("count_entities query: {}", e)))?;
         let row = rows
@@ -39867,10 +39998,14 @@ impl MemoryDB {
         // to the edges/cites union (which includes D7 survivors backed only
         // by pages.citations) changes the eligibility pool and deserves its
         // own test attention. Folds into Stage 2.
+        // G6 Stage 1.5a: `e.name` hydration moved onto the `kind='entity'`
+        // shadow page (via `entity_page_map`) -- name-only projection, no
+        // space touch, LEFT JOIN semantics preserved.
         let mut sql = String::from(
-            "SELECT m.source_id, m.content, m.entity_id, m.space, m.embedding, e.name, m.source_agent, m.content_hash \
+            "SELECT m.source_id, m.content, m.entity_id, m.space, m.embedding, p.title, m.source_agent, m.content_hash \
              FROM memories m \
-             LEFT JOIN entities e ON m.entity_id = e.id \
+             LEFT JOIN entity_page_map epm ON epm.entity_id = m.entity_id \
+             LEFT JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity' AND p.status = 'active' \
              WHERE m.source = 'memory' AND m.chunk_index = 0 \
                AND (m.pinned = 0 OR m.pinned IS NULL) \
                AND m.supersede_mode NOT IN ('archive', 'evicted') \
@@ -40145,9 +40280,12 @@ impl MemoryDB {
         // to the edges/cites union (which includes D7 survivors backed only
         // by pages.citations) changes the eligibility pool and deserves its
         // own test attention. Folds into Stage 2.
+        // G6 Stage 1.5a: `e.name` hydration moved onto the `kind='entity'`
+        // shadow page (via `entity_page_map`) -- same pattern as
+        // `query_distillation_staging_pool` above.
         let mut sql = String::from(
             "SELECT m.id, m.source_id, m.content, m.entity_id, m.space, m.embedding, \
-                    e.name, m.source_agent, m.content_hash, \
+                    p.title, m.source_agent, m.content_hash, \
                     CASE WHEN m.source = 'memory' AND m.chunk_index = 0 \
                            AND (m.pinned = 0 OR m.pinned IS NULL) \
                            AND m.supersede_mode NOT IN ('archive', 'evicted') \
@@ -40160,7 +40298,8 @@ impl MemoryDB {
                            ) \
                          THEN 1 ELSE 0 END AS eligible \
              FROM memories m \
-             LEFT JOIN entities e ON m.entity_id = e.id \
+             LEFT JOIN entity_page_map epm ON epm.entity_id = m.entity_id \
+             LEFT JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity' AND p.status = 'active' \
              WHERE 1 = 1",
         );
         let mut bind = Vec::<libsql::Value>::new();
@@ -40208,10 +40347,13 @@ impl MemoryDB {
         // to the edges/cites union (which includes D7 survivors backed only
         // by pages.citations) changes the eligibility pool and deserves its
         // own test attention. Folds into Stage 2.
+        // G6 Stage 1.5a: `e.name` hydration moved onto the `kind='entity'`
+        // shadow page (via `entity_page_map`) -- same pattern as the two
+        // sibling distillation queries above.
         let mut rows = conn
             .query(
                 "SELECT m.source_id, m.content, m.entity_id, m.space, m.embedding, \
-                        e.name, m.source_agent, m.content_hash, \
+                        p.title, m.source_agent, m.content_hash, \
                         CASE WHEN m.source = 'memory' AND m.chunk_index = 0 \
                                AND (m.pinned = 0 OR m.pinned IS NULL) \
                                AND m.supersede_mode NOT IN ('archive', 'evicted') \
@@ -40226,7 +40368,8 @@ impl MemoryDB {
                              THEN 1 ELSE 0 END AS eligible \
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt \
                  JOIN memories m ON m.rowid = vt.id \
-                 LEFT JOIN entities e ON m.entity_id = e.id",
+                 LEFT JOIN entity_page_map epm ON epm.entity_id = m.entity_id \
+                 LEFT JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity' AND p.status = 'active'",
                 libsql::params![vec_str, limit as i64],
             )
             .await

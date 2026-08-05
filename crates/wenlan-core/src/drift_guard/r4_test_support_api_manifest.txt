@@ -299,6 +299,15 @@ crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::de
 crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::orphan_revision_is_one_exact_repair_for_both_checks|test_primary_session|1
 crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::page_projection_reserved_target_is_blocked|TestDbSession::execute|1
 crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::page_projection_reserved_target_is_blocked|test_primary_session|1
+crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard|TestDbRow::get|1
+crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard|TestDbRow::get|2
+crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard|TestDbRows::next|1
+crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard|TestDbRows::next|2
+crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard|TestDbSession::execute_batch|1
+crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard|TestDbSession::query|1
+crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard|TestDbSession::query|2
+crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard|test_primary_session|1
+crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard|test_primary_session|2
 crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::registered_scope_does_not_resolve_global_tag_findings|TestDbSession::execute_batch|1
 crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::registered_scope_does_not_resolve_global_tag_findings|test_primary_session|1
 crates/wenlan-core/src/repair_plan/deterministic_tests.rs|crate::repair_plan::deterministic::tests::source_page_archive_accepts_rust_whitespace_persisted_below_ingress|TestDbSession::execute|1

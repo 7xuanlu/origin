@@ -169,6 +169,18 @@ Order by measured entanglement:
 5. **`entities` + `entity_aliases` + `observations`** (~25+ fns) — largest surface;
    readers move to the `kind='entity'` shadow pages. Depends on stage 1.2's shared-
    CRUD rework.
+   **Stage 1.5a — status (2026-08-05):** migrated the 18 CLEAN readers in the
+   spec table (`docs/plans/2026-08-05-g6-stage15a-entity-clean-readers-spec.md`)
+   onto `entity_page_map` JOIN `pages` (`kind='entity'`, `status='active'`); the
+   `create_entity` shadow-page landmine fixed alongside. 10 readers stay CARRYOVER
+   (space-sensitive under the NULL->`UNFILED_SPACE_ID` fold, or writer-coupled —
+   dated in place, see the spec's carryover list). Hard-cut, no `reader_uses_entity_pages`
+   gate on the migrated readers: this is the program's Stage 1 contract, the same
+   unconditional cutover 1.1-1.3 used for `edges` while that gate + cutover-lever
+   still existed; the gate and `entity_reader_cutover` retire together with the
+   writers in Stage 2. Empirically backed on the live DB (swept 2026-08-05 07:30,
+   post-migrations 113/114): `entity_page_parity_watermark` drift 0, 907/907
+   expected-vs-actual shadow pages, 0 `entities` rows without a live shadow page.
 
 Each store's migration is one PR: readers redirected to `edges`/shadow pages,
 behavior-equivalence tests, and the store's parity derivation dropped from

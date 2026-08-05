@@ -9,13 +9,19 @@ use wenlan_types::{Space, WriteSpaceSource, WriteSpaceTarget};
 const LEGACY_DEFAULT_WATERMARK: &str = "legacy_default_imported";
 
 impl MemoryDB {
+    // G6 Stage 1.5a: `ent_count` reads the `kind='entity'` shadow page's
+    // `space` (via `entity_page_map`) instead of `entities.space` directly.
+    // Safe: `s.name` here is always a registered space's name (the outer
+    // `WHERE s.id != UNFILED_SPACE_ID` excludes the one spaces row whose
+    // name IS the sentinel), so it can never equal `UNFILED_SPACE_ID` and
+    // spuriously match NULL-folded entities.
     async fn get_space_by_id(&self, id: &str) -> Result<Option<Space>, WenlanError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
                 "SELECT s.id, s.name, s.description, s.suggested, s.created_at, s.updated_at,
                         (SELECT COUNT(DISTINCT c.source_id) FROM memories c WHERE c.space = s.name AND c.source = 'memory' AND c.pending_revision = 0 AND COALESCE(c.is_recap, 0) = 0 AND c.source_id NOT IN (SELECT supersedes FROM memories WHERE supersedes IS NOT NULL AND pending_revision = 0 AND source = 'memory' GROUP BY supersedes)) as mem_count,
-                        (SELECT COUNT(*) FROM entities e WHERE e.space = s.name) as ent_count,
+                        (SELECT COUNT(*) FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id WHERE p.kind = 'entity' AND p.status = 'active' AND p.space = s.name) as ent_count,
                         s.sort_order, s.starred, s.is_default
                  FROM spaces s
                  WHERE s.id = ?1 AND s.id != ?2",
