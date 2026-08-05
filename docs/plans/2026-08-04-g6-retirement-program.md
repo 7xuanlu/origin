@@ -68,6 +68,17 @@ path); ambient watermarks stay drift 0 across a soak.
 
 ## Stage 1 — migrate readers onto canonical stores, cheapest first
 
+**Decision (user, 2026-08-05): one source of truth.** The semantic-payload
+schema change is authorized — `relates` edges carry `relation_type` (+
+`confidence`/`explanation`/`source_agent`), `links` edges carry the display
+`label`, with a backfill migration from the legacy rows. No legacy store
+survives Stage 3 as a permanent side-table. The same principle extends to
+`cites` edges where Stage 1.3 found unrecoverable columns (`link_reason`,
+`linked_at`, the 4-way `source_kind`): carry them in edge payload/columns
+rather than keeping `page_sources`/`page_evidence` alive. The payload PR
+lands FIRST (before any reader migration), since every blocked reader in the
+scout reports migrates only once the semantic fields exist on the edge.
+
 Order by measured entanglement:
 
 1. **`page_links`** (~9 fns) — one dual-write-aware writer choke point
