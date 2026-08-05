@@ -377,14 +377,30 @@ async fn get_entity_detail_scoped_requires_matching_relation_endpoints() {
         )
         .await
         .unwrap();
-    let visible = db
-        .create_relation(&work, &work_peer, "related_to", None, None, None, None)
+    db.create_relation(&work, &work_peer, "related_to", None, None, None, None)
         .await
         .unwrap();
-    let hidden = db
-        .create_relation(&work, &personal, "related_to", None, None, None, None)
+    db.create_relation(&work, &personal, "related_to", None, None, None, None)
         .await
         .unwrap();
+    // G6 Stage 1.2 Trap 2: the reader's relation `id` is now the active
+    // edge's edge_id, not create_relation's relations-row uuid return value.
+    let visible = crate::provenance::compute_edge_id(
+        "relates",
+        "entity",
+        &work,
+        "entity",
+        &work_peer,
+        "related_to",
+    );
+    let hidden = crate::provenance::compute_edge_id(
+        "relates",
+        "entity",
+        &work,
+        "entity",
+        &personal,
+        "related_to",
+    );
 
     let detail = db
         .get_entity_detail_scoped(&work, &ReadScope::Space("work".to_string()))
@@ -426,14 +442,30 @@ async fn list_recent_relations_scoped_requires_both_endpoints() {
         )
         .await
         .unwrap();
-    let visible = db
-        .create_relation(&work, &work_peer, "related_to", None, None, None, None)
+    db.create_relation(&work, &work_peer, "related_to", None, None, None, None)
         .await
         .unwrap();
-    let hidden = db
-        .create_relation(&work, &personal, "related_to", None, None, None, None)
+    db.create_relation(&work, &personal, "related_to", None, None, None, None)
         .await
         .unwrap();
+    // G6 Stage 1.2 Trap 2: the reader's relation `id` is now the active
+    // edge's edge_id, not create_relation's relations-row uuid return value.
+    let visible = crate::provenance::compute_edge_id(
+        "relates",
+        "entity",
+        &work,
+        "entity",
+        &work_peer,
+        "related_to",
+    );
+    let hidden = crate::provenance::compute_edge_id(
+        "relates",
+        "entity",
+        &work,
+        "entity",
+        &personal,
+        "related_to",
+    );
 
     let selected = db
         .list_recent_relations_scoped(20, None, &ReadScope::Space("work".to_string()))
@@ -740,6 +772,79 @@ async fn list_recent_relations_scoped_hybrid_matches_legacy() {
         format!("{legacy:?}"),
         format!("{hybrid:?}"),
         "hybrid list_recent_relations_scoped must be byte-identical to legacy"
+    );
+}
+
+/// G6 Stage 1.2 (relations-readers migration,
+/// docs/plans/2026-08-05-g6-stage12-relations-readers-spec.md): the scoped
+/// variants must read the same `relates` edge fields as their unscoped
+/// counterparts -- edge_id as `id`, entity names via the join -- and the
+/// scope filter must still exclude a relation from a different space.
+#[tokio::test]
+async fn get_entity_detail_scoped_and_list_recent_relations_scoped_read_edges() {
+    let (db, _tmp) = test_db().await;
+    let scope = ReadScope::Space("g6_scoped_space_a".to_string());
+    let alice = db
+        .create_entity("G6 Scoped Alice", "person", Some("g6_scoped_space_a"))
+        .await
+        .unwrap();
+    let wenlan = db
+        .create_entity("G6 Scoped Wenlan", "project", Some("g6_scoped_space_a"))
+        .await
+        .unwrap();
+    db.create_relation(
+        &alice,
+        &wenlan,
+        "works_on",
+        Some("claude"),
+        Some(0.9),
+        Some("seen"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let expected_edge_id = crate::provenance::compute_edge_id(
+        "relates", "entity", &alice, "entity", &wenlan, "works_on",
+    );
+
+    let detail = db.get_entity_detail_scoped(&alice, &scope).await.unwrap();
+    assert_eq!(detail.relations.len(), 1);
+    assert_eq!(
+        detail.relations[0].id, expected_edge_id,
+        "scoped detail relation id must be the active edge's edge_id"
+    );
+    assert_eq!(detail.relations[0].entity_name, "G6 Scoped Wenlan");
+
+    let recent = db
+        .list_recent_relations_scoped(10, None, &scope)
+        .await
+        .unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].id, expected_edge_id);
+    assert_eq!(recent[0].from_entity_name, "G6 Scoped Alice");
+    assert_eq!(recent[0].to_entity_name, "G6 Scoped Wenlan");
+
+    // A relation in a different space must not leak into this scope.
+    let outside_a = db
+        .create_entity("G6 Scoped Outside A", "person", Some("g6_scoped_space_b"))
+        .await
+        .unwrap();
+    let outside_b = db
+        .create_entity("G6 Scoped Outside B", "project", Some("g6_scoped_space_b"))
+        .await
+        .unwrap();
+    db.create_relation(&outside_a, &outside_b, "knows", None, None, None, None)
+        .await
+        .unwrap();
+    let recent_after = db
+        .list_recent_relations_scoped(10, None, &scope)
+        .await
+        .unwrap();
+    assert_eq!(
+        recent_after.len(),
+        1,
+        "a relation in a different space must not leak into this scope"
     );
 }
 

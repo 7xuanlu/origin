@@ -596,7 +596,7 @@ impl MemoryDB {
                 // the edge (G6 Stage 1) — the merge branch just rewrote them.
                 let mut sem_rows = conn
                     .query(
-                        "SELECT confidence, explanation, source_agent FROM relations \
+                        "SELECT confidence, explanation, source_agent, created_at FROM relations \
                          WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
                         libsql::params![from.clone(), to.clone(), canonical.to_string()],
                     )
@@ -611,8 +611,14 @@ impl MemoryDB {
                         row.get::<Option<f64>>(0).unwrap_or(None),
                         row.get::<Option<String>>(1).unwrap_or(None).as_deref(),
                         row.get::<Option<String>>(2).unwrap_or(None).as_deref(),
+                        row.get::<i64>(3).unwrap_or_else(|_| chrono::Utc::now().timestamp()),
                     ),
-                    None => Self::relates_semantic_patch(None, None, None),
+                    None => Self::relates_semantic_patch(
+                        None,
+                        None,
+                        None,
+                        chrono::Utc::now().timestamp(),
+                    ),
                 };
                 drop(sem_rows);
                 let (_, mint_changes) = Self::dual_write_edge_with_payload(
@@ -804,7 +810,11 @@ pub const EMBEDDING_DIM: usize = 768;
 /// lane did while it wrote `relations` without their `edges` twin. It follows
 /// M5's judge-eligibility registry and generation fence at 110. Migration 115
 /// adds `edges.semantic_type` + the payload semantic keys (G6 Stage 1).
-pub const SCHEMA_VERSION: u32 = 115;
+/// Migration 116 backfills `payload.asserted_at` (+ fill-if-absent
+/// `source_memory_id`) on active relates edges (G6 Stage 1.2), so the
+/// migrated `relations` readers order/filter on the relation's true
+/// creation time instead of the edge's dual-write timestamp.
+pub const SCHEMA_VERSION: u32 = 116;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8657,6 +8667,17 @@ impl MemoryDB {
             if version < 115 {
                 self.migrate_115_edge_semantic_payload(version).await?;
             }
+
+            // Migration 116 (KG close plan G6, Stage 1.2): backfill
+            // `payload.asserted_at` (always) and fill-if-absent
+            // `source_memory_id` on every active relates edge from its
+            // live `relations` twin, so the migrated readers can order
+            // and filter on the relation's true creation time instead of
+            // the edge's (possibly migration-day) `created_at`. See
+            // migrate_116_relates_asserted_at.
+            if version < 116 {
+                self.migrate_116_relates_asserted_at(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -13321,7 +13342,7 @@ impl MemoryDB {
                 let mut rows = conn
                     .query(
                         "SELECT from_entity, to_entity, relation_type, \
-                                confidence, explanation, source_agent \
+                                confidence, explanation, source_agent, created_at \
                          FROM relations",
                         (),
                     )
@@ -13338,6 +13359,7 @@ impl MemoryDB {
                     let confidence: Option<f64> = row.get(3).unwrap_or(None);
                     let explanation: Option<String> = row.get(4).unwrap_or(None);
                     let source_agent: Option<String> = row.get(5).unwrap_or(None);
+                    let created_at: i64 = row.get(6).unwrap_or_default();
                     let edge_id = crate::provenance::compute_edge_id(
                         "relates",
                         "entity",
@@ -13346,13 +13368,15 @@ impl MemoryDB {
                         &to_entity,
                         &relation_type,
                     );
-                    // An empty patch is no patch (mirrors
-                    // `relates_semantic_patch`): only semantic_type is set,
-                    // and a NULL payload stays NULL instead of becoming "{}".
+                    // Migration 116 (G6 Stage 1.2) always overwrites
+                    // `asserted_at` afterward from the same live relations
+                    // row, so this call's contribution to that key is
+                    // redundant-but-harmless on a fresh full-chain upgrade.
                     let patch = Self::relates_semantic_patch(
                         confidence,
                         explanation.as_deref(),
                         source_agent.as_deref(),
+                        created_at,
                     );
                     pending.push((edge_id, relation_type, patch));
                 }
@@ -13434,6 +13458,92 @@ impl MemoryDB {
             "[migration] Migration 115 applied: semantic payload backfilled \
              ({relates_updated} relates, {cites_updated} cites, {links_updated} links updates)"
         );
+        Ok(())
+    }
+
+    /// Backfill `payload.asserted_at` (always) and fill-if-absent
+    /// `payload.source_memory_id` on every active `relates` edge, joined
+    /// structurally to its live `relations` twin on `(src_id, dst_id,
+    /// semantic_type)` = `(from_entity, to_entity, relation_type)` --
+    /// UNIQUE in `relations` (the upsert conflict target), so the join
+    /// cannot multiply rows. Edges with no matching live `relations` row
+    /// (retired legacy row, cross-store residue) are left untouched -- the
+    /// COALESCE fallback in the migrated readers covers them. Idempotent:
+    /// a rerun recomputes the same `asserted_at` from the same live row,
+    /// and `source_memory_id` is only ever filled once it is present.
+    async fn migrate_116_relates_asserted_at(&self, prior_version: i64) -> Result<(), WenlanError> {
+        self.backup_before_migration(116, prior_version).await?;
+        let conn = self.conn.lock().await;
+
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m116 begin: {e}")))?;
+
+        let result: Result<u64, WenlanError> = async {
+            #[allow(clippy::type_complexity)]
+            let mut pending: Vec<(String, i64, Option<String>)> = Vec::new();
+            let mut rows = conn
+                .query(
+                    "SELECT e.edge_id, r.created_at, r.source_memory_id \
+                     FROM edges e \
+                     JOIN relations r \
+                       ON r.from_entity = e.src_id AND r.to_entity = e.dst_id \
+                      AND r.relation_type = e.semantic_type \
+                     WHERE e.edge_type = 'relates' AND e.valid_until IS NULL",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m116 scan: {e}")))?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m116 row: {e}")))?
+            {
+                let edge_id: String = row.get(0).unwrap_or_default();
+                let created_at: i64 = row.get(1).unwrap_or_default();
+                let source_memory_id: Option<String> = row.get(2).unwrap_or(None);
+                pending.push((edge_id, created_at, source_memory_id));
+            }
+            drop(rows);
+
+            let mut updated = 0u64;
+            for (edge_id, created_at, source_memory_id) in pending {
+                updated += conn
+                    .execute(
+                        "UPDATE edges SET payload = CASE \
+                             WHEN json_extract(payload, '$.source_memory_id') IS NULL \
+                                  AND ?3 IS NOT NULL \
+                             THEN json_set(json_set(COALESCE(payload, '{}'), \
+                                      '$.asserted_at', ?2), '$.source_memory_id', ?3) \
+                             ELSE json_set(COALESCE(payload, '{}'), '$.asserted_at', ?2) \
+                         END \
+                         WHERE edge_id = ?1 AND valid_until IS NULL",
+                        libsql::params![edge_id, created_at, source_memory_id],
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m116 update: {e}")))?;
+            }
+            Ok(updated)
+        }
+        .await;
+
+        let updated = match result {
+            Ok(count) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m116 commit: {e}")))?;
+                count
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+
+        conn.execute("PRAGMA user_version = 116", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m116 bump: {e}")))?;
+        log::info!("[migration] Migration 116 applied: {updated} relates edges backfilled");
         Ok(())
     }
 
@@ -14358,13 +14468,15 @@ impl MemoryDB {
     /// the relation's display/audit fields, mirrored from its `relations`
     /// row. Only known values are included — `json_patch` treats a JSON
     /// null as "remove the key", so an absent value must be absent from
-    /// the patch, not null. Returns `None` when every field is absent: an
-    /// empty patch is no patch, and must not materialize a `"{}"` payload
-    /// on an edge whose payload would otherwise stay NULL.
+    /// the patch, not null. `asserted_at` (G6 Stage 1.2) mirrors the
+    /// STORED relations row's `created_at` and is always included, so the
+    /// patch is never empty — every call now carries at least this key,
+    /// unlike the pre-Stage-1.2 all-`None` case that returned `None`.
     fn relates_semantic_patch(
         confidence: Option<f64>,
         explanation: Option<&str>,
         source_agent: Option<&str>,
+        asserted_at: i64,
     ) -> Option<String> {
         let mut patch = serde_json::Map::new();
         if let Some(v) = confidence {
@@ -14376,11 +14488,8 @@ impl MemoryDB {
         if let Some(v) = source_agent {
             patch.insert("source_agent".into(), serde_json::json!(v));
         }
-        if patch.is_empty() {
-            None
-        } else {
-            Some(serde_json::Value::Object(patch).to_string())
-        }
+        patch.insert("asserted_at".into(), serde_json::json!(asserted_at));
+        Some(serde_json::Value::Object(patch).to_string())
     }
 
     /// Build the semantic-patch JSON for a `cites` edge (G6 Stage 1): the
@@ -14409,20 +14518,26 @@ impl MemoryDB {
     /// Like [`dual_write_edge`], plus an optional JSON `payload` written
     /// once at INSERT time (M3g Stage A span capture, §2.3/§6.6) and the
     /// G6 semantic fields. The `ON CONFLICT` clause below never assigns
-    /// `payload` from ?12, so a later reactivation/re-write of the same
-    /// content-addressed `edge_id` cannot clobber the PROVENANCE keys
-    /// (`span`, `model_version`, `prompt_version`, `source_memory_id`) --
+    /// `payload` from ?12 wholesale, so a later reactivation/re-write of
+    /// the same content-addressed `edge_id` cannot clobber the
+    /// PROVENANCE keys (`span`, `model_version`, `prompt_version`) --
     /// those stay write-once-at-birth by construction. The SEMANTIC keys
     /// (`label`, `link_reason`, `linked_at`, `source_kind`, `title`,
-    /// `confidence`, `explanation`, `source_agent`), passed as the
-    /// separate `semantic_patch` JSON object, are `json_patch`-MERGED on
-    /// both insert and conflict -- a re-assertion of the same fact
-    /// refreshes them (G6 Stage 1 "one source of truth", spec
-    /// docs/plans/2026-08-05-g6-edge-semantic-payload-spec.md), which is
-    /// what keeps e.g. a relation's confidence current on the edge.
-    /// `semantic_type` (the relates `relation_type`; NULL for cites, and
-    /// reserved for links) is a real column, COALESCE-kept on conflict so
-    /// a caller that does not know it cannot NULL it out.
+    /// `confidence`, `explanation`, `source_agent`, `asserted_at`),
+    /// passed as the separate `semantic_patch` JSON object, are
+    /// `json_patch`-MERGED on both insert and conflict -- a re-assertion
+    /// of the same fact refreshes them (G6 Stage 1 "one source of truth",
+    /// spec docs/plans/2026-08-05-g6-edge-semantic-payload-spec.md),
+    /// which is what keeps e.g. a relation's confidence current on the
+    /// edge. `source_memory_id` (G6 Stage 1.2) is the one exception to
+    /// write-once: it is FILL-IF-ABSENT on conflict -- when the stored
+    /// payload lacks it and `?12` carries one, that single key (only that
+    /// key, never the rest of `?12`'s provenance) is copied in, mirroring
+    /// the legacy `relations` upsert's `COALESCE(source_memory_id,
+    /// EXCLUDED.source_memory_id)`. `semantic_type` (the relates
+    /// `relation_type`; NULL for cites, and reserved for links) is a real
+    /// column, COALESCE-kept on conflict so a caller that does not know
+    /// it cannot NULL it out.
     #[allow(clippy::too_many_arguments)]
     async fn dual_write_edge_with_payload(
         conn: &libsql::Connection,
@@ -14551,8 +14666,15 @@ impl MemoryDB {
                  superseded_by = NULL,
                  space = excluded.space,
                  semantic_type = COALESCE(?13, edges.semantic_type),
-                 payload = CASE WHEN ?14 IS NULL THEN edges.payload
-                                ELSE json_patch(COALESCE(edges.payload, '{}'), ?14) END,
+                 payload = CASE
+                     WHEN json_extract(edges.payload, '$.source_memory_id') IS NULL
+                          AND json_extract(?12, '$.source_memory_id') IS NOT NULL
+                     THEN json_set(
+                              json_patch(COALESCE(edges.payload, '{}'), COALESCE(?14, '{}')),
+                              '$.source_memory_id', json_extract(?12, '$.source_memory_id'))
+                     WHEN ?14 IS NOT NULL THEN json_patch(COALESCE(edges.payload, '{}'), ?14)
+                     ELSE edges.payload
+                 END,
                  lineage = CASE
                      WHEN edges.valid_until IS NOT NULL THEN excluded.lineage
                      WHEN ?11 = 1 THEN 'legacy'
@@ -14569,7 +14691,9 @@ impl MemoryDB {
                 OR (excluded.lineage = 'synthesis' AND edges.lineage NOT IN ('evidence', 'synthesis'))
                 OR (excluded.lineage = 'assertion' AND edges.lineage != 'assertion')
                 OR ?13 IS NOT NULL
-                OR ?14 IS NOT NULL",
+                OR ?14 IS NOT NULL
+                OR (json_extract(edges.payload, '$.source_memory_id') IS NULL
+                    AND json_extract(?12, '$.source_memory_id') IS NOT NULL)",
             libsql::params![
                 edge_id.clone(),
                 src_id.to_string(),
@@ -15114,6 +15238,13 @@ impl MemoryDB {
     /// write is parity-invisible to the M2 oracle (§1). No LLM/embedding call
     /// happens here (§6.3): entailment ran outside, and each survivor's root was
     /// minted before this call. Returns the number of edges ACTUALLY flipped.
+    // 2026-08-05, G6 Stage 1.2 deliberate carryover: the `EXISTS (SELECT 1
+    // FROM relations WHERE id = ?4 ...)` guard below stays on `relations`.
+    // The M5 grounding validator deliberately checks the legacy row as an
+    // INDEPENDENT witness of the promoted fact -- collapsing it onto the
+    // same `edges` row the UPDATE targets would remove that independence.
+    // Redesign belongs to Stage 2, not a reader swap (see
+    // docs/plans/2026-08-05-g6-stage12-relations-readers-spec.md).
     pub async fn promote_edges_grounded(
         &self,
         survivors: &[crate::edge_grounding::EdgePromotion],
@@ -26123,16 +26254,18 @@ impl MemoryDB {
                 ),
             };
             let sql = format!(
-                "SELECT r.from_entity, r.to_entity FROM relations r
-                 JOIN entities ef ON ef.id = r.from_entity
-                 JOIN entities et ON et.id = r.to_entity
-                 WHERE r.from_entity IN ({ph}) {endpoint_scope}
+                "SELECT r.src_id, r.dst_id FROM edges r
+                 JOIN entities ef ON ef.id = r.src_id
+                 JOIN entities et ON et.id = r.dst_id
+                 WHERE r.edge_type='relates' AND r.valid_until IS NULL
+                   AND r.src_id IN ({ph}) {endpoint_scope}
                  UNION
-                 SELECT r.from_entity, r.to_entity FROM relations r
-                 JOIN entities ef ON ef.id = r.from_entity
-                 JOIN entities et ON et.id = r.to_entity
-                 WHERE r.to_entity IN ({ph}) {endpoint_scope}
-                 ORDER BY from_entity, to_entity",
+                 SELECT r.src_id, r.dst_id FROM edges r
+                 JOIN entities ef ON ef.id = r.src_id
+                 JOIN entities et ON et.id = r.dst_id
+                 WHERE r.edge_type='relates' AND r.valid_until IS NULL
+                   AND r.dst_id IN ({ph}) {endpoint_scope}
+                 ORDER BY src_id, dst_id",
                 ph = ph
             );
             let mut params: Vec<libsql::Value> = frontier
@@ -26657,15 +26790,17 @@ impl MemoryDB {
                 ),
             };
             let sql = format!(
-                "SELECT r.to_entity FROM relations r
-                 JOIN entities ef ON ef.id = r.from_entity
-                 JOIN entities et ON et.id = r.to_entity
-                 WHERE r.from_entity IN ({ph}) {endpoint_scope}
+                "SELECT r.dst_id FROM edges r
+                 JOIN entities ef ON ef.id = r.src_id
+                 JOIN entities et ON et.id = r.dst_id
+                 WHERE r.edge_type='relates' AND r.valid_until IS NULL
+                   AND r.src_id IN ({ph}) {endpoint_scope}
                  UNION
-                 SELECT r.from_entity FROM relations r
-                 JOIN entities ef ON ef.id = r.from_entity
-                 JOIN entities et ON et.id = r.to_entity
-                 WHERE r.to_entity IN ({ph}) {endpoint_scope}",
+                 SELECT r.src_id FROM edges r
+                 JOIN entities ef ON ef.id = r.src_id
+                 JOIN entities et ON et.id = r.dst_id
+                 WHERE r.edge_type='relates' AND r.valid_until IS NULL
+                   AND r.dst_id IN ({ph}) {endpoint_scope}",
                 ph = ph
             );
 
@@ -32315,7 +32450,7 @@ impl MemoryDB {
                 // just moved the row under this (from, to, type) triple.
                 let mut sem_rows = conn
                     .query(
-                        "SELECT confidence, explanation, source_agent FROM relations \
+                        "SELECT confidence, explanation, source_agent, created_at FROM relations \
                          WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
                         libsql::params![
                             plan.src_id.clone(),
@@ -32334,8 +32469,14 @@ impl MemoryDB {
                         row.get::<Option<f64>>(0).unwrap_or(None),
                         row.get::<Option<String>>(1).unwrap_or(None).as_deref(),
                         row.get::<Option<String>>(2).unwrap_or(None).as_deref(),
+                        row.get::<i64>(3).unwrap_or_else(|_| chrono::Utc::now().timestamp()),
                     ),
-                    None => Self::relates_semantic_patch(None, None, None),
+                    None => Self::relates_semantic_patch(
+                        None,
+                        None,
+                        None,
+                        chrono::Utc::now().timestamp(),
+                    ),
                 };
                 drop(sem_rows);
                 let (new_edge_id, reactivation_changes) = Self::dual_write_edge_with_payload(
@@ -32786,13 +32927,16 @@ impl MemoryDB {
             // Check if this was an insert (the id we generated exists) vs an update.
             let mut rows = conn
                 .query(
-                    "SELECT id, confidence, explanation, source_agent FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
+                    "SELECT id, confidence, explanation, source_agent, created_at FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
                     libsql::params![from_entity.to_string(), to_entity.to_string(), canonical.clone()],
                 )
                 .await?;
             // The edge's semantic patch mirrors the STORED row, not this
             // call's arguments — the upsert above keeps the higher
             // confidence, so a weaker re-assert must not regress the edge.
+            // `created_at` likewise mirrors the STORED row (immutable under
+            // the upsert), never `now` — that is `asserted_at`'s whole point
+            // (G6 Stage 1.2 trap 1: edges.created_at is not a substitute).
             let (existing_id, semantic_patch) = match rows.next().await? {
                 Some(row) => (
                     row.get::<String>(0).unwrap_or(id.clone()),
@@ -32800,11 +32944,12 @@ impl MemoryDB {
                         row.get::<Option<f64>>(1).unwrap_or(None),
                         row.get::<Option<String>>(2).unwrap_or(None).as_deref(),
                         row.get::<Option<String>>(3).unwrap_or(None).as_deref(),
+                        row.get::<i64>(4).unwrap_or(now),
                     ),
                 ),
                 None => (
                     id.clone(),
-                    Self::relates_semantic_patch(confidence, explanation, source_agent),
+                    Self::relates_semantic_patch(confidence, explanation, source_agent, now),
                 ),
             };
             drop(rows);
@@ -33080,17 +33225,21 @@ impl MemoryDB {
         // Fetch relations (both directions) with entity names
         let mut rel_rows = conn
             .query(
-                "SELECT r.id, r.relation_type, r.source_agent, r.created_at,
-                        'outgoing' as direction, r.to_entity as entity_id,
+                "SELECT r.edge_id, r.semantic_type, json_extract(r.payload, '$.source_agent'),
+                        COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at),
+                        'outgoing' as direction, r.dst_id as entity_id,
                         e.name as entity_name, e.entity_type as entity_type
-                 FROM relations r JOIN entities e ON e.id = r.to_entity
-                 WHERE r.from_entity = ?1
+                 FROM edges r JOIN entities e ON e.id = r.dst_id
+                 WHERE r.edge_type = 'relates' AND r.valid_until IS NULL
+                       AND r.src_id = ?1 AND r.semantic_type IS NOT NULL
                  UNION ALL
-                 SELECT r.id, r.relation_type, r.source_agent, r.created_at,
-                        'incoming' as direction, r.from_entity as entity_id,
+                 SELECT r.edge_id, r.semantic_type, json_extract(r.payload, '$.source_agent'),
+                        COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at),
+                        'incoming' as direction, r.src_id as entity_id,
                         e.name as entity_name, e.entity_type as entity_type
-                 FROM relations r JOIN entities e ON e.id = r.from_entity
-                 WHERE r.to_entity = ?1
+                 FROM edges r JOIN entities e ON e.id = r.src_id
+                 WHERE r.edge_type = 'relates' AND r.valid_until IS NULL
+                       AND r.dst_id = ?1 AND r.semantic_type IS NOT NULL
                  ORDER BY 4 DESC",
                 libsql::params![entity_id],
             )
@@ -33991,7 +34140,7 @@ impl MemoryDB {
                     // re-extraction must not regress the edge).
                     let mut sem_rows = conn
                         .query(
-                            "SELECT confidence, explanation, source_agent FROM relations \
+                            "SELECT confidence, explanation, source_agent, created_at FROM relations \
                              WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
                             libsql::params![
                                 from_id.as_str(),
@@ -34014,11 +34163,13 @@ impl MemoryDB {
                             row.get::<Option<f64>>(0).unwrap_or(None),
                             row.get::<Option<String>>(1).unwrap_or(None).as_deref(),
                             row.get::<Option<String>>(2).unwrap_or(None).as_deref(),
+                            row.get::<i64>(3).unwrap_or(now),
                         ),
                         None => Self::relates_semantic_patch(
                             relation.confidence,
                             relation.explanation.as_deref(),
                             Some("post_ingest"),
+                            now,
                         ),
                     };
                     drop(sem_rows);
@@ -36862,16 +37013,18 @@ impl MemoryDB {
         since_ms: Option<i64>,
     ) -> Result<Vec<wenlan_types::RecentRelation>, WenlanError> {
         let conn = self.conn.lock().await;
-        let sql = "SELECT r.id, r.from_entity, r.relation_type, r.to_entity, \
+        let sql = "SELECT r.edge_id, r.src_id, r.semantic_type, r.dst_id, \
                    e1.name AS from_entity_name, e2.name AS to_entity_name, \
-                   r.created_at \
-                   FROM relations r \
-                   JOIN entities e1 ON r.from_entity = e1.id \
-                   JOIN entities e2 ON r.to_entity = e2.id \
-                   WHERE (?1 IS NULL OR r.created_at >= ?1) \
+                   COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at) AS asserted_ts \
+                   FROM edges r \
+                   JOIN entities e1 ON r.src_id = e1.id \
+                   JOIN entities e2 ON r.dst_id = e2.id \
+                   WHERE r.edge_type = 'relates' AND r.valid_until IS NULL \
+                   AND r.semantic_type IS NOT NULL \
+                   AND (?1 IS NULL OR COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at) >= ?1) \
                    AND e1.name IS NOT NULL AND e1.name != '' \
                    AND e2.name IS NOT NULL AND e2.name != '' \
-                   ORDER BY r.created_at DESC LIMIT ?2";
+                   ORDER BY asserted_ts DESC LIMIT ?2";
         let mut rows = conn
             .query(sql, libsql::params![since_ms, limit as i64])
             .await

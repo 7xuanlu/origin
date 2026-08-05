@@ -10,6 +10,11 @@ pub(crate) struct ContradictionObservationCount {
 }
 
 impl MemoryDB {
+    // 2026-08-05, G6 Stage 1.2 deliberate carryover: stays on `relations`.
+    // `payload.source_memory_id` now converges via migration 116 + the
+    // writer's fill-if-absent semantics, but historical completeness isn't
+    // proven yet -- this reader migrates with the final relations-exit PR
+    // (see docs/plans/2026-08-05-g6-stage12-relations-readers-spec.md).
     pub(crate) async fn count_stale_relation_sources(&self) -> Result<usize, WenlanError> {
         let conn = self.conn.lock().await;
         let mut rows = conn

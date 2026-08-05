@@ -48,6 +48,12 @@ async fn deep_profile_detects_structural_and_advisory_counterexamples() {
              INSERT INTO relations
                  (id,from_entity,to_entity,relation_type,created_at)
              VALUES ('rel_a','entity_a','entity_a','legacy_custom_type',0);
+             -- G6 Stage 1.2: relation_vocabulary (reader #9) reads `edges`,
+             -- not `relations` -- mirror the dual-write here.
+             INSERT INTO edges
+                 (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type)
+             VALUES ('edge-rel_a','entity_a','entity','entity_a','entity','relates','legacy',0,
+                     '00000000-0000-4000-8000-000000000001',0,'legacy_custom_type');
              INSERT INTO memories
                  (id,content,source,source_id,title,chunk_index,last_modified,chunk_type,
                   memory_type,entity_id,pending_revision,is_recap,supersede_mode,structured_fields)

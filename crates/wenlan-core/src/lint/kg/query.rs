@@ -85,12 +85,12 @@ async fn relation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, (
     row_check(
         context,
         &format!(
-            "SELECT CASE WHEN f.id IS NULL OR t.id IS NULL OR TRIM(r.relation_type)=''
+            "SELECT CASE WHEN f.id IS NULL OR t.id IS NULL OR TRIM(r.semantic_type)=''
                   THEN 1 ELSE 0 END
-               FROM relations r
-               LEFT JOIN entities f ON f.id=r.from_entity
-               LEFT JOIN entities t ON t.id=r.to_entity
-               {clause} ORDER BY r.id"
+               FROM (SELECT * FROM edges WHERE edge_type='relates' AND valid_until IS NULL) r
+               LEFT JOIN entities f ON f.id=r.src_id
+               LEFT JOIN entities t ON t.id=r.dst_id
+               {clause} ORDER BY r.edge_id"
         ),
         params,
     )

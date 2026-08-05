@@ -54,7 +54,8 @@ pub(super) async fn entity_partitions(
 pub(super) async fn aggregate_counts(context: &LintContext<'_, '_>) -> Result<AggregateCounts, ()> {
     let values = scalar_row(
         context,
-        "SELECT (SELECT COUNT(*) FROM entities), (SELECT COUNT(*) FROM relations),
+        "SELECT (SELECT COUNT(*) FROM entities),
+                (SELECT COUNT(*) FROM edges WHERE edge_type='relates' AND valid_until IS NULL),
                 (SELECT COUNT(*) FROM observations), (SELECT COUNT(*) FROM memory_entities)",
         libsql::params::Params::None,
         4,

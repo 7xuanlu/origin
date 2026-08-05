@@ -212,17 +212,23 @@ impl MemoryDB {
             ReadScope::Global => unreachable!(),
         };
         let relation_sql = format!(
-            "SELECT r.id, r.relation_type, r.source_agent, r.created_at, \
-                    'outgoing' AS direction, r.to_entity AS entity_id, \
+            "SELECT r.edge_id, r.semantic_type, json_extract(r.payload, '$.source_agent'), \
+                    COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at), \
+                    'outgoing' AS direction, r.dst_id AS entity_id, \
                     e.name AS entity_name, e.entity_type AS entity_type \
-             FROM relations r JOIN entities e ON e.id = r.to_entity \
-             WHERE r.from_entity = ?1 {endpoint_filter} \
+             FROM edges r JOIN entities e ON e.id = r.dst_id \
+             WHERE r.edge_type = 'relates' AND r.valid_until IS NULL \
+               AND r.semantic_type IS NOT NULL \
+               AND r.src_id = ?1 {endpoint_filter} \
              UNION ALL \
-             SELECT r.id, r.relation_type, r.source_agent, r.created_at, \
-                    'incoming' AS direction, r.from_entity AS entity_id, \
+             SELECT r.edge_id, r.semantic_type, json_extract(r.payload, '$.source_agent'), \
+                    COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at), \
+                    'incoming' AS direction, r.src_id AS entity_id, \
                     e.name AS entity_name, e.entity_type AS entity_type \
-             FROM relations r JOIN entities e ON e.id = r.from_entity \
-             WHERE r.to_entity = ?1 {endpoint_filter} \
+             FROM edges r JOIN entities e ON e.id = r.src_id \
+             WHERE r.edge_type = 'relates' AND r.valid_until IS NULL \
+               AND r.semantic_type IS NOT NULL \
+               AND r.dst_id = ?1 {endpoint_filter} \
              ORDER BY 4 DESC"
         );
         let mut relation_values = vec![libsql::Value::Text(entity_id.to_string())];
@@ -323,16 +329,19 @@ impl MemoryDB {
             ReadScope::Global => unreachable!(),
         };
         let sql = format!(
-            "SELECT r.id, r.from_entity, r.relation_type, r.to_entity, \
-                    e1.name, e2.name, r.created_at \
-             FROM relations r \
-             JOIN entities e1 ON r.from_entity = e1.id \
-             JOIN entities e2 ON r.to_entity = e2.id \
-             WHERE (?1 IS NULL OR r.created_at >= ?1) \
+            "SELECT r.edge_id, r.src_id, r.semantic_type, r.dst_id, \
+                    e1.name, e2.name, \
+                    COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at) AS asserted_ts \
+             FROM edges r \
+             JOIN entities e1 ON r.src_id = e1.id \
+             JOIN entities e2 ON r.dst_id = e2.id \
+             WHERE r.edge_type = 'relates' AND r.valid_until IS NULL \
+               AND r.semantic_type IS NOT NULL \
+               AND (?1 IS NULL OR COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at) >= ?1) \
                AND e1.name IS NOT NULL AND e1.name != '' \
                AND e2.name IS NOT NULL AND e2.name != '' \
                {scope_filter} \
-             ORDER BY r.created_at DESC LIMIT ?2"
+             ORDER BY asserted_ts DESC LIMIT ?2"
         );
         let mut values = vec![
             since_ms

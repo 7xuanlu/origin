@@ -245,11 +245,11 @@ async fn relation_vocabulary(context: &LintContext<'_, '_>) -> Result<RowCheck, 
         context,
         &format!(
             "SELECT CASE WHEN v.canonical IS NULL THEN 1 ELSE 0 END
-               FROM relations r
-               LEFT JOIN entities f ON f.id=r.from_entity
-               LEFT JOIN relation_type_vocabulary v ON v.canonical=r.relation_type
+               FROM (SELECT * FROM edges WHERE edge_type='relates' AND valid_until IS NULL) r
+               LEFT JOIN entities f ON f.id=r.src_id
+               LEFT JOIN relation_type_vocabulary v ON v.canonical=r.semantic_type
               WHERE 1=1{scope}
-              ORDER BY r.id"
+              ORDER BY r.edge_id"
         ),
         params,
     )

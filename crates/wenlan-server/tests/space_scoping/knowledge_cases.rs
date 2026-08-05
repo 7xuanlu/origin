@@ -186,16 +186,35 @@ pub async fn detail_and_relation_endpoints_are_scoped() {
     let work = seed_entity(&fixture, "Work anchor", Some("work")).await;
     let work_peer = seed_entity(&fixture, "Work peer", Some("work")).await;
     let personal = seed_entity(&fixture, "Personal peer", Some("personal")).await;
-    let work_relation = fixture
+    fixture
         .db
         .create_relation(&work, &work_peer, "related_to", None, None, None, None)
         .await
         .unwrap();
-    let mixed_relation = fixture
+    fixture
         .db
         .create_relation(&work, &personal, "related_to", None, None, None, None)
         .await
         .unwrap();
+    // G6 Stage 1.2 wire-visible id swap (spec Trap 2): the wire `id` is now
+    // the active edge's content-addressed edge_id, not the `relations` row
+    // uuid `create_relation` returns.
+    let work_relation = wenlan_core::provenance::compute_edge_id(
+        "relates",
+        "entity",
+        &work,
+        "entity",
+        &work_peer,
+        "related_to",
+    );
+    let mixed_relation = wenlan_core::provenance::compute_edge_id(
+        "relates",
+        "entity",
+        &work,
+        "entity",
+        &personal,
+        "related_to",
+    );
 
     let (status, detail) = json_body(
         fixture

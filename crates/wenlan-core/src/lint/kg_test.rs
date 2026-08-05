@@ -226,7 +226,13 @@ async fn seed_corrupt_graph(db: &crate::db::MemoryDB) {
         "INSERT INTO entities (id,name,entity_type,space,confidence,confirmed,created_at,updated_at) VALUES ('entity-ok','Secret Entity','concept',NULL,0.8,0,1,1),('entity-bad',' ','', 'missing-space',1.5,2,1,1);
          INSERT INTO observations (id,entity_id,content,confidence,confirmed,created_at) VALUES ('obs-orphan','missing-id','secret observation',0.5,0,1),('obs-invalid','entity-ok',' ',2.0,2,1);
          INSERT INTO relations (id,from_entity,to_entity,relation_type,created_at) VALUES ('relation-from','missing-id','entity-ok','secret_relation',1),('relation-to','entity-ok','missing-id','secret_relation',1);
-         INSERT INTO memory_entities (memory_id,entity_id) VALUES ('missing-id','entity-ok'),('memory-ok','missing-id'),('entity-ok','entity-ok');"
+         INSERT INTO memory_entities (memory_id,entity_id) VALUES ('missing-id','entity-ok'),('memory-ok','missing-id'),('entity-ok','entity-ok');
+         -- G6 Stage 1.2: relation_integrity (reader #11) reads `edges`, not
+         -- `relations` -- mirror the dangling-endpoint rows here the same way
+         -- create_relation's dual-write would.
+         INSERT INTO edges (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type) VALUES
+             ('edge-relation-from','missing-id','entity','entity-ok','entity','relates','legacy',0,'00000000-0000-4000-8000-000000000001',1,'secret_relation'),
+             ('edge-relation-to','entity-ok','entity','missing-id','entity','relates','legacy',0,'00000000-0000-4000-8000-000000000001',1,'secret_relation');"
     ).await.unwrap();
 }
 
@@ -241,7 +247,11 @@ async fn seed_valid_scoped_graph(db: &crate::db::MemoryDB) {
         "INSERT INTO entities (id,name,entity_type,space,confirmed,created_at,updated_at) VALUES ('ent-a','Alpha','concept','alpha',0,1,1),('ent-b','Beta','concept','beta',0,1,1);
          INSERT INTO observations (id,entity_id,content,confirmed,created_at) VALUES ('obs-a','ent-a','a',0,1),('obs-b','ent-b','b',0,1);
          INSERT INTO relations (id,from_entity,to_entity,relation_type,created_at) VALUES ('rel-a','ent-a','ent-b','related',1);
-         INSERT INTO memory_entities (memory_id,entity_id) VALUES ('mem-alpha','ent-a'),('mem-beta','ent-b'),('mem-none','ent-a');"
+         INSERT INTO memory_entities (memory_id,entity_id) VALUES ('mem-alpha','ent-a'),('mem-beta','ent-b'),('mem-none','ent-a');
+         -- G6 Stage 1.2: relation_integrity + aggregate_counts (readers #11, #3)
+         -- read `edges`, not `relations` -- mirror the dual-write here.
+         INSERT INTO edges (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type) VALUES
+             ('edge-rel-a','ent-a','entity','ent-b','entity','relates','legacy',0,'alpha',1,'related');"
     ).await.unwrap();
 }
 
