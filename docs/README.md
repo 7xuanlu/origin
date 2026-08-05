@@ -17,4 +17,6 @@ If a plan starts with a **Superseded** note, treat it as historical context rath
 - Repository overview and quickstart: `README.md`
 - Retrieval, graph, and model details: `technical-foundations.md`
 - Contributor workflow and CI commands: `CONTRIBUTING.md`
-- Detailed developer architecture conventions: `CLAUDE.md`
+- Agent and developer conventions: `AGENTS.md` at the repo root (`CLAUDE.md` re-imports it)
+- Test layers — what runs at L1-L8, where, when, whether it blocks: `test-layers.md`
+- Platform code — per-OS data dirs, service registration, GPU backends: `cross-platform.md`

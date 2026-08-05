@@ -549,11 +549,16 @@ def contract_violations(
     if "    needs: [docker-manifest, bind-release-tag]" not in finalize:
         violations.append("GitHub release finalization bypasses the GHCR promotion barrier")
     # The lifecycle step resolves the merged release PR through
-    # GET /commits/{sha}/pulls, a pull-requests read. An explicit permissions
-    # block sets every unlisted scope to none, so dropping this scope returns
-    # 403 only AFTER `gh release edit` has already promoted the release —
-    # stable but still labelled pending, with no way to retry the half that
-    # ran. Assert every scope the step actually exercises.
+    # GET /commits/{sha}/pulls, then POSTs and DELETEs on /issues/{pr}/labels to
+    # move it from pending to tagged. The /issues/ path is only the REST
+    # spelling: a pull request routes label WRITES through pull-requests, so
+    # `issues: write` alone cannot move them. An explicit permissions block sets
+    # every unlisted scope to none, so an under-grant here returns 403 only
+    # AFTER `gh release edit` has already promoted the release — stable but
+    # still labelled pending, with no way to retry the half that ran. v0.15.4
+    # under-granted the read and v0.15.5 the write, each failing one call later
+    # than the last. Assert every scope the step actually exercises, at the
+    # exact level it exercises it.
     finalize_permissions = re.search(
         r"    permissions:\n(?P<body>(?:      [^\n]+\n)+)", finalize
     )
@@ -564,7 +569,7 @@ def contract_violations(
         ).splitlines()
         if line.strip() and not line.strip().startswith("#")
     }
-    for scope in ["contents: write", "issues: write", "pull-requests: read"]:
+    for scope in ["contents: write", "issues: write", "pull-requests: write"]:
         if scope not in granted:
             violations.append(
                 f"release finalization does not grant {scope!r} for the lifecycle step"
