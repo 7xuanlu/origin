@@ -1,7 +1,5 @@
 # AGENTS.md
 
-This file guides any coding agent working in this repository — Claude Code, Cursor, Codex, GitHub Copilot, Zed, Aider, and similar. It is the canonical agent-instruction file; vendor-specific files (such as `CLAUDE.md`) re-import from here so the rules stay in sync. The format follows the [agents.md](https://agents.md/) spec.
-
 This repo holds the **daemon** (`wenlan-server`), the **CLI** (`wenlan`), shared **wire types** (`wenlan-types`), the **business-logic core** (`wenlan-core`), and the **MCP server** (`wenlan-mcp`). All five ship from this monorepo. The Tauri desktop app (`wenlan-app`) ships from a separate repo: [7xuanlu/wenlan-app](https://github.com/7xuanlu/wenlan-app). Public product surface lives at [wenlan.app](https://wenlan.app) (marketing, docs at `/docs`, longer-form writing at `/learn`).
 
 ## Repo map
@@ -275,10 +273,6 @@ All post-store enrichment goes through the ONE canonical path (`wenlan_core::ing
 - **libSQL connection pattern**: `MemoryDB` holds `tokio::sync::Mutex<libsql::Connection>` internally. Never try to share a `libsql::Connection` across tasks directly (`Send` but not `Sync`).
 
 ### SQL, strings, data
-- **SQL safety**: Always use parameterized queries — never interpolate user input into SQL strings
-- **NULL semantics**: Store `Option<T>` as SQL NULL, not empty string — so IS NULL filters work correctly
-- **UTF-8 safety**: Never byte-index Rust strings (`&s[..n]`) — use `chars().take(n)` or `strip_prefix`/`strip_suffix`. Exception: byte-slicing after a verified ASCII prefix check is safe (the boundary is guaranteed valid), but prefer the char-safe version anyway for consistency.
-- **Batch SQL**: Wrap multi-row insert/delete loops in BEGIN/COMMIT transactions
 - **LIKE patterns against JSON**: Quote the match target to avoid substring false positives — `%"{id}"%` not `%{id}%` (e.g., `mem_1` would otherwise match `mem_10`). See the fix in `crates/wenlan-core/src/db.rs` (the `%"{id}"%` quoting shown above) and the regression test.
 
 ### Dev environment gotchas
@@ -292,13 +286,10 @@ All post-store enrichment goes through the ONE canonical path (`wenlan_core::ing
 
 ### Worktree cleanup after squash-merge
 
-GitHub squash-merge bundles all PR commits into one new commit on `main` with a fresh SHA. The original commits on the feature branch keep their old SHAs and remain in the local repo + worktree even though their content has shipped. This creates three traps:
+Squash-merge lands a fresh SHA on `main`, so the branch's original commits still look unmerged locally. Two consequences:
 
-- **`git cherry main feature/<name>` lies.** It compares commit SHAs (not patch content) and will mark all squashed commits as "unmerged" (`+` prefix). The branch may be fully merged content-wise. Verify by reading the squash commit body (`git log -1 --format=%B <squash-sha>`); the body lists each original PR commit message. Alternatively, grep `main`'s log for keywords or file paths the branch added.
-- **Stale worktrees accumulate.** `.worktrees/<name>/` is not auto-removed when a PR merges. After confirming all content is in `main`, run from the main repo root: `git worktree remove --force .worktrees/<name>` then `git branch -D <branch>` (force `-D` is needed because `git` thinks it's unmerged for the same SHA reason) then `git worktree prune`.
-- **`.gitignored` per-checkout artifacts.** Files under gitignored paths (`app/eval/baselines/`, `.fastembed_cache/`, build outputs) live per-worktree. Removing a worktree removes its private copies. If a worktree happened to be the only host of some large gitignored artifact (eval baseline DBs, downloaded models), back it up to the canonical shared location first (e.g. `~/.cache/origin-eval/` via `scripts/migrate-eval-cache.sh`) before deleting the worktree.
-
-Run this hygiene pass roughly once a week or whenever `git worktree list` exceeds ~5 entries. Stale worktree paths waste disk + confuse "is this work merged?" investigations.
+- **`git cherry main feature/<name>` lies** — it compares SHAs, not patch content, and marks every squashed commit `+`. Confirm from the squash commit body instead: `git log -1 --format=%B <squash-sha>` lists each original PR commit message.
+- **Removing a worktree destroys its gitignored files.** `app/eval/baselines/`, `.fastembed_cache/`, and build outputs are per-checkout. If a worktree is the only host of an eval baseline DB or downloaded model, move it to `~/.cache/origin-eval/` (via `scripts/migrate-eval-cache.sh`) first, then `git worktree remove --force .worktrees/<name>`, `git branch -D <branch>` (force needed for the same SHA reason), `git worktree prune`.
 
 ### Misc
 - `WENLAN_BIND_ADDR=<host:port>`: override the daemon's bind address (default `127.0.0.1:7878`). Used inside Docker to listen on `0.0.0.0`.
