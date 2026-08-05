@@ -14228,9 +14228,18 @@ impl MemoryDB {
         );
         let provenance = serde_json::json!({"backfilled_from": backfilled_from}).to_string();
         let now = chrono::Utc::now().timestamp();
+        // G6 Stage 1: a `relates` edge's discriminator IS its relation_type,
+        // so the backfill stamps `semantic_type` directly (the parity oracle
+        // checks it). Both callers are chain-safe: migration 81 has just
+        // created the table with the column, and migration 111 ensures it.
+        let semantic_type: Option<String> = if edge_type == "relates" {
+            Some(discriminator.to_string())
+        } else {
+            None
+        };
         conn.execute(
-            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, grounded, root_id, space, weight, payload, provenance, operation_id, created_at, superseded_by, valid_until)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8, NULL, NULL, ?9, NULL, ?10, NULL, NULL)
+            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, grounded, root_id, space, weight, payload, provenance, operation_id, created_at, superseded_by, valid_until, semantic_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8, NULL, NULL, ?9, NULL, ?10, NULL, NULL, ?11)
              ON CONFLICT(edge_id) DO NOTHING",
             libsql::params![
                 edge_id,
@@ -14242,7 +14251,8 @@ impl MemoryDB {
                 lineage.to_string(),
                 space.to_string(),
                 provenance,
-                now
+                now,
+                semantic_type
             ],
         )
         .await
