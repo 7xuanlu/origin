@@ -40,15 +40,20 @@ parity the moment it runs. All sites below were verified at the code level on
 `insert_resolved_page_evidence`, which dual-writes the same content-addressed
 edge id the page_sources row derives to.
 
-**Part 2 (follow-up PR): secondary writers, verified 2026-08-04.**
+**Part 2 (second PR): secondary writers, verified and fixed 2026-08-05.**
 
 | Function | Gap | Status |
 |---|---|---|
-| `rebind_source_id_inner` (db.rs ~27860, incl. `rebind_source_page_in_transaction`) | Renames `page_sources.memory_source_id`, `page_evidence.locator`, and optionally the source page id — identity fields of the content-addressed edge id — with no edge rewrite. Every touching edge strands (extra) and its successor shows as missing. | CONFIRMED, unfixed. Fix must recompute edge ids while preserving grounding/payload/provenance, and chase `superseded_by` FKs. |
-| `replace_source_page_inner` (db.rs ~43093) | DELETEs ALL `page_sources` + `page_evidence` rows (external kinds included) then reinserts the new set; removed rows' edges never retired. | CONFIRMED, unfixed. Same fix shape as `replace_page_sources`, plus external-kind retire. |
-| `accept_page_merge` (db.rs ~44859) | Repoints inbound `page_links.target_page_id` loser→winner with a raw UPDATE; the loser-dst links edges stay active (extra), winner-dst edges show missing. (The loser's own source rows stay in place, so its cites edges remain consistently implied — archived pages are not filtered by the parity derivation.) | CONFIRMED (links repoint only), unfixed. Retire+mint per repointed row using `replace_page_links`'s space/lineage derivation. |
-| `resolve_orphan_page_links` (db.rs ~45684) | Sets `target_page_id` on a previously-orphan row (which derives no edge) without minting the now-implied links edge. | CONFIRMED, unfixed. Mint with `replace_page_links`'s derivation. |
-| `try_update_page_content` (db.rs ~43975) | Rewrites `pages.citations` wholesale without reconciling edges. Narrow: drifts only when a locator backed ONLY by citations (not by `page_sources`/`page_evidence`) drops out of the new value. | CONFIRMED (narrow), unfixed. Reconcile like `set_page_citations` does. |
+| `rebind_source_id_inner` (db.rs ~27860, incl. `rebind_source_page_in_transaction`) | Renames `page_sources.memory_source_id`, `page_evidence.locator`, and optionally the source page id — identity fields of the content-addressed edge id. The M2 PR-1 block already retired+minted memory-locator cites edges for pages listed in `page_sources`/`page_evidence`, but the page-id rename half had no edge rewrite, and citations-only cites edges were missed. | FIXED. New `rebind_edges_identity` helper re-addresses cites edges (disc = dst locator, derivable from the row) with FK-safe `superseded_by` detach/re-attach, collision-aware (an already-minted successor absorbs the old edge as retired history); links edges retire + re-assert from `page_links`. Payload `source_memory_id` provenance re-stamped. |
+| `replace_source_page_inner` (db.rs ~43093) | DELETEs ALL `page_sources` + `page_evidence` rows (external kinds included) then reinserts the new set; removed rows' edges never retired. | FIXED. Removed-locator snapshot before the DELETEs; each dropped locator's cites edge retired in-transaction (external kinds included). |
+| `accept_page_merge` (db.rs ~44859) | Repoints inbound `page_links.target_page_id` loser→winner with a raw UPDATE; the loser-dst links edges stay active (extra), winner-dst edges show missing. Also copies the absorbed page's external evidence rows without minting their edges. | FIXED. Per repointed row: mint the winner-dst links edge (replace_page_links derivation), retire the loser-dst edge superseded-by it. Copied external evidence rows mint their cites edges. |
+| `resolve_orphan_page_links` (db.rs ~45684) | Sets `target_page_id` on a previously-orphan row (which derives no edge) without minting the now-implied links edge. | FIXED. Mints with `replace_page_links`'s derivation in the same per-row transaction. |
+| `try_update_page_content` (db.rs ~43975) | Rewrites `pages.citations` wholesale without reconciling edges. Narrow: drifts only when a locator backed ONLY by citations (not by `page_sources`/`page_evidence`) drops out of the new value. | FIXED. Calls the shared `dual_write_page_citations` reconciler inside the CAS transaction (`set_page_citations_with_changelog_at_version` rewired onto the same helper). |
+
+Known limitation (M5 follow-up, outside Stage 0 scope): M5 claim `supports`
+edges are fenced out of the parity universe, and a source-id rebind retracts
+them (`retract_support_for_rebound_source`, M5 row 13) rather than re-address
+them — pages citing the renamed document re-derive support. No parity impact.
 
 Exit: all fixes merged with regression tests (parity clean after driving each
 path); ambient watermarks stay drift 0 across a soak.
