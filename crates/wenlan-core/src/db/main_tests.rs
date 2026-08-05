@@ -48392,6 +48392,150 @@ async fn rebind_source_id_readdresses_cites_edges() {
     }
 }
 
+/// A page-identity rebind re-asserts every touching `links` edge from the
+/// renamed `page_links` rows; the re-mint must carry the display label like
+/// any other links mint, or the parity oracle's semantic-drift check flags
+/// the edge as corrupt (G6 Stage 1 post-merge review finding #1).
+#[tokio::test]
+async fn rebind_source_page_reasserts_links_edges_with_label() {
+    let (db, _dir) = test_db().await;
+    db.upsert_documents(vec![make_memory_doc(
+        "mem-g6-links-rebind-old",
+        "Body",
+        "fact",
+        "work",
+        "folder",
+    )])
+    .await
+    .unwrap();
+    let chunk_id = db
+        .get_memories_by_source_id("memory", "mem-g6-links-rebind-old")
+        .await
+        .unwrap()[0]
+        .id
+        .clone();
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_g6_links_target",
+        "G6 Links Target",
+        None,
+        "Target body",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    db.insert_page_with_kind(
+        "page_g6_links_src_old",
+        "G6 Links Source",
+        None,
+        "See [[G6 Links Target]].",
+        None,
+        None,
+        &[chunk_id.as_str()],
+        &now,
+        "source",
+        "unconfirmed",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.reconcile_edges_parity().await.unwrap().drift_count,
+        0,
+        "fixture precondition: canonical writes leave parity clean"
+    );
+
+    db.rebind_source_id_with_source_page(
+        "memory",
+        "mem-g6-links-rebind-old",
+        "mem-g6-links-rebind-new",
+        "page_g6_links_src_old",
+        "page_g6_links_src_new",
+    )
+    .await
+    .unwrap();
+
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT json_extract(payload, '$.label') FROM edges \
+                 WHERE edge_type = 'links' AND valid_until IS NULL \
+                   AND src_id = 'page_g6_links_src_new' \
+                   AND dst_id = 'page_g6_links_target'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("re-asserted links edge exists");
+        assert_eq!(
+            row.get::<Option<String>>(0).unwrap_or(None).as_deref(),
+            Some("G6 Links Target"),
+            "the rebind re-mint carries the display label"
+        );
+    }
+    let report = db.reconcile_edges_parity().await.unwrap();
+    assert_eq!(
+        report.drift_count, 0,
+        "a page rebind must not re-drift edges parity (missing={}, extra={}, corrupt={})",
+        report.missing_count, report.extra_count, report.corrupt_count
+    );
+}
+
+/// A crash between m81's COMMIT and its `user_version = 81` stamp on a
+/// pre-G6 binary leaves an `edges` table WITHOUT `semantic_type` at
+/// user_version 80. The m81 rerun's CREATE IF NOT EXISTS cannot widen it,
+/// and its backfill INSERTs name the column — the rerun must probe-add it
+/// instead of failing startup (G6 Stage 1 post-merge review finding #2).
+#[tokio::test]
+async fn migration_81_rerun_recovers_pre_semantic_type_edges_table() {
+    let (db, _dir) = test_db().await;
+    // A live relation guarantees the rerun actually executes a backfill
+    // INSERT that names `semantic_type` (an empty store would pass
+    // vacuously and m98's guard would mask the defect).
+    let e1 = db.create_entity("G6RerunA", "person", None).await.unwrap();
+    let e2 = db.create_entity("G6RerunB", "person", None).await.unwrap();
+    db.create_relation(&e1, &e2, "knows", Some("claude"), None, None, None)
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("ALTER TABLE edges DROP COLUMN semantic_type", ())
+            .await
+            .expect("drop semantic_type to emulate the pre-G6 partial state");
+        conn.execute("PRAGMA user_version = 80", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("m81 rerun must widen the pre-existing edges table, not fail its backfill INSERTs");
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM pragma_table_info('edges') WHERE name = 'semantic_type'",
+            (),
+        )
+        .await
+        .unwrap();
+    let present: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(present, 1, "semantic_type restored by the m81 rerun guard");
+    drop(rows);
+    let mut vrows = conn.query("PRAGMA user_version", ()).await.unwrap();
+    let uv: i64 = vrows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(
+        uv as u32,
+        crate::db::SCHEMA_VERSION,
+        "chain completes back to the current schema version"
+    );
+}
+
 /// A content update rewrites `pages.citations` wholesale; a locator whose only
 /// backing was the old citations value must lose its edge with it.
 #[tokio::test]
