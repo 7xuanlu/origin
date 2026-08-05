@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.15.5](https://github.com/7xuanlu/wenlan/compare/v0.15.4...v0.15.5) (2026-08-04)
+
+
+### Features
+
+* **m6:** gate the genesis shadow lane and fix its turn-driver livelock ([#469](https://github.com/7xuanlu/wenlan/issues/469)) ([7456f4f](https://github.com/7xuanlu/wenlan/commit/7456f4f6622b2b01415db268b90f9f2cbc8a8d59))
+
+
+### Bug Fixes
+
+* align the runtime image env contract with the nested data root ([#464](https://github.com/7xuanlu/wenlan/issues/464)) ([80a0d66](https://github.com/7xuanlu/wenlan/commit/80a0d66a3c63d502267b6c408ed109ba385d382b))
+* give the release runtime image its OpenMP runtime ([#462](https://github.com/7xuanlu/wenlan/issues/462)) ([e8a9f88](https://github.com/7xuanlu/wenlan/commit/e8a9f88ea7e7bba5878d583c4bb0cc7919c15fbf))
+* grant finalize-release the pull-requests scope it reads ([#465](https://github.com/7xuanlu/wenlan/issues/465)) ([1567515](https://github.com/7xuanlu/wenlan/commit/1567515f0e8b62003e7f14ac03aa4093a086bc95))
+* **kg:** ambient enrichment dual-writes canonical edges; migration 111 repairs parity ([#473](https://github.com/7xuanlu/wenlan/issues/473)) ([d31c1eb](https://github.com/7xuanlu/wenlan/commit/d31c1eb58cd950428ad703a677199751ecdf7fbc))
+* **kg:** ambient entity sweep dual-writes entity shadow pages; migration 113 repairs parity ([#479](https://github.com/7xuanlu/wenlan/issues/479)) ([c74ca3c](https://github.com/7xuanlu/wenlan/commit/c74ca3c9246787131a0980159b4321376ab01b46))
+* **kg:** migration 114 re-syncs stale entity shadow pages ([#480](https://github.com/7xuanlu/wenlan/issues/480)) ([cfa972b](https://github.com/7xuanlu/wenlan/commit/cfa972bf593470c8fbff087f937b38378f9e7ac5))
+* make release promotion and latest promotion fail closed ([#460](https://github.com/7xuanlu/wenlan/issues/460)) ([035e04e](https://github.com/7xuanlu/wenlan/commit/035e04ef0764f6138d0dba615b5b5b565445d4ee))
+* nest the runtime data root inside its writable volume ([#463](https://github.com/7xuanlu/wenlan/issues/463)) ([ebfd9ca](https://github.com/7xuanlu/wenlan/commit/ebfd9ca34fbcaec1e1781382f2d5cca4e21f5740))
+* repair the Homebrew and Docker publication lanes ([#461](https://github.com/7xuanlu/wenlan/issues/461)) ([e56c381](https://github.com/7xuanlu/wenlan/commit/e56c381e06290f88e858aa440176bc6f590f7136))
+* skip the release candidate observer when its source CI run did not succeed ([#474](https://github.com/7xuanlu/wenlan/issues/474)) ([c6ef28c](https://github.com/7xuanlu/wenlan/commit/c6ef28c43dac7a4bc120d1602507b76c8cf702b4))
+* **truth:** fence M5 claim edges out of the edges parity sweep ([#478](https://github.com/7xuanlu/wenlan/issues/478)) ([15909df](https://github.com/7xuanlu/wenlan/commit/15909df4518380f8e15fe67a991ac1f104e73ce6))
+* **truth:** make memory origin daemon-authoritative ([#475](https://github.com/7xuanlu/wenlan/issues/475)) ([20bb938](https://github.com/7xuanlu/wenlan/commit/20bb938e132e41a5ec29da3531702c65fb223be4))
+
 ## [0.15.4](https://github.com/7xuanlu/wenlan/compare/v0.15.3...v0.15.4) (2026-08-03)
 
 
