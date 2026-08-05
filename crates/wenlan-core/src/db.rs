@@ -9118,6 +9118,14 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("m81 DDL: {e}")))?;
 
+            // A crash between m81's COMMIT and its `user_version = 81` stamp
+            // on a pre-G6 binary leaves `edges` already created WITHOUT
+            // `semantic_type` at user_version 80 — the CREATE IF NOT EXISTS
+            // above cannot widen it, and the backfill INSERTs below name the
+            // column. Probe-add it so the rerun succeeds (same guard as
+            // migrations 98/111/115).
+            Self::ensure_edges_semantic_type_column(&conn).await?;
+
             let relations = Self::backfill_edges_from_relations(&conn).await?;
             let page_sources = Self::backfill_edges_from_page_sources(&conn).await?;
             let page_evidence = Self::backfill_edges_from_page_evidence(&conn).await?;
@@ -14273,6 +14281,12 @@ impl MemoryDB {
     /// Returns `libsql::Error` so callers whose existing transaction block
     /// is already typed that way (the common case in this file) can
     /// `.await?` it directly.
+    ///
+    /// Test-only seeding wrapper: since G6 Stage 1 every production mint
+    /// supplies its semantic fields through `dual_write_edge_with_payload`;
+    /// kept for the parity-fixture tests that assert the payload-less path
+    /// still converges.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     async fn dual_write_edge(
         conn: &libsql::Connection,
@@ -14785,7 +14799,7 @@ impl MemoryDB {
             let mut link_rows = conn
                 .query(
                     "SELECT pl.source_page_id, pl.target_page_id, pl.label_key, \
-                            sp.space, tp.space \
+                            pl.label, sp.space, tp.space \
                      FROM page_links pl \
                      INNER JOIN pages sp ON sp.id = pl.source_page_id \
                      INNER JOIN pages tp ON tp.id = pl.target_page_id \
@@ -14799,6 +14813,7 @@ impl MemoryDB {
                 String,
                 String,
                 String,
+                String,
                 Option<String>,
                 Option<String>,
             )> = Vec::new();
@@ -14807,12 +14822,13 @@ impl MemoryDB {
                     row.get(0).unwrap_or_default(),
                     row.get(1).unwrap_or_default(),
                     row.get(2).unwrap_or_default(),
-                    row.get::<Option<String>>(3).unwrap_or(None),
+                    row.get(3).unwrap_or_default(),
                     row.get::<Option<String>>(4).unwrap_or(None),
+                    row.get::<Option<String>>(5).unwrap_or(None),
                 ));
             }
             drop(link_rows);
-            for (src_page, dst_page, label_key, src_space, dst_space) in &reassert {
+            for (src_page, dst_page, label_key, label, src_space, dst_space) in &reassert {
                 let Some(space) = src_space.as_deref() else {
                     continue;
                 };
@@ -14823,7 +14839,12 @@ impl MemoryDB {
                 } else {
                     "synthesis"
                 };
-                Self::dual_write_edge(
+                // G6 Stage 1: the re-asserted edge must carry the display
+                // label like every other links mint — a rebind without it
+                // leaves an active label-less edge the parity oracle flags
+                // as semantic drift.
+                let semantic_patch = serde_json::json!({ "label": label }).to_string();
+                Self::dual_write_edge_with_payload(
                     conn,
                     "links",
                     "page",
@@ -14835,6 +14856,9 @@ impl MemoryDB {
                     space,
                     cross_space_downgrade,
                     None,
+                    None,
+                    None,
+                    Some(&semantic_patch),
                 )
                 .await?;
             }
