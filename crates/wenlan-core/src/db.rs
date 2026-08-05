@@ -629,7 +629,7 @@ impl MemoryDB {
                     None,
                     None,
                     Some(canonical),
-                    Some(&semantic_patch),
+                    semantic_patch.as_deref(),
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("fold mint edge: {e}")))?;
@@ -13309,7 +13309,7 @@ impl MemoryDB {
             // column) + confidence/explanation/source_agent in the payload.
             let mut relates_updated = 0u64;
             {
-                let mut pending: Vec<(String, String, String)> = Vec::new();
+                let mut pending: Vec<(String, String, Option<String>)> = Vec::new();
                 let mut rows = conn
                     .query(
                         "SELECT from_entity, to_entity, relation_type, \
@@ -13338,28 +13338,23 @@ impl MemoryDB {
                         &to_entity,
                         &relation_type,
                     );
-                    let mut patch = serde_json::Map::new();
-                    if let Some(v) = confidence {
-                        patch.insert("confidence".into(), serde_json::json!(v));
-                    }
-                    if let Some(v) = explanation {
-                        patch.insert("explanation".into(), serde_json::json!(v));
-                    }
-                    if let Some(v) = source_agent {
-                        patch.insert("source_agent".into(), serde_json::json!(v));
-                    }
-                    pending.push((
-                        edge_id,
-                        relation_type,
-                        serde_json::Value::Object(patch).to_string(),
-                    ));
+                    // An empty patch is no patch (mirrors
+                    // `relates_semantic_patch`): only semantic_type is set,
+                    // and a NULL payload stays NULL instead of becoming "{}".
+                    let patch = Self::relates_semantic_patch(
+                        confidence,
+                        explanation.as_deref(),
+                        source_agent.as_deref(),
+                    );
+                    pending.push((edge_id, relation_type, patch));
                 }
                 for (edge_id, relation_type, patch) in pending {
                     relates_updated += conn
                         .execute(
                             "UPDATE edges \
                              SET semantic_type = ?2, \
-                                 payload = json_patch(COALESCE(payload, '{}'), ?3) \
+                                 payload = CASE WHEN ?3 IS NULL THEN payload \
+                                           ELSE json_patch(COALESCE(payload, '{}'), ?3) END \
                              WHERE edge_id = ?1 AND valid_until IS NULL",
                             libsql::params![edge_id, relation_type, patch],
                         )
@@ -14349,12 +14344,14 @@ impl MemoryDB {
     /// the relation's display/audit fields, mirrored from its `relations`
     /// row. Only known values are included — `json_patch` treats a JSON
     /// null as "remove the key", so an absent value must be absent from
-    /// the patch, not null.
+    /// the patch, not null. Returns `None` when every field is absent: an
+    /// empty patch is no patch, and must not materialize a `"{}"` payload
+    /// on an edge whose payload would otherwise stay NULL.
     fn relates_semantic_patch(
         confidence: Option<f64>,
         explanation: Option<&str>,
         source_agent: Option<&str>,
-    ) -> String {
+    ) -> Option<String> {
         let mut patch = serde_json::Map::new();
         if let Some(v) = confidence {
             patch.insert("confidence".into(), serde_json::json!(v));
@@ -14365,7 +14362,11 @@ impl MemoryDB {
         if let Some(v) = source_agent {
             patch.insert("source_agent".into(), serde_json::json!(v));
         }
-        serde_json::Value::Object(patch).to_string()
+        if patch.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(patch).to_string())
+        }
     }
 
     /// Build the semantic-patch JSON for a `cites` edge (G6 Stage 1): the
@@ -32327,7 +32328,7 @@ impl MemoryDB {
                     None,
                     plan.payload.as_deref(),
                     Some(&plan.relation_type),
-                    Some(&semantic_patch),
+                    semantic_patch.as_deref(),
                 )
                 .await
                 .map_err(|error| {
@@ -32858,7 +32859,7 @@ impl MemoryDB {
                 None,
                 payload.as_deref(),
                 Some(&canonical),
-                Some(&semantic_patch),
+                semantic_patch.as_deref(),
             )
             .await?;
             let generation_updates =
@@ -34011,7 +34012,7 @@ impl MemoryDB {
                         None,
                         Some(payload.as_str()),
                         Some(canonical.as_str()),
-                        Some(&semantic_patch),
+                        semantic_patch.as_deref(),
                     )
                     .await
                     .map_err(|e| {
