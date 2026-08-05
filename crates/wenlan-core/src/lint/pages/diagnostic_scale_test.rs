@@ -114,6 +114,33 @@ async fn generate_fixture(root: &Path) {
                label TEXT NOT NULL,
                PRIMARY KEY (source_page_id, label_key)
              );
+             CREATE TABLE edges (
+               edge_id TEXT PRIMARY KEY,
+               src_id TEXT NOT NULL,
+               src_kind TEXT NOT NULL CHECK(src_kind IN ('page','memory','entity','external')),
+               dst_id TEXT NOT NULL,
+               dst_kind TEXT NOT NULL CHECK(dst_kind IN ('page','memory','entity','external')),
+               edge_type TEXT NOT NULL CHECK(edge_type IN ('mentions','relates','cites','supports','links')),
+               lineage TEXT NOT NULL CHECK(lineage IN ('assertion','evidence','synthesis','legacy')),
+               grounded INTEGER NOT NULL CHECK(grounded IN (0,1)),
+               root_id TEXT REFERENCES provenance_roots(root_id),
+               space TEXT NOT NULL,
+               weight REAL,
+               payload TEXT,
+               provenance TEXT,
+               operation_id TEXT,
+               created_at INTEGER NOT NULL,
+               superseded_by TEXT REFERENCES edges(edge_id),
+               valid_until INTEGER,
+               semantic_type TEXT
+             );
+             CREATE INDEX idx_edges_src ON edges(src_kind, src_id);
+             CREATE INDEX idx_edges_dst ON edges(dst_kind, dst_id);
+             CREATE INDEX idx_edges_root ON edges(root_id) WHERE root_id IS NOT NULL;
+             CREATE INDEX idx_edges_operation ON edges(operation_id) WHERE operation_id IS NOT NULL;
+             CREATE INDEX idx_edges_superseded ON edges(superseded_by) WHERE superseded_by IS NOT NULL;
+             CREATE INDEX idx_edges_active_grounded_space_type
+               ON edges(space, edge_type) WHERE valid_until IS NULL AND grounded = 1;
              CREATE INDEX idx_page_links_target ON page_links(target_page_id)
                WHERE target_page_id IS NOT NULL;
              CREATE INDEX idx_page_links_orphan ON page_links(label_key)
