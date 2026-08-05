@@ -79,6 +79,9 @@ where
                 };
             let parity_before = crate::repair::parity_input_generation_on_connection(&conn).await?;
             let non_target_before = crate::repair::effect_guard_receipt(conn.total_changes());
+            // Canonical-edge dual-writes made alongside a legacy-store repair
+            // (G6 Stage 0); measured per-arm and allowed by the effect guard.
+            let mut edge_dual_write_changes: u64 = 0;
             let affected = match (manifest.target(), manifest.writer(), manifest.mutation()) {
                 (
                     RepairTarget::Memory { source_id, .. },
@@ -222,17 +225,102 @@ where
                         return Err(WenlanError::Conflict("repair_target_stale".to_string()));
                     }
                     drop(target_rows);
-                    conn.execute(
-                        "UPDATE page_links SET target_page_id=?1
-                         WHERE source_page_id=?2 AND label_key=?3 AND target_page_id IS NULL",
-                        libsql::params![
-                            after_target_page_id.clone(),
-                            source_page_id.clone(),
-                            label_key.clone()
-                        ],
-                    )
-                    .await
-                    .map_err(|error| WenlanError::VectorDb(format!("repair bind page link: {error}")))?
+                    let changed = conn
+                        .execute(
+                            "UPDATE page_links SET target_page_id=?1
+                             WHERE source_page_id=?2 AND label_key=?3 AND target_page_id IS NULL",
+                            libsql::params![
+                                after_target_page_id.clone(),
+                                source_page_id.clone(),
+                                label_key.clone()
+                            ],
+                        )
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!("repair bind page link: {error}"))
+                        })?;
+                    // Dual-write (G6 Stage 0): an orphan row derives no edge,
+                    // so binding its target makes the canonical `links` edge
+                    // implied — mint it in the same transaction, mirroring
+                    // `resolve_orphan_page_links`.
+                    let changes_before_mint = conn.total_changes();
+                    if changed > 0 {
+                        let mut src_rows = conn
+                            .query(
+                                "SELECT space FROM pages WHERE id = ?1",
+                                libsql::params![source_page_id.clone()],
+                            )
+                            .await
+                            .map_err(|error| {
+                                WenlanError::VectorDb(format!("repair bind link src space: {error}"))
+                            })?;
+                        let src_space: Option<String> =
+                            match src_rows.next().await.map_err(|error| {
+                                WenlanError::VectorDb(format!("repair bind link src row: {error}"))
+                            })? {
+                                Some(row) => row.get(0).unwrap_or(None),
+                                None => None,
+                            };
+                        drop(src_rows);
+                        if let Some(src_space) = src_space.as_deref() {
+                            let mut dst_rows = conn
+                                .query(
+                                    "SELECT space FROM pages WHERE id = ?1",
+                                    libsql::params![after_target_page_id.clone()],
+                                )
+                                .await
+                                .map_err(|error| {
+                                    WenlanError::VectorDb(format!(
+                                        "repair bind link dst space: {error}"
+                                    ))
+                                })?;
+                            let dst_space: Option<String> =
+                                match dst_rows.next().await.map_err(|error| {
+                                    WenlanError::VectorDb(format!(
+                                        "repair bind link dst row: {error}"
+                                    ))
+                                })? {
+                                    Some(row) => row.get(0).unwrap_or(None),
+                                    None => None,
+                                };
+                            drop(dst_rows);
+                            let cross_space_downgrade = MemoryDB::resolved_space_downgrades(
+                                dst_space.as_deref(),
+                                src_space,
+                            );
+                            let lineage = if cross_space_downgrade {
+                                "legacy"
+                            } else {
+                                "synthesis"
+                            };
+                            MemoryDB::dual_write_edge(
+                                &conn,
+                                "links",
+                                "page",
+                                source_page_id,
+                                "page",
+                                after_target_page_id,
+                                label_key,
+                                lineage,
+                                src_space,
+                                cross_space_downgrade,
+                                None,
+                            )
+                            .await
+                            .map_err(|error| {
+                                WenlanError::VectorDb(format!(
+                                    "repair bind link edge mint: {error}"
+                                ))
+                            })?;
+                        }
+                    }
+                    edge_dual_write_changes = conn
+                        .total_changes()
+                        .checked_sub(changes_before_mint)
+                        .ok_or_else(|| {
+                            WenlanError::VectorDb("repair_effect_counter_underflow".to_string())
+                        })?;
+                    changed
                 }
                 (
                     RepairTarget::Page { page_id, scope },
@@ -353,6 +441,7 @@ where
                 };
             let allowed_changes = affected
                 .checked_add(allowed_derived_changes)
+                .and_then(|changes| changes.checked_add(edge_dual_write_changes))
                 .ok_or_else(|| WenlanError::VectorDb("repair_effect_counter_overflow".to_string()))?;
             let parity_bump = crate::repair::parity_input_generation_on_connection(&conn)
                 .await?

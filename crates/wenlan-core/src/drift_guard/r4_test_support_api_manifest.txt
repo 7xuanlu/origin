@@ -343,6 +343,14 @@ crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::approved_
 crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::approved_general_only_deterministic_manifest_applies_and_verifies_exact_field|TestDbSession::query|1
 crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::approved_general_only_deterministic_manifest_applies_and_verifies_exact_field|test_primary_session|1
 crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::approved_general_only_deterministic_manifest_applies_and_verifies_exact_field|test_primary_session|2
+crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::bind_page_link_repair_mints_the_links_edge|TestDbRow::get|1
+crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::bind_page_link_repair_mints_the_links_edge|TestDbRow::get|2
+crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::bind_page_link_repair_mints_the_links_edge|TestDbRows::next|1
+crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::bind_page_link_repair_mints_the_links_edge|TestDbRows::next|2
+crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::bind_page_link_repair_mints_the_links_edge|TestDbSession::query|1
+crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::bind_page_link_repair_mints_the_links_edge|TestDbSession::query|2
+crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::bind_page_link_repair_mints_the_links_edge|test_primary_session|1
+crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::bind_page_link_repair_mints_the_links_edge|test_primary_session|2
 crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::current_schema_diagnostic_distinguishes_old_and_future_versions|TestDbSession::execute|1
 crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::current_schema_diagnostic_distinguishes_old_and_future_versions|test_primary_session|1
 crates/wenlan-core/src/repair_plan_tests.rs|crate::repair_plan::tests::deep_only_deterministic_finding_is_visible_but_not_general_only_ready|TestDbSession::execute_batch|1

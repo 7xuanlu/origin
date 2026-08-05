@@ -2622,6 +2622,153 @@ async fn deterministic_db_writers_apply_exactly_and_orphan_binding_fails_when_am
     assert_eq!(target, None);
 }
 
+/// The repair tool's orphan-bind (`RepairWriter::BindPageLink`) is a second
+/// writer of `page_links.target_page_id` beside `resolve_orphan_page_links`;
+/// a successful bind must mint the now-implied canonical `links` edge, or the
+/// row is permanent "missing" parity drift (G6 Stage 0).
+#[tokio::test]
+async fn bind_page_link_repair_mints_the_links_edge() {
+    use crate::lint::{
+        context::{CancellationToken, LintClock},
+        runner::LintRunner,
+    };
+    use wenlan_types::{
+        lint::LintQuery,
+        repair::{ApplyRepairRequest, RepairWriter},
+    };
+
+    let (db, _dir) = crate::db::tests::test_db().await;
+    let page_root = tempfile::tempdir().unwrap();
+    let now = "2026-07-15T00:00:00Z";
+    db.insert_page(
+        "source_link",
+        "Source Link",
+        None,
+        "see [[Unique Link Target]]",
+        None,
+        Some("work"),
+        &[],
+        now,
+    )
+    .await
+    .unwrap();
+    db.insert_page(
+        "target_link_a",
+        "Unique Link Target",
+        None,
+        "target",
+        None,
+        Some("work"),
+        &[],
+        now,
+    )
+    .await
+    .unwrap();
+    let runner = || LintRunner::new(LintClock::fixed(), CancellationToken::new());
+    let general = runner()
+        .run(
+            &db,
+            &LintQuery::new(Some(LintProfile::General), None),
+            Some(page_root.path()),
+            true,
+        )
+        .await
+        .unwrap();
+    let deep = runner()
+        .run(
+            &db,
+            &LintQuery::new(Some(LintProfile::Deep), None),
+            Some(page_root.path()),
+            true,
+        )
+        .await
+        .unwrap();
+    let repair_root = tempfile::tempdir().unwrap();
+    let store = crate::repair::RepairArtifactStore::new(repair_root.path().to_path_buf());
+    let plan = prepare_repair_plan(
+        &db,
+        &store,
+        RepairPlanRequest::try_new(RepairLintScope::global(), general, Some(deep)).unwrap(),
+        Some(page_root.path()),
+        1_721_000_000,
+    )
+    .await
+    .unwrap();
+    let manifest = plan
+        .entries()
+        .iter()
+        .find_map(|entry| match entry.resolution() {
+            RepairResolution::Ready { manifest }
+                if manifest.writer() == RepairWriter::BindPageLink =>
+            {
+                Some(manifest.as_ref().clone())
+            }
+            _ => None,
+        })
+        .expect("bind manifest ready");
+    let request = ApplyRepairRequest::try_new(
+        manifest.manifest_id().to_string(),
+        manifest.manifest_digest().clone(),
+        format!(
+            "apply repair {} {}",
+            manifest.manifest_id(),
+            manifest.manifest_digest().as_str()
+        ),
+    )
+    .unwrap();
+    crate::repair::apply_repair(&db, &store, request, 1_721_000_001)
+        .await
+        .unwrap();
+
+    let target = db
+        .test_primary_session()
+        .await
+        .query(
+            "SELECT target_page_id FROM page_links WHERE source_page_id='source_link'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<Option<String>>(0)
+        .unwrap();
+    assert_eq!(target.as_deref(), Some("target_link_a"), "row bound");
+
+    let report = db.reconcile_edges_parity().await.unwrap();
+    assert_eq!(
+        report.drift_count, 0,
+        "a repair-tool orphan bind must not re-drift edges parity (missing={}, extra={}, corrupt={})",
+        report.missing_count, report.extra_count, report.corrupt_count
+    );
+    let edge_id = crate::provenance::compute_edge_id(
+        "links",
+        "page",
+        "source_link",
+        "page",
+        "target_link_a",
+        "unique link target",
+    );
+    let valid_until = db
+        .test_primary_session()
+        .await
+        .query(
+            "SELECT valid_until FROM edges WHERE edge_id = ?1",
+            libsql::params![edge_id.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .expect("minted links edge exists")
+        .get::<Option<i64>>(0)
+        .unwrap();
+    assert!(valid_until.is_none(), "minted links edge is active");
+}
+
 #[tokio::test]
 async fn page_projection_manifest_repairs_only_the_named_page_projection() {
     use crate::db::repair_verification::{
