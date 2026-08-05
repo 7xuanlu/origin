@@ -7,13 +7,27 @@ async fn optional_artifacts_are_neutral_but_deterministic_broken_targets_warn() 
     insert_page(&conn, "page-active", None, "active").await;
     insert_page(&conn, "page-target", None, "active").await;
     insert_page(&conn, "page-archived-target", None, "archived").await;
-    conn.execute(
-        "INSERT INTO page_links (source_page_id, target_page_id, label_key, label) \
-         VALUES ('page-active', 'page-target', 'resolved', 'resolved'), \
-                ('page-active', 'page-missing', 'missing', 'missing'), \
-                ('page-active', 'page-archived-target', 'archived', 'archived'), \
-                ('page-active', NULL, 'unresolved', 'unresolved')",
-        (),
+    drop(conn);
+    db.replace_page_links(
+        "page-active",
+        &[
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("page-target".to_string()),
+                label: "resolved".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("page-missing".to_string()),
+                label: "missing".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("page-archived-target".to_string()),
+                label: "archived".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: None,
+                label: "unresolved".to_string(),
+            },
+        ],
     )
     .await
     .unwrap();

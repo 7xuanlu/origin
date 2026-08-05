@@ -93,6 +93,11 @@ Order by measured entanglement:
    before this store reaches Stage 3: carry the label in a `links` edge payload
    (schema change), or keep `page_links` alive as a label+orphan side-table and
    shrink the Stage 3 drop list accordingly.
+   **Status (2026-08-04):** PR #486 closed the label gap. The product-route
+   readers and `load_link_counts` now read resolved links from `edges`, while
+   orphan readers stay on `page_links`. The decision is recorded: at Stage 3,
+   `page_links` narrows to an orphan-only store rather than being dropped
+   entirely.
 2. **`relations`** (~20 fns) — clear writer choke points, but readers include
    product routes (`get_entity_detail`, `list_recent_relations`), k-hop expansion,
    and lint/repair tooling. Entangled with `entities` via shared CRUD

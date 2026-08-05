@@ -8598,14 +8598,14 @@ async fn rebind_source_id_moves_the_machine_source_page_identity() {
         1
     );
     let outbound = db
-        .get_page_outbound_links("source_page_rebind_new")
+        .get_page_outbound_links_scoped("source_page_rebind_new", &ReadScope::Global)
         .await
         .unwrap();
     assert!(outbound
         .iter()
         .any(|link| { link.target_page_id.as_deref() == Some("page_rebind_link_target") }));
     let inbound = db
-        .get_page_inbound_links("source_page_rebind_new")
+        .get_page_inbound_links_scoped("source_page_rebind_new", &ReadScope::Global)
         .await
         .unwrap();
     assert!(inbound
@@ -19691,7 +19691,10 @@ async fn page_links_resolve_against_existing_titles() {
     .await
     .unwrap();
 
-    let out = db.get_page_outbound_links("page_src").await.unwrap();
+    let out = db
+        .get_page_outbound_links_scoped("page_src", &ReadScope::Global)
+        .await
+        .unwrap();
     // Three labels, sorted alphabetically.
     assert_eq!(out.len(), 3);
     let by_label: std::collections::HashMap<_, _> = out
@@ -19728,7 +19731,10 @@ async fn wikilink_resolution_uses_the_source_page_scope() {
     )
     .await;
 
-    let links = db.get_page_outbound_links("source-work").await.unwrap();
+    let links = db
+        .get_page_outbound_links_scoped("source-work", &ReadScope::Global)
+        .await
+        .unwrap();
     assert_eq!(links.len(), 1);
     assert_eq!(
         links[0].target_page_id.as_deref(),
@@ -19752,7 +19758,7 @@ async fn wikilink_same_scope_duplicate_titles_remain_unresolved() {
     .await;
 
     let links = db
-        .get_page_outbound_links("source-ambiguous")
+        .get_page_outbound_links_scoped("source-ambiguous", &ReadScope::Global)
         .await
         .unwrap();
     assert_eq!(links.len(), 1);
@@ -19792,11 +19798,11 @@ async fn orphan_wikilink_repair_is_scoped_per_source_page() {
 
     assert_eq!(db.resolve_orphan_page_links().await.unwrap(), 1);
     let work_links = db
-        .get_page_outbound_links("orphan-source-work")
+        .get_page_outbound_links_scoped("orphan-source-work", &ReadScope::Global)
         .await
         .unwrap();
     let personal_links = db
-        .get_page_outbound_links("orphan-source-personal")
+        .get_page_outbound_links_scoped("orphan-source-personal", &ReadScope::Global)
         .await
         .unwrap();
     assert_eq!(work_links[0].target_page_id.as_deref(), Some("future-work"));
@@ -19837,7 +19843,7 @@ async fn orphan_resolver_preserves_explicit_cross_scope_targets() {
 
     db.resolve_orphan_page_links().await.unwrap();
     let links = db
-        .get_page_outbound_links("explicit-source-personal")
+        .get_page_outbound_links_scoped("explicit-source-personal", &ReadScope::Global)
         .await
         .unwrap();
     assert_eq!(
@@ -19893,7 +19899,10 @@ async fn page_links_inbound_excludes_archived() {
     .unwrap();
     db.archive_page("page_archived_src").await.unwrap();
 
-    let inbound = db.get_page_inbound_links("page_target_in").await.unwrap();
+    let inbound = db
+        .get_page_inbound_links_scoped("page_target_in", &ReadScope::Global)
+        .await
+        .unwrap();
     let src_ids: Vec<&str> = inbound.iter().map(|(s, _)| s.as_str()).collect();
     assert!(src_ids.contains(&"page_active_src"));
     // Archived source must not surface even though the row exists in
@@ -19919,7 +19928,10 @@ async fn page_links_update_overwrites_old_links() {
     .await
     .unwrap();
 
-    let v1 = db.get_page_outbound_links("page_evolving").await.unwrap();
+    let v1 = db
+        .get_page_outbound_links_scoped("page_evolving", &ReadScope::Global)
+        .await
+        .unwrap();
     assert_eq!(v1.len(), 2);
 
     // Rewrite — Alpha drops, Gamma appears, Beta stays.
@@ -19932,7 +19944,10 @@ async fn page_links_update_overwrites_old_links() {
     .await
     .unwrap();
 
-    let v2 = db.get_page_outbound_links("page_evolving").await.unwrap();
+    let v2 = db
+        .get_page_outbound_links_scoped("page_evolving", &ReadScope::Global)
+        .await
+        .unwrap();
     let labels: std::collections::HashSet<&str> = v2.iter().map(|l| l.label.as_str()).collect();
     assert!(labels.contains("Gamma"));
     assert!(labels.contains("Beta"));
@@ -19999,7 +20014,10 @@ async fn page_links_resolve_orphans_after_target_appears() {
 
     // Confirm both source pages now point at the new target.
     for src in ["page_a", "page_b"] {
-        let out = db.get_page_outbound_links(src).await.unwrap();
+        let out = db
+            .get_page_outbound_links_scoped(src, &ReadScope::Global)
+            .await
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].target_page_id.as_deref(), Some("page_z"));
     }
@@ -20027,13 +20045,19 @@ async fn page_links_cascade_on_source_delete() {
     .unwrap();
 
     assert_eq!(
-        db.get_page_inbound_links("page_tgt").await.unwrap().len(),
+        db.get_page_inbound_links_scoped("page_tgt", &ReadScope::Global)
+            .await
+            .unwrap()
+            .len(),
         1
     );
     db.delete_page("page_src_d").await.unwrap();
     // FK cascade wipes outbound rows when the source row is deleted.
     assert_eq!(
-        db.get_page_inbound_links("page_tgt").await.unwrap().len(),
+        db.get_page_inbound_links_scoped("page_tgt", &ReadScope::Global)
+            .await
+            .unwrap()
+            .len(),
         0
     );
 }
@@ -20067,7 +20091,7 @@ async fn page_links_target_delete_becomes_orphan_and_reresolves() {
     .await
     .unwrap();
     assert_eq!(
-        db.get_page_outbound_links("page_source_keep")
+        db.get_page_outbound_links_scoped("page_source_keep", &ReadScope::Global)
             .await
             .unwrap()[0]
             .target_page_id
@@ -20077,7 +20101,7 @@ async fn page_links_target_delete_becomes_orphan_and_reresolves() {
 
     db.delete_page("page_target_old").await.unwrap();
     let target_after_delete = db
-        .get_page_outbound_links("page_source_keep")
+        .get_page_outbound_links_scoped("page_source_keep", &ReadScope::Global)
         .await
         .unwrap()[0]
         .target_page_id
@@ -20097,7 +20121,7 @@ async fn page_links_target_delete_becomes_orphan_and_reresolves() {
     .unwrap();
     let resolved = db.resolve_orphan_page_links().await.unwrap();
     let target_after_repair = db
-        .get_page_outbound_links("page_source_keep")
+        .get_page_outbound_links_scoped("page_source_keep", &ReadScope::Global)
         .await
         .unwrap()[0]
         .target_page_id
