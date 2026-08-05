@@ -14,7 +14,6 @@ Where things live. Subtree `AGENTS.md` files load automatically when you work un
 | Eval discipline — fixtures, baselines, seed scripts, cache TTL, faithfulness benches | `app/eval/AGENTS.md` |
 | Eval internals — runner conventions, paired-A/B apparatus, the G3 gate | `crates/wenlan-core/src/eval/AGENTS.md` |
 | CLI (`wenlan`) | "Key Modules — wenlan (CLI)" below (no subtree doc) |
-| Wire types (`wenlan-types`), MCP server (`wenlan-mcp`) | Architecture → Workspace Layout below (no subtree doc) |
 | Running & verifying against live surfaces — daemon launch/lifecycle, per-surface drive recipes, mutation audit / behavior trace / weekly sweep | `.claude/skills/run-wenlan/SKILL.md` → `.claude/skills/verify/SKILL.md` → `.claude/skills/prove/SKILL.md` (tracked in-repo) |
 
 ## Build & Dev Commands
@@ -22,49 +21,19 @@ Where things live. Subtree `AGENTS.md` files load automatically when you work un
 Wenlan is a Cargo workspace with 5 crates: `wenlan-types`, `wenlan-core`, `wenlan-server`, `wenlan` (CLI in `crates/wenlan-cli`), and `wenlan-mcp`.
 
 ```bash
-# Run the daemon directly:
-cargo run -p wenlan-server                # listens on 127.0.0.1:7878
-
-# Or start the daemon as a managed launchd service:
+# Daemon as a managed launchd/systemd/schtasks service (not a plain cargo run):
 cargo build -p wenlan -p wenlan-server
 ./target/debug/wenlan setup --basic       # configure local memory
 ./target/debug/wenlan background on       # writes plist, launchctl load
-./target/debug/wenlan status
 ./target/debug/wenlan background off      # when done
 
-# Workspace-level builds
-cargo check --workspace
-cargo build --workspace
-cargo test --workspace
+bash scripts/coverage.sh                  # HTML coverage, opens in browser
+bash scripts/setup-hooks.sh               # one-time: .githooks/pre-commit + pre-push
 
-# Per-crate builds (faster for iteration)
-cargo check -p wenlan-types
-cargo check -p wenlan-core
-cargo check -p wenlan-server
-cargo check -p wenlan                     # the CLI binary
-cargo build -p wenlan --release
-./target/release/wenlan --help
-
-# Run tests for a single crate
-cargo test -p wenlan-core
-cargo test -p wenlan-core --lib <module>::tests
-cargo test -p wenlan-core <test_name>
-
-# Generate coverage reports (opens in browser)
-bash scripts/coverage.sh
-
-# Set up git hooks (one-time; .githooks/pre-commit + pre-push)
-bash scripts/setup-hooks.sh
-
-# Eval benchmarks (require GPU + model files, run manually)
-# Unit tests for eval modules (fast, no GPU):
-cargo test -p wenlan-core --lib locomo::tests
-cargo test -p wenlan-core --lib longmemeval::tests
-
-# Generate eval baselines (slow, needs Qwen 3.5-9B on Metal GPU):
+# Eval baselines are #[ignore]d — they need Qwen 3.5-9B on a Metal GPU:
 cargo test -p wenlan-core --test eval_harness save_locomo_baseline -- --ignored --nocapture
 cargo test -p wenlan-core --test eval_harness save_longmemeval_baseline -- --ignored --nocapture
-# Baselines saved to <EVAL_BASELINES_DIR>/*.json (gitignored, default ~/.cache/origin-eval).
+# Baselines land in <EVAL_BASELINES_DIR>/*.json (gitignored, default ~/.cache/origin-eval).
 ```
 
 Pre-commit checks Rust formatting without changing the worktree and runs Clippy on directly changed crates. Pre-push uses the CI planner to run Clippy and tests over the affected reverse-dependency closure.
@@ -88,10 +57,6 @@ macOS builds use Metal, Windows x86_64 builds use Vulkan with observable CPU/Ope
 ### ORT (ONNX Runtime) on Windows
 
 If you see `Failed to load onnxruntime.dll` or version-mismatch errors on Windows, set `ORT_DYLIB_PATH` to the bundled `onnxruntime.dll` inside the Wenlan install directory before starting the daemon. The bundled DLL ships in the Windows release zip.
-
-### Daemon bind address
-
-The daemon binds to `127.0.0.1:7878` by default. To expose it on a non-loopback address (e.g., inside Docker), set `WENLAN_BIND_ADDR=0.0.0.0:7878` in the daemon's environment. The Docker image already sets this.
 
 ### Manual Windows verification
 
@@ -203,40 +168,9 @@ GitHub Actions caches are pruned daily by `ci-cache-maintenance.yml` to a 9 GB o
 
 Wenlan is a **Personal Agent Memory Layer** — a local-first memory server on macOS where AI agents write what they learn and humans curate. Daemon-centric: a headless HTTP server owns all business logic and data; the desktop app, the CLI, and external MCP clients are all thin clients over its HTTP API.
 
-### Workspace Layout
-
-The repo is a Cargo workspace with 5 crates:
-
-| Crate | Role | Key dependencies |
-|---|---|---|
-| `crates/wenlan-types` | Shared API boundary types (request/response, memory, entities). Lightweight: serde + serde_json + anyhow only. Consumed by `wenlan-mcp`, `wenlan-app` (separate repo, via crates.io), and any other downstream tool. | serde |
-| `crates/wenlan-core` | All business logic: DB, embeddings, LLM engine, search, classification, knowledge graph, distill cycles, pages, export, eval. **Must have NO axum or tauri dependencies.** | libSQL, FastEmbed, llama-cpp-2, hf-hub |
-| `crates/wenlan-server` | Headless HTTP daemon on `127.0.0.1:7878`. Depends on `wenlan-core`. Provides the runtime process used by CLI background management. | axum, tower, clap |
-| `crates/wenlan-cli` | CLI binary `wenlan`. Talks to daemon HTTP via `wenlan-types` and owns setup/service commands. Subcommands include `status`, `setup`, `background`, `restart`, `doctor`, `models`, `keys`, `connect`, `sources`, `capture`, `memories`, and `spaces`. | reqwest, clap |
-| `crates/wenlan-mcp` | MCP server binary that bridges MCP clients (Claude Code, Cursor, Codex, Claude Desktop, etc.) to the daemon HTTP API. Stdio + streamable-HTTP transports via the `rmcp` crate. Ships as a standalone binary + npm package (`npx -y wenlan-mcp`). | rmcp, reqwest, schemars |
-
-The daemon (`wenlan-server`) is the single source of truth. External tools (the desktop app, MCP clients via `wenlan-mcp`, `wenlan` CLI, curl) all talk HTTP to the same daemon. `wenlan-mcp` source lives in this monorepo; at runtime it's a separate process the MCP client spawns.
-
-### Stack
-
-- **Daemon**: Rust, Axum 0.8 (HTTP), libSQL (Turso's SQLite fork — vectors, knowledge graph, documents), Tokio, FastEmbed (BGE-Base-EN-v1.5-Q, 768-dim, 512-token max), llama-cpp-2 (Qwen3-4B-Instruct-2507 via Metal GPU; Qwen3.5-9B optional), launchd for process management
-- **CLI** (`wenlan`): Rust, reqwest, clap
-
 ### Database & events (owned by wenlan-core)
 
 One libSQL database (`MemoryDB` in `crates/wenlan-core/src/db.rs`) holds document chunks + vectors, the knowledge graph, and FTS, combined via Reciprocal Rank Fusion. `wenlan-core` stays framework-agnostic by emitting UI events through an `EventEmitter` trait (`NoopEmitter` in the daemon, `TauriEmitter` in the desktop app) rather than depending on tauri. **Schema, connection/sharing patterns, and the trait definition live in `crates/wenlan-core/AGENTS.md`** (loaded when working under that crate, per the agents.md hierarchical convention).
-
-### IPC Surface
-
-All data flows through the daemon's HTTP API. The desktop app, CLI, and MCP clients all hit it.
-
-- **HTTP API**: Axum on `127.0.0.1:7878`, served by `wenlan-server`. Used by the desktop app, the `wenlan-mcp` MCP server (same workspace, separate binary process), the `wenlan` CLI, and any external tool.
-  - General: `/api/health`, `/api/status`, `/api/search`, `/api/context`, `/api/ping`
-  - Ingest: `/api/ingest/text`, `/api/ingest/webpage`, `/api/ingest/memory`
-  - Memory CRUD: `/api/memory/store`, `/api/memory/search`, `/api/memory/confirm/{id}`, `/api/memory/list`, `/api/memory/delete/{id}`
-  - Knowledge graph: `/api/memory/entities`, `/api/memory/relations`, `/api/memory/observations`
-  - Profile & Agents: `/api/profile`, `/api/agents`, `/api/agents/{name}`
-  - WebSocket: `/ws/updates`
 
 ## Key Modules
 
@@ -244,10 +178,6 @@ Per-crate module tables live in subtree `AGENTS.md` files (loaded when an agent 
 
 - `crates/wenlan-core/AGENTS.md` — all business logic (db, engine, classify, extract, rerank, refinery, pages, eval, ...).
 - `crates/wenlan-server/AGENTS.md` — HTTP daemon (router, routes, state, ingest_batcher, scheduler, ...).
-
-## Key Modules — wenlan (CLI, `crates/wenlan-cli/src/`)
-
-The `wenlan` binary — a thin reqwest-based CLI for the daemon's HTTP API. Subcommands cover `setup`, `background`, `restart`, `status`, `doctor`, `models`, `keys`, `connect`, `sources`, `capture`, `memories`, and `spaces`. The CLI does not touch the database directly: every command is an HTTP call.
 
 ## Conventions
 
