@@ -306,7 +306,12 @@ async fn scoped_candidates_hydrate_cross_space_existing_link_endpoints() {
              INSERT INTO memory_entities (memory_id,entity_id)
              VALUES ('mem-work','entity-personal');
              INSERT INTO relations (id,from_entity,to_entity,relation_type,created_at)
-             VALUES ('relation-cross','entity-work','entity-personal','related',1);",
+             VALUES ('relation-cross','entity-work','entity-personal','related',1);
+             -- G6 Stage 1.2: entity_scope_clause/load_relations (reader #4)
+             -- read `edges`, not `relations` -- mirror the dual-write here.
+             INSERT INTO edges
+                 (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type)
+             VALUES ('edge-relation-cross','entity-work','entity','entity-personal','entity','relates','legacy',0,'work',1,'related');",
         )
         .await
         .unwrap();
@@ -419,6 +424,14 @@ async fn suspicious_existing_page_and_entity_links_are_distinct_candidates() {
          INSERT INTO relations (id,from_entity,to_entity,relation_type,created_at)
          VALUES ('relation-same','entity-work','entity-work-peer','related',1),
                 ('relation-cross','entity-work','entity-personal','related',1);
+         -- G6 Stage 1.2: entity_scope_clause/load_relations (reader #4) read
+         -- `edges`, not `relations` -- mirror the dual-write here. Both rows
+         -- matter: the test asserts the same-space relation is NOT flagged
+         -- while the cross-space one is.
+         INSERT INTO edges
+             (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type)
+         VALUES ('edge-relation-same','entity-work','entity','entity-work-peer','entity','relates','assertion',0,'work',1,'related'),
+                ('edge-relation-cross','entity-work','entity','entity-personal','entity','relates','legacy',0,'work',1,'related');
          INSERT INTO pages
              (id,title,content,source_memory_ids,version,status,created_at,last_compiled,
               last_modified,workspace,creation_kind,review_status)

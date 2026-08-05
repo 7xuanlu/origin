@@ -777,9 +777,10 @@ fn entity_scope_clause(scope: &ScopeFilter) -> (String, libsql::params::Params) 
                         WHERE {memory_filter} AND m.space=?1
                     )
                     OR e.id IN (
-                        SELECT r.to_entity FROM relations r
-                        JOIN entities source ON source.id=r.from_entity
-                        WHERE source.space=?1
+                        SELECT r.dst_id FROM edges r
+                        JOIN entities source ON source.id=r.src_id
+                        WHERE r.edge_type='relates' AND r.valid_until IS NULL
+                          AND source.space=?1
                     ))"
             ),
             libsql::params::Params::Positional(vec![libsql::Value::Text(value.clone())]),
@@ -793,9 +794,10 @@ fn entity_scope_clause(scope: &ScopeFilter) -> (String, libsql::params::Params) 
                         WHERE {memory_filter} AND m.space IS NULL
                     )
                     OR e.id IN (
-                        SELECT r.to_entity FROM relations r
-                        JOIN entities source ON source.id=r.from_entity
-                        WHERE source.space IS NULL
+                        SELECT r.dst_id FROM edges r
+                        JOIN entities source ON source.id=r.src_id
+                        WHERE r.edge_type='relates' AND r.valid_until IS NULL
+                          AND source.space IS NULL
                     ))"
             ),
             libsql::params::Params::None,
@@ -829,7 +831,7 @@ async fn load_memory_entity_links(
 async fn load_relations(context: &LintContext<'_, '_>) -> Result<Vec<Relation>, ()> {
     let (scope, params) = scope_clause(context.scope().filter(), "source.space");
     let mut rows = context.snapshot().query(
-        &format!("SELECT r.from_entity,r.to_entity,r.relation_type FROM relations r JOIN entities source ON source.id=r.from_entity WHERE 1=1{scope} ORDER BY r.from_entity,r.to_entity,r.id"),
+        &format!("SELECT r.src_id,r.dst_id,r.semantic_type FROM edges r JOIN entities source ON source.id=r.src_id WHERE r.edge_type='relates' AND r.valid_until IS NULL AND r.semantic_type IS NOT NULL{scope} ORDER BY r.src_id,r.dst_id,r.edge_id"),
         params,
     ).await.map_err(|_| ())?;
     let mut output = Vec::new();

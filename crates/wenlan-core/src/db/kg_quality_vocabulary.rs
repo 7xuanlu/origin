@@ -4,6 +4,14 @@ use super::MemoryDB;
 use crate::error::WenlanError;
 
 impl MemoryDB {
+    // 2026-08-05, G6 Stage 1.2 deliberate carryover: stays on `relations`,
+    // not `edges`. This is writer coupling, not drift detection -- the
+    // healer's writer, `fold_relation_type` (db.rs), enumerates
+    // `SELECT ... FROM relations WHERE relation_type = ?1` to do the actual
+    // fold. If discovery read `edges` here while repair enumerates
+    // `relations`, the healer would discover a type it then folds zero rows
+    // for. Migrate this reader only alongside `fold_relation_type` itself
+    // (see docs/plans/2026-08-05-g6-stage12-relations-readers-spec.md).
     pub(crate) async fn distinct_relation_types_for_vocabulary_heal(
         &self,
     ) -> Result<Vec<String>, WenlanError> {

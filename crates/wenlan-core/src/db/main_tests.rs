@@ -10879,6 +10879,103 @@ async fn test_get_entity_detail() {
     assert_eq!(origin_detail.relations[0].entity_name, "Alice");
 }
 
+/// G6 Stage 1.2 (relations-readers migration,
+/// docs/plans/2026-08-05-g6-stage12-relations-readers-spec.md):
+/// get_entity_detail now reads active `relates` edges instead of
+/// `relations` rows. The relation `id` is therefore the edge's
+/// content-addressed `edge_id`, not the legacy `relations` row's uuid (no
+/// route dereferences it back into `relations`, so this wire-visible id
+/// swap is safe), and `created_at` is sourced via `asserted_at`, which
+/// mirrors the relations row's own `created_at`.
+#[tokio::test]
+async fn get_entity_detail_reads_relates_edge_fields() {
+    let (db, _dir) = test_db().await;
+    let alice_id = db
+        .store_entity(
+            "Alice G6",
+            "person",
+            Some("work"),
+            Some("claude"),
+            Some(0.9),
+        )
+        .await
+        .unwrap();
+    let wenlan_id = db
+        .store_entity("Wenlan G6", "project", Some("work"), None, None)
+        .await
+        .unwrap();
+    db.create_relation(
+        &alice_id,
+        &wenlan_id,
+        "works_on",
+        Some("claude"),
+        Some(0.9),
+        Some("seen"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let relation_type = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT relation_type FROM relations WHERE from_entity = ?1 AND to_entity = ?2",
+                libsql::params![alice_id.as_str(), wenlan_id.as_str()],
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .expect("relation row")
+            .get::<String>(0)
+            .unwrap()
+    };
+    let expected_edge_id = crate::provenance::compute_edge_id(
+        "relates",
+        "entity",
+        &alice_id,
+        "entity",
+        &wenlan_id,
+        &relation_type,
+    );
+
+    let detail = db.get_entity_detail(&alice_id).await.unwrap();
+    assert_eq!(detail.relations.len(), 1);
+    let relation = &detail.relations[0];
+    assert_eq!(
+        relation.id, expected_edge_id,
+        "relation id must be the active edge's edge_id, not the relations row uuid"
+    );
+    assert_eq!(relation.relation_type, relation_type);
+    assert_eq!(relation.source_agent.as_deref(), Some("claude"));
+    assert_eq!(relation.direction, "outgoing");
+    assert_eq!(relation.entity_id, wenlan_id);
+    assert_eq!(relation.entity_name, "Wenlan G6");
+
+    let stored_created_at: i64 = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT created_at FROM relations WHERE from_entity = ?1 AND to_entity = ?2",
+                libsql::params![alice_id.as_str(), wenlan_id.as_str()],
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .expect("relation row")
+            .get(0)
+            .unwrap()
+    };
+    assert_eq!(
+        relation.created_at, stored_created_at,
+        "created_at must mirror the relations row's created_at via asserted_at"
+    );
+}
+
 #[tokio::test]
 async fn test_update_observation() {
     let (db, _dir) = test_db().await;
@@ -29828,7 +29925,9 @@ async fn migration_114_resyncs_stale_entity_shadow_pages() {
 async fn migration_115_backfills_edge_semantic_payload() {
     let (db, _dir) = test_db().await;
 
-    // relates — live path (dual-writes the edge with payload=NULL today).
+    // relates — live path (post-#486, dual-writes the edge with a
+    // `relates_semantic_patch` payload -- `asserted_at` always, plus
+    // `source_memory_id` when supplied -- never payload=NULL).
     let from = db
         .store_entity("Alice", "person", Some("work"), None, None)
         .await
@@ -30085,6 +30184,405 @@ async fn migration_115_backfills_edge_semantic_payload() {
             "pass {pass}: links display label"
         );
     }
+}
+
+/// G6 Stage 1.2 (docs/plans/2026-08-05-g6-stage12-relations-readers-spec.md):
+/// migration 116 backfills `payload.asserted_at` (always) and fills
+/// `payload.source_memory_id` only when absent, from the live `relations`
+/// twin. A pre-Stage-1.2 edge is simulated by clearing both keys after the
+/// write (the writer now stamps them at insert time, so a fresh write is
+/// never actually missing them). The loop runs the migration twice: the
+/// second pass must converge on the identical end-state.
+#[tokio::test]
+async fn migration_116_backfills_asserted_at_and_fills_source_memory_id() {
+    let (db, _dir) = test_db().await;
+    let from = db
+        .create_entity("G6 Backfill A", "person", Some("space_a"))
+        .await
+        .unwrap();
+    let to = db
+        .create_entity("G6 Backfill B", "project", Some("space_a"))
+        .await
+        .unwrap();
+    db.create_relation(
+        &from,
+        &to,
+        "relates_to",
+        Some("agent"),
+        Some(0.5),
+        None,
+        Some("mem_backfill"),
+    )
+    .await
+    .unwrap();
+
+    let forced_created_at = 1_000_000_000i64;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE relations SET created_at = ?1 WHERE from_entity = ?2 AND to_entity = ?3",
+            libsql::params![forced_created_at, from.as_str(), to.as_str()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE edges SET payload = json_remove(payload, '$.asserted_at', '$.source_memory_id') \
+             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+            libsql::params![from.as_str(), to.as_str()],
+        )
+        .await
+        .unwrap();
+    }
+
+    for pass in 1..=2 {
+        db.migrate_116_relates_asserted_at(115).await.unwrap();
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT json_extract(payload, '$.asserted_at'), \
+                        json_extract(payload, '$.source_memory_id') \
+                 FROM edges WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+                libsql::params![from.as_str(), to.as_str()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("relates edge active");
+        assert_eq!(
+            row.get::<Option<i64>>(0).unwrap(),
+            Some(forced_created_at),
+            "pass {pass}: asserted_at must mirror the relations row's created_at"
+        );
+        assert_eq!(
+            row.get::<Option<String>>(1).unwrap().as_deref(),
+            Some("mem_backfill"),
+            "pass {pass}: source_memory_id must fill in when absent"
+        );
+    }
+}
+
+/// G6 Stage 1.2: the payload backfill migration 116 is non-structural (it
+/// only touches `edges.payload`), so it must never introduce parity drift.
+#[tokio::test]
+async fn migration_116_keeps_relates_edge_parity_clean() {
+    let (db, _dir) = test_db().await;
+    let from = db
+        .create_entity("G6 Parity A", "person", Some("space_a"))
+        .await
+        .unwrap();
+    let to = db
+        .create_entity("G6 Parity B", "project", Some("space_a"))
+        .await
+        .unwrap();
+    db.create_relation(
+        &from,
+        &to,
+        "relates_to",
+        Some("agent"),
+        Some(0.7),
+        None,
+        Some("mem_parity"),
+    )
+    .await
+    .unwrap();
+
+    db.migrate_116_relates_asserted_at(115).await.unwrap();
+
+    assert_eq!(
+        db.reconcile_edges_parity().await.unwrap().drift_count,
+        0,
+        "the payload backfill must not disturb edges parity"
+    );
+}
+
+/// G6 Stage 1.2 divergence test (Sol review S3): no other test can tell
+/// whether a migrated reader actually reads `edges` versus `relations`, since
+/// every OTHER fixture keeps both stores in parity via the dual-write. Here
+/// they're deliberately split: one relates fact exists ONLY in `edges`, and
+/// TWO exist ONLY in `relations` (asymmetric counts so a reader that quietly
+/// fell back to `relations` would report a different number, not the same
+/// one by coincidence). Covers readers #1 (`expand_anchor_entities_khop`),
+/// #2 (`expand_entities_khop_scoped`), #3 (`aggregate_counts`), #5
+/// (`get_entity_detail`), #7 (`list_recent_relations`), #9
+/// (`relation_vocabulary`), and #11 (`relation_integrity`) — each must see
+/// the edge-only fact and stay blind to the relations-only orphans. Readers
+/// #4 (`entity_scope_clause`) and #13 (`load_relations`, both in
+/// `lint/semantic_candidates.rs`) are NOT exercised by this test.
+#[tokio::test]
+async fn migrated_readers_diverge_from_relations_and_follow_edges() {
+    let (db, _dir) = test_db().await;
+    let edge_src = db
+        .create_entity("G6 Divergence EdgeSrc", "thing", None)
+        .await
+        .unwrap();
+    let edge_dst = db
+        .create_entity("G6 Divergence EdgeDst", "thing", None)
+        .await
+        .unwrap();
+    let rel_src = db
+        .create_entity("G6 Divergence RelSrc", "thing", None)
+        .await
+        .unwrap();
+    let rel_dst = db
+        .create_entity("G6 Divergence RelDst", "thing", None)
+        .await
+        .unwrap();
+
+    {
+        let conn = db.conn.lock().await;
+        // Edge-only fact: no `relations` twin.
+        conn.execute(
+            "INSERT INTO edges (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type)
+             VALUES ('edge-only-1',?1,'entity',?2,'entity','relates','legacy',0,?3,1,'edge_only_type')",
+            libsql::params![edge_src.clone(), edge_dst.clone(), UNFILED_SPACE_ID],
+        )
+        .await
+        .unwrap();
+        // Two relations-only orphans (asymmetric count vs the one edge-only
+        // fact above): no `edges` twin for either.
+        conn.execute(
+            "INSERT INTO relations (id,from_entity,to_entity,relation_type,created_at)
+             VALUES ('rel-only-1',?1,?2,'rel_only_type_a',1)",
+            libsql::params![rel_src.clone(), rel_dst.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO relations (id,from_entity,to_entity,relation_type,created_at)
+             VALUES ('rel-only-2',?1,?2,'rel_only_type_b',1)",
+            libsql::params![rel_src.clone(), rel_dst.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    // Reader #5: get_entity_detail.
+    let edge_detail = db.get_entity_detail(&edge_src).await.unwrap();
+    assert!(
+        edge_detail
+            .relations
+            .iter()
+            .any(|r| r.entity_id == edge_dst),
+        "must see the edge-only relation"
+    );
+    let rel_detail = db.get_entity_detail(&rel_src).await.unwrap();
+    assert!(
+        rel_detail.relations.is_empty(),
+        "must not see the relations-only orphans"
+    );
+
+    // Reader #7: list_recent_relations.
+    let recent = db.list_recent_relations(50, None).await.unwrap();
+    assert!(
+        recent
+            .iter()
+            .any(|r| r.from_entity_id == edge_src && r.to_entity_id == edge_dst),
+        "must see the edge-only relation"
+    );
+    assert!(
+        !recent
+            .iter()
+            .any(|r| r.from_entity_id == rel_src && r.to_entity_id == rel_dst),
+        "must not see the relations-only orphans"
+    );
+
+    // Readers #1/#2: k-hop expansion.
+    let expanded = temp_env::async_with_vars([("WENLAN_GRAPH_KHOP_DEPTH", Some("1"))], async {
+        db.expand_anchor_entities_khop(std::slice::from_ref(&edge_src), &ReadScope::Global)
+            .await
+            .unwrap()
+    })
+    .await;
+    assert!(
+        expanded.contains(&edge_dst),
+        "khop must reach the edge-only neighbor"
+    );
+    let not_expanded = temp_env::async_with_vars([("WENLAN_GRAPH_KHOP_DEPTH", Some("1"))], async {
+        db.expand_anchor_entities_khop(std::slice::from_ref(&rel_src), &ReadScope::Global)
+            .await
+            .unwrap()
+    })
+    .await;
+    assert!(
+        !not_expanded.contains(&rel_dst),
+        "khop must not reach a relations-only orphan"
+    );
+
+    // Reader #2: expand_entities_khop_scoped (explicit-param sibling of #1).
+    let expanded_scoped = db
+        .expand_entities_khop_scoped(std::slice::from_ref(&edge_src), 1, 64, &ReadScope::Global)
+        .await
+        .unwrap();
+    assert!(
+        expanded_scoped.contains(&edge_dst),
+        "scoped khop must reach the edge-only neighbor"
+    );
+    let not_expanded_scoped = db
+        .expand_entities_khop_scoped(std::slice::from_ref(&rel_src), 1, 64, &ReadScope::Global)
+        .await
+        .unwrap();
+    assert!(
+        !not_expanded_scoped.contains(&rel_dst),
+        "scoped khop must not reach a relations-only orphan"
+    );
+
+    // Readers #3, #9, #11: Deep profile is a registered superset of General
+    // (see deep_profile_is_a_registered_superset_without_duplicate_general_checks),
+    // so one report covers relation_integrity + aggregate_counts (General/kg)
+    // and relation_vocabulary (Deep).
+    let report = crate::lint::runner::LintRunner::new(
+        crate::lint::context::LintClock::fixed(),
+        crate::lint::context::CancellationToken::new(),
+    )
+    .run(
+        &db,
+        &wenlan_types::lint::LintQuery {
+            profile: Some(wenlan_types::lint::LintProfile::Deep),
+            space: None,
+        },
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    let find_check = |id: &str| {
+        report
+            .checks()
+            .iter()
+            .find(|check| check.check_id() == id)
+            .unwrap_or_else(|| panic!("missing check {id}"))
+    };
+    assert_eq!(
+        find_check("relations.integrity").coverage().denominator(),
+        1,
+        "relation_integrity population must come from edges (1), not relations (2)"
+    );
+    assert_eq!(
+        find_check("relations.vocabulary_integrity")
+            .coverage()
+            .denominator(),
+        1,
+        "relation_vocabulary population must come from edges (1), not relations (2)"
+    );
+    let kg_relations_count = find_check("kg.aggregate_inventory")
+        .metrics()
+        .iter()
+        .find_map(|metric| {
+            (metric.code() == wenlan_types::lint::LintMetricCode::KgRelations).then(|| match metric
+                .value()
+            {
+                wenlan_types::lint::LintMetricValue::Count { value } => *value,
+                _ => 0,
+            })
+        })
+        .unwrap();
+    assert_eq!(
+        kg_relations_count, 1,
+        "aggregate_counts must count edges (1), not relations (2)"
+    );
+}
+
+/// G6 Stage 1.2 Trap 1 (recency scramble): `edges.created_at` is
+/// migration-day for m81-backfilled edges, not a substitute for
+/// `relations.created_at`. `list_recent_relations` must order and filter
+/// on `asserted_at` (COALESCE'd to `edges.created_at` only when absent),
+/// never on the edge's own dual-write timestamp.
+#[tokio::test]
+async fn list_recent_relations_orders_by_asserted_at_not_edge_created_at() {
+    let (db, _dir) = test_db().await;
+    let hub = db
+        .create_entity("G6 Recency Hub", "person", Some("space_a"))
+        .await
+        .unwrap();
+    let e_a = db
+        .create_entity("G6 Recency A", "project", Some("space_a"))
+        .await
+        .unwrap();
+    let e_b = db
+        .create_entity("G6 Recency B", "project", Some("space_a"))
+        .await
+        .unwrap();
+    let e_c = db
+        .create_entity("G6 Recency C", "project", Some("space_a"))
+        .await
+        .unwrap();
+    let e_d = db
+        .create_entity("G6 Recency D", "project", Some("space_a"))
+        .await
+        .unwrap();
+
+    // "type_a".."type_d" all fold to the same normalized relation_type
+    // (create_relation resolves unknown types against the shared
+    // vocabulary), so ordering is asserted on the target entity name
+    // instead -- the (from, to) pair is already unique per target below.
+    db.create_relation(&hub, &e_a, "type_a", None, None, None, None)
+        .await
+        .unwrap();
+    db.create_relation(&hub, &e_b, "type_b", None, None, None, None)
+        .await
+        .unwrap();
+    db.create_relation(&hub, &e_c, "type_c", None, None, None, None)
+        .await
+        .unwrap();
+    db.create_relation(&hub, &e_d, "type_d", None, None, None, None)
+        .await
+        .unwrap();
+
+    // Force distinct relations.created_at (the truth) mirrored onto
+    // edges.payload.asserted_at. e_d additionally gets a much newer
+    // edges.created_at (an m81-style backfill mismatch) to prove ordering
+    // and since_ms filtering key off asserted_at, not edges.created_at.
+    {
+        let conn = db.conn.lock().await;
+        for (target, created_at) in [
+            (&e_a, 1_000i64),
+            (&e_b, 2_000i64),
+            (&e_c, 3_000i64),
+            (&e_d, 500i64),
+        ] {
+            conn.execute(
+                "UPDATE relations SET created_at = ?1 \
+                 WHERE from_entity = ?2 AND to_entity = ?3",
+                libsql::params![created_at, hub.as_str(), target.as_str()],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "UPDATE edges SET payload = json_set(COALESCE(payload, '{}'), '$.asserted_at', ?1) \
+                 WHERE edge_type = 'relates' AND src_id = ?2 AND dst_id = ?3",
+                libsql::params![created_at, hub.as_str(), target.as_str()],
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE edges SET created_at = 9999999 \
+             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+            libsql::params![hub.as_str(), e_d.as_str()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let all = db.list_recent_relations(10, None).await.unwrap();
+    let names: Vec<&str> = all.iter().map(|r| r.to_entity_name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "G6 Recency C",
+            "G6 Recency B",
+            "G6 Recency A",
+            "G6 Recency D"
+        ],
+        "order must follow asserted_at DESC, not edges.created_at"
+    );
+
+    let since = db.list_recent_relations(10, Some(1_500)).await.unwrap();
+    let since_names: Vec<&str> = since.iter().map(|r| r.to_entity_name.as_str()).collect();
+    assert_eq!(
+        since_names,
+        vec!["G6 Recency C", "G6 Recency B"],
+        "since_ms must filter on asserted_at, not edges.created_at"
+    );
 }
 
 /// G6 Stage 1 writer teeth: the live producers must carry semantic fields at
@@ -47181,6 +47679,35 @@ async fn source_backed_relation_retry_preserves_original_relation_and_edge_prove
     assert_eq!(
         relation_source, edge_source,
         "relation and extraction edge provenance must agree after retry"
+    );
+
+    // G6 Stage 1.2: asserted_at must still mirror the ORIGINAL stored row's
+    // created_at (immutable under the upsert), never `now` at the retry;
+    // confidence keeps the higher (0.9) value the retry supplied.
+    let original_created_at: i64 = {
+        let mut rows = conn
+            .query(
+                "SELECT created_at FROM relations WHERE id = ?1",
+                libsql::params![retry_id.clone()],
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .expect("relation row")
+            .get(0)
+            .unwrap()
+    };
+    assert_eq!(
+        payload["asserted_at"],
+        serde_json::json!(original_created_at),
+        "asserted_at must mirror the ORIGINAL stored relation's created_at across the re-assert"
+    );
+    assert_eq!(
+        payload["confidence"],
+        serde_json::json!(0.9),
+        "confidence must reflect the STORED (higher) value after the re-assert"
     );
 }
 

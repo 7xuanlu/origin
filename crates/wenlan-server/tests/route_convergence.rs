@@ -196,7 +196,7 @@ async fn create_relation_missing_entities_returns_422() {
 /// M3g fence: `span`/`model_version`/`prompt_version` are daemon-internal (KG
 /// extraction) only. An agent hitting `/api/memory/relations` directly must
 /// never be able to set them -- the handler strips all three before the
-/// core call, so a request that supplies them still writes `payload=NULL`.
+/// core call.
 #[tokio::test]
 async fn create_relation_strips_agent_supplied_span_capture_fields() {
     let (app, dir) = test_app().await;
@@ -255,9 +255,22 @@ async fn create_relation_strips_agent_supplied_span_capture_fields() {
         .expect("relates edge row")
         .get(0)
         .unwrap();
+    // G6 Stage 1.2: every relates mint now stamps `asserted_at` (mirrors the
+    // stored relations row's created_at), so the payload is no longer empty.
+    // The provenance-stripping contract this test guards is that agent-
+    // supplied span/model_version/prompt_version never land in it.
+    let payload_json: serde_json::Value =
+        serde_json::from_str(payload.as_deref().expect("payload must carry asserted_at"))
+            .expect("payload must be valid JSON");
     assert!(
-        payload.is_none(),
-        "agent-supplied span/model_version/prompt_version must be stripped, got payload: {payload:?}"
+        payload_json.get("span").is_none()
+            && payload_json.get("model_version").is_none()
+            && payload_json.get("prompt_version").is_none(),
+        "agent-supplied span/model_version/prompt_version must be stripped, got payload: {payload_json}"
+    );
+    assert!(
+        payload_json.get("asserted_at").is_some(),
+        "payload must still carry asserted_at, got: {payload_json}"
     );
 }
 
