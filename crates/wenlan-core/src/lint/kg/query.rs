@@ -45,41 +45,45 @@ pub(super) async fn load(context: &LintContext<'_, '_>, hub_cap: u64) -> Result<
     })
 }
 
-// G6 Stage 1.5a carryover (2026-08-05): NOT migrated. The `e.space IS NOT
-// NULL AND NOT EXISTS(spaces…)` body below is not merely imprecise under the
-// shadow-page mirror -- it goes VACUOUSLY TRUE for every row. The mirror
-// folds NULL `entities.space` to the `UNFILED_SPACE_ID` sentinel on the page
-// row, so a shadow-page read would always see space as non-NULL, and the
-// sentinel never matches a real `spaces.name` row; every entity would flag
-// as a false integrity violation, not just a subtly different one. Stays on
-// `entities` until the space-sentinel audit (spec's 1.5b decision record).
+// G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
+// space-sentinel fold: the scope clause now uses `scope_clause_folded`, and
+// the integrity predicate excludes the `UNFILED_SPACE_ID` sentinel itself
+// (never a registered `spaces.name`) so a folded unfiled entity no longer
+// vacuously flags as an integrity violation. 1.5b Part 3 (item 8)
+// disposition: not a reader-migration target -- this audits the legacy
+// `entities` store's own data quality, and reading the shadow-page mirror
+// instead would validate the mirror rather than the store it exists to
+// check. Stays on `entities` until Stage 2 retires the store itself.
 async fn entity_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
-    let (clause, params) = scope_clause(context.scope().filter(), "e", false);
+    let (clause, params) = scope_clause_folded(context.scope().filter(), "e", false);
     row_check(
         context,
         &format!(
             "SELECT CASE WHEN TRIM(e.name)='' OR TRIM(e.entity_type)=''
                     OR COALESCE(e.confirmed,-1) NOT IN (0,1)
                     OR (e.confidence IS NOT NULL AND (e.confidence < 0 OR e.confidence > 1))
-                    OR (e.space IS NOT NULL AND NOT EXISTS(
+                    OR (e.space IS NOT NULL AND e.space != '{}' AND NOT EXISTS(
                         SELECT 1 FROM spaces s WHERE s.name=e.space))
                   THEN 1 ELSE 0 END
-               FROM entities e{clause} ORDER BY e.id"
+               FROM entities e{clause} ORDER BY e.id",
+            crate::db::UNFILED_SPACE_ID
         ),
         params,
     )
     .await
 }
 
-// G6 Stage 1.5a carryover (2026-08-05): NOT migrated (entity-existence side
-// -- observation content itself is out of scope for this stage regardless,
-// see the spec's 1.5b observations ruling). `scope_clause` below filters on
-// `e.space`/`e.id` directly against `entities`; the shadow-page mirror folds
-// NULL `entities.space` to the `UNFILED_SPACE_ID` sentinel, so a migrated
-// read would silently change which rows a space-scoped query matches. Stays
-// on `entities` until the space-sentinel audit.
+// G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
+// space-sentinel fold: `e.space`/`e.id` now uses `scope_clause_folded`,
+// sentinel-aware (entity-existence side only -- observation content itself
+// is out of scope for this stage regardless, see the spec's 1.5b
+// observations ruling). 1.5b Part 3 (item 8) disposition: not a
+// reader-migration target -- this audits the legacy `entities` store's own
+// data quality, and reading the shadow-page mirror instead would validate
+// the mirror rather than the store it exists to check. Stays on `entities`
+// until Stage 2 retires the store itself.
 async fn observation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
-    let (clause, params) = scope_clause(context.scope().filter(), "e", true);
+    let (clause, params) = scope_clause_folded(context.scope().filter(), "e", true);
     row_check(
         context,
         &format!(
@@ -95,14 +99,15 @@ async fn observation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck
     .await
 }
 
-// G6 Stage 1.5a carryover (2026-08-05): NOT migrated. `scope_clause` below
-// filters on `f.space`/`f.id` (the src-entity alias) directly against
-// `entities`; the shadow-page mirror folds NULL `entities.space` to the
-// `UNFILED_SPACE_ID` sentinel, so a migrated read would silently change
-// which rows a space-scoped query matches. Stays on `entities` until the
-// space-sentinel audit.
+// G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
+// space-sentinel fold: `f.space`/`f.id` (the src-entity alias) now uses
+// `scope_clause_folded`, sentinel-aware. 1.5b Part 3 (item 8) disposition:
+// not a reader-migration target -- this audits the legacy `entities`
+// store's own data quality, and reading the shadow-page mirror instead
+// would validate the mirror rather than the store it exists to check.
+// Stays on `entities` until Stage 2 retires the store itself.
 async fn relation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
-    let (clause, params) = scope_clause(context.scope().filter(), "f", true);
+    let (clause, params) = scope_clause_folded(context.scope().filter(), "f", true);
     row_check(
         context,
         &format!(
@@ -186,6 +191,35 @@ pub(super) fn scope_clause(
         ScopeFilter::Uncategorized => (
             format!(
                 " WHERE {alias}.space IS NULL{}",
+                if exclude_missing_owner {
+                    format!(" AND {alias}.id IS NOT NULL")
+                } else {
+                    String::new()
+                }
+            ),
+            libsql::params::Params::None,
+        ),
+    }
+}
+
+/// Same as `scope_clause`, but for an `entities.space` alias folded by the
+/// 1.5b space-sentinel migration: an unfiled row stores `UNFILED_SPACE_ID`,
+/// not SQL NULL, so `Uncategorized` must match either.
+pub(super) fn scope_clause_folded(
+    scope: &ScopeFilter,
+    alias: &str,
+    exclude_missing_owner: bool,
+) -> (String, libsql::params::Params) {
+    match scope {
+        ScopeFilter::Global => (String::new(), libsql::params::Params::None),
+        ScopeFilter::Registered(space) => (
+            format!(" WHERE {alias}.space=?1"),
+            libsql::params::Params::Positional(vec![libsql::Value::Text(space.clone())]),
+        ),
+        ScopeFilter::Uncategorized => (
+            format!(
+                " WHERE ({alias}.space IS NULL OR {alias}.space = '{}'){}",
+                crate::db::UNFILED_SPACE_ID,
                 if exclude_missing_owner {
                     format!(" AND {alias}.id IS NOT NULL")
                 } else {

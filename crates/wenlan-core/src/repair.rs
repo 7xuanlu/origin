@@ -4706,12 +4706,14 @@ fn decode_entity_extraction_space(encoded: &str) -> Result<Option<String>, Wenla
         .map_err(|_| WenlanError::Validation("repair_target_schema_mismatch".to_string()))
 }
 
-// G6 Stage 1.5a carryover (2026-08-05): NOT migrated. The `(?2 IS NULL AND
-// space IS NULL) OR space=?2` guard below distinguishes a literal NULL
-// `entities.space` from a registered space; the shadow-page mirror folds
-// NULL to the `UNFILED_SPACE_ID` sentinel, so a migrated read would silently
-// change which rows validate. Stays on `entities` until the space-sentinel
-// audit.
+// G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
+// space-sentinel fold: the `(?2 IS NULL AND (space IS NULL OR space =
+// sentinel)) OR space=?2` guard below now matches a folded `entities.space`
+// too, so an "expects uncategorized" caller (`space=None`) still validates
+// against a row now carrying the `UNFILED_SPACE_ID` sentinel. 1.5b Part 3
+// (item 8) disposition: writer-coupled discovery read, not a reader-migration
+// target -- re-verifies rows a caller is about to hand to `store_entity`
+// et al, so it flips with those writers in Stage 2, not ahead of them.
 async fn validate_selected_entities_on_snapshot(
     snapshot: &LintReadSnapshot<'_>,
     entity_ids: &[String],
@@ -4721,7 +4723,7 @@ async fn validate_selected_entities_on_snapshot(
         let mut rows = snapshot
             .query(
                 "SELECT 1 FROM entities
-                 WHERE id=?1 AND ((?2 IS NULL AND space IS NULL) OR space=?2)
+                 WHERE id=?1 AND ((?2 IS NULL AND (space IS NULL OR space = '00000000-0000-4000-8000-000000000001')) OR space=?2)
                  LIMIT 2",
                 libsql::params::Params::Positional(vec![
                     libsql::Value::Text(entity_id.clone()),
@@ -4741,14 +4743,13 @@ async fn validate_selected_entities_on_snapshot(
     Ok(())
 }
 
-// G6 Stage 1.5a carryover (2026-08-05): NOT migrated, for two independent
-// reasons. (1) Same space-sentinel trap as the snapshot variant above -- the
-// `(?2 IS NULL AND space IS NULL) OR space=?2` guard distinguishes a literal
-// NULL `entities.space` from a registered space, which the shadow-page
-// mirror's NULL-to-sentinel fold would silently change. (2) This variant
-// runs on the shared-mutex connection inside the entity-extraction repair's
-// own `BEGIN IMMEDIATE` (`db/repair_memory_cas.rs`), re-verifying entities
-// that repair batch itself just wrote -- Stage-2 writer-batch alignment, NOT
+// G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
+// space-sentinel fold: the `(?2 IS NULL AND (space IS NULL OR space =
+// sentinel)) OR space=?2` guard below now matches a folded `entities.space`
+// too, same fix as the snapshot variant above. This variant runs on the
+// shared-mutex connection inside the entity-extraction repair's own `BEGIN
+// IMMEDIATE` (`db/repair_memory_cas.rs`), re-verifying entities that repair
+// batch itself just wrote -- Stage-2 writer-batch alignment, NOT
 // connection-level coupling (the shared-mutex conn can never see uncommitted
 // foreign state from another writer). Flips with `store_entity` in Stage 2.
 pub(crate) async fn validate_selected_entities_on_connection(
@@ -4760,7 +4761,7 @@ pub(crate) async fn validate_selected_entities_on_connection(
         let mut rows = connection
             .query(
                 "SELECT 1 FROM entities
-                 WHERE id=?1 AND ((?2 IS NULL AND space IS NULL) OR space=?2)
+                 WHERE id=?1 AND ((?2 IS NULL AND (space IS NULL OR space = '00000000-0000-4000-8000-000000000001')) OR space=?2)
                  LIMIT 2",
                 libsql::params![entity_id.clone(), space.map(str::to_string)],
             )

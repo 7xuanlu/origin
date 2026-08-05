@@ -753,7 +753,16 @@ async fn load_entities(context: &LintContext<'_, '_>) -> Result<Vec<Entity>, ()>
     ).await.map_err(|_| ())?;
     let mut output = Vec::new();
     while let Some(row) = rows.next().await.map_err(|_| ())? {
-        let space: Option<String> = row.get(2).map_err(|_| ())?;
+        // G6 Stage 1.5b: `entities.space` is NOT NULL as of the space-sentinel
+        // fold migration, so an unfiled entity now carries the reserved
+        // `UNFILED_SPACE_ID` sentinel rather than NULL. Translate it back to
+        // None here, same as load_memories already does for `m.space` (M3
+        // PR-1 stage e), so scope_matches's Uncategorized branch still sees
+        // "no space" as None instead of the sentinel.
+        let space: Option<String> = row
+            .get::<Option<String>>(2)
+            .map_err(|_| ())?
+            .filter(|s| s != crate::db::UNFILED_SPACE_ID);
         output.push(Entity {
             id: row.get(0).map_err(|_| ())?,
             name: row.get(1).map_err(|_| ())?,
@@ -766,6 +775,7 @@ async fn load_entities(context: &LintContext<'_, '_>) -> Result<Vec<Entity>, ()>
 
 fn entity_scope_clause(scope: &ScopeFilter) -> (String, libsql::params::Params) {
     let memory_filter = "m.source='memory' AND m.pending_revision=0 AND COALESCE(m.is_recap,0)=0 AND m.supersede_mode!='evicted'";
+    let unfiled = crate::db::UNFILED_SPACE_ID;
     match scope {
         ScopeFilter::Global => (String::new(), libsql::params::Params::None),
         ScopeFilter::Registered(value) => (
@@ -785,9 +795,14 @@ fn entity_scope_clause(scope: &ScopeFilter) -> (String, libsql::params::Params) 
             ),
             libsql::params::Params::Positional(vec![libsql::Value::Text(value.clone())]),
         ),
+        // G6 Stage 1.5b: `entities.space` is folded (never NULL; unfiled rows
+        // carry `UNFILED_SPACE_ID`), so the `e.space`/`source.space` legs
+        // below match the sentinel too. `m.space` is untouched here — that's
+        // `memories.space`'s own pre-existing fold (M3 PR-1 stage e),
+        // unrelated to this migration.
         ScopeFilter::Uncategorized => (
             format!(
-                " AND (e.space IS NULL
+                " AND ((e.space IS NULL OR e.space = '{unfiled}')
                     OR e.id IN (
                         SELECT me.entity_id FROM memory_entities me
                         JOIN memories m ON m.source_id=me.memory_id
@@ -797,7 +812,7 @@ fn entity_scope_clause(scope: &ScopeFilter) -> (String, libsql::params::Params) 
                         SELECT r.dst_id FROM edges r
                         JOIN entities source ON source.id=r.src_id
                         WHERE r.edge_type='relates' AND r.valid_until IS NULL
-                          AND source.space IS NULL
+                          AND (source.space IS NULL OR source.space = '{unfiled}')
                     ))"
             ),
             libsql::params::Params::None,
@@ -828,14 +843,19 @@ async fn load_memory_entity_links(
     Ok(output)
 }
 
-// G6 Stage 1.5a carryover (2026-08-05): NOT migrated. `scope_clause` below
-// filters on `source.space` (the src-entity alias) directly against
-// `entities`; the shadow-page mirror folds NULL `entities.space` to the
-// `UNFILED_SPACE_ID` sentinel, so a migrated read would silently change
-// which rows a space-scoped query matches. Stays on `entities` until the
-// space-sentinel audit.
+// G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
+// space-sentinel fold: `source.space` now uses `scope_clause_folded`,
+// sentinel-aware. The `source`-aliased `entities` join itself is a separate,
+// still-legacy concern. 1.5b Part 3 (item 8) disposition, correcting the
+// note above: NOT a reader-migration target -- Part 3's 9-item list (spec
+// `docs/plans/2026-08-05-g6-stage15b-entity-reader-completion-spec.md`)
+// does not name this function. Like its `lint/deep.rs`/`lint/kg/query.rs`
+// siblings, this audits the legacy `entities` store's own data quality;
+// reading the shadow-page mirror instead would validate the mirror rather
+// than the store it exists to check. Stays on `entities` until Stage 2
+// retires the store itself.
 async fn load_relations(context: &LintContext<'_, '_>) -> Result<Vec<Relation>, ()> {
-    let (scope, params) = scope_clause(context.scope().filter(), "source.space");
+    let (scope, params) = scope_clause_folded(context.scope().filter(), "source.space");
     let mut rows = context.snapshot().query(
         &format!("SELECT r.src_id,r.dst_id,r.semantic_type FROM edges r JOIN entities source ON source.id=r.src_id WHERE r.edge_type='relates' AND r.valid_until IS NULL AND r.semantic_type IS NOT NULL{scope} ORDER BY r.src_id,r.dst_id,r.edge_id"),
         params,
@@ -908,6 +928,27 @@ fn scope_clause(scope: &ScopeFilter, column: &str) -> (String, libsql::params::P
         ),
         ScopeFilter::Uncategorized => (
             format!(" AND {column} IS NULL"),
+            libsql::params::Params::None,
+        ),
+    }
+}
+
+/// Same as `scope_clause`, but for an `entities.space` column folded by the
+/// 1.5b space-sentinel migration: an unfiled row stores `UNFILED_SPACE_ID`,
+/// not SQL NULL, so `Uncategorized` must match either. Mirrors
+/// `push_read_scope_filter_folded` (db.rs).
+fn scope_clause_folded(scope: &ScopeFilter, column: &str) -> (String, libsql::params::Params) {
+    match scope {
+        ScopeFilter::Global => (String::new(), libsql::params::Params::None),
+        ScopeFilter::Registered(value) => (
+            format!(" AND {column}=?1"),
+            libsql::params::Params::Positional(vec![libsql::Value::Text(value.clone())]),
+        ),
+        ScopeFilter::Uncategorized => (
+            format!(
+                " AND ({column} IS NULL OR {column} = '{}')",
+                crate::db::UNFILED_SPACE_ID
+            ),
             libsql::params::Params::None,
         ),
     }
@@ -1248,5 +1289,66 @@ mod excerpt_tests {
 
         assert_eq!(excerpt, "[lint_context scope=redacted]\nvisible evidence");
         assert!(!excerpt.contains("/Users/alice"));
+    }
+}
+
+#[cfg(test)]
+mod scope_matches_tests {
+    use super::load_entities;
+    use crate::db::tests::test_db;
+    use crate::lint::context::{
+        AppliedScope, CancellationToken, ExecutionGate, LintClock, LintContext,
+    };
+
+    /// G6 Stage 1.5b Part 2 (space-sentinel fold, migration 118): pins
+    /// `scope_matches`'s Uncategorized branch against the folded sentinel via
+    /// its real consumer, `load_entities`/`entity_scope_clause`. An unfiled
+    /// entity now stores `UNFILED_SPACE_ID` in `entities.space`, never NULL;
+    /// without the sentinel-aware translation this entity would silently
+    /// drop out of "uncategorized" scope after the fold.
+    #[tokio::test]
+    async fn uncategorized_scope_selects_the_unfiled_sentinel_entity() {
+        let (db, _tmp) = test_db().await;
+        let unfiled_id = db
+            .store_entity("G6 Unfiled", "person", None, None, None)
+            .await
+            .unwrap();
+        let filed_id = db
+            .store_entity("G6 Filed", "person", Some("space_a"), None, None)
+            .await
+            .unwrap();
+
+        let snapshot = db
+            .open_isolated_lint_snapshot_for_test()
+            .await
+            .expect("snapshot");
+        let scope = AppliedScope::uncategorized();
+        let clock = LintClock::fixed();
+        let gate = ExecutionGate::new(CancellationToken::new());
+        let context = LintContext::new(
+            &snapshot,
+            &scope,
+            None,
+            &clock,
+            &gate,
+            wenlan_types::lint::LintProfile::General,
+        );
+
+        let entities = load_entities(&context).await.expect("load_entities");
+
+        let unfiled = entities
+            .iter()
+            .find(|e| e.id == unfiled_id)
+            .expect("unfiled entity must be visible under Uncategorized scope");
+        assert!(
+            unfiled.selected,
+            "the unfiled sentinel entity must be selected under Uncategorized scope"
+        );
+        assert!(
+            entities.iter().all(|e| e.id != filed_id),
+            "a space-filed entity must not appear under Uncategorized scope"
+        );
+
+        snapshot.finish().await.expect("finish snapshot");
     }
 }

@@ -7,22 +7,34 @@ pub(crate) fn summary_eligible_predicate(alias: &str) -> String {
     let durable_gate = crate::db::community_reader_durable_gate_sql(
         crate::db::COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
     );
+    // G6 Stage 1.5b Part 3: reads `community_id` off the entity's `kind='entity'`
+    // shadow page via `entity_page_map`/`pages` rather than `entities` directly
+    // (unconditional hard cutover, same program contract as `load_summary_buckets`
+    // above) -- the column is mirrored 1:1 off `entities.community_id` by
+    // `insert_entity_shadow_page`/`update_entity_shadow_page`.
     let legacy = format!(
         "{alias}.entity_id IN (
-             SELECT owner.id FROM entities owner
+             SELECT owner_epm.entity_id
+               FROM entity_page_map owner_epm
+               JOIN pages owner_p
+                 ON owner_p.id=owner_epm.page_id
+                AND owner_p.kind='entity' AND owner_p.status='active'
              JOIN (
-                 SELECT peer_entity.community_id
+                 SELECT peer_p.community_id
                    FROM memories peer
-                   JOIN entities peer_entity ON peer.entity_id=peer_entity.id
+                   JOIN entity_page_map peer_epm ON peer.entity_id=peer_epm.entity_id
+                   JOIN pages peer_p
+                     ON peer_p.id=peer_epm.page_id
+                    AND peer_p.kind='entity' AND peer_p.status='active'
                   WHERE peer.source='memory' AND peer.chunk_index=0
                     AND peer.is_recap=0 AND peer.supersede_mode<>'archive'
                     AND peer.source_id NOT LIKE 'merged_%'
                     AND peer.source_id NOT LIKE 'recap_%'
                     AND peer.embedding IS NOT NULL
-                    AND peer_entity.community_id IS NOT NULL
-                  GROUP BY peer_entity.community_id
+                    AND peer_p.community_id IS NOT NULL
+                  GROUP BY peer_p.community_id
                  HAVING COUNT(*) >= {minimum}
-             ) eligible ON eligible.community_id=owner.community_id
+             ) eligible ON eligible.community_id=owner_p.community_id
          )"
     );
     let durable = format!(
@@ -189,6 +201,15 @@ mod tests {
         )
         .await
         .unwrap();
+        drop(conn);
+        // G6 Stage 1.5b Part 3: `summary_eligible_predicate`'s legacy branch now
+        // reads `community_id` off the entity's shadow page, so the raw-SQL
+        // `entities` inserts above need a shadow page each (test helper for
+        // exactly this).
+        for entity_id in ["large-a", "large-b", "large-c", "small-a", "small-b"] {
+            db.test_seed_entity_shadow_page(entity_id).await.unwrap();
+        }
+        let conn = db.test_primary_session().await;
         let vector = format!(
             "[{}]",
             std::iter::repeat_n("0", 768).collect::<Vec<_>>().join(",")

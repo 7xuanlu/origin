@@ -19,6 +19,18 @@ impl ResolvedWriteSpace {
     }
 }
 
+/// Normalizes a folded space column at the wire boundary: an unfiled row
+/// (`entities.space` as of the G6 Stage 1.5b Part 2 space-sentinel fold,
+/// same as the earlier `memories.space`/`pages.workspace` folds) stores
+/// `UNFILED_SPACE_ID`, never SQL NULL -- but the external wire contract for
+/// "unfiled" stays `null`. `wenlan-server`'s HTTP routes never call this
+/// directly: they read already-normalized values from `entity_from_row`
+/// (`db/scoped_entities.rs`), which is the sole crate-boundary crossing --
+/// every call site lives inside `wenlan-core`.
+pub(crate) fn normalize_unfiled_space(space: Option<String>) -> Option<String> {
+    space.filter(|value| value != crate::db::UNFILED_SPACE_ID)
+}
+
 #[derive(Debug)]
 pub struct LegacyDefaultImport {
     pub already_processed: bool,
@@ -33,6 +45,29 @@ mod tests {
     use crate::events::NoopEmitter;
     use crate::WenlanError;
     use wenlan_types::{WriteSpaceSource, WriteSpaceTarget};
+
+    /// G6 Stage 1.5b Part 2 pin test: `normalize_unfiled_space` must fold
+    /// the `UNFILED_SPACE_ID` sentinel back to `None` (so the wire contract
+    /// keeps `null` for "unfiled") while leaving a real space name and an
+    /// already-`None` value untouched.
+    #[test]
+    fn normalize_unfiled_space_folds_sentinel_to_none() {
+        assert_eq!(
+            super::normalize_unfiled_space(Some(UNFILED_SPACE_ID.to_string())),
+            None,
+            "the sentinel must normalize to None at the wire boundary"
+        );
+        assert_eq!(
+            super::normalize_unfiled_space(Some("work".to_string())),
+            Some("work".to_string()),
+            "a real space name must pass through unchanged"
+        );
+        assert_eq!(
+            super::normalize_unfiled_space(None),
+            None,
+            "an already-None value must pass through unchanged"
+        );
+    }
 
     #[tokio::test]
     async fn default_space_set_replace_rename_delete_lifecycle() {

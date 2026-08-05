@@ -20,6 +20,7 @@ use wenlan_types::responses::{
     AddObservationResponse, CreateEntityResponse, CreateRelationResponse, ListEntitiesResponse,
     SearchEntitiesResponse, SuccessResponse,
 };
+use wenlan_types::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};
 
 #[derive(Debug, Deserialize)]
 struct ErrorEnvelope {
@@ -394,4 +395,41 @@ async fn moved_entity_graph_handlers_preserve_typed_contracts() {
         );
         assert_eq!(error.error, "Database not initialized");
     }
+}
+
+/// G6 Stage 1.5b Part 2 pin test: the `entities.space` space-sentinel fold
+/// is an internal storage detail -- `POST /api/memory/entities` for an
+/// unfiled entity must still return `space: null` and
+/// `space_source: "uncategorized"` on the wire, exactly as it did when the
+/// column was literal SQL NULL. Locks the wire contract now, ahead of the
+/// writer-side fold migration landing later in the same PR.
+#[tokio::test]
+async fn create_entity_unfiled_reports_null_space_on_wire() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+
+    let request = CreateEntityRequest {
+        name: "Wire Contract Co".to_string(),
+        entity_type: "org".to_string(),
+        space: WriteSpaceTarget::Uncategorized,
+        source_agent: Some("entity-graph-route-contract".to_string()),
+        confidence: Some(0.9),
+    };
+    let (status, created): (StatusCode, CreateEntityResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities",
+        json_body(&request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        created.space, None,
+        "an unfiled entity must report space: null on the wire, not the sentinel"
+    );
+    assert_eq!(
+        created.space_source,
+        Some(WriteSpaceSource::Uncategorized),
+        "an unfiled entity must report space_source: uncategorized"
+    );
+    assert_eq!(created.write_outcome, Some(WriteOutcome::Created));
 }

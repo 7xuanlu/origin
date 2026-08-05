@@ -10,17 +10,24 @@ pub(crate) struct StaleEntityEmbeddingCandidate {
 }
 
 impl MemoryDB {
+    /// G6 Stage 1.5b Part 3: reads the entity's `kind='entity'` shadow page
+    /// via `entity_page_map`, unconditional hard cutover (same program
+    /// contract as `MemoryDB::list_entities`). `embedding_updated_at` is
+    /// mirrored 1:1 onto `pages` by
+    /// `insert_entity_shadow_page`/`update_entity_shadow_page`.
     pub(crate) async fn stale_entity_embedding_candidates_for_refresh(
         &self,
     ) -> Result<Vec<StaleEntityEmbeddingCandidate>, WenlanError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT e.id, e.name
-                 FROM entities e
-                 LEFT JOIN observations o ON o.entity_id = e.id
-                    AND o.created_at > COALESCE(e.embedding_updated_at, 0)
-                 GROUP BY e.id, e.name
+                "SELECT epm.entity_id, p.title
+                 FROM entity_page_map epm
+                 JOIN pages p ON p.id = epm.page_id
+                    AND p.kind = 'entity' AND p.status = 'active'
+                 LEFT JOIN observations o ON o.entity_id = epm.entity_id
+                    AND o.created_at > COALESCE(p.embedding_updated_at, 0)
+                 GROUP BY epm.entity_id, p.title
                  HAVING COUNT(o.id) >= 5",
                 (),
             )

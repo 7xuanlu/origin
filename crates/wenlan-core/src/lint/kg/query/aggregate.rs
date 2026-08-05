@@ -1,4 +1,4 @@
-use super::scope_clause;
+use super::{scope_clause, scope_clause_folded};
 use crate::lint::context::LintContext;
 use wenlan_types::lint::{LintMetric, LintMetricCode, LintMetricValue};
 
@@ -27,28 +27,28 @@ impl AggregateCounts {
     }
 }
 
-// G6 Stage 1.5a carryover (2026-08-05): NOT migrated. This is a space-count
-// partition, not a well-formedness check -- `KgEntitiesScoped` vs
-// `KgEntitiesUncategorized` IS the NULL-vs-non-NULL `entities.space` split.
-// The shadow-page mirror folds NULL to the `UNFILED_SPACE_ID` sentinel, so a
-// migrated read would see `pages.space` as never NULL and
-// `KgEntitiesUncategorized` would always report 0. Known transitional skew:
-// the `KgEntities` metric emitted here is legacy-derived (`COUNT(*) FROM
-// entities`), while `aggregate_counts` below emits the same metric code
-// shadow-derived (`entity_page_map` JOIN `pages`) -- the two only diverge if
-// the mirror invariant breaks. This function retires with the `entities`
-// store, not before.
+// G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
+// space-sentinel fold: `KgEntitiesScoped` vs `KgEntitiesUncategorized` is
+// still the "has a real space" vs "unfiled" split -- the SUM predicates below
+// now test against the `UNFILED_SPACE_ID` sentinel too, so a folded row keeps
+// classifying as Uncategorized instead of silently reporting 0. Known
+// transitional skew: the `KgEntities` metric emitted here is legacy-derived
+// (`COUNT(*) FROM entities`), while `aggregate_counts` below emits the same
+// metric code shadow-derived (`entity_page_map` JOIN `pages`) -- the two only
+// diverge if the mirror invariant breaks. This function retires with the
+// `entities` store, not before.
 pub(super) async fn entity_partitions(
     context: &LintContext<'_, '_>,
 ) -> Result<Vec<LintMetric>, ()> {
-    let (clause, params) = scope_clause(context.scope().filter(), "e", false);
+    let (clause, params) = scope_clause_folded(context.scope().filter(), "e", false);
     let values = scalar_row(
         context,
         &format!(
             "SELECT COUNT(*), SUM(CASE WHEN e.confirmed=1 THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN e.space IS NOT NULL THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN e.space IS NULL THEN 1 ELSE 0 END)
-               FROM entities e{clause}"
+                    SUM(CASE WHEN e.space IS NOT NULL AND e.space != '{unfiled}' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN e.space IS NULL OR e.space = '{unfiled}' THEN 1 ELSE 0 END)
+               FROM entities e{clause}",
+            unfiled = crate::db::UNFILED_SPACE_ID
         ),
         params,
         4,

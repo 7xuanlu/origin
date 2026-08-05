@@ -181,6 +181,33 @@ Order by measured entanglement:
    writers in Stage 2. Empirically backed on the live DB (swept 2026-08-05 07:30,
    post-migrations 113/114): `entity_page_parity_watermark` drift 0, 907/907
    expected-vs-actual shadow pages, 0 `entities` rows without a live shadow page.
+   **Stage 1.5b — status (2026-08-05):** Part 1 (migration 117) extended the
+   shadow-page scalar mirror to `source_agent`/`entity_created_at`/
+   `entity_updated_at`. Part 2 (migration 118) folded `entities.space` NULL to
+   the `UNFILED_SPACE_ID` sentinel (matching the `memories`/`pages` folds),
+   making every space-sensitive reader safe to trust off the mirror. Part 3
+   (spec `docs/plans/2026-08-05-g6-stage15b-entity-reader-completion-spec.md`)
+   migrated the 9 reader targets 1.5a's CLEAN-reader spec had excluded as
+   space-sensitive or structurally coupled: `list_entities`, `get_entity_detail`
+   (entity-half), `search_entities_by_name` (same unconditional-cutover shape
+   as 1.5a); `search_entities_by_vector`/`_scoped` (the row set stays on
+   `entities` -- the DiskANN index lives there -- but every display field is
+   unconditionally hydrated from the shadow page); `load_summary_buckets`'s
+   legacy branch + `summary_eligible_predicate`; the embedding-refresh
+   staleness sweep; and `list_recent_relations`/`_scoped` (structural rework,
+   not a hydration overlay -- the join itself was legacy-shaped even when
+   gated). This collapses the last `reader_uses_entity_pages` gated hybrid in
+   `scoped_entities.rs`; the gate and `SCOPED_ENTITIES_CONSUMER` are left
+   dead-but-present (retire with the writers in Stage 2, per the spec). Of
+   1.5a's 10 CARRYOVER sites, 3 were already self-documented as writer-coupled
+   (defer to Stage 2) or intentionally legacy (dual-metric emission); the
+   remaining 7 are lint/integrity audits of the `entities` store's own data
+   quality and are reclassified intentionally-legacy -- auditing the shadow
+   mirror instead would validate the mirror, not the store the check exists to
+   audit. Verification: `cargo test -p wenlan-core --lib` -- 4083 passed, 0
+   failed, 33 ignored (GPU-gated), 0 filtered; fmt + clippy (`--lib --bins` and
+   `--all-targets`) clean; M5 reader-inventory and R4 test-support census
+   regenerated.
 
 Each store's migration is one PR: readers redirected to `edges`/shadow pages,
 behavior-equivalence tests, and the store's parity derivation dropped from
