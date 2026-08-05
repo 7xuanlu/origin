@@ -491,6 +491,7 @@ impl MemoryDB {
             drop(rows);
 
             let mut folded = 0usize;
+            let mut graph_changes: Vec<CommunityGraphChange> = Vec::new();
             for (id, from, to, conf, expl, smid) in &ids {
                 // Does a canonical edge already exist for this pair?
                 let mut ex = conn
@@ -553,8 +554,75 @@ impl MemoryDB {
                     .await
                     .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
                 }
+                // Dual-write (G6 Stage 0): `relation_type` is a structural
+                // field of the content-addressed edge id, so a fold retires
+                // the old-type edge and asserts the canonical-type one —
+                // otherwise every folded row becomes permanent parity drift
+                // (one "extra" plus one "missing"). Endpoint-space
+                // classification mirrors `create_relation_with_span`.
+                let old_edge_id = crate::provenance::compute_edge_id(
+                    "relates", "entity", from, "entity", to, old_type,
+                );
+                let new_edge_id = crate::provenance::compute_edge_id(
+                    "relates", "entity", from, "entity", to, canonical,
+                );
+                let mut space_rows = conn
+                    .query(
+                        "SELECT fe.space, te.space FROM entities fe, entities te WHERE fe.id = ?1 AND te.id = ?2",
+                        libsql::params![from.clone(), to.clone()],
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+                let (from_space, to_space): (Option<String>, Option<String>) = match space_rows
+                    .next()
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?
+                {
+                    Some(row) => (row.get(0).unwrap_or(None), row.get(1).unwrap_or(None)),
+                    None => (None, None),
+                };
+                drop(space_rows);
+                let (lineage, space, cross_space_downgrade) = match (&from_space, &to_space) {
+                    (Some(fs), Some(ts)) if fs == ts => ("assertion", fs.clone(), false),
+                    _ => (
+                        "legacy",
+                        from_space
+                            .or(to_space)
+                            .unwrap_or_else(|| UNFILED_SPACE_ID.to_string()),
+                        true,
+                    ),
+                };
+                let (_, mint_changes) = Self::dual_write_edge_with_payload(
+                    &conn,
+                    "relates",
+                    "entity",
+                    from,
+                    "entity",
+                    to,
+                    canonical,
+                    lineage,
+                    &space,
+                    cross_space_downgrade,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("fold mint edge: {e}")))?;
+                graph_changes.extend(mint_changes);
+                // Retire AFTER the mint: `superseded_by` is an FK into
+                // `edges`, so the canonical successor must exist first.
+                if let Some(change) =
+                    Self::dual_write_invalidate_edge(&conn, &old_edge_id, Some(&new_edge_id))
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("fold retire edge: {e}")))?
+                {
+                    graph_changes.push(change);
+                }
                 folded += 1;
             }
+            Self::bump_community_graph_generations(&conn, graph_changes)
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("fold graph bump: {e}")))?;
 
             if !pre_image.is_empty() {
                 let pre_json =
@@ -45114,6 +45182,25 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete_page begin: {e}")))?;
         let result = async {
+            // Dual-write (G6 Stage 0): the FK CASCADE below drops this page's
+            // page_sources/page_evidence/page_links rows, and inbound
+            // page_links lose their target (NULL targets derive no edge), so
+            // every canonical edge touching this page retires in the same
+            // transaction — else each becomes permanent "extra" parity drift.
+            // A direct bulk retire is equivalent to per-edge invalidation
+            // here: page edges are never grounded `relates` assertions, so no
+            // community-graph change is possible (mirrors
+            // `replace_page_links`).
+            let now = chrono::Utc::now().timestamp();
+            conn.execute(
+                "UPDATE edges SET valid_until = ?2, superseded_by = NULL \
+                 WHERE valid_until IS NULL \
+                   AND ((src_kind = 'page' AND src_id = ?1) \
+                     OR (dst_kind = 'page' AND dst_id = ?1))",
+                libsql::params![id, now],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("delete_page retire edges: {e}")))?;
             conn.execute(
                 "UPDATE page_links SET target_page_id = NULL WHERE target_page_id = ?1",
                 libsql::params![id],
@@ -46295,6 +46382,54 @@ impl MemoryDB {
         let result: Result<(), WenlanError> = async {
             let before = Self::page_memory_provenance_state(&conn, page_id).await?;
 
+            // Dual-write (G6 Stage 0): snapshot the sids the prune below
+            // removes so their canonical `cites` edges retire in the same
+            // transaction. The provenance bump at the end NULLs
+            // `pages.citations` whenever the set changes, so a pruned row has
+            // no surviving legacy backing — leaving its edge active is
+            // permanent "extra" parity drift (the 2026-07-23 live damage
+            // class).
+            let removed: Vec<String> = {
+                let (sql, bind): (String, Vec<libsql::Value>) = if memory_source_ids.is_empty() {
+                    (
+                        "SELECT memory_source_id FROM page_sources WHERE page_id = ?1".to_string(),
+                        vec![libsql::Value::Text(page_id.to_string())],
+                    )
+                } else {
+                    let placeholders: String = (0..memory_source_ids.len())
+                        .map(|i| format!("?{}", i + 2))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let mut bind: Vec<libsql::Value> =
+                        Vec::with_capacity(1 + memory_source_ids.len());
+                    bind.push(libsql::Value::Text(page_id.to_string()));
+                    for sid in memory_source_ids {
+                        bind.push(libsql::Value::Text((*sid).to_string()));
+                    }
+                    (
+                        format!(
+                            "SELECT memory_source_id FROM page_sources WHERE page_id = ?1 AND memory_source_id NOT IN ({placeholders})"
+                        ),
+                        bind,
+                    )
+                };
+                let mut rows = conn
+                    .query(&sql, libsql::params_from_iter(bind))
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("replace_page_sources removed scan: {e}"))
+                    })?;
+                let mut removed = Vec::new();
+                while let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?
+                {
+                    removed.push(row.get::<String>(0).unwrap_or_default());
+                }
+                removed
+            };
+
             if memory_source_ids.is_empty() {
             if let Err(e) = conn
                 .execute(
@@ -46387,6 +46522,21 @@ impl MemoryDB {
                 )));
             }
         }
+
+            // Retire the pruned rows' canonical edges (kept sids are
+            // re-asserted just below via `insert_resolved_page_evidence`'s
+            // dual-write, which reactivates on the same content-addressed
+            // edge id if one was ever retired).
+            for sid in &removed {
+                let edge_id = crate::provenance::compute_edge_id(
+                    "cites", "page", page_id, "memory", sid, sid,
+                );
+                Self::dual_write_invalidate_edge(&conn, &edge_id, None)
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("replace_page_sources retire edge: {e}"))
+                    })?;
+            }
 
             if let Err(e) = Self::insert_resolved_page_evidence(
                 &conn,

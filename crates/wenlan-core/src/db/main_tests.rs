@@ -47194,3 +47194,235 @@ async fn refcount_retracts_only_after_last_backing_store_drops_citation() {
         "no legacy store backs mem_oi anymore -- the edge must retract"
     );
 }
+
+// ---- G6 Stage 0: dual-write gap regression tests (parity oracle) ----
+
+/// `fold_relation_type` mutates `relation_type` — a structural field of the
+/// content-addressed edge id — so it must retire the old-type edge and assert
+/// the canonical-type one, in both the simple-rename and the collision-merge
+/// branch. The oracle is the ambient parity sweep itself: drift 0 after a fold.
+#[tokio::test]
+async fn fold_relation_type_dual_writes_edges() {
+    let (db, _dir) = test_db().await;
+    db.create_space("work", None, false).await.unwrap();
+    let a = db
+        .store_entity("Fold A", "concept", Some("work"), Some("test"), None)
+        .await
+        .unwrap();
+    let b = db
+        .store_entity("Fold B", "concept", Some("work"), Some("test"), None)
+        .await
+        .unwrap();
+    let c = db
+        .store_entity("Fold C", "concept", Some("work"), Some("test"), None)
+        .await
+        .unwrap();
+
+    // Simple rename: a->c carries only the old type (both are vocabulary canonicals).
+    db.create_relation(&a, &c, "works_on", Some("test"), None, None, None)
+        .await
+        .unwrap();
+    // Collision merge: a->b carries BOTH the old and the canonical type.
+    db.create_relation(&a, &b, "works_on", Some("test"), None, None, None)
+        .await
+        .unwrap();
+    db.create_relation(&a, &b, "leads", Some("test"), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.reconcile_edges_parity().await.unwrap().drift_count,
+        0,
+        "fixture precondition: canonical writes leave parity clean"
+    );
+
+    let folded = db.fold_relation_type("works_on", "leads").await.unwrap();
+    assert_eq!(folded, 2);
+
+    let report = db.reconcile_edges_parity().await.unwrap();
+    assert_eq!(
+        report.drift_count, 0,
+        "a vocabulary fold must not re-drift edges parity (missing={}, extra={}, corrupt={})",
+        report.missing_count, report.extra_count, report.corrupt_count
+    );
+
+    // Belt-and-braces: the old-type edges are retired, superseded by canonical.
+    let conn = db.conn.lock().await;
+    for to in [&b, &c] {
+        let old_edge_id =
+            crate::provenance::compute_edge_id("relates", "entity", &a, "entity", to, "works_on");
+        let new_edge_id =
+            crate::provenance::compute_edge_id("relates", "entity", &a, "entity", to, "leads");
+        let mut rows = conn
+            .query(
+                "SELECT valid_until, superseded_by FROM edges WHERE edge_id = ?1",
+                libsql::params![old_edge_id.as_str()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("old-type edge exists");
+        assert!(
+            row.get::<Option<i64>>(0).unwrap().is_some(),
+            "old-type edge is retired"
+        );
+        assert_eq!(
+            row.get::<Option<String>>(1).unwrap().as_deref(),
+            Some(new_edge_id.as_str()),
+            "old-type edge points at its canonical successor"
+        );
+    }
+}
+
+/// `replace_page_sources` prunes `page_sources` + memory-kind `page_evidence`
+/// rows and NULLs `pages.citations` — every legacy backing of a pruned sid's
+/// cites edge — so it must retire those edges in the same transaction. This is
+/// the same damage class as the 2026-07-23 live stale-edge incident.
+#[tokio::test]
+async fn replace_page_sources_retires_pruned_cites_edges() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_g6_prune",
+        "Prune Target",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    for sid in ["mem_g6_keep", "mem_g6_drop"] {
+        let doc = make_memory_doc(sid, "Some content.", "knowledge", "work", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.link_page_source("page_g6_prune", sid, "distill")
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        db.reconcile_edges_parity().await.unwrap().drift_count,
+        0,
+        "fixture precondition: linked sources leave parity clean"
+    );
+
+    // Prune one sid, keep the other.
+    db.replace_page_sources("page_g6_prune", &["mem_g6_keep"], "reconcile")
+        .await
+        .unwrap();
+    let report = db.reconcile_edges_parity().await.unwrap();
+    assert_eq!(
+        report.drift_count, 0,
+        "a source prune must not re-drift edges parity (missing={}, extra={}, corrupt={})",
+        report.missing_count, report.extra_count, report.corrupt_count
+    );
+    {
+        let conn = db.conn.lock().await;
+        for (sid, retired) in [("mem_g6_drop", true), ("mem_g6_keep", false)] {
+            let edge_id = crate::provenance::compute_edge_id(
+                "cites",
+                "page",
+                "page_g6_prune",
+                "memory",
+                sid,
+                sid,
+            );
+            let mut rows = conn
+                .query(
+                    "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                    libsql::params![edge_id.as_str()],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().expect("edge exists");
+            assert_eq!(
+                row.get::<Option<i64>>(0).unwrap().is_some(),
+                retired,
+                "{sid}: retired={retired}"
+            );
+        }
+    }
+
+    // Empty keep-set: the remaining source is pruned too.
+    db.replace_page_sources("page_g6_prune", &[], "clear")
+        .await
+        .unwrap();
+    let report = db.reconcile_edges_parity().await.unwrap();
+    assert_eq!(
+        report.drift_count, 0,
+        "an empty-set replace must not re-drift edges parity (missing={}, extra={}, corrupt={})",
+        report.missing_count, report.extra_count, report.corrupt_count
+    );
+}
+
+/// `delete_page` FK-CASCADEs away this page's rows in all three link stores
+/// and NULLs inbound `page_links` targets, so every canonical edge touching
+/// the page — outbound cites AND inbound links — must retire with it.
+#[tokio::test]
+async fn delete_page_retires_all_page_edges() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_g6_del",
+        "Delete Target",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    db.insert_page(
+        "page_g6_linker",
+        "Inbound Linker",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    let doc = make_memory_doc("mem_g6_del", "Some content.", "knowledge", "work", "agent");
+    db.upsert_documents(vec![doc]).await.unwrap();
+    db.link_page_source("page_g6_del", "mem_g6_del", "distill")
+        .await
+        .unwrap();
+    db.replace_page_links(
+        "page_g6_linker",
+        &[crate::synthesis::wikilinks::Wikilink {
+            label: "Delete Target".to_string(),
+            target_page_id: Some("page_g6_del".to_string()),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.reconcile_edges_parity().await.unwrap().drift_count,
+        0,
+        "fixture precondition: cites + inbound links leave parity clean"
+    );
+
+    db.delete_page("page_g6_del").await.unwrap();
+
+    let report = db.reconcile_edges_parity().await.unwrap();
+    assert_eq!(
+        report.drift_count, 0,
+        "a page delete must not re-drift edges parity (missing={}, extra={}, corrupt={})",
+        report.missing_count, report.extra_count, report.corrupt_count
+    );
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE valid_until IS NULL \
+             AND ((src_kind = 'page' AND src_id = 'page_g6_del') \
+               OR (dst_kind = 'page' AND dst_id = 'page_g6_del'))",
+            (),
+        )
+        .await
+        .unwrap();
+    let active: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(active, 0, "no active edge may still touch the deleted page");
+}
