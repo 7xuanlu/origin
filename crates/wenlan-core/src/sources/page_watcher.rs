@@ -611,7 +611,10 @@ mod tests {
 
         // The block-free body means no `mem_*` rows reach the wikilink graph
         // via replace_page_links.
-        let links = db.get_page_outbound_links("page_edit").await.unwrap();
+        let links = db
+            .get_page_outbound_links_scoped("page_edit", &crate::read_scope::ReadScope::Global)
+            .await
+            .unwrap();
         assert!(
             !links.iter().any(|l| l.label.starts_with("mem_")),
             "no mem_* link rows should persist; got {:?}",
@@ -760,7 +763,10 @@ mod tests {
             .await
             .unwrap();
 
-        let links = db.get_page_outbound_links("page_links").await.unwrap();
+        let links = db
+            .get_page_outbound_links_scoped("page_links", &crate::read_scope::ReadScope::Global)
+            .await
+            .unwrap();
         let mem_links: Vec<_> = links
             .iter()
             .filter(|l| l.label.starts_with("mem_"))
@@ -822,7 +828,10 @@ mod tests {
             .join("mem_two.md")
             .exists());
         // No mem_* page_links.
-        let links = db.get_page_outbound_links("page_rt").await.unwrap();
+        let links = db
+            .get_page_outbound_links_scoped("page_rt", &crate::read_scope::ReadScope::Global)
+            .await
+            .unwrap();
         assert!(links.iter().all(|l| !l.label.starts_with("mem_")));
     }
 }

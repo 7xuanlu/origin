@@ -513,18 +513,36 @@ async fn page_links_scoped_gate_parent_and_filter_source_pages() {
         .await
         .unwrap();
     }
-    let conn = db.conn.lock().await;
-    conn.execute(
-        "INSERT INTO page_links (source_page_id, target_page_id, label, label_key)
-         VALUES ('work-source', 'work-target', 'Work target', 'work target'),
-                ('personal-source', 'work-target', 'Work target', 'work target'),
-                ('work-source', NULL, 'Work orphan', 'work orphan'),
-                ('personal-source', NULL, 'Personal orphan', 'personal orphan')",
-        (),
+    db.replace_page_links(
+        "work-source",
+        &[
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("work-target".to_string()),
+                label: "Work target".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: None,
+                label: "Work orphan".to_string(),
+            },
+        ],
     )
     .await
     .unwrap();
-    drop(conn);
+    db.replace_page_links(
+        "personal-source",
+        &[
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("work-target".to_string()),
+                label: "Work target".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: None,
+                label: "Personal orphan".to_string(),
+            },
+        ],
+    )
+    .await
+    .unwrap();
 
     let scope = ReadScope::Space("work".to_string());
     let outbound = db
@@ -550,6 +568,205 @@ async fn page_links_scoped_gate_parent_and_filter_source_pages() {
         db.get_page_sources_scoped("personal-parent", &scope).await,
         Err(crate::WenlanError::NotFound(message)) if message == "page not found"
     ));
+}
+
+#[tokio::test]
+async fn page_links_scoped_outbound_merges_edges_and_orphans_by_label_key() {
+    let (db, _tmp) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, title) in [
+        ("outbound-source", "Outbound source"),
+        ("outbound-alpha", "Alpha"),
+        ("outbound-zulu", "Zulu"),
+    ] {
+        db.insert_page_with_kind(
+            id,
+            title,
+            None,
+            "outbound label ordering",
+            None,
+            Some("work"),
+            &[],
+            &now,
+            "authored",
+            "confirmed",
+            Some("work"),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    db.replace_page_links(
+        "outbound-source",
+        &[
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("outbound-zulu".to_string()),
+                label: "zUlU".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("outbound-alpha".to_string()),
+                label: "ALPHA".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: None,
+                label: "Bravo".to_string(),
+            },
+        ],
+    )
+    .await
+    .unwrap();
+
+    let links = db
+        .get_page_outbound_links_scoped("outbound-source", &ReadScope::Global)
+        .await
+        .unwrap();
+    assert_eq!(
+        links,
+        vec![
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("outbound-alpha".to_string()),
+                label: "ALPHA".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: None,
+                label: "Bravo".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("outbound-zulu".to_string()),
+                label: "zUlU".to_string(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn page_links_scoped_inbound_reads_edges_orders_and_filters_sources() {
+    let (db, _tmp) = test_db().await;
+    for (id, workspace, modified) in [
+        ("inbound-target", "work", "2026-08-04T00:00:00Z"),
+        ("inbound-new", "work", "2026-08-04T03:00:00Z"),
+        ("inbound-old", "work", "2026-08-04T02:00:00Z"),
+        ("inbound-other-space", "personal", "2026-08-04T01:00:00Z"),
+    ] {
+        db.insert_page_with_kind(
+            id,
+            id,
+            None,
+            "inbound edge ordering",
+            None,
+            Some(workspace),
+            &[],
+            modified,
+            "authored",
+            "confirmed",
+            Some(workspace),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    for (source, label) in [
+        ("inbound-new", "New label"),
+        ("inbound-old", "Old label"),
+        ("inbound-other-space", "Other label"),
+    ] {
+        db.replace_page_links(
+            source,
+            &[crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("inbound-target".to_string()),
+                label: label.to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.get_page_inbound_links_scoped("inbound-target", &ReadScope::Global)
+            .await
+            .unwrap(),
+        vec![
+            ("inbound-new".to_string(), "New label".to_string()),
+            ("inbound-old".to_string(), "Old label".to_string()),
+            ("inbound-other-space".to_string(), "Other label".to_string()),
+        ]
+    );
+    assert_eq!(
+        db.get_page_inbound_links_scoped("inbound-target", &ReadScope::Space("work".to_string()),)
+            .await
+            .unwrap(),
+        vec![
+            ("inbound-new".to_string(), "New label".to_string()),
+            ("inbound-old".to_string(), "Old label".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn page_links_scoped_outbound_reads_edges_not_resolved_page_links() {
+    let (db, _tmp) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for id in [
+        "reader-swap-source",
+        "reader-swap-legacy-target",
+        "reader-swap-edge-target",
+    ] {
+        db.insert_page_with_kind(
+            id,
+            id,
+            None,
+            "reader swap control",
+            None,
+            Some("work"),
+            &[],
+            &now,
+            "authored",
+            "confirmed",
+            Some("work"),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO page_links (source_page_id, target_page_id, label_key, label)
+         VALUES ('reader-swap-source', 'reader-swap-legacy-target',
+                 'legacy-only', 'Legacy only')",
+        (),
+    )
+    .await
+    .unwrap();
+    let edge_id = crate::provenance::compute_edge_id(
+        "links",
+        "page",
+        "reader-swap-source",
+        "page",
+        "reader-swap-edge-target",
+        "edge-only",
+    );
+    conn.execute(
+        "INSERT INTO edges (
+             edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+             lineage, grounded, space, payload, created_at
+         ) VALUES (?1, 'reader-swap-source', 'page', 'reader-swap-edge-target',
+                   'page', 'links', 'synthesis', 0, 'work', ?2, 0)",
+        libsql::params![edge_id, r#"{"label":"Edge only"}"#],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    assert_eq!(
+        db.get_page_outbound_links_scoped("reader-swap-source", &ReadScope::Global)
+            .await
+            .unwrap(),
+        vec![crate::synthesis::wikilinks::Wikilink {
+            target_page_id: Some("reader-swap-edge-target".to_string()),
+            label: "Edge only".to_string(),
+        }]
+    );
 }
 
 #[tokio::test]

@@ -46,7 +46,6 @@ crates/wenlan-core/src/lint/pages/link_checks_test.rs|crate::lint::pages::link_c
 crates/wenlan-core/src/lint/pages/link_checks_test.rs|crate::lint::pages::link_checks::tests::link_row_count|TestDbRow::get|1
 crates/wenlan-core/src/lint/pages/link_checks_test.rs|crate::lint::pages::link_checks::tests::link_row_count|TestDbRows::next|1
 crates/wenlan-core/src/lint/pages/link_checks_test.rs|crate::lint::pages::link_checks::tests::link_row_count|TestDbSession::query|1
-crates/wenlan-core/src/lint/pages/link_checks_test/artifacts.rs|crate::lint::pages::link_checks::tests::artifacts::optional_artifacts_are_neutral_but_deterministic_broken_targets_warn|TestDbSession::execute|1
 crates/wenlan-core/src/lint/pages/link_checks_test/artifacts.rs|crate::lint::pages::link_checks::tests::artifacts::optional_artifacts_are_neutral_but_deterministic_broken_targets_warn|test_secondary_session|1
 crates/wenlan-core/src/lint/pages/link_checks_test/orphans.rs|crate::lint::pages::link_checks::tests::orphans::ambiguous_unbound_occurrence_remains_a_finding|test_secondary_session|1
 crates/wenlan-core/src/lint/pages/link_checks_test/orphans.rs|crate::lint::pages::link_checks::tests::orphans::coverage_counts_occurrences_while_metric_counts_distinct_labels|test_secondary_session|1
