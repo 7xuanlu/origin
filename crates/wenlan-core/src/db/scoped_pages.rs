@@ -51,6 +51,10 @@ fn page_not_found() -> WenlanError {
     WenlanError::NotFound("page not found".to_string())
 }
 
+fn page_link_label_key(label: &str) -> String {
+    label.to_lowercase()
+}
+
 /// One unresolved wikilink, still attached to the page whose body it came from.
 ///
 /// This is the row `list_orphan_link_labels_scoped` throws away:
@@ -786,39 +790,90 @@ impl MemoryDB {
         scope: &ReadScope,
     ) -> Result<Vec<crate::synthesis::wikilinks::Wikilink>, WenlanError> {
         let (scope_sql, scope_value) = page_scope_clause(scope, "c.workspace", 2);
-        let sql = format!(
-            "SELECT c.id, pl.target_page_id, pl.label FROM pages c \
-             LEFT JOIN page_links pl ON pl.source_page_id = c.id \
-             WHERE c.id = ?1{scope_sql} ORDER BY pl.label_key"
-        );
-        let mut params = vec![libsql::Value::Text(source_page_id.to_string())];
-        if let Some(value) = scope_value {
-            params.push(value);
-        }
         let conn = self.conn.lock().await;
-        let mut rows = conn.query(&sql, params).await.map_err(|error| {
+        let existence_sql = format!("SELECT c.id FROM pages c WHERE c.id = ?1{scope_sql}");
+        let mut existence_params = vec![libsql::Value::Text(source_page_id.to_string())];
+        if let Some(value) = scope_value.clone() {
+            existence_params.push(value);
+        }
+        let mut rows = conn
+            .query(&existence_sql, existence_params)
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("get_page_outbound_links_scoped: {error}"))
+            })?;
+        let found = rows
+            .next()
+            .await
+            .map_err(|error| WenlanError::VectorDb(error.to_string()))?
+            .is_some();
+        drop(rows);
+        if !found {
+            return Err(page_not_found());
+        }
+
+        let edge_sql = format!(
+            "SELECT e.dst_id, json_extract(e.payload, '$.label') \
+             FROM edges e INNER JOIN pages c ON c.id = e.src_id \
+             WHERE c.id = ?1 AND e.edge_type = 'links' \
+               AND e.src_kind = 'page' AND e.dst_kind = 'page' \
+               AND e.valid_until IS NULL{scope_sql}"
+        );
+        let mut edge_params = vec![libsql::Value::Text(source_page_id.to_string())];
+        if let Some(value) = scope_value {
+            edge_params.push(value);
+        }
+        let mut rows = conn.query(&edge_sql, edge_params).await.map_err(|error| {
             WenlanError::VectorDb(format!("get_page_outbound_links_scoped: {error}"))
         })?;
-        let mut found = false;
         let mut links = Vec::new();
         while let Some(row) = rows
             .next()
             .await
             .map_err(|error| WenlanError::VectorDb(error.to_string()))?
         {
-            found = true;
-            let Some(label) = row.get::<Option<String>>(2).unwrap_or(None) else {
+            let label = row
+                .get::<Option<String>>(1)
+                .unwrap_or(None)
+                .unwrap_or_default();
+            links.push((
+                page_link_label_key(&label),
+                crate::synthesis::wikilinks::Wikilink {
+                    target_page_id: row.get::<String>(0).ok(),
+                    label,
+                },
+            ));
+        }
+        drop(rows);
+
+        let mut rows = conn
+            .query(
+                "SELECT target_page_id, label FROM page_links \
+                 WHERE source_page_id = ?1 AND target_page_id IS NULL",
+                libsql::params![source_page_id],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("get_page_outbound_links_scoped: {error}"))
+            })?;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| WenlanError::VectorDb(error.to_string()))?
+        {
+            let Some(label) = row.get::<Option<String>>(1).unwrap_or(None) else {
                 continue;
             };
-            links.push(crate::synthesis::wikilinks::Wikilink {
-                target_page_id: row.get::<Option<String>>(1).unwrap_or(None),
-                label,
-            });
+            links.push((
+                page_link_label_key(&label),
+                crate::synthesis::wikilinks::Wikilink {
+                    target_page_id: row.get::<Option<String>>(0).unwrap_or(None),
+                    label,
+                },
+            ));
         }
-        if !found {
-            return Err(page_not_found());
-        }
-        Ok(links)
+        links.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(links.into_iter().map(|(_, link)| link).collect())
     }
 
     pub async fn get_page_inbound_links_scoped(
@@ -831,9 +886,12 @@ impl MemoryDB {
         let (target_scope_sql, target_scope_value) =
             page_scope_clause(scope, "target.workspace", 3);
         let sql = format!(
-            "SELECT target.id, source.id, pl.label FROM pages target \
-             LEFT JOIN page_links pl ON pl.target_page_id = target.id \
-             LEFT JOIN pages source ON source.id = pl.source_page_id \
+            "SELECT target.id, source.id, json_extract(e.payload, '$.label') \
+             FROM pages target \
+             LEFT JOIN edges e ON e.dst_id = target.id \
+               AND e.edge_type = 'links' AND e.src_kind = 'page' \
+               AND e.dst_kind = 'page' AND e.valid_until IS NULL \
+             LEFT JOIN pages source ON source.id = e.src_id \
                AND source.status = 'active'{source_scope_sql} \
              WHERE target.id = ?1{target_scope_sql} \
              ORDER BY source.last_modified DESC, source.id ASC"

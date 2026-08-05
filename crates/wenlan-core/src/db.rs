@@ -46847,68 +46847,6 @@ impl MemoryDB {
         }
     }
 
-    /// Outbound links from a page. Used by `/api/pages/{id}/links` and the
-    /// `/pages` preview's link-count line.
-    pub async fn get_page_outbound_links(
-        &self,
-        source_page_id: &str,
-    ) -> Result<Vec<crate::synthesis::wikilinks::Wikilink>, WenlanError> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT target_page_id, label FROM page_links \
-                 WHERE source_page_id = ?1 ORDER BY label_key",
-                libsql::params![source_page_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("get_page_outbound_links: {e}")))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-        {
-            out.push(crate::synthesis::wikilinks::Wikilink {
-                target_page_id: row.get::<Option<String>>(0).unwrap_or(None),
-                label: row.get::<String>(1).unwrap_or_default(),
-            });
-        }
-        Ok(out)
-    }
-
-    /// Inbound links to a page — every active source whose body contains a
-    /// `[[Title]]` reference that resolves here. Used by the page's "linked
-    /// from" view. Tie-break on source_page_id keeps order stable across
-    /// same-second timestamps.
-    pub async fn get_page_inbound_links(
-        &self,
-        target_page_id: &str,
-    ) -> Result<Vec<(String, String)>, WenlanError> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT pl.source_page_id, pl.label FROM page_links pl \
-                 INNER JOIN pages p ON p.id = pl.source_page_id \
-                 WHERE pl.target_page_id = ?1 AND p.status = 'active' \
-                 ORDER BY p.last_modified DESC, pl.source_page_id ASC",
-                libsql::params![target_page_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("get_page_inbound_links: {e}")))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-        {
-            out.push((
-                row.get::<String>(0).unwrap_or_default(),
-                row.get::<String>(1).unwrap_or_default(),
-            ));
-        }
-        Ok(out)
-    }
-
     /// Group every still-orphan label by count, restricted to active source
     /// pages (archived pages keep their `page_links` rows via cascade-on-
     /// delete-only, but they shouldn't inflate the emergence signal once

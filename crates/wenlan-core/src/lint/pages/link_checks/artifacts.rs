@@ -86,13 +86,14 @@ async fn load_link_counts(context: &LintContext<'_, '_>) -> Result<LinkCounts, (
         .query(
             "SELECT \
                (SELECT COUNT(*) FROM pages WHERE status = 'archived'), \
-               COUNT(*), \
+               COUNT(*) + (SELECT COUNT(*) FROM page_links WHERE target_page_id IS NULL), \
                COALESCE(SUM(CASE WHEN target.status = 'active' THEN 1 ELSE 0 END), 0), \
-               COALESCE(SUM(CASE WHEN pl.target_page_id IS NOT NULL \
-                                  AND (target.id IS NULL OR target.status != 'active') \
+               COALESCE(SUM(CASE WHEN target.id IS NULL OR target.status != 'active' \
                                  THEN 1 ELSE 0 END), 0) \
-             FROM page_links pl \
-             LEFT JOIN pages target ON target.id = pl.target_page_id",
+             FROM edges e \
+             LEFT JOIN pages target ON target.id = e.dst_id \
+             WHERE e.edge_type = 'links' AND e.src_kind = 'page' \
+               AND e.dst_kind = 'page' AND e.valid_until IS NULL",
             libsql::params::Params::None,
         )
         .await

@@ -1361,7 +1361,10 @@ mod tests {
             survivor_sources
         );
 
-        let survivor_links = db.get_page_inbound_links("page_survivor").await.unwrap();
+        let survivor_links = db
+            .get_page_inbound_links_scoped("page_survivor", &crate::read_scope::ReadScope::Global)
+            .await
+            .unwrap();
         assert!(
             survivor_links
                 .iter()
@@ -1370,7 +1373,10 @@ mod tests {
             "wikilinks to the absorbed title must point at the survivor now, got {:?}",
             survivor_links
         );
-        let absorbed_links = db.get_page_inbound_links("page_absorbed").await.unwrap();
+        let absorbed_links = db
+            .get_page_inbound_links_scoped("page_absorbed", &crate::read_scope::ReadScope::Global)
+            .await
+            .unwrap();
         assert!(
             !absorbed_links
                 .iter()
