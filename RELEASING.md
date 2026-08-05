@@ -118,3 +118,11 @@ GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/7xuanlu/homebrew-tap.git 
 ```
 
 If this fails or prompts for credentials, make the tap public before cutting the tag. The release preflight stops while the GitHub release is still a prerelease and before crates.io, npm, or GHCR promotion.
+
+## Version-steering policy
+
+Moved out of the root `AGENTS.md` — an agent needs these only at release time.
+
+**A deliberate minor or major is a config change, not a commit-message trick.** Add `"release-as": "0.16.0"` under `packages["."]` (or switch `versioning`), merge it to main, let release-please open the PR, then remove the override. Never rewrite history to steer a version bump.
+
+**Undoing a release: edit the manifest, don't rewrite history.** In manifest mode the "last version" comes from `.release-please-manifest.json`, so a rollback is a normal PR that resets it (plus `version.txt` and the workspace `Cargo.toml`, per teeth #3) alongside deleting the tag + GitHub Release. Leave the merged release PR's `autorelease: tagged` label alone — that label is what stops release-please re-releasing it. No commit-message rewrite, no PR rename.

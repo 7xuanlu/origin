@@ -40,32 +40,75 @@ parity the moment it runs. All sites below were verified at the code level on
 `insert_resolved_page_evidence`, which dual-writes the same content-addressed
 edge id the page_sources row derives to.
 
-**Part 2 (follow-up PR): secondary writers, verified 2026-08-04.**
+**Part 2 (second PR): secondary writers, verified and fixed 2026-08-05.**
 
 | Function | Gap | Status |
 |---|---|---|
-| `rebind_source_id_inner` (db.rs ~27860, incl. `rebind_source_page_in_transaction`) | Renames `page_sources.memory_source_id`, `page_evidence.locator`, and optionally the source page id — identity fields of the content-addressed edge id — with no edge rewrite. Every touching edge strands (extra) and its successor shows as missing. | CONFIRMED, unfixed. Fix must recompute edge ids while preserving grounding/payload/provenance, and chase `superseded_by` FKs. |
-| `replace_source_page_inner` (db.rs ~43093) | DELETEs ALL `page_sources` + `page_evidence` rows (external kinds included) then reinserts the new set; removed rows' edges never retired. | CONFIRMED, unfixed. Same fix shape as `replace_page_sources`, plus external-kind retire. |
-| `accept_page_merge` (db.rs ~44859) | Repoints inbound `page_links.target_page_id` loser→winner with a raw UPDATE; the loser-dst links edges stay active (extra), winner-dst edges show missing. (The loser's own source rows stay in place, so its cites edges remain consistently implied — archived pages are not filtered by the parity derivation.) | CONFIRMED (links repoint only), unfixed. Retire+mint per repointed row using `replace_page_links`'s space/lineage derivation. |
-| `resolve_orphan_page_links` (db.rs ~45684) | Sets `target_page_id` on a previously-orphan row (which derives no edge) without minting the now-implied links edge. | CONFIRMED, unfixed. Mint with `replace_page_links`'s derivation. |
-| `try_update_page_content` (db.rs ~43975) | Rewrites `pages.citations` wholesale without reconciling edges. Narrow: drifts only when a locator backed ONLY by citations (not by `page_sources`/`page_evidence`) drops out of the new value. | CONFIRMED (narrow), unfixed. Reconcile like `set_page_citations` does. |
+| `rebind_source_id_inner` (db.rs ~27860, incl. `rebind_source_page_in_transaction`) | Renames `page_sources.memory_source_id`, `page_evidence.locator`, and optionally the source page id — identity fields of the content-addressed edge id. The M2 PR-1 block already retired+minted memory-locator cites edges for pages listed in `page_sources`/`page_evidence`, but the page-id rename half had no edge rewrite, and citations-only cites edges were missed. | FIXED. New `rebind_edges_identity` helper re-addresses cites edges (disc = dst locator, derivable from the row) with FK-safe `superseded_by` detach/re-attach, collision-aware (an already-minted successor absorbs the old edge as retired history); links edges retire + re-assert from `page_links`. Payload `source_memory_id` provenance re-stamped. |
+| `replace_source_page_inner` (db.rs ~43093) | DELETEs ALL `page_sources` + `page_evidence` rows (external kinds included) then reinserts the new set; removed rows' edges never retired. | FIXED. Removed-locator snapshot before the DELETEs; each dropped locator's cites edge retired in-transaction (external kinds included). |
+| `accept_page_merge` (db.rs ~44859) | Repoints inbound `page_links.target_page_id` loser→winner with a raw UPDATE; the loser-dst links edges stay active (extra), winner-dst edges show missing. Also copies the absorbed page's external evidence rows without minting their edges. | FIXED. Per repointed row: mint the winner-dst links edge (replace_page_links derivation), retire the loser-dst edge superseded-by it. Copied external evidence rows mint their cites edges. |
+| `resolve_orphan_page_links` (db.rs ~45684) | Sets `target_page_id` on a previously-orphan row (which derives no edge) without minting the now-implied links edge. | FIXED. Mints with `replace_page_links`'s derivation in the same per-row transaction. |
+| `try_update_page_content` (db.rs ~43975) | Rewrites `pages.citations` wholesale without reconciling edges. Narrow: drifts only when a locator backed ONLY by citations (not by `page_sources`/`page_evidence`) drops out of the new value. | FIXED. Calls the shared `dual_write_page_citations` reconciler inside the CAS transaction (`set_page_citations_with_changelog_at_version` rewired onto the same helper). |
+| `apply_deterministic_repair_cas`, `RepairWriter::BindPageLink` arm (db/repair_deterministic.rs) | The repair tool's own orphan-bind — a second writer of `page_links.target_page_id` beside `resolve_orphan_page_links` — set the target with a raw UPDATE and no edge mint. Found by the Stage 1.1 scout (`docs/superpowers/g6-stage1-page-links-scout.md`). | FIXED. The arm mints the links edge in-transaction (same derivation as `resolve_orphan_page_links`); the mint's row changes are measured and allowed by the repair effect guard. |
+| `try_update_page_content` — `page_sources`/`page_evidence` half (db.rs ~44266) | Beyond the citations rewrite (row above), the same function does its OWN prune-then-reinsert of `page_sources` + memory-kind `page_evidence` against the `source_memory_ids` argument — a second instance of the `replace_page_sources` bug, with no removed-sid snapshot and no edge retirement. High traffic: manual edits, refinery rewrites, and page growth all route through it. Found by the Stage 1.3 scout (`docs/superpowers/g6-stage1-page-sources-evidence-scout.md`). | FIXED. Snapshot of the pruned locators (page_sources ∪ memory-kind page_evidence) before the DELETEs; each retired in-transaction UNLESS the new `pages.citations` value still backs it (D7 refcount via `cites_backed_by_page_citations` — this path, unlike `replace_page_sources`, sets citations to an explicit new value). Kept sids re-assert through `insert_resolved_page_evidence`. |
+
+Residual (not Stage 0 scope, tracked): the generic repair **rollback** artifact
+restores legacy-store rows byte-wise (`rollback-v1.json` row restore) without
+edge reconciliation — rolling back a bind would re-orphan the row while its
+minted edge stays active. Operator-driven and rare; the parity sweep catches it.
+Fold into Stage 2 when repair writers go canonical-only.
+
+Known limitation (M5 follow-up, outside Stage 0 scope): M5 claim `supports`
+edges are fenced out of the parity universe, and a source-id rebind retracts
+them (`retract_support_for_rebound_source`, M5 row 13) rather than re-address
+them — pages citing the renamed document re-derive support. No parity impact.
 
 Exit: all fixes merged with regression tests (parity clean after driving each
 path); ambient watermarks stay drift 0 across a soak.
 
 ## Stage 1 — migrate readers onto canonical stores, cheapest first
 
+**Decision (user, 2026-08-05): one source of truth.** The semantic-payload
+schema change is authorized — `relates` edges carry `relation_type` (+
+`confidence`/`explanation`/`source_agent`), `links` edges carry the display
+`label`, with a backfill migration from the legacy rows. No legacy store
+survives Stage 3 as a permanent side-table. The same principle extends to
+`cites` edges where Stage 1.3 found unrecoverable columns (`link_reason`,
+`linked_at`, the 4-way `source_kind`): carry them in edge payload/columns
+rather than keeping `page_sources`/`page_evidence` alive. The payload PR
+lands FIRST (before any reader migration), since every blocked reader in the
+scout reports migrates only once the semantic fields exist on the edge.
+
 Order by measured entanglement:
 
 1. **`page_links`** (~9 fns) — one dual-write-aware writer choke point
    (`replace_page_links`), small reader fan-out (`get_page_outbound_links`,
    `get_page_inbound_links`, orphan-label lint), no shared-struct entanglement.
+   **Scout correction (2026-08-05, `docs/superpowers/g6-stage1-page-links-scout.md`):
+   this store cannot fully migrate onto `edges` as wired.** The `label` display
+   text is not stored on edge rows (label_key is only a hash input), and orphan
+   rows (`target_page_id IS NULL`) derive no edge at all — so the two product-route
+   readers behind `GET /api/pages/{id}/links` and all orphan-feed readers stay on
+   `page_links`. Only `load_link_counts` migrates cleanly today. Decision needed
+   before this store reaches Stage 3: carry the label in a `links` edge payload
+   (schema change), or keep `page_links` alive as a label+orphan side-table and
+   shrink the Stage 3 drop list accordingly.
 2. **`relations`** (~20 fns) — clear writer choke points, but readers include
    product routes (`get_entity_detail`, `list_recent_relations`), k-hop expansion,
    and lint/repair tooling. Entangled with `entities` via shared CRUD
    (`merge_entities`, `commit_entity_enrichment_at_version`,
    `delete_by_source_id_in_transaction`) — those functions change once, in this
    stage, for both stores' read sides.
+   **Scout correction (2026-08-05, `docs/superpowers/g6-stage1-relations-scout.md`):
+   blocked harder than page_links.** `relation_type` is a hash-input-only
+   discriminator — never stored on the edge row or payload — so every reader
+   that returns or filters on it (both product routes, most lint/repair tooling;
+   9 of 13 readers) cannot migrate as wired. Only topology-only readers (k-hop
+   ×2, aggregate count, scope subquery) migrate cleanly. All relations writers
+   already dual-write (no Stage 0 gap). Same decision as page_links, but
+   sharper: the semantic-payload schema change (relation_type + confidence /
+   explanation / source_agent on `relates` edges, label on `links` edges, plus
+   backfill migration) is realistically the only path to Stage 3 for this store.
 3. **`page_sources` + `page_evidence`** (~30 fns, co-written pair) —
    `insert_resolved_page_evidence` is the evidence choke point; `page_sources` has
    no single choke point and needs one first.
