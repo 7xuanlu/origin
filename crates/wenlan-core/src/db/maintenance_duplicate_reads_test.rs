@@ -52,6 +52,28 @@ async fn near_duplicate_reader_preserves_pair_order_cursor_and_raw_sources() {
     )
     .await
     .unwrap();
+    // G6 Stage 1.3: `load_bounded_page_source_ids` migrated onto `edges` --
+    // mirror the dual-write here so this raw-SQL fixture still drives the
+    // reader it's meant to test (`lineage='legacy'` exempts the cross-space
+    // fence trigger), same pattern as the retro-scan fixture.
+    for (linked_at, source_id) in [
+        (3, "normalized-b-3"),
+        (1, "normalized-b-1"),
+        (2, "normalized-b-2"),
+    ] {
+        conn.execute(
+            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, \
+                                 lineage, grounded, space, created_at) \
+             VALUES (?1, 'b', 'page', ?2, 'memory', 'cites', 'legacy', 0, 'work', ?3)",
+            libsql::params![
+                format!("dup-reads-b-{source_id}"),
+                source_id,
+                linked_at as i64
+            ],
+        )
+        .await
+        .unwrap();
+    }
     conn.execute("UPDATE pages SET status = 'archived' WHERE id = 'c'", ())
         .await
         .unwrap();

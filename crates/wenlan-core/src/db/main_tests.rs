@@ -22738,6 +22738,84 @@ async fn test_link_concept_source_idempotent() {
     assert_eq!(sources[0].memory_source_id, "src1");
 }
 
+/// G6 Stage 1.3 test 1 (equivalence per product reader): `get_page_sources`,
+/// `get_page_sources_scoped`, and `get_page_evidence` now read `edges`
+/// instead of `page_sources`/`page_evidence`. Seeds via the real writers
+/// (`link_page_source`, which also dual-writes through
+/// `insert_resolved_page_evidence`), then forces one edge's `created_at` to
+/// diverge from its payload `$.linked_at` (the ordering trap: an m81-era
+/// edge's `created_at` is migration day, not the original link time) --
+/// order and the projected `linked_at` must follow the payload, not
+/// `edges.created_at`.
+#[tokio::test]
+async fn get_page_sources_and_evidence_follow_payload_linked_at_not_edge_created_at() {
+    let (db, _dir) = test_db().await;
+    seed_memory_with_source_id_and_space(&db, "mem_g13_a", "content a", "space_a").await;
+    seed_memory_with_source_id_and_space(&db, "mem_g13_b", "content b", "space_a").await;
+    {
+        let conn = db.conn.lock().await;
+        insert_raw_page_for_m81_test(&conn, "page_g13", "space_a").await;
+    }
+    db.link_page_source("page_g13", "mem_g13_a", "reason a")
+        .await
+        .unwrap();
+    db.link_page_source("page_g13", "mem_g13_b", "reason b")
+        .await
+        .unwrap();
+
+    // b's payload linked_at (500) stays earlier than a's (1000) even though
+    // b's edge row is forced to look newer (9999999) -- proves the reader
+    // orders and projects off the payload, not edges.created_at.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE edges SET payload = json_set(payload, '$.linked_at', 1000) \
+             WHERE edge_type = 'cites' AND src_id = 'page_g13' AND dst_id = 'mem_g13_a'",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE edges SET payload = json_set(payload, '$.linked_at', 500), created_at = 9999999 \
+             WHERE edge_type = 'cites' AND src_id = 'page_g13' AND dst_id = 'mem_g13_b'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let sources = db.get_page_sources("page_g13").await.unwrap();
+    assert_eq!(sources.len(), 2);
+    assert_eq!(
+        sources[0].memory_source_id, "mem_g13_b",
+        "must order by payload linked_at (500), not edges.created_at (9999999)"
+    );
+    assert_eq!(sources[0].linked_at, 500);
+    assert_eq!(sources[0].link_reason.as_deref(), Some("reason b"));
+    assert_eq!(sources[1].memory_source_id, "mem_g13_a");
+    assert_eq!(sources[1].linked_at, 1000);
+    assert_eq!(sources[1].link_reason.as_deref(), Some("reason a"));
+
+    let scoped = db
+        .get_page_sources_scoped("page_g13", &ReadScope::Global)
+        .await
+        .unwrap();
+    assert_eq!(scoped.len(), 2);
+    assert_eq!(scoped[0].memory_source_id, "mem_g13_b");
+    assert_eq!(scoped[0].linked_at, 500);
+    assert_eq!(scoped[1].memory_source_id, "mem_g13_a");
+    assert_eq!(scoped[1].linked_at, 1000);
+
+    let evidence = db.get_page_evidence("page_g13").await.unwrap();
+    assert_eq!(evidence.len(), 2);
+    assert_eq!(evidence[0].locator.as_deref(), Some("mem_g13_b"));
+    assert_eq!(evidence[0].linked_at, 500);
+    assert_eq!(evidence[0].source_kind, "memory");
+    assert_eq!(evidence[0].link_reason.as_deref(), Some("reason b"));
+    assert_eq!(evidence[1].locator.as_deref(), Some("mem_g13_a"));
+    assert_eq!(evidence[1].linked_at, 1000);
+}
+
 #[tokio::test]
 async fn page_source_revision_advances_only_when_the_source_set_changes() {
     let (db, _dir) = test_db().await;
@@ -23050,6 +23128,29 @@ async fn test_get_concept_sources_ordered() {
         )
         .await
         .unwrap();
+        // G6 Stage 1.3: `get_page_sources` reads `edges`, ordering by
+        // `COALESCE(json_extract(payload,'$.linked_at'), created_at)` -- mirror
+        // the dual-write here (payload carries the controlled linked_at so
+        // ordering stays deterministic), same pattern as the retro-scan fixture.
+        for (memory_source_id, linked_at, link_reason) in
+            [("src_b", 200i64, "later"), ("src_a", 100i64, "earlier")]
+        {
+            conn.execute(
+                "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, \
+                                     lineage, grounded, space, created_at, payload) \
+                 VALUES (?1, 'c_ord', 'page', ?2, 'memory', 'cites', 'legacy', 0, ?5, ?3, ?4)",
+                libsql::params![
+                    format!("concept-sources-ordered-{memory_source_id}"),
+                    memory_source_id,
+                    linked_at,
+                    serde_json::json!({"linked_at": linked_at, "link_reason": link_reason})
+                        .to_string(),
+                    crate::db::UNFILED_SPACE_ID,
+                ],
+            )
+            .await
+            .unwrap();
+        }
     }
 
     let sources = db.get_page_sources("c_ord").await.unwrap();
@@ -46767,6 +46868,352 @@ async fn link_page_source_dual_writes_cites_edge_via_page_evidence_chokepoint() 
     assert_eq!(space, "space_a");
 }
 
+/// G6 Stage 1.3 test 2 (kind fallback): an active cites edge whose payload
+/// is absent (a simulated pre-#486 remnant -- m115 backfilled the payload
+/// from every edge's live legacy twin, so this models an edge that predates
+/// that migration and has since lost its legacy row). `get_page_evidence`
+/// must apply the NULL-payload discipline and return it with the
+/// dst_kind-derived kind and the created_at-derived linked_at, not error or
+/// drop the row.
+#[tokio::test]
+async fn get_page_evidence_falls_back_when_payload_is_absent() {
+    let (db, _dir) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        insert_raw_page_for_m81_test(&conn, "page_g13_kf", "space_a").await;
+        conn.execute(
+            "INSERT INTO edges (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at) \
+             VALUES ('g13-kindfallback','page_g13_kf','page','mem_g13_kf_orphan','memory','cites','legacy',0,'space_a',42)",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let evidence = db.get_page_evidence("page_g13_kf").await.unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(
+        evidence[0].source_kind, "memory",
+        "must fall back to the dst_kind-derived kind, not error or drop the row"
+    );
+    assert_eq!(
+        evidence[0].linked_at, 42,
+        "must fall back to edges.created_at when payload is absent"
+    );
+    assert_eq!(evidence[0].locator.as_deref(), Some("mem_g13_kf_orphan"));
+    assert_eq!(evidence[0].title, None);
+    assert_eq!(evidence[0].link_reason, None);
+}
+
+/// G6 Stage 1.3 test 3 (divergence, the 1.2 pattern): no other test can tell
+/// whether a migrated reader actually reads `edges` versus quietly falling
+/// back to `page_sources`/`page_evidence`, since every OTHER fixture keeps
+/// the stores in parity via the dual-write. Here they're deliberately
+/// split: one cites fact exists ONLY in `edges`, and TWO exist ONLY in
+/// `page_sources`/`page_evidence` (asymmetric counts so a reader that
+/// quietly fell back to the legacy tables would report a different number,
+/// not the same one by coincidence). Covers readers #1 (`get_page_sources`),
+/// #4 (`get_page_evidence`), #5 (`get_pages_for_memory`), #6
+/// (`mark_pages_depending_on_memory_sources_except`, exercised via its
+/// public caller `update_memory`), and the two migrated EXISTS lints
+/// (#9 `pages.source_page_integrity`, #10 `memories.derived.page_links`) --
+/// each must see the edge-only fact and stay blind to the legacy-only
+/// orphans. Reader #6 runs last since its caller mutates the memory rows.
+/// Exception (S2, 2026-08-05 review): `pages.source_page_integrity`'s
+/// single EXISTS deliberately reads `page_evidence OR edges` (no dst_kind
+/// filter; a NULL-locator authored row is provenance with no edge twin), so
+/// it is NOT blind to the legacy-only page's real `page_evidence` rows --
+/// see the assertion below. Closure review (2026-08-05): a THIRD page,
+/// `g13_div_page_sources_only`, seeds a `page_sources` row alone (no
+/// page_evidence, no edge, `source_memory_ids='[]'`) to keep this check's
+/// negative-direction proof alive -- the migrated reader has no provenance
+/// it can see for that page, so it stays flagged.
+#[tokio::test]
+async fn migrated_readers_diverge_from_legacy_and_follow_edges() {
+    let (db, _dir) = test_db().await;
+    seed_memory_with_source_id_and_space(&db, "g13_div_mem_edge", "edge-only content", "space_a")
+        .await;
+    seed_memory_with_source_id_and_space(
+        &db,
+        "g13_div_mem_legacy_1",
+        "legacy content 1",
+        "space_a",
+    )
+    .await;
+    seed_memory_with_source_id_and_space(
+        &db,
+        "g13_div_mem_legacy_2",
+        "legacy content 2",
+        "space_a",
+    )
+    .await;
+    {
+        let conn = db.conn.lock().await;
+        insert_raw_page_for_m81_test(&conn, "g13_div_page_edge", "space_a").await;
+        insert_raw_page_for_m81_test(&conn, "g13_div_page_legacy", "space_a").await;
+        insert_raw_page_for_m81_test(&conn, "g13_div_page_sources_only", "space_a").await;
+        conn.execute(
+            "UPDATE pages SET creation_kind = 'source' \
+             WHERE id IN ('g13_div_page_edge', 'g13_div_page_legacy', 'g13_div_page_sources_only')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        // Edge-only fact: no page_sources/page_evidence twin.
+        conn.execute(
+            "INSERT INTO edges (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,payload) \
+             VALUES ('g13-div-edge-only','g13_div_page_edge','page','g13_div_mem_edge','memory','cites','evidence',0,'space_a',100, \
+                     '{\"source_kind\":\"memory\",\"linked_at\":100,\"link_reason\":\"edge_only\"}')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        // Two legacy-only facts (asymmetric count vs the one edge-only fact
+        // above): no edges twin for either.
+        seed_page_source(&conn, "g13_div_page_legacy", "g13_div_mem_legacy_1").await;
+        seed_page_source(&conn, "g13_div_page_legacy", "g13_div_mem_legacy_2").await;
+        seed_page_evidence(
+            &conn,
+            "g13_div_page_legacy",
+            "memory",
+            Some("g13_div_mem_legacy_1"),
+        )
+        .await;
+        seed_page_evidence(
+            &conn,
+            "g13_div_page_legacy",
+            "memory",
+            Some("g13_div_mem_legacy_2"),
+        )
+        .await;
+
+        // Negative-direction proof (closure review): a page_sources row with
+        // NO page_evidence row and NO edge -- the migrated
+        // `pages.source_page_integrity` check has nothing to see for this
+        // page and must still flag it.
+        seed_page_source(
+            &conn,
+            "g13_div_page_sources_only",
+            "g13_div_mem_sources_only",
+        )
+        .await;
+    }
+
+    // Reader #1: get_page_sources.
+    let edge_sources = db.get_page_sources("g13_div_page_edge").await.unwrap();
+    assert_eq!(edge_sources.len(), 1, "must see the edge-only fact");
+    assert_eq!(edge_sources[0].memory_source_id, "g13_div_mem_edge");
+    let legacy_sources = db.get_page_sources("g13_div_page_legacy").await.unwrap();
+    assert!(
+        legacy_sources.is_empty(),
+        "must not see the legacy-only orphans"
+    );
+
+    // Reader #4: get_page_evidence.
+    let edge_evidence = db.get_page_evidence("g13_div_page_edge").await.unwrap();
+    assert_eq!(edge_evidence.len(), 1, "must see the edge-only fact");
+    let legacy_evidence = db.get_page_evidence("g13_div_page_legacy").await.unwrap();
+    assert!(
+        legacy_evidence.is_empty(),
+        "must not see the legacy-only orphans"
+    );
+
+    // Reader #5: get_pages_for_memory.
+    let pages_for_edge_mem = db.get_pages_for_memory("g13_div_mem_edge").await.unwrap();
+    assert!(
+        pages_for_edge_mem
+            .iter()
+            .any(|p| p.id == "g13_div_page_edge"),
+        "must see the edge-only fact"
+    );
+    let pages_for_legacy_mem = db
+        .get_pages_for_memory("g13_div_mem_legacy_1")
+        .await
+        .unwrap();
+    assert!(
+        !pages_for_legacy_mem
+            .iter()
+            .any(|p| p.id == "g13_div_page_legacy"),
+        "must not see the legacy-only orphans"
+    );
+
+    // Readers #9/#10: the two migrated EXISTS lints, via the public
+    // LintRunner (must run before reader #6 below deletes the memory rows).
+    let report = crate::lint::runner::LintRunner::new(
+        crate::lint::context::LintClock::fixed(),
+        crate::lint::context::CancellationToken::new(),
+    )
+    .run(
+        &db,
+        &wenlan_types::lint::LintQuery {
+            profile: Some(wenlan_types::lint::LintProfile::General),
+            space: None,
+        },
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    let find_check = |id: &str| {
+        report
+            .checks()
+            .iter()
+            .find(|check| check.check_id() == id)
+            .unwrap_or_else(|| panic!("missing check {id}"))
+    };
+    let affected_of = |check: &wenlan_types::lint::LintCheckResult| {
+        check
+            .metrics()
+            .iter()
+            .find_map(|metric| {
+                (metric.code() == wenlan_types::lint::LintMetricCode::AffectedRecords).then(|| {
+                    match metric.value() {
+                        wenlan_types::lint::LintMetricValue::Count { value } => *value,
+                        _ => 0,
+                    }
+                })
+            })
+            .unwrap()
+    };
+    // S2 (2026-08-05 review): this check's single EXISTS reads
+    // `page_evidence OR edges` (no dst_kind filter), not edges-only, so the
+    // legacy-only page's real `page_evidence` rows (seeded above) make it
+    // PASS this check too. Closure review (2026-08-05): the third page
+    // (`g13_div_page_sources_only`) seeds ONLY a `page_sources` row -- no
+    // page_evidence, no edge -- so it has no provenance the migrated reader
+    // can see and stays flagged. Net: 1 affected (the sources-only page),
+    // not the edge-only or legacy-only page.
+    assert_eq!(
+        affected_of(find_check("pages.source_page_integrity")),
+        1,
+        "source_page_integrity must flag only the sources-only page -- the \
+         edge-only page has an edge and the legacy-only page has real \
+         page_evidence rows, both real provenance under the migrated \
+         page_evidence-OR-edges check, but a page_sources row alone (no \
+         page_evidence, no edge) is invisible to it"
+    );
+    assert_eq!(
+        affected_of(find_check("memories.derived.page_links")),
+        2,
+        "page_links must flag both legacy-only memories as missing page linkage \
+         (2), not the edge-only memory -- population must come from edges"
+    );
+
+    // Reader #6: mark_pages_depending_on_memory_sources_except, exercised via
+    // its public caller update_memory (content update, not deletion --
+    // delete_by_source_id also runs a separate, out-of-scope orphan-cleanup
+    // subsystem that reads the legacy tables directly to remove them, which
+    // would confound this reader-migration-only assertion).
+    db.update_memory("g13_div_mem_edge", "edge-only content, edited")
+        .await
+        .unwrap();
+    let edge_page_stale = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT stale_reason FROM pages WHERE id = 'g13_div_page_edge'",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<Option<String>>(0)
+            .unwrap()
+    };
+    assert_eq!(
+        edge_page_stale.as_deref(),
+        Some("source_updated"),
+        "must mark the edge-only page stale when its cited memory is updated"
+    );
+
+    db.update_memory("g13_div_mem_legacy_1", "legacy content 1, edited")
+        .await
+        .unwrap();
+    let legacy_page_stale = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT stale_reason FROM pages WHERE id = 'g13_div_page_legacy'",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<Option<String>>(0)
+            .unwrap()
+    };
+    assert_eq!(
+        legacy_page_stale, None,
+        "must not mark the legacy-only page stale -- it isn't backed by edges"
+    );
+}
+
+/// G6 Stage 1.3 test 4 (parity stays 0): the reader migration touches no
+/// writer and no parity derivation, so a page linked through both real
+/// writers must still reconcile clean.
+#[tokio::test]
+async fn stage_1_3_reader_migration_keeps_cites_edge_parity_clean() {
+    let (db, _dir) = test_db().await;
+    seed_memory_with_source_id_and_space(&db, "g13_parity_mem", "content", "space_a").await;
+    {
+        let conn = db.conn.lock().await;
+        insert_raw_page_for_m81_test(&conn, "g13_parity_page", "space_a").await;
+    }
+    db.link_page_source("g13_parity_page", "g13_parity_mem", "test")
+        .await
+        .unwrap();
+    db.link_page_evidence(
+        "g13_parity_page",
+        "authored",
+        None,
+        Some("Editor note"),
+        "test",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        db.reconcile_edges_parity().await.unwrap().drift_count,
+        0,
+        "the Stage 1.3 reader migration must not disturb edges parity"
+    );
+
+    // S2 (2026-08-05 review): pin the drop explicitly. `page_evidence` now
+    // has 2 rows (the memory-kind row from link_page_source, plus the
+    // authored/NULL-locator row above), but a NULL-locator row mints no
+    // edge (link_page_evidence's documented skip), so the edge-backed
+    // reader #4 (`get_page_evidence`) must return only 1.
+    let evidence_row_count = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM page_evidence WHERE page_id = 'g13_parity_page'",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    };
+    assert_eq!(evidence_row_count, 2, "legacy page_evidence has both rows");
+    let evidence = db.get_page_evidence("g13_parity_page").await.unwrap();
+    assert_eq!(
+        evidence.len(),
+        1,
+        "get_page_evidence must drop the NULL-locator authored row -- it has \
+         no edge twin, so the edge-backed reader reports fewer rows than the \
+         legacy table by design"
+    );
+    assert_eq!(evidence[0].source_kind, "memory");
+}
+
 #[tokio::test]
 async fn replace_page_links_dual_writes_and_invalidates_removed_links() {
     let (db, _dir) = test_db().await;
@@ -48145,6 +48592,146 @@ async fn cleanup_orphaned_page_sources_preserves_edge_backed_by_page_citations()
         None,
         "pages.citations still backs mem_gone -- the shared edge must stay active"
     );
+}
+
+/// G6 Stage 1.3 S1: pins the D7 survivor as IN SCOPE by design, not an
+/// accident. Post-1.3, "page sources" means "active `cites` edges", which
+/// includes an edge kept alive only by `pages.citations` backing after its
+/// `page_sources` row was pruned (D7 refcount, `cites_backed_by_page_citations`
+/// at db.rs). The reader migration widens what `get_page_sources` reports
+/// versus the pre-migration legacy table -- this is deliberate and
+/// time-boxed: Stage 2 retires `pages.citations`' edge-backing role.
+#[tokio::test]
+async fn get_page_sources_returns_d7_survivor_backed_only_by_citations() {
+    let (db, _dir) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        insert_raw_page_for_m81_test(&conn, "page_d7", "space_a").await;
+        seed_page_source(&conn, "page_d7", "mem_d7_gone").await;
+        let citations = serde_json::json!([
+            {"occurrence": 1, "marker": 1, "source_kind": "memory", "locator": "mem_d7_gone",
+             "score": 0.9, "status": "verified", "scope": "sentence"}
+        ]);
+        conn.execute(
+            "UPDATE pages SET citations = ?1 WHERE id = 'page_d7'",
+            libsql::params![citations.to_string()],
+        )
+        .await
+        .unwrap();
+        conn.execute("BEGIN", ()).await.unwrap();
+        MemoryDB::dual_write_edge(
+            &conn,
+            "cites",
+            "page",
+            "page_d7",
+            "memory",
+            "mem_d7_gone",
+            "mem_d7_gone",
+            "legacy",
+            "space_a",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        conn.execute("COMMIT", ()).await.unwrap();
+    }
+
+    // mem_d7_gone was never a real memory, so its page_sources row is an
+    // orphan -- pruned by the cleanup sweep, but the edge survives because
+    // pages.citations still backs it.
+    let removed = db.cleanup_orphaned_page_sources().await.unwrap();
+    assert_eq!(removed, 1);
+
+    let sources = db.get_page_sources("page_d7").await.unwrap();
+    assert_eq!(
+        sources.len(),
+        1,
+        "get_page_sources must still report the D7 survivor: the legacy row is \
+         gone but the edge stays active, and reading edges means reading the \
+         edge, not the legacy row"
+    );
+    assert_eq!(sources[0].memory_source_id, "mem_d7_gone");
+}
+
+/// G6 Stage 1.3 pin (closure ruling, 2026-08-05): `get_page_sources` is an
+/// ENUMERATION reader and must return every `dst_kind`, not just `memory` --
+/// the `dst_kind='memory'` filter this reader carried before the ruling
+/// narrowed it below what legacy `page_sources` actually returned (that
+/// table's dual-write, `insert_page`'s `INSERT OR IGNORE INTO page_sources`,
+/// has no kind check -- see the spec's "Reader migration table" note). Seeds
+/// one memory-kind and one external-kind cites edge on the same page and
+/// asserts both come back, ordering discipline intact.
+#[tokio::test]
+async fn get_page_sources_returns_external_kind_locators_alongside_memory() {
+    let (db, _dir) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        insert_raw_page_for_m81_test(&conn, "page_ext_pin", "space_a").await;
+        conn.execute("BEGIN", ()).await.unwrap();
+        MemoryDB::dual_write_edge(
+            &conn,
+            "cites",
+            "page",
+            "page_ext_pin",
+            "memory",
+            "mem_ext_pin",
+            "mem_ext_pin",
+            "legacy",
+            "space_a",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        MemoryDB::dual_write_edge(
+            &conn,
+            "cites",
+            "page",
+            "page_ext_pin",
+            "external",
+            "https://example.test/g6-ext-pin",
+            "https://example.test/g6-ext-pin",
+            "legacy",
+            "space_a",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        conn.execute("COMMIT", ()).await.unwrap();
+        // `dual_write_edge` (the test helper above) writes a NULL payload, and
+        // `json_set(NULL, ...)` is a SQLite no-op -- seed a valid JSON object
+        // first so the linked_at write actually lands.
+        conn.execute(
+            "UPDATE edges SET payload = json_set(COALESCE(payload, '{}'), '$.linked_at', 100) \
+             WHERE edge_type = 'cites' AND src_id = 'page_ext_pin' AND dst_kind = 'memory'",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE edges SET payload = json_set(COALESCE(payload, '{}'), '$.linked_at', 200) \
+             WHERE edge_type = 'cites' AND src_id = 'page_ext_pin' AND dst_kind = 'external'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let sources = db.get_page_sources("page_ext_pin").await.unwrap();
+    assert_eq!(
+        sources.len(),
+        2,
+        "an external-kind cites edge must not be filtered out of page-source enumeration"
+    );
+    assert_eq!(sources[0].memory_source_id, "mem_ext_pin");
+    assert_eq!(sources[0].linked_at, 100);
+    assert_eq!(
+        sources[1].memory_source_id,
+        "https://example.test/g6-ext-pin"
+    );
+    assert_eq!(sources[1].linked_at, 200);
 }
 
 #[tokio::test]

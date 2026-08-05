@@ -441,7 +441,14 @@ async fn suspicious_existing_page_and_entity_links_are_distinct_candidates() {
                  'now','now','now','work','research','confirmed');
          INSERT INTO page_evidence (page_id,source_kind,locator,linked_at,link_reason)
          VALUES ('page-unrelated','memory','mem-source',0,'test'),
-                ('page-external','external_url','https://example.test/source',0,'test');",
+                ('page-external','external_url','https://example.test/source',0,'test');
+         -- G6 Stage 1.3: PageEvidenceLinks/PageProvenanceAdequacy candidate
+         -- generation reads `edges`, not `page_evidence` -- mirror the
+         -- dual-write here too (dst_kind drives the memory/external split).
+         INSERT INTO edges
+             (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at)
+         VALUES ('edge-evidence-unrelated','page-unrelated','page','mem-source','memory','cites','legacy',0,'work',0),
+                ('edge-evidence-external','page-external','page','https://example.test/source','external','cites','legacy',0,'work',0);",
         )
         .await
         .unwrap();
@@ -470,9 +477,17 @@ async fn suspicious_existing_page_and_entity_links_are_distinct_candidates() {
 #[tokio::test]
 async fn candidate_generator_failure_is_incomplete() {
     let (db, _dir) = test_db().await;
+    // G6 Stage 1.3: `load_page_evidence`/`load_relations` moved onto `edges`,
+    // so dropping `page_evidence` no longer breaks the up-front candidate
+    // load batch (`candidates::load` in semantic_candidates.rs). `pages` and
+    // most other loader tables have FK dependents SQLite refuses to drop
+    // (`PRAGMA foreign_keys=ON`); `memory_entities` is still read directly by
+    // `load_memory_entity_links` in that same `?`-chained batch and has no
+    // incoming FK references, so dropping it reproduces the same "one query
+    // fails, every check reports FailedToRun" cascade this test exercises.
     db.test_primary_session()
         .await
-        .execute_batch("DROP TABLE page_evidence;")
+        .execute_batch("DROP TABLE memory_entities;")
         .await
         .unwrap();
 
@@ -480,6 +495,21 @@ async fn candidate_generator_failure_is_incomplete() {
     assert_reason(
         &report,
         LintSemanticCheckId::MemoryEntityLinks,
+        LintOutcome::FailedToRun,
+        LintReasonCode::SemanticCandidateGenerationFailure,
+    );
+    // `MemoryClassification`'s own loader (`load_memories`) runs and succeeds
+    // BEFORE `load_memory_entity_links` in the `?`-chain (semantic_candidates.rs
+    // `load()`), so this check's inputs are intact. It still comes back
+    // FailedToRun: a single loader failure aborts `load()` as a whole, and
+    // `run()`'s fallback (`failed_generation`) blanket-marks every
+    // `LintSemanticCheckId`, not just the one whose loader threw. Asserting on
+    // `MemoryEntityLinks` alone (the check that OWNS the dropped table) cannot
+    // tell cascade propagation apart from a plain local failure; a check with
+    // healthy inputs still going down is the property this test exists to pin.
+    assert_reason(
+        &report,
+        LintSemanticCheckId::MemoryClassification,
         LintOutcome::FailedToRun,
         LintReasonCode::SemanticCandidateGenerationFailure,
     );

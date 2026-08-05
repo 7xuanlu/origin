@@ -19928,6 +19928,10 @@ impl MemoryDB {
     /// retracts one of ITS OWN dropped citations, so a still-active
     /// `page_sources`/`page_evidence` row keeps the shared edge alive (D7
     /// refcount, spec v3 M3).
+    ///
+    /// G6 Stage 1.3 carryover (2026-08-05): writer-side D7 refcount machinery,
+    /// not a reader migration target -- it must keep reading the legacy tables
+    /// directly since it is what decides whether they still justify the edge.
     async fn cites_backed_outside_page_citations(
         conn: &libsql::Connection,
         page_id: &str,
@@ -28064,6 +28068,28 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete Page evidence: {e}")))?;
+            // G6 Stage 1.3: the readers above (`get_page_sources`,
+            // `get_page_evidence`) now derive from active `cites` edges, not
+            // these legacy tables. Retiring only the page_sources/page_evidence
+            // rows without also retiring their edge twin left a stale edge
+            // readable after its provenance rows were pruned. Mirror the
+            // same locator set (logical source id + physical memory rows).
+            let now = chrono::Utc::now().timestamp();
+            conn.execute(
+                "UPDATE edges
+                 SET valid_until = ?3, superseded_by = NULL
+                 WHERE edge_type = 'cites' AND src_kind = 'page' AND dst_kind = 'memory'
+                   AND valid_until IS NULL
+                   AND (
+                       dst_id = ?2
+                       OR dst_id IN (
+                           SELECT id FROM memories WHERE source = ?1 AND source_id = ?2
+                       )
+                   )",
+                libsql::params![source, source_id, now],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("delete Page cites edges: {e}")))?;
         }
 
         let mut deleted_locators = physical_row_ids;
@@ -28314,6 +28340,9 @@ impl MemoryDB {
 
         let mut affected_pages: HashMap<String, i64> = HashMap::new();
         for (source, source_id) in unique_sources {
+            // G6 Stage 1.3: the `page_sources` EXISTS clause reads `edges`
+            // (`cites`, `dst_kind='memory'`) instead. The `pages.source_memory_ids`
+            // legacy JSON mirror stays untouched -- out of scope (Stage 1.4).
             let mut rows = conn
                 .query(
                     "SELECT DISTINCT p.id
@@ -28324,11 +28353,12 @@ impl MemoryDB {
                            )
                        AND (
                            EXISTS (
-                               SELECT 1 FROM page_sources ps
-                               WHERE ps.page_id = p.id
+                               SELECT 1 FROM edges ps
+                               WHERE ps.edge_type = 'cites' AND ps.valid_until IS NULL
+                                 AND ps.dst_kind = 'memory' AND ps.src_id = p.id
                                  AND (
-                                     ps.memory_source_id = ?2
-                                     OR ps.memory_source_id IN (
+                                     ps.dst_id = ?2
+                                     OR ps.dst_id IN (
                                          SELECT m.id FROM memories m
                                          WHERE m.source = ?1 AND m.source_id = ?2
                                      )
@@ -39832,6 +39862,11 @@ impl MemoryDB {
         space_filter: Option<&str>,
     ) -> Result<Vec<ClusterMemRow>, WenlanError> {
         let conn = self.conn.lock().await;
+        // S3 (2026-08-05 G6 Stage 1.3 review): distill-eligibility predicate
+        // stays on page_evidence pending a focused migration -- widening it
+        // to the edges/cites union (which includes D7 survivors backed only
+        // by pages.citations) changes the eligibility pool and deserves its
+        // own test attention. Folds into Stage 2.
         let mut sql = String::from(
             "SELECT m.source_id, m.content, m.entity_id, m.space, m.embedding, e.name, m.source_agent, m.content_hash \
              FROM memories m \
@@ -40105,6 +40140,11 @@ impl MemoryDB {
         limit: usize,
     ) -> Result<Vec<RawDistillationSeed>, WenlanError> {
         let conn = self.conn.lock().await;
+        // S3 (2026-08-05 G6 Stage 1.3 review): distill-eligibility predicate
+        // stays on page_evidence pending a focused migration -- widening it
+        // to the edges/cites union (which includes D7 survivors backed only
+        // by pages.citations) changes the eligibility pool and deserves its
+        // own test attention. Folds into Stage 2.
         let mut sql = String::from(
             "SELECT m.id, m.source_id, m.content, m.entity_id, m.space, m.embedding, \
                     e.name, m.source_agent, m.content_hash, \
@@ -40163,6 +40203,11 @@ impl MemoryDB {
         // Fetch the raw fixed-K ANN window first, then evaluate staging
         // eligibility. Predicates after vector_top_k cannot increase work or
         // silently trigger a brute-force fallback.
+        // S3 (2026-08-05 G6 Stage 1.3 review): distill-eligibility predicate
+        // stays on page_evidence pending a focused migration -- widening it
+        // to the edges/cites union (which includes D7 survivors backed only
+        // by pages.citations) changes the eligibility pool and deserves its
+        // own test attention. Folds into Stage 2.
         let mut rows = conn
             .query(
                 "SELECT m.source_id, m.content, m.entity_id, m.space, m.embedding, \
@@ -41831,13 +41876,20 @@ impl MemoryDB {
 
                 let mut affected_pages = HashSet::new();
                 for chunk_id in &chunk_ids {
+                    // G6 Stage 1.3: the `page_sources` EXISTS clause reads
+                    // `edges` (`cites`, `dst_kind='memory'`) instead -- same
+                    // reader #6 twin as `mark_pages_depending_on_memory_sources_except`.
+                    // The `pages.source_memory_ids` legacy JSON mirror stays
+                    // untouched -- out of scope (Stage 1.4).
                     let mut page_rows = conn
                         .query(
                             "SELECT DISTINCT p.id
                          FROM pages p
                          WHERE EXISTS (
-                                   SELECT 1 FROM page_sources ps
-                                   WHERE ps.page_id = p.id AND ps.memory_source_id = ?1
+                                   SELECT 1 FROM edges ps
+                                   WHERE ps.edge_type = 'cites' AND ps.valid_until IS NULL
+                                     AND ps.dst_kind = 'memory' AND ps.src_id = p.id
+                                     AND ps.dst_id = ?1
                                )
                             OR EXISTS (
                                    SELECT 1
@@ -47738,6 +47790,10 @@ impl MemoryDB {
     /// rather than accumulate forever (e.g. the reserved Overview page's
     /// maintenance refresh, spec §5.3) call this before `refresh_page` so the
     /// evidence `refresh_page` reads back is already bounded.
+    // G6 Stage 1.3 carryover (2026-08-05): writer-internal before/after
+    // provenance snapshot (undo-ledger bookkeeping), not a reader migration
+    // target -- it must read the legacy tables directly since it exists to
+    // detect their own change.
     async fn page_memory_provenance_state(
         conn: &libsql::Connection,
         page_id: &str,
@@ -48033,7 +48089,25 @@ impl MemoryDB {
         }
     }
 
-    /// Get all source memories linked to a page, ordered by linked_at ascending.
+    /// Get all sources linked to a page, ordered by linked_at ascending.
+    ///
+    /// G6 Stage 1.3: reads `edges` (`cites`) instead of `page_sources`, spanning
+    /// all `dst_kind`s (no `dst_kind` filter). Ruling (2026-08-05, closure
+    /// review): the original migration filtered `dst_kind='memory'` on the
+    /// premise that legacy `page_sources` was memory-only, but `insert_page`'s
+    /// dual-write (`db.rs`, `INSERT OR IGNORE INTO page_sources`) has never
+    /// applied a kind check -- every source id in `source_memory_ids`, memory
+    /// or external, lands there. Filtering `get_page_sources` to `dst_kind=
+    /// 'memory'` silently narrowed it below what `page_sources` actually
+    /// returned, a real regression (`refresh_page`, distill.rs, depends on the
+    /// full set to build its numbered-citation block). Note this unfiltered
+    /// read is not exactly `page_sources`' old result set either -- it's the
+    /// wider S1 union (see the spec's "Equivalence rationale"), so it also
+    /// admits locators backed only by `page_evidence` or `pages.citations`
+    /// (e.g. a D7 survivor). `linked_at` is COALESCE-total over the
+    /// payload-mirrored legacy value and `edges.created_at` (the ordering
+    /// trap: an m81-era edge's `created_at` is migration day, not the
+    /// original link time) — same discipline as Stage 1.2's `asserted_at`.
     pub async fn get_page_sources(
         &self,
         page_id: &str,
@@ -48041,7 +48115,13 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT page_id, memory_source_id, linked_at, link_reason FROM page_sources WHERE page_id = ?1 ORDER BY linked_at ASC",
+                "SELECT src_id, dst_id,
+                        COALESCE(json_extract(payload,'$.linked_at'), created_at),
+                        json_extract(payload,'$.link_reason')
+                 FROM edges
+                 WHERE edge_type = 'cites' AND valid_until IS NULL
+                       AND src_id = ?1
+                 ORDER BY COALESCE(json_extract(payload,'$.linked_at'), created_at) ASC, dst_id ASC",
                 libsql::params![page_id],
             )
             .await
@@ -48069,6 +48149,10 @@ impl MemoryDB {
     /// Count at most `cap + 1` Page-source links without materializing the
     /// complete source set. Automatic callers use the sentinel row to reject
     /// oversized prompts before loading source contents.
+    ///
+    /// G6 Stage 1.3: counts `edges` (`cites`) instead of `page_sources`,
+    /// spanning all `dst_kind`s (no `dst_kind` filter) -- see the
+    /// `get_page_sources` doc comment for the ruling.
     pub async fn count_page_sources_up_to(
         &self,
         page_id: &str,
@@ -48079,7 +48163,10 @@ impl MemoryDB {
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM (
-                     SELECT 1 FROM page_sources WHERE page_id = ?1 LIMIT ?2
+                     SELECT 1 FROM edges
+                     WHERE edge_type = 'cites' AND valid_until IS NULL
+                           AND src_id = ?1
+                     LIMIT ?2
                  )",
                 libsql::params![page_id, sentinel_limit],
             )
@@ -48095,6 +48182,15 @@ impl MemoryDB {
     }
 
     /// Typed evidence read path (P2). Successor to `get_page_sources`.
+    ///
+    /// G6 Stage 1.3: reads `edges` (`cites`) instead of `page_evidence`, spanning
+    /// all `dst_kind`s (no `dst_kind` filter, matching the legacy table's shape).
+    /// `source_kind` and `linked_at` are COALESCE-total per the NULL-payload
+    /// discipline: `source_kind` falls back on the NOT NULL `dst_kind` column
+    /// (`memory` -> `memory`, else `external`) for the rare pre-#486 edge whose
+    /// legacy row vanished before m115's payload backfill; `linked_at` falls
+    /// back on `edges.created_at` for the same ordering-trap reason as
+    /// `get_page_sources`.
     pub async fn get_page_evidence(
         &self,
         page_id: &str,
@@ -48102,8 +48198,16 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT page_id, source_kind, locator, title, linked_at, link_reason
-             FROM page_evidence WHERE page_id = ?1 ORDER BY linked_at ASC",
+                "SELECT src_id,
+                        COALESCE(json_extract(payload,'$.source_kind'),
+                                 CASE dst_kind WHEN 'memory' THEN 'memory' ELSE 'external' END),
+                        dst_id,
+                        json_extract(payload,'$.title'),
+                        COALESCE(json_extract(payload,'$.linked_at'), created_at),
+                        json_extract(payload,'$.link_reason')
+                 FROM edges
+                 WHERE edge_type = 'cites' AND valid_until IS NULL AND src_id = ?1
+                 ORDER BY COALESCE(json_extract(payload,'$.linked_at'), created_at) ASC, dst_id ASC",
                 libsql::params![page_id],
             )
             .await
@@ -48594,6 +48698,9 @@ impl MemoryDB {
     }
 
     /// Reverse lookup: find all active pages that reference a given memory source_id.
+    ///
+    /// G6 Stage 1.3: joins `edges` (`cites`, `dst_kind='memory'`) instead of
+    /// `page_sources`.
     pub async fn get_pages_for_memory(
         &self,
         memory_source_id: &str,
@@ -48607,8 +48714,9 @@ impl MemoryDB {
                         COALESCE(c.changelog, '[]'), COALESCE(c.creation_kind, 'distilled'), COALESCE(c.review_status, 'confirmed'),
                         c.workspace, c.citations, COALESCE(c.kind, 'concept')
                  FROM pages c
-                 INNER JOIN page_sources cs ON c.id = cs.page_id
-                 WHERE cs.memory_source_id = ?1 AND c.status = 'active'
+                 INNER JOIN edges cs ON cs.src_id = c.id AND cs.edge_type = 'cites'
+                        AND cs.valid_until IS NULL AND cs.dst_kind = 'memory'
+                 WHERE cs.dst_id = ?1 AND c.status = 'active'
                    AND COALESCE(c.kind, 'concept') != 'entity'",
                 libsql::params![memory_source_id],
             )
@@ -48631,6 +48739,10 @@ impl MemoryDB {
     /// invalidate so a `page_sources`/`page_evidence` row pruned for a
     /// since-deleted memory does not retract an edge `pages.citations` still
     /// independently cites (D7 refcount, spec v3 M3).
+    ///
+    /// G6 Stage 1.3 carryover (2026-08-05): writer-side D7 refcount machinery
+    /// (its caller is the `page_sources`/`page_evidence` orphan-cleanup path),
+    /// not a reader migration target.
     async fn cites_backed_by_page_citations(
         conn: &libsql::Connection,
         page_id: &str,

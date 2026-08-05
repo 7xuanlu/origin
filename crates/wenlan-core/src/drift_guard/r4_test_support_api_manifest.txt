@@ -37,8 +37,8 @@ crates/wenlan-core/src/lint/pages/db_checks_test.rs|crate::lint::pages::db_check
 crates/wenlan-core/src/lint/pages/db_checks_test.rs|crate::lint::pages::db_checks::tests::insert_page_with_scope|TestDbSession::execute|1
 crates/wenlan-core/src/lint/pages/db_checks_test.rs|crate::lint::pages::db_checks::tests::same_effective_scope_active_duplicate_titles_warn|test_secondary_session|1
 crates/wenlan-core/src/lint/pages/db_checks_test.rs|crate::lint::pages::db_checks::tests::selected_duplicate_scope_filters_registered_and_uncategorized|test_secondary_session|1
-crates/wenlan-core/src/lint/pages/db_checks_test.rs|crate::lint::pages::db_checks::tests::source_page_integrity_accepts_any_canonical_or_legacy_provenance_representation|TestDbSession::execute_batch|1
-crates/wenlan-core/src/lint/pages/db_checks_test.rs|crate::lint::pages::db_checks::tests::source_page_integrity_accepts_any_canonical_or_legacy_provenance_representation|test_secondary_session|1
+crates/wenlan-core/src/lint/pages/db_checks_test.rs|crate::lint::pages::db_checks::tests::source_page_integrity_accepts_json_mirror_cites_edge_or_evidence_row_provenance|TestDbSession::execute_batch|1
+crates/wenlan-core/src/lint/pages/db_checks_test.rs|crate::lint::pages::db_checks::tests::source_page_integrity_accepts_json_mirror_cites_edge_or_evidence_row_provenance|test_secondary_session|1
 crates/wenlan-core/src/lint/pages/db_checks_test.rs|crate::lint::pages::db_checks::tests::source_page_integrity_runs_without_page_projection_or_page_root|TestDbSession::execute_batch|1
 crates/wenlan-core/src/lint/pages/db_checks_test.rs|crate::lint::pages::db_checks::tests::source_page_integrity_runs_without_page_projection_or_page_root|test_secondary_session|1
 crates/wenlan-core/src/lint/pages/integration_test_support.rs|crate::lint::pages::integration_tests::support::semantic_fingerprint|open_isolated_lint_snapshot_for_test|1

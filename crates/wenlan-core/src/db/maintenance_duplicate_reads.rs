@@ -174,6 +174,8 @@ impl NearDuplicateSliceReader<'_> {
         Ok(pair_rows)
     }
 
+    /// G6 Stage 1.3: reads `edges` (`cites`, `dst_kind='memory'`) instead of
+    /// `page_sources`. Orders by id, not `linked_at` -- no ordering-trap concern.
     pub(crate) async fn load_bounded_page_source_ids(
         &self,
         page_id: &str,
@@ -182,8 +184,10 @@ impl NearDuplicateSliceReader<'_> {
         let mut source_rows = self
             .conn
             .query(
-                "SELECT memory_source_id FROM page_sources \
-                 WHERE page_id = ?1 ORDER BY memory_source_id LIMIT ?2",
+                "SELECT dst_id FROM edges \
+                 WHERE edge_type = 'cites' AND valid_until IS NULL AND dst_kind = 'memory' \
+                       AND src_kind = 'page' AND src_id = ?1 \
+                 ORDER BY dst_id LIMIT ?2",
                 libsql::params![page_id, source_read_limit as i64],
             )
             .await

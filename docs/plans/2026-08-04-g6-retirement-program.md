@@ -117,9 +117,55 @@ Order by measured entanglement:
 3. **`page_sources` + `page_evidence`** (~30 fns, co-written pair) —
    `insert_resolved_page_evidence` is the evidence choke point; `page_sources` has
    no single choke point and needs one first.
+   **Status (2026-08-05):** Stage 1.3 migrated all readers in the spec table
+   (11 mandatory plus one conditional, `retrieval_substrate` in `lint/deep.rs`,
+   a per-channel well-formedness check rather than a cross-store consistency
+   check) onto `edges` (`cites` edge type). No id-swap trap here (unlike
+   Stage 1.2): `memory_source_id`/`locator` are real `dst_id` columns, not
+   hash-input discriminators, so both stores migrate cleanly with no schema
+   change.
+
+   Review round (S1-S7) surfaced four readers beyond the spec table and one
+   equivalence-rationale correction:
+   - **Equivalence (S1):** parity drift 0 proves a THREE-store union, not
+     two — `edges ≡ page_sources ∪ page_evidence(non-NULL locator) ∪
+     pages.citations`. A `cites` edge can stay active backed only by
+     `pages.citations` after its `page_sources`/`page_evidence` row is
+     pruned (the D7 refcount survivor). The migrated readers adopt this
+     union knowingly, pinned by
+     `get_page_sources_returns_d7_survivor_backed_only_by_citations`.
+   - **`delete_non_head_memory_chunks` (db.rs)** — the same page-invalidation
+     shape as reader #6, migrated to `edges` (S3a).
+   - **The evidence half of `lint/pages/db_checks.rs`'s
+     `pages.source_page_integrity` check** — reverted to `page_evidence OR
+     edges` (S2): a NULL-locator `authored` row is real provenance with no
+     edge twin, so an edges-only read undercounted it. The page_sources half
+     of the same check stays edges-only.
+   - **Three distill-eligibility predicates** (`query_distillation_staging_pool`,
+     `query_distillation_seed_slice`, `query_distillation_ann_neighbors`, all
+     db.rs) — CARRYOVER, dated in place (S3b): widening them to the
+     edges/cites union changes the eligibility pool and needs its own test
+     attention; folds into Stage 2.
+
+   Four locations stay on legacy by design and are dated in place: the two
+   provenance cross-store lints in `lint/pages/provenance_checks/source.rs`
+   (compare the legacy tables against each other, not against edges — an
+   edges-only read would make the check trivially pass), the D7 refcount
+   helpers `cites_backed_by_page_citations` / `cites_backed_outside_page_citations`
+   (writer-side machinery gating whether `pages.citations` still backs a
+   locator before retiring its edge), and `page_memory_provenance_state`
+   (writer-internal before/after snapshot). `page_sources`/`page_evidence`
+   themselves stay live as the dual-write target; only the reader side moved.
 4. **`pages.citations`** (4 writer fns, 10+ readers) — hardest: a column in every
    `Page` row mapper (db.rs + db/scoped_pages.rs). Retiring it is a struct/mapping
    reshape, its own PR.
+   **Stage 1.4 (pages.citations) — reclassified 2026-08-05:** `pages.citations`
+   is a derived render cache, not a truth store. Per-occurrence annotation
+   state (occurrence/marker/score/status/scope) is render-layer by design;
+   `citations IS NULL` drives the citation-backfill sweep with no edges
+   analog; the column passes the delete-and-rebuild test. Stage 2 retires its
+   edge-backing role (D7 refcount simplification); the column survives Stage 3
+   the way the FTS index does. No reader cutover.
 5. **`entities` + `entity_aliases` + `observations`** (~25+ fns) — largest surface;
    readers move to the `kind='entity'` shadow pages. Depends on stage 1.2's shared-
    CRUD rework.

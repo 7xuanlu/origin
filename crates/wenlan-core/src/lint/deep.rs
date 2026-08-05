@@ -131,6 +131,19 @@ async fn memory_duplicates(context: &LintContext<'_, '_>) -> Result<RowCheck, ()
     .await
 }
 
+// G6 Stage 1.3 reader #12 disposition: MIGRATE. The `page_evidence` EXISTS
+// below is one of five independent per-channel well-formedness checks (fact,
+// graph, page, summary, episode) over the canonical retrieval substrate, not a
+// cross-store consistency check between two legacy tables -- so it migrates to
+// `edges` like the rest of the table, unlike the provenance-consistency lints
+// in `lint/pages/provenance_checks/source.rs`, which stay legacy carryovers.
+// S1 (2026-08-05): this widens what counts as "page channel present" to
+// include a D7 survivor -- a `cites` edge kept alive only by `pages.citations`
+// backing after its `page_sources`/`page_evidence` row was pruned (see
+// `cites_backed_by_page_citations`). That's by design: post-1.3, "page
+// channel present" MEANS "an active `cites` edge exists", and edges ≡
+// page_sources ∪ page_evidence(non-NULL locator) ∪ pages.citations by parity
+// construction. Stage 2 retires `pages.citations`' edge-backing role.
 async fn retrieval_substrate(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (scope, params) = scope_clause(context.scope().filter(), "m.space", false);
     rows(
@@ -152,8 +165,9 @@ async fn retrieval_substrate(context: &LintContext<'_, '_>) -> Result<RowCheck, 
                     NOT EXISTS(SELECT 1 FROM child_vectors c
                                 WHERE c.parent_kind='memory' AND c.parent_id=h.source_id)
                 AND NOT EXISTS(SELECT 1 FROM memory_entities me WHERE me.memory_id=h.source_id)
-                AND NOT EXISTS(SELECT 1 FROM page_evidence pe
-                                WHERE pe.source_kind='memory' AND pe.locator=h.source_id)
+                AND NOT EXISTS(SELECT 1 FROM edges pe
+                                WHERE pe.edge_type='cites' AND pe.valid_until IS NULL
+                                  AND pe.dst_kind='memory' AND pe.dst_id=h.source_id)
                 AND NOT EXISTS(SELECT 1 FROM summary_node_sources s
                                 WHERE s.memory_source_id=h.source_id)
                 AND NOT EXISTS(SELECT 1 FROM memories ep

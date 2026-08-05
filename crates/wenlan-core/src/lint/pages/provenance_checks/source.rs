@@ -34,6 +34,12 @@ struct SourceBuilder {
     evidence_kinds: Vec<String>,
 }
 
+// G6 Stage 1.3 carryover (2026-08-05): this module validates `page_sources`
+// and `page_evidence` AGAINST EACH OTHER (cross-store consistency), which is
+// definitionally inexpressible over a single canonical `edges` store -- there
+// is no second legacy copy left to disagree with once migrated. Stays on the
+// legacy tables through Stage 1 and Stage 2; retires with the stores at
+// Stage 3, same as `load_sources`/`source_ctes` below.
 pub(super) async fn load_and_assess_sources(
     context: &LintContext<'_, '_>,
 ) -> Result<Assessment, ()> {
