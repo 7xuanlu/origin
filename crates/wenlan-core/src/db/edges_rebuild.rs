@@ -26,7 +26,7 @@ use crate::WenlanError;
 pub(super) const EDGE_COLUMNS: &str =
     "edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, \
                             grounded, root_id, space, weight, payload, provenance, operation_id, \
-                            created_at, superseded_by, valid_until";
+                            created_at, superseded_by, valid_until, semantic_type";
 
 /// The widened table. Three CHECKs are new, and each one is a storage-layer
 /// tooth the artifacts asked for by name.
@@ -72,6 +72,7 @@ pub(super) const EDGES_WIDENED_DDL: &str = "CREATE TABLE edges_new (
     created_at INTEGER NOT NULL,
     superseded_by TEXT REFERENCES edges(edge_id),
     valid_until INTEGER,
+    semantic_type TEXT,
     CHECK (
         lineage <> 'legacy'
         OR (src_kind NOT IN ('claim_revision','root')

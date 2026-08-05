@@ -592,6 +592,29 @@ impl MemoryDB {
                         true,
                     ),
                 };
+                // Mirror the post-fold canonical row's semantic fields onto
+                // the edge (G6 Stage 1) — the merge branch just rewrote them.
+                let mut sem_rows = conn
+                    .query(
+                        "SELECT confidence, explanation, source_agent FROM relations \
+                         WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
+                        libsql::params![from.clone(), to.clone(), canonical.to_string()],
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+                let semantic_patch = match sem_rows
+                    .next()
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?
+                {
+                    Some(row) => Self::relates_semantic_patch(
+                        row.get::<Option<f64>>(0).unwrap_or(None),
+                        row.get::<Option<String>>(1).unwrap_or(None).as_deref(),
+                        row.get::<Option<String>>(2).unwrap_or(None).as_deref(),
+                    ),
+                    None => Self::relates_semantic_patch(None, None, None),
+                };
+                drop(sem_rows);
                 let (_, mint_changes) = Self::dual_write_edge_with_payload(
                     &conn,
                     "relates",
@@ -605,6 +628,8 @@ impl MemoryDB {
                     cross_space_downgrade,
                     None,
                     None,
+                    Some(canonical),
+                    Some(&semantic_patch),
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("fold mint edge: {e}")))?;
@@ -777,8 +802,9 @@ pub const EMBEDDING_DIM: usize = 768;
 /// Bump this whenever a new migration lands. Used as an eval cache invalidation key.
 /// Migration 111 repairs the edges-parity damage the ambient entity-enrichment
 /// lane did while it wrote `relations` without their `edges` twin. It follows
-/// M5's judge-eligibility registry and generation fence at 110.
-pub const SCHEMA_VERSION: u32 = 114;
+/// M5's judge-eligibility registry and generation fence at 110. Migration 115
+/// adds `edges.semantic_type` + the payload semantic keys (G6 Stage 1).
+pub const SCHEMA_VERSION: u32 = 115;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8621,6 +8647,16 @@ impl MemoryDB {
             if version < 114 {
                 self.migrate_114_entity_shadow_resync(version).await?;
             }
+
+            // Migration 115 (KG close plan G6, Stage 1 "one source of truth"):
+            // add `edges.semantic_type` and backfill it plus the payload
+            // semantic keys (label, link_reason, linked_at, source_kind,
+            // confidence, explanation, source_agent) from the live legacy
+            // rows, so the blocked readers can migrate onto the edge. See
+            // migrate_115_edge_semantic_payload.
+            if version < 115 {
+                self.migrate_115_edge_semantic_payload(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -9059,7 +9095,8 @@ impl MemoryDB {
                     operation_id TEXT,
                     created_at INTEGER NOT NULL,
                     superseded_by TEXT REFERENCES edges(edge_id),
-                    valid_until INTEGER
+                    valid_until INTEGER,
+                    semantic_type TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_kind, src_id);
                 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_kind, dst_id);
@@ -11945,6 +11982,12 @@ impl MemoryDB {
             // 105's first drift scan can reference it. Existing 109 databases
             // reach the same DDL through migration 110 below.
             Self::ensure_judge_eligibility_tables(&tx).await?;
+            // The rebuild manifest (`EDGE_COLUMNS`) names `semantic_type`
+            // (G6 Stage 1): fresh chains get it from migration 81's base DDL,
+            // but a pre-98 database predates the column, and the strict
+            // column census would abort on the phantom entry. Add it here so
+            // both directions of the census hold before a row is copied.
+            Self::ensure_edges_semantic_type_column(&tx).await?;
             Self::rebuild_edges_widened(&tx).await?;
 
             // Scoped to `edges` on purpose. The bare pragma walks every foreign
@@ -12532,6 +12575,12 @@ impl MemoryDB {
         // the §6.9 restore point first.
         self.backup_before_migration(111, prior_version).await?;
         let conn = self.conn.lock().await;
+        // The shared dual-write helper (used by step 1b below) references
+        // `edges.semantic_type`, a column migration 115 adds later in the
+        // chain — add it here first so an old database upgrading through
+        // this repair does not hit "no such column". Idempotent (probed),
+        // and m115's own probe then skips its ALTER.
+        Self::ensure_edges_semantic_type_column(&conn).await?;
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("m111 begin: {e}")))?;
@@ -12666,6 +12715,11 @@ impl MemoryDB {
                         space,
                         *downgrade,
                         None,
+                        None,
+                        // semantic_type only — the payload semantic keys are
+                        // backfilled by migration 115, which always follows
+                        // this repair in the chain.
+                        Some(relation_type),
                         None,
                     )
                     .await
@@ -13069,6 +13123,314 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("m114 bump: {e}")))?;
         log::info!("[migration] Migration 114 applied: {resynced} entity shadow pages re-synced");
+        Ok(())
+    }
+
+    // Migration 115 (KG close plan G6, Stage 1 "one source of truth" — spec
+    // docs/plans/2026-08-05-g6-edge-semantic-payload-spec.md): the edge schema
+    // cannot answer what its readers ask. `relation_type` is a hash input of
+    // the edge id but was never stored on the edge, and the display/audit
+    // fields (`label`, `link_reason`, `linked_at`, the 4-way `source_kind`,
+    // `confidence`, `explanation`, `source_agent`) never left their legacy
+    // stores — which is what blocks every reader migration in Stage 1. Adds
+    // `edges.semantic_type` (a real column because it is filtered/grouped on;
+    // NULL for `cites` edges) and backfills it plus the payload semantic keys
+    // from the live legacy rows, re-deriving each content-addressed edge id
+    // with the same derivation the m81 backfill used (relations →
+    // relation_type, page_links → label_key, page_sources / page_evidence /
+    // pages.citations → locator). Active edges only (`valid_until IS NULL`):
+    // retired history keeps its birth payload. The three cites passes run
+    // poorest store first (citations → page_sources → page_evidence) so the
+    // richest (`page_evidence`, the canonical choke point) wins the
+    // `json_patch` merge on shared keys. Idempotent: the column probe skips
+    // the ALTER and every UPDATE re-applies the same values; an edge whose
+    // legacy row is gone is left untouched.
+    async fn migrate_115_edge_semantic_payload(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(115, prior_version).await?;
+        let conn = self.conn.lock().await;
+        Self::ensure_edges_semantic_type_column(&conn).await?;
+
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m115 begin: {e}")))?;
+
+        let result: Result<(u64, u64, u64), WenlanError> = async {
+            // Each pass collects (edge_id, patch) pairs first, then updates —
+            // the single connection cannot interleave an UPDATE with a
+            // streaming SELECT.
+            async fn apply_patches(
+                conn: &libsql::Connection,
+                pending: Vec<(String, String)>,
+                label: &str,
+            ) -> Result<u64, WenlanError> {
+                let mut updated = 0u64;
+                for (edge_id, patch) in pending {
+                    updated += conn
+                        .execute(
+                            "UPDATE edges \
+                             SET payload = json_patch(COALESCE(payload, '{}'), ?2) \
+                             WHERE edge_id = ?1 AND valid_until IS NULL",
+                            libsql::params![edge_id, patch],
+                        )
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m115 {label} update: {e}")))?;
+                }
+                Ok(updated)
+            }
+
+            // Pass 1 of the cites family — pages.citations (poorest store:
+            // only the 4-way source_kind is durable here; occurrence, marker,
+            // score, and status are render-layer and stay in pages.citations
+            // until the Stage 1.4 reader decision).
+            let mut pending: Vec<(String, String)> = Vec::new();
+            {
+                let mut rows = conn
+                    .query(
+                        "SELECT DISTINCT p.id, \
+                                json_extract(je.value, '$.source_kind'), \
+                                json_extract(je.value, '$.locator') \
+                         FROM pages p, json_each(p.citations) je \
+                         WHERE p.citations IS NOT NULL AND json_valid(p.citations)",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m115 citations scan: {e}")))?;
+                while let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m115 citations row: {e}")))?
+                {
+                    let page_id: String = row.get(0).unwrap_or_default();
+                    let source_kind: Option<String> = row.get(1).unwrap_or(None);
+                    let locator: Option<String> = row.get(2).unwrap_or(None);
+                    let (Some(source_kind), Some(locator)) = (source_kind, locator) else {
+                        continue;
+                    };
+                    let dst_kind = if source_kind == "memory" {
+                        "memory"
+                    } else {
+                        "external"
+                    };
+                    let edge_id = crate::provenance::compute_edge_id(
+                        "cites", "page", &page_id, dst_kind, &locator, &locator,
+                    );
+                    let patch = serde_json::json!({ "source_kind": source_kind }).to_string();
+                    pending.push((edge_id, patch));
+                }
+            }
+            let mut cites_updated = apply_patches(&conn, pending, "citations").await?;
+
+            // Pass 2 — page_sources (memory kind; adds linked_at/link_reason).
+            let mut pending: Vec<(String, String)> = Vec::new();
+            {
+                let mut rows = conn
+                    .query(
+                        "SELECT page_id, memory_source_id, linked_at, link_reason \
+                         FROM page_sources",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m115 page_sources scan: {e}")))?;
+                while let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m115 page_sources row: {e}")))?
+                {
+                    let page_id: String = row.get(0).unwrap_or_default();
+                    let sid: String = row.get(1).unwrap_or_default();
+                    let linked_at: Option<i64> = row.get(2).unwrap_or(None);
+                    let link_reason: Option<String> = row.get(3).unwrap_or(None);
+                    let edge_id = crate::provenance::compute_edge_id(
+                        "cites", "page", &page_id, "memory", &sid, &sid,
+                    );
+                    let mut patch = serde_json::Map::new();
+                    patch.insert("source_kind".into(), serde_json::json!("memory"));
+                    if let Some(v) = linked_at {
+                        patch.insert("linked_at".into(), serde_json::json!(v));
+                    }
+                    if let Some(v) = link_reason {
+                        patch.insert("link_reason".into(), serde_json::json!(v));
+                    }
+                    pending.push((edge_id, serde_json::Value::Object(patch).to_string()));
+                }
+            }
+            cites_updated += apply_patches(&conn, pending, "page_sources").await?;
+
+            // Pass 3 — page_evidence (richest: 4-way source_kind + title;
+            // wins the merge over passes 1-2 on shared keys).
+            let mut pending: Vec<(String, String)> = Vec::new();
+            {
+                let mut rows = conn
+                    .query(
+                        "SELECT page_id, source_kind, locator, title, linked_at, link_reason \
+                         FROM page_evidence WHERE locator IS NOT NULL",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m115 page_evidence scan: {e}")))?;
+                while let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m115 page_evidence row: {e}")))?
+                {
+                    let page_id: String = row.get(0).unwrap_or_default();
+                    let source_kind: String = row.get(1).unwrap_or_default();
+                    let locator: String = row.get(2).unwrap_or_default();
+                    let title: Option<String> = row.get(3).unwrap_or(None);
+                    let linked_at: Option<i64> = row.get(4).unwrap_or(None);
+                    let link_reason: Option<String> = row.get(5).unwrap_or(None);
+                    let dst_kind = match source_kind.as_str() {
+                        "memory" => "memory",
+                        _ => "external",
+                    };
+                    let edge_id = crate::provenance::compute_edge_id(
+                        "cites", "page", &page_id, dst_kind, &locator, &locator,
+                    );
+                    let mut patch = serde_json::Map::new();
+                    patch.insert("source_kind".into(), serde_json::json!(source_kind));
+                    if let Some(v) = title {
+                        patch.insert("title".into(), serde_json::json!(v));
+                    }
+                    if let Some(v) = linked_at {
+                        patch.insert("linked_at".into(), serde_json::json!(v));
+                    }
+                    if let Some(v) = link_reason {
+                        patch.insert("link_reason".into(), serde_json::json!(v));
+                    }
+                    pending.push((edge_id, serde_json::Value::Object(patch).to_string()));
+                }
+            }
+            cites_updated += apply_patches(&conn, pending, "page_evidence").await?;
+
+            // Pass 4 — relations → relates edges: semantic_type (the real
+            // column) + confidence/explanation/source_agent in the payload.
+            let mut relates_updated = 0u64;
+            {
+                let mut pending: Vec<(String, String, String)> = Vec::new();
+                let mut rows = conn
+                    .query(
+                        "SELECT from_entity, to_entity, relation_type, \
+                                confidence, explanation, source_agent \
+                         FROM relations",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m115 relations scan: {e}")))?;
+                while let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m115 relations row: {e}")))?
+                {
+                    let from_entity: String = row.get(0).unwrap_or_default();
+                    let to_entity: String = row.get(1).unwrap_or_default();
+                    let relation_type: String = row.get(2).unwrap_or_default();
+                    let confidence: Option<f64> = row.get(3).unwrap_or(None);
+                    let explanation: Option<String> = row.get(4).unwrap_or(None);
+                    let source_agent: Option<String> = row.get(5).unwrap_or(None);
+                    let edge_id = crate::provenance::compute_edge_id(
+                        "relates",
+                        "entity",
+                        &from_entity,
+                        "entity",
+                        &to_entity,
+                        &relation_type,
+                    );
+                    let mut patch = serde_json::Map::new();
+                    if let Some(v) = confidence {
+                        patch.insert("confidence".into(), serde_json::json!(v));
+                    }
+                    if let Some(v) = explanation {
+                        patch.insert("explanation".into(), serde_json::json!(v));
+                    }
+                    if let Some(v) = source_agent {
+                        patch.insert("source_agent".into(), serde_json::json!(v));
+                    }
+                    pending.push((
+                        edge_id,
+                        relation_type,
+                        serde_json::Value::Object(patch).to_string(),
+                    ));
+                }
+                for (edge_id, relation_type, patch) in pending {
+                    relates_updated += conn
+                        .execute(
+                            "UPDATE edges \
+                             SET semantic_type = ?2, \
+                                 payload = json_patch(COALESCE(payload, '{}'), ?3) \
+                             WHERE edge_id = ?1 AND valid_until IS NULL",
+                            libsql::params![edge_id, relation_type, patch],
+                        )
+                        .await
+                        .map_err(|e| {
+                            WenlanError::VectorDb(format!("m115 relations update: {e}"))
+                        })?;
+                }
+            }
+
+            // Pass 5 — page_links → links edges: the display label (only its
+            // lowercased label_key hashes into the edge id). Orphan rows
+            // (target_page_id IS NULL) derive no edge and are skipped, same
+            // as the m81 backfill.
+            let mut pending: Vec<(String, String)> = Vec::new();
+            {
+                let mut rows = conn
+                    .query(
+                        "SELECT source_page_id, target_page_id, label_key, label \
+                         FROM page_links WHERE target_page_id IS NOT NULL",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m115 page_links scan: {e}")))?;
+                while let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m115 page_links row: {e}")))?
+                {
+                    let source_page_id: String = row.get(0).unwrap_or_default();
+                    let target_page_id: String = row.get(1).unwrap_or_default();
+                    let label_key: String = row.get(2).unwrap_or_default();
+                    let label: String = row.get(3).unwrap_or_default();
+                    let edge_id = crate::provenance::compute_edge_id(
+                        "links",
+                        "page",
+                        &source_page_id,
+                        "page",
+                        &target_page_id,
+                        &label_key,
+                    );
+                    let patch = serde_json::json!({ "label": label }).to_string();
+                    pending.push((edge_id, patch));
+                }
+            }
+            let links_updated = apply_patches(&conn, pending, "page_links").await?;
+
+            Ok((relates_updated, cites_updated, links_updated))
+        }
+        .await;
+
+        let (relates_updated, cites_updated, links_updated) = match result {
+            Ok(counts) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m115 commit: {e}")))?;
+                counts
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+
+        conn.execute("PRAGMA user_version = 115", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m115 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 115 applied: semantic payload backfilled \
+             ({relates_updated} relates, {cites_updated} cites, {links_updated} links updates)"
+        );
         Ok(())
     }
 
@@ -13755,13 +14117,13 @@ pub struct ParityReport {
     /// Active-but-unexpected: an active edge with no legacy source (over-shadow).
     pub extra_count: usize,
     /// Same `edge_id` present on both sides but the stored structural columns
-    /// (edge_type, src/dst kind+id) disagree with what the legacy row implies
-    /// -- an endpoint-corrupted row that kept its id. `detect_communities` and
-    /// every other reader consume these stored columns, so a mismatch here
-    /// feeds wrong endpoints and MUST count as drift even though the id set is
-    /// identical. (The discriminator is folded into the id, not stored as a
-    /// column, so it cannot be independently corrupted; the id equality already
-    /// covers it.)
+    /// (edge_type, src/dst kind+id) or the checked semantic fields disagree
+    /// with what the legacy row implies. Structural mismatches can feed wrong
+    /// endpoints, while semantic mismatches make the edge disagree with its
+    /// deriving `relations`/`page_links` row; both MUST count as drift even
+    /// though the id set is identical. (The discriminator is folded into the
+    /// id, not stored as a column, so it cannot be independently corrupted; the
+    /// id equality already covers it.)
     pub corrupt_count: usize,
     /// `missing_count + extra_count + corrupt_count`; the single number the
     /// reader gate reads.
@@ -13770,7 +14132,8 @@ pub struct ParityReport {
     pub missing_sample: Vec<String>,
     /// Up to `SAMPLE_CAP` extra `edge_id`s (sorted).
     pub extra_sample: Vec<String>,
-    /// Up to `SAMPLE_CAP` endpoint-corrupted `edge_id`s (sorted).
+    /// Up to `SAMPLE_CAP` structurally or semantically corrupted `edge_id`s
+    /// (sorted).
     pub corrupt_sample: Vec<String>,
     /// Per-store rows that contributed an edge (diagnostic; pre-dedup).
     pub per_store_contributed: std::collections::BTreeMap<String, u64>,
@@ -13932,16 +14295,109 @@ impl MemoryDB {
             cross_space_downgrade,
             operation_id,
             None,
+            None,
+            None,
         )
         .await?;
         Ok(edge_id)
     }
 
+    /// Probe-guarded `ALTER TABLE edges ADD COLUMN semantic_type TEXT`
+    /// (G6 Stage 1). Called by migration 115 and, defensively, by
+    /// migration 111 — whose repair goes through the shared dual-write
+    /// helper that references the column — and by migration 98, whose
+    /// rebuild manifest names the column and whose strict census would
+    /// otherwise abort a pre-98 upgrade — so any database can upgrade
+    /// through the whole chain in one run.
+    async fn ensure_edges_semantic_type_column(
+        conn: &libsql::Connection,
+    ) -> Result<(), WenlanError> {
+        let mut has_column = false;
+        let mut cols = conn
+            .query("SELECT name FROM pragma_table_info('edges')", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("semantic_type probe: {e}")))?;
+        while let Some(row) = cols
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("semantic_type probe row: {e}")))?
+        {
+            if row.get::<String>(0).ok().as_deref() == Some("semantic_type") {
+                has_column = true;
+            }
+        }
+        drop(cols);
+        if !has_column {
+            conn.execute("ALTER TABLE edges ADD COLUMN semantic_type TEXT", ())
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("semantic_type alter: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Build the semantic-patch JSON for a `relates` edge (G6 Stage 1):
+    /// the relation's display/audit fields, mirrored from its `relations`
+    /// row. Only known values are included — `json_patch` treats a JSON
+    /// null as "remove the key", so an absent value must be absent from
+    /// the patch, not null.
+    fn relates_semantic_patch(
+        confidence: Option<f64>,
+        explanation: Option<&str>,
+        source_agent: Option<&str>,
+    ) -> String {
+        let mut patch = serde_json::Map::new();
+        if let Some(v) = confidence {
+            patch.insert("confidence".into(), serde_json::json!(v));
+        }
+        if let Some(v) = explanation {
+            patch.insert("explanation".into(), serde_json::json!(v));
+        }
+        if let Some(v) = source_agent {
+            patch.insert("source_agent".into(), serde_json::json!(v));
+        }
+        serde_json::Value::Object(patch).to_string()
+    }
+
+    /// Build the semantic-patch JSON for a `cites` edge (G6 Stage 1): the
+    /// 4-way `source_kind` plus the link audit fields where known. Same
+    /// null-omission rule as [`Self::relates_semantic_patch`].
+    fn cites_semantic_patch(
+        source_kind: &str,
+        linked_at: Option<i64>,
+        link_reason: Option<&str>,
+        title: Option<&str>,
+    ) -> String {
+        let mut patch = serde_json::Map::new();
+        patch.insert("source_kind".into(), serde_json::json!(source_kind));
+        if let Some(v) = linked_at {
+            patch.insert("linked_at".into(), serde_json::json!(v));
+        }
+        if let Some(v) = link_reason {
+            patch.insert("link_reason".into(), serde_json::json!(v));
+        }
+        if let Some(v) = title {
+            patch.insert("title".into(), serde_json::json!(v));
+        }
+        serde_json::Value::Object(patch).to_string()
+    }
+
     /// Like [`dual_write_edge`], plus an optional JSON `payload` written
-    /// once at INSERT time (M3g Stage A span capture, §2.3/§6.6). The
-    /// `ON CONFLICT` clause below never assigns `payload`, so a later
-    /// reactivation/re-write of the same content-addressed `edge_id`
-    /// cannot clobber it -- payload is write-once-at-birth by construction.
+    /// once at INSERT time (M3g Stage A span capture, §2.3/§6.6) and the
+    /// G6 semantic fields. The `ON CONFLICT` clause below never assigns
+    /// `payload` from ?12, so a later reactivation/re-write of the same
+    /// content-addressed `edge_id` cannot clobber the PROVENANCE keys
+    /// (`span`, `model_version`, `prompt_version`, `source_memory_id`) --
+    /// those stay write-once-at-birth by construction. The SEMANTIC keys
+    /// (`label`, `link_reason`, `linked_at`, `source_kind`, `title`,
+    /// `confidence`, `explanation`, `source_agent`), passed as the
+    /// separate `semantic_patch` JSON object, are `json_patch`-MERGED on
+    /// both insert and conflict -- a re-assertion of the same fact
+    /// refreshes them (G6 Stage 1 "one source of truth", spec
+    /// docs/plans/2026-08-05-g6-edge-semantic-payload-spec.md), which is
+    /// what keeps e.g. a relation's confidence current on the edge.
+    /// `semantic_type` (the relates `relation_type`; NULL for cites, and
+    /// reserved for links) is a real column, COALESCE-kept on conflict so
+    /// a caller that does not know it cannot NULL it out.
     #[allow(clippy::too_many_arguments)]
     async fn dual_write_edge_with_payload(
         conn: &libsql::Connection,
@@ -13973,6 +14429,8 @@ impl MemoryDB {
         cross_space_downgrade: bool,
         operation_id: Option<&str>,
         payload: Option<&str>,
+        semantic_type: Option<&str>,
+        semantic_patch: Option<&str>,
     ) -> Result<(String, Vec<CommunityGraphChange>), libsql::Error> {
         let edge_id = crate::provenance::compute_edge_id(
             edge_type,
@@ -14058,12 +14516,18 @@ impl MemoryDB {
         // fenced INSERTs, letting a stale-space reactivation slip through).
         let affected = conn
             .execute(
-            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, grounded, root_id, space, weight, payload, provenance, operation_id, created_at, superseded_by, valid_until)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8, NULL, ?12, NULL, ?9, ?10, NULL, NULL)
+            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, grounded, root_id, space, weight, payload, provenance, operation_id, created_at, superseded_by, valid_until, semantic_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8, NULL,
+                     CASE WHEN ?12 IS NULL AND ?14 IS NULL THEN NULL
+                          ELSE json_patch(COALESCE(?12, '{}'), COALESCE(?14, '{}')) END,
+                     NULL, ?9, ?10, NULL, NULL, ?13)
              ON CONFLICT(edge_id) DO UPDATE SET
                  valid_until = NULL,
                  superseded_by = NULL,
                  space = excluded.space,
+                 semantic_type = COALESCE(?13, edges.semantic_type),
+                 payload = CASE WHEN ?14 IS NULL THEN edges.payload
+                                ELSE json_patch(COALESCE(edges.payload, '{}'), ?14) END,
                  lineage = CASE
                      WHEN edges.valid_until IS NOT NULL THEN excluded.lineage
                      WHEN ?11 = 1 THEN 'legacy'
@@ -14078,7 +14542,9 @@ impl MemoryDB {
                 OR (excluded.lineage = 'evidence' AND edges.lineage != 'evidence')
                 OR (excluded.lineage = 'legacy' AND edges.lineage != 'legacy')
                 OR (excluded.lineage = 'synthesis' AND edges.lineage NOT IN ('evidence', 'synthesis'))
-                OR (excluded.lineage = 'assertion' AND edges.lineage != 'assertion')",
+                OR (excluded.lineage = 'assertion' AND edges.lineage != 'assertion')
+                OR ?13 IS NOT NULL
+                OR ?14 IS NOT NULL",
             libsql::params![
                 edge_id.clone(),
                 src_id.to_string(),
@@ -14091,7 +14557,9 @@ impl MemoryDB {
                 operation_id.map(|s| s.to_string()),
                 now,
                 cross_space_downgrade as i64,
-                payload.map(|s| s.to_string())
+                payload.map(|s| s.to_string()),
+                semantic_type.map(|s| s.to_string()),
+                semantic_patch.map(|s| s.to_string())
             ],
         )
         .await?;
@@ -18177,6 +18645,7 @@ impl MemoryDB {
         // row whose endpoints were corrupted in place counts as drift.
         let mut expected: HashMap<String, (String, String, String, String, String)> =
             HashMap::new();
+        let mut expected_semantic: HashMap<String, String> = HashMap::new();
         let mut contributed: BTreeMap<String, u64> = BTreeMap::new();
         let mut skipped: BTreeMap<String, u64> = BTreeMap::new();
 
@@ -18203,9 +18672,10 @@ impl MemoryDB {
                     "relates", "entity", &from, "entity", &to, &rtype,
                 );
                 expected.insert(
-                    id,
+                    id.clone(),
                     ("relates".into(), "entity".into(), from, "entity".into(), to),
                 );
+                expected_semantic.insert(id, rtype);
                 n += 1;
             }
             contributed.insert("relations".to_string(), n);
@@ -18302,7 +18772,7 @@ impl MemoryDB {
             let mut sk = 0u64;
             let mut rows = conn
                 .query(
-                    "SELECT source_page_id, target_page_id, label_key FROM page_links",
+                    "SELECT source_page_id, target_page_id, label_key, label FROM page_links",
                     (),
                 )
                 .await
@@ -18314,14 +18784,20 @@ impl MemoryDB {
             {
                 let src: String = row.get(0).unwrap_or_default();
                 let tgt: Option<String> = row.get(1).unwrap_or(None);
-                let label: String = row.get(2).unwrap_or_default();
+                let label_key: String = row.get(2).unwrap_or_default();
+                let label: String = row.get(3).unwrap_or_default();
                 let Some(tgt) = tgt else {
                     sk += 1;
                     continue;
                 };
-                let id =
-                    crate::provenance::compute_edge_id("links", "page", &src, "page", &tgt, &label);
-                expected.insert(id, ("links".into(), "page".into(), src, "page".into(), tgt));
+                let id = crate::provenance::compute_edge_id(
+                    "links", "page", &src, "page", &tgt, &label_key,
+                );
+                expected.insert(
+                    id.clone(),
+                    ("links".into(), "page".into(), src, "page".into(), tgt),
+                );
+                expected_semantic.insert(id, label);
                 n += 1;
             }
             contributed.insert("page_links".to_string(), n);
@@ -18396,11 +18872,21 @@ impl MemoryDB {
         // the endpoint-kind fence excludes exactly the edges the five stores
         // can never imply. Without it every M5 edge counts as "extra" and the
         // watermark can never come clean on a post-M5 database.
-        let mut actual: HashMap<String, (String, String, String, String, String)> = HashMap::new();
+        type ActualEdge = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        );
+        let mut actual: HashMap<String, ActualEdge> = HashMap::new();
         {
             let mut rows = conn
                 .query(
-                    "SELECT edge_id, edge_type, src_kind, src_id, dst_kind, dst_id \
+                    "SELECT edge_id, edge_type, src_kind, src_id, dst_kind, dst_id, \
+                            semantic_type, json_extract(payload, '$.label') \
                      FROM edges WHERE valid_until IS NULL \
                        AND src_kind NOT IN ('claim_revision', 'root') \
                        AND dst_kind NOT IN ('claim_revision', 'root')",
@@ -18422,14 +18908,16 @@ impl MemoryDB {
                         row.get(3).unwrap_or_default(),
                         row.get(4).unwrap_or_default(),
                         row.get(5).unwrap_or_default(),
+                        row.get(6).unwrap_or(None),
+                        row.get(7).unwrap_or(None),
                     ),
                 );
             }
         }
 
         // drift = missing (expected id absent) + extra (actual id unexpected) +
-        // corrupt (id on both sides but stored columns disagree), bounded
-        // sorted samples.
+        // corrupt (id on both sides but stored structural or semantic fields
+        // disagree), bounded sorted samples.
         let mut missing_count = 0usize;
         let mut missing_sample: Vec<String> = Vec::new();
         let mut corrupt_count = 0usize;
@@ -18442,13 +18930,35 @@ impl MemoryDB {
                         missing_sample.push(id.clone());
                     }
                 }
-                Some(act_cols) if act_cols != exp_cols => {
-                    corrupt_count += 1;
-                    if corrupt_sample.len() < ParityReport::SAMPLE_CAP {
-                        corrupt_sample.push(id.clone());
+                Some(act_cols) => {
+                    let structural_corrupt = (
+                        act_cols.0.as_str(),
+                        act_cols.1.as_str(),
+                        act_cols.2.as_str(),
+                        act_cols.3.as_str(),
+                        act_cols.4.as_str(),
+                    ) != (
+                        exp_cols.0.as_str(),
+                        exp_cols.1.as_str(),
+                        exp_cols.2.as_str(),
+                        exp_cols.3.as_str(),
+                        exp_cols.4.as_str(),
+                    );
+                    let semantic_corrupt = expected_semantic.get(id).is_some_and(|expected| {
+                        let actual = match act_cols.0.as_str() {
+                            "relates" => act_cols.5.as_deref(),
+                            "links" => act_cols.6.as_deref(),
+                            _ => None,
+                        };
+                        actual != Some(expected.as_str())
+                    });
+                    if structural_corrupt || semantic_corrupt {
+                        corrupt_count += 1;
+                        if corrupt_sample.len() < ParityReport::SAMPLE_CAP {
+                            corrupt_sample.push(id.clone());
+                        }
                     }
                 }
-                Some(_) => {}
             }
         }
         let mut extra_count = 0usize;
@@ -19373,7 +19883,12 @@ impl MemoryDB {
                 "external_url" | "external_file" => ("external", "synthesis", false),
                 _ => ("external", "legacy", false),
             };
-            Self::dual_write_edge(
+            // G6 Stage 1: a citation carries only the 4-way source_kind as
+            // durable semantics (occurrence/marker/score/status are
+            // render-layer, still owned by pages.citations).
+            let semantic_patch =
+                Self::cites_semantic_patch(&citation.source_kind, None, None, None);
+            Self::dual_write_edge_with_payload(
                 conn,
                 "cites",
                 "page",
@@ -19385,6 +19900,9 @@ impl MemoryDB {
                 &space,
                 cross_space_downgrade,
                 None,
+                None,
+                None,
+                Some(&semantic_patch),
             )
             .await?;
         }
@@ -28001,7 +28519,35 @@ impl MemoryDB {
                         } else {
                             "evidence"
                         };
-                        Self::dual_write_edge(
+                        // G6 Stage 1: carry the moved evidence row's audit
+                        // fields onto the re-minted edge.
+                        let mut ev_rows = conn
+                            .query(
+                                "SELECT title, linked_at, link_reason FROM page_evidence \
+                                 WHERE page_id = ?1 AND source_kind = 'memory' AND locator = ?2",
+                                libsql::params![page_id.as_str(), new_source_id],
+                            )
+                            .await
+                            .map_err(|e| {
+                                WenlanError::VectorDb(format!(
+                                    "rebind_source_id evidence semantic row: {e}"
+                                ))
+                            })?;
+                        let semantic_patch = match ev_rows.next().await.map_err(|e| {
+                            WenlanError::VectorDb(format!(
+                                "rebind_source_id evidence semantic next: {e}"
+                            ))
+                        })? {
+                            Some(row) => Self::cites_semantic_patch(
+                                "memory",
+                                row.get::<Option<i64>>(1).unwrap_or(None),
+                                row.get::<Option<String>>(2).unwrap_or(None).as_deref(),
+                                row.get::<Option<String>>(0).unwrap_or(None).as_deref(),
+                            ),
+                            None => Self::cites_semantic_patch("memory", None, None, None),
+                        };
+                        drop(ev_rows);
+                        Self::dual_write_edge_with_payload(
                             &conn,
                             "cites",
                             "page",
@@ -28013,6 +28559,9 @@ impl MemoryDB {
                             &page_space,
                             cross_space_downgrade,
                             None,
+                            None,
+                            None,
+                            Some(&semantic_patch),
                         )
                         .await
                         .map_err(|e| {
@@ -31726,6 +32275,34 @@ impl MemoryDB {
                 {
                     graph_changes.push(change);
                 }
+                // Mirror the re-pointed relation's semantic fields onto the
+                // corrected edge (G6 Stage 1) — the endpoint UPDATEs above
+                // just moved the row under this (from, to, type) triple.
+                let mut sem_rows = conn
+                    .query(
+                        "SELECT confidence, explanation, source_agent FROM relations \
+                         WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
+                        libsql::params![
+                            plan.src_id.clone(),
+                            plan.dst_id.clone(),
+                            plan.relation_type.clone()
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("merge_entities semantic row: {error}"))
+                    })?;
+                let semantic_patch = match sem_rows.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("merge_entities semantic next: {error}"))
+                })? {
+                    Some(row) => Self::relates_semantic_patch(
+                        row.get::<Option<f64>>(0).unwrap_or(None),
+                        row.get::<Option<String>>(1).unwrap_or(None).as_deref(),
+                        row.get::<Option<String>>(2).unwrap_or(None).as_deref(),
+                    ),
+                    None => Self::relates_semantic_patch(None, None, None),
+                };
+                drop(sem_rows);
                 let (new_edge_id, reactivation_changes) = Self::dual_write_edge_with_payload(
                     &conn,
                     "relates",
@@ -31739,6 +32316,8 @@ impl MemoryDB {
                     plan.cross_space_downgrade,
                     None,
                     plan.payload.as_deref(),
+                    Some(&plan.relation_type),
+                    Some(&semantic_patch),
                 )
                 .await
                 .map_err(|error| {
@@ -32172,13 +32751,26 @@ impl MemoryDB {
             // Check if this was an insert (the id we generated exists) vs an update.
             let mut rows = conn
                 .query(
-                    "SELECT id FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
+                    "SELECT id, confidence, explanation, source_agent FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
                     libsql::params![from_entity.to_string(), to_entity.to_string(), canonical.clone()],
                 )
                 .await?;
-            let existing_id = match rows.next().await? {
-                Some(row) => row.get::<String>(0).unwrap_or(id.clone()),
-                None => id.clone(),
+            // The edge's semantic patch mirrors the STORED row, not this
+            // call's arguments — the upsert above keeps the higher
+            // confidence, so a weaker re-assert must not regress the edge.
+            let (existing_id, semantic_patch) = match rows.next().await? {
+                Some(row) => (
+                    row.get::<String>(0).unwrap_or(id.clone()),
+                    Self::relates_semantic_patch(
+                        row.get::<Option<f64>>(1).unwrap_or(None),
+                        row.get::<Option<String>>(2).unwrap_or(None).as_deref(),
+                        row.get::<Option<String>>(3).unwrap_or(None).as_deref(),
+                    ),
+                ),
+                None => (
+                    id.clone(),
+                    Self::relates_semantic_patch(confidence, explanation, source_agent),
+                ),
             };
             drop(rows);
 
@@ -32255,6 +32847,8 @@ impl MemoryDB {
                 cross_space_downgrade,
                 None,
                 payload.as_deref(),
+                Some(&canonical),
+                Some(&semantic_patch),
             )
             .await?;
             let generation_updates =
@@ -33357,6 +33951,42 @@ impl MemoryDB {
                             crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION,
                     })
                     .to_string();
+                    // Mirror the STORED row's semantic fields (the upsert
+                    // above keeps the higher confidence, so a weaker
+                    // re-extraction must not regress the edge).
+                    let mut sem_rows = conn
+                        .query(
+                            "SELECT confidence, explanation, source_agent FROM relations \
+                             WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
+                            libsql::params![
+                                from_id.as_str(),
+                                to_id.as_str(),
+                                canonical.as_str()
+                            ],
+                        )
+                        .await
+                        .map_err(|e| {
+                            WenlanError::VectorDb(format!(
+                                "entity enrichment relation semantic row: {e}"
+                            ))
+                        })?;
+                    let semantic_patch = match sem_rows.next().await.map_err(|e| {
+                        WenlanError::VectorDb(format!(
+                            "entity enrichment relation semantic next: {e}"
+                        ))
+                    })? {
+                        Some(row) => Self::relates_semantic_patch(
+                            row.get::<Option<f64>>(0).unwrap_or(None),
+                            row.get::<Option<String>>(1).unwrap_or(None).as_deref(),
+                            row.get::<Option<String>>(2).unwrap_or(None).as_deref(),
+                        ),
+                        None => Self::relates_semantic_patch(
+                            relation.confidence,
+                            relation.explanation.as_deref(),
+                            Some("post_ingest"),
+                        ),
+                    };
+                    drop(sem_rows);
                     let (_, graph_changes) = Self::dual_write_edge_with_payload(
                         &conn,
                         "relates",
@@ -33370,6 +34000,8 @@ impl MemoryDB {
                         cross_space_downgrade,
                         None,
                         Some(payload.as_str()),
+                        Some(canonical.as_str()),
+                        Some(&semantic_patch),
                     )
                     .await
                     .map_err(|e| {
@@ -42870,7 +43502,32 @@ impl MemoryDB {
                     "external_url" | "external_file" => ("external", "evidence", false),
                     _ => ("external", "legacy", false),
                 };
-                Self::dual_write_edge(
+                // G6 Stage 1: mirror the STORED row — the INSERT OR IGNORE
+                // above keeps an existing row's audit fields, and the edge
+                // must agree with the store, not with this call's arguments.
+                let mut ev_rows = conn
+                    .query(
+                        "SELECT title, linked_at, link_reason FROM page_evidence \
+                         WHERE page_id = ?1 AND source_kind = ?2 AND locator = ?3",
+                        libsql::params![page_id, source_kind.clone(), *sid],
+                    )
+                    .await?;
+                let semantic_patch = match ev_rows.next().await? {
+                    Some(row) => Self::cites_semantic_patch(
+                        &source_kind,
+                        row.get::<Option<i64>>(1).unwrap_or(None),
+                        row.get::<Option<String>>(2).unwrap_or(None).as_deref(),
+                        row.get::<Option<String>>(0).unwrap_or(None).as_deref(),
+                    ),
+                    None => Self::cites_semantic_patch(
+                        &source_kind,
+                        Some(linked_at),
+                        Some(link_reason),
+                        None,
+                    ),
+                };
+                drop(ev_rows);
+                Self::dual_write_edge_with_payload(
                     conn,
                     "cites",
                     "page",
@@ -42882,6 +43539,9 @@ impl MemoryDB {
                     space,
                     cross_space_downgrade,
                     None,
+                    None,
+                    None,
+                    Some(&semantic_patch),
                 )
                 .await?;
             }
@@ -45399,7 +46059,8 @@ impl MemoryDB {
             if let Some(space) = &survivor_space {
                 let mut ext_rows = conn
                     .query(
-                        "SELECT source_kind, locator FROM page_evidence \
+                        "SELECT source_kind, locator, title, linked_at, link_reason \
+                         FROM page_evidence \
                          WHERE page_id = ?1 AND source_kind != 'memory' AND locator IS NOT NULL",
                         libsql::params![absorbed_id],
                     )
@@ -45407,7 +46068,14 @@ impl MemoryDB {
                     .map_err(|e| {
                         WenlanError::VectorDb(format!("accept_page_merge ext evidence: {e}"))
                     })?;
-                let mut ext: Vec<(String, String)> = Vec::new();
+                #[allow(clippy::type_complexity)]
+                let mut ext: Vec<(
+                    String,
+                    String,
+                    Option<String>,
+                    Option<i64>,
+                    Option<String>,
+                )> = Vec::new();
                 while let Some(row) = ext_rows
                     .next()
                     .await
@@ -45416,15 +46084,24 @@ impl MemoryDB {
                     ext.push((
                         row.get::<String>(0).unwrap_or_default(),
                         row.get::<String>(1).unwrap_or_default(),
+                        row.get::<Option<String>>(2).unwrap_or(None),
+                        row.get::<Option<i64>>(3).unwrap_or(None),
+                        row.get::<Option<String>>(4).unwrap_or(None),
                     ));
                 }
                 drop(ext_rows);
-                for (source_kind, locator) in &ext {
+                for (source_kind, locator, title, linked_at, link_reason) in &ext {
                     let lineage = match source_kind.as_str() {
                         "external_url" | "external_file" => "evidence",
                         _ => "legacy",
                     };
-                    Self::dual_write_edge(
+                    let semantic_patch = Self::cites_semantic_patch(
+                        source_kind,
+                        *linked_at,
+                        link_reason.as_deref(),
+                        title.as_deref(),
+                    );
+                    Self::dual_write_edge_with_payload(
                         &conn,
                         "cites",
                         "page",
@@ -45436,6 +46113,9 @@ impl MemoryDB {
                         space,
                         false,
                         None,
+                        None,
+                        None,
+                        Some(&semantic_patch),
                     )
                     .await
                     .map_err(|e| {
@@ -45483,7 +46163,7 @@ impl MemoryDB {
             // `edges`. Space/lineage derivation mirrors `replace_page_links`.
             let mut link_rows = conn
                 .query(
-                    "SELECT pl.source_page_id, pl.label_key, pl.target_page_id, p.space \
+                    "SELECT pl.source_page_id, pl.label_key, pl.target_page_id, p.space, pl.label \
                      FROM page_links pl INNER JOIN pages p ON p.id = pl.source_page_id \
                      WHERE pl.target_page_id = ?1 OR pl.label_key = ?2",
                     libsql::params![absorbed_id, absorbed_title_key.as_str()],
@@ -45491,7 +46171,13 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("accept_page_merge link scan: {e}")))?;
             #[allow(clippy::type_complexity)]
-            let mut repointed: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
+            let mut repointed: Vec<(
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                String,
+            )> = Vec::new();
             while let Some(row) = link_rows
                 .next()
                 .await
@@ -45502,6 +46188,7 @@ impl MemoryDB {
                     row.get::<String>(1).unwrap_or_default(),
                     row.get::<Option<String>>(2).unwrap_or(None),
                     row.get::<Option<String>>(3).unwrap_or(None),
+                    row.get::<String>(4).unwrap_or_default(),
                 ));
             }
             drop(link_rows);
@@ -45512,7 +46199,7 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("accept_page_merge links: {e}")))?;
-            for (src_page, label_key, old_target, src_space) in &repointed {
+            for (src_page, label_key, old_target, src_space, label) in &repointed {
                 if old_target.as_deref() == Some(survivor_id) {
                     continue; // already pointed at the survivor: nothing moved
                 }
@@ -45524,8 +46211,9 @@ impl MemoryDB {
                     } else {
                         "synthesis"
                     };
+                    let semantic_patch = serde_json::json!({ "label": label }).to_string();
                     Some(
-                        Self::dual_write_edge(
+                        Self::dual_write_edge_with_payload(
                             &conn,
                             "links",
                             "page",
@@ -45537,11 +46225,15 @@ impl MemoryDB {
                             space,
                             cross_space_downgrade,
                             None,
+                            None,
+                            None,
+                            Some(&semantic_patch),
                         )
                         .await
                         .map_err(|e| {
                             WenlanError::VectorDb(format!("accept_page_merge link mint: {e}"))
-                        })?,
+                        })?
+                        .0,
                     )
                 } else {
                     None
@@ -46082,7 +46774,10 @@ impl MemoryDB {
                 } else {
                     "synthesis"
                 };
-                Self::dual_write_edge(
+                // G6 Stage 1: the display label (only its lowercased
+                // label_key hashes into the edge id).
+                let semantic_patch = serde_json::json!({ "label": link.label }).to_string();
+                Self::dual_write_edge_with_payload(
                     &conn,
                     "links",
                     "page",
@@ -46094,6 +46789,9 @@ impl MemoryDB {
                     &space,
                     cross_space_downgrade,
                     None,
+                    None,
+                    None,
+                    Some(&semantic_patch),
                 )
                 .await?;
             }
@@ -46224,11 +46922,11 @@ impl MemoryDB {
     /// Resolution is per source Page and space; existing non-NULL targets are
     /// explicit inventory and are never rewritten here.
     pub async fn resolve_orphan_page_links(&self) -> Result<usize, WenlanError> {
-        let orphan_rows: Vec<(String, String, Option<String>)> = {
+        let orphan_rows: Vec<(String, String, String, Option<String>)> = {
             let conn = self.conn.lock().await;
             let mut rows = conn
                 .query(
-                    "SELECT pl.source_page_id, pl.label_key, p.space
+                    "SELECT pl.source_page_id, pl.label_key, pl.label, p.space
                      FROM page_links pl
                      INNER JOIN pages p ON p.id = pl.source_page_id
                      WHERE pl.target_page_id IS NULL AND p.status = 'active'
@@ -46246,14 +46944,15 @@ impl MemoryDB {
                 orphan_rows.push((
                     row.get::<String>(0).unwrap_or_default(),
                     row.get::<String>(1).unwrap_or_default(),
-                    row.get::<Option<String>>(2).unwrap_or(None),
+                    row.get::<String>(2).unwrap_or_default(),
+                    row.get::<Option<String>>(3).unwrap_or(None),
                 ));
             }
             orphan_rows
         };
 
         let mut resolved_labels = std::collections::BTreeSet::new();
-        for (source_page_id, label_key, scope) in orphan_rows {
+        for (source_page_id, label_key, label, scope) in orphan_rows {
             let trimmed = label_key.trim();
             if trimmed.is_empty() {
                 continue;
@@ -46315,7 +47014,8 @@ impl MemoryDB {
                         } else {
                             "synthesis"
                         };
-                        Self::dual_write_edge(
+                        let semantic_patch = serde_json::json!({ "label": label }).to_string();
+                        Self::dual_write_edge_with_payload(
                             &conn,
                             "links",
                             "page",
@@ -46327,6 +47027,9 @@ impl MemoryDB {
                             space,
                             cross_space_downgrade,
                             None,
+                            None,
+                            None,
+                            Some(&semantic_patch),
                         )
                         .await
                         .map_err(|e| {
@@ -47547,6 +48250,31 @@ impl MemoryDB {
                 };
                 drop(rows);
                 if let Some(space) = space {
+                    // G6 Stage 1: mirror the STORED row — INSERT OR IGNORE
+                    // keeps an existing row's audit fields, so the edge must
+                    // agree with the store rather than this call's arguments.
+                    let mut ev_rows = conn
+                        .query(
+                            "SELECT title, linked_at, link_reason FROM page_evidence \
+                             WHERE page_id = ?1 AND source_kind = ?2 AND locator = ?3",
+                            libsql::params![page_id, source_kind, locator],
+                        )
+                        .await?;
+                    let semantic_patch = match ev_rows.next().await? {
+                        Some(row) => Self::cites_semantic_patch(
+                            source_kind,
+                            row.get::<Option<i64>>(1).unwrap_or(None),
+                            row.get::<Option<String>>(2).unwrap_or(None).as_deref(),
+                            row.get::<Option<String>>(0).unwrap_or(None).as_deref(),
+                        ),
+                        None => Self::cites_semantic_patch(
+                            source_kind,
+                            Some(now),
+                            Some(link_reason),
+                            title,
+                        ),
+                    };
+                    drop(ev_rows);
                     let (dst_kind, lineage, cross_space_downgrade) = match source_kind {
                         "memory" => {
                             let resolved = Self::resolve_memory_space(&conn, locator).await?;
@@ -47564,7 +48292,7 @@ impl MemoryDB {
                         "external_url" | "external_file" => ("external", "evidence", false),
                         _ => ("external", "legacy", false),
                     };
-                    Self::dual_write_edge(
+                    Self::dual_write_edge_with_payload(
                         &conn,
                         "cites",
                         "page",
@@ -47576,6 +48304,9 @@ impl MemoryDB {
                         &space,
                         cross_space_downgrade,
                         None,
+                        None,
+                        None,
+                        Some(&semantic_patch),
                     )
                     .await?;
                 }

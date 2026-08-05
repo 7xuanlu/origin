@@ -29790,6 +29790,535 @@ async fn migration_114_resyncs_stale_entity_shadow_pages() {
     );
 }
 
+/// G6 Stage 1 (one source of truth, spec
+/// docs/plans/2026-08-05-g6-edge-semantic-payload-spec.md): migration 115
+/// backfills the semantic fields the dual-writes never carried —
+/// `relation_type` onto `edges.semantic_type` (plus confidence /
+/// explanation / source_agent in the payload), the `page_links` display
+/// label, and source_kind / linked_at / link_reason / title for cites
+/// edges — re-deriving each content-addressed edge id from its live legacy
+/// row. The loop runs the migration twice: the second pass must land the
+/// identical end-state (probe skips the ALTER, merges re-apply the same
+/// values).
+#[tokio::test]
+async fn migration_115_backfills_edge_semantic_payload() {
+    let (db, _dir) = test_db().await;
+
+    // relates — live path (dual-writes the edge with payload=NULL today).
+    let from = db
+        .store_entity("Alice", "person", Some("work"), None, None)
+        .await
+        .unwrap();
+    let to = db
+        .store_entity("ProjectX", "project", Some("work"), None, None)
+        .await
+        .unwrap();
+    db.create_relation(
+        &from,
+        &to,
+        "works_on",
+        Some("agent_smith"),
+        Some(0.9),
+        Some("seen in standup"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // cites (memory + external) and links — live paths.
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_g6_sem",
+        "Semantic Source",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    db.insert_page(
+        "page_g6_sem_dst",
+        "Semantic Target",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    let doc = make_memory_doc("mem_g6_sem", "Some content.", "knowledge", "work", "agent");
+    db.upsert_documents(vec![doc]).await.unwrap();
+    db.link_page_source("page_g6_sem", "mem_g6_sem", "distill")
+        .await
+        .unwrap();
+    db.link_page_evidence(
+        "page_g6_sem",
+        "external_url",
+        Some("https://example.com/doc"),
+        Some("Example Doc"),
+        "cited",
+    )
+    .await
+    .unwrap();
+    db.replace_page_links(
+        "page_g6_sem",
+        &[crate::synthesis::wikilinks::Wikilink {
+            label: "Semantic Target".to_string(),
+            target_page_id: Some("page_g6_sem_dst".to_string()),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.reconcile_edges_parity().await.unwrap().drift_count,
+        0,
+        "fixture precondition: live writers leave parity clean"
+    );
+
+    // Read the STORED discriminators back (create_relation normalizes the
+    // relation type; replace_page_links derives label_key) so the test
+    // derives edge ids exactly the way the migration does.
+    let (relation_type, label_key) = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT relation_type FROM relations WHERE from_entity = ?1 AND to_entity = ?2",
+                libsql::params![from.as_str(), to.as_str()],
+            )
+            .await
+            .unwrap();
+        let relation_type: String = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("relation row")
+            .get(0)
+            .unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT label_key FROM page_links WHERE source_page_id = 'page_g6_sem'",
+                (),
+            )
+            .await
+            .unwrap();
+        let label_key: String = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("page_links row")
+            .get(0)
+            .unwrap();
+        (relation_type, label_key)
+    };
+
+    for pass in 1..=2 {
+        db.migrate_115_edge_semantic_payload(114).await.unwrap();
+        let conn = db.conn.lock().await;
+
+        let relates_id = crate::provenance::compute_edge_id(
+            "relates",
+            "entity",
+            &from,
+            "entity",
+            &to,
+            &relation_type,
+        );
+        let mut rows = conn
+            .query(
+                "SELECT semantic_type, \
+                        json_extract(payload, '$.confidence'), \
+                        json_extract(payload, '$.explanation'), \
+                        json_extract(payload, '$.source_agent') \
+                 FROM edges WHERE edge_id = ?1 AND valid_until IS NULL",
+                libsql::params![relates_id.as_str()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("relates edge active");
+        assert_eq!(
+            row.get::<Option<String>>(0).unwrap().as_deref(),
+            Some(relation_type.as_str()),
+            "pass {pass}: semantic_type"
+        );
+        assert_eq!(
+            row.get::<Option<f64>>(1).unwrap(),
+            Some(0.9),
+            "pass {pass}: confidence"
+        );
+        assert_eq!(
+            row.get::<Option<String>>(2).unwrap().as_deref(),
+            Some("seen in standup"),
+            "pass {pass}: explanation"
+        );
+        assert_eq!(
+            row.get::<Option<String>>(3).unwrap().as_deref(),
+            Some("agent_smith"),
+            "pass {pass}: source_agent"
+        );
+
+        let mem_cites_id = crate::provenance::compute_edge_id(
+            "cites",
+            "page",
+            "page_g6_sem",
+            "memory",
+            "mem_g6_sem",
+            "mem_g6_sem",
+        );
+        let mut rows = conn
+            .query(
+                "SELECT json_extract(payload, '$.source_kind'), \
+                        json_extract(payload, '$.link_reason'), \
+                        json_extract(payload, '$.linked_at') \
+                 FROM edges WHERE edge_id = ?1 AND valid_until IS NULL",
+                libsql::params![mem_cites_id.as_str()],
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("memory cites edge active");
+        assert_eq!(
+            row.get::<Option<String>>(0).unwrap().as_deref(),
+            Some("memory"),
+            "pass {pass}: memory cites source_kind"
+        );
+        assert_eq!(
+            row.get::<Option<String>>(1).unwrap().as_deref(),
+            Some("distill"),
+            "pass {pass}: memory cites link_reason"
+        );
+        assert!(
+            row.get::<Option<i64>>(2).unwrap().is_some(),
+            "pass {pass}: memory cites linked_at"
+        );
+
+        let ext_cites_id = crate::provenance::compute_edge_id(
+            "cites",
+            "page",
+            "page_g6_sem",
+            "external",
+            "https://example.com/doc",
+            "https://example.com/doc",
+        );
+        let mut rows = conn
+            .query(
+                "SELECT json_extract(payload, '$.source_kind'), \
+                        json_extract(payload, '$.title'), \
+                        json_extract(payload, '$.link_reason') \
+                 FROM edges WHERE edge_id = ?1 AND valid_until IS NULL",
+                libsql::params![ext_cites_id.as_str()],
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("external cites edge active");
+        assert_eq!(
+            row.get::<Option<String>>(0).unwrap().as_deref(),
+            Some("external_url"),
+            "pass {pass}: external cites keeps the 4-way source_kind"
+        );
+        assert_eq!(
+            row.get::<Option<String>>(1).unwrap().as_deref(),
+            Some("Example Doc"),
+            "pass {pass}: external cites title"
+        );
+        assert_eq!(
+            row.get::<Option<String>>(2).unwrap().as_deref(),
+            Some("cited"),
+            "pass {pass}: external cites link_reason"
+        );
+
+        let links_id = crate::provenance::compute_edge_id(
+            "links",
+            "page",
+            "page_g6_sem",
+            "page",
+            "page_g6_sem_dst",
+            &label_key,
+        );
+        let mut rows = conn
+            .query(
+                "SELECT json_extract(payload, '$.label') \
+                 FROM edges WHERE edge_id = ?1 AND valid_until IS NULL",
+                libsql::params![links_id.as_str()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("links edge active");
+        assert_eq!(
+            row.get::<Option<String>>(0).unwrap().as_deref(),
+            Some("Semantic Target"),
+            "pass {pass}: links display label"
+        );
+    }
+}
+
+/// G6 Stage 1 writer teeth: the live producers must carry semantic fields at
+/// write time, before any migration/backfill pass runs. The final parity check
+/// proves the same writes still agree with their deriving legacy rows.
+#[tokio::test]
+async fn edge_semantic_payload_live_writers_leave_parity_clean() {
+    let (db, _dir) = test_db().await;
+    let from = db
+        .create_entity("G6 Writer A", "person", Some("space_a"))
+        .await
+        .unwrap();
+    let to = db
+        .create_entity("G6 Writer B", "project", Some("space_a"))
+        .await
+        .unwrap();
+    db.create_relation(
+        &from,
+        &to,
+        "knows",
+        Some("writer_agent"),
+        Some(0.87),
+        Some("writer explanation"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    {
+        let conn = db.conn.lock().await;
+        insert_raw_page_for_m81_test(&conn, "page_g6_writer", "space_a").await;
+        insert_raw_page_for_m81_test(&conn, "page_g6_writer_target", "space_a").await;
+        insert_raw_page_for_m81_test(&conn, "page_g6_orphan", "space_a").await;
+        insert_raw_page_for_m81_test(&conn, "page_g6_orphan_target", "space_a").await;
+        conn.execute(
+            "UPDATE pages SET title = 'Orphan Target' WHERE id = 'page_g6_orphan_target'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    seed_memory_with_source_id_and_space(&db, "mem_g6_writer", "writer source", "space_a").await;
+    db.link_page_source("page_g6_writer", "mem_g6_writer", "page source")
+        .await
+        .unwrap();
+    db.link_page_evidence(
+        "page_g6_writer",
+        "external_url",
+        Some("https://example.com/g6-writer"),
+        Some("G6 Writer Source"),
+        "external evidence",
+    )
+    .await
+    .unwrap();
+    db.replace_page_links(
+        "page_g6_writer",
+        &[crate::synthesis::wikilinks::Wikilink {
+            label: "Readable Target".to_string(),
+            target_page_id: Some("page_g6_writer_target".to_string()),
+        }],
+    )
+    .await
+    .unwrap();
+
+    // The orphan path starts with no edge, then resolves and mints one from
+    // the stored display label.
+    db.replace_page_links(
+        "page_g6_orphan",
+        &[crate::synthesis::wikilinks::Wikilink {
+            label: "Orphan Target".to_string(),
+            target_page_id: None,
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(db.resolve_orphan_page_links().await.unwrap(), 1);
+
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT semantic_type, \
+                        json_extract(payload, '$.confidence'), \
+                        json_extract(payload, '$.explanation'), \
+                        json_extract(payload, '$.source_agent') \
+                 FROM edges WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2
+                   AND valid_until IS NULL",
+                libsql::params![from.as_str(), to.as_str()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("live relates edge");
+        assert_eq!(
+            row.get::<Option<String>>(0).unwrap().as_deref(),
+            Some("knows")
+        );
+        assert_eq!(row.get::<Option<f64>>(1).unwrap(), Some(0.87));
+        assert_eq!(
+            row.get::<Option<String>>(2).unwrap().as_deref(),
+            Some("writer explanation")
+        );
+        assert_eq!(
+            row.get::<Option<String>>(3).unwrap().as_deref(),
+            Some("writer_agent")
+        );
+
+        let mut rows = conn
+            .query(
+                "SELECT json_extract(payload, '$.source_kind'), \
+                        json_extract(payload, '$.link_reason') \
+                 FROM edges
+                 WHERE edge_type = 'cites' AND src_id = 'page_g6_writer'
+                   AND dst_kind = 'external' AND dst_id = 'https://example.com/g6-writer'
+                   AND valid_until IS NULL",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("external cites edge");
+        assert_eq!(
+            row.get::<Option<String>>(0).unwrap().as_deref(),
+            Some("external_url")
+        );
+        assert_eq!(
+            row.get::<Option<String>>(1).unwrap().as_deref(),
+            Some("external evidence")
+        );
+
+        let mut rows = conn
+            .query(
+                "SELECT json_extract(payload, '$.label') FROM edges
+                 WHERE edge_type = 'links' AND src_id = 'page_g6_writer'
+                   AND dst_id = 'page_g6_writer_target' AND valid_until IS NULL",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("live links edge");
+        assert_eq!(
+            row.get::<Option<String>>(0).unwrap().as_deref(),
+            Some("Readable Target")
+        );
+
+        let mut rows = conn
+            .query(
+                "SELECT json_extract(payload, '$.label') FROM edges
+                 WHERE edge_type = 'links' AND src_id = 'page_g6_orphan'
+                   AND dst_id = 'page_g6_orphan_target' AND valid_until IS NULL",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("resolved orphan links edge");
+        assert_eq!(
+            row.get::<Option<String>>(0).unwrap().as_deref(),
+            Some("Orphan Target")
+        );
+    }
+
+    assert_eq!(
+        db.reconcile_edges_parity().await.unwrap().drift_count,
+        0,
+        "live semantic writers must leave parity clean without a migration pass"
+    );
+}
+
+/// G6 Stage 1 parity teeth: semantic corruption on active `relates` and
+/// `links` edges is visible to the same watermark/drift oracle, and repairing
+/// the fields restores a clean report.
+#[tokio::test]
+async fn reconcile_edges_detects_semantic_drift() {
+    let (db, _dir) = test_db().await;
+    let from = db
+        .create_entity("G6 Parity A", "person", Some("space_a"))
+        .await
+        .unwrap();
+    let to = db
+        .create_entity("G6 Parity B", "project", Some("space_a"))
+        .await
+        .unwrap();
+    db.create_relation(&from, &to, "knows", None, None, None, None)
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        insert_raw_page_for_m81_test(&conn, "page_g6_parity", "space_a").await;
+        insert_raw_page_for_m81_test(&conn, "page_g6_parity_target", "space_a").await;
+    }
+    db.replace_page_links(
+        "page_g6_parity",
+        &[crate::synthesis::wikilinks::Wikilink {
+            label: "Parity Label".to_string(),
+            target_page_id: Some("page_g6_parity_target".to_string()),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(db.reconcile_edges_parity().await.unwrap().drift_count, 0);
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE edges SET semantic_type = 'wrong'
+             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2
+               AND valid_until IS NULL",
+            libsql::params![from.as_str(), to.as_str()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE edges SET payload = json_remove(COALESCE(payload, '{}'), '$.label')
+             WHERE edge_type = 'links' AND src_id = 'page_g6_parity'
+               AND dst_id = 'page_g6_parity_target' AND valid_until IS NULL",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    let drifted = db.reconcile_edges_parity().await.unwrap();
+    assert!(
+        drifted.drift_count > 0,
+        "semantic corruption must be reported"
+    );
+    assert!(
+        drifted.corrupt_count >= 2,
+        "both semantic edge mismatches must be classified as corrupt: {drifted:?}"
+    );
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE edges SET semantic_type = 'knows'
+             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2
+               AND valid_until IS NULL",
+            libsql::params![from.as_str(), to.as_str()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE edges SET payload = json_set(COALESCE(payload, '{}'), '$.label', ?1)
+             WHERE edge_type = 'links' AND src_id = 'page_g6_parity'
+               AND dst_id = 'page_g6_parity_target' AND valid_until IS NULL",
+            libsql::params!["Parity Label"],
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        db.reconcile_edges_parity().await.unwrap().drift_count,
+        0,
+        "restoring semantic fields must clear parity drift"
+    );
+}
+
 /// KG close plan G1: the ambient lane's dedup DELETE hard-removes every
 /// competing `relations` row between the same endpoints. It used to leave their
 /// dual-written edges ACTIVE, which the parity sweep counts as drift forever.

@@ -245,6 +245,28 @@ where
                     // `resolve_orphan_page_links`.
                     let changes_before_mint = conn.total_changes();
                     if changed > 0 {
+                        let mut label_rows = conn
+                            .query(
+                                "SELECT label FROM page_links
+                                 WHERE source_page_id = ?1 AND label_key = ?2",
+                                libsql::params![source_page_id.clone(), label_key.clone()],
+                            )
+                            .await
+                            .map_err(|error| {
+                                WenlanError::VectorDb(format!("repair bind link label: {error}"))
+                            })?;
+                        let label = match label_rows.next().await.map_err(|error| {
+                            WenlanError::VectorDb(format!("repair bind link label row: {error}"))
+                        })? {
+                            Some(row) => row.get::<String>(0).map_err(|error| {
+                                WenlanError::VectorDb(format!(
+                                    "repair bind link label value: {error}"
+                                ))
+                            })?,
+                            None => label_key.clone(),
+                        };
+                        drop(label_rows);
+                        let semantic_patch = serde_json::json!({ "label": label }).to_string();
                         let mut src_rows = conn
                             .query(
                                 "SELECT space FROM pages WHERE id = ?1",
@@ -293,7 +315,7 @@ where
                             } else {
                                 "synthesis"
                             };
-                            MemoryDB::dual_write_edge(
+                            MemoryDB::dual_write_edge_with_payload(
                                 &conn,
                                 "links",
                                 "page",
@@ -305,6 +327,9 @@ where
                                 src_space,
                                 cross_space_downgrade,
                                 None,
+                                None,
+                                None,
+                                Some(&semantic_patch),
                             )
                             .await
                             .map_err(|error| {
