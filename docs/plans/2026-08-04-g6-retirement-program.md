@@ -50,6 +50,7 @@ edge id the page_sources row derives to.
 | `resolve_orphan_page_links` (db.rs ~45684) | Sets `target_page_id` on a previously-orphan row (which derives no edge) without minting the now-implied links edge. | FIXED. Mints with `replace_page_links`'s derivation in the same per-row transaction. |
 | `try_update_page_content` (db.rs ~43975) | Rewrites `pages.citations` wholesale without reconciling edges. Narrow: drifts only when a locator backed ONLY by citations (not by `page_sources`/`page_evidence`) drops out of the new value. | FIXED. Calls the shared `dual_write_page_citations` reconciler inside the CAS transaction (`set_page_citations_with_changelog_at_version` rewired onto the same helper). |
 | `apply_deterministic_repair_cas`, `RepairWriter::BindPageLink` arm (db/repair_deterministic.rs) | The repair tool's own orphan-bind — a second writer of `page_links.target_page_id` beside `resolve_orphan_page_links` — set the target with a raw UPDATE and no edge mint. Found by the Stage 1.1 scout (`docs/superpowers/g6-stage1-page-links-scout.md`). | FIXED. The arm mints the links edge in-transaction (same derivation as `resolve_orphan_page_links`); the mint's row changes are measured and allowed by the repair effect guard. |
+| `try_update_page_content` — `page_sources`/`page_evidence` half (db.rs ~44266) | Beyond the citations rewrite (row above), the same function does its OWN prune-then-reinsert of `page_sources` + memory-kind `page_evidence` against the `source_memory_ids` argument — a second instance of the `replace_page_sources` bug, with no removed-sid snapshot and no edge retirement. High traffic: manual edits, refinery rewrites, and page growth all route through it. Found by the Stage 1.3 scout (`docs/superpowers/g6-stage1-page-sources-evidence-scout.md`). | FIXED. Snapshot of the pruned locators (page_sources ∪ memory-kind page_evidence) before the DELETEs; each retired in-transaction UNLESS the new `pages.citations` value still backs it (D7 refcount via `cites_backed_by_page_citations` — this path, unlike `replace_page_sources`, sets citations to an explicit new value). Kept sids re-assert through `insert_resolved_page_evidence`. |
 
 Residual (not Stage 0 scope, tracked): the generic repair **rollback** artifact
 restores legacy-store rows byte-wise (`rollback-v1.json` row restore) without
@@ -87,6 +88,16 @@ Order by measured entanglement:
    (`merge_entities`, `commit_entity_enrichment_at_version`,
    `delete_by_source_id_in_transaction`) — those functions change once, in this
    stage, for both stores' read sides.
+   **Scout correction (2026-08-05, `docs/superpowers/g6-stage1-relations-scout.md`):
+   blocked harder than page_links.** `relation_type` is a hash-input-only
+   discriminator — never stored on the edge row or payload — so every reader
+   that returns or filters on it (both product routes, most lint/repair tooling;
+   9 of 13 readers) cannot migrate as wired. Only topology-only readers (k-hop
+   ×2, aggregate count, scope subquery) migrate cleanly. All relations writers
+   already dual-write (no Stage 0 gap). Same decision as page_links, but
+   sharper: the semantic-payload schema change (relation_type + confidence /
+   explanation / source_agent on `relates` edges, label on `links` edges, plus
+   backfill migration) is realistically the only path to Stage 3 for this store.
 3. **`page_sources` + `page_evidence`** (~30 fns, co-written pair) —
    `insert_resolved_page_evidence` is the evidence choke point; `page_sources` has
    no single choke point and needs one first.

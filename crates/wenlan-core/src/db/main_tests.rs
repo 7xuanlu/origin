@@ -47354,6 +47354,110 @@ async fn replace_page_sources_retires_pruned_cites_edges() {
     );
 }
 
+/// `try_update_page_content` reimplements `replace_page_sources`'s
+/// prune-then-reinsert on `page_sources` + memory-kind `page_evidence`, so a
+/// sid dropped from the new source list must have its cites edge retired in
+/// the same transaction — except when the new `pages.citations` value still
+/// backs the locator (D7 refcount). Same damage class as the 2026-07-23 live
+/// stale-edge incident, on the higher-traffic write path (manual edits,
+/// refinery rewrites, page growth).
+#[tokio::test]
+async fn update_page_content_retires_pruned_cites_edges() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_g6_upc",
+        "Update Target",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    for sid in ["mem_g6_upc_keep", "mem_g6_upc_drop", "mem_g6_upc_cited"] {
+        let doc = make_memory_doc(sid, "Some content.", "knowledge", "work", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+        db.link_page_source("page_g6_upc", sid, "distill")
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        db.reconcile_edges_parity().await.unwrap().drift_count,
+        0,
+        "fixture precondition: linked sources leave parity clean"
+    );
+
+    // Drop two sids, keep one; the new citations value still backs one of
+    // the dropped locators, so its edge must survive (D7 refcount).
+    let citations = r#"[{"occurrence":1,"marker":1,"source_kind":"memory","locator":"mem_g6_upc_cited","score":1.0,"status":"verified","scope":"sentence"}]"#;
+    let landed = db
+        .try_update_page_content_with_changelog(
+            "page_g6_upc",
+            "new content",
+            &["mem_g6_upc_keep"],
+            "reconcile",
+            false,
+            "[]",
+            Some(citations),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(landed, "non-CAS content update must land");
+    let report = db.reconcile_edges_parity().await.unwrap();
+    assert_eq!(
+        report.drift_count, 0,
+        "a content update must not re-drift edges parity (missing={}, extra={}, corrupt={})",
+        report.missing_count, report.extra_count, report.corrupt_count
+    );
+    {
+        let conn = db.conn.lock().await;
+        for (sid, retired) in [
+            ("mem_g6_upc_drop", true),
+            ("mem_g6_upc_keep", false),
+            ("mem_g6_upc_cited", false),
+        ] {
+            let edge_id = crate::provenance::compute_edge_id(
+                "cites",
+                "page",
+                "page_g6_upc",
+                "memory",
+                sid,
+                sid,
+            );
+            let mut rows = conn
+                .query(
+                    "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                    libsql::params![edge_id.as_str()],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().expect("edge exists");
+            assert_eq!(
+                row.get::<Option<i64>>(0).unwrap().is_some(),
+                retired,
+                "{sid}: retired={retired}"
+            );
+        }
+    }
+
+    // Empty source list + NULL citations: every remaining backing drops, so
+    // every cites edge must retire.
+    db.update_page_content("page_g6_upc", "cleared", &[], "clear")
+        .await
+        .unwrap();
+    let report = db.reconcile_edges_parity().await.unwrap();
+    assert_eq!(
+        report.drift_count, 0,
+        "an empty-set update must not re-drift edges parity (missing={}, extra={}, corrupt={})",
+        report.missing_count, report.extra_count, report.corrupt_count
+    );
+}
+
 /// `delete_page` FK-CASCADEs away this page's rows in all three link stores
 /// and NULLs inbound `page_links` targets, so every canonical edge touching
 /// the page — outbound cites AND inbound links — must retire with it.

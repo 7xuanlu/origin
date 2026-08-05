@@ -44666,6 +44666,71 @@ impl MemoryDB {
             )));
         }
 
+        // Dual-write (G6 Stage 0): snapshot the memory locators the two
+        // prunes below remove (page_sources sids UNION memory-kind
+        // page_evidence locators — both derive the same content-addressed
+        // cites edge) so their canonical edges retire in this transaction.
+        // Unlike `replace_page_sources`, this path SETS `pages.citations` to
+        // an explicit new value (reconciled above), so a pruned locator can
+        // still be citation-backed — the D7 refcount check at the retire
+        // site keeps those edges active.
+        let removed_locators: Vec<String> = {
+            let (sql, bind): (String, Vec<libsql::Value>) = if source_memory_ids.is_empty() {
+                (
+                    "SELECT memory_source_id FROM page_sources WHERE page_id = ?1
+                     UNION
+                     SELECT locator FROM page_evidence
+                     WHERE page_id = ?1 AND source_kind = 'memory'"
+                        .to_string(),
+                    vec![libsql::Value::Text(id.to_string())],
+                )
+            } else {
+                let placeholders: String = (0..source_memory_ids.len())
+                    .map(|i| format!("?{}", i + 2))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut bind: Vec<libsql::Value> = Vec::with_capacity(1 + source_memory_ids.len());
+                bind.push(libsql::Value::Text(id.to_string()));
+                for sid in source_memory_ids {
+                    bind.push(libsql::Value::Text((*sid).to_string()));
+                }
+                (
+                    format!(
+                        "SELECT memory_source_id FROM page_sources
+                         WHERE page_id = ?1 AND memory_source_id NOT IN ({placeholders})
+                         UNION
+                         SELECT locator FROM page_evidence
+                         WHERE page_id = ?1 AND source_kind = 'memory'
+                           AND locator NOT IN ({placeholders})"
+                    ),
+                    bind,
+                )
+            };
+            let mut rows = match conn.query(&sql, libsql::params_from_iter(bind)).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(WenlanError::VectorDb(format!(
+                        "update_page_content removed scan: {e}"
+                    )));
+                }
+            };
+            let mut removed = Vec::new();
+            loop {
+                match rows.next().await {
+                    Ok(Some(row)) => removed.push(row.get::<String>(0).unwrap_or_default()),
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        return Err(WenlanError::VectorDb(format!(
+                            "update_page_content removed row: {e}"
+                        )));
+                    }
+                }
+            }
+            removed
+        };
+
         // Reconcile join table: DELETE rows whose memory_source_id is no
         // longer in the list, then INSERT OR IGNORE the survivors. Preserves
         // existing `link_reason` on rows that survive — only brand-new rows
@@ -44763,6 +44828,31 @@ impl MemoryDB {
                 )));
             }
         }
+        // Retire the pruned locators' canonical edges — except those the new
+        // `pages.citations` value (written above) still backs (D7 refcount).
+        // Kept sids are re-asserted just below via
+        // `insert_resolved_page_evidence`'s dual-write.
+        for locator in &removed_locators {
+            match Self::cites_backed_by_page_citations(&conn, id, locator).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(WenlanError::VectorDb(format!(
+                        "update_page_content citations check: {e}"
+                    )));
+                }
+            }
+            let edge_id =
+                crate::provenance::compute_edge_id("cites", "page", id, "memory", locator, locator);
+            if let Err(e) = Self::dual_write_invalidate_edge(&conn, &edge_id, None).await {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(WenlanError::VectorDb(format!(
+                    "update_page_content retire edge: {e}"
+                )));
+            }
+        }
+
         if let Err(e) =
             Self::insert_resolved_page_evidence(&conn, id, source_memory_ids, now_ts, link_reason)
                 .await
