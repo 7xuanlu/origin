@@ -1079,12 +1079,15 @@ jobs:
     permissions:
       contents: write
       issues: write
-      # Finding the merged release PR uses GET /commits/{sha}/pulls, which is a
-      # pull-requests read. An explicit permissions block sets every unlisted
-      # scope to none, so omitting this returned 403 after the release had
-      # already been promoted, leaving v0.15.4 stable but still labelled
-      # pending. Labels themselves are the issues scope above.
-      pull-requests: read
+      # The lifecycle target is the merged release PR, so every call here is a
+      # pull-requests scope: GET /commits/{sha}/pulls to find it, then POST and
+      # DELETE on /issues/{pr}/labels to move it from pending to tagged. The
+      # /issues/ path is only the REST spelling — a pull request routes label
+      # WRITES through pull-requests, which is why `maintain-release-pr` labels
+      # this same PR with pull-requests: write and no issues scope at all.
+      # Granting only read here returned 403 after `gh release edit` had already
+      # promoted the release, leaving v0.15.5 stable but still labelled pending.
+      pull-requests: write
     steps:
       - name: Promote
         run: |
