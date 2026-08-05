@@ -945,6 +945,15 @@ def validate_candidate(
         }
     if payload.get("action") != "completed":
         raise CandidateError("candidate workflow_run action is not completed")
+    if event_run.get("conclusion") != "success":
+        # A cancelled or failed CI run never produced release artifacts, so there
+        # is no candidate to observe. Skipping keeps the observer silent on the
+        # superseded runs release-please generates on every push to its branch.
+        # Identity below still requires success, so this only ever fails closed.
+        return {
+            "status": "skipped",
+            "reason": "completed CI run did not succeed, so it produced no release candidate",
+        }
     run_id = _positive_int(event_run.get("id"), "event workflow run id")
     run_attempt = _positive_int(
         event_run.get("run_attempt"), "event workflow run attempt"
@@ -1512,7 +1521,8 @@ def _main(argv: list[str]) -> int:
             args.temp_root,
             validated_assets_dir=args.validated_assets_dir,
         )
-        write_validated_receipt(args.receipt, receipt)
+        if receipt["status"] != "skipped":
+            write_validated_receipt(args.receipt, receipt)
     except Exception as error:
         receipt = {"status": "failed", "reason": f"{type(error).__name__}: {error}"}
         write_summary(args.summary, receipt)
