@@ -41,6 +41,23 @@ async fn insert_normalized_sources(db: &MemoryDB, page_id: &str, source_ids: &[&
         )
         .await
         .unwrap();
+        // G6 Stage 1.3: the retro-scan reader migrated onto `edges` --
+        // mirror the dual-write here so this raw-SQL fixture still drives
+        // the reader it's meant to test (`lineage='legacy'` exempts the
+        // cross-space fence trigger).
+        conn.execute(
+            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, \
+                                 lineage, grounded, space, created_at) \
+             VALUES (?1, ?2, 'page', ?3, 'memory', 'cites', 'legacy', 0, 'default', ?4)",
+            libsql::params![
+                format!("retro-scan-{page_id}-{source_id}"),
+                page_id,
+                *source_id,
+                linked_at as i64,
+            ],
+        )
+        .await
+        .unwrap();
     }
 }
 

@@ -872,10 +872,14 @@ async fn load_pages(context: &LintContext<'_, '_>) -> Result<Vec<Page>, ()> {
     Ok(output)
 }
 
+// G6 Stage 1.3: reads `edges` (`cites`) instead of `page_evidence`. `source_kind`
+// is COALESCE-total over the payload-mirrored value and the NOT NULL `dst_kind`
+// column (NULL-payload discipline); the old `locator IS NOT NULL` filter is
+// redundant now that `dst_id` is a NOT NULL edge column.
 async fn load_page_evidence(context: &LintContext<'_, '_>) -> Result<Vec<PageEvidence>, ()> {
     let (scope, params) = scope_clause(context.scope().filter(), "p.workspace");
     let mut rows = context.snapshot().query(
-        &format!("SELECT pe.page_id,pe.source_kind,pe.locator FROM page_evidence pe JOIN pages p ON p.id=pe.page_id WHERE pe.locator IS NOT NULL{scope} ORDER BY pe.page_id,pe.source_kind,pe.locator"),
+        &format!("SELECT pe.src_id, COALESCE(json_extract(pe.payload,'$.source_kind'), CASE pe.dst_kind WHEN 'memory' THEN 'memory' ELSE 'external' END) AS resolved_kind, pe.dst_id FROM edges pe JOIN pages p ON p.id=pe.src_id WHERE pe.edge_type='cites' AND pe.valid_until IS NULL{scope} ORDER BY pe.src_id,resolved_kind,pe.dst_id"),
         params,
     ).await.map_err(|_| ())?;
     let mut output = Vec::new();

@@ -105,10 +105,21 @@ async fn load_and_assess_source_integrity(context: &LintContext<'_, '_>) -> Resu
             libsql::params::Params::None,
         ),
     };
+    // G6 Stage 1.3: page provenance reads `edges` (`cites`).
+    // S2 (2026-08-05 review): the evidence EXISTS reads `page_evidence` OR
+    // `edges` -- a NULL-locator `authored` row IS provenance (it has no
+    // edge twin; `insert_resolved_page_evidence` only dual-writes when a
+    // real locator resolves), and this check is well-formedness over
+    // provenance rows, not a reader of the canonical `edges` store alone.
+    // Closure review (2026-08-05): the former page_sources-analog EXISTS
+    // (edges restricted to dst_kind='memory') is a strict subset of this
+    // evidence arm's edges half (no dst_kind filter) -- any edge satisfying
+    // it also satisfies the OR here, so it never changed `valid`. Deleted.
     let sql = format!(
         "SELECT p.source_memory_ids,
-                EXISTS(SELECT 1 FROM page_sources ps WHERE ps.page_id=p.id),
                 EXISTS(SELECT 1 FROM page_evidence pe WHERE pe.page_id=p.id)
+                OR EXISTS(SELECT 1 FROM edges pe WHERE pe.edge_type='cites' AND pe.valid_until IS NULL
+                       AND pe.src_id=p.id)
            FROM pages p
           WHERE p.status='active' AND p.creation_kind='source'{scope_clause}
           ORDER BY p.id"
@@ -124,9 +135,8 @@ async fn load_and_assess_source_integrity(context: &LintContext<'_, '_>) -> Resu
         let source_ids = row.get::<String>(0).map_err(|_| ())?;
         let parsed_nonempty =
             serde_json::from_str::<Vec<String>>(&source_ids).is_ok_and(|ids| !ids.is_empty());
-        let has_page_source = row.get::<i64>(1).map_err(|_| ())? != 0;
-        let has_page_evidence = row.get::<i64>(2).map_err(|_| ())? != 0;
-        let valid = parsed_nonempty || has_page_source || has_page_evidence;
+        let has_page_evidence = row.get::<i64>(1).map_err(|_| ())? != 0;
+        let valid = parsed_nonempty || has_page_evidence;
         assessment.push(if valid { Level::Pass } else { Level::Error });
         affected = affected.saturating_add(u64::from(!valid));
     }

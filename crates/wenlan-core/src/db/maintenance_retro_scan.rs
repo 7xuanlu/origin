@@ -74,10 +74,15 @@ impl MemoryDB {
 
         // The caller-provided cap is sufficient for its stub decision; no
         // exact count or full source-list materialization is needed.
+        //
+        // G6 Stage 1.3: reads `edges` (`cites`, `dst_kind='memory'`) instead of
+        // `page_sources`.
         let mut source_rows = conn
             .query(
-                "SELECT memory_source_id FROM page_sources \
-                 WHERE page_id = ?1 ORDER BY memory_source_id LIMIT ?2",
+                "SELECT dst_id FROM edges \
+                 WHERE edge_type = 'cites' AND valid_until IS NULL AND dst_kind = 'memory' \
+                       AND src_kind = 'page' AND src_id = ?1 \
+                 ORDER BY dst_id LIMIT ?2",
                 libsql::params![page_id.as_str(), source_read_limit as i64],
             )
             .await

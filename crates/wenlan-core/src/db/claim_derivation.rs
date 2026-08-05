@@ -1829,6 +1829,10 @@ impl MemoryDB {
         }
         drop(lease);
 
+        // G6 Stage 1.3 carryover (2026-08-05): already edges-aware by design --
+        // the UNION already covers both a legacy-only `page_evidence` row and
+        // an edges-only row, so migrating the `page_evidence` arm would only
+        // drop coverage during the transition. Leave as is.
         let mut rows = conn
             .query(
                 "WITH linked(source_id) AS (

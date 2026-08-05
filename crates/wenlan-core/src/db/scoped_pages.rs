@@ -740,6 +740,12 @@ impl MemoryDB {
         }
     }
 
+    /// G6 Stage 1.3: the joined side reads `edges` (`cites`) instead of
+    /// `page_sources`, spanning all `dst_kind`s (no `dst_kind` filter) -- see
+    /// the unscoped `get_page_sources` doc comment for the ruling. `linked_at`
+    /// is COALESCE-total over the payload-mirrored legacy value and
+    /// `edges.created_at` (ordering trap, same discipline as the unscoped
+    /// reader).
     pub async fn get_page_sources_scoped(
         &self,
         page_id: &str,
@@ -747,9 +753,13 @@ impl MemoryDB {
     ) -> Result<Vec<wenlan_types::PageSource>, WenlanError> {
         let (scope_sql, scope_value) = page_scope_clause(scope, "c.workspace", 2);
         let sql = format!(
-            "SELECT c.id, ps.page_id, ps.memory_source_id, ps.linked_at, ps.link_reason \
-             FROM pages c LEFT JOIN page_sources ps ON ps.page_id = c.id \
-             WHERE c.id = ?1{scope_sql} ORDER BY ps.linked_at ASC"
+            "SELECT c.id, ps.src_id, ps.dst_id, \
+                    COALESCE(json_extract(ps.payload,'$.linked_at'), ps.created_at), \
+                    json_extract(ps.payload,'$.link_reason') \
+             FROM pages c LEFT JOIN edges ps ON ps.src_id = c.id AND ps.edge_type = 'cites' \
+                    AND ps.valid_until IS NULL \
+             WHERE c.id = ?1{scope_sql} \
+             ORDER BY COALESCE(json_extract(ps.payload,'$.linked_at'), ps.created_at) ASC, ps.dst_id ASC"
         );
         let mut params = vec![libsql::Value::Text(page_id.to_string())];
         if let Some(value) = scope_value {
