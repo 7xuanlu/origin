@@ -8,12 +8,13 @@ Where things live. Subtree `AGENTS.md` files load automatically when you work un
 
 | Working on… | Start here |
 |---|---|
-| Cross-cutting rules — build/dev, CI layers, releasing, crate boundaries, async & SQL safety, dev gotchas | **this file** (loaded every session) |
+| Cross-cutting rules — crate boundaries, async & SQL safety, dev gotchas, release policy | **this file** (loaded every session) |
 | Business logic — DB, engine, classify/extract, rerank, pages, retrieval + the deep flag reference | `crates/wenlan-core/AGENTS.md` |
 | HTTP daemon — router, routes, state, ingest batcher, scheduler, websocket | `crates/wenlan-server/AGENTS.md` |
 | Eval discipline — fixtures, baselines, seed scripts, cache TTL, faithfulness benches | `app/eval/AGENTS.md` |
 | Eval internals — runner conventions, paired-A/B apparatus, the G3 gate | `crates/wenlan-core/src/eval/AGENTS.md` |
-| CLI (`wenlan`) | "Key Modules — wenlan (CLI)" below (no subtree doc) |
+| Test layers — what runs at L1-L8, where, when, whether it blocks | `docs/test-layers.md` |
+| Platform code — per-OS data dirs, service registration, GPU backends, Windows verification | `docs/cross-platform.md` |
 | Running & verifying against live surfaces — daemon launch/lifecycle, per-surface drive recipes, mutation audit / behavior trace / weekly sweep | `.claude/skills/run-wenlan/SKILL.md` → `.claude/skills/verify/SKILL.md` → `.claude/skills/prove/SKILL.md` (tracked in-repo) |
 
 ## Build & Dev Commands
@@ -40,77 +41,22 @@ Pre-commit checks Rust formatting without changing the worktree and runs Clippy 
 
 ## Cross-platform
 
-Supported builds and prebuilt releases cover macOS arm64, Linux x86_64/aarch64 with glibc, and Windows x86_64. macOS x86_64 is not a supported stock source-build target: the pinned ONNX Runtime dependency has no prebuilt Intel macOS binary, so a custom build must compile ONNX Runtime separately and provide it through `ORT_LIB_LOCATION`.
+Supported: macOS arm64, Linux x86_64/aarch64 (glibc), Windows x86_64. macOS x86_64 is not a stock source-build target — the pinned ONNX Runtime has no prebuilt Intel macOS binary, so a custom build must compile it separately and point `ORT_LIB_LOCATION` at the result.
 
-| OS | Data dir | Service registration |
-|---|---|---|
-| macOS | `~/Library/Application Support/wenlan/` | launchd via `~/Library/LaunchAgents/com.wenlan.server.plist` (user-level) |
-| Linux | `~/.local/share/wenlan/` (or `$XDG_DATA_HOME/origin`) | systemd user unit at `~/.config/systemd/user/wenlan-server.service` (qualifier dropped per `ServiceLabel::to_script_name()`). Enable lingering with `loginctl enable-linger` if you want the service alive after logout. |
-| Windows | `%LOCALAPPDATA%\origin\` | Per-user Task Scheduler ONLOGON task registered via `schtasks.exe /create /tn WenlanServer /sc ONLOGON /tr <exe> /f`. `wenlan background on` short-circuits before service-manager and drives schtasks directly (wenlan-server is a plain console app and would otherwise time out at 30s under sc.exe + the Windows Service Control Protocol). `wenlan background off` stops the running task with `schtasks /end /tn WenlanServer` while preserving its registration. |
+**Per-OS data dirs and service registration, the llama-cpp-2 GPU backends, ORT on Windows, the three manual Windows GPU verification legs, and the Linux-smoke-from-macOS recipe are in [`docs/cross-platform.md`](docs/cross-platform.md).** Read it before touching platform-conditional code or the release matrix.
 
-`wenlan background on` / `wenlan background off` work on macOS, Linux, and Windows. macOS + Linux go through the `service-manager` crate (launchd / systemd-user); Windows takes the schtasks path described above so the daemon does not need a service dispatcher.
+## Test layers
 
-### llama-cpp-2 backend
+Eight layers run, from the IDE to pre-release evals. The split answers three questions: can a hosted runner do this (no GPU, no keys, no cost), is it under 60s cold, and does it gate correctness or measure quality. **Quality measures never gate.**
 
-macOS builds use Metal, Windows x86_64 builds use Vulkan with observable CPU/OpenMP fallback, and Linux builds remain CPU/OpenMP. Windows setup, device selection, CI/release prerequisites, and physical Qwen live-smoke commands are in [`docs/windows-vulkan.md`](docs/windows-vulkan.md).
+**The full table — what runs at each layer, where, when, and whether it blocks — is in [`docs/test-layers.md`](docs/test-layers.md).** Read it before adding a test or changing CI routing.
 
-### ORT (ONNX Runtime) on Windows
+Two rules to obey while writing code:
 
-If you see `Failed to load onnxruntime.dll` or version-mismatch errors on Windows, set `ORT_DYLIB_PATH` to the bundled `onnxruntime.dll` inside the Wenlan install directory before starting the daemon. The bundled DLL ships in the Windows release zip.
-
-### Manual Windows verification
-
-The CI matrix includes `windows-2022` for Windows-affecting PRs, but hosted runners do not prove physical GPU inference. Follow [`docs/windows-vulkan.md`](docs/windows-vulkan.md) on a real Windows 11 GPU machine and run all three Qwen live-smoke legs: Vulkan/device assertion, forced CPU, and injected CPU fallback.
-
-### Linux smoke from macOS
-
-```bash
-bash scripts/smoke-linux.sh
-```
-
-Builds the multi-arch daemon image (linux/arm64 for native Apple Silicon speed via OrbStack / Docker Desktop), starts a container, exercises the HTTP API, asserts responses, tears down. Runtime ~3 minutes after the first build.
-
-## Local vs CI test responsibilities
-
-Wenlan runs across several layers. The split is driven by three questions: **(1) Can a hosted runner do this?** (no GPU, no API keys, no cost). **(2) Is it under 60s on cold cache?** **(3) Does it gate correctness or measure quality?** Quality measures never gate.
-
-### Terminology: e2e / smoke / live
-
-- **`_e2e.rs`** (`chat_import_e2e`, `doc_reconcile_e2e`, `page_citations_e2e`, ...) = hermetic: full internal pipeline, in-process, external deps (the LLM) faked/stubbed. Fast, deterministic, CI-safe (L4).
-- **`scripts/smoke-*.sh`** = HTTP black-box check against a running daemon. Depth varies — check whether the script actually invokes the real on-device model:
-  - No real model touched (`smoke-folder-ingest.sh`, `smoke-linux.sh`, `smoke-windows.ps1`) → plain **smoke test**, CI-safe (L4).
-  - Real on-device model touched → **live smoke test**, filename folds the qualifier in (`live-smoke-doc-reconcile.sh`, `live-smoke-page-citations.sh`), L7 manual-only (needs the qwen3-4b GGUF cached; GitHub runners have no Metal/GPU).
-- Never write bare "smoke test" for a GPU-gated script — the word alone doesn't signal depth. Always pair it with "live" so the non-hermetic tier is legible at a glance, in code comments and docs alike.
-
-| Layer | What runs | Where | When | Time | Blocks? |
-|---|---|---|---|---|---|
-| **L1 dev loop** | rust-analyzer / IDE | Local | Every save | <1s | No |
-| **L2 pre-commit** | `cargo fmt --all -- --check`; Clippy on directly changed crates only | Local | `git commit` | ~5s | Yes |
-| **L3 pre-push** | Planner-selected Clippy + lib tests over the affected reverse-dependency closure; directly edited integration targets and isolated unit-test owners run alone | Local | `git push` | change-dependent | Yes |
-| **L4 CI on PR/main** | Fail-closed differential plan: affected lib, integration, contract, platform, and HTTP smoke owners only; aggregate `conclusion` verifies every expected job. Pushes to `main` reuse the same source-owned routing; release-sensitive pushes retain the Windows release-profile cache warmer, while CI-only pushes skip it. Manual dispatch is the full backstop. An exact same-repository Release PR whose current-main diff passes the semantic validator omits duplicate base-tree Rust/platform lanes only after independently proving that base's main CI succeeded; release-managed plugin/npm/docs checks and all four shipped-target preflights remain. | GitHub (`ci.yml`) | Every PR/main push | target ≤20min | Yes (required) |
-| **L5 coverage** | `cargo llvm-cov` on wenlan-core + wenlan-server only | GitHub (`coverage.yml`) | Relevant source-owner push to `main`, or manual dispatch | ~30min | **No (informational)** |
-| **L6 main canary** | Exact retrieval-quality + ranking-drift pair (`test_run_quality_cost_eval_basic`, `ranking_drift_vs_golden`) | GitHub (`main-canary.yml`) | Relevant core/eval-owner push to `main`, or manual dispatch | <20min | No (post-merge) |
-| **L7 manual local** | `bash scripts/coverage.sh` (HTML coverage), GPU eval suite (`cargo test -- --ignored`), Anthropic batch judge (`ANTHROPIC_API_KEY=... cargo test ...`), live smokes with a real on-device judge (`bash scripts/live-smoke-doc-reconcile.sh`, `bash scripts/live-smoke-page-citations.sh`) — run the matching live smoke before merging a feature whose e2e stubs the LLM or never boots the daemon | Your laptop | On demand | minutes-hours | No |
-| **L8 pre-release** | Full eval suite vs saved baseline. Commit a **curated, env-stamped snapshot** of headline numbers to a results doc/README (single-run tagged "scaffold"; headline claims need N≥3 + stddev). Raw per-run baselines + history series stay gitignored. See "Commit policy" under Eval Citation Discipline. | Your laptop | Per release | hours | Soft gate |
-
-Windows release preflight treats cache availability as an optimization: a measured host+target cold miss waits 25 seconds and makes one pinned restore-only retry before Cargo. The final probe fails on partial or exact-but-empty state, records exact/fallback/cold plus the selected Cargo job bound, and continues a coherent cold build with two jobs.
+- **`_e2e.rs` is hermetic** — full internal pipeline, in-process, the LLM stubbed. Fast, deterministic, CI-safe. **`scripts/smoke-*.sh`** is an HTTP black-box check against a running daemon, and its depth varies.
+- **Never write bare "smoke test" for a GPU-gated script.** If it touches the real on-device model it is a *live* smoke test and the filename folds the qualifier in (`live-smoke-doc-reconcile.sh`). The word alone does not signal depth — pair it with "live" in code comments and docs alike, so the non-hermetic tier is legible at a glance.
 
 A required CI check failed intermittently? Follow [`docs/ci-flake-policy.md`](docs/ci-flake-policy.md) before rerunning, quarantining, rerouting, or reverting.
-
-### What does NOT run in CI and why
-
-- **GPU evals (LongMemEval / LoCoMo runner functions, Qwen3.5-9B inference)** — GitHub macOS runners have no Metal acceleration. The tests are `#[ignore]`d so they don't accidentally run.
-- **Anthropic API batch judge** — costs $0.35/run and requires `ANTHROPIC_API_KEY` which we don't expose to PR runs from forks.
-- **Tauri / desktop coverage** — the desktop app lives in [7xuanlu/wenlan-app](https://github.com/7xuanlu/wenlan-app) and runs its own CI there. This repo's coverage is scoped to `wenlan-core + wenlan-server`.
-
-### Why pre-push doesn't run coverage
-
-Tried 90% `cargo llvm-cov` gate in pre-push, removed because:
-- **Slow:** instrumented rebuild 5-15min, memory pressure.
-- **Not mirrored in CI:** `ci.yml` has no coverage gate, so local-only friction.
-- **Percentage gates rot:** new untestable surface forces busywork.
-
-Pre-push now runs planner-selected Clippy + non-instrumented tests only. Coverage = L5 (main/manual, informational) or L7 (manual HTML).
 
 ### Eval cache, baselines & faithfulness benches → `app/eval/AGENTS.md`
 
@@ -129,13 +75,9 @@ Releases are automated via [release-please](https://github.com/googleapis/releas
 | `BREAKING CHANGE` | patch | Breaking |
 | `chore:`, `ci:`, `docs:`, `refactor:`, `test:` | no bump on its own | hidden |
 
-**A deliberate minor or major is a config change, not a commit-message trick.** Add `"release-as": "0.16.0"` under `packages["."]` (or switch `versioning`), merge it to main, let release-please open the PR, then remove the override. Never rewrite history to steer a version bump.
-
 **Squash merge commit messages still matter — for the changelog.** When GitHub squash-merges a PR, the commit message defaults to the PR title. The prefix no longer changes the bump size (always patch), but it decides whether and where the change appears in `CHANGELOG.md`, and a title without a conventional `type:` prefix is invisible to release-please entirely. Keep PR titles valid conventional commits.
 
 **Version files must stay in sync:** `version.txt`, `.release-please-manifest.json`, and the root workspace `Cargo.toml` (`# x-release-please-version` marker on the `[workspace.package]` version line; the 4 crates inherit it via `version.workspace = true`). Teeth #3 enforces this; the release-please workflow syncs them on the release branch, so any manual version edit must touch all three. The desktop app version lives in [7xuanlu/wenlan-app](https://github.com/7xuanlu/wenlan-app) and bumps independently.
-
-**Undoing a release: edit the manifest, don't rewrite history.** In manifest mode the "last version" comes from `.release-please-manifest.json`, so a rollback is a normal PR that resets it (plus `version.txt` and the workspace `Cargo.toml`, per teeth #3) alongside deleting the tag + GitHub Release. Leave the merged release PR's `autorelease: tagged` label alone — that label is what stops release-please re-releasing it. No commit-message rewrite, no PR rename.
 
 ### Branch protection
 
@@ -146,7 +88,7 @@ Main branch has: required CI (`conclusion` — aggregate gate over `fmt` + `lint
 Manual setup: `bash scripts/setup-hooks.sh`. Hooks live under `.githooks/`.
 
 - **Pre-commit:** checks formatting (`cargo fmt --all -- --check`) without modifying or staging files, then runs Clippy on directly changed crates.
-- **Pre-push:** planner-selected Clippy + library tests for affected packages and reverse dependents. Direct integration-test edits and isolated unit-test owners run only that target/module. No coverage gate (see above).
+- **Pre-push:** planner-selected Clippy + library tests for affected packages and reverse dependents. Direct integration-test edits and isolated unit-test owners run only that target/module. No coverage gate — [`docs/test-layers.md`](docs/test-layers.md) records why the 90% gate was tried and removed.
 
 ### Drift-defense (doc/flag/config drift)
 
