@@ -19,17 +19,6 @@ Where things live. Subtree `AGENTS.md` files load automatically when you work un
 | Wire types (`wenlan-types`), MCP server (`wenlan-mcp`) | Architecture → Workspace Layout below (no subtree doc) |
 | Running & verifying against live surfaces — daemon launch/lifecycle, per-surface drive recipes, mutation audit / behavior trace / weekly sweep | `.claude/skills/run-wenlan/SKILL.md` → `.claude/skills/verify/SKILL.md` → `.claude/skills/prove/SKILL.md` (tracked in-repo) |
 
-## Design Philosophy
-
-- **Simple and elegant over clever** — prefer the straightforward solution; reads-like-easy-to-write usually is right.
-- **Use existing packages** — check for a well-maintained library before custom implementation. Don't reinvent the wheel.
-- **Minimize moving parts** — fewer abstractions, layers, indirections. Complexity must justify itself.
-- **Standard idioms first** — follow ecosystem conventions. Surprising code is usually wrong code.
-- **No speculative surface** — no features beyond what's asked, no abstractions for single-use code, no "flexibility" or "configurability" that wasn't requested, no error handling for impossible scenarios. (Karpathy's Simplicity First.)
-- **Surgical changes** — touch only what the task requires. No "while I'm here" refactors, no adjacent-code cleanups, no formatting fixes outside the diff. Match existing style. Remove only imports/vars your own change made unused; pre-existing dead code needs an explicit ask. (Karpathy's Surgical Changes.)
-- **Challenge assumptions** — don't follow user framing uncritically. If multiple interpretations exist, present them rather than pick silently. Push back when the approach is wrong. (Karpathy's Think Before Coding.)
-- **Verify before claiming done** — run tests, check the build, confirm behavior. Evidence before assertions. (Karpathy's Goal-Driven Execution.)
-
 ## Build & Dev Commands
 
 Wenlan is a Cargo workspace with 5 crates: `wenlan-types`, `wenlan-core`, `wenlan-server`, `wenlan` (CLI in `crates/wenlan-cli`), and `wenlan-mcp`.
