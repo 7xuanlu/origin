@@ -521,6 +521,7 @@ crates/wenlan-core/src/lint/runtime_test.rs|crate::lint::runtime::tests::missing
 crates/wenlan-core/src/lint/runtime_test.rs|crate::lint::runtime::tests::missing_memories_is_schema_finding_with_only_dependent_status_incomplete|test_primary_session|1
 crates/wenlan-core/src/lint/runtime_test.rs|crate::lint::runtime::tests::schema_and_index_fixtures_fail_loud_without_status_rescue|TestDbSession::execute_batch|1
 crates/wenlan-core/src/lint/runtime_test.rs|crate::lint::runtime::tests::schema_and_index_fixtures_fail_loud_without_status_rescue|test_primary_session|1
+crates/wenlan-core/src/lint/semantic_candidates.rs|crate::lint::semantic::candidates::scope_matches_tests::uncategorized_scope_selects_the_unfiled_sentinel_entity|open_isolated_lint_snapshot_for_test|1
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::approved_link_repair_removes_candidate_on_rerun|TestDbSession::execute|1
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::approved_link_repair_removes_candidate_on_rerun|TestDbSession::execute_batch|1
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::approved_link_repair_removes_candidate_on_rerun|test_primary_session|1
@@ -597,6 +598,7 @@ crates/wenlan-core/src/derived_artifact_state.rs|crate::derived_artifact_state::
 crates/wenlan-core/src/derived_artifact_state.rs|crate::derived_artifact_state::tests::summary_eligibility_requires_a_qualifying_community_and_candidate|TestDbSession::execute_batch|1
 crates/wenlan-core/src/derived_artifact_state.rs|crate::derived_artifact_state::tests::summary_eligibility_requires_a_qualifying_community_and_candidate|TestDbSession::query|1
 crates/wenlan-core/src/derived_artifact_state.rs|crate::derived_artifact_state::tests::summary_eligibility_requires_a_qualifying_community_and_candidate|test_primary_session|1
+crates/wenlan-core/src/derived_artifact_state.rs|crate::derived_artifact_state::tests::summary_eligibility_requires_a_qualifying_community_and_candidate|test_primary_session|2
 crates/wenlan-core/src/document_enrichment.rs|crate::document_enrichment::tests::assert_corrupt_prepared_generation_is_replaced|TestDbSession::execute|1
 crates/wenlan-core/src/document_enrichment.rs|crate::document_enrichment::tests::assert_corrupt_prepared_generation_is_replaced|TestDbSession::execute|2
 crates/wenlan-core/src/document_enrichment.rs|crate::document_enrichment::tests::assert_corrupt_prepared_generation_is_replaced|TestDbSession::execute|3

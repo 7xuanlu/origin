@@ -2283,6 +2283,14 @@ async fn empty_grounded_space_holds_and_keeps_all_community_consumers_on_legacy(
             .unwrap();
         }
     }
+    // G6 Stage 1.5b Part 3: the legacy branches of `load_summary_buckets` and
+    // `summary_eligible_predicate` now read `community_id` off the entity's
+    // shadow page, so the raw-SQL `entities` inserts above need one each.
+    for suffix in ["a", "b", "c"] {
+        db.test_seed_entity_shadow_page(&format!("m96-held-entity-{suffix}"))
+            .await
+            .unwrap();
+    }
 
     let outcome = db
         .run_next_community_grouping_cycle()
@@ -2524,6 +2532,15 @@ async fn community_reader_reconciliation_flips_equivalent_consumers_and_is_rever
         )
         .await
         .unwrap();
+    }
+    // G6 Stage 1.5b Part 3: `load_summary_buckets`/`summary_eligible_predicate`'s
+    // legacy branches now read `community_id` off the entity's shadow page,
+    // so the raw-SQL `entities` inserts above need one each (exercised below
+    // once the BUCKETS consumer is flipped back off durable).
+    for suffix in ["a", "b", "c"] {
+        db.test_seed_entity_shadow_page(&format!("m96-parity-entity-{suffix}"))
+            .await
+            .unwrap();
     }
 
     for consumer in [
@@ -2803,6 +2820,14 @@ async fn community_reader_parity_is_a_true_global_differential() {
             .await
             .unwrap();
         }
+    }
+    // G6 Stage 1.5b Part 3: `load_summary_buckets`'s legacy branch now reads
+    // `community_id` off the entity's shadow page, so the raw-SQL `entities`
+    // inserts above need one each.
+    for suffix in ["a", "b", "c"] {
+        db.test_seed_entity_shadow_page(&format!("m96-global-entity-{suffix}"))
+            .await
+            .unwrap();
     }
 
     let legacy_buckets = db.load_summary_buckets().await.unwrap();
@@ -11569,7 +11594,9 @@ async fn test_store_entity_null_domain() {
         .await
         .unwrap();
 
-    // Verify space is NULL, not empty string
+    // G6 Stage 1.5b Part 2: space is folded (never NULL) at write time --
+    // an unfiled entity carries UNFILED_SPACE_ID, not NULL. source_agent has
+    // no such fold and stays NULL when absent, as this section's name says.
     let conn = db.conn.lock().await;
     let mut rows = conn
         .query(
@@ -11581,8 +11608,8 @@ async fn test_store_entity_null_domain() {
     let row = rows.next().await.unwrap().unwrap();
     let space_val = row.get_value(0).unwrap();
     assert!(
-        matches!(space_val, libsql::Value::Null),
-        "space should be NULL, got {:?}",
+        matches!(space_val, libsql::Value::Text(ref s) if s == UNFILED_SPACE_ID),
+        "space should be the unfiled sentinel, got {:?}",
         space_val
     );
     let agent_val = row.get_value(1).unwrap();
@@ -16131,6 +16158,16 @@ async fn load_summary_buckets_excludes_pending_and_hide_superseded_memories() {
         )
         .await
         .unwrap();
+        // G6 Stage 1.5b Part 3: `load_summary_buckets`'s legacy branch now
+        // reads `community_id` off the entity's shadow page, so the raw
+        // `entities` update above must land on the mirror too.
+        conn.execute(
+            "UPDATE pages SET community_id = 7 \
+             WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![entity_id.clone()],
+        )
+        .await
+        .unwrap();
     }
 
     let mut active = make_memory_doc(
@@ -16824,11 +16861,11 @@ async fn delete_space_unassign_folds_memories_to_sentinel_not_null() {
 }
 
 #[tokio::test]
-async fn delete_space_unassign_folds_entity_shadow_space_to_sentinel() {
-    // rework2 ITEM 2 (M3 PR-1): unassign clears entities.space to NULL
-    // (entities never fold), but the mapped kind='entity' shadow's NOT NULL
-    // space/workspace must fold to the sentinel -- not keep the deleted
-    // space name -- matching insert_entity_shadow_page's fold rule.
+async fn delete_space_unassign_folds_entity_and_shadow_space_to_sentinel() {
+    // rework2 ITEM 2 (M3 PR-1) originally left entities.space NULL on
+    // unassign while only the kind='entity' shadow's NOT NULL space/workspace
+    // folded to the sentinel. As of G6 Stage 1.5b Part 2, entities.space
+    // folds the same way -- both must carry the sentinel, never NULL.
     let (db, _dir) = test_db().await;
     db.create_space("old", None, false).await.unwrap();
     let id = db
@@ -16845,10 +16882,10 @@ async fn delete_space_unassign_folds_entity_shadow_space_to_sentinel() {
     db.delete_space("old", "unassign").await.unwrap();
 
     let conn = db.conn.lock().await;
-    let entity_space_null: i64 = {
+    let entity_space: String = {
         let mut rows = conn
             .query(
-                "SELECT space IS NULL FROM entities WHERE id = ?1",
+                "SELECT space FROM entities WHERE id = ?1",
                 libsql::params![id.clone()],
             )
             .await
@@ -16856,8 +16893,8 @@ async fn delete_space_unassign_folds_entity_shadow_space_to_sentinel() {
         rows.next().await.unwrap().unwrap().get(0).unwrap()
     };
     assert_eq!(
-        entity_space_null, 1,
-        "entities.space must be NULL after unassign (entities never fold)"
+        entity_space, UNFILED_SPACE_ID,
+        "entities.space must fold to the sentinel after unassign, never NULL"
     );
 
     let (space, workspace): (String, String) = {
@@ -16885,6 +16922,53 @@ async fn delete_space_unassign_folds_entity_shadow_space_to_sentinel() {
         workspace, UNFILED_SPACE_ID,
         "shadow workspace must fold to the sentinel"
     );
+}
+
+/// G6 Stage 1.5b Part 2 writer-side fold invariant: `store_entity` and
+/// `create_entity` must fold `space: None` to `UNFILED_SPACE_ID` at write
+/// time, not pass NULL through -- else NULLs recur even after the fold
+/// migration backfills existing rows.
+#[tokio::test]
+async fn store_entity_folds_none_space_to_sentinel_never_null() {
+    let (db, _dir) = test_db().await;
+    let store_id = db
+        .store_entity("Ada Lovelace", "person", None, Some("test"), None)
+        .await
+        .unwrap();
+    let create_id = db
+        .create_entity("Grace Hopper", "person", None)
+        .await
+        .unwrap();
+
+    let conn = db.conn.lock().await;
+    let null_count: i64 = {
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM entities WHERE space IS NULL", ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(
+        null_count, 0,
+        "no entities.space row may be NULL after a None-space write"
+    );
+
+    for id in [store_id, create_id] {
+        let space: String = {
+            let mut rows = conn
+                .query(
+                    "SELECT space FROM entities WHERE id = ?1",
+                    libsql::params![id],
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(
+            space, UNFILED_SPACE_ID,
+            "an unfiled entity must carry the sentinel, never NULL"
+        );
+    }
 }
 
 #[tokio::test]
@@ -30395,6 +30479,392 @@ async fn migration_116_keeps_relates_edge_parity_clean() {
     );
 }
 
+/// G6 Stage 1.5b Part 1: migration 117 backfills the entity-page scalar
+/// mirror (`source_agent`/`entity_created_at`/`entity_updated_at`/
+/// `community_id`/`embedding_updated_at`) from `entities` via
+/// `entity_page_map`, row-for-row.
+#[tokio::test]
+async fn migration_117_backfills_entity_page_scalar_mirror() {
+    let (db, _dir) = test_db().await;
+    let id = db
+        .store_entity(
+            "G6 Scalar Mirror",
+            "person",
+            Some("space_a"),
+            Some("test-agent"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let forced_created_at = 1_000_000_001i64;
+    let forced_updated_at = 1_000_000_002i64;
+    let forced_community_id = 7i64;
+    let forced_embedding_updated_at = 1_000_000_003i64;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE entities SET created_at = ?1, updated_at = ?2, community_id = ?3,
+                embedding_updated_at = ?4
+             WHERE id = ?5",
+            libsql::params![
+                forced_created_at,
+                forced_updated_at,
+                forced_community_id,
+                forced_embedding_updated_at,
+                id.as_str()
+            ],
+        )
+        .await
+        .unwrap();
+        // Simulate a shadow page that predates migration 117: null out the
+        // new mirror columns even though the entity row already carries them.
+        conn.execute(
+            "UPDATE pages SET source_agent = NULL, entity_created_at = NULL,
+                entity_updated_at = NULL, community_id = NULL, embedding_updated_at = NULL
+             WHERE kind = 'entity'
+               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![id.as_str()],
+        )
+        .await
+        .unwrap();
+    }
+
+    for pass in 1..=2 {
+        db.migrate_117_entity_page_scalar_mirror(116).await.unwrap();
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT p.source_agent, p.entity_created_at, p.entity_updated_at,
+                        p.community_id, p.embedding_updated_at
+                 FROM pages p
+                 JOIN entity_page_map m ON m.page_id = p.id
+                 WHERE m.entity_id = ?1",
+                libsql::params![id.as_str()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("shadow page row");
+        assert_eq!(
+            row.get::<Option<String>>(0).unwrap().as_deref(),
+            Some("test-agent"),
+            "pass {pass}: source_agent must mirror entities.source_agent"
+        );
+        assert_eq!(
+            row.get::<Option<i64>>(1).unwrap(),
+            Some(forced_created_at),
+            "pass {pass}: entity_created_at must mirror entities.created_at"
+        );
+        assert_eq!(
+            row.get::<Option<i64>>(2).unwrap(),
+            Some(forced_updated_at),
+            "pass {pass}: entity_updated_at must mirror entities.updated_at"
+        );
+        assert_eq!(
+            row.get::<Option<String>>(3).unwrap().as_deref(),
+            Some(forced_community_id.to_string()).as_deref(),
+            "pass {pass}: community_id must mirror entities.community_id (as text)"
+        );
+        assert_eq!(
+            row.get::<Option<i64>>(4).unwrap(),
+            Some(forced_embedding_updated_at),
+            "pass {pass}: embedding_updated_at must mirror entities.embedding_updated_at"
+        );
+    }
+}
+
+/// G6 Stage 1.5b Part 1: every shared-CRUD writer that touches one of the
+/// 5 new mirrored scalars re-syncs the shadow page via the existing
+/// `update_entity_shadow_page` call already on its path -- this pins that
+/// the mirror actually lands for `store_entity`, `confirm_entity`,
+/// `refresh_entity_embedding`, and `merge_entities`, not just that the
+/// function compiles.
+#[tokio::test]
+async fn entity_writers_thread_through_scalar_mirror_to_shadow_page() {
+    async fn shadow_scalars(
+        db: &MemoryDB,
+        entity_id: &str,
+    ) -> (Option<String>, Option<i64>, Option<i64>, Vec<u8>) {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT p.source_agent, p.entity_updated_at, p.embedding_updated_at, p.embedding
+                 FROM pages p
+                 JOIN entity_page_map m ON m.page_id = p.id
+                 WHERE m.entity_id = ?1",
+                libsql::params![entity_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("shadow page row");
+        (
+            row.get(0).unwrap(),
+            row.get(1).unwrap(),
+            row.get(2).unwrap(),
+            row.get::<Option<Vec<u8>>>(3).unwrap().unwrap_or_default(),
+        )
+    }
+
+    let (db, _dir) = test_db().await;
+
+    // store_entity: source_agent lands on the shadow at write time.
+    let id = db
+        .store_entity(
+            "G6 Thread Through",
+            "person",
+            Some("space_a"),
+            Some("agent-x"),
+            None,
+        )
+        .await
+        .unwrap();
+    let (source_agent, _, _, _) = shadow_scalars(&db, &id).await;
+    assert_eq!(
+        source_agent.as_deref(),
+        Some("agent-x"),
+        "store_entity must thread source_agent onto the shadow page"
+    );
+
+    // confirm_entity: re-syncs the mirror without corrupting it.
+    db.confirm_entity(&id, true).await.unwrap();
+    let entity_updated_at: Option<i64> = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT updated_at FROM entities WHERE id = ?1",
+                libsql::params![id.as_str()],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    let (_, page_entity_updated_at, _, _) = shadow_scalars(&db, &id).await;
+    assert_eq!(
+        page_entity_updated_at, entity_updated_at,
+        "confirm_entity must re-sync entity_updated_at onto the shadow page"
+    );
+
+    // refresh_entity_embedding: embedding_updated_at + embedding both land.
+    db.refresh_entity_embedding(&id, "G6 Thread Through refreshed")
+        .await
+        .unwrap();
+    let embedding_updated_at: Option<i64> = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT embedding_updated_at FROM entities WHERE id = ?1",
+                libsql::params![id.as_str()],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    let (_, _, page_embedding_updated_at, page_embedding) = shadow_scalars(&db, &id).await;
+    assert_eq!(
+        page_embedding_updated_at, embedding_updated_at,
+        "refresh_entity_embedding must re-sync embedding_updated_at onto the shadow page"
+    );
+    assert!(
+        !page_embedding.is_empty(),
+        "refresh_entity_embedding must re-sync the embedding bytes onto the shadow page"
+    );
+
+    // merge_entities: the canonical's shadow still mirrors the canonical
+    // entity row (source_agent survives the merge transaction).
+    let alias_id = db
+        .store_entity(
+            "G6 Thread Through Alias",
+            "person",
+            Some("space_a"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.merge_entities(&id, &alias_id).await.unwrap();
+    let (source_agent_after_merge, _, _, _) = shadow_scalars(&db, &id).await;
+    assert_eq!(
+        source_agent_after_merge.as_deref(),
+        Some("agent-x"),
+        "merge_entities must leave the canonical's mirrored source_agent intact"
+    );
+
+    // add_observation: re-syncs entity_updated_at onto the shadow page (G6
+    // review fix -- the write used to be a bare best-effort `.ok()` UPDATE on
+    // `entities` with no shadow sync at all).
+    db.add_observation(&id, "G6 Thread Through observation", None, None)
+        .await
+        .unwrap();
+    let entity_updated_at_after_observation: Option<i64> = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT updated_at FROM entities WHERE id = ?1",
+                libsql::params![id.as_str()],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    let (_, page_entity_updated_at_after_observation, _, _) = shadow_scalars(&db, &id).await;
+    assert_eq!(
+        page_entity_updated_at_after_observation, entity_updated_at_after_observation,
+        "add_observation must re-sync entity_updated_at onto the shadow page"
+    );
+}
+
+// -- G6 Stage 1.5b Part 2: migration 118 entity space fold --
+
+/// Mirrors `relax_memories_space_to_nullable` for `entities`.
+async fn relax_entities_space_to_nullable(conn: &libsql::Connection) {
+    let sql: String = {
+        let mut rows = conn
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='entities'",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    let patched = sql.replacen(
+        &format!("space TEXT NOT NULL DEFAULT '{UNFILED_SPACE_ID}',"),
+        "space TEXT,",
+        1,
+    );
+    assert_ne!(
+        patched, sql,
+        "expected entities.space to already be NOT NULL before relaxing"
+    );
+    conn.execute("PRAGMA writable_schema=ON", ()).await.unwrap();
+    conn.execute(
+        "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='entities'",
+        libsql::params![patched],
+    )
+    .await
+    .unwrap();
+    conn.execute("PRAGMA writable_schema=RESET", ())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn migration_118_backfills_null_space_to_unfiled() {
+    let (db, _dir) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        relax_entities_space_to_nullable(&conn).await;
+        insert_raw_entity_for_m92_test(
+            &conn,
+            "ent_null_space",
+            "G6 Null Space",
+            "person",
+            None,
+            None,
+            0,
+        )
+        .await;
+        conn.execute("PRAGMA user_version = 117", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query("SELECT space FROM entities WHERE id = 'ent_null_space'", ())
+        .await
+        .unwrap();
+    let space: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(space, UNFILED_SPACE_ID);
+}
+
+#[tokio::test]
+async fn migration_118_not_null_constraint_rejects_null_space_insert() {
+    let (db, _dir) = test_db().await;
+    let conn = db.conn.lock().await;
+    let result = conn
+        .execute(
+            "INSERT INTO entities (id, name, entity_type, space, confidence, confirmed, created_at, updated_at) \
+             VALUES ('ent_reject', 'G6 Reject', 'person', NULL, NULL, 0, unixepoch(), unixepoch())",
+            (),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "inserting a NULL space must be rejected once migration 118 has run"
+    );
+}
+
+#[tokio::test]
+async fn migration_118_raw_insert_omitting_space_lands_unfiled() {
+    // Proves the DEFAULT half of the fix, mirroring
+    // `migration_91_raw_insert_omitting_space_lands_unfiled`: a raw INSERT
+    // that omits `space` entirely must land the sentinel rather than
+    // tripping the NOT NULL constraint -- the companion
+    // `migration_118_not_null_constraint_rejects_null_space_insert` proves
+    // an EXPLICIT NULL bind is still rejected, since a column DEFAULT only
+    // fires when the column is omitted.
+    let (db, _dir) = test_db().await;
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO entities (id, name, entity_type, confidence, confirmed, created_at, updated_at) \
+         VALUES ('ent_omitted', 'G6 Omitted', 'person', NULL, 0, unixepoch(), unixepoch())",
+        (),
+    )
+    .await
+    .expect("omitting space must fall back to the column DEFAULT, not error");
+
+    let mut rows = conn
+        .query("SELECT space FROM entities WHERE id = 'ent_omitted'", ())
+        .await
+        .unwrap();
+    let space: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(space, UNFILED_SPACE_ID);
+}
+
+#[tokio::test]
+async fn migration_118_rebuilds_index_without_partial_predicate() {
+    let (db, _dir) = test_db().await;
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_entities_space'",
+            (),
+        )
+        .await
+        .unwrap();
+    let sql: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert!(
+        !sql.contains("WHERE"),
+        "idx_entities_space must drop its now-vacuous partial predicate: {sql}"
+    );
+}
+
+#[tokio::test]
+async fn migration_118_assertion_detects_unresolved_space() {
+    let (db, _dir) = test_db().await;
+    let conn = db.conn.lock().await;
+    relax_entities_space_to_nullable(&conn).await;
+    insert_raw_entity_for_m92_test(
+        &conn,
+        "ent_unresolved",
+        "G6 Unresolved",
+        "person",
+        None,
+        None,
+        0,
+    )
+    .await;
+
+    let result = MemoryDB::assert_entities_space_backfilled(&conn).await;
+    let err = result.expect_err("assertion must detect the NULL survivor");
+    assert!(
+        err.to_string().contains("m118"),
+        "error should identify migration 118: {err}"
+    );
+}
+
 /// G6 Stage 1.2 divergence test (Sol review S3): no other test can tell
 /// whether a migrated reader actually reads `edges` versus `relations`, since
 /// every OTHER fixture keeps both stores in parity via the dual-write. Here
@@ -41683,7 +42153,7 @@ async fn migration_92_backfills_preexisting_entities_into_shadow_pages() {
             "e_pre2",
             "Pre-existing Bob",
             "person",
-            None,
+            Some(UNFILED_SPACE_ID),
             None,
             0,
         )
@@ -41750,9 +42220,26 @@ async fn migration_92_backfill_report_records_created_count() {
     let (db, _dir) = test_db().await;
     {
         let conn = db.conn.lock().await;
-        insert_raw_entity_for_m92_test(&conn, "e_r1", "Report Alice", "person", None, None, 0)
-            .await;
-        insert_raw_entity_for_m92_test(&conn, "e_r2", "Report Bob", "person", None, None, 0).await;
+        insert_raw_entity_for_m92_test(
+            &conn,
+            "e_r1",
+            "Report Alice",
+            "person",
+            Some(UNFILED_SPACE_ID),
+            None,
+            0,
+        )
+        .await;
+        insert_raw_entity_for_m92_test(
+            &conn,
+            "e_r2",
+            "Report Bob",
+            "person",
+            Some(UNFILED_SPACE_ID),
+            None,
+            0,
+        )
+        .await;
     }
     rerun_migration_92(&db).await;
 
@@ -41773,7 +42260,16 @@ async fn migration_92_backfill_report_records_created_count() {
 async fn migration_92_assertion_detects_entity_missing_shadow_page() {
     let (db, _dir) = test_db().await;
     let conn = db.conn.lock().await;
-    insert_raw_entity_for_m92_test(&conn, "e_orphan", "Orphan Dave", "person", None, None, 0).await;
+    insert_raw_entity_for_m92_test(
+        &conn,
+        "e_orphan",
+        "Orphan Dave",
+        "person",
+        Some(UNFILED_SPACE_ID),
+        None,
+        0,
+    )
+    .await;
 
     let result = MemoryDB::assert_entities_have_shadow_pages(&conn).await;
     let err = result.expect_err("assertion must detect the entity with no shadow page");
@@ -41797,9 +42293,26 @@ async fn migration_92_resume_reads_stored_cursor_and_skips_below_range() {
     let (db, _dir) = test_db().await;
     let (r_below, r_tail) = {
         let conn = db.conn.lock().await;
-        insert_raw_entity_for_m92_test(&conn, "e_below", "Below Cursor", "person", None, None, 0)
-            .await;
-        insert_raw_entity_for_m92_test(&conn, "e_tail", "Tail", "person", None, None, 0).await;
+        insert_raw_entity_for_m92_test(
+            &conn,
+            "e_below",
+            "Below Cursor",
+            "person",
+            Some(UNFILED_SPACE_ID),
+            None,
+            0,
+        )
+        .await;
+        insert_raw_entity_for_m92_test(
+            &conn,
+            "e_tail",
+            "Tail",
+            "person",
+            Some(UNFILED_SPACE_ID),
+            None,
+            0,
+        )
+        .await;
         // Both entities must be unmapped so the backfill has real work and
         // the completeness assertion has teeth: clear any shadow pages the
         // initial test_db migration minted, plus the map.
@@ -44953,6 +45466,179 @@ async fn detect_communities_flipped_excludes_cross_space_legacy_edge() {
     );
 }
 
+/// G6 Stage 1.5b Part 2 pin test: the community adjacency builder's
+/// cross-space exclusion (D6) treats an indeterminate-space endpoint
+/// identically whether `entities.space` is literal SQL NULL (pre-fold) or
+/// the `UNFILED_SPACE_ID` sentinel (post-fold) -- the space-sentinel fold
+/// changes the spelling of "unfiled," never the semantics, so the admitted
+/// edge set must be IDENTICAL before and after. No fold migration exists
+/// yet at this stage of the PR, so the fold is simulated in place: the same
+/// fixture is run once with the endpoint's space left NULL, then again
+/// after flipping that one row's stored space to the sentinel (exactly
+/// what the fold migration will do), and both runs must agree.
+#[tokio::test]
+async fn detect_communities_flipped_admits_sentinel_endpoint_like_null() {
+    let (db, _dir) = test_db().await;
+    let a = db
+        .create_entity("A", "person", Some("space_a"))
+        .await
+        .unwrap();
+    let b = db.create_entity("B", "person", None).await.unwrap();
+
+    // `lineage='legacy'` edge (the fence exempts it at write time) --
+    // mirrors what a real cross-space backfill/dual-write produces.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at) \
+             VALUES ('rel_indeterminate', ?1, ?2, 'knows', 0)",
+            libsql::params![a.clone(), b.clone()],
+        )
+        .await
+        .unwrap();
+        MemoryDB::insert_backfilled_edge(
+            &conn, "relates", "entity", &a, "entity", &b, "knows", "legacy", "space_a", "test",
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn community_map(db: &MemoryDB) -> std::collections::BTreeMap<String, i64> {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query("SELECT id, community_id FROM entities ORDER BY id", ())
+            .await
+            .unwrap();
+        let mut m = std::collections::BTreeMap::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            m.insert(
+                row.get::<String>(0).unwrap(),
+                row.get::<i64>(1).unwrap_or(-1),
+            );
+        }
+        m
+    }
+
+    // Flip: prove parity, enable the edges-backed consumer.
+    assert_eq!(db.reconcile_edges_parity().await.unwrap().drift_count, 0);
+    db.set_reader_cutover("communities", true).await.unwrap();
+    {
+        let conn = db.conn.lock().await;
+        assert!(MemoryDB::reader_uses_edges(&conn, "communities")
+            .await
+            .unwrap());
+    }
+
+    // Pre-fold: B's space is literal NULL. Indeterminate -> admitted -> A
+    // and B merge into one community.
+    db.detect_communities().await.unwrap();
+    let null_map = community_map(&db).await;
+    assert_eq!(
+        null_map[&a], null_map[&b],
+        "a NULL-space endpoint is indeterminate, not cross-space -- must merge"
+    );
+
+    // Simulate the fold in place: B's space becomes the sentinel, same as
+    // the fold migration will write.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE entities SET space = ?1 WHERE id = ?2",
+            libsql::params![UNFILED_SPACE_ID, b.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    // Post-fold: B's space is the sentinel. Must still be indeterminate,
+    // not cross-space -- admission must be IDENTICAL to the NULL case.
+    db.detect_communities().await.unwrap();
+    let sentinel_map = community_map(&db).await;
+    assert_eq!(
+        sentinel_map[&a], sentinel_map[&b],
+        "a sentinel-space endpoint is indeterminate, not cross-space -- must merge, same as NULL"
+    );
+}
+
+/// G6 Stage 1.5b Part 1: `detect_communities`'s legacy label-propagation
+/// write is a shared-CRUD write to `entities.community_id` -- it must
+/// thread through to the shadow page like every other writer on this list,
+/// or `reconcile_entity_page_parity` would flag every community-assigned
+/// entity as drift after the next detection run.
+#[tokio::test]
+async fn detect_communities_threads_community_id_through_to_shadow_page() {
+    let (db, _dir) = test_db().await;
+    let a = db
+        .create_entity("G6 Community Thread A", "person", Some("space_a"))
+        .await
+        .unwrap();
+    let b = db
+        .create_entity("G6 Community Thread B", "person", Some("space_a"))
+        .await
+        .unwrap();
+    db.create_relation(&a, &b, "knows", None, None, None, None)
+        .await
+        .unwrap();
+
+    db.detect_communities().await.unwrap();
+
+    let conn = db.conn.lock().await;
+    for id in [&a, &b] {
+        let mut rows = conn
+            .query(
+                "SELECT e.community_id, p.community_id
+                 FROM entities e
+                 JOIN entity_page_map m ON m.entity_id = e.id
+                 JOIN pages p ON p.id = m.page_id
+                 WHERE e.id = ?1",
+                libsql::params![id.as_str()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("shadow page row");
+        let entity_community_id: i64 = row.get(0).unwrap();
+        let page_community_id: Option<String> = row.get(1).unwrap();
+        assert_eq!(
+            page_community_id.as_deref(),
+            Some(entity_community_id.to_string()).as_deref(),
+            "the shadow page's community_id must mirror entities.community_id after detect_communities"
+        );
+    }
+}
+
+/// G6 Stage 1.5b Part 2 pin test: `get_entity_detail` is the read path
+/// `handle_create_entity` (and every other entity route) relies on to
+/// produce the wire response -- it must fold `UNFILED_SPACE_ID` back to
+/// `null` for an entity whose `entities.space` carries the sentinel, same
+/// as it already does for a literal NULL. No fold migration exists yet at
+/// this stage of the PR, so the fold is simulated in place via a direct
+/// SQL UPDATE (exactly what the fold migration will write).
+#[tokio::test]
+async fn get_entity_detail_normalizes_sentinel_space_to_none() {
+    let (db, _dir) = test_db().await;
+    let id = db.create_entity("Sentinel Co", "org", None).await.unwrap();
+    assert_eq!(
+        db.get_entity_detail(&id).await.unwrap().entity.space,
+        None,
+        "a NULL-space entity must read back as None (baseline, pre-fold)"
+    );
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE entities SET space = ?1 WHERE id = ?2",
+            libsql::params![UNFILED_SPACE_ID, id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        db.get_entity_detail(&id).await.unwrap().entity.space,
+        None,
+        "a sentinel-space entity must ALSO read back as None -- the wire contract stays null"
+    );
+}
+
 /// §6.9 restore drill: an online backup is a sound, INDEPENDENT restore
 /// point. Seed (including an EMBEDDED row so the DiskANN vector index carries
 /// real content -- the shadow tables a naive `VACUUM INTO` would reorder),
@@ -45838,70 +46524,42 @@ async fn bench_reconcile_entity_page_parity_at_scale() {
         assert!(proven_epoch.is_some(), "watermark must be stamped");
     }
 
-    // ---- flipped-read benchmark at scale: cutover OFF (legacy) vs ON
-    // (hybrid), on the SAME seeded DB, under the clean watermark just
-    // proven above ----
+    // ---- read benchmark at scale: list_entities_scoped/get_entity_
+    // detail_scoped timing under the clean watermark just proven above.
+    // G6 review fix: this used to flip `set_entity_reader_cutover` OFF
+    // then ON and assert both arms byte-identical -- vacuous once Part 3
+    // collapsed the gate (no scoped reader consults it anymore, so OFF
+    // and ON run the identical unconditional-canonical code path and the
+    // comparison could never fail). Single un-gated pass keeps the
+    // timing data for the PR body.
     let scope = ReadScope::Space(SPACE.to_string());
     let detail_ids = sample_ids(&entity_ids, DETAIL_SAMPLE);
 
-    db.set_entity_reader_cutover(MemoryDB::SCOPED_ENTITIES_CONSUMER, false)
-        .await
-        .unwrap();
-    let t_list_off = Instant::now();
-    let list_off = db.list_entities_scoped(None, &scope).await.unwrap();
-    let list_off_secs = t_list_off.elapsed().as_secs_f64();
-    let t_detail_off = Instant::now();
-    let mut detail_off = Vec::with_capacity(detail_ids.len());
+    let t_list = Instant::now();
+    let list = db.list_entities_scoped(None, &scope).await.unwrap();
+    let list_secs = t_list.elapsed().as_secs_f64();
+    let t_detail = Instant::now();
+    let mut detail = Vec::with_capacity(detail_ids.len());
     for id in &detail_ids {
-        detail_off.push(db.get_entity_detail_scoped(id, &scope).await.unwrap());
+        detail.push(db.get_entity_detail_scoped(id, &scope).await.unwrap());
     }
-    let detail_off_secs = t_detail_off.elapsed().as_secs_f64();
-    eprintln!(
-        "[bench §6.5 entity] OFF leg done: list={list_off_secs:.3}s detail={detail_off_secs:.3}s"
-    );
-
-    db.set_entity_reader_cutover(MemoryDB::SCOPED_ENTITIES_CONSUMER, true)
-        .await
-        .unwrap();
-    {
-        let conn = db.conn.lock().await;
-        assert!(
-            MemoryDB::reader_uses_entity_pages(&conn, MemoryDB::SCOPED_ENTITIES_CONSUMER)
-                .await
-                .unwrap(),
-            "sanity: a clean, current watermark must open the gate at scale"
-        );
-    }
-    let t_list_on = Instant::now();
-    let list_on = db.list_entities_scoped(None, &scope).await.unwrap();
-    let list_on_secs = t_list_on.elapsed().as_secs_f64();
-    let t_detail_on = Instant::now();
-    let mut detail_on = Vec::with_capacity(detail_ids.len());
-    for id in &detail_ids {
-        detail_on.push(db.get_entity_detail_scoped(id, &scope).await.unwrap());
-    }
-    let detail_on_secs = t_detail_on.elapsed().as_secs_f64();
+    let detail_secs = t_detail.elapsed().as_secs_f64();
 
     assert_eq!(
-        list_off.len(),
+        list.len(),
         ENTITIES,
         "sanity: full listing covers every seeded entity"
     );
     assert_eq!(
-        format!("{list_off:?}"),
-        format!("{list_on:?}"),
-        "flipped list_entities_scoped must be byte-identical to legacy at scale"
-    );
-    assert_eq!(
-        format!("{detail_off:?}"),
-        format!("{detail_on:?}"),
-        "flipped get_entity_detail_scoped must be byte-identical to legacy at scale"
+        detail.len(),
+        DETAIL_SAMPLE,
+        "sanity: every sampled detail id resolved"
     );
     eprintln!(
-        "[bench §6.5 entity] list_entities_scoped (full listing, n={ENTITIES}): off={list_off_secs:.3}s on={list_on_secs:.3}s"
+        "[bench §6.5 entity] list_entities_scoped (full listing, n={ENTITIES}): {list_secs:.3}s"
     );
     eprintln!(
-        "[bench §6.5 entity] get_entity_detail_scoped (n={DETAIL_SAMPLE}): off={detail_off_secs:.3}s on={detail_on_secs:.3}s"
+        "[bench §6.5 entity] get_entity_detail_scoped (n={DETAIL_SAMPLE}): {detail_secs:.3}s"
     );
 
     // ---- EXPLAIN QUERY PLAN at scale: the flipped queries must reach
@@ -45993,105 +46651,6 @@ async fn bench_reconcile_entity_page_parity_at_scale() {
     assert_eq!(
         dirty_report.drift_count, PERTURB,
         "exactly the {PERTURB} perturbed shadows must be flagged corrupt, not more or fewer"
-    );
-}
-
-/// M3 stage F acceptance-box proof: with the "scoped_entities" cutover
-/// gate OFF vs ON, `list_entities_scoped`/`get_entity_detail_scoped`
-/// results serialize to byte-identical JSON -- the actual wire shape,
-/// not just Rust `Debug` output -- proving the adapter's entity_id<->
-/// page_id translation makes no app-visible shape change. Small-scale,
-/// non-ignored sibling of `bench_reconcile_entity_page_parity_at_scale`'s
-/// ON/OFF comparison above.
-#[tokio::test]
-async fn scoped_entities_cutover_flip_is_wire_invariant() {
-    const SPACE: &str = "wire_invariance_space";
-    let (db, _dir) = test_db().await;
-    let mut entity_ids: Vec<String> = Vec::new();
-    for i in 0..5 {
-        let id = db
-            .store_entity(
-                &format!("Wire Invariance Entity {i}"),
-                "person",
-                Some(SPACE),
-                Some("test"),
-                Some(0.8),
-            )
-            .await
-            .unwrap();
-        entity_ids.push(id);
-    }
-    db.create_relation(
-        &entity_ids[0],
-        &entity_ids[1],
-        "related_to",
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    {
-        let conn = db.conn.lock().await;
-        conn.execute(
-            "INSERT INTO observations (id, entity_id, content, source_agent, confidence, confirmed, created_at) \
-             VALUES ('wire_invariance_obs', ?1, 'observed', NULL, 0.9, 1, unixepoch())",
-            libsql::params![entity_ids[0].clone()],
-        )
-        .await
-        .unwrap();
-    }
-
-    let scope = ReadScope::Space(SPACE.to_string());
-
-    db.set_entity_reader_cutover(MemoryDB::SCOPED_ENTITIES_CONSUMER, false)
-        .await
-        .unwrap();
-    let list_off = db.list_entities_scoped(None, &scope).await.unwrap();
-    let mut detail_off = Vec::with_capacity(entity_ids.len());
-    for id in &entity_ids {
-        detail_off.push(db.get_entity_detail_scoped(id, &scope).await.unwrap());
-    }
-
-    db.set_entity_reader_cutover(MemoryDB::SCOPED_ENTITIES_CONSUMER, true)
-        .await
-        .unwrap();
-    assert_eq!(
-        db.reconcile_entity_page_parity().await.unwrap().drift_count,
-        0,
-        "seed must reconcile clean before the gate can open"
-    );
-    {
-        let conn = db.conn.lock().await;
-        assert!(
-            MemoryDB::reader_uses_entity_pages(&conn, MemoryDB::SCOPED_ENTITIES_CONSUMER)
-                .await
-                .unwrap(),
-            "sanity: a clean, current watermark must open the gate"
-        );
-    }
-    let list_on = db.list_entities_scoped(None, &scope).await.unwrap();
-    let mut detail_on = Vec::with_capacity(entity_ids.len());
-    for id in &entity_ids {
-        detail_on.push(db.get_entity_detail_scoped(id, &scope).await.unwrap());
-    }
-
-    assert_eq!(list_off.len(), 5, "sanity: all seeded entities are listed");
-    assert_eq!(
-        list_off.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
-        list_on.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
-        "sanity: same entity_ids on both arms"
-    );
-    assert_eq!(
-        serde_json::to_value(&list_off).unwrap(),
-        serde_json::to_value(&list_on).unwrap(),
-        "list_entities_scoped wire shape must be byte-identical across the cutover flip"
-    );
-    assert_eq!(
-        serde_json::to_value(&detail_off).unwrap(),
-        serde_json::to_value(&detail_on).unwrap(),
-        "get_entity_detail_scoped wire shape must be byte-identical across the cutover flip"
     );
 }
 

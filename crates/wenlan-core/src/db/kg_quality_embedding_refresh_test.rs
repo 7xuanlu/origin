@@ -3,15 +3,20 @@
 use super::MemoryDB;
 
 async fn insert_entity(db: &MemoryDB, id: &str, name: &str, embedding_updated_at: Option<i64>) {
-    let conn = db.conn.lock().await;
-    conn.execute(
-        "INSERT INTO entities (
-             id, name, entity_type, created_at, updated_at, embedding_updated_at
-         ) VALUES (?1, ?2, 'test', 1, 1, ?3)",
-        libsql::params![id, name, embedding_updated_at],
-    )
-    .await
-    .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO entities (
+                 id, name, entity_type, created_at, updated_at, embedding_updated_at
+             ) VALUES (?1, ?2, 'test', 1, 1, ?3)",
+            libsql::params![id, name, embedding_updated_at],
+        )
+        .await
+        .unwrap();
+    }
+    // G6 Stage 1.5b Part 3: `stale_entity_embedding_candidates_for_refresh`
+    // now reads the shadow page, so the raw `entities` insert above needs one.
+    db.test_seed_entity_shadow_page(id).await.unwrap();
 }
 
 async fn insert_observations(db: &MemoryDB, entity_id: &str, observations: &[(i64, &str)]) {

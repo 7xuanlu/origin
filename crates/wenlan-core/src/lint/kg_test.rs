@@ -226,7 +226,7 @@ async fn seed_corrupt_graph(db: &crate::db::MemoryDB) {
     let conn = db.test_primary_session().await;
     conn.execute("PRAGMA foreign_keys = OFF", ()).await.unwrap();
     conn.execute_batch(
-        "INSERT INTO entities (id,name,entity_type,space,confidence,confirmed,created_at,updated_at) VALUES ('entity-ok','Secret Entity','concept',NULL,0.8,0,1,1),('entity-bad',' ','', 'missing-space',1.5,2,1,1);
+        "INSERT INTO entities (id,name,entity_type,space,confidence,confirmed,created_at,updated_at) VALUES ('entity-ok','Secret Entity','concept','00000000-0000-4000-8000-000000000001',0.8,0,1,1),('entity-bad',' ','', 'missing-space',1.5,2,1,1);
          INSERT INTO observations (id,entity_id,content,confidence,confirmed,created_at) VALUES ('obs-orphan','missing-id','secret observation',0.5,0,1),('obs-invalid','entity-ok',' ',2.0,2,1);
          INSERT INTO relations (id,from_entity,to_entity,relation_type,created_at) VALUES ('relation-from','missing-id','entity-ok','secret_relation',1),('relation-to','entity-ok','missing-id','secret_relation',1);
          INSERT INTO memory_entities (memory_id,entity_id) VALUES ('missing-id','entity-ok'),('memory-ok','missing-id'),('entity-ok','entity-ok');

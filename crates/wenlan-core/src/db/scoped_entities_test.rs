@@ -600,180 +600,38 @@ async fn stage_c_seed_entities(db: &super::MemoryDB) -> (String, String, String)
     (work, work_peer, uncategorized)
 }
 
-/// Flip the "scoped_entities" consumer on and prove the gate actually
-/// opened (a clean, current parity watermark), so a bug that silently
-/// leaves every fn on legacy can't pass a differential test vacuously.
-async fn stage_c_enable_cutover_clean(db: &super::MemoryDB) {
-    db.set_entity_reader_cutover(super::MemoryDB::SCOPED_ENTITIES_CONSUMER, true)
-        .await
-        .unwrap();
-    assert_eq!(
-        db.reconcile_entity_page_parity().await.unwrap().drift_count,
-        0,
-        "seed must reconcile clean before the gate can open"
-    );
-    let conn = db.conn.lock().await;
-    assert!(
-        super::MemoryDB::reader_uses_entity_pages(&conn, super::MemoryDB::SCOPED_ENTITIES_CONSUMER)
-            .await
-            .unwrap(),
-        "sanity: a clean, current watermark must open the gate"
-    );
-}
+// G6 Stage 1.5b Part 3: the `stage_c_enable_cutover_clean` helper that used
+// to flip the "scoped_entities" consumer before a differential read (proving
+// the gate actually opened) has no callers left -- every gated hybrid in
+// this file collapsed onto an unconditional hard cutover (spec item 9), so
+// there is no more gate to flip in a test. Removed rather than left dead:
+// unlike the production `reader_uses_entity_pages`/`SCOPED_ENTITIES_CONSUMER`
+// (left dead-but-present per the spec's Stage 2 retirement note), this was
+// a test-local helper with no Stage 2 obligation to keep it present.
 
-#[tokio::test]
-async fn list_entities_scoped_hybrid_matches_legacy() {
-    let (db, _tmp) = test_db().await;
-    stage_c_seed_entities(&db).await;
-    let work_scope = ReadScope::Space("stage_c_work".to_string());
+// G6 Stage 1.5b Part 3: `list_entities_scoped`/`get_entity_detail_scoped`
+// collapsed onto an unconditional hard cutover (spec item 9) -- there is no
+// more legacy/hybrid branch for these two fns to differ across, so the
+// former `*_hybrid_matches_legacy` A/B tests (which called each fn once
+// before and once after flipping the now-deleted gate check) retired as
+// vacuous: both calls run the identical code path. Coverage that these
+// readers produce correct results lives on in
+// `list_entities_scoped_distinguishes_null_from_literal_uncategorized` and
+// `get_entity_detail_scoped_requires_matching_relation_endpoints`; coverage
+// that they read the shadow page rather than legacy `entities` lives on in
+// `list_entities_scoped_reads_shadow_page_directly` and
+// `get_entity_detail_scoped_reads_shadow_page_directly` below.
 
-    let legacy_scoped = db.list_entities_scoped(None, &work_scope).await.unwrap();
-    let legacy_typed = db
-        .list_entities_scoped(Some("person"), &work_scope)
-        .await
-        .unwrap();
-    let legacy_uncategorized = db
-        .list_entities_scoped(None, &ReadScope::Uncategorized)
-        .await
-        .unwrap();
-
-    stage_c_enable_cutover_clean(&db).await;
-
-    let hybrid_scoped = db.list_entities_scoped(None, &work_scope).await.unwrap();
-    let hybrid_typed = db
-        .list_entities_scoped(Some("person"), &work_scope)
-        .await
-        .unwrap();
-    let hybrid_uncategorized = db
-        .list_entities_scoped(None, &ReadScope::Uncategorized)
-        .await
-        .unwrap();
-
-    assert_eq!(legacy_scoped.len(), 2, "sanity: two work entities seeded");
-    assert_eq!(
-        format!("{legacy_scoped:?}"),
-        format!("{hybrid_scoped:?}"),
-        "hybrid list_entities_scoped must be byte-identical to legacy"
-    );
-    assert_eq!(
-        format!("{legacy_typed:?}"),
-        format!("{hybrid_typed:?}"),
-        "hybrid list_entities_scoped (entity_type filter) must be byte-identical to legacy"
-    );
-    assert_eq!(
-        format!("{legacy_uncategorized:?}"),
-        format!("{hybrid_uncategorized:?}"),
-        "hybrid list_entities_scoped (Uncategorized) must be byte-identical to legacy"
-    );
-}
-
-#[tokio::test]
-async fn get_entity_detail_scoped_hybrid_matches_legacy() {
-    let (db, _tmp) = test_db().await;
-    let (work, work_peer, _uncategorized) = stage_c_seed_entities(&db).await;
-    let personal = db
-        .store_entity(
-            "Stage C Personal",
-            "person",
-            Some("stage_c_personal"),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    db.create_relation(&work, &work_peer, "related_to", None, None, None, None)
-        .await
-        .unwrap();
-    db.create_relation(&work, &personal, "related_to", None, None, None, None)
-        .await
-        .unwrap();
-    {
-        let conn = db.conn.lock().await;
-        conn.execute(
-            "INSERT INTO observations (id, entity_id, content, source_agent, confidence, confirmed, created_at) \
-             VALUES ('stage_c_obs_1', ?1, 'confirmed observation', NULL, 0.9, 1, unixepoch())",
-            libsql::params![work.clone()],
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "INSERT INTO observations (id, entity_id, content, source_agent, confidence, confirmed, created_at) \
-             VALUES ('stage_c_obs_2', ?1, 'unconfirmed observation', NULL, NULL, 0, unixepoch())",
-            libsql::params![work.clone()],
-        )
-        .await
-        .unwrap();
-    }
-
-    let scope = ReadScope::Space("stage_c_work".to_string());
-    let legacy = db.get_entity_detail_scoped(&work, &scope).await.unwrap();
-
-    stage_c_enable_cutover_clean(&db).await;
-
-    let hybrid = db.get_entity_detail_scoped(&work, &scope).await.unwrap();
-
-    assert_eq!(
-        legacy.observations.len(),
-        2,
-        "sanity: two observations seeded"
-    );
-    assert_eq!(
-        legacy.relations.len(),
-        1,
-        "sanity: only the in-scope relation is visible"
-    );
-    assert_eq!(
-        format!("{legacy:?}"),
-        format!("{hybrid:?}"),
-        "hybrid get_entity_detail_scoped must be byte-identical to legacy"
-    );
-}
-
-#[tokio::test]
-async fn list_recent_relations_scoped_hybrid_matches_legacy() {
-    let (db, _tmp) = test_db().await;
-    let (work, work_peer, _uncategorized) = stage_c_seed_entities(&db).await;
-    let personal = db
-        .store_entity(
-            "Stage C Personal Relation",
-            "person",
-            Some("stage_c_personal"),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    db.create_relation(&work, &work_peer, "related_to", None, None, None, None)
-        .await
-        .unwrap();
-    db.create_relation(&work, &personal, "related_to", None, None, None, None)
-        .await
-        .unwrap();
-
-    let scope = ReadScope::Space("stage_c_work".to_string());
-    let legacy = db
-        .list_recent_relations_scoped(20, None, &scope)
-        .await
-        .unwrap();
-
-    stage_c_enable_cutover_clean(&db).await;
-
-    let hybrid = db
-        .list_recent_relations_scoped(20, None, &scope)
-        .await
-        .unwrap();
-
-    assert_eq!(
-        legacy.len(),
-        1,
-        "sanity: only the in-scope relation is visible"
-    );
-    assert_eq!(
-        format!("{legacy:?}"),
-        format!("{hybrid:?}"),
-        "hybrid list_recent_relations_scoped must be byte-identical to legacy"
-    );
-}
+// G6 Stage 1.5b Part 3: `list_recent_relations_scoped` collapsed onto an
+// unconditional hard cutover (spec item 9) and its join was structurally
+// rebuilt on shadow pages (spec item 7), so there is no more legacy/hybrid
+// branch for it to differ across -- the former `*_hybrid_matches_legacy` A/B
+// test (which called the fn once before and once after flipping the
+// now-deleted gate check) retired as vacuous: both calls run the identical
+// code path. Coverage that this reader produces correct results lives on in
+// `get_entity_detail_scoped_and_list_recent_relations_scoped_read_edges`
+// below; coverage that it reads the shadow page rather than legacy
+// `entities` lives on in `list_recent_relations_scoped_reads_shadow_page_directly`.
 
 /// G6 Stage 1.2 (relations-readers migration,
 /// docs/plans/2026-08-05-g6-stage12-relations-readers-spec.md): the scoped
@@ -848,110 +706,25 @@ async fn get_entity_detail_scoped_and_list_recent_relations_scoped_read_edges() 
     );
 }
 
-#[tokio::test]
-async fn search_entities_by_vector_scoped_hybrid_matches_legacy() {
-    let (db, _tmp) = test_db().await;
-    let work_id = db
-        .store_entity(
-            "Stage C Vector Work",
-            "project",
-            Some("stage_c_vec_work"),
-            None,
-            Some(0.9),
-        )
-        .await
-        .unwrap();
-    db.confirm_entity(&work_id, true).await.unwrap();
-    db.store_entity(
-        "Stage C Vector Personal",
-        "project",
-        Some("stage_c_vec_personal"),
-        None,
-        Some(0.9),
-    )
-    .await
-    .unwrap();
+// G6 Stage 1.5b Part 3: `search_entities_by_vector_scoped`'s hydration
+// overlay collapsed onto an unconditional run (spec item 9) -- there is no
+// more legacy/hybrid branch for it to differ across, so the former
+// `*_hybrid_matches_legacy` A/B test (which called the fn once before and
+// once after flipping the now-deleted gate check) retired as vacuous: both
+// calls run the identical code path. Coverage that the overlay reads the
+// shadow page rather than legacy `entities` lives on in
+// `search_entities_by_vector_scoped_reads_shadow_page_directly` above.
 
-    let scope = ReadScope::Space("stage_c_vec_work".to_string());
-    let legacy = db
-        .search_entities_by_vector_scoped("stage c vector query", 5, &scope)
-        .await
-        .unwrap();
-
-    stage_c_enable_cutover_clean(&db).await;
-
-    let hybrid = db
-        .search_entities_by_vector_scoped("stage c vector query", 5, &scope)
-        .await
-        .unwrap();
-
-    assert_eq!(
-        legacy.len(),
-        1,
-        "sanity: only the in-scope entity is visible"
-    );
-    assert_eq!(legacy[0].entity.id, work_id);
-    assert_eq!(
-        format!("{legacy:?}"),
-        format!("{hybrid:?}"),
-        "hybrid search_entities_by_vector_scoped must be byte-identical to legacy"
-    );
-}
-
-/// THE gate-closure test (one, not per-fn, per the stage-c contract):
-/// corrupting a shadow and re-reconciling makes the watermark dirty, so
-/// the reader must transparently fall back to legacy even though the
-/// consumer is still enabled. Mirrors stage b's
-/// `entity_reader_gate_blocked_by_nonzero_drift`; `list_entities_scoped`
-/// stands in as the representative fn.
-#[tokio::test]
-async fn scoped_entities_gate_closes_on_drift_serves_legacy_transparently() {
-    let (db, _tmp) = test_db().await;
-    let entity_id = db
-        .store_entity(
-            "Stage C Drift",
-            "person",
-            Some("stage_c_drift"),
-            None,
-            Some(0.9),
-        )
-        .await
-        .unwrap();
-    stage_c_enable_cutover_clean(&db).await;
-
-    let scope = ReadScope::Space("stage_c_drift".to_string());
-    let clean_hybrid = db.list_entities_scoped(None, &scope).await.unwrap();
-    assert_eq!(clean_hybrid.len(), 1);
-    assert_eq!(clean_hybrid[0].entity_type, "person");
-
-    {
-        let conn = db.conn.lock().await;
-        conn.execute(
-            "UPDATE pages SET entity_type = 'organization' \
-             WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
-            libsql::params![entity_id.clone()],
-        )
-        .await
-        .unwrap();
-    }
-    let report = db.reconcile_entity_page_parity().await.unwrap();
-    assert!(
-        report.drift_count >= 1,
-        "sanity: reconcile must see the drift"
-    );
-
-    let gated = db.list_entities_scoped(None, &scope).await.unwrap();
-    assert_eq!(
-        gated.len(),
-        1,
-        "the entity must still be visible via the legacy fallback"
-    );
-    assert_eq!(
-        gated[0].entity_type, "person",
-        "a dirty watermark must transparently serve the uncorrupted legacy \
-         value, not the drifted shadow"
-    );
-}
+// G6 Stage 1.5b Part 3: the former "THE gate-closure test (one, not per-fn)"
+// used `list_entities_scoped` as its representative fn -- that fn collapsed
+// onto an unconditional hard cutover (spec item 9) and no longer falls back
+// to legacy on drift, so it can no longer stand in for the gate-closure
+// contract. The underlying `reader_uses_entity_pages` predicate is still
+// covered directly by `entity_reader_gate_blocked_by_nonzero_drift`
+// (main_tests.rs); `search_entities_by_vector_scoped` collapsed alongside
+// it (spec item 9), so `list_recent_relations_scoped` (target #7's
+// structural rework) is now the gate's only remaining scoped_entities.rs
+// consumer, and keeps its own fallback coverage below.
 
 async fn stage_c_query_plan_detail(conn: &libsql::Connection, sql: &str) -> String {
     let mut rows = conn
@@ -966,27 +739,25 @@ async fn stage_c_query_plan_detail(conn: &libsql::Connection, sql: &str) -> Stri
     details.join(" | ")
 }
 
-/// `list_entities_scoped`'s flipped query must reach the shadow page
-/// through the `entity_page_map` UNIQUE index / pages PK, never a bare
-/// `SCAN pages`.
+/// `list_entities_scoped`'s query must reach the shadow page through the
+/// `entity_page_map` UNIQUE index / pages PK, never a bare `SCAN pages`.
 #[tokio::test]
 async fn list_entities_scoped_flipped_query_uses_index_not_pages_scan() {
     let (db, _tmp) = test_db().await;
     stage_c_seed_entities(&db).await;
-    stage_c_enable_cutover_clean(&db).await;
 
     let conn = db.conn.lock().await;
-    // Mirrors exactly the flipped SELECT `list_entities_scoped` builds
-    // once `reader_uses_entity_pages` is true (Space scope, no
+    // Mirrors exactly the SELECT `list_entities_scoped` builds (G6 Stage
+    // 1.5b Part 3: unconditional hard cutover, Space scope, no
     // entity_type filter).
     let plan = stage_c_query_plan_detail(
         &conn,
-        "SELECT e.id, p.title, p.entity_type, e.space, e.source_agent, p.confidence, \
-                p.entity_confirmed, e.created_at, e.updated_at \
-         FROM entities e \
-         JOIN entity_page_map m ON m.entity_id = e.id \
-         JOIN pages p ON p.id = m.page_id AND p.kind = 'entity' AND p.status = 'active' \
-         WHERE e.space = 'stage_c_work' ORDER BY e.updated_at DESC, e.id ASC",
+        "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, \
+                p.entity_confirmed, p.entity_created_at, p.entity_updated_at \
+         FROM entity_page_map epm \
+         JOIN pages p ON p.id = epm.page_id \
+         WHERE p.kind = 'entity' AND p.status = 'active' AND p.space = 'stage_c_work' \
+         ORDER BY p.entity_updated_at DESC, epm.entity_id ASC",
     )
     .await;
 
@@ -1008,148 +779,24 @@ async fn list_entities_scoped_flipped_query_uses_index_not_pages_scan() {
 
 // ===== M3 PR-2 stage f: tie-safe flipped reads (Sol review fix 3+4) =====
 //
-// `list_recent_relations_scoped` and `search_entities_by_vector_scoped` no
-// longer run a divergent flipped SQL arm; the flipped path replays the
-// EXACT legacy selection query, then overlays only the mirrored fields via
-// a second hydration query keyed on the selected rows' entity ids. Row set
-// and order are therefore identical to legacy by construction -- including
-// ties -- rather than by discipline between two hand-maintained queries.
+// G6 Stage 1.5b Part 3: both `list_recent_relations_scoped` and
+// `search_entities_by_vector_scoped` collapsed onto an unconditional hard
+// cutover (spec item 9), so the `*_tie_heavy_selection_matches_legacy` A/B
+// tests that used to live here (proving the tied LIMIT boundary lands the
+// same row set/order OFF vs ON) retired as vacuous for the same reason as
+// the `*_hybrid_matches_legacy` tests above: there is only one code path
+// left to run, twice, against itself. Neither fn's `ORDER BY` clause
+// changed in this migration (still an untiebroken `DESC LIMIT`), so no
+// stability coverage was lost -- SQLite's own tie-break determinism for a
+// fixed query plan is not a G6 concern.
 
-/// Tie-heavy differential: more relations than the LIMIT, all sharing one
-/// `created_at`, so the un-tiebroken `ORDER BY r.created_at DESC LIMIT ?2`
-/// can only stay stable OFF vs ON if both arms run the identical query.
+/// Positive control (G6 Stage 1.5b Part 3): mutating a shadow page's title
+/// directly (without touching `entities`) must be visible through
+/// `list_entities_scoped`, proving the unconditional hard cutover reads the
+/// mirror -- not legacy `entities.name` -- since there is no flip left to
+/// stamp a watermark under.
 #[tokio::test]
-async fn list_recent_relations_scoped_tie_heavy_selection_matches_legacy() {
-    let (db, _tmp) = test_db().await;
-    let scope = ReadScope::Space("stage_f_tie_relations".to_string());
-    for index in 0..6 {
-        let from = db
-            .store_entity(
-                &format!("Tie From {index}"),
-                "person",
-                Some("stage_f_tie_relations"),
-                None,
-                Some(0.9),
-            )
-            .await
-            .unwrap();
-        let to = db
-            .store_entity(
-                &format!("Tie To {index}"),
-                "person",
-                Some("stage_f_tie_relations"),
-                None,
-                Some(0.9),
-            )
-            .await
-            .unwrap();
-        db.create_relation(&from, &to, "related_to", None, None, None, None)
-            .await
-            .unwrap();
-    }
-    {
-        // Force an exact tie on created_at so the LIMIT boundary is decided
-        // by the query plan alone, not wall-clock insertion order.
-        let conn = db.conn.lock().await;
-        conn.execute("UPDATE relations SET created_at = 1000", ())
-            .await
-            .unwrap();
-    }
-
-    let legacy = db
-        .list_recent_relations_scoped(3, None, &scope)
-        .await
-        .unwrap();
-    assert_eq!(legacy.len(), 3, "sanity: LIMIT applies under the tie");
-
-    stage_c_enable_cutover_clean(&db).await;
-
-    let hybrid_first = db
-        .list_recent_relations_scoped(3, None, &scope)
-        .await
-        .unwrap();
-    let hybrid_second = db
-        .list_recent_relations_scoped(3, None, &scope)
-        .await
-        .unwrap();
-    assert_eq!(
-        format!("{legacy:?}"),
-        format!("{hybrid_first:?}"),
-        "tied created_at must select and order the identical row set OFF vs ON"
-    );
-    assert_eq!(
-        format!("{legacy:?}"),
-        format!("{hybrid_second:?}"),
-        "the tied row set/order must stay stable across repeated ON calls"
-    );
-}
-
-/// Tie-heavy differential: more in-scope entities than the LIMIT, all with
-/// a byte-identical embedding, so `ORDER BY distance ASC LIMIT ?2` ties on
-/// every row unless both arms run the identical ANN query.
-#[tokio::test]
-async fn search_entities_by_vector_scoped_tie_heavy_selection_matches_legacy() {
-    let (db, _tmp) = test_db().await;
-    let scope = ReadScope::Space("stage_f_tie_vector".to_string());
-    let mut ids = Vec::new();
-    for index in 0..6 {
-        ids.push(
-            db.store_entity(
-                &format!("Tie Vector {index}"),
-                "project",
-                Some("stage_f_tie_vector"),
-                None,
-                Some(0.9),
-            )
-            .await
-            .unwrap(),
-        );
-    }
-    // `refresh_entity_embedding` re-derives the embedding from `text` and
-    // re-syncs the shadow page in the same transaction (see
-    // `refresh_entity_embedding_syncs_shadow_embedding`), so every row gets
-    // a byte-identical embedding on BOTH sides and still reconciles clean.
-    for id in &ids {
-        db.refresh_entity_embedding(id, "tie vector anchor")
-            .await
-            .unwrap();
-    }
-
-    let legacy = db
-        .search_entities_by_vector_scoped("tie vector anchor", 3, &scope)
-        .await
-        .unwrap();
-    assert_eq!(legacy.len(), 3, "sanity: LIMIT applies under the tie");
-
-    stage_c_enable_cutover_clean(&db).await;
-
-    let hybrid_first = db
-        .search_entities_by_vector_scoped("tie vector anchor", 3, &scope)
-        .await
-        .unwrap();
-    let hybrid_second = db
-        .search_entities_by_vector_scoped("tie vector anchor", 3, &scope)
-        .await
-        .unwrap();
-    assert_eq!(
-        format!("{legacy:?}"),
-        format!("{hybrid_first:?}"),
-        "tied distances must select and order the identical row set OFF vs ON"
-    );
-    assert_eq!(
-        format!("{legacy:?}"),
-        format!("{hybrid_second:?}"),
-        "the tied row set/order must stay stable across repeated ON calls"
-    );
-}
-
-/// Positive control (review finding 6): stamping a clean watermark, then
-/// mutating a shadow page's title WITHOUT re-reconciling, must be visible
-/// through the flipped read -- proving `list_entities_scoped` reads
-/// through the mirror live, not silently through legacy. Re-reconciling
-/// (drift > 0) must fall back to legacy again.
-#[tokio::test]
-async fn list_entities_scoped_flip_serves_unreconciled_shadow_mutation() {
+async fn list_entities_scoped_reads_shadow_page_directly() {
     let (db, _tmp) = test_db().await;
     let entity_id = db
         .store_entity(
@@ -1161,7 +808,6 @@ async fn list_entities_scoped_flip_serves_unreconciled_shadow_mutation() {
         )
         .await
         .unwrap();
-    stage_c_enable_cutover_clean(&db).await;
     let scope = ReadScope::Space("stage_f_list_live".to_string());
 
     {
@@ -1175,30 +821,18 @@ async fn list_entities_scoped_flip_serves_unreconciled_shadow_mutation() {
         .unwrap();
     }
 
-    let live = db.list_entities_scoped(None, &scope).await.unwrap();
-    assert_eq!(live.len(), 1);
+    let entities = db.list_entities_scoped(None, &scope).await.unwrap();
+    assert_eq!(entities.len(), 1);
     assert_eq!(
-        live[0].name, "Mutated List Title",
-        "flipped read must serve the live shadow mutation before re-reconcile"
-    );
-
-    let report = db.reconcile_entity_page_parity().await.unwrap();
-    assert!(
-        report.drift_count >= 1,
-        "sanity: reconcile must see the drift"
-    );
-
-    let after = db.list_entities_scoped(None, &scope).await.unwrap();
-    assert_eq!(
-        after[0].name, "Stage F List Live",
-        "a dirty watermark must serve legacy again"
+        entities[0].name, "Mutated List Title",
+        "list_entities_scoped must read the shadow page's title, not legacy entities.name"
     );
 }
 
-/// Positive control for the other UNTOUCHED fn: same pattern as above, for
+/// Positive control for the other migrated fn: same pattern as above, for
 /// `get_entity_detail_scoped`'s primary entity row.
 #[tokio::test]
-async fn get_entity_detail_scoped_flip_serves_unreconciled_shadow_mutation() {
+async fn get_entity_detail_scoped_reads_shadow_page_directly() {
     let (db, _tmp) = test_db().await;
     let entity_id = db
         .store_entity(
@@ -1210,7 +844,6 @@ async fn get_entity_detail_scoped_flip_serves_unreconciled_shadow_mutation() {
         )
         .await
         .unwrap();
-    stage_c_enable_cutover_clean(&db).await;
     let scope = ReadScope::Space("stage_f_detail_live".to_string());
 
     {
@@ -1224,36 +857,26 @@ async fn get_entity_detail_scoped_flip_serves_unreconciled_shadow_mutation() {
         .unwrap();
     }
 
-    let live = db
+    let detail = db
         .get_entity_detail_scoped(&entity_id, &scope)
         .await
         .unwrap();
     assert_eq!(
-        live.entity.name, "Mutated Detail Title",
-        "flipped read must serve the live shadow mutation before re-reconcile"
-    );
-
-    let report = db.reconcile_entity_page_parity().await.unwrap();
-    assert!(
-        report.drift_count >= 1,
-        "sanity: reconcile must see the drift"
-    );
-
-    let after = db
-        .get_entity_detail_scoped(&entity_id, &scope)
-        .await
-        .unwrap();
-    assert_eq!(
-        after.entity.name, "Stage F Detail Live",
-        "a dirty watermark must serve legacy again"
+        detail.entity.name, "Mutated Detail Title",
+        "get_entity_detail_scoped must read the shadow page's title, not legacy entities.name"
     );
 }
 
-/// Positive control for the RESTRUCTURED relations fn: proves the
-/// hydration overlay reads live shadow state (before re-reconcile), not a
-/// cached value, and falls back to legacy once the watermark goes dirty.
+/// Positive control (G6 Stage 1.5b Part 3): mutating a shadow page's title
+/// directly (without touching `entities`) must be visible through
+/// `list_recent_relations_scoped`, proving the rebuilt join (spec item 7)
+/// reads the mirror -- not legacy `entities.name` -- since there is no flip
+/// left to stamp a watermark under. The former second half of this test
+/// (re-reconcile, then assert a dirty watermark falls back to the legacy
+/// name) no longer holds: the join has no legacy branch left to fall back
+/// to, so that assertion would now be simply wrong, not merely untested.
 #[tokio::test]
-async fn list_recent_relations_scoped_flip_serves_unreconciled_shadow_mutation() {
+async fn list_recent_relations_scoped_reads_shadow_page_directly() {
     let (db, _tmp) = test_db().await;
     let from = db
         .store_entity(
@@ -1278,7 +901,6 @@ async fn list_recent_relations_scoped_flip_serves_unreconciled_shadow_mutation()
     db.create_relation(&from, &to, "related_to", None, None, None, None)
         .await
         .unwrap();
-    stage_c_enable_cutover_clean(&db).await;
     let scope = ReadScope::Space("stage_f_relation_live".to_string());
 
     {
@@ -1299,32 +921,17 @@ async fn list_recent_relations_scoped_flip_serves_unreconciled_shadow_mutation()
     assert_eq!(live.len(), 1);
     assert_eq!(
         live[0].from_entity_name, "Mutated From Title",
-        "the hydration overlay must serve the live shadow mutation before re-reconcile"
+        "list_recent_relations_scoped must read the shadow page's title, not legacy entities.name"
     );
     assert_eq!(live[0].to_entity_name, "Stage F Relation To");
-
-    let report = db.reconcile_entity_page_parity().await.unwrap();
-    assert!(
-        report.drift_count >= 1,
-        "sanity: reconcile must see the drift"
-    );
-
-    let after = db
-        .list_recent_relations_scoped(20, None, &scope)
-        .await
-        .unwrap();
-    assert_eq!(
-        after[0].from_entity_name, "Stage F Relation From",
-        "a dirty watermark must fall back to legacy for the overlay too"
-    );
 }
 
-/// Positive control for the RESTRUCTURED vector fn: proves the hydration
-/// overlay reads live shadow state for every mirrored field
-/// (name/entity_type/confidence/confirmed) before re-reconcile, and falls
-/// back to legacy once the watermark goes dirty.
+/// Positive control: proves the hydration overlay reads live shadow state
+/// for every mirrored field (name/entity_type/confidence/confirmed)
+/// unconditionally (G6 Stage 1.5b Part 3 collapsed the gate this overlay
+/// used to sit behind -- spec item 9).
 #[tokio::test]
-async fn search_entities_by_vector_scoped_flip_serves_unreconciled_shadow_mutation() {
+async fn search_entities_by_vector_scoped_reads_shadow_page_directly() {
     let (db, _tmp) = test_db().await;
     let entity_id = db
         .store_entity(
@@ -1336,7 +943,6 @@ async fn search_entities_by_vector_scoped_flip_serves_unreconciled_shadow_mutati
         )
         .await
         .unwrap();
-    stage_c_enable_cutover_clean(&db).await;
     let scope = ReadScope::Space("stage_f_vector_live".to_string());
 
     {
@@ -1351,28 +957,13 @@ async fn search_entities_by_vector_scoped_flip_serves_unreconciled_shadow_mutati
         .unwrap();
     }
 
-    let live = db
+    let results = db
         .search_entities_by_vector_scoped("stage f vector live query", 5, &scope)
         .await
         .unwrap();
-    assert_eq!(live.len(), 1);
-    assert_eq!(live[0].entity.name, "Mutated Vector Title");
-    assert_eq!(live[0].entity.entity_type, "organization");
-    assert_eq!(live[0].entity.confidence, Some(0.75));
-    assert!(live[0].entity.confirmed);
-
-    let report = db.reconcile_entity_page_parity().await.unwrap();
-    assert!(
-        report.drift_count >= 1,
-        "sanity: reconcile must see the drift"
-    );
-
-    let after = db
-        .search_entities_by_vector_scoped("stage f vector live query", 5, &scope)
-        .await
-        .unwrap();
-    assert_eq!(after[0].entity.name, "Stage F Vector Live");
-    assert_eq!(after[0].entity.entity_type, "project");
-    assert_eq!(after[0].entity.confidence, Some(0.5));
-    assert!(!after[0].entity.confirmed);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].entity.name, "Mutated Vector Title");
+    assert_eq!(results[0].entity.entity_type, "organization");
+    assert_eq!(results[0].entity.confidence, Some(0.75));
+    assert!(results[0].entity.confirmed);
 }
