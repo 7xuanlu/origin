@@ -1248,7 +1248,7 @@ mod tests {
 
     #[tokio::test]
     async fn backlog_edge_promotes_by_entailment_only() {
-        // payload NULL (§4.2): no span gate, entailment-only path.
+        // No captured span (§4.2): no span gate, entailment-only path.
         let (db, _dir) = crate::db::tests::test_db().await;
         let content = "Alice works on ProjectX per the charter.";
         seed_folder_memory(&db, "doc_1", content, "space_a").await;
@@ -1258,9 +1258,17 @@ mod tests {
             content,
         )
         .await;
-        // Confirm the seeded edge really has no payload span.
+        // Confirm the seeded edge really has no payload span. G6 Stage 1
+        // made payload carry semantic keys at birth, so "backlog" means no
+        // `span` key — not a NULL payload.
         let pre = db.edge_snapshot_for_test(&edge_id).await.unwrap();
-        assert!(pre["payload"].is_null(), "backlog edge starts payload NULL");
+        let pre_span_absent = match pre["payload"].as_str() {
+            None => true,
+            Some(raw) => serde_json::from_str::<serde_json::Value>(raw)
+                .map(|p| p.get("span").is_none())
+                .unwrap_or(false),
+        };
+        assert!(pre_span_absent, "backlog edge starts with no captured span");
 
         let (_p, llm) = scripted(&[], 0.9);
         let report = run_edge_grounding_tick(&db, &llm, &PromptRegistry::default())
