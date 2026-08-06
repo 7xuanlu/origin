@@ -808,7 +808,7 @@ pub const EMBEDDING_DIM: usize = 768;
 /// `embedding_updated_at` (G6 Stage 1.5b Part 1). Migration 118 folds NULL
 /// `entities.space` -> `UNFILED_SPACE_ID` and stamps NOT NULL DEFAULT (G6
 /// Stage 1.5b Part 2).
-pub const SCHEMA_VERSION: u32 = 118;
+pub const SCHEMA_VERSION: u32 = 119;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8691,6 +8691,17 @@ impl MemoryDB {
             if version < 118 {
                 self.migrate_118_entity_space_fold(version).await?;
             }
+
+            // Migration 119 (G6 edges-parity repair): reactivates every
+            // retired, non-superseded `cites` edge whose derived active
+            // `page_evidence` backing still exists -- repairs the damage
+            // from the over-retire (`replace_source_page_inner`) and
+            // kind-derivation (page_sources contributor/backfill) defects
+            // fixed in this same PR. No edge is minted. See
+            // migrate_119_edges_reactivate_backed.
+            if version < 119 {
+                self.migrate_119_edges_reactivate_backed(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -13938,6 +13949,98 @@ impl MemoryDB {
         log::info!(
             "[migration] Migration 118 applied: entities.space unfiled fold + NOT NULL (G6 Stage 1.5b Part 2)"
         );
+        Ok(())
+    }
+
+    /// Migration 119 (G6 edges-parity repair): reactivate every retired,
+    /// non-superseded `cites` edge whose derived active `page_evidence`
+    /// backing still exists. Two defects fixed earlier in this same PR
+    /// over-retired live edges -- `replace_source_page_inner`'s over-retire
+    /// of carried-over evidence, and the `page_sources` contributor/backfill
+    /// kind-derivation disagreement with the live writer -- so a repair,
+    /// not just the forward fix, is needed to un-stick already-damaged
+    /// databases. Reactivate-only: for each `page_evidence` row the
+    /// derived `edge_id` is recomputed with the same kind-resolution rule
+    /// the live writer uses, and `valid_until` is cleared iff the edge
+    /// exists retired-and-not-superseded. No edge is minted, so a database
+    /// with no legacy backing for a given locator is left untouched.
+    /// Idempotent: a second run's UPDATE matches zero rows.
+    async fn migrate_119_edges_reactivate_backed(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(119, prior_version).await?;
+        let conn = self.conn.lock().await;
+
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m119 begin: {e}")))?;
+
+        let result: Result<u64, WenlanError> = async {
+            let mut rows = conn
+                .query(
+                    "SELECT page_id, source_kind, locator FROM page_evidence \
+                     WHERE locator IS NOT NULL",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m119 select page_evidence: {e}")))?;
+            let mut evidence: Vec<(String, String, String)> = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m119 page_evidence row: {e}")))?
+            {
+                evidence.push((
+                    row.get::<String>(0).unwrap_or_default(),
+                    row.get::<String>(1).unwrap_or_default(),
+                    row.get::<String>(2).unwrap_or_default(),
+                ));
+            }
+            drop(rows);
+
+            let mut reactivated = 0u64;
+            for (page_id, source_kind, locator) in evidence {
+                let dst_kind = if source_kind == "memory" {
+                    "memory"
+                } else {
+                    "external"
+                };
+                let edge_id = crate::provenance::compute_edge_id(
+                    "cites", "page", &page_id, dst_kind, &locator, &locator,
+                );
+                let affected = conn
+                    .execute(
+                        "UPDATE edges SET valid_until = NULL \
+                         WHERE edge_id = ?1 AND valid_until IS NOT NULL \
+                           AND superseded_by IS NULL",
+                        libsql::params![edge_id],
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m119 reactivate: {e}")))?;
+                reactivated += affected;
+            }
+            Ok(reactivated)
+        }
+        .await;
+
+        let reactivated = match result {
+            Ok(count) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m119 commit: {e}")))?;
+                count
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+
+        conn.execute("PRAGMA user_version = 119", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m119 bump: {e}")))?;
+        log::info!("[migration] Migration 119 applied: {reactivated} cites edge(s) reactivated");
         Ok(())
     }
 
@@ -19250,8 +19353,12 @@ impl MemoryDB {
             contributed.insert("relations".to_string(), n);
         }
 
-        // page_sources -> cites (page->memory, discriminator memory_source_id).
-        // Mirrors backfill_edges_from_page_sources: every row, none skipped.
+        // page_sources -> cites (page->memory|external, discriminator
+        // memory_source_id). Mirrors backfill_edges_from_page_sources:
+        // every row, none skipped; dst_kind resolved via the same shared
+        // rule insert_resolved_page_evidence uses (G6 edges-parity repair
+        // fix a), not hard-coded, so a folder-doc source page's expected id
+        // agrees with what the live writer minted.
         {
             let mut n = 0u64;
             let mut rows = conn
@@ -19265,8 +19372,19 @@ impl MemoryDB {
             {
                 let page_id: String = row.get(0).unwrap_or_default();
                 let msid: String = row.get(1).unwrap_or_default();
+                let source_kind =
+                    Self::resolve_one_source_kind(&conn, &msid)
+                        .await
+                        .map_err(|e| {
+                            WenlanError::VectorDb(format!("reconcile page_sources kind: {e}"))
+                        })?;
+                let dst_kind = if source_kind == "memory" {
+                    "memory"
+                } else {
+                    "external"
+                };
                 let id = crate::provenance::compute_edge_id(
-                    "cites", "page", &page_id, "memory", &msid, &msid,
+                    "cites", "page", &page_id, dst_kind, &msid, &msid,
                 );
                 expected.insert(
                     id,
@@ -19274,7 +19392,7 @@ impl MemoryDB {
                         "cites".into(),
                         "page".into(),
                         page_id,
-                        "memory".into(),
+                        dst_kind.into(),
                         msid,
                     ),
                 );
@@ -20667,12 +20785,24 @@ impl MemoryDB {
                 counts.unknown_inserted += 1;
                 "legacy"
             };
+            // dst_kind resolved via the same shared rule
+            // insert_resolved_page_evidence uses (G6 edges-parity repair fix
+            // a), not hard-coded, so a folder-doc source's backfilled edge
+            // agrees with what a live re-enrichment would mint.
+            let source_kind = Self::resolve_one_source_kind(conn, &memory_source_id)
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m81 page_sources kind: {e}")))?;
+            let dst_kind = if source_kind == "memory" {
+                "memory"
+            } else {
+                "external"
+            };
             Self::insert_backfilled_edge(
                 conn,
                 "cites",
                 "page",
                 &page_id,
-                "memory",
+                dst_kind,
                 &memory_source_id,
                 &memory_source_id,
                 lineage,
@@ -45157,8 +45287,13 @@ impl MemoryDB {
             // DELETEs below un-imply so their canonical cites edges retire in
             // this transaction (the pages UPDATE above already NULLed
             // `citations`, so a removed row keeps no legacy backing). Kept
-            // memory sids re-assert through `insert_resolved_page_evidence`'s
-            // dual-write.
+            // sids re-assert through `insert_resolved_page_evidence`'s
+            // dual-write, so the subtraction below (old set minus new set)
+            // must resolve kinds via the SAME shared rule
+            // (`resolve_one_source_kind`) on both sides -- G6 edges-parity
+            // repair fix b: a carried-over external-kind locator (folder-doc
+            // source) must not survive as a phantom `memory`-kind entry that
+            // the subtraction never matches.
             let mut removed: std::collections::BTreeSet<(String, String)> = Default::default();
             let mut sid_rows = conn
                 .query(
@@ -45169,17 +45304,28 @@ impl MemoryDB {
                 .map_err(|e| {
                     WenlanError::VectorDb(format!("replace_source_page removed scan: {e}"))
                 })?;
+            let mut old_sids: Vec<String> = Vec::new();
             while let Some(row) = sid_rows
                 .next()
                 .await
                 .map_err(|e| WenlanError::VectorDb(e.to_string()))?
             {
-                removed.insert((
-                    "memory".to_string(),
-                    row.get::<String>(0).unwrap_or_default(),
-                ));
+                old_sids.push(row.get::<String>(0).unwrap_or_default());
             }
             drop(sid_rows);
+            for sid in &old_sids {
+                let kind = Self::resolve_one_source_kind(&conn, sid)
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("replace_source_page kind resolve: {e}"))
+                    })?;
+                let dst = if kind == "memory" {
+                    "memory"
+                } else {
+                    "external"
+                };
+                removed.insert((dst.to_string(), sid.clone()));
+            }
             let mut ev_rows = conn
                 .query(
                     "SELECT source_kind, locator FROM page_evidence \
@@ -45205,7 +45351,43 @@ impl MemoryDB {
             }
             drop(ev_rows);
             for sid in source_memory_ids {
-                removed.remove(&("memory".to_string(), (*sid).to_string()));
+                let kind = Self::resolve_one_source_kind(&conn, sid)
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("replace_source_page kind resolve: {e}"))
+                    })?;
+                let dst = if kind == "memory" {
+                    "memory"
+                } else {
+                    "external"
+                };
+                removed.remove(&(dst.to_string(), (*sid).to_string()));
+            }
+            // Retire BEFORE the evidence insert below (mirrors
+            // `try_update_page_content`'s shape) so a carried-over locator is
+            // never re-asserted then immediately killed in the same
+            // transaction. The `cites_backed_by_page_citations` guard below
+            // is kept as a defensive mirror of the sibling shape, but it can
+            // never actually fire on this path: it matches `source_kind =
+            // 'memory'` only, and the pages UPDATE earlier in this same
+            // transaction already NULLs `citations` (F2, review round 13).
+            for (dst_kind, locator) in &removed {
+                if Self::cites_backed_by_page_citations(&conn, id, locator)
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("replace_source_page citations check: {e}"))
+                    })?
+                {
+                    continue;
+                }
+                let edge_id = crate::provenance::compute_edge_id(
+                    "cites", "page", id, dst_kind, locator, locator,
+                );
+                Self::dual_write_invalidate_edge(&conn, &edge_id, None)
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("replace_source_page retire edge: {e}"))
+                    })?;
             }
             conn.execute(
                 "DELETE FROM page_sources WHERE page_id=?1",
@@ -45236,16 +45418,6 @@ impl MemoryDB {
                 .map_err(|e| {
                     WenlanError::VectorDb(format!("replace_source_page evidence insert: {e}"))
                 })?;
-            for (dst_kind, locator) in &removed {
-                let edge_id = crate::provenance::compute_edge_id(
-                    "cites", "page", id, dst_kind, locator, locator,
-                );
-                Self::dual_write_invalidate_edge(&conn, &edge_id, None)
-                    .await
-                    .map_err(|e| {
-                        WenlanError::VectorDb(format!("replace_source_page retire edge: {e}"))
-                    })?;
-            }
             // Same transaction as the version bump above: a re-enriched source
             // page is a new version like any other, and leaves the same durable
             // row behind.
@@ -48831,7 +49003,15 @@ impl MemoryDB {
             // Retire the pruned rows' canonical edges (kept sids are
             // re-asserted just below via `insert_resolved_page_evidence`'s
             // dual-write, which reactivates on the same content-addressed
-            // edge id if one was ever retired).
+            // edge id if one was ever retired). dst_kind stays hard-coded
+            // "memory": this site's page_evidence prune above is
+            // memory-kind-only by design, so a pruned folder-doc sid's
+            // external-kind evidence row survives and keeps its real edge
+            // legitimately expected -- resolving the kind here would retire
+            // a still-backed edge (G6 edges-parity repair, fold-in
+            // RETRACTED in review; the memory-kind id below was never
+            // minted for such a sid, so this retire is a harmless no-op for
+            // it).
             for sid in &removed {
                 let edge_id = crate::provenance::compute_edge_id(
                     "cites", "page", page_id, "memory", sid, sid,

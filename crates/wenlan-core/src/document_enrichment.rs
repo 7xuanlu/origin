@@ -2010,6 +2010,150 @@ mod tests {
         assert_eq!(after.version, before.version);
     }
 
+    /// G6 edges-parity repair: drives the real `write_document_source_page`
+    /// path (the production route, not the `#[cfg(test)]` `write_source_page`
+    /// shim) twice over the same folder-doc source page with a growing chunk
+    /// set -- the 29->48 shape from the incident, reduced to a deterministic
+    /// keep/drop/add triple. Both prior defects fired in this exact call
+    /// path: `replace_source_page_inner`'s over-retire of carried-over
+    /// evidence (fix b) and the page_sources/backfill kind-derivation
+    /// disagreement with the live writer (fix a). Folder-agent sids (source_id
+    /// containing "::") resolve via `resolve_page_evidence_source_kind` to
+    /// `external_file` -> `dst_kind="external"`, the same rule
+    /// `insert_resolved_page_evidence` uses.
+    ///
+    /// RED control (source mutation, run by hand 2026-08-05): reverting fix
+    /// (a) alone (hard-coding `dst_kind="memory"` back into the
+    /// `reconcile_edges_parity` page_sources contributor) fails the FIRST
+    /// `drift_count == 0` assertion (left=2, right=0), because the sweep then
+    /// expects a memory-kind edge no writer ever mints. Reverting fix (b)
+    /// alone (restoring `replace_source_page_inner`'s retire loop to run
+    /// AFTER `insert_resolved_page_evidence`, with the old memory-kind-only
+    /// subtraction) fails the SECOND `drift_count == 0` assertion instead
+    /// (left=1, right=0): the over-retire kills the carried-over `keep_sid`
+    /// edge after `insert_resolved_page_evidence` re-asserts it, and the
+    /// still-intact `page_sources`/`page_evidence` rows then disagree with
+    /// the now-retired live edge. Both reverts confirmed to fail by hand,
+    /// then the fix restored and this test re-confirmed green.
+    #[tokio::test]
+    async fn write_document_source_page_replace_keeps_carried_over_retires_dropped() {
+        use crate::sources::RawDocument;
+
+        let (db, _dir) = test_db().await;
+        let file_path = "fake/g6-red-control-doc.md".to_string();
+        db.enqueue_document("folder-notes", &file_path, Some("hash-v1"))
+            .await
+            .unwrap();
+        let entry = db.claim_next_pending().await.unwrap().expect("claim");
+
+        let keep_sid = "doc_g6_red::chunk_keep";
+        let drop_sid = "doc_g6_red::chunk_drop";
+        let new_sid = "doc_g6_red::chunk_new";
+        for sid in [keep_sid, drop_sid, new_sid] {
+            let doc = RawDocument {
+                source: "memory".to_string(),
+                source_id: sid.to_string(),
+                title: format!("chunk-{sid}"),
+                summary: None,
+                content: format!("Folder-doc content for {sid}."),
+                url: None,
+                last_modified: chrono::Utc::now().timestamp(),
+                metadata: std::collections::HashMap::new(),
+                memory_type: Some("fact".to_string()),
+                space: Some("work".to_string()),
+                source_agent: Some("folder".to_string()),
+                confidence: Some(0.9),
+                confirmed: Some(false),
+                ..Default::default()
+            };
+            db.upsert_documents(vec![doc]).await.unwrap();
+        }
+
+        write_document_source_page(
+            &db,
+            &entry,
+            "page_g6_red_control",
+            "Source page v1",
+            None,
+            "content v1",
+            &[keep_sid.to_string(), drop_sid.to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.reconcile_edges_parity().await.unwrap().drift_count,
+            0,
+            "first write must leave parity clean"
+        );
+
+        write_document_source_page(
+            &db,
+            &entry,
+            "page_g6_red_control",
+            "Source page v2",
+            None,
+            "content v2, grown",
+            &[keep_sid.to_string(), new_sid.to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.reconcile_edges_parity().await.unwrap().drift_count,
+            0,
+            "second write (growing chunk set) must leave parity clean"
+        );
+
+        let conn = db.test_primary_session().await;
+        let keep_edge_id = crate::provenance::compute_edge_id(
+            "cites",
+            "page",
+            "page_g6_red_control",
+            "external",
+            keep_sid,
+            keep_sid,
+        );
+        let drop_edge_id = crate::provenance::compute_edge_id(
+            "cites",
+            "page",
+            "page_g6_red_control",
+            "external",
+            drop_sid,
+            drop_sid,
+        );
+        let new_edge_id = crate::provenance::compute_edge_id(
+            "cites",
+            "page",
+            "page_g6_red_control",
+            "external",
+            new_sid,
+            new_sid,
+        );
+        for (edge_id, label, expect_active) in [
+            (keep_edge_id.as_str(), "carried-over", true),
+            (drop_edge_id.as_str(), "dropped", false),
+            (new_edge_id.as_str(), "newly added", true),
+        ] {
+            let mut rows = conn
+                .query(
+                    "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                    libsql::params![edge_id],
+                )
+                .await
+                .unwrap();
+            let row = rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{label} edge must exist"));
+            let valid_until: Option<u64> = row.get(0).unwrap();
+            assert_eq!(
+                valid_until.is_none(),
+                expect_active,
+                "{label} locator's cites edge active-state mismatch"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn source_page_replacement_failure_preserves_last_valid_page_and_provenance() {
         let (db, dir) = test_db().await;

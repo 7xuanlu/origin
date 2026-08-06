@@ -3229,15 +3229,17 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        1007,
+        1010,
         "PR-D integration must expose the frozen 967 support calls, the 6 PR-D test identities, \
          the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, \
          the 8 G6 BindPageLink repair-test calls, the 9 G6 Stage 1.5a \
          raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard calls, \
-         the 1 G6 Stage 1.5b uncategorized_scope_selects_the_unfiled_sentinel_entity call, and \
+         the 1 G6 Stage 1.5b uncategorized_scope_selects_the_unfiled_sentinel_entity call, \
          the 1 G6 Stage 1.5b Part 3 second test_primary_session re-acquire in \
          summary_eligibility_requires_a_qualifying_community_and_candidate (drop/reseed/reacquire \
-         around test_seed_entity_shadow_page's internal conn lock)"
+         around test_seed_entity_shadow_page's internal conn lock), and the 3 G6 edges-parity \
+         repair RED-controlled test calls in \
+         write_document_source_page_replace_keeps_carried_over_retires_dropped"
     );
 }
 

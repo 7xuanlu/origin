@@ -30865,6 +30865,210 @@ async fn migration_118_assertion_detects_unresolved_space() {
     );
 }
 
+/// G6 edges-parity repair: a `cites` edge wrongly retired by the Defect
+/// 1/2 over-retire (see `replace_source_page_inner`/`page_sources`
+/// contributor fixes in the same PR) must reactivate when its
+/// `page_evidence` backing is still active -- no new edge is minted, the
+/// existing row's `valid_until` is just cleared. Uses an `external_file`
+/// (folder-doc) locator deliberately: that is the exact shape Defect 2's
+/// kind-derivation disagreement mis-retired.
+#[tokio::test]
+async fn migration_119_reactivates_qualifying_retired_edge() {
+    let (db, _dir) = test_db().await;
+    db.insert_page(
+        "pg_m119",
+        "M119 Page",
+        None,
+        "",
+        None,
+        Some("space_a"),
+        &[],
+        "2026-08-05T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    let edge_id = crate::provenance::compute_edge_id(
+        "cites",
+        "page",
+        "pg_m119",
+        "external",
+        "src_doc_locator",
+        "src_doc_locator",
+    );
+    {
+        let conn = db.conn.lock().await;
+        conn.execute_batch(&format!(
+            "INSERT INTO page_evidence (page_id, source_kind, locator, linked_at)
+             VALUES ('pg_m119', 'external_file', 'src_doc_locator', 0);
+             INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                lineage, grounded, space, created_at, valid_until)
+             VALUES ('{edge_id}', 'pg_m119', 'page', 'src_doc_locator', 'external', 'cites',
+                     'evidence', 0, 'space_a', 0, 100);"
+        ))
+        .await
+        .unwrap();
+    }
+
+    db.migrate_119_edges_reactivate_backed(118).await.unwrap();
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT valid_until FROM edges WHERE edge_id = ?1",
+            libsql::params![edge_id.as_str()],
+        )
+        .await
+        .unwrap();
+    let valid_until: Option<i64> = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("edge row")
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        valid_until, None,
+        "a retired edge backed by an active page_evidence row must reactivate"
+    );
+}
+
+/// A retired edge that was superseded (replaced by a different edge_id,
+/// e.g. a renamed identity) must NOT reactivate -- `superseded_by` marks
+/// it permanently retracted regardless of legacy backing.
+#[tokio::test]
+async fn migration_119_leaves_superseded_edge_alone() {
+    let (db, _dir) = test_db().await;
+    db.insert_page(
+        "pg_m119_sup",
+        "M119 Superseded Page",
+        None,
+        "",
+        None,
+        Some("space_a"),
+        &[],
+        "2026-08-05T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    let old_edge_id = crate::provenance::compute_edge_id(
+        "cites",
+        "page",
+        "pg_m119_sup",
+        "external",
+        "src_old_locator",
+        "src_old_locator",
+    );
+    let new_edge_id = crate::provenance::compute_edge_id(
+        "cites",
+        "page",
+        "pg_m119_sup",
+        "external",
+        "src_new_locator",
+        "src_new_locator",
+    );
+    {
+        let conn = db.conn.lock().await;
+        conn.execute_batch(&format!(
+            "INSERT INTO page_evidence (page_id, source_kind, locator, linked_at)
+             VALUES ('pg_m119_sup', 'external_file', 'src_old_locator', 0);
+             INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                lineage, grounded, space, created_at, valid_until)
+             VALUES ('{new_edge_id}', 'pg_m119_sup', 'page', 'src_new_locator', 'external',
+                     'cites', 'evidence', 0, 'space_a', 0, NULL);
+             INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                lineage, grounded, space, created_at, valid_until, superseded_by)
+             VALUES ('{old_edge_id}', 'pg_m119_sup', 'page', 'src_old_locator', 'external',
+                     'cites', 'evidence', 0, 'space_a', 0, 100, '{new_edge_id}');"
+        ))
+        .await
+        .unwrap();
+    }
+
+    db.migrate_119_edges_reactivate_backed(118).await.unwrap();
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT valid_until FROM edges WHERE edge_id = ?1",
+            libsql::params![old_edge_id.as_str()],
+        )
+        .await
+        .unwrap();
+    let valid_until: Option<i64> = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("edge row")
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        valid_until,
+        Some(100),
+        "a superseded edge must stay retired even though its legacy backing still exists"
+    );
+}
+
+/// Re-running migration 119 against an already-reactivated database must
+/// be a no-op: the UPDATE's `valid_until IS NOT NULL` guard matches zero
+/// rows the second time, so a re-run neither errors nor un-does anything.
+#[tokio::test]
+async fn migration_119_idempotent_on_rerun() {
+    let (db, _dir) = test_db().await;
+    db.insert_page(
+        "pg_m119_idem",
+        "M119 Idempotent Page",
+        None,
+        "",
+        None,
+        Some("space_a"),
+        &[],
+        "2026-08-05T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    let edge_id = crate::provenance::compute_edge_id(
+        "cites",
+        "page",
+        "pg_m119_idem",
+        "external",
+        "src_idem_locator",
+        "src_idem_locator",
+    );
+    {
+        let conn = db.conn.lock().await;
+        conn.execute_batch(&format!(
+            "INSERT INTO page_evidence (page_id, source_kind, locator, linked_at)
+             VALUES ('pg_m119_idem', 'external_file', 'src_idem_locator', 0);
+             INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                                lineage, grounded, space, created_at, valid_until)
+             VALUES ('{edge_id}', 'pg_m119_idem', 'page', 'src_idem_locator', 'external',
+                     'cites', 'evidence', 0, 'space_a', 0, 100);"
+        ))
+        .await
+        .unwrap();
+    }
+
+    for pass in 1..=2 {
+        db.migrate_119_edges_reactivate_backed(118).await.unwrap();
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                libsql::params![edge_id.as_str()],
+            )
+            .await
+            .unwrap();
+        let valid_until: Option<i64> = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("edge row")
+            .get(0)
+            .unwrap();
+        assert_eq!(valid_until, None, "pass {pass}: edge must be active");
+    }
+}
+
 /// G6 Stage 1.2 divergence test (Sol review S3): no other test can tell
 /// whether a migrated reader actually reads `edges` versus `relations`, since
 /// every OTHER fixture keeps both stores in parity via the dual-write. Here
@@ -49611,6 +49815,121 @@ async fn replace_page_sources_retires_pruned_cites_edges() {
         report.drift_count, 0,
         "an empty-set replace must not re-drift edges parity (missing={}, extra={}, corrupt={})",
         report.missing_count, report.extra_count, report.corrupt_count
+    );
+}
+
+/// G6 edges-parity repair, post-retraction shape (fold-in of fix (a) into
+/// this site was RULED OUT in review round 13): `replace_page_sources`'s
+/// `page_evidence` prune is memory-kind-only, so a pruned folder-doc row's
+/// external-kind evidence survives -- the sweep still legitimately expects
+/// its `external`-kind edge, and the retire loop's hard-coded `"memory"`
+/// dst_kind is a no-op for it (no memory-kind edge was ever minted for a
+/// folder-doc sid). Pruning a folder-doc row must therefore leave the REAL
+/// `external`-kind edge ACTIVE, and parity must stay clean immediately
+/// after the prune (the settling check that caught the original fold-in
+/// ruling: on that tree this assertion failed with drift 1).
+#[tokio::test]
+async fn replace_page_sources_prunes_external_kind_edge_not_phantom_memory() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_g6_prune_ext",
+        "Prune External Target",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    let keep_sid = "mem_g6_ext_keep";
+    let drop_sid = "doc_g6_ext_drop::v1";
+    let doc = make_memory_doc(keep_sid, "Kept content.", "knowledge", "work", "agent");
+    db.upsert_documents(vec![doc]).await.unwrap();
+    let folder_doc = make_memory_doc(
+        drop_sid,
+        "Folder-doc content.",
+        "knowledge",
+        "work",
+        "folder",
+    );
+    db.upsert_documents(vec![folder_doc]).await.unwrap();
+    for sid in [keep_sid, drop_sid] {
+        db.link_page_source("page_g6_prune_ext", sid, "distill")
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        db.reconcile_edges_parity().await.unwrap().drift_count,
+        0,
+        "fixture precondition: linked sources leave parity clean"
+    );
+
+    // `replace_page_sources`'s own page_evidence prune is memory-kind-only by
+    // design ("external/authored evidence, if any, is preserved" -- see the
+    // comment on that DELETE), so the external-kind page_evidence row for
+    // `drop_sid` survives even though `page_sources` drops the sid. That
+    // surviving evidence row legitimately backs the edge, so this prune
+    // must leave the REAL external-kind edge ACTIVE (fold-in of fix (a)
+    // into this site's retire was RULED OUT in review -- see the doc
+    // comment above).
+    db.replace_page_sources("page_g6_prune_ext", &[keep_sid], "reconcile")
+        .await
+        .unwrap();
+
+    // Settling check: the prune above must not manufacture parity drift.
+    assert_eq!(
+        db.reconcile_edges_parity().await.unwrap().drift_count,
+        0,
+        "post-prune parity must be clean"
+    );
+
+    let conn = db.conn.lock().await;
+    let real_edge_id = crate::provenance::compute_edge_id(
+        "cites",
+        "page",
+        "page_g6_prune_ext",
+        "external",
+        drop_sid,
+        drop_sid,
+    );
+    let mut rows = conn
+        .query(
+            "SELECT valid_until FROM edges WHERE edge_id = ?1",
+            libsql::params![real_edge_id.as_str()],
+        )
+        .await
+        .unwrap();
+    let row = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("real external-kind edge exists");
+    assert!(
+        row.get::<Option<i64>>(0).unwrap().is_none(),
+        "the real external-kind edge must stay active -- its evidence row survives the prune"
+    );
+
+    let phantom_edge_id = crate::provenance::compute_edge_id(
+        "cites",
+        "page",
+        "page_g6_prune_ext",
+        "memory",
+        drop_sid,
+        drop_sid,
+    );
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM edges WHERE edge_id = ?1",
+            libsql::params![phantom_edge_id.as_str()],
+        )
+        .await
+        .unwrap();
+    assert!(
+        rows.next().await.unwrap().is_none(),
+        "no phantom memory-kind edge should ever exist for a folder-doc locator"
     );
 }
 
