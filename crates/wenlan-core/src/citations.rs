@@ -1256,4 +1256,121 @@ mod tests {
             "changelog: {log}"
         );
     }
+
+    /// Relocated from `tests/page_citations_e2e.rs` (G6 Stage 2 PR 2b):
+    /// `link_page_evidence` closed to `#[cfg(test)]` (Q2 ruling), and
+    /// `#[cfg(test)]` is invisible across the `tests/` integration-binary
+    /// boundary, so this helper's manual evidence attach no longer compiled
+    /// there. Moved into the crate's own unit-test suite, where it does.
+    /// Exercises the real `create_page` API (not the lower-level
+    /// `insert_page`), unlike this module's other `seed_backfill_page`.
+    async fn seed_backfill_page_via_create_page(
+        db: &crate::db::MemoryDB,
+        body: &str,
+        mem_id: &str,
+        mem_content: &str,
+    ) -> String {
+        insert_test_memory(db, mem_id, mem_content).await;
+        let result = crate::post_write::create_page(
+            db,
+            wenlan_types::requests::CreateConceptRequest {
+                title: "T".to_string(),
+                content: body.to_string(),
+                summary: None,
+                entity_id: None,
+                space: None.into(),
+                source_memory_ids: vec![],
+                creation_kind: Some("authored".to_string()),
+                workspace: None,
+            },
+            "test",
+            None,
+        )
+        .await
+        .unwrap();
+        db.link_page_evidence(&result.id, "memory", Some(mem_id), None, "test")
+            .await
+            .unwrap();
+        result.id
+    }
+
+    /// Relocated from `tests/page_citations_e2e.rs::backfill_annotates_legacy_page`.
+    /// Assertions unchanged.
+    #[tokio::test]
+    async fn backfill_annotates_legacy_page_via_create_page() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let page_id =
+            seed_backfill_page_via_create_page(&db, BACKFILL_BODY, "mem_a", BACKFILL_MEM_CONTENT)
+                .await;
+        assert!(db
+            .get_pages_missing_citations(10)
+            .await
+            .unwrap()
+            .contains(&page_id));
+
+        let annotated = format!("{BACKFILL_BODY}[1]");
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(&annotated));
+        let prompts = PromptRegistry::default();
+
+        run_citation_backfill_tick(&db, &llm, &prompts)
+            .await
+            .unwrap();
+
+        let page = db.get_page(&page_id).await.unwrap().unwrap();
+        assert_eq!(
+            page.content, annotated,
+            "prose stays byte-identical modulo the inserted marker"
+        );
+        assert_eq!(page.citations.len(), 1, "citations: {:?}", page.citations);
+        assert_eq!(page.citations[0].status, "verified");
+        assert!(
+            !db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&page_id),
+            "page should no longer be citations-missing"
+        );
+        let changelog = db.get_page_changelog(&page_id).await.unwrap();
+        assert!(
+            changelog.contains("citation_backfill"),
+            "changelog: {changelog}"
+        );
+    }
+
+    /// Relocated from `tests/page_citations_e2e.rs::backfill_guard_rejects_rewrite_then_poison_pills`.
+    /// Assertions unchanged.
+    #[tokio::test]
+    async fn backfill_guard_rejects_rewrite_then_poison_pills_via_create_page() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let page_id =
+            seed_backfill_page_via_create_page(&db, BACKFILL_BODY, "mem_a", BACKFILL_MEM_CONTENT)
+                .await;
+
+        let rewritten = "A completely different sentence about something else entirely.[1]";
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(rewritten));
+        let prompts = PromptRegistry::default();
+
+        // 3 consecutive rejected ticks poison-pill the page.
+        for _ in 0..3 {
+            run_citation_backfill_tick(&db, &llm, &prompts)
+                .await
+                .unwrap();
+        }
+
+        let page = db.get_page(&page_id).await.unwrap().unwrap();
+        assert_eq!(page.content, BACKFILL_BODY, "prose must never be rewritten");
+        assert!(page.citations.is_empty());
+        assert!(
+            !db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&page_id),
+            "citations should be '[]' (gave up), not NULL"
+        );
+        let changelog = db.get_page_changelog(&page_id).await.unwrap();
+        assert!(
+            changelog.contains("citation backfill gave up"),
+            "changelog: {changelog}"
+        );
+    }
 }

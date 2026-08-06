@@ -2720,11 +2720,15 @@ async fn bind_page_link_repair_mints_the_links_edge() {
         .await
         .unwrap();
 
-    let target = db
+    // G6 Stage 2 PR 2b (item 3): resolving a bind stops writing the
+    // resolved row into `page_links` -- the row is deleted once bound, not
+    // updated in place. The edge minted below is now the sole canonical
+    // representation of "row bound".
+    let orphan_row_gone = db
         .test_primary_session()
         .await
         .query(
-            "SELECT target_page_id FROM page_links WHERE source_page_id='source_link'",
+            "SELECT 1 FROM page_links WHERE source_page_id='source_link'",
             (),
         )
         .await
@@ -2732,17 +2736,13 @@ async fn bind_page_link_repair_mints_the_links_edge() {
         .next()
         .await
         .unwrap()
-        .unwrap()
-        .get::<Option<String>>(0)
-        .unwrap();
-    assert_eq!(target.as_deref(), Some("target_link_a"), "row bound");
-
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "a repair-tool orphan bind must not re-drift edges parity (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
+        .is_none();
+    assert!(
+        orphan_row_gone,
+        "resolved orphan row is deleted, not updated in place"
     );
+
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
     let edge_id = crate::provenance::compute_edge_id(
         "links",
         "page",

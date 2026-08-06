@@ -63,20 +63,15 @@ pub const EDGE_GROUNDING_ENTAILMENT_PROMPT_VERSION: &str = "m3g-entailment-v3";
 /// Durable cursor + poison state key in `app_metadata`.
 pub(crate) const EDGE_GROUNDING_CURSOR_KEY: &str = "edge_grounding_cursor";
 
-/// One promotion candidate: a `relates` relation joined to its endpoint entity
-/// names, its recomputed content-addressed `edge_id`, the current edge state,
-/// and the chunk-0 source memory (present only for a still-live source). Built
-/// by [`MemoryDB::edge_grounding_candidates`].
+/// One promotion candidate: an active-store `relates` edge joined to its
+/// endpoint entity names, its current state (`grounded`/`valid_until`/
+/// `payload`), and the chunk-0 source memory (present only for a still-live
+/// source). Built by [`MemoryDB::edge_grounding_candidates`], which reads the
+/// canonical `edges` table directly since G6 Stage 2 PR 2b.
 #[derive(Debug, Clone)]
 pub struct EdgeGroundingCandidate {
-    /// `relations.rowid` — the monotonic scan cursor key.
+    /// `edges.rowid` — the monotonic scan cursor key.
     pub rowid: i64,
-    /// `relations.id` (a UUID) — the relation-row identity/generation the flip
-    /// re-verifies (§C2 linkage guard). Stable across an ON CONFLICT upsert
-    /// (same triple re-asserted from a different source keeps this id but moves
-    /// `source_memory_id`), fresh on a delete + re-add (supersede/reactivate),
-    /// so it distinguishes the judged relation generation from a replacement.
-    pub relation_id: String,
     pub edge_id: String,
     pub from_name: String,
     pub to_name: String,
@@ -108,25 +103,30 @@ pub struct EdgeGroundingCandidate {
 /// multi-second entailment call runs OUTSIDE any transaction. A concurrent
 /// supersede or source edit during that window can invalidate the basis, so the
 /// flip re-verifies IN its own transaction that the edge is still active
-/// (`valid_until IS NULL`), that the RELATION still derives from the judged
-/// source (same `relations.id` generation AND same `source_memory_id`), and
-/// that the judged source content is byte-identical to what entailment saw. On
-/// any mismatch the flip affects zero rows and the caller skips it (no poison),
-/// re-judging the edge against fresh evidence on a later tick. See
-/// [`MemoryDB::promote_edges_grounded`].
+/// (`valid_until IS NULL`), that the edge still derives from the judged source
+/// (its `payload.$.source_memory_id` is unchanged), and that the judged source
+/// content is byte-identical to what entailment saw. On any mismatch the flip
+/// affects zero rows and the caller skips it (no poison), re-judging the edge
+/// against fresh evidence on a later tick. See
+/// [`MemoryDB::promote_edges_grounded`], whose comment records which §C2 term
+/// the G6 Stage 2 PR 2b canonical-only cutover kept and which it could not.
 #[derive(Debug, Clone)]
 pub struct EdgePromotion {
     pub edge_id: String,
     pub root_id: String,
+    /// The grounding-only verdict patch (`build_grounding_payload`'s output,
+    /// a bare `{"grounding": {...}}` object). The flip's UPDATE merges this
+    /// onto the edge's live payload with `json_patch` (server-side, no
+    /// read-modify-write) rather than overwriting the column, so it touches
+    /// only the key promotion owns — whatever the edge's other payload
+    /// fields hold (`span`, `source_memory_id`, `confidence`, `explanation`,
+    /// `source_agent`, `asserted_at`) survives untouched, including a
+    /// concurrent semantic-key edit that lands mid-entailment.
     pub payload: String,
-    /// The `relations.id` (UUID) whose triple produced this `edge_id` at scan
-    /// time — the linkage-recheck generation key. A same-triple upsert from
-    /// another source keeps this id but changes `source_memory_id`; a
-    /// delete + re-add mints a new id. The flip requires BOTH this id AND
-    /// `source_memory_id` to still match, so neither vector grounds a verdict
-    /// whose provenance has moved (§C2).
-    pub relation_id: String,
-    /// The source memory whose chunk-0 content was judged (the recheck key).
+    /// The source memory whose chunk-0 content was judged — both the
+    /// content-recheck key and the linkage-recheck key (the flip requires the
+    /// edge's own `payload.$.source_memory_id` to still equal it, so a
+    /// provenance move off the judged source grounds nothing, §C2).
     pub source_memory_id: String,
     /// The exact chunk-0 content entailment judged; the flip requires the live
     /// `memories.content` to still equal this, else it grounds nothing.
@@ -138,7 +138,7 @@ pub struct EdgePromotion {
 /// the per-tick caps), mirroring `reconcile::FrontierState`.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GroundingState {
-    /// Highest `relations.rowid` durably decided; the next scan fetches `> cursor`.
+    /// Highest `edges.rowid` durably decided; the next scan fetches `> cursor`.
     pub cursor: i64,
     /// The rowid currently accruing consecutive-failure strikes.
     pub stuck_rowid: Option<i64>,
@@ -264,33 +264,29 @@ pub(crate) fn build_entailment_prompt(
     )
 }
 
-/// Build the promotion `payload`: preserve any Stage A span keys and append the
-/// `grounding` verdict + its entailment versions (§2.4/§6.6). A backlog edge
-/// (no prior payload) starts from an empty object, so its promoted payload is
-/// `{"grounding": …}` with no span keys.
+/// Build the promotion payload PATCH: just the `grounding` verdict + its
+/// entailment versions (§2.4/§6.6), never the edge's other payload fields.
+/// `MemoryDB::promote_edges_grounded` merges this onto the live payload with
+/// `json_patch` server-side, so the edge's span/provenance/semantic keys
+/// survive by construction — this function has no need to read or preserve
+/// them itself.
 pub(crate) fn build_grounding_payload(
-    existing_payload: Option<&str>,
     path: &str,
     entailment_score: f64,
     model_id: &str,
     promoted_at: i64,
 ) -> String {
-    let mut obj = existing_payload
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-    obj.insert(
-        "grounding".to_string(),
-        serde_json::json!({
+    serde_json::json!({
+        "grounding": {
             "path": path,
             "entailment_score": entailment_score,
             "model_id": model_id,
             "model_version": model_id,
             "prompt_version": EDGE_GROUNDING_ENTAILMENT_PROMPT_VERSION,
             "promoted_at": promoted_at,
-        }),
-    );
-    serde_json::Value::Object(obj).to_string()
+        }
+    })
+    .to_string()
 }
 
 /// Record a failure on the tick's head edge. Returns true when it has failed
@@ -566,18 +562,12 @@ async fn run_edge_grounding_with_budget(
             }
         };
 
-        let payload = build_grounding_payload(
-            cand.edge_payload.as_deref(),
-            path,
-            score,
-            &llm.model_id(),
-            chrono::Utc::now().timestamp(),
-        );
+        let payload =
+            build_grounding_payload(path, score, &llm.model_id(), chrono::Utc::now().timestamp());
         let promotion = EdgePromotion {
             edge_id: cand.edge_id.clone(),
             root_id,
             payload,
-            relation_id: cand.relation_id.clone(),
             source_memory_id: source_memory_id.to_string(),
             judged_content: content.to_string(),
         };
@@ -686,18 +676,19 @@ mod tests {
     }
 
     #[test]
-    fn build_grounding_payload_preserves_span_and_appends_verdict() {
-        let existing = r#"{"source_memory_id":"m1","span":{"quote":"q"},"model_version":"ex"}"#;
-        let out = build_grounding_payload(
-            Some(existing),
-            "span+entailment",
-            0.9,
-            "qwen-test",
-            1753000000,
-        );
+    fn build_grounding_payload_is_grounding_key_only() {
+        // Span/provenance preservation is now by construction in SQL
+        // (`promote_edges_grounded`'s `json_patch` merge) rather than this
+        // function's job — it builds ONLY the verdict patch, so this pins
+        // that the patch never carries any other key regardless of the
+        // scanned edge's own payload shape.
+        let out = build_grounding_payload("span+entailment", 0.9, "qwen-test", 1753000000);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["source_memory_id"], "m1", "span keys preserved");
-        assert_eq!(v["span"]["quote"], "q");
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            1,
+            "the patch carries only the grounding key: {v}"
+        );
         assert_eq!(v["grounding"]["path"], "span+entailment");
         assert_eq!(v["grounding"]["entailment_score"], 0.9);
         assert_eq!(v["grounding"]["model_id"], "qwen-test");
@@ -705,11 +696,6 @@ mod tests {
             v["grounding"]["prompt_version"],
             EDGE_GROUNDING_ENTAILMENT_PROMPT_VERSION
         );
-        // Backlog edge (no prior payload) → grounding-only object.
-        let backlog = build_grounding_payload(None, "entailment-only", 0.8, "qwen-test", 1);
-        let bv: serde_json::Value = serde_json::from_str(&backlog).unwrap();
-        assert_eq!(bv["grounding"]["path"], "entailment-only");
-        assert!(bv.get("span").is_none());
     }
 
     #[test]
@@ -894,10 +880,18 @@ mod tests {
         /// `relations.id` stays fixed. The linkage guard's `source_memory_id`
         /// term must reject the stale verdict.
         MoveLinkage { new_source_id: String },
-        /// Supersede-then-reactivate: delete + re-add the relation, minting a
-        /// FRESH `relations.id` while the edge is reactivated active. The linkage
-        /// guard's `id` term must reject the stale verdict.
+        /// Supersede-then-reactivate: delete + re-add the relation while the
+        /// edge is reactivated active. Content-addressed post-G6-Stage-2, so
+        /// this reactivates the SAME row rather than minting a fresh identity
+        /// (see `MemoryDB::supersede_and_readd_relation_for_test`'s comment) —
+        /// the promotion is judging the same (triple, content) it scanned, so
+        /// it still promotes.
         SupersedeReactivate,
+        /// Concurrent semantic-key edit: bump `payload.$.confidence` on the
+        /// live edge, simulating a reassert-driven confidence upgrade landing
+        /// mid-entailment. The `json_patch`-only merge (§C2 redesign) must
+        /// promote without clobbering it.
+        ConcurrentConfidenceEdit { confidence: f64 },
     }
 
     /// A provider that MUTATES the DB from inside `generate()` (re-entering the
@@ -936,6 +930,11 @@ mod tests {
                 StaleMutation::SupersedeReactivate => {
                     self.db
                         .supersede_and_readd_relation_for_test(&self.source_id)
+                        .await;
+                }
+                StaleMutation::ConcurrentConfidenceEdit { confidence } => {
+                    self.db
+                        .bump_edge_confidence_for_test(&self.edge_id, *confidence)
                         .await;
                 }
             }
@@ -992,6 +991,91 @@ mod tests {
         assert_eq!(payload["grounding"]["path"], "span+entailment");
         assert_eq!(payload["grounding"]["entailment_score"], 0.95);
         assert_eq!(payload["span"]["quote"], "Alice works on ProjectX");
+    }
+
+    #[tokio::test]
+    async fn canonical_only_edge_with_no_relations_row_is_scanned_and_promoted() {
+        // G6 Stage 2 PR 2b regression. The M3g candidate scan used to select
+        // from `relations`, documented there as "the sole producer of every
+        // `relates` edge, so this scan is complete". PR 2b flipped
+        // `create_relation_with_span` to canonical-only, so a post-cutover edge
+        // has NO `relations` row at all: a relations-driven scan returns an
+        // empty batch and the entire sweep silently no-ops (0 scanned, 0
+        // promoted, cursor never moves) instead of failing.
+        //
+        // The `relations`-is-empty assertion below is the RED control. Without
+        // it a fixture that happened to seed both stores would keep a
+        // relations-driven scan green; with it, re-pointing the scan back at
+        // `relations` reddens this test by cause.
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let content = "The filing states that Alice works on ProjectX.";
+        seed_folder_memory(&db, "doc_1", content, "space_a").await;
+        let edge_id = seed_edge(
+            &db,
+            "Alice",
+            "ProjectX",
+            "works_on",
+            "space_a",
+            "doc_1",
+            Some("Alice works on ProjectX"),
+            content,
+        )
+        .await;
+
+        assert_eq!(
+            db.relations_row_count_for_test().await,
+            0,
+            "PR 2b's relation writer is canonical-only: nothing may reach `relations`"
+        );
+
+        // 1. The scan finds the edge, reading every field off the canonical row.
+        let candidates = db
+            .edge_grounding_candidates(0, EDGE_GROUNDING_SCAN_PER_TICK)
+            .await
+            .unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the canonical-only edge is a promotion candidate"
+        );
+        let cand = &candidates[0];
+        assert_eq!(cand.edge_id, edge_id, "edge_id comes straight off the row");
+        assert_eq!(
+            cand.source_memory_id.as_deref(),
+            Some("doc_1"),
+            "source linkage read from payload.$.source_memory_id (migration 116's \
+             canonical home), not from a relations column"
+        );
+        assert_eq!(
+            cand.relation_type, "works_on",
+            "relation_type read from edges.semantic_type"
+        );
+        assert_eq!(cand.from_name, "Alice");
+        assert_eq!(cand.to_name, "ProjectX");
+        assert_eq!(cand.edge_grounded, Some(0));
+        assert!(cand.edge_valid_until.is_none(), "edge is active");
+        assert_eq!(
+            cand.mem_content.as_deref(),
+            Some(content),
+            "the chunk-0 source memory joins through the payload linkage"
+        );
+
+        // 2. The full promotion path runs over it, with the file's own scripted
+        //    entailment stub (no new harness).
+        let (_p, llm) = scripted(&[], 0.95);
+        let report = run_edge_grounding_tick(&db, &llm, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.entailment_calls, 1);
+        assert_eq!(report.promoted, 1, "a canonical-only edge promotes");
+
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge["grounded"], 1);
+        assert!(
+            edge["root_id"].as_str().is_some(),
+            "a promoted edge carries a real root_id (Q-G1)"
+        );
     }
 
     #[tokio::test]
@@ -1863,13 +1947,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_evidence_supersede_reactivate_during_entailment_grounds_nothing() {
-        // §C2 supersede-and-reactivate race: the relation is deleted and re-added
-        // (a FRESH `relations.id`) DURING entailment, and the edge is reactivated
-        // ACTIVE. So at flip time the edge passes `valid_until IS NULL` and the
-        // source content is unchanged — ONLY the relation identity differs from
-        // the judged generation. The flip's linkage `id` term must ground
-        // nothing; the pre-existing valid_until guard cannot catch this.
+    async fn stale_evidence_byte_identical_supersede_reactivate_during_entailment_still_grounds() {
+        // §C2 supersede-and-reactivate race, post-json_patch-merge redesign:
+        // the relation is deleted and re-added DURING entailment, reactivating
+        // the SAME content-addressed edge row (no fresh identity to refuse on
+        // post-G6-Stage-2 -- see `promote_edges_grounded`'s comment). At flip
+        // time the edge is active and the source content is unchanged, so the
+        // (triple, content) being flipped is byte-identical to what was
+        // judged: this is not a false ground, so the flip must promote, and
+        // the edge's pre-existing payload (source_memory_id) must survive the
+        // merge alongside the new `grounding` key.
         let (db, _dir) = crate::db::tests::test_db().await;
         let db = Arc::new(db);
         let content = "The charter records that Alice works on ProjectX.";
@@ -1895,38 +1982,73 @@ mod tests {
 
         assert!(provider.mutated.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
-            report.promoted, 0,
-            "a supersede + reactivate during entailment must ground nothing"
+            report.promoted, 1,
+            "a byte-identical retract+reassert mid-entailment still promotes"
         );
         let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
-        assert_eq!(edge["grounded"], 0, "edge stays grounded=0 (invariant #11)");
-        assert!(edge["root_id"].is_null());
-        // KEY isolation: the reactivated edge is ACTIVE, so the pre-existing
-        // valid_until guard would have let it through — only the fresh
-        // relation.id refused it.
-        assert!(
-            edge["valid_until"].is_null(),
-            "edge was reactivated active; the relation.id term, not valid_until, is what refused"
+        assert_eq!(edge["grounded"], 1);
+        assert!(edge["root_id"].is_string(), "root_id minted on promotion");
+        let payload: serde_json::Value =
+            serde_json::from_str(edge["payload"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            payload["source_memory_id"], "doc_1",
+            "the reactivated edge's own payload fields survive the grounding-only merge"
         );
+        assert!(
+            payload["grounding"].is_object(),
+            "the grounding verdict lands alongside the surviving fields"
+        );
+    }
 
-        // Re-decidable: a fresh tick scans the re-added relation (new identity)
-        // and grounds it — the skip held, it did not poison.
-        db.set_app_metadata(
-            EDGE_GROUNDING_CURSOR_KEY,
-            &serde_json::to_string(&GroundingState::default()).unwrap(),
+    #[tokio::test]
+    async fn concurrent_confidence_edit_during_entailment_still_grounds_and_edit_survives() {
+        // §C2 redesign boundary: a confidence upgrade (a semantic-key edit,
+        // e.g. from a reassert) lands mid-entailment. The judged (triple,
+        // content) is unaffected by a confidence change, so the flip must
+        // still promote -- and because `promote_edges_grounded` now merges
+        // only the `grounding` key via `json_patch` rather than overwriting
+        // the whole payload column, the concurrent confidence edit must
+        // survive post-promotion alongside the new grounding verdict.
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let db = Arc::new(db);
+        let content = "The charter records that Alice works on ProjectX.";
+        let edge_id = seed_single_span_edge(&db, content).await;
+
+        let provider = Arc::new(MutatingProvider {
+            db: db.clone(),
+            mutation: StaleMutation::ConcurrentConfidenceEdit { confidence: 0.42 },
+            edge_id: edge_id.clone(),
+            source_id: "doc_1".to_string(),
+            new_content: String::new(),
+            mutated: std::sync::atomic::AtomicBool::new(false),
+        });
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        let report = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_edge_grounding_tick(&db, &llm, &PromptRegistry::default()),
         )
         .await
+        .expect("no DB mutex may span the entailment call even for a write")
         .unwrap();
-        let (_p, entail) = scripted(&[], 0.9);
-        let report2 = run_edge_grounding_tick(&db, &entail, &PromptRegistry::default())
-            .await
-            .unwrap();
+
+        assert!(provider.mutated.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
-            report2.promoted, 1,
-            "the re-added relation grounds cleanly on a later tick"
+            report.promoted, 1,
+            "a concurrent confidence edit during entailment must still promote"
         );
-        let edge2 = db.edge_snapshot_for_test(&edge_id).await.unwrap();
-        assert_eq!(edge2["grounded"], 1);
+        let edge = db.edge_snapshot_for_test(&edge_id).await.unwrap();
+        assert_eq!(edge["grounded"], 1);
+        let payload: serde_json::Value =
+            serde_json::from_str(edge["payload"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            payload["confidence"], 0.42,
+            "the mid-entailment confidence upgrade is not clobbered by the grounding merge"
+        );
+        assert!(
+            payload["grounding"].is_object(),
+            "the grounding verdict lands alongside the surviving confidence edit"
+        );
     }
 
     // ---- §I5a: provider-scope gate (on-device only) ------------------------

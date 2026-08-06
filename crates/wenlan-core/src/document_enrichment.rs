@@ -2080,11 +2080,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            db.compute_edges_parity_report().await.unwrap().drift_count,
-            0,
-            "first write must leave parity clean"
-        );
+        // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
         write_document_source_page(
             &db,
@@ -2097,11 +2093,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            db.compute_edges_parity_report().await.unwrap().drift_count,
-            0,
-            "second write (growing chunk set) must leave parity clean"
-        );
+        // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
         let conn = db.test_primary_session().await;
         let keep_edge_id = crate::provenance::compute_edge_id(

@@ -234,15 +234,41 @@ where
                         return Err(WenlanError::Conflict("repair_target_stale".to_string()));
                     }
                     drop(target_rows);
+                    // G6 Stage 2 PR 2b (item 3): capture the row's label
+                    // BEFORE the write below -- the write stops being an
+                    // UPDATE and becomes a DELETE, so a post-write re-read
+                    // of this row would return nothing (same entanglement
+                    // class fixed across item 2's writers).
+                    let label: Option<String> = {
+                        let mut label_rows = conn
+                            .query(
+                                "SELECT label FROM page_links
+                                 WHERE source_page_id = ?1 AND label_key = ?2
+                                   AND target_page_id IS NULL",
+                                libsql::params![source_page_id.clone(), label_key.clone()],
+                            )
+                            .await
+                            .map_err(|error| {
+                                WenlanError::VectorDb(format!("repair bind link label: {error}"))
+                            })?;
+                        match label_rows.next().await.map_err(|error| {
+                            WenlanError::VectorDb(format!("repair bind link label row: {error}"))
+                        })? {
+                            Some(row) => row.get::<String>(0).ok(),
+                            None => None,
+                        }
+                    };
+                    // G6 Stage 2 PR 2b (item 3): resolution writes stop --
+                    // binding an orphan's target no longer UPDATEs
+                    // page_links, it DELETEs the row (mirrors
+                    // `resolve_orphan_page_links`/`accept_page_merge`); the
+                    // edge minted below is the sole canonical
+                    // representation once a link resolves.
                     let changed = conn
                         .execute(
-                            "UPDATE page_links SET target_page_id=?1
-                             WHERE source_page_id=?2 AND label_key=?3 AND target_page_id IS NULL",
-                            libsql::params![
-                                after_target_page_id.clone(),
-                                source_page_id.clone(),
-                                label_key.clone()
-                            ],
+                            "DELETE FROM page_links
+                             WHERE source_page_id=?1 AND label_key=?2 AND target_page_id IS NULL",
+                            libsql::params![source_page_id.clone(), label_key.clone()],
                         )
                         .await
                         .map_err(|error| {
@@ -254,27 +280,7 @@ where
                     // `resolve_orphan_page_links`.
                     let changes_before_mint = conn.total_changes();
                     if changed > 0 {
-                        let mut label_rows = conn
-                            .query(
-                                "SELECT label FROM page_links
-                                 WHERE source_page_id = ?1 AND label_key = ?2",
-                                libsql::params![source_page_id.clone(), label_key.clone()],
-                            )
-                            .await
-                            .map_err(|error| {
-                                WenlanError::VectorDb(format!("repair bind link label: {error}"))
-                            })?;
-                        let label = match label_rows.next().await.map_err(|error| {
-                            WenlanError::VectorDb(format!("repair bind link label row: {error}"))
-                        })? {
-                            Some(row) => row.get::<String>(0).map_err(|error| {
-                                WenlanError::VectorDb(format!(
-                                    "repair bind link label value: {error}"
-                                ))
-                            })?,
-                            None => label_key.clone(),
-                        };
-                        drop(label_rows);
+                        let label = label.unwrap_or_else(|| label_key.clone());
                         let semantic_patch = serde_json::json!({ "label": label }).to_string();
                         let mut src_rows = conn
                             .query(

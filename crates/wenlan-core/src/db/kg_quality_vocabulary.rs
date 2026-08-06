@@ -4,20 +4,22 @@ use super::MemoryDB;
 use crate::error::WenlanError;
 
 impl MemoryDB {
-    // 2026-08-05, G6 Stage 1.2 deliberate carryover: stays on `relations`,
-    // not `edges`. This is writer coupling, not drift detection -- the
-    // healer's writer, `fold_relation_type` (db.rs), enumerates
-    // `SELECT ... FROM relations WHERE relation_type = ?1` to do the actual
-    // fold. If discovery read `edges` here while repair enumerates
-    // `relations`, the healer would discover a type it then folds zero rows
-    // for. Migrate this reader only alongside `fold_relation_type` itself
-    // (see docs/plans/2026-08-05-g6-stage12-relations-readers-spec.md).
+    // G6 Stage 2 PR 2b sweep instance 4: ported alongside `fold_relation_type`
+    // (db.rs) in the same PR, closing the writer-coupling hazard the prior
+    // carryover comment (2026-08-05, G6 Stage 1.2) flagged -- the healer's
+    // writer now enumerates live `relates` edges too, so discovery and repair
+    // agree on the source of truth again. Distinct `relation_type` over live
+    // relates edges.
     pub(crate) async fn distinct_relation_types_for_vocabulary_heal(
         &self,
     ) -> Result<Vec<String>, WenlanError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
-            .query("SELECT DISTINCT relation_type FROM relations", ())
+            .query(
+                "SELECT DISTINCT semantic_type FROM edges \
+                 WHERE edge_type = 'relates' AND valid_until IS NULL",
+                (),
+            )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("distinct rel types: {}", e)))?;
         let mut types = Vec::new();

@@ -3229,17 +3229,30 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        1010,
+        1026,
         "PR-D integration must expose the frozen 967 support calls, the 6 PR-D test identities, \
          the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, \
-         the 8 G6 BindPageLink repair-test calls, the 9 G6 Stage 1.5a \
-         raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard calls, \
-         the 1 G6 Stage 1.5b uncategorized_scope_selects_the_unfiled_sentinel_entity call, \
+         the 7 G6 BindPageLink repair-test calls (G6 Stage 2 PR 2b, item 3: \
+         bind_page_link_repair_mints_the_links_edge dropped its second TestDbRow::get call when \
+         the resolved-row assertion was replaced with an orphan-row-absence check), the 9 G6 \
+         Stage 1.5a raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard \
+         calls, the 1 G6 Stage 1.5b uncategorized_scope_selects_the_unfiled_sentinel_entity call, \
          the 1 G6 Stage 1.5b Part 3 second test_primary_session re-acquire in \
          summary_eligibility_requires_a_qualifying_community_and_candidate (drop/reseed/reacquire \
-         around test_seed_entity_shadow_page's internal conn lock), and the 3 G6 edges-parity \
+         around test_seed_entity_shadow_page's internal conn lock), the 3 G6 edges-parity \
          repair RED-controlled test calls in \
-         write_document_source_page_replace_keeps_carried_over_retires_dropped"
+         write_document_source_page_replace_keeps_carried_over_retires_dropped, and the net +17 \
+         G6 Stage 2 PR 2b sweep instance 4 calls (fold_relation_type discovery-scan port re-seeded \
+         onto edges: fold_relation_type_merges_provenance_and_ledgers_the_loser and \
+         fold_relation_type_rolls_back_when_ledger_insert_fails switched their raw-INSERT seeding \
+         to create_relation, each dropping its TestDbSession::execute pair (rolls_back also gains \
+         one TestDbRow::get from its edges-shaped readback); \
+         heal_relation_vocabulary_folds_aliases_and_queues_semantics and \
+         test_run_rethink_normalizes_relation_types re-seed a non-canonical type via raw \
+         INSERT INTO edges, each gaining a query/next pair (test_run_rethink_normalizes_relation_types \
+         also gains a TestDbRow::get); and the new acceptance-pin test \
+         heal_relation_vocabulary_discovers_and_folds_edges_collision_keeps_stronger contributes \
+         15 calls)"
     );
 }
 

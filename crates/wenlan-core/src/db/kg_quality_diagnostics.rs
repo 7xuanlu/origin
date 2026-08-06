@@ -10,11 +10,14 @@ pub(crate) struct ContradictionObservationCount {
 }
 
 impl MemoryDB {
-    // 2026-08-05, G6 Stage 1.2 deliberate carryover: stays on `relations`.
-    // `payload.source_memory_id` now converges via migration 116 + the
-    // writer's fill-if-absent semantics, but historical completeness isn't
-    // proven yet -- this reader migrates with the final relations-exit PR
-    // (see docs/plans/2026-08-05-g6-stage12-relations-readers-spec.md).
+    // G6 Stage 2 PR 2b sweep classification (2026-08-06): Tripwire, not a
+    // live bug -- `detect_stale_relations` (kg_quality.rs), the only caller,
+    // is pure `log::warn!` for visibility with no behavioral effect (its own
+    // doc comment: "actual pruning is deferred"). Left on `relations` on
+    // purpose, same disposition as the Q3-ruled entity-store lint audits
+    // (frozen-store tripwire; a CONSTANT post-cutover count is itself the
+    // signal that no writer regressed back onto `relations`). Retires with
+    // the store in Stage 3, not migrated onto `edges` in Stage 2.
     pub(crate) async fn count_stale_relation_sources(&self) -> Result<usize, WenlanError> {
         let conn = self.conn.lock().await;
         let mut rows = conn

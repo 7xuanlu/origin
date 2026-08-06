@@ -47,28 +47,6 @@ impl LlmProvider for DistillStub {
     }
 }
 
-/// Stub for the annotate-only backfill path: returns a fixed body for every
-/// `citation_annotate` call.
-struct AnnotateStub {
-    body: String,
-}
-
-#[async_trait::async_trait]
-impl LlmProvider for AnnotateStub {
-    async fn generate(&self, _req: LlmRequest) -> Result<String, LlmError> {
-        Ok(self.body.clone())
-    }
-    fn is_available(&self) -> bool {
-        true
-    }
-    fn name(&self) -> &str {
-        "annotate-stub"
-    }
-    fn backend(&self) -> LlmBackend {
-        LlmBackend::Api
-    }
-}
-
 fn distill_cluster() -> DistillationCluster {
     DistillationCluster {
         source_ids: vec!["mem_daemon".into(), "mem_embed".into(), "mem_local".into()],
@@ -212,122 +190,17 @@ async fn unmatched_claim_unverified() {
         .contains("encrypted peer-to-peer video conferencing"));
 }
 
-/// Seed a legacy page (citations NULL) with one memory-kind evidence link,
-/// mirroring the annotate-only backfill's target shape.
-async fn seed_backfill_page(db: &MemoryDB, body: &str, mem_id: &str, mem_content: &str) -> String {
-    db.upsert_documents(vec![RawDocument {
-        source: "memory".to_string(),
-        source_id: mem_id.to_string(),
-        title: mem_content.chars().take(40).collect(),
-        content: mem_content.to_string(),
-        last_modified: chrono::Utc::now().timestamp(),
-        confirmed: Some(true),
-        ..Default::default()
-    }])
-    .await
-    .unwrap();
-
-    let result = create_page(
-        db,
-        CreateConceptRequest {
-            title: "T".to_string(),
-            content: body.to_string(),
-            summary: None,
-            entity_id: None,
-            space: (None).into(),
-            source_memory_ids: vec![],
-            creation_kind: Some("authored".to_string()),
-            workspace: None,
-        },
-        "test",
-        None,
-    )
-    .await
-    .unwrap();
-    db.link_page_evidence(&result.id, "memory", Some(mem_id), None, "test")
-        .await
-        .unwrap();
-    result.id
-}
-
-const BACKFILL_BODY: &str = "The daemon binds to port 7878 by default.";
-const BACKFILL_MEM_CONTENT: &str = "The daemon binds to port 7878 by default";
-
-#[tokio::test]
-async fn backfill_annotates_legacy_page() {
-    let (_dir, db) = temp_db().await;
-    let page_id = seed_backfill_page(&db, BACKFILL_BODY, "mem_a", BACKFILL_MEM_CONTENT).await;
-    assert!(db
-        .get_pages_missing_citations(10)
-        .await
-        .unwrap()
-        .contains(&page_id));
-
-    let annotated = format!("{BACKFILL_BODY}[1]");
-    let llm: Arc<dyn LlmProvider> = Arc::new(AnnotateStub {
-        body: annotated.clone(),
-    });
-    let prompts = PromptRegistry::default();
-
-    wenlan_core::citations::run_citation_backfill_tick(&db, &llm, &prompts)
-        .await
-        .unwrap();
-
-    let page = db.get_page(&page_id).await.unwrap().unwrap();
-    assert_eq!(
-        page.content, annotated,
-        "prose stays byte-identical modulo the inserted marker"
-    );
-    assert_eq!(page.citations.len(), 1, "citations: {:?}", page.citations);
-    assert_eq!(page.citations[0].status, "verified");
-    assert!(
-        !db.get_pages_missing_citations(10)
-            .await
-            .unwrap()
-            .contains(&page_id),
-        "page should no longer be citations-missing"
-    );
-    let changelog = db.get_page_changelog(&page_id).await.unwrap();
-    assert!(
-        changelog.contains("citation_backfill"),
-        "changelog: {changelog}"
-    );
-}
-
-#[tokio::test]
-async fn backfill_guard_rejects_rewrite_then_poison_pills() {
-    let (_dir, db) = temp_db().await;
-    let page_id = seed_backfill_page(&db, BACKFILL_BODY, "mem_a", BACKFILL_MEM_CONTENT).await;
-
-    let rewritten = "A completely different sentence about something else entirely.[1]";
-    let llm: Arc<dyn LlmProvider> = Arc::new(AnnotateStub {
-        body: rewritten.to_string(),
-    });
-    let prompts = PromptRegistry::default();
-
-    // 3 consecutive rejected ticks poison-pill the page.
-    for _ in 0..3 {
-        wenlan_core::citations::run_citation_backfill_tick(&db, &llm, &prompts)
-            .await
-            .unwrap();
-    }
-
-    let page = db.get_page(&page_id).await.unwrap().unwrap();
-    assert_eq!(page.content, BACKFILL_BODY, "prose must never be rewritten");
-    assert!(page.citations.is_empty());
-    assert!(
-        !db.get_pages_missing_citations(10)
-            .await
-            .unwrap()
-            .contains(&page_id),
-        "citations should be '[]' (gave up), not NULL"
-    );
-    let changelog = db.get_page_changelog(&page_id).await.unwrap();
-    assert!(
-        changelog.contains("citation backfill gave up"),
-        "changelog: {changelog}"
-    );
-}
+// `backfill_annotates_legacy_page` and
+// `backfill_guard_rejects_rewrite_then_poison_pills` (plus their
+// `seed_backfill_page` helper, `AnnotateStub`, and the `BACKFILL_BODY`/
+// `BACKFILL_MEM_CONTENT` constants) relocated to
+// `crates/wenlan-core/src/citations.rs`'s own `#[cfg(test)] mod tests`
+// (G6 Stage 2 PR 2b): their seed helper called `link_page_evidence`, which
+// closed to `#[cfg(test)]` under the Q2 ruling. `#[cfg(test)]` does not
+// cross the `tests/` integration-binary boundary, so the tests moved into
+// the crate's own unit-test suite, where they compile. Assertions
+// unchanged; renamed with a `_via_create_page` suffix there to distinguish
+// them from that module's existing `insert_page`-based `seed_backfill_page`.
 
 #[tokio::test]
 async fn old_page_wire_compat() {
