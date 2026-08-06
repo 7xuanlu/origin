@@ -28,7 +28,15 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("rel type row: {}", e)))?
         {
-            types.push(row.get::<String>(0).unwrap_or_default());
+            // NULL and empty-string are distinct signals -- NULL means no type
+            // was ever recorded (not a vocabulary value), empty string means a
+            // row explicitly stored one. Collapsing NULL into "" via
+            // `unwrap_or_default` would misreport an absent type as the
+            // vocabulary heal's "keep empty" case, so skip NULL rather than
+            // coerce it.
+            if let Some(t) = row.get::<Option<String>>(0).unwrap_or(None) {
+                types.push(t);
+            }
         }
         Ok(types)
     }
@@ -47,6 +55,10 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("entity type row: {}", e)))?
         {
+            // `entities.entity_type` is `TEXT NOT NULL` -- unlike relates
+            // edges' `semantic_type`, a NULL row is impossible by schema, so
+            // `unwrap_or_default` never coerces an absent value; it only
+            // ever hands back the stored string.
             types.push(row.get::<String>(0).unwrap_or_default());
         }
         Ok(types)

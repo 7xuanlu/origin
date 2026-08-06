@@ -30749,8 +30749,9 @@ async fn migration_115_backfills_edge_semantic_payload() {
 
 /// G6 Stage 1.2 (docs/plans/2026-08-05-g6-stage12-relations-readers-spec.md):
 /// migration 116 backfills `payload.asserted_at` (always) and fills
-/// `payload.source_memory_id` only when absent, from the live `relations`
-/// twin. A pre-Stage-1.2 edge is simulated by clearing both keys after the
+/// `payload.source_memory_id` only when absent, from the frozen `relations`
+/// twin (backfill machinery, still read by migrations per the writer-
+/// retirement spec). A pre-Stage-1.2 edge is simulated by clearing both keys after the
 /// write (the writer now stamps them at insert time, so a fresh write is
 /// never actually missing them). The loop runs the migration twice: the
 /// second pass must converge on the identical end-state.
@@ -48417,8 +48418,9 @@ async fn get_page_sources_omits_edge_retracted_despite_citations_backing() {
     }
 
     // mem_d7_gone was never a real memory, so its page_sources row is an
-    // orphan -- pruned by the cleanup sweep, but the edge survives because
-    // pages.citations still backs it.
+    // orphan -- pruned by the cleanup sweep. D7 is retired (item 4), so
+    // pages.citations backing no longer keeps the edge alive either; it
+    // retracts along with the row.
     let removed = db.cleanup_orphaned_page_sources().await.unwrap();
     assert_eq!(removed, 1);
 
@@ -48599,10 +48601,11 @@ async fn dual_write_page_citations_retracts_dropped_citation_when_unbacked() {
 // backed_outside_page_citations` helpers); pages.citations is a pure render
 // cache now and grants the shared edge no immunity. The post-item-4 contract
 // (edge retires when the ONE remaining backing store -- a live `memories`
-// row -- drops, regardless of citations JSON) is already pinned by
+// row -- drops, regardless of citations JSON) is pinned by
 // `cleanup_orphaned_page_sources_retracts_edge_even_when_backed_by_page_
 // citations` and `get_page_sources_omits_edge_retracted_despite_citations_
-// backing` above.
+// backing` above -- both renamed and flipped in this PR from their
+// pre-item-4 D7-survivor assertions, not pre-existing coverage.
 
 // ---- G6 Stage 0: dual-write gap regression tests (parity oracle) ----
 
@@ -48734,7 +48737,31 @@ async fn replace_page_sources_retires_pruned_cites_edges() {
     db.replace_page_sources("page_g6_prune", &[], "clear")
         .await
         .unwrap();
-    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
+    {
+        let conn = db.conn.lock().await;
+        for sid in ["mem_g6_keep", "mem_g6_drop"] {
+            let edge_id = crate::provenance::compute_edge_id(
+                "cites",
+                "page",
+                "page_g6_prune",
+                "memory",
+                sid,
+                sid,
+            );
+            let mut rows = conn
+                .query(
+                    "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                    libsql::params![edge_id.as_str()],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().expect("edge exists");
+            assert!(
+                row.get::<Option<i64>>(0).unwrap().is_some(),
+                "{sid}: empty keep-set must retire every remaining cites edge"
+            );
+        }
+    }
 }
 
 /// G6 edges-parity repair, post-retraction shape (fold-in of fix (a) into
@@ -48843,8 +48870,9 @@ async fn replace_page_sources_prunes_external_kind_edge_not_phantom_memory() {
     );
 }
 
-/// `try_update_page_content` reimplements `replace_page_sources`'s
-/// prune-then-reinsert on `page_sources` + memory-kind `page_evidence`, so a
+/// `try_update_page_content` mirrors `replace_page_sources`'s prune-then-
+/// reinsert shape, but against the live memory-kind `cites` edge set
+/// directly -- `page_sources`/`page_evidence` are frozen (items 1-2), so a
 /// sid dropped from the new source list must have its cites edge retired in
 /// the same transaction. G6 Stage 2 PR 2b (item 4): D7 (the refcount that
 /// let a `pages.citations` backing the same locator grant immunity) is
@@ -48933,7 +48961,31 @@ async fn update_page_content_retires_pruned_cites_edges() {
     db.update_page_content("page_g6_upc", "cleared", &[], "clear")
         .await
         .unwrap();
-    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
+    {
+        let conn = db.conn.lock().await;
+        for sid in ["mem_g6_upc_drop", "mem_g6_upc_keep", "mem_g6_upc_cited"] {
+            let edge_id = crate::provenance::compute_edge_id(
+                "cites",
+                "page",
+                "page_g6_upc",
+                "memory",
+                sid,
+                sid,
+            );
+            let mut rows = conn
+                .query(
+                    "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                    libsql::params![edge_id.as_str()],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().expect("edge exists");
+            assert!(
+                row.get::<Option<i64>>(0).unwrap().is_some(),
+                "{sid}: every remaining backing drop must retire the edge"
+            );
+        }
+    }
 }
 
 /// `delete_page` FK-CASCADEs away this page's rows in all three link stores

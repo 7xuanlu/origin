@@ -299,14 +299,17 @@ async fn identical_unbacked_relation_becomes_source_backed() {
 
     assert_eq!(second.id, first.id, "upsert must preserve the relation id");
     let conn = db.test_primary_session().await;
+    // G6 Stage 2 PR 2b: `relations` is frozen -- `first.id`/`second.id` are
+    // now the content-addressed `edges.edge_id` (item 3 compat note), so
+    // round-trip through `edges` instead of the old `relations.id`.
     let mut rows = conn
         .query(
-            "SELECT source_memory_id FROM relations WHERE id = ?1",
+            "SELECT json_extract(payload, '$.source_memory_id') FROM edges WHERE edge_id = ?1",
             libsql::params![first.id],
         )
         .await
         .unwrap();
-    let row = rows.next().await.unwrap().expect("relation row");
+    let row = rows.next().await.unwrap().expect("relates edge");
     let source_memory_id: Option<String> = row.get(0).unwrap();
     assert_eq!(
         source_memory_id.as_deref(),
@@ -4308,10 +4311,14 @@ async fn accept_page_revision_source_failure_keeps_page_retryable() {
 
     {
         let conn = db.test_primary_session().await;
+        // G6 Stage 2 PR 2b: `insert_resolved_page_evidence` stopped writing
+        // `page_sources` -- `edges` is the sole live producer of `cites`
+        // edges now. Re-point the fault at the same-transaction edges INSERT
+        // so this still exercises a mid-acceptance source-attachment abort.
         conn.execute_batch(&format!(
             "CREATE TRIGGER abort_page_revision_source
-             BEFORE INSERT ON page_sources
-             WHEN NEW.memory_source_id = '{}'
+             BEFORE INSERT ON edges
+             WHEN NEW.edge_type = 'cites' AND NEW.dst_id = '{}'
              BEGIN SELECT RAISE(ABORT, 'blocked revision source attachment'); END;",
             new_mem_id.replace('\'', "''")
         ))

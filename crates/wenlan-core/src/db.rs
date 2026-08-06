@@ -46584,6 +46584,14 @@ impl MemoryDB {
             // invisible to this repoint and would be silently stranded on
             // the archived page. Fold every such edge into the same
             // `repointed` batch the loop below already handles.
+            //
+            // A page matched by BOTH scans (a legacy row and its resolved
+            // live edge) is pushed into `repointed` twice; benign, since the
+            // repoint below mints via content-addressed `edge_id`, so a
+            // repeat entry just re-upserts the same row. The retire half is
+            // equally idempotent: `dual_write_invalidate_edge` guards its
+            // UPDATE on `AND valid_until IS NULL` (db.rs:15293), so a repeat
+            // call on an already-retired `old_edge_id` matches zero rows.
             let mut inbound_edge_rows = conn
                 .query(
                     "SELECT e.src_id, json_extract(e.payload, '$.label'), p.space \
