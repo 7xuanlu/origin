@@ -7882,15 +7882,17 @@ async fn delete_memory_cleans_page_provenance_and_background_dependents() {
         1
     );
 
+    // G6 Stage 2 PR 2b: the `relations` prune-on-delete stops (item 1 already
+    // stopped writing it; `invalidate_relation_edges_for_source_in_transaction`
+    // above retracts the live `relates` edge instead, and has its own direct
+    // coverage) -- the raw legacy row seeded above is left in place
+    // deliberately, to prove its presence doesn't break the delete, but is no
+    // longer asserted gone here.
     let conn = db.conn.lock().await;
     for (table, sql) in [
         (
             "episodes",
             "SELECT COUNT(*) FROM memories WHERE source='episode' AND source_id='mem-forget-dependencies'",
-        ),
-        (
-            "relations",
-            "SELECT COUNT(*) FROM relations WHERE source_memory_id='mem-forget-dependencies'",
         ),
         (
             "document_enrichment_queue",
@@ -10005,8 +10007,13 @@ async fn test_knowledge_graph_full_lifecycle() {
         assert_eq!(count, 2);
     }
 
+    // G6 Stage 2 PR 2b: `relations` is frozen -- count the live `relates`
+    // edge instead.
     let mut rows = conn
-        .query("SELECT COUNT(*) FROM relations", ())
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' AND valid_until IS NULL",
+            (),
+        )
         .await
         .unwrap();
     if let Ok(Some(row)) = rows.next().await {
@@ -11000,11 +11007,15 @@ async fn get_entity_detail_reads_relates_edge_fields() {
     .await
     .unwrap();
 
+    // G6 Stage 2 PR 2b: `relations` is frozen -- read the live `relates`
+    // edge instead.
     let relation_type = {
         let conn = db.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT relation_type FROM relations WHERE from_entity = ?1 AND to_entity = ?2",
+                "SELECT semantic_type FROM edges \
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+                   AND valid_until IS NULL",
                 libsql::params![alice_id.as_str(), wenlan_id.as_str()],
             )
             .await
@@ -11042,7 +11053,9 @@ async fn get_entity_detail_reads_relates_edge_fields() {
         let conn = db.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT created_at FROM relations WHERE from_entity = ?1 AND to_entity = ?2",
+                "SELECT created_at FROM edges \
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+                   AND valid_until IS NULL",
                 libsql::params![alice_id.as_str(), wenlan_id.as_str()],
             )
             .await
@@ -11939,10 +11952,12 @@ async fn test_create_relation_null_source_agent() {
         .await
         .unwrap();
 
+    // G6 Stage 2 PR 2b: `relations` is frozen; `source_agent` now lives in
+    // the live edge's payload.
     let conn = db.conn.lock().await;
     let mut rows = conn
         .query(
-            "SELECT source_agent FROM relations WHERE id = ?1",
+            "SELECT json_extract(payload, '$.source_agent') FROM edges WHERE edge_id = ?1",
             libsql::params![rid],
         )
         .await
@@ -11983,11 +11998,16 @@ async fn test_relation_type_normalized_at_insert() {
     .await
     .unwrap();
 
-    // Query the relation to verify normalization
+    // Query the relation to verify normalization. G6 Stage 2 PR 2b:
+    // `relations` is frozen -- `relation_type` is the live edge's
+    // `semantic_type` column, the rest live in its payload.
     let conn = db.conn.lock().await;
     let mut rows = conn
         .query(
-            "SELECT relation_type, confidence, explanation, source_memory_id FROM relations WHERE from_entity = ?1",
+            "SELECT semantic_type, json_extract(payload, '$.confidence'), \
+                    json_extract(payload, '$.explanation'), \
+                    json_extract(payload, '$.source_memory_id') \
+             FROM edges WHERE edge_type = 'relates' AND src_id = ?1 AND valid_until IS NULL",
             libsql::params![e1.clone()],
         )
         .await
@@ -22897,10 +22917,13 @@ async fn create_relation_coerces_unknown_type_to_related_to() {
         .await
         .unwrap();
 
+    // G6 Stage 2 PR 2b: `relations` is frozen and `create_relation` now
+    // returns the content-addressed `edges.edge_id` (item 3 compat note),
+    // so the coerced type is read straight off the live edge it names.
     let conn = db.conn.lock().await;
     let mut rows = conn
         .query(
-            "SELECT relation_type FROM relations WHERE id = ?1",
+            "SELECT semantic_type FROM edges WHERE edge_id = ?1",
             libsql::params![id],
         )
         .await
@@ -22939,11 +22962,14 @@ async fn create_relation_captures_coerced_type_as_promote_candidate() {
         1,
         "coerced type should queue exactly one promote candidate"
     );
-    // The row itself is still related_to (write unchanged).
+    // The row itself is still related_to (write unchanged). `relations` is
+    // frozen (G6 Stage 2 PR 2b) -- read the live `relates` edge instead.
     let conn = db.conn.lock().await;
     let mut rows = conn
         .query(
-            "SELECT relation_type FROM relations WHERE from_entity = ?1 AND to_entity = ?2",
+            "SELECT semantic_type FROM edges \
+             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+               AND valid_until IS NULL",
             libsql::params![e1.clone(), e2.clone()],
         )
         .await
@@ -25202,6 +25228,9 @@ async fn update_memory_invalidates_source_owned_kg_and_requeues_entity_enrichmen
     );
     {
         let conn = db.conn.lock().await;
+        // G6 Stage 2 PR 2b: `relations` is frozen -- the owned/manual relates
+        // checks below read the live `edges` twin instead. `manual_relation`
+        // is the content-addressed `edges.edge_id` (item 3 compat note).
         let mut rows = conn
             .query(
                 "SELECT
@@ -25209,13 +25238,15 @@ async fn update_memory_invalidates_source_owned_kg_and_requeues_entity_enrichmen
                       WHERE memory_id = 'mem_kg_invalidation'),
                      (SELECT COUNT(*) FROM observations
                       WHERE source_memory_id = 'mem_kg_invalidation'),
-                     (SELECT COUNT(*) FROM relations
-                      WHERE source_memory_id = 'mem_kg_invalidation'),
+                     (SELECT COUNT(*) FROM edges
+                      WHERE edge_type = 'relates' AND valid_until IS NULL
+                        AND json_extract(payload, '$.source_memory_id') = 'mem_kg_invalidation'),
                      (SELECT COUNT(*) FROM observations
                       WHERE content = 'manual observation must survive content edits'
                         AND source_memory_id IS NULL),
-                     (SELECT COUNT(*) FROM relations
-                      WHERE id = ?1 AND source_memory_id IS NULL)",
+                     (SELECT COUNT(*) FROM edges
+                      WHERE edge_id = ?1
+                        AND json_extract(payload, '$.source_memory_id') IS NULL)",
                 libsql::params![manual_relation.as_str()],
             )
             .await
@@ -25246,6 +25277,8 @@ async fn update_memory_invalidates_source_owned_kg_and_requeues_entity_enrichmen
     assert_eq!(selected, 1, "the edited v2 memory must be re-enriched");
 
     let conn = db.conn.lock().await;
+    // G6 Stage 2 PR 2b: `relations` is frozen -- see the comment on the
+    // pre-re-enrichment block above.
     let mut rows = conn
         .query(
             "SELECT
@@ -25255,13 +25288,15 @@ async fn update_memory_invalidates_source_owned_kg_and_requeues_entity_enrichmen
                   WHERE source_id = 'mem_kg_invalidation' AND entity_id IS NOT NULL),
                  (SELECT COUNT(*) FROM observations
                   WHERE source_memory_id = 'mem_kg_invalidation'),
-                 (SELECT COUNT(*) FROM relations
-                  WHERE source_memory_id = 'mem_kg_invalidation'),
+                 (SELECT COUNT(*) FROM edges
+                  WHERE edge_type = 'relates' AND valid_until IS NULL
+                    AND json_extract(payload, '$.source_memory_id') = 'mem_kg_invalidation'),
                  (SELECT COUNT(*) FROM observations
                   WHERE content = 'manual observation must survive content edits'
                     AND source_memory_id IS NULL),
-                 (SELECT COUNT(*) FROM relations
-                  WHERE id = ?1 AND source_memory_id IS NULL)",
+                 (SELECT COUNT(*) FROM edges
+                  WHERE edge_id = ?1
+                    AND json_extract(payload, '$.source_memory_id') IS NULL)",
             libsql::params![manual_relation.as_str()],
         )
         .await
@@ -26810,46 +26845,60 @@ async fn merge_entities_repoints_relations() {
     let (db, _tmp) = test_db().await;
     let (canonical, alias) = seed_two_entities(&db).await;
     let other = db.create_entity("Bob", "person", None).await.unwrap();
-    // Inbound relation: other --works_at--> alias  (tests to_entity re-point)
-    let rel_in = db
-        .create_relation(&other, &alias, "works_at", None, Some(0.9), None, None)
+    // Inbound relation: other --works_at--> alias  (tests dst_id re-point)
+    db.create_relation(&other, &alias, "works_at", None, Some(0.9), None, None)
         .await
         .unwrap();
-    // Outbound relation: alias --leads--> other  (tests from_entity re-point)
-    let rel_out = db
-        .create_relation(&alias, &other, "leads", None, Some(0.9), None, None)
+    // Outbound relation: alias --leads--> other  (tests src_id re-point)
+    db.create_relation(&alias, &other, "leads", None, Some(0.9), None, None)
         .await
         .unwrap();
 
     db.merge_entities(&canonical, &alias).await.unwrap();
 
+    // G6 Stage 2 PR 2b: merge no longer repoints a `relations` row in place
+    // -- it retires the alias-side edge and reasserts a corrected edge onto
+    // the canonical endpoint (`merge_edge_plans`, db.rs). Read the live
+    // `relates` edge between the corrected endpoints instead.
     let conn = db.conn.lock().await;
-    let mut rows = conn
+    let inbound: i64 = conn
         .query(
-            "SELECT to_entity FROM relations WHERE id = ?1",
-            libsql::params![rel_in],
+            "SELECT COUNT(*) FROM edges \
+             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+               AND valid_until IS NULL",
+            libsql::params![other.as_str(), canonical.as_str()],
         )
         .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
         .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
-    let to: String = row.get(0).unwrap();
     assert_eq!(
-        to, canonical,
-        "inbound relation should re-point to canonical via to_entity"
+        inbound, 1,
+        "inbound relation should re-point to canonical via dst_id"
     );
 
-    let mut rows = conn
+    let outbound: i64 = conn
         .query(
-            "SELECT from_entity FROM relations WHERE id = ?1",
-            libsql::params![rel_out],
+            "SELECT COUNT(*) FROM edges \
+             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+               AND valid_until IS NULL",
+            libsql::params![canonical.as_str(), other.as_str()],
         )
         .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
         .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
-    let from: String = row.get(0).unwrap();
     assert_eq!(
-        from, canonical,
-        "outbound relation should re-point to canonical via from_entity"
+        outbound, 1,
+        "outbound relation should re-point to canonical via src_id"
     );
 }
 
@@ -27267,28 +27316,45 @@ async fn supersede_relation_deletes_loser() {
 
     db.supersede_relation(&loser, &winner).await.unwrap();
 
+    // G6 Stage 2 PR 2b: the `relations` hard-delete stops -- supersede now
+    // soft-invalidates the loser's edge instead. `loser`/`winner` are
+    // `edges.edge_id` values (item 3 compat note).
     let conn = db.conn.lock().await;
-    let mut rows = conn
+    let loser_valid_until: Option<i64> = conn
         .query(
-            "SELECT COUNT(*) FROM relations WHERE id = ?1",
-            libsql::params![loser],
+            "SELECT valid_until FROM edges WHERE edge_id = ?1",
+            libsql::params![loser.as_str()],
         )
         .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
         .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
-    let count: i64 = row.get(0).unwrap();
-    assert_eq!(count, 0, "loser relation should be deleted");
+    assert!(
+        loser_valid_until.is_some(),
+        "loser relation's edge should be retired"
+    );
 
-    let mut rows = conn
+    let winner_valid_until: Option<i64> = conn
         .query(
-            "SELECT COUNT(*) FROM relations WHERE id = ?1",
-            libsql::params![winner],
+            "SELECT valid_until FROM edges WHERE edge_id = ?1",
+            libsql::params![winner.as_str()],
         )
         .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
         .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
-    let count: i64 = row.get(0).unwrap();
-    assert_eq!(count, 1, "winner relation should remain");
+    assert!(
+        winner_valid_until.is_none(),
+        "winner relation's edge should remain active"
+    );
 }
 
 #[tokio::test]
@@ -30198,10 +30264,14 @@ async fn ambient_entity_sweep_dual_writes_canonical_relates_edge() {
     assert_eq!(selected, 1, "the sweep processed the seeded memory");
 
     let conn = db.conn.lock().await;
+    // G6 Stage 2 PR 2b: `relations` is frozen -- count the live `relates`
+    // edge instead.
     let relation_count: i64 = {
         let mut rows = conn
             .query(
-                "SELECT COUNT(*) FROM relations WHERE relation_type = 'works_on'",
+                "SELECT COUNT(*) FROM edges \
+                 WHERE edge_type = 'relates' AND semantic_type = 'works_on' \
+                   AND valid_until IS NULL",
                 (),
             )
             .await
@@ -30500,14 +30570,21 @@ async fn migration_115_backfills_edge_semantic_payload() {
     .unwrap();
     // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
-    // Read the STORED discriminators back (create_relation normalizes the
-    // relation type; replace_page_links derives label_key) so the test
-    // derives edge ids exactly the way the migration does.
-    let (relation_type, label_key) = {
+    // Read the STORED discriminator back (create_relation normalizes the
+    // relation type) so the test derives the relates edge id exactly the
+    // way the migration does. G6 Stage 2 PR 2b: `create_relation` no longer
+    // writes `relations` -- read the live `relates` edge's `semantic_type`
+    // instead. `label_key` is just `link.label.to_lowercase()`
+    // (`replace_page_links`, db.rs) and a resolved link's `page_links` row
+    // stops at write time (item 3) -- compute it directly rather than
+    // reading a row that no longer exists.
+    let relation_type = {
         let conn = db.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT relation_type FROM relations WHERE from_entity = ?1 AND to_entity = ?2",
+                "SELECT semantic_type FROM edges \
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+                   AND valid_until IS NULL",
                 libsql::params![from.as_str(), to.as_str()],
             )
             .await
@@ -30516,25 +30593,12 @@ async fn migration_115_backfills_edge_semantic_payload() {
             .next()
             .await
             .unwrap()
-            .expect("relation row")
+            .expect("relates edge")
             .get(0)
             .unwrap();
-        let mut rows = conn
-            .query(
-                "SELECT label_key FROM page_links WHERE source_page_id = 'page_g6_sem'",
-                (),
-            )
-            .await
-            .unwrap();
-        let label_key: String = rows
-            .next()
-            .await
-            .unwrap()
-            .expect("page_links row")
-            .get(0)
-            .unwrap();
-        (relation_type, label_key)
+        relation_type
     };
+    let label_key = "Semantic Target".to_lowercase();
 
     for pass in 1..=2 {
         db.migrate_115_edge_semantic_payload(114).await.unwrap();
@@ -30716,9 +30780,33 @@ async fn migration_116_backfills_asserted_at_and_fills_source_memory_id() {
     let forced_created_at = 1_000_000_000i64;
     {
         let conn = db.conn.lock().await;
+        // G6 Stage 2 PR 2b: `create_relation` no longer writes `relations` --
+        // migration 116 still reads it (backfill machinery, kept per the
+        // writer-retirement spec) as the twin it backfills `asserted_at`/
+        // `source_memory_id` from. Raw-insert the historical row the join
+        // expects, using the edge's own (possibly-coerced) semantic_type so
+        // the join key matches.
+        let semantic_type: String = {
+            let mut rows = conn
+                .query(
+                    "SELECT semantic_type FROM edges \
+                     WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+                       AND valid_until IS NULL",
+                    libsql::params![from.as_str(), to.as_str()],
+                )
+                .await
+                .unwrap();
+            rows.next()
+                .await
+                .unwrap()
+                .expect("relates edge")
+                .get(0)
+                .unwrap()
+        };
         conn.execute(
-            "UPDATE relations SET created_at = ?1 WHERE from_entity = ?2 AND to_entity = ?3",
-            libsql::params![forced_created_at, from.as_str(), to.as_str()],
+            "INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at, source_memory_id) \
+             VALUES ('rel_m116_backfill', ?1, ?2, ?3, ?4, 'mem_backfill')",
+            libsql::params![from.as_str(), to.as_str(), semantic_type.as_str(), forced_created_at],
         )
         .await
         .unwrap();
@@ -31965,9 +32053,15 @@ async fn ambient_dedup_delete_retracts_the_losing_edge() {
         .unwrap());
 
     let conn = db.conn.lock().await;
+    // G6 Stage 2 PR 2b: `relations` is frozen -- read the surviving relation
+    // type off the live `relates` edge instead.
     let surviving_types: Vec<String> = {
         let mut rows = conn
-            .query("SELECT relation_type FROM relations", ())
+            .query(
+                "SELECT semantic_type FROM edges \
+                 WHERE edge_type = 'relates' AND valid_until IS NULL",
+                (),
+            )
             .await
             .unwrap();
         let mut out = Vec::new();
@@ -32357,6 +32451,23 @@ async fn migration_111_is_a_no_op_on_an_undamaged_database() {
     )
     .await
     .unwrap();
+    // G6 Stage 2 PR 2b: `create_relation_with_span` no longer writes
+    // `relations` -- migration 111 still reads it (backfill machinery, m81/
+    // m111-only, deliberately kept per the writer-retirement spec) to decide
+    // whether an edge is "expected". Raw-insert the historical twin so an
+    // "undamaged" database looks the way one actually did pre-cutover:
+    // relation and edge both present and in parity, not a live edge with no
+    // twin at all (which m111 would otherwise read as an orphan and retract).
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at) \
+             VALUES ('rel_m111_healthy', ?1, ?2, 'related_to', strftime('%s','now'))",
+            libsql::params![src.as_str(), dst.as_str()],
+        )
+        .await
+        .unwrap();
+    }
 
     db.set_app_metadata(
         crate::edge_grounding::EDGE_GROUNDING_CURSOR_KEY,
@@ -46840,11 +46951,16 @@ async fn stage_1_3_reader_migration_keeps_cites_edge_parity_clean() {
     .unwrap();
     // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
-    // S2 (2026-08-05 review): pin the drop explicitly. `page_evidence` now
-    // has 2 rows (the memory-kind row from link_page_source, plus the
-    // authored/NULL-locator row above), but a NULL-locator row mints no
-    // edge (link_page_evidence's documented skip), so the edge-backed
-    // reader #4 (`get_page_evidence`) must return only 1.
+    // S2 (2026-08-05 review): pin the drop explicitly. G6 Stage 2 PR 2b:
+    // `link_page_source`'s memory-kind `page_evidence` insert stopped
+    // (`insert_resolved_page_evidence`, db.rs) -- `edges` is its sole live
+    // producer now. Only the authored/NULL-locator row above still lands in
+    // `page_evidence`, from the now-`#[cfg(test)]`-only `link_page_evidence`
+    // (Q2 ruling: that shape has no canonical edge representation, so the
+    // legacy row is the only representation left, same as it always was).
+    // A NULL-locator row mints no edge (link_page_evidence's documented
+    // skip) either way, so the edge-backed reader #4 (`get_page_evidence`)
+    // must return only 1.
     let evidence_row_count = {
         let conn = db.conn.lock().await;
         let mut rows = conn
@@ -46856,7 +46972,10 @@ async fn stage_1_3_reader_migration_keeps_cites_edge_parity_clean() {
             .unwrap();
         rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
     };
-    assert_eq!(evidence_row_count, 2, "legacy page_evidence has both rows");
+    assert_eq!(
+        evidence_row_count, 1,
+        "legacy page_evidence has only the authored row"
+    );
     let evidence = db.get_page_evidence("g13_parity_page").await.unwrap();
     assert_eq!(
         evidence.len(),
@@ -47709,6 +47828,26 @@ async fn source_backed_relation_retry_preserves_original_relation_and_edge_prove
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2b: `relations` is frozen -- `asserted_at` must mirror
+    // the ORIGINAL mint's stamp across the retry's re-assert, so capture it
+    // here (before the retry) as the independent oracle, instead of reading
+    // a `relations.created_at` that no longer exists.
+    let original_asserted_at: i64 = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT json_extract(payload, '$.asserted_at') FROM edges WHERE edge_id = ?1",
+                libsql::params![first_id.clone()],
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .expect("relates edge")
+            .get(0)
+            .unwrap()
+    };
     let retry_id = db
         .create_relation_with_span(
             &e1,
@@ -47728,9 +47867,13 @@ async fn source_backed_relation_retry_preserves_original_relation_and_edge_prove
     assert_eq!(retry_id, first_id, "retry must converge on one relation");
 
     let conn = db.conn.lock().await;
+    // G6 Stage 2 PR 2b: `relations` is frozen -- `edges` is the sole live
+    // producer, so the "relation store" and "extraction edge" reads below
+    // both resolve to the same edge (`first_id`/`retry_id` are the
+    // content-addressed `edges.edge_id`, item 3 compat note).
     let mut relation_rows = conn
         .query(
-            "SELECT source_memory_id FROM relations WHERE id = ?1",
+            "SELECT json_extract(payload, '$.source_memory_id') FROM edges WHERE edge_id = ?1",
             libsql::params![first_id],
         )
         .await
@@ -47739,7 +47882,7 @@ async fn source_backed_relation_retry_preserves_original_relation_and_edge_prove
         .next()
         .await
         .unwrap()
-        .expect("relation row")
+        .expect("relates edge")
         .get(0)
         .unwrap();
     drop(relation_rows);
@@ -47780,24 +47923,9 @@ async fn source_backed_relation_retry_preserves_original_relation_and_edge_prove
     // G6 Stage 1.2: asserted_at must still mirror the ORIGINAL stored row's
     // created_at (immutable under the upsert), never `now` at the retry;
     // confidence keeps the higher (0.9) value the retry supplied.
-    let original_created_at: i64 = {
-        let mut rows = conn
-            .query(
-                "SELECT created_at FROM relations WHERE id = ?1",
-                libsql::params![retry_id.clone()],
-            )
-            .await
-            .unwrap();
-        rows.next()
-            .await
-            .unwrap()
-            .expect("relation row")
-            .get(0)
-            .unwrap()
-    };
     assert_eq!(
         payload["asserted_at"],
-        serde_json::json!(original_created_at),
+        serde_json::json!(original_asserted_at),
         "asserted_at must mirror the ORIGINAL stored relation's created_at across the re-assert"
     );
     assert_eq!(
@@ -48463,53 +48591,18 @@ async fn dual_write_page_citations_retracts_dropped_citation_when_unbacked() {
     );
 }
 
-#[tokio::test]
-async fn refcount_retracts_only_after_last_backing_store_drops_citation() {
-    // D7 order-independence: whichever legacy store (page_evidence vs
-    // pages.citations) drops its backing FIRST, the shared edge must
-    // stay active until the LAST one drops -- mirrors
-    // `dual_write_page_citations_preserves_edge_backed_by_page_evidence`
-    // (citations-first order) with the reverse order (page_evidence
-    // first, via orphan cleanup) to prove both orders converge on the
-    // same "retract only when refcount hits zero" outcome.
-    let (db, _dir) = test_db().await;
-    let edge_id = crate::provenance::compute_edge_id(
-        "cites", "page", "page_oi", "memory", "mem_oi", "mem_oi",
-    );
-    {
-        let conn = db.conn.lock().await;
-        insert_raw_page_for_m81_test(&conn, "page_oi", "space_a").await;
-        seed_page_evidence(&conn, "page_oi", "memory", Some("mem_oi")).await;
-    }
-    let citations = serde_json::json!([
-        {"occurrence": 1, "marker": 1, "source_kind": "memory", "locator": "mem_oi",
-         "score": 0.9, "status": "verified", "scope": "sentence"}
-    ]);
-    db.set_page_citations("page_oi", Some(&citations.to_string()))
-        .await
-        .unwrap();
-
-    // page_evidence's row for mem_oi is orphaned (no backing memory) --
-    // pages.citations still cites it, so the edge must stay active.
-    db.cleanup_orphaned_page_sources().await.unwrap();
-    {
-        let conn = db.conn.lock().await;
-        assert_eq!(
-            edge_valid_until(&conn, &edge_id).await,
-            None,
-            "pages.citations still backs mem_oi after page_evidence is pruned"
-        );
-    }
-
-    // Now pages.citations also drops it -- the last backing store is
-    // gone, so the edge must retract.
-    db.set_page_citations("page_oi", Some("[]")).await.unwrap();
-    let conn = db.conn.lock().await;
-    assert!(
-        edge_valid_until(&conn, &edge_id).await.is_some(),
-        "no legacy store backs mem_oi anymore -- the edge must retract"
-    );
-}
+// G6 Stage 2 PR 2b (item 4) retired `refcount_retracts_only_after_last_
+// backing_store_drops_citation`: it asserted D7's order-independent refcount
+// -- an edge stays active until BOTH page_evidence and pages.citations drop
+// their backing, whichever goes first. D7 itself is retired (`dual_write_
+// page_citations`, db.rs: no more `cites_backed_by_page_citations`/`cites_
+// backed_outside_page_citations` helpers); pages.citations is a pure render
+// cache now and grants the shared edge no immunity. The post-item-4 contract
+// (edge retires when the ONE remaining backing store -- a live `memories`
+// row -- drops, regardless of citations JSON) is already pinned by
+// `cleanup_orphaned_page_sources_retracts_edge_even_when_backed_by_page_
+// citations` and `get_page_sources_omits_edge_retracted_despite_citations_
+// backing` above.
 
 // ---- G6 Stage 0: dual-write gap regression tests (parity oracle) ----
 
@@ -48753,10 +48846,12 @@ async fn replace_page_sources_prunes_external_kind_edge_not_phantom_memory() {
 /// `try_update_page_content` reimplements `replace_page_sources`'s
 /// prune-then-reinsert on `page_sources` + memory-kind `page_evidence`, so a
 /// sid dropped from the new source list must have its cites edge retired in
-/// the same transaction — except when the new `pages.citations` value still
-/// backs the locator (D7 refcount). Same damage class as the 2026-07-23 live
-/// stale-edge incident, on the higher-traffic write path (manual edits,
-/// refinery rewrites, page growth).
+/// the same transaction. G6 Stage 2 PR 2b (item 4): D7 (the refcount that
+/// let a `pages.citations` backing the same locator grant immunity) is
+/// retired — a drop from the source list now always retires the edge,
+/// regardless of what the new citations value says. Same damage class as
+/// the 2026-07-23 live stale-edge incident, on the higher-traffic write path
+/// (manual edits, refinery rewrites, page growth).
 #[tokio::test]
 async fn update_page_content_retires_pruned_cites_edges() {
     let (db, _dir) = test_db().await;
@@ -48782,8 +48877,9 @@ async fn update_page_content_retires_pruned_cites_edges() {
     }
     // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
-    // Drop two sids, keep one; the new citations value still backs one of
-    // the dropped locators, so its edge must survive (D7 refcount).
+    // Drop two sids, keep one; the new citations value still names one of
+    // the dropped locators, but D7 is retired (item 4) -- that no longer
+    // grants immunity, so its edge must retire along with the other drop.
     let citations = r#"[{"occurrence":1,"marker":1,"source_kind":"memory","locator":"mem_g6_upc_cited","score":1.0,"status":"verified","scope":"sentence"}]"#;
     let landed = db
         .try_update_page_content_with_changelog(
@@ -48806,7 +48902,7 @@ async fn update_page_content_retires_pruned_cites_edges() {
         for (sid, retired) in [
             ("mem_g6_upc_drop", true),
             ("mem_g6_upc_keep", false),
-            ("mem_g6_upc_cited", false),
+            ("mem_g6_upc_cited", true),
         ] {
             let edge_id = crate::provenance::compute_edge_id(
                 "cites",
