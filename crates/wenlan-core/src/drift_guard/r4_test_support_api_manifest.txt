@@ -648,6 +648,9 @@ crates/wenlan-core/src/document_enrichment.rs|crate::document_enrichment::tests:
 crates/wenlan-core/src/document_enrichment.rs|crate::document_enrichment::tests::sync_receipt_failure_does_not_leave_same_hash_queue_terminal|TestDbSession::execute_batch|1
 crates/wenlan-core/src/document_enrichment.rs|crate::document_enrichment::tests::sync_receipt_failure_does_not_leave_same_hash_queue_terminal|test_primary_session|1
 crates/wenlan-core/src/document_enrichment.rs|crate::document_enrichment::tests::sync_receipt_failure_does_not_leave_same_hash_queue_terminal|test_primary_session|2
+crates/wenlan-core/src/document_enrichment.rs|crate::document_enrichment::tests::write_document_source_page_replace_keeps_carried_over_retires_dropped|TestDbRows::next|1
+crates/wenlan-core/src/document_enrichment.rs|crate::document_enrichment::tests::write_document_source_page_replace_keeps_carried_over_retires_dropped|TestDbSession::query|1
+crates/wenlan-core/src/document_enrichment.rs|crate::document_enrichment::tests::write_document_source_page_replace_keeps_carried_over_retires_dropped|test_primary_session|1
 crates/wenlan-core/src/eval/shared.rs|crate::eval::shared::tests::batched_path_meets_graph_contract|TestDbSession::check_seed_contract|1
 crates/wenlan-core/src/eval/shared.rs|crate::eval::shared::tests::batched_path_meets_graph_contract|test_primary_session|1
 crates/wenlan-core/src/eval/shared.rs|crate::eval::shared::tests::collect_fingerprint|TestDbRow::get|1
