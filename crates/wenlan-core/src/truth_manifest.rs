@@ -20,12 +20,14 @@
 //! pages.title (M3)"`. That conflates M3's shadow-mirror mechanism with an
 //! actual page leak, and the route is demoted here.
 //!
-//! `get_entity_detail_scoped` (`db/scoped_entities.rs:114-131`) reads `pages`
-//! only when the per-consumer `entity_reader_cutover` for `"scoped_entities"`
-//! is on, and that is default OFF -- the live path selects `entities.name`. On
-//! the cutover branch it selects `p.title, p.entity_type, p.confidence,
-//! p.entity_confirmed` and **no page body**, and `p.title` is not authored
-//! prose: `update_entity_shadow_page` (`db.rs:9952`) writes it as
+//! `get_entity_detail_scoped` (`db/scoped_entities.rs:63`) reads `pages`
+//! unconditionally -- G6 Stage 1.5b Part 3 collapsed its
+//! `entity_reader_cutover` gate to a hard cutover, and G6 Stage 2 PR 2a
+//! deleted the gate itself, so there is no legacy `entities.name` branch
+//! left to select instead. It selects `p.title, p.entity_type, p.space,
+//! p.source_agent, p.confidence, p.entity_confirmed, p.entity_created_at,
+//! p.entity_updated_at` and **no page body**, and `p.title` is not authored
+//! prose: `update_entity_shadow_page` (`db.rs:10070`) writes it as
 //! `title = (SELECT name FROM entities WHERE id = ?1)`. The arrow runs
 //! entity -> page, so the title is the entity's own name arriving by a longer
 //! road. Observations and relations come from `observations` / `relations`

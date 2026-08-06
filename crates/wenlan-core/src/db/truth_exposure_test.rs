@@ -24,7 +24,8 @@ async fn the_cutover_generation_round_trips_and_rolls_back() {
 }
 
 /// A generation written as garbage reads as off, not as on. The gate fails
-/// toward inert in every ambiguous case, mirroring `reader_uses_edges`.
+/// toward inert in every ambiguous case, mirroring the retired cutover
+/// levers' fail-toward-inert convention.
 #[tokio::test]
 async fn an_unparseable_generation_reads_as_off() {
     let (db, _tmp) = test_db().await;

@@ -925,7 +925,6 @@ carrying the authority of agreement.
 | `core/db.rs::query_distillation_seed_slice` | `private` | no | no | — | — |
 | `core/db.rs::query_distillation_staging_pool` | `private` | no | no | — | — |
 | `core/db.rs::rebind_source_page_in_transaction` | `private` | no | no | — | — |
-| `core/db.rs::reconcile_entity_page_parity` | `pub` | no | **yes** | `server/scheduler/ambient.rs::run_ambient_job` | — |
 | `core/db.rs::resolve_entity_by_name` | `pub` | no | **yes** | `server/memory_routes.rs::handle_store_memory` | — |
 | `core/db.rs::run_migrations` | `pub` | no | no | — | — |
 | `core/db.rs::search_entities_by_name` | `pub` | no | no | — | — |
@@ -1060,7 +1059,6 @@ carrying the authority of agreement.
 | `server/routes.rs::handle_distill` | `pub` | no | no | — | `core/db.rs::list_stale_pages_scoped`, `core/db.rs::load_page_source_index` |
 | `server/routes.rs::handle_recent_page_changes` | `pub` | no | no | — | `core/db/scoped_pages.rs::list_recent_changes_scoped` |
 | `server/routes.rs::handle_recent_retrievals` | `pub` | no | no | — | `core/db.rs::list_recent_retrievals_scoped` |
-| `server/scheduler/ambient.rs::run_ambient_job` | `pub(super)` | no | no | `server/scheduler/ambient.rs::run_ambient_job_safe` | `core/db.rs::reconcile_entity_page_parity` |
 
 ### Depth 2 — consumers
 
@@ -1207,7 +1205,7 @@ carrying the authority of agreement.
 | `server/routes.rs::handle_recent_pages` | `pub` | no | no | — | `core/db/scoped_pages.rs::list_recent_pages_with_badges_scoped` |
 | `server/routes.rs::handle_search` | `pub` | no | no | — | `core/db.rs::search_memory` |
 | `server/scheduler.rs::fire_maintenance_stage_safe` | `private` | no | no | `server/scheduler.rs::spawn_scheduler` | `core/maintenance.rs::run_maintenance_stage_slice` |
-| `server/scheduler/ambient.rs::run_ambient_job_safe` | `pub(super)` | no | no | `server/scheduler.rs::spawn_scheduler` | `server/scheduler/ambient.rs::run_ambient_job` |
+| `server/scheduler/ambient.rs::run_ambient_job` | `pub(super)` | no | no | `server/scheduler/ambient.rs::run_ambient_job_safe` | `core/post_ingest.rs::run_page_growth_slice` |
 
 ### Depth 3 — outer consumers — route handlers and orchestration
 
@@ -1297,7 +1295,8 @@ carrying the authority of agreement.
 | `server/repair_routes.rs::handle_apply` | `private` | no | no | — | `core/repair.rs::apply_repair_with_pages` |
 | `server/routes.rs::handle_context` | `pub` | no | no | — | `server/brief_routes.rs::handle_read_brief` |
 | `server/scheduler.rs::fire_steep_phase` | `private` | no | no | `server/scheduler.rs::fire_steep_phase_safe` | `core/refinery/mod.rs::run_periodic_steep_phase_with_api` |
-| `server/scheduler.rs::spawn_scheduler` | `pub` | no | **yes** | `server/main.rs::run_daemon` | `server/scheduler.rs::fire_maintenance_stage_safe`, `server/scheduler/ambient.rs::run_ambient_job_safe` |
+| `server/scheduler.rs::spawn_scheduler` | `pub` | no | **yes** | `server/main.rs::run_daemon` | `server/scheduler.rs::fire_maintenance_stage_safe` |
+| `server/scheduler/ambient.rs::run_ambient_job_safe` | `pub(super)` | no | no | `server/scheduler.rs::spawn_scheduler` | `server/scheduler/ambient.rs::run_ambient_job` |
 | `server/source_routes.rs::sync_directory_source` | `pub(crate)` | no | no | `server/scheduler.rs::sync_directory_sources`, `server/source_routes.rs::handle_sync_source` | `core/db.rs::rebind_source_id_with_source_page` |
 
 <!-- m5-reader-sweep:end -->

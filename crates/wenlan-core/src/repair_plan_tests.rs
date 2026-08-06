@@ -2737,7 +2737,7 @@ async fn bind_page_link_repair_mints_the_links_edge() {
         .unwrap();
     assert_eq!(target.as_deref(), Some("target_link_a"), "row bound");
 
-    let report = db.reconcile_edges_parity().await.unwrap();
+    let report = db.compute_edges_parity_report().await.unwrap();
     assert_eq!(
         report.drift_count, 0,
         "a repair-tool orphan bind must not re-drift edges parity (missing={}, extra={}, corrupt={})",

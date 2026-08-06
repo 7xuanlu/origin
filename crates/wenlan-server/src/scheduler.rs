@@ -40,8 +40,6 @@ const DERIVED_RECEIPT_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const ENRICHMENT_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const RECONCILE_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const CITATION_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
-const EDGES_RECONCILE_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
-const ENTITY_PAGE_RECONCILE_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const EDGE_GROUNDING_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Target-Mac evidence keeps short ambient turns below a 5% duty cycle while
 /// avoiding the fivefold convergence penalty of the provisional ten-minute

@@ -2024,7 +2024,7 @@ mod tests {
     ///
     /// RED control (source mutation, run by hand 2026-08-05): reverting fix
     /// (a) alone (hard-coding `dst_kind="memory"` back into the
-    /// `reconcile_edges_parity` page_sources contributor) fails the FIRST
+    /// `compute_edges_parity_report` page_sources contributor) fails the FIRST
     /// `drift_count == 0` assertion (left=2, right=0), because the sweep then
     /// expects a memory-kind edge no writer ever mints. Reverting fix (b)
     /// alone (restoring `replace_source_page_inner`'s retire loop to run
@@ -2081,7 +2081,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            db.reconcile_edges_parity().await.unwrap().drift_count,
+            db.compute_edges_parity_report().await.unwrap().drift_count,
             0,
             "first write must leave parity clean"
         );
@@ -2098,7 +2098,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            db.reconcile_edges_parity().await.unwrap().drift_count,
+            db.compute_edges_parity_report().await.unwrap().drift_count,
             0,
             "second write (growing chunk set) must leave parity clean"
         );

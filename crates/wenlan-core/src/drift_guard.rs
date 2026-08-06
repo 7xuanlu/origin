@@ -12269,3 +12269,110 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
         );
     }
 }
+
+// ── G6 Stage 2 PR 2a: retired edges/entity-page parity machinery stays retired ──
+
+/// Function/const/flag identifiers retired by G6 Stage 2 PR 2a along with the
+/// edges/entity-page parity oracle and cutover machinery. Every remaining
+/// mention in the tree today is prose inside a `//`/`///` comment (recording
+/// why the retirement happened); this guard exists so a future call site,
+/// redefinition, or flag read can't quietly resurrect the surface without
+/// updating it. Table names are deliberately excluded --
+/// `edges_parity_watermark`/`entity_page_parity_watermark`/
+/// `edges_reader_cutover`/`entity_reader_cutover` remain forever as SQL
+/// string literals in db.rs's migration history (the `CREATE TABLE`s at
+/// migrations 82/94, the `DROP TABLE`s at migration 120), which is expected
+/// and not drift.
+const RETIRED_PARITY_MACHINERY_SYMBOLS: &[&str] = &[
+    "reconcile_edges_parity",
+    "reconcile_entity_page_parity",
+    "edges_reconcile_enabled",
+    "edges_reconcile_enabled_value",
+    "entity_page_reconcile_enabled",
+    "entity_page_reconcile_enabled_value",
+    "set_reader_cutover",
+    "reader_uses_edges",
+    "set_entity_reader_cutover",
+    "reader_uses_entity_pages",
+    "SCOPED_ENTITIES_CONSUMER",
+    "WENLAN_ENABLE_EDGES_RECONCILE",
+    "WENLAN_ENABLE_ENTITY_PAGE_RECONCILE",
+    "EdgesReconcile",
+    "EntityPageReconcile",
+];
+
+/// Live (non-comment) occurrences of any of `symbols` in one file's source,
+/// as `(1-based line number, symbol)` pairs. A line counts as a comment, and
+/// is skipped, only when its trimmed text starts with `//` -- the same shape
+/// every existing retirement note in this tree already uses (`// G6 Stage 2
+/// PR 2a retired ...`, `/// ...`). `re` is one alternation over `symbols`
+/// (each already `\b`-wrapped), compiled once by the caller -- this scans
+/// every tracked `*.rs` file's every line, so a per-line/per-symbol compile
+/// is the difference between a sub-second test and a multi-minute one.
+fn live_references_to_retired_symbols_in_source(
+    source: &str,
+    re: &regex::Regex,
+) -> Vec<(usize, String)> {
+    let mut hits = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        for m in re.find_iter(line) {
+            hits.push((i + 1, m.as_str().to_string()));
+        }
+    }
+    hits
+}
+
+/// One alternation regex over `\b`-wrapped `symbols`, for
+/// `live_references_to_retired_symbols_in_source`.
+fn retired_symbols_regex(symbols: &[&str]) -> regex::Regex {
+    let pattern = symbols
+        .iter()
+        .map(|s| format!(r"\b{}\b", regex::escape(s)))
+        .collect::<Vec<_>>()
+        .join("|");
+    regex::Regex::new(&pattern).unwrap()
+}
+
+/// Known limits: `git_ls_files(&root, "*.rs")` scans only `*.rs`, so a
+/// retired symbol resurrected in a non-Rust file (docs, scripts, config)
+/// is invisible here; and a retired symbol inside a `rust` doc-test fence
+/// is skipped by this line-based scan too, but is NOT silently safe --
+/// `cargo test --doc` fails loud on it unless the fence is `ignore` or
+/// `text`, which is the actual backstop for that case.
+#[test]
+fn retired_edges_entity_parity_machinery_has_no_live_references() {
+    let root = repo_root();
+    let re = retired_symbols_regex(RETIRED_PARITY_MACHINERY_SYMBOLS);
+    let mut hits = Vec::new();
+    for f in git_ls_files(&root, "*.rs") {
+        // This guard's own symbol list and positive-control fixture necessarily
+        // spell out the retired names as plain strings, which isn't drift.
+        if f == "crates/wenlan-core/src/drift_guard.rs" {
+            continue;
+        }
+        let txt = std::fs::read_to_string(root.join(&f)).unwrap_or_default();
+        for (line_no, sym) in live_references_to_retired_symbols_in_source(&txt, &re) {
+            hits.push(format!("{f}:{line_no}: {sym}"));
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "G6 Stage 2 PR 2a retired these functions/flags; a live (non-comment) \
+         reference means the surface came back without updating this guard:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn retired_parity_machinery_guard_detects_a_live_reference() {
+    // Positive control: a live (non-comment) mention of a retired symbol must
+    // be caught, and a comment-only mention of the same symbol must not.
+    let source = "const SCOPED_ENTITIES_CONSUMER: &str = \"scoped_entities\";\n\
+                  // mentions SCOPED_ENTITIES_CONSUMER only in prose\n";
+    let re = retired_symbols_regex(&["SCOPED_ENTITIES_CONSUMER"]);
+    let hits = live_references_to_retired_symbols_in_source(source, &re);
+    assert_eq!(hits, vec![(1, "SCOPED_ENTITIES_CONSUMER".to_string())]);
+}
