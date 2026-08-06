@@ -10,13 +10,11 @@ pub(super) enum AmbientJob {
     PageGrowth,
     Reconcile,
     Citation,
-    EdgesReconcile,
-    EntityPageReconcile,
     EdgeGroundingPromote,
 }
 
 impl AmbientJob {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 9] = [
         Self::Document,
         Self::Classification,
         Self::StructuredExtract,
@@ -25,8 +23,6 @@ impl AmbientJob {
         Self::PageGrowth,
         Self::Reconcile,
         Self::Citation,
-        Self::EdgesReconcile,
-        Self::EntityPageReconcile,
         Self::EdgeGroundingPromote,
     ];
 }
@@ -41,8 +37,6 @@ pub(super) struct AmbientAvailability {
     pub(super) page_growth: bool,
     pub(super) reconcile: bool,
     pub(super) citation: bool,
-    pub(super) edges_reconcile: bool,
-    pub(super) entity_page_reconcile: bool,
     pub(super) edge_grounding_promote: bool,
 }
 
@@ -61,10 +55,6 @@ impl AmbientAvailability {
             page_growth: provider_available,
             reconcile: provider_available && wenlan_core::db::doc_reconcile_enabled(),
             citation: provider_available && wenlan_core::db::citation_backfill_enabled(),
-            // No model or model consent is involved, but the scan still goes
-            // through the shared foreground/resource/cooldown controller.
-            edges_reconcile: wenlan_core::db::edges_reconcile_enabled(),
-            entity_page_reconcile: wenlan_core::db::entity_page_reconcile_enabled(),
             // Provider-gated: the mandatory entailment check spends an LLM call,
             // so the lane parks unless the pinned provider is authorized+healthy
             // AND the opt-in flag is set (mirroring reconcile / citation).
@@ -83,8 +73,6 @@ impl AmbientAvailability {
             AmbientJob::PageGrowth => self.page_growth,
             AmbientJob::Reconcile => self.reconcile,
             AmbientJob::Citation => self.citation,
-            AmbientJob::EdgesReconcile => self.edges_reconcile,
-            AmbientJob::EntityPageReconcile => self.entity_page_reconcile,
             AmbientJob::EdgeGroundingPromote => self.edge_grounding_promote,
         }
     }
@@ -100,8 +88,6 @@ pub(super) struct AmbientSchedule {
     last_page_growth: Option<Instant>,
     pub(super) last_reconcile: Option<Instant>,
     pub(super) last_citation: Option<Instant>,
-    pub(super) last_edges_reconcile: Option<Instant>,
-    pub(super) last_entity_page_reconcile: Option<Instant>,
     last_edge_grounding_promote: Option<Instant>,
 }
 
@@ -117,8 +103,6 @@ impl AmbientSchedule {
             last_page_growth: None,
             last_reconcile: None,
             last_citation: None,
-            last_edges_reconcile: None,
-            last_entity_page_reconcile: None,
             last_edge_grounding_promote: None,
         }
     }
@@ -157,14 +141,6 @@ impl AmbientSchedule {
                 AmbientJob::Citation => self
                     .last_citation
                     .is_none_or(|last| now.duration_since(last) >= CITATION_SWEEP_INTERVAL),
-                AmbientJob::EdgesReconcile => self
-                    .last_edges_reconcile
-                    .is_none_or(|last| now.duration_since(last) >= EDGES_RECONCILE_SWEEP_INTERVAL),
-                AmbientJob::EntityPageReconcile => {
-                    self.last_entity_page_reconcile.is_none_or(|last| {
-                        now.duration_since(last) >= ENTITY_PAGE_RECONCILE_SWEEP_INTERVAL
-                    })
-                }
                 AmbientJob::EdgeGroundingPromote => self
                     .last_edge_grounding_promote
                     .is_none_or(|last| now.duration_since(last) >= EDGE_GROUNDING_SWEEP_INTERVAL),
@@ -181,7 +157,7 @@ impl AmbientSchedule {
     /// thermal cooldown still limits actual work; this only prevents a second
     /// 30-minute delay from turning catch-up into a multi-week drain.
     pub(super) fn note_job_result(&mut self, job: AmbientJob, now: Instant, selected: bool) {
-        if selected && job != AmbientJob::EdgesReconcile && job != AmbientJob::EntityPageReconcile {
+        if selected {
             return;
         }
         match job {
@@ -193,11 +169,6 @@ impl AmbientSchedule {
             AmbientJob::PageGrowth => self.last_page_growth = Some(now),
             AmbientJob::Reconcile => self.last_reconcile = Some(now),
             AmbientJob::Citation => self.last_citation = Some(now),
-            // One edge reconciliation is a complete full pass, not one item
-            // from a backlog. Always enforce its 30-minute interval.
-            AmbientJob::EdgesReconcile => self.last_edges_reconcile = Some(now),
-            // Same full-pass reasoning as EdgesReconcile.
-            AmbientJob::EntityPageReconcile => self.last_entity_page_reconcile = Some(now),
             // Backlog drainer, not a full pass: this arm only runs when the
             // slice made no progress (empty backlog), so stamp the interval to
             // back off. A progressing slice returned early above, staying due.
@@ -234,10 +205,6 @@ pub(super) fn ambient_work_consumes_thermal_turn(
     page_growth_terminal_no_match_committed: bool,
 ) -> bool {
     llm_calls > 0
-        || matches!(
-            job,
-            AmbientJob::EdgesReconcile | AmbientJob::EntityPageReconcile
-        )
         || (selected
             && (matches!(job, AmbientJob::Document | AmbientJob::Reconcile)
                 || (matches!(job, AmbientJob::PageGrowth)
@@ -512,40 +479,6 @@ pub(super) async fn run_ambient_job(
                 }
             }
         }
-        AmbientJob::EdgesReconcile => match db.reconcile_edges_parity().await {
-            Ok(report) => {
-                tracing::info!(
-                    "[scheduler] edges parity sweep: drift={} (missing={}, extra={}, corrupt={}) epoch={}",
-                    report.drift_count,
-                    report.missing_count,
-                    report.extra_count,
-                    report.corrupt_count,
-                    report.epoch
-                );
-                true
-            }
-            Err(error) => {
-                tracing::warn!("[scheduler] edges parity sweep error: {error}");
-                false
-            }
-        },
-        AmbientJob::EntityPageReconcile => match db.reconcile_entity_page_parity().await {
-            Ok(report) => {
-                tracing::info!(
-                    "[scheduler] entity/page parity sweep: drift={} (missing={}, extra={}, corrupt={}) epoch={}",
-                    report.drift_count,
-                    report.missing_count,
-                    report.extra_count,
-                    report.corrupt_count,
-                    report.epoch
-                );
-                true
-            }
-            Err(error) => {
-                tracing::warn!("[scheduler] entity/page parity sweep error: {error}");
-                false
-            }
-        },
         AmbientJob::EdgeGroundingPromote => {
             let Some(provider) = provider.as_ref() else {
                 return AmbientTurnReport {

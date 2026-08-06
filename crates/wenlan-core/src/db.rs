@@ -807,8 +807,12 @@ pub const EMBEDDING_DIM: usize = 768;
 /// `entity_created_at`/`entity_updated_at`/`community_id`/
 /// `embedding_updated_at` (G6 Stage 1.5b Part 1). Migration 118 folds NULL
 /// `entities.space` -> `UNFILED_SPACE_ID` and stamps NOT NULL DEFAULT (G6
-/// Stage 1.5b Part 2).
-pub const SCHEMA_VERSION: u32 = 119;
+/// Stage 1.5b Part 2). Migration 119 reactivates retired `cites` edges still
+/// backed by live `page_evidence` (G6 edges-parity repair). Migration 120
+/// drops `edges_parity_watermark`/`entity_page_parity_watermark`/
+/// `edges_reader_cutover`/`entity_reader_cutover`, the tables the retired
+/// parity-oracle and cutover machinery owned (G6 Stage 2 PR 2a).
+pub const SCHEMA_VERSION: u32 = 120;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -1776,47 +1780,13 @@ pub fn citation_backfill_enabled() -> bool {
     }
 }
 
-/// Gate for the background edges-parity reconcile sweep (M2 stage-d). Opt-in:
-/// default OFF; enable with WENLAN_ENABLE_EDGES_RECONCILE=1/true/yes. The
-/// sweep is read-only apart from the single `edges_parity_watermark` UPSERT that
-/// [`MemoryDB::reconcile_edges_parity`] stamps; it never flips a reader (that is
-/// the manual `set_reader_cutover` lever). No LLM. It remains opt-in until the
-/// full-store scan has a measured foreground-latency and memory ceiling.
-pub fn edges_reconcile_enabled() -> bool {
-    let value = std::env::var("WENLAN_ENABLE_EDGES_RECONCILE").ok();
-    edges_reconcile_enabled_value(value.as_deref())
-}
-
-fn edges_reconcile_enabled_value(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes"
-        )
-    })
-}
-
-/// Gate for the background entity/page-parity reconcile sweep (M3 PR-2,
-/// stage a). Opt-in: default OFF; enable with
-/// WENLAN_ENABLE_ENTITY_PAGE_RECONCILE=1/true/yes. The sweep is read-only
-/// apart from the single `entity_page_parity_watermark` UPSERT that
-/// [`MemoryDB::reconcile_entity_page_parity`] stamps; it never flips a reader
-/// (that is stage b's manual cutover lever). No LLM. It remains opt-in until
-/// the full-store scan has a measured foreground-latency and memory ceiling,
-/// mirroring [`edges_reconcile_enabled`].
-pub fn entity_page_reconcile_enabled() -> bool {
-    let value = std::env::var("WENLAN_ENABLE_ENTITY_PAGE_RECONCILE").ok();
-    entity_page_reconcile_enabled_value(value.as_deref())
-}
-
-fn entity_page_reconcile_enabled_value(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes"
-        )
-    })
-}
+// G6 Stage 2 PR 2a retired `edges_reconcile_enabled`/
+// `edges_reconcile_enabled_value` and `entity_page_reconcile_enabled`/
+// `entity_page_reconcile_enabled_value` -- the `WENLAN_ENABLE_EDGES_RECONCILE`
+// / `WENLAN_ENABLE_ENTITY_PAGE_RECONCILE` flag parsers -- along with the
+// production reconcile sweeps they gated (`reconcile_edges_parity`/
+// `reconcile_entity_page_parity`, retired above) and the ambient scheduler
+// lanes that read them.
 
 /// Gate for the background edge-grounding promotion sweep (M3g, spec v3 §7).
 /// Opt-in: default OFF; enable with WENLAN_ENABLE_EDGE_GROUNDING_PROMOTE=1/true/yes.
@@ -1826,7 +1796,7 @@ fn entity_page_reconcile_enabled_value(value: Option<&str>) -> bool {
 /// Promotion is monotone derived state (§1) — disabling the flag leaves already-promoted
 /// bits in place. Bounded per tick (scan + entailment caps); the entailment LLM runs
 /// strictly OUTSIDE any transaction (§6.3). Parsed here, checked in `scheduler.rs`
-/// before the fire-condition, mirroring [`edges_reconcile_enabled`]. It stays
+/// before the fire-condition. It stays
 /// opt-in until the sweep's foreground-latency and false-grounding gates
 /// (`docs/plans/2026-07-25-m3g-gate-criteria.md`) are measured on a real corpus.
 pub fn edge_grounding_promote_enabled() -> bool {
@@ -1874,10 +1844,11 @@ fn community_leiden_enabled_value(value: Option<&str>) -> bool {
 /// The question is contention: a turn polls every 1s idle / 100ms working and
 /// takes the single `MemoryDB` connection mutex each time, and neither its RSS
 /// nor its foreground-request-latency cost has been measured on a real corpus.
-/// The sibling ambient lanes ([`edges_reconcile_enabled`],
-/// [`entity_page_reconcile_enabled`], [`edge_grounding_promote_enabled`]) are
-/// default-OFF for exactly this reason at 30-minute cadences; this one polls
-/// three orders of magnitude faster.
+/// The sibling ambient lane [`edge_grounding_promote_enabled`] is
+/// default-OFF for exactly this reason at a 30-minute cadence; this one polls
+/// three orders of magnitude faster. (Two other siblings that shared this
+/// reasoning, `edges_reconcile_enabled` and `entity_page_reconcile_enabled`,
+/// retired in G6 Stage 2 PR 2a along with the sweeps they gated.)
 ///
 /// It is also what makes spec §10.3's rollback executable: PR-B rollback is
 /// "a flag flip plus a lease sweep", and with no flag there is no flip.
@@ -8702,6 +8673,17 @@ impl MemoryDB {
             if version < 119 {
                 self.migrate_119_edges_reactivate_backed(version).await?;
             }
+
+            // Migration 120 (G6 Stage 2 PR 2a): drops the four tables the
+            // retired edges/entity-page parity oracle and cutover machinery
+            // owned -- `edges_parity_watermark`, `entity_page_parity_
+            // watermark`, `edges_reader_cutover`, `entity_reader_cutover`.
+            // Nothing reads or writes them anymore; see
+            // migrate_120_retire_edges_entity_parity_tables.
+            if version < 120 {
+                self.migrate_120_retire_edges_entity_parity_tables(version)
+                    .await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -14044,6 +14026,64 @@ impl MemoryDB {
         Ok(())
     }
 
+    /// Migration 120 (G6 Stage 2 PR 2a): drop the four tables the retired
+    /// edges/entity-page parity oracle and cutover machinery owned --
+    /// `edges_parity_watermark`, `entity_page_parity_watermark`,
+    /// `edges_reader_cutover`, `entity_reader_cutover`. Their sweeps
+    /// (`reconcile_edges_parity`, `reconcile_entity_page_parity`), the
+    /// cutover levers (`set_reader_cutover`, `set_entity_reader_cutover`),
+    /// and the gating predicates (`reader_uses_edges`,
+    /// `reader_uses_entity_pages`) all retired earlier in this same PR --
+    /// nothing reads or writes these tables anymore, `edges` and the
+    /// entity-page projection are the sole canonical stores, and there is
+    /// no reader left to cut over. Pure `DROP TABLE IF EXISTS`, no data to
+    /// preserve: replay-safe, idempotent on a second run.
+    async fn migrate_120_retire_edges_entity_parity_tables(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(120, prior_version).await?;
+        let conn = self.conn.lock().await;
+
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m120 begin: {e}")))?;
+
+        let result: Result<(), WenlanError> = async {
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS edges_parity_watermark;
+                 DROP TABLE IF EXISTS entity_page_parity_watermark;
+                 DROP TABLE IF EXISTS edges_reader_cutover;
+                 DROP TABLE IF EXISTS entity_reader_cutover;",
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m120 drop tables: {e}")))?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m120 commit: {e}")))?;
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        }
+
+        conn.execute("PRAGMA user_version = 120", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m120 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 120 applied: dropped edges_parity_watermark, \
+             entity_page_parity_watermark, edges_reader_cutover, entity_reader_cutover"
+        );
+        Ok(())
+    }
+
     async fn repair_community_cutover(&self) -> Result<(), WenlanError> {
         let conn = self.conn.lock().await;
         let tx = conn
@@ -14709,11 +14749,13 @@ impl EdgeBackfillCounts {
 /// `drift_count == 0` means the invariant `edges (active) ≡ relations ∪
 /// page_sources ∪ page_evidence ∪ pages.citations ∪ page_links` holds --
 /// every non-skipped legacy row has its active `edges` twin AND every
-/// active edge has a legacy source. `reader_uses_edges` only flips a
-/// consumer to `edges` when the stamped watermark carrying this result is
-/// clean (drift 0) and current (proven under the live dual-write epoch).
-/// Samples are bounded by `SAMPLE_CAP` so a large drift cannot balloon the
-/// stored report.
+/// active edge has a legacy source. Returned by the TRANSITIONAL test-only
+/// oracle `compute_edges_parity_report` (see its own doc comment): G6
+/// Stage 2 PR 2a retired the production sweep that used to stamp this into
+/// a watermark and gate a reader cutover on it -- there is no live
+/// watermark or cutover anymore, only the surviving per-writer regression
+/// net calling the oracle directly. Samples are bounded by `SAMPLE_CAP` so
+/// a large drift cannot balloon the stored report.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ParityReport {
     /// Dual-write epoch the sweep ran under (stamped into the watermark).
@@ -14754,6 +14796,10 @@ pub struct ParityReport {
 }
 
 impl ParityReport {
+    // Only consulted from `compute_edges_parity_report`, the `#[cfg(test)]`
+    // extraction that is this report's sole remaining producer (G6 Stage 2
+    // PR 2a retired the production sweep).
+    #[cfg(test)]
     const SAMPLE_CAP: usize = 20;
 }
 
@@ -14793,6 +14839,10 @@ pub struct EntityPageParityReport {
 }
 
 impl EntityPageParityReport {
+    // Only consulted from `compute_entity_page_parity_report`, the
+    // `#[cfg(test)]` extraction that is this report's sole remaining
+    // producer (G6 Stage 2 PR 2a retired the production sweep).
+    #[cfg(test)]
     const SAMPLE_CAP: usize = 20;
 }
 
@@ -16902,14 +16952,18 @@ impl MemoryDB {
         Some((row.get::<String>(0).ok()?, row.get::<String>(1).ok()?))
     }
 
-    // ===== M2 PR-2 reader-cutover control plane (stages c+d) =====
+    // ===== M2 PR-2 dual-write epoch bookkeeping =====
     //
-    // The cutover gate that lets a reader switch from a legacy store to
-    // `edges`, per-consumer and reversibly, only after parity is proven.
-    // `reader_uses_edges` is the single predicate every cut-over reader
-    // consults; everything else here maintains the state it reads. The
-    // reconciliation sweep that STAMPS the watermark lives further below
-    // (`reconcile_edges_parity`).
+    // G6 Stage 2 PR 2a retired the reader-cutover gate and lever
+    // (`reader_uses_edges`/`set_reader_cutover`) that used to live in this
+    // section, along with the `edges_reader_cutover` table (dropped in
+    // migration 120) -- see the doc comment on `detect_communities`'s
+    // `adjacency_sql` for the collapse this made possible and why keeping
+    // the gate, not retiring it, was the broken option. The epoch
+    // bookkeeping below persists: it is still consulted by
+    // `compute_edges_parity_report` (the test-only extraction of the
+    // retired sweep's pure computation) and stays live production
+    // machinery until Stage 3.
 
     /// The current dual-write coverage epoch (spec v3 §7 M2 row). Lives on the
     /// single `edges_migration_state` row (created + seeded to 1 by PR-1's
@@ -16975,122 +17029,6 @@ impl MemoryDB {
                     "bump_dual_write_epoch: state row vanished after bump".to_string(),
                 )
             })
-    }
-
-    /// Flip a reader consumer's cutover ON or OFF (spec v3 §7 M2 row: cutover
-    /// is "per-consumer and reversible"). Idempotent upsert. This records
-    /// INTENT only; the actual read source is still decided by
-    /// `reader_uses_edges` on a clean, current parity watermark, so enabling a
-    /// consumer before parity is proven does not move it off legacy, and
-    /// disabling it always moves it back (reversibility). `cutover_epoch`
-    /// records the epoch a consumer was last enabled under, for soak audit; it
-    /// is not part of the gate.
-    pub async fn set_reader_cutover(
-        &self,
-        consumer: &str,
-        enabled: bool,
-    ) -> Result<(), WenlanError> {
-        let conn = self.conn.lock().await;
-        let now = chrono::Utc::now().timestamp();
-        // Audit-only field (not part of the gate). With no current epoch (no
-        // migration state yet) record 0: `reader_uses_edges` keeps the consumer
-        // on legacy regardless, so a missing epoch must not block the lever.
-        let epoch = Self::current_dual_write_epoch(&conn)
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("set_reader_cutover epoch: {e}")))?
-            .unwrap_or(0);
-        conn.execute(
-            "INSERT INTO edges_reader_cutover (consumer, enabled, cutover_epoch, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(consumer) DO UPDATE SET
-                 enabled = excluded.enabled,
-                 cutover_epoch = CASE
-                     WHEN excluded.enabled = 1 THEN excluded.cutover_epoch
-                     ELSE edges_reader_cutover.cutover_epoch
-                 END,
-                 updated_at = excluded.updated_at",
-            libsql::params![consumer, if enabled { 1i64 } else { 0i64 }, epoch, now],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("set_reader_cutover: {e}")))?;
-        Ok(())
-    }
-
-    /// THE reader-cutover gate (spec v3 §7 M2 row). Returns true iff the named
-    /// consumer may read from `edges` instead of its legacy store right now.
-    /// All three must hold:
-    ///   1. the consumer is explicitly enabled,
-    ///   2. the parity watermark is CLEAN (`drift_count = 0`) -- the stage-(d)
-    ///      reconciliation proved `edges` byte-identical to the union of the
-    ///      five legacy stores, so no unreconciled legacy row ("older
-    ///      operation") remains, and
-    ///   3. the proof is CURRENT: `proven_epoch` equals the current dual-write
-    ///      epoch, so no coverage lapse has invalidated it since.
-    ///
-    /// Any missing row (no watermark yet, unknown consumer) => false => legacy.
-    /// This is the ONLY thing standing between a premature flip and a wrong
-    /// read; it fails safe toward legacy in every ambiguous case.
-    ///
-    /// D6 obligation (M2 review fork-#2 verdict (a)): this predicate only
-    /// gates WHETHER a consumer may flip -- it does not itself exclude
-    /// cross-space legacy rows. Any consumer that flips onto this gate MUST
-    /// strictly exclude `lineage='legacy'` edges whose endpoints are
-    /// cross-space from its OWN flipped read (read-side exclusion only,
-    /// never a row mutation -- see `detect_communities`'s `adjacency_sql`
-    /// for the pattern this obligation inherits).
-    async fn reader_uses_edges(
-        conn: &libsql::Connection,
-        consumer: &str,
-    ) -> Result<bool, libsql::Error> {
-        // (1) consumer explicitly enabled?
-        let enabled: bool = {
-            let mut rows = conn
-                .query(
-                    "SELECT enabled FROM edges_reader_cutover WHERE consumer = ?1",
-                    libsql::params![consumer],
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => row.get::<i64>(0).unwrap_or(0) == 1,
-                None => false,
-            }
-        };
-        if !enabled {
-            return Ok(false);
-        }
-        // (2)+(3) a clean, current parity watermark?
-        let (proven_epoch, drift): (Option<i64>, Option<i64>) = {
-            let mut rows = conn
-                .query(
-                    "SELECT proven_epoch, drift_count FROM edges_parity_watermark WHERE id = 1",
-                    (),
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => (
-                    row.get::<Option<i64>>(0).unwrap_or(None),
-                    row.get::<Option<i64>>(1).unwrap_or(None),
-                ),
-                None => (None, None),
-            }
-        };
-        // Clean == drift proven and zero; any drift or an unproven watermark
-        // keeps the reader on legacy.
-        if drift != Some(0) {
-            return Ok(false);
-        }
-        let proven_epoch = match proven_epoch {
-            Some(e) => e,
-            None => return Ok(false),
-        };
-        // Current == proof taken under the epoch we are still in (no lapse). No
-        // current epoch (missing/corrupt state) => cannot prove currency => stay
-        // on legacy.
-        let current_epoch = match Self::current_dual_write_epoch(conn).await? {
-            Some(e) => e,
-            None => return Ok(false),
-        };
-        Ok(proven_epoch == current_epoch)
     }
 
     /// Record intent to move one community consumer onto the durable M4
@@ -19271,58 +19209,47 @@ impl MemoryDB {
         })
     }
 
-    /// Stage-(d) reconciliation sweep (spec v3 §7 M2 row). Recomputes the
-    /// content-addressed `edge_id` set the five legacy stores imply and
-    /// diffs it against the live *active* edges in the legacy-derivable
-    /// universe, asserting `edges − claim-lineage ≡ relations ∪ page_sources ∪
-    /// page_evidence ∪ pages.citations ∪ page_links`. M5 claim edges
-    /// (claim_revision/root endpoints: `supports`, `attests`) are outside the
-    /// diff — no legacy store implies them, and the schema CHECK bars
-    /// `lineage='legacy'` from those endpoint kinds. Stamps
-    /// `edges_parity_watermark` with the drift and the
-    /// current epoch; `reader_uses_edges` gates every cutover on that stamp.
-    ///
-    /// This RE-DERIVES the expected set independently -- it does NOT call the
-    /// `backfill_edges_from_*` helpers -- so a fresh-DB run reporting
-    /// `drift_count == 0` is a real differential/equivalence oracle (backfill
-    /// and reconcile agreeing is evidence, not a tautology). `edge_id` is
-    /// content-addressed over structural fields ONLY (edge_type, src/dst
-    /// kind+id, discriminator), never `space` or `lineage`, so the expected
-    /// set needs no per-row space resolution and the sweep is a linear scan
-    /// -- which is what lets it run at the §6.5 scale (100k memories / 5k
-    /// pages). The skip rules mirror the backfill exactly (NULL locator, NULL
-    /// `target_page_id`, unparseable citations blob), so a skipped row is
-    /// absent from BOTH sides and stays drift-neutral.
-    ///
-    /// SQLite discipline (§6.3): reads only, then ONE watermark UPSERT; no
-    /// transaction spans anything (there are no LLM/embedding calls here).
-    pub async fn reconcile_edges_parity(&self) -> Result<ParityReport, WenlanError> {
+    // G6 Stage 2 PR 2a retired the production `reconcile_edges_parity` sweep
+    // (the ambient scheduler lane that called it, `WENLAN_ENABLE_EDGES_RECONCILE`,
+    // and the `edges_parity_watermark` table it stamped -- dropped in migration
+    // 120 -- all retire in this PR too). `compute_edges_parity_report` below is
+    // its pure derive-and-diff half, kept test-only for the surviving regression
+    // net; see its own doc comment for what does and does not carry forward.
+
+    /// TRANSITIONAL test-only oracle (G6 Stage 2 PR 2a). The pure
+    /// derive-and-diff half of the retired `reconcile_edges_parity` sweep,
+    /// split at its watermark-stamp boundary: everything above builds and
+    /// returns the same `ParityReport`; only the `edges_parity_watermark`
+    /// UPSERT (and the machinery that read it -- the ambient scheduler lane,
+    /// the flag, the cutover levers) retired with PR 2a. Kept so the
+    /// existing per-writer regression net (migration tests, dual-write
+    /// tests) keeps asserting "derived-from-legacy-stores equals live
+    /// edges" without reimplementing the diff per test. This is NOT a
+    /// permanent invariant: once PR 2b/2c flip writers canonical-only, the
+    /// legacy-derived expected set diverges from live edges BY DESIGN, and
+    /// every test still calling this helper on a flipped writer's path gets
+    /// reworked in that PR to a no-legacy-write assertion instead. This
+    /// helper retires with the last such test, likely at the end of 2c.
+    #[cfg(test)]
+    pub(crate) async fn compute_edges_parity_report(&self) -> Result<ParityReport, WenlanError> {
         use std::collections::{BTreeMap, HashMap};
         let conn = self.conn.lock().await;
-        // No current epoch (missing/corrupt edges_migration_state) => there is
-        // nothing trustworthy to stamp a watermark under; fail loud rather than
-        // proving parity against a fabricated epoch.
         let epoch = Self::current_dual_write_epoch(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("reconcile epoch: {e}")))?
             .ok_or_else(|| {
                 WenlanError::VectorDb(
-                    "reconcile_edges_parity: no current dual-write epoch (missing/corrupt edges_migration_state)"
+                    "compute_edges_parity_report: no current dual-write epoch (missing/corrupt edges_migration_state)"
                         .to_string(),
                 )
             })?;
 
-        // edge_id -> the stored structural columns it must carry (edge_type,
-        // src_kind, src_id, dst_kind, dst_id). A map, not a set, so a same-id
-        // row whose endpoints were corrupted in place counts as drift.
         let mut expected: HashMap<String, (String, String, String, String, String)> =
             HashMap::new();
         let mut expected_semantic: HashMap<String, String> = HashMap::new();
         let mut contributed: BTreeMap<String, u64> = BTreeMap::new();
         let mut skipped: BTreeMap<String, u64> = BTreeMap::new();
 
-        // relations -> relates (entity->entity, discriminator relation_type).
-        // Mirrors backfill_edges_from_relations: every row, none skipped.
         {
             let mut n = 0u64;
             let mut rows = conn
@@ -19353,12 +19280,6 @@ impl MemoryDB {
             contributed.insert("relations".to_string(), n);
         }
 
-        // page_sources -> cites (page->memory|external, discriminator
-        // memory_source_id). Mirrors backfill_edges_from_page_sources:
-        // every row, none skipped; dst_kind resolved via the same shared
-        // rule insert_resolved_page_evidence uses (G6 edges-parity repair
-        // fix a), not hard-coded, so a folder-doc source page's expected id
-        // agrees with what the live writer minted.
         {
             let mut n = 0u64;
             let mut rows = conn
@@ -19401,10 +19322,6 @@ impl MemoryDB {
             contributed.insert("page_sources".to_string(), n);
         }
 
-        // page_evidence -> cites (dst memory|external, discriminator locator).
-        // Mirrors backfill_edges_from_page_evidence: NULL locator is skipped
-        // (no destination); dst_kind is `memory` iff source_kind==`memory`,
-        // else `external`. Space only sets lineage, so it is not read here.
         {
             let mut n = 0u64;
             let mut sk = 0u64;
@@ -19451,9 +19368,6 @@ impl MemoryDB {
             skipped.insert("page_evidence".to_string(), sk);
         }
 
-        // page_links -> links (page->page, discriminator label_key). Mirrors
-        // backfill_edges_from_page_links: NULL target_page_id (orphan
-        // wikilink) is skipped -- no page->page edge exists yet.
         {
             let mut n = 0u64;
             let mut sk = 0u64;
@@ -19491,10 +19405,6 @@ impl MemoryDB {
             skipped.insert("page_links".to_string(), sk);
         }
 
-        // pages.citations -> cites (dst memory|external, discriminator
-        // locator). Mirrors backfill_edges_from_page_citations: an
-        // unparseable citations blob skips the WHOLE page. Rows are collected
-        // before the parse loop so the query handle is released first.
         {
             let mut pages: Vec<(String, String)> = Vec::new();
             let mut rows = conn
@@ -19548,17 +19458,6 @@ impl MemoryDB {
             skipped.insert("pages.citations".to_string(), sk);
         }
 
-        // actual: the live active edges, id -> stored structural columns. Reads
-        // the SAME columns `detect_communities` (and every reader) consume, so a
-        // corrupted endpoint is visible here even when the id set matches.
-        //
-        // Scoped to the legacy-derivable universe: M5 claim edges (`supports`
-        // from a claim_revision, `attests` from a root) have no legacy-store
-        // counterpart to diff against — the schema CHECK guarantees
-        // `lineage='legacy'` never touches a claim_revision/root endpoint, so
-        // the endpoint-kind fence excludes exactly the edges the five stores
-        // can never imply. Without it every M5 edge counts as "extra" and the
-        // watermark can never come clean on a post-M5 database.
         type ActualEdge = (
             String,
             String,
@@ -19602,9 +19501,6 @@ impl MemoryDB {
             }
         }
 
-        // drift = missing (expected id absent) + extra (actual id unexpected) +
-        // corrupt (id on both sides but stored structural or semantic fields
-        // disagree), bounded sorted samples.
         let mut missing_count = 0usize;
         let mut missing_sample: Vec<String> = Vec::new();
         let mut corrupt_count = 0usize;
@@ -19678,26 +19574,6 @@ impl MemoryDB {
             per_store_skipped: skipped,
         };
 
-        // Stamp the watermark: proven_epoch is always the epoch we scanned
-        // under, drift_count is the result. `reader_uses_edges` requires BOTH
-        // drift==0 AND proven_epoch==current, so a nonzero drift or a later
-        // epoch bump keeps every consumer on legacy.
-        let now = chrono::Utc::now().timestamp();
-        let report_json = serde_json::to_string(&report)
-            .map_err(|e| WenlanError::VectorDb(format!("reconcile report json: {e}")))?;
-        conn.execute(
-            "INSERT INTO edges_parity_watermark (id, proven_epoch, drift_count, checked_at, report_json)
-             VALUES (1, ?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                 proven_epoch = excluded.proven_epoch,
-                 drift_count = excluded.drift_count,
-                 checked_at = excluded.checked_at,
-                 report_json = excluded.report_json",
-            libsql::params![epoch, drift_count as i64, now, report_json],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("reconcile watermark: {e}")))?;
-
         Ok(report)
     }
 
@@ -19708,10 +19584,16 @@ impl MemoryDB {
     /// `current_dual_write_epoch` for `edges`. Returns `None` when there is
     /// no trustworthy current epoch -- a missing state row, an undecodable
     /// `epoch` column, or a non-positive epoch -- 0 is the recorded "no
-    /// trustworthy epoch" sentinel (see
-    /// `set_entity_reader_cutover_with_missing_state_records_epoch_zero`) --
-    /// and callers must treat that as "gate closed / cannot prove", never
-    /// fabricate a generation.
+    /// trustworthy epoch" sentinel -- and callers must treat that as "gate
+    /// closed / cannot prove", never fabricate a generation.
+    ///
+    /// `#[cfg(test)]`: unlike `current_dual_write_epoch` on the `edges` side
+    /// (still read by the live `bump_dual_write_epoch`), no
+    /// `bump_entity_dual_write_epoch` ever existed, and G6 Stage 2 PR 2a
+    /// retired this function's only other caller
+    /// (`set_entity_reader_cutover`) along with the cutover lever. Its sole
+    /// remaining caller is the test-only `compute_entity_page_parity_report`.
+    #[cfg(test)]
     async fn current_entity_dual_write_epoch(
         conn: &libsql::Connection,
     ) -> Result<Option<i64>, libsql::Error> {
@@ -19727,61 +19609,36 @@ impl MemoryDB {
         }
     }
 
-    /// Stage-a reconciliation sweep (M3 PR-2): proves every `entities` row
-    /// has a byte-identical, live `kind='entity'` shadow page -- the
-    /// dual-write invariant M3 PR-1 established. Stamps
-    /// `entity_page_parity_watermark` with the drift and the current epoch;
-    /// stage b's reader-cutover gate (`reader_uses_entity_pages`) only flips
-    /// a consumer on a clean, current watermark, mirroring
-    /// `reader_uses_edges` for M2.
-    ///
-    /// SQLite discipline (§6.3): reads only, then ONE watermark UPSERT; no
-    /// transaction spans anything (no LLM/embedding calls here). Enumerates
-    /// rows rather than trusting `COUNT(*)` -- both `entities` and `pages`
-    /// carry `F32_BLOB` vector-indexed columns, so a bare `COUNT(*)` is
-    /// subject to the same libsql vector-index COUNT bug `reconcile_edges_parity`
-    /// avoids.
-    pub async fn reconcile_entity_page_parity(
+    // G6 Stage 2 PR 2a retired the production `reconcile_entity_page_parity`
+    // sweep (the ambient scheduler lane that called it,
+    // `WENLAN_ENABLE_ENTITY_PAGE_RECONCILE`, and the
+    // `entity_page_parity_watermark` table it stamped -- dropped in
+    // migration 120 -- all retire in this PR too). Mirrors the M2/`edges`
+    // retirement above; `compute_entity_page_parity_report` below is its
+    // pure derive-and-diff half, kept test-only for the surviving
+    // regression net.
+
+    /// TRANSITIONAL test-only oracle (G6 Stage 2 PR 2a) -- see
+    /// [`Self::compute_edges_parity_report`]'s doc comment for the full
+    /// rationale; this is the same split applied to the retired
+    /// `reconcile_entity_page_parity` sweep, at its
+    /// `entity_page_parity_watermark` UPSERT boundary.
+    #[cfg(test)]
+    pub(crate) async fn compute_entity_page_parity_report(
         &self,
     ) -> Result<EntityPageParityReport, WenlanError> {
         let conn = self.conn.lock().await;
-        // No current epoch (missing/corrupt entity_page_migration_state) =>
-        // nothing trustworthy to stamp a watermark under; fail loud rather
-        // than proving parity against a fabricated epoch.
         let epoch = Self::current_entity_dual_write_epoch(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("reconcile epoch: {e}")))?
             .ok_or_else(|| {
                 WenlanError::VectorDb(
-                    "reconcile_entity_page_parity: no current dual-write epoch \
+                    "compute_entity_page_parity_report: no current dual-write epoch \
                      (missing/corrupt entity_page_migration_state)"
                         .to_string(),
                 )
             })?;
 
-        // expected_active + missing/corrupt: every `entities` row, LEFT
-        // JOINed onto its live (`status='active'`, `kind='entity'`) shadow.
-        // A NULL join (no map row, the mapped page is gone, or it is no
-        // longer live) is missing; a matched row whose mirrored fields
-        // disagree is corrupt. The mirrored fields are exactly what
-        // `insert_entity_shadow_page`/`update_entity_shadow_page` write:
-        // name, entity_type, confidence, confirmed (-> `entity_confirmed`),
-        // embedding, space semantics (both `space` and `workspace` carry the
-        // same unfiled-sentinel fold), the `entity_aliases` projection
-        // (recomputed here the same way `update_entity_shadow_page` does, so
-        // a shadow whose aliases were never re-synced after an alias change
-        // is flagged corrupt), and the G6 Stage 1.5b Part 1 scalar mirror
-        // (`source_agent`, `entity_created_at`/`entity_updated_at`,
-        // `community_id` -- compared via the entities-side integer's string
-        // form since `pages.community_id` is TEXT -- and
-        // `embedding_updated_at`). Embedding compares raw blob bytes -- NULL vs
-        // NULL (never embedded on either side) is equal via the `Option`
-        // fold to an empty Vec; a genuine F32_BLOB(768) is never empty, so no
-        // false match against an unset embedding. An undecodable mirrored
-        // column -- wrong SQLite storage class on either side, which the
-        // shadow writer's mirror-copy can produce identically on BOTH sides
-        // -- is drift, never equality: it always counts as corrupt, so a
-        // symmetric decode failure can never fold to a false match.
         let mut expected_active = 0usize;
         let mut missing_count = 0usize;
         let mut missing_sample: Vec<String> = Vec::new();
@@ -19815,9 +19672,6 @@ impl MemoryDB {
                 .map_err(|e| WenlanError::VectorDb(format!("reconcile entities row: {e}")))?
             {
                 expected_active += 1;
-                // The id itself is not a mirrored field; a failure to decode
-                // it only degrades the sample label, it does not by itself
-                // decide missing/corrupt below.
                 let entity_id: String = row
                     .get::<String>(0)
                     .unwrap_or_else(|_| "<undecodable>".to_string());
@@ -19833,15 +19687,6 @@ impl MemoryDB {
                     let source_agent: Option<String> = row.get(16)?;
                     let created_at: Option<i64> = row.get(17)?;
                     let updated_at: Option<i64> = row.get(18)?;
-                    // community_id is INTEGER on entities, TEXT on pages (SQLite
-                    // TEXT-affinity coercion at mirror time) -- compare via the
-                    // integer's string form, matching what actually lands there.
-                    // TEXT was the deliberate choice, not a shortcut: every
-                    // existing consumer of entities.community_id already reads
-                    // it as a string (CAST(e.community_id AS TEXT) into the
-                    // durable-community Option<String> fields, and the m4
-                    // `communities` table keys are TEXT), so an INTEGER mirror
-                    // would introduce casts rather than remove them.
                     let community_id: Option<String> =
                         row.get::<Option<i64>>(19)?.map(|v| v.to_string());
                     let embedding_updated_at: Option<i64> = row.get(20)?;
@@ -19883,8 +19728,6 @@ impl MemoryDB {
                 };
                 let expected_space = space.unwrap_or_else(|| UNFILED_SPACE_ID.to_string());
 
-                // NULL (no live shadow joined) stays missing; an undecodable
-                // non-NULL title is a corrupt row, not a missing one.
                 let page_title = match row.get::<Option<String>>(5) {
                     Ok(Some(title)) => title,
                     Ok(None) => {
@@ -19976,8 +19819,6 @@ impl MemoryDB {
             }
         }
 
-        // actual_active: live kind='entity' pages, enumerated independently
-        // of the join above (a raw population count for the report).
         let mut actual_active = 0usize;
         {
             let mut rows = conn
@@ -19997,12 +19838,6 @@ impl MemoryDB {
             }
         }
 
-        // extra: (a) orphan `entity_page_map` rows -- entity or page side
-        // missing. `entity_id`/`page_id` both carry `ON DELETE CASCADE`, so
-        // this is unreachable via normal writes (mirrors the
-        // `backfill_edges_from_relations` "unknown" branch: a defensive
-        // check, not a live case on this schema); (b) a live kind='entity'
-        // page with no map row at all (an unclaimed shadow).
         let mut extra_count = 0usize;
         let mut extra_sample: Vec<String> = Vec::new();
         {
@@ -20053,7 +19888,7 @@ impl MemoryDB {
         corrupt_sample.sort();
         let drift_count = missing_count + extra_count + corrupt_count;
 
-        let report = EntityPageParityReport {
+        Ok(EntityPageParityReport {
             epoch,
             expected_active,
             actual_active,
@@ -20064,197 +19899,18 @@ impl MemoryDB {
             missing_sample,
             extra_sample,
             corrupt_sample,
-        };
-
-        // Stamp the watermark: proven_epoch is always the epoch we scanned
-        // under, drift_count is the result.
-        let now = chrono::Utc::now().timestamp();
-        let report_json = serde_json::to_string(&report)
-            .map_err(|e| WenlanError::VectorDb(format!("reconcile report json: {e}")))?;
-        conn.execute(
-            "INSERT INTO entity_page_parity_watermark (id, proven_epoch, drift_count, checked_at, report_json)
-             VALUES (1, ?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                 proven_epoch = excluded.proven_epoch,
-                 drift_count = excluded.drift_count,
-                 checked_at = excluded.checked_at,
-                 report_json = excluded.report_json",
-            libsql::params![epoch, drift_count as i64, now, report_json],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("reconcile watermark: {e}")))?;
-
-        Ok(report)
+        })
     }
 
-    // ===== M3 PR-2 stage b: entity reader-cutover gate =====
-    //
-    // Mirrors M2's `set_reader_cutover`/`reader_uses_edges` pair exactly,
-    // over the entity<->page control plane stage a built (migration 94:
-    // `entity_reader_cutover`, `entity_page_parity_watermark`). Stage b
-    // wired ONLY the predicate + the manual lever -- stage c flips the
-    // vanguard `scoped_entities` consumer onto `reader_uses_entity_pages`
-    // (`crates/wenlan-core/src/db/scoped_entities.rs`). Flipping a
-    // PRODUCTION consumer additionally waits on the program's D1
-    // soak-exit.
-
-    /// M3 PR-2 stage c: the single consumer key the `scoped_entities`
-    /// vanguard flip checks the gate under. Mirrors M2's `detect_communities`
-    /// literal `"communities"` key, named as a const per the stage-c
-    /// contract so every `scoped_entities.rs` call site shares one source
-    /// of truth.
-    ///
-    /// G6 Stage 1.5b Part 3 (spec item 9): the last `scoped_entities.rs`
-    /// call site (`list_recent_relations_scoped`) collapsed onto an
-    /// unconditional hard cutover, so this const has no reader left. Left
-    /// dead-but-present per the spec -- the gate and `entity_reader_cutover`
-    /// retire together in Stage 2 with the writers.
-    #[allow(dead_code)]
-    pub(crate) const SCOPED_ENTITIES_CONSUMER: &str = "scoped_entities";
-
-    /// Flip an entity-reader consumer's cutover ON or OFF (M3 PR-2 stage b;
-    /// mirrors `set_reader_cutover` for M2's `edges`). Idempotent upsert.
-    /// This records INTENT only; the actual read source is still decided
-    /// by `reader_uses_entity_pages` on a clean, current parity watermark,
-    /// so enabling a consumer before parity is proven does not move it off
-    /// legacy, and disabling it always moves it back (reversibility).
-    /// `cutover_epoch` records the epoch a consumer was last enabled
-    /// under, for soak audit; it is not part of the gate.
-    ///
-    /// Stage b wired the lever with no live caller; stage c flips the
-    /// vanguard `scoped_entities` consumer onto it. Flipping a PRODUCTION
-    /// consumer additionally waits on the program's D1 soak-exit.
-    pub async fn set_entity_reader_cutover(
-        &self,
-        consumer: &str,
-        enabled: bool,
-    ) -> Result<(), WenlanError> {
-        let conn = self.conn.lock().await;
-        let now = chrono::Utc::now().timestamp();
-        // Audit-only field (not part of the gate). With no current epoch
-        // (no migration state yet) record 0: `reader_uses_entity_pages`
-        // keeps the consumer on legacy regardless, so a missing epoch
-        // must not block the lever.
-        let epoch = Self::current_entity_dual_write_epoch(&conn)
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("set_entity_reader_cutover epoch: {e}")))?
-            .unwrap_or(0);
-        conn.execute(
-            "INSERT INTO entity_reader_cutover (consumer, enabled, cutover_epoch, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(consumer) DO UPDATE SET
-                 enabled = excluded.enabled,
-                 cutover_epoch = CASE
-                     WHEN excluded.enabled = 1 THEN excluded.cutover_epoch
-                     ELSE entity_reader_cutover.cutover_epoch
-                 END,
-                 updated_at = excluded.updated_at",
-            libsql::params![consumer, if enabled { 1i64 } else { 0i64 }, epoch, now],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("set_entity_reader_cutover: {e}")))?;
-        Ok(())
-    }
-
-    /// THE entity-reader cutover gate (M3 PR-2 stage b; mirrors
-    /// `reader_uses_edges` for M2's `edges`). Returns true iff the named
-    /// consumer may read the `kind='entity'` shadow pages instead of the
-    /// legacy `entities` store right now. All three must hold:
-    ///   1. the consumer is explicitly enabled,
-    ///   2. the parity watermark is CLEAN (`drift_count = 0`) -- the
-    ///      stage-a reconciliation proved every `entities` row has a
-    ///      byte-identical, live shadow page, so no unreconciled legacy
-    ///      row remains, and
-    ///   3. the proof is CURRENT: `proven_epoch` equals the current
-    ///      entity dual-write epoch, so no coverage lapse has invalidated
-    ///      it since.
-    ///
-    /// Any missing row (no watermark yet, unknown consumer) => false =>
-    /// legacy. This is the ONLY thing standing between a premature flip
-    /// and a wrong read; it fails safe toward legacy in every ambiguous
-    /// case.
-    ///
-    /// Stage b wired this predicate with no live caller; stage c flips the
-    /// vanguard `scoped_entities` consumer onto it
-    /// (`crates/wenlan-core/src/db/scoped_entities.rs`). Flipping a
-    /// PRODUCTION consumer additionally waits on the program's D1
-    /// soak-exit.
-    ///
-    /// D6 obligation (M2 review fork-#2 verdict (a), mirrored from
-    /// `reader_uses_edges`): this predicate only gates WHETHER a consumer
-    /// may flip -- it does not itself exclude cross-space legacy rows. Any
-    /// consumer that flips onto this gate MUST strictly exclude
-    /// cross-space legacy rows from its OWN flipped read (read-side
-    /// exclusion only, never a row mutation).
-    ///
-    /// 2026-08-05, G6 Stage 1.5a: the 18 readers migrated in that stage
-    /// bypass this gate entirely -- by G6 program design, Stage 1 is an
-    /// unconditional hard cutover to the canonical shadow-page store, the
-    /// same contract 1.1-1.3 used for `edges` while the `reader_uses_edges`
-    /// gate + cutover lever still existed. This gate's only remaining
-    /// consumers are the `scoped_entities` vanguard hybrid reads
-    /// (`db/scoped_entities.rs`); this gate and `entity_reader_cutover`
-    /// retire together in Stage 2 when the writers cut over.
-    ///
-    /// 2026-08-05, G6 Stage 1.5b Part 3 (spec item 9): those vanguard hybrid
-    /// reads have now all collapsed onto an unconditional hard cutover
-    /// (same as the 1.5a readers), so this predicate has no caller left.
-    /// Left dead-but-present per the spec rather than deleted here.
-    #[allow(dead_code)]
-    async fn reader_uses_entity_pages(
-        conn: &libsql::Connection,
-        consumer: &str,
-    ) -> Result<bool, libsql::Error> {
-        // (1) consumer explicitly enabled?
-        let enabled: bool = {
-            let mut rows = conn
-                .query(
-                    "SELECT enabled FROM entity_reader_cutover WHERE consumer = ?1",
-                    libsql::params![consumer],
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => row.get::<i64>(0).unwrap_or(0) == 1,
-                None => false,
-            }
-        };
-        if !enabled {
-            return Ok(false);
-        }
-        // (2)+(3) a clean, current parity watermark?
-        let (proven_epoch, drift): (Option<i64>, Option<i64>) = {
-            let mut rows = conn
-                .query(
-                    "SELECT proven_epoch, drift_count FROM entity_page_parity_watermark WHERE id = 1",
-                    (),
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => (
-                    row.get::<Option<i64>>(0).unwrap_or(None),
-                    row.get::<Option<i64>>(1).unwrap_or(None),
-                ),
-                None => (None, None),
-            }
-        };
-        // Clean == drift proven and zero; any drift or an unproven
-        // watermark keeps the reader on legacy.
-        if drift != Some(0) {
-            return Ok(false);
-        }
-        let proven_epoch = match proven_epoch {
-            Some(e) => e,
-            None => return Ok(false),
-        };
-        // Current == proof taken under the epoch we are still in (no
-        // lapse). No current epoch (missing/corrupt state) => cannot
-        // prove currency => stay on legacy.
-        let current_epoch = match Self::current_entity_dual_write_epoch(conn).await? {
-            Some(e) => e,
-            None => return Ok(false),
-        };
-        Ok(proven_epoch == current_epoch)
-    }
+    // G6 Stage 2 PR 2a retired the M3 PR-2 stage b entity reader-cutover
+    // gate and lever (`reader_uses_entity_pages`/`set_entity_reader_cutover`)
+    // and the `SCOPED_ENTITIES_CONSUMER` key that named their one intended
+    // consumer, along with the `entity_reader_cutover` table (dropped in
+    // migration 120). All three were already dead-but-present since G6
+    // Stage 1.5b Part 3, when `scoped_entities.rs`'s last hybrid read
+    // collapsed onto an unconditional hard cutover -- mirrors the M2/`edges`
+    // gate retirement above. `current_entity_dual_write_epoch` stays live,
+    // consulted by `compute_entity_page_parity_report`.
 
     /// §6.9 pre-migration online backup. A raw file copy is unsound while a WAL
     /// is live, so this first folds the WAL back into the main database and
@@ -36207,52 +35863,47 @@ impl MemoryDB {
         }
 
         // 2. Build adjacency list (undirected, weighted by parallel-edge count).
-        // Reader cutover (M2 PR-2, stage c): the "communities" consumer reads
-        // the `relates` adjacency from `edges` instead of the legacy
-        // `relations` store ONLY when `reader_uses_edges` says parity is
-        // proven-clean and current -- otherwise it stays on legacy. The two
-        // sources are byte-identical under clean parity for SAME-SPACE rows:
-        // `relations` has a UNIQUE(from_entity,to_entity,relation_type) index,
-        // so each row maps to exactly one distinct `relates` edge_id and the
-        // (from,to) multiset matches. D6 (M2 review fork-#2 verdict (a),
-        // deferred to "an explicit M3 reader-cutover gate"): a
-        // `lineage='legacy'` edge whose endpoints are cross-space is EXCLUDED
-        // below once flipped -- read-side only, never a row mutation (would
-        // register as parity drift and freeze every cutover) -- so the two
-        // paths diverge exactly on cross-space legacy rows. The gate defaults
-        // OFF, so production behavior is unchanged until a cutover is
-        // explicitly enabled AND a clean watermark exists; regression-locked
-        // by `detect_communities_edges_path_matches_legacy` (same-space
-        // parity) and `detect_communities_flipped_excludes_cross_space_legacy_edge`
-        // (the cross-space carve-out).
-        let adjacency_sql = if Self::reader_uses_edges(&conn, "communities")
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-        {
-            // Endpoint-space predicate mirrors `audit_legacy_cross_space_links`'s
-            // `relations` tally: an indeterminate-space endpoint is
-            // `null_space`, not `cross_space`, so it is not excluded here
-            // either. G6 Stage 1.5b Part 2: `se.space`/`de.space` are
-            // `entities.space`, folded by the space-sentinel migration -- an
-            // unfiled endpoint now carries `UNFILED_SPACE_ID` rather than
-            // NULL when the entity row exists, so the sentinel is excluded
-            // from the "has a real space" check alongside NULL (missing
-            // entity row), keeping the admitted edge set identical pre/post
-            // fold.
-            format!(
-                "SELECT e.src_id, e.dst_id FROM edges e \
-                 LEFT JOIN entities se ON se.id = e.src_id \
-                 LEFT JOIN entities de ON de.id = e.dst_id \
-                 WHERE e.edge_type = 'relates' AND e.valid_until IS NULL \
-                 AND NOT (e.lineage = 'legacy' \
-                          AND se.space IS NOT NULL AND se.space != '{unfiled}' \
-                          AND de.space IS NOT NULL AND de.space != '{unfiled}' \
-                          AND se.space != de.space)",
-                unfiled = UNFILED_SPACE_ID
-            )
-        } else {
-            "SELECT from_entity, to_entity FROM relations".to_string()
-        };
+        // Hard cutover (G6 Stage 2 PR 2a): the "communities" consumer reads
+        // the `relates` adjacency from `edges` unconditionally now -- the
+        // `reader_uses_edges` gate that used to guard this read retired with
+        // the parity-oracle sweep (`reconcile_edges_parity` and its
+        // watermark table) in the same PR. This is not merely safe, it is
+        // NECESSARY: once the sweep is gone no watermark can ever become
+        // current again, so a fail-closed gate here would have permanently
+        // pinned every DB onto the legacy `relations` path -- keeping the
+        // gate was the broken option, not the conservative one. Safety for
+        // today's collapse rests on the program's closing drift-0 receipts
+        // (`docs/plans/2026-08-06-g6-stage2-writer-retirement-spec.md`):
+        // `relations` and `edges` agreed byte-for-byte at the moment the
+        // oracle retired, and writers keep dual-writing both stores through
+        // PR 2b, so the two sources stay identical until the legacy writer
+        // itself is flipped off. Mirrors the identical collapse already
+        // applied to the entity-side "scoped_entities" consumer in Stage
+        // 1.5b Part 3. D6 (M2 review fork-#2 verdict (a)) stays in force
+        // unconditionally: a `lineage='legacy'` edge whose endpoints are
+        // cross-space must never contribute to adjacency, since the fence
+        // never validated it at write time -- read-side only, never a row
+        // mutation. Endpoint-space predicate mirrors
+        // `audit_legacy_cross_space_links`'s `relations` tally: an
+        // indeterminate-space endpoint is `null_space`, not `cross_space`,
+        // so it is not excluded here either. G6 Stage 1.5b Part 2:
+        // `se.space`/`de.space` are `entities.space`, folded by the
+        // space-sentinel migration -- an unfiled endpoint now carries
+        // `UNFILED_SPACE_ID` rather than NULL when the entity row exists, so
+        // the sentinel is excluded from the "has a real space" check
+        // alongside NULL (missing entity row), keeping the admitted edge set
+        // identical pre/post fold.
+        let adjacency_sql = format!(
+            "SELECT e.src_id, e.dst_id FROM edges e \
+             LEFT JOIN entities se ON se.id = e.src_id \
+             LEFT JOIN entities de ON de.id = e.dst_id \
+             WHERE e.edge_type = 'relates' AND e.valid_until IS NULL \
+             AND NOT (e.lineage = 'legacy' \
+                      AND se.space IS NOT NULL AND se.space != '{unfiled}' \
+                      AND de.space IS NOT NULL AND de.space != '{unfiled}' \
+                      AND se.space != de.space)",
+            unfiled = UNFILED_SPACE_ID
+        );
         let mut edge_rows = conn
             .query(&adjacency_sql, ())
             .await

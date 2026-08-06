@@ -13,12 +13,10 @@ fn ambient_schedule_includes_fixed_memory_stages() {
         page_growth: true,
         reconcile: true,
         citation: true,
-        edges_reconcile: true,
-        entity_page_reconcile: true,
         edge_grounding_promote: true,
     };
     assert_eq!(
-        (0..11)
+        (0..9)
             .filter_map(|_| schedule.select_due(now, available))
             .collect::<Vec<_>>(),
         vec![
@@ -30,8 +28,6 @@ fn ambient_schedule_includes_fixed_memory_stages() {
             AmbientJob::PageGrowth,
             AmbientJob::Reconcile,
             AmbientJob::Citation,
-            AmbientJob::EdgesReconcile,
-            AmbientJob::EntityPageReconcile,
             AmbientJob::EdgeGroundingPromote,
         ]
     );
@@ -351,8 +347,6 @@ fn ambient_schedule_round_robins_all_due_jobs() {
         page_growth: true,
         reconcile: true,
         citation: true,
-        edges_reconcile: true,
-        entity_page_reconcile: true,
         edge_grounding_promote: true,
     };
 
@@ -387,7 +381,7 @@ fn ambient_schedule_round_robins_all_due_jobs() {
     );
     assert_eq!(
         schedule.select_due(now, available),
-        Some(AmbientJob::EdgesReconcile)
+        Some(AmbientJob::EdgeGroundingPromote)
     );
 }
 
@@ -404,8 +398,6 @@ fn selected_backlog_lane_stays_due_after_global_cooldown() {
         page_growth: true,
         reconcile: true,
         citation: true,
-        edges_reconcile: true,
-        entity_page_reconcile: true,
         edge_grounding_promote: true,
     };
 
@@ -441,14 +433,6 @@ fn selected_backlog_lane_stays_due_after_global_cooldown() {
     );
     assert_eq!(
         schedule.select_due(now, available),
-        Some(AmbientJob::EdgesReconcile)
-    );
-    assert_eq!(
-        schedule.select_due(now, available),
-        Some(AmbientJob::EntityPageReconcile)
-    );
-    assert_eq!(
-        schedule.select_due(now, available),
         Some(AmbientJob::EdgeGroundingPromote)
     );
     assert_eq!(
@@ -469,87 +453,14 @@ fn attempted_inference_is_not_treated_as_an_empty_lane() {
     assert!(!should_backoff_ambient_lane(true, 0));
 }
 
-#[test]
-fn edge_reconcile_full_pass_is_interval_and_thermal_paced_even_on_error() {
-    let now = Instant::now();
-    let mut schedule = AmbientSchedule::new(now);
-    let edge_only = AmbientAvailability {
-        document: false,
-        classification: false,
-        structured_extract: false,
-        entity: false,
-        title: false,
-        page_growth: false,
-        reconcile: false,
-        citation: false,
-        edges_reconcile: true,
-        entity_page_reconcile: false,
-        edge_grounding_promote: false,
-    };
-
-    assert_eq!(
-        schedule.select_due(now, edge_only),
-        Some(AmbientJob::EdgesReconcile)
-    );
-    schedule.note_job_result(AmbientJob::EdgesReconcile, now, true);
-    assert_eq!(schedule.last_edges_reconcile, Some(now));
-    assert_eq!(
-        schedule.select_due(
-            now + EDGES_RECONCILE_SWEEP_INTERVAL - Duration::from_secs(1),
-            edge_only
-        ),
-        None
-    );
-    assert_eq!(
-        schedule.select_due(now + EDGES_RECONCILE_SWEEP_INTERVAL, edge_only),
-        Some(AmbientJob::EdgesReconcile)
-    );
-    assert!(
-        ambient_work_consumes_thermal_turn(AmbientJob::EdgesReconcile, false, 0, false),
-        "a failed final watermark write can follow a full scan and must still cool down"
-    );
-}
-
-#[test]
-fn entity_page_reconcile_full_pass_is_interval_and_thermal_paced_even_on_error() {
-    let now = Instant::now();
-    let mut schedule = AmbientSchedule::new(now);
-    let entity_page_only = AmbientAvailability {
-        document: false,
-        classification: false,
-        structured_extract: false,
-        entity: false,
-        title: false,
-        page_growth: false,
-        reconcile: false,
-        citation: false,
-        edges_reconcile: false,
-        entity_page_reconcile: true,
-        edge_grounding_promote: false,
-    };
-
-    assert_eq!(
-        schedule.select_due(now, entity_page_only),
-        Some(AmbientJob::EntityPageReconcile)
-    );
-    schedule.note_job_result(AmbientJob::EntityPageReconcile, now, true);
-    assert_eq!(schedule.last_entity_page_reconcile, Some(now));
-    assert_eq!(
-        schedule.select_due(
-            now + ENTITY_PAGE_RECONCILE_SWEEP_INTERVAL - Duration::from_secs(1),
-            entity_page_only
-        ),
-        None
-    );
-    assert_eq!(
-        schedule.select_due(now + ENTITY_PAGE_RECONCILE_SWEEP_INTERVAL, entity_page_only),
-        Some(AmbientJob::EntityPageReconcile)
-    );
-    assert!(
-        ambient_work_consumes_thermal_turn(AmbientJob::EntityPageReconcile, false, 0, false),
-        "a failed final watermark write can follow a full scan and must still cool down"
-    );
-}
+// G6 Stage 2 PR 2a retired `edge_reconcile_full_pass_is_interval_and_thermal_
+// paced_even_on_error` and `entity_page_reconcile_full_pass_is_interval_and_
+// thermal_paced_even_on_error`: both tested the `EdgesReconcile`/
+// `EntityPageReconcile` ambient lanes' full-pass interval pacing, and both
+// lanes retire in this PR along with the production sweeps
+// (`reconcile_edges_parity`/`reconcile_entity_page_parity`) and flags
+// (`WENLAN_ENABLE_EDGES_RECONCILE`/`WENLAN_ENABLE_ENTITY_PAGE_RECONCILE`)
+// they scheduled.
 
 #[test]
 fn only_committed_page_growth_terminal_no_match_skips_the_thermal_turn() {
@@ -3292,8 +3203,6 @@ async fn ambient_reconcile_backpressure_uses_lane_rescan_backoff() {
         page_growth: false,
         reconcile: true,
         citation: false,
-        edges_reconcile: false,
-        entity_page_reconcile: false,
         edge_grounding_promote: false,
     };
     assert_eq!(

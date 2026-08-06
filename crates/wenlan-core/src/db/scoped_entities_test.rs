@@ -560,8 +560,11 @@ async fn list_entity_suggestions_scoped_excludes_invalid_and_mixed_owner_sets() 
 // string equality stands in for full struct equality -- it is exact and
 // order-sensitive the same way `assert_eq!` would be. One shared
 // gate-closure test (not per-fn) proves a shadow corrupted after the proof
-// re-reconciles dirty and the reader transparently falls back to legacy,
-// mirroring stage b's `entity_reader_gate_blocked_by_nonzero_drift`.
+// re-reconciles dirty and the reader transparently falls back to legacy --
+// stage b's mirror-image coverage of the same cutover-lever predicate,
+// `entity_reader_gate_blocked_by_nonzero_drift`, retired with the gate
+// itself in G6 Stage 2 PR 2a (see the retirement note at
+// `main_tests.rs:44591`).
 
 /// Seed entities covering the edge shapes the hybrid read must reproduce:
 /// a named space + NULL space, confirmed + unconfirmed, and an entity with
@@ -605,9 +608,10 @@ async fn stage_c_seed_entities(db: &super::MemoryDB) -> (String, String, String)
 // the gate actually opened) has no callers left -- every gated hybrid in
 // this file collapsed onto an unconditional hard cutover (spec item 9), so
 // there is no more gate to flip in a test. Removed rather than left dead:
-// unlike the production `reader_uses_entity_pages`/`SCOPED_ENTITIES_CONSUMER`
-// (left dead-but-present per the spec's Stage 2 retirement note), this was
-// a test-local helper with no Stage 2 obligation to keep it present.
+// this was a test-local helper, so it carried no Stage 2 retirement
+// obligation of its own -- the production `reader_uses_entity_pages`/
+// `SCOPED_ENTITIES_CONSUMER` surface it used to flip has since been
+// deleted outright in G6 Stage 2 PR 2a, completing that retirement.
 
 // G6 Stage 1.5b Part 3: `list_entities_scoped`/`get_entity_detail_scoped`
 // collapsed onto an unconditional hard cutover (spec item 9) -- there is no
@@ -719,12 +723,11 @@ async fn get_entity_detail_scoped_and_list_recent_relations_scoped_read_edges() 
 // used `list_entities_scoped` as its representative fn -- that fn collapsed
 // onto an unconditional hard cutover (spec item 9) and no longer falls back
 // to legacy on drift, so it can no longer stand in for the gate-closure
-// contract. The underlying `reader_uses_entity_pages` predicate is still
-// covered directly by `entity_reader_gate_blocked_by_nonzero_drift`
-// (main_tests.rs); `search_entities_by_vector_scoped` collapsed alongside
-// it (spec item 9), so `list_recent_relations_scoped` (target #7's
-// structural rework) is now the gate's only remaining scoped_entities.rs
-// consumer, and keeps its own fallback coverage below.
+// contract. The underlying `reader_uses_entity_pages` predicate and its
+// `entity_reader_gate_blocked_by_nonzero_drift` coverage both retired
+// outright in G6 Stage 2 PR 2a (see the retirement note at
+// `main_tests.rs:44591`) -- there is no gate left for any
+// scoped_entities.rs consumer to fall back through.
 
 async fn stage_c_query_plan_detail(conn: &libsql::Connection, sql: &str) -> String {
     let mut rows = conn

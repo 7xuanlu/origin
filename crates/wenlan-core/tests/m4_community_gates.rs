@@ -852,9 +852,11 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
     assert!(second_space_state.dirty);
     assert!(second_space_state.members.is_empty());
 
-    db.set_reader_cutover("communities", true)
-        .await
-        .expect("route legacy detector through the graded edge corpus");
+    // G6 Stage 2 PR 2a: `detect_communities` now reads `edges` (where
+    // `seed_m4_graded_corpus` seeds this test's corpus, via raw SQL, not
+    // through `relations`) unconditionally -- the `set_reader_cutover`
+    // flip this test used to need to route the legacy detector onto that
+    // corpus is gone with the cutover lever it drove.
     db.detect_communities()
         .await
         .expect("seed the legacy label-prop shadow");
