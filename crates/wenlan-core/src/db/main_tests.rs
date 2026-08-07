@@ -45159,6 +45159,149 @@ async fn detect_communities_threads_community_id_through_to_shadow_page() {
     }
 }
 
+/// G6 Stage 2 PR 2c item 3 RED control: both entity-discovery scans this PR
+/// ports to shadow pages -- `detect_communities`'s adjacency scan and
+/// `load_community_entities_paged` (reached via `prepare_community_grouping`)
+/// -- must surface an entity that exists ONLY as a shadow page (a post-flip
+/// entity: `entity_page_map` + `pages` row, no `entities` row). A raw insert
+/// simulates that state without waiting for the writer flip. Neither
+/// assertion below is a static check: `a` and `b` share no edge of their
+/// own, so they merge into one community (path 1) and the shadow-only id
+/// appears in `entity_embeddings` (path 2) ONLY if each scan actually reads
+/// past `entities` -- reverting either port back to `entities`-only flips
+/// the matching assertion from pass to fail.
+#[tokio::test]
+async fn community_discovery_surfaces_shadow_only_entity() {
+    const SPACE: &str = "m97-shadow-discovery-space";
+    let (db, _dir) = test_db().await;
+
+    // Two real entities, otherwise unconnected -- each is its own singleton
+    // community unless something bridges them.
+    let a = db
+        .create_entity("Shadow Discovery A", "person", Some(SPACE))
+        .await
+        .unwrap();
+    let b = db
+        .create_entity("Shadow Discovery B", "person", Some(SPACE))
+        .await
+        .unwrap();
+
+    // A shadow-only entity: a `kind='entity'` page + `entity_page_map` row,
+    // deliberately with NO `entities` row -- the exact post-flip state a
+    // discovery scan still reading `entities` directly would miss.
+    let shadow_only_id = "m97-shadow-only-entity";
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    let now_unix = chrono::Utc::now().timestamp();
+    {
+        let conn = db.conn.lock().await;
+        // `entity_page_map.entity_id` still carries `REFERENCES entities(id)
+        // ON DELETE CASCADE`, which makes a real post-flip entity-only
+        // shadow page impossible to insert today -- sub-step 3 (the writer
+        // flip) gains a migration to relax/repoint this FK; drop this
+        // PRAGMA workaround once that migration ships and the map row can
+        // be inserted directly. Toggle FK enforcement off for just these
+        // two inserts to simulate that future state early, same technique
+        // `get_entity_detail_normalizes_sentinel_space_to_none` below uses
+        // to simulate its not-yet-shipped fold migration.
+        conn.execute("PRAGMA foreign_keys = OFF", ()).await.unwrap();
+        conn.execute(
+            "INSERT INTO pages (
+                id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+                embedding, space, workspace, source_memory_ids, version, status,
+                created_at, last_compiled, last_modified, creation_kind, review_status
+             ) VALUES (
+                'm97-shadow-only-page', 'Shadow Only', NULL, '', 'entity', 'concept', NULL, 0,
+                NULL, ?1, ?1, '[]', 1, 'active', ?2, ?2, ?2, 'entity', 'unconfirmed'
+             )",
+            libsql::params![SPACE, now_iso.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at)
+             VALUES (?1, 'm97-shadow-only-page', ?2)",
+            libsql::params![shadow_only_id, now_iso.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA foreign_keys = ON", ()).await.unwrap();
+
+        // Bridge `a` and `b` through the shadow-only entity via two
+        // `lineage='legacy'` edges. D6's cross-space check on
+        // `detect_communities` looks up `entities.space` per endpoint, finds
+        // no row for `shadow_only_id`, and treats that as null-space (not
+        // cross-space) -- the same carve-out
+        // `detect_communities_cross_space_excluded_but_sentinel_endpoint_admitted`
+        // pins for a real NULL -- so a broken discovery scan is the only
+        // thing that can keep these edges from contributing to adjacency.
+        for (edge_id, dst) in [("m97-bridge-a", a.as_str()), ("m97-bridge-b", b.as_str())] {
+            conn.execute(
+                "INSERT INTO edges
+                    (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                     grounded, root_id, space, created_at)
+                 VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'legacy', 0, NULL, ?4, ?5)",
+                libsql::params![edge_id, shadow_only_id, dst, SPACE, now_unix],
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    // Discovery path 1: `detect_communities`'s legacy label-propagation
+    // scan. If it still reads `entities` directly, `shadow_only_id` is
+    // never loaded, both bridging edges have nothing to attach to, and `a`/
+    // `b` stay in separate singleton communities.
+    db.detect_communities().await.unwrap();
+    let conn = db.conn.lock().await;
+    let mut community_ids = std::collections::HashMap::new();
+    for (label, id) in [("a", &a), ("b", &b)] {
+        let mut rows = conn
+            .query(
+                "SELECT community_id FROM entities WHERE id = ?1",
+                libsql::params![id.as_str()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("entity row");
+        let community_id: i64 = row.get(0).unwrap();
+        community_ids.insert(label, community_id);
+    }
+    drop(conn);
+    assert_eq!(
+        community_ids["a"], community_ids["b"],
+        "a and b share no edge of their own -- they can only land in the \
+         same community if detect_communities discovered the shadow-only \
+         bridging entity and its two legacy edges"
+    );
+
+    // Discovery path 2: `load_community_entities_paged`, reached through
+    // `prepare_community_grouping`'s M4 Leiden path. Seed a dirty
+    // `space_graph_state` row -- same precondition
+    // `finalizing_a_split_queues_review_without_overwriting_curated_names`
+    // seeds above -- so the lease can be acquired.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO space_graph_state
+                (space, graph_generation, grouping_generation, published_generation, dirty)
+             VALUES (?1, 1, 1, NULL, 1)
+             ON CONFLICT(space) DO UPDATE SET dirty = 1",
+            libsql::params![SPACE],
+        )
+        .await
+        .unwrap();
+    }
+    let attempt = db.prepare_community_grouping(SPACE).await.unwrap();
+    assert!(
+        attempt.entity_embeddings.contains_key(shadow_only_id),
+        "load_community_entities_paged must discover the shadow-only \
+         entity through entity_page_map/pages, not just entities -- a scan \
+         still reading entities directly would never see it"
+    );
+    // `attempt`'s Drop spawns the lease-cleanup task; no finalize needed
+    // for a discovery-only assertion.
+}
+
 /// G6 Stage 1.5b Part 2 pin test: `get_entity_detail` is the read path
 /// `handle_create_entity` (and every other entity route) relies on to
 /// produce the wire response -- it must fold `UNFILED_SPACE_ID` back to
@@ -49504,9 +49647,3 @@ async fn migration_81_rerun_recovers_pre_semantic_type_edges_table() {
         "chain completes back to the current schema version"
     );
 }
-
-// G6 Stage 2 PR 2b: `page_content_update_reconciles_citation_only_edges`
-// retired -- its only check that the dropped citation's edge retired was the
-// parity oracle's drift count; replacement coverage for a citations-only
-// locator losing its last backing store is
-// `dual_write_page_citations_retracts_dropped_citation_when_unbacked`.

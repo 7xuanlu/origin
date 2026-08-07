@@ -537,7 +537,7 @@ impl MemoryDB {
     }
 
     /// Route/retrieval-facing Entity vector search. The Global path retains
-    /// DiskANN; selected scopes rank only rows satisfying `entities.space`.
+    /// DiskANN; selected scopes rank via a brute-force scan.
     pub async fn search_entities_by_vector_scoped(
         &self,
         query: &str,
@@ -552,38 +552,38 @@ impl MemoryDB {
         let vec_str = Self::vec_to_sql(&embedding);
 
         let conn = self.conn.lock().await;
-        // G6 Stage 1.5b Part 3: unconditional hydration overlay (spec item
-        // 9 collapses this reader's `reader_uses_entity_pages` gate; same
-        // program contract as 1.5a). Selection always runs the EXACT
-        // legacy ANN query below -- row set and order (tied distances
-        // included) are unaffected by the overlay. The ANN ordering/filter
-        // stay on `e.embedding` (the entity-side DiskANN index; the design
-        // deliberately does not swap ranking infrastructure -- the page
-        // embedding is byte-identical by parity, not a different index). A
-        // hydration query below overlays the mirrored columns
-        // (name/entity_type/confidence/confirmed) from each row's shadow
-        // page, falling back to the legacy entity-side value already
-        // selected on a hydration miss. Both queries run under this one
-        // held `conn` guard, no re-lock in between.
+        // G6 Stage 2 PR 2c sub-step 1: selection now ranks on the
+        // `kind='entity'` shadow page's own embedding/space (via
+        // `entity_page_map` joined to `pages`) instead of brute-forcing
+        // `entities`. The hydration query below re-reads the same shadow
+        // page for the same rows, so it's now a no-op overlay -- kept
+        // in place (rather than deleted) for the same unconditional
+        // program contract 1.5a established, and because dropping it is
+        // a structural change outside this sub-step's query-swap scope.
+        // Both queries still run under this one held `conn` guard, no
+        // re-lock in between.
 
-        // G6 Stage 1.5b: `entities.space` is folded (never NULL; unfiled rows
-        // carry `UNFILED_SPACE_ID`), so `Uncategorized` must match either.
+        // G6 Stage 2 PR 2c item 2: `pages.space` is folded the same way
+        // `entities.space` was (never NULL; unfiled rows carry
+        // `UNFILED_SPACE_ID`, confirmed by the same parity receipt), so
+        // `Uncategorized` must match either.
         let (scope_sql, scope_value) = match scope {
             ReadScope::Space(space) => {
-                ("AND e.space = ?3", Some(libsql::Value::Text(space.clone())))
+                ("AND p.space = ?3", Some(libsql::Value::Text(space.clone())))
             }
             ReadScope::Uncategorized => (
-                "AND (e.space IS NULL OR e.space = '00000000-0000-4000-8000-000000000001')",
+                "AND (p.space IS NULL OR p.space = '00000000-0000-4000-8000-000000000001')",
                 None,
             ),
             ReadScope::Global => unreachable!(),
         };
         let sql = format!(
-            "SELECT e.id, e.name, e.entity_type, e.space, e.source_agent, e.confidence, \
-                    e.confirmed, e.created_at, e.updated_at, \
-                    vector_distance_cos(e.embedding, vector32(?1)) AS distance \
-             FROM entities e \
-             WHERE e.embedding IS NOT NULL {scope_sql} \
+            "SELECT m.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, \
+                    p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
+                    vector_distance_cos(p.embedding, vector32(?1)) AS distance \
+             FROM entity_page_map m \
+             JOIN pages p ON p.id = m.page_id \
+             WHERE p.kind = 'entity' AND p.status = 'active' AND p.embedding IS NOT NULL {scope_sql} \
              ORDER BY distance ASC LIMIT ?2"
         );
         let mut params = vec![

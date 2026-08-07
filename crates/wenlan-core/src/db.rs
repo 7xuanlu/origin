@@ -16251,11 +16251,17 @@ impl MemoryDB {
         loop {
             let conn = self.conn.lock().await;
             let held_at = std::time::Instant::now();
+            // G6 Stage 2 PR 2c item 3: discovery ported from `entities` to
+            // the `kind='entity'` shadow page via `entity_page_map`, same
+            // join shape as `load_summary_buckets`'s legacy branch, so a
+            // post-flip entity (shadow page only) is still paged in here.
             let mut rows = conn
                 .query(
-                    "SELECT id, embedding FROM entities \
-                     WHERE space = ?1 AND id > ?2 \
-                     ORDER BY id LIMIT ?3",
+                    "SELECT epm.entity_id, p.embedding FROM entity_page_map epm \
+                     JOIN pages p ON p.id = epm.page_id \
+                     WHERE p.kind = 'entity' AND p.status = 'active' \
+                       AND p.space = ?1 AND epm.entity_id > ?2 \
+                     ORDER BY epm.entity_id LIMIT ?3",
                     libsql::params![space.to_owned(), cursor.clone(), COMMUNITY_READ_PAGE_SIZE],
                 )
                 .await
@@ -35563,9 +35569,18 @@ impl MemoryDB {
     pub async fn detect_communities(&self) -> Result<usize, WenlanError> {
         let conn = self.conn.lock().await;
 
-        // 1. Load all entity IDs
+        // 1. Load all entity IDs. G6 Stage 2 PR 2c item 3: discovery ported
+        // from `entities` to the `kind='entity'` shadow page via
+        // `entity_page_map`, same join shape as `load_summary_buckets`'s
+        // legacy branch, so an entity created after the writer flip (only
+        // written to `pages`) is still discovered here.
         let mut entity_rows = conn
-            .query("SELECT id FROM entities", ())
+            .query(
+                "SELECT epm.entity_id FROM entity_page_map epm \
+                 JOIN pages p ON p.id = epm.page_id \
+                 WHERE p.kind = 'entity' AND p.status = 'active'",
+                (),
+            )
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
 
@@ -35721,13 +35736,29 @@ impl MemoryDB {
         let update_result: Result<(), WenlanError> = async {
             for (i, entity_id) in entity_ids.iter().enumerate() {
                 let community_id = label_to_community[&labels[i]];
-                conn.execute(
-                    "UPDATE entities SET community_id = ?1 WHERE id = ?2",
-                    libsql::params![community_id, entity_id.clone()],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
-                Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+                let update_count = conn
+                    .execute(
+                        "UPDATE entities SET community_id = ?1 WHERE id = ?2",
+                        libsql::params![community_id, entity_id.clone()],
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+                // G6 Stage 2 PR 2c item 3: discovery now includes
+                // shadow-only entities (no `entities` row), which the
+                // `UPDATE` above silently no-ops for -- expected, not an
+                // error. `update_entity_shadow_page` re-derives every
+                // mirrored column from `entities` via subquery, so calling
+                // it for a shadow-only id would write NULL into
+                // `pages.title` (NOT NULL) and fail. Bridge guard: skip the
+                // shadow-page mirror refresh when there was no `entities`
+                // row to source it from. A shadow-only entity's own
+                // community_id write is a silent no-op until sub-step 2
+                // inverts this write to target the shadow page directly --
+                // sub-step 2 MUST land before sub-step 3 (writer flip) so
+                // that no-op window never exists live.
+                if update_count > 0 {
+                    Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+                }
             }
             Ok(())
         }
