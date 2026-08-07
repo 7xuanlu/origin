@@ -46012,6 +46012,178 @@ async fn migration_81_creates_edges_and_provenance_schema() {
     assert_eq!(uv as u32, crate::db::SCHEMA_VERSION);
 }
 
+/// G6 Stage 2 PR 2c item 1: `edges_space_fence`'s `entity` arm now reads the
+/// endpoint's space off its `kind='entity'` shadow page (via
+/// `entity_page_map`) instead of `entities` directly. This is a real
+/// cross-space mismatch, unrelated to the port itself -- it pins that the
+/// ported read still resolves the RIGHT space for each endpoint and still
+/// rejects a genuine mismatch, not just a missing row.
+#[tokio::test]
+async fn edges_space_fence_mismatch_aborts_entity_endpoint() {
+    let (db, _dir) = test_db().await;
+    let a = db
+        .create_entity("Fence A", "person", Some("space_fence_a"))
+        .await
+        .unwrap();
+    let b = db
+        .create_entity("Fence B", "person", Some("space_fence_b"))
+        .await
+        .unwrap();
+
+    let conn = db.conn.lock().await;
+    let result = conn
+        .execute(
+            "INSERT INTO edges
+                (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                 grounded, root_id, space, created_at)
+             VALUES ('m97-fence-mismatch', ?1, 'entity', ?2, 'entity', 'relates',
+                     'assertion', 0, NULL, 'space_fence_a', 1712707200)",
+            libsql::params![a.as_str(), b.as_str()],
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a non-legacy edge between two entities in genuinely different \
+         spaces must still be rejected after the shadow-page port"
+    );
+}
+
+/// G6 Stage 2 PR 2c item 1 RED control: an entity whose `entities` row is
+/// present but whose shadow page is missing (a data-integrity gap the port
+/// makes newly load-bearing) must fail closed, per the ruling -- "missing
+/// shadow page ABORTs like a mismatch". Both endpoints start in the SAME
+/// space, so a pre-port read of `entities.space` would have agreed and
+/// admitted the edge; the only thing that can reject it here is the ported
+/// read finding no shadow page for `a` and resolving NULL, same as a
+/// genuinely missing `entities` row always has.
+#[tokio::test]
+async fn edges_space_fence_missing_shadow_page_aborts_like_mismatch() {
+    let (db, _dir) = test_db().await;
+    let a = db
+        .create_entity("Fence Missing Shadow A", "person", Some("space_fence_c"))
+        .await
+        .unwrap();
+    let b = db
+        .create_entity("Fence Missing Shadow B", "person", Some("space_fence_c"))
+        .await
+        .unwrap();
+
+    let conn = db.conn.lock().await;
+    // Simulate a shadow-page integrity gap: `a`'s `entities` row and
+    // `entities.space` are untouched, but its shadow page linkage is gone.
+    conn.execute(
+        "DELETE FROM entity_page_map WHERE entity_id = ?1",
+        libsql::params![a.as_str()],
+    )
+    .await
+    .unwrap();
+
+    let result = conn
+        .execute(
+            "INSERT INTO edges
+                (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+                 grounded, root_id, space, created_at)
+             VALUES ('m97-fence-missing-shadow', ?1, 'entity', ?2, 'entity', 'relates',
+                     'assertion', 0, NULL, 'space_fence_c', 1712707200)",
+            libsql::params![a.as_str(), b.as_str()],
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a missing shadow page must fail closed even though entities.space \
+         (if it were still read) would have agreed with the edge's space"
+    );
+}
+
+/// G6 Stage 2 PR 2c item 1: the `lineage='legacy'` exemption (the trigger's
+/// `WHEN` clause) is untouched by the entity-arm port -- it must still skip
+/// the fence body entirely, even against the new failure mode the port
+/// introduces (a missing shadow page). Reuses the missing-shadow-page setup
+/// above so this test would fail the same way that one does if the `WHEN`
+/// clause were ever accidentally narrowed or the exemption lost.
+#[tokio::test]
+async fn edges_space_fence_legacy_lineage_exempt_despite_missing_shadow_page() {
+    let (db, _dir) = test_db().await;
+    let a = db
+        .create_entity("Fence Legacy A", "person", Some("space_fence_d"))
+        .await
+        .unwrap();
+    let b = db
+        .create_entity("Fence Legacy B", "person", Some("space_fence_d"))
+        .await
+        .unwrap();
+
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "DELETE FROM entity_page_map WHERE entity_id = ?1",
+        libsql::params![a.as_str()],
+    )
+    .await
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO edges
+            (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+             grounded, root_id, space, created_at)
+         VALUES ('m97-fence-legacy-exempt', ?1, 'entity', ?2, 'entity', 'relates',
+                 'legacy', 0, NULL, 'space_fence_d', 1712707200)",
+        libsql::params![a.as_str(), b.as_str()],
+    )
+    .await
+    .expect("lineage='legacy' must bypass the fence entirely, missing shadow page or not");
+}
+
+/// G6 Stage 2 PR 2c item 1: the UPDATE twin (`edges_space_fence_update`)
+/// re-fences a row whenever it is edited into an active, non-legacy state,
+/// which is exactly what `dual_write_edge`'s reactivation path does. Insert
+/// under the `lineage='legacy'` exemption (bypassing the INSERT trigger),
+/// then flip lineage to a fenced value against an endpoint with a missing
+/// shadow page -- the UPDATE must be rejected the same way the INSERT test
+/// above is, proving the port landed on both twins, not just one.
+#[tokio::test]
+async fn edges_space_fence_update_trigger_aborts_on_missing_shadow_page() {
+    let (db, _dir) = test_db().await;
+    let a = db
+        .create_entity("Fence Update A", "person", Some("space_fence_e"))
+        .await
+        .unwrap();
+    let b = db
+        .create_entity("Fence Update B", "person", Some("space_fence_e"))
+        .await
+        .unwrap();
+
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO edges
+            (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage,
+             grounded, root_id, space, created_at)
+         VALUES ('m97-fence-update', ?1, 'entity', ?2, 'entity', 'relates',
+                 'legacy', 0, NULL, 'space_fence_e', 1712707200)",
+        libsql::params![a.as_str(), b.as_str()],
+    )
+    .await
+    .expect("legacy-lineage insert must succeed (INSERT trigger exempt)");
+
+    conn.execute(
+        "DELETE FROM entity_page_map WHERE entity_id = ?1",
+        libsql::params![a.as_str()],
+    )
+    .await
+    .unwrap();
+
+    let result = conn
+        .execute(
+            "UPDATE edges SET lineage = 'assertion' WHERE edge_id = 'm97-fence-update'",
+            (),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "reactivating a legacy edge into a fenced lineage must re-check the \
+         shadow page and abort when it's missing, same as the INSERT twin"
+    );
+}
+
 #[tokio::test]
 async fn migration_81_migration_state_row_records_report() {
     let (db, _dir) = test_db().await;

@@ -109,6 +109,15 @@ pub(super) const EDGES_WIDENED_DDL: &str = "CREATE TABLE edges_new (
 ///
 /// Written as one string used for both twins so the INSERT and UPDATE bodies
 /// cannot drift apart — the failure the UPDATE twin exists to prevent.
+///
+/// G6 Stage 2 PR 2c item 1: the `entity` arm reads the `kind='entity'`
+/// shadow page's space via `entity_page_map` instead of `entities` directly
+/// -- same fail-closed shape as the `db.rs` `edges_space_fence` copy this
+/// migration overwrites (`m98 widen space fence`, below): a missing shadow
+/// page resolves to NULL, and `IS NOT NEW.space` aborts on NULL the same way
+/// it already aborted on a missing `entities` row. Both copies are ported in
+/// lockstep so they never disagree on which endpoints a `lineage != 'legacy'`
+/// edge may cross.
 const FENCE_BODY: &str = "
     SELECT RAISE(ABORT, 'edges_space_fence: cross-space edge rejected')
     WHERE (
@@ -117,7 +126,12 @@ const FENCE_BODY: &str = "
             CASE NEW.src_kind
                 WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.src_id)
                 WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.src_id)
-                WHEN 'entity' THEN (SELECT space FROM entities WHERE id = NEW.src_id)
+                WHEN 'entity' THEN (
+                    SELECT p.space FROM entity_page_map epm
+                      JOIN pages p ON p.id = epm.page_id
+                     WHERE epm.entity_id = NEW.src_id
+                       AND p.kind = 'entity' AND p.status = 'active'
+                )
                 WHEN 'claim_revision' THEN (
                     SELECT p.space FROM claim_revisions cr
                       JOIN claims c ON c.claim_id = cr.claim_id
@@ -134,7 +148,12 @@ const FENCE_BODY: &str = "
             CASE NEW.dst_kind
                 WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.dst_id)
                 WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.dst_id)
-                WHEN 'entity' THEN (SELECT space FROM entities WHERE id = NEW.dst_id)
+                WHEN 'entity' THEN (
+                    SELECT p.space FROM entity_page_map epm
+                      JOIN pages p ON p.id = epm.page_id
+                     WHERE epm.entity_id = NEW.dst_id
+                       AND p.kind = 'entity' AND p.status = 'active'
+                )
                 WHEN 'claim_revision' THEN (
                     SELECT p.space FROM claim_revisions cr
                       JOIN claims c ON c.claim_id = cr.claim_id

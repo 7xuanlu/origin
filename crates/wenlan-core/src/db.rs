@@ -9206,6 +9206,17 @@ impl MemoryDB {
             // never blocked -- only an update that keeps the edge ACTIVE and
             // typed is re-fenced. Without the UPDATE twin a reactivation could
             // resurrect a typed row against a now-cross-space endpoint.
+            // G6 Stage 2 PR 2c item 1: the `entity` arm reads the
+            // `kind='entity'` shadow page's space via `entity_page_map`
+            // instead of `entities` directly -- a missing shadow page
+            // resolves to NULL, and `IS NOT NEW.space` aborts on NULL the
+            // same way it already aborted on a missing `entities` row
+            // (fail-closed, unchanged). This trigger is only ever live
+            // between migration 81 and migration 98, which drops and
+            // recreates it with the M5-widened `FENCE_BODY` in
+            // `edges_rebuild.rs` -- ported there too, in lockstep, so the
+            // two never disagree on which endpoints a cross-space edge may
+            // touch.
             conn.execute_batch(
                 "CREATE TRIGGER IF NOT EXISTS edges_space_fence
                  AFTER INSERT ON edges
@@ -9216,7 +9227,12 @@ impl MemoryDB {
                          CASE NEW.src_kind
                              WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.src_id)
                              WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.src_id)
-                             WHEN 'entity' THEN (SELECT space FROM entities WHERE id = NEW.src_id)
+                             WHEN 'entity' THEN (
+                                SELECT p.space FROM entity_page_map epm
+                                JOIN pages p ON p.id = epm.page_id
+                                WHERE epm.entity_id = NEW.src_id
+                                  AND p.kind = 'entity' AND p.status = 'active'
+                            )
                              ELSE NULL
                          END
                      ) IS NOT NEW.space
@@ -9226,7 +9242,12 @@ impl MemoryDB {
                              CASE NEW.dst_kind
                                  WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.dst_id)
                                  WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.dst_id)
-                                 WHEN 'entity' THEN (SELECT space FROM entities WHERE id = NEW.dst_id)
+                                 WHEN 'entity' THEN (
+                                    SELECT p.space FROM entity_page_map epm
+                                    JOIN pages p ON p.id = epm.page_id
+                                    WHERE epm.entity_id = NEW.dst_id
+                                      AND p.kind = 'entity' AND p.status = 'active'
+                                )
                                  ELSE NULL
                              END
                          ) IS NOT NEW.space
@@ -9241,7 +9262,12 @@ impl MemoryDB {
                          CASE NEW.src_kind
                              WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.src_id)
                              WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.src_id)
-                             WHEN 'entity' THEN (SELECT space FROM entities WHERE id = NEW.src_id)
+                             WHEN 'entity' THEN (
+                                SELECT p.space FROM entity_page_map epm
+                                JOIN pages p ON p.id = epm.page_id
+                                WHERE epm.entity_id = NEW.src_id
+                                  AND p.kind = 'entity' AND p.status = 'active'
+                            )
                              ELSE NULL
                          END
                      ) IS NOT NEW.space
@@ -9251,7 +9277,12 @@ impl MemoryDB {
                              CASE NEW.dst_kind
                                  WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.dst_id)
                                  WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.dst_id)
-                                 WHEN 'entity' THEN (SELECT space FROM entities WHERE id = NEW.dst_id)
+                                 WHEN 'entity' THEN (
+                                    SELECT p.space FROM entity_page_map epm
+                                    JOIN pages p ON p.id = epm.page_id
+                                    WHERE epm.entity_id = NEW.dst_id
+                                      AND p.kind = 'entity' AND p.status = 'active'
+                                )
                                  ELSE NULL
                              END
                          ) IS NOT NEW.space
