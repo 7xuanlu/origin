@@ -307,70 +307,13 @@ async fn dual_write_keeps_page_evidence_consistent_with_page_sources() {
     assert_eq!(ev, ps, "link_page_source diverged");
 }
 
-#[tokio::test]
-async fn update_prunes_memory_evidence_but_preserves_external() {
-    let (db, _d) = make_db().await;
-    seed_memory(&db, "mem_a", "alpha").await;
-    seed_memory(&db, "mem_b", "beta").await;
-    let page_id = create_page_fixture(
-        &db,
-        PageFixture {
-            title: "T",
-            summary: Some("s"),
-            content: "body",
-            space: None,
-            source_ids: &["mem_a", "mem_b"],
-            creation_kind: "distilled",
-            workspace: None,
-        },
-    )
-    .await;
-    // Attach a non-memory evidence row directly (the row a memory-source edit must NOT touch).
-    db.link_page_evidence(
-        &page_id,
-        "external_url",
-        Some("https://example.com"),
-        Some("Example"),
-        "manual",
-    )
-    .await
-    .unwrap();
-
-    // Edit drops mem_b. Memory rows reconcile; the external row must survive.
-    db.update_page_content(&page_id, "body2", &["mem_a"], "manual_edit")
-        .await
-        .unwrap();
-    let ev = db.get_page_evidence(&page_id).await.unwrap();
-    let mem: Vec<String> = ev
-        .iter()
-        .filter(|e| e.source_kind == "memory")
-        .filter_map(|e| e.locator.clone())
-        .collect();
-    assert_eq!(
-        mem,
-        vec!["mem_a".to_string()],
-        "memory evidence reconciled to new set"
-    );
-    assert!(
-        ev.iter().any(|e| e.source_kind == "external_url"
-            && e.locator.as_deref() == Some("https://example.com")),
-        "external evidence must survive a memory-source edit"
-    );
-
-    // Empty-source edit: prune ALL memory rows; external still preserved.
-    db.update_page_content(&page_id, "body3", &[], "manual_edit")
-        .await
-        .unwrap();
-    let ev = db.get_page_evidence(&page_id).await.unwrap();
-    assert!(
-        !ev.iter().any(|e| e.source_kind == "memory"),
-        "empty-source edit prunes all memory evidence"
-    );
-    assert!(
-        ev.iter().any(|e| e.source_kind == "external_url"),
-        "external evidence preserved on empty-source edit"
-    );
-}
+// `update_prunes_memory_evidence_but_preserves_external` relocated to
+// `crates/wenlan-core/src/db/main_tests.rs` (G6 Stage 2 PR 2b): its one
+// manual `external_url` evidence attach called `link_page_evidence`, which
+// closed to `#[cfg(test)]` under the Q2 ruling (the authored/typed-manual
+// entry point had zero live rows). `#[cfg(test)]` does not cross the
+// `tests/` integration-binary boundary, so the test moved into the crate's
+// own unit-test suite where it compiles. Assertions unchanged.
 
 #[tokio::test]
 async fn distilled_page_defaults_creation_kind_distilled() {

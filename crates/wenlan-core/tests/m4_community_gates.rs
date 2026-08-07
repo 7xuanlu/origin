@@ -2542,7 +2542,6 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
             edge_id: edge_id.clone(),
             root_id: root_id.clone(),
             payload: r#"{"grounded":true,"source":"m4-correction"}"#.to_owned(),
-            relation_id: relation_id.clone(),
             source_memory_id: SOURCE_ID.to_owned(),
             judged_content: SOURCE_CONTENT.to_owned(),
         }])
@@ -2615,7 +2614,6 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
             edge_id: old_merge_edge.clone(),
             root_id,
             payload: r#"{"grounded":true,"source":"m4-merge"}"#.to_owned(),
-            relation_id: merge_relation,
             source_memory_id: SOURCE_ID.to_owned(),
             judged_content: SOURCE_CONTENT.to_owned(),
         }])
@@ -2720,7 +2718,6 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
                 .await
                 .expect("reacquire restart root"),
             payload: r#"{"grounded":true,"source":"m4-restart"}"#.to_owned(),
-            relation_id: restart_relation,
             source_memory_id: SOURCE_ID.to_owned(),
             judged_content: SOURCE_CONTENT.to_owned(),
         }])
@@ -2839,7 +2836,6 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
                 edge_id: delete_edge.clone(),
                 root_id: delete_root,
                 payload: r#"{"grounded":true,"source":"m4-delete"}"#.to_owned(),
-                relation_id: delete_relation,
                 source_memory_id: DELETE_SOURCE.to_owned(),
                 judged_content: DELETE_CONTENT.to_owned(),
             }])
@@ -2929,7 +2925,6 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
                 edge_id: refresh_edge.clone(),
                 root_id: refresh_root,
                 payload: r#"{"grounded":true,"source":"m4-refresh"}"#.to_owned(),
-                relation_id: refresh_relation,
                 source_memory_id: REFRESH_SOURCE.to_owned(),
                 judged_content: REFRESH_CONTENT.to_owned(),
             }])
@@ -3054,7 +3049,7 @@ async fn m4_merge_collision_advances_graph_and_rebuilds_changed_node_order() {
         &root_id,
     )
     .await;
-    let canonical_relation_id = canonical_promotion.relation_id.clone();
+    let canonical_relation_id = canonical_promotion.edge_id.clone();
     assert_eq!(
         db.promote_edges_grounded(&[canonical_promotion])
             .await
@@ -3153,23 +3148,21 @@ async fn stage_m4_promotion(
     judged_content: &str,
     root_id: &str,
 ) -> EdgePromotion {
-    let relation_id = db
-        .create_relation(
-            from,
-            to,
-            "related_to",
-            Some("m4-gate"),
-            Some(1.0),
-            Some("M4 real-job acceptance edge"),
-            Some(source_memory_id),
-        )
-        .await
-        .expect("stage grounded=0 relation");
+    db.create_relation(
+        from,
+        to,
+        "related_to",
+        Some("m4-gate"),
+        Some(1.0),
+        Some("M4 real-job acceptance edge"),
+        Some(source_memory_id),
+    )
+    .await
+    .expect("stage grounded=0 relation");
     EdgePromotion {
         edge_id: compute_edge_id("relates", "entity", from, "entity", to, "related_to"),
         root_id: root_id.to_owned(),
         payload: r#"{"grounded":true,"score":1.0,"source":"m4-gate"}"#.to_owned(),
-        relation_id,
         source_memory_id: source_memory_id.to_owned(),
         judged_content: judged_content.to_owned(),
     }

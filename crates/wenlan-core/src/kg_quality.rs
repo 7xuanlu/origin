@@ -545,18 +545,43 @@ mod tests {
             .await
             .unwrap();
 
-        // Bypass create_relation's normalization by inserting directly.
-        // This simulates legacy data created before relation vocabulary existed.
+        // Bypass create_relation's normalization by inserting directly into
+        // `edges` (see `heal_relation_vocabulary_folds_aliases_and_queues_semantics`
+        // above for why `create_relation` itself can't seed a raw `working_at`
+        // row post-G6-Stage-2). This simulates legacy data created before
+        // relation vocabulary existed.
+        let legacy_edge_id = crate::provenance::compute_edge_id(
+            "relates",
+            "entity",
+            &e1,
+            "entity",
+            &e2,
+            "working_at",
+        );
         {
             let conn = db.test_primary_session().await;
+            let space: Option<String> = {
+                let mut rows = conn
+                    .query(
+                        "SELECT space FROM entities WHERE id = ?1",
+                        libsql::params![e1.clone()],
+                    )
+                    .await
+                    .unwrap();
+                rows.next().await.unwrap().and_then(|r| r.get(0).ok())
+            };
             conn.execute(
-                "INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, \
+                                     lineage, grounded, root_id, space, weight, payload, \
+                                     provenance, operation_id, created_at, superseded_by, \
+                                     valid_until, semantic_type) \
+                 VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion', 0, NULL, \
+                         ?4, NULL, NULL, NULL, NULL, ?5, NULL, NULL, 'working_at')",
                 libsql::params![
-                    "rel-legacy-1".to_string(),
+                    legacy_edge_id.clone(),
                     e1.clone(),
                     e2.clone(),
-                    "working_at".to_string(),
+                    space,
                     chrono::Utc::now().timestamp()
                 ],
             )
@@ -574,18 +599,42 @@ mod tests {
             report.relations_healed
         );
 
-        // Verify the relation now has the canonical type
+        // Verify the canonical edge now exists (works_on), and the legacy-type
+        // edge_id is retired (superseded), not left live under the old type.
         let conn = db.test_primary_session().await;
+        let canonical_edge_id =
+            crate::provenance::compute_edge_id("relates", "entity", &e1, "entity", &e2, "works_on");
         let mut rows = conn
             .query(
-                "SELECT relation_type FROM relations WHERE id = ?1",
-                libsql::params!["rel-legacy-1".to_string()],
+                "SELECT semantic_type, valid_until FROM edges WHERE edge_id = ?1",
+                libsql::params![canonical_edge_id],
             )
             .await
             .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("canonical works_on edge should exist");
         let rt: String = row.get::<String>(0).unwrap();
         assert_eq!(rt, "works_on");
+        drop(rows);
+        let mut legacy_rows = conn
+            .query(
+                "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                libsql::params![legacy_edge_id],
+            )
+            .await
+            .unwrap();
+        let legacy_row = legacy_rows
+            .next()
+            .await
+            .unwrap()
+            .expect("legacy-type edge should still exist, retired");
+        assert!(
+            legacy_row.get::<Option<i64>>(0).unwrap().is_some(),
+            "legacy-type edge must be retired (valid_until set) after the fold"
+        );
     }
 
     #[tokio::test]
@@ -768,12 +817,16 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify confidence is now 0.9
+        // Verify confidence is now 0.9 (canonical-only since G6 Stage 2 item 1:
+        // `create_relation`'s keep-if-stronger upsert lands on the live `edges`
+        // row, not `relations`).
         {
             let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
-                    "SELECT confidence FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
+                    "SELECT json_extract(payload,'$.confidence') FROM edges \
+                     WHERE edge_type = 'relates' AND src_kind = 'entity' AND dst_kind = 'entity' \
+                       AND src_id = ?1 AND dst_id = ?2 AND semantic_type = ?3 AND valid_until IS NULL",
                     libsql::params![e1.clone(), e2.clone(), "works_on".to_string()],
                 )
                 .await
@@ -796,7 +849,9 @@ mod tests {
             let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
-                    "SELECT confidence, COUNT(*) as cnt FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
+                    "SELECT json_extract(payload,'$.confidence'), COUNT(*) as cnt FROM edges \
+                     WHERE edge_type = 'relates' AND src_kind = 'entity' AND dst_kind = 'entity' \
+                       AND src_id = ?1 AND dst_id = ?2 AND semantic_type = ?3 AND valid_until IS NULL",
                     libsql::params![e1.clone(), e2.clone(), "works_on".to_string()],
                 )
                 .await
@@ -825,31 +880,47 @@ mod tests {
             .store_entity("EntityB", "project", None, Some("test"), None)
             .await
             .unwrap();
-        let now = chrono::Utc::now().timestamp();
-        {
-            let conn = db.test_primary_session().await;
-            // Survivor: canonical works_on, confidence 0.9.
-            conn.execute(
-                "INSERT INTO relations (id, from_entity, to_entity, relation_type, confidence, created_at) VALUES ('rel-canon', ?1, ?2, 'works_on', 0.9, ?3)",
-                libsql::params![e1.clone(), e2.clone(), now]).await.unwrap();
-            // Loser: alias working_at, confidence 0.5, has an explanation.
-            conn.execute(
-                "INSERT INTO relations (id, from_entity, to_entity, relation_type, confidence, explanation, created_at) VALUES ('rel-alias', ?1, ?2, 'working_at', 0.5, 'employed since 2020', ?3)",
-                libsql::params![e1.clone(), e2.clone(), now]).await.unwrap();
-        }
-
-        let folded = db
-            .fold_relation_type("working_at", "works_on")
+        // Seeded via `create_relation` (canonical-only since G6 Stage 2 PR 2b
+        // item 1), using two vocabulary-canonical, non-aliased types --
+        // `working_at`/`works_on` no longer work here because `working_at` is
+        // itself an ALIAS that `resolve_relation_type` collapses onto
+        // `works_on` at create time, so a `create_relation("working_at", ...)`
+        // call would never produce a `working_at`-typed edge to fold in the
+        // first place. `leads`/`works_on` are both canonicals (see the sibling
+        // `fold_relation_type_dual_writes_edges`, db/main_tests.rs), so they
+        // stay distinct until this test's own fold merges them.
+        // Survivor: canonical works_on, confidence 0.9.
+        db.create_relation(&e1, &e2, "works_on", Some("test"), Some(0.9), None, None)
             .await
             .unwrap();
+        // Loser: leads, confidence 0.5, has an explanation.
+        db.create_relation(
+            &e1,
+            &e2,
+            "leads",
+            Some("test"),
+            Some(0.5),
+            Some("employed since 2020"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let folded = db.fold_relation_type("leads", "works_on").await.unwrap();
         assert_eq!(folded, 1);
 
         let conn = db.test_primary_session().await;
-        // Exactly one A->B row survives, canonical, confidence preserved at 0.9,
-        // and the loser's explanation was merged in (survivor had none).
-        let mut rows = conn.query(
-            "SELECT COUNT(*), MAX(confidence) FROM relations WHERE from_entity = ?1 AND to_entity = ?2",
-            libsql::params![e1.clone(), e2.clone()]).await.unwrap();
+        // Exactly one A->B relates edge survives, canonical, confidence
+        // preserved at 0.9, and the loser's explanation was merged in
+        // (survivor had none).
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*), MAX(json_extract(payload,'$.confidence')) FROM edges \
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 AND valid_until IS NULL",
+                libsql::params![e1.clone(), e2.clone()],
+            )
+            .await
+            .unwrap();
         let row = rows.next().await.unwrap().unwrap();
         let cnt: i64 = row.get(0).unwrap();
         let conf: f64 = row.get(1).unwrap();
@@ -864,7 +935,7 @@ mod tests {
         // restore is possible on undo.
         let mut led = conn
             .query(
-                "SELECT COUNT(*), MAX(pre_image) FROM vocab_heal_ledger WHERE old_value = 'working_at'",
+                "SELECT COUNT(*), MAX(pre_image) FROM vocab_heal_ledger WHERE old_value = 'leads'",
                 (),
             )
             .await
@@ -879,11 +950,15 @@ mod tests {
         );
         // Spec §2.5: the SURVIVOR is mutated too (provenance COALESCE-merge), so its
         // pre-image must also be ledgered before the UPDATE, else undo cannot restore
-        // its pre-merge confidence/explanation. `rel-canon` is the survivor's id and
-        // appears in NO loser pre-image (loser id is `rel-alias`), so its presence
-        // proves the survivor pre-image was captured.
+        // its pre-merge confidence/explanation. The survivor's edge_id is
+        // content-addressed by (relates, entity, e1, entity, e2, "works_on") and
+        // appears in NO loser pre-image (the loser's own edge_id has a different
+        // discriminator, "leads"), so its presence proves the survivor pre-image
+        // was captured.
+        let survivor_edge_id =
+            crate::provenance::compute_edge_id("relates", "entity", &e1, "entity", &e2, "works_on");
         assert!(
-            pre_image.contains("rel-canon"),
+            pre_image.contains(&survivor_edge_id),
             "survivor pre-image must be ledgered so undo can restore the mutated survivor, got {pre_image}"
         );
     }
@@ -899,26 +974,25 @@ mod tests {
             .store_entity("RollbackB", "project", None, Some("test"), None)
             .await
             .unwrap();
+        // Seeded via `create_relation` -- see the sibling test above for why
+        // `leads`/`works_on` (both vocabulary canonicals) replace the old
+        // `working_at`/`works_on` alias pair.
+        db.create_relation(&e1, &e2, "works_on", Some("test"), Some(0.9), None, None)
+            .await
+            .unwrap();
+        db.create_relation(
+            &e1,
+            &e2,
+            "leads",
+            Some("test"),
+            Some(0.5),
+            Some("must survive failed ledger"),
+            None,
+        )
+        .await
+        .unwrap();
         {
             let conn = db.test_primary_session().await;
-            conn.execute(
-                "INSERT INTO relations
-                     (id, from_entity, to_entity, relation_type, confidence, created_at)
-                 VALUES ('rollback-canon', ?1, ?2, 'works_on', 0.9, 1)",
-                libsql::params![e1.clone(), e2.clone()],
-            )
-            .await
-            .unwrap();
-            conn.execute(
-                "INSERT INTO relations
-                     (id, from_entity, to_entity, relation_type, confidence,
-                      explanation, created_at)
-                 VALUES ('rollback-alias', ?1, ?2, 'working_at', 0.5,
-                         'must survive failed ledger', 1)",
-                libsql::params![e1.clone(), e2.clone()],
-            )
-            .await
-            .unwrap();
             conn.execute_batch(
                 "CREATE TRIGGER fail_relation_vocab_ledger
                  BEFORE INSERT ON vocab_heal_ledger
@@ -932,7 +1006,7 @@ mod tests {
         }
 
         let error = db
-            .fold_relation_type("working_at", "works_on")
+            .fold_relation_type("leads", "works_on")
             .await
             .expect_err("ledger failure must reject the whole fold");
         assert!(
@@ -943,11 +1017,10 @@ mod tests {
         let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
-                "SELECT id, relation_type, explanation
-                 FROM relations
-                 WHERE from_entity = ?1 AND to_entity = ?2
-                 ORDER BY id",
-                libsql::params![e1, e2],
+                "SELECT edge_id, semantic_type, valid_until, json_extract(payload,'$.explanation')
+                 FROM edges
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+                libsql::params![e1.clone(), e2.clone()],
             )
             .await
             .unwrap();
@@ -956,20 +1029,33 @@ mod tests {
             surviving.push((
                 row.get::<String>(0).unwrap(),
                 row.get::<String>(1).unwrap(),
-                row.get::<Option<String>>(2).unwrap(),
+                row.get::<Option<i64>>(2).unwrap(),
+                row.get::<Option<String>>(3).unwrap(),
             ));
         }
-        assert_eq!(
-            surviving,
-            vec![
-                (
-                    "rollback-alias".to_string(),
-                    "working_at".to_string(),
-                    Some("must survive failed ledger".to_string()),
+        surviving.sort();
+        let mut expected = vec![
+            (
+                crate::provenance::compute_edge_id(
+                    "relates", "entity", &e1, "entity", &e2, "leads",
                 ),
-                ("rollback-canon".to_string(), "works_on".to_string(), None,),
-            ],
-            "relation mutation and undo ledger must commit or roll back together"
+                "leads".to_string(),
+                None,
+                Some("must survive failed ledger".to_string()),
+            ),
+            (
+                crate::provenance::compute_edge_id(
+                    "relates", "entity", &e1, "entity", &e2, "works_on",
+                ),
+                "works_on".to_string(),
+                None,
+                None,
+            ),
+        ];
+        expected.sort();
+        assert_eq!(
+            surviving, expected,
+            "edge mutation and undo ledger must commit or roll back together"
         );
     }
 
@@ -1049,12 +1135,16 @@ mod tests {
         .await
         .unwrap();
 
-        // Verify source_memory_id was stored
+        // Verify source_memory_id was stored (canonical-only since G6 Stage 2
+        // item 1: `source_memory_id` lives in `payload`, not a `relations`
+        // column).
         {
             let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
-                    "SELECT source_memory_id FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
+                    "SELECT json_extract(payload,'$.source_memory_id') FROM edges \
+                     WHERE edge_type = 'relates' AND src_kind = 'entity' AND dst_kind = 'entity' \
+                       AND src_id = ?1 AND dst_id = ?2 AND semantic_type = ?3 AND valid_until IS NULL",
                     libsql::params![e1.clone(), e2.clone(), "works_on".to_string()],
                 )
                 .await
@@ -1082,7 +1172,10 @@ mod tests {
             let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
-                    "SELECT source_memory_id, confidence FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
+                    "SELECT json_extract(payload,'$.source_memory_id'), \
+                            json_extract(payload,'$.confidence') FROM edges \
+                     WHERE edge_type = 'relates' AND src_kind = 'entity' AND dst_kind = 'entity' \
+                       AND src_id = ?1 AND dst_id = ?2 AND semantic_type = ?3 AND valid_until IS NULL",
                     libsql::params![e1.clone(), e2.clone(), "works_on".to_string()],
                 )
                 .await
@@ -1119,7 +1212,10 @@ mod tests {
             let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
-                    "SELECT source_memory_id, confidence FROM relations WHERE from_entity = ?1 AND to_entity = ?2 AND relation_type = ?3",
+                    "SELECT json_extract(payload,'$.source_memory_id'), \
+                            json_extract(payload,'$.confidence') FROM edges \
+                     WHERE edge_type = 'relates' AND src_kind = 'entity' AND dst_kind = 'entity' \
+                       AND src_id = ?1 AND dst_id = ?2 AND semantic_type = ?3 AND valid_until IS NULL",
                     libsql::params![e1.clone(), e2.clone(), "works_on".to_string()],
                 )
                 .await
@@ -1236,12 +1332,50 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         {
             let conn = db.test_primary_session().await;
-            // Known alias -> auto-fold to works_on.
-            conn.execute("INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at) VALUES ('r1', ?1, ?2, 'working_at', ?3)",
-                libsql::params![e1.clone(), e2.clone(), now]).await.unwrap();
-            // Semantic new type -> queue promote.
-            conn.execute("INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at) VALUES ('r2', ?1, ?2, 'design_inspiration', ?3)",
-                libsql::params![e1.clone(), e2.clone(), now]).await.unwrap();
+            // Both rows must land with their RAW (non-normalized) type, so this
+            // seeds `edges` directly rather than via `create_relation` --
+            // `create_relation` resolves `working_at` to `works_on` and coerces
+            // an unrecognized type like `design_inspiration` to `related_to`
+            // (queuing its own promote proposal) at WRITE time, which would
+            // defeat the exact discovery-then-heal path this test exercises.
+            let space: Option<String> = {
+                let mut rows = conn
+                    .query(
+                        "SELECT space FROM entities WHERE id = ?1",
+                        libsql::params![e1.clone()],
+                    )
+                    .await
+                    .unwrap();
+                rows.next().await.unwrap().and_then(|r| r.get(0).ok())
+            };
+            for (id_suffix, relation_type) in [("r1", "working_at"), ("r2", "design_inspiration")] {
+                let edge_id = crate::provenance::compute_edge_id(
+                    "relates",
+                    "entity",
+                    &e1,
+                    "entity",
+                    &e2,
+                    relation_type,
+                );
+                conn.execute(
+                    "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, \
+                                         lineage, grounded, root_id, space, weight, payload, \
+                                         provenance, operation_id, created_at, superseded_by, \
+                                         valid_until, semantic_type) \
+                     VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion', 0, NULL, \
+                             ?4, NULL, NULL, NULL, NULL, ?5, NULL, NULL, ?6)",
+                    libsql::params![
+                        edge_id,
+                        e1.clone(),
+                        e2.clone(),
+                        space.clone(),
+                        now,
+                        relation_type
+                    ],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("seed edge {id_suffix}: {e}"));
+            }
         }
         let counts = super::heal_relation_vocabulary(&db).await.unwrap();
         assert!(
@@ -1256,7 +1390,9 @@ mod tests {
         let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
-                "SELECT relation_type FROM relations ORDER BY relation_type",
+                "SELECT DISTINCT semantic_type FROM edges \
+                 WHERE edge_type = 'relates' AND valid_until IS NULL \
+                 ORDER BY semantic_type",
                 (),
             )
             .await
@@ -1277,6 +1413,146 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("design_inspiration")));
+    }
+
+    // G6 Stage 2 PR 2b sweep instance 4 acceptance pin: `heal_relation_vocabulary`
+    // discovers a non-canonical-type edge that COLLIDES with an existing
+    // canonical edge (unlike the simple-rename case above), and the fold it
+    // drives keeps the stronger confidence rather than duplicate-asserting --
+    // exercising the full `heal_relation_vocabulary` -> `fold_relation_type`
+    // path end to end against `edges`, not just `fold_relation_type` in
+    // isolation (see `fold_relation_type_merges_provenance_and_ledgers_the_loser`
+    // above for the isolated collision case).
+    #[tokio::test]
+    async fn heal_relation_vocabulary_discovers_and_folds_edges_collision_keeps_stronger() {
+        let (db, _dir) = test_db().await;
+        let e1 = db
+            .store_entity("HealA", "person", None, Some("t"), None)
+            .await
+            .unwrap();
+        let e2 = db
+            .store_entity("HealB", "project", None, Some("t"), None)
+            .await
+            .unwrap();
+
+        // Canonical survivor, minted through the real canonical-only writer
+        // (`create_relation`, post-G6-Stage-2 item 1), confidence 0.9.
+        db.create_relation(&e1, &e2, "works_on", Some("test"), Some(0.9), None, None)
+            .await
+            .unwrap();
+
+        // Legacy-typed loser, seeded directly into `edges` (bypassing
+        // `create_relation`'s eager alias resolution -- same technique as
+        // `heal_relation_vocabulary_folds_aliases_and_queues_semantics`
+        // above), confidence 0.3 -- weaker than the survivor.
+        let loser_edge_id = crate::provenance::compute_edge_id(
+            "relates",
+            "entity",
+            &e1,
+            "entity",
+            &e2,
+            "working_at",
+        );
+        {
+            let conn = db.test_primary_session().await;
+            let space: Option<String> = {
+                let mut rows = conn
+                    .query(
+                        "SELECT space FROM entities WHERE id = ?1",
+                        libsql::params![e1.clone()],
+                    )
+                    .await
+                    .unwrap();
+                rows.next().await.unwrap().and_then(|r| r.get(0).ok())
+            };
+            let payload = serde_json::json!({"confidence": 0.3}).to_string();
+            conn.execute(
+                "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, \
+                                     lineage, grounded, root_id, space, weight, payload, \
+                                     provenance, operation_id, created_at, superseded_by, \
+                                     valid_until, semantic_type) \
+                 VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'assertion', 0, NULL, \
+                         ?4, NULL, ?5, NULL, NULL, ?6, NULL, NULL, 'working_at')",
+                libsql::params![
+                    loser_edge_id.clone(),
+                    e1.clone(),
+                    e2.clone(),
+                    space,
+                    payload,
+                    chrono::Utc::now().timestamp()
+                ],
+            )
+            .await
+            .unwrap();
+        }
+
+        let counts = super::heal_relation_vocabulary(&db).await.unwrap();
+        assert!(
+            counts.healed >= 1,
+            "working_at is a known alias colliding with an existing canonical, must auto-fold"
+        );
+
+        let conn = db.test_primary_session().await;
+        // Exactly one live edge between e1/e2: no duplicate assert.
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*), MAX(json_extract(payload,'$.confidence')) FROM edges \
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 AND valid_until IS NULL",
+                libsql::params![e1.clone(), e2.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let cnt: i64 = row.get(0).unwrap();
+        let conf: f64 = row.get(1).unwrap();
+        assert_eq!(
+            cnt, 1,
+            "collision must not leave two live edges (no duplicate assert)"
+        );
+        assert!(
+            (conf - 0.9).abs() < 1e-6,
+            "survivor keeps the stronger confidence (keep-if-stronger), got {conf}"
+        );
+        drop(rows);
+
+        // The canonical survivor's edge_id is unchanged (content-addressed by
+        // participants + canonical type) and stays live; the legacy-typed
+        // edge is retired, not left duplicated.
+        let canonical_edge_id =
+            crate::provenance::compute_edge_id("relates", "entity", &e1, "entity", &e2, "works_on");
+        let mut surv = conn
+            .query(
+                "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                libsql::params![canonical_edge_id],
+            )
+            .await
+            .unwrap();
+        let surv_row = surv
+            .next()
+            .await
+            .unwrap()
+            .expect("canonical survivor edge exists");
+        assert!(
+            surv_row.get::<Option<i64>>(0).unwrap().is_none(),
+            "survivor stays live"
+        );
+        drop(surv);
+        let mut loser = conn
+            .query(
+                "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                libsql::params![loser_edge_id],
+            )
+            .await
+            .unwrap();
+        let loser_row = loser
+            .next()
+            .await
+            .unwrap()
+            .expect("legacy-typed edge still exists, retired");
+        assert!(
+            loser_row.get::<Option<i64>>(0).unwrap().is_some(),
+            "legacy-typed edge is retired, not duplicated"
+        );
     }
 
     #[tokio::test]

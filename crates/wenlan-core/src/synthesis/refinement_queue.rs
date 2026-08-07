@@ -1144,26 +1144,36 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.action_applied, "relation_conflict");
 
+        // G6 Stage 2 PR 2b: `relations` is frozen -- `supersede_relation` is
+        // keyed on `edges.edge_id` now (item 3 compat note), and it
+        // retracts (not deletes) the loser edge, so assert `valid_until`
+        // instead of a `relations` row count.
         let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
-                "SELECT COUNT(*) FROM relations WHERE id = ?1",
+                "SELECT valid_until FROM edges WHERE edge_id = ?1",
                 libsql::params![new_rel],
             )
             .await
             .unwrap();
-        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(count, 1, "new relation (winner) should remain");
+        let valid_until: Option<i64> = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert!(
+            valid_until.is_none(),
+            "new relation (winner) should remain active"
+        );
 
         let mut rows = conn
             .query(
-                "SELECT COUNT(*) FROM relations WHERE id = ?1",
+                "SELECT valid_until FROM edges WHERE edge_id = ?1",
                 libsql::params![existing_rel],
             )
             .await
             .unwrap();
-        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(count, 0, "existing relation (loser) should be deleted");
+        let valid_until: Option<i64> = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert!(
+            valid_until.is_some(),
+            "existing relation (loser) should be retracted"
+        );
     }
 
     #[tokio::test]

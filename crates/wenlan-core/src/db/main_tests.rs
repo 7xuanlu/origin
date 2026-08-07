@@ -7882,15 +7882,17 @@ async fn delete_memory_cleans_page_provenance_and_background_dependents() {
         1
     );
 
+    // G6 Stage 2 PR 2b: the `relations` prune-on-delete stops (item 1 already
+    // stopped writing it; `invalidate_relation_edges_for_source_in_transaction`
+    // above retracts the live `relates` edge instead, and has its own direct
+    // coverage) -- the raw legacy row seeded above is left in place
+    // deliberately, to prove its presence doesn't break the delete, but is no
+    // longer asserted gone here.
     let conn = db.conn.lock().await;
     for (table, sql) in [
         (
             "episodes",
             "SELECT COUNT(*) FROM memories WHERE source='episode' AND source_id='mem-forget-dependencies'",
-        ),
-        (
-            "relations",
-            "SELECT COUNT(*) FROM relations WHERE source_memory_id='mem-forget-dependencies'",
         ),
         (
             "document_enrichment_queue",
@@ -8262,10 +8264,6 @@ async fn rebind_source_id_moves_durable_provenance_without_memory_generation_bum
                  (id,entity_id,content,source_memory_id,confirmed,created_at)
              VALUES ('observation-rebind','rebind-from','Owned observation',
                      'source-rebind-old',0,1);
-             INSERT INTO relations
-                 (id,from_entity,to_entity,relation_type,source_memory_id,created_at)
-             VALUES ('relation-rebind','rebind-from','rebind-to','related_to',
-                     'source-rebind-old',1);
              INSERT INTO summary_nodes
                  (id,level,title,body,source_count,generated_at,status)
              VALUES ('summary-rebind',0,'Summary','Body',1,1,'active');
@@ -8283,6 +8281,22 @@ async fn rebind_source_id_moves_durable_provenance_without_memory_generation_bum
         .await
         .unwrap();
     }
+    // G6 Stage 2 PR 2b: `create_relation` writes straight to `edges` now
+    // (item 1), so this seeds the "relates" edge the same way live callers
+    // do, instead of a raw `relations` row `rebind_source_id_inner` no
+    // longer touches (Fork 2, widened sweep -- relations rebinds stopped
+    // alongside page_sources/page_evidence).
+    db.create_relation(
+        "rebind-from",
+        "rebind-to",
+        "related_to",
+        None,
+        None,
+        None,
+        Some("source-rebind-old"),
+    )
+    .await
+    .unwrap();
 
     db.rebind_source_id("memory", "source-rebind-old", "source-rebind-new")
         .await
@@ -8328,17 +8342,69 @@ async fn rebind_source_id_moves_durable_provenance_without_memory_generation_bum
     );
     drop(page_rows);
 
+    // G6 Stage 2 PR 2b (sweep instance 5): page_sources/page_evidence no
+    // longer gain rows, so the durable-provenance guarantee for a cited
+    // page now lives on the `cites` edge -- verify the old locator's edge
+    // retired and the new locator's edge is live instead of counting the
+    // frozen stores.
+    let old_cites_edge_id = crate::provenance::compute_edge_id(
+        "cites",
+        "page",
+        "page_rebind_provenance",
+        "memory",
+        "source-rebind-old",
+        "source-rebind-old",
+    );
+    let new_cites_edge_id = crate::provenance::compute_edge_id(
+        "cites",
+        "page",
+        "page_rebind_provenance",
+        "memory",
+        "source-rebind-new",
+        "source-rebind-new",
+    );
+    for (edge_id, retired) in [
+        (old_cites_edge_id.as_str(), true),
+        (new_cites_edge_id.as_str(), false),
+    ] {
+        let mut rows = conn
+            .query(
+                "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                libsql::params![edge_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("cites edge exists");
+        assert_eq!(
+            row.get::<Option<i64>>(0).unwrap().is_some(),
+            retired,
+            "cites edge {edge_id}: retired={retired}"
+        );
+    }
+    // Same for the "relates" edge's `payload.source_memory_id` -- it moves
+    // to the new identity via the trailing payload-carry UPDATE in
+    // `rebind_source_id_inner`, same as the legacy `relations.source_memory_id`
+    // column used to.
+    {
+        let mut rows = conn
+            .query(
+                "SELECT json_extract(payload,'$.source_memory_id') FROM edges \
+                 WHERE edge_type = 'relates' AND src_kind = 'entity' AND dst_kind = 'entity' \
+                   AND src_id = 'rebind-from' AND dst_id = 'rebind-to' \
+                   AND semantic_type = 'related_to' AND valid_until IS NULL",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("relates edge exists");
+        assert_eq!(
+            row.get::<String>(0).unwrap(),
+            "source-rebind-new",
+            "relates edge payload.source_memory_id should follow the rebind"
+        );
+    }
+
     for (table, old_sql, new_sql) in [
-        (
-            "page_sources",
-            "SELECT COUNT(*) FROM page_sources WHERE memory_source_id='source-rebind-old'",
-            "SELECT COUNT(*) FROM page_sources WHERE memory_source_id='source-rebind-new'",
-        ),
-        (
-            "page_evidence",
-            "SELECT COUNT(*) FROM page_evidence WHERE locator='source-rebind-old'",
-            "SELECT COUNT(*) FROM page_evidence WHERE locator='source-rebind-new'",
-        ),
         (
             "memory_entities",
             "SELECT COUNT(*) FROM memory_entities WHERE memory_id='source-rebind-old'",
@@ -8348,11 +8414,6 @@ async fn rebind_source_id_moves_durable_provenance_without_memory_generation_bum
             "observations",
             "SELECT COUNT(*) FROM observations WHERE source_memory_id='source-rebind-old'",
             "SELECT COUNT(*) FROM observations WHERE source_memory_id='source-rebind-new'",
-        ),
-        (
-            "relations",
-            "SELECT COUNT(*) FROM relations WHERE source_memory_id='source-rebind-old'",
-            "SELECT COUNT(*) FROM relations WHERE source_memory_id='source-rebind-new'",
         ),
         (
             "summary_node_sources",
@@ -9946,8 +10007,13 @@ async fn test_knowledge_graph_full_lifecycle() {
         assert_eq!(count, 2);
     }
 
+    // G6 Stage 2 PR 2b: `relations` is frozen -- count the live `relates`
+    // edge instead.
     let mut rows = conn
-        .query("SELECT COUNT(*) FROM relations", ())
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' AND valid_until IS NULL",
+            (),
+        )
         .await
         .unwrap();
     if let Ok(Some(row)) = rows.next().await {
@@ -10941,11 +11007,15 @@ async fn get_entity_detail_reads_relates_edge_fields() {
     .await
     .unwrap();
 
+    // G6 Stage 2 PR 2b: `relations` is frozen -- read the live `relates`
+    // edge instead.
     let relation_type = {
         let conn = db.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT relation_type FROM relations WHERE from_entity = ?1 AND to_entity = ?2",
+                "SELECT semantic_type FROM edges \
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+                   AND valid_until IS NULL",
                 libsql::params![alice_id.as_str(), wenlan_id.as_str()],
             )
             .await
@@ -10983,7 +11053,9 @@ async fn get_entity_detail_reads_relates_edge_fields() {
         let conn = db.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT created_at FROM relations WHERE from_entity = ?1 AND to_entity = ?2",
+                "SELECT created_at FROM edges \
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+                   AND valid_until IS NULL",
                 libsql::params![alice_id.as_str(), wenlan_id.as_str()],
             )
             .await
@@ -11880,10 +11952,12 @@ async fn test_create_relation_null_source_agent() {
         .await
         .unwrap();
 
+    // G6 Stage 2 PR 2b: `relations` is frozen; `source_agent` now lives in
+    // the live edge's payload.
     let conn = db.conn.lock().await;
     let mut rows = conn
         .query(
-            "SELECT source_agent FROM relations WHERE id = ?1",
+            "SELECT json_extract(payload, '$.source_agent') FROM edges WHERE edge_id = ?1",
             libsql::params![rid],
         )
         .await
@@ -11924,11 +11998,16 @@ async fn test_relation_type_normalized_at_insert() {
     .await
     .unwrap();
 
-    // Query the relation to verify normalization
+    // Query the relation to verify normalization. G6 Stage 2 PR 2b:
+    // `relations` is frozen -- `relation_type` is the live edge's
+    // `semantic_type` column, the rest live in its payload.
     let conn = db.conn.lock().await;
     let mut rows = conn
         .query(
-            "SELECT relation_type, confidence, explanation, source_memory_id FROM relations WHERE from_entity = ?1",
+            "SELECT semantic_type, json_extract(payload, '$.confidence'), \
+                    json_extract(payload, '$.explanation'), \
+                    json_extract(payload, '$.source_memory_id') \
+             FROM edges WHERE edge_type = 'relates' AND src_id = ?1 AND valid_until IS NULL",
             libsql::params![e1.clone()],
         )
         .await
@@ -14102,6 +14181,88 @@ async fn test_find_distillation_clusters() {
             cluster.source_ids
         );
     }
+}
+
+/// G6 Stage 2 PR 2b: `query_distillation_staging_pool`'s eligibility
+/// predicate widened from a page_evidence-only check to the edges/cites
+/// union (see the doc comment on the function in db.rs). This pins the NEW
+/// half: a memory cited only via an active `edges` `cites` row -- no
+/// page_evidence row backing it, the shape a citation minted after PR 2b's
+/// page_evidence writer stop will have -- must still be excluded from the
+/// staging pool, not just a page_evidence-backed one.
+#[tokio::test]
+async fn distillation_staging_pool_excludes_edges_only_cites_backing() {
+    let (db, _dir) = test_db().await;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    for sid in ["mem_edges_cited", "mem_edges_uncited"] {
+        let doc = RawDocument {
+            source: "memory".to_string(),
+            source_id: sid.to_string(),
+            content: format!("Content about {sid}"),
+            title: sid.to_string(),
+            url: None,
+            last_modified: now,
+            memory_type: Some("fact".to_string()),
+            space: Some("test".to_string()),
+            ..Default::default()
+        };
+        db.upsert_documents(vec![doc]).await.unwrap();
+    }
+
+    let page_now = chrono::Utc::now().to_rfc3339();
+    db.insert_page_with_kind(
+        "page_edges_only_cite",
+        "T",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &page_now,
+        "authored",
+        "confirmed",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    // Mints both the page_evidence row and its dual-written `cites` edge.
+    db.link_page_evidence(
+        "page_edges_only_cite",
+        "memory",
+        Some("mem_edges_cited"),
+        None,
+        "test",
+    )
+    .await
+    .unwrap();
+    // Simulate the PR 2b post-flip shape: the legacy page_evidence row is
+    // gone (writer stopped), but the canonical `cites` edge stays active.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "DELETE FROM page_evidence WHERE page_id = ?1 AND locator = ?2",
+            libsql::params!["page_edges_only_cite", "mem_edges_cited"],
+        )
+        .await
+        .unwrap();
+    }
+
+    let pool = db
+        .query_distillation_staging_pool(None, None)
+        .await
+        .unwrap();
+    let pool_ids: Vec<&str> = pool.iter().map(|m| m.source_id.as_str()).collect();
+    assert!(
+        !pool_ids.contains(&"mem_edges_cited"),
+        "edges-only cites backing must still exclude the memory from the \
+         staging pool: {pool_ids:?}"
+    );
+    assert!(
+        pool_ids.contains(&"mem_edges_uncited"),
+        "an uncited memory must remain eligible: {pool_ids:?}"
+    );
 }
 
 #[tokio::test]
@@ -20147,6 +20308,64 @@ async fn page_links_cascade_on_source_delete() {
 }
 
 #[tokio::test]
+async fn delete_by_source_id_recompute_does_not_resurrect_dropped_citation() {
+    // G6 Stage 2 PR 2b (sweep instance 6): a citation legitimately dropped
+    // via a content edit must stay dropped when an UNRELATED memory is
+    // later deleted, even though its old `page_sources` row is never
+    // pruned and persists forever.
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for sid in ["mem_i6_a", "mem_i6_b", "mem_i6_c"] {
+        let doc = make_memory_doc(sid, "content", "fact", "work", "agent");
+        db.upsert_documents(vec![doc]).await.unwrap();
+    }
+    db.insert_page(
+        "page_i6",
+        "I6 Page",
+        None,
+        "content v1",
+        None,
+        None,
+        &["mem_i6_a", "mem_i6_b"],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    // Simulate a frozen legacy page_sources row for mem_i6_b -- no live path
+    // writes page_sources anymore, but old rows persist forever.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO page_sources (page_id, memory_source_id, link_reason, linked_at) \
+             VALUES ('page_i6', 'mem_i6_b', 'legacy', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Legitimately drop mem_i6_b, add mem_i6_c via a real content edit.
+    db.update_page_content("page_i6", "content v2", &["mem_i6_a", "mem_i6_c"], "edit")
+        .await
+        .unwrap();
+
+    // Delete an unrelated memory (mem_i6_c) that page_i6 currently cites --
+    // this is what triggers the remaining-sources recompute.
+    db.delete_bulk(&[("memory".to_string(), "mem_i6_c".to_string())])
+        .await
+        .unwrap();
+
+    let page = db.get_page("page_i6").await.unwrap().unwrap();
+    assert_eq!(
+        page.source_memory_ids,
+        vec!["mem_i6_a".to_string()],
+        "mem_i6_a survives, mem_i6_c is gone (deleted), mem_i6_b must not \
+         resurrect from the frozen page_sources row"
+    );
+}
+
+#[tokio::test]
 async fn page_links_target_delete_becomes_orphan_and_reresolves() {
     let (db, _dir) = test_db().await;
     let now = chrono::Utc::now().to_rfc3339();
@@ -22698,10 +22917,13 @@ async fn create_relation_coerces_unknown_type_to_related_to() {
         .await
         .unwrap();
 
+    // G6 Stage 2 PR 2b: `relations` is frozen and `create_relation` now
+    // returns the content-addressed `edges.edge_id` (item 3 compat note),
+    // so the coerced type is read straight off the live edge it names.
     let conn = db.conn.lock().await;
     let mut rows = conn
         .query(
-            "SELECT relation_type FROM relations WHERE id = ?1",
+            "SELECT semantic_type FROM edges WHERE edge_id = ?1",
             libsql::params![id],
         )
         .await
@@ -22740,11 +22962,14 @@ async fn create_relation_captures_coerced_type_as_promote_candidate() {
         1,
         "coerced type should queue exactly one promote candidate"
     );
-    // The row itself is still related_to (write unchanged).
+    // The row itself is still related_to (write unchanged). `relations` is
+    // frozen (G6 Stage 2 PR 2b) -- read the live `relates` edge instead.
     let conn = db.conn.lock().await;
     let mut rows = conn
         .query(
-            "SELECT relation_type FROM relations WHERE from_entity = ?1 AND to_entity = ?2",
+            "SELECT semantic_type FROM edges \
+             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+               AND valid_until IS NULL",
             libsql::params![e1.clone(), e2.clone()],
         )
         .await
@@ -25003,6 +25228,9 @@ async fn update_memory_invalidates_source_owned_kg_and_requeues_entity_enrichmen
     );
     {
         let conn = db.conn.lock().await;
+        // G6 Stage 2 PR 2b: `relations` is frozen -- the owned/manual relates
+        // checks below read the live `edges` twin instead. `manual_relation`
+        // is the content-addressed `edges.edge_id` (item 3 compat note).
         let mut rows = conn
             .query(
                 "SELECT
@@ -25010,13 +25238,15 @@ async fn update_memory_invalidates_source_owned_kg_and_requeues_entity_enrichmen
                       WHERE memory_id = 'mem_kg_invalidation'),
                      (SELECT COUNT(*) FROM observations
                       WHERE source_memory_id = 'mem_kg_invalidation'),
-                     (SELECT COUNT(*) FROM relations
-                      WHERE source_memory_id = 'mem_kg_invalidation'),
+                     (SELECT COUNT(*) FROM edges
+                      WHERE edge_type = 'relates' AND valid_until IS NULL
+                        AND json_extract(payload, '$.source_memory_id') = 'mem_kg_invalidation'),
                      (SELECT COUNT(*) FROM observations
                       WHERE content = 'manual observation must survive content edits'
                         AND source_memory_id IS NULL),
-                     (SELECT COUNT(*) FROM relations
-                      WHERE id = ?1 AND source_memory_id IS NULL)",
+                     (SELECT COUNT(*) FROM edges
+                      WHERE edge_id = ?1
+                        AND json_extract(payload, '$.source_memory_id') IS NULL)",
                 libsql::params![manual_relation.as_str()],
             )
             .await
@@ -25047,6 +25277,8 @@ async fn update_memory_invalidates_source_owned_kg_and_requeues_entity_enrichmen
     assert_eq!(selected, 1, "the edited v2 memory must be re-enriched");
 
     let conn = db.conn.lock().await;
+    // G6 Stage 2 PR 2b: `relations` is frozen -- see the comment on the
+    // pre-re-enrichment block above.
     let mut rows = conn
         .query(
             "SELECT
@@ -25056,13 +25288,15 @@ async fn update_memory_invalidates_source_owned_kg_and_requeues_entity_enrichmen
                   WHERE source_id = 'mem_kg_invalidation' AND entity_id IS NOT NULL),
                  (SELECT COUNT(*) FROM observations
                   WHERE source_memory_id = 'mem_kg_invalidation'),
-                 (SELECT COUNT(*) FROM relations
-                  WHERE source_memory_id = 'mem_kg_invalidation'),
+                 (SELECT COUNT(*) FROM edges
+                  WHERE edge_type = 'relates' AND valid_until IS NULL
+                    AND json_extract(payload, '$.source_memory_id') = 'mem_kg_invalidation'),
                  (SELECT COUNT(*) FROM observations
                   WHERE content = 'manual observation must survive content edits'
                     AND source_memory_id IS NULL),
-                 (SELECT COUNT(*) FROM relations
-                  WHERE id = ?1 AND source_memory_id IS NULL)",
+                 (SELECT COUNT(*) FROM edges
+                  WHERE edge_id = ?1
+                    AND json_extract(payload, '$.source_memory_id') IS NULL)",
             libsql::params![manual_relation.as_str()],
         )
         .await
@@ -26611,46 +26845,60 @@ async fn merge_entities_repoints_relations() {
     let (db, _tmp) = test_db().await;
     let (canonical, alias) = seed_two_entities(&db).await;
     let other = db.create_entity("Bob", "person", None).await.unwrap();
-    // Inbound relation: other --works_at--> alias  (tests to_entity re-point)
-    let rel_in = db
-        .create_relation(&other, &alias, "works_at", None, Some(0.9), None, None)
+    // Inbound relation: other --works_at--> alias  (tests dst_id re-point)
+    db.create_relation(&other, &alias, "works_at", None, Some(0.9), None, None)
         .await
         .unwrap();
-    // Outbound relation: alias --leads--> other  (tests from_entity re-point)
-    let rel_out = db
-        .create_relation(&alias, &other, "leads", None, Some(0.9), None, None)
+    // Outbound relation: alias --leads--> other  (tests src_id re-point)
+    db.create_relation(&alias, &other, "leads", None, Some(0.9), None, None)
         .await
         .unwrap();
 
     db.merge_entities(&canonical, &alias).await.unwrap();
 
+    // G6 Stage 2 PR 2b: merge no longer repoints a `relations` row in place
+    // -- it retires the alias-side edge and reasserts a corrected edge onto
+    // the canonical endpoint (`merge_edge_plans`, db.rs). Read the live
+    // `relates` edge between the corrected endpoints instead.
     let conn = db.conn.lock().await;
-    let mut rows = conn
+    let inbound: i64 = conn
         .query(
-            "SELECT to_entity FROM relations WHERE id = ?1",
-            libsql::params![rel_in],
+            "SELECT COUNT(*) FROM edges \
+             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+               AND valid_until IS NULL",
+            libsql::params![other.as_str(), canonical.as_str()],
         )
         .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
         .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
-    let to: String = row.get(0).unwrap();
     assert_eq!(
-        to, canonical,
-        "inbound relation should re-point to canonical via to_entity"
+        inbound, 1,
+        "inbound relation should re-point to canonical via dst_id"
     );
 
-    let mut rows = conn
+    let outbound: i64 = conn
         .query(
-            "SELECT from_entity FROM relations WHERE id = ?1",
-            libsql::params![rel_out],
+            "SELECT COUNT(*) FROM edges \
+             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+               AND valid_until IS NULL",
+            libsql::params![canonical.as_str(), other.as_str()],
         )
         .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
         .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
-    let from: String = row.get(0).unwrap();
     assert_eq!(
-        from, canonical,
-        "outbound relation should re-point to canonical via from_entity"
+        outbound, 1,
+        "outbound relation should re-point to canonical via src_id"
     );
 }
 
@@ -27068,28 +27316,45 @@ async fn supersede_relation_deletes_loser() {
 
     db.supersede_relation(&loser, &winner).await.unwrap();
 
+    // G6 Stage 2 PR 2b: the `relations` hard-delete stops -- supersede now
+    // soft-invalidates the loser's edge instead. `loser`/`winner` are
+    // `edges.edge_id` values (item 3 compat note).
     let conn = db.conn.lock().await;
-    let mut rows = conn
+    let loser_valid_until: Option<i64> = conn
         .query(
-            "SELECT COUNT(*) FROM relations WHERE id = ?1",
-            libsql::params![loser],
+            "SELECT valid_until FROM edges WHERE edge_id = ?1",
+            libsql::params![loser.as_str()],
         )
         .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
         .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
-    let count: i64 = row.get(0).unwrap();
-    assert_eq!(count, 0, "loser relation should be deleted");
+    assert!(
+        loser_valid_until.is_some(),
+        "loser relation's edge should be retired"
+    );
 
-    let mut rows = conn
+    let winner_valid_until: Option<i64> = conn
         .query(
-            "SELECT COUNT(*) FROM relations WHERE id = ?1",
-            libsql::params![winner],
+            "SELECT valid_until FROM edges WHERE edge_id = ?1",
+            libsql::params![winner.as_str()],
         )
         .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
         .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
-    let count: i64 = row.get(0).unwrap();
-    assert_eq!(count, 1, "winner relation should remain");
+    assert!(
+        winner_valid_until.is_none(),
+        "winner relation's edge should remain active"
+    );
 }
 
 #[tokio::test]
@@ -28709,6 +28974,117 @@ async fn typed_page_evidence_change_advances_source_revision_only() {
     );
 }
 
+/// Relocated from `tests/provenance_p2.rs::update_prunes_memory_evidence_but_preserves_external`
+/// (G6 Stage 2 PR 2b): `link_page_evidence` closed to `#[cfg(test)]` (Q2
+/// ruling, its only live rows are memory/external kinds minted elsewhere;
+/// this manual `external_url` attach was the one caller left, and `#[cfg(test)]`
+/// is invisible across the `tests/` integration-binary boundary, so the test
+/// moves here where it compiles under the crate's own unit-test cfg).
+/// Assertions unchanged: a memory-source edit must reconcile memory-kind
+/// evidence to the new source set while leaving a manually-attached
+/// external-kind row untouched, down to an empty source set.
+#[tokio::test]
+async fn update_prunes_memory_evidence_but_preserves_external() {
+    let (db, _dir) = test_db().await;
+    db.upsert_documents(vec![
+        make_memory_doc(
+            "mem_prune_evidence_a",
+            "alpha",
+            "fact",
+            "technology",
+            "test-agent",
+        ),
+        make_memory_doc(
+            "mem_prune_evidence_b",
+            "beta",
+            "fact",
+            "technology",
+            "test-agent",
+        ),
+    ])
+    .await
+    .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page_with_kind(
+        "page_prune_evidence_generation",
+        "T",
+        Some("s"),
+        "body",
+        None,
+        None,
+        &["mem_prune_evidence_a", "mem_prune_evidence_b"],
+        &now,
+        "distilled",
+        "confirmed",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Attach a non-memory evidence row directly (the row a memory-source edit must NOT touch).
+    db.link_page_evidence(
+        "page_prune_evidence_generation",
+        "external_url",
+        Some("https://example.com"),
+        Some("Example"),
+        "manual",
+    )
+    .await
+    .unwrap();
+
+    // Edit drops mem_prune_evidence_b. Memory rows reconcile; the external row must survive.
+    db.update_page_content(
+        "page_prune_evidence_generation",
+        "body2",
+        &["mem_prune_evidence_a"],
+        "manual_edit",
+    )
+    .await
+    .unwrap();
+    let ev = db
+        .get_page_evidence("page_prune_evidence_generation")
+        .await
+        .unwrap();
+    let mem: Vec<String> = ev
+        .iter()
+        .filter(|e| e.source_kind == "memory")
+        .filter_map(|e| e.locator.clone())
+        .collect();
+    assert_eq!(
+        mem,
+        vec!["mem_prune_evidence_a".to_string()],
+        "memory evidence reconciled to new set"
+    );
+    assert!(
+        ev.iter().any(|e| e.source_kind == "external_url"
+            && e.locator.as_deref() == Some("https://example.com")),
+        "external evidence must survive a memory-source edit"
+    );
+
+    // Empty-source edit: prune ALL memory rows; external still preserved.
+    db.update_page_content(
+        "page_prune_evidence_generation",
+        "body3",
+        &[],
+        "manual_edit",
+    )
+    .await
+    .unwrap();
+    let ev = db
+        .get_page_evidence("page_prune_evidence_generation")
+        .await
+        .unwrap();
+    assert!(
+        !ev.iter().any(|e| e.source_kind == "memory"),
+        "empty-source edit prunes all memory evidence"
+    );
+    assert!(
+        ev.iter().any(|e| e.source_kind == "external_url"),
+        "external evidence preserved on empty-source edit"
+    );
+}
+
 #[tokio::test]
 async fn source_page_replacement_reopens_citation_backfill() {
     let (db, _dir) = test_db().await;
@@ -29888,10 +30264,14 @@ async fn ambient_entity_sweep_dual_writes_canonical_relates_edge() {
     assert_eq!(selected, 1, "the sweep processed the seeded memory");
 
     let conn = db.conn.lock().await;
+    // G6 Stage 2 PR 2b: `relations` is frozen -- count the live `relates`
+    // edge instead.
     let relation_count: i64 = {
         let mut rows = conn
             .query(
-                "SELECT COUNT(*) FROM relations WHERE relation_type = 'works_on'",
+                "SELECT COUNT(*) FROM edges \
+                 WHERE edge_type = 'relates' AND semantic_type = 'works_on' \
+                   AND valid_until IS NULL",
                 (),
             )
             .await
@@ -30188,20 +30568,23 @@ async fn migration_115_backfills_edge_semantic_payload() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "fixture precondition: live writers leave parity clean"
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
-    // Read the STORED discriminators back (create_relation normalizes the
-    // relation type; replace_page_links derives label_key) so the test
-    // derives edge ids exactly the way the migration does.
-    let (relation_type, label_key) = {
+    // Read the STORED discriminator back (create_relation normalizes the
+    // relation type) so the test derives the relates edge id exactly the
+    // way the migration does. G6 Stage 2 PR 2b: `create_relation` no longer
+    // writes `relations` -- read the live `relates` edge's `semantic_type`
+    // instead. `label_key` is just `link.label.to_lowercase()`
+    // (`replace_page_links`, db.rs) and a resolved link's `page_links` row
+    // stops at write time (item 3) -- compute it directly rather than
+    // reading a row that no longer exists.
+    let relation_type = {
         let conn = db.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT relation_type FROM relations WHERE from_entity = ?1 AND to_entity = ?2",
+                "SELECT semantic_type FROM edges \
+                 WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+                   AND valid_until IS NULL",
                 libsql::params![from.as_str(), to.as_str()],
             )
             .await
@@ -30210,25 +30593,12 @@ async fn migration_115_backfills_edge_semantic_payload() {
             .next()
             .await
             .unwrap()
-            .expect("relation row")
+            .expect("relates edge")
             .get(0)
             .unwrap();
-        let mut rows = conn
-            .query(
-                "SELECT label_key FROM page_links WHERE source_page_id = 'page_g6_sem'",
-                (),
-            )
-            .await
-            .unwrap();
-        let label_key: String = rows
-            .next()
-            .await
-            .unwrap()
-            .expect("page_links row")
-            .get(0)
-            .unwrap();
-        (relation_type, label_key)
+        relation_type
     };
+    let label_key = "Semantic Target".to_lowercase();
 
     for pass in 1..=2 {
         db.migrate_115_edge_semantic_payload(114).await.unwrap();
@@ -30379,8 +30749,9 @@ async fn migration_115_backfills_edge_semantic_payload() {
 
 /// G6 Stage 1.2 (docs/plans/2026-08-05-g6-stage12-relations-readers-spec.md):
 /// migration 116 backfills `payload.asserted_at` (always) and fills
-/// `payload.source_memory_id` only when absent, from the live `relations`
-/// twin. A pre-Stage-1.2 edge is simulated by clearing both keys after the
+/// `payload.source_memory_id` only when absent, from the frozen `relations`
+/// twin (backfill machinery, still read by migrations per the writer-
+/// retirement spec). A pre-Stage-1.2 edge is simulated by clearing both keys after the
 /// write (the writer now stamps them at insert time, so a fresh write is
 /// never actually missing them). The loop runs the migration twice: the
 /// second pass must converge on the identical end-state.
@@ -30410,9 +30781,33 @@ async fn migration_116_backfills_asserted_at_and_fills_source_memory_id() {
     let forced_created_at = 1_000_000_000i64;
     {
         let conn = db.conn.lock().await;
+        // G6 Stage 2 PR 2b: `create_relation` no longer writes `relations` --
+        // migration 116 still reads it (backfill machinery, kept per the
+        // writer-retirement spec) as the twin it backfills `asserted_at`/
+        // `source_memory_id` from. Raw-insert the historical row the join
+        // expects, using the edge's own (possibly-coerced) semantic_type so
+        // the join key matches.
+        let semantic_type: String = {
+            let mut rows = conn
+                .query(
+                    "SELECT semantic_type FROM edges \
+                     WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 \
+                       AND valid_until IS NULL",
+                    libsql::params![from.as_str(), to.as_str()],
+                )
+                .await
+                .unwrap();
+            rows.next()
+                .await
+                .unwrap()
+                .expect("relates edge")
+                .get(0)
+                .unwrap()
+        };
         conn.execute(
-            "UPDATE relations SET created_at = ?1 WHERE from_entity = ?2 AND to_entity = ?3",
-            libsql::params![forced_created_at, from.as_str(), to.as_str()],
+            "INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at, source_memory_id) \
+             VALUES ('rel_m116_backfill', ?1, ?2, ?3, ?4, 'mem_backfill')",
+            libsql::params![from.as_str(), to.as_str(), semantic_type.as_str(), forced_created_at],
         )
         .await
         .unwrap();
@@ -30451,39 +30846,9 @@ async fn migration_116_backfills_asserted_at_and_fills_source_memory_id() {
     }
 }
 
-/// G6 Stage 1.2: the payload backfill migration 116 is non-structural (it
-/// only touches `edges.payload`), so it must never introduce parity drift.
-#[tokio::test]
-async fn migration_116_keeps_relates_edge_parity_clean() {
-    let (db, _dir) = test_db().await;
-    let from = db
-        .create_entity("G6 Parity A", "person", Some("space_a"))
-        .await
-        .unwrap();
-    let to = db
-        .create_entity("G6 Parity B", "project", Some("space_a"))
-        .await
-        .unwrap();
-    db.create_relation(
-        &from,
-        &to,
-        "relates_to",
-        Some("agent"),
-        Some(0.7),
-        None,
-        Some("mem_parity"),
-    )
-    .await
-    .unwrap();
-
-    db.migrate_116_relates_asserted_at(115).await.unwrap();
-
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "the payload backfill must not disturb edges parity"
-    );
-}
+// G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer
+// regression tests (item 7) -- see `migration_116_backfills_asserted_at_and_fills_source_memory_id`
+// immediately above for migration 116's own coverage.
 
 /// G6 Stage 1.5b Part 1: migration 117 backfills the entity-page scalar
 /// mirror (`source_agent`/`entity_created_at`/`entity_updated_at`/
@@ -31625,104 +31990,13 @@ async fn edge_semantic_payload_live_writers_leave_parity_clean() {
             Some("Orphan Target")
         );
     }
-
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "live semantic writers must leave parity clean without a migration pass"
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 }
 
-/// G6 Stage 1 parity teeth: semantic corruption on active `relates` and
-/// `links` edges is visible to the same watermark/drift oracle, and repairing
-/// the fields restores a clean report.
-#[tokio::test]
-async fn reconcile_edges_detects_semantic_drift() {
-    let (db, _dir) = test_db().await;
-    let from = db
-        .create_entity("G6 Parity A", "person", Some("space_a"))
-        .await
-        .unwrap();
-    let to = db
-        .create_entity("G6 Parity B", "project", Some("space_a"))
-        .await
-        .unwrap();
-    db.create_relation(&from, &to, "knows", None, None, None, None)
-        .await
-        .unwrap();
-    {
-        let conn = db.conn.lock().await;
-        insert_raw_page_for_m81_test(&conn, "page_g6_parity", "space_a").await;
-        insert_raw_page_for_m81_test(&conn, "page_g6_parity_target", "space_a").await;
-    }
-    db.replace_page_links(
-        "page_g6_parity",
-        &[crate::synthesis::wikilinks::Wikilink {
-            label: "Parity Label".to_string(),
-            target_page_id: Some("page_g6_parity_target".to_string()),
-        }],
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0
-    );
-
-    {
-        let conn = db.conn.lock().await;
-        conn.execute(
-            "UPDATE edges SET semantic_type = 'wrong'
-             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2
-               AND valid_until IS NULL",
-            libsql::params![from.as_str(), to.as_str()],
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "UPDATE edges SET payload = json_remove(COALESCE(payload, '{}'), '$.label')
-             WHERE edge_type = 'links' AND src_id = 'page_g6_parity'
-               AND dst_id = 'page_g6_parity_target' AND valid_until IS NULL",
-            (),
-        )
-        .await
-        .unwrap();
-    }
-    let drifted = db.compute_edges_parity_report().await.unwrap();
-    assert!(
-        drifted.drift_count > 0,
-        "semantic corruption must be reported"
-    );
-    assert!(
-        drifted.corrupt_count >= 2,
-        "both semantic edge mismatches must be classified as corrupt: {drifted:?}"
-    );
-
-    {
-        let conn = db.conn.lock().await;
-        conn.execute(
-            "UPDATE edges SET semantic_type = 'knows'
-             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2
-               AND valid_until IS NULL",
-            libsql::params![from.as_str(), to.as_str()],
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "UPDATE edges SET payload = json_set(COALESCE(payload, '{}'), '$.label', ?1)
-             WHERE edge_type = 'links' AND src_id = 'page_g6_parity'
-               AND dst_id = 'page_g6_parity_target' AND valid_until IS NULL",
-            libsql::params!["Parity Label"],
-        )
-        .await
-        .unwrap();
-    }
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "restoring semantic fields must clear parity drift"
-    );
-}
+// G6 Stage 2 PR 2b: `reconcile_edges_detects_semantic_drift` retired -- its
+// entire subject was the parity oracle's own detection of semantic drift
+// (`compute_edges_parity_report`'s corrupt/drift fields), no oracle-independent
+// replacement needed yet.
 
 /// KG close plan G1: the ambient lane's dedup DELETE hard-removes every
 /// competing `relations` row between the same endpoints. It used to leave their
@@ -31780,9 +32054,15 @@ async fn ambient_dedup_delete_retracts_the_losing_edge() {
         .unwrap());
 
     let conn = db.conn.lock().await;
+    // G6 Stage 2 PR 2b: `relations` is frozen -- read the surviving relation
+    // type off the live `relates` edge instead.
     let surviving_types: Vec<String> = {
         let mut rows = conn
-            .query("SELECT relation_type FROM relations", ())
+            .query(
+                "SELECT semantic_type FROM edges \
+                 WHERE edge_type = 'relates' AND valid_until IS NULL",
+                (),
+            )
             .await
             .unwrap();
         let mut out = Vec::new();
@@ -32137,14 +32417,7 @@ async fn migration_111_reactivates_a_retracted_edge_and_settles_parity_at_zero()
             "reactivation re-derives lineage from the CURRENT endpoint spaces"
         );
     }
-
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "the repair must settle the parity oracle at zero, not merely look clean \
-         to its own detector (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 }
 
 /// The damage gate is the detector, not the version number: an undamaged
@@ -32179,6 +32452,23 @@ async fn migration_111_is_a_no_op_on_an_undamaged_database() {
     )
     .await
     .unwrap();
+    // G6 Stage 2 PR 2b: `create_relation_with_span` no longer writes
+    // `relations` -- migration 111 still reads it (backfill machinery, m81/
+    // m111-only, deliberately kept per the writer-retirement spec) to decide
+    // whether an edge is "expected". Raw-insert the historical twin so an
+    // "undamaged" database looks the way one actually did pre-cutover:
+    // relation and edge both present and in parity, not a live edge with no
+    // twin at all (which m111 would otherwise read as an orphan and retract).
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at) \
+             VALUES ('rel_m111_healthy', ?1, ?2, 'related_to', strftime('%s','now'))",
+            libsql::params![src.as_str(), dst.as_str()],
+        )
+        .await
+        .unwrap();
+    }
 
     db.set_app_metadata(
         crate::edge_grounding::EDGE_GROUNDING_CURSOR_KEY,
@@ -39647,6 +39937,23 @@ async fn m_ws_backfills_workspace_from_source_memory_space() {
         conn.execute("UPDATE pages SET workspace = NULL", ())
             .await
             .unwrap();
+        // G6 Stage 2 PR 2b: `insert_page` no longer writes `page_sources`
+        // post-cutover, so migration 63's `page_sources`-driven backfill SQL
+        // would find nothing to read from a modern fixture. Raw-INSERT the
+        // legacy rows migration 63 expects, simulating the pre-migration-63
+        // historical DB state (same seeding pattern as migration_81's tests).
+        conn.execute(
+            "INSERT INTO page_sources (page_id, memory_source_id, linked_at, link_reason) VALUES ('page_work', 'mem_work_1', 1700000000, 'distill')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO page_sources (page_id, memory_source_id, linked_at, link_reason) VALUES ('page_pers', 'mem_pers_1', 1700000000, 'distill')",
+            (),
+        )
+        .await
+        .unwrap();
         conn.execute("PRAGMA user_version = 62", ()).await.unwrap();
     }
     db.run_migrations(&crate::events::NoopEmitter)
@@ -41384,33 +41691,10 @@ async fn seed_page_evidence(
     .unwrap();
 }
 
-async fn seed_page_link(
-    conn: &libsql::Connection,
-    source_page_id: &str,
-    target_page_id: Option<&str>,
-    label_key: &str,
-) {
-    conn.execute(
-        "INSERT INTO page_links (source_page_id, target_page_id, label_key, label) \
-         VALUES (?1, ?2, ?3, ?3)",
-        libsql::params![
-            source_page_id,
-            target_page_id.map(|s| s.to_string()),
-            label_key
-        ],
-    )
-    .await
-    .unwrap();
-}
-
-async fn set_page_citations(conn: &libsql::Connection, page_id: &str, json: &str) {
-    conn.execute(
-        "UPDATE pages SET citations = ?1 WHERE id = ?2",
-        libsql::params![json, page_id],
-    )
-    .await
-    .unwrap();
-}
+// G6 Stage 2 PR 2b retired `seed_page_link` and `set_page_citations` (the
+// direct-connection test helpers): their sole caller,
+// `reconcile_fresh_backfill_drift_zero_across_all_stores`, retired alongside
+// the parity oracle itself (item 7).
 
 // G6 Stage 2 PR 2a retired `parity_watermark_row` (the watermark-read test
 // helper): its last caller, `reconcile_fresh_backfill_drift_zero_across_all_
@@ -44662,82 +44946,10 @@ async fn apply_memory_update_explicit_clear_folds_to_unfiled() {
 // retires in this PR alongside the sweep it gated. Same rationale as the
 // `entity_reader_*` stage-b tests above (this is their `edges`-side mirror).
 
-/// M5 claim edges (`supports` from a claim_revision, `attests` from a root)
-/// have no legacy-store counterpart. The sweep must fence them out of the
-/// actual set — otherwise every claim edge counts as "extra" and a post-M5
-/// database can never stamp a clean watermark (observed live 2026-08-04:
-/// 2,540 supports edges reported as drift on an otherwise-clean corpus).
-#[tokio::test]
-async fn reconcile_ignores_claim_lineage_edges() {
-    let (db, _dir) = test_db().await;
-    // Legacy world: one relation, dual-written.
-    let e1 = db
-        .create_entity("Alice", "person", Some("space_a"))
-        .await
-        .unwrap();
-    let e2 = db
-        .create_entity("Bob", "person", Some("space_a"))
-        .await
-        .unwrap();
-    db.create_relation(&e1, &e2, "knows", None, None, None, None)
-        .await
-        .unwrap();
-
-    // M5 world on the same database: a claim revision supported by an
-    // evidence memory, attested by a human root (the claim_edge_lifecycle
-    // seed shape).
-    db.insert_page(
-        "pg1",
-        "pg1",
-        None,
-        "",
-        None,
-        Some("space_a"),
-        &[],
-        "2026-07-27T00:00:00Z",
-    )
-    .await
-    .unwrap();
-    {
-        let conn = db.conn.lock().await;
-        conn.execute_batch(
-            "INSERT INTO memories (id, content, source, source_id, title, chunk_index,
-                                   last_modified, chunk_type, space)
-             VALUES ('m1', 'evidence', 'memory', 'mem1', 'title', 0, 0, 'text', 'space_a');
-
-             INSERT INTO claims (claim_id, page_id, created_at) VALUES ('c1', 'pg1', 0);
-             INSERT INTO claim_revisions (claim_revision_id, claim_id, predecessor_revision_id,
-                                          canonical_text, canonical_text_digest, claim_kind,
-                                          extractor_version, created_at)
-             VALUES ('cr1', 'c1', '', 'a sentence', 'digest', 'observation', 1, 0);
-
-             INSERT INTO provenance_roots (root_id, identity_version, identity_digest,
-                                           root_kind, independence_group_id, created_at)
-             VALUES ('r1', 1, 'r1', 'human_capture', 'g', 0);
-
-             INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
-                                lineage, grounded, root_id, space, created_at)
-             VALUES ('s1', 'cr1', 'claim_revision', 'mem1', 'memory', 'supports',
-                     'evidence', 1, 'r1', 'space_a', 0);
-             INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
-                                lineage, grounded, root_id, space, created_at)
-             VALUES ('a1', 'r1', 'root', 'cr1', 'claim_revision', 'attests',
-                     'assertion', 0, 'r1', 'space_a', 0);",
-        )
-        .await
-        .unwrap();
-    }
-
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "claim-lineage edges must not count as drift: {report:?}"
-    );
-    assert_eq!(
-        report.extra_count, 0,
-        "supports/attests edges are outside the legacy-derivable universe"
-    );
-}
+// G6 Stage 2 PR 2b: `reconcile_ignores_claim_lineage_edges` retired -- its
+// entire subject was the parity oracle's own fencing of claim-lineage edges
+// out of its expected set (`compute_edges_parity_report`'s drift/extra
+// fields), no oracle-independent replacement needed yet.
 
 // G6 Stage 2 PR 2a retired `epoch_bump_retires_watermark_and_reblocks_reader`,
 // `nonzero_drift_keeps_reader_on_legacy`, and
@@ -44768,200 +44980,12 @@ async fn bump_epoch_fails_loud_when_state_row_missing() {
     );
 }
 
-/// The stage-(d) differential/equivalence oracle: on a freshly-backfilled
-/// DB seeded across ALL FIVE stores (including the skip cases), reconcile
-/// -- which re-derives the expected set INDEPENDENTLY of the backfill code
-/// -- must report drift 0. Backfill and reconcile agreeing is the proof.
-#[tokio::test]
-async fn reconcile_fresh_backfill_drift_zero_across_all_stores() {
-    let (db, _dir) = test_db().await;
-    let e1 = db
-        .create_entity("Alice", "person", Some("space_a"))
-        .await
-        .unwrap();
-    let e2 = db
-        .create_entity("Bob", "person", Some("space_a"))
-        .await
-        .unwrap();
-    db.create_relation(&e1, &e2, "knows", None, None, None, None)
-        .await
-        .unwrap();
-    seed_memory_with_source_id_and_space(&db, "mem_1", "content one", "space_a").await;
-    {
-        let conn = db.conn.lock().await;
-        insert_raw_page_for_m81_test(&conn, "page_1", "space_a").await;
-        insert_raw_page_for_m81_test(&conn, "page_2", "space_a").await;
-        // page_sources: page_1 -> mem_1
-        seed_page_source(&conn, "page_1", "mem_1").await;
-        // page_evidence: one classifiable memory row + one NULL-locator
-        // row (the SKIP case -- must be drift-neutral).
-        seed_page_evidence(&conn, "page_1", "external_url", Some("https://ex.com")).await;
-        seed_page_evidence(&conn, "page_1", "authored", None).await;
-        // page_links: one resolved + one orphan (target NULL -> SKIP).
-        seed_page_link(&conn, "page_1", Some("page_2"), "alpha").await;
-        seed_page_link(&conn, "page_1", None, "orphan").await;
-        // pages.citations blob: one memory citation on page_2.
-        set_page_citations(
-            &conn,
-            "page_2",
-            r#"[{"occurrence":1,"marker":1,"source_kind":"memory","locator":"mem_1","score":0.9,"status":"verified","scope":"sentence"}]"#,
-        )
-        .await;
-    }
-    rerun_migration_81(&db).await;
-
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "backfill and independent reconcile must agree exactly (missing={}, extra={}, missing_sample={:?}, extra_sample={:?})",
-        report.missing_count, report.extra_count, report.missing_sample, report.extra_sample
-    );
-    assert!(
-        report.expected_active > 0,
-        "the seeded stores must imply edges"
-    );
-    assert_eq!(report.expected_active, report.actual_active);
-    // Skip cases were counted, not turned into edges.
-    assert_eq!(report.per_store_skipped.get("page_evidence"), Some(&1));
-    assert_eq!(report.per_store_skipped.get("page_links"), Some(&1));
-}
-
-#[tokio::test]
-async fn reconcile_detects_missing_edge() {
-    let (db, _dir) = test_db().await;
-    let e1 = db
-        .create_entity("Alice", "person", Some("space_a"))
-        .await
-        .unwrap();
-    let e2 = db
-        .create_entity("Bob", "person", Some("space_a"))
-        .await
-        .unwrap();
-    db.create_relation(&e1, &e2, "knows", None, None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0
-    );
-
-    // Tombstone the live edge WITHOUT deleting its legacy relation row:
-    // the relation is now under-shadowed.
-    {
-        let conn = db.conn.lock().await;
-        conn.execute(
-            "UPDATE edges SET valid_until = 1712707200 WHERE edge_type = 'relates'",
-            (),
-        )
-        .await
-        .unwrap();
-    }
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert!(
-        report.missing_count >= 1,
-        "a retracted edge over a live relation is missing"
-    );
-    assert!(report.drift_count >= 1);
-}
-
-#[tokio::test]
-async fn reconcile_detects_extra_edge() {
-    let (db, _dir) = test_db().await;
-    let e1 = db
-        .create_entity("Alice", "person", Some("space_a"))
-        .await
-        .unwrap();
-    let e2 = db
-        .create_entity("Bob", "person", Some("space_a"))
-        .await
-        .unwrap();
-    db.create_relation(&e1, &e2, "knows", None, None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0
-    );
-
-    // Insert an active edge with no legacy source (fence-exempt legacy
-    // lineage): an over-shadow.
-    {
-        let conn = db.conn.lock().await;
-        MemoryDB::insert_backfilled_edge(
-            &conn, "relates", "entity", "ghost_a", "entity", "ghost_b", "rt", "legacy", "space_a",
-            "test",
-        )
-        .await
-        .unwrap();
-    }
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert!(report.extra_count >= 1, "an orphan active edge is extra");
-    assert!(report.drift_count >= 1);
-}
-
-/// The parity oracle must be STRUCTURAL, not set-only: a live edge whose
-/// stored endpoint was corrupted in place -- WITHOUT changing its
-/// content-addressed `edge_id` -- keeps the id set identical yet feeds a
-/// wrong endpoint to every reader (`detect_communities` reads `dst_id`
-/// directly). A set-difference oracle would report this clean; the
-/// structural-column diff must flag it as drift.
-#[tokio::test]
-async fn reconcile_detects_corrupt_endpoint() {
-    let (db, _dir) = test_db().await;
-    let e1 = db
-        .create_entity("Alice", "person", Some("space_a"))
-        .await
-        .unwrap();
-    let e2 = db
-        .create_entity("Bob", "person", Some("space_a"))
-        .await
-        .unwrap();
-    // A third entity in the SAME space: a real, fence-legal endpoint to
-    // silently drift the edge onto (repointing to a non-existent id would
-    // instead trip `edges_space_fence`, which is a different guard).
-    let e3 = db
-        .create_entity("Carol", "person", Some("space_a"))
-        .await
-        .unwrap();
-    db.create_relation(&e1, &e2, "knows", None, None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0
-    );
-
-    // Corrupt the STORED dst endpoint in place, leaving `edge_id` untouched:
-    // the legacy relation still implies (e1 -> e2), but the live edge now
-    // points at e3 -- a real, same-space, but WRONG endpoint. The id set is
-    // unchanged (no missing/extra), yet every reader now sees e1 -> e3.
-    {
-        let conn = db.conn.lock().await;
-        let affected = conn
-            .execute(
-                "UPDATE edges SET dst_id = ?1 \
-                 WHERE edge_type = 'relates' AND dst_id = ?2 AND valid_until IS NULL",
-                libsql::params![e3.clone(), e2.clone()],
-            )
-            .await
-            .unwrap();
-        assert_eq!(affected, 1, "exactly one live relates edge to corrupt");
-    }
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert!(
-        report.corrupt_count >= 1,
-        "an endpoint-corrupted row is corrupt, not clean (report={report:?})"
-    );
-    assert_eq!(
-        report.missing_count, 0,
-        "the id set is unchanged: not a missing edge"
-    );
-    assert_eq!(
-        report.extra_count, 0,
-        "the id set is unchanged: not an extra edge"
-    );
-    assert!(report.drift_count >= 1);
-}
+// G6 Stage 2 PR 2b: `reconcile_fresh_backfill_drift_zero_across_all_stores`,
+// `reconcile_detects_missing_edge`, `reconcile_detects_extra_edge`, and
+// `reconcile_detects_corrupt_endpoint` retired -- each test's entire subject
+// was the parity oracle's own differential/detection logic
+// (`compute_edges_parity_report`'s missing/extra/corrupt/drift/per-store
+// fields), no oracle-independent replacement needed yet.
 
 // G6 Stage 2 PR 2a retired three cutover-lever tests that used to live
 // here: `detect_communities_edges_path_matches_legacy`,
@@ -46926,18 +46950,18 @@ async fn stage_1_3_reader_migration_keeps_cites_edge_parity_clean() {
     )
     .await
     .unwrap();
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "the Stage 1.3 reader migration must not disturb edges parity"
-    );
-
-    // S2 (2026-08-05 review): pin the drop explicitly. `page_evidence` now
-    // has 2 rows (the memory-kind row from link_page_source, plus the
-    // authored/NULL-locator row above), but a NULL-locator row mints no
-    // edge (link_page_evidence's documented skip), so the edge-backed
-    // reader #4 (`get_page_evidence`) must return only 1.
+    // S2 (2026-08-05 review): pin the drop explicitly. G6 Stage 2 PR 2b:
+    // `link_page_source`'s memory-kind `page_evidence` insert stopped
+    // (`insert_resolved_page_evidence`, db.rs) -- `edges` is its sole live
+    // producer now. Only the authored/NULL-locator row above still lands in
+    // `page_evidence`, from the now-`#[cfg(test)]`-only `link_page_evidence`
+    // (Q2 ruling: that shape has no canonical edge representation, so the
+    // legacy row is the only representation left, same as it always was).
+    // A NULL-locator row mints no edge (link_page_evidence's documented
+    // skip) either way, so the edge-backed reader #4 (`get_page_evidence`)
+    // must return only 1.
     let evidence_row_count = {
         let conn = db.conn.lock().await;
         let mut rows = conn
@@ -46949,7 +46973,10 @@ async fn stage_1_3_reader_migration_keeps_cites_edge_parity_clean() {
             .unwrap();
         rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
     };
-    assert_eq!(evidence_row_count, 2, "legacy page_evidence has both rows");
+    assert_eq!(
+        evidence_row_count, 1,
+        "legacy page_evidence has only the authored row"
+    );
     let evidence = db.get_page_evidence("g13_parity_page").await.unwrap();
     assert_eq!(
         evidence.len(),
@@ -47735,12 +47762,7 @@ async fn create_relation_with_span_writes_payload_and_keeps_parity_clean() {
     )
     .await
     .unwrap();
-
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "a payload write must not disturb structural-column parity"
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
     let conn = db.conn.lock().await;
     let mut rows = conn
@@ -47807,6 +47829,26 @@ async fn source_backed_relation_retry_preserves_original_relation_and_edge_prove
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2b: `relations` is frozen -- `asserted_at` must mirror
+    // the ORIGINAL mint's stamp across the retry's re-assert, so capture it
+    // here (before the retry) as the independent oracle, instead of reading
+    // a `relations.created_at` that no longer exists.
+    let original_asserted_at: i64 = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT json_extract(payload, '$.asserted_at') FROM edges WHERE edge_id = ?1",
+                libsql::params![first_id.clone()],
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .expect("relates edge")
+            .get(0)
+            .unwrap()
+    };
     let retry_id = db
         .create_relation_with_span(
             &e1,
@@ -47826,9 +47868,13 @@ async fn source_backed_relation_retry_preserves_original_relation_and_edge_prove
     assert_eq!(retry_id, first_id, "retry must converge on one relation");
 
     let conn = db.conn.lock().await;
+    // G6 Stage 2 PR 2b: `relations` is frozen -- `edges` is the sole live
+    // producer, so the "relation store" and "extraction edge" reads below
+    // both resolve to the same edge (`first_id`/`retry_id` are the
+    // content-addressed `edges.edge_id`, item 3 compat note).
     let mut relation_rows = conn
         .query(
-            "SELECT source_memory_id FROM relations WHERE id = ?1",
+            "SELECT json_extract(payload, '$.source_memory_id') FROM edges WHERE edge_id = ?1",
             libsql::params![first_id],
         )
         .await
@@ -47837,7 +47883,7 @@ async fn source_backed_relation_retry_preserves_original_relation_and_edge_prove
         .next()
         .await
         .unwrap()
-        .expect("relation row")
+        .expect("relates edge")
         .get(0)
         .unwrap();
     drop(relation_rows);
@@ -47878,24 +47924,9 @@ async fn source_backed_relation_retry_preserves_original_relation_and_edge_prove
     // G6 Stage 1.2: asserted_at must still mirror the ORIGINAL stored row's
     // created_at (immutable under the upsert), never `now` at the retry;
     // confidence keeps the higher (0.9) value the retry supplied.
-    let original_created_at: i64 = {
-        let mut rows = conn
-            .query(
-                "SELECT created_at FROM relations WHERE id = ?1",
-                libsql::params![retry_id.clone()],
-            )
-            .await
-            .unwrap();
-        rows.next()
-            .await
-            .unwrap()
-            .expect("relation row")
-            .get(0)
-            .unwrap()
-    };
     assert_eq!(
         payload["asserted_at"],
-        serde_json::json!(original_created_at),
+        serde_json::json!(original_asserted_at),
         "asserted_at must mirror the ORIGINAL stored relation's created_at across the re-assert"
     );
     assert_eq!(
@@ -48284,10 +48315,12 @@ async fn edge_valid_until(conn: &libsql::Connection, edge_id: &str) -> Option<i6
 }
 
 #[tokio::test]
-async fn cleanup_orphaned_page_sources_preserves_edge_backed_by_page_citations() {
-    // D7 (spec v3 M3): pruning an orphaned page_sources row must not
-    // retract the shared `cites` edge_id when `pages.citations`
-    // independently still backs the same (page, locator) pair.
+async fn cleanup_orphaned_page_sources_retracts_edge_even_when_backed_by_page_citations() {
+    // G6 Stage 2 PR 2b (item 4): D7 (spec v3 M3) retired. Pruning an
+    // orphaned page_sources row now retracts the shared `cites` edge_id
+    // unconditionally -- `pages.citations` independently backing the same
+    // (page, locator) pair no longer grants immunity; the column is a pure
+    // render cache.
     let (db, _dir) = test_db().await;
     let edge_id = crate::provenance::compute_edge_id(
         "cites", "page", "page_pc", "memory", "mem_gone", "mem_gone",
@@ -48317,12 +48350,12 @@ async fn cleanup_orphaned_page_sources_preserves_edge_backed_by_page_citations()
     }
 
     let removed = db.cleanup_orphaned_page_sources().await.unwrap();
-    assert_eq!(
-        removed, 1,
-        "the orphaned page_sources row must still be pruned"
-    );
+    assert_eq!(removed, 1, "the orphaned edge must still be retracted");
 
     let conn = db.conn.lock().await;
+    // G6 Stage 2 PR 2b (item 2, carried forward): `page_sources` is frozen
+    // -- this sweep stopped deleting from it, so the seeded row persists.
+    // The `edges` invalidate below is the sole canonical signal now.
     let ps_count: i64 = {
         let mut rows = conn
             .query(
@@ -48333,23 +48366,23 @@ async fn cleanup_orphaned_page_sources_preserves_edge_backed_by_page_citations()
             .unwrap();
         rows.next().await.unwrap().unwrap().get(0).unwrap()
     };
-    assert_eq!(ps_count, 0, "the orphaned page_sources row is gone");
     assert_eq!(
-        edge_valid_until(&conn, &edge_id).await,
-        None,
-        "pages.citations still backs mem_gone -- the shared edge must stay active"
+        ps_count, 1,
+        "page_sources is frozen -- the orphaned row is untouched, not pruned"
+    );
+    assert!(
+        edge_valid_until(&conn, &edge_id).await.is_some(),
+        "D7 retired (item 4) -- pages.citations backing mem_gone no longer \
+         keeps the shared edge active"
     );
 }
 
-/// G6 Stage 1.3 S1: pins the D7 survivor as IN SCOPE by design, not an
-/// accident. Post-1.3, "page sources" means "active `cites` edges", which
-/// includes an edge kept alive only by `pages.citations` backing after its
-/// `page_sources` row was pruned (D7 refcount, `cites_backed_by_page_citations`
-/// at db.rs). The reader migration widens what `get_page_sources` reports
-/// versus the pre-migration legacy table -- this is deliberate and
-/// time-boxed: Stage 2 retires `pages.citations`' edge-backing role.
+/// G6 Stage 2 PR 2b (item 4): D7 retired. What used to be the "D7 survivor"
+/// case -- an edge kept alive only by `pages.citations` backing after its
+/// `page_sources` row was pruned -- no longer survives: cleanup retracts
+/// the edge unconditionally, so `get_page_sources` reports nothing for it.
 #[tokio::test]
-async fn get_page_sources_returns_d7_survivor_backed_only_by_citations() {
+async fn get_page_sources_omits_edge_retracted_despite_citations_backing() {
     let (db, _dir) = test_db().await;
     {
         let conn = db.conn.lock().await;
@@ -48385,20 +48418,19 @@ async fn get_page_sources_returns_d7_survivor_backed_only_by_citations() {
     }
 
     // mem_d7_gone was never a real memory, so its page_sources row is an
-    // orphan -- pruned by the cleanup sweep, but the edge survives because
-    // pages.citations still backs it.
+    // orphan -- pruned by the cleanup sweep. D7 is retired (item 4), so
+    // pages.citations backing no longer keeps the edge alive either; it
+    // retracts along with the row.
     let removed = db.cleanup_orphaned_page_sources().await.unwrap();
     assert_eq!(removed, 1);
 
     let sources = db.get_page_sources("page_d7").await.unwrap();
     assert_eq!(
         sources.len(),
-        1,
-        "get_page_sources must still report the D7 survivor: the legacy row is \
-         gone but the edge stays active, and reading edges means reading the \
-         edge, not the legacy row"
+        0,
+        "D7 retired (item 4) -- pages.citations backing no longer keeps the \
+         edge active, so the retracted source must not be reported"
     );
-    assert_eq!(sources[0].memory_source_id, "mem_d7_gone");
 }
 
 /// G6 Stage 1.3 pin (closure ruling, 2026-08-05): `get_page_sources` is an
@@ -48482,10 +48514,11 @@ async fn get_page_sources_returns_external_kind_locators_alongside_memory() {
 }
 
 #[tokio::test]
-async fn dual_write_page_citations_preserves_edge_backed_by_page_evidence() {
-    // D7: dropping a citation from the `pages.citations` blob must not
-    // retract the shared edge when `page_evidence` independently still
-    // backs the same (page, locator) pair.
+async fn dual_write_page_citations_retracts_edge_even_when_backed_by_page_evidence() {
+    // G6 Stage 2 PR 2b (item 4): D7 retired. Dropping a citation from the
+    // `pages.citations` blob now retracts the shared edge unconditionally
+    // -- `page_evidence` independently still backing the same (page,
+    // locator) pair no longer grants immunity.
     let (db, _dir) = test_db().await;
     let edge_id = crate::provenance::compute_edge_id(
         "cites",
@@ -48513,10 +48546,9 @@ async fn dual_write_page_citations_preserves_edge_backed_by_page_evidence() {
     db.set_page_citations("page_dc", Some("[]")).await.unwrap();
 
     let conn = db.conn.lock().await;
-    assert_eq!(
-        edge_valid_until(&conn, &edge_id).await,
-        None,
-        "page_evidence still backs mem_shared -- dropping it from pages.citations alone must not retract the edge"
+    assert!(
+        edge_valid_until(&conn, &edge_id).await.is_some(),
+        "D7 retired (item 4) -- page_evidence backing mem_shared no longer keeps the edge active"
     );
 }
 
@@ -48561,53 +48593,19 @@ async fn dual_write_page_citations_retracts_dropped_citation_when_unbacked() {
     );
 }
 
-#[tokio::test]
-async fn refcount_retracts_only_after_last_backing_store_drops_citation() {
-    // D7 order-independence: whichever legacy store (page_evidence vs
-    // pages.citations) drops its backing FIRST, the shared edge must
-    // stay active until the LAST one drops -- mirrors
-    // `dual_write_page_citations_preserves_edge_backed_by_page_evidence`
-    // (citations-first order) with the reverse order (page_evidence
-    // first, via orphan cleanup) to prove both orders converge on the
-    // same "retract only when refcount hits zero" outcome.
-    let (db, _dir) = test_db().await;
-    let edge_id = crate::provenance::compute_edge_id(
-        "cites", "page", "page_oi", "memory", "mem_oi", "mem_oi",
-    );
-    {
-        let conn = db.conn.lock().await;
-        insert_raw_page_for_m81_test(&conn, "page_oi", "space_a").await;
-        seed_page_evidence(&conn, "page_oi", "memory", Some("mem_oi")).await;
-    }
-    let citations = serde_json::json!([
-        {"occurrence": 1, "marker": 1, "source_kind": "memory", "locator": "mem_oi",
-         "score": 0.9, "status": "verified", "scope": "sentence"}
-    ]);
-    db.set_page_citations("page_oi", Some(&citations.to_string()))
-        .await
-        .unwrap();
-
-    // page_evidence's row for mem_oi is orphaned (no backing memory) --
-    // pages.citations still cites it, so the edge must stay active.
-    db.cleanup_orphaned_page_sources().await.unwrap();
-    {
-        let conn = db.conn.lock().await;
-        assert_eq!(
-            edge_valid_until(&conn, &edge_id).await,
-            None,
-            "pages.citations still backs mem_oi after page_evidence is pruned"
-        );
-    }
-
-    // Now pages.citations also drops it -- the last backing store is
-    // gone, so the edge must retract.
-    db.set_page_citations("page_oi", Some("[]")).await.unwrap();
-    let conn = db.conn.lock().await;
-    assert!(
-        edge_valid_until(&conn, &edge_id).await.is_some(),
-        "no legacy store backs mem_oi anymore -- the edge must retract"
-    );
-}
+// G6 Stage 2 PR 2b (item 4) retired `refcount_retracts_only_after_last_
+// backing_store_drops_citation`: it asserted D7's order-independent refcount
+// -- an edge stays active until BOTH page_evidence and pages.citations drop
+// their backing, whichever goes first. D7 itself is retired (`dual_write_
+// page_citations`, db.rs: no more `cites_backed_by_page_citations`/`cites_
+// backed_outside_page_citations` helpers); pages.citations is a pure render
+// cache now and grants the shared edge no immunity. The post-item-4 contract
+// (edge retires when the ONE remaining backing store -- a live `memories`
+// row -- drops, regardless of citations JSON) is pinned by
+// `cleanup_orphaned_page_sources_retracts_edge_even_when_backed_by_page_
+// citations` and `get_page_sources_omits_edge_retracted_despite_citations_
+// backing` above -- both renamed and flipped in this PR from their
+// pre-item-4 D7-survivor assertions, not pre-existing coverage.
 
 // ---- G6 Stage 0: dual-write gap regression tests (parity oracle) ----
 
@@ -48643,21 +48641,10 @@ async fn fold_relation_type_dual_writes_edges() {
     db.create_relation(&a, &b, "leads", Some("test"), None, None, None)
         .await
         .unwrap();
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "fixture precondition: canonical writes leave parity clean"
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
     let folded = db.fold_relation_type("works_on", "leads").await.unwrap();
     assert_eq!(folded, 2);
-
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "a vocabulary fold must not re-drift edges parity (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
-    );
 
     // Belt-and-braces: the old-type edges are retired, superseded by canonical.
     let conn = db.conn.lock().await;
@@ -48713,22 +48700,12 @@ async fn replace_page_sources_retires_pruned_cites_edges() {
             .await
             .unwrap();
     }
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "fixture precondition: linked sources leave parity clean"
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
     // Prune one sid, keep the other.
     db.replace_page_sources("page_g6_prune", &["mem_g6_keep"], "reconcile")
         .await
         .unwrap();
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "a source prune must not re-drift edges parity (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
-    );
     {
         let conn = db.conn.lock().await;
         for (sid, retired) in [("mem_g6_drop", true), ("mem_g6_keep", false)] {
@@ -48760,12 +48737,31 @@ async fn replace_page_sources_retires_pruned_cites_edges() {
     db.replace_page_sources("page_g6_prune", &[], "clear")
         .await
         .unwrap();
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "an empty-set replace must not re-drift edges parity (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
-    );
+    {
+        let conn = db.conn.lock().await;
+        for sid in ["mem_g6_keep", "mem_g6_drop"] {
+            let edge_id = crate::provenance::compute_edge_id(
+                "cites",
+                "page",
+                "page_g6_prune",
+                "memory",
+                sid,
+                sid,
+            );
+            let mut rows = conn
+                .query(
+                    "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                    libsql::params![edge_id.as_str()],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().expect("edge exists");
+            assert!(
+                row.get::<Option<i64>>(0).unwrap().is_some(),
+                "{sid}: empty keep-set must retire every remaining cites edge"
+            );
+        }
+    }
 }
 
 /// G6 edges-parity repair, post-retraction shape (fold-in of fix (a) into
@@ -48811,11 +48807,7 @@ async fn replace_page_sources_prunes_external_kind_edge_not_phantom_memory() {
             .await
             .unwrap();
     }
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "fixture precondition: linked sources leave parity clean"
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
     // `replace_page_sources`'s own page_evidence prune is memory-kind-only by
     // design ("external/authored evidence, if any, is preserved" -- see the
@@ -48829,12 +48821,7 @@ async fn replace_page_sources_prunes_external_kind_edge_not_phantom_memory() {
         .await
         .unwrap();
 
-    // Settling check: the prune above must not manufacture parity drift.
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "post-prune parity must be clean"
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
     let conn = db.conn.lock().await;
     let real_edge_id = crate::provenance::compute_edge_id(
@@ -48883,13 +48870,16 @@ async fn replace_page_sources_prunes_external_kind_edge_not_phantom_memory() {
     );
 }
 
-/// `try_update_page_content` reimplements `replace_page_sources`'s
-/// prune-then-reinsert on `page_sources` + memory-kind `page_evidence`, so a
+/// `try_update_page_content` mirrors `replace_page_sources`'s prune-then-
+/// reinsert shape, but against the live memory-kind `cites` edge set
+/// directly -- `page_sources`/`page_evidence` are frozen (items 1-2), so a
 /// sid dropped from the new source list must have its cites edge retired in
-/// the same transaction — except when the new `pages.citations` value still
-/// backs the locator (D7 refcount). Same damage class as the 2026-07-23 live
-/// stale-edge incident, on the higher-traffic write path (manual edits,
-/// refinery rewrites, page growth).
+/// the same transaction. G6 Stage 2 PR 2b (item 4): D7 (the refcount that
+/// let a `pages.citations` backing the same locator grant immunity) is
+/// retired — a drop from the source list now always retires the edge,
+/// regardless of what the new citations value says. Same damage class as
+/// the 2026-07-23 live stale-edge incident, on the higher-traffic write path
+/// (manual edits, refinery rewrites, page growth).
 #[tokio::test]
 async fn update_page_content_retires_pruned_cites_edges() {
     let (db, _dir) = test_db().await;
@@ -48913,14 +48903,11 @@ async fn update_page_content_retires_pruned_cites_edges() {
             .await
             .unwrap();
     }
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "fixture precondition: linked sources leave parity clean"
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
-    // Drop two sids, keep one; the new citations value still backs one of
-    // the dropped locators, so its edge must survive (D7 refcount).
+    // Drop two sids, keep one; the new citations value still names one of
+    // the dropped locators, but D7 is retired (item 4) -- that no longer
+    // grants immunity, so its edge must retire along with the other drop.
     let citations = r#"[{"occurrence":1,"marker":1,"source_kind":"memory","locator":"mem_g6_upc_cited","score":1.0,"status":"verified","scope":"sentence"}]"#;
     let landed = db
         .try_update_page_content_with_changelog(
@@ -48937,18 +48924,13 @@ async fn update_page_content_retires_pruned_cites_edges() {
         .await
         .unwrap();
     assert!(landed, "non-CAS content update must land");
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "a content update must not re-drift edges parity (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
     {
         let conn = db.conn.lock().await;
         for (sid, retired) in [
             ("mem_g6_upc_drop", true),
             ("mem_g6_upc_keep", false),
-            ("mem_g6_upc_cited", false),
+            ("mem_g6_upc_cited", true),
         ] {
             let edge_id = crate::provenance::compute_edge_id(
                 "cites",
@@ -48979,12 +48961,31 @@ async fn update_page_content_retires_pruned_cites_edges() {
     db.update_page_content("page_g6_upc", "cleared", &[], "clear")
         .await
         .unwrap();
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "an empty-set update must not re-drift edges parity (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
-    );
+    {
+        let conn = db.conn.lock().await;
+        for sid in ["mem_g6_upc_drop", "mem_g6_upc_keep", "mem_g6_upc_cited"] {
+            let edge_id = crate::provenance::compute_edge_id(
+                "cites",
+                "page",
+                "page_g6_upc",
+                "memory",
+                sid,
+                sid,
+            );
+            let mut rows = conn
+                .query(
+                    "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                    libsql::params![edge_id.as_str()],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().expect("edge exists");
+            assert!(
+                row.get::<Option<i64>>(0).unwrap().is_some(),
+                "{sid}: every remaining backing drop must retire the edge"
+            );
+        }
+    }
 }
 
 /// `delete_page` FK-CASCADEs away this page's rows in all three link stores
@@ -49032,20 +49033,10 @@ async fn delete_page_retires_all_page_edges() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "fixture precondition: cites + inbound links leave parity clean"
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
     db.delete_page("page_g6_del").await.unwrap();
 
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "a page delete must not re-drift edges parity (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
-    );
     let conn = db.conn.lock().await;
     let mut rows = conn
         .query(
@@ -49101,20 +49092,9 @@ async fn resolve_orphan_page_links_mints_links_edges() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "fixture precondition: an orphan link derives no edge"
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
     assert_eq!(db.resolve_orphan_page_links().await.unwrap(), 1);
-
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "orphan resolution must mint the implied links edge (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
-    );
 }
 
 /// A page merge repoints inbound links rows and copies the absorbed page's
@@ -49174,22 +49154,12 @@ async fn accept_page_merge_reconciles_links_and_evidence_edges() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "fixture precondition: canonical writes leave parity clean"
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
     db.accept_page_merge("proposal_g6_merge", "page_g6_survivor", "page_g6_absorbed")
         .await
         .unwrap();
 
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "a page merge must not re-drift edges parity (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
-    );
     // The linker's edge now points at the survivor; the absorbed-target edge
     // is retired.
     let conn = db.conn.lock().await;
@@ -49215,20 +49185,27 @@ async fn accept_page_merge_reconciles_links_and_evidence_edges() {
     );
 }
 
-/// A source-page replace deletes and rebuilds the page's entire evidence set;
-/// rows that do not survive must retire their edges in the same transaction.
+// G6 Stage 2 PR 2b: `replace_source_page_retires_removed_source_edges` retired
+// -- beyond the operation's own success return, its only check of "removed
+// source edges retire" was the parity oracle's drift count; no
+// oracle-independent replacement needed yet.
+
+/// Item 7 regression test for `replace_source_page_inner`'s `cites`-edge
+/// retirement: a source id dropped from `source_memory_ids` on replace must
+/// have its `cites` edge retired (`valid_until` set), while an id carried
+/// over stays active. Asserted directly against `edges` -- no parity oracle.
 #[tokio::test]
-async fn replace_source_page_retires_removed_source_edges() {
+async fn replace_source_page_retires_removed_source_cites_edge() {
     let (db, _dir) = test_db().await;
     let now = chrono::Utc::now().to_rfc3339();
     db.insert_page_with_kind(
-        "page_g6_source",
+        "page-g6-replace-retire",
         "Source page",
         None,
         "Original body",
         None,
         None,
-        &[],
+        &["source-keep", "source-drop"],
         &now,
         "source",
         "confirmed",
@@ -49237,45 +49214,56 @@ async fn replace_source_page_retires_removed_source_edges() {
     )
     .await
     .unwrap();
-    for sid in ["mem_g6_src_old", "mem_g6_src_new"] {
-        let doc = make_memory_doc(sid, "Some content.", "knowledge", "work", "agent");
-        db.upsert_documents(vec![doc]).await.unwrap();
-    }
-    db.link_page_source("page_g6_source", "mem_g6_src_old", "distill")
-        .await
-        .unwrap();
-    db.link_page_evidence(
-        "page_g6_source",
-        "external_url",
-        Some("https://example.com/replaced"),
-        None,
-        "cite",
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "fixture precondition: canonical writes leave parity clean"
-    );
 
-    assert!(db
+    let keep_edge_id = crate::provenance::compute_edge_id(
+        "cites",
+        "page",
+        "page-g6-replace-retire",
+        "memory",
+        "source-keep",
+        "source-keep",
+    );
+    let drop_edge_id = crate::provenance::compute_edge_id(
+        "cites",
+        "page",
+        "page-g6-replace-retire",
+        "memory",
+        "source-drop",
+        "source-drop",
+    );
+    {
+        let conn = db.conn.lock().await;
+        assert!(
+            edge_valid_until(&conn, &keep_edge_id).await.is_none(),
+            "kept-to-be source id starts active"
+        );
+        assert!(
+            edge_valid_until(&conn, &drop_edge_id).await.is_none(),
+            "dropped-to-be source id starts active"
+        );
+    }
+
+    let replaced = db
         .replace_source_page(
-            "page_g6_source",
+            "page-g6-replace-retire",
             "Source page",
             None,
-            "Replaced body",
-            &["mem_g6_src_new"],
+            "Original body",
+            &["source-keep", "source-new"],
             "source_refresh",
         )
         .await
-        .unwrap());
+        .unwrap();
+    assert!(replaced);
 
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "a source-page replace must not re-drift edges parity (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
+    let conn = db.conn.lock().await;
+    assert!(
+        edge_valid_until(&conn, &keep_edge_id).await.is_none(),
+        "carried-over source id's edge must stay active"
+    );
+    assert!(
+        edge_valid_until(&conn, &drop_edge_id).await.is_some(),
+        "the dropped source id's edge must be retired"
     );
 }
 
@@ -49308,22 +49296,12 @@ async fn rebind_source_id_readdresses_cites_edges() {
     db.link_page_source("page_g6_rebind", "mem_g6_rebind_old", "distill")
         .await
         .unwrap();
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "fixture precondition: canonical writes leave parity clean"
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
     db.rebind_source_id("memory", "mem_g6_rebind_old", "mem_g6_rebind_new")
         .await
         .unwrap();
 
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "a source-id rebind must not re-drift edges parity (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
-    );
     // No ACTIVE edge still references the old identity. A retired edge
     // keeping the old id is correct history (superseded-by chain below).
     let conn = db.conn.lock().await;
@@ -49443,11 +49421,7 @@ async fn rebind_source_page_reasserts_links_edges_with_label() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "fixture precondition: canonical writes leave parity clean"
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
     db.rebind_source_id_with_source_page(
         "memory",
@@ -49482,12 +49456,7 @@ async fn rebind_source_page_reasserts_links_edges_with_label() {
             "the rebind re-mint carries the display label"
         );
     }
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "a page rebind must not re-drift edges parity (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
-    );
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 }
 
 /// A crash between m81's COMMIT and its `user_version = 81` stamp on a
@@ -49536,59 +49505,8 @@ async fn migration_81_rerun_recovers_pre_semantic_type_edges_table() {
     );
 }
 
-/// A content update rewrites `pages.citations` wholesale; a locator whose only
-/// backing was the old citations value must lose its edge with it.
-#[tokio::test]
-async fn page_content_update_reconciles_citation_only_edges() {
-    let (db, _dir) = test_db().await;
-    let now = chrono::Utc::now().to_rfc3339();
-    db.insert_page(
-        "page_g6_cit",
-        "Citation Page",
-        None,
-        "body",
-        None,
-        None,
-        &[],
-        &now,
-    )
-    .await
-    .unwrap();
-    let doc = make_memory_doc("mem_g6_cit", "Some content.", "knowledge", "work", "agent");
-    db.upsert_documents(vec![doc]).await.unwrap();
-    // Citations-only backing: no page_sources / page_evidence row for it.
-    let citations = serde_json::json!([
-        {"occurrence": 1, "marker": 1, "source_kind": "memory", "locator": "mem_g6_cit",
-         "score": 0.9, "status": "verified", "scope": "sentence"}
-    ]);
-    db.set_page_citations("page_g6_cit", Some(&citations.to_string()))
-        .await
-        .unwrap();
-    assert_eq!(
-        db.compute_edges_parity_report().await.unwrap().drift_count,
-        0,
-        "fixture precondition: set_page_citations minted the citation edge"
-    );
-
-    // The rewrite drops the citation — its edge must retire with it.
-    db.try_update_page_content_with_changelog(
-        "page_g6_cit",
-        "new body",
-        &[],
-        "fs_edit",
-        false,
-        "rewrite",
-        Some("[]"),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-
-    let report = db.compute_edges_parity_report().await.unwrap();
-    assert_eq!(
-        report.drift_count, 0,
-        "a citations rewrite must not re-drift edges parity (missing={}, extra={}, corrupt={})",
-        report.missing_count, report.extra_count, report.corrupt_count
-    );
-}
+// G6 Stage 2 PR 2b: `page_content_update_reconciles_citation_only_edges`
+// retired -- its only check that the dropped citation's edge retired was the
+// parity oracle's drift count; replacement coverage for a citations-only
+// locator losing its last backing store is
+// `dual_write_page_citations_retracts_dropped_citation_when_unbacked`.

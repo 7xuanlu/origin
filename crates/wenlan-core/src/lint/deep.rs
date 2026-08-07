@@ -145,13 +145,12 @@ async fn memory_duplicates(context: &LintContext<'_, '_>) -> Result<RowCheck, ()
 // cross-store consistency check between two legacy tables -- so it migrates to
 // `edges` like the rest of the table, unlike the provenance-consistency lints
 // in `lint/pages/provenance_checks/source.rs`, which stay legacy carryovers.
-// S1 (2026-08-05): this widens what counts as "page channel present" to
-// include a D7 survivor -- a `cites` edge kept alive only by `pages.citations`
-// backing after its `page_sources`/`page_evidence` row was pruned (see
-// `cites_backed_by_page_citations`). That's by design: post-1.3, "page
-// channel present" MEANS "an active `cites` edge exists", and edges ≡
-// page_sources ∪ page_evidence(non-NULL locator) ∪ pages.citations by parity
-// construction. Stage 2 retires `pages.citations`' edge-backing role.
+// S1 (2026-08-05): "page channel present" MEANS "an active `cites` edge
+// exists" -- the EXISTS below reads `edges` directly and needs no other
+// change. G6 Stage 2 PR 2b (item 4, 2026-08-06): `pages.citations`' D7
+// edge-backing role (`cites_backed_by_page_citations`) retired -- an edge
+// once kept alive only by that column's backing no longer survives orphan
+// cleanup, so this check's substrate is simply "edges", full stop.
 async fn retrieval_substrate(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (scope, params) = scope_clause(context.scope().filter(), "m.space", false);
     rows(

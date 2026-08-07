@@ -13,6 +13,11 @@ async fn insert_entity(db: &MemoryDB, id: &str, entity_type: &str) {
     .unwrap();
 }
 
+// G6 Stage 2 PR 2b: `relations` is frozen -- `distinct_relation_types_for_
+// vocabulary_heal` reads live `relates` edges, so seed those directly. Raw
+// INSERT (not `create_relation`) because these tests exercise UNNORMALIZED
+// `semantic_type` values (including empty string) that the live write path's
+// vocabulary coercion would collapse away.
 async fn insert_relation(
     db: &MemoryDB,
     id: &str,
@@ -22,8 +27,9 @@ async fn insert_relation(
 ) {
     let conn = db.conn.lock().await;
     conn.execute(
-        "INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at)
-         VALUES (?1, ?2, ?3, ?4, 1)",
+        "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, \
+                             lineage, grounded, space, semantic_type, created_at, valid_until)
+         VALUES (?1, ?2, 'entity', ?3, 'entity', 'relates', 'legacy', 0, 'general', ?4, 1, NULL)",
         libsql::params![id, from_entity, to_entity, relation_type],
     )
     .await

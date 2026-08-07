@@ -457,6 +457,13 @@ impl RepairArtifactStore {
                 }
             },
         };
+        // G6 Stage 2 PR 2b (item 6): refuse a manifest whose captured
+        // baseline names a retired store before trusting its precondition.
+        if rollback_targets_retired_store(&rollback) {
+            return Err(WenlanError::Validation(
+                "repair_rollback_targets_retired_store".to_string(),
+            ));
+        }
         let expected_format_version = if matches!(
             manifest.writer(),
             RepairWriter::RenamePageTitle | RepairWriter::CompleteEntityExtraction
@@ -1313,6 +1320,39 @@ fn rollback_matches_target(rollback: &StoredRollbackArtifact, target: &RepairTar
             ) && rollback.source_id == *page_id
         }
     }
+}
+
+/// G6 Stage 2 PR 2b (item 6): whether `rollback` names a table this repair
+/// pipeline must refuse. `relations`/`page_sources`/`page_evidence` are
+/// frozen -- a manifest whose captured baseline names one of them was
+/// proposed against a table no writer refreshes anymore, so its "current
+/// state" precondition can no longer be trusted. `page_links` survives as
+/// the orphan side-table (item 3), so it refuses only when NOT provably
+/// orphan-only: every captured row's `target_page_id` must read back "NULL"
+/// (the shape `RepairTarget::PageLink` always captures, since `BindPageLink`
+/// only ever targets an orphan row) -- a row captured with a resolved
+/// `target_page_id` could only have come from before item 3 stopped writing
+/// resolved rows there.
+fn rollback_targets_retired_store(rollback: &StoredRollbackArtifact) -> bool {
+    const RETIRED_ROLLBACK_TABLES: [&str; 3] = ["relations", "page_sources", "page_evidence"];
+    if RETIRED_ROLLBACK_TABLES.contains(&rollback.table.as_str()) {
+        return true;
+    }
+    if rollback.table == "page_links" {
+        let orphan_only = rollback
+            .columns
+            .iter()
+            .position(|c| c == "target_page_id")
+            .map(|idx| {
+                rollback
+                    .rows
+                    .iter()
+                    .all(|row| row.get(idx).map(String::as_str) == Some("NULL"))
+            })
+            .unwrap_or(false);
+        return !orphan_only;
+    }
+    false
 }
 
 fn validate_stale_page_projection_apply_journal_rollback(
@@ -6718,6 +6758,75 @@ mod tests {
             target_receipt(&rollback).unwrap(),
             repair_digest(&legacy_bytes)
         );
+    }
+
+    fn hand_built_legacy_rollback(
+        table: &str,
+        columns: &[&str],
+        row: &[&str],
+    ) -> StoredRollbackArtifact {
+        StoredRollbackArtifact {
+            format_version: LEGACY_ROLLBACK_FORMAT_VERSION,
+            table: table.to_string(),
+            source_id: "irrelevant".to_string(),
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            rows: vec![row.iter().map(|v| v.to_string()).collect()],
+        }
+    }
+
+    #[test]
+    fn rollback_targets_retired_store_refuses_relations() {
+        let rollback =
+            hand_built_legacy_rollback("relations", &["id", "kind"], &["rel_1", "relates"]);
+        assert!(rollback_targets_retired_store(&rollback));
+    }
+
+    #[test]
+    fn rollback_targets_retired_store_refuses_page_sources() {
+        let rollback = hand_built_legacy_rollback(
+            "page_sources",
+            &["page_id", "memory_source_id"],
+            &["page_1", "mem_1"],
+        );
+        assert!(rollback_targets_retired_store(&rollback));
+    }
+
+    #[test]
+    fn rollback_targets_retired_store_refuses_page_evidence() {
+        let rollback = hand_built_legacy_rollback(
+            "page_evidence",
+            &["page_id", "locator"],
+            &["page_1", "mem_1"],
+        );
+        assert!(rollback_targets_retired_store(&rollback));
+    }
+
+    #[test]
+    fn rollback_targets_retired_store_refuses_page_links_resolved_row() {
+        // A `page_links` rollback whose captured `target_page_id` is NOT
+        // "NULL" could only have come from before item 3 stopped writing
+        // resolved rows there -- refuse, since that row shape no longer
+        // exists on the writer's live path.
+        let rollback = hand_built_legacy_rollback(
+            "page_links",
+            &["source_page_id", "target_page_id", "label_key"],
+            &["page_1", "page_2", "widget"],
+        );
+        assert!(rollback_targets_retired_store(&rollback));
+    }
+
+    #[test]
+    fn rollback_targets_retired_store_admits_page_links_orphan_row() {
+        // The shape `RepairTarget::PageLink` always captures for
+        // `BindPageLink` -- `target_page_id` reads back "NULL" since
+        // `BindPageLink` only ever targets an orphan row. Must stay
+        // admitted or the live repair flow breaks.
+        let rollback = hand_built_legacy_rollback(
+            "page_links",
+            &["source_page_id", "target_page_id", "label_key"],
+            &["page_1", "NULL", "widget"],
+        );
+        assert!(!rollback_targets_retired_store(&rollback));
     }
 
     async fn fixture() -> (MemoryDB, tempfile::TempDir) {
