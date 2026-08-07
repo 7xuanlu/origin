@@ -50089,3 +50089,102 @@ async fn migration_81_rerun_recovers_pre_semantic_type_edges_table() {
         "chain completes back to the current schema version"
     );
 }
+
+/// G6 Stage 2 PR 2c frozen-replay fix, RED control. Simulates the exact
+/// upgrade window the bug was in: an old DB reaching migration 97 (just
+/// before migration 98 installs the space fence in its M5-widened shape),
+/// with an entity missing its shadow page (shadow-page completeness is not
+/// guaranteed until migrations 113/114/117 run) and a bare `relations` row
+/// migration 111 will backfill into an edge -- the exact shape migration
+/// 111's own tests already use for the ambient-lane-left-no-edge damage.
+///
+/// Rolling `PRAGMA user_version` back only to 110 cannot reproduce this: it
+/// skips re-running migrations 81/98 (both guarded by `version < N` below
+/// 110), so the fence trigger stays whatever the DB's ORIGINAL `test_db()`
+/// build already installed, and neither code path is exercised. Rolling
+/// back to 97 puts migration 98 back in the replay path, so it reinstalls
+/// the fence trigger from `edges_rebuild.rs`'s current `FENCE_BODY` --
+/// exactly the historical-vs-ported distinction under test.
+///
+/// Falsifiability (hand-verified, not asserted here since this test can only
+/// run against one tree at a time): temporarily reverting `FENCE_BODY`'s
+/// `entity` arm back to the ported `entity_page_map` form reproduces the
+/// original defect -- migration 111's backfill aborts with
+/// `edges_space_fence: cross-space edge rejected` and `run_migrations`
+/// returns `Err`, bricking the chain. Restoring the frozen historical form
+/// (this tree) lets migration 111 replay under the fence active at ITS
+/// point in the timeline, which does not consult the shadow page, so the
+/// backfill succeeds; migration 121 only re-installs the pages-reading
+/// fence afterward, once migrations 113/114/117 have already run.
+#[tokio::test]
+async fn migration_121_split_survives_shadow_gap_during_m111_replay() {
+    let (db, _dir) = test_db().await;
+    db.create_space("work", None, false).await.unwrap();
+    let a = db
+        .store_entity("A", "concept", Some("work"), Some("test"), None)
+        .await
+        .unwrap();
+    let b = db
+        .store_entity("B", "concept", Some("work"), Some("test"), None)
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        // The damage: a's shadow page is missing, simulating an upgrade
+        // reaching migration 98 before migrations 113/114/117 repair it.
+        conn.execute(
+            "DELETE FROM entity_page_map WHERE entity_id = ?1",
+            libsql::params![a.as_str()],
+        )
+        .await
+        .unwrap();
+        // The shape the old ambient lane left: a relation with no edge twin,
+        // same as migration 111's own bare-relation tests above.
+        conn.execute(
+            "INSERT INTO relations
+                 (id, from_entity, to_entity, relation_type, source_agent,
+                  confidence, explanation, source_memory_id, created_at)
+             VALUES ('rel_g6_shadow_gap', ?1, ?2, 'related_to', 'post_ingest', NULL, NULL, NULL, 1)",
+            libsql::params![a.as_str(), b.as_str()],
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA user_version = 97", ()).await.unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("migration 111's backfill must not abort on a's missing shadow page");
+
+    let edge_id =
+        crate::provenance::compute_edge_id("relates", "entity", &a, "entity", &b, "related_to");
+    let conn = db.conn.lock().await;
+    let (lineage, valid_until): (String, Option<i64>) = {
+        let mut rows = conn
+            .query(
+                "SELECT lineage, valid_until FROM edges WHERE edge_id = ?1",
+                libsql::params![edge_id.as_str()],
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("migration 111 must have backfilled the bare relation into an edge");
+        (row.get(0).unwrap(), row.get::<Option<i64>>(1).unwrap())
+    };
+    assert_eq!(
+        lineage, "assertion",
+        "both entities share one Space, so the backfilled edge is first-class"
+    );
+    assert!(valid_until.is_none(), "the backfilled edge is active");
+
+    let mut vrows = conn.query("PRAGMA user_version", ()).await.unwrap();
+    let uv: i64 = vrows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(
+        uv as u32,
+        crate::db::SCHEMA_VERSION,
+        "chain completes back to the current schema version, past migration 121"
+    );
+}

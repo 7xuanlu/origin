@@ -821,8 +821,15 @@ pub const EMBEDDING_DIM: usize = 768;
 /// backed by live `page_evidence` (G6 edges-parity repair). Migration 120
 /// drops `edges_parity_watermark`/`entity_page_parity_watermark`/
 /// `edges_reader_cutover`/`entity_reader_cutover`, the tables the retired
-/// parity-oracle and cutover machinery owned (G6 Stage 2 PR 2a).
-pub const SCHEMA_VERSION: u32 = 120;
+/// parity-oracle and cutover machinery owned (G6 Stage 2 PR 2a). Migration
+/// 121 drops and recreates `edges_space_fence`/`edges_space_fence_update`
+/// with the `entity` arm reading each endpoint's shadow-page space instead
+/// of `entities` directly, positioned after migrations 113/114/117
+/// establish shadow-page completeness so the pages fence never goes live
+/// over an entity that could still be missing one (G6 Stage 2 PR 2c
+/// frozen-replay fix -- migrations 81/98 keep the historical
+/// `entities`-reading fence body).
+pub const SCHEMA_VERSION: u32 = 121;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8694,6 +8701,21 @@ impl MemoryDB {
                 self.migrate_120_retire_edges_entity_parity_tables(version)
                     .await?;
             }
+
+            // Migration 121 (G6 Stage 2 PR 2c, frozen-replay fix): drops and
+            // recreates `edges_space_fence`/`edges_space_fence_update` with
+            // the `entity` arm reading each endpoint's `kind='entity'`
+            // shadow-page space instead of `entities` directly. Migrations
+            // 81 and 98 keep the historical `entities`-reading fence body
+            // (frozen replay, same principle as migrations 92/113/114) --
+            // an old DB upgrading through those migrations has no
+            // shadow-page completeness guarantee until migrations
+            // 113/114/117 run. Positioned here, after that guarantee holds,
+            // so the pages fence never goes live over an entity that could
+            // still be missing one. See migrate_121_edges_space_fence_pages.
+            if version < 121 {
+                self.migrate_121_edges_space_fence_pages(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -9206,17 +9228,21 @@ impl MemoryDB {
             // never blocked -- only an update that keeps the edge ACTIVE and
             // typed is re-fenced. Without the UPDATE twin a reactivation could
             // resurrect a typed row against a now-cross-space endpoint.
-            // G6 Stage 2 PR 2c item 1: the `entity` arm reads the
+            // G6 Stage 2 PR 2c item 1 ported the `entity` arm to read the
             // `kind='entity'` shadow page's space via `entity_page_map`
-            // instead of `entities` directly -- a missing shadow page
-            // resolves to NULL, and `IS NOT NEW.space` aborts on NULL the
-            // same way it already aborted on a missing `entities` row
-            // (fail-closed, unchanged). This trigger is only ever live
-            // between migration 81 and migration 98, which drops and
-            // recreates it with the M5-widened `FENCE_BODY` in
-            // `edges_rebuild.rs` -- ported there too, in lockstep, so the
-            // two never disagree on which endpoints a cross-space edge may
-            // touch.
+            // instead of `entities` directly -- but that port mutated a
+            // migration body, which violates frozen replay (same principle
+            // already applied to migrations 92/113/114): this trigger
+            // replays against the schema state AT migration 81, and an
+            // old DB upgrading through this window has no shadow-page
+            // completeness guarantee until migrations 113/114/117 run.
+            // REVERTED here to the historical `entities`-reading form,
+            // frozen. The pages-reading form is not lost -- migration 121
+            // drops and recreates both fence triggers with that exact body
+            // (moved verbatim from here / from `edges_rebuild.rs`'s
+            // `FENCE_BODY`), positioned after shadow-page completeness is
+            // established, so the pages fence goes live only once it is
+            // safe to.
             conn.execute_batch(
                 "CREATE TRIGGER IF NOT EXISTS edges_space_fence
                  AFTER INSERT ON edges
@@ -9227,12 +9253,7 @@ impl MemoryDB {
                          CASE NEW.src_kind
                              WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.src_id)
                              WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.src_id)
-                             WHEN 'entity' THEN (
-                                SELECT p.space FROM entity_page_map epm
-                                JOIN pages p ON p.id = epm.page_id
-                                WHERE epm.entity_id = NEW.src_id
-                                  AND p.kind = 'entity' AND p.status = 'active'
-                            )
+                             WHEN 'entity' THEN (SELECT space FROM entities WHERE id = NEW.src_id)
                              ELSE NULL
                          END
                      ) IS NOT NEW.space
@@ -9242,12 +9263,7 @@ impl MemoryDB {
                              CASE NEW.dst_kind
                                  WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.dst_id)
                                  WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.dst_id)
-                                 WHEN 'entity' THEN (
-                                    SELECT p.space FROM entity_page_map epm
-                                    JOIN pages p ON p.id = epm.page_id
-                                    WHERE epm.entity_id = NEW.dst_id
-                                      AND p.kind = 'entity' AND p.status = 'active'
-                                )
+                                 WHEN 'entity' THEN (SELECT space FROM entities WHERE id = NEW.dst_id)
                                  ELSE NULL
                              END
                          ) IS NOT NEW.space
@@ -9262,12 +9278,7 @@ impl MemoryDB {
                          CASE NEW.src_kind
                              WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.src_id)
                              WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.src_id)
-                             WHEN 'entity' THEN (
-                                SELECT p.space FROM entity_page_map epm
-                                JOIN pages p ON p.id = epm.page_id
-                                WHERE epm.entity_id = NEW.src_id
-                                  AND p.kind = 'entity' AND p.status = 'active'
-                            )
+                             WHEN 'entity' THEN (SELECT space FROM entities WHERE id = NEW.src_id)
                              ELSE NULL
                          END
                      ) IS NOT NEW.space
@@ -9277,12 +9288,7 @@ impl MemoryDB {
                              CASE NEW.dst_kind
                                  WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.dst_id)
                                  WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.dst_id)
-                                 WHEN 'entity' THEN (
-                                    SELECT p.space FROM entity_page_map epm
-                                    JOIN pages p ON p.id = epm.page_id
-                                    WHERE epm.entity_id = NEW.dst_id
-                                      AND p.kind = 'entity' AND p.status = 'active'
-                                )
+                                 WHEN 'entity' THEN (SELECT space FROM entities WHERE id = NEW.dst_id)
                                  ELSE NULL
                              END
                          ) IS NOT NEW.space
@@ -14309,6 +14315,164 @@ impl MemoryDB {
         log::info!(
             "[migration] Migration 120 applied: dropped edges_parity_watermark, \
              entity_page_parity_watermark, edges_reader_cutover, entity_reader_cutover"
+        );
+        Ok(())
+    }
+
+    /// Migration 121 (G6 Stage 2 PR 2c, frozen-replay fix): drop and
+    /// recreate `edges_space_fence`/`edges_space_fence_update` (the
+    /// M5-widened, four-CASE-arm shape migration 98 installs) with the
+    /// `entity` arm reading each endpoint's `kind='entity'` shadow-page
+    /// space via `entity_page_map` instead of `entities` directly -- a
+    /// missing shadow page resolves to NULL, and `IS NOT NEW.space` aborts
+    /// on NULL the same way it already aborted on a missing `entities`
+    /// row (fail-closed, unchanged). This body is the G6 Stage 2 PR 2c
+    /// item 1 port, moved verbatim here from migration 98's `FENCE_BODY`
+    /// (`edges_rebuild.rs`) and migration 81's copy (`db.rs`), both of
+    /// which are reverted back to the historical `entities`-reading form
+    /// so they stay frozen replays. By migration 121 the schema already
+    /// has migrations 113/114/117's shadow-page completeness guarantee, so
+    /// the pages fence only ever goes live once every entity is known to
+    /// have a shadow page.
+    async fn migrate_121_edges_space_fence_pages(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(121, prior_version).await?;
+        let conn = self.conn.lock().await;
+
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m121 begin: {e}")))?;
+
+        let result: Result<(), WenlanError> = async {
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS edges_space_fence;
+                 DROP TRIGGER IF EXISTS edges_space_fence_update;
+                 CREATE TRIGGER edges_space_fence
+                 AFTER INSERT ON edges
+                 WHEN NEW.lineage != 'legacy'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'edges_space_fence: cross-space edge rejected')
+                     WHERE (
+                         NOT (NEW.edge_type = 'attests' AND NEW.src_kind = 'root')
+                         AND (
+                             CASE NEW.src_kind
+                                 WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.src_id)
+                                 WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.src_id)
+                                 WHEN 'entity' THEN (
+                                     SELECT p.space FROM entity_page_map epm
+                                       JOIN pages p ON p.id = epm.page_id
+                                      WHERE epm.entity_id = NEW.src_id
+                                        AND p.kind = 'entity' AND p.status = 'active'
+                                 )
+                                 WHEN 'claim_revision' THEN (
+                                     SELECT p.space FROM claim_revisions cr
+                                       JOIN claims c ON c.claim_id = cr.claim_id
+                                       JOIN pages p ON p.id = c.page_id
+                                      WHERE cr.claim_revision_id = NEW.src_id
+                                 )
+                                 ELSE NULL
+                             END
+                         ) IS NOT NEW.space
+                     )
+                     OR (
+                         NOT (NEW.edge_type = 'cites' AND NEW.dst_kind = 'external')
+                         AND (
+                             CASE NEW.dst_kind
+                                 WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.dst_id)
+                                 WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.dst_id)
+                                 WHEN 'entity' THEN (
+                                     SELECT p.space FROM entity_page_map epm
+                                       JOIN pages p ON p.id = epm.page_id
+                                      WHERE epm.entity_id = NEW.dst_id
+                                        AND p.kind = 'entity' AND p.status = 'active'
+                                 )
+                                 WHEN 'claim_revision' THEN (
+                                     SELECT p.space FROM claim_revisions cr
+                                       JOIN claims c ON c.claim_id = cr.claim_id
+                                       JOIN pages p ON p.id = c.page_id
+                                      WHERE cr.claim_revision_id = NEW.dst_id
+                                 )
+                                 ELSE NULL
+                             END
+                         ) IS NOT NEW.space
+                     );
+                 END;
+                 CREATE TRIGGER edges_space_fence_update
+                 AFTER UPDATE ON edges
+                 WHEN NEW.lineage != 'legacy' AND NEW.valid_until IS NULL
+                 BEGIN
+                     SELECT RAISE(ABORT, 'edges_space_fence: cross-space edge rejected')
+                     WHERE (
+                         NOT (NEW.edge_type = 'attests' AND NEW.src_kind = 'root')
+                         AND (
+                             CASE NEW.src_kind
+                                 WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.src_id)
+                                 WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.src_id)
+                                 WHEN 'entity' THEN (
+                                     SELECT p.space FROM entity_page_map epm
+                                       JOIN pages p ON p.id = epm.page_id
+                                      WHERE epm.entity_id = NEW.src_id
+                                        AND p.kind = 'entity' AND p.status = 'active'
+                                 )
+                                 WHEN 'claim_revision' THEN (
+                                     SELECT p.space FROM claim_revisions cr
+                                       JOIN claims c ON c.claim_id = cr.claim_id
+                                       JOIN pages p ON p.id = c.page_id
+                                      WHERE cr.claim_revision_id = NEW.src_id
+                                 )
+                                 ELSE NULL
+                             END
+                         ) IS NOT NEW.space
+                     )
+                     OR (
+                         NOT (NEW.edge_type = 'cites' AND NEW.dst_kind = 'external')
+                         AND (
+                             CASE NEW.dst_kind
+                                 WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.dst_id)
+                                 WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.dst_id)
+                                 WHEN 'entity' THEN (
+                                     SELECT p.space FROM entity_page_map epm
+                                       JOIN pages p ON p.id = epm.page_id
+                                      WHERE epm.entity_id = NEW.dst_id
+                                        AND p.kind = 'entity' AND p.status = 'active'
+                                 )
+                                 WHEN 'claim_revision' THEN (
+                                     SELECT p.space FROM claim_revisions cr
+                                       JOIN claims c ON c.claim_id = cr.claim_id
+                                       JOIN pages p ON p.id = c.page_id
+                                      WHERE cr.claim_revision_id = NEW.dst_id
+                                 )
+                                 ELSE NULL
+                             END
+                         ) IS NOT NEW.space
+                     );
+                 END;",
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m121 fence trigger: {e}")))?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m121 commit: {e}")))?;
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        }
+
+        conn.execute("PRAGMA user_version = 121", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m121 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 121 applied: edges_space_fence entity arm reads shadow pages"
         );
         Ok(())
     }
