@@ -27205,14 +27205,28 @@ impl MemoryDB {
 
         let conn = self.conn.lock().await;
 
-        // Try DiskANN index first
-        let sql = "SELECT e.id, e.name, e.entity_type, e.space, e.source_agent, e.confidence, e.confirmed, e.created_at, e.updated_at, vector_distance_cos(e.embedding, vector32(?1))
-                   FROM vector_top_k('entities_vec_idx', vector32(?1), ?2) AS vt
-                   JOIN entities e ON e.rowid = vt.id";
+        // G6 Stage 2 PR 2c sub-step 1: primary ranking re-pointed at
+        // `idx_pages_embedding` on the `kind='entity'` shadow pages (the
+        // `search_pages` precedent -- 3x over-fetch absorbs the post-ANN
+        // kind/status filter, since vector_top_k can't filter before
+        // ranking). `entities_vec_idx` and the brute-force fallback below
+        // stay wired to `entities` as-is; they retire with the writer flip
+        // in sub-step 3, not here.
+        let fetch_limit = (limit * 3) as i64;
+        let sql = "SELECT m.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, vector_distance_cos(p.embedding, vector32(?1)) AS dist
+                   FROM vector_top_k('idx_pages_embedding', vector32(?1), ?2) AS vt
+                   JOIN pages p ON p.rowid = vt.id
+                   JOIN entity_page_map m ON m.page_id = p.id
+                   WHERE p.kind = 'entity' AND p.status = 'active'
+                   ORDER BY dist ASC
+                   LIMIT ?3";
 
         let mut results = Vec::new();
         match conn
-            .query(sql, libsql::params![vec_str.clone(), limit as i64])
+            .query(
+                sql,
+                libsql::params![vec_str.clone(), fetch_limit, limit as i64],
+            )
             .await
         {
             Ok(mut rows) => {
@@ -27293,11 +27307,12 @@ impl MemoryDB {
             }
         }
 
-        // G6 Stage 1.5b Part 3: ranking stays on `entities.embedding`'s
-        // DiskANN index by design (M3 PR-2 stage f review: the design
-        // deliberately does not swap ranking infrastructure), but the
-        // display fields overlay from the `kind='entity'` shadow page,
-        // unconditionally -- same program contract as 1.5a, mirroring
+        // G6 Stage 2 PR 2c sub-step 1: the primary path above now ranks on
+        // the shadow page's embedding too, so this overlay is a no-op for
+        // those rows. It still matters for the brute-force fallback, which
+        // stays sourced from legacy `entities` columns until sub-step 3 --
+        // unconditional overlay keeps both paths converging on the same
+        // display fields, same program contract as 1.5a, mirroring
         // `search_entities_by_vector_scoped`'s hydration overlay.
         if !results.is_empty() {
             struct Mirror {
@@ -33149,9 +33164,19 @@ impl MemoryDB {
             // Dual-write (M2 PR-1): mirror `backfill_edges_from_relations`'s
             // classification exactly so a live-written edge and a backfilled
             // edge for the same fact converge on the same edge_id.
+            //
+            // G6 Stage 2 PR 2c item 2: space authority ported from `entities`
+            // to the entity shadow page (`pages` via `entity_page_map`) --
+            // the parity receipt found 965/965 entities mapped, zero
+            // `pages.space`/`entities.space` drift, and every entity-space
+            // move (`update_space`, `delete_space`, `reassign_memories_space`)
+            // syncing the shadow page in the same transaction. Zero rows on
+            // either side (no shadow page) matches the prior "entity not
+            // found" fallback.
             let mut space_rows = conn
                 .query(
-                    "SELECT fe.space, te.space FROM entities fe, entities te WHERE fe.id = ?1 AND te.id = ?2",
+                    "SELECT pf.space, pt.space FROM entity_page_map mf, pages pf, entity_page_map mt, pages pt \
+                     WHERE mf.entity_id = ?1 AND pf.id = mf.page_id AND mt.entity_id = ?2 AND pt.id = mt.page_id",
                     libsql::params![from_entity.to_string(), to_entity.to_string()],
                 )
                 .await?;
@@ -34343,10 +34368,15 @@ impl MemoryDB {
                     // `backfill_edges_from_relations` exactly, so a live write,
                     // a backfilled row, and this lane converge on one edge_id
                     // AND one lineage.
+                    //
+                    // G6 Stage 2 PR 2c item 2: space authority ported from
+                    // `entities` to the entity shadow page, same parity
+                    // receipt as `create_relation` (965/965 mapped, zero
+                    // drift, writer-synced) -- see the comment there.
                     let mut endpoint_rows = conn
                         .query(
-                            "SELECT fe.space, te.space FROM entities fe, entities te \
-                             WHERE fe.id = ?1 AND te.id = ?2",
+                            "SELECT pf.space, pt.space FROM entity_page_map mf, pages pf, entity_page_map mt, pages pt \
+                             WHERE mf.entity_id = ?1 AND pf.id = mf.page_id AND mt.entity_id = ?2 AND pt.id = mt.page_id",
                             libsql::params![from_id.as_str(), to_id.as_str()],
                         )
                         .await
