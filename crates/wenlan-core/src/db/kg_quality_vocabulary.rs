@@ -41,12 +41,21 @@ impl MemoryDB {
         Ok(types)
     }
 
+    // G6 Stage 2 PR 2c sub-step 3 item 1: `entities.entity_type` reads move
+    // to the `kind='entity'` shadow page's `entity_type` via
+    // `entity_page_map`/`pages`, same as `fold_relation_type`'s sibling
+    // `distinct_relation_types_for_vocabulary_heal` above.
     pub(crate) async fn distinct_entity_types_for_vocabulary_heal(
         &self,
     ) -> Result<Vec<String>, WenlanError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
-            .query("SELECT DISTINCT entity_type FROM entities", ())
+            .query(
+                "SELECT DISTINCT p.entity_type FROM entity_page_map epm \
+                 JOIN pages p ON p.id = epm.page_id \
+                 WHERE p.kind = 'entity' AND p.status = 'active'",
+                (),
+            )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("distinct entity types: {}", e)))?;
         let mut types = Vec::new();
@@ -55,10 +64,10 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("entity type row: {}", e)))?
         {
-            // `entities.entity_type` is `TEXT NOT NULL` -- unlike relates
-            // edges' `semantic_type`, a NULL row is impossible by schema, so
-            // `unwrap_or_default` never coerces an absent value; it only
-            // ever hands back the stored string.
+            // `pages.entity_type` is `TEXT NOT NULL` for `kind='entity'` rows
+            // -- unlike relates edges' `semantic_type`, a NULL row is
+            // impossible by schema, so `unwrap_or_default` never coerces an
+            // absent value; it only ever hands back the stored string.
             types.push(row.get::<String>(0).unwrap_or_default());
         }
         Ok(types)

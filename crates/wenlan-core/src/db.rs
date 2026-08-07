@@ -596,7 +596,11 @@ impl MemoryDB {
                 );
                 let mut space_rows = conn
                     .query(
-                        "SELECT fe.space, te.space FROM entities fe, entities te WHERE fe.id = ?1 AND te.id = ?2",
+                        "SELECT \
+                            (SELECT p.space FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id \
+                              WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'), \
+                            (SELECT p.space FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id \
+                              WHERE epm.entity_id = ?2 AND p.kind = 'entity' AND p.status = 'active')",
                         libsql::params![from.clone(), to.clone()],
                     )
                     .await
@@ -21539,7 +21543,7 @@ impl MemoryDB {
             .query(
                 "SELECT s.id, s.name, s.description, s.suggested, s.created_at, s.updated_at,
                         (SELECT COUNT(DISTINCT c.source_id) FROM memories c WHERE c.space = s.name AND c.source = 'memory' AND c.pending_revision = 0 AND COALESCE(c.is_recap, 0) = 0 AND c.source_id NOT IN (SELECT supersedes FROM memories WHERE supersedes IS NOT NULL AND pending_revision = 0 AND source = 'memory' GROUP BY supersedes)) as mem_count,
-                        (SELECT COUNT(*) FROM entities e WHERE e.space = s.name) as ent_count,
+                        (SELECT COUNT(*) FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id WHERE p.space = s.name AND p.kind = 'entity' AND p.status = 'active') as ent_count,
                         s.sort_order, s.starred, s.is_default
                  FROM spaces s
                  WHERE s.id != ?1
@@ -21578,7 +21582,7 @@ impl MemoryDB {
             .query(
                 "SELECT s.id, s.name, s.description, s.suggested, s.created_at, s.updated_at,
                         (SELECT COUNT(DISTINCT c.source_id) FROM memories c WHERE c.space = s.name AND c.source = 'memory' AND c.pending_revision = 0 AND COALESCE(c.is_recap, 0) = 0 AND c.source_id NOT IN (SELECT supersedes FROM memories WHERE supersedes IS NOT NULL AND pending_revision = 0 AND source = 'memory' GROUP BY supersedes)) as mem_count,
-                        (SELECT COUNT(*) FROM entities e WHERE e.space = s.name) as ent_count,
+                        (SELECT COUNT(*) FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id WHERE p.space = s.name AND p.kind = 'entity' AND p.status = 'active') as ent_count,
                         s.sort_order, s.starred, s.is_default
                  FROM spaces s WHERE s.name = ?1",
                 libsql::params![name],
@@ -27783,9 +27787,10 @@ impl MemoryDB {
         let placeholders: Vec<String> = (1..=entity_ids.len()).map(|i| format!("?{}", i)).collect();
         let limit_param = entity_ids.len() + 1;
         let sql = format!(
-            "SELECT o.id, o.content, e.name, o.created_at, o.source_agent, o.confidence
+            "SELECT o.id, o.content, p.title, o.created_at, o.source_agent, o.confidence
              FROM observations o
-             JOIN entities e ON o.entity_id = e.id
+             JOIN entity_page_map epm ON o.entity_id = epm.entity_id
+             JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity' AND p.status = 'active'
              WHERE o.entity_id IN ({})
              ORDER BY o.confidence DESC NULLS LAST, o.created_at DESC
              LIMIT ?{}",
@@ -33909,9 +33914,11 @@ impl MemoryDB {
     /// G6 Stage 1.5b Part 3: the entity-half reads the `kind='entity'`
     /// shadow page via `entity_page_map`, unconditional hard cutover (same
     /// program contract as 1.5a and `list_entities` above). The
-    /// observations query and the relations query's own `entities` JOIN
-    /// (which hydrates the OTHER side of each relation) stay on their own
-    /// stores -- out of scope per spec.
+    /// observations query stays on its own store (keyed on `entity_id`,
+    /// nothing to hydrate from a shadow page). G6 Stage 2 PR 2c sub-step 3
+    /// item 4 closes the relations query's own `entities` JOIN too -- the
+    /// OTHER side of each relation now hydrates from its `entity_page_map`/
+    /// `pages` shadow, same as the entity-half above.
     pub async fn get_entity_detail(&self, entity_id: &str) -> Result<EntityDetail, WenlanError> {
         let conn = self.conn.lock().await;
 
@@ -33986,16 +33993,20 @@ impl MemoryDB {
                 "SELECT r.edge_id, r.semantic_type, json_extract(r.payload, '$.source_agent'),
                         COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at),
                         'outgoing' as direction, r.dst_id as entity_id,
-                        e.name as entity_name, e.entity_type as entity_type
-                 FROM edges r JOIN entities e ON e.id = r.dst_id
+                        p.title as entity_name, p.entity_type as entity_type
+                 FROM edges r
+                 JOIN entity_page_map epm ON epm.entity_id = r.dst_id
+                 JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity' AND p.status = 'active'
                  WHERE r.edge_type = 'relates' AND r.valid_until IS NULL
                        AND r.src_id = ?1 AND r.semantic_type IS NOT NULL
                  UNION ALL
                  SELECT r.edge_id, r.semantic_type, json_extract(r.payload, '$.source_agent'),
                         COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at),
                         'incoming' as direction, r.src_id as entity_id,
-                        e.name as entity_name, e.entity_type as entity_type
-                 FROM edges r JOIN entities e ON e.id = r.src_id
+                        p.title as entity_name, p.entity_type as entity_type
+                 FROM edges r
+                 JOIN entity_page_map epm ON epm.entity_id = r.src_id
+                 JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity' AND p.status = 'active'
                  WHERE r.edge_type = 'relates' AND r.valid_until IS NULL
                        AND r.dst_id = ?1 AND r.semantic_type IS NOT NULL
                  ORDER BY 4 DESC",
@@ -35341,6 +35352,15 @@ impl MemoryDB {
             .await
     }
 
+    /// G6 Stage 2 PR 2c sub-step 3 item 1 (entity-sweep selector): the
+    /// `existing_entity_id` existence checks now require a live
+    /// `kind='entity'` shadow page via `entity_page_map`/`pages`, not just an
+    /// `entities` row. This is a discovery/visibility change -- a linked
+    /// entity that somehow lacks a shadow page becomes invisible to this
+    /// selector's linkage detection (same class as
+    /// `community_discovery_surfaces_shadow_only_entity`'s shadow-page
+    /// dependency), so it carries the RED-control test
+    /// `entity_enrichment_selector_requires_shadow_page_for_linkage`.
     async fn run_entity_enrichment_slice_inner<F, Fut>(
         &self,
         entity_link_distance: Option<f32>,
@@ -35375,9 +35395,14 @@ impl MemoryDB {
                                  ELSE COALESCE(es.attempts, 0) END, \
                             es.status, m.version, \
                             COALESCE( \
-                                (SELECT e.id FROM entities e WHERE e.id=m.entity_id), \
+                                (SELECT epm.entity_id FROM entity_page_map epm \
+                                 JOIN pages p ON p.id=epm.page_id \
+                                 WHERE epm.entity_id=m.entity_id \
+                                   AND p.kind='entity' AND p.status='active'), \
                                 (SELECT me.entity_id FROM memory_entities me \
-                                 JOIN entities e ON e.id=me.entity_id \
+                                 JOIN entity_page_map epm ON epm.entity_id=me.entity_id \
+                                 JOIN pages p ON p.id=epm.page_id \
+                                  AND p.kind='entity' AND p.status='active' \
                                  WHERE me.memory_id=m.source_id \
                                  ORDER BY me.entity_id LIMIT 1) \
                             ) \

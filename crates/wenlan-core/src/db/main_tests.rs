@@ -11138,6 +11138,53 @@ async fn get_entity_detail_reads_relates_edge_fields() {
     );
 }
 
+/// G6 Stage 2 PR 2c sub-step 3 item 4: the relations query's `entities` JOIN
+/// (hydrating the OTHER side of each relation) now reads the target's
+/// `kind='entity'` shadow page via `entity_page_map`/`pages` instead of
+/// `entities` directly -- closing the site the G6 Stage 1.5b Part 3 port left
+/// "out of scope per spec". Mutate ONLY the shadow page's `title`/
+/// `entity_type` (leaving `entities` untouched, since sub-step 2's writers
+/// still dual-write both stores) and assert the hydrated relation reflects
+/// the page value: if this read were still on `entities`, it would see the
+/// original name/type instead.
+#[tokio::test]
+async fn get_entity_detail_relations_hydrate_from_shadow_page() {
+    let (db, _dir) = test_db().await;
+    let alice_id = db
+        .store_entity("Alice Shadow", "person", Some("work"), None, None)
+        .await
+        .unwrap();
+    let wenlan_id = db
+        .store_entity("Wenlan Shadow", "project", Some("work"), None, None)
+        .await
+        .unwrap();
+    db.create_relation(&alice_id, &wenlan_id, "works_on", None, None, None, None)
+        .await
+        .unwrap();
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET title = 'Wenlan Retitled', entity_type = 'org' \
+             WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![wenlan_id.as_str()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let detail = db.get_entity_detail(&alice_id).await.unwrap();
+    assert_eq!(detail.relations.len(), 1);
+    assert_eq!(
+        detail.relations[0].entity_name, "Wenlan Retitled",
+        "relation hydration must read the shadow page's title, not entities.name"
+    );
+    assert_eq!(
+        detail.relations[0].entity_type, "org",
+        "relation hydration must read the shadow page's entity_type, not entities.entity_type"
+    );
+}
+
 #[tokio::test]
 async fn test_update_observation() {
     let (db, _dir) = test_db().await;
@@ -19159,6 +19206,10 @@ async fn test_observations_have_unique_source_ids() {
         .unwrap();
     }
     drop(conn);
+    // G6 Stage 2 PR 2c sub-step 3 item 1: `get_observations_for_entities`
+    // now reads the `kind='entity'` shadow page, not `entities` directly --
+    // backfill it for this raw-seeded row.
+    db.test_seed_entity_shadow_page("e1").await.unwrap();
 
     let results = db
         .get_observations_for_entities(&["e1".to_string()], 10)
@@ -25086,6 +25137,102 @@ async fn same_source_upsert_uses_old_version_plus_one() {
             .unwrap(),
         1,
         "the v1 receipt must be stale after a same-source replacement"
+    );
+}
+
+/// G6 Stage 2 PR 2c sub-step 3 item 1 RED control: the entity-sweep
+/// selector's `existing_entity_id` legs now require a live `kind='entity'`
+/// shadow page via `entity_page_map`/`pages`, not just a `memory_entities`
+/// junction row (same discovery/visibility class as
+/// `community_discovery_surfaces_shadow_only_entity`). Link a memory to a
+/// shadow-only entity -- a page + `entity_page_map` row with deliberately
+/// NO `entities` row, the post-flip state a selector still reading
+/// `entities` directly would miss -- and assert the selector recognizes the
+/// existing link (short-circuits to a receipt repair, `extract_fn` never
+/// runs) instead of treating the memory as unlinked and re-running
+/// extraction. The assertion is only true if the selector actually reads
+/// past `entities`: reverting the port back to `entities`-only flips it
+/// from pass to fail.
+#[tokio::test]
+async fn entity_enrichment_selector_requires_shadow_page_for_linkage() {
+    const SPACE: &str = "m1-selector-shadow-space";
+    let (db, _dir) = test_db().await;
+    db.upsert_documents(vec![make_memory_doc(
+        "mem_selector_shadow_link",
+        "Some content for the shadow-linked memory.",
+        "fact",
+        SPACE,
+        "agent",
+    )])
+    .await
+    .unwrap();
+
+    let shadow_only_id = "m1-shadow-only-entity";
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    {
+        let conn = db.conn.lock().await;
+        // `entity_page_map.entity_id` still carries `REFERENCES entities(id)
+        // ON DELETE CASCADE` until sub-step 3's FK-relaxation migration
+        // ships, so toggle enforcement off for just these two inserts --
+        // same technique `community_discovery_surfaces_shadow_only_entity`
+        // uses to simulate the post-flip shadow-only state early.
+        conn.execute("PRAGMA foreign_keys = OFF", ()).await.unwrap();
+        conn.execute(
+            "INSERT INTO pages (
+                id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+                embedding, space, workspace, source_memory_ids, version, status,
+                created_at, last_compiled, last_modified, creation_kind, review_status
+             ) VALUES (
+                'm1-shadow-only-page', 'Shadow Only Selector', NULL, '', 'entity', 'concept', NULL, 0,
+                NULL, ?1, ?1, '[]', 1, 'active', ?2, ?2, ?2, 'entity', 'unconfirmed'
+             )",
+            libsql::params![SPACE, now_iso.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at)
+             VALUES (?1, 'm1-shadow-only-page', ?2)",
+            libsql::params![shadow_only_id, now_iso.clone()],
+        )
+        .await
+        .unwrap();
+        // Link the memory to the shadow-only entity via the junction table
+        // only (`memory_entities.entity_id` carries the same FK) --
+        // `memories.entity_id` stays NULL, matching a real
+        // link-without-mirror state the selector's COALESCE must still
+        // resolve via its second (`memory_entities`) leg.
+        conn.execute(
+            "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?1, ?2)",
+            libsql::params!["mem_selector_shadow_link", shadow_only_id],
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA foreign_keys = ON", ()).await.unwrap();
+    }
+
+    let extract_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let extract_called_clone = extract_called.clone();
+    let processed = db
+        .run_entity_enrichment_slice(move |_content| {
+            let flag = extract_called_clone.clone();
+            async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        processed, 1,
+        "the shadow-linked memory must be selected as the one candidate"
+    );
+    assert!(
+        !extract_called.load(std::sync::atomic::Ordering::SeqCst),
+        "selector must recognize the existing shadow-page-backed link and skip \
+         extraction -- a selector still reading `entities` directly would miss \
+         this link and re-extract"
     );
 }
 

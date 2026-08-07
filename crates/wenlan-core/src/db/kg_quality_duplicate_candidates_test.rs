@@ -3,14 +3,21 @@
 use super::MemoryDB;
 
 async fn insert_entity(db: &MemoryDB, id: &str, name: &str, entity_type: &str) {
-    let conn = db.conn.lock().await;
-    conn.execute(
-        "INSERT INTO entities (id, name, entity_type, created_at, updated_at)
-         VALUES (?1, ?2, ?3, 1, 1)",
-        libsql::params![id, name, entity_type],
-    )
-    .await
-    .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO entities (id, name, entity_type, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 1, 1)",
+            libsql::params![id, name, entity_type],
+        )
+        .await
+        .unwrap();
+    }
+    // G6 Stage 2 PR 2c sub-step 3 item 1: both readers under test now read
+    // the `kind='entity'` shadow page, not `entities` directly -- backfill
+    // it for this raw-seeded row, same as every other raw-SQL entity
+    // fixture since the 1.5a port.
+    db.test_seed_entity_shadow_page(id).await.unwrap();
 }
 
 #[tokio::test]
