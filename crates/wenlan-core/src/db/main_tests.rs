@@ -17290,6 +17290,20 @@ async fn delete_space_delete_removes_entity_shadow_pages() {
             .unwrap()
             .expect("shadow must exist before delete")
     };
+    // G6 Stage 2 PR 2c sub-step 3 item 4: `store_entity` no longer writes a
+    // self-alias row (the shadow page's own `aliases` seed replaces it), so
+    // seed one directly to keep this FK-guard delete exercised against a
+    // real row instead of a vacuous zero-to-zero check.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) \
+             VALUES (?1, ?2, unixepoch(), 'test')",
+            libsql::params!["doomed dan", id.clone()],
+        )
+        .await
+        .unwrap();
+    }
 
     db.delete_space("doomed", "delete").await.unwrap();
 
@@ -22930,6 +22944,77 @@ async fn test_add_entity_alias() {
     assert_eq!(r2, Some(id.clone()));
 }
 
+/// G6 Stage 2 PR 2c sub-step 3 item 4: losing `entity_aliases`'
+/// `UNIQUE(alias_name)` means no ordinary write path (`add_entity_alias`,
+/// `merge_entities`, enrichment) can produce two *active* entity pages both
+/// claiming the same alias -- each write targets exactly one page's `aliases`
+/// array. But nothing in the schema forbids it either (a bug, not an expected
+/// state), so `resolve_entity_by_alias`'s `ORDER BY p.created_at,
+/// epm.entity_id LIMIT 1` tie-break must be exercised directly: raw-SQL seed
+/// two distinct entity shadow pages that both carry the same alias with
+/// controlled, distinct `created_at` values, and assert resolution always
+/// picks the older page's entity -- never row-order chance.
+#[tokio::test]
+async fn resolve_entity_by_alias_collision_picks_older_page_deterministically() {
+    let (db, _dir) = test_db().await;
+    let older_entity = "collide-entity-older";
+    let newer_entity = "collide-entity-newer";
+    let older_created = "2020-01-01T00:00:00Z";
+    let newer_created = "2021-01-01T00:00:00Z";
+    {
+        let conn = db.conn.lock().await;
+        // `entity_page_map.entity_id` still carries `REFERENCES entities(id)
+        // ON DELETE CASCADE` until sub-step 3's FK-relaxation migration ships
+        // -- same simulate-future-state technique as
+        // `entity_enrichment_selector_requires_shadow_page_for_linkage`.
+        conn.execute("PRAGMA foreign_keys = OFF", ()).await.unwrap();
+        for (entity_id, page_id, created_at, title) in [
+            (
+                older_entity,
+                "collide-page-older",
+                older_created,
+                "Collider Older",
+            ),
+            (
+                newer_entity,
+                "collide-page-newer",
+                newer_created,
+                "Collider Newer",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO pages (
+                    id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+                    embedding, space, workspace, source_memory_ids, version, status,
+                    created_at, last_compiled, last_modified, creation_kind, review_status, aliases
+                 ) VALUES (
+                    ?1, ?2, NULL, '', 'entity', 'concept', NULL, 0,
+                    NULL, 'unfiled', 'unfiled', '[]', 1, 'active', ?3, ?3, ?3, 'entity', 'unconfirmed', ?4
+                 )",
+                libsql::params![page_id, title, created_at, r#"["collide alias"]"#],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entity_page_map (entity_id, page_id, created_at)
+                 VALUES (?1, ?2, ?3)",
+                libsql::params![entity_id, page_id, created_at],
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute("PRAGMA foreign_keys = ON", ()).await.unwrap();
+    }
+
+    let resolved = db.resolve_entity_by_alias("collide alias").await.unwrap();
+    assert_eq!(
+        resolved,
+        Some(older_entity.to_string()),
+        "two active entity pages claiming the same alias must resolve to the \
+         older page's entity deterministically, never row-order chance"
+    );
+}
+
 #[tokio::test]
 async fn test_resolve_relation_type() {
     let (db, _dir) = test_db().await;
@@ -27251,24 +27336,21 @@ async fn merge_entities_transfers_canonical_memory_links_and_page_owner() {
 
 #[tokio::test]
 async fn merge_entities_registers_alias_name() {
+    // G6 Stage 2 PR 2c sub-step 3 item 4: the loser's name used to be
+    // registered as a new `entity_aliases` row (source='merge'); that
+    // write is retired, folded into the canonical shadow's page-payload
+    // union instead -- assert via `resolve_entity_by_alias`, the reader
+    // that now owns alias resolution.
     let (db, _tmp) = test_db().await;
     let (canonical, alias) = seed_two_entities(&db).await;
 
     db.merge_entities(&canonical, &alias).await.unwrap();
 
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(
-            "SELECT canonical_entity_id, source FROM entity_aliases WHERE alias_name = ?1",
-            libsql::params!["Acme Corporation"],
-        )
+    let resolved = db
+        .resolve_entity_by_alias("acme corporation")
         .await
         .unwrap();
-    let row = rows.next().await.unwrap().expect("alias row should exist");
-    let cid: String = row.get(0).unwrap();
-    let src: String = row.get(1).unwrap();
-    assert_eq!(cid, canonical);
-    assert_eq!(src, "merge");
+    assert_eq!(resolved, Some(canonical));
 }
 
 #[tokio::test]
@@ -27361,17 +27443,20 @@ async fn merge_entities_idempotent() {
         "alias should remain deleted after idempotent calls"
     );
 
-    let mut rows = conn
-        .query(
-            "SELECT COUNT(*) FROM entity_aliases WHERE alias_name = ?1 AND source = 'merge'",
-            libsql::params!["Acme Corporation"],
-        )
-        .await
-        .unwrap();
-    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    drop(conn);
+    // G6 Stage 2 PR 2c sub-step 3 item 4: the merge-source alias row is
+    // retired -- assert the page-payload UNION stayed idempotent instead
+    // (exactly one "acme corporation" entry, not duplicated by the repeat
+    // merge call).
+    let aliases = shadow_aliases(&db, &canonical).await.unwrap();
+    let parsed: Vec<String> = serde_json::from_str(&aliases).unwrap();
+    let occurrences = parsed
+        .iter()
+        .filter(|a| a.as_str() == "acme corporation")
+        .count();
     assert_eq!(
-        count, 1,
-        "exactly one merge-source alias row should exist (INSERT OR IGNORE)"
+        occurrences, 1,
+        "the UNION-based alias write must stay idempotent across repeat merges: {aliases}"
     );
 }
 
@@ -30657,6 +30742,16 @@ async fn migration_113_backfills_missing_entity_shadow_pages() {
 /// re-sync drifts the mirrored `aliases` column (`corrupt` in the parity
 /// report, observed live 2026-08-04). Simulate that damage, run the
 /// migration, and the parity sweep must come back clean.
+///
+/// G6 Stage 2 PR 2c sub-step 3 item 4: the alias leg retired from
+/// `compute_entity_page_parity_report` (`entity_aliases` stopped being
+/// written), so the pre-migration "stale" state below is no longer visible
+/// to `drift_count` — it was the ONLY drift this scenario produced (every
+/// other shadowed field was already in sync). Assert the staleness directly
+/// against `pages.aliases` instead; the migration body itself is frozen
+/// historical replay and still re-derives `aliases` from `entity_aliases`
+/// (the table still exists, just un-written by live code), so the raw seed
+/// + resync behavior under test is unchanged.
 #[tokio::test]
 async fn migration_114_resyncs_stale_entity_shadow_pages() {
     let (db, _dir) = test_db().await;
@@ -30676,21 +30771,23 @@ async fn migration_114_resyncs_stale_entity_shadow_pages() {
         .await
         .unwrap();
     }
-    assert_eq!(
-        db.compute_entity_page_parity_report()
-            .await
-            .unwrap()
-            .drift_count,
-        1,
-        "the stale shadow must register as corrupt drift"
+    let stale_aliases = shadow_aliases(&db, &eid).await.unwrap_or_default();
+    assert!(
+        !stale_aliases.contains("quality gates"),
+        "the shadow must still be stale before the migration runs: {stale_aliases}"
     );
 
     db.migrate_114_entity_shadow_resync(113).await.unwrap();
 
+    let resynced_aliases = shadow_aliases(&db, &eid).await.unwrap_or_default();
+    assert!(
+        resynced_aliases.contains("quality gates"),
+        "migration 114 must re-sync the stale alias: {resynced_aliases}"
+    );
     let report = db.compute_entity_page_parity_report().await.unwrap();
     assert_eq!(
         report.drift_count, 0,
-        "migration 114 must re-sync the stale shadow (report={report:?})"
+        "migration 114 must leave the shadow's remaining fields in parity too (report={report:?})"
     );
 }
 
@@ -33538,23 +33635,22 @@ async fn ambient_entity_commit_preserves_minhash_resolution() {
             "ambient resolution must link the canonical MinHash entity"
         );
 
-        let conn = db.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT source FROM entity_aliases
-                 WHERE alias_name = 'vorpalblade jabberwock ino'",
-                (),
-            )
+        // G6 Stage 2 PR 2c sub-step 3 item 4: `entity_aliases` stops being
+        // written, and `pages.aliases` carries no per-alias provenance
+        // field (see `add_entity_alias`'s doc comment) -- so the
+        // MinHash-vs-auto `source` distinction this test used to check is
+        // no longer expressible. Assert the behavior that matters instead:
+        // the near-duplicate name resolves to the canonical entity via the
+        // page-payload alias array.
+        let resolved = db
+            .resolve_entity_by_alias("vorpalblade jabberwock ino")
             .await
             .unwrap();
-        let source = rows
-            .next()
-            .await
-            .unwrap()
-            .expect("near-duplicate alias")
-            .get::<String>(0)
-            .unwrap();
-        assert_eq!(source, "minhash");
+        assert_eq!(
+            resolved.as_deref(),
+            Some(canonical.id.as_str()),
+            "the MinHash-resolved near-duplicate must resolve via the page payload"
+        );
     })
     .await;
 }
@@ -44487,6 +44583,19 @@ async fn migration_93_backfills_null_shadow_aliases() {
         .unwrap();
     {
         let conn = db.conn.lock().await;
+        // G6 Stage 2 PR 2c sub-step 3 item 4: `store_entity` no longer
+        // writes a self-alias into `entity_aliases` (the shadow page's own
+        // `aliases` seed replaces it) -- migration 93's backfill body is
+        // frozen historical replay and still reads `entity_aliases`, so
+        // seed the row raw to reproduce the pre-93 state it was written
+        // against (the era's `store_entity` did write this row).
+        conn.execute(
+            "INSERT INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) \
+             VALUES ('backfill target', ?1, unixepoch(), 'auto')",
+            libsql::params![eid.clone()],
+        )
+        .await
+        .unwrap();
         conn.execute("UPDATE pages SET aliases = NULL WHERE kind = 'entity'", ())
             .await
             .unwrap();

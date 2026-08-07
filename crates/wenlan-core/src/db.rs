@@ -19741,14 +19741,21 @@ impl MemoryDB {
         let mut corrupt_count = 0usize;
         let mut corrupt_sample: Vec<String> = Vec::new();
         {
+            // G6 Stage 2 PR 2c sub-step 3 item 4: the alias comparison
+            // (`entity_aliases`-derived `expected_aliases` vs. `p.aliases`)
+            // is retired from this oracle -- `entity_aliases` stopped being
+            // written this item, so comparing it to the page payload would
+            // only measure staleness, not drift. The closing ALIAS drift-0
+            // receipt is the a2e14604 full-suite green (1440/0, task
+            // byt7fmpf8) -- the last commit where both alias stores were
+            // still live and this oracle still asserted parity between them.
+            // The entities-scalar legs below (name/type/confidence/space/
+            // confirmed/embedding/source_agent/timestamps/community) stay
+            // until item 5's writer flip.
             let mut rows = conn
                 .query(
                     "SELECT e.id, e.name, e.entity_type, e.confidence, e.space,
-                            p.title, p.entity_type, p.confidence, p.space, p.workspace, p.aliases,
-                            (SELECT json_group_array(alias_name) FROM (
-                                SELECT alias_name FROM entity_aliases
-                                WHERE canonical_entity_id = e.id ORDER BY alias_name
-                             )) AS expected_aliases,
+                            p.title, p.entity_type, p.confidence, p.space, p.workspace,
                             e.confirmed, e.embedding, p.entity_confirmed, p.embedding,
                             e.source_agent, e.created_at, e.updated_at, e.community_id,
                             e.embedding_updated_at,
@@ -19777,21 +19784,19 @@ impl MemoryDB {
                     let entity_type: String = row.get(2)?;
                     let confidence: Option<f64> = row.get(3)?;
                     let space: Option<String> = row.get(4)?;
-                    let expected_aliases: Option<String> = row.get(11)?;
-                    let confirmed: Option<i64> = row.get(12)?;
-                    let embedding: Vec<u8> = row.get::<Option<Vec<u8>>>(13)?.unwrap_or_default();
-                    let source_agent: Option<String> = row.get(16)?;
-                    let created_at: Option<i64> = row.get(17)?;
-                    let updated_at: Option<i64> = row.get(18)?;
+                    let confirmed: Option<i64> = row.get(10)?;
+                    let embedding: Vec<u8> = row.get::<Option<Vec<u8>>>(11)?.unwrap_or_default();
+                    let source_agent: Option<String> = row.get(14)?;
+                    let created_at: Option<i64> = row.get(15)?;
+                    let updated_at: Option<i64> = row.get(16)?;
                     let community_id: Option<String> =
-                        row.get::<Option<i64>>(19)?.map(|v| v.to_string());
-                    let embedding_updated_at: Option<i64> = row.get(20)?;
+                        row.get::<Option<i64>>(17)?.map(|v| v.to_string());
+                    let embedding_updated_at: Option<i64> = row.get(18)?;
                     Ok((
                         name,
                         entity_type,
                         confidence,
                         space,
-                        expected_aliases,
                         confirmed,
                         embedding,
                         source_agent,
@@ -19806,7 +19811,6 @@ impl MemoryDB {
                     entity_type,
                     confidence,
                     space,
-                    expected_aliases,
                     confirmed,
                     embedding,
                     source_agent,
@@ -19847,21 +19851,19 @@ impl MemoryDB {
                     let page_confidence: Option<f64> = row.get(7)?;
                     let page_space: Option<String> = row.get(8)?;
                     let page_workspace: Option<String> = row.get(9)?;
-                    let page_aliases: Option<String> = row.get(10)?;
-                    let page_confirmed: Option<i64> = row.get(14)?;
+                    let page_confirmed: Option<i64> = row.get(12)?;
                     let page_embedding: Vec<u8> =
-                        row.get::<Option<Vec<u8>>>(15)?.unwrap_or_default();
-                    let page_source_agent: Option<String> = row.get(21)?;
-                    let page_entity_created_at: Option<i64> = row.get(22)?;
-                    let page_entity_updated_at: Option<i64> = row.get(23)?;
-                    let page_community_id: Option<String> = row.get(24)?;
-                    let page_embedding_updated_at: Option<i64> = row.get(25)?;
+                        row.get::<Option<Vec<u8>>>(13)?.unwrap_or_default();
+                    let page_source_agent: Option<String> = row.get(19)?;
+                    let page_entity_created_at: Option<i64> = row.get(20)?;
+                    let page_entity_updated_at: Option<i64> = row.get(21)?;
+                    let page_community_id: Option<String> = row.get(22)?;
+                    let page_embedding_updated_at: Option<i64> = row.get(23)?;
                     Ok((
                         page_entity_type,
                         page_confidence,
                         page_space,
                         page_workspace,
-                        page_aliases,
                         page_confirmed,
                         page_embedding,
                         page_source_agent,
@@ -19876,7 +19878,6 @@ impl MemoryDB {
                     page_confidence,
                     page_space,
                     page_workspace,
-                    page_aliases,
                     page_confirmed,
                     page_embedding,
                     page_source_agent,
@@ -19898,7 +19899,6 @@ impl MemoryDB {
                     && page_confidence == confidence
                     && page_space.as_deref() == Some(expected_space.as_str())
                     && page_workspace.as_deref() == Some(expected_space.as_str())
-                    && page_aliases == expected_aliases
                     && page_confirmed == confirmed
                     && page_embedding == embedding
                     && page_source_agent == source_agent
@@ -21949,6 +21949,10 @@ impl MemoryDB {
                         e
                     ))
                 })?;
+                // G6 Stage 2 PR 2c sub-step 3 item 4: FK-guard, kept on
+                // purpose (same NO ACTION FK as `merge_entities`'s and
+                // `delete_entity`'s cleanup deletes). Retire together with
+                // the table in item 5.
                 tx.execute(
                     "DELETE FROM entity_aliases \
                      WHERE canonical_entity_id IN (SELECT id FROM entities WHERE space = ?1)",
@@ -32122,20 +32126,16 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("store_entity: {}", e)))?;
 
-            // Auto-create a self-alias for the entity name (lowercase).
-            conn.execute(
-                "INSERT OR IGNORE INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) VALUES (?1, ?2, unixepoch(), 'auto')",
-                libsql::params![name.to_lowercase(), id.clone()],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("store_entity alias: {}", e)))?;
-
+            // G6 Stage 2 PR 2c sub-step 3 item 4: the self-alias used to be
+            // registered in `entity_aliases` here; that write is retired --
+            // the shadow page's own `aliases` seed just below
+            // (`aliases_json`) is now the sole record of it.
             let page_id = crate::pages::new_page_id();
-            // G6 Stage 2 PR 2c sub-step 2: direct values-based write. The
-            // self-alias just inserted above is the only alias this entity
-            // has yet, so the seed literal must byte-match what
-            // `json_group_array(alias_name)` would aggregate -- a compact
-            // single-element JSON array, same shape `serde_json` produces.
+            // The self-alias seeded below is the only alias this entity
+            // has yet, so the seed literal must byte-match what the
+            // page-payload UNION in `add_entity_alias` would produce -- a
+            // compact single-element JSON array, same shape `serde_json`
+            // produces.
             let aliases_json = serde_json::to_string(&[name.to_lowercase()])
                 .map_err(|e| WenlanError::VectorDb(format!("store_entity aliases: {}", e)))?;
             Self::insert_entity_shadow_page(
@@ -32222,14 +32222,18 @@ impl MemoryDB {
             }
         }
 
-        // Step 3: vector similarity (distance < 0.1 => sim > 0.9).
+        // Step 3: vector similarity (distance < 0.1 => sim > 0.9). Gated by
+        // the same entropy check Step 2.5 uses: a short/low-entropy name
+        // (e.g. "API" vs "APIs") can embed within the merge distance while
+        // still being a genuinely distinct entity, so it skips auto-merge
+        // here too and falls through to Step 4 (create new).
         if let Some(result) = self
             .search_entities_by_vector(name, 1)
             .await?
             .into_iter()
             .next()
         {
-            if result.distance < 0.1 {
+            if result.distance < 0.1 && crate::retrieval::dedup::has_high_entropy(name) {
                 let _ = self
                     .add_entity_alias(&name_lower, &result.entity.id, "auto")
                     .await;
@@ -32438,11 +32442,24 @@ impl MemoryDB {
     }
 
     /// Resolve an entity ID from an alias (case-insensitive).
+    ///
+    /// G6 Stage 2 PR 2c sub-step 3 item 4: reads the `kind='entity'` shadow
+    /// page's `aliases` JSON array via `entity_page_map`/`pages` --
+    /// `entity_aliases` stopped being written this sub-step. Losing the
+    /// table's UNIQUE(alias_name) means two active entity pages could in
+    /// principle both claim the same alias (a bug, not an expected state);
+    /// `ORDER BY p.created_at, epm.entity_id LIMIT 1` picks the oldest page
+    /// deterministically, approximating the old first-registration-wins
+    /// semantics instead of leaving the collision to row-order chance.
     pub async fn resolve_entity_by_alias(&self, name: &str) -> Result<Option<String>, WenlanError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT canonical_entity_id FROM entity_aliases WHERE alias_name = ?1",
+                "SELECT epm.entity_id FROM entity_page_map epm
+                 JOIN pages p ON p.id = epm.page_id
+                 WHERE p.kind = 'entity' AND p.status = 'active'
+                   AND EXISTS (SELECT 1 FROM json_each(p.aliases) WHERE value = ?1)
+                 ORDER BY p.created_at, epm.entity_id LIMIT 1",
                 libsql::params![name.to_lowercase()],
             )
             .await
@@ -32459,59 +32476,39 @@ impl MemoryDB {
     }
 
     /// Add an alias entry for an entity.
+    ///
+    /// G6 Stage 2 PR 2c sub-step 3 item 4: `entity_aliases` stops being
+    /// written -- the shadow page's `aliases` JSON array is now the sole
+    /// alias store, so this is a single page-payload read-modify-write
+    /// (UNION into the page's existing array dedupes/sorts, same as the
+    /// old `entity_aliases`-backed aggregate did) rather than an insert
+    /// plus a re-derivation. `_source` is unused: `pages.aliases` carries
+    /// no per-alias provenance field, so `entity_aliases.source` had no
+    /// page-payload equivalent to preserve.
     pub async fn add_entity_alias(
         &self,
         alias: &str,
         entity_id: &str,
-        source: &str,
+        _source: &str,
     ) -> Result<(), WenlanError> {
         let now_iso = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
-        // Transaction so the alias insert and the shadow-page alias re-sync
-        // (M3 PR-1 item C) commit atomically -- the shadow's `aliases` array
-        // never lags the `entity_aliases` table.
-        conn.execute("BEGIN", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("add alias begin: {}", e)))?;
-        let result: Result<(), WenlanError> = async {
-            conn.execute(
-                "INSERT OR IGNORE INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) VALUES (?1, ?2, unixepoch(), ?3)",
-                libsql::params![alias.to_lowercase(), entity_id.to_string(), source.to_string()],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("add alias: {}", e)))?;
-            // G6 Stage 2 PR 2c sub-step 2: narrowed aliases-aggregate BRIDGE
-            // -- `entity_aliases` is still the alias source of truth until
-            // sub-step 3's alias-write flip (named deferred item), so this
-            // stays a subquery re-derivation scoped to `aliases` only,
-            // never the full re-derivation `update_entity_shadow_page` did.
-            conn.execute(
-                "UPDATE pages SET
-                    aliases = (SELECT json_group_array(alias_name)
-                               FROM (SELECT alias_name FROM entity_aliases
-                                     WHERE canonical_entity_id = ?1 ORDER BY alias_name)),
-                    last_modified = ?2
-                 WHERE kind = 'entity'
-                   AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
-                libsql::params![entity_id.to_string(), now_iso.clone()],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("add alias shadow: {}", e)))?;
-            Ok(())
-        }
-        .await;
-        match result {
-            Ok(()) => {
-                conn.execute("COMMIT", ())
-                    .await
-                    .map_err(|e| WenlanError::VectorDb(format!("add alias commit: {}", e)))?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = conn.execute("ROLLBACK", ()).await;
-                Err(e)
-            }
-        }
+        conn.execute(
+            "UPDATE pages SET
+                aliases = (SELECT json_group_array(value) FROM (
+                    SELECT value FROM json_each(pages.aliases)
+                    UNION
+                    SELECT ?1
+                    ORDER BY value
+                )),
+                last_modified = ?2
+             WHERE kind = 'entity'
+               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
+            libsql::params![alias.to_lowercase(), now_iso, entity_id.to_string()],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("add alias shadow: {}", e)))?;
+        Ok(())
     }
 
     /// Resolve a relation type string against the vocabulary (case-insensitive).
@@ -33239,22 +33236,18 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities pages: {e}")))?;
 
+            // G6 Stage 2 PR 2c sub-step 3 item 4: FK-guard, kept on purpose.
+            // `entity_aliases.canonical_entity_id` has a NO ACTION FK into
+            // `entities(id)` that m122 does not rebuild, so any surviving
+            // alias row pointing at the loser blocks the `DELETE FROM
+            // entities` below. Retire this redirect together with the
+            // table in item 5.
             conn.execute(
                 "UPDATE OR IGNORE entity_aliases SET canonical_entity_id = ?1 WHERE canonical_entity_id = ?2",
                 libsql::params![canonical_id, alias_id],
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities alias redirect: {e}")))?;
-
-            if let Some(name) = &alias_name {
-                conn.execute(
-                    "INSERT OR IGNORE INTO entity_aliases (alias_name, canonical_entity_id, created_at, source) \
-                     VALUES (?1, ?2, unixepoch(), 'merge')",
-                    libsql::params![name.as_str(), canonical_id],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities alias register: {e}")))?;
-            }
 
             // T16 conservative type-promotion: generic canonical -> alias's
             // concrete type. The WHERE guard re-checks both conditions in SQL so
@@ -33280,6 +33273,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities band cleanup: {e}")))?;
 
+            // G6 Stage 2 PR 2c sub-step 3 item 4: FK-guard, kept on purpose
+            // (same NO ACTION FK as the redirect above -- every entity has
+            // at least a self-alias row, so this must run before the
+            // `DELETE FROM entities` below). Retire together with the
+            // table in item 5.
             conn.execute(
                 "DELETE FROM entity_aliases WHERE canonical_entity_id = ?1",
                 libsql::params![alias_id],
@@ -33291,9 +33289,33 @@ impl MemoryDB {
             // page would otherwise be orphaned by the entity delete below (the
             // map row cascades on the entity FK, never the page). Delete it
             // first so its own ON DELETE CASCADE drops the map row.
+            //
+            // G6 Stage 2 PR 2c sub-step 3 item 4: capture the loser's
+            // `aliases` JSON before deleting its shadow page -- the old
+            // redirect above moved ALL of the loser's `entity_aliases`
+            // rows (not just its self-alias) onto the canonical id, so the
+            // canonical bridge below must union the loser's full alias set
+            // to match, not just its bare name.
+            let mut loser_aliases_json: Option<String> = None;
             if let Some(loser_page_id) =
                 entity_page_adapter::page_id_for_entity(&conn, alias_id).await?
             {
+                let mut loser_rows = conn
+                    .query(
+                        "SELECT aliases FROM pages WHERE id = ?1",
+                        libsql::params![loser_page_id.clone()],
+                    )
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("merge_entities loser aliases read: {e}"))
+                    })?;
+                if let Some(row) = loser_rows.next().await.map_err(|e| {
+                    WenlanError::VectorDb(format!("merge_entities loser aliases row: {e}"))
+                })? {
+                    loser_aliases_json = row.get::<Option<String>>(0).unwrap_or(None);
+                }
+                drop(loser_rows);
+
                 conn.execute(
                     "DELETE FROM pages WHERE kind = 'entity' AND id = ?1",
                     libsql::params![loser_page_id],
@@ -33310,24 +33332,33 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities delete alias: {e}")))?;
 
             // The canonical's shadowed fields drifted in this merge: aliases
-            // were redirected + the loser's name registered, and its
-            // entity_type may have been promoted. G6 Stage 2 PR 2c sub-step
-            // 2: narrowed aliases-aggregate BRIDGE (approved scope: aliases
-            // + last_modified + entity_type when relevant) -- entity_aliases
-            // is still the alias source of truth until sub-step 3's
-            // alias-write flip (named deferred item), so this stays a
-            // subquery re-derivation scoped to these columns only, never
-            // the full re-derivation `update_entity_shadow_page` did.
+            // gained the loser's full alias set, and entity_type may have
+            // been promoted. G6 Stage 2 PR 2c sub-step 3 item 4: aliases is
+            // now a page-payload UNION of the canonical's existing array,
+            // the loser's captured array, and the loser's bare name (the
+            // union covers the same ground the old `entity_aliases`
+            // redirect + register did); entity_type stays reading from
+            // `entities` unchanged until item 5's flip.
             conn.execute(
                 "UPDATE pages SET
                     entity_type = (SELECT entity_type FROM entities WHERE id = ?1),
-                    aliases = (SELECT json_group_array(alias_name)
-                               FROM (SELECT alias_name FROM entity_aliases
-                                     WHERE canonical_entity_id = ?1 ORDER BY alias_name)),
-                    last_modified = ?2
+                    aliases = (SELECT json_group_array(value) FROM (
+                        SELECT value FROM json_each(pages.aliases)
+                        UNION
+                        SELECT value FROM json_each(COALESCE(?2, '[]'))
+                        UNION
+                        SELECT ?3 WHERE ?3 != ''
+                        ORDER BY value
+                    )),
+                    last_modified = ?4
                  WHERE kind = 'entity'
                    AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
-                libsql::params![canonical_id.to_string(), now_iso.clone()],
+                libsql::params![
+                    canonical_id.to_string(),
+                    loser_aliases_json,
+                    alias_name.as_deref().map(|n| n.to_lowercase()).unwrap_or_default(),
+                    now_iso.clone(),
+                ],
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities canonical shadow: {e}")))?;
@@ -34087,6 +34118,12 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete_entity pages: {e}")))?;
 
+            // G6 Stage 2 PR 2c sub-step 3 item 4: FK-guard, kept on purpose.
+            // `entity_aliases.canonical_entity_id` has a NO ACTION FK into
+            // `entities(id)` that m122 does not rebuild, and every entity
+            // has at least a self-alias row, so this must run before the
+            // `DELETE FROM entities` below. Retire together with the table
+            // in item 5.
             conn.execute(
                 "DELETE FROM entity_aliases WHERE canonical_entity_id = ?1",
                 libsql::params![entity_id],
@@ -34551,12 +34588,18 @@ impl MemoryDB {
             let mut first_entity_id: Option<String> = None;
             for (lower, name, entity_type, embedding, minhash_candidate) in &prepared_entities {
                 let mut resolved: Option<String> = None;
-                let mut alias_source = "auto";
 
+                // G6 Stage 2 PR 2c sub-step 3 item 4: page-payload lookup,
+                // same JSON-containment + deterministic tie-break as
+                // `resolve_entity_by_alias` -- `entity_aliases` stopped
+                // being written this sub-step.
                 let mut alias_rows = conn
                     .query(
-                        "SELECT canonical_entity_id FROM entity_aliases
-                         WHERE alias_name = ?1 LIMIT 1",
+                        "SELECT epm.entity_id FROM entity_page_map epm
+                         JOIN pages p ON p.id = epm.page_id
+                         WHERE p.kind = 'entity' AND p.status = 'active'
+                           AND EXISTS (SELECT 1 FROM json_each(p.aliases) WHERE value = ?1)
+                         ORDER BY p.created_at, epm.entity_id LIMIT 1",
                         libsql::params![lower.as_str()],
                     )
                     .await
@@ -34623,7 +34666,6 @@ impl MemoryDB {
                             .is_some()
                         {
                             resolved = Some(candidate_id.clone());
-                            alias_source = "minhash";
                         }
                     }
                 }
@@ -34710,33 +34752,25 @@ impl MemoryDB {
                     }
                 };
 
-                conn.execute(
-                    "INSERT OR IGNORE INTO entity_aliases
-                         (alias_name, canonical_entity_id, created_at, source)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    libsql::params![lower.as_str(), entity_id.as_str(), now, alias_source],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("entity enrichment alias insert: {e}"))
-                })?;
                 // `aliases` is a shadow-mirrored column, so a (possibly new)
                 // alias on a resolved entity must re-sync the shadow too --
-                // same rule as `add_entity_alias`. No-op when nothing changed.
-                // G6 Stage 2 PR 2c sub-step 2: narrowed aliases-aggregate
-                // BRIDGE (approved scope) -- `entity_aliases` is still the
-                // alias source of truth until sub-step 3's alias-write flip
-                // (named deferred item), so this stays a subquery
-                // re-derivation scoped to `aliases` only.
+                // same rule as `add_entity_alias`. No-op when the alias is
+                // already present. G6 Stage 2 PR 2c sub-step 3 item 4:
+                // `entity_aliases` stops being written -- page-payload
+                // UNION read-modify-write, same pattern as
+                // `add_entity_alias`.
                 conn.execute(
                     "UPDATE pages SET
-                        aliases = (SELECT json_group_array(alias_name)
-                                   FROM (SELECT alias_name FROM entity_aliases
-                                         WHERE canonical_entity_id = ?1 ORDER BY alias_name)),
+                        aliases = (SELECT json_group_array(value) FROM (
+                            SELECT value FROM json_each(pages.aliases)
+                            UNION
+                            SELECT ?1
+                            ORDER BY value
+                        )),
                         last_modified = ?2
                      WHERE kind = 'entity'
-                       AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
-                    libsql::params![entity_id.as_str(), now_iso.clone()],
+                       AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
+                    libsql::params![lower.as_str(), now_iso.clone(), entity_id.as_str()],
                 )
                 .await
                 .map_err(|e| {

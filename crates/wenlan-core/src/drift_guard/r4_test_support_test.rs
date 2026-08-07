@@ -3229,7 +3229,7 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        1026,
+        1020,
         "PR-D integration must expose the frozen 967 support calls, the 6 PR-D test identities, \
          the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, \
          the 7 G6 BindPageLink repair-test calls (G6 Stage 2 PR 2b, item 3: \
@@ -3252,7 +3252,11 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
          INSERT INTO edges, each gaining a query/next pair (test_run_rethink_normalizes_relation_types \
          also gains a TestDbRow::get); and the new acceptance-pin test \
          heal_relation_vocabulary_discovers_and_folds_edges_collision_keeps_stronger contributes \
-         15 calls)"
+         15 calls); minus the net -6 G6 Stage 2 PR 2c item 4 calls (entity alias storage moves \
+         off the raw entity_aliases table onto resolve_entity_by_alias's shadow-page scan: \
+         create_entity_minhash_disabled_is_noop and create_entity_minhash_short_name_skips_fuzzy \
+         each drop their second TestDbRow::get, TestDbRows::next, and TestDbSession::query call, \
+         losing the raw alias-row readback the old exact-match SQL needed)"
     );
 }
 
