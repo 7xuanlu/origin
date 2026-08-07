@@ -427,11 +427,124 @@ async fn suspicious_existing_page_and_entity_links_are_distinct_candidates() {
          -- G6 Stage 1.2: entity_scope_clause/load_relations (reader #4) read
          -- `edges`, not `relations` -- mirror the dual-write here. Both rows
          -- matter: the test asserts the same-space relation is NOT flagged
-         -- while the cross-space one is.
+         -- while the cross-space one is. `edges_space_fence`'s entity arm
+         -- (migration 121) resolves an entity endpoint's space via its
+         -- `kind='entity'` shadow page, which these raw-seeded entities
+         -- deliberately don't have -- so the fence itself is dropped and
+         -- recreated verbatim (migration 121's exact body) around this
+         -- INSERT to simulate legacy pre-shadow-page data, which the fence
+         -- already grandfathers via its `lineage != 'legacy'` WHEN guard.
+         -- Seeding real shadow pages instead would dodge that guard but
+         -- leaks the two rows into `load_pages`'s unfenced `p.status='active'`
+         -- scan (semantic_candidates.rs) as false PageProvenanceAdequacy
+         -- candidates -- a real, separate bug, not something to paper over
+         -- here.
+         DROP TRIGGER edges_space_fence;
+         DROP TRIGGER edges_space_fence_update;
          INSERT INTO edges
              (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type)
          VALUES ('edge-relation-same','entity-work','entity','entity-work-peer','entity','relates','assertion',0,'work',1,'related'),
                 ('edge-relation-cross','entity-work','entity','entity-personal','entity','relates','legacy',0,'work',1,'related');
+         CREATE TRIGGER edges_space_fence
+         AFTER INSERT ON edges
+         WHEN NEW.lineage != 'legacy'
+         BEGIN
+             SELECT RAISE(ABORT, 'edges_space_fence: cross-space edge rejected')
+             WHERE (
+                 NOT (NEW.edge_type = 'attests' AND NEW.src_kind = 'root')
+                 AND (
+                     CASE NEW.src_kind
+                         WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.src_id)
+                         WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.src_id)
+                         WHEN 'entity' THEN (
+                             SELECT p.space FROM entity_page_map epm
+                               JOIN pages p ON p.id = epm.page_id
+                              WHERE epm.entity_id = NEW.src_id
+                                AND p.kind = 'entity' AND p.status = 'active'
+                         )
+                         WHEN 'claim_revision' THEN (
+                             SELECT p.space FROM claim_revisions cr
+                               JOIN claims c ON c.claim_id = cr.claim_id
+                               JOIN pages p ON p.id = c.page_id
+                              WHERE cr.claim_revision_id = NEW.src_id
+                         )
+                         ELSE NULL
+                     END
+                 ) IS NOT NEW.space
+             )
+             OR (
+                 NOT (NEW.edge_type = 'cites' AND NEW.dst_kind = 'external')
+                 AND (
+                     CASE NEW.dst_kind
+                         WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.dst_id)
+                         WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.dst_id)
+                         WHEN 'entity' THEN (
+                             SELECT p.space FROM entity_page_map epm
+                               JOIN pages p ON p.id = epm.page_id
+                              WHERE epm.entity_id = NEW.dst_id
+                                AND p.kind = 'entity' AND p.status = 'active'
+                         )
+                         WHEN 'claim_revision' THEN (
+                             SELECT p.space FROM claim_revisions cr
+                               JOIN claims c ON c.claim_id = cr.claim_id
+                               JOIN pages p ON p.id = c.page_id
+                              WHERE cr.claim_revision_id = NEW.dst_id
+                         )
+                         ELSE NULL
+                     END
+                 ) IS NOT NEW.space
+             );
+         END;
+         CREATE TRIGGER edges_space_fence_update
+         AFTER UPDATE ON edges
+         WHEN NEW.lineage != 'legacy' AND NEW.valid_until IS NULL
+         BEGIN
+             SELECT RAISE(ABORT, 'edges_space_fence: cross-space edge rejected')
+             WHERE (
+                 NOT (NEW.edge_type = 'attests' AND NEW.src_kind = 'root')
+                 AND (
+                     CASE NEW.src_kind
+                         WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.src_id)
+                         WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.src_id)
+                         WHEN 'entity' THEN (
+                             SELECT p.space FROM entity_page_map epm
+                               JOIN pages p ON p.id = epm.page_id
+                              WHERE epm.entity_id = NEW.src_id
+                                AND p.kind = 'entity' AND p.status = 'active'
+                         )
+                         WHEN 'claim_revision' THEN (
+                             SELECT p.space FROM claim_revisions cr
+                               JOIN claims c ON c.claim_id = cr.claim_id
+                               JOIN pages p ON p.id = c.page_id
+                              WHERE cr.claim_revision_id = NEW.src_id
+                         )
+                         ELSE NULL
+                     END
+                 ) IS NOT NEW.space
+             )
+             OR (
+                 NOT (NEW.edge_type = 'cites' AND NEW.dst_kind = 'external')
+                 AND (
+                     CASE NEW.dst_kind
+                         WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.dst_id)
+                         WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.dst_id)
+                         WHEN 'entity' THEN (
+                             SELECT p.space FROM entity_page_map epm
+                               JOIN pages p ON p.id = epm.page_id
+                              WHERE epm.entity_id = NEW.dst_id
+                                AND p.kind = 'entity' AND p.status = 'active'
+                         )
+                         WHEN 'claim_revision' THEN (
+                             SELECT p.space FROM claim_revisions cr
+                               JOIN claims c ON c.claim_id = cr.claim_id
+                               JOIN pages p ON p.id = c.page_id
+                              WHERE cr.claim_revision_id = NEW.dst_id
+                         )
+                         ELSE NULL
+                     END
+                 ) IS NOT NEW.space
+             );
+         END;
          INSERT INTO pages
              (id,title,content,source_memory_ids,version,status,created_at,last_compiled,
               last_modified,workspace,creation_kind,review_status)

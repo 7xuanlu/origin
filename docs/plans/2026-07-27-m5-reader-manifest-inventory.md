@@ -900,6 +900,7 @@ carrying the authority of agreement.
 | `core/db.rs::find_unique_active_page_id_by_title_scoped` | `pub` | no | no | — | — |
 | `core/db.rs::get_entity_detail` | `pub` | no | **yes** | `server/entity_graph_routes.rs::handle_create_entity` | — |
 | `core/db.rs::get_entity_name_type` | `pub` | no | **yes** | `server/page_map_routes.rs::compute_ref_state` | — |
+| `core/db.rs::get_observations_for_entities` | `pub` | no | no | — | — |
 | `core/db.rs::get_page_by_entity` | `pub` | no | no | — | — |
 | `core/db.rs::get_page_inner` | `private` | no | no | — | — |
 | `core/db.rs::get_pages_for_memory` | `pub` | no | no | — | — |
@@ -934,6 +935,8 @@ carrying the authority of agreement.
 | `core/db/claim_derivation.rs::evaluate_support_on` | `private` | no | no | — | — |
 | `core/db/claim_derivation.rs::load_linked_memory_chunks` | `private` | no | no | — | — |
 | `core/db/kg_quality_diagnostics.rs::list_contradiction_observation_counts` | `pub(crate)` | no | no | — | — |
+| `core/db/kg_quality_duplicate_candidates.rs::duplicate_name_groups_for_merge_candidates` | `pub(crate)` | no | no | — | — |
+| `core/db/kg_quality_duplicate_candidates.rs::entities_for_minhash_merge_candidates` | `pub(crate)` | no | no | — | — |
 | `core/db/kg_quality_embedding_refresh.rs::stale_entity_embedding_candidates_for_refresh` | `pub(crate)` | no | no | — | — |
 | `core/db/maintenance_duplicate_reads.rs::embedding_near_duplicate_pairs` | `pub(crate)` | no | no | — | — |
 | `core/db/maintenance_duplicate_reads.rs::scan_near_duplicate_slice` | `pub(crate)` | no | no | — | — |
@@ -1008,12 +1011,15 @@ carrying the authority of agreement.
 | `core/db/claim_derivation.rs::run_leased_page_linked_truth_promotion` | `pub(super)` | no | no | — | `core/db/claim_derivation.rs::derive_leased_page_claims`, `core/db/claim_derivation.rs::load_linked_memory_chunks` |
 | `core/db/presence_review.rs::review_in_txn` | `private` | no | no | — | `core/db/presence_review.rs::page_binding` |
 | `core/db/repair_page_rename.rs::rename_page_projection_matches_post` | `private` | no | no | — | `core/db/repair_page_rename.rs::page_on_connection` |
+| `core/db/scoped_entities.rs::get_observations_for_entities_scoped` | `pub(super)` | no | no | — | `core/db.rs::get_observations_for_entities` |
 | `core/db/scoped_pages.rs::list_recent_pages_with_badges_scoped` | `pub` | no | **yes** | `server/routes.rs::handle_recent_pages` | `core/db.rs::list_recent_pages_with_badges` |
 | `core/db/truth_exposure.rs::page_visibility` | `pub` | no | no | — | `core/db/truth_exposure.rs::page_truth_states` |
 | `core/export/knowledge.rs::plan_truth_cutover` | `pub` | no | **yes** | `server/cmd_cutover.rs::run` | `core/db/truth_exposure.rs::page_truth_states` |
 | `core/kg/reweave.rs::reweave_entity_links` | `pub` | no | no | — | `core/db.rs::search_entities_by_vector` |
+| `core/kg_quality.rs::find_merge_candidates` | `pub` | no | no | — | `core/db/kg_quality_duplicate_candidates.rs::duplicate_name_groups_for_merge_candidates` |
 | `core/kg_quality.rs::refresh_stale_entity_embeddings` | `pub` | no | no | — | `core/db/kg_quality_embedding_refresh.rs::stale_entity_embedding_candidates_for_refresh` |
 | `core/kg_quality.rs::scan_contradictions` | `pub` | no | no | — | `core/db/kg_quality_diagnostics.rs::list_contradiction_observation_counts` |
+| `core/kg_quality.rs::surface_minhash_merge_candidates` | `private` | no | no | — | `core/db/kg_quality_duplicate_candidates.rs::entities_for_minhash_merge_candidates` |
 | `core/kg_quality.rs::verify_entity` | `pub` | no | no | — | `core/db.rs::search_entities_by_vector` |
 | `core/lint/deep.rs::run` | `pub(super)` | yes | no | — | `core/lint/deep.rs::page_body_result`, `core/lint/deep.rs::page_duplicates` |
 | `core/lint/kg/query.rs::load` | `pub(super)` | yes | no | — | `core/lint/kg/query/aggregate.rs::advisory_metrics` |
@@ -1066,7 +1072,7 @@ carrying the authority of agreement.
 |---|---|---|---|---|---|
 | `core/citations.rs::run_citation_backfill_with_page_limit` | `private` | no | no | — | `core/db.rs::get_page` |
 | `core/db.rs::augment_with_graph` | `pub` | no | no | — | `core/db.rs::augment_with_graph_gated` |
-| `core/db.rs::augment_with_graph_seeded_scoped` | `private` | no | no | — | `core/db.rs::augment_with_graph_gated` |
+| `core/db.rs::augment_with_graph_seeded_scoped` | `private` | no | no | — | `core/db.rs::augment_with_graph_gated`, `core/db/scoped_entities.rs::get_observations_for_entities_scoped` |
 | `core/db.rs::commit_entity_enrichment_at_version` | `private` | no | no | — | `core/db.rs::minhash_resolve_candidate` |
 | `core/db.rs::find_distillation_clusters` | `pub` | no | no | — | `core/db.rs::find_distillation_clusters_scoped` |
 | `core/db.rs::find_page_by_source_memory` | `pub` | no | no | — | `core/db.rs::get_page` |
@@ -1150,7 +1156,7 @@ carrying the authority of agreement.
 | `core/export/knowledge.rs::run_truth_cutover` | `pub` | no | **yes** | `server/cmd_cutover.rs::run` | `core/export/knowledge.rs::plan_truth_cutover` |
 | `core/importer.rs::resolve_entity_bulk` | `pub(crate)` | no | no | — | `core/db.rs::resolve_or_create_entity` |
 | `core/ingest.rs::run_canonical_enrichment` | `pub` | no | no | — | `core/post_ingest.rs::run_post_ingest_enrichment` |
-| `core/kg_quality.rs::run_rethink` | `pub` | no | no | — | `core/kg_quality.rs::refresh_stale_entity_embeddings`, `core/kg_quality.rs::scan_contradictions` |
+| `core/kg_quality.rs::run_rethink` | `pub` | no | no | — | `core/kg_quality.rs::find_merge_candidates`, `core/kg_quality.rs::refresh_stale_entity_embeddings`, `core/kg_quality.rs::scan_contradictions` |
 | `core/kg_quality.rs::verify_page` | `pub` | no | no | — | `core/db.rs::search_memory` |
 | `core/lint/semantic.rs::run_agent_submit` | `private` | no | no | — | `core/truth_adapter.rs::verdicts` |
 | `core/m6/oracle.rs::recompute_full` | `pub` | no | no | — | `core/m6/signals.rs::community_overview`, `core/m6/signals.rs::evidence_cluster`, `core/m6/signals.rs::orphan_wikilink`, `core/m6/signals.rs::space_overview` |

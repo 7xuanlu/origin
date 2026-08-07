@@ -673,6 +673,14 @@ mod tests {
             }
             drop(conn);
 
+            // `find_merge_candidates` groups by the `kind='entity'` shadow
+            // page's title (G6 Stage 2 PR 2c sub-step 3 item 1), not the raw
+            // `entities.name` inserted above -- seed a shadow page per id so
+            // the migrated query has something to group.
+            for id in ["dup-1", "dup-2", "dup-3", "singleton"] {
+                db.test_seed_entity_shadow_page(id).await.unwrap();
+            }
+
             let count = find_merge_candidates(&db).await.unwrap();
             assert_eq!(
                 count, 2,
