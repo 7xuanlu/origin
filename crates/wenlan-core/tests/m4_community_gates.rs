@@ -1608,6 +1608,10 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
         )
         .await
         .expect("seed embedded isolated entity");
+    // The ported `edges_space_fence` trigger resolves an entity endpoint's
+    // space via its shadow page and fails closed mid-transaction, so the
+    // entities above need shadow pages before the edges below can insert.
+    seed_entity_shadow_pages(&observer).await;
     for node in 0..10 {
         observer
             .execute(
@@ -2236,6 +2240,10 @@ async fn m4_below_floor_holds_prior_publication_and_stays_queued() {
             .await
             .expect("seed below-floor entity");
     }
+    // The ported `edges_space_fence` trigger resolves an entity endpoint's
+    // space via its shadow page, so the entities above need one each before
+    // the edges below can insert.
+    seed_entity_shadow_pages(&observer).await;
     for node in 0..PARTICIPANTS {
         observer
             .execute(
@@ -2373,6 +2381,10 @@ async fn m4_phase_round_robin_reaches_later_dirty_space_after_held_restart() {
                 .await
                 .expect("seed round-robin entity");
         }
+        // The ported `edges_space_fence` trigger resolves an entity endpoint's
+        // space via its shadow page, so this space's entities need one each
+        // before its edges below can insert.
+        seed_entity_shadow_pages(&observer).await;
         for node in 0..participants {
             observer
                 .execute(
@@ -3261,6 +3273,11 @@ async fn seed_m4_graded_corpus(observer: &libsql::Connection) {
                     .expect("seed M4 scale entity");
             }
         }
+
+        // The ported `edges_space_fence` trigger resolves an entity endpoint's
+        // space via its shadow page and fails closed mid-transaction, so this
+        // space's entities need shadow pages before its edges below can insert.
+        seed_entity_shadow_pages(observer).await;
 
         let mut edge_index = 0usize;
         for cluster in 0..CLUSTERS_PER_SPACE {

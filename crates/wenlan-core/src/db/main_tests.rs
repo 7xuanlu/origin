@@ -544,6 +544,17 @@ async fn cancelling_m4_finalize_rolls_back_and_restores_lease_connection_and_run
             .await
             .unwrap();
         }
+    }
+    // The ported `edges_space_fence` trigger resolves an entity endpoint's
+    // space via its shadow page, so the raw-seeded nodes above need one each
+    // before the edges below can insert.
+    for node in 0..NODE_COUNT {
+        db.test_seed_entity_shadow_page(&format!("m4-cancel-node-{node:02}"))
+            .await
+            .unwrap();
+    }
+    {
+        let conn = db.conn.lock().await;
         for node in 0..NODE_COUNT {
             conn.execute(
                 "INSERT INTO edges
@@ -765,6 +776,17 @@ async fn older_m4_cycle_cannot_overwrite_newer_published_runtime() {
             .await
             .unwrap();
         }
+    }
+    // The ported `edges_space_fence` trigger resolves an entity endpoint's
+    // space via its shadow page, so the raw-seeded nodes above need one each
+    // before the edges below can insert.
+    for node in 0..NODE_COUNT {
+        db.test_seed_entity_shadow_page(&format!("m4-overlap-node-{node:02}"))
+            .await
+            .unwrap();
+    }
+    {
+        let conn = db.conn.lock().await;
         for node in 0..NODE_COUNT {
             conn.execute(
                 "INSERT INTO edges
@@ -1316,6 +1338,17 @@ async fn migration_95_repairs_stamped_schema_and_bootstraps_existing_grounded_sp
     )
     .await
     .unwrap();
+    drop(conn);
+    // The ported `edges_space_fence` trigger resolves an entity endpoint's
+    // space via its shadow page, so the two raw-seeded entities above need
+    // one each before the edge below can insert.
+    db.test_seed_entity_shadow_page("m95-bootstrap-left")
+        .await
+        .unwrap();
+    db.test_seed_entity_shadow_page("m95-bootstrap-right")
+        .await
+        .unwrap();
+    let conn = db.conn.lock().await;
     // Content-addressed, and backed by the `relations` row above: `relations` is
     // the sole producer of `relates`, so an edge with no relation behind it is
     // parity drift that migration 111's repair retracts.
@@ -1425,22 +1458,39 @@ async fn migration_95_complete_shape_does_not_repeat_grounded_bootstrap_scan() {
     )
     .await
     .unwrap();
-    conn.execute_batch(
+    conn.execute(
         "INSERT INTO provenance_roots (
              root_id, identity_version, identity_digest, root_kind,
              independence_group_id, status, created_at
          ) VALUES (
              'm95-late-root', 1, 'm95-late-digest', 'generated',
              'm95-late-group', 'active', 1
-         );
-         INSERT INTO edges (
+         )",
+        (),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    // The ported `edges_space_fence` trigger resolves an entity endpoint's
+    // space via its shadow page, so the two raw-seeded entities above need
+    // one each before the edge below can insert.
+    db.test_seed_entity_shadow_page("m95-late-left")
+        .await
+        .unwrap();
+    db.test_seed_entity_shadow_page("m95-late-right")
+        .await
+        .unwrap();
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO edges (
              edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
              lineage, grounded, root_id, space, created_at
          ) VALUES (
              'm95-late-edge', 'm95-late-left', 'entity',
              'm95-late-right', 'entity', 'relates', 'assertion', 1,
              'm95-late-root', 'm95-late-direct-space', 1
-         );",
+         )",
+        (),
     )
     .await
     .unwrap();
@@ -4987,6 +5037,16 @@ async fn community_consistency_detects_a_missing_connected_participant() {
             .await
             .unwrap();
         }
+        drop(conn);
+        // The ported `edges_space_fence` trigger resolves an entity
+        // endpoint's space via its shadow page, so the raw-seeded nodes
+        // above need one each before the edges below can insert.
+        for node in 0..10 {
+            db.test_seed_entity_shadow_page(&format!("m96-consistency-node-{node:02}"))
+                .await
+                .unwrap();
+        }
+        let conn = db.conn.lock().await;
         for node in 0..10 {
             conn.execute(
                 "INSERT INTO edges
@@ -48152,6 +48212,13 @@ async fn dual_write_edge_relates_destination_move_downgrades_to_legacy() {
         .await
         .unwrap();
     }
+    drop(conn);
+    // The ported `edges_space_fence` trigger resolves an entity endpoint's
+    // space via its shadow page, so both raw-seeded entities need one before
+    // the first (same-space) edge below can insert.
+    db.test_seed_entity_shadow_page("ent_src").await.unwrap();
+    db.test_seed_entity_shadow_page("ent_dst").await.unwrap();
+    let conn = db.conn.lock().await;
     MemoryDB::dual_write_edge(
         &conn,
         "relates",
@@ -48169,6 +48236,17 @@ async fn dual_write_edge_relates_destination_move_downgrades_to_legacy() {
     .expect("same-space assertion edge inserts");
     conn.execute(
         "UPDATE entities SET space = 'space_b' WHERE id = 'ent_dst'",
+        (),
+    )
+    .await
+    .unwrap();
+    // Production space-mutating writers sync the entity's shadow page in the
+    // same transaction (G6 Stage 2 item 2); mirror that here so the fence
+    // sees the same cross-space move this test is asserting a downgrade for.
+    conn.execute(
+        "UPDATE pages SET space = 'space_b', workspace = 'space_b' \
+         WHERE kind = 'entity' \
+           AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = 'ent_dst')",
         (),
     )
     .await

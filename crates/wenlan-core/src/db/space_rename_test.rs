@@ -47,6 +47,40 @@ async fn seed_substrate(conn: &libsql::Connection, space: &str) {
              VALUES ('ent-1', 'Anchor', 'concept', ?1, 1, 1)",
             vec![space.into()],
         ),
+        // G6 Stage 2 item 1 (db.rs:9219): the ported `edges_space_fence`/
+        // `edges_space_fence_update` triggers resolve an entity endpoint's
+        // space via its shadow page, not `entities.space` directly, and
+        // fail closed (abort) when no shadow page exists. The non-legacy
+        // edge seeded below needs one for 'ent-1' before it can insert.
+        // Same shape as `insert_entity_shadow_page`/`m4_community_gates.rs`'s
+        // `seed_entity_shadow_pages`.
+        (
+            "INSERT INTO pages (
+                 id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+                 embedding, space, workspace, source_memory_ids, version, status,
+                 created_at, last_compiled, last_modified, creation_kind, review_status
+             )
+             VALUES ('shadow-ent-1', 'Anchor', NULL, '', 'entity', 'concept', NULL, 0,
+                     NULL, ?1, ?1, '[]', 1, 'active',
+                     '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z',
+                     'entity', 'unconfirmed')",
+            vec![space.into()],
+        ),
+        (
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at)
+             VALUES ('ent-1', 'shadow-ent-1', '2024-01-01T00:00:00Z')",
+            vec![],
+        ),
+        // `m4_page_community_page_insert_input` (db.rs:11483) fires on every
+        // `pages` insert and mints a `page_community_route_inputs` row keyed
+        // by page_id, so the shadow page above added a second one this
+        // closure never expected -- 'page-1' is the fixture's one
+        // community-routable page. Undo the trigger's side effect for the
+        // shadow page only; it carries no separate routing meaning here.
+        (
+            "DELETE FROM page_community_route_inputs WHERE page_id = 'shadow-ent-1'",
+            vec![],
+        ),
         (
             "INSERT INTO pages (id, title, content, space, created_at, last_compiled, last_modified)
              VALUES ('page-1', 'Anchor', 'body', ?1, '2024-01-01T00:00:00Z',
