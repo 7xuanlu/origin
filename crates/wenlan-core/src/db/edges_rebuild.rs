@@ -133,12 +133,7 @@ const FENCE_BODY: &str = "
             CASE NEW.src_kind
                 WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.src_id)
                 WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.src_id)
-                WHEN 'entity' THEN (
-                    SELECT p.space FROM entity_page_map epm
-                      JOIN pages p ON p.id = epm.page_id
-                     WHERE epm.entity_id = NEW.src_id
-                       AND p.kind = 'entity' AND p.status = 'active'
-                )
+                WHEN 'entity' THEN (SELECT space FROM entities WHERE id = NEW.src_id)
                 WHEN 'claim_revision' THEN (
                     SELECT p.space FROM claim_revisions cr
                       JOIN claims c ON c.claim_id = cr.claim_id
@@ -155,12 +150,7 @@ const FENCE_BODY: &str = "
             CASE NEW.dst_kind
                 WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.dst_id)
                 WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.dst_id)
-                WHEN 'entity' THEN (
-                    SELECT p.space FROM entity_page_map epm
-                      JOIN pages p ON p.id = epm.page_id
-                     WHERE epm.entity_id = NEW.dst_id
-                       AND p.kind = 'entity' AND p.status = 'active'
-                )
+                WHEN 'entity' THEN (SELECT space FROM entities WHERE id = NEW.dst_id)
                 WHEN 'claim_revision' THEN (
                     SELECT p.space FROM claim_revisions cr
                       JOIN claims c ON c.claim_id = cr.claim_id
