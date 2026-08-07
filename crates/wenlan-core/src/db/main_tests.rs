@@ -3922,9 +3922,14 @@ async fn entity_shadow_centroid_routes_and_invalidates_entity_poor_pages() {
         )
         .await
         .unwrap();
-        MemoryDB::update_entity_shadow_page(&conn, &entity_id, "now")
-            .await
-            .unwrap();
+        conn.execute(
+            "UPDATE pages SET embedding = vector32(?1)
+             WHERE kind = 'entity'
+               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?2)",
+            libsql::params![aligned_sql.clone(), entity_id.clone()],
+        )
+        .await
+        .unwrap();
         conn.execute(
             "INSERT INTO communities
                 (community_id, space, display_name, algo_version, projection_version,
@@ -44503,6 +44508,193 @@ async fn merge_entities_deletes_loser_shadow_and_resyncs_canonical() {
     assert_eq!(
         et, "person",
         "the canonical shadow must reflect the promoted entity_type"
+    );
+}
+
+/// G6 Stage 2 PR 2c sub-step 2 oracle gate: every live entity mutator now
+/// writes its shadow page directly from values in hand instead of
+/// re-deriving from `entities` via `update_entity_shadow_page` (retired
+/// this sub-step). Drives every mutation kind in sequence and asserts
+/// `compute_entity_page_parity_report` stays drift-0 after each one.
+#[tokio::test]
+async fn every_entity_mutation_kind_stays_page_parity() {
+    let (db, _dir) = test_db().await;
+
+    let a = db
+        .create_entity("Parity A", "person", Some("space_parity"))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.compute_entity_page_parity_report()
+            .await
+            .unwrap()
+            .drift_count,
+        0,
+        "create_entity"
+    );
+
+    db.add_entity_alias("Parity Alias", &a, "test")
+        .await
+        .unwrap();
+    assert_eq!(
+        db.compute_entity_page_parity_report()
+            .await
+            .unwrap()
+            .drift_count,
+        0,
+        "add_entity_alias"
+    );
+
+    db.add_observation(&a, "an observation about Parity A", Some("test"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.compute_entity_page_parity_report()
+            .await
+            .unwrap()
+            .drift_count,
+        0,
+        "add_observation"
+    );
+
+    db.confirm_entity(&a, true).await.unwrap();
+    assert_eq!(
+        db.compute_entity_page_parity_report()
+            .await
+            .unwrap()
+            .drift_count,
+        0,
+        "confirm_entity"
+    );
+
+    db.refresh_entity_embedding(&a, "fresh embedding text for Parity A")
+        .await
+        .unwrap();
+    assert_eq!(
+        db.compute_entity_page_parity_report()
+            .await
+            .unwrap()
+            .drift_count,
+        0,
+        "refresh_entity_embedding"
+    );
+
+    let b = db
+        .store_entity(
+            "Parity B",
+            "entity",
+            Some("space_parity"),
+            Some("test"),
+            Some(0.5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.compute_entity_page_parity_report()
+            .await
+            .unwrap()
+            .drift_count,
+        0,
+        "store_entity"
+    );
+    // Generic `b` merges into concrete-typed `a` -- exercises the merge
+    // path's aliases-aggregate bridge without a type promotion.
+    db.merge_entities(&a, &b).await.unwrap();
+    assert_eq!(
+        db.compute_entity_page_parity_report()
+            .await
+            .unwrap()
+            .drift_count,
+        0,
+        "merge_entities"
+    );
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO memories
+                 (id, content, source, source_id, title, chunk_index,
+                  last_modified, chunk_type, pending_revision, version)
+             VALUES ('c_parity_enrich', 'enrichment content', 'memory',
+                     'mem_parity_enrich', '', 0, 1, 'text', 0, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    assert!(db
+        .commit_entity_enrichment_at_version(
+            "mem_parity_enrich",
+            1,
+            &extracted_entity_with_observation("Parity C", "concept", "an enrichment observation"),
+            "an enrichment observation",
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        db.compute_entity_page_parity_report()
+            .await
+            .unwrap()
+            .drift_count,
+        0,
+        "commit_entity_enrichment_at_version create branch"
+    );
+    let c = db
+        .search_entities_by_name("Parity C")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .id;
+
+    // Re-enrich the same source at the next version: resolves the
+    // already-existing "Parity C" entity instead of creating it, exercising
+    // the alias-bridge re-sync site and the post-observation targeted-write
+    // site.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET content = 'enrichment content v2', version = 2
+             WHERE source_id = 'mem_parity_enrich'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    assert!(db
+        .commit_entity_enrichment_at_version(
+            "mem_parity_enrich",
+            2,
+            &extracted_entity_with_observation(
+                "Parity C",
+                "concept",
+                "a second enrichment observation"
+            ),
+            "a second enrichment observation",
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        db.compute_entity_page_parity_report()
+            .await
+            .unwrap()
+            .drift_count,
+        0,
+        "commit_entity_enrichment_at_version resolve branch"
+    );
+
+    db.create_relation(&a, &c, "relates_to", None, None, None, None)
+        .await
+        .unwrap();
+    db.detect_communities().await.unwrap();
+    assert_eq!(
+        db.compute_entity_page_parity_report()
+            .await
+            .unwrap()
+            .drift_count,
+        0,
+        "detect_communities"
     );
 }
 

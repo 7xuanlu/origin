@@ -10051,37 +10051,79 @@ impl MemoryDB {
         Ok(())
     }
 
-    /// Insert a `kind='entity'` page shadow for an existing `entities` row
-    /// (M3 PR-1 stage f) + its `entity_page_map` row, inside the caller's
-    /// already-open transaction. Every field is read straight off `entities`
-    /// (`SELECT ... FROM entities WHERE id = ?4`), so `store_entity`'s
-    /// live create-time dual-write and migration 92's backfill loop -- the
-    /// two callers -- produce byte-identical shadow-page shapes without
-    /// either keeping its own copy of the entity's fields in sync. `space`
-    /// is nullable on `entities` but `pages.space`/`pages.workspace` are
-    /// NOT NULL (M1 honest columns), so a NULL entity space folds to the
-    /// reserved `UNFILED_SPACE_ID` sentinel, matching migration 80/91's rule
-    /// for the same case. `content` is the empty string: entity shadow pages
-    /// hold no prose -- Q1 makes them browse/search-visible (the explicit
-    /// `_browse` surfaces) yet they stay excluded from retrieval/context,
-    /// export, and every page mutation, so there is nothing to render.
+    /// Insert a `kind='entity'` page shadow + its `entity_page_map` row,
+    /// inside the caller's already-open transaction. G6 Stage 2 PR 2c
+    /// sub-step 2: values-based -- every mirrored column is a parameter,
+    /// never a subquery onto `entities`, so a caller can mint a shadow page
+    /// with no `entities` row backing it (the shape sub-step 3's flip
+    /// needs). `space` folds a `None` to the reserved `UNFILED_SPACE_ID`
+    /// sentinel, matching migration 80/91's rule for the same case.
+    /// `content` is the empty string: entity shadow pages hold no prose --
+    /// Q1 makes them browse/search-visible (the explicit `_browse`
+    /// surfaces) yet they stay excluded from retrieval/context, export, and
+    /// every page mutation, so there is nothing to render. `aliases_json`
+    /// is not optional: every caller passes an explicit JSON array literal
+    /// (`"[]"` when it has none yet), matching the always-set aliases
+    /// column the retired re-derivation used to guarantee -- see
+    /// `add_entity_alias` for the narrowed aliases-aggregate bridge that
+    /// keeps a later alias add in sync (entity_aliases is still the alias
+    /// source of truth pre-flip).
+    #[allow(clippy::too_many_arguments)]
     async fn insert_entity_shadow_page(
         conn: &libsql::Connection,
         entity_id: &str,
         page_id: &str,
+        name: &str,
+        entity_type: &str,
+        confidence: Option<f32>,
+        confirmed: bool,
+        embedding: Option<&str>,
+        space: Option<&str>,
+        source_agent: Option<&str>,
+        aliases_json: &str,
         now_iso: &str,
+        // `entities.created_at`/`updated_at` are INTEGER (unix seconds);
+        // `pages.entity_created_at`/`entity_updated_at` mirror them with
+        // the same affinity, distinct from the page's own TEXT/RFC3339
+        // `created_at`/`last_compiled`/`last_modified` columns above.
+        entity_created_at: i64,
+        entity_updated_at: i64,
     ) -> Result<(), WenlanError> {
         conn.execute(
             "INSERT INTO pages (
                 id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
                 embedding, space, workspace, source_memory_ids, version, status,
-                created_at, last_compiled, last_modified, creation_kind, review_status
+                created_at, last_compiled, last_modified, creation_kind, review_status,
+                aliases, source_agent, entity_created_at, entity_updated_at
              )
-             SELECT ?1, name, NULL, '', 'entity', entity_type, confidence, confirmed,
-                    embedding, COALESCE(space, ?2), COALESCE(space, ?2), '[]', 1, 'active',
-                    ?3, ?3, ?3, 'entity', 'unconfirmed'
-             FROM entities WHERE id = ?4",
-            libsql::params![page_id, UNFILED_SPACE_ID, now_iso, entity_id],
+             VALUES (?1, ?2, NULL, '', 'entity', ?3, ?4, ?5,
+                     CASE WHEN ?6 IS NULL THEN NULL ELSE vector32(?6) END,
+                     COALESCE(?7, ?8), COALESCE(?7, ?8), '[]', 1, 'active',
+                     ?9, ?9, ?9, 'entity', 'unconfirmed',
+                     ?10, ?11, ?12, ?13)",
+            libsql::params![
+                page_id,
+                name,
+                entity_type,
+                confidence
+                    .map(|v| libsql::Value::Real(v as f64))
+                    .unwrap_or(libsql::Value::Null),
+                if confirmed { 1i64 } else { 0i64 },
+                embedding
+                    .map(|v| libsql::Value::Text(v.to_string()))
+                    .unwrap_or(libsql::Value::Null),
+                space
+                    .map(|v| libsql::Value::Text(v.to_string()))
+                    .unwrap_or(libsql::Value::Null),
+                UNFILED_SPACE_ID,
+                now_iso,
+                aliases_json,
+                source_agent
+                    .map(|v| libsql::Value::Text(v.to_string()))
+                    .unwrap_or(libsql::Value::Null),
+                entity_created_at,
+                entity_updated_at,
+            ],
         )
         .await
         .map_err(|e| WenlanError::VectorDb(format!("insert_entity_shadow_page pages: {e}")))?;
@@ -10096,57 +10138,16 @@ impl MemoryDB {
         Ok(())
     }
 
-    /// Re-sync a `kind='entity'` page shadow's mirrored columns from its live
-    /// `entities` row (M3 PR-1 item C, update-path parity). Every entity
-    /// mutator that changes a shadowed field (`store_entity`, `add_entity_alias`,
-    /// `confirm_entity`, `refresh_entity_embedding`, `merge_entities`) calls
-    /// this inside its own transaction after the `entities` write, so the
-    /// shadow never drifts from the row it mirrors. Unlike
-    /// `insert_entity_shadow_page`, this also refreshes `aliases` -- the
-    /// `entity_aliases` JSON array added to `pages` in migration 93 -- which
-    /// the insert path deliberately leaves untouched: migration 92's backfill
-    /// calls `insert_entity_shadow_page` BEFORE migration 93 adds the
-    /// `pages.aliases` column, so the insert SQL cannot reference it. A no-op
-    /// when the entity has no mapped shadow (the `WHERE` finds no row).
-    async fn update_entity_shadow_page(
-        conn: &libsql::Connection,
-        entity_id: &str,
-        now_iso: &str,
-    ) -> Result<(), WenlanError> {
-        conn.execute(
-            "UPDATE pages SET
-                title = (SELECT name FROM entities WHERE id = ?1),
-                entity_type = (SELECT entity_type FROM entities WHERE id = ?1),
-                confidence = (SELECT confidence FROM entities WHERE id = ?1),
-                entity_confirmed = (SELECT confirmed FROM entities WHERE id = ?1),
-                embedding = (SELECT embedding FROM entities WHERE id = ?1),
-                space = COALESCE((SELECT space FROM entities WHERE id = ?1), ?2),
-                workspace = COALESCE((SELECT space FROM entities WHERE id = ?1), ?2),
-                aliases = (SELECT json_group_array(alias_name)
-                           FROM (SELECT alias_name FROM entity_aliases
-                                 WHERE canonical_entity_id = ?1 ORDER BY alias_name)),
-                source_agent = (SELECT source_agent FROM entities WHERE id = ?1),
-                entity_created_at = (SELECT created_at FROM entities WHERE id = ?1),
-                entity_updated_at = (SELECT updated_at FROM entities WHERE id = ?1),
-                community_id = (SELECT community_id FROM entities WHERE id = ?1),
-                embedding_updated_at = (SELECT embedding_updated_at FROM entities WHERE id = ?1),
-                last_modified = ?3
-             WHERE kind = 'entity'
-               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
-            libsql::params![entity_id, UNFILED_SPACE_ID, now_iso],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("update_entity_shadow_page: {e}")))?;
-
-        Ok(())
-    }
-
     /// G6 Stage 1.5a test helper: backfills the `kind='entity'` shadow page
     /// for a raw-SQL-seeded `entities` row (test fixtures that `INSERT INTO
     /// entities` directly, bypassing `store_entity`, would otherwise be
     /// invisible to every reader migrated in this stage). Call right after
     /// the raw insert. Not for production use -- normal writes stay on
     /// `store_entity`, which does this in the same transaction.
+    /// G6 Stage 2 PR 2c sub-step 2: reads the raw-seeded `entities` row once
+    /// (test-only; `insert_entity_shadow_page` is values-based and has no
+    /// live callers left that read `entities`) and mints the shadow via the
+    /// same values-based primitive `create_entity` uses.
     #[cfg(test)]
     pub(crate) async fn test_seed_entity_shadow_page(
         &self,
@@ -10155,12 +10156,105 @@ impl MemoryDB {
         let now_iso = chrono::Utc::now().to_rfc3339();
         let page_id = crate::pages::new_page_id();
         let conn = self.conn.lock().await;
-        Self::insert_entity_shadow_page(&conn, entity_id, &page_id, &now_iso).await?;
-        // G6 Stage 1.5b Part 1: same live-only re-sync as `create_entity`/
-        // `store_entity` -- backfills source_agent/entity_created_at/
-        // entity_updated_at/community_id/embedding_updated_at, which
-        // `insert_entity_shadow_page` deliberately leaves untouched.
-        Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await
+        let (
+            name,
+            entity_type,
+            confidence,
+            confirmed,
+            space,
+            source_agent,
+            created_at,
+            updated_at,
+            community_id,
+            embedding_updated_at,
+        ): (
+            String,
+            String,
+            Option<f64>,
+            i64,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        ) = {
+            let mut rows = conn
+                .query(
+                    "SELECT name, entity_type, confidence, confirmed, space, source_agent, \
+                     created_at, updated_at, community_id, embedding_updated_at \
+                     FROM entities WHERE id = ?1",
+                    libsql::params![entity_id],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("test_seed_entity_shadow_page read: {e}"))
+                })?;
+            let row = rows
+                .next()
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("test_seed_entity_shadow_page row: {e}"))
+                })?
+                .ok_or_else(|| {
+                    WenlanError::VectorDb(format!(
+                        "test_seed_entity_shadow_page: no entities row for {entity_id}"
+                    ))
+                })?;
+            (
+                row.get(0).unwrap_or_default(),
+                row.get(1).unwrap_or_default(),
+                row.get(2).unwrap_or(None),
+                row.get(3).unwrap_or(0),
+                row.get(4).unwrap_or(None),
+                row.get(5).unwrap_or(None),
+                row.get(6).unwrap_or(0),
+                row.get(7).unwrap_or(0),
+                row.get(8).unwrap_or(None),
+                row.get(9).unwrap_or(None),
+            )
+        };
+        Self::insert_entity_shadow_page(
+            &conn,
+            entity_id,
+            &page_id,
+            &name,
+            &entity_type,
+            confidence.map(|v| v as f32),
+            confirmed != 0,
+            // Raw-SQL test fixtures seeded through this helper don't carry a
+            // real embedding blob to re-encode as vector32 text; tests that
+            // need an embedded shadow go through store_entity/
+            // refresh_entity_embedding instead.
+            None,
+            space.as_deref(),
+            source_agent.as_deref(),
+            "[]",
+            &now_iso,
+            created_at,
+            updated_at,
+        )
+        .await?;
+        // `insert_entity_shadow_page` has no `community_id`/`embedding_updated_at`
+        // params -- no live caller sets either at creation time (both are
+        // always assigned later, by `detect_communities`/
+        // `refresh_entity_embedding`) -- but a raw-SQL test fixture seeded
+        // through this helper may already carry them (e.g. `community_id`
+        // stamped directly), so backfill from the just-read `entities` row.
+        // `pages.community_id` is TEXT (`entities.community_id` is INTEGER).
+        conn.execute(
+            "UPDATE pages SET community_id = ?1, embedding_updated_at = ?2
+             WHERE kind = 'entity'
+               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
+            libsql::params![
+                community_id.map(|v| v.to_string()),
+                embedding_updated_at,
+                entity_id
+            ],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("test_seed_entity_shadow_page mirror: {e}")))?;
+        Ok(())
     }
 
     // Migration 92 (M3 PR-1, stage f): dual-write entities as `kind='entity'`
@@ -10170,13 +10264,19 @@ impl MemoryDB {
     // writable_schema technique), creates `entity_page_migration_state`
     // (mirrors `edges_migration_state`, db.rs `edges_migration_state`
     // CREATE), and backfills every existing entity a shadow page +
-    // `entity_page_map` row via `insert_entity_shadow_page` -- the SAME
-    // helper `store_entity`'s live dual-write uses, so a freshly created
-    // entity and a backfilled one are byte-identical in shape. Shadow pages
-    // are write-only in PR-1: `select_visible_pages` and every other
-    // page-reading surface fence out `kind='entity'` (their own stage-f
-    // change + regression test), so this migration cannot leak them to a
-    // reader on its own.
+    // `entity_page_map` row by re-deriving every column from `entities`
+    // inline (G6 Stage 2 PR 2c sub-step 2: this is `insert_entity_shadow_page`'s
+    // old subquery-based body, byte-for-byte -- that helper went
+    // values-based for every live write path in this sub-step, but a
+    // migration body is a frozen replay: at this point in the schema
+    // timeline, before migrations 93/117 add `aliases`/`source_agent`/
+    // `entity_created_at`/`entity_updated_at`/`community_id`/
+    // `embedding_updated_at`, `entities` IS authoritative and those columns
+    // don't exist yet, so this INSERT deliberately omits them, matching the
+    // original migration-92-safe shape). Shadow pages are write-only in
+    // PR-1: `select_visible_pages` and every other page-reading surface
+    // fence out `kind='entity'` (their own stage-f change + regression
+    // test), so this migration cannot leak them to a reader on its own.
     async fn migrate_92_entity_shadow_pages(&self, prior_version: i64) -> Result<(), WenlanError> {
         // §6.9: pre-migration online backup + integrity receipt, mirroring
         // migrations 82/89/90/91.
@@ -10403,7 +10503,31 @@ impl MemoryDB {
                         continue;
                     }
                     let page_id = crate::pages::new_page_id();
-                    Self::insert_entity_shadow_page(&conn, entity_id, &page_id, &now_iso).await?;
+                    conn.execute(
+                        "INSERT INTO pages (
+                            id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+                            embedding, space, workspace, source_memory_ids, version, status,
+                            created_at, last_compiled, last_modified, creation_kind, review_status
+                         )
+                         SELECT ?1, name, NULL, '', 'entity', entity_type, confidence, confirmed,
+                                embedding, COALESCE(space, ?2), COALESCE(space, ?2), '[]', 1, 'active',
+                                ?3, ?3, ?3, 'entity', 'unconfirmed'
+                         FROM entities WHERE id = ?4",
+                        libsql::params![
+                            page_id.as_str(),
+                            UNFILED_SPACE_ID,
+                            now_iso.as_str(),
+                            entity_id.as_str()
+                        ],
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m92 shadow insert: {e}")))?;
+                    conn.execute(
+                        "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, ?2, ?3)",
+                        libsql::params![entity_id.as_str(), page_id.as_str(), now_iso.as_str()],
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m92 shadow map: {e}")))?;
                     created += 1;
                 }
                 conn.execute(
@@ -13101,10 +13225,15 @@ impl MemoryDB {
     // `missing` drift in `entity_page_parity_watermark` — permanently holding
     // the `reader_uses_entity_pages` cutover gate closed. The companion code
     // fix makes that path dual-write; this migration repairs the rows already
-    // written. Uses the SAME helpers as the live dual-write
-    // (`insert_entity_shadow_page` + `update_entity_shadow_page`, the
-    // migration-92 pattern), so a repaired entity is byte-identical in shape
-    // to a correctly created one, aliases folded in. Idempotent: scoped to
+    // written. Seeds a placeholder shadow via `insert_entity_shadow_page`
+    // then re-derives every mirrored column from `entities` inline (G6
+    // Stage 2 PR 2c sub-step 2: this is `update_entity_shadow_page`'s old
+    // body, byte-for-byte -- that helper retired from every live write path
+    // in this sub-step, but a migration body is a frozen replay: at this
+    // point in the schema timeline `entities` IS authoritative, so
+    // re-deriving the shadow from it here remains correct forever, unlike a
+    // live writer). A repaired entity is byte-identical in shape to a
+    // correctly created one, aliases folded in. Idempotent: scoped to
     // entities with no `entity_page_map` row at all.
     async fn migrate_113_entity_shadow_page_repair(
         &self,
@@ -13139,8 +13268,38 @@ impl MemoryDB {
             let now_iso = chrono::Utc::now().to_rfc3339();
             for entity_id in &unmapped {
                 let page_id = crate::pages::new_page_id();
-                Self::insert_entity_shadow_page(&conn, entity_id, &page_id, &now_iso).await?;
-                Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+                // Placeholder row: every parameterized column below is
+                // immediately overwritten by the inline re-sync that
+                // follows, in the same transaction.
+                Self::insert_entity_shadow_page(
+                    &conn, entity_id, &page_id, "", "", None, false, None, None, None, "[]",
+                    &now_iso, 0, 0,
+                )
+                .await?;
+                conn.execute(
+                    "UPDATE pages SET
+                        title = (SELECT name FROM entities WHERE id = ?1),
+                        entity_type = (SELECT entity_type FROM entities WHERE id = ?1),
+                        confidence = (SELECT confidence FROM entities WHERE id = ?1),
+                        entity_confirmed = (SELECT confirmed FROM entities WHERE id = ?1),
+                        embedding = (SELECT embedding FROM entities WHERE id = ?1),
+                        space = COALESCE((SELECT space FROM entities WHERE id = ?1), ?2),
+                        workspace = COALESCE((SELECT space FROM entities WHERE id = ?1), ?2),
+                        aliases = (SELECT json_group_array(alias_name)
+                                   FROM (SELECT alias_name FROM entity_aliases
+                                         WHERE canonical_entity_id = ?1 ORDER BY alias_name)),
+                        source_agent = (SELECT source_agent FROM entities WHERE id = ?1),
+                        entity_created_at = (SELECT created_at FROM entities WHERE id = ?1),
+                        entity_updated_at = (SELECT updated_at FROM entities WHERE id = ?1),
+                        community_id = (SELECT community_id FROM entities WHERE id = ?1),
+                        embedding_updated_at = (SELECT embedding_updated_at FROM entities WHERE id = ?1),
+                        last_modified = ?3
+                     WHERE kind = 'entity'
+                       AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+                    libsql::params![entity_id.as_str(), UNFILED_SPACE_ID, now_iso.as_str()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m113 resync: {e}")))?;
             }
             Ok(unmapped.len() as u64)
         }
@@ -13170,11 +13329,17 @@ impl MemoryDB {
     // page from its live `entities` row. Migration 113 repaired MISSING
     // shadows, but the pre-fix ambient sweep could also leave an EXISTING
     // shadow stale: resolving a new mention onto an existing entity inserted
-    // an `entity_aliases` row without `update_entity_shadow_page`, so the
-    // shadow's `aliases` column (a mirrored field) drifted — `corrupt` in
+    // an `entity_aliases` row without re-syncing the shadow, so the shadow's
+    // `aliases` column (a mirrored field) drifted — `corrupt` in
     // `entity_page_parity_watermark` (observed live 2026-08-04, corrupt=1,
-    // stale alias list). A blanket re-sync via the SAME helper the live
-    // mutators use is idempotent and repairs every stale mirrored column.
+    // stale alias list). A blanket re-sync, re-deriving every mirrored
+    // column from `entities` inline (G6 Stage 2 PR 2c sub-step 2: this is
+    // `update_entity_shadow_page`'s old body, byte-for-byte -- that helper
+    // retired from every live write path in this sub-step, but a migration
+    // body is a frozen replay: at this point in the schema timeline
+    // `entities` IS authoritative, so re-deriving the shadow from it here
+    // remains correct forever, unlike a live writer), is idempotent and
+    // repairs every stale mirrored column.
     async fn migrate_114_entity_shadow_resync(
         &self,
         prior_version: i64,
@@ -13203,7 +13368,30 @@ impl MemoryDB {
 
             let now_iso = chrono::Utc::now().to_rfc3339();
             for entity_id in &mapped {
-                Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+                conn.execute(
+                    "UPDATE pages SET
+                        title = (SELECT name FROM entities WHERE id = ?1),
+                        entity_type = (SELECT entity_type FROM entities WHERE id = ?1),
+                        confidence = (SELECT confidence FROM entities WHERE id = ?1),
+                        entity_confirmed = (SELECT confirmed FROM entities WHERE id = ?1),
+                        embedding = (SELECT embedding FROM entities WHERE id = ?1),
+                        space = COALESCE((SELECT space FROM entities WHERE id = ?1), ?2),
+                        workspace = COALESCE((SELECT space FROM entities WHERE id = ?1), ?2),
+                        aliases = (SELECT json_group_array(alias_name)
+                                   FROM (SELECT alias_name FROM entity_aliases
+                                         WHERE canonical_entity_id = ?1 ORDER BY alias_name)),
+                        source_agent = (SELECT source_agent FROM entities WHERE id = ?1),
+                        entity_created_at = (SELECT created_at FROM entities WHERE id = ?1),
+                        entity_updated_at = (SELECT updated_at FROM entities WHERE id = ?1),
+                        community_id = (SELECT community_id FROM entities WHERE id = ?1),
+                        embedding_updated_at = (SELECT embedding_updated_at FROM entities WHERE id = ?1),
+                        last_modified = ?3
+                     WHERE kind = 'entity'
+                       AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+                    libsql::params![entity_id.as_str(), UNFILED_SPACE_ID, now_iso.as_str()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m114 resync: {e}")))?;
             }
             Ok(mapped.len() as u64)
         }
@@ -31673,15 +31861,26 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("create_entity: {}", e)))?;
 
             let page_id = crate::pages::new_page_id();
-            Self::insert_entity_shadow_page(&conn, &id, &page_id, &now_iso).await?;
-            // G6 Stage 1.5b Part 1: `insert_entity_shadow_page` stays
-            // migration-92-safe (it also backfills historical entities
-            // mid-migration-sequence, before migration 117 adds these
-            // columns), so it never touches source_agent/entity_created_at/
-            // entity_updated_at/community_id/embedding_updated_at. This
-            // live-only path re-syncs them immediately after, same
-            // transaction, mirroring `store_entity`.
-            Self::update_entity_shadow_page(&conn, &id, &now_iso).await?;
+            // G6 Stage 2 PR 2c sub-step 2: direct values-based write, no
+            // re-derivation -- a brand-new entity has no confidence,
+            // embedding, source_agent, or aliases yet.
+            Self::insert_entity_shadow_page(
+                &conn,
+                &id,
+                &page_id,
+                name,
+                entity_type,
+                None,
+                false,
+                None,
+                space,
+                None,
+                "[]",
+                &now_iso,
+                now,
+                now,
+            )
+            .await?;
 
             Ok(())
         }
@@ -31748,7 +31947,7 @@ impl MemoryDB {
                         .map(|v| libsql::Value::Real(v as f64))
                         .unwrap_or(libsql::Value::Null),
                     now,
-                    vec_str
+                    vec_str.clone()
                 ],
             )
             .await
@@ -31763,13 +31962,30 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("store_entity alias: {}", e)))?;
 
             let page_id = crate::pages::new_page_id();
-            Self::insert_entity_shadow_page(&conn, &id, &page_id, &now_iso).await?;
-            // The insert path leaves `aliases` NULL (it is shared with
-            // migration 92, which predates the `pages.aliases` column); the
-            // self-alias inserted just above is now visible, so re-sync the
-            // shadow to fold it in. Same transaction -> the shadow never
-            // observes a NULL-aliases state.
-            Self::update_entity_shadow_page(&conn, &id, &now_iso).await?;
+            // G6 Stage 2 PR 2c sub-step 2: direct values-based write. The
+            // self-alias just inserted above is the only alias this entity
+            // has yet, so the seed literal must byte-match what
+            // `json_group_array(alias_name)` would aggregate -- a compact
+            // single-element JSON array, same shape `serde_json` produces.
+            let aliases_json = serde_json::to_string(&[name.to_lowercase()])
+                .map_err(|e| WenlanError::VectorDb(format!("store_entity aliases: {}", e)))?;
+            Self::insert_entity_shadow_page(
+                &conn,
+                &id,
+                &page_id,
+                name,
+                entity_type,
+                confidence,
+                false,
+                Some(&vec_str),
+                space,
+                source_agent,
+                &aliases_json,
+                &now_iso,
+                now,
+                now,
+            )
+            .await?;
 
             Ok(())
         }
@@ -32095,7 +32311,23 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("add alias: {}", e)))?;
-            Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+            // G6 Stage 2 PR 2c sub-step 2: narrowed aliases-aggregate BRIDGE
+            // -- `entity_aliases` is still the alias source of truth until
+            // sub-step 3's alias-write flip (named deferred item), so this
+            // stays a subquery re-derivation scoped to `aliases` only,
+            // never the full re-derivation `update_entity_shadow_page` did.
+            conn.execute(
+                "UPDATE pages SET
+                    aliases = (SELECT json_group_array(alias_name)
+                               FROM (SELECT alias_name FROM entity_aliases
+                                     WHERE canonical_entity_id = ?1 ORDER BY alias_name)),
+                    last_modified = ?2
+                 WHERE kind = 'entity'
+                   AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+                libsql::params![entity_id.to_string(), now_iso.clone()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("add alias shadow: {}", e)))?;
             Ok(())
         }
         .await;
@@ -32338,11 +32570,24 @@ impl MemoryDB {
         let result: Result<(), WenlanError> = async {
             conn.execute(
                 "UPDATE entities SET embedding = vector32(?1), embedding_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
-                libsql::params![vec_str, now, entity_id.to_string()],
+                libsql::params![vec_str.clone(), now, entity_id.to_string()],
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("refresh_entity_embedding: {}", e)))?;
-            Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+            // G6 Stage 2 PR 2c sub-step 2: direct targeted write. Both
+            // `embedding_updated_at` columns are INTEGER (unix seconds), so
+            // this uses `now`, not `now_iso` -- mixing the two would drift
+            // against `compute_entity_page_parity_report`'s type-matched
+            // comparison.
+            conn.execute(
+                "UPDATE pages SET embedding = vector32(?1), entity_updated_at = ?2,
+                    embedding_updated_at = ?2, last_modified = ?3
+                 WHERE kind = 'entity'
+                   AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?4)",
+                libsql::params![vec_str, now, now_iso.clone(), entity_id.to_string()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("refresh_entity_embedding shadow: {}", e)))?;
             Ok(())
         }
         .await;
@@ -32405,7 +32650,16 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("add_observation timestamp: {}", e)))?;
 
-            Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+            // G6 Stage 2 PR 2c sub-step 2: direct targeted write -- adding
+            // an observation only touches the entity's `updated_at`.
+            conn.execute(
+                "UPDATE pages SET entity_updated_at = ?1, last_modified = ?2
+                 WHERE kind = 'entity'
+                   AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
+                libsql::params![now, now_iso.clone(), entity_id.to_string()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("add_observation shadow: {}", e)))?;
 
             Ok(())
         }
@@ -32888,9 +33142,26 @@ impl MemoryDB {
 
             // The canonical's shadowed fields drifted in this merge: aliases
             // were redirected + the loser's name registered, and its
-            // entity_type may have been promoted. Re-sync the canonical shadow
-            // to the final entity state (M3 PR-1 item C).
-            Self::update_entity_shadow_page(&conn, canonical_id, &now_iso).await?;
+            // entity_type may have been promoted. G6 Stage 2 PR 2c sub-step
+            // 2: narrowed aliases-aggregate BRIDGE (approved scope: aliases
+            // + last_modified + entity_type when relevant) -- entity_aliases
+            // is still the alias source of truth until sub-step 3's
+            // alias-write flip (named deferred item), so this stays a
+            // subquery re-derivation scoped to these columns only, never
+            // the full re-derivation `update_entity_shadow_page` did.
+            conn.execute(
+                "UPDATE pages SET
+                    entity_type = (SELECT entity_type FROM entities WHERE id = ?1),
+                    aliases = (SELECT json_group_array(alias_name)
+                               FROM (SELECT alias_name FROM entity_aliases
+                                     WHERE canonical_entity_id = ?1 ORDER BY alias_name)),
+                    last_modified = ?2
+                 WHERE kind = 'entity'
+                   AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+                libsql::params![canonical_id.to_string(), now_iso.clone()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("merge_entities canonical shadow: {e}")))?;
 
             Self::bump_community_graph_generations(&conn, graph_changes)
                 .await
@@ -34237,13 +34508,28 @@ impl MemoryDB {
                         // transaction (mirrors `store_entity`). This path missed
                         // it when #473 added canonical-edge dual-writes here;
                         // caught live by `reconcile_entity_page_parity`.
+                        // G6 Stage 2 PR 2c sub-step 2: direct values-based
+                        // write -- no aliases yet, the `lower` self-alias is
+                        // inserted just below and re-synced by the narrowed
+                        // aliases-aggregate bridge that follows.
                         let page_id = crate::pages::new_page_id();
-                        Self::insert_entity_shadow_page(&conn, &id, &page_id, &now_iso).await?;
-                        // G6 Stage 1.5b Part 1: same live-only re-sync as
-                        // `create_entity`/`store_entity` -- `insert_entity_shadow_page`
-                        // stays migration-92-safe and never touches the Part 1
-                        // mirror columns, so backfill them here.
-                        Self::update_entity_shadow_page(&conn, &id, &now_iso).await?;
+                        Self::insert_entity_shadow_page(
+                            &conn,
+                            &id,
+                            &page_id,
+                            name.as_str(),
+                            entity_type.as_str(),
+                            None,
+                            false,
+                            Some(embedding.as_str()),
+                            entity_space.as_deref(),
+                            Some("post_ingest"),
+                            "[]",
+                            &now_iso,
+                            now,
+                            now,
+                        )
+                        .await?;
                         created_entities.push((id.clone(), name.clone()));
                         id
                     }
@@ -34262,7 +34548,25 @@ impl MemoryDB {
                 // `aliases` is a shadow-mirrored column, so a (possibly new)
                 // alias on a resolved entity must re-sync the shadow too --
                 // same rule as `add_entity_alias`. No-op when nothing changed.
-                Self::update_entity_shadow_page(&conn, &entity_id, &now_iso).await?;
+                // G6 Stage 2 PR 2c sub-step 2: narrowed aliases-aggregate
+                // BRIDGE (approved scope) -- `entity_aliases` is still the
+                // alias source of truth until sub-step 3's alias-write flip
+                // (named deferred item), so this stays a subquery
+                // re-derivation scoped to `aliases` only.
+                conn.execute(
+                    "UPDATE pages SET
+                        aliases = (SELECT json_group_array(alias_name)
+                                   FROM (SELECT alias_name FROM entity_aliases
+                                         WHERE canonical_entity_id = ?1 ORDER BY alias_name)),
+                        last_modified = ?2
+                     WHERE kind = 'entity'
+                       AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+                    libsql::params![entity_id.as_str(), now_iso.clone()],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("entity enrichment alias shadow: {e}"))
+                })?;
 
                 if first_entity_id.is_none() {
                     first_entity_id = Some(entity_id.clone());
@@ -34311,11 +34615,21 @@ impl MemoryDB {
                     })?;
                     // `updated_at` is a shadow-mirrored column; the resolved-
                     // existing-entity path's shadow sync above (this loop's
-                    // earlier `update_entity_shadow_page` call, per entity) ran
-                    // before this observation bumped `updated_at`, so it must
-                    // re-sync again here or the shadow strands at the pre-
-                    // observation timestamp (G6 review fix).
-                    Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+                    // earlier alias-shadow write, per entity) ran before this
+                    // observation bumped `updated_at`, so it must re-sync
+                    // again here or the shadow strands at the pre-observation
+                    // timestamp (G6 review fix). G6 Stage 2 PR 2c sub-step 2:
+                    // direct targeted write -- only `updated_at` changed.
+                    conn.execute(
+                        "UPDATE pages SET entity_updated_at = ?1, last_modified = ?2
+                         WHERE kind = 'entity'
+                           AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
+                        libsql::params![now, now_iso.clone(), entity_id.as_str()],
+                    )
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("entity enrichment observation shadow: {e}"))
+                    })?;
                 }
 
                 for relation in &kg.relations {
@@ -35562,7 +35876,20 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("confirm_entity: {}", e)))?;
-            Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
+            // G6 Stage 2 PR 2c sub-step 2: direct targeted write -- only
+            // `entity_confirmed` changed.
+            conn.execute(
+                "UPDATE pages SET entity_confirmed = ?1, last_modified = ?2
+                 WHERE kind = 'entity'
+                   AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
+                libsql::params![
+                    if confirmed { 1i64 } else { 0i64 },
+                    now_iso.clone(),
+                    entity_id.to_string()
+                ],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("confirm_entity shadow: {}", e)))?;
             Ok(())
         }
         .await;
@@ -35767,29 +36094,29 @@ impl MemoryDB {
         let update_result: Result<(), WenlanError> = async {
             for (i, entity_id) in entity_ids.iter().enumerate() {
                 let community_id = label_to_community[&labels[i]];
-                let update_count = conn
-                    .execute(
-                        "UPDATE entities SET community_id = ?1 WHERE id = ?2",
-                        libsql::params![community_id, entity_id.clone()],
-                    )
-                    .await
-                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
-                // G6 Stage 2 PR 2c item 3: discovery now includes
-                // shadow-only entities (no `entities` row), which the
-                // `UPDATE` above silently no-ops for -- expected, not an
-                // error. `update_entity_shadow_page` re-derives every
-                // mirrored column from `entities` via subquery, so calling
-                // it for a shadow-only id would write NULL into
-                // `pages.title` (NOT NULL) and fail. Bridge guard: skip the
-                // shadow-page mirror refresh when there was no `entities`
-                // row to source it from. A shadow-only entity's own
-                // community_id write is a silent no-op until sub-step 2
-                // inverts this write to target the shadow page directly --
-                // sub-step 2 MUST land before sub-step 3 (writer flip) so
-                // that no-op window never exists live.
-                if update_count > 0 {
-                    Self::update_entity_shadow_page(&conn, entity_id, &now_iso).await?;
-                }
+                // `entities` write stays best-effort: a shadow-only entity
+                // (no `entities` row) silently no-ops here, expected.
+                conn.execute(
+                    "UPDATE entities SET community_id = ?1 WHERE id = ?2",
+                    libsql::params![community_id, entity_id.clone()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+                // G6 Stage 2 PR 2c sub-step 2: direct targeted write on the
+                // shadow page itself, not derived from `entities` -- retires
+                // the item-3 surgical guard (db.rs, prior revision), since
+                // this write no longer depends on an `entities` row
+                // existing and so no longer no-ops for a shadow-only
+                // entity. `pages.community_id` is TEXT (`entities.community_id`
+                // is INTEGER), so the value is stringified here to match.
+                conn.execute(
+                    "UPDATE pages SET community_id = ?1, last_modified = ?2
+                     WHERE kind = 'entity'
+                       AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
+                    libsql::params![community_id.to_string(), now_iso.clone(), entity_id.clone()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
             }
             Ok(())
         }
