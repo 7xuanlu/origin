@@ -179,8 +179,7 @@ fn default_config_root() -> PathBuf {
 /// That is a race, not a guarantee — the guard's `remove_var` on one thread can
 /// land between another thread's `set_var` and its `save_config`, and then the
 /// write goes to the real file. `Config::default()` carries no API key and no
-/// reranker mode, so losing that race wipes both. Two holes are already open:
-/// `page_map_routes.rs` uses a guard without taking `TEST_DATA_DIR_LOCK`, and
+/// reranker mode, so losing that race wipes both. One hole is still open:
 /// `spaces.rs` sets the same var raw, which `temp_env`'s lock does not see.
 ///
 /// Redirecting the *default* root closes it at the one place that resolves it,

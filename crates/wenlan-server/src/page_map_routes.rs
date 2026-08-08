@@ -1099,6 +1099,10 @@ mod tests {
             }
         }
 
+        let _lock = crate::TEST_DATA_DIR_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
         let _env = DataDirGuard::new();
         // Empty temp data dir → load_config returns defaults; set the flag OFF
         // explicitly and persist it, so a hypothetical future gating of this
