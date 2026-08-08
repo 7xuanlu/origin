@@ -460,7 +460,12 @@ mod tests {
                 retrieval_cue TEXT, event_date INTEGER, content TEXT
              );
              CREATE TABLE memory_entities (memory_id TEXT, entity_id TEXT);
-             CREATE TABLE pages (id TEXT, status TEXT);
+             -- `kind` mirrors the real `pages` schema. It is not decoration:
+             -- `count_active_pages` fences out `kind='entity'` shadow pages,
+             -- and a fixture table without the column makes that query fail to
+             -- compile, which the counter's table-missing tolerance then
+             -- reports as zero active pages.
+             CREATE TABLE pages (id TEXT, status TEXT, kind TEXT);
              CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT);",
         )
         .await
@@ -504,6 +509,9 @@ mod tests {
     }
 
     /// Insert a page row (page-channel substrate).
+    /// A distilled page, the substrate the page channel is measured over.
+    /// `kind` is left NULL, which is what a page predating the column carries;
+    /// `count_active_pages` folds that to `'concept'`.
     async fn insert_page(conn: &libsql::Connection, pid: &str, status: &str) {
         conn.execute(
             "INSERT INTO pages (id, status) VALUES (?1, ?2)",
@@ -511,6 +519,18 @@ mod tests {
         )
         .await
         .expect("insert page");
+    }
+
+    /// An entity's `kind='entity'` shadow page. Since G6 Stage 2 made the
+    /// entity side canonical these share the `pages` table with distilled
+    /// pages, and they are exactly what the page channel is NOT measured over.
+    async fn insert_entity_shadow_page(conn: &libsql::Connection, pid: &str, status: &str) {
+        conn.execute(
+            "INSERT INTO pages (id, status, kind) VALUES (?1, ?2, 'entity')",
+            libsql::params![pid, status],
+        )
+        .await
+        .expect("insert entity shadow page");
     }
 
     #[tokio::test]
@@ -754,6 +774,31 @@ mod tests {
         assert_feature_substrate_live(&conn, "page_channel")
             .await
             .expect("page substrate present → allowed");
+    }
+
+    /// The fence itself, which nothing else covers. A store whose only active
+    /// `pages` rows are entity shadow pages has a DEAD page channel, and the
+    /// contract exists to refuse exactly that rather than measure over it.
+    ///
+    /// Mutation control: drop `AND COALESCE(kind, 'concept') <> 'entity'` from
+    /// `count_active_pages` and the first refusal below stops arriving.
+    #[tokio::test]
+    async fn entity_shadow_pages_are_not_page_channel_substrate() {
+        let conn = mem_conn().await;
+        insert(&conn, "a", Some(0.5), Some("cue")).await;
+        insert_entity_shadow_page(&conn, "ent-page", "active").await;
+
+        let err = assert_feature_substrate_live(&conn, "page_channel")
+            .await
+            .expect_err("a store with only entity shadow pages has no page channel");
+        assert!(format!("{err}").contains("page substrate empty"));
+
+        // The control: one genuine distilled page and the same call proceeds,
+        // so the refusal above is the fence and not an unrelated failure.
+        insert_page(&conn, "p1", "active").await;
+        assert_feature_substrate_live(&conn, "page_channel")
+            .await
+            .expect("one distilled page revives the channel");
     }
 
     #[tokio::test]
