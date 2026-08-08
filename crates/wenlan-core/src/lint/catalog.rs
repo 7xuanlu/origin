@@ -44,10 +44,10 @@ pub struct LintCatalogEntry {
 
 const CATALOG: &[LintCatalogEntry] = &[
     deep_entry(
-        "entities.alias_integrity",
+        "entities.alias_collision_inventory",
         ScopePolicy::ScopedRows,
         ScopeAxis::EntitiesSpace,
-        LintGateEffect::Actionable,
+        LintGateEffect::Advisory,
     ),
     entity_entry("entities.partition_inventory", ScopePolicy::ScopedRows),
     entity_entry("entities.structural_integrity", ScopePolicy::ScopedRows),

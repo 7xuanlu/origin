@@ -1085,7 +1085,7 @@ mod tests {
         let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
-                "SELECT COUNT(*) FROM entities WHERE id = ?1",
+                "SELECT COUNT(*) FROM entity_page_map WHERE entity_id = ?1",
                 libsql::params![existing_ent],
             )
             .await
@@ -1095,7 +1095,7 @@ mod tests {
 
         let mut rows = conn
             .query(
-                "SELECT COUNT(*) FROM entities WHERE id = ?1",
+                "SELECT COUNT(*) FROM entity_page_map WHERE entity_id = ?1",
                 libsql::params![new_ent],
             )
             .await

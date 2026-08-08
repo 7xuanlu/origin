@@ -9849,10 +9849,15 @@ async fn enrichment_parity_contract() {
         let conn = sdb.connect().expect("connect for entity read");
         let mut rows = conn
             .query(
-                "SELECT me.memory_id, e.name \
+                // G6 Stage 3: entity identity is the `kind='entity'` shadow
+                // page reached through `entity_page_map`; `entities` is gone.
+                // `pages.title` carries what `entities.name` used to.
+                "SELECT me.memory_id, p.title \
                  FROM memory_entities me \
-                 JOIN entities e ON e.id = me.entity_id \
-                 ORDER BY me.memory_id, e.name",
+                 JOIN entity_page_map epm ON epm.entity_id = me.entity_id \
+                 JOIN pages p ON p.id = epm.page_id \
+                 WHERE p.kind = 'entity' AND p.status = 'active' \
+                 ORDER BY me.memory_id, p.title",
                 (),
             )
             .await

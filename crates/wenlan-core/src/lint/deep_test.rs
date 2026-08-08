@@ -36,12 +36,24 @@ async fn deep_profile_detects_structural_and_advisory_counterexamples() {
     db.test_primary_session()
         .await
         .execute_batch(
-            "INSERT INTO entities
-                 (id,name,entity_type,created_at,updated_at)
-             VALUES ('entity_a','A','person',0,0);
-             INSERT INTO entity_aliases
-                 (alias_name,canonical_entity_id,created_at)
-             VALUES ('','entity_a',0);
+            "-- G6 Stage 3 retirement lint track: migration 123 drops
+             -- `entities` outright, so there is no legacy row to raw-INSERT
+             -- for entity_a any more -- observation_duplicates ports to the
+             -- canonical entity_page_map/pages join (INNER, same as the
+             -- legacy `entities` join it replaces), so entity_a needs a
+             -- shadow page or its observations drop out of that check's
+             -- population entirely. observations/relations/edges/
+             -- memory_entities below reference 'entity_a' as a bare id --
+             -- no FK to `entities` remains to satisfy.
+             INSERT INTO pages
+                 (id,title,summary,content,kind,entity_type,confidence,entity_confirmed,
+                  embedding,space,workspace,source_memory_ids,version,status,
+                  created_at,last_compiled,last_modified,creation_kind,review_status,aliases)
+             VALUES
+                 ('page_entity_a','A',NULL,'','entity','person',NULL,0,
+                  NULL,'unfiled','unfiled','[]',1,'active',0,0,0,'entity','unconfirmed','[]');
+             INSERT INTO entity_page_map (entity_id,page_id,created_at)
+             VALUES ('entity_a','page_entity_a',0);
              INSERT INTO observations
                  (id,entity_id,content,created_at)
              VALUES ('obs_a','entity_a','same',0),('obs_b','entity_a','same',0);
@@ -73,10 +85,14 @@ async fn deep_profile_detects_structural_and_advisory_counterexamples() {
         .unwrap();
 
     let report = deep_report(&db, None).await;
-    for id in [ALIASES, RELATION_VOCABULARY] {
-        assert_eq!(check(&report, id).outcome(), LintOutcome::Finding);
-        assert_eq!(check(&report, id).gate_effect(), LintGateEffect::Actionable);
-    }
+    assert_eq!(
+        check(&report, RELATION_VOCABULARY).outcome(),
+        LintOutcome::Finding
+    );
+    assert_eq!(
+        check(&report, RELATION_VOCABULARY).gate_effect(),
+        LintGateEffect::Actionable
+    );
     for id in [
         MEMORY_DUPLICATES,
         RETRIEVAL_SUBSTRATE,
@@ -95,6 +111,71 @@ async fn deep_profile_detects_structural_and_advisory_counterexamples() {
     assert_eq!(
         check(&report, SOURCE_RESIDUE).outcome(),
         LintOutcome::NotRunPrerequisite
+    );
+}
+
+// G6 Stage 3 retirement lint track: dropping `entity_aliases`' own
+// UNIQUE(alias_name) means two active entity shadow pages can now claim the
+// same lowercased alias (see `MemoryDB::add_entity_alias`'s write-time
+// guard, db.rs) -- `alias_collisions` is the lint-visible detector for that.
+#[tokio::test]
+async fn alias_collision_inventory_flags_the_same_alias_on_two_active_pages() {
+    let (db, _dir) = test_db().await;
+    db.test_primary_session()
+        .await
+        .execute_batch(
+            "INSERT INTO pages
+                 (id,title,summary,content,kind,entity_type,confidence,entity_confirmed,
+                  embedding,space,workspace,source_memory_ids,version,status,
+                  created_at,last_compiled,last_modified,creation_kind,review_status,aliases)
+             VALUES
+                 ('page_older','Older',NULL,'','entity','concept',NULL,0,
+                  NULL,'unfiled','unfiled','[]',1,'active','2020-01-01T00:00:00Z',
+                  '2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','entity','unconfirmed',
+                  '[\"collide alias\"]'),
+                 ('page_newer','Newer',NULL,'','entity','concept',NULL,0,
+                  NULL,'unfiled','unfiled','[]',1,'active','2021-01-01T00:00:00Z',
+                  '2021-01-01T00:00:00Z','2021-01-01T00:00:00Z','entity','unconfirmed',
+                  '[\"collide alias\"]');
+             INSERT INTO entity_page_map (entity_id,page_id,created_at)
+             VALUES ('collide-older','page_older','2020-01-01T00:00:00Z'),
+                    ('collide-newer','page_newer','2021-01-01T00:00:00Z');",
+        )
+        .await
+        .unwrap();
+
+    let report = deep_report(&db, None).await;
+    let result = check(&report, ALIAS_COLLISIONS);
+    assert_eq!(result.outcome(), LintOutcome::Finding);
+    assert_eq!(result.gate_effect(), LintGateEffect::Advisory);
+    assert!(!result.evidence().is_empty());
+}
+
+#[tokio::test]
+async fn alias_collision_inventory_is_silent_on_a_clean_store() {
+    let (db, _dir) = test_db().await;
+    db.test_primary_session()
+        .await
+        .execute_batch(
+            "INSERT INTO pages
+                 (id,title,summary,content,kind,entity_type,confidence,entity_confirmed,
+                  embedding,space,workspace,source_memory_ids,version,status,
+                  created_at,last_compiled,last_modified,creation_kind,review_status,aliases)
+             VALUES
+                 ('page_solo','Solo',NULL,'','entity','concept',NULL,0,
+                  NULL,'unfiled','unfiled','[]',1,'active','2020-01-01T00:00:00Z',
+                  '2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','entity','unconfirmed',
+                  '[\"unique alias\"]');
+             INSERT INTO entity_page_map (entity_id,page_id,created_at)
+             VALUES ('solo-entity','page_solo','2020-01-01T00:00:00Z');",
+        )
+        .await
+        .unwrap();
+
+    let report = deep_report(&db, None).await;
+    assert_eq!(
+        check(&report, ALIAS_COLLISIONS).outcome(),
+        LintOutcome::Pass
     );
 }
 
