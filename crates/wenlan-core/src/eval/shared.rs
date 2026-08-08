@@ -3134,10 +3134,12 @@ mod tests {
     /// step records instead.
     #[derive(Debug, PartialEq, Eq)]
     struct SubstrateFingerprint {
-        /// Sorted set of (name, entity_type) across all entities.
+        /// Sorted set of (name, entity_type) across all entities, read off the
+        /// canonical shadow pages (`entity_page_map` JOIN `pages`).
         entities: Vec<(String, String)>,
         /// Sorted list of (source_id, entity_name) derived from
-        /// `memories.entity_id → entities.name` for chunk_index=0 primary memories.
+        /// `memories.entity_id → entity_page_map → pages.title` for
+        /// chunk_index=0 primary memories.
         memory_entity_links: Vec<(String, String)>,
         /// Sorted list of (source_id, title) for chunk_index=0 primary memories.
         titles: Vec<(String, String)>,
@@ -3155,7 +3157,11 @@ mod tests {
         {
             let mut rows = conn
                 .query(
-                    "SELECT name, entity_type FROM entities ORDER BY name, entity_type",
+                    "SELECT p.title, p.entity_type
+                       FROM entity_page_map epm
+                       JOIN pages p ON p.id = epm.page_id
+                      WHERE p.kind = 'entity' AND p.status = 'active'
+                      ORDER BY p.title, p.entity_type",
                     (),
                 )
                 .await
@@ -3175,9 +3181,11 @@ mod tests {
         {
             let mut rows = conn
                 .query(
-                    "SELECT m.source_id, e.name
+                    "SELECT m.source_id, p.title
                      FROM memories m
-                     JOIN entities e ON e.id = m.entity_id
+                     JOIN entity_page_map epm ON epm.entity_id = m.entity_id
+                     JOIN pages p ON p.id = epm.page_id
+                          AND p.kind = 'entity' AND p.status = 'active'
                      WHERE m.chunk_index = 0 AND m.source = 'memory'
                      ORDER BY m.source_id",
                     (),

@@ -105,6 +105,14 @@ async fn entity_fixture() -> (
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 5: `validate_selected_entities_on_connection`
+    // now reads the `kind='entity'` shadow page, not the raw `entities` row above --
+    // backfill both fixture entities' shadow pages via the established raw-seed
+    // helper so the CAS repair's entity-existence check sees them.
+    db.test_seed_entity_shadow_page("ent-existing")
+        .await
+        .unwrap();
+    db.test_seed_entity_shadow_page("ent-new").await.unwrap();
 
     let occurrence = RepairDigest::parse(ENTITY_OCCURRENCE).unwrap();
     let review_id = format!("lint_review_{ENTITY_OCCURRENCE}");

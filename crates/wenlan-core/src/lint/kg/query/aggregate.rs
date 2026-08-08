@@ -35,8 +35,9 @@ impl AggregateCounts {
 // transitional skew: the `KgEntities` metric emitted here is legacy-derived
 // (`COUNT(*) FROM entities`), while `aggregate_counts` below emits the same
 // metric code shadow-derived (`entity_page_map` JOIN `pages`) -- the two only
-// diverge if the mirror invariant breaks. This function retires with the
-// `entities` store, not before.
+// diverge if the mirror invariant breaks. Stays on `entities` through
+// Stage 1 and Stage 2; retires with the store at Stage 3, same as
+// `lint/pages/provenance_checks/source.rs`.
 pub(super) async fn entity_partitions(
     context: &LintContext<'_, '_>,
 ) -> Result<Vec<LintMetric>, ()> {

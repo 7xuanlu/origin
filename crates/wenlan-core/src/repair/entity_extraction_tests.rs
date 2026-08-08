@@ -28,28 +28,41 @@ struct EntityExtractionFixture {
 }
 
 async fn entity_extraction_fixture() -> EntityExtractionFixture {
+    entity_extraction_fixture_in_space(Some("work")).await
+}
+
+/// G6 Stage 2 PR 2c, independent-review finding 2: the same fixture with the
+/// memory and its entities UNCATEGORIZED. `memories.space` is NOT NULL as of
+/// migration 91, so an unfiled memory carries the reserved sentinel id -- and
+/// `entities.space` is NOT NULL for the same reason, so the entity and its
+/// shadow page carry it too. Every existing
+/// entity-extraction test used a registered space, which is why nothing caught
+/// the CAS link INSERT reading the sentinel as a mismatch.
+async fn entity_extraction_fixture_in_space(space: Option<&str>) -> EntityExtractionFixture {
     let (db, db_dir) = test_db().await;
+    let memory_space = space.unwrap_or(crate::db::UNFILED_SPACE_ID);
+    let entity_space = space.unwrap_or(crate::db::UNFILED_SPACE_ID);
     db.test_primary_session()
         .await
-        .execute_batch(
+        .execute_batch(&format!(
             "INSERT INTO spaces (id,name,created_at,updated_at)
              VALUES ('space-work','work',1,1),('space-personal','personal',1,1);
              INSERT INTO memories
                  (id,content,source,source_id,title,chunk_index,last_modified,chunk_type,
                   pending_revision,is_recap,supersede_mode,memory_type,space)
              VALUES ('row-entity','Target memory','memory','mem-entity','target',0,10,
-                     'text',0,0,'hide','fact','work');
+                     'text',0,0,'hide','fact','{memory_space}');
              INSERT INTO entities
                  (id,name,entity_type,space,created_at,updated_at)
-             VALUES ('ent-existing','Existing','concept','work',1,1),
-                    ('ent-new','New','concept','work',1,1),
-                    ('ent-extra','Extra','concept','work',1,1);
+             VALUES ('ent-existing','Existing','concept','{entity_space}',1,1),
+                    ('ent-new','New','concept','{entity_space}',1,1),
+                    ('ent-extra','Extra','concept','{entity_space}',1,1);
              INSERT INTO memory_entities(memory_id,entity_id)
              VALUES ('mem-entity','ent-existing');
              INSERT INTO enrichment_steps
                  (source_id,step_name,status,error,attempts,updated_at)
-             VALUES ('mem-entity','entity_extract','failed','transient',2,1721000000);",
-        )
+             VALUES ('mem-entity','entity_extract','failed','transient',2,1721000000);"
+        ))
         .await
         .unwrap();
     // G6 Stage 1.5a review fix round fallout: `entities` is raw-SQL-seeded
@@ -279,6 +292,43 @@ async fn apply_preserves_existing_link_adds_approved_link_and_completes_only_sel
     );
 }
 
+/// G6 Stage 2 PR 2c, independent-review finding 2: a complete-entity-extraction
+/// repair whose target is UNCATEGORIZED must actually apply. Selection-time
+/// validation treats an entity page as unfiled when its space is NULL *or* the
+/// reserved sentinel, because the M1 fold stores the sentinel; the CAS link
+/// INSERT used to accept only NULL, so the guarded INSERT matched no row, the
+/// link was silently never written, and the post-write proof failed the whole
+/// repair with `repair_target_write_unproven`. Registered-space coverage cannot
+/// see this -- the two predicates agree whenever a real space id is involved.
+#[tokio::test]
+async fn uncategorized_target_completes_entity_extraction() {
+    let fixture = entity_extraction_fixture_in_space(None).await;
+    let manifest = prepare(&fixture).await;
+    assert_eq!(
+        manifest.target().scope(),
+        &RepairScope::uncategorized(),
+        "the fixture must actually resolve to an uncategorized target"
+    );
+
+    apply_repair(
+        &fixture.db,
+        &RepairArtifactStore::new(fixture.repair_root.path().to_path_buf()),
+        exact_apply(&manifest),
+        1_721_000_002,
+    )
+    .await
+    .expect("an uncategorized complete-entity-extraction repair must apply");
+
+    assert_eq!(
+        entity_state(&fixture.db).await,
+        (
+            vec!["ent-existing".to_string(), "ent-new".to_string()],
+            ("ok".to_string(), None, 2, 1_721_000_000)
+        ),
+        "the approved link must be written and the failed step completed"
+    );
+}
+
 #[tokio::test]
 async fn entity_rollback_uncertainty_retains_pending_receipt() {
     let fixture = entity_extraction_fixture().await;
@@ -504,13 +554,38 @@ async fn aggregate_cas_rejects_every_stale_dimension_without_database_mutation()
                     .await
                     .unwrap();
             }
+            // G6 Stage 2 PR 2c item 5/6: the selected-entity guard reads the
+            // canonical shadow page, so "absent"/"rescoped" must be simulated
+            // there -- deleting or rescoping only the legacy `entities` row
+            // leaves the shadow live and the guard passes.
             "entity_absent" => {
+                session
+                    .execute(
+                        "DELETE FROM pages WHERE kind='entity' AND id=(
+                             SELECT page_id FROM entity_page_map WHERE entity_id='ent-new')",
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                session
+                    .execute("DELETE FROM entity_page_map WHERE entity_id='ent-new'", ())
+                    .await
+                    .unwrap();
                 session
                     .execute("DELETE FROM entities WHERE id='ent-new'", ())
                     .await
                     .unwrap();
             }
             "entity_scope" => {
+                session
+                    .execute(
+                        "UPDATE pages SET space='personal'
+                         WHERE kind='entity' AND id=(
+                             SELECT page_id FROM entity_page_map WHERE entity_id='ent-new')",
+                        (),
+                    )
+                    .await
+                    .unwrap();
                 session
                     .execute(
                         "UPDATE entities SET space='personal' WHERE id='ent-new'",

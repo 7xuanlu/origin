@@ -124,6 +124,14 @@ async fn fixture() -> (crate::db::MemoryDB, tempfile::TempDir) {
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: `load_entities` now
+    // reads the canonical `kind='entity'` shadow page, not `entities`
+    // directly, so this raw-seeded entity needs a matching shadow page or
+    // every check depending on entity candidate generation sees zero
+    // entities.
+    db.test_seed_entity_shadow_page("entity-atlas")
+        .await
+        .unwrap();
     (db, dir)
 }
 
@@ -265,6 +273,15 @@ async fn candidate_generation_distinguishes_missing_wrong_and_cross_space_links(
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above.
+    for entity_id in [
+        "entity-atlas-work",
+        "entity-atlas-personal",
+        "entity-wrong",
+        "entity-wenlan",
+    ] {
+        db.test_seed_entity_shadow_page(entity_id).await.unwrap();
+    }
 
     let report = prepare(&db, None).await;
     let work = report.agent_work().unwrap();
@@ -315,6 +332,10 @@ async fn scoped_candidates_hydrate_cross_space_existing_link_endpoints() {
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above.
+    for entity_id in ["entity-work", "entity-personal"] {
+        db.test_seed_entity_shadow_page(entity_id).await.unwrap();
+    }
 
     let report = prepare(&db, Some("work")).await;
     let work = report.agent_work().unwrap();
@@ -361,6 +382,53 @@ async fn scoped_candidates_hydrate_cross_space_existing_link_endpoints() {
 }
 
 #[tokio::test]
+async fn load_relations_sees_a_canonical_only_entitys_existing_edge() {
+    let (db, _dir) = test_db().await;
+    // Both entities are canonical-only: created via `store_entity` (item 5,
+    // G6 Stage 2 PR 2c), which no longer writes an `entities` row. The
+    // Codex Sol review's finding 3: `load_relations`'s unfixed `JOIN
+    // entities source` is an INNER join, so an edge whose endpoints have no
+    // `entities` row is silently dropped from `relation_pairs` -- the
+    // relation already exists, but the candidate generator can't see it.
+    let alpha_id = db
+        .store_entity("Alpha Widget", "concept", Some("work"), None, None)
+        .await
+        .unwrap();
+    let beta_id = db
+        .store_entity("Beta Gadget", "concept", Some("work"), None, None)
+        .await
+        .unwrap();
+    db.test_primary_session()
+        .await
+        .execute_batch(&format!(
+            "INSERT INTO memories
+             (id,content,source,source_id,title,chunk_index,last_modified,chunk_type,
+              pending_revision,is_recap,supersede_mode,space,memory_type)
+         VALUES ('mem-widgets-row','Alpha Widget connects to Beta Gadget','memory','mem-widgets',
+                 'widgets',0,100,'text',0,0,'hide','work','fact');
+         INSERT INTO edges
+             (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type)
+         VALUES ('edge-widgets-relates','{alpha_id}','entity','{beta_id}','entity','relates','assertion',1,'work',1,'related');",
+        ))
+        .await
+        .unwrap();
+
+    let report = prepare(&db, None).await;
+    let work = report.agent_work().unwrap();
+    // Both entities are co-mentioned in the memory above, and their edge
+    // already records the relation. A `load_relations` that can see
+    // canonical-only entities must NOT propose adding it again.
+    let false_add = candidates_for(work, LintSemanticCheckId::EntityRelations)
+        .into_iter()
+        .find(|candidate| candidate.proposed_action() == LintSemanticAction::AddEntityRelation);
+    assert!(
+        false_add.is_none(),
+        "load_relations dropped a canonical-only entity's existing edge, proposing a false \
+         AddEntityRelation for a relation that already exists: {false_add:?}"
+    );
+}
+
+#[tokio::test]
 async fn approved_link_repair_removes_candidate_on_rerun() {
     let (db, _dir) = test_db().await;
     db.test_primary_session()
@@ -375,6 +443,10 @@ async fn approved_link_repair_removes_candidate_on_rerun() {
              (id,name,entity_type,space,confirmed,created_at,updated_at)
          VALUES ('entity-atlas','Project Atlas','concept','work',1,1,1);",
         )
+        .await
+        .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above.
+    db.test_seed_entity_shadow_page("entity-atlas")
         .await
         .unwrap();
 
@@ -423,12 +495,24 @@ async fn suspicious_existing_page_and_entity_links_are_distinct_candidates() {
                 ('entity-personal','Personal Entity','concept','personal',1,1,1);
          INSERT INTO relations (id,from_entity,to_entity,relation_type,created_at)
          VALUES ('relation-same','entity-work','entity-work-peer','related',1),
-                ('relation-cross','entity-work','entity-personal','related',1);
-         -- G6 Stage 1.2: entity_scope_clause/load_relations (reader #4) read
-         -- `edges`, not `relations` -- mirror the dual-write here. Both rows
-         -- matter: the test asserts the same-space relation is NOT flagged
-         -- while the cross-space one is.
-         INSERT INTO edges
+                ('relation-cross','entity-work','entity-personal','related',1);",
+        )
+        .await
+        .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 (RULING-ESC-1): entities get real
+    // canonical shadow pages, so `edges_space_fence`'s entity arm (migration
+    // 121) and the ported `load_entities` both resolve them directly -- no
+    // more dropping/recreating the fence to simulate legacy pre-shadow-page
+    // data. `load_pages` now excludes `kind='entity'` (semantic_candidates.rs
+    // `load_pages`), so these shadow pages can't leak into the
+    // PageProvenanceAdequacy scan as false candidates.
+    for entity_id in ["entity-work", "entity-work-peer", "entity-personal"] {
+        db.test_seed_entity_shadow_page(entity_id).await.unwrap();
+    }
+    db.test_primary_session()
+        .await
+        .execute_batch(
+            "INSERT INTO edges
              (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type)
          VALUES ('edge-relation-same','entity-work','entity','entity-work-peer','entity','relates','assertion',0,'work',1,'related'),
                 ('edge-relation-cross','entity-work','entity','entity-personal','entity','relates','legacy',0,'work',1,'related');
@@ -537,6 +621,12 @@ async fn candidate_truncation_completes_after_bounded_adjudication() {
         .unwrap();
     }
     drop(conn);
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above.
+    // `conn`'s owned lock must be dropped first -- `test_seed_entity_shadow_page`
+    // takes its own lock on the same non-reentrant connection mutex.
+    db.test_seed_entity_shadow_page("entity-atlas")
+        .await
+        .unwrap();
     let report = prepare(&db, None).await;
     let work = report.agent_work().unwrap();
     let population = population_for(work, LintSemanticCheckId::MemoryEntityLinks);
@@ -923,6 +1013,11 @@ async fn duplicate_pair_paths_consume_one_candidate_slot() {
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above
+    // (fixture() already seeds entity-atlas; this test adds its own entity).
+    db.test_seed_entity_shadow_page("entity-launch")
+        .await
+        .unwrap();
     let report = prepare(&db, None).await;
     assert_eq!(
         population_for(
@@ -968,6 +1063,12 @@ async fn contradiction_cap_keeps_highest_signal_pair_not_first_ids() {
         .unwrap();
     }
     drop(conn);
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above.
+    // `conn`'s owned lock must be dropped first -- `test_seed_entity_shadow_page`
+    // takes its own lock on the same non-reentrant connection mutex.
+    db.test_seed_entity_shadow_page("entity-atlas")
+        .await
+        .unwrap();
 
     let report = prepare(&db, None).await;
     let work = report.agent_work().unwrap();
