@@ -41,11 +41,3 @@ retries = 2
 filter = 'test(back_pressure_holds_sweep_at_pending_cap)'
 retries = 2
 
-# Same load-flake protection as above: wall-clock gates.
-[[profile.default.overrides]]
-filter = 'test(m4_pr2_global_parity_reconcile_scale_receipt)'
-retries = 2
-
-[[profile.default.overrides]]
-filter = 'test(m4_partition_scale_churn_and_poison_receipt)'
-retries = 2
