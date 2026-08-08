@@ -57,19 +57,21 @@ async fn search_entities_scopes_before_vector_limit() {
             .collect::<Vec<_>>(),
     );
     let conn = db.conn.lock().await;
+    // G6: entity ANN ranks off the shadow page's embedding (PR 2c sub-step 1),
+    // and migration 123 dropped `entities`, so the page IS the vector.
+    const SET_SHADOW_EMBEDDING: &str = "UPDATE pages SET embedding = vector32(?1) \
+         WHERE kind = 'entity' \
+           AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?2)";
     conn.execute(
-        "UPDATE entities SET embedding = vector32(?1) WHERE id = ?2",
+        SET_SHADOW_EMBEDDING,
         libsql::params![opposite, work_id.clone()],
     )
     .await
     .unwrap();
     for id in personal_ids {
-        conn.execute(
-            "UPDATE entities SET embedding = vector32(?1) WHERE id = ?2",
-            libsql::params![exact.clone(), id],
-        )
-        .await
-        .unwrap();
+        conn.execute(SET_SHADOW_EMBEDDING, libsql::params![exact.clone(), id])
+            .await
+            .unwrap();
     }
     drop(conn);
 

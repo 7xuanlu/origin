@@ -49,12 +49,16 @@ pub(super) async fn load(context: &LintContext<'_, '_>, hub_cap: u64) -> Result<
 // space-sentinel fold: the scope clause now uses `scope_clause_folded`, and
 // the integrity predicate excludes the `UNFILED_SPACE_ID` sentinel itself
 // (never a registered `spaces.name`) so a folded unfiled entity no longer
-// vacuously flags as an integrity violation. 1.5b Part 3 (item 8)
-// disposition: not a reader-migration target -- this audits the legacy
-// `entities` store's own data quality, and reading the shadow-page mirror
-// instead would validate the mirror rather than the store it exists to
-// check. Stays on `entities` through Stage 1 and Stage 2; retires with the
-// store at Stage 3, same as `lint/pages/provenance_checks/source.rs`.
+// vacuously flags as an integrity violation. G6 Stage 3 retirement lint
+// track: the prior disposition here ("audits the legacy entities store's
+// own data quality") no longer holds -- every column this check validates
+// (name, entity_type, confirmed, confidence, space) is mirrored verbatim
+// onto the `kind='entity'` shadow page (item 5, writer flip), so validating
+// the shadow page validates the live store, not a stale mirror. Ported to
+// the canonical projected subquery (same pattern as `link_integrity` above
+// and `semantic_candidates.rs::load_entities`), aliased so every downstream
+// `e.name`/`e.entity_type`/`e.confirmed`/`e.confidence`/`e.space`/`e.id`
+// reference is unchanged.
 async fn entity_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (clause, params) = scope_clause_folded(context.scope().filter(), "e", false);
     row_check(
@@ -63,11 +67,15 @@ async fn entity_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()>
             "SELECT CASE WHEN TRIM(e.name)='' OR TRIM(e.entity_type)=''
                     OR COALESCE(e.confirmed,-1) NOT IN (0,1)
                     OR (e.confidence IS NOT NULL AND (e.confidence < 0 OR e.confidence > 1))
-                    OR (e.space IS NOT NULL AND e.space != '{}' AND NOT EXISTS(
+                    OR (e.space IS NOT NULL AND e.space != '{unfiled}' AND NOT EXISTS(
                         SELECT 1 FROM spaces s WHERE s.name=e.space))
                   THEN 1 ELSE 0 END
-               FROM entities e{clause} ORDER BY e.id",
-            crate::db::UNFILED_SPACE_ID
+               FROM (SELECT epm.entity_id AS id, p.title AS name, p.entity_type AS entity_type,
+                            p.entity_confirmed AS confirmed, p.confidence AS confidence,
+                            p.space AS space
+                       FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
+                      WHERE p.kind='entity' AND p.status='active') e{clause} ORDER BY e.id",
+            unfiled = crate::db::UNFILED_SPACE_ID
         ),
         params,
     )
@@ -78,12 +86,15 @@ async fn entity_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()>
 // space-sentinel fold: `e.space`/`e.id` now uses `scope_clause_folded`,
 // sentinel-aware (entity-existence side only -- observation content itself
 // is out of scope for this stage regardless, see the spec's 1.5b
-// observations ruling). 1.5b Part 3 (item 8) disposition: not a
-// reader-migration target -- this audits the legacy `entities` store's own
-// data quality, and reading the shadow-page mirror instead would validate
-// the mirror rather than the store it exists to check. Stays on `entities`
-// through Stage 1 and Stage 2; retires with the store at Stage 3, same as
-// `lint/pages/provenance_checks/source.rs`.
+// observations ruling). G6 Stage 3 retirement lint track: the prior
+// disposition here ("audits the legacy entities store's own data quality")
+// was only half right -- `TRIM(o.content)=''`/confirmed/confidence bounds
+// are genuine observation-quality checks with nothing to do with `entities`,
+// and `e.id IS NULL` is a real orphan-observation check (does this
+// observation's owning entity still exist), which stays meaningful once
+// the store retires. Only the join needed porting, same pattern as
+// `link_integrity` above: a canonical-only entity's observations no longer
+// read as orphaned just because it never got an `entities` row.
 async fn observation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (clause, params) = scope_clause_folded(context.scope().filter(), "e", true);
     row_check(
@@ -93,7 +104,11 @@ async fn observation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck
                     OR COALESCE(o.confirmed,-1) NOT IN (0,1)
                     OR (o.confidence IS NOT NULL AND (o.confidence < 0 OR o.confidence > 1))
                   THEN 1 ELSE 0 END
-               FROM observations o LEFT JOIN entities e ON e.id=o.entity_id
+               FROM observations o
+               LEFT JOIN (SELECT epm.entity_id AS id, p.space AS space
+                            FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
+                           WHERE p.kind='entity' AND p.status='active') e
+                 ON e.id=o.entity_id
                {clause} ORDER BY o.id"
         ),
         params,
@@ -103,12 +118,14 @@ async fn observation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck
 
 // G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
 // space-sentinel fold: `f.space`/`f.id` (the src-entity alias) now uses
-// `scope_clause_folded`, sentinel-aware. 1.5b Part 3 (item 8) disposition:
-// not a reader-migration target -- this audits the legacy `entities`
-// store's own data quality, and reading the shadow-page mirror instead
-// would validate the mirror rather than the store it exists to check.
-// Stays on `entities` through Stage 1 and Stage 2; retires with the store
-// at Stage 3, same as `lint/pages/provenance_checks/source.rs`.
+// `scope_clause_folded`, sentinel-aware. G6 Stage 3 retirement lint track:
+// the prior disposition here ("audits the legacy entities store's own data
+// quality") was only half right -- `TRIM(r.semantic_type)=''` has nothing to
+// do with `entities`, and `f.id`/`t.id IS NULL` are real orphan-relation
+// checks (does this edge's src/dst entity still exist), which stay
+// meaningful once the store retires. Both joins ported to the canonical
+// projected subquery, same pattern as `link_integrity` above; two separate
+// subquery instances since `f` and `t` each need their own derived table.
 async fn relation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (clause, params) = scope_clause_folded(context.scope().filter(), "f", true);
     row_check(
@@ -117,8 +134,14 @@ async fn relation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, (
             "SELECT CASE WHEN f.id IS NULL OR t.id IS NULL OR TRIM(r.semantic_type)=''
                   THEN 1 ELSE 0 END
                FROM (SELECT * FROM edges WHERE edge_type='relates' AND valid_until IS NULL) r
-               LEFT JOIN entities f ON f.id=r.src_id
-               LEFT JOIN entities t ON t.id=r.dst_id
+               LEFT JOIN (SELECT epm.entity_id AS id, p.space AS space
+                            FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
+                           WHERE p.kind='entity' AND p.status='active') f
+                 ON f.id=r.src_id
+               LEFT JOIN (SELECT epm.entity_id AS id, p.space AS space
+                            FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
+                           WHERE p.kind='entity' AND p.status='active') t
+                 ON t.id=r.dst_id
                {clause} ORDER BY r.edge_id"
         ),
         params,

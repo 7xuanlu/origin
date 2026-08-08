@@ -10,7 +10,7 @@ use wenlan_types::lint::{
     LINT_MAX_EVIDENCE_PER_CHECK,
 };
 
-const ALIASES: &str = "entities.alias_integrity";
+const ALIAS_COLLISIONS: &str = "entities.alias_collision_inventory";
 const MEMORY_DUPLICATES: &str = "memories.duplicate_inventory";
 const RETRIEVAL_SUBSTRATE: &str = "memories.retrieval_substrate_inventory";
 const CONFLICTS: &str = "memories.structured_conflict_inventory";
@@ -34,10 +34,10 @@ pub(super) async fn run(
     vec![
         query_result(
             context,
-            ALIASES,
-            alias_integrity(context).await,
-            LintMetricCode::AffectedRecords,
-            LintSeverity::Error,
+            ALIAS_COLLISIONS,
+            alias_collisions(context).await,
+            LintMetricCode::DeepDuplicateRecords,
+            LintSeverity::Warning,
         ),
         query_result(
             context,
@@ -86,25 +86,36 @@ pub(super) async fn run(
     ]
 }
 
-// G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
-// space-sentinel fold: `e.space` now uses `scope_clause_folded`,
-// sentinel-aware. The `entity_aliases`/`entities` join itself is a separate,
-// still-legacy concern. 1.5b Part 3 (item 8) disposition: not a
-// reader-migration target -- this audits the legacy `entities` store's own
-// data quality, and reading the shadow-page mirror instead would validate
-// the mirror rather than the store it exists to check. Stays on `entities`
-// through Stage 1 and Stage 2; retires with the store at Stage 3, same as
-// `lint/pages/provenance_checks/source.rs`.
-async fn alias_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
-    let (scope, params) = scope_clause_folded(context.scope().filter(), "e.space", true);
+// G6 Stage 3 retirement lint track: `alias_integrity` (retired here) audited
+// `entity_aliases`' own referential integrity (empty alias_name, orphan
+// canonical_entity_id) -- a concept that has no successor once the table
+// drops with the store, so it retires rather than ports. What DOES survive
+// Stage 3 is collision detection: dropping `entity_aliases`' UNIQUE(alias_name)
+// means two active entity shadow pages can now claim the same lowercased
+// alias (see `MemoryDB::add_entity_alias`'s write-time guard and
+// `resolve_entity_by_alias`'s deterministic older-page tie-break, both in
+// db.rs) -- a real, user-facing data-quality finding that the old check never
+// covered (the table's UNIQUE constraint made it structurally impossible
+// pre-Stage-3). Scans every active `kind='entity'` shadow page's `aliases`
+// JSON array directly; no `entities`/`entity_aliases` read at all.
+async fn alias_collisions(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
+    let (scope, params) = scope_clause_folded(context.scope().filter(), "p.space", false);
     rows(
         context,
         &format!(
-            "SELECT CASE WHEN TRIM(a.alias_name)='' OR e.id IS NULL THEN 1 ELSE 0 END
-               FROM entity_aliases a
-               LEFT JOIN entities e ON e.id=a.canonical_entity_id
-              WHERE 1=1{scope}
-              ORDER BY a.alias_name, a.canonical_entity_id"
+            "WITH entity_aliases AS (
+                 SELECT epm.entity_id AS entity_id, LOWER(TRIM(a.value)) AS alias
+                   FROM entity_page_map epm
+                   JOIN pages p ON p.id = epm.page_id
+                   JOIN json_each(p.aliases) a ON 1=1
+                  WHERE p.kind='entity' AND p.status='active'{scope}
+             ), collisions AS (
+                 SELECT alias FROM entity_aliases WHERE alias!=''
+                  GROUP BY alias HAVING COUNT(DISTINCT entity_id)>1
+             )
+             SELECT CASE WHEN c.alias IS NULL THEN 0 ELSE 1 END
+               FROM entity_aliases ea LEFT JOIN collisions c ON c.alias=ea.alias
+              ORDER BY ea.entity_id, ea.alias"
         ),
         params,
     )
@@ -221,12 +232,16 @@ async fn structured_conflicts(context: &LintContext<'_, '_>) -> Result<RowCheck,
 // space-sentinel fold: `e.space` now uses `scope_clause_folded`,
 // sentinel-aware (entity-existence side only -- observation content itself
 // is out of scope for this stage regardless, see the spec's 1.5b
-// observations ruling). 1.5b Part 3 (item 8) disposition: not a
-// reader-migration target -- this audits the legacy `entities` store's own
-// data quality, and reading the shadow-page mirror instead would validate
-// the mirror rather than the store it exists to check. Stays on `entities`
-// through Stage 1 and Stage 2; retires with the store at Stage 3, same as
-// `lint/pages/provenance_checks/source.rs`.
+// observations ruling). G6 Stage 3 retirement lint track: the prior
+// disposition here ("audits the legacy entities store's own data quality")
+// was wrong for this check -- the `entities` join exists ONLY to resolve
+// `e.space` for scope filtering; the actual subject being checked is
+// observation content duplication, which has nothing to do with the
+// entities table's own row quality and must keep working once the store
+// drops. Ported to the canonical projected subquery (same pattern as
+// `semantic_candidates.rs::load_relations`, PR 2c fix round finding 3): a
+// canonical-only entity (no `entities` row) no longer silently drops its
+// observations out of this scope filter.
 async fn observation_duplicates(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (scope, params) = scope_clause_folded(context.scope().filter(), "e.space", true);
     rows(
@@ -234,7 +249,11 @@ async fn observation_duplicates(context: &LintContext<'_, '_>) -> Result<RowChec
         &format!(
             "WITH candidates AS (
                  SELECT o.id, o.entity_id, LOWER(TRIM(o.content)) AS normalized
-                   FROM observations o JOIN entities e ON e.id=o.entity_id
+                   FROM observations o
+                   JOIN (SELECT epm.entity_id AS id, p.space AS space
+                           FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
+                          WHERE p.kind='entity' AND p.status='active') e
+                     ON e.id=o.entity_id
                   WHERE 1=1{scope}
              ), duplicates AS (
                  SELECT entity_id, normalized FROM candidates WHERE normalized!=''
@@ -273,13 +292,15 @@ async fn page_duplicates(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> 
 
 // G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
 // space-sentinel fold: `f.space` (the src-entity alias) now uses
-// `scope_clause_folded`, sentinel-aware. The `entities` join itself is a
-// separate, still-legacy concern. 1.5b Part 3 (item 8) disposition: not a
-// reader-migration target -- this audits the legacy `entities` store's own
-// data quality, and reading the shadow-page mirror instead would validate
-// the mirror rather than the store it exists to check. Stays on `entities`
-// through Stage 1 and Stage 2; retires with the store at Stage 3, same as
-// `lint/pages/provenance_checks/source.rs`.
+// `scope_clause_folded`, sentinel-aware. G6 Stage 3 retirement lint track:
+// the prior disposition here ("audits the legacy entities store's own data
+// quality") was wrong -- the `entities` join exists ONLY to resolve
+// `f.space` for scope filtering; the actual subject is whether a relation
+// edge's `semantic_type` is in the canonical vocabulary, unrelated to the
+// entities table's own row quality. Ported to the canonical projected
+// subquery (same pattern as `semantic_candidates.rs::load_relations`, PR 2c
+// fix round finding 3): a canonical-only src entity no longer silently
+// drops its relates edges out of this scope filter.
 async fn relation_vocabulary(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (scope, params) = scope_clause_folded(context.scope().filter(), "f.space", true);
     rows(
@@ -287,7 +308,10 @@ async fn relation_vocabulary(context: &LintContext<'_, '_>) -> Result<RowCheck, 
         &format!(
             "SELECT CASE WHEN v.canonical IS NULL THEN 1 ELSE 0 END
                FROM (SELECT * FROM edges WHERE edge_type='relates' AND valid_until IS NULL) r
-               LEFT JOIN entities f ON f.id=r.src_id
+               LEFT JOIN (SELECT epm.entity_id AS id, p.space AS space
+                            FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
+                           WHERE p.kind='entity' AND p.status='active') f
+                 ON f.id=r.src_id
                LEFT JOIN relation_type_vocabulary v ON v.canonical=r.semantic_type
               WHERE 1=1{scope}
               ORDER BY r.edge_id"

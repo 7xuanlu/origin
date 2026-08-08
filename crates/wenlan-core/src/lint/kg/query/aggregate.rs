@@ -31,13 +31,14 @@ impl AggregateCounts {
 // space-sentinel fold: `KgEntitiesScoped` vs `KgEntitiesUncategorized` is
 // still the "has a real space" vs "unfiled" split -- the SUM predicates below
 // now test against the `UNFILED_SPACE_ID` sentinel too, so a folded row keeps
-// classifying as Uncategorized instead of silently reporting 0. Known
-// transitional skew: the `KgEntities` metric emitted here is legacy-derived
-// (`COUNT(*) FROM entities`), while `aggregate_counts` below emits the same
-// metric code shadow-derived (`entity_page_map` JOIN `pages`) -- the two only
-// diverge if the mirror invariant breaks. Stays on `entities` through
-// Stage 1 and Stage 2; retires with the store at Stage 3, same as
-// `lint/pages/provenance_checks/source.rs`.
+// classifying as Uncategorized instead of silently reporting 0. G6 Stage 3
+// retirement lint track: this resolves the "known transitional skew" the
+// prior comment flagged -- `KgEntities` here was legacy-derived
+// (`COUNT(*) FROM entities`) while `aggregate_counts` below already emits the
+// same metric code shadow-derived (`entity_page_map` JOIN `pages`); porting
+// this query onto the identical canonical projection makes the two counts
+// the same query in different shapes, not two independently-drifting
+// sources of truth.
 pub(super) async fn entity_partitions(
     context: &LintContext<'_, '_>,
 ) -> Result<Vec<LintMetric>, ()> {
@@ -48,7 +49,10 @@ pub(super) async fn entity_partitions(
             "SELECT COUNT(*), SUM(CASE WHEN e.confirmed=1 THEN 1 ELSE 0 END),
                     SUM(CASE WHEN e.space IS NOT NULL AND e.space != '{unfiled}' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN e.space IS NULL OR e.space = '{unfiled}' THEN 1 ELSE 0 END)
-               FROM entities e{clause}",
+               FROM (SELECT epm.entity_id AS id, p.entity_confirmed AS confirmed,
+                            p.space AS space
+                       FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
+                      WHERE p.kind='entity' AND p.status='active') e{clause}",
             unfiled = crate::db::UNFILED_SPACE_ID
         ),
         params,

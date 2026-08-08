@@ -4,28 +4,38 @@ use super::MemoryDB;
 use wenlan_types::repair::{RepairEnrichmentStep, RepairScope, RepairTarget};
 
 async fn seed_entity_extraction_target(db: &MemoryDB) {
-    let connection = db.conn.lock().await;
-    connection
-        .execute_batch(
-            "INSERT INTO spaces (id,name,created_at,updated_at)
+    {
+        let connection = db.conn.lock().await;
+        connection
+            .execute_batch(
+                "INSERT INTO spaces (id,name,created_at,updated_at)
              VALUES ('space-work','work',1,1);
              INSERT INTO memories
                  (id,content,source,source_id,title,chunk_index,last_modified,chunk_type,
                   pending_revision,is_recap,supersede_mode,memory_type,space)
              VALUES ('row-receipt','Target memory','memory','mem-receipt','target',0,10,
                      'text',0,0,'hide','fact','work');
-             INSERT INTO entities
-                 (id,name,entity_type,space,created_at,updated_at)
-             VALUES ('ent-existing','Existing','concept','work',1,1),
-                    ('ent-new','New','concept','work',1,1);
              INSERT INTO memory_entities(memory_id,entity_id)
              VALUES ('mem-receipt','ent-existing');
              INSERT INTO enrichment_steps
                  (source_id,step_name,status,error,attempts,updated_at)
              VALUES ('mem-receipt','entity_extract','failed','transient',2,1721000000);",
+            )
+            .await
+            .unwrap();
+    }
+
+    // G6 Stage 3: the two entity identities are `kind='entity'` shadow pages
+    // now -- migration 123 dropped `entities`, so the INSERT that used to sit
+    // inside the batch above is gone. Seeded after the batch so the 'work'
+    // space row exists first.
+    for (id, name) in [("ent-existing", "Existing"), ("ent-new", "New")] {
+        db.test_seed_entity_shadow_page(
+            crate::db::TestEntity::new(id, name, "concept").space("work"),
         )
         .await
         .unwrap();
+    }
 }
 
 fn entity_extraction_target(scope: RepairScope) -> RepairTarget {

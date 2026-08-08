@@ -52,11 +52,6 @@ async fn entity_extraction_fixture_in_space(space: Option<&str>) -> EntityExtrac
                   pending_revision,is_recap,supersede_mode,memory_type,space)
              VALUES ('row-entity','Target memory','memory','mem-entity','target',0,10,
                      'text',0,0,'hide','fact','{memory_space}');
-             INSERT INTO entities
-                 (id,name,entity_type,space,created_at,updated_at)
-             VALUES ('ent-existing','Existing','concept','{entity_space}',1,1),
-                    ('ent-new','New','concept','{entity_space}',1,1),
-                    ('ent-extra','Extra','concept','{entity_space}',1,1);
              INSERT INTO memory_entities(memory_id,entity_id)
              VALUES ('mem-entity','ent-existing');
              INSERT INTO enrichment_steps
@@ -65,16 +60,22 @@ async fn entity_extraction_fixture_in_space(space: Option<&str>) -> EntityExtrac
         ))
         .await
         .unwrap();
-    // G6 Stage 1.5a review fix round fallout: `entities` is raw-SQL-seeded
-    // above (bypassing `store_entity`), so without a shadow page these three
-    // entities are invisible to the readers this stage migrated
-    // (`link_integrity`, `entity_integrity`, ...) -- `mem-entity`/
-    // `ent-existing`'s link would read as broken before this repair ever
+    // G6 Stage 3: migration 123 dropped `entities`, so the `kind='entity'`
+    // shadow page IS these three fixture entities. Without them the readers
+    // this arc migrated (`link_integrity`, `entity_integrity`, ...) would see
+    // `mem-entity`/`ent-existing`'s link as broken before the repair ever
     // runs, corrupting the before/after lint comparison in
-    // `record_repair_verification`. Backfill the invariant the same way a
-    // real write would.
-    for entity_id in ["ent-existing", "ent-new", "ent-extra"] {
-        db.test_seed_entity_shadow_page(entity_id).await.unwrap();
+    // `record_repair_verification`.
+    for (entity_id, name) in [
+        ("ent-existing", "Existing"),
+        ("ent-new", "New"),
+        ("ent-extra", "Extra"),
+    ] {
+        db.test_seed_entity_shadow_page(
+            crate::db::TestEntity::new(entity_id, name, "concept").space(entity_space),
+        )
+        .await
+        .unwrap();
     }
 
     let occurrence = RepairDigest::parse(OCCURRENCE).unwrap();
@@ -571,10 +572,6 @@ async fn aggregate_cas_rejects_every_stale_dimension_without_database_mutation()
                     .execute("DELETE FROM entity_page_map WHERE entity_id='ent-new'", ())
                     .await
                     .unwrap();
-                session
-                    .execute("DELETE FROM entities WHERE id='ent-new'", ())
-                    .await
-                    .unwrap();
             }
             "entity_scope" => {
                 session
@@ -582,13 +579,6 @@ async fn aggregate_cas_rejects_every_stale_dimension_without_database_mutation()
                         "UPDATE pages SET space='personal'
                          WHERE kind='entity' AND id=(
                              SELECT page_id FROM entity_page_map WHERE entity_id='ent-new')",
-                        (),
-                    )
-                    .await
-                    .unwrap();
-                session
-                    .execute(
-                        "UPDATE entities SET space='personal' WHERE id='ent-new'",
                         (),
                     )
                     .await
@@ -1010,15 +1000,25 @@ async fn prepare_rejects_oversized_memory_receipt_without_persisting_manifest() 
 async fn prepare_rejects_oversized_link_receipt_without_persisting_manifest() {
     let fixture = entity_extraction_fixture().await;
     let raw_bytes = (REPAIR_ROLLBACK_ARTIFACT_MAX_BYTES / 2) + 1;
+    // G6 Stage 3: `entities` is gone (migration 123); the oversized entity id
+    // this test needs is seeded straight onto the shadow page. `lower(hex(
+    // zeroblob(n)))` is 2n lowercase '0' characters -- reproduced here so the
+    // id stays byte-identical to what the retired SQL produced.
+    let huge_id = "0".repeat((raw_bytes * 2) as usize);
+    fixture
+        .db
+        .test_seed_entity_shadow_page(
+            crate::db::TestEntity::new(&huge_id, "Huge", "concept").space("work"),
+        )
+        .await
+        .unwrap();
     fixture
         .db
         .test_primary_session()
         .await
         .execute_batch(&format!(
-            "INSERT INTO entities(id,name,entity_type,space,created_at,updated_at)
-             SELECT lower(hex(zeroblob({raw_bytes}))),'Huge','concept','work',1,1;
-             INSERT INTO memory_entities(memory_id,entity_id)
-             SELECT 'mem-entity',id FROM entities WHERE name='Huge';"
+            "INSERT INTO memory_entities(memory_id,entity_id)
+             VALUES ('mem-entity','{huge_id}');"
         ))
         .await
         .unwrap();
@@ -1073,14 +1073,22 @@ async fn memory_preflight_counts_multibyte_and_embedded_nul_text_bytes() {
 async fn link_preflight_counts_multibyte_and_embedded_nul_id_bytes() {
     let fixture = entity_extraction_fixture().await;
     let entity_id = "界\0x";
+    // G6 Stage 3: `entities` is gone (migration 123). The id carries an
+    // interior NUL, which is why the surviving `memory_entities` insert still
+    // spells it as a byte literal; the shadow page binds the same bytes.
+    fixture
+        .db
+        .test_seed_entity_shadow_page(
+            crate::db::TestEntity::new(entity_id, "Byte ID", "concept").space("work"),
+        )
+        .await
+        .unwrap();
     fixture
         .db
         .test_primary_session()
         .await
         .execute_batch(
-            "INSERT INTO entities(id,name,entity_type,space,created_at,updated_at)
-             VALUES (CAST(X'e7958c0078' AS TEXT),'Byte ID','concept','work',1,1);
-             INSERT INTO memory_entities(memory_id,entity_id)
+            "INSERT INTO memory_entities(memory_id,entity_id)
              VALUES ('mem-entity',CAST(X'e7958c0078' AS TEXT));",
         )
         .await

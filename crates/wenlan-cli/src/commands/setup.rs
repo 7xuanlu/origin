@@ -669,8 +669,25 @@ async fn print_daemon_health() {
     match reqwest::get(&url).await {
         Ok(resp) if resp.status().is_success() => println!("Daemon: running on {}", url),
         Ok(resp) => println!("Daemon: unhealthy ({})", resp.status()),
-        Err(_) => println!("Daemon: not reachable on {}", url),
+        Err(_) => {
+            println!("Daemon: not reachable on {}", url);
+            print_downgrade_barrier_hint();
+        }
     }
+}
+
+/// A daemon that refuses to start because the store was migrated by a newer
+/// build looks exactly like a daemon that is simply not running. Say the
+/// difference out loud: the refusal is deliberate, it is written to the daemon
+/// log verbatim, and the fix is to upgrade rather than to keep restarting.
+fn print_downgrade_barrier_hint() {
+    println!(
+        "  If the store was migrated by a NEWER Wenlan, this build refuses to open it \
+         on purpose (this build supports schema version {}).",
+        wenlan_core::db::SCHEMA_VERSION
+    );
+    println!("  Check the daemon log for: \"newer than this build supports\".");
+    println!("  Fix: upgrade Wenlan, or quit the newer copy. Restarting will not clear it.");
 }
 
 /// Fetch `/api/status` and print the per-path reranker summary (mode + deep + light).

@@ -768,20 +768,9 @@ impl MemoryDB {
                 .collect();
             let pre_json = serde_json::to_string(&pre).unwrap_or_else(|_| "[]".into());
 
-            // Legacy-row maintenance: no-op for a post-flip (shadow-only)
-            // entity, since `entities` has no matching row for it, but
-            // still keeps a pre-flip legacy row consistent with its shadow
-            // for as long as the entity-store parity oracle (scheduled to
-            // retire alongside the rest of the reconcile machinery) reads
-            // it. Expires at oracle retirement / Stage 3, same as the
-            // FK-guard deletes restored elsewhere in this item.
-            conn.execute(
-                "UPDATE entities SET entity_type = ?1 WHERE entity_type = ?2",
-                libsql::params![canonical.to_string(), old_type.to_string()],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("fold_entity_type: {e}")))?;
-
+            // G6 Stage 3: the legacy-row maintenance UPDATE that used to sit
+            // here is gone with the `entities` table itself (migration 123).
+            //
             // Canonical mirror (M3 PR-1 item C), and now the sole thing
             // that drives the returned count and the vocab_heal_ledger
             // pre-image above -- the early-return moved after the
@@ -853,8 +842,18 @@ pub const EMBEDDING_DIM: usize = 768;
 /// establish shadow-page completeness so the pages fence never goes live
 /// over an entity that could still be missing one (G6 Stage 2 PR 2c
 /// frozen-replay fix -- migrations 81/98 keep the historical
-/// `entities`-reading fence body).
-pub const SCHEMA_VERSION: u32 = 122;
+/// `entities`-reading fence body). Migration 122 rebuilds `entity_page_map`/
+/// `observations`/`memory_entities`/`entity_minhash_bands` without their
+/// `REFERENCES entities(id)` foreign key. Migration 123 (G6 Stage 3) drops
+/// `entities` and `entity_aliases` outright.
+///
+/// This constant is also the **downgrade barrier**. `run_migrations` refuses
+/// to open a database whose `user_version` exceeds it, so a build that
+/// predates migration 123 cannot write to a retired store — it would find no
+/// `entities` table, skip every `version < N` branch, and quietly operate
+/// against a schema it cannot see. Refusing to open is recoverable; writing is
+/// not.
+pub const SCHEMA_VERSION: u32 = 123;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -3167,19 +3166,10 @@ CREATE INDEX IF NOT EXISTS idx_memories_is_recap ON memories(is_recap) WHERE is_
 CREATE INDEX IF NOT EXISTS idx_memories_pending_revision ON memories(pending_revision) WHERE pending_revision != 0;
 CREATE INDEX IF NOT EXISTS idx_memories_stability ON memories(stability) WHERE source = 'memory';
 
--- Knowledge graph: Entities
-CREATE TABLE IF NOT EXISTS entities (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    entity_type TEXT NOT NULL,
-    domain TEXT,
-    source_agent TEXT,
-    confidence REAL,
-    confirmed INTEGER DEFAULT 0,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    embedding F32_BLOB(768)
-);
+-- Knowledge graph: Entities -- MOVED to LEGACY_ENTITIES_SCHEMA (G6 Stage 3).
+-- `SCHEMA` runs unconditionally on EVERY open, before run_migrations, so
+-- leaving the `entities` DDL here would silently resurrect an empty table on
+-- the first boot after migration 123 drops it. See LEGACY_ENTITIES_SCHEMA.
 
 -- Knowledge graph: Observations
 CREATE TABLE IF NOT EXISTS observations (
@@ -3286,6 +3276,418 @@ CREATE TABLE IF NOT EXISTS child_vectors (
 );
 CREATE INDEX IF NOT EXISTS idx_child_vectors_parent ON child_vectors(parent_kind, parent_id);
 ";
+
+/// The legacy `entities` table, split out of `SCHEMA` by G6 Stage 3.
+///
+/// `SCHEMA` is executed on EVERY open (both constructors), unconditionally and
+/// before `run_migrations`, which is exactly what makes `CREATE TABLE IF NOT
+/// EXISTS` safe for a table that is never dropped. `entities` stops being such
+/// a table at migration 123: leaving its DDL in `SCHEMA` would recreate an
+/// empty `entities` on the very next boot after the retirement migration, and
+/// then every boot after that -- a resurrection nothing would ever notice,
+/// since no reader is left to complain about it being empty.
+///
+/// It cannot simply be deleted either. A fresh install replays the WHOLE
+/// migration chain from `user_version = 0`, and dozens of migrations between 1
+/// and 122 `ALTER TABLE entities`, index it, backfill it, and read it. The
+/// table has to exist for that replay and then be dropped at 123, exactly as it
+/// does for a real upgrading database.
+///
+/// So: create it for the fresh install, and only there. Applied by
+/// `ensure_legacy_entities_table`, called once at the top of `run_migrations`
+/// — the chain replay is what needs the substrate, so the guarantee belongs
+/// there rather than in the constructors.
+///
+/// Shape matters, and there are two of them. This constant is the shape a
+/// database carried at `user_version = 0`, which is where a fresh install
+/// starts and where the chain then reshapes it (migration 24 rebuilds the
+/// table, 27 adds `community_id`, 50 renames `domain` to `space`). A database
+/// that is PAST those migrations needs the reshaped table instead —
+/// `LEGACY_ENTITIES_SCHEMA_V122` — because the frozen bodies it is about to
+/// replay read `entities.space`, a column this shape does not have. Handing a
+/// version-72 database a version-0-shaped table is worse than handing it
+/// nothing: the failure moves from "no such table" to "no such column", which
+/// reads like a bug in the migration rather than a missing substrate.
+const LEGACY_ENTITIES_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS entities (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    domain TEXT,
+    source_agent TEXT,
+    confidence REAL,
+    confirmed INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    embedding F32_BLOB(768)
+);
+";
+
+/// `entities` at the shape a database carried at `user_version = 122` — the
+/// instant before migration 123 dropped it. Its companion `entity_aliases`
+/// lives in `LEGACY_ENTITY_ALIASES_SCHEMA`.
+///
+/// Column order is not load-bearing (every reader names its columns) but the
+/// column SET is: the base table from migration 24's rebuild, `domain` renamed
+/// to `space` by 50, `space` given migration 118's `NOT NULL DEFAULT`, plus the
+/// two later `ADD COLUMN`s (`community_id`, `embedding_updated_at`).
+const LEGACY_ENTITIES_SCHEMA_V122: &str = "
+CREATE TABLE IF NOT EXISTS entities (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    space TEXT NOT NULL DEFAULT '{unfiled}',
+    source_agent TEXT,
+    confidence REAL,
+    confirmed INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    embedding F32_BLOB(768),
+    community_id INTEGER,
+    embedding_updated_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_entities_space ON entities(space);
+CREATE INDEX IF NOT EXISTS idx_entities_community ON entities(community_id);
+";
+
+/// `entity_aliases` as migration 41 created it, verbatim.
+///
+/// Kept separate from `LEGACY_ENTITIES_SCHEMA_V122` because the two tables can
+/// go missing independently: a fixture that hand-rolls an `entities` table to
+/// give a frozen body something to read leaves the alias table absent, and the
+/// alias half is the only part such a database still needs.
+const LEGACY_ENTITY_ALIASES_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS entity_aliases (
+    alias_name TEXT NOT NULL,
+    canonical_entity_id TEXT NOT NULL REFERENCES entities(id),
+    created_at INTEGER NOT NULL,
+    source TEXT DEFAULT 'auto'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alias_name ON entity_aliases(alias_name);
+";
+
+/// First `user_version` at which `entities`/`entity_aliases` no longer exist.
+const ENTITY_RETIREMENT_VERSION: i64 = 123;
+
+/// `user_version` at which `entity_aliases` first exists — migration 41 creates
+/// it. Below this the chain still creates it itself, so standing it up early
+/// would hand the database a shape its own position does not imply.
+const ENTITY_ALIASES_VERSION: i64 = 41;
+
+/// Is this database past migration 50's `domain` -> `space` rename, whatever
+/// its stamped `user_version` says?
+///
+/// `LEGACY_ENTITIES_SCHEMA_V122` spells `space`, so handing it to a database
+/// that is still `domain`-shaped builds a table that never existed and then
+/// dies confusingly: migration 50 would `RENAME COLUMN domain TO space` on a
+/// table that already has `space`. The stamped version cannot answer this,
+/// because the two callers that arrive here with `entities` missing disagree
+/// about what their version means -- a genuinely mid-chain store is the shape
+/// its version implies, while a test fixture that rewound `user_version` on a
+/// migrated database is version-122-shaped no matter how low it stamped.
+///
+/// So ask the shape, not the number, using the exact signal migration 50 uses
+/// for its own idempotency probe: `memories.space`. Same question, same answer,
+/// one source of truth.
+async fn memories_carries_space(conn: &libsql::Connection) -> Result<bool, WenlanError> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = 'space'",
+            (),
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("legacy entities shape probe: {e}")))?;
+    Ok(rows
+        .next()
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("legacy entities shape probe row: {e}")))?
+        .and_then(|row| row.get::<i64>(0).ok())
+        .unwrap_or(0)
+        > 0)
+}
+
+/// Stand the pre-retirement `entities` substrate up when the chain is about to
+/// replay against it, so the frozen bodies below meet the table they were
+/// specified against. See `LEGACY_ENTITIES_SCHEMA` for why the DDL lives here
+/// rather than in `SCHEMA`.
+///
+/// Three states, three answers:
+///
+/// - **At 123 or above** — retired. Never recreate it; that is the whole point
+///   of splitting the DDL out of `SCHEMA`.
+/// - **At 0** — a fresh install about to replay the entire chain. It gets the
+///   version-0 shape and the chain reshapes it, exactly as it did for every
+///   database that ever upgraded through those migrations.
+/// - **Between** — an upgrading database, which already HAS the table, so this
+///   is a no-op for every real one. It is not a no-op for a database whose
+///   `entities` is missing at a mid-chain version, and only two things produce
+///   that: migration 123 committing its drop and crashing before the version
+///   bump, or a test fixture rewinding `user_version` on a migrated database.
+///   Both were shaped like a version-122 database an instant ago, so that is
+///   the shape they get back — but only if they still look it. The check is
+///   `memories_carries_space`, not the stamped version: a rewound fixture is
+///   version-122-shaped however low it stamped, while a genuinely mid-chain
+///   store below migration 50 is `domain`-shaped and cannot be handed a
+///   `space`-shaped table. That one refuses and says so.
+///
+/// The "already HAS the table" no-op has to be checked, not assumed from the
+/// version: a database mid-chain carries whatever shape its own position
+/// implies, and the version-122 DDL indexes a `space` column that a database
+/// below migration 50 spells `domain`. `CREATE TABLE IF NOT EXISTS` would
+/// quietly skip the table and then fail on the index. Presence of the table is
+/// the only signal that matters here -- this function's job is to create it
+/// when absent, never to reshape it.
+///
+/// The two tables are probed independently. On a real database they arrive
+/// together (nothing between migration 41 and 123 drops one without the
+/// other), but a test fixture that hand-rolls an `entities` table -- so a
+/// frozen body has raw rows to read -- builds exactly the combination a real
+/// database never reaches: `entities` present, `entity_aliases` absent. An
+/// all-or-nothing probe reads that as "already stood up" and leaves the alias
+/// half missing for whichever later migration reads it.
+async fn ensure_legacy_entities_table(conn: &libsql::Connection) -> Result<(), WenlanError> {
+    let mut rows = conn
+        .query("PRAGMA user_version", ())
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("legacy entities gate read: {e}")))?;
+    let version = rows
+        .next()
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("legacy entities gate row: {e}")))?
+        .and_then(|row| row.get::<i64>(0).ok())
+        .unwrap_or(0);
+    drop(rows);
+    if version >= ENTITY_RETIREMENT_VERSION {
+        return sweep_legacy_entity_residue(conn).await;
+    }
+
+    if !legacy_table_present(conn, "entities").await? {
+        let ddl = if version == 0 {
+            LEGACY_ENTITIES_SCHEMA.to_string()
+        } else if memories_carries_space(conn).await? {
+            LEGACY_ENTITIES_SCHEMA_V122.replace("{unfiled}", UNFILED_SPACE_ID)
+        } else {
+            return Err(WenlanError::VectorDb(format!(
+                "entities table missing at user_version {version} on a database that is still \
+                 `domain`-shaped — this store is corrupt (the table is only ever absent at 0 or \
+                 at/above {ENTITY_RETIREMENT_VERSION}, and a pre-migration-50 shape cannot be \
+                 reconstructed: the columns migrations 1..{version} added to a table that is now \
+                 gone do not come back). Restore from a backup rather than letting the upgrade \
+                 rebuild a store that never existed."
+            )));
+        };
+        conn.execute_batch(&ddl)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("legacy entities schema: {e}")))?;
+    }
+
+    if version >= ENTITY_ALIASES_VERSION && !legacy_table_present(conn, "entity_aliases").await? {
+        conn.execute_batch(LEGACY_ENTITY_ALIASES_SCHEMA)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("legacy entity_aliases schema: {e}")))?;
+    }
+    Ok(())
+}
+
+/// The downgrade barrier: a database migrated by a NEWER daemon is not ours to
+/// write to.
+///
+/// Every migration body is gated `if version < N`, so a newer `user_version`
+/// silently skips all of them and this build would go on writing against a
+/// schema it cannot see — ignoring columns and constraints added after it. This
+/// is not hypothetical: an older installed build can still be running and
+/// reopening the same file every few seconds. Refusing to open is the
+/// recoverable failure; writing is not.
+fn refuse_if_newer_schema(version: i64) -> Result<(), WenlanError> {
+    if version > i64::from(SCHEMA_VERSION) {
+        return Err(WenlanError::VectorDb(format!(
+            "database schema is version {version}, newer than this build supports \
+             ({SCHEMA_VERSION}); a newer Wenlan has already migrated it. Upgrade \
+             Wenlan (or quit the older copy) rather than letting this one write to it."
+        )));
+    }
+    Ok(())
+}
+
+/// `refuse_if_newer_schema` at open time, before this connection has written
+/// anything.
+///
+/// The barrier used to live only inside `run_migrations`, which is the last
+/// thing a constructor calls — by then it has already set `journal_mode=WAL`,
+/// swept legacy `chunks` artifacts, and executed `SCHEMA` plus the FTS and
+/// trigger DDL against a store built by a build it does not understand. A
+/// refusal that arrives after the writes is not a barrier. This runs
+/// immediately after `connect`, so a too-new database is left byte-identical;
+/// `run_migrations` keeps its own check as defense in depth for the callers
+/// that reach it by another route.
+async fn refuse_newer_schema_at_open(conn: &libsql::Connection) -> Result<(), WenlanError> {
+    let mut rows = conn
+        .query("PRAGMA user_version", ())
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("open-time schema version read: {e}")))?;
+    let version = rows
+        .next()
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("open-time schema version row: {e}")))?
+        .and_then(|row| row.get::<i64>(0).ok())
+        .unwrap_or(0);
+    drop(rows);
+    refuse_if_newer_schema(version)
+}
+
+/// Remove an empty legacy `entities`/`entity_aliases` shell from a retired
+/// store, and never remove one that has rows.
+///
+/// A pre-123 build opening a retired database executes its own `SCHEMA` — which
+/// still carries `CREATE TABLE IF NOT EXISTS entities` — before its downgrade
+/// barrier refuses, so it leaves an empty table behind and quits. Nothing else
+/// cleans that up: this build's reconstruction path early-returns at 123 and
+/// above. The shell is not harmless, because it makes every "is the table
+/// gone?" probe (the drop's own assertions, lint fixtures, an operator's
+/// `sqlite_master` read) answer wrong about a store that is in fact retired.
+///
+/// Rows change the answer completely. An empty shell can only be schema
+/// residue; a populated one means something wrote entity data into a store
+/// whose canonical copy is the shadow page, and this function cannot know which
+/// copy is right. Boot is the worst possible place to decide, so it warns and
+/// leaves the data alone. The two tables are handled as a pair — `entity_aliases`
+/// carries `REFERENCES entities(id)`, so dropping the parent out from under a
+/// populated child would fail the foreign-key check anyway.
+async fn sweep_legacy_entity_residue(conn: &libsql::Connection) -> Result<(), WenlanError> {
+    let mut present: Vec<&str> = Vec::new();
+    for name in ["entity_aliases", "entities"] {
+        if legacy_table_present(conn, name).await? {
+            present.push(name);
+        }
+    }
+    if present.is_empty() {
+        return Ok(());
+    }
+
+    for name in &present {
+        let mut rows = conn
+            .query(&format!("SELECT COUNT(*) FROM {name}"), ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("legacy {name} residue count: {e}")))?;
+        let count = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("legacy {name} residue row: {e}")))?
+            .and_then(|row| row.get::<i64>(0).ok())
+            .unwrap_or(0);
+        drop(rows);
+        if count > 0 {
+            log::warn!(
+                "[memory_db] legacy `{name}` table is present with {count} row(s) on a retired \
+                 (user_version >= {ENTITY_RETIREMENT_VERSION}) store. Leaving it untouched — the \
+                 canonical entity store is the kind='entity' shadow page, so these rows are of \
+                 unknown provenance and are not deleted at boot."
+            );
+            return Ok(());
+        }
+    }
+
+    // Child first: `entity_aliases` references `entities(id)`.
+    for name in &present {
+        conn.execute(&format!("DROP TABLE {name}"), ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("legacy {name} residue drop: {e}")))?;
+    }
+    log::warn!(
+        "[memory_db] dropped empty legacy {} shell(s) ({}) left on a retired store — a pre-{} \
+         build opened this database, ran its own SCHEMA, and refused at its downgrade barrier.",
+        present.len(),
+        present.join(", "),
+        ENTITY_RETIREMENT_VERSION
+    );
+    Ok(())
+}
+
+/// Does `name` exist as a table right now? The version alone cannot answer
+/// this -- see `ensure_legacy_entities_table`.
+async fn legacy_table_present(conn: &libsql::Connection, name: &str) -> Result<bool, WenlanError> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+            libsql::params![name],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("legacy {name} gate probe: {e}")))?;
+    Ok(rows
+        .next()
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("legacy {name} gate probe row: {e}")))?
+        .is_some())
+}
+
+/// G6 Stage 3 test fixture: describes an entity for
+/// `MemoryDB::test_seed_entity_shadow_page`. Before Stage 3 a fixture
+/// raw-INSERTed an `entities` row and the helper re-read it; migration 123
+/// drops that table, so the fields come in explicitly. Defaults match what an
+/// omitted column used to mean in those raw INSERTs -- NULL space,
+/// source_agent and confidence, `confirmed = 0`, and the `1, 1` epoch
+/// timestamps nearly every fixture passed. A `None` space still folds to the
+/// reserved `UNFILED_SPACE_ID` sentinel inside `insert_entity_shadow_page`,
+/// which is exactly what the old read-a-NULL-then-pass-None path produced.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestEntity<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub entity_type: &'a str,
+    pub space: Option<&'a str>,
+    pub source_agent: Option<&'a str>,
+    pub confidence: Option<f32>,
+    pub confirmed: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub community_id: Option<i64>,
+    pub embedding_updated_at: Option<i64>,
+}
+
+#[cfg(test)]
+impl<'a> TestEntity<'a> {
+    pub(crate) fn new(id: &'a str, name: &'a str, entity_type: &'a str) -> Self {
+        Self {
+            id,
+            name,
+            entity_type,
+            space: None,
+            source_agent: None,
+            confidence: None,
+            confirmed: false,
+            created_at: 1,
+            updated_at: 1,
+            community_id: None,
+            embedding_updated_at: None,
+        }
+    }
+    pub(crate) fn space(mut self, space: &'a str) -> Self {
+        self.space = Some(space);
+        self
+    }
+    pub(crate) fn source_agent(mut self, source_agent: &'a str) -> Self {
+        self.source_agent = Some(source_agent);
+        self
+    }
+    pub(crate) fn confirmed(mut self, confirmed: bool) -> Self {
+        self.confirmed = confirmed;
+        self
+    }
+    pub(crate) fn timestamps(mut self, created_at: i64, updated_at: i64) -> Self {
+        self.created_at = created_at;
+        self.updated_at = updated_at;
+        self
+    }
+    pub(crate) fn community_id(mut self, community_id: i64) -> Self {
+        self.community_id = Some(community_id);
+        self
+    }
+    pub(crate) fn embedding_updated_at(mut self, at: i64) -> Self {
+        self.embedding_updated_at = Some(at);
+        self
+    }
+}
 
 // FTS5 and vector indexes created separately (may not support IF NOT EXISTS)
 const FTS_SCHEMA: &str = "
@@ -3501,6 +3903,10 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("libsql connect: {}", e)))?;
         log::warn!("[memory_db] connected, running PRAGMA...");
 
+        // Before anything writes: refuse a database a newer build already
+        // migrated. See `refuse_newer_schema_at_open`.
+        refuse_newer_schema_at_open(&conn).await?;
+
         // Enable WAL mode and foreign keys
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .await
@@ -3714,6 +4120,10 @@ impl MemoryDB {
             .connect()
             .map_err(|e| WenlanError::VectorDb(format!("libsql connect: {}", e)))?;
 
+        // Before anything writes: refuse a database a newer build already
+        // migrated. See `refuse_newer_schema_at_open`.
+        refuse_newer_schema_at_open(&conn).await?;
+
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .await
             .map_err(|e| WenlanError::VectorDb(format!("pragma: {}", e)))?;
@@ -3735,11 +4145,11 @@ impl MemoryDB {
                 libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32')
             )", (),
         ).await;
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS entities_vec_idx ON entities (
-                libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32')
-            )", (),
-        ).await;
+        // G6 Stage 3: no `entities_vec_idx` here. Migration 123 drops
+        // `entities`, and this statement runs before `run_migrations` on a
+        // fresh open, so it could only ever recreate an index on a table this
+        // open is about to retire. Entity embeddings live on the
+        // `kind='entity'` shadow page and are served by `idx_pages_embedding`.
         // T15a: child-vector index (mirrors memories_vec_idx). The migration
         // also creates this IF NOT EXISTS for upgraded DBs.
         let _ = conn.execute(
@@ -3843,21 +4253,23 @@ impl MemoryDB {
         };
         drop(rows);
 
-        // A database migrated by a NEWER daemon is not ours to write to. Every
-        // migration below is gated `if version < N`, so a newer user_version
-        // silently skips all of them and we would go on writing against a
-        // schema we cannot see — ignoring columns and constraints added after
-        // us. This is not hypothetical: an older installed build can still be
-        // running and reopening the same file every few seconds.
-        //
-        // Refusing to open is the recoverable failure; writing is not.
-        if version > i64::from(SCHEMA_VERSION) {
-            return Err(WenlanError::VectorDb(format!(
-                "database schema is version {version}, newer than this build supports \
-                 ({SCHEMA_VERSION}); a newer Wenlan has already migrated it. Upgrade \
-                 Wenlan (or quit the older copy) rather than letting this one write to it."
-            )));
-        }
+        // The downgrade barrier — see `refuse_if_newer_schema`. The constructors
+        // now run it at open time, before any DDL; this call is defense in depth
+        // for anything that reaches migrations by another route.
+        refuse_if_newer_schema(version)?;
+
+        // G6 Stage 3: migration 123 DROPs `entities`/`entity_aliases`, so
+        // `SCHEMA` (execute_batch'd on every open, before this function) no
+        // longer carries their DDL — a `CREATE TABLE IF NOT EXISTS entities`
+        // there would silently resurrect the dropped table on every restart.
+        // But every pre-123 migration body is a FROZEN replay, and ten of them
+        // (81/92/93/98/113/114/117/118/121/122) read `entities`. A fresh
+        // install replays that whole chain from `user_version = 0`, so the
+        // table has to be stood up before it starts; an upgrading database
+        // already carries it, and a retired one must never get it back. This is
+        // that one guarantee, and it lives here rather than in the constructors
+        // because the chain replay is what needs it.
+        ensure_legacy_entities_table(&conn).await?;
 
         if version < 1 {
             // Migration 1: reserved (initial schema — no-op since CREATE TABLE IF NOT EXISTS handles it)
@@ -8635,6 +9047,18 @@ impl MemoryDB {
             if version < 122 {
                 self.migrate_122_relax_entity_fk_dependents(version).await?;
             }
+
+            // Migration 123 (G6 Stage 3): DROP `entities` + `entity_aliases`.
+            // The point of no return -- see
+            // migrate_123_retire_legacy_entity_tables. Runs last on purpose:
+            // migrations 90-118 are what make every legacy entity row's
+            // `kind='entity'` shadow page exist, and 121/122 are what make the
+            // surviving dependents readable and writable without the legacy
+            // table. Only then is dropping it a no-op for every reader.
+            if version < 123 {
+                self.migrate_123_retire_legacy_entity_tables(version)
+                    .await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -8659,23 +9083,19 @@ impl MemoryDB {
             // memories recovery pass, well before migration 90) this crashed
             // every fresh install with `no such table: entity_page_map`.
             //
-            // G6 Stage 2 PR 2c sub-step 3 item 6: UNION the legacy `entities`
-            // scan with the canonical `kind='entity'` shadow-page scan,
-            // deduped on entity id -- a canonical-only scan would miss a
-            // pre-flip legacy row whose `entities.embedding` is NULL but
-            // whose shadow mirror was already backfilled non-NULL (or vice
-            // versa), and this pass exists precisely to catch a crash
-            // mid-recovery, so it errs toward re-embedding a row twice over
-            // silently missing one. A legacy-only scan was structurally
-            // blind to any entity created after the writer flip (no
-            // `entities` row to find at all).
+            // G6 Stage 2 PR 2c sub-step 3 item 6 UNIONed the legacy `entities`
+            // scan with the canonical `kind='entity'` shadow-page scan, so a
+            // crash mid-recovery could not leave either side unre-embedded
+            // while both stores were live. G6 Stage 3 drops `entities`, and
+            // this block runs unconditionally on EVERY open -- the legacy arm
+            // would turn every post-retirement boot into `no such table:
+            // entities` and the daemon would never come up. Canonical arm
+            // only; there is no other store left for it to miss.
             let entity_null_count = {
                 let conn = self.conn.lock().await;
                 let mut rows = conn
                     .query(
                         "SELECT COUNT(*) FROM ( \
-                             SELECT id FROM entities WHERE embedding IS NULL \
-                             UNION \
                              SELECT epm.entity_id AS id FROM entity_page_map epm \
                              JOIN pages p ON p.id = epm.page_id \
                                   AND p.kind = 'entity' AND p.status = 'active' \
@@ -8713,8 +9133,6 @@ impl MemoryDB {
                         let mut rows = conn
                             .query(
                                 "SELECT id, MAX(name) FROM ( \
-                                     SELECT id, name FROM entities WHERE embedding IS NULL \
-                                     UNION ALL \
                                      SELECT epm.entity_id AS id, p.title AS name \
                                      FROM entity_page_map epm \
                                      JOIN pages p ON p.id = epm.page_id \
@@ -8753,25 +9171,11 @@ impl MemoryDB {
                     }
                     for (idx, (id, _)) in batch.iter().enumerate() {
                         if idx < embeddings.len() {
-                            if let Err(e) = conn
-                                .execute(
-                                    "UPDATE entities SET embedding = vector32(?1) WHERE id = ?2",
-                                    libsql::params![Self::vec_to_sql(&embeddings[idx]), id.clone()],
-                                )
-                                .await
-                            {
-                                log::warn!(
-                                    "[memory_db] null entity embed recovery id={}: {}",
-                                    id,
-                                    e
-                                );
-                            }
-                            // Mirror the recovered embedding onto the entity's
-                            // kind='entity' shadow page (M3 PR-1 dual-write
-                            // parity), in the SAME tx, so a boot that recovers
-                            // entity embeddings never leaves the shadow's
-                            // embedding stale/NULL. A no-op for an entity that
-                            // has no mapped shadow.
+                            // The entity's `kind='entity'` shadow page IS the
+                            // entity (G6 Stage 3 retired `entities`), so this
+                            // single write is the whole recovery. It was the
+                            // mirror half of a dual write until the legacy
+                            // `UPDATE entities SET embedding` lost its table.
                             if let Err(e) = conn
                                 .execute(
                                     "UPDATE pages SET embedding = vector32(?1) \
@@ -10222,228 +10626,171 @@ impl MemoryDB {
         Ok(())
     }
 
-    /// G6 Stage 1.5a test helper: backfills the `kind='entity'` shadow page
-    /// for a raw-SQL-seeded `entities` row (test fixtures that `INSERT INTO
-    /// entities` directly, bypassing `store_entity`, would otherwise be
-    /// invisible to every reader migrated in this stage). Call right after
-    /// the raw insert. Not for production use -- normal writes stay on
-    /// `store_entity`, which does this in the same transaction.
-    /// G6 Stage 2 PR 2c sub-step 2: reads the raw-seeded `entities` row once
-    /// (test-only; `insert_entity_shadow_page` is values-based and has no
-    /// live callers left that read `entities`) and mints the shadow via the
-    /// same values-based primitive `create_entity` uses.
+    /// G6 Stage 3 test helper: recreates `entities` + `entity_aliases` at the
+    /// shape a database carried at `user_version = 122`, i.e. the instant
+    /// before migration 123 dropped them.
+    ///
+    /// This is NOT a way to keep using the legacy tables. It exists for one
+    /// job: the tests that replay a FROZEN pre-123 migration body (92's shadow
+    /// backfill, 93's alias backfill, 118's space fold, 121's fence split, 24's
+    /// crash recovery). Those bodies are specified against a database where
+    /// `entities` still exists, and on a real upgrade they only ever run there
+    /// -- `ensure_legacy_entities_table` stands the same substrate up whenever
+    /// the chain is about to replay against it, so a genuinely old database
+    /// presents the tables for exactly as long as the chain needs them. A test
+    /// that drives one of those bodies WITHOUT rewinding `user_version` gets no
+    /// such help and has to stand them up for itself; that is what this does.
+    ///
+    /// Same DDL as the gate's mid-chain shape, from the same constants, so the
+    /// two can never drift into disagreeing about what "the tables before 123"
+    /// meant.
+    #[cfg(test)]
+    pub(crate) async fn test_create_legacy_entity_tables(&self) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        conn.execute_batch(&format!(
+            "{}{}",
+            LEGACY_ENTITIES_SCHEMA_V122.replace("{unfiled}", UNFILED_SPACE_ID),
+            LEGACY_ENTITY_ALIASES_SCHEMA
+        ))
+        .await
+        .map(|_| ())
+        .map_err(|e| WenlanError::VectorDb(format!("test_create_legacy_entity_tables: {e}")))
+    }
+
+    /// G6 Stage 3 test helper: stand the legacy tables up AND repopulate
+    /// `entities` from the canonical shadow pages, so the legacy substrate is
+    /// not merely present but agrees with the canonical one.
+    ///
+    /// Before Stage 2 an `entity_page_map` row could only exist because an
+    /// `entities` row did -- the map was derived from it. Any frozen body that
+    /// reads `entities` was specified against that invariant: migration 114's
+    /// resync reads `title` back out of it, migration 55's self-heal treats an
+    /// id missing from it as an orphan to null. An empty table therefore does
+    /// not model "the database before 123"; it models a database whose entities
+    /// were all deleted. Reconstructing the rows from the shadow pages is the
+    /// inverse of what migration 113 did to create them.
+    #[cfg(test)]
+    pub(crate) async fn test_restore_legacy_entity_rows(&self) -> Result<(), WenlanError> {
+        self.test_create_legacy_entity_tables().await?;
+        let conn = self.conn.lock().await;
+        conn.execute_batch(&format!(
+            "INSERT OR IGNORE INTO entities (
+                 id, name, entity_type, space, source_agent, confidence, confirmed,
+                 created_at, updated_at, embedding, embedding_updated_at
+             )
+             SELECT epm.entity_id,
+                    COALESCE(p.title, epm.entity_id),
+                    COALESCE(p.entity_type, 'concept'),
+                    COALESCE(p.space, '{UNFILED_SPACE_ID}'),
+                    p.source_agent,
+                    p.confidence,
+                    COALESCE(p.entity_confirmed, 0),
+                    COALESCE(p.entity_created_at, 1),
+                    COALESCE(p.entity_updated_at, 1),
+                    p.embedding,
+                    p.embedding_updated_at
+               FROM entity_page_map epm
+               JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity';"
+        ))
+        .await
+        .map(|_| ())
+        .map_err(|e| WenlanError::VectorDb(format!("test_restore_legacy_entity_rows: {e}")))
+    }
+
+    /// G6 Stage 3 test helper: rewind a migrated database to `version` the way
+    /// a database that genuinely SAT at that version was shaped, rather than by
+    /// stamping `PRAGMA user_version` alone.
+    ///
+    /// A bare stamp leaves a tip-shaped database wearing an old version number,
+    /// and the frozen bodies it then replays are entitled to assume otherwise.
+    /// Two assumptions break loudly:
+    ///
+    /// 1. **Every mapped entity has an `entities` row** -- see
+    ///    `test_restore_legacy_entity_rows`, which this delegates to.
+    /// 2. **The M4 entity triggers are anchored on `entities`.** Migration 123
+    ///    re-anchors them on `pages`, so a rewound database fires them on page
+    ///    writes that a real database at this version never fired them on. They
+    ///    are dropped here; the `repair_community_*` pass at the end of
+    ///    `run_migrations` reinstalls them.
+    #[cfg(test)]
+    pub(crate) async fn test_rewind_to_version(&self, version: i64) -> Result<(), WenlanError> {
+        self.test_restore_legacy_entity_rows().await?;
+        let conn = self.conn.lock().await;
+        conn.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS m4_grouping_entity_insert;
+             DROP TRIGGER IF EXISTS m4_grouping_entity_delete;
+             DROP TRIGGER IF EXISTS m4_grouping_entity_update;
+             DROP TRIGGER IF EXISTS m4_parity_input_entity_insert;
+             DROP TRIGGER IF EXISTS m4_parity_input_entity_delete;
+             DROP TRIGGER IF EXISTS m4_parity_input_entity_update;
+
+             PRAGMA user_version = {version};"
+        ))
+        .await
+        .map(|_| ())
+        .map_err(|e| WenlanError::VectorDb(format!("test_rewind_to_version({version}): {e}")))
+    }
+
+    /// G6 Stage 1.5a test helper, respecified at Stage 3: seeds the canonical
+    /// entity substrate -- the `kind='entity'` shadow page plus its
+    /// `entity_page_map` row -- from explicit fields. It used to backfill the
+    /// shadow for a raw-SQL-seeded `entities` row, but Stage 3's migration 123
+    /// drops that table, so this is now the whole write rather than half of
+    /// one: a fixture calls it INSTEAD of `INSERT INTO entities`, not after.
+    /// Not for production use -- normal writes stay on `store_entity`, which
+    /// does the same thing in its own transaction.
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub(crate) async fn test_seed_entity_shadow_page(
         &self,
-        entity_id: &str,
+        entity: TestEntity<'_>,
     ) -> Result<(), WenlanError> {
         let now_iso = chrono::Utc::now().to_rfc3339();
         let page_id = crate::pages::new_page_id();
         let conn = self.conn.lock().await;
-        let (
-            name,
-            entity_type,
-            confidence,
-            confirmed,
-            space,
-            source_agent,
-            created_at,
-            updated_at,
-            community_id,
-            embedding_updated_at,
-        ): (
-            String,
-            String,
-            Option<f64>,
-            i64,
-            Option<String>,
-            Option<String>,
-            i64,
-            i64,
-            Option<i64>,
-            Option<i64>,
-        ) = {
-            let mut rows = conn
-                .query(
-                    "SELECT name, entity_type, confidence, confirmed, space, source_agent, \
-                     created_at, updated_at, community_id, embedding_updated_at \
-                     FROM entities WHERE id = ?1",
-                    libsql::params![entity_id],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("test_seed_entity_shadow_page read: {e}"))
-                })?;
-            let row = rows
-                .next()
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("test_seed_entity_shadow_page row: {e}"))
-                })?
-                .ok_or_else(|| {
-                    WenlanError::VectorDb(format!(
-                        "test_seed_entity_shadow_page: no entities row for {entity_id}"
-                    ))
-                })?;
-            (
-                row.get(0).unwrap_or_default(),
-                row.get(1).unwrap_or_default(),
-                row.get(2).unwrap_or(None),
-                row.get(3).unwrap_or(0),
-                row.get(4).unwrap_or(None),
-                row.get(5).unwrap_or(None),
-                row.get(6).unwrap_or(0),
-                row.get(7).unwrap_or(0),
-                row.get(8).unwrap_or(None),
-                row.get(9).unwrap_or(None),
-            )
-        };
         Self::insert_entity_shadow_page(
             &conn,
-            entity_id,
+            entity.id,
             &page_id,
-            &name,
-            &entity_type,
-            confidence.map(|v| v as f32),
-            confirmed != 0,
-            // Raw-SQL test fixtures seeded through this helper don't carry a
-            // real embedding blob to re-encode as vector32 text; tests that
-            // need an embedded shadow go through store_entity/
-            // refresh_entity_embedding instead.
+            entity.name,
+            entity.entity_type,
+            entity.confidence,
+            entity.confirmed,
+            // Fixtures seeded through this helper don't carry a real embedding
+            // blob to re-encode as vector32 text; tests that need an embedded
+            // shadow go through store_entity/refresh_entity_embedding instead.
             None,
-            space.as_deref(),
-            source_agent.as_deref(),
+            entity.space,
+            entity.source_agent,
             "[]",
             &now_iso,
-            created_at,
-            updated_at,
+            entity.created_at,
+            entity.updated_at,
         )
         .await?;
         // `insert_entity_shadow_page` has no `community_id`/`embedding_updated_at`
         // params -- no live caller sets either at creation time (both are
         // always assigned later, by `detect_communities`/
-        // `refresh_entity_embedding`) -- but a raw-SQL test fixture seeded
-        // through this helper may already carry them (e.g. `community_id`
-        // stamped directly), so backfill from the just-read `entities` row.
-        // `pages.community_id` is TEXT (`entities.community_id` is INTEGER).
-        conn.execute(
-            "UPDATE pages SET community_id = ?1, embedding_updated_at = ?2
-             WHERE kind = 'entity'
-               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
-            libsql::params![
-                community_id.map(|v| v.to_string()),
-                embedding_updated_at,
-                entity_id
-            ],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("test_seed_entity_shadow_page mirror: {e}")))?;
-        Ok(())
-    }
-
-    /// G6 Stage 2 PR 2c sub-step 3 item 5: `store_entity` no longer writes
-    /// `entities`, so a shadow-only entity has no legacy row for anything
-    /// that still needs one -- e.g. an FK migration 122 did not relax
-    /// (`relations.from_entity`/`to_entity`, see `kg_quality.rs`'s callers).
-    /// The inverse of `test_seed_entity_shadow_page` above: reads the
-    /// just-created shadow page's mirrored fields and raw-INSERTs a
-    /// byte-matching `entities` row, mirroring what `store_entity` used to
-    /// write pre-flip. `compute_entity_page_parity_report` (retired,
-    /// sub-step 3 item 6) was this helper's original motivating caller but
-    /// is no longer its only one.
-    #[cfg(test)]
-    #[allow(clippy::type_complexity)]
-    pub(crate) async fn test_seed_legacy_entities_row_from_shadow(
-        &self,
-        entity_id: &str,
-    ) -> Result<(), WenlanError> {
-        let conn = self.conn.lock().await;
-        let (
-            title,
-            entity_type,
-            confidence,
-            confirmed,
-            space,
-            source_agent,
-            created_at,
-            updated_at,
-            embedding,
-        ): (
-            String,
-            String,
-            Option<f64>,
-            i64,
-            String,
-            Option<String>,
-            i64,
-            i64,
-            Option<Vec<u8>>,
-        ) = {
-            let mut rows = conn
-                .query(
-                    "SELECT p.title, p.entity_type, p.confidence, p.entity_confirmed, p.space, \
-                            p.source_agent, p.entity_created_at, p.entity_updated_at, p.embedding \
-                     FROM entity_page_map epm \
-                     JOIN pages p ON p.id = epm.page_id \
-                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
-                    libsql::params![entity_id],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!(
-                        "test_seed_legacy_entities_row_from_shadow read: {e}"
-                    ))
-                })?;
-            let row = rows
-                .next()
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!(
-                        "test_seed_legacy_entities_row_from_shadow row: {e}"
-                    ))
-                })?
-                .ok_or_else(|| {
-                    WenlanError::VectorDb(format!(
-                        "test_seed_legacy_entities_row_from_shadow: no live shadow for {entity_id}"
-                    ))
-                })?;
-            (
-                row.get(0).unwrap_or_default(),
-                row.get(1).unwrap_or_default(),
-                row.get(2).unwrap_or(None),
-                row.get(3).unwrap_or(0),
-                row.get(4).unwrap_or_else(|_| UNFILED_SPACE_ID.to_string()),
-                row.get(5).unwrap_or(None),
-                row.get(6).unwrap_or(0),
-                row.get(7).unwrap_or(0),
-                row.get(8).unwrap_or(None),
+        // `refresh_entity_embedding`) -- but a fixture may want one stamped up
+        // front, so apply them here. `pages.community_id` is TEXT (the retired
+        // `entities.community_id` was INTEGER, and fixtures still speak in the
+        // integer ids `detect_communities` assigns).
+        if entity.community_id.is_some() || entity.embedding_updated_at.is_some() {
+            conn.execute(
+                "UPDATE pages SET community_id = ?1, embedding_updated_at = ?2
+                 WHERE kind = 'entity'
+                   AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
+                libsql::params![
+                    entity.community_id.map(|v| v.to_string()),
+                    entity.embedding_updated_at,
+                    entity.id
+                ],
             )
-        };
-        conn.execute(
-            "INSERT INTO entities \
-                (id, name, entity_type, space, source_agent, confidence, confirmed, \
-                 created_at, updated_at, embedding) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            libsql::params![
-                entity_id,
-                title,
-                entity_type,
-                space,
-                source_agent,
-                confidence,
-                confirmed,
-                created_at,
-                updated_at,
-                embedding
-            ],
-        )
-        .await
-        .map_err(|e| {
-            WenlanError::VectorDb(format!(
-                "test_seed_legacy_entities_row_from_shadow insert: {e}"
-            ))
-        })?;
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("test_seed_entity_shadow_page mirror: {e}"))
+            })?;
+        }
         Ok(())
     }
 
@@ -11432,29 +11779,37 @@ impl MemoryDB {
                   );
              END;
 
-             -- G6 Stage 2 PR 2c sub-step 3 item 6 (lead ruling, document-only:
-             -- YAGNI while WENLAN_ENABLE_COMMUNITY_LEIDEN stays default-OFF and
-             -- unmeasured): this trigger and six siblings -- the other two
-             -- `m4_grouping_entity_*` triggers immediately below,
-             -- `m4_community_parity_entity_update` (further down this same
-             -- function, self-dropped again a few statements later -- its
-             -- CREATE alone would still fail once `entities` is gone), and
-             -- the three `m4_parity_input_entity_*` triggers (also further
-             -- down this function) -- all fire `... ON entities`. Every one
-             -- of them is blind to a shadow-only entity (item 5: `store_entity`
-             -- stopped writing `entities`; a shadow-only entity has no
-             -- `entities` row to fire an `entities` trigger on), and every
-             -- one fails outright the moment the Stage 3 retirement migration
-             -- drops `entities` -- which would break `repair_community_
-             -- cutover`'s unconditional-at-startup reinstall of this whole
-             -- function. Rebuild all seven against the canonical
-             -- `entity_page_map`/`pages` shadow (mirroring the
-             -- `detect_communities` adjacency-query port, same PR) before the
-             -- flag ever ships default-ON, and no later than Stage 3. See the
-             -- Stage 3 checklist in docs/plans/2026-08-04-g6-retirement-program.md.
+             -- G6 Stage 3: the three `m4_grouping_entity_*` triggers below --
+             -- and the three `m4_parity_input_entity_*` triggers in
+             -- `ensure_community_cutover_tables` -- fired `... ON entities`
+             -- until the retirement migration. Two independent reasons they
+             -- had to move, both load-bearing:
+             --   1. Blindness. Stage 2 item 5 stopped `store_entity` writing
+             --      `entities` at all, so a shadow-only entity never fired an
+             --      `entities` trigger and its space was never marked dirty.
+             --   2. Breakage. Migration 123 drops `entities`, and BOTH this
+             --      function and `ensure_community_cutover_tables` are
+             --      reinstalled unconditionally at EVERY startup by
+             --      `repair_community_substrate`/`repair_community_cutover`.
+             --      A `CREATE TRIGGER ... ON entities` there is not a latent
+             --      problem after the drop, it is a daemon that cannot boot.
+             -- Anchored on `pages` ALONE, fenced `kind='entity'` -- never on
+             -- both tables. Anchoring on both would double-bump every
+             -- generation counter for as long as any dual write survived,
+             -- which is the Stage-2 finding-1 lesson. The trigger NAMES are
+             -- deliberately unchanged: the DROP statements that already
+             -- precede these CREATEs then swap an old database's
+             -- entities-anchored triggers for the pages-anchored ones for
+             -- free, with no rename bookkeeping and no validator-list churn.
+             -- The bodies are the historical ones verbatim; only the anchor,
+             -- the `kind` fence, and (on update) the `status`/`kind` change
+             -- predicates are new. Over-invalidation is safe here -- these
+             -- only mark a space dirty for recompute -- so the update arm
+             -- deliberately covers a status flip and a kind flip, which are
+             -- the canonical analogues of an entity appearing or vanishing.
              CREATE TRIGGER IF NOT EXISTS m4_grouping_entity_insert
-             AFTER INSERT ON entities
-             WHEN NEW.space IS NOT NULL
+             AFTER INSERT ON pages
+             WHEN NEW.kind = 'entity' AND NEW.space IS NOT NULL
              BEGIN
                UPDATE space_graph_state
                   SET grouping_generation = grouping_generation + 1, dirty = 1
@@ -11462,8 +11817,8 @@ impl MemoryDB {
              END;
 
              CREATE TRIGGER IF NOT EXISTS m4_grouping_entity_delete
-             AFTER DELETE ON entities
-             WHEN OLD.space IS NOT NULL
+             AFTER DELETE ON pages
+             WHEN OLD.kind = 'entity' AND OLD.space IS NOT NULL
              BEGIN
                UPDATE space_graph_state
                   SET grouping_generation = grouping_generation + 1, dirty = 1
@@ -11471,8 +11826,14 @@ impl MemoryDB {
              END;
 
              CREATE TRIGGER IF NOT EXISTS m4_grouping_entity_update
-             AFTER UPDATE ON entities
-             WHEN OLD.space IS NOT NEW.space OR OLD.embedding IS NOT NEW.embedding
+             AFTER UPDATE ON pages
+             WHEN (OLD.kind = 'entity' OR NEW.kind = 'entity')
+              AND (
+                     OLD.space IS NOT NEW.space
+                  OR OLD.embedding IS NOT NEW.embedding
+                  OR OLD.status IS NOT NEW.status
+                  OR OLD.kind IS NOT NEW.kind
+              )
              BEGIN
                UPDATE space_graph_state
                   SET grouping_generation = grouping_generation + 1, dirty = 1
@@ -11489,7 +11850,11 @@ impl MemoryDB {
                 WHERE space = NEW.space
                   AND NEW.space IS NOT NULL
                   AND OLD.space IS NEW.space
-                  AND OLD.embedding IS NOT NEW.embedding;
+                  AND (
+                         OLD.embedding IS NOT NEW.embedding
+                      OR OLD.status IS NOT NEW.status
+                      OR OLD.kind IS NOT NEW.kind
+                  );
              END;",
         )
         .await
@@ -12100,9 +12465,11 @@ impl MemoryDB {
         conn.execute(
             "INSERT INTO space_graph_state
                 (space, graph_generation, grouping_generation, published_generation, dirty)
-             SELECT DISTINCT space, 0, 1, NULL, 1
-               FROM entities
-              WHERE space IS NOT NULL
+             SELECT DISTINCT p.space, 0, 1, NULL, 1
+               FROM entity_page_map epm
+               JOIN pages p ON p.id = epm.page_id
+                    AND p.kind = 'entity' AND p.status = 'active'
+              WHERE p.space IS NOT NULL
              ON CONFLICT(space) DO NOTHING",
             (),
         )
@@ -12120,9 +12487,15 @@ impl MemoryDB {
              DROP TRIGGER IF EXISTS m4_grouping_entity_delete;
              DROP TRIGGER IF EXISTS m4_grouping_entity_update;
 
+             -- G6 Stage 3: anchored on `pages` fenced `kind='entity'`, not on
+             -- `entities`. Full rationale on the sibling block in
+             -- `ensure_community_substrate_tables` above -- in short, this
+             -- whole function is reinstalled at every startup by
+             -- `repair_community_cutover`, so an `ON entities` trigger here
+             -- stops being installable the moment migration 123 lands.
              CREATE TRIGGER m4_grouping_entity_insert
-             AFTER INSERT ON entities
-             WHEN NEW.space IS NOT NULL
+             AFTER INSERT ON pages
+             WHEN NEW.kind = 'entity' AND NEW.space IS NOT NULL
              BEGIN
                INSERT INTO space_graph_state
                     (space, graph_generation, grouping_generation, published_generation, dirty)
@@ -12133,8 +12506,8 @@ impl MemoryDB {
              END;
 
              CREATE TRIGGER m4_grouping_entity_delete
-             AFTER DELETE ON entities
-             WHEN OLD.space IS NOT NULL
+             AFTER DELETE ON pages
+             WHEN OLD.kind = 'entity' AND OLD.space IS NOT NULL
              BEGIN
                UPDATE space_graph_state
                   SET grouping_generation = grouping_generation + 1, dirty = 1
@@ -12142,8 +12515,14 @@ impl MemoryDB {
              END;
 
              CREATE TRIGGER m4_grouping_entity_update
-             AFTER UPDATE ON entities
-             WHEN OLD.space IS NOT NEW.space OR OLD.embedding IS NOT NEW.embedding
+             AFTER UPDATE ON pages
+             WHEN (OLD.kind = 'entity' OR NEW.kind = 'entity')
+              AND (
+                     OLD.space IS NOT NEW.space
+                  OR OLD.embedding IS NOT NEW.embedding
+                  OR OLD.status IS NOT NEW.status
+                  OR OLD.kind IS NOT NEW.kind
+              )
              BEGIN
                UPDATE space_graph_state
                   SET grouping_generation = grouping_generation + 1, dirty = 1
@@ -12157,6 +12536,8 @@ impl MemoryDB {
                   AND (
                          OLD.space IS NOT NEW.space
                       OR OLD.embedding IS NOT NEW.embedding
+                      OR OLD.status IS NOT NEW.status
+                      OR OLD.kind IS NOT NEW.kind
                   )
                ON CONFLICT(space) DO UPDATE SET
                     grouping_generation = grouping_generation + 1,
@@ -12168,13 +12549,14 @@ impl MemoryDB {
              DROP TRIGGER IF EXISTS m4_community_parity_memory_delete;
              DROP TRIGGER IF EXISTS m4_community_parity_memory_update;
 
-             CREATE TRIGGER m4_community_parity_entity_update
-             AFTER UPDATE OF community_id ON entities
-             WHEN OLD.community_id IS NOT NEW.community_id
-             BEGIN
-               DELETE FROM community_reader_parity
-                WHERE space=OLD.space OR space=NEW.space;
-             END;
+             -- `m4_community_parity_entity_update` (the seventh `ON entities`
+             -- trigger) had its CREATE removed here by G6 Stage 3. It was
+             -- created at this point and dropped again a few statements below
+             -- alongside `DROP TABLE IF EXISTS community_reader_parity`, with
+             -- no DML in between, so it never had an observable effect -- but
+             -- the bare CREATE would still abort the whole function once
+             -- `entities` was gone. The DROP above and the one below stay, so
+             -- an old database still gets it cleaned up.
 
              CREATE TRIGGER m4_community_parity_memory_insert
              AFTER INSERT ON memories
@@ -12281,13 +12663,23 @@ impl MemoryDB {
              DROP TRIGGER IF EXISTS m4_parity_input_state_delete;
              DROP TRIGGER IF EXISTS m4_parity_input_state_update;
 
-             CREATE TRIGGER m4_parity_input_entity_insert AFTER INSERT ON entities BEGIN
+             -- G6 Stage 3: pages-anchored, `kind='entity'`-fenced. Same
+             -- rationale as the `m4_grouping_entity_*` block above. The body
+             -- is byte-identical to the historical one, which matters beyond
+             -- tidiness: `repair::parity_input_generation_on_connection`
+             -- subtracts the MEASURED generation delta from `total_changes()`
+             -- in the repair effect guard, and that subtraction is only exact
+             -- while every bump stays one single-row update of the singleton.
+             CREATE TRIGGER m4_parity_input_entity_insert AFTER INSERT ON pages
+             WHEN NEW.kind='entity' BEGIN
                UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
              END;
-             CREATE TRIGGER m4_parity_input_entity_delete AFTER DELETE ON entities BEGIN
+             CREATE TRIGGER m4_parity_input_entity_delete AFTER DELETE ON pages
+             WHEN OLD.kind='entity' BEGIN
                UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
              END;
-             CREATE TRIGGER m4_parity_input_entity_update AFTER UPDATE ON entities BEGIN
+             CREATE TRIGGER m4_parity_input_entity_update AFTER UPDATE ON pages
+             WHEN OLD.kind='entity' OR NEW.kind='entity' BEGIN
                UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
              END;
              CREATE TRIGGER m4_parity_input_memory_insert AFTER INSERT ON memories BEGIN
@@ -15019,6 +15411,244 @@ impl MemoryDB {
         log::info!(
             "[migration] Migration 122 applied: entity_page_map/observations/memory_entities/\
              entity_minhash_bands rebuilt without their entities foreign key"
+        );
+        Ok(())
+    }
+
+    /// Migration 123 (G6 Stage 3, the retirement): drop `entities` and
+    /// `entity_aliases`. **This is the point of no return** — every prior G6
+    /// migration was reversible by pointing readers back at the legacy tables;
+    /// after this one the `kind='entity'` shadow page is not merely canonical,
+    /// it is the only copy that exists.
+    ///
+    /// Scope is exactly those two tables. `memory_entities`, `observations`,
+    /// `entity_page_map`, `relations`, `page_sources`, `page_links` and
+    /// `pages.citations` all SURVIVE — they are keyed by entity id, and an
+    /// entity id is now a shadow page's id, so they need no rewrite.
+    ///
+    /// Three things have to happen before the drops, in this order:
+    ///
+    /// 1. **`relations` loses its `entities` foreign keys.** Migration 122
+    ///    already relaxed the other four dependents; `relations` was
+    ///    deliberately left out then because Stage 2 still wanted its FK guards.
+    ///    It is the last table pointing at `entities`, and a surviving
+    ///    `REFERENCES entities(id)` clause would make every future INSERT fail
+    ///    with `no such table: main.entities` under `PRAGMA foreign_keys=ON`.
+    ///    Rebuilt by the same m24/m122 technique, at its current-at-tip shape,
+    ///    with all three indexes replayed and no attached triggers to restore
+    ///    (verified by a full trigger-body scan of a migrated schema: the only
+    ///    six triggers naming `entities` anywhere are the ones item 2 ports).
+    ///
+    /// 2. **The six `ON entities` triggers move to `pages`.** They are ported
+    ///    in `ensure_community_substrate_tables`/`ensure_community_cutover_
+    ///    tables` (see the comments there), which is what makes a post-drop
+    ///    startup survive `repair_community_*`'s unconditional reinstall. This
+    ///    migration swaps them on the spot as well, so the database is
+    ///    consistent the instant it commits rather than at the next boot.
+    ///
+    /// 3. **`entity_aliases` drops before `entities`.** It carries
+    ///    `canonical_entity_id ... REFERENCES entities(id)`; dropping the
+    ///    parent first would leave a table whose FK names a table that is gone.
+    ///
+    /// `PRAGMA foreign_keys` is suspended around the whole thing, exactly as in
+    /// migrations 98 and 122, because the intermediate states are not valid
+    /// under enforcement. `foreign_key_check` is scoped to `relations` — never
+    /// the bare pragma, which would abort on any unrelated pre-existing orphan
+    /// elsewhere and strand the database at version 122 forever (migration 98's
+    /// rationale, and the stakes are higher here than anywhere).
+    async fn migrate_123_retire_legacy_entity_tables(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(123, prior_version).await?;
+
+        let conn = self.conn.lock().await;
+        conn.execute("PRAGMA foreign_keys = OFF", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m123 fk off: {error}")))?;
+
+        let result: Result<(), WenlanError> = async {
+            let tx = conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m123 begin: {error}")))?;
+
+            // -- 1. relations, rebuilt without the two entities foreign keys.
+            // Column list, types, and the trailing nullable columns added by
+            // later ALTERs are reproduced exactly as a migrated database
+            // carries them; only `REFERENCES entities(id) ON DELETE CASCADE`
+            // is dropped from `from_entity`/`to_entity`.
+            tx.execute_batch(
+                "CREATE TABLE relations_new (
+                    id TEXT PRIMARY KEY,
+                    from_entity TEXT NOT NULL,
+                    to_entity TEXT NOT NULL,
+                    relation_type TEXT NOT NULL,
+                    source_agent TEXT,
+                    created_at INTEGER NOT NULL,
+                    confidence REAL,
+                    explanation TEXT,
+                    source_memory_id TEXT
+                );
+                INSERT INTO relations_new (
+                    id, from_entity, to_entity, relation_type, source_agent,
+                    created_at, confidence, explanation, source_memory_id
+                )
+                SELECT id, from_entity, to_entity, relation_type, source_agent,
+                       created_at, confidence, explanation, source_memory_id
+                FROM relations ORDER BY id;
+                DROP TABLE relations;",
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m123 rebuild relations: {error}")))?;
+            // Same schema-wide-reparse hazard every m122 rename faces: SQLite
+            // >=3.25 revalidates every trigger body in the database during a
+            // rename, and a body naming a transiently-absent table aborts it.
+            Self::m122_rename_into_place(&tx, "relations_new", "relations").await?;
+            tx.execute_batch(
+                "CREATE INDEX idx_relations_from ON relations(from_entity, to_entity);
+                CREATE INDEX idx_relations_to ON relations(to_entity, from_entity);
+                CREATE UNIQUE INDEX idx_relations_unique
+                    ON relations(from_entity, to_entity, relation_type);",
+            )
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m123 reindex relations: {error}")))?;
+
+            // -- 2. Swap the six entities-anchored triggers for their
+            // pages-anchored ports, so this database is consistent at commit
+            // rather than at the next `repair_community_*` startup pass.
+            //
+            // The bodies are copied from `ensure_community_cutover_tables`,
+            // not from `ensure_community_substrate_tables`. Both install
+            // triggers under these six names and they are NOT the same text:
+            // the substrate function still carries migration 95's UPDATE-only
+            // invalidation, which cannot create a state row, while the cutover
+            // function carries PR-2's upsert, which must (its state universe
+            // includes entity-only spaces). The cutover text is the one that
+            // wins on any live database -- the substrate function guards its
+            // CREATEs with IF NOT EXISTS, while `repair_community_cutover`
+            // drops and recreates its own at every startup -- so copying it is
+            // what keeps this migration's result stable across the next boot.
+            tx.execute_batch(
+                "DROP TRIGGER IF EXISTS m4_grouping_entity_insert;
+                 DROP TRIGGER IF EXISTS m4_grouping_entity_delete;
+                 DROP TRIGGER IF EXISTS m4_grouping_entity_update;
+                 DROP TRIGGER IF EXISTS m4_parity_input_entity_insert;
+                 DROP TRIGGER IF EXISTS m4_parity_input_entity_delete;
+                 DROP TRIGGER IF EXISTS m4_parity_input_entity_update;
+                 DROP TRIGGER IF EXISTS m4_community_parity_entity_update;
+
+                 CREATE TRIGGER m4_grouping_entity_insert
+                 AFTER INSERT ON pages
+                 WHEN NEW.kind = 'entity' AND NEW.space IS NOT NULL
+                 BEGIN
+                   INSERT INTO space_graph_state
+                        (space, graph_generation, grouping_generation, published_generation, dirty)
+                   VALUES (NEW.space, 0, 1, NULL, 1)
+                   ON CONFLICT(space) DO UPDATE SET
+                        grouping_generation = grouping_generation + 1,
+                        dirty = 1;
+                 END;
+
+                 CREATE TRIGGER m4_grouping_entity_delete
+                 AFTER DELETE ON pages
+                 WHEN OLD.kind = 'entity' AND OLD.space IS NOT NULL
+                 BEGIN
+                   UPDATE space_graph_state
+                      SET grouping_generation = grouping_generation + 1, dirty = 1
+                    WHERE space = OLD.space;
+                 END;
+
+                 CREATE TRIGGER m4_grouping_entity_update
+                 AFTER UPDATE ON pages
+                 WHEN (OLD.kind = 'entity' OR NEW.kind = 'entity')
+                  AND (
+                         OLD.space IS NOT NEW.space
+                      OR OLD.embedding IS NOT NEW.embedding
+                      OR OLD.status IS NOT NEW.status
+                      OR OLD.kind IS NOT NEW.kind
+                  )
+                 BEGIN
+                   UPDATE space_graph_state
+                      SET grouping_generation = grouping_generation + 1, dirty = 1
+                    WHERE space = OLD.space
+                      AND OLD.space IS NOT NULL
+                      AND OLD.space IS NOT NEW.space;
+                   INSERT INTO space_graph_state
+                        (space, graph_generation, grouping_generation, published_generation, dirty)
+                   SELECT NEW.space, 0, 1, NULL, 1
+                    WHERE NEW.space IS NOT NULL
+                      AND (
+                             OLD.space IS NOT NEW.space
+                          OR OLD.embedding IS NOT NEW.embedding
+                          OR OLD.status IS NOT NEW.status
+                          OR OLD.kind IS NOT NEW.kind
+                      )
+                   ON CONFLICT(space) DO UPDATE SET
+                        grouping_generation = grouping_generation + 1,
+                        dirty = 1;
+                 END;
+
+                 CREATE TRIGGER m4_parity_input_entity_insert AFTER INSERT ON pages
+                 WHEN NEW.kind='entity' BEGIN
+                   UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+                 END;
+                 CREATE TRIGGER m4_parity_input_entity_delete AFTER DELETE ON pages
+                 WHEN OLD.kind='entity' BEGIN
+                   UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+                 END;
+                 CREATE TRIGGER m4_parity_input_entity_update AFTER UPDATE ON pages
+                 WHEN OLD.kind='entity' OR NEW.kind='entity' BEGIN
+                   UPDATE community_parity_input_state SET generation=generation+1 WHERE singleton=1;
+                 END;",
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("m123 port entity triggers to pages: {error}"))
+            })?;
+
+            // -- 3. The drops. Child before parent.
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS entity_aliases;
+                 DROP TABLE IF EXISTS entities;",
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("m123 drop legacy entity tables: {error}"))
+            })?;
+
+            let mut violations = tx
+                .query("PRAGMA foreign_key_check(relations)", ())
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m123 fk check: {error}")))?;
+            let violation = violations
+                .next()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m123 fk check read: {error}")))?;
+            if violation.is_some() {
+                return Err(WenlanError::VectorDb(
+                    "m123 rebuild left a dangling foreign-key reference on relations".into(),
+                ));
+            }
+
+            tx.commit()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m123 commit: {error}")))
+        }
+        .await;
+
+        conn.execute("PRAGMA foreign_keys = ON", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m123 fk on: {error}")))?;
+        result?;
+
+        conn.execute("PRAGMA user_version = 123", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m123 bump: {error}")))?;
+        log::info!(
+            "[migration] Migration 123 applied: legacy entities/entity_aliases retired; \
+             relations rebuilt without its entities foreign keys; the six entity community \
+             triggers now fire on kind='entity' pages"
         );
         Ok(())
     }
@@ -18001,8 +18631,11 @@ impl MemoryDB {
 
     /// Record intent to move one community consumer onto the durable M4
     /// substrate. Intent is deliberately separate from permission: the reader
-    /// stays on `entities.community_id` until every space that can contribute
-    /// actual legacy or durable rows has a clean, current parity receipt.
+    /// stays on the pre-M4 assignment until every space that can contribute
+    /// actual legacy or durable rows has a clean, current parity receipt. That
+    /// assignment lives on the entity's `kind='entity'` shadow page since G6
+    /// Stage 3 retired `entities.community_id` along with its table; the
+    /// fallback branch is unchanged in every other respect.
     pub async fn set_community_reader_cutover(
         &self,
         consumer: &str,
@@ -18187,12 +18820,20 @@ impl MemoryDB {
 
             let mut candidate_rows = snapshot_conn
                 .query(
-                    "SELECT m.source_id, m.space, CAST(e.community_id AS TEXT),
+                    // G6 Stage 3: the "legacy" side of this comparator used to
+                    // read `entities.community_id` directly. `detect_communities`
+                    // dual-wrote that column and the entity's shadow page; the
+                    // retirement migration leaves only the shadow, which is the
+                    // same value by the same writer, read through the same join
+                    // shape `search_summary_buckets` already uses.
+                    "SELECT m.source_id, m.space, CAST(p.community_id AS TEXT),
                                 raw_member.community_id,
                                 CASE WHEN current_community.community_id IS NOT NULL
                                      THEN raw_member.community_id END
                            FROM memories m
-                           LEFT JOIN entities e ON e.id=m.entity_id
+                           LEFT JOIN entity_page_map epm ON epm.entity_id=m.entity_id
+                           LEFT JOIN pages p ON p.id=epm.page_id
+                            AND p.kind='entity' AND p.status='active'
                            LEFT JOIN community_members raw_member
                              ON raw_member.node_id=m.entity_id
                             AND raw_member.space=m.space
@@ -21928,13 +22569,10 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("update_space cascade memories: {}", e)))?;
 
-            tx.execute(
-                "UPDATE entities SET space = ?1 WHERE space = ?2",
-                libsql::params![new_name, name],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("update_space cascade entities: {}", e)))?;
-
+            // The legacy `UPDATE entities SET space` leg that stood here was
+            // the other half of a dual write; G6 Stage 3 retired its table.
+            // The `pages` cascade immediately below already renames every
+            // `kind='entity'` shadow, which IS the entity now.
             tx.execute(
                 "UPDATE pages
                      SET version = CASE
@@ -22031,32 +22669,13 @@ impl MemoryDB {
                 .map_err(|e| {
                     WenlanError::VectorDb(format!("delete_space unassign memories: {}", e))
                 })?;
-                // Fold the mapped entity shadows' space columns to the sentinel
-                // (M3 PR-1 dual-write parity). MUST run BEFORE the entities.space
-                // fold below so the join still sees the deleted space. As of
-                // G6 Stage 1.5b Part 2, entities.space folds the same way the
-                // pages shadow columns already did -- `SET space = NULL` here
-                // would recreate exactly the NULL the fold migration removes.
-                tx.execute(
-                    "UPDATE pages SET space = ?2, workspace = ?2 \
-                     WHERE kind = 'entity' \
-                       AND id IN (SELECT page_id FROM entity_page_map m \
-                                  JOIN entities e ON e.id = m.entity_id \
-                                  WHERE e.space = ?1)",
-                    libsql::params![name, UNFILED_SPACE_ID],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("delete_space unassign shadow fold: {}", e))
-                })?;
-                tx.execute(
-                    "UPDATE entities SET space = ?2 WHERE space = ?1",
-                    libsql::params![name, UNFILED_SPACE_ID],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("delete_space unassign entities: {}", e))
-                })?;
+                // Two statements stood here until G6 Stage 3: an entity-shadow
+                // space fold that located its rows by joining `entities`, and
+                // the `entities.space` fold it mirrored. Both are gone with the
+                // table, and neither is missed -- the general `pages` fold
+                // immediately below already rewrites every page whose `space`
+                // or `workspace` is the deleted one, and an entity's shadow
+                // page carries that space itself rather than borrowing it.
                 tx.execute(
                     "UPDATE pages
                      SET version = CASE WHEN status='draft' THEN version+1 ELSE version END,
@@ -22107,34 +22726,24 @@ impl MemoryDB {
                         .await?;
                 }
                 // Tear the space's entities down the SAME way the single-entity
-                // `delete_entity` does (M3 PR-1), scoped to the space. G6 Stage 2
-                // PR 2c sub-step 3 item 5: `entities` stops being written (see
-                // `store_entity`), so a post-flip entity never gets an `entities`
-                // row and would be invisible to a `WHERE space = ?1` enumeration
-                // sourced from it alone -- every cleanup subquery below now
-                // enumerates the UNION of the legacy source (`entities.space`,
-                // for rows written before this flip) and the canonical store
-                // (`entity_page_map` JOIN `pages` on the page's own `space`, for
-                // everything written after). The join side is deliberately NOT
-                // filtered on `kind = 'entity'`: entity_page_map rows are
-                // entity-only by construction in normal operation, and the one
-                // abnormal case -- a row pointing at a page that never got that
-                // kind set -- is exactly the belt-and-suspenders scenario a few
-                // lines down, so narrowing the join would silently re-open that
-                // gap (see delete_space_delete_removes_entity_page_map_row_without_entity_kind_page).
-                // The item-4 comment's prediction that the FK-guard
-                // `entity_aliases` delete retires here was wrong (ruling
-                // 2026-08-07): the raw `DELETE FROM entities` further down
-                // stays for legacy rows until Stage 3 drops the table, so
-                // the guard (below, right before that delete) must keep
-                // running for exactly as long as that delete does.
+                // `delete_entity` does (M3 PR-1), scoped to the space. Every
+                // cleanup subquery below enumerates the canonical store
+                // (`entity_page_map` JOIN `pages` on the page's own `space`);
+                // the `SELECT id FROM entities WHERE space = ?1` arm each one
+                // used to UNION in retired with the table at G6 Stage 3, and
+                // there is no longer a second place an entity can live.
+                // The join side is deliberately NOT filtered on `kind =
+                // 'entity'`: entity_page_map rows are entity-only by
+                // construction in normal operation, and the one abnormal case
+                // -- a row pointing at a page that never got that kind set --
+                // is exactly the belt-and-suspenders scenario a few lines down,
+                // so narrowing the join would silently re-open that gap (see
+                // delete_space_delete_removes_entity_page_map_row_without_entity_kind_page).
                 // memories/pages entity_id references are nulled to match
                 // delete_entity exactly (no dangling link to a removed entity).
                 tx.execute(
                     "UPDATE memories SET entity_id = NULL \
-                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1 \
-                                          UNION \
-                                          SELECT epm.entity_id FROM entity_page_map epm \
+                     WHERE entity_id IN (SELECT epm.entity_id FROM entity_page_map epm \
                                           JOIN pages p ON p.id = epm.page_id \
                                           WHERE p.space = ?1)",
                     libsql::params![name],
@@ -22148,9 +22757,7 @@ impl MemoryDB {
                 })?;
                 tx.execute(
                     "UPDATE pages SET entity_id = NULL \
-                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1 \
-                                          UNION \
-                                          SELECT epm.entity_id FROM entity_page_map epm \
+                     WHERE entity_id IN (SELECT epm.entity_id FROM entity_page_map epm \
                                           JOIN pages p ON p.id = epm.page_id \
                                           WHERE p.space = ?1)",
                     libsql::params![name],
@@ -22173,9 +22780,7 @@ impl MemoryDB {
                 // side of these enumerations would then find nothing.
                 tx.execute(
                     "DELETE FROM memory_entities \
-                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1 \
-                                          UNION \
-                                          SELECT epm.entity_id FROM entity_page_map epm \
+                     WHERE entity_id IN (SELECT epm.entity_id FROM entity_page_map epm \
                                           JOIN pages p ON p.id = epm.page_id \
                                           WHERE p.space = ?1)",
                     libsql::params![name],
@@ -22186,9 +22791,7 @@ impl MemoryDB {
                 })?;
                 tx.execute(
                     "DELETE FROM observations \
-                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1 \
-                                          UNION \
-                                          SELECT epm.entity_id FROM entity_page_map epm \
+                     WHERE entity_id IN (SELECT epm.entity_id FROM entity_page_map epm \
                                           JOIN pages p ON p.id = epm.page_id \
                                           WHERE p.space = ?1)",
                     libsql::params![name],
@@ -22199,9 +22802,7 @@ impl MemoryDB {
                 })?;
                 tx.execute(
                     "DELETE FROM entity_minhash_bands \
-                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1 \
-                                          UNION \
-                                          SELECT epm.entity_id FROM entity_page_map epm \
+                     WHERE entity_id IN (SELECT epm.entity_id FROM entity_page_map epm \
                                           JOIN pages p ON p.id = epm.page_id \
                                           WHERE p.space = ?1)",
                     libsql::params![name],
@@ -22217,9 +22818,7 @@ impl MemoryDB {
                 // before the shadow-page delete for the same reason as above.
                 tx.execute(
                     "DELETE FROM entity_page_map \
-                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1 \
-                                          UNION \
-                                          SELECT epm.entity_id FROM entity_page_map epm \
+                     WHERE entity_id IN (SELECT epm.entity_id FROM entity_page_map epm \
                                           JOIN pages p ON p.id = epm.page_id \
                                           WHERE p.space = ?1)",
                     libsql::params![name],
@@ -22243,29 +22842,10 @@ impl MemoryDB {
                 .map_err(|e| {
                     WenlanError::VectorDb(format!("delete_space delete shadow pages: {}", e))
                 })?;
-                // Legacy FK-guard: `entity_aliases.canonical_entity_id` is a
-                // NO ACTION FK into `entities(id)`; must precede the legacy
-                // `DELETE FROM entities` below. Retires in Stage 3 with the
-                // `entity_aliases` drop, not before (same guard as
-                // delete_entity/merge_entities, extended here to the
-                // space-scoped bulk delete).
-                tx.execute(
-                    "DELETE FROM entity_aliases \
-                     WHERE canonical_entity_id IN (SELECT id FROM entities WHERE space = ?1)",
-                    libsql::params![name],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("delete_space delete alias fk guard: {}", e))
-                })?;
-                tx.execute(
-                    "DELETE FROM entities WHERE space = ?1",
-                    libsql::params![name],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("delete_space delete entities: {}", e))
-                })?;
+                // The `entity_aliases` FK-guard delete and the raw
+                // `DELETE FROM entities` that followed it both retired here at
+                // G6 Stage 3, together with the two tables they named. The
+                // shadow-page delete above is now the whole teardown.
                 tx.execute(
                     "UPDATE pages
                      SET version = CASE WHEN status='draft' THEN version+1 ELSE version END,
@@ -22323,12 +22903,9 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("delete_space move memories: {}", e)))?;
-                tx.execute(
-                    "UPDATE entities SET space = ?1 WHERE space = ?2",
-                    libsql::params![target, name],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("delete_space move entities: {}", e)))?;
+                // Legacy `UPDATE entities SET space` leg retired with its table
+                // (G6 Stage 3); the `pages` move below carries every
+                // `kind='entity'` shadow across.
                 tx.execute(
                     "UPDATE pages
                              SET version = CASE
@@ -22452,13 +23029,9 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("reassign memories: {}", e)))?;
 
-        tx.execute(
-            "UPDATE entities SET space = ?1 WHERE space = ?2",
-            libsql::params![to, from],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("reassign entities: {}", e)))?;
-
+        // Legacy `UPDATE entities SET space` leg retired with its table (G6
+        // Stage 3); the `pages` reassignment below moves every `kind='entity'`
+        // shadow with it.
         tx.execute(
             "UPDATE pages
                  SET version = CASE
@@ -32305,22 +32878,10 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("create_entity begin: {}", e)))?;
 
         let result: Result<(), WenlanError> = async {
-            conn.execute(
-                "INSERT INTO entities (id, name, entity_type, space, confirmed, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
-                libsql::params![
-                    id.clone(),
-                    name.to_string(),
-                    entity_type.to_string(),
-                    // G6 Stage 1.5b Part 2: entities.space is folded (never
-                    // NULL) -- fold at write time, else NULLs recur post-migration.
-                    space.map(|d| d.to_string()).unwrap_or_else(|| UNFILED_SPACE_ID.to_string()),
-                    now
-                ],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("create_entity: {}", e)))?;
-
+            // G6 Stage 3: the `INSERT INTO entities` that led here is gone with
+            // its table. The shadow-page write below was already the other half
+            // of the pair and is now the whole of it -- same signature, so every
+            // existing fixture call site keeps working unchanged.
             let page_id = crate::pages::new_page_id();
             // G6 Stage 2 PR 2c sub-step 2: direct values-based write, no
             // re-derivation -- a brand-new entity has no confidence,
@@ -33013,16 +33574,10 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("refresh_entity_embedding begin: {}", e)))?;
         let result: Result<(), WenlanError> = async {
-            conn.execute(
-                "UPDATE entities SET embedding = vector32(?1), embedding_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
-                libsql::params![vec_str.clone(), now, entity_id.to_string()],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("refresh_entity_embedding: {}", e)))?;
             // G6 Stage 2 PR 2c sub-step 2: direct targeted write.
-            // `pages.embedding_updated_at` is INTEGER (unix seconds), same
-            // as `entities.embedding_updated_at` above -- this uses `now`,
-            // not `now_iso`, to match the column's declared type.
+            // `pages.embedding_updated_at` is INTEGER (unix seconds), which is
+            // why this uses `now` rather than `now_iso`. It was the mirror half
+            // of a dual write until G6 Stage 3 retired `entities`.
             conn.execute(
                 "UPDATE pages SET embedding = vector32(?1), entity_updated_at = ?2,
                     embedding_updated_at = ?2, last_modified = ?3
@@ -33031,7 +33586,9 @@ impl MemoryDB {
                 libsql::params![vec_str, now, now_iso.clone(), entity_id.to_string()],
             )
             .await
-            .map_err(|e| WenlanError::VectorDb(format!("refresh_entity_embedding shadow: {}", e)))?;
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("refresh_entity_embedding shadow: {}", e))
+            })?;
             Ok(())
         }
         .await;
@@ -33087,15 +33644,9 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("add_observation: {}", e)))?;
 
-            conn.execute(
-                "UPDATE entities SET updated_at = ?1 WHERE id = ?2",
-                libsql::params![now, entity_id.to_string()],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("add_observation timestamp: {}", e)))?;
-
             // G6 Stage 2 PR 2c sub-step 2: direct targeted write -- adding
-            // an observation only touches the entity's `updated_at`.
+            // an observation only touches the entity's `updated_at`. The
+            // matching `UPDATE entities SET updated_at` retired at Stage 3.
             conn.execute(
                 "UPDATE pages SET entity_updated_at = ?1, last_modified = ?2
                  WHERE kind = 'entity'
@@ -33556,29 +34107,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities pages: {e}")))?;
 
-            // G6 Stage 2 PR 2c sub-step 3 item 5: the item-4 comment's
-            // prediction that this spot's `entity_aliases` FK-guard retires
-            // together with `entities` here was wrong (ruling 2026-08-07).
-            // The alias-redirect UPDATE and the winner-side entity_type
-            // promotion UPDATE genuinely retire -- `final_entity_type` is
-            // computed in Rust above and applied straight to the canonical
-            // shadow page below, no `entities` round-trip needed -- but the
-            // FK guard does NOT: every pre-flip entity still carries a live
-            // `entities` row, and the raw `DELETE FROM entities` further
-            // down keeps running for those legacy rows until Stage 3 drops
-            // the table. `entity_aliases.canonical_entity_id` is a NO ACTION
-            // FK into `entities(id)`, so it must still be cleared here or
-            // the delete below fails loud on any alias with surviving
-            // `entity_aliases` rows. Retires in Stage 3 with the
-            // `entity_aliases` drop, not before.
-            conn.execute(
-                "DELETE FROM entity_aliases WHERE canonical_entity_id = ?1",
-                libsql::params![alias_id],
-            )
-            .await
-            .map_err(|e| {
-                WenlanError::VectorDb(format!("merge_entities delete alias fk guard: {e}"))
-            })?;
+            // The `entity_aliases` FK-guard delete that stood here retired at
+            // G6 Stage 3, as its own comment predicted it eventually would:
+            // it existed only to clear a NO ACTION foreign key ahead of the
+            // raw `DELETE FROM entities` below, and both that delete and both
+            // tables are gone.
 
             // T16 band cleanup for the loser (complements ON DELETE CASCADE).
             conn.execute(
@@ -33627,12 +34160,8 @@ impl MemoryDB {
                 .map_err(|e| WenlanError::VectorDb(format!("merge_entities loser shadow: {e}")))?;
             }
 
-            conn.execute(
-                "DELETE FROM entities WHERE id = ?1",
-                libsql::params![alias_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("merge_entities delete alias: {e}")))?;
+            // The loser's `DELETE FROM entities` retired at G6 Stage 3; its
+            // shadow-page delete just above is now the whole removal.
 
             // The canonical's shadowed fields drifted in this merge: aliases
             // gained the loser's full alias set, and entity_type may have
@@ -34427,22 +34956,9 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete_entity pages: {e}")))?;
 
-            // G6 Stage 2 PR 2c sub-step 3 item 5: the item-4 comment's
-            // prediction that this FK-guard delete retires here was wrong
-            // (ruling 2026-08-07) -- legacy FK-guard: `entity_aliases.
-            // canonical_entity_id` is a NO ACTION FK into `entities(id)`,
-            // and every pre-flip entity still carries a live `entities`
-            // row (the raw `DELETE FROM entities` below keeps running for
-            // those legacy rows until Stage 3 drops the table), so this
-            // guard must precede that delete for as long as the table it
-            // guards is still written to. Retires in Stage 3 with the
-            // `entity_aliases` drop, not before.
-            conn.execute(
-                "DELETE FROM entity_aliases WHERE canonical_entity_id = ?1",
-                libsql::params![entity_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("delete_entity alias fk guard: {e}")))?;
+            // The `entity_aliases` FK-guard delete retired here at G6 Stage 3
+            // along with the table it guarded and the `DELETE FROM entities`
+            // it had to precede.
 
             // G6 Stage 2 PR 2c sub-step 3 (m122 fold-in): migration 122
             // relaxed memory_entities/observations/entity_minhash_bands'
@@ -34475,12 +34991,10 @@ impl MemoryDB {
                 WenlanError::VectorDb(format!("delete_entity entity_minhash_bands: {e}"))
             })?;
 
-            // Delete the entity's shadow page (M3 PR-1 item C). The
+            // Delete the entity's shadow page (M3 PR-1 item C) -- since G6
+            // Stage 3 this IS the entity delete, not a mirror of one. The
             // `entity_page_map` row has an ON DELETE CASCADE FK to `pages`, so
-            // deleting the shadow removes the map row too; the subsequent
-            // `DELETE FROM entities` then finds no dangling map row. Without
-            // this the shadow would be orphaned (the map's entity-side cascade
-            // drops the map row on entity delete, but never the page itself).
+            // deleting the shadow removes the map row too.
             if let Some(shadow_page_id) =
                 entity_page_adapter::page_id_for_entity(&conn, entity_id).await?
             {
@@ -34506,12 +35020,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete_entity entity_page_map: {e}")))?;
 
-            conn.execute(
-                "DELETE FROM entities WHERE id = ?1",
-                libsql::params![entity_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("delete_entity entity: {e}")))?;
+            // The closing `DELETE FROM entities` retired at G6 Stage 3.
 
             Ok(())
         }
@@ -34746,8 +35255,18 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT me.entity_id, COUNT(*) c, COALESCE(e.name, me.entity_id) nm \
-                 FROM memory_entities me LEFT JOIN entities e ON e.id = me.entity_id \
+                // G6 Stage 3: the display name comes from the entity's
+                // `kind='entity'` shadow page title, which is where the name
+                // lives now. Still a LEFT JOIN with the same
+                // `COALESCE(..., me.entity_id)` fallback, so a link whose
+                // entity has been deleted degrades to showing the raw id
+                // exactly as it did when the fallback covered a missing
+                // `entities` row.
+                "SELECT me.entity_id, COUNT(*) c, COALESCE(p.title, me.entity_id) nm \
+                 FROM memory_entities me \
+                 LEFT JOIN entity_page_map epm ON epm.entity_id = me.entity_id \
+                 LEFT JOIN pages p ON p.id = epm.page_id \
+                      AND p.kind = 'entity' AND p.status = 'active' \
                  GROUP BY me.entity_id ORDER BY c DESC LIMIT ?1",
                 libsql::params![n as i64],
             )
@@ -36469,14 +36988,9 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("confirm_entity begin: {}", e)))?;
         let result: Result<(), WenlanError> = async {
-            conn.execute(
-                "UPDATE entities SET confirmed = ?1 WHERE id = ?2",
-                libsql::params![if confirmed { 1i64 } else { 0i64 }, entity_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("confirm_entity: {}", e)))?;
             // G6 Stage 2 PR 2c sub-step 2: direct targeted write -- only
-            // `entity_confirmed` changed.
+            // `entity_confirmed` changed. Its `UPDATE entities SET confirmed`
+            // counterpart retired at Stage 3.
             conn.execute(
                 "UPDATE pages SET entity_confirmed = ?1, last_modified = ?2
                  WHERE kind = 'entity'
@@ -36697,27 +37211,21 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
-        // G6 Stage 1.5b Part 1: community_id is a shared-CRUD write to entities,
-        // so mirror it onto the shadow page in the same transaction.
+        // G6 Stage 1.5b Part 1: community_id is a shared-CRUD write, mirrored
+        // onto the shadow page. G6 Stage 3 retired the `entities` half, so the
+        // shadow page is the sole store of a computed community assignment.
         let now_iso = chrono::Utc::now().to_rfc3339();
         let update_result: Result<(), WenlanError> = async {
             for (i, entity_id) in entity_ids.iter().enumerate() {
                 let community_id = label_to_community[&labels[i]];
-                // `entities` write stays best-effort: a shadow-only entity
-                // (no `entities` row) silently no-ops here, expected.
-                conn.execute(
-                    "UPDATE entities SET community_id = ?1 WHERE id = ?2",
-                    libsql::params![community_id, entity_id.clone()],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
                 // G6 Stage 2 PR 2c sub-step 2: direct targeted write on the
                 // shadow page itself, not derived from `entities` -- retires
                 // the item-3 surgical guard (db.rs, prior revision), since
                 // this write no longer depends on an `entities` row
                 // existing and so no longer no-ops for a shadow-only
-                // entity. `pages.community_id` is TEXT (`entities.community_id`
-                // is INTEGER), so the value is stringified here to match.
+                // entity. `pages.community_id` is TEXT (the retired
+                // `entities.community_id` was INTEGER), so the value is
+                // stringified here to match.
                 conn.execute(
                     "UPDATE pages SET community_id = ?1, last_modified = ?2
                      WHERE kind = 'entity'
@@ -41736,8 +42244,9 @@ impl MemoryDB {
             "enrichment_steps",
             "observations",
             "relations",
-            "entity_aliases",
-            "entities",
+            // `entity_aliases`/`entities` dropped from this list with the
+            // tables themselves (G6 Stage 3). Entity rows now live in `pages`
+            // as `kind='entity'` shadows and are wiped with the page store.
             "memories",
             // T15a: child_vectors has no FK cascade; wipe alongside memories so
             // eval re-seeds don't accumulate orphaned child rows.
@@ -52359,14 +52868,28 @@ impl MemoryDB {
 
         // Self-heal orphaned refs first: a deleted entity can leave dangling
         // `memories.entity_id` rows (that column has no FK, so they sit harmless).
-        // Copying them into the FK-constrained `memory_entities` below would abort
-        // the whole INSERT on `FOREIGN KEY constraint failed` and crash-loop the
-        // daemon on every boot (0.8.4 incident). Null them so the backfill — gated
-        // on `entity_id IS NOT NULL` — skips them cleanly.
+        // Copying them into `memory_entities` below would once have aborted the
+        // whole INSERT on `FOREIGN KEY constraint failed` and crash-looped the
+        // daemon on every boot (0.8.4 incident); m122 relaxed that FK, so the
+        // crash motivation is gone, but backfilling a link to an entity that no
+        // longer exists is still wrong. Null them so the backfill — gated on
+        // `entity_id IS NOT NULL` — skips them cleanly.
+        //
+        // G6 Stage 3: membership is the canonical shadow page, matching
+        // `entity_exists` exactly (this runs unconditionally at server startup,
+        // so a fresh install replaying the chain to 123 reaches it with no
+        // `entities` table to read). A non-active shadow page counts as gone,
+        // which is m123's own semantics — its trigger update arms treat a
+        // `status`/`kind` flip as the entity appearing or vanishing.
         conn.execute(
             "UPDATE memories SET entity_id = NULL
              WHERE entity_id IS NOT NULL
-               AND entity_id NOT IN (SELECT id FROM entities)",
+               AND NOT EXISTS (
+                     SELECT 1 FROM entity_page_map epm
+                     JOIN pages p ON p.id = epm.page_id
+                     WHERE epm.entity_id = memories.entity_id
+                       AND p.kind = 'entity' AND p.status = 'active'
+                   )",
             (),
         )
         .await

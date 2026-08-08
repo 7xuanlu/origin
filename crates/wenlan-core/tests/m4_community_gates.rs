@@ -1415,9 +1415,11 @@ async fn m4_pr2_global_parity_reconcile_scale_receipt() {
 
     observer
         .execute(
-            "UPDATE entities
+            "UPDATE pages
                 SET community_id=1
-              WHERE id IN (SELECT node_id FROM community_members)",
+              WHERE kind='entity'
+                AND id IN (SELECT page_id FROM entity_page_map
+                            WHERE entity_id IN (SELECT node_id FROM community_members))",
             (),
         )
         .await
@@ -1575,44 +1577,25 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
         .expect("seed M4 isolated provenance root");
     for node in 0..10 {
         let entity_id = format!("core-{node:02}");
-        observer
-            .execute(
-                "INSERT INTO entities \
-                    (id, name, entity_type, space, created_at, updated_at, embedding) \
-                 VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200, vector32(?3))",
-                libsql::params![entity_id, SPACE, unit_embedding.as_str()],
-            )
-            .await
-            .expect("seed core entity");
+        seed_m4_entity(&observer, &entity_id, SPACE, Some(unit_embedding.as_str())).await;
     }
-    observer
-        .execute(
-            "INSERT INTO entities \
-                (id, name, entity_type, space, created_at, updated_at) VALUES \
-                ('isolated-ungrounded', 'isolated-ungrounded', 'concept', ?1, 1712707200, 1712707200), \
-                ('isolated-none', 'isolated-none', 'concept', ?1, 1712707200, 1712707200), \
-                ('z-chain-a', 'z-chain-a', 'concept', ?1, 1712707200, 1712707200), \
-                ('z-chain-b', 'z-chain-b', 'concept', ?1, 1712707200, 1712707200), \
-                ('z-cycle-a', 'z-cycle-a', 'concept', ?1, 1712707200, 1712707200), \
-                ('z-cycle-b', 'z-cycle-b', 'concept', ?1, 1712707200, 1712707200)",
-            libsql::params![SPACE],
-        )
-        .await
-        .expect("seed non-embedded isolated entities");
-    observer
-        .execute(
-            "INSERT INTO entities \
-                (id, name, entity_type, space, created_at, updated_at, embedding) \
-             VALUES ('isolated-embedding', 'isolated-embedding', 'concept', ?1, \
-                     1712707200, 1712707200, vector32(?2))",
-            libsql::params![SPACE, unit_embedding],
-        )
-        .await
-        .expect("seed embedded isolated entity");
-    // The ported `edges_space_fence` trigger resolves an entity endpoint's
-    // space via its shadow page and fails closed mid-transaction, so the
-    // entities above need shadow pages before the edges below can insert.
-    seed_entity_shadow_pages(&observer).await;
+    for entity_id in [
+        "isolated-ungrounded",
+        "isolated-none",
+        "z-chain-a",
+        "z-chain-b",
+        "z-cycle-a",
+        "z-cycle-b",
+    ] {
+        seed_m4_entity(&observer, entity_id, SPACE, None).await;
+    }
+    seed_m4_entity(
+        &observer,
+        "isolated-embedding",
+        SPACE,
+        Some(&unit_embedding),
+    )
+    .await;
     for node in 0..10 {
         observer
             .execute(
@@ -1664,7 +1647,6 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
         .execute("COMMIT", ())
         .await
         .expect("commit M4 isolated seed");
-    seed_entity_shadow_pages(&observer).await;
 
     let (left, right) = tokio::join!(
         db.prepare_community_grouping(SPACE),
@@ -1845,7 +1827,10 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
 
     observer
         .execute(
-            "UPDATE entities SET embedding = vector32(?1) WHERE id = 'isolated-embedding'",
+            "UPDATE pages SET embedding = vector32(?1)
+              WHERE kind='entity'
+                AND id = (SELECT page_id FROM entity_page_map
+                           WHERE entity_id = 'isolated-embedding')",
             libsql::params![m4_unit_embedding(1)],
         )
         .await
@@ -1943,7 +1928,10 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
         .expect("inject published algorithm-version mismatch");
     observer
         .execute(
-            "UPDATE entities SET embedding = vector32(?1) WHERE id = 'isolated-embedding'",
+            "UPDATE pages SET embedding = vector32(?1)
+              WHERE kind='entity'
+                AND id = (SELECT page_id FROM entity_page_map
+                           WHERE entity_id = 'isolated-embedding')",
             libsql::params![m4_unit_embedding(2)],
         )
         .await
@@ -1963,7 +1951,10 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
 
     observer
         .execute(
-            "UPDATE entities SET embedding = vector32(?1) WHERE id = 'isolated-embedding'",
+            "UPDATE pages SET embedding = vector32(?1)
+              WHERE kind='entity'
+                AND id = (SELECT page_id FROM entity_page_map
+                           WHERE entity_id = 'isolated-embedding')",
             libsql::params![m4_unit_embedding(3)],
         )
         .await
@@ -2019,17 +2010,8 @@ async fn m4_raw_grounded_writes_force_full_recovery_instead_of_reusing_stale_cor
         .await
         .expect("seed raw-trigger provenance root");
     for node in 0..10 {
-        observer
-            .execute(
-                "INSERT INTO entities
-                    (id, name, entity_type, space, created_at, updated_at)
-                 VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
-                libsql::params![format!("raw-node-{node:02}"), SPACE],
-            )
-            .await
-            .expect("seed raw-trigger entity");
+        seed_m4_entity(&observer, &format!("raw-node-{node:02}"), SPACE, None).await;
     }
-    seed_entity_shadow_pages(&observer).await;
     for node in 0..10 {
         observer
             .execute(
@@ -2231,20 +2213,8 @@ async fn m4_below_floor_holds_prior_publication_and_stays_queued() {
         .expect("seed below-floor provenance root");
     for node in 0..PARTICIPANTS {
         let node_id = format!("below-floor-node-{node:02}");
-        observer
-            .execute(
-                "INSERT INTO entities
-                 (id, name, entity_type, space, created_at, updated_at)
-                 VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
-                libsql::params![node_id, SPACE],
-            )
-            .await
-            .expect("seed below-floor entity");
+        seed_m4_entity(&observer, &node_id, SPACE, None).await;
     }
-    // The ported `edges_space_fence` trigger resolves an entity endpoint's
-    // space via its shadow page, so the entities above need one each before
-    // the edges below can insert.
-    seed_entity_shadow_pages(&observer).await;
     for node in 0..PARTICIPANTS {
         observer
             .execute(
@@ -2372,20 +2342,8 @@ async fn m4_phase_round_robin_reaches_later_dirty_space_after_held_restart() {
         (VIABLE_SPACE, VIABLE_PARTICIPANTS, "viable"),
     ] {
         for node in 0..participants {
-            observer
-                .execute(
-                    "INSERT INTO entities
-                     (id, name, entity_type, space, created_at, updated_at)
-                     VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
-                    libsql::params![format!("{prefix}-node-{node:02}"), space],
-                )
-                .await
-                .expect("seed round-robin entity");
+            seed_m4_entity(&observer, &format!("{prefix}-node-{node:02}"), space, None).await;
         }
-        // The ported `edges_space_fence` trigger resolves an entity endpoint's
-        // space via its shadow page, so this space's entities need one each
-        // before its edges below can insert.
-        seed_entity_shadow_pages(&observer).await;
         for node in 0..participants {
             observer
                 .execute(
@@ -2406,7 +2364,6 @@ async fn m4_phase_round_robin_reaches_later_dirty_space_after_held_restart() {
                 .expect("seed round-robin grounded edge");
         }
     }
-    seed_entity_shadow_pages(&observer).await;
 
     let held_generation = read_m4_grouping_generation(&observer, HELD_SPACE).await;
     let first = db
@@ -3017,26 +2974,9 @@ async fn m4_merge_collision_advances_graph_and_rebuilds_changed_node_order() {
         .expect("connect M4 merge-collision observer");
 
     for node in 0..CORE_NODES {
-        observer
-            .execute(
-                "INSERT INTO entities
-                    (id, name, entity_type, space, created_at, updated_at)
-                 VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
-                libsql::params![format!("merge-core-{node:02}"), SPACE],
-            )
-            .await
-            .expect("seed merge-collision core entity");
+        seed_m4_entity(&observer, &format!("merge-core-{node:02}"), SPACE, None).await;
     }
-    observer
-        .execute(
-            "INSERT INTO entities
-                (id, name, entity_type, space, created_at, updated_at)
-             VALUES ('merge-alias', 'merge-alias', 'concept', ?1, 1712707200, 1712707200)",
-            libsql::params![SPACE],
-        )
-        .await
-        .expect("seed merge-collision alias");
-    seed_entity_shadow_pages(&observer).await;
+    seed_m4_entity(&observer, "merge-alias", SPACE, None).await;
     for node in 0..CORE_NODES {
         observer
             .execute(
@@ -3263,22 +3203,9 @@ async fn seed_m4_graded_corpus(observer: &libsql::Connection) {
         for cluster in 0..CLUSTERS_PER_SPACE {
             for node in 0..NODES_PER_CLUSTER {
                 let entity_id = format!("space-{space}-cluster-{cluster:02}-node-{node:03}");
-                observer
-                    .execute(
-                        "INSERT INTO entities \
-                         (id, name, entity_type, space, created_at, updated_at) \
-                         VALUES (?1, ?1, 'concept', ?2, 1712707200, 1712707200)",
-                        libsql::params![entity_id, format!("space-{space}")],
-                    )
-                    .await
-                    .expect("seed M4 scale entity");
+                seed_m4_entity(observer, &entity_id, &format!("space-{space}"), None).await;
             }
         }
-
-        // The ported `edges_space_fence` trigger resolves an entity endpoint's
-        // space via its shadow page and fails closed mid-transaction, so this
-        // space's entities need shadow pages before its edges below can insert.
-        seed_entity_shadow_pages(observer).await;
 
         let mut edge_index = 0usize;
         for cluster in 0..CLUSTERS_PER_SPACE {
@@ -3372,8 +3299,6 @@ async fn seed_m4_graded_corpus(observer: &libsql::Connection) {
                 .expect("seed M4 native page citation");
         }
     }
-
-    seed_entity_shadow_pages(observer).await;
 
     observer
         .execute("COMMIT", ())
@@ -3721,13 +3646,24 @@ async fn assert_m4_schema(observer: &libsql::Connection) {
     }
 }
 
+/// The label-propagation shadow, read from where it lives now. G6 Stage 3
+/// retired `entities`, so the assignment is on the entity's `kind='entity'`
+/// shadow page -- and `pages.community_id` is TEXT (migration 122's
+/// `ALTER TABLE pages ADD COLUMN community_id TEXT`), not the INTEGER the
+/// retired `entities.community_id` was. Reading it as `Option<i64>` panics
+/// inside libsql rather than failing the query, so the type has to move with
+/// the column.
 async fn read_legacy_community_shadow(
     observer: &libsql::Connection,
     space: &str,
-) -> Vec<(String, Option<i64>)> {
+) -> Vec<(String, Option<String>)> {
     let mut rows = observer
         .query(
-            "SELECT id, community_id FROM entities WHERE space = ?1 ORDER BY id",
+            "SELECT m.entity_id, p.community_id
+               FROM entity_page_map m
+               JOIN pages p ON p.id = m.page_id
+              WHERE p.kind = 'entity' AND p.space = ?1
+              ORDER BY m.entity_id",
             libsql::params![space.to_owned()],
         )
         .await
@@ -3799,34 +3735,70 @@ async fn read_m4_generation(observer: &libsql::Connection, space: &str) -> i64 {
 /// `MemoryDB::test_seed_entity_shadow_page`) since some fixtures here are
 /// scale-sized; same column set as `MemoryDB::insert_entity_shadow_page`.
 /// Idempotent: only backfills entities that don't have one yet.
-async fn seed_entity_shadow_pages(observer: &libsql::Connection) {
-    observer
-        .execute(
-            "INSERT INTO pages (
-                id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
-                embedding, space, workspace, source_memory_ids, version, status,
-                created_at, last_compiled, last_modified, creation_kind, review_status
-             )
-             SELECT 'shadow-' || id, name, NULL, '', 'entity', entity_type, confidence, confirmed,
-                    embedding, COALESCE(space, '00000000-0000-4000-8000-000000000001'),
-                    COALESCE(space, '00000000-0000-4000-8000-000000000001'), '[]', 1,
-                    'active', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z',
-                    '2024-01-01T00:00:00Z', 'entity', 'unconfirmed'
-             FROM entities
-             WHERE NOT EXISTS (SELECT 1 FROM entity_page_map WHERE entity_id = entities.id)",
-            (),
-        )
-        .await
-        .expect("seed M4 entity shadow pages");
+/// Seed one entity the way production writes one since G6: a `kind='entity'`
+/// shadow page plus its `entity_page_map` row. Migration 123 dropped
+/// `entities`, so this IS the entity -- there is no legacy row to derive from
+/// any more, which is why the old `seed_entity_shadow_pages` sweep (a
+/// `SELECT ... FROM entities` backfill run after a batch of raw inserts) is
+/// gone and each seed site calls this directly.
+async fn seed_m4_entity(
+    observer: &libsql::Connection,
+    entity_id: &str,
+    space: &str,
+    embedding: Option<&str>,
+) {
+    let page_id = format!("shadow-{entity_id}");
+    match embedding {
+        Some(vector) => {
+            observer
+                .execute(
+                    "INSERT INTO pages (
+                        id, title, summary, content, kind, entity_type, confidence,
+                        entity_confirmed, embedding, space, workspace, source_memory_ids,
+                        version, status, created_at, last_compiled, last_modified,
+                        creation_kind, review_status
+                     )
+                     VALUES (?1, ?2, NULL, '', 'entity', 'concept', NULL, 0, vector32(?4),
+                             ?3, ?3, '[]', 1, 'active', '2024-01-01T00:00:00Z',
+                             '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'entity',
+                             'unconfirmed')",
+                    libsql::params![
+                        page_id.clone(),
+                        entity_id.to_owned(),
+                        space.to_owned(),
+                        vector.to_owned()
+                    ],
+                )
+                .await
+                .expect("seed M4 entity shadow page");
+        }
+        None => {
+            observer
+                .execute(
+                    "INSERT INTO pages (
+                        id, title, summary, content, kind, entity_type, confidence,
+                        entity_confirmed, embedding, space, workspace, source_memory_ids,
+                        version, status, created_at, last_compiled, last_modified,
+                        creation_kind, review_status
+                     )
+                     VALUES (?1, ?2, NULL, '', 'entity', 'concept', NULL, 0, NULL,
+                             ?3, ?3, '[]', 1, 'active', '2024-01-01T00:00:00Z',
+                             '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'entity',
+                             'unconfirmed')",
+                    libsql::params![page_id.clone(), entity_id.to_owned(), space.to_owned()],
+                )
+                .await
+                .expect("seed M4 entity shadow page");
+        }
+    }
     observer
         .execute(
             "INSERT INTO entity_page_map (entity_id, page_id, created_at)
-             SELECT id, 'shadow-' || id, '2024-01-01T00:00:00Z' FROM entities
-             WHERE NOT EXISTS (SELECT 1 FROM entity_page_map WHERE entity_id = entities.id)",
-            (),
+             VALUES (?1, ?2, '2024-01-01T00:00:00Z')",
+            libsql::params![entity_id.to_owned(), page_id],
         )
         .await
-        .expect("seed M4 entity_page_map rows");
+        .expect("seed M4 entity_page_map row");
 }
 
 async fn read_m4_grouping_generation(observer: &libsql::Connection, space: &str) -> i64 {

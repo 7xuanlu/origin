@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+use crate::db::TestEntity;
 
 use super::MemoryDB;
 use crate::{
@@ -93,10 +94,6 @@ async fn entity_fixture() -> (
                   pending_revision,is_recap,supersede_mode,memory_type,space)
              VALUES ('row-entity','Target memory','memory','mem-entity','target',0,10,
                      'text',0,0,'hide','fact','work');
-             INSERT INTO entities
-                 (id,name,entity_type,space,created_at,updated_at)
-             VALUES ('ent-existing','Existing','concept','work',1,1),
-                    ('ent-new','New','concept','work',1,1);
              INSERT INTO memory_entities(memory_id,entity_id)
              VALUES ('mem-entity','ent-existing');
              INSERT INTO enrichment_steps
@@ -105,14 +102,17 @@ async fn entity_fixture() -> (
         )
         .await
         .unwrap();
-    // G6 Stage 2 PR 2c sub-step 3 item 5: `validate_selected_entities_on_connection`
-    // now reads the `kind='entity'` shadow page, not the raw `entities` row above --
-    // backfill both fixture entities' shadow pages via the established raw-seed
-    // helper so the CAS repair's entity-existence check sees them.
-    db.test_seed_entity_shadow_page("ent-existing")
+    // G6 Stage 3: `validate_selected_entities_on_connection` reads the
+    // `kind='entity'` shadow page, and migration 123 dropped `entities`, so
+    // the shadow IS the seed for both fixture entities.
+    db.test_seed_entity_shadow_page(
+        TestEntity::new("ent-existing", "Existing", "concept").space("work"),
+    )
+    .await
+    .unwrap();
+    db.test_seed_entity_shadow_page(TestEntity::new("ent-new", "New", "concept").space("work"))
         .await
         .unwrap();
-    db.test_seed_entity_shadow_page("ent-new").await.unwrap();
 
     let occurrence = RepairDigest::parse(ENTITY_OCCURRENCE).unwrap();
     let review_id = format!("lint_review_{ENTITY_OCCURRENCE}");

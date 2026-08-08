@@ -3229,7 +3229,7 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        1027,
+        1015,
         "PR-D integration must expose the frozen 967 support calls, the 6 PR-D test identities, \
          the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, \
          the 7 G6 BindPageLink repair-test calls (G6 Stage 2 PR 2b, item 3: \
@@ -3274,7 +3274,43 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
          entity_extraction_fixture (finding 2: the CAS link-INSERT unfiled-space bug) is now a \
          thin wrapper delegating to the new entity_extraction_fixture_in_space(space), which inherits \
          the fixture's own execute_batch/test_primary_session pair -- a net wash for that fixture, \
-         so the +2 total is load_relations's test alone"
+         so the +2 total is load_relations's test alone; plus the G6 Stage 3 retirement round's \
+         net -12, re-derived per call site: -16 calls removed by three distinct mechanisms, all \
+         downstream of migration 123 dropping `entities`. \
+         (a) SEED CONVERSION, -8: a fixture's raw `INSERT INTO entities` moved onto \
+         test_seed_entity_shadow_page, whose new TestEntity argument carries the columns the raw \
+         insert used to spell out (space, source_agent, confidence, community_id, timestamps). The \
+         helper is not itself a censused support API, so the insert's own TestDbSession::execute / \
+         execute_batch disappears, and with it any test_primary_session that existed only to host \
+         the insert. derived_artifact_state.rs's \
+         summary_eligibility_requires_a_qualifying_community_and_candidate loses execute_batch|1 + \
+         test_primary_session|2 (its five-row insert; community_id moved onto the builder), \
+         kg_quality.rs's test_find_merge_candidates_detects_duplicates loses execute|1 + \
+         test_primary_session|1, lint/kg_test.rs's seed_advisory_graph loses execute_batch|1 + \
+         test_primary_session|2, and lint/semantic_test.rs's \
+         candidate_truncation_completes_after_bounded_adjudication and \
+         contradiction_cap_keeps_highest_signal_pair_not_first_ids lose execute_batch|1 each -- \
+         both already called the helper, so their raw insert was pure duplication once the helper \
+         carried the whole entity identity rather than half of it. \
+         (b) DUAL-MUTATION COLLAPSE, -2: repair/entity_extraction_tests.rs's \
+         aggregate_cas_rejects_every_stale_dimension_without_database_mutation simulated each \
+         stale CAS dimension by mutating BOTH stores -- a `DELETE FROM entities` beside the \
+         `DELETE FROM entity_page_map` in the entity_absent arm, an `UPDATE entities SET space` \
+         beside the canonical `UPDATE pages` in the entity_scope arm. With one store left the \
+         canonical mutation IS the whole simulation, so execute|9 and execute|10 go. \
+         (c) ASSERTION RETIREMENT, -6: two repair_plan/deterministic_tests.rs tests each asserted \
+         on a legacy row that outlived the repair, and each such assertion cost a query/next/get \
+         triple. orphan_link_cas_stales_on_restored_owner_and_deletes_only_the_exact_pair dropped \
+         `SELECT COUNT(*) FROM entities` = 2 (TestDbSession::query|5, TestDbRows::next|5, \
+         TestDbRow::get|3), and raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard \
+         dropped `SELECT COUNT(*) FROM entities WHERE id='entity_raw_no_shadow'` = 1 \
+         (TestDbSession::query|2, TestDbRows::next|2, TestDbRow::get|2), which had proved the \
+         applier deletes the dangling link while leaving the legacy row alone -- with the table \
+         gone there is no such row to leave alone, and each test's surviving link-count assertion \
+         carries the behavior on its own; +4 calls added for the new \
+         alias_collision lint check's own fixtures, lint/deep_test.rs's \
+         alias_collision_inventory_flags_the_same_alias_on_two_active_pages and \
+         alias_collision_inventory_is_silent_on_a_clean_store"
     );
 }
 

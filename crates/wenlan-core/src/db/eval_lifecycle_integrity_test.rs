@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+use crate::db::TestEntity;
 
 use super::MemoryDB;
 
@@ -127,17 +128,19 @@ async fn lifecycle_state_counts_preserve_all_four_legacy_queries() {
             "CREATE TABLE concepts (id TEXT PRIMARY KEY, status TEXT NOT NULL);
              INSERT INTO concepts (id, status) VALUES
                  ('concept-active', 'active'),
-                 ('concept-archived', 'archived');
-             INSERT INTO entities (id, name, entity_type, created_at, updated_at) VALUES
-                 ('entity-1', 'One', 'concept', 1, 1),
-                 ('entity-2', 'Two', 'concept', 1, 1);",
+                 ('concept-archived', 'archived');",
         )
         .await
         .unwrap();
     }
-    // G6 Stage 1.5a: entity_count now reads the `kind='entity'` shadow page.
-    db.test_seed_entity_shadow_page("entity-1").await.unwrap();
-    db.test_seed_entity_shadow_page("entity-2").await.unwrap();
+    // G6 Stage 3: entity_count reads the `kind='entity'` shadow page, and
+    // migration 123 dropped `entities`, so the shadow IS the seed.
+    db.test_seed_entity_shadow_page(TestEntity::new("entity-1", "One", "concept"))
+        .await
+        .unwrap();
+    db.test_seed_entity_shadow_page(TestEntity::new("entity-2", "Two", "concept"))
+        .await
+        .unwrap();
 
     for fixture in [
         MemoryFixture {

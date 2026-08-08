@@ -662,7 +662,9 @@ mod tests {
 
             // Create three case-folded duplicates plus a singleton by bypassing
             // alias resolution. The caller owns the N-1 candidate math.
-            let conn = db.test_primary_session().await;
+            // `find_merge_candidates` groups by the `kind='entity'` shadow
+            // page's title, and G6 Stage 3's migration 123 dropped `entities`,
+            // so the shadow IS the seed.
             let now = chrono::Utc::now().timestamp();
             for (id, name) in [
                 ("dup-1", "Alice"),
@@ -670,22 +672,13 @@ mod tests {
                 ("dup-3", "ALICE"),
                 ("singleton", "Bob"),
             ] {
-                conn.execute(
-                    "INSERT INTO entities (id, name, entity_type, source_agent, created_at, updated_at)
-                     VALUES (?1, ?2, 'person', 'test', ?3, ?3)",
-                    libsql::params![id, name, now],
+                db.test_seed_entity_shadow_page(
+                    crate::db::TestEntity::new(id, name, "person")
+                        .source_agent("test")
+                        .timestamps(now, now),
                 )
                 .await
                 .unwrap();
-            }
-            drop(conn);
-
-            // `find_merge_candidates` groups by the `kind='entity'` shadow
-            // page's title (G6 Stage 2 PR 2c sub-step 3 item 1), not the raw
-            // `entities.name` inserted above -- seed a shadow page per id so
-            // the migrated query has something to group.
-            for id in ["dup-1", "dup-2", "dup-3", "singleton"] {
-                db.test_seed_entity_shadow_page(id).await.unwrap();
             }
 
             let count = find_merge_candidates(&db).await.unwrap();
@@ -1631,15 +1624,12 @@ mod tests {
             .store_entity("B", "project", None, Some("t"), None)
             .await
             .unwrap();
-        // G6 Stage 2 PR 2c sub-step 3 item 6: `store_entity` no longer writes
-        // `entities` -- seed the legacy rows the raw `relations` insert below
-        // still needs (its FK is not relaxed by migration 122).
-        db.test_seed_legacy_entities_row_from_shadow(&e1)
-            .await
-            .unwrap();
-        db.test_seed_legacy_entities_row_from_shadow(&e2)
-            .await
-            .unwrap();
+        // G6 Stage 3: the raw `relations` insert below needed legacy
+        // `entities` rows only because `relations.from_entity`/`to_entity`
+        // still carried `REFERENCES entities(id)`. Migration 123 rebuilds
+        // `relations` without those foreign keys, so there is nothing left to
+        // seed -- the shadow pages `store_entity` wrote above are the whole
+        // substrate.
         {
             let conn = db.test_primary_session().await;
             conn.execute("INSERT INTO relations (id, from_entity, to_entity, relation_type, created_at) VALUES ('r1', ?1, ?2, 'design_inspiration', 0)",

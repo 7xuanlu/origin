@@ -750,16 +750,20 @@ async fn orphan_revision_is_one_exact_repair_for_both_checks() {
 #[tokio::test]
 async fn orphan_memory_entity_link_resolves_to_one_exact_pair_delete() {
     let (db, _dir) = test_db().await;
+    // G6 Stage 3: an entity "being present" IS its `kind='entity'` shadow page
+    // (migration 123 dropped `entities`), so seed the canonical shape.
+    db.test_seed_entity_shadow_page(crate::db::TestEntity::new(
+        "entity_present",
+        "present",
+        "concept",
+    ))
+    .await
+    .unwrap();
     db.test_primary_session()
         .await
         .execute_batch(
-            "PRAGMA foreign_keys=OFF;
-             INSERT INTO entities
-                 (id,name,entity_type,confirmed,created_at,updated_at)
-             VALUES ('entity_present','present','concept',0,1,1);
-             INSERT INTO memory_entities(memory_id,entity_id)
-             VALUES ('mem_missing','entity_present');
-             PRAGMA foreign_keys=ON;",
+            "INSERT INTO memory_entities(memory_id,entity_id)
+             VALUES ('mem_missing','entity_present');",
         )
         .await
         .unwrap();
@@ -959,8 +963,6 @@ async fn raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_g
              VALUES
                  ('row_raw','Raw Entity Owner','local_files','/tmp/raw_entity.md','doc',0,1,'text');
              PRAGMA foreign_keys=OFF;
-             INSERT INTO entities(id,name,entity_type,confirmed,created_at,updated_at)
-             VALUES ('entity_raw_no_shadow','Raw','concept',0,1,1);
              INSERT INTO memory_entities(memory_id,entity_id)
              VALUES ('/tmp/raw_entity.md','entity_raw_no_shadow');
              PRAGMA foreign_keys=ON;",
@@ -999,21 +1001,7 @@ async fn raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_g
         .unwrap()
         .get::<i64>(0)
         .unwrap();
-    let entity_row_count = conn
-        .query(
-            "SELECT COUNT(*) FROM entities WHERE id='entity_raw_no_shadow'",
-            (),
-        )
-        .await
-        .unwrap()
-        .next()
-        .await
-        .unwrap()
-        .unwrap()
-        .get::<i64>(0)
-        .unwrap();
     assert_eq!(link_count, 0);
-    assert_eq!(entity_row_count, 1);
 }
 
 #[tokio::test]
@@ -1200,10 +1188,6 @@ async fn orphan_link_cas_stales_on_restored_owner_and_deletes_only_the_exact_pai
         .await
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
-             INSERT INTO entities(id,name,entity_type,confirmed,created_at,updated_at)
-             VALUES
-                 ('entity_target','target','concept',0,1,1),
-                 ('entity_other','other','concept',0,1,1);
              INSERT INTO memory_entities(memory_id,entity_id)
              VALUES
                  ('mem_missing','entity_target'),
@@ -1341,19 +1325,8 @@ async fn orphan_link_cas_stales_on_restored_owner_and_deletes_only_the_exact_pai
         .unwrap()
         .get::<i64>(0)
         .unwrap();
-    let entity_count = conn
-        .query("SELECT COUNT(*) FROM entities", ())
-        .await
-        .unwrap()
-        .next()
-        .await
-        .unwrap()
-        .unwrap()
-        .get::<i64>(0)
-        .unwrap();
     assert_eq!(target_count, 0);
     assert_eq!(all_link_count, 1);
-    assert_eq!(entity_count, 2);
     drop(conn);
     assert!(
         crate::post_write::apply_deterministic_repair_cas(&db, &manifest, &[], |_| Ok(()))

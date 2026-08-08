@@ -1,22 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::MemoryDB;
+use crate::db::TestEntity;
 
 async fn insert_entity(db: &MemoryDB, id: &str, entity_type: &str) {
-    {
-        let conn = db.conn.lock().await;
-        conn.execute(
-            "INSERT INTO entities (id, name, entity_type, created_at, updated_at)
-             VALUES (?1, ?1, ?2, 1, 1)",
-            libsql::params![id, entity_type],
-        )
+    // G6 Stage 3: `distinct_entity_types_for_vocabulary_heal` reads the
+    // `kind='entity'` shadow page, and migration 123 dropped `entities`, so the
+    // shadow IS the seed -- there is no legacy row to backfill from.
+    db.test_seed_entity_shadow_page(TestEntity::new(id, id, entity_type))
         .await
         .unwrap();
-    }
-    // G6 Stage 2 PR 2c sub-step 3 item 1: `distinct_entity_types_for_
-    // vocabulary_heal` now reads the `kind='entity'` shadow page, not
-    // `entities` directly -- backfill it for this raw-seeded row.
-    db.test_seed_entity_shadow_page(id).await.unwrap();
 }
 
 // G6 Stage 2 PR 2b: `relations` is frozen -- `distinct_relation_types_for_

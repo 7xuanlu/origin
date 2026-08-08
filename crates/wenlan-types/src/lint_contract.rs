@@ -10,7 +10,7 @@ pub const LINT_GENERAL_CHECK_COUNT: usize = 56;
 pub const LINT_DEEP_CHECK_COUNT: usize = 74;
 
 pub(crate) const LINT_CANONICAL_CHECK_IDS: [&str; LINT_DEEP_CHECK_COUNT] = [
-    "entities.alias_integrity",
+    "entities.alias_collision_inventory",
     "entities.partition_inventory",
     "entities.structural_integrity",
     "identity.cache_inventory",
@@ -87,7 +87,7 @@ pub(crate) const LINT_CANONICAL_CHECK_IDS: [&str; LINT_DEEP_CHECK_COUNT] = [
 ];
 
 const LINT_DEEP_ONLY_CHECK_IDS: [&str; LINT_DEEP_CHECK_COUNT - LINT_GENERAL_CHECK_COUNT] = [
-    "entities.alias_integrity",
+    "entities.alias_collision_inventory",
     "kg.semantic.entity_relations",
     "kg.semantic.memory_entity_links",
     "memories.duplicate_inventory",
@@ -107,7 +107,8 @@ const LINT_DEEP_ONLY_CHECK_IDS: [&str; LINT_DEEP_CHECK_COUNT - LINT_GENERAL_CHEC
     "serving.semantic.retrieval_quality",
 ];
 
-const LINT_ADVISORY_CHECK_IDS: [&str; 14] = [
+const LINT_ADVISORY_CHECK_IDS: [&str; 15] = [
+    "entities.alias_collision_inventory",
     "kg.semantic.entity_relations",
     "kg.semantic.memory_entity_links",
     "memories.duplicate_inventory",
