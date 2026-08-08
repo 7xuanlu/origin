@@ -26,36 +26,17 @@ threads-required = "num-test-threads"
 filter = 'test(folder_ingest_full_pipeline_e2e)'
 slow-timeout = { period = "60s", terminate-after = 3 }
 
-# The three data_root_lock_* tests contend on a shared fs2/flock EAGAIN (os
-# error 35) when they race; characterized 2026-08-01 at a 2/5 failure rate at
-# identical positions, 3/3 green in single-test isolation. bind_addr_tests.rs
-# also serializes them behind an in-process static Mutex, but nextest runs
-# each test as its own process, so that mutex never engages here — this
-# retry is the only protection in this lane (the mutex covers plain
-# `cargo test`, where all three land in one process).
+# These tests contend on a shared flock; the in-process mutex in bind_addr_tests.rs never engages under nextest's process-per-test model.
 [[profile.default.overrides]]
 filter = 'test(/^bind_addr_tests::data_root_lock_/)'
 retries = 2
 
-# m4_real_job_mutex_and_correction_latency_gate's p95 wall-clock bar can spike
-# under parallel-cargo load (observed 1.01s vs 164ms isolated, 2026-08-01).
-# The bar itself stays at 500ms — a looser bar would let a real multi-x
-# regression pass silently at nearest-rank p95. This retry is the flake
-# protection instead: a load flake passes on retry, a real regression fails
-# all three attempts deterministically.
+# p95 bar spikes under parallel-cargo load; a load flake passes on retry, a real regression fails all attempts.
 [[profile.default.overrides]]
 filter = 'test(m4_real_job_mutex_and_correction_latency_gate)'
 retries = 2
 
-# back_pressure_holds_sweep_at_pending_cap failed once at SETUP under
-# parallel-cargo load with `open temp MemoryDB: VectorDb("PRAGMA page_count:
-# SQLite failure: bad parameter or other API misuse")` (2026-08-01; 8/8 green
-# isolated). That message can only come from pragma_i64 in db.rs, whose only
-# callers are the online_backup tests in the db lib test binary — MemoryDB::new
-# cannot emit it, so the single sighting's attribution is uncertain (most
-# likely interleaved stdout from a parallel binary, not this test's own
-# setup). This retry is the whole mechanism: whatever actually failed gets
-# quarantined without pinning a diagnosis to unverified output.
+# One unattributed setup failure under parallel load; retry rather than pin a diagnosis.
 [[profile.default.overrides]]
 filter = 'test(back_pressure_holds_sweep_at_pending_cap)'
 retries = 2

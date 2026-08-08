@@ -1211,12 +1211,7 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
     );
     let mutex_p95 = duration_p95(&mutex_holds);
     let mutex_max = mutex_holds.iter().copied().max().expect("mutex receipts");
-    // Keep the 500ms bar tight enough to catch a real regression (at
-    // nearest-rank p95 over ~20 samples, a looser bar hides a multi-x
-    // slowdown). Load flakiness under parallel-cargo (observed 1.01s vs
-    // 164ms isolated, 2026-08-01) is handled by the nextest `retries = 2`
-    // override instead: a load flake passes on retry, a real regression
-    // fails all three attempts deterministically.
+    // Bar stays 500ms; load flakes are absorbed by the nextest retries override.
     assert!(
         mutex_p95 <= Duration::from_millis(500),
         "Gate 1.4 real-path DB-mutex p95 {mutex_p95:?} exceeds 500 ms"
@@ -1232,8 +1227,6 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
         .copied()
         .max()
         .expect("foreground latency receipts");
-    // Same tight bar and same reasoning as the mutex p95 above: nextest
-    // retries absorb load flakiness, the bar itself stays a real gate.
     assert!(
         foreground_p95 <= Duration::from_millis(500),
         "independent foreground-query p95 {foreground_p95:?} exceeds the mutex bar"

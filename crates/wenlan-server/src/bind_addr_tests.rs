@@ -18,12 +18,8 @@ fn subprocess_lock() -> &'static Mutex<()> {
     TEST_SUBPROCESS_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-// Recovers from poisoning so one panicking holder (any test below) can't
-// cascade a misleading second failure into whichever test locks next.
-// Serializes the three data_root_lock_* tests, characterized 2026-08-01 at a
-// 2/5 failure rate on a shared fs2/flock EAGAIN (os error 35) when they race
-// in one `cargo test` process (3/3 green in single-test isolation), plus
-// daemon_exit_skips_c_exit_handlers, which spawns a subprocess the same way.
+// Serializes tests that spawn subprocesses or contend on the data-root
+// flock; poison recovery keeps one panicking test from failing the next.
 fn subprocess_lock_guard() -> std::sync::MutexGuard<'static, ()> {
     subprocess_lock()
         .lock()
