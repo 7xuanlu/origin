@@ -560,10 +560,17 @@ mod tests {
         );
         {
             let conn = db.test_primary_session().await;
+            // G6 Stage 2 PR 2c sub-step 3 item 5/6 fallout fix: `store_entity`
+            // no longer writes `entities`, so this raw-INSERT edge seed reads
+            // the entity's space from its canonical shadow page instead (same
+            // join shape as `distinct_entity_types_for_vocabulary_heal`/
+            // `fold_entity_type`).
             let space: Option<String> = {
                 let mut rows = conn
                     .query(
-                        "SELECT space FROM entities WHERE id = ?1",
+                        "SELECT p.space FROM entity_page_map epm \
+                         JOIN pages p ON p.id = epm.page_id \
+                         WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
                         libsql::params![e1.clone()],
                     )
                     .await
@@ -1346,10 +1353,17 @@ mod tests {
             // an unrecognized type like `design_inspiration` to `related_to`
             // (queuing its own promote proposal) at WRITE time, which would
             // defeat the exact discovery-then-heal path this test exercises.
+            // G6 Stage 2 PR 2c sub-step 3 item 5/6 fallout fix: `store_entity`
+            // no longer writes `entities`, so this raw-INSERT edge seed reads
+            // the entity's space from its canonical shadow page instead (same
+            // join shape as `distinct_entity_types_for_vocabulary_heal`/
+            // `fold_entity_type`).
             let space: Option<String> = {
                 let mut rows = conn
                     .query(
-                        "SELECT space FROM entities WHERE id = ?1",
+                        "SELECT p.space FROM entity_page_map epm \
+                         JOIN pages p ON p.id = epm.page_id \
+                         WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
                         libsql::params![e1.clone()],
                     )
                     .await
@@ -1463,10 +1477,17 @@ mod tests {
         );
         {
             let conn = db.test_primary_session().await;
+            // G6 Stage 2 PR 2c sub-step 3 item 5/6 fallout fix: `store_entity`
+            // no longer writes `entities`, so this raw-INSERT edge seed reads
+            // the entity's space from its canonical shadow page instead (same
+            // join shape as `distinct_entity_types_for_vocabulary_heal`/
+            // `fold_entity_type`).
             let space: Option<String> = {
                 let mut rows = conn
                     .query(
-                        "SELECT space FROM entities WHERE id = ?1",
+                        "SELECT p.space FROM entity_page_map epm \
+                         JOIN pages p ON p.id = epm.page_id \
+                         WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
                         libsql::params![e1.clone()],
                     )
                     .await
@@ -1575,9 +1596,18 @@ mod tests {
         let counts = super::heal_entity_vocabulary(&db).await.unwrap();
         assert!(counts.healed >= 1);
         assert!(counts.queued >= 1);
+        // G6 Stage 2 PR 2c sub-step 3 item 5 fallout fix: `store_entity` no
+        // longer writes `entities`, so the fold's outcome is checked on the
+        // canonical shadow page instead -- `fold_entity_type` already writes
+        // `pages.entity_type` as the source the returned count is based on
+        // (see its own comment), this assertion just needed to catch up.
         let conn = db.test_primary_session().await;
         let mut rows = conn
-            .query("SELECT entity_type FROM entities ORDER BY entity_type", ())
+            .query(
+                "SELECT entity_type FROM pages \
+                 WHERE kind = 'entity' AND status = 'active' ORDER BY entity_type",
+                (),
+            )
             .await
             .unwrap();
         let mut types = vec![];
@@ -1599,6 +1629,15 @@ mod tests {
             .unwrap();
         let e2 = db
             .store_entity("B", "project", None, Some("t"), None)
+            .await
+            .unwrap();
+        // G6 Stage 2 PR 2c sub-step 3 item 6: `store_entity` no longer writes
+        // `entities` -- seed the legacy rows the raw `relations` insert below
+        // still needs (its FK is not relaxed by migration 122).
+        db.test_seed_legacy_entities_row_from_shadow(&e1)
+            .await
+            .unwrap();
+        db.test_seed_legacy_entities_row_from_shadow(&e2)
             .await
             .unwrap();
         {

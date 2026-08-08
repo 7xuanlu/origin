@@ -246,6 +246,21 @@ the `pages.citations` column, `entities`, `entity_aliases`, `observations`, and
   drop, not before" — grep `Retires in Stage 3 with the` to find and
   remove all three when this migration lands, since the table they guard
   against will no longer exist to violate.
+- **M4 community trigger cluster must be rebuilt canonical-shape before this
+  migration, and before `WENLAN_ENABLE_COMMUNITY_LEIDEN` ever ships default-ON**
+  (Stage 2 sub-step 3 item 6 ruling, document-only for that PR — YAGNI while
+  the flag is default-OFF/unmeasured). Seven triggers, all installed by
+  `ensure_community_cutover_tables` (db.rs) and re-armed unconditionally at
+  every startup by `repair_community_cutover` (db.rs): `m4_grouping_entity_insert`,
+  `m4_grouping_entity_delete`, `m4_grouping_entity_update`,
+  `m4_parity_input_entity_insert`, `m4_parity_input_entity_delete`,
+  `m4_parity_input_entity_update`, `m4_community_parity_entity_update` — all
+  fire `... ON entities`, so all are blind to a shadow-only entity (no
+  `entities` row to fire on) and all fail outright the moment this migration
+  drops `entities`, which would break `repair_community_cutover`'s
+  unconditional startup reinstall. Rebuild them against the canonical
+  `entity_page_map`/`pages` shadow (mirroring the `detect_communities`
+  adjacency-query port, same PR) before this migration ships.
 
 ## Rollback story per stage
 

@@ -747,10 +747,27 @@ async fn load_memories(context: &LintContext<'_, '_>) -> Result<LoadedMemories, 
 
 async fn load_entities(context: &LintContext<'_, '_>) -> Result<Vec<Entity>, ()> {
     let (scope, params) = entity_scope_clause(context.scope().filter());
-    let mut rows = context.snapshot().query(
-        &format!("SELECT e.id,e.name,e.space FROM entities e WHERE TRIM(e.name)!=''{scope} ORDER BY e.id"),
-        params,
-    ).await.map_err(|_| ())?;
+    // G6 Stage 2 PR 2c sub-step 3 item 6 (lead ruling): `entities e` ported
+    // to a projected subquery over the canonical `entity_page_map`/`pages`
+    // shadow -- `e.id` still resolves to the ENTITY id (not the page id),
+    // so every downstream `e.*` reference (here and in
+    // `entity_scope_clause` below) is unchanged. A shadow-only entity
+    // (post-item-5 `store_entity`, no `entities` row) is now discoverable
+    // here; a scan still reading `entities` directly would never see it.
+    let mut rows = context
+        .snapshot()
+        .query(
+            &format!(
+                "SELECT e.id,e.name,e.space FROM \
+             (SELECT epm.entity_id AS id, p.title AS name, p.space AS space \
+              FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id \
+              WHERE p.kind='entity' AND p.status='active') e \
+             WHERE TRIM(e.name)!=''{scope} ORDER BY e.id"
+            ),
+            params,
+        )
+        .await
+        .map_err(|_| ())?;
     let mut output = Vec::new();
     while let Some(row) = rows.next().await.map_err(|_| ())? {
         // G6 Stage 1.5b: `entities.space` is NOT NULL as of the space-sentinel
@@ -788,7 +805,10 @@ fn entity_scope_clause(scope: &ScopeFilter) -> (String, libsql::params::Params) 
                     )
                     OR e.id IN (
                         SELECT r.dst_id FROM edges r
-                        JOIN entities source ON source.id=r.src_id
+                        JOIN (SELECT epm.entity_id AS id, p.space AS space
+                              FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
+                              WHERE p.kind='entity' AND p.status='active') source
+                          ON source.id=r.src_id
                         WHERE r.edge_type='relates' AND r.valid_until IS NULL
                           AND source.space=?1
                     ))"
@@ -810,7 +830,10 @@ fn entity_scope_clause(scope: &ScopeFilter) -> (String, libsql::params::Params) 
                     )
                     OR e.id IN (
                         SELECT r.dst_id FROM edges r
-                        JOIN entities source ON source.id=r.src_id
+                        JOIN (SELECT epm.entity_id AS id, p.space AS space
+                              FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
+                              WHERE p.kind='entity' AND p.status='active') source
+                          ON source.id=r.src_id
                         WHERE r.edge_type='relates' AND r.valid_until IS NULL
                           AND (source.space IS NULL OR source.space = '{unfiled}')
                     ))"
@@ -852,8 +875,9 @@ async fn load_memory_entity_links(
 // does not name this function. Like its `lint/deep.rs`/`lint/kg/query.rs`
 // siblings, this audits the legacy `entities` store's own data quality;
 // reading the shadow-page mirror instead would validate the mirror rather
-// than the store it exists to check. Stays on `entities` until Stage 2
-// retires the store itself.
+// than the store it exists to check. Stays on `entities` through Stage 1
+// and Stage 2; retires with the store at Stage 3, same as
+// `lint/pages/provenance_checks/source.rs`.
 async fn load_relations(context: &LintContext<'_, '_>) -> Result<Vec<Relation>, ()> {
     let (scope, params) = scope_clause_folded(context.scope().filter(), "source.space");
     let mut rows = context.snapshot().query(
@@ -874,7 +898,7 @@ async fn load_relations(context: &LintContext<'_, '_>) -> Result<Vec<Relation>, 
 async fn load_pages(context: &LintContext<'_, '_>) -> Result<Vec<Page>, ()> {
     let (scope, params) = scope_clause(context.scope().filter(), "p.workspace");
     let mut rows = context.snapshot().query(
-        &format!("SELECT p.id,p.content,p.workspace,p.creation_kind,p.review_status FROM pages p WHERE p.status='active'{scope} ORDER BY p.id"),
+        &format!("SELECT p.id,p.content,p.workspace,p.creation_kind,p.review_status FROM pages p WHERE p.status='active' AND COALESCE(p.kind,'concept') <> 'entity'{scope} ORDER BY p.id"),
         params,
     ).await.map_err(|_| ())?;
     let mut output = Vec::new();

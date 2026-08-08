@@ -816,8 +816,10 @@ impl MemoryDB {
             .join(",");
         let limit_parameter = visible_ids.len() + 1;
         let sql = format!(
-            "SELECT o.id, o.content, e.name, o.created_at, o.source_agent, o.confidence \
-             FROM observations o JOIN entities e ON o.entity_id = e.id \
+            "SELECT o.id, o.content, e.title, o.created_at, o.source_agent, o.confidence \
+             FROM observations o \
+             JOIN entity_page_map epm ON o.entity_id = epm.entity_id \
+             JOIN pages e ON e.id = epm.page_id AND e.kind = 'entity' AND e.status = 'active' \
              WHERE o.entity_id IN ({placeholders}) \
              ORDER BY o.confidence DESC NULLS LAST, o.created_at DESC \
              LIMIT ?{limit_parameter}"

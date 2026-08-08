@@ -53,7 +53,8 @@ pub(super) async fn load(context: &LintContext<'_, '_>, hub_cap: u64) -> Result<
 // disposition: not a reader-migration target -- this audits the legacy
 // `entities` store's own data quality, and reading the shadow-page mirror
 // instead would validate the mirror rather than the store it exists to
-// check. Stays on `entities` until Stage 2 retires the store itself.
+// check. Stays on `entities` through Stage 1 and Stage 2; retires with the
+// store at Stage 3, same as `lint/pages/provenance_checks/source.rs`.
 async fn entity_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (clause, params) = scope_clause_folded(context.scope().filter(), "e", false);
     row_check(
@@ -81,7 +82,8 @@ async fn entity_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()>
 // reader-migration target -- this audits the legacy `entities` store's own
 // data quality, and reading the shadow-page mirror instead would validate
 // the mirror rather than the store it exists to check. Stays on `entities`
-// until Stage 2 retires the store itself.
+// through Stage 1 and Stage 2; retires with the store at Stage 3, same as
+// `lint/pages/provenance_checks/source.rs`.
 async fn observation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (clause, params) = scope_clause_folded(context.scope().filter(), "e", true);
     row_check(
@@ -105,7 +107,8 @@ async fn observation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck
 // not a reader-migration target -- this audits the legacy `entities`
 // store's own data quality, and reading the shadow-page mirror instead
 // would validate the mirror rather than the store it exists to check.
-// Stays on `entities` until Stage 2 retires the store itself.
+// Stays on `entities` through Stage 1 and Stage 2; retires with the store
+// at Stage 3, same as `lint/pages/provenance_checks/source.rs`.
 async fn relation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (clause, params) = scope_clause_folded(context.scope().filter(), "f", true);
     row_check(

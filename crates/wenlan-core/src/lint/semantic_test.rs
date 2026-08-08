@@ -124,6 +124,14 @@ async fn fixture() -> (crate::db::MemoryDB, tempfile::TempDir) {
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: `load_entities` now
+    // reads the canonical `kind='entity'` shadow page, not `entities`
+    // directly, so this raw-seeded entity needs a matching shadow page or
+    // every check depending on entity candidate generation sees zero
+    // entities.
+    db.test_seed_entity_shadow_page("entity-atlas")
+        .await
+        .unwrap();
     (db, dir)
 }
 
@@ -265,6 +273,15 @@ async fn candidate_generation_distinguishes_missing_wrong_and_cross_space_links(
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above.
+    for entity_id in [
+        "entity-atlas-work",
+        "entity-atlas-personal",
+        "entity-wrong",
+        "entity-wenlan",
+    ] {
+        db.test_seed_entity_shadow_page(entity_id).await.unwrap();
+    }
 
     let report = prepare(&db, None).await;
     let work = report.agent_work().unwrap();
@@ -315,6 +332,10 @@ async fn scoped_candidates_hydrate_cross_space_existing_link_endpoints() {
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above.
+    for entity_id in ["entity-work", "entity-personal"] {
+        db.test_seed_entity_shadow_page(entity_id).await.unwrap();
+    }
 
     let report = prepare(&db, Some("work")).await;
     let work = report.agent_work().unwrap();
@@ -377,6 +398,10 @@ async fn approved_link_repair_removes_candidate_on_rerun() {
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above.
+    db.test_seed_entity_shadow_page("entity-atlas")
+        .await
+        .unwrap();
 
     let before = prepare(&db, None).await;
     assert_eq!(
@@ -423,128 +448,27 @@ async fn suspicious_existing_page_and_entity_links_are_distinct_candidates() {
                 ('entity-personal','Personal Entity','concept','personal',1,1,1);
          INSERT INTO relations (id,from_entity,to_entity,relation_type,created_at)
          VALUES ('relation-same','entity-work','entity-work-peer','related',1),
-                ('relation-cross','entity-work','entity-personal','related',1);
-         -- G6 Stage 1.2: entity_scope_clause/load_relations (reader #4) read
-         -- `edges`, not `relations` -- mirror the dual-write here. Both rows
-         -- matter: the test asserts the same-space relation is NOT flagged
-         -- while the cross-space one is. `edges_space_fence`'s entity arm
-         -- (migration 121) resolves an entity endpoint's space via its
-         -- `kind='entity'` shadow page, which these raw-seeded entities
-         -- deliberately don't have -- so the fence itself is dropped and
-         -- recreated verbatim (migration 121's exact body) around this
-         -- INSERT to simulate legacy pre-shadow-page data, which the fence
-         -- already grandfathers via its `lineage != 'legacy'` WHEN guard.
-         -- Seeding real shadow pages instead would dodge that guard but
-         -- leaks the two rows into `load_pages`'s unfenced `p.status='active'`
-         -- scan (semantic_candidates.rs) as false PageProvenanceAdequacy
-         -- candidates -- a real, separate bug, not something to paper over
-         -- here.
-         DROP TRIGGER edges_space_fence;
-         DROP TRIGGER edges_space_fence_update;
-         INSERT INTO edges
+                ('relation-cross','entity-work','entity-personal','related',1);",
+        )
+        .await
+        .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 (RULING-ESC-1): entities get real
+    // canonical shadow pages, so `edges_space_fence`'s entity arm (migration
+    // 121) and the ported `load_entities` both resolve them directly -- no
+    // more dropping/recreating the fence to simulate legacy pre-shadow-page
+    // data. `load_pages` now excludes `kind='entity'` (semantic_candidates.rs
+    // `load_pages`), so these shadow pages can't leak into the
+    // PageProvenanceAdequacy scan as false candidates.
+    for entity_id in ["entity-work", "entity-work-peer", "entity-personal"] {
+        db.test_seed_entity_shadow_page(entity_id).await.unwrap();
+    }
+    db.test_primary_session()
+        .await
+        .execute_batch(
+            "INSERT INTO edges
              (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type)
          VALUES ('edge-relation-same','entity-work','entity','entity-work-peer','entity','relates','assertion',0,'work',1,'related'),
                 ('edge-relation-cross','entity-work','entity','entity-personal','entity','relates','legacy',0,'work',1,'related');
-         CREATE TRIGGER edges_space_fence
-         AFTER INSERT ON edges
-         WHEN NEW.lineage != 'legacy'
-         BEGIN
-             SELECT RAISE(ABORT, 'edges_space_fence: cross-space edge rejected')
-             WHERE (
-                 NOT (NEW.edge_type = 'attests' AND NEW.src_kind = 'root')
-                 AND (
-                     CASE NEW.src_kind
-                         WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.src_id)
-                         WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.src_id)
-                         WHEN 'entity' THEN (
-                             SELECT p.space FROM entity_page_map epm
-                               JOIN pages p ON p.id = epm.page_id
-                              WHERE epm.entity_id = NEW.src_id
-                                AND p.kind = 'entity' AND p.status = 'active'
-                         )
-                         WHEN 'claim_revision' THEN (
-                             SELECT p.space FROM claim_revisions cr
-                               JOIN claims c ON c.claim_id = cr.claim_id
-                               JOIN pages p ON p.id = c.page_id
-                              WHERE cr.claim_revision_id = NEW.src_id
-                         )
-                         ELSE NULL
-                     END
-                 ) IS NOT NEW.space
-             )
-             OR (
-                 NOT (NEW.edge_type = 'cites' AND NEW.dst_kind = 'external')
-                 AND (
-                     CASE NEW.dst_kind
-                         WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.dst_id)
-                         WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.dst_id)
-                         WHEN 'entity' THEN (
-                             SELECT p.space FROM entity_page_map epm
-                               JOIN pages p ON p.id = epm.page_id
-                              WHERE epm.entity_id = NEW.dst_id
-                                AND p.kind = 'entity' AND p.status = 'active'
-                         )
-                         WHEN 'claim_revision' THEN (
-                             SELECT p.space FROM claim_revisions cr
-                               JOIN claims c ON c.claim_id = cr.claim_id
-                               JOIN pages p ON p.id = c.page_id
-                              WHERE cr.claim_revision_id = NEW.dst_id
-                         )
-                         ELSE NULL
-                     END
-                 ) IS NOT NEW.space
-             );
-         END;
-         CREATE TRIGGER edges_space_fence_update
-         AFTER UPDATE ON edges
-         WHEN NEW.lineage != 'legacy' AND NEW.valid_until IS NULL
-         BEGIN
-             SELECT RAISE(ABORT, 'edges_space_fence: cross-space edge rejected')
-             WHERE (
-                 NOT (NEW.edge_type = 'attests' AND NEW.src_kind = 'root')
-                 AND (
-                     CASE NEW.src_kind
-                         WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.src_id)
-                         WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.src_id)
-                         WHEN 'entity' THEN (
-                             SELECT p.space FROM entity_page_map epm
-                               JOIN pages p ON p.id = epm.page_id
-                              WHERE epm.entity_id = NEW.src_id
-                                AND p.kind = 'entity' AND p.status = 'active'
-                         )
-                         WHEN 'claim_revision' THEN (
-                             SELECT p.space FROM claim_revisions cr
-                               JOIN claims c ON c.claim_id = cr.claim_id
-                               JOIN pages p ON p.id = c.page_id
-                              WHERE cr.claim_revision_id = NEW.src_id
-                         )
-                         ELSE NULL
-                     END
-                 ) IS NOT NEW.space
-             )
-             OR (
-                 NOT (NEW.edge_type = 'cites' AND NEW.dst_kind = 'external')
-                 AND (
-                     CASE NEW.dst_kind
-                         WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.dst_id)
-                         WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.dst_id)
-                         WHEN 'entity' THEN (
-                             SELECT p.space FROM entity_page_map epm
-                               JOIN pages p ON p.id = epm.page_id
-                              WHERE epm.entity_id = NEW.dst_id
-                                AND p.kind = 'entity' AND p.status = 'active'
-                         )
-                         WHEN 'claim_revision' THEN (
-                             SELECT p.space FROM claim_revisions cr
-                               JOIN claims c ON c.claim_id = cr.claim_id
-                               JOIN pages p ON p.id = c.page_id
-                              WHERE cr.claim_revision_id = NEW.dst_id
-                         )
-                         ELSE NULL
-                     END
-                 ) IS NOT NEW.space
-             );
-         END;
          INSERT INTO pages
              (id,title,content,source_memory_ids,version,status,created_at,last_compiled,
               last_modified,workspace,creation_kind,review_status)
@@ -650,6 +574,12 @@ async fn candidate_truncation_completes_after_bounded_adjudication() {
         .unwrap();
     }
     drop(conn);
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above.
+    // `conn`'s owned lock must be dropped first -- `test_seed_entity_shadow_page`
+    // takes its own lock on the same non-reentrant connection mutex.
+    db.test_seed_entity_shadow_page("entity-atlas")
+        .await
+        .unwrap();
     let report = prepare(&db, None).await;
     let work = report.agent_work().unwrap();
     let population = population_for(work, LintSemanticCheckId::MemoryEntityLinks);
@@ -1036,6 +966,11 @@ async fn duplicate_pair_paths_consume_one_candidate_slot() {
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above
+    // (fixture() already seeds entity-atlas; this test adds its own entity).
+    db.test_seed_entity_shadow_page("entity-launch")
+        .await
+        .unwrap();
     let report = prepare(&db, None).await;
     assert_eq!(
         population_for(
@@ -1081,6 +1016,12 @@ async fn contradiction_cap_keeps_highest_signal_pair_not_first_ids() {
         .unwrap();
     }
     drop(conn);
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above.
+    // `conn`'s owned lock must be dropped first -- `test_seed_entity_shadow_page`
+    // takes its own lock on the same non-reentrant connection mutex.
+    db.test_seed_entity_shadow_page("entity-atlas")
+        .await
+        .unwrap();
 
     let report = prepare(&db, None).await;
     let work = report.agent_work().unwrap();
