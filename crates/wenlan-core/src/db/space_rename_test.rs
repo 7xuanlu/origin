@@ -42,11 +42,11 @@ fn permanent_destination_fence_covers_retained_migration_109_history() {
 
 async fn seed_substrate(conn: &libsql::Connection, space: &str) {
     let stmts: Vec<(&str, Vec<libsql::Value>)> = vec![
-        (
-            "INSERT INTO entities (id, name, entity_type, space, created_at, updated_at)
-             VALUES ('ent-1', 'Anchor', 'concept', ?1, 1, 1)",
-            vec![space.into()],
-        ),
+        // G6 Stage 3: the `entities` row 'ent-1' that used to head this list
+        // is gone with the table (migration 123). Its space column was one of
+        // the rename targets; the shadow page below now carries the entity's
+        // space, and it is already in the list.
+        //
         // G6 Stage 2 item 1 (db.rs:9219): the ported `edges_space_fence`/
         // `edges_space_fence_update` triggers resolve an entity endpoint's
         // space via its shadow page, not `entities.space` directly, and

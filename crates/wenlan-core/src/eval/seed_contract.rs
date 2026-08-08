@@ -329,7 +329,18 @@ async fn count_memory_entities(conn: &libsql::Connection) -> Result<i64, WenlanE
 /// the table being absent (pre-pages seeds) — returns `0` rather than erroring.
 async fn count_active_pages(conn: &libsql::Connection) -> Result<i64, WenlanError> {
     let mut rows = match conn
-        .query("SELECT COUNT(*) FROM pages WHERE status = 'active'", ())
+        .query(
+            // G6: `kind='entity'` rows in `pages` are entity shadow pages, not
+            // distilled pages. Counting them makes this liveness gate report a
+            // live page channel on a store with zero distilled pages — the
+            // exact "measuring against a dead substrate" lie the contract
+            // exists to prevent. Same fence as lint's `load_pages` (G6 Stage 2
+            // PR 2c item 6). Defect predates Stage 3: entity shadow pages have
+            // existed since Stage 2 made the entity side canonical.
+            "SELECT COUNT(*) FROM pages \
+             WHERE status = 'active' AND COALESCE(kind, 'concept') <> 'entity'",
+            (),
+        )
         .await
     {
         Ok(r) => r,

@@ -933,6 +933,7 @@ carrying the authority of agreement.
 | `core/db.rs::search_entities_by_name` | `pub` | no | no | — | — |
 | `core/db.rs::search_entities_by_vector` | `pub` | no | no | — | — |
 | `core/db.rs::search_memory_with_cue` | `private` | no | no | — | — |
+| `core/db.rs::top_memory_entity_hubs` | `pub` | no | no | — | — |
 | `core/db/claim_derivation.rs::derive_leased_page_claims` | `pub(super)` | no | no | — | — |
 | `core/db/claim_derivation.rs::evaluate_support_on` | `private` | no | no | — | — |
 | `core/db/claim_derivation.rs::load_linked_memory_chunks` | `private` | no | no | — | — |
@@ -954,8 +955,11 @@ carrying the authority of agreement.
 | `core/db/scoped_entities.rs::search_entities_by_vector_scoped` | `pub` | no | **yes** | `server/entity_graph_routes.rs::handle_search_entities` | — |
 | `core/db/scoped_pages.rs::list_recent_changes_scoped` | `pub` | no | **yes** | `server/routes.rs::handle_recent_page_changes` | — |
 | `core/db/truth_exposure.rs::page_truth_states` | `pub` | no | no | — | — |
+| `core/lint/deep.rs::observation_duplicates` | `private` | no | no | — | — |
 | `core/lint/deep.rs::page_body_result` | `private` | no | no | — | — |
 | `core/lint/deep.rs::page_duplicates` | `private` | no | no | — | — |
+| `core/lint/kg/query.rs::entity_integrity` | `private` | no | no | — | — |
+| `core/lint/kg/query.rs::observation_integrity` | `private` | no | no | — | — |
 | `core/lint/kg/query/aggregate.rs::advisory_metrics` | `pub(super)` | no | no | — | — |
 | `core/lint/pages/db_checks.rs::load_rows` | `private` | no | no | — | — |
 | `core/lint/pages/link_checks/orphans.rs::load` | `pub(super)` | yes | no | — | — |
@@ -1025,8 +1029,8 @@ carrying the authority of agreement.
 | `core/kg_quality.rs::scan_contradictions` | `pub` | no | no | — | `core/db/kg_quality_diagnostics.rs::list_contradiction_observation_counts` |
 | `core/kg_quality.rs::surface_minhash_merge_candidates` | `private` | no | no | — | `core/db/kg_quality_duplicate_candidates.rs::entities_for_minhash_merge_candidates` |
 | `core/kg_quality.rs::verify_entity` | `pub` | no | no | — | `core/db.rs::search_entities_by_vector` |
-| `core/lint/deep.rs::run` | `pub(super)` | yes | no | — | `core/lint/deep.rs::page_body_result`, `core/lint/deep.rs::page_duplicates` |
-| `core/lint/kg/query.rs::load` | `pub(super)` | yes | no | — | `core/lint/kg/query/aggregate.rs::advisory_metrics` |
+| `core/lint/deep.rs::run` | `pub(super)` | yes | no | — | `core/lint/deep.rs::observation_duplicates`, `core/lint/deep.rs::page_body_result`, `core/lint/deep.rs::page_duplicates` |
+| `core/lint/kg/query.rs::load` | `pub(super)` | yes | no | — | `core/lint/kg/query.rs::entity_integrity`, `core/lint/kg/query.rs::observation_integrity`, `core/lint/kg/query/aggregate.rs::advisory_metrics` |
 | `core/lint/pages/db_checks.rs::run` | `pub(crate)` | yes | no | — | `core/lint/pages/db_checks.rs::load_rows` |
 | `core/lint/semantic_candidates.rs::load` | `pub(super)` | yes | no | — | `core/lint/semantic_candidates.rs::load_entities` |
 | `core/m6/signals.rs::community_overview` | `pub` | no | no | — | `core/m6/independence.rs::distinct_group_count`, `core/m6/signals.rs::scoped_root_ids` |

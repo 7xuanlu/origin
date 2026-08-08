@@ -1,21 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::MemoryDB;
+use crate::db::TestEntity;
 
 async fn insert_entity(db: &MemoryDB, id: &str, name: &str) {
-    {
-        let conn = db.conn.lock().await;
-        conn.execute(
-            "INSERT INTO entities (id, name, entity_type, created_at, updated_at)
-             VALUES (?1, ?2, 'test', 1, 1)",
-            libsql::params![id, name],
-        )
+    // G6 Stage 3: `list_contradiction_observation_counts` reads the
+    // `kind='entity'` shadow page, and migration 123 dropped `entities`, so
+    // the shadow IS the seed.
+    db.test_seed_entity_shadow_page(TestEntity::new(id, name, "test"))
         .await
         .unwrap();
-    }
-    // G6 Stage 1.5a: list_contradiction_observation_counts now reads the
-    // `kind='entity'` shadow page.
-    db.test_seed_entity_shadow_page(id).await.unwrap();
 }
 
 async fn insert_memory_source(db: &MemoryDB, id: &str, source_id: &str) {

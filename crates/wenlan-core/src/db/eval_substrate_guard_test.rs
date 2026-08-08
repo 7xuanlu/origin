@@ -17,14 +17,17 @@ async fn seed_temporal(db: &MemoryDB) {
 }
 
 async fn seed_graph(db: &MemoryDB) {
-    let conn = db.conn.lock().await;
-    conn.execute(
-        "INSERT INTO entities (id, name, entity_type, created_at, updated_at)
-         VALUES ('entity-graph', 'Graph', 'concept', 1, 1)",
-        (),
-    )
+    // G6 Stage 3: the entity identity is the `kind='entity'` shadow page now;
+    // migration 123 dropped `entities`, and migration 122 already removed
+    // `memory_entities`' FK onto it.
+    db.test_seed_entity_shadow_page(crate::db::TestEntity::new(
+        "entity-graph",
+        "Graph",
+        "concept",
+    ))
     .await
     .unwrap();
+    let conn = db.conn.lock().await;
     conn.execute(
         "INSERT INTO memory_entities (memory_id, entity_id)
          VALUES ('source-temporal', 'entity-graph')",

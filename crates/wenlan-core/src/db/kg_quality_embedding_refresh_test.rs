@@ -1,22 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::MemoryDB;
+use crate::db::TestEntity;
 
 async fn insert_entity(db: &MemoryDB, id: &str, name: &str, embedding_updated_at: Option<i64>) {
-    {
-        let conn = db.conn.lock().await;
-        conn.execute(
-            "INSERT INTO entities (
-                 id, name, entity_type, created_at, updated_at, embedding_updated_at
-             ) VALUES (?1, ?2, 'test', 1, 1, ?3)",
-            libsql::params![id, name, embedding_updated_at],
-        )
-        .await
-        .unwrap();
+    // G6 Stage 3: `stale_entity_embedding_candidates_for_refresh` reads the
+    // shadow page, and migration 123 dropped `entities`, so the shadow IS the
+    // seed.
+    let mut entity = TestEntity::new(id, name, "test");
+    if let Some(at) = embedding_updated_at {
+        entity = entity.embedding_updated_at(at);
     }
-    // G6 Stage 1.5b Part 3: `stale_entity_embedding_candidates_for_refresh`
-    // now reads the shadow page, so the raw `entities` insert above needs one.
-    db.test_seed_entity_shadow_page(id).await.unwrap();
+    db.test_seed_entity_shadow_page(entity).await.unwrap();
 }
 
 async fn insert_observations(db: &MemoryDB, entity_id: &str, observations: &[(i64, &str)]) {

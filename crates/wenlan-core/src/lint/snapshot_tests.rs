@@ -46,9 +46,13 @@ async fn snapshot_keeps_multiple_reads_coherent_while_writer_commits() {
     writer_ready.wait().await;
 
     // When: a writer commits between two reads from the open snapshot.
+    // G6 Stage 3 retirement lint track: migration 123 drops `entities`
+    // outright, and `create_entity` (the writer below) is canonical-only --
+    // the count moves onto `entity_page_map`, 1:1 with an active
+    // `kind='entity'` shadow page by the shadow-page invariant.
     let mut before_rows = snapshot
         .query(
-            "SELECT COUNT(*) FROM entities",
+            "SELECT COUNT(*) FROM entity_page_map",
             libsql::params::Params::None,
         )
         .await
@@ -74,7 +78,7 @@ async fn snapshot_keeps_multiple_reads_coherent_while_writer_commits() {
         .expect("writer commits");
     let mut after_rows = snapshot
         .query(
-            "SELECT COUNT(*) FROM entities",
+            "SELECT COUNT(*) FROM entity_page_map",
             libsql::params::Params::None,
         )
         .await
@@ -112,11 +116,15 @@ async fn snapshot_receipt_detects_same_row_count_update() {
     let writer = tokio::spawn(async move {
         writer_ready_for_task.wait().await;
         writer_release_for_task.wait().await;
+        // G6 Stage 3 retirement lint track: migration 123 drops `entities`
+        // outright -- an entity's name now lives on its `kind='entity'`
+        // shadow page, reached through `entity_page_map`.
         writer_db
             .test_primary_session()
             .await
             .execute(
-                "UPDATE entities SET name = ?1 WHERE id = ?2",
+                "UPDATE pages SET title = ?1
+                 WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?2)",
                 libsql::params!["after update", writer_id],
             )
             .await
@@ -331,9 +339,21 @@ async fn snapshot_read_only_transaction_rejects_mutation() {
     let snapshot = db.open_lint_snapshot().await.expect("lint snapshot opens");
 
     // When: a lint query attempts a write.
+    // G6 Stage 3 retirement lint track: migration 123 drops `entities`
+    // outright, so an INSERT into it would fail with "no such table" even
+    // outside a read-only transaction -- that would test table absence, not
+    // the read-only rejection this test exists for. `pages` stays a real,
+    // always-present table; this INSERT mirrors the minimal valid column set
+    // already used elsewhere in this lint fixture family (see deep_test.rs).
     let write_result = snapshot
         .query(
-            "INSERT INTO entities (id, name, entity_type, confirmed, created_at, updated_at) VALUES ('lint-write', 'lint-write', 'test', 0, 1, 1) RETURNING id",
+            "INSERT INTO pages
+                 (id,title,content,source_memory_ids,version,status,created_at,
+                  last_compiled,last_modified,creation_kind,review_status)
+             VALUES
+                 ('lint-write','lint-write','lint-write','[]',1,'active','now','now','now',
+                  'distilled','confirmed')
+             RETURNING id",
             libsql::params::Params::None,
         )
         .await;
@@ -358,9 +378,13 @@ async fn snapshot_query_failure_cleans_up_without_passing() {
     let snapshot = db.open_lint_snapshot().await.expect("lint snapshot opens");
 
     // When: a malformed lint query fails and the snapshot is dropped.
+    // G6 Stage 3 retirement lint track: migration 123 drops `entities`
+    // outright, so this query would fail on table absence rather than the
+    // missing-column malformation this test exists to exercise. `pages`
+    // stays a real, always-present table.
     let query_result = snapshot
         .query(
-            "SELECT missing_column FROM entities",
+            "SELECT missing_column FROM pages",
             libsql::params::Params::None,
         )
         .await;
@@ -381,10 +405,15 @@ async fn snapshot_query_failure_cleans_up_without_passing() {
         .expect("next snapshot finishes");
 }
 
+// G6 Stage 3 retirement lint track: migration 123 drops `entities` outright --
+// an entity's name now lives on its `kind='entity'` shadow page, reached
+// through `entity_page_map`.
 async fn entity_name(snapshot: &super::LintReadSnapshot<'_>, entity_id: &str) -> String {
     let mut rows = snapshot
         .query(
-            "SELECT name FROM entities WHERE id = ?1",
+            "SELECT p.title FROM pages p
+             JOIN entity_page_map epm ON epm.page_id = p.id
+             WHERE epm.entity_id = ?1",
             libsql::params::Params::Positional(vec![libsql::Value::Text(entity_id.to_owned())]),
         )
         .await

@@ -188,26 +188,22 @@ mod tests {
     #[tokio::test]
     async fn summary_eligibility_requires_a_qualifying_community_and_candidate() {
         let (db, _tmp) = test_db().await;
-        let conn = db.test_primary_session().await;
-        conn.execute_batch(
-            "INSERT INTO entities
-               (id,name,entity_type,confirmed,created_at,updated_at,community_id)
-             VALUES
-               ('large-a','large-a','concept',0,1,1,1),
-               ('large-b','large-b','concept',0,1,1,1),
-               ('large-c','large-c','concept',0,1,1,1),
-               ('small-a','small-a','concept',0,1,1,2),
-               ('small-b','small-b','concept',0,1,1,2);",
-        )
-        .await
-        .unwrap();
-        drop(conn);
-        // G6 Stage 1.5b Part 3: `summary_eligible_predicate`'s legacy branch now
-        // reads `community_id` off the entity's shadow page, so the raw-SQL
-        // `entities` inserts above need a shadow page each (test helper for
-        // exactly this).
-        for entity_id in ["large-a", "large-b", "large-c", "small-a", "small-b"] {
-            db.test_seed_entity_shadow_page(entity_id).await.unwrap();
+        // G6 Stage 3: `summary_eligible_predicate`'s legacy branch reads
+        // `community_id` off the entity's shadow page, and migration 123
+        // dropped `entities`, so the shadow IS the seed.
+        for (entity_id, community_id) in [
+            ("large-a", 1),
+            ("large-b", 1),
+            ("large-c", 1),
+            ("small-a", 2),
+            ("small-b", 2),
+        ] {
+            db.test_seed_entity_shadow_page(
+                crate::db::TestEntity::new(entity_id, entity_id, "concept")
+                    .community_id(community_id),
+            )
+            .await
+            .unwrap();
         }
         let conn = db.test_primary_session().await;
         let vector = format!(

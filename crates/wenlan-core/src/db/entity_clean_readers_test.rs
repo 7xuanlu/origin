@@ -64,71 +64,52 @@ async fn migrated_readers_return_fields_that_match_what_store_entity_wrote() {
     );
 }
 
-/// Test category 2 (spec "Tests" item 2): divergence under asymmetric
-/// seeding. One entity exists only as a shadow page (writer-seeded, then its
-/// `entities` row deleted via raw SQL) -- migrated readers must still see
-/// it, because they never touch `entities`. Two entities exist only as raw
-/// `entities` rows with no shadow page (seeded via raw SQL, bypassing the
-/// mirror invariant on purpose) -- migrated readers must NOT see them.
+/// Test category 2 (spec "Tests" item 2), respecified at G6 Stage 3.
 ///
-/// RED-control: manually reverting `count_entities`'s SQL to the legacy
-/// `SELECT COUNT(*) FROM entities` and re-running this test locally makes it
-/// fail (returns 2, asserted 1) -- confirming the assertion below actually
-/// exercises the migration rather than passing vacuously. Not committed as
-/// code; verified by hand per the 1.2/1.3 RED-control precedent.
+/// The original test seeded the divergence directly: an entity present only
+/// as a shadow page (its `entities` row raw-deleted) had to stay visible,
+/// and two entities present only as raw `entities` rows had to stay
+/// invisible. Migration 123 dropped `entities`, so the raw-only half is no
+/// longer a state the database can reach -- every entity is shadow-only now,
+/// and seeding the legacy half would test a substrate production does not
+/// have.
+///
+/// What survives is the reader contract that half was written to pin:
+/// resolution goes through `entity_page_map` alone, so an entity id with no
+/// map row resolves to `None` and counts for nothing, no matter that it is a
+/// well-formed id.
+///
+/// RED-control (recorded at Stage 1.5a, still the control for the positive
+/// assertion): reverting `count_entities`'s SQL to the legacy
+/// `SELECT COUNT(*) FROM entities` made this fail. Post-123 that revert no
+/// longer compiles against a real database -- the drop itself is now the
+/// control.
 #[tokio::test]
-async fn migrated_readers_see_shadow_only_entities_not_raw_only_entities() {
+async fn migrated_readers_resolve_only_through_entity_page_map() {
     let (db, _tmp) = crate::db::tests::test_db().await;
 
-    // Shadow-only: written for real, then the legacy row is deleted,
-    // leaving only entity_page_map + the pages row behind.
     let shadow_only = db
         .store_entity("Shadow Only", "concept", None, None, Some(0.5))
         .await
         .unwrap();
-    {
-        let conn = db.conn.lock().await;
-        conn.execute(
-            "DELETE FROM entities WHERE id = ?1",
-            libsql::params![shadow_only.clone()],
-        )
-        .await
-        .unwrap();
-    }
-
-    // Raw-only: inserted directly into `entities`, bypassing store_entity
-    // (and therefore `insert_entity_shadow_page`) entirely.
-    {
-        let conn = db.conn.lock().await;
-        conn.execute_batch(
-            "INSERT INTO entities (id,name,entity_type,confirmed,created_at,updated_at) VALUES
-                 ('raw-only-1','Raw Only One','concept',0,1,1),
-                 ('raw-only-2','Raw Only Two','concept',0,1,1);",
-        )
-        .await
-        .unwrap();
-    }
 
     assert_eq!(
         db.count_entities().await.unwrap(),
         1,
-        "count_entities must see the shadow-only entity and neither raw-only entity"
+        "count_entities must count the one mapped shadow page and nothing else"
     );
     assert_eq!(
         db.get_entity_name_type(&shadow_only).await.unwrap(),
         Some(("Shadow Only".to_string(), "concept".to_string())),
         "get_entity_name_type must resolve the shadow-only entity via entity_page_map"
     );
-    assert_eq!(
-        db.get_entity_name_type("raw-only-1").await.unwrap(),
-        None,
-        "get_entity_name_type must not see a raw entities row with no shadow page"
-    );
-    assert_eq!(
-        db.get_entity_name_type("raw-only-2").await.unwrap(),
-        None,
-        "get_entity_name_type must not see a raw entities row with no shadow page"
-    );
+    for unmapped in ["raw-only-1", "raw-only-2"] {
+        assert_eq!(
+            db.get_entity_name_type(unmapped).await.unwrap(),
+            None,
+            "get_entity_name_type must return None for an id with no entity_page_map row"
+        );
+    }
 }
 
 /// Test category 3 (spec "Tests" item 3): the mirror invariant itself --

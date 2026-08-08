@@ -2310,21 +2310,20 @@ async fn review_item_contract_failed_entity_plan_can_prepare_manifest() {
                   pending_revision,is_recap,supersede_mode,memory_type,space)
              VALUES ('row-entity','Target memory','memory','mem-entity','target',0,10,
                      'text',0,0,'hide','fact','work');
-             INSERT INTO entities
-                 (id,name,entity_type,space,created_at,updated_at)
-             VALUES ('ent-new','New','concept','work',1,1);
              INSERT INTO enrichment_steps
                  (source_id,step_name,status,error,attempts,updated_at)
              VALUES ('mem-entity','entity_extract','failed','transient',2,1721000000);",
         )
         .await
         .unwrap();
-    // G6 Stage 2 PR 2c item 5/6: `entities` is raw-SQL-seeded above, and the
-    // selected-entity existence guard now reads the canonical shadow page
-    // (`entity_page_map` JOIN `pages`), so a legacy-only row reads as absent
-    // and `prepare` rejects the target as stale. Backfill the shadow the same
-    // way a real `store_entity` write would.
-    db.test_seed_entity_shadow_page("ent-new").await.unwrap();
+    // G6 Stage 3: the selected-entity existence guard reads the canonical
+    // shadow page (`entity_page_map` JOIN `pages`), and migration 123 dropped
+    // `entities`, so the shadow IS the seed.
+    db.test_seed_entity_shadow_page(
+        crate::db::TestEntity::new("ent-new", "New", "concept").space("work"),
+    )
+    .await
+    .unwrap();
     let runner = || LintRunner::new(LintClock::fixed(), CancellationToken::new());
     let general = runner()
         .run(
