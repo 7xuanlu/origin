@@ -13433,16 +13433,24 @@ impl MemoryDB {
     // `missing` drift in `entity_page_parity_watermark` — permanently holding
     // the `reader_uses_entity_pages` cutover gate closed. The companion code
     // fix makes that path dual-write; this migration repairs the rows already
-    // written. Seeds a placeholder shadow via `insert_entity_shadow_page`
-    // then re-derives every mirrored column from `entities` inline (G6
-    // Stage 2 PR 2c sub-step 2: this is `update_entity_shadow_page`'s old
-    // body, byte-for-byte -- that helper retired from every live write path
-    // in this sub-step, but a migration body is a frozen replay: at this
-    // point in the schema timeline `entities` IS authoritative, so
-    // re-deriving the shadow from it here remains correct forever, unlike a
-    // live writer). A repaired entity is byte-identical in shape to a
-    // correctly created one, aliases folded in. Idempotent: scoped to
-    // entities with no `entity_page_map` row at all.
+    // written. Inserts the shadow directly from the live `entities` row then
+    // re-derives every mirrored column from it (G6 Stage 2 PR 2c sub-step 2:
+    // both statements are `insert_entity_shadow_page`'s and
+    // `update_entity_shadow_page`'s OLD bodies, byte-for-byte -- those
+    // helpers retired from every live write path in this sub-step, but a
+    // migration body is a frozen replay: at this point in the schema timeline
+    // `entities` IS authoritative, so re-deriving the shadow from it here
+    // remains correct forever, unlike a live writer). The INSERT must carry
+    // the entity's REAL space and embedding rather than placeholders repaired
+    // by the UPDATE that follows: migration 96's
+    // `m4_page_community_page_invalidate` trigger (AFTER UPDATE OF ... space,
+    // embedding ... ON pages) is live at replay time, so a placeholder row
+    // would mint an unfiled-sentinel community-route row and bump route
+    // generations the historical replay never touched -- see
+    // `migration_113_repair_matches_historical_community_routing_side_effects`.
+    // A repaired entity is byte-identical in shape to a correctly created
+    // one, aliases folded in. Idempotent: scoped to entities with no
+    // `entity_page_map` row at all.
     async fn migrate_113_entity_shadow_page_repair(
         &self,
         prior_version: i64,
@@ -13476,14 +13484,31 @@ impl MemoryDB {
             let now_iso = chrono::Utc::now().to_rfc3339();
             for entity_id in &unmapped {
                 let page_id = crate::pages::new_page_id();
-                // Placeholder row: every parameterized column below is
-                // immediately overwritten by the inline re-sync that
-                // follows, in the same transaction.
-                Self::insert_entity_shadow_page(
-                    &conn, entity_id, &page_id, "", "", None, false, None, None, None, "[]",
-                    &now_iso, 0, 0,
+                conn.execute(
+                    "INSERT INTO pages (
+                        id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+                        embedding, space, workspace, source_memory_ids, version, status,
+                        created_at, last_compiled, last_modified, creation_kind, review_status
+                     )
+                     SELECT ?1, name, NULL, '', 'entity', entity_type, confidence, confirmed,
+                            embedding, COALESCE(space, ?2), COALESCE(space, ?2), '[]', 1, 'active',
+                            ?3, ?3, ?3, 'entity', 'unconfirmed'
+                     FROM entities WHERE id = ?4",
+                    libsql::params![
+                        page_id.as_str(),
+                        UNFILED_SPACE_ID,
+                        now_iso.as_str(),
+                        entity_id.as_str()
+                    ],
                 )
-                .await?;
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m113 shadow insert: {e}")))?;
+                conn.execute(
+                    "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, ?2, ?3)",
+                    libsql::params![entity_id.as_str(), page_id.as_str(), now_iso.as_str()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m113 shadow map: {e}")))?;
                 conn.execute(
                     "UPDATE pages SET
                         title = (SELECT name FROM entities WHERE id = ?1),
@@ -32723,6 +32748,14 @@ impl MemoryDB {
     /// plus a re-derivation. `_source` is unused: `pages.aliases` carries
     /// no per-alias provenance field, so `entity_aliases.source` had no
     /// page-payload equivalent to preserve.
+    ///
+    /// First-registration-wins stays **write-enforced**: the `NOT EXISTS`
+    /// arm skips the append when any OTHER active entity shadow page already
+    /// claims the alias, mirroring what `entity_aliases`' `UNIQUE(alias_name)`
+    /// plus `INSERT OR IGNORE` did (a silent skip, not an error -- callers
+    /// like `resolve_or_create_entity` discard the result). Re-adding an alias
+    /// the target entity already owns is still a no-op update, since its own
+    /// page is excluded from the guard.
     pub async fn add_entity_alias(
         &self,
         alias: &str,
@@ -32741,7 +32774,13 @@ impl MemoryDB {
                 )),
                 last_modified = ?2
              WHERE kind = 'entity'
-               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
+               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)
+               AND NOT EXISTS (
+                   SELECT 1 FROM entity_page_map epm2
+                    JOIN pages p2 ON p2.id = epm2.page_id
+                    WHERE p2.kind = 'entity' AND p2.status = 'active'
+                      AND epm2.entity_id <> ?3
+                      AND EXISTS (SELECT 1 FROM json_each(p2.aliases) WHERE value = ?1))",
             libsql::params![alias.to_lowercase(), now_iso, entity_id.to_string()],
         )
         .await
@@ -35027,7 +35066,13 @@ impl MemoryDB {
                     {
                         if let Ok(Some(row)) = vector_rows.next().await {
                             let distance = row.get::<f64>(1).unwrap_or(1.0);
-                            if distance < 0.1 {
+                            // Same entropy gate `resolve_or_create_entity`
+                            // step 3 applies: a short/low-entropy name ("API"
+                            // vs "APIs") embeds inside the merge distance
+                            // while being a genuinely distinct entity. Without
+                            // it this ambient cascade auto-merged pairs the
+                            // user-facing create path keeps apart.
+                            if distance < 0.1 && crate::retrieval::dedup::has_high_entropy(name) {
                                 resolved = row.get::<String>(0).ok();
                             }
                         }
@@ -35080,7 +35125,12 @@ impl MemoryDB {
                 // already present. G6 Stage 2 PR 2c sub-step 3 item 4:
                 // `entity_aliases` stops being written -- page-payload
                 // UNION read-modify-write, same pattern as
-                // `add_entity_alias`.
+                // `add_entity_alias`. This site needs no
+                // first-registration-wins guard of its own: the alias lookup
+                // at the top of this loop resolves `lower` against every
+                // active entity page before anything else, so if another
+                // entity already owns the alias, `entity_id` IS that owner
+                // and the write is a no-op re-append onto its own page.
                 conn.execute(
                     "UPDATE pages SET
                         aliases = (SELECT json_group_array(value) FROM (

@@ -175,8 +175,8 @@ crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_e
 crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::apply_preserves_existing_link_adds_approved_link_and_completes_only_selected_step|test_primary_session|2
 crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::complete_entity_extraction_verifies_end_to_end_with_unrelated_failure_remaining|TestDbSession::execute_batch|1
 crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::complete_entity_extraction_verifies_end_to_end_with_unrelated_failure_remaining|test_primary_session|1
-crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::entity_extraction_fixture|TestDbSession::execute_batch|1
-crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::entity_extraction_fixture|test_primary_session|1
+crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::entity_extraction_fixture_in_space|TestDbSession::execute_batch|1
+crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::entity_extraction_fixture_in_space|test_primary_session|1
 crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::entity_rollback_uncertainty_retains_pending_receipt|TestDbSession::execute|1
 crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::entity_rollback_uncertainty_retains_pending_receipt|test_primary_session|1
 crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::entity_state|TestDbRow::get|1
@@ -543,6 +543,8 @@ crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::dupli
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::duplicate_pair_paths_consume_one_candidate_slot|test_primary_session|1
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::fixture|TestDbSession::execute_batch|1
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::fixture|test_primary_session|1
+crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::load_relations_sees_a_canonical_only_entitys_existing_edge|TestDbSession::execute_batch|1
+crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::load_relations_sees_a_canonical_only_entitys_existing_edge|test_primary_session|1
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::page_evidence_candidates_ignore_high_frequency_token_noise|TestDbSession::execute|1
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::page_evidence_candidates_ignore_high_frequency_token_noise|TestDbSession::execute_batch|1
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::page_evidence_candidates_ignore_high_frequency_token_noise|test_primary_session|1

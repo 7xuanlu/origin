@@ -23223,13 +23223,69 @@ async fn test_add_entity_alias() {
     assert_eq!(r2, Some(id.clone()));
 }
 
-/// G6 Stage 2 PR 2c sub-step 3 item 4: losing `entity_aliases`'
-/// `UNIQUE(alias_name)` means no ordinary write path (`add_entity_alias`,
-/// `merge_entities`, enrichment) can produce two *active* entity pages both
-/// claiming the same alias -- each write targets exactly one page's `aliases`
-/// array. But nothing in the schema forbids it either (a bug, not an expected
-/// state), so `resolve_entity_by_alias`'s `ORDER BY p.created_at,
-/// epm.entity_id LIMIT 1` tie-break must be exercised directly: raw-SQL seed
+/// Ordinary sequential writers must not be able to create an alias collision:
+/// `add_entity_alias` skips the append when another active entity page already
+/// claims the alias, which is what `entity_aliases`' `UNIQUE(alias_name)` +
+/// `INSERT OR IGNORE` enforced before G6 Stage 2 PR 2c retired that table.
+/// Ownership stays with the first registrant.
+#[tokio::test]
+async fn add_entity_alias_keeps_ownership_with_the_first_registrant() {
+    let (db, _dir) = test_db().await;
+    let first = db
+        .store_entity("Meridian Reactor", "project", None, Some("test"), None)
+        .await
+        .unwrap();
+    let second = db
+        .store_entity("Meridian Refinery", "project", None, Some("test"), None)
+        .await
+        .unwrap();
+
+    db.add_entity_alias("meridian", &first, "auto")
+        .await
+        .unwrap();
+    db.add_entity_alias("meridian", &second, "auto")
+        .await
+        .unwrap();
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT epm.entity_id FROM entity_page_map epm
+             JOIN pages p ON p.id = epm.page_id
+             WHERE p.kind = 'entity' AND p.status = 'active'
+               AND EXISTS (SELECT 1 FROM json_each(p.aliases) WHERE value = 'meridian')
+             ORDER BY epm.entity_id",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut owners: Vec<String> = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        owners.push(row.get::<String>(0).unwrap());
+    }
+    assert_eq!(
+        owners,
+        vec![first.clone()],
+        "a second writer must not be able to claim an alias the first registrant owns"
+    );
+    drop(rows);
+    drop(conn);
+    assert_eq!(
+        db.resolve_entity_by_alias("meridian").await.unwrap(),
+        Some(first),
+        "ownership stays with the first registrant"
+    );
+    assert_ne!(second, "", "the second entity still exists, just aliasless");
+}
+
+/// G6 Stage 2 PR 2c sub-step 3 item 4: `add_entity_alias` write-enforces
+/// first-registration-wins (see the test above), so an ordinary write path
+/// cannot produce two *active* entity pages claiming the same alias. Nothing
+/// in the schema forbids it either -- a pre-existing collision seeded before
+/// that enforcement, or a direct page write, can still get there (a bug, not
+/// an expected state), so `resolve_entity_by_alias`'s `ORDER BY p.created_at,
+/// epm.entity_id LIMIT 1` tie-break stays as the read-time belt and must be
+/// exercised directly: raw-SQL seed
 /// two distinct entity shadow pages that both carry the same alias with
 /// controlled, distinct `created_at` values, and assert resolution always
 /// picks the older page's entity -- never row-order chance.
@@ -31086,6 +31142,175 @@ async fn migration_113_backfills_missing_entity_shadow_pages() {
     assert_eq!(space, "work");
 }
 
+/// G6 Stage 2 PR 2c, independent-review finding 1: migration 113's body is a
+/// FROZEN replay, so it must produce the same side effects it produced when it
+/// shipped, not merely the same end state in `pages`. Migration 96 creates
+/// `m4_page_community_page_insert_input` (AFTER INSERT ON pages),
+/// `m4_page_community_page_invalidate` (AFTER UPDATE OF ... space, embedding
+/// ... ON pages) and `m4_page_community_map_insert_invalidate` (AFTER INSERT ON
+/// entity_page_map), all live by the time 113 replays -- so the community-route
+/// generations 113 leaves behind depend on the exact column values it writes,
+/// not just on the row it ends up with.
+///
+/// This is a golden differential rather than a hand-computed expectation: the
+/// historical body is replayed inline against one database, the shipped
+/// migration against an identically damaged one, and the complete
+/// community-routing state must match. Seeding a placeholder row (NULL space
+/// folding to the unfiled sentinel, NULL embedding) and repairing it by UPDATE
+/// fails this -- it mints an unfiled-sentinel route row the historical replay
+/// never created and bumps the repaired page's own route generation off the
+/// value a direct insert leaves.
+#[tokio::test]
+async fn migration_113_repair_matches_historical_community_routing_side_effects() {
+    /// The damage migration 113 exists to repair: an `entities` row whose
+    /// shadow page and map row are both missing.
+    /// A fixed id, so the two databases agree on the key the page-routing
+    /// fingerprint is read by (`store_entity` mints a random uuid).
+    const ORPHAN: &str = "ent-orphan-m113";
+
+    async fn seed_unmapped_entity(db: &MemoryDB) {
+        // An anchor entity written the normal way, so the 'work' space already
+        // carries community-route state before the migration runs -- otherwise
+        // the trigger arms that bump an EXISTING row would go unexercised.
+        db.store_entity("Anchor", "concept", Some("work"), None, None)
+            .await
+            .unwrap();
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO entities (id, name, entity_type, space, created_at, updated_at) \
+             VALUES (?1, 'Orphan', 'concept', 'work', unixepoch(), unixepoch())",
+            libsql::params![ORPHAN],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Every community-routing generation the m4 triggers maintain. Page rows
+    /// are keyed by their entity id, not the random page id, so two
+    /// independently repaired databases are comparable.
+    async fn routing_fingerprint(
+        db: &MemoryDB,
+    ) -> (Vec<(String, i64)>, Vec<(String, String, i64)>) {
+        let conn = db.conn.lock().await;
+        let mut spaces = Vec::new();
+        let mut rows = conn
+            .query(
+                "SELECT space, generation FROM community_route_space_inputs ORDER BY space",
+                (),
+            )
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            spaces.push((row.get::<String>(0).unwrap(), row.get::<i64>(1).unwrap()));
+        }
+        drop(rows);
+        let mut pages = Vec::new();
+        let mut rows = conn
+            .query(
+                "SELECT m.entity_id, r.space, r.generation \
+                   FROM page_community_route_inputs r \
+                   JOIN entity_page_map m ON m.page_id = r.page_id \
+                  WHERE m.entity_id = ?1 \
+                  ORDER BY m.entity_id",
+                libsql::params![ORPHAN],
+            )
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            pages.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<String>(1).unwrap(),
+                row.get::<i64>(2).unwrap(),
+            ));
+        }
+        (spaces, pages)
+    }
+
+    // WAY A -- migration 113 exactly as it shipped, replayed inline. The two
+    // statements are `insert_entity_shadow_page`'s and
+    // `update_entity_shadow_page`'s pre-G6 bodies; both helpers have since
+    // been rewritten for live callers, which is precisely why the frozen
+    // replay is pinned here rather than routed back through them.
+    let (db_historical, _dir_historical) = test_db().await;
+    seed_unmapped_entity(&db_historical).await;
+    {
+        let conn = db_historical.conn.lock().await;
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let page_id = crate::pages::new_page_id();
+        conn.execute(
+            "INSERT INTO pages (
+                id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+                embedding, space, workspace, source_memory_ids, version, status,
+                created_at, last_compiled, last_modified, creation_kind, review_status
+             )
+             SELECT ?1, name, NULL, '', 'entity', entity_type, confidence, confirmed,
+                    embedding, COALESCE(space, ?2), COALESCE(space, ?2), '[]', 1, 'active',
+                    ?3, ?3, ?3, 'entity', 'unconfirmed'
+             FROM entities WHERE id = ?4",
+            libsql::params![
+                page_id.as_str(),
+                crate::db::UNFILED_SPACE_ID,
+                now_iso.as_str(),
+                ORPHAN
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at) VALUES (?1, ?2, ?3)",
+            libsql::params![ORPHAN, page_id.as_str(), now_iso.as_str()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE pages SET
+                title = (SELECT name FROM entities WHERE id = ?1),
+                entity_type = (SELECT entity_type FROM entities WHERE id = ?1),
+                confidence = (SELECT confidence FROM entities WHERE id = ?1),
+                entity_confirmed = (SELECT confirmed FROM entities WHERE id = ?1),
+                embedding = (SELECT embedding FROM entities WHERE id = ?1),
+                space = COALESCE((SELECT space FROM entities WHERE id = ?1), ?2),
+                workspace = COALESCE((SELECT space FROM entities WHERE id = ?1), ?2),
+                aliases = (SELECT json_group_array(alias_name)
+                           FROM (SELECT alias_name FROM entity_aliases
+                                 WHERE canonical_entity_id = ?1 ORDER BY alias_name)),
+                source_agent = (SELECT source_agent FROM entities WHERE id = ?1),
+                entity_created_at = (SELECT created_at FROM entities WHERE id = ?1),
+                entity_updated_at = (SELECT updated_at FROM entities WHERE id = ?1),
+                community_id = (SELECT community_id FROM entities WHERE id = ?1),
+                embedding_updated_at = (SELECT embedding_updated_at FROM entities WHERE id = ?1),
+                last_modified = ?3
+             WHERE kind = 'entity'
+               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![ORPHAN, crate::db::UNFILED_SPACE_ID, now_iso.as_str()],
+        )
+        .await
+        .unwrap();
+    }
+
+    // WAY B -- the shipped migration against identical damage.
+    let (db_shipped, _dir_shipped) = test_db().await;
+    seed_unmapped_entity(&db_shipped).await;
+    db_shipped
+        .migrate_113_entity_shadow_page_repair(112)
+        .await
+        .unwrap();
+
+    let (spaces_historical, pages_historical) = routing_fingerprint(&db_historical).await;
+    let (spaces_shipped, pages_shipped) = routing_fingerprint(&db_shipped).await;
+
+    assert_eq!(
+        spaces_historical, spaces_shipped,
+        "migration 113 must leave the same per-space community-route generations \
+         as its historical body"
+    );
+    assert_eq!(
+        pages_historical, pages_shipped,
+        "migration 113 must leave the same per-page community-route generations \
+         as its historical body"
+    );
+}
+
 /// KG close plan G5: migration 114 repairs shadows the pre-fix sweep left
 /// STALE — an alias inserted onto an existing entity without the shadow
 /// re-sync drifts the mirrored `aliases` column (`corrupt` in the parity
@@ -33605,6 +33830,72 @@ async fn linked_new_generation_repairs_entity_receipt_without_inference() {
             .unwrap(),
         0,
         "a repaired linked generation must be terminal"
+    );
+}
+
+/// The ambient enrichment cascade must gate its vector-similarity auto-merge
+/// by the same `has_high_entropy` check `resolve_or_create_entity` step 3
+/// applies. Without it "API" and "APIs" embed inside the 0.1 merge distance
+/// and collapse into one entity through post-ingest enrichment even though the
+/// user-facing create path keeps them apart.
+#[tokio::test]
+async fn enrichment_cascade_skips_vector_merge_for_low_entropy_names() {
+    let (db, _dir) = test_db().await;
+    for (index, source_id) in ["mem_entropy_api", "mem_entropy_apis"]
+        .into_iter()
+        .enumerate()
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO memories
+                 (id, content, source, source_id, title, chunk_index,
+                  last_modified, chunk_type, pending_revision, version)
+             VALUES (?1, 'entropy gate fixture', 'memory', ?2, '', 0, 1, 'text', 0, 1)",
+            libsql::params![format!("c_entropy_{index}"), source_id],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(db
+        .commit_entity_enrichment_at_version(
+            "mem_entropy_api",
+            1,
+            &extracted_entity("API", "concept"),
+            "entropy gate fixture",
+        )
+        .await
+        .unwrap());
+    assert!(db
+        .commit_entity_enrichment_at_version(
+            "mem_entropy_apis",
+            1,
+            &extracted_entity("APIs", "concept"),
+            "entropy gate fixture",
+        )
+        .await
+        .unwrap());
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT p.title FROM entity_page_map epm
+             JOIN pages p ON p.id = epm.page_id
+             WHERE p.kind = 'entity' AND p.status = 'active'
+               AND p.title IN ('API', 'APIs')
+             ORDER BY p.title",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut titles: Vec<String> = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        titles.push(row.get::<String>(0).unwrap());
+    }
+    assert_eq!(
+        titles,
+        vec!["API".to_string(), "APIs".to_string()],
+        "low-entropy names must not vector-auto-merge through the enrichment cascade"
     );
 }
 

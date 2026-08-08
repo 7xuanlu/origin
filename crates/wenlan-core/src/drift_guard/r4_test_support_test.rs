@@ -3229,7 +3229,7 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        1025,
+        1027,
         "PR-D integration must expose the frozen 967 support calls, the 6 PR-D test identities, \
          the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, \
          the 7 G6 BindPageLink repair-test calls (G6 Stage 2 PR 2b, item 3: \
@@ -3266,7 +3266,15 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
          PR 2c fix-round calls in aggregate_cas_rejects_every_stale_dimension_without_database_mutation: \
          the repair-CAS fixture's entity-absent/rescoped simulation moved onto canonical `UPDATE pages` \
          mutations (the ported CAS guard reads shadow pages now, not the legacy entities row), adding \
-         three TestDbSession::execute calls"
+         three TestDbSession::execute calls; plus the net +2 calls from the PR 2c Sol-review fix round \
+         (findings 1-5): the new RED-controlled test \
+         load_relations_sees_a_canonical_only_entitys_existing_edge (finding 3: load_relations's \
+         legacy `entities` join silently dropped canonical-only entities' real edges) contributes a \
+         TestDbSession::execute_batch and a test_primary_session call, and \
+         entity_extraction_fixture (finding 2: the CAS link-INSERT unfiled-space bug) is now a \
+         thin wrapper delegating to the new entity_extraction_fixture_in_space(space), which inherits \
+         the fixture's own execute_batch/test_primary_session pair -- a net wash for that fixture, \
+         so the +2 total is load_relations's test alone"
     );
 }
 

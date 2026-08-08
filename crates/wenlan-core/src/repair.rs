@@ -4308,7 +4308,13 @@ async fn capture_complete_entity_extraction_on_snapshot(
     if step_rows.next().await.map_err(snapshot_error)?.is_some() {
         return Err(WenlanError::Conflict("repair_target_stale".to_string()));
     }
-    let target_scope = match space {
+    // memories.space is NOT NULL as of migration 91, so an unscoped memory
+    // carries the reserved sentinel id rather than NULL. Fold it back to None
+    // here, the same translation `validate_target_space_on_connection` and
+    // `repair_plan/deterministic.rs` already apply -- without it an unfiled
+    // memory resolves to `Registered(sentinel)` and every apply of the
+    // resulting manifest conflicts against the folded apply-time check.
+    let target_scope = match space.filter(|space| space != crate::db::UNFILED_SPACE_ID) {
         Some(space) => RepairScope::registered(space),
         None => Ok(RepairScope::uncategorized()),
     }

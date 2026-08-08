@@ -382,6 +382,53 @@ async fn scoped_candidates_hydrate_cross_space_existing_link_endpoints() {
 }
 
 #[tokio::test]
+async fn load_relations_sees_a_canonical_only_entitys_existing_edge() {
+    let (db, _dir) = test_db().await;
+    // Both entities are canonical-only: created via `store_entity` (item 5,
+    // G6 Stage 2 PR 2c), which no longer writes an `entities` row. The
+    // Codex Sol review's finding 3: `load_relations`'s unfixed `JOIN
+    // entities source` is an INNER join, so an edge whose endpoints have no
+    // `entities` row is silently dropped from `relation_pairs` -- the
+    // relation already exists, but the candidate generator can't see it.
+    let alpha_id = db
+        .store_entity("Alpha Widget", "concept", Some("work"), None, None)
+        .await
+        .unwrap();
+    let beta_id = db
+        .store_entity("Beta Gadget", "concept", Some("work"), None, None)
+        .await
+        .unwrap();
+    db.test_primary_session()
+        .await
+        .execute_batch(&format!(
+            "INSERT INTO memories
+             (id,content,source,source_id,title,chunk_index,last_modified,chunk_type,
+              pending_revision,is_recap,supersede_mode,space,memory_type)
+         VALUES ('mem-widgets-row','Alpha Widget connects to Beta Gadget','memory','mem-widgets',
+                 'widgets',0,100,'text',0,0,'hide','work','fact');
+         INSERT INTO edges
+             (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type)
+         VALUES ('edge-widgets-relates','{alpha_id}','entity','{beta_id}','entity','relates','assertion',1,'work',1,'related');",
+        ))
+        .await
+        .unwrap();
+
+    let report = prepare(&db, None).await;
+    let work = report.agent_work().unwrap();
+    // Both entities are co-mentioned in the memory above, and their edge
+    // already records the relation. A `load_relations` that can see
+    // canonical-only entities must NOT propose adding it again.
+    let false_add = candidates_for(work, LintSemanticCheckId::EntityRelations)
+        .into_iter()
+        .find(|candidate| candidate.proposed_action() == LintSemanticAction::AddEntityRelation);
+    assert!(
+        false_add.is_none(),
+        "load_relations dropped a canonical-only entity's existing edge, proposing a false \
+         AddEntityRelation for a relation that already exists: {false_add:?}"
+    );
+}
+
+#[tokio::test]
 async fn approved_link_repair_removes_candidate_on_rerun() {
     let (db, _dir) = test_db().await;
     db.test_primary_session()

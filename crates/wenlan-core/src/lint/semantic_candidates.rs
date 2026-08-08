@@ -866,24 +866,37 @@ async fn load_memory_entity_links(
     Ok(output)
 }
 
-// G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
-// space-sentinel fold: `source.space` now uses `scope_clause_folded`,
-// sentinel-aware. The `source`-aliased `entities` join itself is a separate,
-// still-legacy concern. 1.5b Part 3 (item 8) disposition, correcting the
-// note above: NOT a reader-migration target -- Part 3's 9-item list (spec
-// `docs/plans/2026-08-05-g6-stage15b-entity-reader-completion-spec.md`)
-// does not name this function. Like its `lint/deep.rs`/`lint/kg/query.rs`
-// siblings, this audits the legacy `entities` store's own data quality;
-// reading the shadow-page mirror instead would validate the mirror rather
-// than the store it exists to check. Stays on `entities` through Stage 1
-// and Stage 2; retires with the store at Stage 3, same as
-// `lint/pages/provenance_checks/source.rs`.
+// G6 Stage 2 PR 2c fix round (Codex Sol review finding 3): the disposition
+// above ("audits the legacy `entities` store's own data quality... stays on
+// `entities` through Stage 2") was written when writers dual-wrote and the
+// `entities` join was lossless. It no longer is: this function feeds
+// user-facing semantic candidates (EntityRelations), not a legacy-store
+// audit, and after the writer flip (item 5) a canonical-only entity has no
+// `entities` row -- the unfixed INNER JOIN silently dropped its real edges
+// from `relation_pairs`, so semantic lint proposed false AddEntityRelation
+// repairs for relations that already existed. Ported to the same canonical
+// projected subquery `entity_scope_clause` above already uses for its
+// `source`-aliased edges joins; `source.space` still resolves the same way,
+// so `scope_clause_folded` needs no change.
 async fn load_relations(context: &LintContext<'_, '_>) -> Result<Vec<Relation>, ()> {
     let (scope, params) = scope_clause_folded(context.scope().filter(), "source.space");
-    let mut rows = context.snapshot().query(
-        &format!("SELECT r.src_id,r.dst_id,r.semantic_type FROM edges r JOIN entities source ON source.id=r.src_id WHERE r.edge_type='relates' AND r.valid_until IS NULL AND r.semantic_type IS NOT NULL{scope} ORDER BY r.src_id,r.dst_id,r.edge_id"),
-        params,
-    ).await.map_err(|_| ())?;
+    let mut rows = context
+        .snapshot()
+        .query(
+            &format!(
+                "SELECT r.src_id,r.dst_id,r.semantic_type FROM edges r \
+             JOIN (SELECT epm.entity_id AS id, p.space AS space \
+                   FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id \
+                   WHERE p.kind='entity' AND p.status='active') source \
+               ON source.id=r.src_id \
+             WHERE r.edge_type='relates' AND r.valid_until IS NULL \
+               AND r.semantic_type IS NOT NULL{scope} \
+             ORDER BY r.src_id,r.dst_id,r.edge_id"
+            ),
+            params,
+        )
+        .await
+        .map_err(|_| ())?;
     let mut output = Vec::new();
     while let Some(row) = rows.next().await.map_err(|_| ())? {
         output.push(Relation {
