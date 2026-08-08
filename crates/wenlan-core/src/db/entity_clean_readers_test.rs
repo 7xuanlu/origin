@@ -88,7 +88,6 @@ async fn migrated_readers_see_shadow_only_entities_not_raw_only_entities() {
         .unwrap();
     {
         let conn = db.conn.lock().await;
-        conn.execute("PRAGMA foreign_keys = OFF", ()).await.unwrap();
         conn.execute(
             "DELETE FROM entities WHERE id = ?1",
             libsql::params![shadow_only.clone()],

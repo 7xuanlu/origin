@@ -833,7 +833,7 @@ pub const EMBEDDING_DIM: usize = 768;
 /// over an entity that could still be missing one (G6 Stage 2 PR 2c
 /// frozen-replay fix -- migrations 81/98 keep the historical
 /// `entities`-reading fence body).
-pub const SCHEMA_VERSION: u32 = 121;
+pub const SCHEMA_VERSION: u32 = 122;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -8720,6 +8720,21 @@ impl MemoryDB {
             if version < 121 {
                 self.migrate_121_edges_space_fence_pages(version).await?;
             }
+
+            // Migration 122 (G6 Stage 2 PR 2c sub-step 3): relax the
+            // `entities`-referencing foreign key on `entity_page_map`,
+            // `observations`, `memory_entities`, and `entity_minhash_bands`.
+            // All four are historical entity-table dependents; the shadow
+            // page IS the entity now (migrations 90-118), so a row naming an
+            // entity id that has no `entities` row -- the ordinary post-flip
+            // state once item 4 (this same PR) stops writing `entities` at
+            // all -- must be insertable. `ON DELETE CASCADE` into a table
+            // this migration does not retire would otherwise make every
+            // shadow-only entity's observations/links/bands un-writable. See
+            // migrate_122_relax_entity_fk_dependents.
+            if version < 122 {
+                self.migrate_122_relax_entity_fk_dependents(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -14477,6 +14492,323 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("m121 bump: {e}")))?;
         log::info!(
             "[migration] Migration 121 applied: edges_space_fence entity arm reads shadow pages"
+        );
+        Ok(())
+    }
+
+    /// Rename a migration-122 scratch table into place, suppressing
+    /// SQLite's post-3.25 schema-wide reparse for just this one statement.
+    /// `ALTER TABLE ... RENAME TO` normally revalidates every trigger/view
+    /// body in the database (not only ones referencing the renamed table),
+    /// which aborts the rename if ANY of them currently names a table that
+    /// happens to be transiently missing -- proven by
+    /// `migration_96_converges_local_only_...`'s deliberately-inconsistent
+    /// fixture, where an unrelated leftover trigger on `entities` broke
+    /// this migration's plain `observations` rename. `legacy_alter_table`
+    /// asks for pre-3.25 behavior (rename the schema entry, rewrite
+    /// nothing), which is safe here because nothing references the `_new`
+    /// scratch name. Mirrors `edges_rebuild.rs`'s `rename_into_place`.
+    async fn m122_rename_into_place(
+        tx: &libsql::Transaction,
+        from: &str,
+        to: &str,
+    ) -> Result<(), WenlanError> {
+        tx.execute("PRAGMA legacy_alter_table = ON", ())
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("m122 legacy_alter_table on: {error}"))
+            })?;
+        let renamed = tx
+            .execute(&format!("ALTER TABLE {from} RENAME TO {to}"), ())
+            .await;
+        tx.execute("PRAGMA legacy_alter_table = OFF", ())
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("m122 legacy_alter_table off: {error}"))
+            })?;
+        renamed
+            .map(|_| ())
+            .map_err(|error| WenlanError::VectorDb(format!("m122 rename {from}: {error}")))
+    }
+
+    /// Migration 122 (G6 Stage 2 PR 2c sub-step 3): table-rebuild-under-
+    /// `PRAGMA foreign_keys=OFF` (migration-24 precedent, `db.rs:4653-4844`;
+    /// the widened-`edges` variant of the same technique is migration 98's
+    /// `rebuild_edges_widened`) applied to the four tables that still carry
+    /// `entity_id ... REFERENCES entities(id) ON DELETE CASCADE`:
+    /// `entity_page_map`, `observations`, `memory_entities`,
+    /// `entity_minhash_bands`. Each is rebuilt at its CURRENT-at-tip schema
+    /// shape (matching the fresh-install DDL near the top of this file, not
+    /// any single historical migration's partial ALTER), minus that one
+    /// clause. Every other column, type, default, and constraint is
+    /// unchanged; `entity_page_map.page_id`'s `REFERENCES pages(id) ON
+    /// DELETE CASCADE` is untouched -- only the entities edge is cut.
+    ///
+    /// Verified by direct schema read before writing this migration: none
+    /// of the four is the target of any OTHER table's foreign key (a repo-
+    /// wide grep for `REFERENCES entity_page_map`/`observations`/
+    /// `memory_entities`/`entity_minhash_bands` finds nothing), so cutting
+    /// their outbound edge into `entities` cannot leave a dangling reference
+    /// anywhere else. `entity_aliases` is deliberately NOT in this list --
+    /// item 4 (this same PR) already retired that table's storage path, and
+    /// its own `REFERENCES entities(id)` guard comments describe a FK this
+    /// migration does not touch.
+    ///
+    /// Attached-object accounting (verified by a repo-wide trigger-body
+    /// scan, not assumed): three of the four tables carry no triggers and
+    /// are referenced in no other trigger's body, so their rebuild is a
+    /// plain create/copy/drop/rename. `entity_page_map` is the one
+    /// exception, on both counts:
+    ///   1. It owns three attached triggers (`m4_page_community_map_*`,
+    ///      `db.rs:11537-11560`) that `DROP TABLE entity_page_map` takes
+    ///      with it. They are hand-replayed verbatim below rather than
+    ///      captured generically the way `rebuild_edges_widened` captures
+    ///      `edges`'s attached objects -- `edges` earned that generality
+    ///      because it accumulates unrelated triggers across migrations
+    ///      with real churn; these three are one migration's (M4 community
+    ///      grouping) stable, exhaustively-verified set on a table nothing
+    ///      else attaches to.
+    ///   2. `edges_space_fence`/`edges_space_fence_update` (migration 121)
+    ///      read `entity_page_map` by name in their CASE body without being
+    ///      attached to it, which makes `ALTER TABLE entity_page_map_new
+    ///      RENAME TO entity_page_map` hit the exact reparse trap
+    ///      `rename_into_place`'s doc comment describes for `edges`/`pages`:
+    ///      SQLite revalidates every trigger body during the rename, and
+    ///      the fence's body names a table that is momentarily absent
+    ///      (dropped, not yet renamed back into place). `legacy_alter_table`
+    ///      suppresses that reparse for this one statement, exactly as it
+    ///      does there.
+    ///
+    /// `PRAGMA foreign_keys` is suspended around the whole rebuild for the
+    /// same reason migration 98 suspends it: the four tables are dropped
+    /// and recreated inside one transaction, and enforcement would reject
+    /// the intermediate state. `foreign_key_check`, scoped to each rebuilt
+    /// table individually (never the bare pragma -- see migration 98's
+    /// comment on why an unrelated pre-existing orphan must not abort an
+    /// unrelated rebuild), runs before commit so the suspension cannot hide
+    /// a reference the rebuild itself broke.
+    async fn migrate_122_relax_entity_fk_dependents(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(122, prior_version).await?;
+
+        let conn = self.conn.lock().await;
+        conn.execute("PRAGMA foreign_keys = OFF", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m122 fk off: {error}")))?;
+
+        let result: Result<(), WenlanError> = async {
+            let tx = conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m122 begin: {error}")))?;
+
+            // -- observations: no attached triggers of its own, and no
+            // other trigger's body names it by text. But `ALTER TABLE ...
+            // RENAME TO` always triggers a schema-WIDE reparse (SQLite
+            // >=3.25) of every trigger/view in the database, not only ones
+            // referencing the renamed table -- proven the hard way: this
+            // rename aborted under `migration_96_converges_local_only_...`'s
+            // deliberately-inconsistent old-shape fixture, where an
+            // unrelated leftover trigger (`m4_parity_input_entity_insert`,
+            // attached to `entities`) named a table
+            // (`community_parity_input_state`) that didn't exist yet at
+            // that point in the replay. `legacy_alter_table` sidesteps the
+            // reparse for the rename statement itself, same as
+            // `entity_page_map`'s rename below and `edges_rebuild.rs`'s
+            // `rename_into_place` -- applied to all four renames in this
+            // migration now, not only the one with a *known* cross-reference,
+            // since the trap fires on ANY broken trigger anywhere in the
+            // schema, not just ones naming the table being renamed.
+            tx.execute_batch(
+                "CREATE TABLE observations_new (
+                    id TEXT PRIMARY KEY,
+                    entity_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    source_memory_id TEXT,
+                    source_agent TEXT,
+                    confidence REAL,
+                    confirmed INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO observations_new (
+                    id, entity_id, content, source_memory_id, source_agent,
+                    confidence, confirmed, created_at
+                )
+                SELECT id, entity_id, content, source_memory_id, source_agent,
+                       confidence, confirmed, created_at
+                FROM observations ORDER BY id;
+                DROP TABLE observations;",
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("m122 rebuild observations: {error}"))
+            })?;
+            Self::m122_rename_into_place(&tx, "observations_new", "observations").await?;
+            tx.execute_batch(
+                "CREATE INDEX idx_observations_entity ON observations(entity_id);
+                CREATE INDEX idx_observations_source_memory
+                    ON observations(source_memory_id)
+                    WHERE source_memory_id IS NOT NULL;",
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("m122 reindex observations: {error}"))
+            })?;
+
+            // -- memory_entities: same schema-wide-reparse hazard as
+            // observations above.
+            tx.execute_batch(
+                "CREATE TABLE memory_entities_new (
+                    memory_id TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    PRIMARY KEY (memory_id, entity_id)
+                );
+                INSERT INTO memory_entities_new (memory_id, entity_id)
+                SELECT memory_id, entity_id FROM memory_entities
+                ORDER BY memory_id, entity_id;
+                DROP TABLE memory_entities;",
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("m122 rebuild memory_entities: {error}"))
+            })?;
+            Self::m122_rename_into_place(&tx, "memory_entities_new", "memory_entities").await?;
+            tx.execute_batch(
+                "CREATE INDEX idx_memory_entities_entity_memory
+                    ON memory_entities(entity_id, memory_id);",
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("m122 reindex memory_entities: {error}"))
+            })?;
+
+            // -- entity_minhash_bands: same schema-wide-reparse hazard as
+            // observations above.
+            tx.execute_batch(
+                "CREATE TABLE entity_minhash_bands_new (
+                    band_key INTEGER NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    PRIMARY KEY (band_key, entity_id)
+                );
+                INSERT INTO entity_minhash_bands_new (band_key, entity_id)
+                SELECT band_key, entity_id FROM entity_minhash_bands
+                ORDER BY band_key, entity_id;
+                DROP TABLE entity_minhash_bands;",
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("m122 rebuild entity_minhash_bands: {error}"))
+            })?;
+            Self::m122_rename_into_place(&tx, "entity_minhash_bands_new", "entity_minhash_bands")
+                .await?;
+            tx.execute_batch(
+                "CREATE INDEX idx_minhash_band_key ON entity_minhash_bands(band_key);",
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("m122 reindex entity_minhash_bands: {error}"))
+            })?;
+
+            // -- entity_page_map: three attached triggers dropped with the
+            // table, hand-replayed verbatim (body copied from
+            // db.rs:11537-11560). `page_id`'s `REFERENCES pages(id) ON
+            // DELETE CASCADE` is preserved -- only the `entities` edge is
+            // cut. Same schema-wide-reparse hazard as the other three
+            // tables above; this one has a KNOWN cross-reference too
+            // (edges_space_fence/edges_space_fence_update, migration 121,
+            // attached to `edges`, name `entity_page_map` in their CASE
+            // body), which is what surfaced the hazard in the first place.
+            tx.execute_batch(
+                "CREATE TABLE entity_page_map_new (
+                    entity_id TEXT NOT NULL PRIMARY KEY,
+                    page_id TEXT NOT NULL UNIQUE REFERENCES pages(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO entity_page_map_new (entity_id, page_id, created_at)
+                SELECT entity_id, page_id, created_at FROM entity_page_map
+                ORDER BY entity_id;
+                DROP TABLE entity_page_map;",
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("m122 rebuild entity_page_map: {error}"))
+            })?;
+            Self::m122_rename_into_place(&tx, "entity_page_map_new", "entity_page_map").await?;
+
+            tx.execute_batch(
+                "CREATE TRIGGER m4_page_community_map_insert_invalidate
+                 AFTER INSERT ON entity_page_map
+                 BEGIN
+                   UPDATE community_route_space_inputs
+                      SET generation=generation + 1
+                    WHERE space=(SELECT space FROM pages WHERE id=NEW.page_id);
+                 END;
+                 CREATE TRIGGER m4_page_community_map_delete_invalidate
+                 AFTER DELETE ON entity_page_map
+                 BEGIN
+                   UPDATE community_route_space_inputs
+                      SET generation=generation + 1
+                    WHERE space=(SELECT space FROM pages WHERE id=OLD.page_id);
+                 END;
+                 CREATE TRIGGER m4_page_community_map_update_invalidate
+                 AFTER UPDATE OF entity_id, page_id ON entity_page_map
+                 BEGIN
+                   UPDATE community_route_space_inputs
+                      SET generation=generation + 1
+                    WHERE space=(SELECT space FROM pages WHERE id=OLD.page_id)
+                       OR space=(SELECT space FROM pages WHERE id=NEW.page_id);
+                 END;",
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("m122 replay entity_page_map triggers: {error}"))
+            })?;
+
+            // Scoped foreign_key_check per rebuilt table -- never the bare
+            // pragma, which would abort on an unrelated pre-existing orphan
+            // elsewhere in the database (migration 98's rationale, applied
+            // here verbatim).
+            for table in [
+                "observations",
+                "memory_entities",
+                "entity_minhash_bands",
+                "entity_page_map",
+            ] {
+                let mut violations = tx
+                    .query(&format!("PRAGMA foreign_key_check({table})"), ())
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("m122 fk check {table}: {error}"))
+                    })?;
+                let violation = violations.next().await.map_err(|error| {
+                    WenlanError::VectorDb(format!("m122 fk check {table} read: {error}"))
+                })?;
+                if violation.is_some() {
+                    return Err(WenlanError::VectorDb(format!(
+                        "m122 rebuild left a dangling foreign-key reference on {table}"
+                    )));
+                }
+            }
+
+            tx.commit()
+                .await
+                .map_err(|error| WenlanError::VectorDb(format!("m122 commit: {error}")))
+        }
+        .await;
+
+        conn.execute("PRAGMA foreign_keys = ON", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m122 fk on: {error}")))?;
+        result?;
+
+        conn.execute("PRAGMA user_version = 122", ())
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("m122 bump: {error}")))?;
+        log::info!(
+            "[migration] Migration 122 applied: entity_page_map/observations/memory_entities/\
+             entity_minhash_bands rebuilt without their entities foreign key"
         );
         Ok(())
     }
@@ -21972,6 +22304,58 @@ impl MemoryDB {
                 .await
                 .map_err(|e| {
                     WenlanError::VectorDb(format!("delete_space delete shadow pages: {}", e))
+                })?;
+                // G6 Stage 2 PR 2c sub-step 3 (m122): migration 122 relaxed
+                // the entities-referencing FK on memory_entities/
+                // observations/entity_minhash_bands, so nothing cascades
+                // from the `DELETE FROM entities` below anymore -- same gap
+                // fixed in delete_entity, extended here to the space-scoped
+                // bulk delete.
+                tx.execute(
+                    "DELETE FROM memory_entities \
+                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                    libsql::params![name],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("delete_space delete memory_entities: {}", e))
+                })?;
+                tx.execute(
+                    "DELETE FROM observations \
+                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                    libsql::params![name],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("delete_space delete observations: {}", e))
+                })?;
+                tx.execute(
+                    "DELETE FROM entity_minhash_bands \
+                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                    libsql::params![name],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!(
+                        "delete_space delete entity_minhash_bands: {}",
+                        e
+                    ))
+                })?;
+                // Belt-and-suspenders (mirrors delete_entity's own): the
+                // shadow-page delete above is guarded by `kind = 'entity'`,
+                // so a stray entity_page_map row pointing at a page that
+                // never got that kind would otherwise survive it. Before
+                // m122, entity_page_map's entities-side FK cascade cleaned
+                // such a row up regardless of page kind; m122 relaxed that
+                // FK, so this explicit delete restores the same coverage.
+                tx.execute(
+                    "DELETE FROM entity_page_map \
+                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                    libsql::params![name],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("delete_space delete entity_page_map: {}", e))
                 })?;
                 tx.execute(
                     "DELETE FROM entities WHERE space = ?1",
@@ -34131,6 +34515,37 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete_entity aliases: {e}")))?;
 
+            // G6 Stage 2 PR 2c sub-step 3 (m122 fold-in): migration 122
+            // relaxed memory_entities/observations/entity_minhash_bands'
+            // `entity_id ... REFERENCES entities(id) ON DELETE CASCADE` (the
+            // same motivation as entity_aliases above -- a shadow-only
+            // entity id must be insertable), so these three no longer clean
+            // up for free when `entities` loses a row. Explicit deletes
+            // restore the pre-m122 behavior. Can't call
+            // `delete_entity_minhash_bands` here -- it takes its own
+            // `conn.lock()`, which would deadlock against the one already
+            // held in this transaction.
+            conn.execute(
+                "DELETE FROM memory_entities WHERE entity_id = ?1",
+                libsql::params![entity_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("delete_entity memory_entities: {e}")))?;
+            conn.execute(
+                "DELETE FROM observations WHERE entity_id = ?1",
+                libsql::params![entity_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("delete_entity observations: {e}")))?;
+            conn.execute(
+                "DELETE FROM entity_minhash_bands WHERE entity_id = ?1",
+                libsql::params![entity_id],
+            )
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("delete_entity entity_minhash_bands: {e}"))
+            })?;
+
             // Delete the entity's shadow page (M3 PR-1 item C). The
             // `entity_page_map` row has an ON DELETE CASCADE FK to `pages`, so
             // deleting the shadow removes the map row too; the subsequent
@@ -34147,6 +34562,20 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("delete_entity shadow: {e}")))?;
             }
+
+            // G6 Stage 2 PR 2c sub-step 3 (m122 fold-in): belt-and-suspenders.
+            // The shadow-page delete above is guarded by `kind = 'entity'`;
+            // before m122, entity_page_map's own `entities` FK cascade
+            // cleaned up a stray map row regardless of the page's kind (a
+            // schema-level guarantee, not an application-level one). m122
+            // relaxed that FK, so this explicit delete restores the same
+            // coverage.
+            conn.execute(
+                "DELETE FROM entity_page_map WHERE entity_id = ?1",
+                libsql::params![entity_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("delete_entity entity_page_map: {e}")))?;
 
             conn.execute(
                 "DELETE FROM entities WHERE id = ?1",

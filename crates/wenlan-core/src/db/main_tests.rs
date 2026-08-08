@@ -17361,6 +17361,147 @@ async fn delete_space_delete_removes_entity_shadow_pages() {
 }
 
 #[tokio::test]
+async fn delete_space_delete_removes_entity_owned_graph_rows() {
+    // G6 Stage 2 PR 2c sub-step 3 (m122): migration 122 relaxed the
+    // entities-referencing FK on memory_entities/observations/
+    // entity_minhash_bands, so delete_space("delete")'s prior reliance on
+    // that cascade (see delete_space_delete_removes_entity_shadow_pages's
+    // now-stale comment, which predates m122) no longer clears these three
+    // tables. Mirrors delete_entity_rolls_back_and_clears_all_owned_references's
+    // coverage but for the space-scoped bulk delete path. The linked memory
+    // lives in a DIFFERENT space than the one being deleted, so any
+    // memory_entities cleanup observed here is attributable only to the
+    // entity-side handling under test, not to the memory row itself being
+    // swept away by delete_space's own memory-delete loop.
+    let (db, _dir) = test_db().await;
+    db.create_space("doomed_graph", None, false).await.unwrap();
+    let entity_id = db
+        .store_entity(
+            "Doomed Graphling",
+            "person",
+            Some("doomed_graph"),
+            Some("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    db.upsert_documents(vec![make_memory_doc(
+        "doomed_graph_bystander_memory",
+        "Memory in an unrelated space, linked to the doomed entity",
+        "knowledge",
+        "work",
+        "agent",
+    )])
+    .await
+    .unwrap();
+    db.link_memory_entities("doomed_graph_bystander_memory", &[entity_id.as_str()])
+        .await
+        .unwrap();
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO observations (id, entity_id, content, created_at) \
+             VALUES ('doomed_graph_obs', ?1, 'obs content', unixepoch())",
+            libsql::params![entity_id.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_minhash_bands (band_key, entity_id) VALUES (1, ?1)",
+            libsql::params![entity_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    db.delete_space("doomed_graph", "delete").await.unwrap();
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT
+                (SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?1),
+                (SELECT COUNT(*) FROM observations WHERE entity_id = ?1),
+                (SELECT COUNT(*) FROM entity_minhash_bands WHERE entity_id = ?1)",
+            libsql::params![entity_id],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(
+        row.get::<i64>(0).unwrap(),
+        0,
+        "memory_entities must be cleared when the entity's space is deleted"
+    );
+    assert_eq!(
+        row.get::<i64>(1).unwrap(),
+        0,
+        "observations must be cleared when the entity's space is deleted"
+    );
+    assert_eq!(
+        row.get::<i64>(2).unwrap(),
+        0,
+        "entity_minhash_bands must be cleared when the entity's space is deleted"
+    );
+}
+
+#[tokio::test]
+async fn delete_space_delete_removes_entity_page_map_row_without_entity_kind_page() {
+    // G6 Stage 2 PR 2c sub-step 3 (m122): mirrors
+    // migration_90_entity_page_map_cascades_on_entity_delete, but for
+    // delete_space's "delete" disposition. delete_space's shadow-page
+    // delete is guarded by `kind = 'entity'` (same guard delete_entity has),
+    // so a raw-seeded entity_page_map row pointing at a page that never got
+    // `kind = 'entity'` skips that delete entirely. Before m122 the
+    // entities-side FK cascade cleaned the map row anyway, regardless of
+    // page kind; m122 relaxed that FK, so without an explicit belt-and-
+    // suspenders delete the map row is now orphaned once its entity row is
+    // gone. Raw-seeded (not db.create_entity/store_entity) for the same
+    // reason migration_90's tests are: the normal helpers always mint a
+    // matching kind='entity' shadow, which would never exercise this gap.
+    let (db, _dir) = test_db().await;
+    db.create_space("doomed_raw", None, false).await.unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO entities (id, name, entity_type, space, created_at, updated_at) \
+             VALUES ('e_raw', 'Raw Entity', 'person', 'doomed_raw', 0, 0)",
+            (),
+        )
+        .await
+        .unwrap();
+        insert_test_page(&conn, "page_raw").await;
+        conn.execute(
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at) \
+             VALUES ('e_raw', 'page_raw', '2024-01-01T00:00:00Z')",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    db.delete_space("doomed_raw", "delete").await.unwrap();
+
+    let conn = db.conn.lock().await;
+    let remaining: i64 = {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM entity_page_map WHERE entity_id = ?1",
+                libsql::params!["e_raw"],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(
+        remaining, 0,
+        "map row must not be orphaned when its entity's space is deleted"
+    );
+}
+
+#[tokio::test]
 async fn delete_space_move_rejects_same_source_and_destination() {
     let (db, _dir) = test_db().await;
     db.create_space("same", None, false).await.unwrap();
@@ -22963,11 +23104,10 @@ async fn resolve_entity_by_alias_collision_picks_older_page_deterministically() 
     let newer_created = "2021-01-01T00:00:00Z";
     {
         let conn = db.conn.lock().await;
-        // `entity_page_map.entity_id` still carries `REFERENCES entities(id)
-        // ON DELETE CASCADE` until sub-step 3's FK-relaxation migration ships
-        // -- same simulate-future-state technique as
-        // `entity_enrichment_selector_requires_shadow_page_for_linkage`.
-        conn.execute("PRAGMA foreign_keys = OFF", ()).await.unwrap();
+        // Migration 122 relaxed `entity_page_map.entity_id`'s FK into
+        // `entities` -- these entity ids name shadow pages only, the
+        // ordinary post-flip state, so the raw seed below runs with
+        // `foreign_keys` left ON throughout.
         for (entity_id, page_id, created_at, title) in [
             (
                 older_entity,
@@ -23003,7 +23143,6 @@ async fn resolve_entity_by_alias_collision_picks_older_page_deterministically() 
             .await
             .unwrap();
         }
-        conn.execute("PRAGMA foreign_keys = ON", ()).await.unwrap();
     }
 
     let resolved = db.resolve_entity_by_alias("collide alias").await.unwrap();
@@ -25256,12 +25395,10 @@ async fn entity_enrichment_selector_requires_shadow_page_for_linkage() {
     let now_iso = chrono::Utc::now().to_rfc3339();
     {
         let conn = db.conn.lock().await;
-        // `entity_page_map.entity_id` still carries `REFERENCES entities(id)
-        // ON DELETE CASCADE` until sub-step 3's FK-relaxation migration
-        // ships, so toggle enforcement off for just these two inserts --
-        // same technique `community_discovery_surfaces_shadow_only_entity`
-        // uses to simulate the post-flip shadow-only state early.
-        conn.execute("PRAGMA foreign_keys = OFF", ()).await.unwrap();
+        // Migration 122 relaxed `entity_page_map.entity_id`'s (and
+        // `memory_entities.entity_id`'s) FK into `entities` -- a
+        // shadow-only entity id is the ordinary post-flip state, so this
+        // seed runs with `foreign_keys` left ON throughout.
         conn.execute(
             "INSERT INTO pages (
                 id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
@@ -25293,7 +25430,6 @@ async fn entity_enrichment_selector_requires_shadow_page_for_linkage() {
         )
         .await
         .unwrap();
-        conn.execute("PRAGMA foreign_keys = ON", ()).await.unwrap();
     }
 
     let extract_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -28845,7 +28981,12 @@ async fn test_migration_54_memory_entities_table() {
         .await;
     assert!(res.is_ok(), "insert should succeed (no FK on memory_id)");
 
-    // FK on entity_id rejects a bogus entity.
+    // G6 Stage 2 PR 2c sub-step 3 (m122): migration 122 relaxed
+    // memory_entities.entity_id's FK into entities(id) -- a shadow-only
+    // entity id (no `entities` row) must be linkable by design (acceptance
+    // criterion b). Pre-m122 this insert FK-failed against a bogus entity
+    // id; test_db()/MemoryDB::new() both run the full migration chain, so
+    // by the time this test runs the relaxed FK is already in effect.
     let res = conn
         .execute(
             "INSERT INTO memory_entities (memory_id, entity_id) VALUES ('mem_y', 'ent_bogus')",
@@ -28853,8 +28994,8 @@ async fn test_migration_54_memory_entities_table() {
         )
         .await;
     assert!(
-        res.is_err(),
-        "insert should fail (FK violation on entity_id)"
+        res.is_ok(),
+        "insert should succeed post-m122 (entity_id FK relaxed)"
     );
 }
 
@@ -45702,16 +45843,9 @@ async fn community_discovery_surfaces_shadow_only_entity() {
     let now_unix = chrono::Utc::now().timestamp();
     {
         let conn = db.conn.lock().await;
-        // `entity_page_map.entity_id` still carries `REFERENCES entities(id)
-        // ON DELETE CASCADE`, which makes a real post-flip entity-only
-        // shadow page impossible to insert today -- sub-step 3 (the writer
-        // flip) gains a migration to relax/repoint this FK; drop this
-        // PRAGMA workaround once that migration ships and the map row can
-        // be inserted directly. Toggle FK enforcement off for just these
-        // two inserts to simulate that future state early, same technique
-        // `get_entity_detail_normalizes_sentinel_space_to_none` below uses
-        // to simulate its not-yet-shipped fold migration.
-        conn.execute("PRAGMA foreign_keys = OFF", ()).await.unwrap();
+        // Migration 122 relaxed `entity_page_map.entity_id`'s FK into
+        // `entities`, so a real post-flip entity-only shadow page inserts
+        // directly with `foreign_keys` left ON throughout.
         conn.execute(
             "INSERT INTO pages (
                 id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
@@ -45732,7 +45866,6 @@ async fn community_discovery_surfaces_shadow_only_entity() {
         )
         .await
         .unwrap();
-        conn.execute("PRAGMA foreign_keys = ON", ()).await.unwrap();
 
         // Bridge `a` and `b` through the shadow-only entity via two
         // `lineage='legacy'` edges. D6's cross-space check on
@@ -50442,5 +50575,315 @@ async fn migration_121_split_survives_shadow_gap_during_m111_replay() {
         uv as u32,
         crate::db::SCHEMA_VERSION,
         "chain completes back to the current schema version, past migration 121"
+    );
+}
+
+/// G6 Stage 2 PR 2c sub-step 3 (m122), acceptance criterion (b): once
+/// `entity_page_map`/`observations`/`memory_entities`/`entity_minhash_bands`
+/// no longer carry `REFERENCES entities(id)`, a shadow-only entity id (a
+/// `kind='entity'` page + `entity_page_map` row with deliberately NO
+/// `entities` row -- the ordinary post-flip state once item 4, this same
+/// PR, stops writing `entities` at all) must be linkable through every one
+/// of the four rebuilt tables with `foreign_keys` left ON throughout.
+/// Reverting migration 122 (restoring any one table's `entities` FK) flips
+/// this from pass to fail with a `FOREIGN KEY constraint failed` error.
+#[tokio::test]
+async fn migration_122_shadow_only_entity_links_insert_with_fk_on() {
+    let (db, _dir) = test_db().await;
+    const SHADOW_ONLY_ID: &str = "m122-shadow-only-entity";
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    let now_unix = chrono::Utc::now().timestamp();
+
+    let conn = db.conn.lock().await;
+    let fk_state: i64 = {
+        let mut rows = conn.query("PRAGMA foreign_keys", ()).await.unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(
+        fk_state, 1,
+        "foreign_keys must be ON for this to be a real test of the relaxed FK"
+    );
+
+    conn.execute(
+        "INSERT INTO pages (
+            id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+            embedding, space, workspace, source_memory_ids, version, status,
+            created_at, last_compiled, last_modified, creation_kind, review_status
+         ) VALUES (
+            'm122-shadow-only-page', 'M122 Shadow Only', NULL, '', 'entity', 'concept', NULL, 0,
+            NULL, 'unfiled', 'unfiled', '[]', 1, 'active', ?1, ?1, ?1, 'entity', 'unconfirmed'
+         )",
+        libsql::params![now_iso.clone()],
+    )
+    .await
+    .expect("shadow page insert must succeed with foreign_keys ON");
+
+    conn.execute(
+        "INSERT INTO entity_page_map (entity_id, page_id, created_at)
+         VALUES (?1, 'm122-shadow-only-page', ?2)",
+        libsql::params![SHADOW_ONLY_ID, now_iso.clone()],
+    )
+    .await
+    .expect(
+        "entity_page_map insert for a shadow-only entity must succeed \
+         with foreign_keys ON (migration 122)",
+    );
+
+    conn.execute(
+        "INSERT INTO memory_entities (memory_id, entity_id) VALUES ('m122-mem', ?1)",
+        libsql::params![SHADOW_ONLY_ID],
+    )
+    .await
+    .expect(
+        "memory_entities insert for a shadow-only entity must succeed \
+         with foreign_keys ON (migration 122)",
+    );
+
+    // Same fix, same shape -- the other two m122-rebuilt tables accept a
+    // shadow-only entity id too.
+    conn.execute(
+        "INSERT INTO observations
+            (id, entity_id, content, source_memory_id, source_agent, confidence, confirmed, created_at)
+         VALUES ('m122-obs', ?1, 'shadow-only observation', NULL, 'test', NULL, 0, ?2)",
+        libsql::params![SHADOW_ONLY_ID, now_unix],
+    )
+    .await
+    .expect(
+        "observations insert for a shadow-only entity must succeed \
+         with foreign_keys ON (migration 122)",
+    );
+
+    conn.execute(
+        "INSERT INTO entity_minhash_bands (band_key, entity_id) VALUES (12345, ?1)",
+        libsql::params![SHADOW_ONLY_ID],
+    )
+    .await
+    .expect(
+        "entity_minhash_bands insert for a shadow-only entity must succeed \
+         with foreign_keys ON (migration 122)",
+    );
+}
+
+/// G6 Stage 2 PR 2c sub-step 3 (m122), acceptance criterion (c): the
+/// create/copy/drop/rename rebuild must not lose data. Seeds rows in all
+/// four tables migration 122 rebuilds (mixing a real entity id with a
+/// shadow-only one, so the rebuild's blind `SELECT ... FROM X` copy is
+/// proven indifferent to which kind of row it is moving), rolls
+/// `user_version` back to 121, then reruns `run_migrations` -- the table
+/// SHAPES are already the rebuilt shape from `test_db()`'s initial
+/// migration pass, but the dispatch chain only consults `user_version`, so
+/// this exercises `migrate_122_relax_entity_fk_dependents`'s rebuild again
+/// exactly as an upgrading database's replay would, and doubles as an
+/// idempotent-rerun check. Row counts and spot-checked content must survive
+/// unchanged.
+#[tokio::test]
+async fn migration_122_rebuild_preserves_existing_rows_across_replay() {
+    let (db, _dir) = test_db().await;
+    let real_entity = db
+        .store_entity("M122 Preserve", "concept", None, Some("test"), None)
+        .await
+        .unwrap();
+    const SHADOW_ONLY_ID: &str = "m122-preserve-shadow";
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    let now_unix = chrono::Utc::now().timestamp();
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO pages (
+                id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+                embedding, space, workspace, source_memory_ids, version, status,
+                created_at, last_compiled, last_modified, creation_kind, review_status
+             ) VALUES (
+                'm122-preserve-page', 'M122 Preserve Shadow', NULL, '', 'entity', 'concept', NULL, 0,
+                NULL, 'unfiled', 'unfiled', '[]', 1, 'active', ?1, ?1, ?1, 'entity', 'unconfirmed'
+             )",
+            libsql::params![now_iso.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at)
+             VALUES (?1, 'm122-preserve-page', ?2)",
+            libsql::params![SHADOW_ONLY_ID, now_iso.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations
+                (id, entity_id, content, source_memory_id, source_agent, confidence, confirmed, created_at)
+             VALUES ('m122-preserve-obs', ?1, 'preserve me across the rebuild', NULL, 'test', 0.5, 1, ?2)",
+            libsql::params![real_entity.as_str(), now_unix],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_entities (memory_id, entity_id) VALUES ('m122-preserve-mem-real', ?1)",
+            libsql::params![real_entity.as_str()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_entities (memory_id, entity_id) VALUES ('m122-preserve-mem-shadow', ?1)",
+            libsql::params![SHADOW_ONLY_ID],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_minhash_bands (band_key, entity_id) VALUES (54321, ?1)",
+            libsql::params![SHADOW_ONLY_ID],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn table_count(conn: &libsql::Connection, table: &str) -> i64 {
+        let mut rows = conn
+            .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
+    // Index + trigger inventory for the four m122-rebuilt tables, normalized
+    // (whitespace collapsed) so a DROP TABLE followed by a byte-identical
+    // recreate can't silently pass while a REFORMATTED-but-different
+    // recreate would fail loud. sqlite_autoindex_* entries (SQL is NULL,
+    // auto-generated from PRIMARY KEY/UNIQUE column constraints already in
+    // the CREATE TABLE body) are excluded on purpose -- they need no replay
+    // code of their own, so comparing them would only assert that SQLite's
+    // own autoindex-naming scheme is stable, not that migration 122 did its
+    // job.
+    async fn schema_objects(conn: &libsql::Connection) -> Vec<(String, String, String)> {
+        let mut rows = conn
+            .query(
+                "SELECT type, name, sql FROM sqlite_master \
+                 WHERE tbl_name IN ('entity_page_map','observations','memory_entities','entity_minhash_bands') \
+                 AND type IN ('index','trigger') \
+                 AND name NOT LIKE 'sqlite_autoindex_%' \
+                 ORDER BY type, name",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut objects = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            let obj_type: String = row.get(0).unwrap();
+            let name: String = row.get(1).unwrap();
+            let sql: String = row.get::<String>(2).unwrap();
+            let normalized: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            objects.push((obj_type, name, normalized));
+        }
+        objects
+    }
+
+    let (before_epm, before_obs, before_me, before_bands, before_schema) = {
+        let conn = db.conn.lock().await;
+        (
+            table_count(&conn, "entity_page_map").await,
+            table_count(&conn, "observations").await,
+            table_count(&conn, "memory_entities").await,
+            table_count(&conn, "entity_minhash_bands").await,
+            schema_objects(&conn).await,
+        )
+    };
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("PRAGMA user_version = 121", ()).await.unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("migration 122 rerun must not fail or lose data on an already-rebuilt table");
+
+    let conn = db.conn.lock().await;
+    let after_epm = table_count(&conn, "entity_page_map").await;
+    let after_obs = table_count(&conn, "observations").await;
+    let after_me = table_count(&conn, "memory_entities").await;
+    let after_bands = table_count(&conn, "entity_minhash_bands").await;
+    let after_schema = schema_objects(&conn).await;
+    assert_eq!(
+        before_schema, after_schema,
+        "the rebuild's index + trigger inventory (name, normalized SQL) for \
+         entity_page_map/observations/memory_entities/entity_minhash_bands \
+         must be identical before and after the replay -- a dropped index \
+         or trigger that DROP TABLE destroys and the migration forgets to \
+         recreate would otherwise pass silently on row counts alone"
+    );
+    assert_eq!(
+        before_epm, after_epm,
+        "entity_page_map row count must survive the rebuild"
+    );
+    assert_eq!(
+        before_obs, after_obs,
+        "observations row count must survive the rebuild"
+    );
+    assert_eq!(
+        before_me, after_me,
+        "memory_entities row count must survive the rebuild"
+    );
+    assert_eq!(
+        before_bands, after_bands,
+        "entity_minhash_bands row count must survive the rebuild"
+    );
+
+    let preserved_page_id: String = {
+        let mut rows = conn
+            .query(
+                "SELECT page_id FROM entity_page_map WHERE entity_id = ?1",
+                libsql::params![SHADOW_ONLY_ID],
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .expect("shadow-only entity_page_map row must survive")
+            .get(0)
+            .unwrap()
+    };
+    assert_eq!(preserved_page_id, "m122-preserve-page");
+
+    let preserved_content: String = {
+        let mut rows = conn
+            .query(
+                "SELECT content FROM observations WHERE id = 'm122-preserve-obs'",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .expect("observation row must survive")
+            .get(0)
+            .unwrap()
+    };
+    assert_eq!(preserved_content, "preserve me across the rebuild");
+
+    let band_entity: String = {
+        let mut rows = conn
+            .query(
+                "SELECT entity_id FROM entity_minhash_bands WHERE band_key = 54321",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .expect("entity_minhash_bands row must survive")
+            .get(0)
+            .unwrap()
+    };
+    assert_eq!(band_entity, SHADOW_ONLY_ID);
+
+    let mut vrows = conn.query("PRAGMA user_version", ()).await.unwrap();
+    let uv: i64 = vrows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(
+        uv as u32,
+        crate::db::SCHEMA_VERSION,
+        "chain completes back to the current schema version, past migration 122"
     );
 }
