@@ -30628,10 +30628,10 @@ async fn test_migration_55_pass_b_self_heals_orphaned_entity_id() {
         .unwrap();
     }
 
-    // G6 Stage 3: restore the pre-123 substrate the self-heal arm reads, with
-    // `e_real` in it and `e_ghost` absent -- which is exactly the deleted-entity
-    // shape this regression is about.
-    db.test_restore_legacy_entity_rows().await.unwrap();
+    // No legacy substrate is restored here on purpose. The self-heal arm reads
+    // canonical entity membership, so `e_real` (seeded above as a shadow page)
+    // is live and `e_ghost` is not -- exactly the deleted-entity shape this
+    // regression is about, on the store shape a fresh install actually has.
 
     // Must NOT crash on the orphaned FK ref (the 0.8.4 bug).
     db.run_migration_55_pass_b()
@@ -52253,4 +52253,374 @@ async fn community_pipeline_survives_entity_retirement_end_to_end() {
     db.reconcile_pending_community_readers()
         .await
         .expect("the reader reconcile the refinery runs next must not fault");
+}
+
+/// The fresh-install shape for migration 55 Pass B.
+///
+/// Server startup calls `run_migration_55` unconditionally, before it binds
+/// HTTP. Pass B's idempotency receipt is written by Pass B and by nothing else,
+/// so a brand-new install reaches it with no receipt and runs the body for
+/// real — including the self-heal, which before Stage 3 read `entities`. A
+/// fresh install replays the chain to 123, which drops that table, so the
+/// legacy predicate would have failed `no such table: entities` and aborted
+/// startup for every new user. The existing tests all ran against stores that
+/// carry the receipt, which is exactly why none of them saw it.
+#[tokio::test]
+async fn migration_55_pass_b_runs_on_a_fresh_install_at_the_retirement_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = MemoryDB::new(
+        &tmp.path().join("fresh"),
+        Arc::new(crate::events::NoopEmitter),
+    )
+    .await
+    .expect("a fresh install must open");
+
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        let version: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            version,
+            i64::from(SCHEMA_VERSION),
+            "fixture precondition: a fresh install replays the whole chain"
+        );
+        assert!(
+            !legacy_table_present(&conn, "entities").await.unwrap(),
+            "fixture precondition: migration 123 has dropped `entities`"
+        );
+    }
+    assert!(
+        db.get_app_metadata("backfill_memory_entities_v1")
+            .await
+            .unwrap()
+            .is_none(),
+        "fixture precondition: a fresh install carries no Pass B receipt, so the body runs"
+    );
+
+    db.run_migration_55()
+        .await
+        .expect("startup runs migration 55 before binding HTTP; a fresh install must survive it");
+}
+
+/// Pass B's self-heal decides what an orphan IS, and post-Stage-3 that has to
+/// mean the same thing it means everywhere else: no `kind='entity'` shadow page
+/// reachable through `entity_page_map` — `entity_exists`'s own predicate.
+///
+/// Both halves matter. Nulling everything would be a passing "self-heal" that
+/// silently destroys every real link; nulling nothing would leave orphans to be
+/// backfilled as links to entities that do not exist.
+#[tokio::test]
+async fn migration_55_pass_b_self_heals_against_canonical_entity_membership() {
+    let (db, _dir) = test_db().await;
+
+    db.test_seed_entity_shadow_page(TestEntity::new("ent_live", "Live Entity", "concept"))
+        .await
+        .unwrap();
+
+    {
+        let conn = db.conn.lock().await;
+        for (id, source_id, entity_id) in [
+            ("c_live", "mem_m55b_live", "ent_live"),
+            ("c_orphan", "mem_m55b_orphan", "ent_never_existed"),
+        ] {
+            conn.execute(
+                "INSERT INTO memories (id, content, source, source_id, title, chunk_index, \
+                 last_modified, chunk_type, entity_id) \
+                 VALUES (?1, 'body', 'memory', ?2, 't', 0, 0, 'text', ?3)",
+                libsql::params![id, source_id, entity_id],
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    db.run_migration_55_pass_b()
+        .await
+        .expect("pass B must complete");
+
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT source_id, entity_id FROM memories \
+                 WHERE source_id LIKE 'mem_m55b_%' ORDER BY source_id",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            seen.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<Option<String>>(1).unwrap(),
+            ));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ("mem_m55b_live".to_string(), Some("ent_live".to_string())),
+                ("mem_m55b_orphan".to_string(), None),
+            ],
+            "an id with a live shadow page keeps its link; one without is nulled"
+        );
+
+        let mut rows = conn
+            .query(
+                "SELECT entity_id FROM memory_entities WHERE memory_id LIKE 'mem_m55b_%'",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut links = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            links.push(row.get::<String>(0).unwrap());
+        }
+        assert_eq!(
+            links,
+            vec!["ent_live".to_string()],
+            "only the canonical entity earns a backfilled link"
+        );
+    }
+}
+
+/// The downgrade barrier has to fire before the constructor writes, not merely
+/// before it migrates.
+///
+/// `run_migrations` is the LAST thing `MemoryDB::new` calls. By the time the
+/// old check ran, the constructor had already set `journal_mode=WAL`, swept
+/// legacy `chunks` artifacts, and executed `SCHEMA` plus the FTS and trigger
+/// DDL against a store built by a build it does not understand. So the
+/// assertion here is not just "it refused" — it is that `sqlite_master` is
+/// byte-identical afterwards. A barrier that refuses after writing is a
+/// post-mortem.
+#[tokio::test]
+async fn the_downgrade_barrier_refuses_before_the_constructor_writes_anything() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("newer");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_file = root.join("origin_memory.db");
+
+    let schema_snapshot = |file: std::path::PathBuf| async move {
+        let raw = libsql::Builder::new_local(file.to_string_lossy().to_string())
+            .build()
+            .await
+            .unwrap();
+        let conn = raw.connect().unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT type || '|' || name FROM sqlite_master ORDER BY type, name",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut objects = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            objects.push(row.get::<String>(0).unwrap());
+        }
+        objects
+    };
+
+    {
+        let raw = libsql::Builder::new_local(db_file.to_string_lossy().to_string())
+            .build()
+            .await
+            .unwrap();
+        let conn = raw.connect().unwrap();
+        conn.execute(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1), ())
+            .await
+            .unwrap();
+    }
+    let before = schema_snapshot(db_file.clone()).await;
+
+    let refusal = match MemoryDB::new(&root, Arc::new(crate::events::NoopEmitter)).await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a database newer than this build must refuse at the constructor"),
+    };
+    assert!(
+        refusal.contains("newer than this build supports"),
+        "the barrier must say why it refused: {refusal}"
+    );
+
+    let after = schema_snapshot(db_file.clone()).await;
+    assert_eq!(
+        after, before,
+        "the refused open must leave the schema untouched — no SCHEMA, no FTS, no triggers"
+    );
+
+    // Control: the same file at the same path, with only `user_version` changed
+    // back to 0, opens and migrates. So the refusal above is the barrier and not
+    // an unrelated constructor failure on this fixture.
+    {
+        let raw = libsql::Builder::new_local(db_file.to_string_lossy().to_string())
+            .build()
+            .await
+            .unwrap();
+        let conn = raw.connect().unwrap();
+        conn.execute("PRAGMA user_version = 0", ()).await.unwrap();
+    }
+    let opened = MemoryDB::new(&root, Arc::new(crate::events::NoopEmitter))
+        .await
+        .expect("the same fixture below the barrier must open");
+    {
+        let conn = opened.conn.lock().await;
+        let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            i64::from(SCHEMA_VERSION),
+            "the control must actually migrate, or it proves nothing about the refusal"
+        );
+    }
+}
+
+/// The residue an older build leaves behind, and the residue that is not
+/// residue at all.
+///
+/// A pre-123 build opening a retired store runs its own `SCHEMA` — which still
+/// carries `CREATE TABLE IF NOT EXISTS entities` — before its barrier refuses,
+/// so it leaves an empty shell and quits. Nothing removed it: the
+/// reconstruction path early-returns at 123 and above. Rows flip the answer,
+/// because boot is no place to decide which copy of entity data is right.
+#[tokio::test]
+async fn an_empty_legacy_entity_shell_is_swept_from_a_retired_store() {
+    let (db, _dir) = test_db().await;
+    db.test_create_legacy_entity_tables().await.unwrap();
+    {
+        let conn = db.conn.lock().await;
+        for name in ["entities", "entity_aliases"] {
+            assert!(
+                legacy_table_present(&conn, name).await.unwrap(),
+                "fixture precondition: the older build's shell is present ({name})"
+            );
+        }
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("a retired store carrying an empty shell must still boot");
+
+    {
+        let conn = db.conn.lock().await;
+        for name in ["entities", "entity_aliases"] {
+            assert!(
+                !legacy_table_present(&conn, name).await.unwrap(),
+                "an empty `{name}` shell on a retired store is schema residue and must be swept"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_populated_legacy_entity_shell_survives_a_retired_boot() {
+    let (db, _dir) = test_db().await;
+    db.test_create_legacy_entity_tables().await.unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO entities (id, name, entity_type, created_at, updated_at) \
+             VALUES ('ent_unknown_provenance', 'Unknown', 'concept', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("a retired store carrying unexplained legacy rows must still boot");
+
+    {
+        let conn = db.conn.lock().await;
+        assert!(
+            legacy_table_present(&conn, "entities").await.unwrap(),
+            "rows of unknown provenance are never destroyed at boot"
+        );
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM entities", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            1,
+            "the row must survive untouched"
+        );
+        assert!(
+            legacy_table_present(&conn, "entity_aliases").await.unwrap(),
+            "the pair is handled together: `entity_aliases` references `entities(id)`"
+        );
+    }
+}
+
+/// Reconstruction refuses where it cannot be right — and the discriminator is
+/// the SHAPE, not the stamped version.
+///
+/// `LEGACY_ENTITIES_SCHEMA_V122` spells `space`, which migration 50 is what
+/// renames `domain` into. Hand it to a store that is still `domain`-shaped and
+/// migration 50 later tries to rename a column that is already there. But the
+/// version number cannot tell you which store you have: a fixture that rewound
+/// `user_version` on a fully migrated database stamps 44 while being
+/// version-122-shaped, and refusing that one would break every rewind fixture
+/// in this suite (`test_migration_45_folds_goal_to_identity` and
+/// `test_migration_49_pages_changelog_column` are the two that prove it). So
+/// both halves are asserted at the SAME version, differing only in whether
+/// `memories` carries `space`.
+#[tokio::test]
+async fn reconstruction_refuses_a_pre_rename_shape_and_serves_a_rewound_one() {
+    let dir = tempdir().unwrap();
+    const STAMPED: i64 = 44;
+
+    let fixture = |name: &'static str, space_column: &'static str| {
+        let path = dir.path().join(name);
+        async move {
+            let raw = libsql::Builder::new_local(path.to_string_lossy().to_string())
+                .build()
+                .await
+                .unwrap();
+            let conn = raw.connect().unwrap();
+            conn.execute(
+                &format!("CREATE TABLE memories (id TEXT PRIMARY KEY, {space_column} TEXT)"),
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(&format!("PRAGMA user_version = {STAMPED}"), ())
+                .await
+                .unwrap();
+            (raw, conn)
+        }
+    };
+
+    // Genuinely mid-chain: `memories` has not been renamed yet, so this store
+    // predates migration 50 and its `entities` shape cannot be rebuilt.
+    let (_pre_raw, pre_rename) = fixture("pre_rename.db", "domain").await;
+    let refusal = ensure_legacy_entities_table(&pre_rename)
+        .await
+        .expect_err("a `domain`-shaped store must refuse, not synthesize a `space`-shaped table")
+        .to_string();
+    assert!(
+        refusal.contains("corrupt"),
+        "the refusal must name the state: {refusal}"
+    );
+    assert!(
+        !legacy_table_present(&pre_rename, "entities").await.unwrap(),
+        "refusing means building nothing"
+    );
+
+    // Same stamped version, post-rename shape: a rewound fixture. It gets the
+    // version-122 shape back, which is what it was an instant ago.
+    let (_post_raw, rewound) = fixture("rewound.db", "space").await;
+    ensure_legacy_entities_table(&rewound)
+        .await
+        .expect("a version-122-shaped store gets the version-122 shape, whatever it stamped");
+    let mut rows = rewound
+        .query(
+            "SELECT COUNT(*) FROM pragma_table_info('entities') WHERE name = 'space'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        1,
+        "the reconstructed table must carry `space`, which is what makes it the post-50 shape"
+    );
 }

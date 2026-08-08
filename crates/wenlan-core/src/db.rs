@@ -3374,6 +3374,38 @@ const ENTITY_RETIREMENT_VERSION: i64 = 123;
 /// would hand the database a shape its own position does not imply.
 const ENTITY_ALIASES_VERSION: i64 = 41;
 
+/// Is this database past migration 50's `domain` -> `space` rename, whatever
+/// its stamped `user_version` says?
+///
+/// `LEGACY_ENTITIES_SCHEMA_V122` spells `space`, so handing it to a database
+/// that is still `domain`-shaped builds a table that never existed and then
+/// dies confusingly: migration 50 would `RENAME COLUMN domain TO space` on a
+/// table that already has `space`. The stamped version cannot answer this,
+/// because the two callers that arrive here with `entities` missing disagree
+/// about what their version means -- a genuinely mid-chain store is the shape
+/// its version implies, while a test fixture that rewound `user_version` on a
+/// migrated database is version-122-shaped no matter how low it stamped.
+///
+/// So ask the shape, not the number, using the exact signal migration 50 uses
+/// for its own idempotency probe: `memories.space`. Same question, same answer,
+/// one source of truth.
+async fn memories_carries_space(conn: &libsql::Connection) -> Result<bool, WenlanError> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = 'space'",
+            (),
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("legacy entities shape probe: {e}")))?;
+    Ok(rows
+        .next()
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("legacy entities shape probe row: {e}")))?
+        .and_then(|row| row.get::<i64>(0).ok())
+        .unwrap_or(0)
+        > 0)
+}
+
 /// Stand the pre-retirement `entities` substrate up when the chain is about to
 /// replay against it, so the frozen bodies below meet the table they were
 /// specified against. See `LEGACY_ENTITIES_SCHEMA` for why the DDL lives here
@@ -3392,7 +3424,11 @@ const ENTITY_ALIASES_VERSION: i64 = 41;
 ///   that: migration 123 committing its drop and crashing before the version
 ///   bump, or a test fixture rewinding `user_version` on a migrated database.
 ///   Both were shaped like a version-122 database an instant ago, so that is
-///   the shape they get back.
+///   the shape they get back — but only if they still look it. The check is
+///   `memories_carries_space`, not the stamped version: a rewound fixture is
+///   version-122-shaped however low it stamped, while a genuinely mid-chain
+///   store below migration 50 is `domain`-shaped and cannot be handed a
+///   `space`-shaped table. That one refuses and says so.
 ///
 /// The "already HAS the table" no-op has to be checked, not assumed from the
 /// version: a database mid-chain carries whatever shape its own position
@@ -3422,14 +3458,23 @@ async fn ensure_legacy_entities_table(conn: &libsql::Connection) -> Result<(), W
         .unwrap_or(0);
     drop(rows);
     if version >= ENTITY_RETIREMENT_VERSION {
-        return Ok(());
+        return sweep_legacy_entity_residue(conn).await;
     }
 
     if !legacy_table_present(conn, "entities").await? {
         let ddl = if version == 0 {
             LEGACY_ENTITIES_SCHEMA.to_string()
-        } else {
+        } else if memories_carries_space(conn).await? {
             LEGACY_ENTITIES_SCHEMA_V122.replace("{unfiled}", UNFILED_SPACE_ID)
+        } else {
+            return Err(WenlanError::VectorDb(format!(
+                "entities table missing at user_version {version} on a database that is still \
+                 `domain`-shaped — this store is corrupt (the table is only ever absent at 0 or \
+                 at/above {ENTITY_RETIREMENT_VERSION}, and a pre-migration-50 shape cannot be \
+                 reconstructed: the columns migrations 1..{version} added to a table that is now \
+                 gone do not come back). Restore from a backup rather than letting the upgrade \
+                 rebuild a store that never existed."
+            )));
         };
         conn.execute_batch(&ddl)
             .await
@@ -3441,6 +3486,120 @@ async fn ensure_legacy_entities_table(conn: &libsql::Connection) -> Result<(), W
             .await
             .map_err(|e| WenlanError::VectorDb(format!("legacy entity_aliases schema: {e}")))?;
     }
+    Ok(())
+}
+
+/// The downgrade barrier: a database migrated by a NEWER daemon is not ours to
+/// write to.
+///
+/// Every migration body is gated `if version < N`, so a newer `user_version`
+/// silently skips all of them and this build would go on writing against a
+/// schema it cannot see — ignoring columns and constraints added after it. This
+/// is not hypothetical: an older installed build can still be running and
+/// reopening the same file every few seconds. Refusing to open is the
+/// recoverable failure; writing is not.
+fn refuse_if_newer_schema(version: i64) -> Result<(), WenlanError> {
+    if version > i64::from(SCHEMA_VERSION) {
+        return Err(WenlanError::VectorDb(format!(
+            "database schema is version {version}, newer than this build supports \
+             ({SCHEMA_VERSION}); a newer Wenlan has already migrated it. Upgrade \
+             Wenlan (or quit the older copy) rather than letting this one write to it."
+        )));
+    }
+    Ok(())
+}
+
+/// `refuse_if_newer_schema` at open time, before this connection has written
+/// anything.
+///
+/// The barrier used to live only inside `run_migrations`, which is the last
+/// thing a constructor calls — by then it has already set `journal_mode=WAL`,
+/// swept legacy `chunks` artifacts, and executed `SCHEMA` plus the FTS and
+/// trigger DDL against a store built by a build it does not understand. A
+/// refusal that arrives after the writes is not a barrier. This runs
+/// immediately after `connect`, so a too-new database is left byte-identical;
+/// `run_migrations` keeps its own check as defense in depth for the callers
+/// that reach it by another route.
+async fn refuse_newer_schema_at_open(conn: &libsql::Connection) -> Result<(), WenlanError> {
+    let mut rows = conn
+        .query("PRAGMA user_version", ())
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("open-time schema version read: {e}")))?;
+    let version = rows
+        .next()
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("open-time schema version row: {e}")))?
+        .and_then(|row| row.get::<i64>(0).ok())
+        .unwrap_or(0);
+    drop(rows);
+    refuse_if_newer_schema(version)
+}
+
+/// Remove an empty legacy `entities`/`entity_aliases` shell from a retired
+/// store, and never remove one that has rows.
+///
+/// A pre-123 build opening a retired database executes its own `SCHEMA` — which
+/// still carries `CREATE TABLE IF NOT EXISTS entities` — before its downgrade
+/// barrier refuses, so it leaves an empty table behind and quits. Nothing else
+/// cleans that up: this build's reconstruction path early-returns at 123 and
+/// above. The shell is not harmless, because it makes every "is the table
+/// gone?" probe (the drop's own assertions, lint fixtures, an operator's
+/// `sqlite_master` read) answer wrong about a store that is in fact retired.
+///
+/// Rows change the answer completely. An empty shell can only be schema
+/// residue; a populated one means something wrote entity data into a store
+/// whose canonical copy is the shadow page, and this function cannot know which
+/// copy is right. Boot is the worst possible place to decide, so it warns and
+/// leaves the data alone. The two tables are handled as a pair — `entity_aliases`
+/// carries `REFERENCES entities(id)`, so dropping the parent out from under a
+/// populated child would fail the foreign-key check anyway.
+async fn sweep_legacy_entity_residue(conn: &libsql::Connection) -> Result<(), WenlanError> {
+    let mut present: Vec<&str> = Vec::new();
+    for name in ["entity_aliases", "entities"] {
+        if legacy_table_present(conn, name).await? {
+            present.push(name);
+        }
+    }
+    if present.is_empty() {
+        return Ok(());
+    }
+
+    for name in &present {
+        let mut rows = conn
+            .query(&format!("SELECT COUNT(*) FROM {name}"), ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("legacy {name} residue count: {e}")))?;
+        let count = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("legacy {name} residue row: {e}")))?
+            .and_then(|row| row.get::<i64>(0).ok())
+            .unwrap_or(0);
+        drop(rows);
+        if count > 0 {
+            log::warn!(
+                "[memory_db] legacy `{name}` table is present with {count} row(s) on a retired \
+                 (user_version >= {ENTITY_RETIREMENT_VERSION}) store. Leaving it untouched — the \
+                 canonical entity store is the kind='entity' shadow page, so these rows are of \
+                 unknown provenance and are not deleted at boot."
+            );
+            return Ok(());
+        }
+    }
+
+    // Child first: `entity_aliases` references `entities(id)`.
+    for name in &present {
+        conn.execute(&format!("DROP TABLE {name}"), ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("legacy {name} residue drop: {e}")))?;
+    }
+    log::warn!(
+        "[memory_db] dropped empty legacy {} shell(s) ({}) left on a retired store — a pre-{} \
+         build opened this database, ran its own SCHEMA, and refused at its downgrade barrier.",
+        present.len(),
+        present.join(", "),
+        ENTITY_RETIREMENT_VERSION
+    );
     Ok(())
 }
 
@@ -3744,6 +3903,10 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("libsql connect: {}", e)))?;
         log::warn!("[memory_db] connected, running PRAGMA...");
 
+        // Before anything writes: refuse a database a newer build already
+        // migrated. See `refuse_newer_schema_at_open`.
+        refuse_newer_schema_at_open(&conn).await?;
+
         // Enable WAL mode and foreign keys
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .await
@@ -3957,6 +4120,10 @@ impl MemoryDB {
             .connect()
             .map_err(|e| WenlanError::VectorDb(format!("libsql connect: {}", e)))?;
 
+        // Before anything writes: refuse a database a newer build already
+        // migrated. See `refuse_newer_schema_at_open`.
+        refuse_newer_schema_at_open(&conn).await?;
+
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .await
             .map_err(|e| WenlanError::VectorDb(format!("pragma: {}", e)))?;
@@ -4086,21 +4253,10 @@ impl MemoryDB {
         };
         drop(rows);
 
-        // A database migrated by a NEWER daemon is not ours to write to. Every
-        // migration below is gated `if version < N`, so a newer user_version
-        // silently skips all of them and we would go on writing against a
-        // schema we cannot see — ignoring columns and constraints added after
-        // us. This is not hypothetical: an older installed build can still be
-        // running and reopening the same file every few seconds.
-        //
-        // Refusing to open is the recoverable failure; writing is not.
-        if version > i64::from(SCHEMA_VERSION) {
-            return Err(WenlanError::VectorDb(format!(
-                "database schema is version {version}, newer than this build supports \
-                 ({SCHEMA_VERSION}); a newer Wenlan has already migrated it. Upgrade \
-                 Wenlan (or quit the older copy) rather than letting this one write to it."
-            )));
-        }
+        // The downgrade barrier — see `refuse_if_newer_schema`. The constructors
+        // now run it at open time, before any DDL; this call is defense in depth
+        // for anything that reaches migrations by another route.
+        refuse_if_newer_schema(version)?;
 
         // G6 Stage 3: migration 123 DROPs `entities`/`entity_aliases`, so
         // `SCHEMA` (execute_batch'd on every open, before this function) no
@@ -52711,14 +52867,28 @@ impl MemoryDB {
 
         // Self-heal orphaned refs first: a deleted entity can leave dangling
         // `memories.entity_id` rows (that column has no FK, so they sit harmless).
-        // Copying them into the FK-constrained `memory_entities` below would abort
-        // the whole INSERT on `FOREIGN KEY constraint failed` and crash-loop the
-        // daemon on every boot (0.8.4 incident). Null them so the backfill — gated
-        // on `entity_id IS NOT NULL` — skips them cleanly.
+        // Copying them into `memory_entities` below would once have aborted the
+        // whole INSERT on `FOREIGN KEY constraint failed` and crash-looped the
+        // daemon on every boot (0.8.4 incident); m122 relaxed that FK, so the
+        // crash motivation is gone, but backfilling a link to an entity that no
+        // longer exists is still wrong. Null them so the backfill — gated on
+        // `entity_id IS NOT NULL` — skips them cleanly.
+        //
+        // G6 Stage 3: membership is the canonical shadow page, matching
+        // `entity_exists` exactly (this runs unconditionally at server startup,
+        // so a fresh install replaying the chain to 123 reaches it with no
+        // `entities` table to read). A non-active shadow page counts as gone,
+        // which is m123's own semantics — its trigger update arms treat a
+        // `status`/`kind` flip as the entity appearing or vanishing.
         conn.execute(
             "UPDATE memories SET entity_id = NULL
              WHERE entity_id IS NOT NULL
-               AND entity_id NOT IN (SELECT id FROM entities)",
+               AND NOT EXISTS (
+                     SELECT 1 FROM entity_page_map epm
+                     JOIN pages p ON p.id = epm.page_id
+                     WHERE epm.entity_id = memories.entity_id
+                       AND p.kind = 'entity' AND p.status = 'active'
+                   )",
             (),
         )
         .await
