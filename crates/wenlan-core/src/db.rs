@@ -10233,6 +10233,7 @@ impl MemoryDB {
     /// live callers left that read `entities`) and mints the shadow via the
     /// same values-based primitive `create_entity` uses.
     #[cfg(test)]
+    #[allow(clippy::type_complexity)]
     pub(crate) async fn test_seed_entity_shadow_page(
         &self,
         entity_id: &str,
@@ -10352,6 +10353,7 @@ impl MemoryDB {
     /// sub-step 3 item 6) was this helper's original motivating caller but
     /// is no longer its only one.
     #[cfg(test)]
+    #[allow(clippy::type_complexity)]
     pub(crate) async fn test_seed_legacy_entities_row_from_shadow(
         &self,
         entity_id: &str,
