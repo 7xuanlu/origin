@@ -4746,14 +4746,16 @@ fn decode_entity_extraction_space(encoded: &str) -> Result<Option<String>, Wenla
         .map_err(|_| WenlanError::Validation("repair_target_schema_mismatch".to_string()))
 }
 
-// G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
-// space-sentinel fold: the `(?2 IS NULL AND (space IS NULL OR space =
-// sentinel)) OR space=?2` guard below now matches a folded `entities.space`
-// too, so an "expects uncategorized" caller (`space=None`) still validates
-// against a row now carrying the `UNFILED_SPACE_ID` sentinel. 1.5b Part 3
-// (item 8) disposition: writer-coupled discovery read, not a reader-migration
-// target -- re-verifies rows a caller is about to hand to `store_entity`
-// et al, so it flips with those writers in Stage 2, not ahead of them.
+// G6 Stage 2 PR 2c sub-step 3 item 5: was a writer-coupled discovery read,
+// held back so it wouldn't flip ahead of `store_entity`/`merge_entities` and
+// split a single logical write path across two stores mid-flight (1.5a
+// carryover, 2026-08-05). Those writers stop writing `entities` in this item
+// (see `store_entity`), so this now reads the same `entity_page_map` JOIN
+// `pages` (`kind = 'entity'`, `status = 'active'`) shape `list_entities`/
+// `get_entity_detail`/`entity_exists` already use. The `(?2 IS NULL AND
+// (space IS NULL OR space = sentinel)) OR space = ?2` guard is unchanged --
+// it matches a folded shadow-page `space` (1.5b Part 2's fold) the same way
+// it matched a folded `entities.space` before.
 async fn validate_selected_entities_on_snapshot(
     snapshot: &LintReadSnapshot<'_>,
     entity_ids: &[String],
@@ -4762,8 +4764,10 @@ async fn validate_selected_entities_on_snapshot(
     for entity_id in entity_ids {
         let mut rows = snapshot
             .query(
-                "SELECT 1 FROM entities
-                 WHERE id=?1 AND ((?2 IS NULL AND (space IS NULL OR space = '00000000-0000-4000-8000-000000000001')) OR space=?2)
+                "SELECT 1 FROM entity_page_map epm
+                 JOIN pages p ON p.id = epm.page_id
+                 WHERE epm.entity_id=?1 AND p.kind = 'entity' AND p.status = 'active'
+                 AND ((?2 IS NULL AND (p.space IS NULL OR p.space = '00000000-0000-4000-8000-000000000001')) OR p.space=?2)
                  LIMIT 2",
                 libsql::params::Params::Positional(vec![
                     libsql::Value::Text(entity_id.clone()),
@@ -4783,15 +4787,14 @@ async fn validate_selected_entities_on_snapshot(
     Ok(())
 }
 
-// G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
-// space-sentinel fold: the `(?2 IS NULL AND (space IS NULL OR space =
-// sentinel)) OR space=?2` guard below now matches a folded `entities.space`
-// too, same fix as the snapshot variant above. This variant runs on the
-// shared-mutex connection inside the entity-extraction repair's own `BEGIN
-// IMMEDIATE` (`db/repair_memory_cas.rs`), re-verifying entities that repair
-// batch itself just wrote -- Stage-2 writer-batch alignment, NOT
-// connection-level coupling (the shared-mutex conn can never see uncommitted
-// foreign state from another writer). Flips with `store_entity` in Stage 2.
+// G6 Stage 2 PR 2c sub-step 3 item 5: same flip as the snapshot variant
+// above, for the same reason. This variant runs on the shared-mutex
+// connection inside the entity-extraction repair's own `BEGIN IMMEDIATE`
+// (`db/repair_memory_cas.rs`), re-verifying entities that repair batch itself
+// just wrote -- Stage-2 writer-batch alignment, NOT connection-level coupling
+// (the shared-mutex conn can never see uncommitted foreign state from
+// another writer). `store_entity`/`merge_entities` stop writing `entities`
+// in this item (see `store_entity`), so this reads the shadow-page shape.
 pub(crate) async fn validate_selected_entities_on_connection(
     connection: &libsql::Connection,
     entity_ids: &[String],
@@ -4800,8 +4803,10 @@ pub(crate) async fn validate_selected_entities_on_connection(
     for entity_id in entity_ids {
         let mut rows = connection
             .query(
-                "SELECT 1 FROM entities
-                 WHERE id=?1 AND ((?2 IS NULL AND (space IS NULL OR space = '00000000-0000-4000-8000-000000000001')) OR space=?2)
+                "SELECT 1 FROM entity_page_map epm
+                 JOIN pages p ON p.id = epm.page_id
+                 WHERE epm.entity_id=?1 AND p.kind = 'entity' AND p.status = 'active'
+                 AND ((?2 IS NULL AND (p.space IS NULL OR p.space = '00000000-0000-4000-8000-000000000001')) OR p.space=?2)
                  LIMIT 2",
                 libsql::params![entity_id.clone(), space.map(str::to_string)],
             )

@@ -237,6 +237,15 @@ the `pages.citations` column, `entities`, `entity_aliases`, `observations`, and
   open the database afterward; `wenlan doctor` must say so plainly.
 - Export/import is NOT the safety net (debt register).
 - User confirms the point of no return before the migration ships in a release.
+- **Code cleanup, same PR as the drop migration:** three legacy FK-guard
+  deletes against `entity_aliases.canonical_entity_id` (a NO ACTION FK into
+  `entities(id)`) were restored in Stage 2 sub-step 3 item 5 after an
+  initial (wrong) attempt to retire them early — `delete_entity`,
+  `merge_entities`' loser-side delete, and `delete_space`'s bulk equivalent
+  (db.rs). Each is commented "Retires in Stage 3 with the `entity_aliases`
+  drop, not before" — grep `Retires in Stage 3 with the` to find and
+  remove all three when this migration lands, since the table they guard
+  against will no longer exist to violate.
 
 ## Rollback story per stage
 

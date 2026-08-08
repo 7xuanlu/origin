@@ -71,13 +71,15 @@ impl MemoryDB {
 
         let conn = self.conn.lock().await;
         // G6 Stage 1.5b Part 3: unconditional hard cutover onto the
-        // `kind='entity'` shadow page, for the primary entity row only --
-        // the observations query below never touched `entities`, and the
-        // relations query's own `entities` JOIN hydrates the OTHER side of
-        // each relation (a distinct case the design deferred to a later
-        // retirement rung), so neither changes here. Spec item 9 collapses
-        // this reader's `reader_uses_entity_pages` gate (same program
-        // contract as 1.5a and `list_entities_scoped` above).
+        // `kind='entity'` shadow page, for the primary entity row and (G6
+        // Stage 2 PR 2c sub-step 3 item 5) the relations query's endpoint
+        // hydration below -- `store_entity` no longer writes `entities`, so
+        // the old `entities` JOIN silently excluded any shadow-only
+        // endpoint. Ported onto `entity_page_map`/`pages`, same shape as
+        // `list_recent_relations_scoped` below. The observations query
+        // never touched `entities`, so it's unchanged. Spec item 9
+        // collapses this reader's `reader_uses_entity_pages` gate (same
+        // program contract as 1.5a and `list_entities_scoped` above).
         let mut conditions = vec!["epm.entity_id = ?".to_string()];
         let mut values = vec![libsql::Value::Text(entity_id.to_string())];
         // G6 Stage 1.5b: `entities.space` is folded (never NULL; unfiled rows
@@ -182,8 +184,10 @@ impl MemoryDB {
             "SELECT r.edge_id, r.semantic_type, json_extract(r.payload, '$.source_agent'), \
                     COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at), \
                     'outgoing' AS direction, r.dst_id AS entity_id, \
-                    e.name AS entity_name, e.entity_type AS entity_type \
-             FROM edges r JOIN entities e ON e.id = r.dst_id \
+                    e.title AS entity_name, e.entity_type AS entity_type \
+             FROM edges r \
+             JOIN entity_page_map epm ON epm.entity_id = r.dst_id \
+             JOIN pages e ON e.id = epm.page_id AND e.kind = 'entity' AND e.status = 'active' \
              WHERE r.edge_type = 'relates' AND r.valid_until IS NULL \
                AND r.semantic_type IS NOT NULL \
                AND r.src_id = ?1 {endpoint_filter} \
@@ -191,8 +195,10 @@ impl MemoryDB {
              SELECT r.edge_id, r.semantic_type, json_extract(r.payload, '$.source_agent'), \
                     COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at), \
                     'incoming' AS direction, r.src_id AS entity_id, \
-                    e.name AS entity_name, e.entity_type AS entity_type \
-             FROM edges r JOIN entities e ON e.id = r.src_id \
+                    e.title AS entity_name, e.entity_type AS entity_type \
+             FROM edges r \
+             JOIN entity_page_map epm ON epm.entity_id = r.src_id \
+             JOIN pages e ON e.id = epm.page_id AND e.kind = 'entity' AND e.status = 'active' \
              WHERE r.edge_type = 'relates' AND r.valid_until IS NULL \
                AND r.semantic_type IS NOT NULL \
                AND r.dst_id = ?1 {endpoint_filter} \

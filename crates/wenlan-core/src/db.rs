@@ -730,9 +730,19 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("fold_entity begin: {e}")))?;
 
         let result: Result<usize, WenlanError> = async {
+            // G6 Stage 2 PR 2c sub-step 3 item 5 (ruling 2026-08-07):
+            // selection goes canonical. Every legacy entity has a shadow
+            // page (m113 backfill + the drift-0 receipts), so this
+            // entity_page_map/pages selection is a strict superset of the
+            // old `entities`-only one -- nothing is missed -- and it is now
+            // the ONLY source that sees a post-flip (shadow-only) entity,
+            // which has no `entities` row at all.
             let mut rows = conn
                 .query(
-                    "SELECT id FROM entities WHERE entity_type = ?1",
+                    "SELECT epm.entity_id FROM entity_page_map epm \
+                     JOIN pages p ON p.id = epm.page_id \
+                     WHERE p.kind = 'entity' AND p.status = 'active' \
+                       AND p.entity_type = ?1",
                     libsql::params![old_type],
                 )
                 .await
@@ -749,12 +759,22 @@ impl MemoryDB {
             if ids.is_empty() {
                 return Ok(0);
             }
+            // vocab_heal_ledger pre-image is unchanged: entity ids are
+            // identical across both stores, only the selection source
+            // moved from `entities` to the canonical shadow.
             let pre: Vec<serde_json::Value> = ids
                 .iter()
                 .map(|id| serde_json::json!({"id": id, "entity_type": old_type}))
                 .collect();
             let pre_json = serde_json::to_string(&pre).unwrap_or_else(|_| "[]".into());
 
+            // Legacy-row maintenance: no-op for a post-flip (shadow-only)
+            // entity, since `entities` has no matching row for it, but
+            // still keeps a pre-flip legacy row consistent with its shadow
+            // for as long as the entity-store parity oracle (scheduled to
+            // retire alongside the rest of the reconcile machinery) reads
+            // it. Expires at oracle retirement / Stage 3, same as the
+            // FK-guard deletes restored elsewhere in this item.
             conn.execute(
                 "UPDATE entities SET entity_type = ?1 WHERE entity_type = ?2",
                 libsql::params![canonical.to_string(), old_type.to_string()],
@@ -762,11 +782,12 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("fold_entity_type: {e}")))?;
 
-            // Mirror the fold into the entity shadows (M3 PR-1 item C). This
-            // fold only touches `entity_type`, so a set-based UPDATE of every
-            // `kind='entity'` page still carrying `old_type` is exact parity
-            // with the entities UPDATE above -- and self-heals any drift --
-            // without needing to iterate the captured id list.
+            // Canonical mirror (M3 PR-1 item C), and now the sole thing
+            // that drives the returned count and the vocab_heal_ledger
+            // pre-image above -- the early-return moved after the
+            // selection this UPDATE now shares the WHERE-clause shape
+            // with, so a shadow-only entity's fold can no longer be
+            // skipped.
             let now_iso = chrono::Utc::now().to_rfc3339();
             conn.execute(
                 "UPDATE pages SET entity_type = ?1, last_modified = ?2 \
@@ -10279,6 +10300,110 @@ impl MemoryDB {
         )
         .await
         .map_err(|e| WenlanError::VectorDb(format!("test_seed_entity_shadow_page mirror: {e}")))?;
+        Ok(())
+    }
+
+    /// G6 Stage 2 PR 2c sub-step 3 item 5: `store_entity` no longer writes
+    /// `entities`, so the `compute_entity_page_parity_report` oracle (test-
+    /// only, scheduled for retirement) reads a shadow-only entity's `entities`
+    /// row as absent and unconditionally flags it "extra" drift -- fatal to
+    /// any oracle test that asserts a clean baseline right after
+    /// `store_entity`. The inverse of `test_seed_entity_shadow_page` above:
+    /// reads the just-created shadow page's mirrored fields and raw-INSERTs
+    /// a byte-matching `entities` row, mirroring what `store_entity` used to
+    /// write pre-flip so the oracle's entities-vs-shadow comparator reads
+    /// clean until the test's own deliberate mutation introduces real drift.
+    #[cfg(test)]
+    pub(crate) async fn test_seed_legacy_entities_row_from_shadow(
+        &self,
+        entity_id: &str,
+    ) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        let (
+            title,
+            entity_type,
+            confidence,
+            confirmed,
+            space,
+            source_agent,
+            created_at,
+            updated_at,
+            embedding,
+        ): (
+            String,
+            String,
+            Option<f64>,
+            i64,
+            String,
+            Option<String>,
+            i64,
+            i64,
+            Option<Vec<u8>>,
+        ) = {
+            let mut rows = conn
+                .query(
+                    "SELECT p.title, p.entity_type, p.confidence, p.entity_confirmed, p.space, \
+                            p.source_agent, p.entity_created_at, p.entity_updated_at, p.embedding \
+                     FROM entity_page_map epm \
+                     JOIN pages p ON p.id = epm.page_id \
+                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
+                    libsql::params![entity_id],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!(
+                        "test_seed_legacy_entities_row_from_shadow read: {e}"
+                    ))
+                })?;
+            let row = rows
+                .next()
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!(
+                        "test_seed_legacy_entities_row_from_shadow row: {e}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    WenlanError::VectorDb(format!(
+                        "test_seed_legacy_entities_row_from_shadow: no live shadow for {entity_id}"
+                    ))
+                })?;
+            (
+                row.get(0).unwrap_or_default(),
+                row.get(1).unwrap_or_default(),
+                row.get(2).unwrap_or(None),
+                row.get(3).unwrap_or(0),
+                row.get(4).unwrap_or_else(|_| UNFILED_SPACE_ID.to_string()),
+                row.get(5).unwrap_or(None),
+                row.get(6).unwrap_or(0),
+                row.get(7).unwrap_or(0),
+                row.get(8).unwrap_or(None),
+            )
+        };
+        conn.execute(
+            "INSERT INTO entities \
+                (id, name, entity_type, space, source_agent, confidence, confirmed, \
+                 created_at, updated_at, embedding) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            libsql::params![
+                entity_id,
+                title,
+                entity_type,
+                space,
+                source_agent,
+                confidence,
+                confirmed,
+                created_at,
+                updated_at,
+                embedding
+            ],
+        )
+        .await
+        .map_err(|e| {
+            WenlanError::VectorDb(format!(
+                "test_seed_legacy_entities_row_from_shadow insert: {e}"
+            ))
+        })?;
         Ok(())
     }
 
@@ -22243,23 +22368,36 @@ impl MemoryDB {
                         .await?;
                 }
                 // Tear the space's entities down the SAME way the single-entity
-                // `delete_entity` does (M3 PR-1), scoped to the space, BEFORE the
-                // `DELETE FROM entities` below. Two reasons this is the full
-                // mirror, not just a shadow delete:
-                //  * entity_aliases.canonical_entity_id references entities(id)
-                //    WITHOUT ON DELETE CASCADE (db.rs migration 41 DDL), and
-                //    store_entity auto-creates a self-alias, so a bare
-                //    `DELETE FROM entities` FK-fails for any real entity -- the
-                //    whole delete would roll back. Clear the aliases first.
-                //  * the kind='entity' shadow pages are orphaned otherwise: the
-                //    entity_page_map row's entity-side cascade drops only the map
-                //    row on entity delete, never the shadow page. Delete the
-                //    shadows here (their map rows then cascade on the page side).
+                // `delete_entity` does (M3 PR-1), scoped to the space. G6 Stage 2
+                // PR 2c sub-step 3 item 5: `entities` stops being written (see
+                // `store_entity`), so a post-flip entity never gets an `entities`
+                // row and would be invisible to a `WHERE space = ?1` enumeration
+                // sourced from it alone -- every cleanup subquery below now
+                // enumerates the UNION of the legacy source (`entities.space`,
+                // for rows written before this flip) and the canonical store
+                // (`entity_page_map` JOIN `pages` on the page's own `space`, for
+                // everything written after). The join side is deliberately NOT
+                // filtered on `kind = 'entity'`: entity_page_map rows are
+                // entity-only by construction in normal operation, and the one
+                // abnormal case -- a row pointing at a page that never got that
+                // kind set -- is exactly the belt-and-suspenders scenario a few
+                // lines down, so narrowing the join would silently re-open that
+                // gap (see delete_space_delete_removes_entity_page_map_row_without_entity_kind_page).
+                // The item-4 comment's prediction that the FK-guard
+                // `entity_aliases` delete retires here was wrong (ruling
+                // 2026-08-07): the raw `DELETE FROM entities` further down
+                // stays for legacy rows until Stage 3 drops the table, so
+                // the guard (below, right before that delete) must keep
+                // running for exactly as long as that delete does.
                 // memories/pages entity_id references are nulled to match
                 // delete_entity exactly (no dangling link to a removed entity).
                 tx.execute(
                     "UPDATE memories SET entity_id = NULL \
-                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1 \
+                                          UNION \
+                                          SELECT epm.entity_id FROM entity_page_map epm \
+                                          JOIN pages p ON p.id = epm.page_id \
+                                          WHERE p.space = ?1)",
                     libsql::params![name],
                 )
                 .await
@@ -22271,7 +22409,11 @@ impl MemoryDB {
                 })?;
                 tx.execute(
                     "UPDATE pages SET entity_id = NULL \
-                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1 \
+                                          UNION \
+                                          SELECT epm.entity_id FROM entity_page_map epm \
+                                          JOIN pages p ON p.id = epm.page_id \
+                                          WHERE p.space = ?1)",
                     libsql::params![name],
                 )
                 .await
@@ -22281,39 +22423,22 @@ impl MemoryDB {
                         e
                     ))
                 })?;
-                // G6 Stage 2 PR 2c sub-step 3 item 4: FK-guard, kept on
-                // purpose (same NO ACTION FK as `merge_entities`'s and
-                // `delete_entity`'s cleanup deletes). Retire together with
-                // the table in item 5.
-                tx.execute(
-                    "DELETE FROM entity_aliases \
-                     WHERE canonical_entity_id IN (SELECT id FROM entities WHERE space = ?1)",
-                    libsql::params![name],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("delete_space delete aliases: {}", e))
-                })?;
-                tx.execute(
-                    "DELETE FROM pages WHERE kind = 'entity' \
-                     AND id IN (SELECT page_id FROM entity_page_map m \
-                                JOIN entities e ON e.id = m.entity_id \
-                                WHERE e.space = ?1)",
-                    libsql::params![name],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("delete_space delete shadow pages: {}", e))
-                })?;
                 // G6 Stage 2 PR 2c sub-step 3 (m122): migration 122 relaxed
                 // the entities-referencing FK on memory_entities/
                 // observations/entity_minhash_bands, so nothing cascades
                 // from the `DELETE FROM entities` below anymore -- same gap
                 // fixed in delete_entity, extended here to the space-scoped
-                // bulk delete.
+                // bulk delete. Must run BEFORE the shadow-page delete below:
+                // once a shadow page is gone, its entity_page_map row cascades
+                // away too (pages' own ON DELETE CASCADE), and the canonical
+                // side of these enumerations would then find nothing.
                 tx.execute(
                     "DELETE FROM memory_entities \
-                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1 \
+                                          UNION \
+                                          SELECT epm.entity_id FROM entity_page_map epm \
+                                          JOIN pages p ON p.id = epm.page_id \
+                                          WHERE p.space = ?1)",
                     libsql::params![name],
                 )
                 .await
@@ -22322,7 +22447,11 @@ impl MemoryDB {
                 })?;
                 tx.execute(
                     "DELETE FROM observations \
-                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1 \
+                                          UNION \
+                                          SELECT epm.entity_id FROM entity_page_map epm \
+                                          JOIN pages p ON p.id = epm.page_id \
+                                          WHERE p.space = ?1)",
                     libsql::params![name],
                 )
                 .await
@@ -22331,7 +22460,11 @@ impl MemoryDB {
                 })?;
                 tx.execute(
                     "DELETE FROM entity_minhash_bands \
-                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1 \
+                                          UNION \
+                                          SELECT epm.entity_id FROM entity_page_map epm \
+                                          JOIN pages p ON p.id = epm.page_id \
+                                          WHERE p.space = ?1)",
                     libsql::params![name],
                 )
                 .await
@@ -22341,21 +22474,50 @@ impl MemoryDB {
                         e
                     ))
                 })?;
-                // Belt-and-suspenders (mirrors delete_entity's own): the
-                // shadow-page delete above is guarded by `kind = 'entity'`,
-                // so a stray entity_page_map row pointing at a page that
-                // never got that kind would otherwise survive it. Before
-                // m122, entity_page_map's entities-side FK cascade cleaned
-                // such a row up regardless of page kind; m122 relaxed that
-                // FK, so this explicit delete restores the same coverage.
+                // Belt-and-suspenders (mirrors delete_entity's own), also
+                // before the shadow-page delete for the same reason as above.
                 tx.execute(
                     "DELETE FROM entity_page_map \
-                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                     WHERE entity_id IN (SELECT id FROM entities WHERE space = ?1 \
+                                          UNION \
+                                          SELECT epm.entity_id FROM entity_page_map epm \
+                                          JOIN pages p ON p.id = epm.page_id \
+                                          WHERE p.space = ?1)",
                     libsql::params![name],
                 )
                 .await
                 .map_err(|e| {
                     WenlanError::VectorDb(format!("delete_space delete entity_page_map: {}", e))
+                })?;
+                // Shadow-page delete last: unlike the enumerations above, this
+                // targets `pages` directly by its own `space` column (every
+                // entity shadow page carries `space`/`workspace` mirrored 1:1
+                // from the entity, per `insert_entity_shadow_page`) so it has
+                // no entity_page_map dependency to preserve. `kind = 'entity'`
+                // keeps this scoped to entity shadows, not every page in the
+                // space.
+                tx.execute(
+                    "DELETE FROM pages WHERE kind = 'entity' AND space = ?1",
+                    libsql::params![name],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("delete_space delete shadow pages: {}", e))
+                })?;
+                // Legacy FK-guard: `entity_aliases.canonical_entity_id` is a
+                // NO ACTION FK into `entities(id)`; must precede the legacy
+                // `DELETE FROM entities` below. Retires in Stage 3 with the
+                // `entity_aliases` drop, not before (same guard as
+                // delete_entity/merge_entities, extended here to the
+                // space-scoped bulk delete).
+                tx.execute(
+                    "DELETE FROM entity_aliases \
+                     WHERE canonical_entity_id IN (SELECT id FROM entities WHERE space = ?1)",
+                    libsql::params![name],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("delete_space delete alias fk guard: {}", e))
                 })?;
                 tx.execute(
                     "DELETE FROM entities WHERE space = ?1",
@@ -27990,9 +28152,9 @@ impl MemoryDB {
         // `idx_pages_embedding` on the `kind='entity'` shadow pages (the
         // `search_pages` precedent -- 3x over-fetch absorbs the post-ANN
         // kind/status filter, since vector_top_k can't filter before
-        // ranking). `entities_vec_idx` and the brute-force fallback below
-        // stay wired to `entities` as-is; they retire with the writer flip
-        // in sub-step 3, not here.
+        // ranking). Sub-step 3 item 5 ports the brute-force fallback below
+        // off `entities` too, now that `store_entity` no longer writes it --
+        // a shadow-only entity has no legacy row for the fallback to find.
         let fetch_limit = (limit * 3) as i64;
         let sql = "SELECT m.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, vector_distance_cos(p.embedding, vector32(?1)) AS dist
                    FROM vector_top_k('idx_pages_embedding', vector32(?1), ?2) AS vt
@@ -28044,12 +28206,17 @@ impl MemoryDB {
             }
         }
 
-        // Fallback: brute-force cosine distance when DiskANN index is unavailable or empty
+        // Fallback: brute-force cosine distance when DiskANN index is unavailable or empty.
+        // G6 Stage 2 PR 2c sub-step 3 item 5: sourced from the shadow page
+        // now, same shape as the primary path above -- `entities` is no
+        // longer written by `store_entity`, so a shadow-only entity had no
+        // row here and silently dropped out of auto-link/dedup matching.
         if results.is_empty() {
             let fallback_sql =
-                "SELECT id, name, entity_type, space, source_agent, confidence, confirmed, created_at, updated_at, vector_distance_cos(embedding, vector32(?1)) as distance
-                 FROM entities
-                 WHERE embedding IS NOT NULL
+                "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, vector_distance_cos(p.embedding, vector32(?1)) as distance
+                 FROM entity_page_map epm
+                 JOIN pages p ON p.id = epm.page_id
+                 WHERE p.kind = 'entity' AND p.status = 'active' AND p.embedding IS NOT NULL
                  ORDER BY distance ASC
                  LIMIT ?2";
             match conn
@@ -28088,12 +28255,10 @@ impl MemoryDB {
             }
         }
 
-        // G6 Stage 2 PR 2c sub-step 1: the primary path above now ranks on
-        // the shadow page's embedding too, so this overlay is a no-op for
-        // those rows. It still matters for the brute-force fallback, which
-        // stays sourced from legacy `entities` columns until sub-step 3 --
-        // unconditional overlay keeps both paths converging on the same
-        // display fields, same program contract as 1.5a, mirroring
+        // G6 Stage 2 PR 2c sub-step 3 item 5: both the primary path and the
+        // brute-force fallback above now rank on the shadow page's fields,
+        // so this hydration overlay is a no-op in the common case -- kept
+        // as a defensive re-read rather than removed, mirroring
         // `search_entities_by_vector_scoped`'s hydration overlay.
         if !results.is_empty() {
             struct Mirror {
@@ -32484,36 +32649,13 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("store_entity begin: {}", e)))?;
 
         let result: Result<(), WenlanError> = async {
-            conn.execute(
-                "INSERT INTO entities (id, name, entity_type, space, source_agent, confidence,
-                    confirmed, created_at, updated_at, embedding)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7, vector32(?8))",
-                libsql::params![
-                    id.clone(),
-                    name.to_string(),
-                    entity_type.to_string(),
-                    // G6 Stage 1.5b Part 2: entities.space is folded (never
-                    // NULL) -- fold at write time, else NULLs recur post-migration.
-                    space
-                        .map(|s| libsql::Value::Text(s.to_string()))
-                        .unwrap_or_else(|| libsql::Value::Text(UNFILED_SPACE_ID.to_string())),
-                    source_agent
-                        .map(|s| libsql::Value::Text(s.to_string()))
-                        .unwrap_or(libsql::Value::Null),
-                    confidence
-                        .map(|v| libsql::Value::Real(v as f64))
-                        .unwrap_or(libsql::Value::Null),
-                    now,
-                    vec_str.clone()
-                ],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("store_entity: {}", e)))?;
-
-            // G6 Stage 2 PR 2c sub-step 3 item 4: the self-alias used to be
-            // registered in `entity_aliases` here; that write is retired --
-            // the shadow page's own `aliases` seed just below
-            // (`aliases_json`) is now the sole record of it.
+            // G6 Stage 2 PR 2c sub-step 3 item 5: `entities` stops being
+            // written -- `insert_entity_shadow_page` below (values-based,
+            // no subquery onto `entities`) is now the sole store. The
+            // self-alias used to be registered in `entity_aliases` here
+            // too; that write retired in item 4 (the shadow page's own
+            // `aliases` seed just below, `aliases_json`, is now the sole
+            // record of it).
             let page_id = crate::pages::new_page_id();
             // The self-alias seeded below is the only alias this entity
             // has yet, so the seed literal must byte-match what the
@@ -33248,10 +33390,21 @@ impl MemoryDB {
         // Idempotency check: assumes single-writer daemon (no other process holds
         // a libSQL connection to this DB). Mutex<Connection> serializes within-process;
         // cross-process races are not defended against.
+        //
+        // G6 Stage 2 PR 2c sub-step 3 item 5 (completing the port, ruling
+        // 2026-08-07): `entities` stops being written by `store_entity`, so a
+        // post-flip entity has no legacy row for this COUNT to find. Liveness
+        // is now read from the canonical store (entity_page_map JOIN pages,
+        // kind='entity' AND status='active'), the same shape `entity_exists`
+        // uses -- inlined here rather than calling it, since that method
+        // takes its own `conn.lock()` and would self-deadlock against the
+        // lock already held in this transaction.
         let alias_exists: i64 = {
             let mut rows = conn
                 .query(
-                    "SELECT COUNT(*) FROM entities WHERE id = ?1",
+                    "SELECT COUNT(*) FROM entity_page_map epm \
+                     JOIN pages p ON p.id = epm.page_id \
+                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
                     libsql::params![alias_id],
                 )
                 .await
@@ -33270,7 +33423,9 @@ impl MemoryDB {
         let canonical_exists: i64 = {
             let mut rows = conn
                 .query(
-                    "SELECT COUNT(*) FROM entities WHERE id = ?1",
+                    "SELECT COUNT(*) FROM entity_page_map epm \
+                     JOIN pages p ON p.id = epm.page_id \
+                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
                     libsql::params![canonical_id],
                 )
                 .await
@@ -33290,10 +33445,16 @@ impl MemoryDB {
             )));
         }
 
+        // Name/type reads below source from the canonical shadow's scalar
+        // mirror (`pages.title`/`pages.entity_type`) rather than
+        // `entities.name`/`entities.entity_type` for the same reason as the
+        // liveness checks above.
         let alias_name: Option<String> = {
             let mut rows = conn
                 .query(
-                    "SELECT name FROM entities WHERE id = ?1",
+                    "SELECT p.title FROM entity_page_map epm \
+                     JOIN pages p ON p.id = epm.page_id \
+                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
                     libsql::params![alias_id],
                 )
                 .await
@@ -33313,7 +33474,9 @@ impl MemoryDB {
         let alias_type: String = {
             let mut rows = conn
                 .query(
-                    "SELECT entity_type FROM entities WHERE id = ?1",
+                    "SELECT p.entity_type FROM entity_page_map epm \
+                     JOIN pages p ON p.id = epm.page_id \
+                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
                     libsql::params![alias_id],
                 )
                 .await
@@ -33329,7 +33492,9 @@ impl MemoryDB {
         let canonical_type: String = {
             let mut rows = conn
                 .query(
-                    "SELECT entity_type FROM entities WHERE id = ?1",
+                    "SELECT p.entity_type FROM entity_page_map epm \
+                     JOIN pages p ON p.id = epm.page_id \
+                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
                     libsql::params![canonical_id],
                 )
                 .await
@@ -33351,6 +33516,16 @@ impl MemoryDB {
             )
         };
         let should_promote = is_generic(&canonical_type) && !is_generic(&alias_type);
+        // G6 Stage 2 PR 2c sub-step 3 item 5: the promoted type used to be
+        // written to `entities` and re-read back via a subquery in the
+        // canonical shadow's UPDATE below; `entities` stops being written
+        // by this item, so the promotion decision is carried straight
+        // through in Rust instead.
+        let final_entity_type = if should_promote {
+            alias_type.clone()
+        } else {
+            canonical_type.clone()
+        };
         let now_iso = chrono::Utc::now().to_rfc3339();
 
         // Scan the alias's active `relates` edges directly (G6 Stage 2 PR
@@ -33423,11 +33598,20 @@ impl MemoryDB {
                 } else {
                     old_dst
                 };
+                // G6 Stage 2 PR 2c sub-step 3 item 5: sourced from the
+                // canonical shadow's own `space` mirror rather than the
+                // legacy `entities` table -- a shadow-only endpoint (the
+                // normal post-flip case) has no `entities` row for the old
+                // two-table join to find.
                 let mut space_rows = conn
                     .query(
-                        "SELECT source.space, destination.space \
-                         FROM entities source, entities destination \
-                         WHERE source.id = ?1 AND destination.id = ?2",
+                        "SELECT \
+                            (SELECT p.space FROM entity_page_map epm \
+                             JOIN pages p ON p.id = epm.page_id \
+                             WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'), \
+                            (SELECT p.space FROM entity_page_map epm \
+                             JOIN pages p ON p.id = epm.page_id \
+                             WHERE epm.entity_id = ?2 AND p.kind = 'entity' AND p.status = 'active')",
                         libsql::params![src_id.clone(), dst_id.clone()],
                     )
                     .await
@@ -33543,21 +33727,21 @@ impl MemoryDB {
                 if plan.grounded {
                     let grounded_transition = conn
                         .execute(
-                        "UPDATE edges SET grounded = 1, root_id = ?1, \
+                            "UPDATE edges SET grounded = 1, root_id = ?1, \
                             payload = COALESCE(payload, ?2) \
                          WHERE edge_id = ?3 AND valid_until IS NULL AND grounded = 0",
-                        libsql::params![
-                            plan.root_id.clone(),
-                            plan.payload.clone(),
-                            new_edge_id.clone()
-                        ],
-                    )
-                    .await
-                    .map_err(|error| {
-                        WenlanError::VectorDb(format!(
-                            "merge_entities preserve edge grounding: {error}"
-                        ))
-                    })?;
+                            libsql::params![
+                                plan.root_id.clone(),
+                                plan.payload.clone(),
+                                new_edge_id.clone()
+                            ],
+                        )
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "merge_entities preserve edge grounding: {error}"
+                            ))
+                        })?;
                     if grounded_transition == 0 {
                         conn.execute(
                             "UPDATE edges SET root_id = ?1, payload = COALESCE(payload, ?2) \
@@ -33620,34 +33804,29 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities pages: {e}")))?;
 
-            // G6 Stage 2 PR 2c sub-step 3 item 4: FK-guard, kept on purpose.
-            // `entity_aliases.canonical_entity_id` has a NO ACTION FK into
-            // `entities(id)` that m122 does not rebuild, so any surviving
-            // alias row pointing at the loser blocks the `DELETE FROM
-            // entities` below. Retire this redirect together with the
-            // table in item 5.
+            // G6 Stage 2 PR 2c sub-step 3 item 5: the item-4 comment's
+            // prediction that this spot's `entity_aliases` FK-guard retires
+            // together with `entities` here was wrong (ruling 2026-08-07).
+            // The alias-redirect UPDATE and the winner-side entity_type
+            // promotion UPDATE genuinely retire -- `final_entity_type` is
+            // computed in Rust above and applied straight to the canonical
+            // shadow page below, no `entities` round-trip needed -- but the
+            // FK guard does NOT: every pre-flip entity still carries a live
+            // `entities` row, and the raw `DELETE FROM entities` further
+            // down keeps running for those legacy rows until Stage 3 drops
+            // the table. `entity_aliases.canonical_entity_id` is a NO ACTION
+            // FK into `entities(id)`, so it must still be cleared here or
+            // the delete below fails loud on any alias with surviving
+            // `entity_aliases` rows. Retires in Stage 3 with the
+            // `entity_aliases` drop, not before.
             conn.execute(
-                "UPDATE OR IGNORE entity_aliases SET canonical_entity_id = ?1 WHERE canonical_entity_id = ?2",
-                libsql::params![canonical_id, alias_id],
+                "DELETE FROM entity_aliases WHERE canonical_entity_id = ?1",
+                libsql::params![alias_id],
             )
             .await
-            .map_err(|e| WenlanError::VectorDb(format!("merge_entities alias redirect: {e}")))?;
-
-            // T16 conservative type-promotion: generic canonical -> alias's
-            // concrete type. The WHERE guard re-checks both conditions in SQL so
-            // a concurrent write can't demote a concrete canonical. Never flips
-            // between two concrete types.
-            if should_promote {
-                conn.execute(
-                    "UPDATE entities SET entity_type = ?1 \
-                     WHERE id = ?2 \
-                       AND LOWER(entity_type) IN ('entity', 'unknown', '') \
-                       AND LOWER(?1) NOT IN ('entity', 'unknown', '')",
-                    libsql::params![alias_type.as_str(), canonical_id],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities promote type: {e}")))?;
-            }
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("merge_entities delete alias fk guard: {e}"))
+            })?;
 
             // T16 band cleanup for the loser (complements ON DELETE CASCADE).
             conn.execute(
@@ -33656,18 +33835,6 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities band cleanup: {e}")))?;
-
-            // G6 Stage 2 PR 2c sub-step 3 item 4: FK-guard, kept on purpose
-            // (same NO ACTION FK as the redirect above -- every entity has
-            // at least a self-alias row, so this must run before the
-            // `DELETE FROM entities` below). Retire together with the
-            // table in item 5.
-            conn.execute(
-                "DELETE FROM entity_aliases WHERE canonical_entity_id = ?1",
-                libsql::params![alias_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("merge_entities alias cleanup: {e}")))?;
 
             // M3 PR-1 item C (beyond Sol's enumerated list): the loser's shadow
             // page would otherwise be orphaned by the entity delete below (the
@@ -33717,15 +33884,16 @@ impl MemoryDB {
 
             // The canonical's shadowed fields drifted in this merge: aliases
             // gained the loser's full alias set, and entity_type may have
-            // been promoted. G6 Stage 2 PR 2c sub-step 3 item 4: aliases is
-            // now a page-payload UNION of the canonical's existing array,
-            // the loser's captured array, and the loser's bare name (the
-            // union covers the same ground the old `entity_aliases`
-            // redirect + register did); entity_type stays reading from
-            // `entities` unchanged until item 5's flip.
+            // been promoted. Aliases is a page-payload UNION of the
+            // canonical's existing array, the loser's captured array, and
+            // the loser's bare name (the union covers the same ground the
+            // old `entity_aliases` redirect + register did). G6 Stage 2 PR
+            // 2c sub-step 3 item 5: entity_type is now the pre-computed
+            // `final_entity_type` (item 4's `entities` subquery bridge
+            // retired with the rest of the entities writes in this item).
             conn.execute(
                 "UPDATE pages SET
-                    entity_type = (SELECT entity_type FROM entities WHERE id = ?1),
+                    entity_type = ?5,
                     aliases = (SELECT json_group_array(value) FROM (
                         SELECT value FROM json_each(pages.aliases)
                         UNION
@@ -33740,8 +33908,12 @@ impl MemoryDB {
                 libsql::params![
                     canonical_id.to_string(),
                     loser_aliases_json,
-                    alias_name.as_deref().map(|n| n.to_lowercase()).unwrap_or_default(),
+                    alias_name
+                        .as_deref()
+                        .map(|n| n.to_lowercase())
+                        .unwrap_or_default(),
                     now_iso.clone(),
+                    final_entity_type.clone(),
                 ],
             )
             .await
@@ -33750,9 +33922,7 @@ impl MemoryDB {
             Self::bump_community_graph_generations(&conn, graph_changes)
                 .await
                 .map_err(|error| {
-                    WenlanError::VectorDb(format!(
-                        "merge_entities community generation: {error}"
-                    ))
+                    WenlanError::VectorDb(format!("merge_entities community generation: {error}"))
                 })
         }
         .await;
@@ -34225,21 +34395,24 @@ impl MemoryDB {
         Ok(result)
     }
 
-    // G6 Stage 1.5a carryover (2026-08-05): NOT migrated. This guards relation
-    // writes (`post_write/entity_graph.rs`, both endpoints of a new relation)
+    // G6 Stage 2 PR 2c sub-step 3 item 5: this guards relation writes
+    // (`post_write/entity_graph.rs`, both endpoints of a new relation)
     // reading the exact store `store_entity`/`merge_entities` write -- the
-    // spec's WRITER-COUPLED shared-CRUD core, whose discovery reads flip with
-    // their writers in Stage 2, not ahead of them. The reason is Stage-2
-    // writer-BATCH alignment (this check and its writer move as one unit so
-    // the migration doesn't split a single logical write path across two
-    // stores mid-flight), not connection-level coupling -- the shared-mutex
-    // `conn` below can never observe another writer's uncommitted rows
-    // regardless of which store it queries, so that argument never held.
+    // spec's WRITER-COUPLED shared-CRUD core, whose discovery read was held
+    // back to flip with its writers in the same batch (Stage-2 writer-BATCH
+    // alignment, so the migration wouldn't split a single logical write path
+    // across two stores mid-flight). `store_entity`/`merge_entities` stop
+    // writing `entities` in this item (see `store_entity`), so this now
+    // reads the same shadow-page shape `list_entities`/`get_entity_detail`
+    // already use.
     pub async fn entity_exists(&self, entity_id: &str) -> Result<bool, WenlanError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT 1 FROM entities WHERE id = ?1 LIMIT 1",
+                "SELECT 1 FROM entity_page_map epm \
+                 JOIN pages p ON p.id = epm.page_id \
+                 WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active' \
+                 LIMIT 1",
                 libsql::params![entity_id],
             )
             .await
@@ -34502,18 +34675,22 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete_entity pages: {e}")))?;
 
-            // G6 Stage 2 PR 2c sub-step 3 item 4: FK-guard, kept on purpose.
-            // `entity_aliases.canonical_entity_id` has a NO ACTION FK into
-            // `entities(id)` that m122 does not rebuild, and every entity
-            // has at least a self-alias row, so this must run before the
-            // `DELETE FROM entities` below. Retire together with the table
-            // in item 5.
+            // G6 Stage 2 PR 2c sub-step 3 item 5: the item-4 comment's
+            // prediction that this FK-guard delete retires here was wrong
+            // (ruling 2026-08-07) -- legacy FK-guard: `entity_aliases.
+            // canonical_entity_id` is a NO ACTION FK into `entities(id)`,
+            // and every pre-flip entity still carries a live `entities`
+            // row (the raw `DELETE FROM entities` below keeps running for
+            // those legacy rows until Stage 3 drops the table), so this
+            // guard must precede that delete for as long as the table it
+            // guards is still written to. Retires in Stage 3 with the
+            // `entity_aliases` drop, not before.
             conn.execute(
                 "DELETE FROM entity_aliases WHERE canonical_entity_id = ?1",
                 libsql::params![entity_id],
             )
             .await
-            .map_err(|e| WenlanError::VectorDb(format!("delete_entity aliases: {e}")))?;
+            .map_err(|e| WenlanError::VectorDb(format!("delete_entity alias fk guard: {e}")))?;
 
             // G6 Stage 2 PR 2c sub-step 3 (m122 fold-in): migration 122
             // relaxed memory_entities/observations/entity_minhash_bands'
@@ -35044,11 +35221,18 @@ impl MemoryDB {
                 }
                 drop(alias_rows);
 
+                // G6 Stage 2 PR 2c sub-step 3 item 5: page-payload lookup,
+                // same JOIN shape as the alias lookup above -- an exact-name
+                // match resolves off the shadow page's mirrored `title`
+                // instead of the retiring `entities.name`.
                 if resolved.is_none() {
                     let mut exact_rows = conn
                         .query(
-                            "SELECT id FROM entities WHERE LOWER(name) = ?1
-                             ORDER BY created_at ASC, id ASC LIMIT 1",
+                            "SELECT epm.entity_id FROM entity_page_map epm
+                             JOIN pages p ON p.id = epm.page_id
+                             WHERE p.kind = 'entity' AND p.status = 'active'
+                               AND LOWER(p.title) = ?1
+                             ORDER BY p.created_at, epm.entity_id LIMIT 1",
                             libsql::params![lower.as_str()],
                         )
                         .await
@@ -35071,11 +35255,20 @@ impl MemoryDB {
                 // resolution in the canonical create_entity cascade. Its
                 // candidate was prepared outside this transaction; verify the
                 // entity still exists before accepting it.
+                // G6 Stage 2 PR 2c sub-step 3 item 5: same shadow-page
+                // existence check as `entity_exists` -- the minhash
+                // candidate's band was already resolved off
+                // `entity_minhash_bands`/the shadow page (see
+                // `minhash_resolve_candidate`/`get_entity_name_type`), this
+                // just re-verifies it is still live before accepting it.
                 if resolved.is_none() {
                     if let Some(candidate_id) = minhash_candidate {
                         let mut candidate_rows = conn
                             .query(
-                                "SELECT 1 FROM entities WHERE id = ?1 LIMIT 1",
+                                "SELECT 1 FROM entity_page_map epm
+                                 JOIN pages p ON p.id = epm.page_id
+                                 WHERE epm.entity_id = ?1 AND p.kind = 'entity'
+                                   AND p.status = 'active' LIMIT 1",
                                 libsql::params![candidate_id.as_str()],
                             )
                             .await
@@ -35100,12 +35293,22 @@ impl MemoryDB {
                 }
 
                 // Preserve the existing create_entity cascade's >0.9 vector
-                // resolution without leaving the transaction.
+                // resolution without leaving the transaction. G6 Stage 2 PR
+                // 2c sub-step 3 item 5: ported to `pages.embedding` -- every
+                // live writer that sets an embedding (`store_entity`, this
+                // function's own create branch below, `refresh_entity_
+                // embedding`) mirrors it onto the `kind='entity'` shadow in
+                // the same transaction, so this scan has the same coverage
+                // `entities.embedding` had (verified against
+                // `insert_entity_shadow_page`'s embedding param and
+                // `refresh_entity_embedding`'s shadow re-sync).
                 if resolved.is_none() {
                     if let Ok(mut vector_rows) = conn
                         .query(
-                            "SELECT id, vector_distance_cos(embedding, vector32(?1)) AS distance
-                             FROM entities WHERE embedding IS NOT NULL
+                            "SELECT epm.entity_id, vector_distance_cos(p.embedding, vector32(?1)) AS distance
+                             FROM entity_page_map epm
+                             JOIN pages p ON p.id = epm.page_id
+                             WHERE p.kind = 'entity' AND p.status = 'active' AND p.embedding IS NOT NULL
                              ORDER BY distance ASC LIMIT 1",
                             libsql::params![embedding.as_str()],
                         )
@@ -35124,39 +35327,18 @@ impl MemoryDB {
                     Some(id) => id,
                     None => {
                         let id = uuid::Uuid::new_v4().to_string();
-                        conn.execute(
-                            "INSERT INTO entities
-                                 (id, name, entity_type, space, source_agent, confidence,
-                                  confirmed, created_at, updated_at, embedding)
-                             VALUES (?1, ?2, ?3, ?6, 'post_ingest', NULL,
-                                     0, ?4, ?4, vector32(?5))",
-                            libsql::params![
-                                id.as_str(),
-                                name.as_str(),
-                                entity_type.as_str(),
-                                now,
-                                embedding.as_str(),
-                                // G6 Stage 1.5b Part 2: entities.space is
-                                // folded (never NULL) -- fold at write time,
-                                // else NULLs recur post-migration.
-                                entity_space
-                                    .as_deref()
-                                    .map(|s| libsql::Value::Text(s.to_string()))
-                                    .unwrap_or_else(|| libsql::Value::Text(UNFILED_SPACE_ID.to_string()))
-                            ],
-                        )
-                        .await
-                        .map_err(|e| {
-                            WenlanError::VectorDb(format!("entity enrichment entity insert: {e}"))
-                        })?;
-                        // M3 PR-1 dual-write invariant: every `entities` INSERT
-                        // creates its `kind='entity'` shadow page in the same
-                        // transaction (mirrors `store_entity`). This path missed
-                        // it when #473 added canonical-edge dual-writes here;
-                        // caught live by `reconcile_entity_page_parity`.
-                        // G6 Stage 2 PR 2c sub-step 2: direct values-based
-                        // write -- no aliases yet, the `lower` self-alias is
-                        // inserted just below and re-synced by the narrowed
+                        // G6 Stage 2 PR 2c sub-step 3 item 5: `entities`
+                        // stops being written -- the `insert_entity_shadow_
+                        // page` call below (values-based, no subquery onto
+                        // `entities`) is now the sole store. It already
+                        // covers everything the retired `INSERT INTO
+                        // entities` wrote here: name, entity_type,
+                        // confidence (NULL/None), confirmed (0/false),
+                        // embedding, space (folded the same way, via
+                        // `entity_space`), source_agent ('post_ingest'),
+                        // and created_at/updated_at (`now`/`now`). No
+                        // aliases yet -- the `lower` self-alias is inserted
+                        // just below and re-synced by the narrowed
                         // aliases-aggregate bridge that follows.
                         let page_id = crate::pages::new_page_id();
                         Self::insert_entity_shadow_page(
@@ -35241,23 +35423,16 @@ impl MemoryDB {
                             "entity enrichment observation insert: {e}"
                         ))
                     })?;
-                    conn.execute(
-                        "UPDATE entities SET updated_at = ?1 WHERE id = ?2",
-                        libsql::params![now, entity_id.as_str()],
-                    )
-                    .await
-                    .map_err(|e| {
-                        WenlanError::VectorDb(format!(
-                            "entity enrichment observation timestamp: {e}"
-                        ))
-                    })?;
                     // `updated_at` is a shadow-mirrored column; the resolved-
                     // existing-entity path's shadow sync above (this loop's
                     // earlier alias-shadow write, per entity) ran before this
                     // observation bumped `updated_at`, so it must re-sync
                     // again here or the shadow strands at the pre-observation
-                    // timestamp (G6 review fix). G6 Stage 2 PR 2c sub-step 2:
-                    // direct targeted write -- only `updated_at` changed.
+                    // timestamp (G6 review fix). G6 Stage 2 PR 2c sub-step 3
+                    // item 5: `entities` stops being written -- this is now
+                    // the sole freshness stamp for the observation (the
+                    // retired `UPDATE entities SET updated_at` wrote a
+                    // column nothing reads anymore).
                     conn.execute(
                         "UPDATE pages SET entity_updated_at = ?1, last_modified = ?2
                          WHERE kind = 'entity'
@@ -35686,12 +35861,21 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("entity link begin: {e}")))?;
         let result: Result<bool, WenlanError> = async {
+            // G6 Stage 2 PR 2c sub-step 3 item 5: the entity-liveness leg of
+            // this guard now checks the `kind='entity'` shadow page, not
+            // `entities` -- `store_entity` no longer writes `entities`, so
+            // the old EXISTS clause always failed for a freshly resolved
+            // shadow-only entity, silently dropping the link as "stale".
             let mut rows = conn
                 .query(
                     "SELECT 1 FROM memories
                      WHERE source='memory' AND source_id=?1 AND chunk_index=0
                        AND version=?2 AND COALESCE(pending_revision, 0)=0
-                       AND EXISTS (SELECT 1 FROM entities WHERE id=?3)
+                       AND EXISTS (
+                           SELECT 1 FROM entity_page_map epm
+                           JOIN pages p ON p.id = epm.page_id
+                           WHERE epm.entity_id = ?3 AND p.kind = 'entity' AND p.status = 'active'
+                       )
                        AND NOT EXISTS (
                            SELECT 1 FROM memories superseder
                            WHERE superseder.supersedes = memories.source_id
