@@ -340,19 +340,30 @@ impl MemoryDB {
             for entity_id in entity_ids {
                 inserted = inserted.saturating_add(
                     conn.execute(
+                        // The unscoped predicate must match
+                        // `validate_selected_entities_on_connection` exactly:
+                        // pages.space is NOT NULL and an unfiled shadow page
+                        // carries the reserved sentinel, so accepting only
+                        // NULL here made every uncategorized-scope repair pass
+                        // validation and then insert nothing
+                        // (repair_target_write_unproven).
                         "INSERT INTO memory_entities(memory_id,entity_id)
                          SELECT ?1,?2
                           WHERE EXISTS(
-                                SELECT 1 FROM entities
-                                 WHERE id=?2
-                                   AND ((?3 IS NULL AND space IS NULL) OR space=?3))
+                                SELECT 1 FROM entity_page_map epm
+                                 JOIN pages p ON p.id = epm.page_id
+                                   AND p.kind = 'entity' AND p.status = 'active'
+                                 WHERE epm.entity_id=?2
+                                   AND ((?3 IS NULL AND (p.space IS NULL OR p.space=?4))
+                                        OR p.space=?3))
                             AND NOT EXISTS(
                                 SELECT 1 FROM memory_entities
                                  WHERE memory_id=?1 AND entity_id=?2)",
                         libsql::params![
                             memory_id.clone(),
                             entity_id.clone(),
-                            scope.space().map(str::to_string)
+                            scope.space().map(str::to_string),
+                            crate::db::UNFILED_SPACE_ID
                         ],
                     )
                     .await

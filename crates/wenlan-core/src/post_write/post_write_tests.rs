@@ -4734,10 +4734,10 @@ async fn create_entity_minhash_short_name_skips_fuzzy() {
         let (db, _dir) = test_db().await;
         // "API"/"APIs" are below the entropy gate, so Step 2.5 must punt them
         // to the vector step and never record a "minhash" alias.
-        let _ = create_entity(&db, entity_req("API", "concept"), "test")
+        let first = create_entity(&db, entity_req("API", "concept"), "test")
             .await
             .unwrap();
-        let _ = create_entity(&db, entity_req("APIs", "concept"), "test")
+        let second = create_entity(&db, entity_req("APIs", "concept"), "test")
             .await
             .unwrap();
         // No band rows are written for low-entropy names, regardless of how
@@ -4753,17 +4753,25 @@ async fn create_entity_minhash_short_name_skips_fuzzy() {
             "low-entropy names must not be indexed into entity_minhash_bands"
         );
         drop(rows);
-        let mut arows = conn
-            .query(
-                "SELECT COUNT(*) FROM entity_aliases WHERE source = 'minhash'",
-                (),
-            )
-            .await
-            .unwrap();
-        let minhash_aliases: i64 = arows.next().await.unwrap().unwrap().get(0).unwrap();
+        // `conn` holds the primary connection's tokio Mutex guard
+        // (`test_primary_session` -> `lock_owned`); drop it before the next
+        // `db.*` call below re-locks the same mutex internally, or the two
+        // acquisitions on this task self-deadlock.
+        drop(conn);
+        // G6 Stage 2 PR 2c sub-step 3 item 4: `entity_aliases` stops being
+        // written, and `pages.aliases` carries no per-alias provenance
+        // field, so the minhash-source distinction this test used to check
+        // is no longer expressible. Assert the behavior that matters
+        // instead: a short name must not have been cross-registered as the
+        // other entity's alias via the page payload.
+        assert_ne!(
+            first.id, second.id,
+            "short names must not have been minhash-merged into one entity"
+        );
         assert_eq!(
-            minhash_aliases, 0,
-            "short names must not produce a minhash alias"
+            db.resolve_entity_by_alias("apis").await.unwrap(),
+            Some(second.id),
+            "APIs must resolve only to its own entity, never as API's alias"
         );
     })
     .await;
@@ -4803,17 +4811,21 @@ async fn create_entity_minhash_disabled_is_noop() {
         let band_count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(band_count, 0, "flag OFF must write zero band rows");
         drop(rows);
-        let mut arows = conn
-            .query(
-                "SELECT COUNT(*) FROM entity_aliases WHERE source = 'minhash'",
-                (),
-            )
-            .await
-            .unwrap();
-        let minhash_aliases: i64 = arows.next().await.unwrap().unwrap().get(0).unwrap();
+        // `conn` holds the primary connection's tokio Mutex guard
+        // (`test_primary_session` -> `lock_owned`); drop it before the next
+        // `db.*` call below re-locks the same mutex internally, or the two
+        // acquisitions on this task self-deadlock.
+        drop(conn);
+        // G6 Stage 2 PR 2c sub-step 3 item 4: see the short-name test above
+        // -- the minhash-source distinction is no longer expressible, so
+        // assert the near-dup stayed unresolved via the page payload
+        // instead of checking `entity_aliases.source`.
         assert_eq!(
-            minhash_aliases, 0,
-            "flag OFF must write zero minhash aliases"
+            db.resolve_entity_by_alias("vorpalblade jabberwock ino")
+                .await
+                .unwrap(),
+            Some(second.id),
+            "flag OFF must leave the near-dup resolving only to its own entity"
         );
     })
     .await;

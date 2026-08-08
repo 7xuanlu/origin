@@ -109,6 +109,22 @@ pub(super) const EDGES_WIDENED_DDL: &str = "CREATE TABLE edges_new (
 ///
 /// Written as one string used for both twins so the INSERT and UPDATE bodies
 /// cannot drift apart — the failure the UPDATE twin exists to prevent.
+///
+/// G6 Stage 2 PR 2c item 1 ported the `entity` arm to read the
+/// `kind='entity'` shadow page's space via `entity_page_map` instead of
+/// `entities` directly -- but this constant is replayed by migration 98
+/// (`rebuild_edges_widened`, below) against the schema state AT migration
+/// 98, so mutating it retroactively changed a historical migration's
+/// behavior, violating frozen replay (same principle already applied to
+/// migrations 92/113/114). An old DB upgrading through migration 98 has no
+/// shadow-page completeness guarantee until migrations 113/114/117 run.
+/// REVERTED here to the historical `entities`-reading form, frozen, in
+/// lockstep with the `db.rs` `edges_space_fence` copy (migration 81, which
+/// this migration overwrites). The pages-reading form is not lost --
+/// migration 121 drops and recreates both fence triggers with this exact
+/// body (moved verbatim to there), positioned after shadow-page
+/// completeness is established, so the pages fence goes live only once it
+/// is safe to.
 const FENCE_BODY: &str = "
     SELECT RAISE(ABORT, 'edges_space_fence: cross-space edge rejected')
     WHERE (

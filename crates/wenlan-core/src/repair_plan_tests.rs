@@ -2319,6 +2319,12 @@ async fn review_item_contract_failed_entity_plan_can_prepare_manifest() {
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2c item 5/6: `entities` is raw-SQL-seeded above, and the
+    // selected-entity existence guard now reads the canonical shadow page
+    // (`entity_page_map` JOIN `pages`), so a legacy-only row reads as absent
+    // and `prepare` rejects the target as stale. Backfill the shadow the same
+    // way a real `store_entity` write would.
+    db.test_seed_entity_shadow_page("ent-new").await.unwrap();
     let runner = || LintRunner::new(LintClock::fixed(), CancellationToken::new());
     let general = runner()
         .run(

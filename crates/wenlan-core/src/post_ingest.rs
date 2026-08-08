@@ -1390,9 +1390,13 @@ mod tests {
         let mut rows = conn
             .query(
                 "SELECT e.payload FROM edges e \
-                 JOIN entities fe ON e.src_id = fe.id \
-                 JOIN entities te ON e.dst_id = te.id \
-                 WHERE e.edge_type = 'relates' AND fe.name = ?1 AND te.name = ?2",
+                 JOIN entity_page_map fm ON fm.entity_id = e.src_id \
+                 JOIN pages fp ON fp.id = fm.page_id \
+                     AND fp.kind = 'entity' AND fp.status = 'active' \
+                 JOIN entity_page_map tm ON tm.entity_id = e.dst_id \
+                 JOIN pages tp ON tp.id = tm.page_id \
+                     AND tp.kind = 'entity' AND tp.status = 'active' \
+                 WHERE e.edge_type = 'relates' AND fp.title = ?1 AND tp.title = ?2",
                 libsql::params![from_name, to_name],
             )
             .await

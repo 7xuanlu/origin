@@ -1609,6 +1609,10 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
         )
         .await
         .expect("seed embedded isolated entity");
+    // The ported `edges_space_fence` trigger resolves an entity endpoint's
+    // space via its shadow page and fails closed mid-transaction, so the
+    // entities above need shadow pages before the edges below can insert.
+    seed_entity_shadow_pages(&observer).await;
     for node in 0..10 {
         observer
             .execute(
@@ -1660,6 +1664,7 @@ async fn m4_concurrent_lease_is_exact_once_and_isolated_nodes_attach_posthoc() {
         .execute("COMMIT", ())
         .await
         .expect("commit M4 isolated seed");
+    seed_entity_shadow_pages(&observer).await;
 
     let (left, right) = tokio::join!(
         db.prepare_community_grouping(SPACE),
@@ -2024,6 +2029,7 @@ async fn m4_raw_grounded_writes_force_full_recovery_instead_of_reusing_stale_cor
             .await
             .expect("seed raw-trigger entity");
     }
+    seed_entity_shadow_pages(&observer).await;
     for node in 0..10 {
         observer
             .execute(
@@ -2235,6 +2241,10 @@ async fn m4_below_floor_holds_prior_publication_and_stays_queued() {
             .await
             .expect("seed below-floor entity");
     }
+    // The ported `edges_space_fence` trigger resolves an entity endpoint's
+    // space via its shadow page, so the entities above need one each before
+    // the edges below can insert.
+    seed_entity_shadow_pages(&observer).await;
     for node in 0..PARTICIPANTS {
         observer
             .execute(
@@ -2372,6 +2382,10 @@ async fn m4_phase_round_robin_reaches_later_dirty_space_after_held_restart() {
                 .await
                 .expect("seed round-robin entity");
         }
+        // The ported `edges_space_fence` trigger resolves an entity endpoint's
+        // space via its shadow page, so this space's entities need one each
+        // before its edges below can insert.
+        seed_entity_shadow_pages(&observer).await;
         for node in 0..participants {
             observer
                 .execute(
@@ -2392,6 +2406,7 @@ async fn m4_phase_round_robin_reaches_later_dirty_space_after_held_restart() {
                 .expect("seed round-robin grounded edge");
         }
     }
+    seed_entity_shadow_pages(&observer).await;
 
     let held_generation = read_m4_grouping_generation(&observer, HELD_SPACE).await;
     let first = db
@@ -3021,6 +3036,7 @@ async fn m4_merge_collision_advances_graph_and_rebuilds_changed_node_order() {
         )
         .await
         .expect("seed merge-collision alias");
+    seed_entity_shadow_pages(&observer).await;
     for node in 0..CORE_NODES {
         observer
             .execute(
@@ -3259,6 +3275,11 @@ async fn seed_m4_graded_corpus(observer: &libsql::Connection) {
             }
         }
 
+        // The ported `edges_space_fence` trigger resolves an entity endpoint's
+        // space via its shadow page and fails closed mid-transaction, so this
+        // space's entities need shadow pages before its edges below can insert.
+        seed_entity_shadow_pages(observer).await;
+
         let mut edge_index = 0usize;
         for cluster in 0..CLUSTERS_PER_SPACE {
             for node in 0..NODES_PER_CLUSTER {
@@ -3351,6 +3372,9 @@ async fn seed_m4_graded_corpus(observer: &libsql::Connection) {
                 .expect("seed M4 native page citation");
         }
     }
+
+    seed_entity_shadow_pages(observer).await;
+
     observer
         .execute("COMMIT", ())
         .await
@@ -3765,6 +3789,44 @@ async fn read_m4_generation(observer: &libsql::Connection, space: &str) -> i64 {
         .expect("M4 generation row")
         .get(0)
         .expect("decode M4 generation")
+}
+
+/// G6 Stage 2 PR 2c item 3: `detect_communities`/`load_community_entities_paged`
+/// now discover entities via the `kind='entity'` shadow page
+/// (`entity_page_map` joined to `pages`) instead of `entities` directly, so
+/// every raw-SQL entity fixture in this file needs a matching shadow page --
+/// call right after the seeding transaction commits. Bulk (not per-row, via
+/// `MemoryDB::test_seed_entity_shadow_page`) since some fixtures here are
+/// scale-sized; same column set as `MemoryDB::insert_entity_shadow_page`.
+/// Idempotent: only backfills entities that don't have one yet.
+async fn seed_entity_shadow_pages(observer: &libsql::Connection) {
+    observer
+        .execute(
+            "INSERT INTO pages (
+                id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+                embedding, space, workspace, source_memory_ids, version, status,
+                created_at, last_compiled, last_modified, creation_kind, review_status
+             )
+             SELECT 'shadow-' || id, name, NULL, '', 'entity', entity_type, confidence, confirmed,
+                    embedding, COALESCE(space, '00000000-0000-4000-8000-000000000001'),
+                    COALESCE(space, '00000000-0000-4000-8000-000000000001'), '[]', 1,
+                    'active', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z',
+                    '2024-01-01T00:00:00Z', 'entity', 'unconfirmed'
+             FROM entities
+             WHERE NOT EXISTS (SELECT 1 FROM entity_page_map WHERE entity_id = entities.id)",
+            (),
+        )
+        .await
+        .expect("seed M4 entity shadow pages");
+    observer
+        .execute(
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at)
+             SELECT id, 'shadow-' || id, '2024-01-01T00:00:00Z' FROM entities
+             WHERE NOT EXISTS (SELECT 1 FROM entity_page_map WHERE entity_id = entities.id)",
+            (),
+        )
+        .await
+        .expect("seed M4 entity_page_map rows");
 }
 
 async fn read_m4_grouping_generation(observer: &libsql::Connection, space: &str) -> i64 {

@@ -93,7 +93,8 @@ pub(super) async fn run(
 // reader-migration target -- this audits the legacy `entities` store's own
 // data quality, and reading the shadow-page mirror instead would validate
 // the mirror rather than the store it exists to check. Stays on `entities`
-// until Stage 2 retires the store itself.
+// through Stage 1 and Stage 2; retires with the store at Stage 3, same as
+// `lint/pages/provenance_checks/source.rs`.
 async fn alias_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (scope, params) = scope_clause_folded(context.scope().filter(), "e.space", true);
     rows(
@@ -224,7 +225,8 @@ async fn structured_conflicts(context: &LintContext<'_, '_>) -> Result<RowCheck,
 // reader-migration target -- this audits the legacy `entities` store's own
 // data quality, and reading the shadow-page mirror instead would validate
 // the mirror rather than the store it exists to check. Stays on `entities`
-// until Stage 2 retires the store itself.
+// through Stage 1 and Stage 2; retires with the store at Stage 3, same as
+// `lint/pages/provenance_checks/source.rs`.
 async fn observation_duplicates(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (scope, params) = scope_clause_folded(context.scope().filter(), "e.space", true);
     rows(
@@ -276,7 +278,8 @@ async fn page_duplicates(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> 
 // reader-migration target -- this audits the legacy `entities` store's own
 // data quality, and reading the shadow-page mirror instead would validate
 // the mirror rather than the store it exists to check. Stays on `entities`
-// until Stage 2 retires the store itself.
+// through Stage 1 and Stage 2; retires with the store at Stage 3, same as
+// `lint/pages/provenance_checks/source.rs`.
 async fn relation_vocabulary(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (scope, params) = scope_clause_folded(context.scope().filter(), "f.space", true);
     rows(
