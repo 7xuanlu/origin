@@ -155,6 +155,9 @@ crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_e
 crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::aggregate_cas_rejects_every_stale_dimension_without_database_mutation|TestDbSession::execute|5
 crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::aggregate_cas_rejects_every_stale_dimension_without_database_mutation|TestDbSession::execute|6
 crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::aggregate_cas_rejects_every_stale_dimension_without_database_mutation|TestDbSession::execute|7
+crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::aggregate_cas_rejects_every_stale_dimension_without_database_mutation|TestDbSession::execute|8
+crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::aggregate_cas_rejects_every_stale_dimension_without_database_mutation|TestDbSession::execute|9
+crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::aggregate_cas_rejects_every_stale_dimension_without_database_mutation|TestDbSession::execute|10
 crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::aggregate_cas_rejects_every_stale_dimension_without_database_mutation|TestDbSession::repair_database_content_digest|1
 crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::aggregate_cas_rejects_every_stale_dimension_without_database_mutation|TestDbSession::repair_database_content_digest|2
 crates/wenlan-core/src/repair/entity_extraction_tests.rs|crate::repair::entity_extraction_tests::aggregate_cas_rejects_every_stale_dimension_without_database_mutation|test_primary_session|1
@@ -546,7 +549,9 @@ crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::page_
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::scoped_candidates_hydrate_cross_space_existing_link_endpoints|TestDbSession::execute_batch|1
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::scoped_candidates_hydrate_cross_space_existing_link_endpoints|test_primary_session|1
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::suspicious_existing_page_and_entity_links_are_distinct_candidates|TestDbSession::execute_batch|1
+crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::suspicious_existing_page_and_entity_links_are_distinct_candidates|TestDbSession::execute_batch|2
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::suspicious_existing_page_and_entity_links_are_distinct_candidates|test_primary_session|1
+crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::suspicious_existing_page_and_entity_links_are_distinct_candidates|test_primary_session|2
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::temporal_evolution_and_related_page_can_be_cleared_without_fabricating_links|TestDbSession::execute|1
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::temporal_evolution_and_related_page_can_be_cleared_without_fabricating_links|test_primary_session|1
 crates/wenlan-core/src/lint/semantic_test.rs|crate::lint::semantic::tests::work_digest_binds_scope_and_records_outside_the_packet|TestDbSession::execute|1

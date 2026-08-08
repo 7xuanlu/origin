@@ -504,13 +504,38 @@ async fn aggregate_cas_rejects_every_stale_dimension_without_database_mutation()
                     .await
                     .unwrap();
             }
+            // G6 Stage 2 PR 2c item 5/6: the selected-entity guard reads the
+            // canonical shadow page, so "absent"/"rescoped" must be simulated
+            // there -- deleting or rescoping only the legacy `entities` row
+            // leaves the shadow live and the guard passes.
             "entity_absent" => {
+                session
+                    .execute(
+                        "DELETE FROM pages WHERE kind='entity' AND id=(
+                             SELECT page_id FROM entity_page_map WHERE entity_id='ent-new')",
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                session
+                    .execute("DELETE FROM entity_page_map WHERE entity_id='ent-new'", ())
+                    .await
+                    .unwrap();
                 session
                     .execute("DELETE FROM entities WHERE id='ent-new'", ())
                     .await
                     .unwrap();
             }
             "entity_scope" => {
+                session
+                    .execute(
+                        "UPDATE pages SET space='personal'
+                         WHERE kind='entity' AND id=(
+                             SELECT page_id FROM entity_page_map WHERE entity_id='ent-new')",
+                        (),
+                    )
+                    .await
+                    .unwrap();
                 session
                     .execute(
                         "UPDATE entities SET space='personal' WHERE id='ent-new'",

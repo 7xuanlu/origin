@@ -3229,7 +3229,7 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        1020,
+        1025,
         "PR-D integration must expose the frozen 967 support calls, the 6 PR-D test identities, \
          the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, \
          the 7 G6 BindPageLink repair-test calls (G6 Stage 2 PR 2b, item 3: \
@@ -3256,7 +3256,17 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
          off the raw entity_aliases table onto resolve_entity_by_alias's shadow-page scan: \
          create_entity_minhash_disabled_is_noop and create_entity_minhash_short_name_skips_fuzzy \
          each drop their second TestDbRow::get, TestDbRows::next, and TestDbSession::query call, \
-         losing the raw alias-row readback the old exact-match SQL needed)"
+         losing the raw alias-row readback the old exact-match SQL needed); plus the net +2 G6 \
+         Stage 2 PR 2c item 6 (RULING-ESC-1) call in \
+         suspicious_existing_page_and_entity_links_are_distinct_candidates: the entity-fence setup \
+         no longer drops/recreates the fence to simulate legacy pre-shadow-page data, splitting the \
+         test's single raw-INSERT batch into two -- entities/relations, then edges/pages once each \
+         entity's shadow page is seeded via test_seed_entity_shadow_page -- gaining a second \
+         TestDbSession::execute_batch and a second test_primary_session call; plus the net +3 g6-triage \
+         PR 2c fix-round calls in aggregate_cas_rejects_every_stale_dimension_without_database_mutation: \
+         the repair-CAS fixture's entity-absent/rescoped simulation moved onto canonical `UPDATE pages` \
+         mutations (the ported CAS guard reads shadow pages now, not the legacy entities row), adding \
+         three TestDbSession::execute calls"
     );
 }
 
