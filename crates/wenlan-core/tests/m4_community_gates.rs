@@ -2597,7 +2597,7 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         .store_entity("Merge Neighbor", "concept", Some(SPACE), None, None)
         .await
         .expect("create merge neighbor");
-    let merge_relation = db
+    let _merge_relation = db
         .create_relation(
             &alias,
             &neighbor,
@@ -2690,7 +2690,7 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         .store_entity("Restart Right", "concept", Some(SPACE), None, None)
         .await
         .expect("create restart right");
-    let restart_relation = db
+    let _restart_relation = db
         .create_relation(
             &restart_left,
             &restart_right,
@@ -2806,7 +2806,7 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         .store_entity("Delete Cascade Right", "concept", Some(SPACE), None, None)
         .await
         .expect("create delete-cascade right");
-    let delete_relation = reopened
+    let _delete_relation = reopened
         .create_relation(
             &delete_left,
             &delete_right,
@@ -2895,7 +2895,7 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         .store_entity("Refresh Cascade Right", "concept", Some(SPACE), None, None)
         .await
         .expect("create refresh-cascade right");
-    let refresh_relation = reopened
+    let _refresh_relation = reopened
         .create_relation(
             &refresh_left,
             &refresh_right,
