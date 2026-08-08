@@ -18,6 +18,14 @@ fn subprocess_lock() -> &'static Mutex<()> {
     TEST_SUBPROCESS_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+// Serializes tests that spawn subprocesses or contend on the data-root
+// flock; poison recovery keeps one panicking test from failing the next.
+fn subprocess_lock_guard() -> std::sync::MutexGuard<'static, ()> {
+    subprocess_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(unix)]
 extern "C" fn fail_if_c_exit_handlers_run() {
     // SAFETY: This callback runs only in the dedicated child below. `_exit`
@@ -36,7 +44,7 @@ fn daemon_exit_skips_c_exit_handlers() {
         exit_daemon(0);
     }
 
-    let _guard = subprocess_lock().lock().unwrap();
+    let _guard = subprocess_lock_guard();
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -347,7 +355,7 @@ fn data_root_lock_excludes_a_second_daemon_for_the_same_root() {
     // A concurrently spawned test child inherits open Unix file descriptors,
     // including this lock. Keep the drop-and-reacquire proof isolated from
     // every test in this module that launches the current test executable.
-    let _guard = subprocess_lock().lock().unwrap();
+    let _guard = subprocess_lock_guard();
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("wenlan");
     let first = DaemonDataLock::acquire(&root, false).unwrap();
@@ -392,6 +400,7 @@ fn normal_data_root_lock_does_not_suppress_legacy_migration() {
 
 #[test]
 fn data_root_lock_child_process_holds_lock() {
+    let _guard = subprocess_lock_guard();
     let Some(root) = std::env::var_os("WENLAN_DATA_LOCK_CHILD_ROOT") else {
         return;
     };
@@ -410,7 +419,7 @@ fn data_root_lock_child_process_holds_lock() {
 
 #[test]
 fn data_root_lock_excludes_another_process_with_a_different_temp_dir() {
-    let _guard = subprocess_lock().lock().unwrap();
+    let _guard = subprocess_lock_guard();
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("wenlan");
     let child_tmp = parent.path().join("other-tmp");

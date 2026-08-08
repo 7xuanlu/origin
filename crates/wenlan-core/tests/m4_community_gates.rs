@@ -1211,6 +1211,7 @@ async fn m4_real_job_mutex_and_correction_latency_gate() {
     );
     let mutex_p95 = duration_p95(&mutex_holds);
     let mutex_max = mutex_holds.iter().copied().max().expect("mutex receipts");
+    // Bar stays 500ms; load flakes are absorbed by the nextest retries override.
     assert!(
         mutex_p95 <= Duration::from_millis(500),
         "Gate 1.4 real-path DB-mutex p95 {mutex_p95:?} exceeds 500 ms"
@@ -2589,7 +2590,7 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         .store_entity("Merge Neighbor", "concept", Some(SPACE), None, None)
         .await
         .expect("create merge neighbor");
-    let merge_relation = db
+    let _merge_relation = db
         .create_relation(
             &alias,
             &neighbor,
@@ -2682,7 +2683,7 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         .store_entity("Restart Right", "concept", Some(SPACE), None, None)
         .await
         .expect("create restart right");
-    let restart_relation = db
+    let _restart_relation = db
         .create_relation(
             &restart_left,
             &restart_right,
@@ -2798,7 +2799,7 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         .store_entity("Delete Cascade Right", "concept", Some(SPACE), None, None)
         .await
         .expect("create delete-cascade right");
-    let delete_relation = reopened
+    let _delete_relation = reopened
         .create_relation(
             &delete_left,
             &delete_right,
@@ -2887,7 +2888,7 @@ async fn m4_generation_tracks_grounded_retraction_reactivation_and_entity_merge(
         .store_entity("Refresh Cascade Right", "concept", Some(SPACE), None, None)
         .await
         .expect("create refresh-cascade right");
-    let refresh_relation = reopened
+    let _refresh_relation = reopened
         .create_relation(
             &refresh_left,
             &refresh_right,
