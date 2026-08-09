@@ -53,9 +53,13 @@ fn git_ls_files(root: &Path, pattern: &str) -> Vec<String> {
 /// The 4 daemon crates use `version.workspace = true`, so the only Cargo version
 /// is the root workspace one. Plus the CC plugin manifest (`plugin.json`) and the
 /// desktop app trio (`app/Cargo.toml`, `app/tauri.conf.json`, `package.json`),
-/// all kept on the same release train via `release-please-config.json`
-/// `extra-files` so neither the plugin nor the app can silently lag the daemon
-/// (the recurring version-drift nag). 7 sources.
+/// all kept on the same release train by `scripts/bump-version.sh` (run from
+/// release-please.yml on the release branch) rather than release-please's
+/// `extra-files` mechanism — `extra-files` collides with the closed
+/// `release-please-config.json` schema and pinned release-PR changed-file set
+/// that `scripts/validate-release-candidate.py` enforces. So neither the
+/// plugin nor the app can silently lag the daemon (the recurring
+/// version-drift nag). 7 sources.
 fn version_sources() -> Vec<(String, String)> {
     let root = repo_root();
     let mut out = Vec::new();

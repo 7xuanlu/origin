@@ -22,7 +22,7 @@ LOCK_VERSIONS=$(awk '
   in_pkg && $1 == "version" && $2 == "=" {
     version=$3
     gsub(/"/, "", version)
-    if (name == "wenlan" || name == "wenlan-core" || name == "wenlan-mcp" || name == "wenlan-server" || name == "wenlan-types") {
+    if (name == "wenlan" || name == "wenlan-app" || name == "wenlan-core" || name == "wenlan-mcp" || name == "wenlan-server" || name == "wenlan-types") {
       print name ":" version
     }
     in_pkg=0
@@ -75,7 +75,7 @@ if [[ -z "$CODEX_RUNNER_PINS" || -z "$CODEX_README_PINS" || -z "$CODEX_SETUP_TAG
     exit 1
 fi
 
-for crate in wenlan wenlan-core wenlan-mcp wenlan-server wenlan-types; do
+for crate in wenlan wenlan-app wenlan-core wenlan-mcp wenlan-server wenlan-types; do
     if ! printf '%s\n' "$LOCK_VERSIONS" | grep -qx "${crate}:${TAG_VER}"; then
         echo "ERROR: Cargo.lock drift — ${crate} is not ${TAG_VER}"
         exit 1
