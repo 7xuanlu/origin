@@ -52,7 +52,7 @@ The desktop app is the fastest way to see the complete workflow: read pages, ins
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-The [installer is inspectable](scripts/install-macos-app.sh). It checks the release archive against GitHub's published SHA-256 before replacing an existing app. Prefer the DMG or want to inspect the app source? See [wenlan-app releases](https://github.com/7xuanlu/wenlan-app/releases/latest) and [wenlan-app](https://github.com/7xuanlu/wenlan-app).
+The [installer is inspectable](scripts/install-macos-app.sh). It checks the release archive against GitHub's published SHA-256 before replacing an existing app. Prefer the DMG or want to inspect the app source? See [wenlan-app releases](https://github.com/7xuanlu/wenlan-app/releases/latest) or the in-tree [`app/`](app/) crate.
 
 <a id="claude-code-in-30-seconds"></a>
 
@@ -321,20 +321,21 @@ More detailed documentation, concepts, and comparisons:
 
 ## Contributing
 
-Bug fixes, eval cases, docs, and features are welcome. Installing Wenlan does not require building from source. For local development, run each group from the root of the named repository:
+Bug fixes, eval cases, docs, and features are welcome. Installing Wenlan does not require building from source. For local development, run these commands from this repository's root:
 
 ```bash
-# 7xuanlu/wenlan — runtime, CLI, and MCP
-cargo build --workspace
-cargo test --workspace
+# daemon crates (default-members — the desktop app is not compiled)
+cargo build
+cargo test
 
-# 7xuanlu/wenlan-app — desktop app
+# desktop app (Cargo target and root-level frontend tooling)
+cargo build -p wenlan-app
 pnpm install
 pnpm tauri dev
 pnpm build:all
 ```
 
-Use `pnpm dev:all` in the app repository when you want a fresh daemon-plus-app sequence. See this repository's [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md), plus [wenlan-app's AGENTS.md](https://github.com/7xuanlu/wenlan-app/blob/main/AGENTS.md), for the complete development workflow. Security reports: [SECURITY.md](SECURITY.md). Please also read the [Code of Conduct](CODE_OF_CONDUCT.md).
+Use `pnpm dev:all` in this repository when you want a fresh daemon-plus-app sequence. See this repository's [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md), plus the in-tree [app/AGENTS.md](app/AGENTS.md), for the complete development workflow. Security reports: [SECURITY.md](SECURITY.md). Please also read the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ---
 

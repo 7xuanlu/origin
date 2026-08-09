@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=00a9e0d18b88c59ba9ffd709551d33aecc990a22fc4c2daf8e11b41e46a868c9 -->
+<!-- README_SYNC: source=README.md sha256=7bbf1b1a901c212818cfa814b34f772c3eb388959add7c1c4097db1af6562f69 -->
 
 <p align="center">
   <picture>
@@ -54,7 +54,7 @@ La aplicación de escritorio es la forma más rápida de ver el flujo de trabajo
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-El [instalador es inspeccionable](scripts/install-macos-app.sh). Verifica el archivo de la versión contra el SHA-256 publicado en GitHub antes de reemplazar una aplicación existente. ¿Prefieres el DMG o quieres inspeccionar el código fuente de la aplicación? Consulta las [versiones de wenlan-app](https://github.com/7xuanlu/wenlan-app/releases/latest) y [wenlan-app](https://github.com/7xuanlu/wenlan-app).
+El [instalador es inspeccionable](scripts/install-macos-app.sh). Verifica el archivo de la versión contra el SHA-256 publicado en GitHub antes de reemplazar una aplicación existente. ¿Prefieres el DMG o quieres inspeccionar el código fuente de la aplicación? Consulta las [versiones de wenlan-app](https://github.com/7xuanlu/wenlan-app/releases/latest) o el crate [`app/`](app/) dentro de este repositorio.
 
 <a id="claude-code-in-30-seconds"></a>
 
@@ -323,20 +323,21 @@ Documentación más detallada, conceptos y comparaciones:
 
 ## Contribuir
 
-Las correcciones de errores, casos de evaluación, documentación y funciones son bienvenidos. Instalar Wenlan no requiere compilar desde el código fuente. Para el desarrollo local, ejecuta cada grupo desde la raíz del repositorio nombrado:
+Las correcciones de errores, casos de evaluación, documentación y funciones son bienvenidos. Instalar Wenlan no requiere compilar desde el código fuente. Para el desarrollo local, ejecuta estos comandos desde la raíz de este repositorio:
 
 ```bash
-# 7xuanlu/wenlan — runtime, CLI y MCP
-cargo build --workspace
-cargo test --workspace
+# crates del daemon (default-members: la aplicación de escritorio no se compila)
+cargo build
+cargo test
 
-# 7xuanlu/wenlan-app — aplicación de escritorio
+# aplicación de escritorio (target de Cargo y herramientas frontend en la raíz)
+cargo build -p wenlan-app
 pnpm install
 pnpm tauri dev
 pnpm build:all
 ```
 
-Usa `pnpm dev:all` en el repositorio de la aplicación cuando quieras iniciar desde cero el daemon y, después, la aplicación. Consulta el [AGENTS.md](AGENTS.md) y [CONTRIBUTING.md](CONTRIBUTING.md) de este repositorio, además del [AGENTS.md de wenlan-app](https://github.com/7xuanlu/wenlan-app/blob/main/AGENTS.md), para el flujo de trabajo de desarrollo completo. Reportes de seguridad: [SECURITY.md](SECURITY.md). Por favor, lee también el [Código de Conducta](CODE_OF_CONDUCT.md).
+Usa `pnpm dev:all` en este repositorio cuando quieras iniciar desde cero el daemon y, después, la aplicación. Consulta el [AGENTS.md](AGENTS.md) y [CONTRIBUTING.md](CONTRIBUTING.md) de este repositorio, además del [app/AGENTS.md](app/AGENTS.md) dentro del repositorio, para el flujo de trabajo de desarrollo completo. Reportes de seguridad: [SECURITY.md](SECURITY.md). Por favor, lee también el [Código de Conducta](CODE_OF_CONDUCT.md).
 
 ---
 
