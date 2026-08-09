@@ -1035,7 +1035,7 @@ pub async fn store_memory(
     let daemon_req = requests::StoreMemoryRequest {
         content: req.content,
         memory_type: req.memory_type,
-        space: req.domain,
+        space: req.domain.into(),
         source_agent: req.source_agent,
         title: req.title,
         confidence: req.confidence,
@@ -1517,6 +1517,7 @@ pub async fn import_memories_cmd(
         source,
         content,
         label: _label,
+        space: Default::default(),
     };
     let result: responses::ImportMemoriesResponse =
         s.client.post_json("/api/import/memories", &req).await?;
@@ -1615,7 +1616,7 @@ pub async fn create_entity_cmd(
     let req = requests::CreateEntityRequest {
         name,
         entity_type,
-        space: domain,
+        space: domain.into(),
         source_agent: None,
         confidence: None,
     };
@@ -2901,10 +2902,12 @@ fn authored_page_request(
         content: content.trim().to_string(),
         summary: None,
         entity_id: None,
-        space: space.and_then(|value| {
-            let normalized = value.trim();
-            (!normalized.is_empty()).then(|| normalized.to_string())
-        }),
+        space: space
+            .and_then(|value| {
+                let normalized = value.trim();
+                (!normalized.is_empty()).then(|| normalized.to_string())
+            })
+            .into(),
         source_memory_ids: Vec::new(),
         creation_kind: Some("authored".to_string()),
         workspace: None,
@@ -4454,6 +4457,9 @@ mod status_response_tests {
                 model_id: "bge-reranker".to_string(),
             },
             reranker_mode: "lite".to_string(),
+            on_device_inference: Default::default(),
+            capabilities: Vec::new(),
+            truth: None,
         };
 
         let merged = merge_daemon_status(local, daemon);
