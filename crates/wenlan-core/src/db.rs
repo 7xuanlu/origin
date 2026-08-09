@@ -167,6 +167,8 @@ mod space_rename_test;
 #[cfg(test)]
 #[path = "db/test_support_test.rs"]
 pub(crate) mod test_support;
+#[cfg(test)]
+mod tx_rollback_test;
 
 /// Builds the `ReadScope::Uncategorized` filter for a space column folded by
 /// the space-sentinel migration (`memories.space`, `chunks.space`,
@@ -4205,6 +4207,34 @@ impl MemoryDB {
             .map_err(|_| WenlanError::Embedding("embedder thread panicked".into()))?
             .map_err(|e| WenlanError::Embedding(format!("init embedder: {}", e)))?;
         Ok(Arc::new(std::sync::Mutex::new(embedder)))
+    }
+
+    /// Self-healing transaction watchdog.
+    ///
+    /// `MemoryDB` owns ONE shared `libsql::Connection`, so a `BEGIN ... ?
+    /// ... COMMIT` body that returns early without a `ROLLBACK` leaves that
+    /// single connection inside an open transaction. Every later write then
+    /// lands in the leaked transaction: it is visible to the daemon's own
+    /// reads, never reaches the WAL, and is discarded when the process dies —
+    /// silent total write loss.
+    ///
+    /// Call this where a leak would otherwise go unnoticed (after a background
+    /// sweep phase, after the ingest enrichment pass). Returns `true` when a
+    /// leak was found; the connection is rolled back to autocommit either way,
+    /// so the next write commits normally.
+    pub async fn assert_autocommit_or_recover(&self, call_site: &str) -> bool {
+        let conn = self.conn.lock().await;
+        if conn.is_autocommit() {
+            return false;
+        }
+        log::error!(
+            "[tx-watchdog] connection left inside an open transaction after {call_site}; \
+             every subsequent write would be uncommitted and lost on exit. Rolling back to recover."
+        );
+        if let Err(e) = conn.execute("ROLLBACK", ()).await {
+            log::error!("[tx-watchdog] recovery ROLLBACK after {call_site} failed: {e}");
+        }
+        true
     }
 
     // ===== Migrations =====
@@ -23103,31 +23133,46 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("reorder begin: {}", e)))?;
 
-        if new_order < old_order {
-            // Moving up: shift items in [new_order, old_order) down by 1
-            conn.execute(
-                "UPDATE spaces SET sort_order = sort_order + 1 WHERE sort_order >= ?1 AND sort_order < ?2",
-                libsql::params![new_order, old_order],
-            ).await.map_err(|e| WenlanError::VectorDb(format!("reorder shift down: {}", e)))?;
-        } else {
-            // Moving down: shift items in (old_order, new_order] up by 1
-            conn.execute(
-                "UPDATE spaces SET sort_order = sort_order - 1 WHERE sort_order > ?1 AND sort_order <= ?2",
-                libsql::params![old_order, new_order],
-            ).await.map_err(|e| WenlanError::VectorDb(format!("reorder shift up: {}", e)))?;
-        }
+        // Inner block so any early Err routes through ROLLBACK below instead of
+        // leaking an open transaction on the shared connection (mirrors
+        // `fold_relation_type`).
+        let result: Result<(), WenlanError> = async {
+            if new_order < old_order {
+                // Moving up: shift items in [new_order, old_order) down by 1
+                conn.execute(
+                    "UPDATE spaces SET sort_order = sort_order + 1 WHERE sort_order >= ?1 AND sort_order < ?2",
+                    libsql::params![new_order, old_order],
+                ).await.map_err(|e| WenlanError::VectorDb(format!("reorder shift down: {}", e)))?;
+            } else {
+                // Moving down: shift items in (old_order, new_order] up by 1
+                conn.execute(
+                    "UPDATE spaces SET sort_order = sort_order - 1 WHERE sort_order > ?1 AND sort_order <= ?2",
+                    libsql::params![old_order, new_order],
+                ).await.map_err(|e| WenlanError::VectorDb(format!("reorder shift up: {}", e)))?;
+            }
 
-        conn.execute(
-            "UPDATE spaces SET sort_order = ?1 WHERE name = ?2",
-            libsql::params![new_order, name],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("reorder set: {}", e)))?;
-
-        conn.execute("COMMIT", ())
+            conn.execute(
+                "UPDATE spaces SET sort_order = ?1 WHERE name = ?2",
+                libsql::params![new_order, name],
+            )
             .await
-            .map_err(|e| WenlanError::VectorDb(format!("reorder commit: {}", e)))?;
-        Ok(())
+            .map_err(|e| WenlanError::VectorDb(format!("reorder set: {}", e)))?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("reorder commit: {}", e)))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     pub async fn toggle_space_starred(&self, name: &str) -> Result<bool, WenlanError> {
@@ -28946,18 +28991,35 @@ impl MemoryDB {
             conn.execute("BEGIN", ()).await.map_err(|e| {
                 WenlanError::VectorDb(format!("insert_summary_node srcs begin: {e}"))
             })?;
-            for src in sources {
-                conn.execute(
-                    "INSERT OR IGNORE INTO summary_node_sources (node_id, memory_source_id) \
-                     VALUES (?1, ?2)",
-                    libsql::params![id.to_string(), src.clone()],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("insert_summary_node src: {e}")))?;
+
+            // Inner block so any early Err routes through ROLLBACK below instead
+            // of leaking an open transaction on the shared connection (mirrors
+            // `fold_relation_type`).
+            let result: Result<(), WenlanError> = async {
+                for src in sources {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO summary_node_sources (node_id, memory_source_id) \
+                         VALUES (?1, ?2)",
+                        libsql::params![id.to_string(), src.clone()],
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("insert_summary_node src: {e}")))?;
+                }
+                Ok(())
             }
-            conn.execute("COMMIT", ()).await.map_err(|e| {
-                WenlanError::VectorDb(format!("insert_summary_node srcs commit: {e}"))
-            })?;
+            .await;
+
+            match result {
+                Ok(()) => {
+                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                        WenlanError::VectorDb(format!("insert_summary_node srcs commit: {e}"))
+                    })?;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
@@ -31833,27 +31895,44 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("rebuild_child begin: {e}")))?;
-        conn.execute(
-            "DELETE FROM child_vectors WHERE parent_kind = 'memory' AND parent_id = ?1",
-            libsql::params![parent_id.to_string()],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("rebuild_child delete: {e}")))?;
-        for ((field, text), embedding) in fields.into_iter().zip(embeddings.iter()) {
-            let child_id = child_vector_id(parent_id, &field);
-            let vec_str = Self::vec_to_sql(embedding);
+
+        // Inner block so any early Err routes through ROLLBACK below instead of
+        // leaking an open transaction on the shared connection (mirrors
+        // `fold_relation_type`).
+        let result: Result<(), WenlanError> = async {
             conn.execute(
-                "INSERT OR REPLACE INTO child_vectors (id, parent_kind, parent_id, field, content, embedding)
-                 VALUES (?1, 'memory', ?2, ?3, ?4, vector32(?5))",
-                libsql::params![child_id, parent_id.to_string(), field, text, vec_str],
+                "DELETE FROM child_vectors WHERE parent_kind = 'memory' AND parent_id = ?1",
+                libsql::params![parent_id.to_string()],
             )
             .await
-            .map_err(|e| WenlanError::VectorDb(format!("rebuild_child insert: {e}")))?;
+            .map_err(|e| WenlanError::VectorDb(format!("rebuild_child delete: {e}")))?;
+            for ((field, text), embedding) in fields.into_iter().zip(embeddings.iter()) {
+                let child_id = child_vector_id(parent_id, &field);
+                let vec_str = Self::vec_to_sql(embedding);
+                conn.execute(
+                    "INSERT OR REPLACE INTO child_vectors (id, parent_kind, parent_id, field, content, embedding)
+                     VALUES (?1, 'memory', ?2, ?3, ?4, vector32(?5))",
+                    libsql::params![child_id, parent_id.to_string(), field, text, vec_str],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("rebuild_child insert: {e}")))?;
+            }
+            Ok(())
         }
-        conn.execute("COMMIT", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("rebuild_child commit: {e}")))?;
-        Ok(())
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("rebuild_child commit: {e}")))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// Idempotent backfill: rebuild `child_vectors` for every `source='memory'`
@@ -35149,18 +35228,35 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("link_memory_entities BEGIN: {e}")))?;
-        for eid in entity_ids {
-            conn.execute(
-                "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
-                libsql::params![memory_source_id, *eid],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("link_memory_entities INSERT: {e}")))?;
+
+        // Inner block so any early Err routes through ROLLBACK below instead of
+        // leaking an open transaction on the shared connection (mirrors
+        // `fold_relation_type`).
+        let result: Result<(), WenlanError> = async {
+            for eid in entity_ids {
+                conn.execute(
+                    "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                    libsql::params![memory_source_id, *eid],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("link_memory_entities INSERT: {e}")))?;
+            }
+            Ok(())
         }
-        conn.execute("COMMIT", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("link_memory_entities COMMIT: {e}")))?;
-        Ok(())
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ()).await.map_err(|e| {
+                    WenlanError::VectorDb(format!("link_memory_entities COMMIT: {e}"))
+                })?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// Compute the `memory_entities` degree distribution in one pass.
@@ -40134,18 +40230,35 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("mark_packaged begin: {}", e)))?;
-        for source_id in source_ids {
-            conn.execute(
-                "UPDATE capture_refs SET snapshot_id = ?1 WHERE source_id = ?2",
-                libsql::params![snapshot_id, *source_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("mark_packaged update: {}", e)))?;
+
+        // Inner block so any early Err routes through ROLLBACK below instead of
+        // leaking an open transaction on the shared connection (mirrors
+        // `fold_relation_type`).
+        let result: Result<(), WenlanError> = async {
+            for source_id in source_ids {
+                conn.execute(
+                    "UPDATE capture_refs SET snapshot_id = ?1 WHERE source_id = ?2",
+                    libsql::params![snapshot_id, *source_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("mark_packaged update: {}", e)))?;
+            }
+            Ok(())
         }
-        conn.execute("COMMIT", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("mark_packaged commit: {}", e)))?;
-        Ok(())
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("mark_packaged commit: {}", e)))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// Check if an activity has any unpackaged captures.
@@ -42368,21 +42481,38 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("set_event_dates begin: {e}")))?;
-        let mut updated = 0usize;
-        for (source_id, ts) in updates {
-            let n = conn
-                .execute(
-                    "UPDATE memories SET event_date = ?1 WHERE source_id = ?2",
-                    libsql::params![*ts, source_id.as_str()],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("set_event_dates update: {e}")))?;
-            updated += n as usize;
+
+        // Inner block so any early Err routes through ROLLBACK below instead of
+        // leaking an open transaction on the shared connection (mirrors
+        // `fold_relation_type`).
+        let result: Result<usize, WenlanError> = async {
+            let mut updated = 0usize;
+            for (source_id, ts) in updates {
+                let n = conn
+                    .execute(
+                        "UPDATE memories SET event_date = ?1 WHERE source_id = ?2",
+                        libsql::params![*ts, source_id.as_str()],
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("set_event_dates update: {e}")))?;
+                updated += n as usize;
+            }
+            Ok(updated)
         }
-        conn.execute("COMMIT", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("set_event_dates commit: {e}")))?;
-        Ok(updated)
+        .await;
+
+        match result {
+            Ok(updated) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("set_event_dates commit: {e}")))?;
+                Ok(updated)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// Additively backfill verbatim `source='episode'` rows for every existing
@@ -43938,17 +44068,35 @@ impl MemoryDB {
             conn.execute("BEGIN", ())
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("decay begin: {}", e)))?;
-            for (source_id, eff) in &updates {
-                conn.execute(
-                    "UPDATE memories SET effective_confidence = ?1 WHERE source_id = ?2",
-                    libsql::params![*eff, source_id.as_str()],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("decay update: {}", e)))?;
+
+            // Inner block so any early Err routes through ROLLBACK below instead
+            // of leaking an open transaction on the shared connection (mirrors
+            // `fold_relation_type`). `refinery::run_phase` swallows this error,
+            // so a leak here would silently uncommit every later daemon write.
+            let result: Result<(), WenlanError> = async {
+                for (source_id, eff) in &updates {
+                    conn.execute(
+                        "UPDATE memories SET effective_confidence = ?1 WHERE source_id = ?2",
+                        libsql::params![*eff, source_id.as_str()],
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("decay update: {}", e)))?;
+                }
+                Ok(())
             }
-            conn.execute("COMMIT", ())
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("decay commit: {}", e)))?;
+            .await;
+
+            match result {
+                Ok(()) => {
+                    conn.execute("COMMIT", ())
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("decay commit: {}", e)))?;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
         }
 
         Ok(count)
@@ -43966,18 +44114,36 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("flush_access begin: {}", e)))?;
-        for source_id in source_ids {
-            conn.execute(
-                "UPDATE memories SET access_count = COALESCE(access_count, 0) + 1, last_accessed = datetime('now') WHERE source_id = ?1",
-                [source_id.as_str()],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("flush_access update: {}", e)))?;
+
+        // Inner block so any early Err routes through ROLLBACK below instead of
+        // leaking an open transaction on the shared connection (mirrors
+        // `fold_relation_type`). The access-tracker timer calls this every 60s
+        // and drops the error, so a leak here would go unnoticed.
+        let result: Result<(), WenlanError> = async {
+            for source_id in source_ids {
+                conn.execute(
+                    "UPDATE memories SET access_count = COALESCE(access_count, 0) + 1, last_accessed = datetime('now') WHERE source_id = ?1",
+                    [source_id.as_str()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("flush_access update: {}", e)))?;
+            }
+            Ok(())
         }
-        conn.execute("COMMIT", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("flush_access commit: {}", e)))?;
-        Ok(())
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("flush_access commit: {}", e)))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// Log individual access events for time-granular stats (today/week).
@@ -43990,18 +44156,36 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("log_accesses begin: {}", e)))?;
-        for sid in source_ids {
-            conn.execute(
-                "INSERT INTO access_log (source_id, accessed_at) VALUES (?1, ?2)",
-                libsql::params![sid.as_str(), now],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("log_accesses insert: {}", e)))?;
+
+        // Inner block so any early Err routes through ROLLBACK below instead of
+        // leaking an open transaction on the shared connection (mirrors
+        // `fold_relation_type`). Same 60s access-tracker timer as
+        // `flush_access_counts`, same dropped error.
+        let result: Result<(), WenlanError> = async {
+            for sid in source_ids {
+                conn.execute(
+                    "INSERT INTO access_log (source_id, accessed_at) VALUES (?1, ?2)",
+                    libsql::params![sid.as_str(), now],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("log_accesses insert: {}", e)))?;
+            }
+            Ok(())
         }
-        conn.execute("COMMIT", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("log_accesses commit: {}", e)))?;
-        Ok(())
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("log_accesses commit: {}", e)))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// Log an agent activity event (read, search, or refine).
@@ -45418,18 +45602,35 @@ impl MemoryDB {
             conn.execute("BEGIN", ())
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("evict begin: {e}")))?;
-            for source_id in &to_archive {
-                conn.execute(
-                    "UPDATE memories SET supersede_mode = 'evicted' \
-                     WHERE source_id = ?1 AND source = 'memory'",
-                    libsql::params![source_id.as_str()],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("evict update: {e}")))?;
+
+            // Inner block so any early Err routes through ROLLBACK below instead
+            // of leaking an open transaction on the shared connection (mirrors
+            // `fold_relation_type`).
+            let result: Result<(), WenlanError> = async {
+                for source_id in &to_archive {
+                    conn.execute(
+                        "UPDATE memories SET supersede_mode = 'evicted' \
+                         WHERE source_id = ?1 AND source = 'memory'",
+                        libsql::params![source_id.as_str()],
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("evict update: {e}")))?;
+                }
+                Ok(())
             }
-            conn.execute("COMMIT", ())
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("evict commit: {e}")))?;
+            .await;
+
+            match result {
+                Ok(()) => {
+                    conn.execute("COMMIT", ())
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("evict commit: {e}")))?;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
         }
 
         Ok(EvictionReport {
@@ -49304,10 +49505,17 @@ impl MemoryDB {
             }
         }
 
-        conn.execute("COMMIT", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("backfill commit: {e}")))?;
-        Ok(count)
+        // The per-row UPDATE above swallows its own error, so COMMIT is the only
+        // fallible step inside this transaction — but a failing COMMIT still
+        // leaves the shared connection mid-transaction, so it needs the ROLLBACK
+        // path too (mirrors `fold_relation_type`).
+        match conn.execute("COMMIT", ()).await {
+            Ok(_) => Ok(count),
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(WenlanError::VectorDb(format!("backfill commit: {e}")))
+            }
+        }
     }
 
     /// Parse a row into a Page. Column order must match the SELECT used in page queries.
@@ -52787,22 +52995,40 @@ impl MemoryDB {
                 conn.execute("BEGIN", ())
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m55a begin: {e}")))?;
-                for (sid, content, last_modified) in &batch {
-                    let now = chrono::DateTime::from_timestamp(*last_modified, 0)
-                        .unwrap_or_else(chrono::Utc::now);
-                    if let Some(cue) = crate::temporal_query::extract_cue_for_content(content, now)
-                    {
-                        conn.execute(
-                            "UPDATE memories SET event_date = ?, event_end = ? WHERE source_id = ?",
-                            libsql::params![cue.range.start, cue.range.end, sid.as_str()],
-                        )
-                        .await
-                        .map_err(|e| WenlanError::VectorDb(format!("m55a update: {e}")))?;
+
+                // Inner block so any early Err routes through ROLLBACK below
+                // instead of leaking an open transaction on the shared
+                // connection (mirrors `fold_relation_type`).
+                let result: Result<(), WenlanError> = async {
+                    for (sid, content, last_modified) in &batch {
+                        let now = chrono::DateTime::from_timestamp(*last_modified, 0)
+                            .unwrap_or_else(chrono::Utc::now);
+                        if let Some(cue) =
+                            crate::temporal_query::extract_cue_for_content(content, now)
+                        {
+                            conn.execute(
+                                "UPDATE memories SET event_date = ?, event_end = ? WHERE source_id = ?",
+                                libsql::params![cue.range.start, cue.range.end, sid.as_str()],
+                            )
+                            .await
+                            .map_err(|e| WenlanError::VectorDb(format!("m55a update: {e}")))?;
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        conn.execute("COMMIT", ())
+                            .await
+                            .map_err(|e| WenlanError::VectorDb(format!("m55a commit: {e}")))?;
+                    }
+                    Err(e) => {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        return Err(e);
                     }
                 }
-                conn.execute("COMMIT", ())
-                    .await
-                    .map_err(|e| WenlanError::VectorDb(format!("m55a commit: {e}")))?;
             }
 
             scanned += batch_len;
@@ -52866,6 +53092,10 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("m55b begin: {e}")))?;
 
+        // Inner block so any early Err routes through ROLLBACK below instead of
+        // leaking an open transaction on the shared connection (mirrors
+        // `fold_relation_type`).
+        let result: Result<usize, WenlanError> = async {
         // Self-heal orphaned refs first: a deleted entity can leave dangling
         // `memories.entity_id` rows (that column has no FK, so they sit harmless).
         // Copying them into `memory_entities` below would once have aborted the
@@ -52916,9 +53146,22 @@ impl MemoryDB {
         .await
         .map_err(|e| WenlanError::VectorDb(format!("m55b flag: {e}")))?;
 
-        conn.execute("COMMIT", ())
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("m55b commit: {e}")))?;
+            Ok(inserted)
+        }
+        .await;
+
+        let inserted = match result {
+            Ok(inserted) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m55b commit: {e}")))?;
+                inserted
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
 
         log::info!(
             "[migration] Migration 55 Pass B complete: memory_entities backfilled from memories.entity_id"

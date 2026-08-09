@@ -606,6 +606,14 @@ pub async fn run_canonical_enrichment(
         }
     }
 
+    // Transaction watchdog. Every phase above is log-and-degrade, so a DB helper
+    // that returned early out of a `BEGIN ... COMMIT` without rolling back would
+    // leave `MemoryDB`'s single shared connection inside an open transaction and
+    // silently uncommit every later write. Checking on the store path — the
+    // hottest write path there is — turns that into a loud error plus recovery.
+    db.assert_autocommit_or_recover("canonical enrichment")
+        .await;
+
     outcome
 }
 
