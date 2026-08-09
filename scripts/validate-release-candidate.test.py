@@ -13,6 +13,7 @@ import os
 import shutil
 import tarfile
 import tempfile
+import tomllib
 import unittest
 import urllib.request
 import zipfile
@@ -155,6 +156,41 @@ class DownloadApi:
         return len(raw), hashlib.sha256(raw).hexdigest()
 
 
+def lock_contents(
+    workspace_version: str,
+    dep_version: str,
+    *,
+    squat_version: str | None = None,
+    patch_version: str | None = None,
+) -> str:
+    squat_version = squat_version or dep_version
+    patch_version = patch_version or dep_version
+    stanzas = [
+        "version = 3",
+        f'[[package]]\nname = "decoy-dep"\nversion = "{dep_version}"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+        'checksum = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface"',
+        # a registry package squatting a workspace name must never be rewritten
+        f'[[package]]\nname = "wenlan-core"\nversion = "{squat_version}"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+        'checksum = "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe"',
+    ]
+    for name in sorted(VALIDATOR.WORKSPACE_LOCK_PACKAGES):
+        stanza = f'[[package]]\nname = "{name}"\nversion = "{workspace_version}"'
+        if name == "wenlan":
+            stanza += (
+                "\ndependencies = [\n"
+                ' "decoy-dep",\n'
+                ' "wenlan-core",\n'
+                "]"
+            )
+        stanzas.append(stanza)
+    stanzas.append(
+        f'[[patch.unused]]\nname = "wenlan-types"\nversion = "{patch_version}"'
+    )
+    return "\n\n".join(stanzas) + "\n"
+
+
 def release_contents() -> tuple[dict[str, str], dict[str, str]]:
     old_version = "0.15.3"
     new_version = "0.15.4"
@@ -182,6 +218,10 @@ def release_contents() -> tuple[dict[str, str], dict[str, str]]:
     new[codex] = json.dumps({"version": f"{new_version}+codex"})
     old["Cargo.toml"] = f'version = "{old_version}"   # x-release-please-version\n'
     new["Cargo.toml"] = f'version = "{new_version}"   # x-release-please-version\n'
+    # The decoy dependency legitimately sits at the workspace's old version and
+    # must survive the release untouched (the hashbrown 0.15.5 collision).
+    old["Cargo.lock"] = lock_contents(old_version, dep_version=old_version)
+    new["Cargo.lock"] = lock_contents(new_version, dep_version=old_version)
     old["release-please-config.json"] = json.dumps(
         {
             "packages": {
@@ -1147,6 +1187,211 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
                     VALIDATOR.validate_release_pr_content(
                         FakeContentApi(old, new), "7xuanlu/wenlan", candidate_pr()
                     )
+
+    def test_lock_transform_tolerates_dependency_at_the_old_release_version(self) -> None:
+        # Regression: hashbrown sat at 0.15.5 while the release moved
+        # 0.15.5 → 0.15.6, so a whole-file replace demanded a hashbrown bump
+        # the candidate correctly does not make. The stanza-scoped transform
+        # must accept the untouched dependency (covered by the fixture decoy)
+        # and still reject any dependency-stanza mutation.
+        old, new = release_contents()
+        version, _, _ = VALIDATOR.validate_release_pr_content(
+            FakeContentApi(old, new), "7xuanlu/wenlan", candidate_pr()
+        )
+        self.assertEqual(version, "0.15.4")
+
+        hostile_lock_mutations = {
+            "dependency version bumped": lock_contents("0.15.4", dep_version="0.15.4"),
+            "dependency checksum changed": new["Cargo.lock"].replace(
+                "feedface", "deadbeef", 1
+            ),
+            "trailing content appended": new["Cargo.lock"] + 'name = "extra"\n',
+            "registry squat bumped": lock_contents(
+                "0.15.4", dep_version="0.15.3", squat_version="0.15.4"
+            ),
+            "patch.unused stanza bumped": lock_contents(
+                "0.15.4", dep_version="0.15.3", patch_version="0.15.4"
+            ),
+        }
+        for label, hostile in hostile_lock_mutations.items():
+            with self.subTest(label=label):
+                old, new = release_contents()
+                new["Cargo.lock"] = hostile
+                with self.assertRaisesRegex(
+                    VALIDATOR.CandidateError, "workspace-stanza version-only"
+                ):
+                    VALIDATOR.validate_release_pr_content(
+                        FakeContentApi(old, new), "7xuanlu/wenlan", candidate_pr()
+                    )
+
+    def test_unchanged_lock_is_rejected_before_the_lock_transform(self) -> None:
+        old, new = release_contents()
+        stale = lock_contents("0.15.3", dep_version="0.15.3")
+        old["Cargo.lock"] = stale
+        new["Cargo.lock"] = stale
+        with self.assertRaisesRegex(VALIDATOR.CandidateError, "did not change"):
+            VALIDATOR.validate_release_pr_content(
+                FakeContentApi(old, new), "7xuanlu/wenlan", candidate_pr()
+            )
+
+    def test_lock_transform_refuses_ambiguous_workspace_stanzas(self) -> None:
+        transform = VALIDATOR._expected_lock_transform
+        base = lock_contents("0.15.3", dep_version="0.15.3")
+
+        # keys reordered inside a stanza are still recognized and bumped
+        reordered = base.replace(
+            '[[package]]\nname = "wenlan"\nversion = "0.15.3"',
+            '[[package]]\nversion = "0.15.3"\nname = "wenlan"',
+        )
+        self.assertIn(
+            '[[package]]\nversion = "0.15.4"\nname = "wenlan"',
+            transform(reordered, "0.15.3", "0.15.4"),
+        )
+
+        # a second source-less stanza for one member is ambiguous
+        duplicated = base + '\n[[package]]\nname = "wenlan"\nversion = "0.15.3"\n'
+        with self.assertRaisesRegex(
+            VALIDATOR.CandidateError, "exactly one workspace stanza"
+        ):
+            transform(duplicated, "0.15.3", "0.15.4")
+
+        # every workspace member must be present in the lock
+        missing = base.replace('name = "wenlan-mcp"', 'name = "renamed-mcp"')
+        with self.assertRaisesRegex(
+            VALIDATOR.CandidateError, "exactly one workspace stanza"
+        ):
+            transform(missing, "0.15.3", "0.15.4")
+
+        # a workspace stanza off the base version is never silently skipped
+        off_version = base.replace(
+            'name = "wenlan-server"\nversion = "0.15.3"',
+            'name = "wenlan-server"\nversion = "0.15.2"',
+        )
+        with self.assertRaisesRegex(
+            VALIDATOR.CandidateError, "does not pin exactly the base version"
+        ):
+            transform(off_version, "0.15.3", "0.15.4")
+
+        # a CRLF version line cannot slip through as an untouched stale stanza
+        crlf = base.replace(
+            'name = "wenlan-types"\nversion = "0.15.3"',
+            'name = "wenlan-types"\nversion = "0.15.3"\r',
+            1,
+        )
+        with self.assertRaisesRegex(
+            VALIDATOR.CandidateError, "does not pin exactly the base version"
+        ):
+            transform(crlf, "0.15.3", "0.15.4")
+
+        # a version-qualified reference to a workspace member is refused
+        # outright — in every form Cargo can emit it, wherever it appears, and
+        # even hidden behind a TOML escape sequence
+        qualified_locks = [
+            base.replace(' "wenlan-core",', ' "wenlan-core 0.15.3",', 1),
+            base.replace(' "wenlan-core",', '  "wenlan-core 0.15.3"', 1),
+            base.replace(
+                ' "wenlan-core",',
+                ' "wenlan-core 0.15.3 (registry+https://github.com'
+                "/rust-lang/crates.io-index)\",",
+                1,
+            ),
+            base.replace(' "wenlan-core",', ' "wenlan-core\\u00200.15.3",', 1),
+            base + '\n[extra]\nnote = "wenlan-server 0.15.3"\n',
+            base
+            + '\n[metadata]\n'
+            + '"checksum wenlan-core 0.15.3 '
+            + '(registry+https://github.com/rust-lang/crates.io-index)" = "abc"\n',
+        ]
+        for qualified in qualified_locks:
+            with self.assertRaisesRegex(
+                VALIDATOR.CandidateError, "version-qualified reference"
+            ):
+                transform(qualified, "0.15.3", "0.15.4")
+
+        # the rejection is semantic, not textual: a comment mentioning a
+        # member is tolerated, while a base that is not TOML at all is refused
+        commented = base + '# "wenlan-core release note"\n'
+        self.assertIn('version = "0.15.4"', transform(commented, "0.15.3", "0.15.4"))
+        metadata_note = base + '\n[metadata]\nnote = "wenlan-core release note"\n'
+        self.assertIn(
+            'version = "0.15.4"', transform(metadata_note, "0.15.3", "0.15.4")
+        )
+        with self.assertRaisesRegex(VALIDATOR.CandidateError, "not valid TOML"):
+            transform(base + ' "dangling-line",\n', "0.15.3", "0.15.4")
+
+    def test_lock_transform_rejects_raw_parser_disagreement(self) -> None:
+        transform = VALIDATOR._expected_lock_transform
+        real_packages = "\n\n".join(
+            f' [[package]]\nname = "{name}"\nversion = "0.15.3"'
+            for name in sorted(VALIDATOR.WORKSPACE_LOCK_PACKAGES)
+        )
+        fake_packages = "\n".join(
+            f'[[package]]\nname = "{name}"\nversion = "0.15.3"'
+            for name in sorted(VALIDATOR.WORKSPACE_LOCK_PACKAGES)
+        )
+        base = (
+            "version = 3\n\n"
+            + real_packages
+            + '\n\n[metadata]\nnote = """\n'
+            + fake_packages
+            + '\n"""\n'
+        )
+        self.assertIsInstance(tomllib.loads(base)["package"], list)
+        with self.assertRaisesRegex(
+            VALIDATOR.CandidateError, "transform does not reduce"
+        ):
+            transform(base, "0.15.3", "0.15.4")
+
+    def test_lock_transform_rejects_indented_stale_workspace_package(self) -> None:
+        transform = VALIDATOR._expected_lock_transform
+        hostile = (
+            lock_contents("0.15.3", dep_version="0.15.3")
+            + '\n [[package]]\nname = "wenlan-core"\nversion = "0.15.2"\n'
+        )
+        parsed = tomllib.loads(hostile)
+        self.assertEqual(
+            sum(
+                package.get("name") == "wenlan-core"
+                and "source" not in package
+                for package in parsed["package"]
+            ),
+            2,
+        )
+        self.assertIn(
+            "0.15.2",
+            [
+                package["version"]
+                for package in parsed["package"]
+                if package.get("name") == "wenlan-core" and "source" not in package
+            ],
+        )
+        with self.assertRaisesRegex(
+            VALIDATOR.CandidateError,
+            "does not contain exactly the workspace package set",
+        ):
+            transform(hostile, "0.15.3", "0.15.4")
+
+    def test_lock_transform_accepts_version_shaped_prose_suffix(self) -> None:
+        transform = VALIDATOR._expected_lock_transform
+        base = lock_contents("0.15.3", dep_version="0.15.3")
+        noted = base + '\n[metadata]\nnote = "wenlan-core 0.15.6th release note"\n'
+        transformed = transform(noted, "0.15.3", "0.15.4")
+        self.assertIn('name = "wenlan-core"\nversion = "0.15.4"', transformed)
+
+    def test_lock_transform_rejects_qualified_version_extensions(self) -> None:
+        transform = VALIDATOR._expected_lock_transform
+        base = lock_contents("0.15.3", dep_version="0.15.3")
+        for note in (
+            "wenlan-core 0.15.3-alpha",
+            "wenlan-core 0.15.55",
+            "wenlan-core 0.15.3 (registry+https://github.com/rust-lang/crates.io-index)",
+        ):
+            with self.subTest(note=note):
+                qualified = base + f'\n[metadata]\nnote = "{note}"\n'
+                with self.assertRaisesRegex(
+                    VALIDATOR.CandidateError, "version-qualified reference"
+                ):
+                    transform(qualified, "0.15.3", "0.15.4")
 
     def test_release_runner_mode_change_is_rejected(self) -> None:
         old, new = release_contents()
