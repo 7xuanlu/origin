@@ -436,9 +436,147 @@ jobs:
           echo "ERROR: legacy tag-push Release run $legacy_run_id did not reach cancelled."
           exit 1
 
+  app-bundle:
+    name: Build macOS desktop app bundle
+    needs: [resolve-promotion, bind-release-tag]
+    runs-on: macos-14
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      dmg_filename: ${{ steps.stage.outputs.dmg_filename }}
+      tarball_filename: ${{ steps.stage.outputs.tarball_filename }}
+      sig_filename: ${{ steps.stage.outputs.sig_filename }}
+      dmg_sha256: ${{ steps.stage.outputs.dmg_sha256 }}
+      tarball_sha256: ${{ steps.stage.outputs.tarball_sha256 }}
+      sig_sha256: ${{ steps.stage.outputs.sig_sha256 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify release checkout
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          checkout_sha="$(git rev-parse HEAD)"
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$checkout_sha" != "$RELEASE_SHA" || "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: release SHA $RELEASE_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
+            exit 1
+          fi
+
+      - name: Milestone-B 4b app version lockstep guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_VERSION="$(jq -er '.version | strings' app/tauri.conf.json)"
+          if [[ "v$APP_VERSION" != "$RELEASE_TAG" ]]; then
+            echo "ERROR: Milestone-B 4b lockstep guard: app/tauri.conf.json version $APP_VERSION does not match release tag $RELEASE_TAG; stays red until phase 4c bumps the app version."
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: app-bundle
+          cache-all-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download cloudflared sidecar
+        run: |
+          mkdir -p app/binaries
+          curl -fsSL -o /tmp/cloudflared.tgz \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz
+          tar -xzf /tmp/cloudflared.tgz -C /tmp
+          chmod 755 /tmp/cloudflared
+          xattr -cr /tmp/cloudflared
+          echo "CLOUDFLARED_BIN=/tmp/cloudflared" >> "$GITHUB_ENV"
+
+      - name: Build macOS desktop app bundle
+        shell: bash
+        env:
+          CXXFLAGS: "-std=c++17"
+          CLOUDFLARED_BIN: ${{ env.CLOUDFLARED_BIN }}
+          # Ad-hoc sign ("-") when no Apple Developer cert is configured.
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --target aarch64-apple-darwin
+
+      - name: Stage app bundle assets and checksums
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_VERSION="$(jq -er '.version | strings' app/tauri.conf.json)"
+          bundle_dir="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle"
+          dmg="$(find "$bundle_dir/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          tarball="$(find "$bundle_dir/macos" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit)"
+          sig="${tarball}.sig"
+          [[ -n "$dmg" && -f "$dmg" ]] || { echo "ERROR: Tauri did not emit a .dmg under $bundle_dir/dmg."; exit 1; }
+          [[ -n "$tarball" && -f "$tarball" ]] || { echo "ERROR: Tauri did not emit an .app.tar.gz under $bundle_dir/macos."; exit 1; }
+          [[ -f "$sig" ]] || { echo "ERROR: Tauri did not emit $sig."; exit 1; }
+
+          staged="$RUNNER_TEMP/app-bundle-staging"
+          rm -rf "$staged"
+          mkdir -p "$staged"
+          dmg_name="Wenlan_${APP_VERSION}_aarch64.dmg"
+          tarball_name="Wenlan_aarch64.app.tar.gz"
+          sig_name="${tarball_name}.sig"
+          cp "$dmg" "$staged/$dmg_name"
+          cp "$tarball" "$staged/$tarball_name"
+          cp "$sig" "$staged/$sig_name"
+
+          dmg_sha256="$(shasum -a 256 "$staged/$dmg_name" | awk '{print $1}')"
+          tarball_sha256="$(shasum -a 256 "$staged/$tarball_name" | awk '{print $1}')"
+          sig_sha256="$(shasum -a 256 "$staged/$sig_name" | awk '{print $1}')"
+          echo "Tauri DMG: $dmg"
+          echo "Tauri updater bundle: $tarball"
+          echo "Tauri updater signature: $sig"
+          echo "Staged checksums: $dmg_sha256 $tarball_sha256 $sig_sha256"
+          {
+            echo "dmg_filename=$dmg_name"
+            echo "tarball_filename=$tarball_name"
+            echo "sig_filename=$sig_name"
+            echo "dmg_sha256=$dmg_sha256"
+            echo "tarball_sha256=$tarball_sha256"
+            echo "sig_sha256=$sig_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload macOS app bundle artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: app-bundle-${{ github.run_id }}
+          path: ${{ runner.temp }}/app-bundle-staging
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
+
   promote-assets:
     name: Promote exact validated release assets
-    needs: [resolve-promotion, bind-release-tag, prepare-release]
+    needs: [resolve-promotion, bind-release-tag, prepare-release, app-bundle]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -496,6 +634,90 @@ jobs:
               gh release upload "$RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY"
             fi
           done
+      - name: Download macOS app bundle artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: app-bundle-${{ github.run_id }}
+          path: ${{ runner.temp }}/app-bundle
+      - name: Verify macOS app bundle bytes before promotion
+        shell: bash
+        run: |
+          set -euo pipefail
+          verify_sha256() {
+            local name="$1" expected="$2" actual path
+            path="$RUNNER_TEMP/app-bundle/$name"
+            [[ -f "$path" ]] || { echo "ERROR: missing app bundle artifact $name."; exit 1; }
+            actual="$(sha256sum "$path" | awk '{print $1}')"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "ERROR: app bundle asset $name SHA-256 mismatch: expected $expected, got $actual."
+              exit 1
+            fi
+            echo "$name: $actual"
+          }
+          verify_sha256 "${{ needs.app-bundle.outputs.dmg_filename }}" "${{ needs.app-bundle.outputs.dmg_sha256 }}"
+          verify_sha256 "${{ needs.app-bundle.outputs.tarball_filename }}" "${{ needs.app-bundle.outputs.tarball_sha256 }}"
+          verify_sha256 "${{ needs.app-bundle.outputs.sig_filename }}" "${{ needs.app-bundle.outputs.sig_sha256 }}"
+      - name: Upload macOS app assets and updater metadata without clobbering
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          existing="$RUNNER_TEMP/existing-app-release-assets"
+          mkdir -p "$existing"
+
+          upload_without_clobber() {
+            local asset="$1" name tag_sha
+            name="$(basename "$asset")"
+            tag_sha="$(gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+            if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+              echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
+              exit 1
+            fi
+            if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name' | grep -Fxq "$name"; then
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --pattern "$name" --dir "$existing"
+              cmp "$asset" "$existing/$name" || {
+                echo "Existing release asset $name differs; refusing to clobber."
+                exit 1
+              }
+              echo "$name already exists with identical bytes."
+            else
+              gh release upload "$RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY"
+            fi
+          }
+
+          upload_without_clobber "$RUNNER_TEMP/app-bundle/${{ needs.app-bundle.outputs.dmg_filename }}"
+          upload_without_clobber "$RUNNER_TEMP/app-bundle/${{ needs.app-bundle.outputs.tarball_filename }}"
+          upload_without_clobber "$RUNNER_TEMP/app-bundle/${{ needs.app-bundle.outputs.sig_filename }}"
+
+          # Installed clients still read the OLD repo endpoint until the phase-5 cutover;
+          # this file must exist on the unified release BEFORE that cutover.
+          version="${RELEASE_TAG#v}"
+          notes="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq '.body')"
+          pub_date="$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")"
+          signature="$(cat "$RUNNER_TEMP/app-bundle/${{ needs.app-bundle.outputs.sig_filename }}")"
+          tarball_name="${{ needs.app-bundle.outputs.tarball_filename }}"
+          jq -n \
+            --arg version "$version" \
+            --arg notes "$notes" \
+            --arg pub_date "$pub_date" \
+            --arg signature "$signature" \
+            --arg url "https://github.com/7xuanlu/wenlan/releases/download/$RELEASE_TAG/$tarball_name" \
+            '{
+              version: $version,
+              notes: $notes,
+              pub_date: $pub_date,
+              platforms: {
+                "darwin-aarch64": {signature: $signature, url: $url},
+                "darwin-aarch64-app": {signature: $signature, url: $url}
+              }
+            }' > "$RUNNER_TEMP/app-bundle/latest.json"
+          upload_without_clobber "$RUNNER_TEMP/app-bundle/latest.json"
       - name: Publish exact Homebrew inputs for this run
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
