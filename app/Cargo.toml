@@ -82,7 +82,8 @@ raw-window-handle = "0.6"
 
 # Workspace crates
 wenlan-types = { workspace = true }
-sysinfo = "0.33"
+# Workspace-pinned (=0.38.3): the scheduler tooth requires exactly one sysinfo in Cargo.lock
+sysinfo = { workspace = true }
 pdf-extract = "0.10"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
