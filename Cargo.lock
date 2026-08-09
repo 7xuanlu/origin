@@ -9544,7 +9544,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "wenlan"
-version = "0.15.5"
+version = "0.15.6"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -9616,7 +9616,7 @@ dependencies = [
 
 [[package]]
 name = "wenlan-core"
-version = "0.15.5"
+version = "0.15.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9666,7 +9666,7 @@ dependencies = [
 
 [[package]]
 name = "wenlan-mcp"
-version = "0.15.5"
+version = "0.15.6"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -9700,7 +9700,7 @@ dependencies = [
 
 [[package]]
 name = "wenlan-server"
-version = "0.15.5"
+version = "0.15.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9739,7 +9739,7 @@ dependencies = [
 
 [[package]]
 name = "wenlan-types"
-version = "0.15.5"
+version = "0.15.6"
 dependencies = [
  "anyhow",
  "serde",
