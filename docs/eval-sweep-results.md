@@ -1,9 +1,9 @@
 # Eval sweep results
 
-Measurement records extracted from `crates/wenlan-core/src/eval/AGENTS.md`. These are
+Measurement records extracted from `crates/wenlan-core/src/eval/REFERENCE.md`. These are
 receipts for decisions already made — read them when re-opening one of those decisions,
 not on every eval session. The binding methodology that governs future sweeps stays in
-that AGENTS.md ("CE rerank pool / model eval methodology" and "emitter correctness").
+[`eval reference`](../crates/wenlan-core/src/eval/REFERENCE.md) "CE rerank pool / model eval methodology (boule-verified 2026-06-19)"; emitter details are in its nested "emitter correctness" section.
 
 ## deep-S N=31 pool/model sweep — RESULTS + substrate caveats (2026-06-19)
 
@@ -28,4 +28,3 @@ First faithful deep-S retrieval-NDCG sweep: 9 arms × N=31 via `rerank_pool_retr
 - **Immediate (no reseed):** re-run the N=31 sweep with `WENLAN_ENABLE_PAGE_CHANNEL=1` on the existing pool31 to get the **page-channel-ON family** — but FIRST wire page→source expansion into the probe's scorer (else pages count as misses). This tests "does pool depth shift when page candidates join the CE pool" without any seeding.
 - **The remaining real reason to reseed N=90 = REPRESENTATIVENESS only** (the category skew: SSU 36% vs full 14%, MS/TR starved), NOT pages. Stratify to full LME-S proportions (KU 14 · MS 24 · SSA 10 · SSP 5 · SSU 13 · TR 24 = 90). Episodes (genuinely absent) can be added in the same reseed if the episode channel is ever wired into retrieval.
 - The N=90 reseed MUST use the batched enrichment path (n_seq_max=8); the seed-only `enrich_fullpipeline_lme_only` path measured at n_seq_max=1 / 0.4s/call (serial) — see throughput note. CE-on ships now; turbo↔bge flip + pool-depth + adaptive-kill wait for the representative N=90. Per-query latency N-independent (turbo p10 stays 280ms).
-

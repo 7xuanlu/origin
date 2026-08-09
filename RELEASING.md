@@ -6,7 +6,9 @@ This document covers releases of the local runtime: `wenlan` CLI, `wenlan-server
 
 Merge conventional commits to `main` (for example, `feat:`, `fix:`, or `chore:`). The push-only `release-pr-maintenance` workflow immediately opens or updates the Release PR, bumps the version, and updates `CHANGELOG.md` while main CI runs in parallel. It sets `skip-github-release: true`: this path may maintain the PR but cannot create a tag or GitHub Release. The later successful-main `workflow_run` keeps the same PR-only operation as a no-op fallback for transient push-workflow failures. Merging the Release PR cuts a release only after the trusted promotion gate binds that exact merge tree to the archives already built and tested by the PR. The gate then creates the exact `v*` tag, which triggers artifact-only publication in `release.yml`.
 
-> The coding-time rules—why every release bumps patch (`"versioning": "always-bump-patch"`), how to force a deliberate minor via `release-as`, the version-file-sync rule, and how to undo a release—live in the root [`AGENTS.md`](AGENTS.md) "Releasing (release-please)" section. This document is the human operator procedure.
+> This document is the canonical release procedure. Coding changes must preserve
+> the conventional-title and synchronized-version rules in root
+> [`AGENTS.md`](AGENTS.md) "Git and release".
 
 The `.release-please-manifest.json` is the canonical version source; check the pending version with `cat .release-please-manifest.json`. The release-please workflow syncs Cargo manifests, npm package manifests, plugin metadata, and pinned install URLs from `version.txt`. It also syncs the workspace `Cargo.toml` version on the release branch because release-please cannot reliably handle Cargo workspaces with the `simple` release type.
 
