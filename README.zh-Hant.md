@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=00a9e0d18b88c59ba9ffd709551d33aecc990a22fc4c2daf8e11b41e46a868c9 -->
+<!-- README_SYNC: source=README.md sha256=7bbf1b1a901c212818cfa814b34f772c3eb388959add7c1c4097db1af6562f69 -->
 
 <p align="center">
   <picture>
@@ -54,7 +54,7 @@
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-你可以直接[檢查安裝器原始碼](scripts/install-macos-app.sh)。安裝器會先用 GitHub 發布的 SHA-256 核對下載檔案，再替換現有 app。偏好 DMG 或想查看 app 原始碼？請前往 [wenlan-app releases](https://github.com/7xuanlu/wenlan-app/releases/latest) 和 [wenlan-app](https://github.com/7xuanlu/wenlan-app)。
+你可以直接[檢查安裝器原始碼](scripts/install-macos-app.sh)。安裝器會先用 GitHub 發布的 SHA-256 核對下載檔案，再替換現有 app。偏好 DMG 或想查看 app 原始碼？請前往 [wenlan-app releases](https://github.com/7xuanlu/wenlan-app/releases/latest)，或檢視本儲存庫內的 [`app/`](app/) crate。
 
 <a id="claude-code-in-30-seconds"></a>
 
@@ -323,20 +323,21 @@ a1b2c3d distill: 4 pages
 
 ## 貢獻
 
-歡迎 bug fixes、eval cases、文件與功能。安裝 Wenlan 不需要從原始碼建置。本機開發時，請從對應 repository 的根目錄執行每組命令：
+歡迎 bug fixes、eval cases、文件與功能。安裝 Wenlan 不需要從原始碼建置。本機開發時，請從本 repository 的根目錄執行以下命令：
 
 ```bash
-# 7xuanlu/wenlan — runtime、CLI 與 MCP
-cargo build --workspace
-cargo test --workspace
+# daemon crates（default-members——不會編譯桌面 app）
+cargo build
+cargo test
 
-# 7xuanlu/wenlan-app — 桌面 app
+# 桌面 app（Cargo target 與根目錄的前端工具鏈）
+cargo build -p wenlan-app
 pnpm install
 pnpm tauri dev
 pnpm build:all
 ```
 
-需要從全新的 daemon 開始執行 app 時，請在 app repository 使用 `pnpm dev:all`。完整開發流程見本 repository 的 [AGENTS.md](AGENTS.md) 與 [CONTRIBUTING.md](CONTRIBUTING.md)，以及 [wenlan-app 的 AGENTS.md](https://github.com/7xuanlu/wenlan-app/blob/main/AGENTS.md)。安全性問題請見 [SECURITY.md](SECURITY.md)，也請閱讀 [Code of Conduct](CODE_OF_CONDUCT.md)。
+需要從全新的 daemon 開始執行 app 時，請在本 repository 使用 `pnpm dev:all`。完整開發流程見本 repository 的 [AGENTS.md](AGENTS.md) 與 [CONTRIBUTING.md](CONTRIBUTING.md)，以及儲存庫內的 [app/AGENTS.md](app/AGENTS.md)。安全性問題請見 [SECURITY.md](SECURITY.md)，也請閱讀 [Code of Conduct](CODE_OF_CONDUCT.md)。
 
 ---
 

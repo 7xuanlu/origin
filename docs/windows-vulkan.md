@@ -248,7 +248,7 @@ the process module inventory resolved that exact path, not a system loader.
 | device `99`, expected fallback | Reported `requested GPU device index 99 is unavailable`; offloaded `0/37` layers and used the same CPU-only context contract; valid classification in 11.80 seconds |
 | status route | `routes::recent_endpoints_tests::status_reports_selected_vulkan_device` passed |
 | backend daemon smoke | Stored one source, returned a vector-only semantic-search hit, and loaded the exact adjacent ONNX Runtime and Vulkan loader modules |
-| app-owned daemon | The companion `wenlan-app` PR must record its own branch-tip `result.json`; a historical app run or this model probe alone is not accepted as current app evidence |
+| app-owned daemon | App-side changes are now PRs in this repository under `app/`; the app-owned daemon leg must record its branch-tip `result.json` from that same PR/branch. A historical app run or this model probe alone is not accepted as current app evidence |
 
 These timings are smoke evidence, not a benchmark. Compare warmed, repeated
 runs before making performance claims.
