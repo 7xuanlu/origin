@@ -952,3 +952,5 @@ async fn main() -> anyhow::Result<()> {
     }
     result
 }
+
+// CI routing probe: daemon-only change must skip app-check (PR closed unmerged).
