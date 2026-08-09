@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.8](https://github.com/7xuanlu/wenlan/compare/v0.15.7...v0.15.8) (2026-08-09)
+
+
+### Features
+
+* point the app updater at the unified release manifest ([#514](https://github.com/7xuanlu/wenlan/issues/514)) ([350512d](https://github.com/7xuanlu/wenlan/commit/350512d925b3eebcb869ea4e3ccb7e09fc1f89e1))
+
 ## [0.15.7](https://github.com/7xuanlu/wenlan/compare/v0.15.6...v0.15.7) (2026-08-09)
 
 
