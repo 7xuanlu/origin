@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RELEASE_JSON_URL=${WENLAN_APP_RELEASE_JSON_URL:-https://api.github.com/repos/7xuanlu/wenlan-app/releases/latest}
+RELEASE_JSON_URL=${WENLAN_APP_RELEASE_JSON_URL:-https://api.github.com/repos/7xuanlu/wenlan/releases/latest}
 ASSET_NAME=${WENLAN_APP_ASSET_NAME:-Wenlan_aarch64.app.tar.gz}
 
 die() {
