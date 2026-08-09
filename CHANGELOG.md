@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.15.7](https://github.com/7xuanlu/wenlan/compare/v0.15.6...v0.15.7) (2026-08-09)
+
+
+### Features
+
+* build and promote the macOS app bundle in the unified release workflow ([#509](https://github.com/7xuanlu/wenlan/issues/509)) ([56b6d7b](https://github.com/7xuanlu/wenlan/commit/56b6d7bdc4044b05046aa1c1419d27f3a7820e2d))
+* lock the desktop app version to the workspace release train ([#510](https://github.com/7xuanlu/wenlan/issues/510)) ([f56d304](https://github.com/7xuanlu/wenlan/commit/f56d3043cef00e48d0f8844ad104ab92be192210))
+* source app sidecars from the monorepo tree ([#507](https://github.com/7xuanlu/wenlan/issues/507)) ([e47c2b0](https://github.com/7xuanlu/wenlan/commit/e47c2b0d6cf08b496905721a5bb028f3f68b7df3))
+
 ## [0.15.6](https://github.com/7xuanlu/wenlan/compare/v0.15.5...v0.15.6) (2026-08-09)
 
 
