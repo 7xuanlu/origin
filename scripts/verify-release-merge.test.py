@@ -43,6 +43,18 @@ def load_script():
     return module
 
 
+def load_validator():
+    validator_path = Path(__file__).with_name("validate-release-candidate.py")
+    spec = importlib.util.spec_from_file_location(
+        "validate_release_candidate", validator_path
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"cannot load {validator_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class FakeApi:
     def __init__(self, responses: dict[str, object]) -> None:
         self.responses = responses
@@ -343,6 +355,28 @@ class VerifyReleaseMergeTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("verified-release-merge=false\n", emitted)
         self.assertIn("release-proof-reason=", emitted)
+
+
+class ReleaseManagedPathsConsistencyTests(unittest.TestCase):
+    """A stale copy of RELEASE_MANAGED_PATHS must not silently drift.
+
+    validate-release-candidate.py is the canonical source of REQUIRED_RELEASE_PATHS.
+    This copy legitimately carries extra entries (e.g. "plugin/bin/wenlan-mcp-runner.sh"),
+    so the contract is superset, not equality.
+    """
+
+    def test_release_managed_paths_is_superset_of_validator_required_paths(self) -> None:
+        merge_module = load_script()
+        validator_module = load_validator()
+        missing = (
+            validator_module.REQUIRED_RELEASE_PATHS - merge_module.RELEASE_MANAGED_PATHS
+        )
+        self.assertEqual(
+            missing,
+            set(),
+            "verify-release-merge.py RELEASE_MANAGED_PATHS is missing paths tracked "
+            f"by validate-release-candidate.py REQUIRED_RELEASE_PATHS: {sorted(missing)}",
+        )
 
 
 if __name__ == "__main__":
