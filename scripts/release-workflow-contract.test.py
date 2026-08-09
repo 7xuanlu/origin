@@ -419,7 +419,7 @@ def contract_violations(
         "update-homebrew": 20,
         "docker-manifest": 10,
         "finalize-release": 10,
-        "app-bundle": 60,
+        "app-bundle": 90,
     }.items():
         if not re.search(
             rf"^    timeout-minutes: {timeout}\s*$",
@@ -511,7 +511,7 @@ def contract_violations(
         "TAURI_SIGNING_PRIVATE_KEY"
     ):
         violations.append("Tauri signing key leaks outside the app-bundle job")
-    for marker in ["latest.json", "darwin-aarch64-app"]:
+    for marker in ["latest.json", "darwin-aarch64-app", "needs.app-bundle.outputs.dmg_sha256"]:
         if marker not in promote:
             violations.append(f"validated asset promotion omits updater manifest {marker!r}")
     verify_idx = promote.find("Verify macOS app bundle bytes before promotion")

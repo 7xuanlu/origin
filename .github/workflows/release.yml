@@ -440,7 +440,7 @@ jobs:
     name: Build macOS desktop app bundle
     needs: [resolve-promotion, bind-release-tag]
     runs-on: macos-14
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     outputs:
@@ -457,6 +457,7 @@ jobs:
           ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: Verify release checkout
         shell: bash
@@ -499,7 +500,9 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Download cloudflared sidecar
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p app/binaries
           curl -fsSL -o /tmp/cloudflared.tgz \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz
@@ -629,6 +632,41 @@ jobs:
               gh release upload "$RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY"
             fi
           done
+      - name: Publish exact Homebrew inputs for this run
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: homebrew-artifacts
+          path: |
+            ${{ runner.temp }}/promoted-assets/wenlan-cli-darwin-arm64.tar.gz
+            ${{ runner.temp }}/promoted-assets/wenlan-mcp-darwin-arm64.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+          # Internal retry locator. The uploaded archives are still the exact
+          # receipt-validated bytes, and every rerun creates a fresh artifact ID.
+          overwrite: true
+      # upload-artifact roots the archive at the common ancestor of its paths,
+      # so listing promoted-assets/ and promotion-plan/ together nests both
+      # under the runner temp root while the Docker job reads them flat. Stage
+      # one directory so the producer and the consumer agree on the layout.
+      - name: Stage exact Docker runtime inputs
+        run: |
+          set -euo pipefail
+          staged="$RUNNER_TEMP/docker-runtime-staging"
+          mkdir -p "$staged"
+          cp "$RUNNER_TEMP/promoted-assets/wenlan-linux-x64.tar.gz" "$staged/"
+          cp "$RUNNER_TEMP/promoted-assets/wenlan-linux-arm64.tar.gz" "$staged/"
+          cp "$RUNNER_TEMP/promotion-plan/release-promotion-plan.json" "$staged/"
+      - name: Publish exact Docker runtime inputs for this run
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: docker-runtime-inputs
+          path: ${{ runner.temp }}/docker-runtime-staging
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+          # Internal retry locator; Docker revalidates the receipt and archive
+          # hashes before it executes the copied server binary.
+          overwrite: true
       - name: Download macOS app bundle artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -694,7 +732,7 @@ jobs:
           # this file must exist on the unified release BEFORE that cutover.
           version="${RELEASE_TAG#v}"
           notes="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq '.body')"
-          pub_date="$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")"
+          pub_date="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_SHA" --jq '.commit.committer.date')"
           signature="$(cat "$RUNNER_TEMP/app-bundle/${{ needs.app-bundle.outputs.sig_filename }}")"
           tarball_name="${{ needs.app-bundle.outputs.tarball_filename }}"
           jq -n \
@@ -713,41 +751,6 @@ jobs:
               }
             }' > "$RUNNER_TEMP/app-bundle/latest.json"
           upload_without_clobber "$RUNNER_TEMP/app-bundle/latest.json"
-      - name: Publish exact Homebrew inputs for this run
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: homebrew-artifacts
-          path: |
-            ${{ runner.temp }}/promoted-assets/wenlan-cli-darwin-arm64.tar.gz
-            ${{ runner.temp }}/promoted-assets/wenlan-mcp-darwin-arm64.tar.gz
-          retention-days: 1
-          if-no-files-found: error
-          # Internal retry locator. The uploaded archives are still the exact
-          # receipt-validated bytes, and every rerun creates a fresh artifact ID.
-          overwrite: true
-      # upload-artifact roots the archive at the common ancestor of its paths,
-      # so listing promoted-assets/ and promotion-plan/ together nests both
-      # under the runner temp root while the Docker job reads them flat. Stage
-      # one directory so the producer and the consumer agree on the layout.
-      - name: Stage exact Docker runtime inputs
-        run: |
-          set -euo pipefail
-          staged="$RUNNER_TEMP/docker-runtime-staging"
-          mkdir -p "$staged"
-          cp "$RUNNER_TEMP/promoted-assets/wenlan-linux-x64.tar.gz" "$staged/"
-          cp "$RUNNER_TEMP/promoted-assets/wenlan-linux-arm64.tar.gz" "$staged/"
-          cp "$RUNNER_TEMP/promotion-plan/release-promotion-plan.json" "$staged/"
-      - name: Publish exact Docker runtime inputs for this run
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: docker-runtime-inputs
-          path: ${{ runner.temp }}/docker-runtime-staging
-          compression-level: 0
-          retention-days: 1
-          if-no-files-found: error
-          # Internal retry locator; Docker revalidates the receipt and archive
-          # hashes before it executes the copied server binary.
-          overwrite: true
 
   docker:
     name: Verify & Push Runtime Image (${{ matrix.platform }})
