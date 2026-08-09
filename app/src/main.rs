@@ -8,3 +8,5 @@ fn main() {
     #[cfg(not(feature = "review-fixtures"))]
     wenlan_lib::run()
 }
+
+// CI routing probe: app-only change must run app-check and no rust test lanes (PR closed unmerged).
