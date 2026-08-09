@@ -61,7 +61,7 @@ describe("runtime product identity", () => {
     );
 
     expect(tauri.plugins.updater.endpoints[0]).toBe(
-      "https://github.com/7xuanlu/wenlan-app/releases/latest/download/latest.json",
+      "https://github.com/7xuanlu/wenlan/releases/latest/download/latest.json",
     );
   });
 

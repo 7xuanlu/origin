@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=7bbf1b1a901c212818cfa814b34f772c3eb388959add7c1c4097db1af6562f69 -->
+<!-- README_SYNC: source=README.md sha256=4a3802a3bebf6dd84fdff116e3a9f5582876770641175974ee226853ee49956b -->
 
 <p align="center">
   <picture>
@@ -54,7 +54,7 @@ La aplicación de escritorio es la forma más rápida de ver el flujo de trabajo
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-El [instalador es inspeccionable](scripts/install-macos-app.sh). Verifica el archivo de la versión contra el SHA-256 publicado en GitHub antes de reemplazar una aplicación existente. ¿Prefieres el DMG o quieres inspeccionar el código fuente de la aplicación? Consulta las [versiones de wenlan-app](https://github.com/7xuanlu/wenlan-app/releases/latest) o el crate [`app/`](app/) dentro de este repositorio.
+El [instalador es inspeccionable](scripts/install-macos-app.sh). Verifica el archivo de la versión contra el SHA-256 publicado en GitHub antes de reemplazar una aplicación existente. ¿Prefieres el DMG o quieres inspeccionar el código fuente de la aplicación? Consulta las [versiones de wenlan](https://github.com/7xuanlu/wenlan/releases/latest) o el crate [`app/`](app/) dentro de este repositorio.
 
 <a id="claude-code-in-30-seconds"></a>
 
