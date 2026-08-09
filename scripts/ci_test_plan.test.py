@@ -14,6 +14,8 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 
 from ci_test_plan import (
+    APP_JOB_FILES,
+    APP_JOB_PREFIXES,
     PlanError,
     affected_package_names,
     archive_command_for,
@@ -458,6 +460,46 @@ class PlatformPlanTests(unittest.TestCase):
             any(fnmatchcase(M5_READER_PATHS[0], pattern) for pattern in patterns),
             patterns,
         )
+
+    def test_app_filter_covers_every_app_only_planner_input(self) -> None:
+        """Missing app globs would silently skip app-check, the sole owner.
+
+        This drift happened once for app-release.yml and was caught only by
+        manual review; keep the planner's app-only ownership and CI's app
+        filter connected by an executable invariant.
+        """
+        workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+        workflow = workflow_path.read_text(encoding="utf-8")
+        app_marker = "            app:\n"
+        app_start = workflow.find(app_marker)
+        self.assertGreaterEqual(app_start, 0, "ci.yml app filter boundary is missing")
+        app_body_start = app_start + len(app_marker)
+        next_filter = re.search(
+            r"^ {12}[A-Za-z0-9_-]+:\s*$",
+            workflow[app_body_start:],
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(next_filter, "ci.yml app filter has no following boundary")
+        app_block = workflow[app_body_start : app_body_start + next_filter.start()]
+        # fnmatchcase's `*` crosses `/`, unlike picomatch; collapsing exact
+        # paths into shorthands like `scripts/*.mjs` could keep this tooth green
+        # while GitHub misses nested files. Keep APP_JOB_FILES exact and filter
+        # globs conservative.
+        patterns = re.findall(r"^\s+- '([^']+)'\s*$", app_block, re.MULTILINE)
+        self.assertTrue(patterns)
+
+        for path in sorted(APP_JOB_FILES):
+            self.assertTrue(
+                any(fnmatchcase(path, pattern) for pattern in patterns),
+                f"{path!r} is not matched by the ci.yml app filter: {patterns!r}",
+            )
+
+        for prefix in APP_JOB_PREFIXES:
+            representative = f"{prefix}/x"
+            self.assertTrue(
+                any(fnmatchcase(representative, pattern) for pattern in patterns),
+                f"{prefix!r} is not matched by the ci.yml app filter: {patterns!r}",
+            )
 
     def test_infrastructure_does_not_widen_mixed_server_change(self) -> None:
         product = "crates/wenlan-server/src/bind_addr_tests.rs"
