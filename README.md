@@ -52,7 +52,7 @@ The desktop app is the fastest way to see the complete workflow: read pages, ins
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-The [installer is inspectable](scripts/install-macos-app.sh). It checks the release archive against GitHub's published SHA-256 before replacing an existing app. Prefer the DMG or want to inspect the app source? See [wenlan-app releases](https://github.com/7xuanlu/wenlan-app/releases/latest) or the in-tree [`app/`](app/) crate.
+The [installer is inspectable](scripts/install-macos-app.sh). It checks the release archive against GitHub's published SHA-256 before replacing an existing app. Prefer the DMG or want to inspect the app source? See [wenlan releases](https://github.com/7xuanlu/wenlan/releases/latest) or the in-tree [`app/`](app/) crate.
 
 <a id="claude-code-in-30-seconds"></a>
 
