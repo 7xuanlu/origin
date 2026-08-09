@@ -470,8 +470,21 @@ class PlatformPlanTests(unittest.TestCase):
         """
         workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
         workflow = workflow_path.read_text(encoding="utf-8")
-        app_block = workflow.split("            app:\n", 1)[1]
-        app_block = app_block.split("            rust:\n", 1)[0]
+        app_marker = "            app:\n"
+        app_start = workflow.find(app_marker)
+        self.assertGreaterEqual(app_start, 0, "ci.yml app filter boundary is missing")
+        app_body_start = app_start + len(app_marker)
+        next_filter = re.search(
+            r"^ {12}[A-Za-z0-9_-]+:\s*$",
+            workflow[app_body_start:],
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(next_filter, "ci.yml app filter has no following boundary")
+        app_block = workflow[app_body_start : app_body_start + next_filter.start()]
+        # fnmatchcase's `*` crosses `/`, unlike picomatch; collapsing exact
+        # paths into shorthands like `scripts/*.mjs` could keep this tooth green
+        # while GitHub misses nested files. Keep APP_JOB_FILES exact and filter
+        # globs conservative.
         patterns = re.findall(r"^\s+- '([^']+)'\s*$", app_block, re.MULTILINE)
         self.assertTrue(patterns)
 
