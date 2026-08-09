@@ -156,7 +156,6 @@ APP_JOB_FILES = {
     "scripts/release-version-sync.test.ts",
     "scripts/resolve-backend-dir.sh",
     "scripts/verify-review-bundle.mjs",
-    ".github/workflows/app-release.yml",
 }
 
 SUITE_OUTPUT_KEYS = {

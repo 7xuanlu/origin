@@ -441,14 +441,16 @@ pub fn detect_mcp_clients() -> Vec<McpClient> {
         .collect()
 }
 
-/// The backend release this app ships against. Deriving the npm fallback from
-/// the same file the sidecar download uses means the two can never disagree:
-/// bumping the pin bumps the fallback.
-const BACKEND_VERSION_PIN: &str = include_str!("../../.wenlan-backend-version");
+/// The backend release this app ships against. `app/Cargo.toml`'s version is
+/// lockstepped to the daemon release (Milestone B phase 4c: the app builds
+/// from the same tagged commit as `wenlan-server`/`wenlan-mcp`), so the
+/// crate's own compile-time version can never disagree with the daemon this
+/// build was tested against — no separate pin file needed.
+const BACKEND_VERSION_PIN: &str = env!("CARGO_PKG_VERSION");
 
 /// `wenlan-mcp@^<pinned version>`, e.g. `wenlan-mcp@^0.12.0`. Falls back to the
-/// bare package name only if the pin file is unparseable — an unpinned `npx`
-/// can silently pull a backend the app was never tested against.
+/// bare package name only if the pinned version string is unparseable — an
+/// unpinned `npx` can silently pull a backend the app was never tested against.
 fn pinned_wenlan_mcp_package(pin_file: &str) -> String {
     let version = pin_file
         .lines()

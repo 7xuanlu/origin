@@ -2,43 +2,39 @@
 
 ## OVERVIEW
 
-Release, backend-pin, sidecar, and repo-inventory contracts. These scripts are
+Release, sidecar, and repo-inventory contracts. These scripts are
 part of packaging behavior, not generic local helpers.
 
 ## WHERE TO LOOK
 
 | Task | Location | Notes |
 | --- | --- | --- |
-| Stage sidecars | `prepare-sidecars.sh` | local build and pinned download modes |
-| Tauri build hook | `prepare-tauri-build-sidecars.sh` | `WENLAN_DOWNLOAD_SIDECARS=1` switches to download |
+| Stage sidecars | `prepare-sidecars.sh` | tree-build only; compiles from the checked-out backend |
+| Tauri build hook | `prepare-tauri-build-sidecars.sh` | picks debug vs release based on `TAURI_ENV_DEBUG` |
 | Resolve backend checkout | `resolve-backend-dir.sh` | validates sibling or `WENLAN_BACKEND_DIR` shape |
-| Version lockstep | `release-version-sync.test.ts` | app, Cargo, Tauri, daemon pin must match |
-| Sidecar tests | `prepare-sidecars.test.ts` | locks path, cloudflared, download, checksum behavior |
+| Version lockstep | `release-version-sync.test.ts` | app, Cargo, Tauri versions must match |
+| Sidecar tests | `prepare-sidecars.test.ts` | locks path and cloudflared behavior |
 | API route inventory | `refactor/api-route-diff.mjs` | route coverage signal, not a product requirement |
 
 ## CONVENTIONS
 
-- `.wenlan-backend-version` format is exact: line 1 is the daemon release tag,
-  line 2 is the sha256 for `wenlan-darwin-arm64.tar.gz`.
-- Local/dev sidecars come from a sibling backend checkout found by
-  `resolve-backend-dir.sh`; release/download sidecars come from the pinned
-  public `7xuanlu/wenlan` asset.
+- Sidecars always come from a backend checkout in the same tree, found by
+  `resolve-backend-dir.sh` (sibling checkout or `WENLAN_BACKEND_DIR`). The old
+  pinned-download mode (`.wenlan-backend-version`, `prepare-sidecars.sh
+  --download`) was deleted once the unified release (v0.15.7) proved the
+  in-tree build.
 - `prepare-tauri-build-sidecars.sh` is the Tauri hook; keep it aligned with
   `app/tauri.conf.json` `beforeBuildCommand`.
-- `cloudflared` is optional only for download smoke paths. Full Tauri bundles
-  need `binaries/cloudflared-$TRIPLE`.
+- `cloudflared` is required for a full Tauri bundle:
+  `binaries/cloudflared-$TRIPLE`.
 - Update scripts, tests, and workflows together when release or sidecar behavior
   changes. The workflow comments are part of the operational contract.
 
 ## ANTI-PATTERNS
 
-- Do not remove sha256 verification, archive extraction checks, or `--help`
-  smoke semantics from backend-pin/download flows.
 - Do not let CI placeholder binaries become a release substitute.
 - Do not make `resolve-backend-dir.sh` silently accept a directory that lacks
   `crates/wenlan-server`, `crates/wenlan-mcp`, and `crates/wenlan-cli`.
-- Do not edit `.wenlan-backend-version` as casual metadata; it drives release
-  validation and sidecar downloads.
 
 ## COMMANDS
 
