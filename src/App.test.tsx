@@ -77,6 +77,10 @@ vi.mock("./components/SetupWizard", () => ({
   default: () => <div data-testid="setup-wizard">wizard</div>,
 }));
 
+vi.mock("./components/RuntimeOverlays", () => ({
+  RuntimeOverlays: () => <div data-testid="runtime-overlays">runtime overlays</div>,
+}));
+
 // EntityDetail transitively imports AtlasView → sigma, whose dist touches
 // WebGL2RenderingContext at module scope — jsdom has no such global, so the
 // real import crashes this whole suite before a single test runs.
@@ -131,6 +135,7 @@ describe("App - first-run wizard gate", () => {
     renderApp();
 
     expect(await screen.findByTestId("setup-wizard")).toBeInTheDocument();
+    expect(screen.getByTestId("runtime-overlays")).toBeInTheDocument();
     expect(screen.queryByTestId("home-main")).not.toBeInTheDocument();
   });
 

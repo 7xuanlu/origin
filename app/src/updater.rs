@@ -54,17 +54,21 @@ fn record_dismissal(app: &AppHandle, version: &str) {
     }
 }
 
-/// Emit `updater://available` to the main webview and wait for the user's
-/// choice via the `updater://action` event. The actual UI is rendered by
-/// `UpdaterDialog` inside the main window's React tree (see
-/// `src/components/UpdaterDialog.tsx`), so the dialog stays attached to the
-/// app window and travels with it.
-async fn prompt_via_overlay(app: &AppHandle, version: &str) -> bool {
+fn emit_available(app: &AppHandle, version: &str) {
     let _ = app.emit(
         "updater://available",
         serde_json::json!({ "version": version }),
     );
+}
 
+/// Emit `updater://available` to the main webview and wait for the user's
+/// choice via the `updater://action` event. The UI announces
+/// `updater://ui-ready` after mounting, so a prompt emitted before the
+/// webview or a non-main App branch is ready is replayed until answered.
+/// The actual UI is rendered by `UpdaterDialog` inside the main window's
+/// React tree (see `src/components/UpdaterDialog.tsx`), so the dialog stays
+/// attached to the app window and travels with it.
+async fn prompt_via_overlay(app: &AppHandle, version: &str) -> bool {
     let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
     let tx = Arc::new(Mutex::new(Some(tx)));
 
@@ -79,15 +83,26 @@ async fn prompt_via_overlay(app: &AppHandle, version: &str) -> bool {
         }
     });
 
+    let app_for_ready = app.clone();
+    let version_for_ready = version.to_string();
+    let ui_ready_id = app.listen("updater://ui-ready", move |_| {
+        emit_available(&app_for_ready, &version_for_ready);
+    });
+
+    emit_available(app, version);
+
     let accepted = rx.await.unwrap_or(false);
     app.unlisten(action_id);
+    app.unlisten(ui_ready_id);
     accepted
 }
 
 /// Check for an update on startup. If one exists and the user hasn't dismissed
-/// it within the last 24 hours, prompt via an in-app overlay; on accept,
-/// download + install + relaunch with progress events. Failures are logged
-/// and surfaced in the overlay, never blocking.
+/// it within the last 24 hours, prompt via an in-app overlay. The overlay uses
+/// a `updater://ui-ready` handshake so the one-shot availability event is
+/// replayed while the user has not answered; on accept, download + install +
+/// relaunch with progress events. Failures are logged and surfaced in the
+/// overlay, never blocking.
 pub async fn check_and_prompt(app: AppHandle) {
     tokio::time::sleep(STARTUP_DELAY).await;
 
