@@ -511,9 +511,13 @@ def contract_violations(
         "TAURI_SIGNING_PRIVATE_KEY"
     ):
         violations.append("Tauri signing key leaks outside the app-bundle job")
-    for marker in ["latest.json", "darwin-aarch64-app", "needs.app-bundle.outputs.dmg_sha256"]:
+    for marker in ["latest.json", "darwin-aarch64-app"]:
         if marker not in promote:
             violations.append(f"validated asset promotion omits updater manifest {marker!r}")
+    if "needs.app-bundle.outputs.dmg_sha256" not in promote:
+        violations.append(
+            "app bundle SHA-256 re-verification is not wired to the app-bundle job outputs"
+        )
     verify_idx = promote.find("Verify macOS app bundle bytes before promotion")
     upload_idx = promote.find(
         "Upload macOS app assets and updater metadata without clobbering"
