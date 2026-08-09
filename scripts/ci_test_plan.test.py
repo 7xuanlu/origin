@@ -34,7 +34,7 @@ WORKSPACE_ROOT = "/repo"
 M5_READER_PATHS = (
     "scripts/m5-reader-sweep.py",
     "crates/wenlan-core/AGENTS.md",
-    "docs/plans/2026-07-27-m5-reader-manifest-inventory.md",
+    "docs/contracts/m5-reader-manifest-inventory.md",
 )
 M5_READER_FILTERSET = (
     "package(wenlan-core) & "

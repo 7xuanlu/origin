@@ -96,7 +96,7 @@ const REGISTRY: [(&str, Coverage); 14] = [
     ),
 ];
 
-const CATALOG: &str = "docs/plans/2026-08-01-m6-mutation-catalog.md";
+const CATALOG: &str = "docs/contracts/m6-mutation-catalog.md";
 
 /// Repo root, resolved from this crate's manifest dir — the same derivation
 /// `drift_guard::repo_root` uses, kept local because that one is private.

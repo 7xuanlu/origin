@@ -79,7 +79,9 @@ app/eval/data/longmemeval_*.json
 # Eval baselines — competitive intelligence, keep local
 app/eval/baselines/
 
-# Superpowers working docs (specs, plans, research, prototypes)
+# Working design docs — plans, specs, research, prototypes. Local only.
+# Live contracts that code or CI actually reads belong in docs/contracts/ instead.
+docs/plans/
 docs/superpowers/
 .superpowers/
 
