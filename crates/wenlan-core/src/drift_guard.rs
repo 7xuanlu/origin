@@ -9289,8 +9289,9 @@ const FLAG_ALLOWLIST: &[&str] = &[
 /// BASELINE: behavioral flags undocumented when this contract was introduced
 /// (2026-06-19). Grandfathered so the gate lands green on a repo with an existing
 /// backlog; a NEW undocumented flag still fails fail-closed. BURN DOWN by
-/// documenting each in an AGENTS.md and deleting it from this list. (Pure test/infra
-/// flags — e.g. WENLAN_TEST_FASTEMBED_CACHE — should instead move to FLAG_ALLOWLIST.)
+/// documenting each in the owning AGENTS.md or REFERENCE.md and deleting it from this
+/// list. (Pure test/infra flags — e.g. WENLAN_TEST_FASTEMBED_CACHE — should instead
+/// move to FLAG_ALLOWLIST.)
 const BASELINE_UNDOCUMENTED: &[&str] = &[
     "WENLAN_COT_MAX_ITER",
     "WENLAN_COT_ROUND_TIMEOUT_SECS",
@@ -9360,11 +9361,15 @@ fn flags_read_in_code(root: &Path) -> BTreeSet<String> {
     flags
 }
 
-/// Every WENLAN_* flag mentioned in any tracked AGENTS.md (the prose flag docs).
+/// Every WENLAN_* flag mentioned in tracked agent instructions or an owning
+/// `REFERENCE.md`. Instructions keep only behavior; detailed wiring and receipts live
+/// in the reference next to the code they describe.
 fn documented_flags(root: &Path) -> BTreeSet<String> {
     let re = regex::Regex::new(r"WENLAN_[A-Z0-9_]+").unwrap();
     let mut flags = BTreeSet::new();
-    for f in git_ls_files(root, "*AGENTS.md") {
+    let mut docs = git_ls_files(root, "*AGENTS.md");
+    docs.extend(git_ls_files(root, "*REFERENCE.md"));
+    for f in docs {
         let txt = std::fs::read_to_string(root.join(&f)).unwrap_or_default();
         for m in re.find_iter(&txt) {
             flags.insert(m.as_str().to_string());
@@ -9417,8 +9422,9 @@ fn behavioral_flags_are_documented() {
 
     assert!(
         missing.is_empty(),
-        "NEW undocumented behavioral WENLAN_* flag(s). Fix: document in an *AGENTS.md* \
-         (only AGENTS.md files are scanned for docs — docs/ and READMEs do NOT count), \
+        "NEW undocumented behavioral WENLAN_* flag(s). Fix: document the behavior in the \
+         owning AGENTS.md or detailed wiring/default in its REFERENCE.md \
+         (generic docs and READMEs do not satisfy this contract), \
          or add to FLAG_ALLOWLIST / BASELINE_UNDOCUMENTED with a reason:\n{}",
         missing.join("\n")
     );
@@ -9466,30 +9472,79 @@ fn flag_default_mismatch_warns() {
     }
 }
 
+fn agents_instruction_chain_bytes(files: &[(String, u64)], leaf: &str) -> u64 {
+    let leaf_dir = Path::new(leaf).parent().unwrap_or_else(|| Path::new(""));
+    let mut count = 0_u64;
+    let bytes = files
+        .iter()
+        .filter(|(file, _)| {
+            let dir = Path::new(file).parent().unwrap_or_else(|| Path::new(""));
+            leaf_dir.starts_with(dir)
+        })
+        .map(|(_, bytes)| {
+            count += 1;
+            *bytes
+        })
+        .sum::<u64>();
+    bytes + count.saturating_sub(1) * 2 // Codex joins instruction files with blank lines.
+}
+
+fn oversized_agents_instruction_chains(files: &[(String, u64)], budget: u64) -> Vec<String> {
+    files
+        .iter()
+        .filter_map(|(leaf, _)| {
+            let bytes = agents_instruction_chain_bytes(files, leaf);
+            (bytes > budget).then(|| format!("{leaf}: {bytes}B"))
+        })
+        .collect()
+}
+
 #[test]
-fn root_agents_md_stays_lean() {
-    // Teeth #4 — size budget on the ONE always-loaded instruction file.
-    // Root AGENTS.md (which CLAUDE.md re-imports) is paid in full context EVERY
-    // session; subtree AGENTS.md load on-demand. It silently accreted 39.9KB ->
-    // 57.3KB as each retrieval/engine PR appended its flag wall to the path of
-    // least resistance (the file it was already editing). This gate makes the
-    // agents.md hierarchical convention the DEFAULT-BY-FORCE: exceed the budget
-    // and the only green path is moving crate-specific reference into the owning
-    // crate's AGENTS.md, not raising this number. No verifier control needed —
-    // the check is a byte comparison, not parsing logic.
-    const BUDGET: u64 = 44_000; // ~11k tok. Today ~39.8KB after the 2026-06-23 extraction.
-    let path = repo_root().join("AGENTS.md");
-    let bytes = std::fs::metadata(&path).expect("stat root AGENTS.md").len();
-    assert!(
-        bytes <= BUDGET,
-        "root AGENTS.md is {bytes}B > {BUDGET}B budget. It loads in FULL every session. \
-         Push crate-specific reference (env-flag docs, deep internals) into the owning crate's \
-         subtree AGENTS.md — they load on-demand and still satisfy the teeth-#2 flag-doc contract \
-         (it scans every tracked *AGENTS.md). Raising BUDGET is the wrong fix."
+fn agents_instruction_chain_calculation_excludes_siblings_and_bites() {
+    let files = vec![
+        ("AGENTS.md".to_string(), 100),
+        ("crates/wenlan-core/AGENTS.md".to_string(), 200),
+        ("crates/wenlan-core/src/eval/AGENTS.md".to_string(), 300),
+        ("app/AGENTS.md".to_string(), 400),
+    ];
+    assert_eq!(
+        agents_instruction_chain_bytes(&files, "crates/wenlan-core/src/eval/AGENTS.md"),
+        604
+    );
+    assert_eq!(agents_instruction_chain_bytes(&files, "app/AGENTS.md"), 502);
+    assert_eq!(
+        oversized_agents_instruction_chains(&files, 600),
+        vec!["crates/wenlan-core/src/eval/AGENTS.md: 604B"]
     );
 }
 
-// ── Teeth #6: quoted AGENTS.md section-heading resolver ──
+#[test]
+fn agents_instruction_chains_fit_codex_default_budget() {
+    // Teeth #4 — Codex concatenates root-to-leaf project instructions and stops at
+    // `project_doc_max_bytes` (32 KiB by default). Guard every active chain, not only
+    // the root file, so a large parent cannot silently hide the closest instructions.
+    const BUDGET: u64 = 32 * 1024;
+    let root = repo_root();
+    let files = git_ls_files(&root, "*AGENTS.md")
+        .into_iter()
+        .map(|file| {
+            let bytes = std::fs::metadata(root.join(&file))
+                .unwrap_or_else(|err| panic!("stat {file}: {err}"))
+                .len();
+            (file, bytes)
+        })
+        .collect::<Vec<_>>();
+    let violations = oversized_agents_instruction_chains(&files, BUDGET);
+    assert!(
+        violations.is_empty(),
+        "AGENTS.md instruction chain(s) exceed Codex's {BUDGET}B default and can hide \
+         the closest rules. Move facts, flag wiring, receipts, and long rationale to an \
+         on-demand REFERENCE.md; do not raise the budget:\n{}",
+        violations.join("\n")
+    );
+}
+
+// ── Teeth #6: quoted instruction/reference section-heading resolver ──
 //
 // Teeth #1 verifies a referenced *path* exists, but a cross-reference like
 //   See `crates/wenlan-core/AGENTS.md` "Eval seed + eval read: ONE route, ONE contract".
@@ -9499,13 +9554,19 @@ fn root_agents_md_stays_lean() {
 // resolves each quoted heading against the target file's actual headings
 // (case-insensitively, since prose sometimes lowercases the title).
 
-/// Parse `<…AGENTS.md> "<heading>"` cross-references from one markdown file's text.
-/// Returns (target_relative_to_root, quoted_heading); a bare `AGENTS.md` (no `/`)
-/// resolves to the root AGENTS.md. Only a quote immediately following the AGENTS.md
-/// mention (one optional backtick + whitespace) counts, which keeps unrelated quotes
+/// Parse `<…AGENTS.md|REFERENCE.md> "<heading>"` cross-references from one markdown
+/// file's text. Both backticked paths and Markdown links count. Returns
+/// (target, quoted_heading, is_markdown_link). Backticked paths are repo-relative;
+/// Markdown links are relative to the source document, like normal Markdown. Only a
+/// quote immediately following the file mention counts, which keeps unrelated quotes
 /// out. Skips code fences and `<!-- drift-ok -->` lines, mirroring teeth #1.
-fn extract_section_refs(md: &str) -> Vec<(String, String)> {
-    let re = regex::Regex::new(r#"`?([A-Za-z0-9_./\-]*AGENTS\.md)`?\s+"([^"]{3,})""#).unwrap();
+fn extract_section_refs(md: &str) -> Vec<(String, String, bool)> {
+    let path_re =
+        regex::Regex::new(r#"`?([A-Za-z0-9_./\-]*(?:AGENTS|REFERENCE)\.md)`?\s+"([^"]{3,})""#)
+            .unwrap();
+    let link_re =
+        regex::Regex::new(r#"\[[^\]]+\]\(([^)\s]*(?:AGENTS|REFERENCE)\.md)\)\s+"([^"]{3,})""#)
+            .unwrap();
     let mut refs = Vec::new();
     let mut in_fence = false;
     for line in md.lines() {
@@ -9516,14 +9577,11 @@ fn extract_section_refs(md: &str) -> Vec<(String, String)> {
         if in_fence || line.contains("<!-- drift-ok -->") {
             continue;
         }
-        for c in re.captures_iter(line) {
-            let token = &c[1];
-            let target = if token.contains('/') {
-                token.to_string()
-            } else {
-                "AGENTS.md".to_string() // bare/`root` reference => root file
-            };
-            refs.push((target, c[2].to_string()));
+        for c in path_re.captures_iter(line) {
+            refs.push((c[1].to_string(), c[2].to_string(), false));
+        }
+        for c in link_re.captures_iter(line) {
+            refs.push((c[1].to_string(), c[2].to_string(), true));
         }
     }
     refs
@@ -9554,6 +9612,9 @@ fn section_ref_extractor_parses_forms_and_skips_noise() {
     let md = "\
 See `crates/wenlan-core/AGENTS.md` \"Eval seed contract\".
 Also root `AGENTS.md` \"Eval Citation Discipline\" applies.
+The [`root rules`](AGENTS.md) \"Git and release\" apply.
+See [`eval details`](crates/wenlan-core/src/eval/REFERENCE.md) \"emitter correctness\".
+And `app/eval/REFERENCE.md` \"Sweep receipts\" is valid syntax.
 ```
 `crates/x/AGENTS.md` \"fenced ref\" must be ignored
 ```
@@ -9563,22 +9624,35 @@ A suppressed `app/eval/AGENTS.md` \"skip me\" line. <!-- drift-ok -->
     let refs = extract_section_refs(md);
     assert!(refs.contains(&(
         "crates/wenlan-core/AGENTS.md".to_string(),
-        "Eval seed contract".to_string()
+        "Eval seed contract".to_string(),
+        false
     )));
     assert!(refs.contains(&(
         "AGENTS.md".to_string(),
-        "Eval Citation Discipline".to_string()
+        "Eval Citation Discipline".to_string(),
+        false
+    )));
+    assert!(refs.contains(&("AGENTS.md".to_string(), "Git and release".to_string(), true)));
+    assert!(refs.contains(&(
+        "crates/wenlan-core/src/eval/REFERENCE.md".to_string(),
+        "emitter correctness".to_string(),
+        true
+    )));
+    assert!(refs.contains(&(
+        "app/eval/REFERENCE.md".to_string(),
+        "Sweep receipts".to_string(),
+        false
     )));
     assert!(
-        !refs.iter().any(|(_, h)| h == "fenced ref"),
+        !refs.iter().any(|(_, h, _)| h == "fenced ref"),
         "fenced ref leaked"
     );
     assert!(
-        !refs.iter().any(|(_, h)| h == "Some Heading"),
+        !refs.iter().any(|(_, h, _)| h == "Some Heading"),
         "unquoted heading matched"
     );
     assert!(
-        !refs.iter().any(|(_, h)| h == "skip me"),
+        !refs.iter().any(|(_, h, _)| h == "skip me"),
         "drift-ok line leaked"
     );
 }
@@ -9596,15 +9670,17 @@ fn doc_section_references_resolve() {
             continue;
         }
         let txt = std::fs::read_to_string(root.join(&f)).unwrap_or_default();
-        for (target, heading) in extract_section_refs(&txt) {
-            let Ok(target_txt) = std::fs::read_to_string(root.join(&target)) else {
-                // A missing target *path* is teeth #1's job for slash refs; only flag
-                // here for the root file, which teeth #1's '/'-gated extractor skips.
-                if !target.contains('/') {
-                    dangling.push(format!(
-                        "{f} -> {target} unreadable (heading \"{heading}\")"
-                    ));
-                }
+        for (target, heading, is_link) in extract_section_refs(&txt) {
+            let target_path = if is_link {
+                let source_dir = Path::new(&f).parent().unwrap_or_else(|| Path::new(""));
+                root.join(source_dir).join(&target)
+            } else {
+                root.join(&target)
+            };
+            let Ok(target_txt) = std::fs::read_to_string(&target_path) else {
+                dangling.push(format!(
+                    "{f} -> {target} unreadable (heading \"{heading}\")"
+                ));
                 continue;
             };
             let want = heading.to_lowercase();
@@ -9618,7 +9694,7 @@ fn doc_section_references_resolve() {
     }
     assert!(
         dangling.is_empty(),
-        "quoted AGENTS.md section references that don't resolve to a heading \
+        "quoted AGENTS.md/REFERENCE.md section references that don't resolve to a heading \
          (fix the pointer, fix the heading, or add <!-- drift-ok -->):\n{}",
         dangling.join("\n")
     );
@@ -9628,14 +9704,15 @@ fn doc_section_references_resolve() {
 fn section_resolver_detects_moved_heading() {
     // Positive control: a quoted heading absent from the target must be flagged,
     // and a present one (case-insensitively) must be accepted.
-    let src = "See `crates/wenlan-core/AGENTS.md` \"Gone Section\" for details.";
+    let src = "See [`details`](crates/wenlan-core/REFERENCE.md) \"Gone Section\".";
     let target = "# Title\n\n## Present Section\n\nbody\n### another one\n";
     let refs = extract_section_refs(src);
     assert_eq!(
         refs,
         vec![(
-            "crates/wenlan-core/AGENTS.md".to_string(),
-            "Gone Section".to_string()
+            "crates/wenlan-core/REFERENCE.md".to_string(),
+            "Gone Section".to_string(),
+            true
         )]
     );
     let headings = md_headings(target);
