@@ -135,6 +135,10 @@ describe("prepare-sidecars backend discovery", () => {
     expect(output).toContain(`cli_src=${backendRoot}/target/debug/wenlan`);
   });
 
+  it("defaults to the monorepo root when no backend override is set", () => {
+    expect(resolveBackend(root)).toBe(root);
+  });
+
   it("keeps relative WENLAN_BACKEND_DIR overrides relative to the app checkout", () => {
     const base = makeTempRoot();
     const appRoot = resolve(base, "wenlan-app");

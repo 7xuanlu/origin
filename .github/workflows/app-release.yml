@@ -6,8 +6,8 @@ name: Release
 # origin-app repo for the .dmg" but a release workflow was never added here —
 # this repo has only ever had the test-only ci.yml. This file closes that
 # gap. Renamed origin -> wenlan throughout; adapted to the current
-# cross-repo sidecar build (scripts/prepare-sidecars.sh, which needs a
-# sibling wenlan backend checkout) and current secret names.
+# in-tree sidecar build (scripts/prepare-sidecars.sh, which compiles from the
+# checked-out monorepo) and current secret names.
 #
 # Signing key: rotated 2026-07-01 to ~/.tauri/wenlan-updater.key (the prior
 # origin-updater.key was retired after its encrypted blob was accidentally
@@ -222,12 +222,7 @@ jobs:
           TAURI_DIR: app
           CXXFLAGS: "-std=c++17"
           CLOUDFLARED_BIN: ${{ env.CLOUDFLARED_BIN }}
-          # Daemon sidecars come from the pinned RELEASED asset: tauri's
-          # beforeBuildCommand runs prepare-tauri-build-sidecars.sh, which honors
-          # WENLAN_DOWNLOAD_SIDECARS=1 to download instead of compiling from a
-          # backend checkout. GH_TOKEN authenticates the cross-repo gh download.
-          WENLAN_DOWNLOAD_SIDECARS: '1'
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Milestone B phase 4a: daemon sidecars compile from this same tree.
           # Ad-hoc sign ("-") when no Apple Developer cert is configured.
           # APPLE_ID/PASSWORD/TEAM_ID must be omitted (not empty) or Tauri
           # attempts notarization and fails on "Team ID must be at least 3 characters".
