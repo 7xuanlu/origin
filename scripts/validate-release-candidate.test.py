@@ -218,6 +218,11 @@ def release_contents() -> tuple[dict[str, str], dict[str, str]]:
     new[codex] = json.dumps({"version": f"{new_version}+codex"})
     old["Cargo.toml"] = f'version = "{old_version}"   # x-release-please-version\n'
     new["Cargo.toml"] = f'version = "{new_version}"   # x-release-please-version\n'
+    old["app/Cargo.toml"] = f'version = "{old_version}" # x-release-please-version\n'
+    new["app/Cargo.toml"] = f'version = "{new_version}" # x-release-please-version\n'
+    for path in ("app/tauri.conf.json", "package.json"):
+        old[path] = json.dumps({"version": old_version})
+        new[path] = json.dumps({"version": new_version})
     # The decoy dependency legitimately sits at the workspace's old version and
     # must survive the release untouched (the hashbrown 0.15.5 collision).
     old["Cargo.lock"] = lock_contents(old_version, dep_version=old_version)
@@ -1188,6 +1193,64 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
                         FakeContentApi(old, new), "7xuanlu/wenlan", candidate_pr()
                     )
 
+    def test_app_cargo_transform_rejects_extra_line_changes(self) -> None:
+        # Positive: the marker-line-only transform accepts a legitimate bump
+        # even when app/Cargo.toml carries a dependency literal that happens
+        # to sit at the base version and is left untouched.
+        old, new = release_contents()
+        old["app/Cargo.toml"] = (
+            'version = "0.15.3" # x-release-please-version\n'
+            'some-dep = "0.15.3"\n'
+        )
+        new["app/Cargo.toml"] = (
+            'version = "0.15.4" # x-release-please-version\n'
+            'some-dep = "0.15.3"\n'
+        )
+        version, _, _ = VALIDATOR.validate_release_pr_content(
+            FakeContentApi(old, new), "7xuanlu/wenlan", candidate_pr()
+        )
+        self.assertEqual(version, "0.15.4")
+
+        # Collision-negative: a dependency literal that ALSO happens to land
+        # on the candidate version must still be rejected — the scoped
+        # transform allows only the marker line to move, same collision
+        # class the Cargo.lock scoped transform guards against.
+        hostile_new = dict(new)
+        hostile_new["app/Cargo.toml"] = (
+            'version = "0.15.4" # x-release-please-version\n'
+            'some-dep = "0.15.4"\n'
+        )
+        with self.assertRaisesRegex(VALIDATOR.CandidateError, "marker-line-only"):
+            VALIDATOR.validate_release_pr_content(
+                FakeContentApi(old, hostile_new), "7xuanlu/wenlan", candidate_pr()
+            )
+
+    def test_json_trio_transforms_reject_extra_field_changes(self) -> None:
+        # Positive + collision-negative for the shared JSON scoped transform,
+        # covering both app/tauri.conf.json and package.json.
+        for path in ("app/tauri.conf.json", "package.json"):
+            with self.subTest(path=path):
+                old, new = release_contents()
+                old[path] = json.dumps({"version": "0.15.3", "productName": "Wenlan"})
+                new[path] = json.dumps({"version": "0.15.4", "productName": "Wenlan"})
+                version, _, _ = VALIDATOR.validate_release_pr_content(
+                    FakeContentApi(old, new), "7xuanlu/wenlan", candidate_pr()
+                )
+                self.assertEqual(version, "0.15.4")
+
+                # an unrelated field change that rides along with the correct
+                # version bump must still be rejected.
+                hostile_new = dict(new)
+                hostile_new[path] = json.dumps(
+                    {"version": "0.15.4", "productName": "Renamed"}
+                )
+                with self.assertRaisesRegex(
+                    VALIDATOR.CandidateError, "changed more than the version field"
+                ):
+                    VALIDATOR.validate_release_pr_content(
+                        FakeContentApi(old, hostile_new), "7xuanlu/wenlan", candidate_pr()
+                    )
+
     def test_lock_transform_tolerates_dependency_at_the_old_release_version(self) -> None:
         # Regression: hashbrown sat at 0.15.5 while the release moved
         # 0.15.5 → 0.15.6, so a whole-file replace demanded a hashbrown bump
@@ -1438,6 +1501,20 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
         VALIDATOR._release_version_policy(json.dumps(base), "0.15.3", "1.0.0")
         with self.assertRaisesRegex(VALIDATOR.CandidateError, "exactly match release-as"):
             VALIDATOR._release_version_policy(json.dumps(base), "0.15.3", "0.15.4")
+
+    def test_release_version_policy_accepts_the_real_repo_config(self) -> None:
+        # Regression: round 1 of the version-lockstep work added an
+        # "extra-files" key to release-please-config.json without checking
+        # it against this policy, which rejects any key outside its closed
+        # schema. Exercising the real repo file here means a future config
+        # edit that reintroduces that collision fails at test time, not at
+        # candidate validation time.
+        repo_root = Path(__file__).resolve().parent.parent
+        config_text = (repo_root / "release-please-config.json").read_text()
+        version_txt = (repo_root / "version.txt").read_text().strip()
+        major, minor, patch = (int(part) for part in version_txt.split("."))
+        next_version = f"{major}.{minor}.{patch + 1}"
+        VALIDATOR._release_version_policy(config_text, version_txt, next_version)
 
     def test_artifact_record_rejects_expiry_digest_and_fork_identity(self) -> None:
         name = "release-candidate-1-1-x86_64-unknown-linux-gnu"

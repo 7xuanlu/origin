@@ -51,9 +51,15 @@ fn git_ls_files(root: &Path, pattern: &str) -> Vec<String> {
 
 /// The version string carried by each release-please-managed source of truth.
 /// The 4 daemon crates use `version.workspace = true`, so the only Cargo version
-/// is the root workspace one. Plus the CC plugin manifest (`plugin.json`), kept on
-/// the same release train via `release-please-config.json` `extra-files` so the
-/// plugin can't silently lag the daemon (the recurring version-drift nag). 4 sources.
+/// is the root workspace one. Plus the CC plugin manifest (`plugin.json`) and the
+/// desktop app trio (`app/Cargo.toml`, `app/tauri.conf.json`, `package.json`),
+/// all kept on the same release train by `scripts/bump-version.sh` (run from
+/// release-please.yml on the release branch) rather than release-please's
+/// `extra-files` mechanism — `extra-files` collides with the closed
+/// `release-please-config.json` schema and pinned release-PR changed-file set
+/// that `scripts/validate-release-candidate.py` enforces. So neither the
+/// plugin nor the app can silently lag the daemon (the recurring
+/// version-drift nag). 7 sources.
 fn version_sources() -> Vec<(String, String)> {
     let root = repo_root();
     let mut out = Vec::new();
@@ -89,6 +95,38 @@ fn version_sources() -> Vec<(String, String)> {
             .to_string(),
     ));
 
+    let apct = std::fs::read_to_string(root.join("app/Cargo.toml")).expect("read app/Cargo.toml");
+    let apc_line = apct
+        .lines()
+        .find(|l| l.contains("x-release-please-version"))
+        .expect("app Cargo.toml version line with x-release-please-version marker");
+    let apc_v = re
+        .captures(apc_line)
+        .expect("version literal on app marker line")[1]
+        .to_string();
+    out.push(("app/Cargo.toml".to_string(), apc_v));
+
+    let tc = std::fs::read_to_string(root.join("app/tauri.conf.json"))
+        .expect("read app/tauri.conf.json");
+    let tcj: serde_json::Value = serde_json::from_str(&tc).expect("parse app/tauri.conf.json");
+    out.push((
+        "app/tauri.conf.json".to_string(),
+        tcj["version"]
+            .as_str()
+            .expect("app/tauri.conf.json \"version\" key")
+            .to_string(),
+    ));
+
+    let pkg = std::fs::read_to_string(root.join("package.json")).expect("read package.json");
+    let pkgj: serde_json::Value = serde_json::from_str(&pkg).expect("parse package.json");
+    out.push((
+        "package.json".to_string(),
+        pkgj["version"]
+            .as_str()
+            .expect("package.json \"version\" key")
+            .to_string(),
+    ));
+
     out
 }
 
@@ -100,8 +138,10 @@ fn version_files_are_in_sync() {
     assert!(
         mismatched.is_empty(),
         "version drift across release-please files: {sources:?} (expected all == {first}). \
-         Fix: set the SAME version string in version.txt, .release-please-manifest.json, and \
-         the workspace Cargo.toml version line — a manual bump must touch all three (teeth #3)"
+         Fix: set the SAME version string in version.txt, .release-please-manifest.json, the \
+         workspace Cargo.toml version line, plugin/.claude-plugin/plugin.json, and the desktop \
+         app trio (app/Cargo.toml, app/tauri.conf.json, package.json) — a manual bump must touch \
+         all seven (teeth #3)"
     );
 }
 

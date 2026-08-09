@@ -11,7 +11,8 @@ mkdir -p \
     "$TMPDIR_TEST/plugin/.claude-plugin" \
     "$TMPDIR_TEST/plugin-codex/.codex-plugin" \
     "$TMPDIR_TEST/plugin-codex/bin" \
-    "$TMPDIR_TEST/plugin-codex/skills/setup"
+    "$TMPDIR_TEST/plugin-codex/skills/setup" \
+    "$TMPDIR_TEST/app"
 echo "0.5.0" > "$TMPDIR_TEST/version.txt"
 cat > "$TMPDIR_TEST/Cargo.toml" <<EOF
 [workspace.package]
@@ -24,6 +25,10 @@ EOF
 cat > "$TMPDIR_TEST/Cargo.lock" <<EOF
 [[package]]
 name = "wenlan"
+version = "0.5.0"
+
+[[package]]
+name = "wenlan-app"
 version = "0.5.0"
 
 [[package]]
@@ -46,6 +51,13 @@ echo '{"version": "0.5.0"}' > "$TMPDIR_TEST/crates/wenlan-mcp/npm/package.json"
 echo '{"version": "0.5.0"}' > "$TMPDIR_TEST/crates/wenlan-cli/npm/package.json"
 echo '{"version": "0.5.0"}' > "$TMPDIR_TEST/plugin/.claude-plugin/plugin.json"
 echo '{"version": "0.5.0+codex"}' > "$TMPDIR_TEST/plugin-codex/.codex-plugin/plugin.json"
+cat > "$TMPDIR_TEST/app/Cargo.toml" <<EOF
+[package]
+name = "wenlan-app"
+version = "0.5.0" # x-release-please-version
+EOF
+echo '{"version": "0.5.0"}' > "$TMPDIR_TEST/app/tauri.conf.json"
+echo '{"name": "wenlan-app", "version": "0.5.0"}' > "$TMPDIR_TEST/package.json"
 cat > "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh" <<EOF
 exec npx -y wenlan-mcp@^0.5.0 --agent-name "\${agent_name}" "\$@"
 EOF
@@ -67,6 +79,41 @@ if (cd "$TMPDIR_TEST" && RELEASE_TAG="v0.5.0" bash "$OLDPWD/scripts/validate-ver
     exit 1
 fi
 echo "PASS test 2: drift detected"
+
+# Test 2b: app trio version mismatch → exit 1
+echo '{"version": "0.4.9"}' > "$TMPDIR_TEST/app/tauri.conf.json"
+if (cd "$TMPDIR_TEST" && RELEASE_TAG="v0.5.0" bash "$OLDPWD/scripts/validate-versions.sh") 2>/dev/null; then
+    echo "FAIL test 2b: should have detected app/tauri.conf.json drift"
+    exit 1
+fi
+echo "PASS test 2b: app/tauri.conf.json drift detected"
+echo '{"version": "0.5.0"}' > "$TMPDIR_TEST/app/tauri.conf.json"
+
+# Test 2c: app/Cargo.toml version mismatch → exit 1
+cat > "$TMPDIR_TEST/app/Cargo.toml" <<EOF
+[package]
+name = "wenlan-app"
+version = "0.4.9" # x-release-please-version
+EOF
+if (cd "$TMPDIR_TEST" && RELEASE_TAG="v0.5.0" bash "$OLDPWD/scripts/validate-versions.sh") 2>/dev/null; then
+    echo "FAIL test 2c: should have detected app/Cargo.toml drift"
+    exit 1
+fi
+echo "PASS test 2c: app/Cargo.toml drift detected"
+cat > "$TMPDIR_TEST/app/Cargo.toml" <<EOF
+[package]
+name = "wenlan-app"
+version = "0.5.0" # x-release-please-version
+EOF
+
+# Test 2d: package.json version mismatch → exit 1
+echo '{"name": "wenlan-app", "version": "0.4.9"}' > "$TMPDIR_TEST/package.json"
+if (cd "$TMPDIR_TEST" && RELEASE_TAG="v0.5.0" bash "$OLDPWD/scripts/validate-versions.sh") 2>/dev/null; then
+    echo "FAIL test 2d: should have detected package.json drift"
+    exit 1
+fi
+echo "PASS test 2d: package.json drift detected"
+echo '{"name": "wenlan-app", "version": "0.5.0"}' > "$TMPDIR_TEST/package.json"
 
 # Test 3: internal workspace dependency mismatch → exit 1
 echo '{"version": "0.5.0"}' > "$TMPDIR_TEST/plugin/.claude-plugin/plugin.json"

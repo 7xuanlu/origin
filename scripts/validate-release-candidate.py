@@ -59,8 +59,11 @@ RELEASE_MANAGED_PATHS = frozenset(
         "CHANGELOG.md",
         "Cargo.lock",
         "Cargo.toml",
+        "app/Cargo.toml",
+        "app/tauri.conf.json",
         "crates/wenlan-cli/npm/package.json",
         "crates/wenlan-mcp/npm/package.json",
+        "package.json",
         "plugin-codex/.codex-plugin/plugin.json",
         "plugin-codex/README.md",
         "plugin-codex/bin/wenlan-mcp-runner.sh",
@@ -76,7 +79,7 @@ REQUIRED_RELEASE_PATHS = RELEASE_MANAGED_PATHS
 # release 0.15.5 → 0.15.6). Its transform is therefore scoped to exactly these
 # workspace package stanzas instead of a whole-file version replace.
 WORKSPACE_LOCK_PACKAGES = frozenset(
-    {"wenlan", "wenlan-core", "wenlan-mcp", "wenlan-server", "wenlan-types"}
+    {"wenlan", "wenlan-app", "wenlan-core", "wenlan-mcp", "wenlan-server", "wenlan-types"}
 )
 WORKSPACE_LOCK_QUALIFIED_REF_PATTERNS = {
     name: re.compile(
@@ -430,6 +433,66 @@ def _reject_qualified_workspace_refs(value: object) -> None:
             _reject_qualified_workspace_refs(item)
 
 
+_APP_CARGO_MARKER_RE = re.compile(r'^version = "([^"]+)"(.*x-release-please-version.*)$')
+
+
+def _expected_app_cargo_transform(old: str, old_version: str, new_version: str) -> str:
+    """Bump only the `# x-release-please-version` marker line in app/Cargo.toml,
+    keeping every other line byte-identical.
+
+    Unlike the root workspace Cargo.toml, app/Cargo.toml carries third-party
+    dependency version literals that can collide with the workspace version
+    string, so the generic whole-file `old.replace(old_version, new_version)`
+    transform is unsafe here — same collision class the Cargo.lock scoped
+    transform guards against.
+    """
+    lines = old.split("\n")
+    marker_rows = [i for i, line in enumerate(lines) if _APP_CARGO_MARKER_RE.match(line)]
+    if len(marker_rows) != 1:
+        raise CandidateError(
+            "app/Cargo.toml does not pin exactly one x-release-please-version marker line"
+        )
+    row = marker_rows[0]
+    match = _APP_CARGO_MARKER_RE.match(lines[row])
+    assert match is not None
+    if match.group(1) != old_version:
+        raise CandidateError("app/Cargo.toml marker line is not at the base version")
+    lines[row] = f'version = "{new_version}"{match.group(2)}'
+    return "\n".join(lines)
+
+
+def _validate_scoped_json_version_transform(
+    path: str, old: str, new: str, old_version: str, new_version: str
+) -> None:
+    """Only the top-level `version` field of a JSON manifest may change.
+
+    Both app/tauri.conf.json and package.json could in principle carry the
+    workspace version string elsewhere (e.g. a pinned dependency), so this
+    parses old and new content, checks the version field made exactly the
+    expected base -> candidate move, and asserts the two documents are
+    otherwise deep-equal after normalizing that one field.
+    """
+    try:
+        old_doc = json.loads(old)
+        new_doc = json.loads(new)
+    except json.JSONDecodeError as error:
+        raise CandidateError(f"release-managed file {path!r} is not valid JSON") from error
+    if not isinstance(old_doc, dict) or not isinstance(new_doc, dict):
+        raise CandidateError(f"release-managed file {path!r} is not a JSON object")
+    if old_doc.get("version") != old_version:
+        raise CandidateError(f"release-managed file {path!r} is not at the base version")
+    if new_doc.get("version") != new_version:
+        raise CandidateError(
+            f"release-managed file {path!r} did not bump to the candidate version"
+        )
+    patched = copy.deepcopy(old_doc)
+    patched["version"] = new_version
+    if patched != new_doc:
+        raise CandidateError(
+            f"release-managed file {path!r} changed more than the version field"
+        )
+
+
 def _validate_content_delta(path: str, old: str, new: str, old_version: str, new_version: str) -> None:
     removed: list[str] = []
     added: list[str] = []
@@ -452,6 +515,16 @@ def _validate_content_delta(path: str, old: str, new: str, old_version: str, new
                 "release-managed file 'Cargo.lock' is not the exact"
                 " workspace-stanza version-only transform"
             )
+        return
+    if path == "app/Cargo.toml":
+        if new != _expected_app_cargo_transform(old, old_version, new_version):
+            raise CandidateError(
+                "release-managed file 'app/Cargo.toml' is not the exact"
+                " marker-line-only transform"
+            )
+        return
+    if path in ("app/tauri.conf.json", "package.json"):
+        _validate_scoped_json_version_transform(path, old, new, old_version, new_version)
         return
     if old_version not in old:
         raise CandidateError(f"release-managed file {path!r} has no base version to replace")

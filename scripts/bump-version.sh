@@ -103,18 +103,42 @@ else
 fi
 echo "  Updated $CODEX_SETUP_SKILL (install.sh tag pin)"
 
-# 6. Cargo.lock workspace member versions. release-please bumps the manifests
+# 6. Desktop app version trio (app/Cargo.toml, app/tauri.conf.json,
+# package.json). Kept in lockstep with the workspace release train here,
+# not via release-please extra-files — extra-files collides with the
+# closed config-key schema and pinned changed-file set enforced by
+# scripts/validate-release-candidate.py.
+APP_CARGO_TOML="app/Cargo.toml"
+if [[ "$(uname)" == "Darwin" ]]; then
+    sed -i '' -E "s/^(version = \")[^\"]+(\".*x-release-please-version)/\1${NEW_VERSION}\2/" "$APP_CARGO_TOML"
+else
+    sed -i -E "s/^(version = \")[^\"]+(\".*x-release-please-version)/\1${NEW_VERSION}\2/" "$APP_CARGO_TOML"
+fi
+echo "  Updated $APP_CARGO_TOML (package.version)"
+
+APP_TAURI_CONF="app/tauri.conf.json"
+jq ".version = \"$NEW_VERSION\"" "$APP_TAURI_CONF" > "${APP_TAURI_CONF}.tmp"
+mv "${APP_TAURI_CONF}.tmp" "$APP_TAURI_CONF"
+echo "  Updated $APP_TAURI_CONF"
+
+APP_PACKAGE_JSON="package.json"
+jq ".version = \"$NEW_VERSION\"" "$APP_PACKAGE_JSON" > "${APP_PACKAGE_JSON}.tmp"
+mv "${APP_PACKAGE_JSON}.tmp" "$APP_PACKAGE_JSON"
+echo "  Updated $APP_PACKAGE_JSON"
+
+# 7. Cargo.lock workspace member versions. release-please bumps the manifests
 # above but never regenerates the lockfile, so validate-versions.sh (run in
 # release.yml on the tag) fails on "Cargo.lock drift" and aborts the release.
 # cargo isn't available on the release-please runner, so rewrite the lock
 # entries textually — symmetric with validate-versions.sh's reader. Internal
 # wenlan deps are listed name-only (no version string) in Cargo.lock, so only
-# each member's own version line needs to change.
+# each member's own version line needs to change. wenlan-app joins the
+# daemon crates here since it now rides the same release train (step 6).
 awk -v ver="$NEW_VERSION" '
   $0 == "[[package]]" { in_pkg=1; is_member=0; print; next }
   in_pkg && $1 == "name" && $2 == "=" {
     n=$3; gsub(/"/, "", n)
-    is_member = (n=="wenlan" || n=="wenlan-core" || n=="wenlan-mcp" || n=="wenlan-server" || n=="wenlan-types")
+    is_member = (n=="wenlan" || n=="wenlan-app" || n=="wenlan-core" || n=="wenlan-mcp" || n=="wenlan-server" || n=="wenlan-types")
     print; next
   }
   in_pkg && is_member && /^version = / { print "version = \"" ver "\""; in_pkg=0; is_member=0; next }
@@ -123,4 +147,4 @@ awk -v ver="$NEW_VERSION" '
 echo "  Updated Cargo.lock (workspace member versions)"
 
 echo ""
-echo "Versions synced from version.txt (${NEW_VERSION}) to Cargo.toml + npm + plugin manifests + plugin MCP/skills + Cargo.lock."
+echo "Versions synced from version.txt (${NEW_VERSION}) to Cargo.toml + npm + plugin manifests + plugin MCP/skills + desktop app trio + Cargo.lock."
