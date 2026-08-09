@@ -1,6 +1,6 @@
 use super::*;
 use crate::db::tests::test_db;
-use crate::lint::context::{CancellationToken, LintClock};
+use crate::lint::context::{AppliedScope, CancellationToken, ExecutionGate, LintClock};
 use crate::lint::pages::fs::scan_page_root;
 use crate::lint::runner::LintRunner;
 use std::fs;
@@ -487,7 +487,7 @@ async fn runner_uses_pages_workspace_and_keeps_other_workspace_out_of_output() {
         "private.md",
         "---\norigin_id: page_CANARY_OTHER\norigin_version: 8\n---\nprivate\n",
     );
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute(
         "INSERT INTO spaces (id, name, created_at, updated_at) VALUES ('space-alpha', 'alpha', 1, 1), ('space-beta', 'beta', 1, 1)",
         (),
@@ -529,4 +529,37 @@ async fn runner_uses_pages_workspace_and_keeps_other_workspace_out_of_output() {
     assert!(!serde_json::to_string(&report)
         .unwrap()
         .contains("CANARY_OTHER"));
+}
+
+#[tokio::test]
+async fn uncategorized_scope_load_pages_finds_unfiled_workspace_and_excludes_registered() {
+    let (db, _db_dir) = test_db().await;
+    let conn = db.test_primary_session().await;
+    conn.execute(
+        "INSERT INTO pages (id, title, content, source_memory_ids, version, status, created_at, last_compiled, last_modified, workspace) VALUES          ('page-unfiled', 'unfiled', 'body', '[]', 1, 'active', '1', '1', '1', '00000000-0000-4000-8000-000000000001'),          ('page-CANARY-alpha', 'alpha', 'body', '[]', 1, 'active', '1', '1', '1', 'alpha')",
+        (),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    // Shape-C regression guard: `workspace IS NULL` was permanently dead
+    // after migration 80's NOT NULL stamp, so a revert here would make
+    // `load_pages` vacuously return zero rows under this scope instead of
+    // actually excluding page-CANARY-alpha.
+    let snapshot = db.open_lint_snapshot().await.unwrap();
+    let scope = AppliedScope::uncategorized();
+    let clock = LintClock::fixed();
+    let gate = ExecutionGate::new(CancellationToken::new());
+    let context = LintContext::new(
+        &snapshot,
+        &scope,
+        None,
+        &clock,
+        &gate,
+        wenlan_types::lint::LintProfile::General,
+    );
+    let pages = load_pages(&context).await.unwrap();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].id, "page-unfiled");
 }

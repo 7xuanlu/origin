@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=d2ed67bd1a4b51576c1c33d57e40262cb257bec83b097e8f595d574f3c5e25bf -->
+<!-- README_SYNC: source=README.md sha256=00a9e0d18b88c59ba9ffd709551d33aecc990a22fc4c2daf8e11b41e46a868c9 -->
 
 <p align="center">
   <picture>
@@ -10,7 +10,7 @@
 和 AI 聊出的成果，不該在對話結束後消失。Wenlan 會建立真正需要的頁面，並在來源變動時讓它們保持最新；只有需要判斷時才找你。
 
 <p align="center">
-  <a href="./README.md">English</a> | <a href="./README.zh-Hans.md">简体中文</a> | 繁體中文
+  <a href="./README.md">English</a> | <a href="./README.zh-Hans.md">简体中文</a> | 繁體中文 | <a href="./README.es-ES.md">Español</a>
 </p>
 
 <p align="center">
@@ -261,9 +261,9 @@ a1b2c3d distill: 4 pages
 
 這個循環分成四步：
 
-1. **找到最新知識。** 開啟相關 Page、搜尋，或使用 `/recall <query>`；`/brief [topic]` 可選擇性彙整更完整的 session-start context。其他 AI 工具可使用等價的 page、search、recall 與 context 工具。
+1. **找到最新知識。** 開啟相關 Page、搜尋，或使用 `/recall <query>`；`/brief [topic]` 讀取目前的 Space Brief；提供 topic 時，會另外附上同一 Space 的相關上下文。其他 AI 工具可使用等價的 page、search、recall 與 brief 工具。
 2. **工作時隨手保存與查找。** `/capture <thing>` 保存決策、經驗、踩坑或事實，並記錄來源。`/recall <query>` 只取回相關內容，不載入全部歷史。
-3. **閉合循環。** `/handoff` 記錄改動與待辦，也指出下次工作的起點。
+3. **閉合循環。** `/handoff` 記錄本次改動，並把類型化的逐項更新套用到目前的 Space Brief。
 4. **讓 wiki 保持最新。** `/distill` 主動建立或刷新頁面。可選的模型流程會在兩次工作之間補充已保存內容、連結相關知識，並刷新符合條件的頁面。`/lint` 檢查知識庫健康狀態；`/curate` 讓你審核頁面更新提案，以及可選 Reconcile 流程產生的衝突項目。
 
 ### 模型與隱私

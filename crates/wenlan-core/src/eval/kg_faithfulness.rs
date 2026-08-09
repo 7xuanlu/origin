@@ -453,6 +453,7 @@ mod tests {
                 relation_type: "related_to".into(),
                 confidence: None,
                 explanation: None,
+                span: None,
             }],
         };
         let r = score_case("test.toml", &case, &extracted);

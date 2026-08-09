@@ -11,13 +11,52 @@
 use anyhow::{Context, Result};
 use service_manager::{
     ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx, ServiceStopCtx,
-    ServiceUninstallCtx,
 };
 use std::path::{Path, PathBuf};
 
 use crate::client::origin_host_from_env;
 
 pub const SERVICE_LABEL: &str = "com.wenlan.server";
+const DEFAULT_LOCAL_BIND_ADDR: &str = "127.0.0.1:7878";
+const SHUTDOWN_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const SHUTDOWN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const SHUTDOWN_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+const SHUTDOWN_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+const DAEMON_PROCESS_ID_HEADER: &str = "x-wenlan-process-id";
+
+#[derive(Clone, Copy, Debug)]
+struct DaemonProcessIdentity {
+    pid: sysinfo::Pid,
+    started_at: Option<u64>,
+}
+
+impl DaemonProcessIdentity {
+    fn capture(raw_pid: u32) -> Self {
+        let pid = sysinfo::Pid::from_u32(raw_pid);
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        Self {
+            pid,
+            started_at: system.process(pid).map(sysinfo::Process::start_time),
+        }
+    }
+
+    fn is_running(self, system: &mut sysinfo::System) -> bool {
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[self.pid]), true);
+        match (self.started_at, system.process(self.pid)) {
+            (Some(started_at), Some(process)) => process.start_time() == started_at,
+            // The process had already exited by the time the CLI captured its
+            // identity. Do not let PID reuse turn that completed exit back
+            // into a live match.
+            (None, _) | (_, None) => false,
+        }
+    }
+}
+
+enum DaemonShutdownRequest {
+    NotRunning,
+    Requested(Option<DaemonProcessIdentity>),
+}
 
 /// Windows Task Scheduler does not love dots in task names. The macOS launchd
 /// and systemd-user paths still use the canonical reverse-DNS `SERVICE_LABEL`.
@@ -28,14 +67,14 @@ pub const WINDOWS_TASK_NAME: &str = "WenlanServer";
 pub enum BackgroundCommand {
     /// Start Wenlan now and keep it running in the background after login.
     On,
-    /// Stop Wenlan and stop keeping it running in the background.
+    /// Stop Wenlan now while keeping its background registration.
     Off,
 }
 
-pub fn run_background(command: BackgroundCommand) -> Result<()> {
+pub async fn run_background(command: BackgroundCommand) -> Result<()> {
     match command {
         BackgroundCommand::On => install(),
-        BackgroundCommand::Off => uninstall(),
+        BackgroundCommand::Off => stop().await,
     }
 }
 
@@ -68,8 +107,8 @@ fn run_schtasks(args: &[&str], action: &str) -> Result<std::process::Output> {
 }
 
 fn manager() -> Result<Box<dyn ServiceManager>> {
-    // macOS + Linux only. Windows install/uninstall short-circuit before
-    // calling this and drive schtasks.exe directly (see install/uninstall).
+    // macOS + Linux only. Windows install/stop short-circuit before
+    // calling this and drive schtasks.exe directly (see install/stop).
     let mut m = <dyn ServiceManager>::native().context("detect native service manager")?;
     let _ = m.set_level(ServiceLevel::User);
     Ok(m)
@@ -139,9 +178,10 @@ fn origin_data_root() -> PathBuf {
 
 /// Builds a launchd plist that mirrors `service-manager`'s default output for
 /// `OnFailure` restart + user-level + autostart, with the extra keys the old
-/// embedded `com.wenlan.server.plist` template carried: `StandardOutPath`,
-/// `StandardErrorPath`, `EnvironmentVariables.RUST_LOG`, and the canonical
-/// `WENLAN_DATA_DIR` ownership marker consumed by the desktop app.
+/// embedded `com.wenlan.server.plist` template carried: stdout/stderr routing,
+/// `EnvironmentVariables.RUST_LOG`, and the canonical `WENLAN_DATA_DIR`
+/// ownership marker consumed by the desktop app. The daemon owns bounded file
+/// logging, so launchd routes its raw streams to `/dev/null`.
 ///
 /// `LaunchdInstallConfig` in service-manager 0.11 only exposes `keep_alive`;
 /// stdout/stderr paths must come through `ServiceInstallCtx.contents` as a
@@ -259,25 +299,18 @@ pub fn install() -> Result<()> {
     // exported in the user environment).
     let environment = Some(vec![("RUST_LOG".to_string(), "info".to_string())]);
 
-    // macOS: hand-roll the plist so we can keep `StandardOutPath` and
-    // `StandardErrorPath` parity with the legacy template. service-manager 0.11
-    // has no struct field for those keys, so the only honest knob is
+    // macOS: hand-roll the plist so launchd does not append an unbounded
+    // duplicate of the daemon-owned rotating log. service-manager 0.11 has no
+    // struct field for these keys, so the only honest knob is
     // `ServiceInstallCtx.contents`.
     let contents = {
         #[cfg(target_os = "macos")]
         {
             let data_root = origin_data_root();
-            let log_dir = data_root.join("logs");
-            // Best-effort: launchd creates parent dirs for log files in many
-            // builds, but creating ahead of time guarantees the daemon never
-            // racing the dir into existence on first start.
-            let _ = std::fs::create_dir_all(&log_dir);
-            let stdout_path = log_dir.join("wenlan-server.stdout.log");
-            let stderr_path = log_dir.join("wenlan-server.stderr.log");
             Some(build_launchd_plist(
                 &program,
-                &stdout_path,
-                &stderr_path,
+                Path::new("/dev/null"),
+                Path::new("/dev/null"),
                 "info",
                 &data_root,
             ))
@@ -311,40 +344,307 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
-pub fn uninstall() -> Result<()> {
+#[cfg(target_os = "macos")]
+fn current_user_id() -> Result<String> {
+    let output = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .context("run id -u for launchd user domain")?;
+    if !output.status.success() {
+        anyhow::bail!("id -u failed (exit {})", output.status.code().unwrap_or(-1));
+    }
+    let uid = std::str::from_utf8(&output.stdout)
+        .context("id -u returned non-UTF-8 output")?
+        .trim();
+    if uid.is_empty() || !uid.bytes().all(|byte| byte.is_ascii_digit()) {
+        anyhow::bail!("id -u returned invalid user id: {uid:?}");
+    }
+    Ok(uid.to_owned())
+}
+
+fn stop_registered_service() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        // /end returns nonzero if the task is not currently running; that
-        // is not an error worth surfacing, so swallow the exit code.
+        // /end returns nonzero when the registered task is not currently
+        // running. Preserve idempotence and, critically, never /delete it.
         let _ = std::process::Command::new("schtasks.exe")
             .args(["/end", "/tn", WINDOWS_TASK_NAME])
-            .output();
-        run_schtasks(
-            &["/delete", "/tn", WINDOWS_TASK_NAME, "/f"],
-            "delete scheduled task",
-        )?;
-        println!(
-            "Uninstalled Windows scheduled task '{}'.",
-            WINDOWS_TASK_NAME
-        );
-        return Ok(());
+            .output()
+            .context("spawn schtasks.exe (end scheduled task)")?;
+        Ok(())
     }
 
-    #[cfg_attr(target_os = "windows", allow(unreachable_code))]
-    let label_value = label()?;
-    let m = manager()?;
-    // launchd KeepAlive jobs must be removed directly. A separate `stop`
-    // schedules an immediate replacement before `uninstall` can remove the
-    // job, leaving an orphan daemon racing the next owner for port 7878.
-    // systemd uninstall does not stop the unit, so Linux keeps the explicit
-    // stop before removing its unit file.
-    #[cfg(not(target_os = "macos"))]
-    let _ = m.stop(ServiceStopCtx {
-        label: label_value.clone(),
-    });
-    m.uninstall(ServiceUninstallCtx { label: label_value })
-        .context("uninstall service")?;
-    println!("Uninstalled {}.", SERVICE_LABEL);
+    #[cfg(target_os = "macos")]
+    {
+        let uid = current_user_id()?;
+        let domain = format!("gui/{uid}");
+        let plist = service_unit_path()?;
+        let bootout = std::process::Command::new("launchctl")
+            .arg("bootout")
+            .arg(&domain)
+            .arg(&plist)
+            .output()
+            .context("spawn launchctl bootout")?;
+
+        if !bootout.status.success() {
+            let target = format!("{domain}/{SERVICE_LABEL}");
+            let status = std::process::Command::new("launchctl")
+                .args(["print", &target])
+                .output()
+                .context("spawn launchctl print after failed bootout")?;
+            if status.status.code() != Some(113) {
+                let stderr = String::from_utf8_lossy(&bootout.stderr);
+                let stdout = String::from_utf8_lossy(&bootout.stdout);
+                let details = if stderr.trim().is_empty() {
+                    stdout.trim()
+                } else {
+                    stderr.trim()
+                };
+                anyhow::bail!(
+                    "launchctl bootout failed (exit {}): {}",
+                    bootout.status.code().unwrap_or(-1),
+                    details
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let label_value = label()?;
+        let m = manager()?;
+        m.stop(ServiceStopCtx { label: label_value })
+            .context("stop service")?;
+        Ok(())
+    }
+}
+
+async fn request_daemon_shutdown() -> Result<DaemonShutdownRequest> {
+    let base_url = local_daemon_base_url()?;
+    let shutdown_url = format!("{base_url}/api/shutdown");
+    let shutdown_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .pool_max_idle_per_host(0)
+        .build()
+        .context("build daemon shutdown client")?;
+
+    let response = match build_shutdown_request(&shutdown_client, &shutdown_url)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) if error.is_connect() => return Ok(DaemonShutdownRequest::NotRunning),
+        Err(error) => {
+            return Err(error).with_context(|| format!("POST {shutdown_url} failed"));
+        }
+    };
+    let response = response
+        .error_for_status()
+        .with_context(|| format!("daemon returned an error for {shutdown_url}"))?;
+    let process = response
+        .headers()
+        .get(DAEMON_PROCESS_ID_HEADER)
+        .map(|value| {
+            value
+                .to_str()
+                .context("daemon shutdown process id header is not UTF-8")?
+                .parse::<u32>()
+                .context("daemon shutdown process id header is not a valid PID")
+        })
+        .transpose()?
+        .map(DaemonProcessIdentity::capture);
+    response
+        .bytes()
+        .await
+        .with_context(|| format!("read daemon shutdown response from {shutdown_url}"))?;
+    drop(shutdown_client);
+    Ok(DaemonShutdownRequest::Requested(process))
+}
+
+fn build_shutdown_request(client: &reqwest::Client, shutdown_url: &str) -> reqwest::RequestBuilder {
+    // This is a server-visible shutdown contract, not merely a client pool
+    // preference. Hyper graceful shutdown waits for accepted HTTP/1.1
+    // connections to close, so the shutdown request must not leave its
+    // connection alive for the health verifier to reuse.
+    client
+        .post(shutdown_url)
+        .header(reqwest::header::CONNECTION, "close")
+}
+
+fn local_daemon_base_url() -> Result<String> {
+    let raw =
+        std::env::var("WENLAN_BIND_ADDR").unwrap_or_else(|_| DEFAULT_LOCAL_BIND_ADDR.to_string());
+    let mut address: std::net::SocketAddr = raw
+        .parse()
+        .with_context(|| format!("invalid local WENLAN_BIND_ADDR {raw:?}"))?;
+    if address.ip().is_unspecified() {
+        address.set_ip(if address.is_ipv4() {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        } else {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        });
+    } else if !address.ip().is_loopback() {
+        anyhow::bail!(
+            "refusing background lifecycle control through non-loopback WENLAN_BIND_ADDR {raw:?}"
+        );
+    }
+    Ok(format!("http://{address}"))
+}
+
+async fn verify_daemon_unreachable(
+    client: &reqwest::Client,
+    health_url: &str,
+    expected_process: Option<DaemonProcessIdentity>,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + SHUTDOWN_VERIFY_TIMEOUT;
+    let mut unreachable_since = None;
+    let mut process_system = expected_process.map(|_| sysinfo::System::new());
+    loop {
+        tokio::time::sleep(SHUTDOWN_PROBE_INTERVAL).await;
+        let expected_process_running = match (expected_process, process_system.as_mut()) {
+            (Some(process), Some(system)) => process.is_running(system),
+            _ => false,
+        };
+        match client
+            .get(health_url)
+            .timeout(SHUTDOWN_PROBE_TIMEOUT)
+            .send()
+            .await
+        {
+            // During cooperative shutdown the socket can still accept a
+            // connection after the HTTP service has stopped answering. A
+            // timeout is neither proof of exit nor a terminal verification
+            // error: keep probing until the bounded overall deadline. Reset
+            // the refusal window because a listening-but-hung socket is not
+            // yet a confirmed stop.
+            Err(error) if error.is_timeout() => {
+                if expected_process.is_some() && !expected_process_running {
+                    unreachable_since.get_or_insert_with(std::time::Instant::now);
+                } else {
+                    unreachable_since = None;
+                }
+            }
+            Err(error) if is_shutdown_disconnect(&error) => {
+                if expected_process.is_none() || !expected_process_running {
+                    unreachable_since.get_or_insert_with(std::time::Instant::now);
+                } else {
+                    unreachable_since = None;
+                }
+            }
+            Ok(_) => {
+                if !expected_process_running {
+                    if let Some(process) = expected_process {
+                        anyhow::bail!(
+                            "a different daemon remained reachable at {health_url} after process {} exited",
+                            process.pid
+                        );
+                    }
+                }
+                if unreachable_since.is_some() {
+                    anyhow::bail!("daemon remained reachable at {health_url} after disconnecting");
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("verify shutdown via {health_url}"));
+            }
+        }
+        if unreachable_since.is_some_and(|since| since.elapsed() >= SHUTDOWN_STABILITY_WINDOW) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            if expected_process_running {
+                if let Some(process) = expected_process {
+                    anyhow::bail!("daemon process {} remained running", process.pid);
+                }
+            }
+            anyhow::bail!("daemon remained reachable at {health_url}");
+        }
+    }
+}
+
+fn is_shutdown_disconnect(error: &reqwest::Error) -> bool {
+    if error.is_connect() {
+        return true;
+    }
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if let Some(io_error) = current.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+            );
+        }
+        cause = current.source();
+    }
+    false
+}
+
+async fn verify_local_daemon_shutdown(
+    expected_process: Option<DaemonProcessIdentity>,
+) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .pool_max_idle_per_host(0)
+        .build()
+        .context("build daemon shutdown verification client")?;
+    let health_url = format!("{}/api/health", local_daemon_base_url()?);
+    verify_daemon_unreachable(&client, &health_url, expected_process).await
+}
+
+async fn stop() -> Result<()> {
+    let registration_present = is_installed();
+    let mut expected_process = None;
+    let graceful_result = match request_daemon_shutdown().await {
+        Ok(DaemonShutdownRequest::Requested(process)) => {
+            expected_process = process;
+            verify_local_daemon_shutdown(process).await.map(|()| true)
+        }
+        Ok(DaemonShutdownRequest::NotRunning) => Ok(false),
+        Err(error) => Err(error),
+    };
+    let shutdown_requested = match graceful_result {
+        Ok(true) => true,
+        Ok(false) if registration_present => {
+            // Connection refusal is ambiguous while a registered manager job
+            // may still be starting or respawning. Stop the supervisor too;
+            // otherwise `background off` can report success before the hot
+            // daemon appears on its port.
+            stop_registered_service().context("daemon was unreachable; service fallback failed")?;
+            verify_local_daemon_shutdown(None)
+                .await
+                .context("service fallback did not keep the daemon stopped")?;
+            true
+        }
+        Ok(false) => false,
+        Err(graceful_error) if registration_present => {
+            stop_registered_service().with_context(|| {
+                format!(
+                    "graceful daemon shutdown failed ({graceful_error:#}); service fallback failed"
+                )
+            })?;
+            verify_local_daemon_shutdown(expected_process)
+                .await
+                .with_context(|| format!("graceful daemon shutdown failed: {graceful_error:#}"))?;
+            true
+        }
+        Err(error) => return Err(error),
+    };
+    if registration_present {
+        println!("Stopped {}. Background registration kept.", SERVICE_LABEL);
+    } else if shutdown_requested {
+        println!(
+            "Stopped {}. No background registration found.",
+            SERVICE_LABEL
+        );
+    } else {
+        println!("Wenlan background process is already stopped; no registration found.");
+    }
     Ok(())
 }
 
@@ -360,7 +660,7 @@ pub fn restart() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         // No service-manager on Windows: drive Task Scheduler directly,
-        // mirroring uninstall()'s /end and install()'s /run.
+        // mirroring stop()'s /end and install()'s /run.
         let _ = std::process::Command::new("schtasks.exe")
             .args(["/end", "/tn", WINDOWS_TASK_NAME])
             .output();
@@ -437,4 +737,55 @@ pub async fn print_status() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_process_identity_observes_child_exit() {
+        #[cfg(target_os = "windows")]
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+            .spawn()
+            .expect("spawn process identity test child");
+        #[cfg(not(target_os = "windows"))]
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn process identity test child");
+
+        let identity = DaemonProcessIdentity::capture(child.id());
+        let mut system = sysinfo::System::new();
+        assert!(identity.is_running(&mut system));
+
+        child.kill().expect("kill process identity test child");
+        child.wait().expect("reap process identity test child");
+        // Windows can keep a terminated process visible in the enumeration
+        // snapshot briefly after wait(); poll instead of racing one check.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while identity.is_running(&mut system) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child process still visible 10s after exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn shutdown_request_declares_connection_close() {
+        let client = reqwest::Client::builder()
+            .build()
+            .expect("build shutdown request test client");
+        let request = build_shutdown_request(&client, "http://127.0.0.1:7878/api/shutdown")
+            .build()
+            .expect("build shutdown request");
+
+        assert_eq!(
+            request.headers().get(reqwest::header::CONNECTION),
+            Some(&reqwest::header::HeaderValue::from_static("close"))
+        );
+    }
 }

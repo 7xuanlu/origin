@@ -94,7 +94,7 @@ fn npm_package_allowlists_match_release_generated_files() {
     );
 
     // wenlan-mcp ships prebuilt binaries for every release-matrix target
-    // (darwin x2, linux x2, windows x1) via its npm postinstall. The
+    // (darwin arm64, linux arm64/x64, windows x64) via its npm postinstall. The
     // allowlist must include each platform the matrix uploads or `npm
     // install` rejects the package on those hosts.
     let mcp_pkg = read_json("crates/wenlan-mcp/npm/package.json");
@@ -114,27 +114,18 @@ fn npm_package_allowlists_match_release_generated_files() {
 }
 
 #[test]
-fn release_workflow_publishes_cli_and_mcp_npm_packages() {
+fn release_workflow_promotes_target_inventory_and_publishes_npm_packages() {
     let workflow = fs::read_to_string(repo_root().join(".github/workflows/release.yml"))
         .expect("read release workflow");
-    // The release workflow uses a target matrix; the strings below are the
-    // matrix step names + artifact names every release must continue to
-    // produce. Adding a target should ALSO add its artifact name here so a
-    // dropped target shows up as a test failure rather than a silent gap in
-    // the release.
     for needle in [
-        "Build & Publish ${{ matrix.target }}",
+        "Promote exact validated release assets",
+        "scripts/release-promotion.py consume-main-receipt",
+        "scripts/release-promotion.py download-assets",
+        "name: docker-runtime-inputs",
         "Publish wenlan-mcp",
         "Publish wenlan",
         "cp README.md crates/wenlan-mcp/npm/README.md",
         "cp README.md crates/wenlan-cli/npm/README.md",
-        "wenlan-darwin-arm64",
-        // wenlan-darwin-x64 dropped in v0.7.0 (PR #168) — ort has no
-        // prebuilt for x86_64-apple-darwin. Re-add when ONNX builds from
-        // source or ort-tract becomes viable.
-        "wenlan-linux-arm64",
-        "wenlan-linux-x64",
-        "wenlan-windows-x64",
         "wenlan-mcp-darwin-arm64.tar.gz",
     ] {
         assert!(
@@ -142,6 +133,35 @@ fn release_workflow_publishes_cli_and_mcp_npm_packages() {
             "release workflow missing `{needle}`"
         );
     }
+
+    let inventory = Command::new("python3")
+        .arg(repo_root().join("scripts/release_targets.py"))
+        .arg("matrix")
+        .output()
+        .expect("run canonical release-target inventory");
+    assert!(
+        inventory.status.success(),
+        "release-target inventory failed:\n{}",
+        String::from_utf8_lossy(&inventory.stderr)
+    );
+    let matrix: Value =
+        serde_json::from_slice(&inventory.stdout).expect("parse canonical release-target matrix");
+    let artifact_names = matrix["include"]
+        .as_array()
+        .expect("release matrix include array")
+        .iter()
+        .map(|entry| json_string(entry, "artifact_name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        artifact_names,
+        [
+            "wenlan-darwin-arm64",
+            "wenlan-linux-arm64",
+            "wenlan-linux-x64",
+            "wenlan-windows-x64",
+        ],
+        "canonical release artifact inventory drift"
+    );
 }
 
 #[test]

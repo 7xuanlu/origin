@@ -1,7 +1,6 @@
 use crate::db::tests::test_db;
 use crate::lint::context::{CancellationToken, LintClock};
 use crate::lint::runner::{LintRunner, TestSyncPoint, TestSynchronization};
-use crate::lint::snapshot::LintReadSnapshot;
 use crate::lint::test_support::DbSemanticFingerprint;
 use crate::pages::Page;
 use std::sync::Arc;
@@ -60,8 +59,7 @@ pub(super) fn assert_selective_inconsistency(
 }
 
 pub(super) async fn insert_page(db: &crate::db::MemoryDB, id: &str) {
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO pages (id, title, content, source_memory_ids, version, status, created_at, last_compiled, last_modified, creation_kind, review_status) VALUES (?1, ?1, 'body', '[]', 1, 'active', 'now', 'now', 'now', 'distilled', 'confirmed')",
@@ -72,7 +70,7 @@ pub(super) async fn insert_page(db: &crate::db::MemoryDB, id: &str) {
 }
 
 pub(super) async fn semantic_fingerprint(db: &crate::db::MemoryDB) -> DbSemanticFingerprint {
-    let snapshot = LintReadSnapshot::open(&db._db).await.unwrap();
+    let snapshot = db.open_isolated_lint_snapshot_for_test().await.unwrap();
     let fingerprint = DbSemanticFingerprint::capture(&snapshot).await.unwrap();
     snapshot.finish().await.unwrap();
     fingerprint
@@ -105,5 +103,7 @@ pub(super) fn page(id: &str) -> Page {
         review_status: "confirmed".to_string(),
         workspace: None,
         citations: Vec::new(),
+        kind: "concept".to_string(),
+        truth: None,
     }
 }

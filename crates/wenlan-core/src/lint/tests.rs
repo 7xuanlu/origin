@@ -456,8 +456,7 @@ async fn page_group_timeout_with_incomplete_enumeration_fails_the_report() {
 #[tokio::test]
 async fn selected_scope_enforces_scoped_and_global_denominators() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO spaces (id, name, created_at, updated_at) VALUES ('lint-space', 'alpha', 1, 1)",

@@ -1,0 +1,44 @@
+{
+  "observed_at_epoch": 1784568630,
+  "source": {
+    "git_head": "c8a87bfee2661b4c474b2df63b2d259563252d57",
+    "dirty": true,
+    "audit_script_sha256": "64e001c299c12a3b3cf3033ebffdec8f13db31b1db3d0190c49e6226e0cc977a"
+  },
+  "boundary": {
+    "read_only": true,
+    "one_read_transaction_for_counts": true,
+    "raw_content_titles_paths_or_ids_returned": false,
+    "content_or_title_predicates_evaluated": false,
+    "database_migrated": false,
+    "schema_version": 79,
+    "selector_mode": "legacy_population_projection",
+    "enrichment_origin_present": false,
+    "enrichment_steps_input_version_present": false,
+    "enrichment_origin_service_class_present": false
+  },
+  "counts": {
+    "memory_rows": 5807,
+    "memory_heads": 2885,
+    "active_pages": 133,
+    "document_queue": 0,
+    "pending_revision_heads": 1,
+    "legacy_enrichment_receipts": 9548,
+    "active_pages_missing_citations": 1,
+    "missing_citation_pages_with_evidence": 0,
+    "classification_population": 2443,
+    "page_growth_population": 2397,
+    "title_population_upper_bound": 2443,
+    "entity_candidates": 2787,
+    "entity_candidates_linked": 1523,
+    "entity_candidates_unlinked": 1264,
+    "accepted_revision_heads": 94
+  },
+  "exact_current_eligible": {
+    "classification": null,
+    "structured_extract": null,
+    "entity": null,
+    "title": null,
+    "page_growth": null
+  }
+}

@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::test_support::TestDbSession;
 use crate::db::tests::test_db;
 use crate::lint::context::{
     AppliedScope, CancellationToken, ExecutionGate, LintClock, LintContext,
@@ -86,14 +87,13 @@ fn active_duplicates_warn_but_archived_rows_remain_inventory() {
 #[tokio::test]
 async fn cross_effective_scope_active_duplicate_titles_pass() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page_with_scope(
         &conn,
         "page-a",
         "Shared Title",
         "active",
         Some("workspace-a"),
-        None,
     )
     .await;
     insert_page_with_scope(
@@ -101,7 +101,6 @@ async fn cross_effective_scope_active_duplicate_titles_pass() {
         "page-b",
         "shared title",
         "active",
-        None,
         Some("workspace-b"),
     )
     .await;
@@ -128,14 +127,13 @@ async fn cross_effective_scope_active_duplicate_titles_pass() {
 #[tokio::test]
 async fn same_effective_scope_active_duplicate_titles_warn() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page_with_scope(
         &conn,
         "page-a",
         "Shared Title",
         "active",
         Some("workspace-a"),
-        None,
     )
     .await;
     insert_page_with_scope(
@@ -143,7 +141,6 @@ async fn same_effective_scope_active_duplicate_titles_warn() {
         "page-b",
         "shared title",
         "active",
-        None,
         Some("workspace-a"),
     )
     .await;
@@ -169,36 +166,30 @@ async fn same_effective_scope_active_duplicate_titles_warn() {
 }
 
 #[tokio::test]
-async fn selected_duplicate_scope_uses_legacy_space_fallback() {
+// M1 honest columns retired the workspace/space fallback this test used
+// to probe (renamed from selected_duplicate_scope_uses_legacy_space_fallback);
+// the surviving assertion is that Registered/Uncategorized scope filters
+// still partition correctly now that both pages carry `space` directly.
+async fn selected_duplicate_scope_filters_registered_and_uncategorized() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page_with_scope(
         &conn,
         "page-current",
         "Shared Title",
         "active",
         Some("workspace-a"),
-        None,
     )
     .await;
     insert_page_with_scope(
         &conn,
-        "page-legacy",
+        "page-other",
         "shared title",
         "active",
-        None,
         Some("workspace-a"),
     )
     .await;
-    insert_page_with_scope(
-        &conn,
-        "page-uncategorized",
-        "shared title",
-        "active",
-        None,
-        None,
-    )
-    .await;
+    insert_page_with_scope(&conn, "page-uncategorized", "shared title", "active", None).await;
     let snapshot = db.open_lint_snapshot().await.unwrap();
     let clock = LintClock::fixed();
     let gate = ExecutionGate::new(CancellationToken::new());
@@ -238,26 +229,46 @@ async fn selected_duplicate_scope_uses_legacy_space_fallback() {
     assert!(uncategorized.evidence().is_empty());
 }
 
+// M1 honest columns: `workspace` and `space` are NOT NULL and always
+// mirrored (migration 80), so this seeds one logical scope into both --
+// `None` means unfiled/uncategorized, matching the migration's own
+// sentinel rather than binding a literal NULL a NOT NULL column rejects.
 async fn insert_page_with_scope(
-    conn: &libsql::Connection,
+    conn: &TestDbSession,
     id: &str,
     title: &str,
     status: &str,
-    workspace: Option<&str>,
-    legacy_space: Option<&str>,
+    scope: Option<&str>,
 ) {
+    let scope = scope.unwrap_or(crate::db::UNFILED_SPACE_ID);
     conn.execute(
         "INSERT INTO pages (id, title, content, source_memory_ids, version, status, created_at, last_compiled, last_modified, workspace, space, creation_kind, review_status) VALUES (?1, ?2, 'body', '[]', 1, ?3, 'now', 'now', 'now', ?4, ?5, 'distilled', 'confirmed')",
-        libsql::params![id, title, status, workspace, legacy_space],
+        libsql::params![id, title, status, scope, scope],
     )
     .await
     .unwrap();
 }
 
 #[tokio::test]
-async fn source_page_integrity_accepts_any_canonical_or_legacy_provenance_representation() {
+async fn source_page_integrity_accepts_json_mirror_cites_edge_or_evidence_row_provenance() {
+    // S2/S5/S6 (2026-08-05 review): three pages, three DISTINCT provenance
+    // shapes, each proving one branch of the check without redundancy. Post
+    // closure-review deletion of the redundant page_sources-analog EXISTS,
+    // the check is a single `page_evidence OR edges` test (no dst_kind
+    // filter on the edges half), so all three pages route through it:
+    //   - source_json: valid via the JSON `source_memory_ids` mirror alone
+    //     (checked before the EXISTS, no DB row needed).
+    //   - source_join: valid via a `cites` edge alone -- a legacy
+    //     page_sources row with NO edge twin would NOT satisfy the EXISTS;
+    //     the edge is the load-bearing seed here, not the legacy row.
+    //   - source_evidence: valid via a legacy `page_evidence` row alone --
+    //     S2's OR reads a NULL-locator authored row as provenance with no
+    //     edge twin, so no edge seed is needed here. An earlier fixture
+    //     revision added a synthetic edge for this page too; it was dead
+    //     weight (the legacy row alone already satisfies the OR) and has
+    //     been dropped.
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     conn.execute_batch(
         "INSERT INTO pages
              (id,title,content,source_memory_ids,version,status,created_at,last_compiled,
@@ -278,7 +289,9 @@ async fn source_page_integrity_accepts_any_canonical_or_legacy_provenance_repres
          INSERT INTO page_sources(page_id,memory_source_id,linked_at,link_reason)
          VALUES ('source_join','mem-join',1,'legacy');
          INSERT INTO page_evidence(page_id,source_kind,locator,linked_at,link_reason)
-         VALUES ('source_evidence','external_url',NULL,1,'canonical');",
+         VALUES ('source_evidence','external_url',NULL,1,'canonical');
+         INSERT INTO edges (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at)
+         VALUES ('source_join-edge','source_join','page','mem-join','memory','cites','legacy',0,'default',1);",
     )
     .await
     .unwrap();
@@ -311,8 +324,7 @@ async fn source_page_integrity_accepts_any_canonical_or_legacy_provenance_repres
 #[tokio::test]
 async fn source_page_integrity_runs_without_page_projection_or_page_root() {
     let (db, _tmp) = test_db().await;
-    db._db
-        .connect()
+    db.test_secondary_session()
         .unwrap()
         .execute_batch(
             "INSERT INTO pages

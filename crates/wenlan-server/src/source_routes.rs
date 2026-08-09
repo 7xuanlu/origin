@@ -2,7 +2,8 @@
 //! REST API endpoints for source management.
 
 use crate::error::ServerError;
-use crate::state::ServerState;
+use crate::route_registry::{delete, get, post, TrackedRouter};
+use crate::state::{ServerState, SharedState};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -17,6 +18,16 @@ use wenlan_core::sources::directory::{is_reserved_ingest_root, scan_directory};
 use wenlan_core::sources::obsidian::{has_any_markdown, note_to_documents, scan_vault};
 use wenlan_core::sources::Source;
 use wenlan_types::sources::{SourceType, SyncStatus};
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route(
+            "/api/sources",
+            get(handle_list_sources).post(handle_add_source),
+        )
+        .route("/api/sources/{id}", delete(handle_remove_source))
+        .route("/api/sources/{id}/sync", post(handle_sync_source))
+}
 
 // ===== Request/Response Types =====
 
@@ -468,38 +479,72 @@ pub(crate) async fn sync_directory_source(
         }
 
         // Rename optimization: check if this file's hash matches a vanished file's.
-        if let Some((old_doc_source_id, old_path)) = vanished_by_hash.get(&hash) {
+        if let Some((old_doc_source_id, old_path)) = vanished_by_hash.remove(&hash) {
             // This file has the same content as a vanished file — rebind instead of re-enqueue.
             let new_doc_source_id = wenlan_core::sources::directory::document_source_id(
                 &id,
                 file_path,
                 Some(&knowledge_path),
             );
+            let old_source_page_id =
+                wenlan_core::document_enrichment::source_page_id(&id, &old_path);
+            let new_source_page_id =
+                wenlan_core::document_enrichment::source_page_id(&id, &file_key);
 
             // UPDATE memories: rebind chunks from old_doc_source_id to new_doc_source_id.
-            if let Err(e) = db
-                .rebind_source_id("memory", old_doc_source_id.as_str(), &new_doc_source_id)
+            match db
+                .rebind_source_id_with_source_page(
+                    "memory",
+                    old_doc_source_id.as_str(),
+                    &new_doc_source_id,
+                    &old_source_page_id,
+                    &new_source_page_id,
+                )
                 .await
             {
-                tracing::warn!(
-                    "[sync] rebind failed for {} (renamed from {}): {}",
-                    file_path.display(),
-                    old_path,
-                    e
-                );
-                errors += 1;
-                continue;
+                Ok(()) => {
+                    // Sync/queue bookkeeping is path-keyed rather than
+                    // document-id-keyed, so it stays outside rebind_source_id.
+                    for outcome in [
+                        db.delete_sync_state(&id, &old_path).await,
+                        db.dequeue_document(&id, &old_path).await,
+                    ] {
+                        if let Err(error) = outcome {
+                            tracing::warn!(
+                                "[sync] rename cleanup failed for {}: {}",
+                                old_path,
+                                error
+                            );
+                            errors += 1;
+                            file_errors += 1;
+                        }
+                    }
+                    if let Err(error) = db.upsert_sync_state(&id, &file_key, mtime_ns, &hash).await
+                    {
+                        tracing::warn!(
+                            "[sync] renamed sync_state failed for {}: {}",
+                            file_path.display(),
+                            error
+                        );
+                        errors += 1;
+                        file_errors += 1;
+                    }
+
+                    // Mark this file as renamed (don't delete it later).
+                    renamed_files.insert(old_path);
+                    // Skipped instead of ingested: chunks reused, not re-enriched.
+                    skipped += 1;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "[sync] rebind yielded for {} (candidate {}): {}; falling back to enqueue",
+                        file_path.display(),
+                        old_path,
+                        error
+                    );
+                }
             }
-
-            // Delete old sync_state, create new sync_state for the new path.
-            let _ = db.delete_sync_state(&id, old_path).await;
-            let _ = db.upsert_sync_state(&id, &file_key, mtime_ns, &hash).await;
-
-            // Mark this file as renamed (don't delete it later).
-            renamed_files.insert(old_path.clone());
-            // Skipped instead of ingested: chunks reused, not re-enriched.
-            skipped += 1;
-            continue;
         }
 
         // Normal enqueue (no rename match).
@@ -1339,6 +1384,34 @@ mod tests {
             "original file should have enriched chunks"
         );
         let orig_chunk_count = orig_chunks.len();
+        let orig_chunk_ids: Vec<String> =
+            orig_chunks.iter().map(|chunk| chunk.id.clone()).collect();
+        let original_key = orig_path.to_string_lossy().to_string();
+        let old_source_page_id =
+            wenlan_core::document_enrichment::source_page_id(&source_id, &original_key);
+        wenlan_core::post_write::page_write(
+            &db,
+            wenlan_core::post_write::PageWrite::Create {
+                page_id: Some(&old_source_page_id),
+                req: wenlan_types::requests::CreateConceptRequest {
+                    title: "Original Source Page".to_string(),
+                    content: "Source Page body survives an identical-content rename.".to_string(),
+                    summary: None,
+                    entity_id: None,
+                    space: None.into(),
+                    source_memory_ids: orig_chunk_ids,
+                    creation_kind: Some("source".to_string()),
+                    workspace: None,
+                },
+                agent: "test",
+                knowledge_path: None,
+                page_min_cluster_size: 1,
+                page_match_threshold: 0.0,
+                citations_json: None,
+            },
+        )
+        .await
+        .unwrap();
 
         // Rename the file: old vanishes, new appears with identical content.
         std::fs::remove_file(&orig_path).unwrap();
@@ -1350,6 +1423,8 @@ mod tests {
             &renamed_path,
             Some(&knowledge_path),
         );
+        let new_source_page_id =
+            wenlan_core::document_enrichment::source_page_id(&source_id, &renamed_key);
 
         let state = Arc::new(RwLock::new(ServerState {
             db: Some(db.clone()),
@@ -1389,6 +1464,16 @@ mod tests {
             orig_chunk_count,
             "renamed file should have same chunks re-pointed to the new path"
         );
+        assert!(
+            db.get_page(&old_source_page_id).await.unwrap().is_none(),
+            "the path-derived SOURCE Page id must not remain orphaned"
+        );
+        let renamed_page = db
+            .get_page(&new_source_page_id)
+            .await
+            .unwrap()
+            .expect("SOURCE Page identity should move with the file");
+        assert_eq!(renamed_page.version, 1);
 
         // New sync_state exists with the new path.
         assert!(
@@ -1407,5 +1492,155 @@ mod tests {
                 .is_none(),
             "renamed file should NOT be queued (chunks reused, not re-enriched)"
         );
+    }
+
+    #[tokio::test]
+    async fn rename_optimization_consumes_each_vanished_hash_only_once() {
+        let _lock = crate::TEST_DATA_DIR_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let _env = DataDirGuard::new();
+
+        let source_root = tempfile::tempdir().unwrap();
+        let original_path = source_root.path().join("original.txt");
+        let first_new_path = source_root.path().join("copy_a.txt");
+        let second_new_path = source_root.path().join("copy_b.txt");
+        let content = "One vanished document cannot be rebound into two new files.";
+        std::fs::write(&original_path, content).unwrap();
+
+        let source_id = "directory-duplicate-hash".to_string();
+        register_directory_source(&source_id, source_root.path());
+        let knowledge_path = wenlan_core::config::load_config().knowledge_path_or_default();
+        let (db, _db_dir) = new_test_db().await;
+        seed_document(&db, &source_id, &original_path, &knowledge_path, content).await;
+
+        std::fs::remove_file(&original_path).unwrap();
+        std::fs::write(&first_new_path, content).unwrap();
+        std::fs::write(&second_new_path, content).unwrap();
+
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db.clone()),
+            ..ServerState::default()
+        }));
+        let Json(stats) = handle_sync_source(State(state), Path(source_id.clone()))
+            .await
+            .expect("directory sync should succeed");
+
+        assert_eq!(
+            stats.errors, 0,
+            "duplicate content is valid, not a sync error"
+        );
+        assert_eq!(
+            stats.ingested, 1,
+            "one copy reuses chunks and the other must enter normal enrichment"
+        );
+        let mut rebound_files = 0usize;
+        let mut queued_files = 0usize;
+        for path in [&first_new_path, &second_new_path] {
+            let doc_source_id = wenlan_core::sources::directory::document_source_id(
+                &source_id,
+                path,
+                Some(&knowledge_path),
+            );
+            if !db
+                .get_memories_by_source_id("memory", &doc_source_id)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                rebound_files += 1;
+            }
+            if db
+                .get_queue_entry(&source_id, &path.to_string_lossy())
+                .await
+                .unwrap()
+                .is_some()
+            {
+                queued_files += 1;
+            }
+        }
+        assert_eq!(rebound_files, 1);
+        assert_eq!(queued_files, 1);
+    }
+
+    #[tokio::test]
+    async fn occupied_rename_target_falls_back_to_normal_enrichment() {
+        let _lock = crate::TEST_DATA_DIR_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let _env = DataDirGuard::new();
+
+        let source_root = tempfile::tempdir().unwrap();
+        let vanished_path = source_root.path().join("vanished.txt");
+        let target_path = source_root.path().join("target.txt");
+        let moved_content = "Content moving onto an already tracked target path.";
+        let old_target_content = "The target previously held different content.";
+        std::fs::write(&vanished_path, moved_content).unwrap();
+        std::fs::write(&target_path, old_target_content).unwrap();
+
+        let source_id = "directory-occupied-target".to_string();
+        register_directory_source(&source_id, source_root.path());
+        let knowledge_path = wenlan_core::config::load_config().knowledge_path_or_default();
+        let (db, _db_dir) = new_test_db().await;
+        let vanished_doc = seed_document(
+            &db,
+            &source_id,
+            &vanished_path,
+            &knowledge_path,
+            moved_content,
+        )
+        .await;
+        let target_doc = seed_document(
+            &db,
+            &source_id,
+            &target_path,
+            &knowledge_path,
+            old_target_content,
+        )
+        .await;
+
+        std::fs::remove_file(&vanished_path).unwrap();
+        std::fs::write(&target_path, moved_content).unwrap();
+        let target_key = target_path.to_string_lossy().to_string();
+        db.upsert_sync_state(
+            &source_id,
+            &target_key,
+            -1,
+            &content_hash(old_target_content),
+        )
+        .await
+        .unwrap();
+
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db.clone()),
+            ..ServerState::default()
+        }));
+        let Json(stats) = handle_sync_source(State(state), Path(source_id.clone()))
+            .await
+            .expect("directory sync should succeed");
+
+        assert_eq!(stats.errors, 0);
+        assert_eq!(stats.ingested, 1, "the occupied target must be enqueued");
+        assert!(
+            db.get_memories_by_source_id("memory", &vanished_doc)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the vanished source is cleaned through canonical forget"
+        );
+        let target_chunks = db
+            .get_memories_by_source_id("memory", &target_doc)
+            .await
+            .unwrap();
+        assert_eq!(target_chunks.len(), 1, "target chunks must not be merged");
+        assert_eq!(target_chunks[0].content, old_target_content);
+        let queued = db
+            .get_queue_entry(&source_id, &target_key)
+            .await
+            .unwrap()
+            .expect("target should wait for bounded enrichment");
+        assert_eq!(queued.content_hash, Some(content_hash(moved_content)));
     }
 }

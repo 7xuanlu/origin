@@ -12,12 +12,16 @@ use std::sync::Arc;
 /// the caller is responsible for linking them to a specific memory.
 ///
 /// This is the extraction-only primitive used by `run_enrichment_sweep` (and any
-/// other caller that controls when/how linkage happens).
+/// other caller that controls when/how linkage happens). `source_id`, when the
+/// caller has it in hand, is threaded into each relation's `source_memory_id`
+/// so its span payload can resolve back to a source memory; `None` keeps the
+/// relation's payload `source_memory_id`-less, matching pre-M3g behavior.
 pub async fn extract_entities_for_content(
     db: &MemoryDB,
     llm: &Arc<dyn LlmProvider>,
     prompts: &PromptRegistry,
     content: &str,
+    source_id: Option<&str>,
 ) -> Result<Vec<String>, WenlanError> {
     let truncated: String = content.chars().take(500).collect();
     let numbered = format!("1. {}", truncated);
@@ -36,6 +40,14 @@ pub async fn extract_entities_for_content(
 
     let batch = [(0usize, content.to_string())];
     let kg_results = crate::extract::parse_kg_response(&response, &batch);
+    let _space_write_guard = db.lock_space_writes().await;
+    let entity_space = match source_id {
+        Some(source_id) => match db.get_memory_space(source_id).await? {
+            Some(space) => wenlan_types::WriteSpaceTarget::Named(space),
+            None => wenlan_types::WriteSpaceTarget::Uncategorized,
+        },
+        None => wenlan_types::WriteSpaceTarget::Uncategorized,
+    };
 
     let mut entity_cache: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -49,7 +61,7 @@ pub async fn extract_entities_for_content(
             let req = wenlan_types::requests::CreateEntityRequest {
                 name: entity.name.clone(),
                 entity_type: entity.entity_type.clone(),
-                space: None,
+                space: entity_space.clone(),
                 source_agent: Some("post_ingest".to_string()),
                 confidence: None,
             };
@@ -84,9 +96,21 @@ pub async fn extract_entities_for_content(
                     source_agent: Some("post_ingest".to_string()),
                     confidence: rel.confidence,
                     explanation: rel.explanation.clone(),
-                    source_memory_id: None,
+                    source_memory_id: source_id.map(|s| s.to_string()),
+                    span: rel.span.clone(),
+                    model_version: Some(llm.model_id()),
+                    prompt_version: Some(
+                        crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION.to_string(),
+                    ),
                 };
-                if let Err(e) = crate::post_write::create_relation(db, req, "post_ingest").await {
+                if let Err(e) = crate::post_write::create_relation_with_span(
+                    db,
+                    req,
+                    "post_ingest",
+                    Some(content),
+                )
+                .await
+                {
                     log::warn!("[extract_entities_for_content] create_relation failed: {e}");
                 }
             }
@@ -124,11 +148,22 @@ pub async fn extract_kg(
 
 /// Serial DB-write half: commit a parsed KG result set to the DB and link
 /// the memory row identified by `source_id`. Returns the primary entity id.
+/// `content` is the exact text `kg` was extracted from -- threaded through
+/// (never re-fetched) so M3g span capture (§2.3) locates each relation's
+/// quote against the string the model actually saw. `model_version` is the
+/// extraction LLM's provenance for the same capture (§6.6).
 pub async fn commit_kg(
     db: &MemoryDB,
     source_id: &str,
     kg: &[crate::extract::KgExtractionResult],
+    content: &str,
+    model_version: Option<&str>,
 ) -> Result<Option<String>, WenlanError> {
+    let _space_write_guard = db.lock_space_writes().await;
+    let entity_space = match db.get_memory_space(source_id).await? {
+        Some(space) => wenlan_types::WriteSpaceTarget::Named(space),
+        None => wenlan_types::WriteSpaceTarget::Uncategorized,
+    };
     let mut entity_cache: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut first_entity_id: Option<String> = None;
@@ -146,7 +181,7 @@ pub async fn commit_kg(
             let req = wenlan_types::requests::CreateEntityRequest {
                 name: entity.name.clone(),
                 entity_type: entity.entity_type.clone(),
-                space: None,
+                space: entity_space.clone(),
                 source_agent: Some("post_ingest".to_string()),
                 confidence: None,
             };
@@ -185,8 +220,20 @@ pub async fn commit_kg(
                     confidence: rel.confidence,
                     explanation: rel.explanation.clone(),
                     source_memory_id: Some(source_id.to_string()),
+                    span: rel.span.clone(),
+                    model_version: model_version.map(|s| s.to_string()),
+                    prompt_version: Some(
+                        crate::extract::EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION.to_string(),
+                    ),
                 };
-                if let Err(e) = crate::post_write::create_relation(db, req, "post_ingest").await {
+                if let Err(e) = crate::post_write::create_relation_with_span(
+                    db,
+                    req,
+                    "post_ingest",
+                    Some(content),
+                )
+                .await
+                {
                     log::warn!("[post_ingest] create_relation failed: {e}");
                 }
             }
@@ -218,7 +265,7 @@ pub async fn extract_single_memory_entities(
     content: &str,
 ) -> Result<Option<String>, WenlanError> {
     let kg = extract_kg(llm, prompts, content).await?;
-    commit_kg(db, source_id, &kg).await
+    commit_kg(db, source_id, &kg, content, Some(&llm.model_id())).await
 }
 
 #[cfg(test)]
@@ -300,7 +347,9 @@ mod tests {
         .await
         .expect("extract_kg failed");
 
-        let eid = commit_kg(&db, "m1", &kg).await.expect("commit_kg failed");
+        let eid = commit_kg(&db, "m1", &kg, "Alice joined Acme", None)
+            .await
+            .expect("commit_kg failed");
         assert!(
             eid.is_some(),
             "expected a primary entity id after commit_kg"
@@ -315,5 +364,115 @@ mod tests {
             stored_eid, eid,
             "stored entity_id should match the one returned by commit_kg"
         );
+    }
+
+    #[tokio::test]
+    async fn commit_kg_files_new_entities_with_the_source_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::MemoryDB::new(dir.path(), Arc::new(crate::events::NoopEmitter))
+            .await
+            .expect("MemoryDB::new failed");
+        db.create_space("work", None, false).await.unwrap();
+        let doc = RawDocument {
+            source: "memory".to_string(),
+            source_id: "m_space".to_string(),
+            title: "Space-derived entity".to_string(),
+            content: "Space Entity Canary joined the project.".to_string(),
+            space: Some("work".to_string()),
+            ..Default::default()
+        };
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        let kg = vec![crate::extract::KgExtractionResult {
+            index: 0,
+            entities: vec![crate::extract::ExtractedEntity {
+                name: "Space Entity Canary".to_string(),
+                entity_type: "person".to_string(),
+            }],
+            observations: vec![],
+            relations: vec![],
+        }];
+        let entity_id = commit_kg(
+            &db,
+            "m_space",
+            &kg,
+            "Space Entity Canary joined the project.",
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let detail = db.get_entity_detail(&entity_id).await.unwrap();
+        assert_eq!(
+            detail.entity.space.as_deref(),
+            Some("work"),
+            "new derived entities must inherit the persisted source-memory Space"
+        );
+    }
+
+    /// Minor-1 (M3g stage-a review): the entity-sweep path used to write
+    /// `source_memory_id: null` even when the caller had the real source
+    /// memory id trivially in hand, leaving the span dead weight (no
+    /// promotion path can resolve it). When `source_id` is threaded through,
+    /// the payload must carry it.
+    #[tokio::test]
+    async fn extract_entities_for_content_threads_source_id_into_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::MemoryDB::new(dir.path(), Arc::new(crate::events::NoopEmitter))
+            .await
+            .expect("MemoryDB::new failed");
+        let content = "Alice works at Acme Corp.";
+        let doc = RawDocument {
+            source: "memory".to_string(),
+            source_id: "mem_sweep".to_string(),
+            title: "Test memory".to_string(),
+            content: content.to_string(),
+            ..Default::default()
+        };
+        db.upsert_documents(vec![doc])
+            .await
+            .expect("upsert_documents failed");
+
+        let prompts = test_prompts();
+        let key_fragment = prompts
+            .extract_knowledge_graph
+            .chars()
+            .take(30)
+            .collect::<String>();
+        let kg_json = r#"[{"entities":[{"name":"Alice","type":"person"},{"name":"Acme","type":"org"}],"observations":[],"relations":[{"from":"Alice","to":"Acme","type":"works_on","span":"Alice works at Acme Corp"}]}]"#;
+        let canned: Arc<dyn LlmProvider> =
+            Arc::new(CannedLlmProvider::new("DEFAULT").with(key_fragment, kg_json));
+
+        extract_entities_for_content(&db, &canned, &prompts, content, Some("mem_sweep"))
+            .await
+            .expect("extract_entities_for_content failed");
+
+        let conn = db.test_primary_session().await;
+        let mut rows = conn
+            .query(
+                "SELECT e.payload FROM edges e \
+                 JOIN entity_page_map fm ON fm.entity_id = e.src_id \
+                 JOIN pages fp ON fp.id = fm.page_id \
+                     AND fp.kind = 'entity' AND fp.status = 'active' \
+                 JOIN entity_page_map tm ON tm.entity_id = e.dst_id \
+                 JOIN pages tp ON tp.id = tm.page_id \
+                     AND tp.kind = 'entity' AND tp.status = 'active' \
+                 WHERE e.edge_type = 'relates' AND fp.title = 'Alice' AND tp.title = 'Acme'",
+                libsql::params![],
+            )
+            .await
+            .unwrap();
+        let payload_text: String = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("relates edge row")
+            .get(0)
+            .expect(
+                "payload must be non-NULL: source_memory_id + model_version + prompt_version are Some",
+            );
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).unwrap();
+        assert_eq!(payload["source_memory_id"], serde_json::json!("mem_sweep"));
     }
 }

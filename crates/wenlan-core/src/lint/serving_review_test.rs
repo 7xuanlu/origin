@@ -59,6 +59,7 @@ fn route_catalog_freezes_exact_global_and_scoped_keys() {
         (Method::Get, "/api/agents/{name}"),
         (Method::Get, "/api/memory/stats"),
         (Method::Get, "/api/spaces"),
+        (Method::Get, "/api/spaces/default"),
         (Method::Get, "/api/sources"),
         (Method::Get, "/api/profile/narrative"),
         (Method::Get, "/api/knowledge/count"),
@@ -73,6 +74,7 @@ fn route_catalog_freezes_exact_global_and_scoped_keys() {
     const SCOPED: &[(Method, &str)] = &[
         (Method::Post, "/api/search"),
         (Method::Post, "/api/context"),
+        (Method::Post, "/api/brief"),
         (Method::Get, "/api/memory/recent"),
         (Method::Get, "/api/memory/unconfirmed"),
         (Method::Post, "/api/memory/search"),
@@ -114,6 +116,10 @@ fn route_catalog_freezes_exact_global_and_scoped_keys() {
         (Method::Get, "/api/memory/entities/{entity_id}"),
         (Method::Get, "/api/memory/entity-suggestions"),
         (Method::Get, "/api/knowledge/recent-relations"),
+        (Method::Get, "/api/communities"),
+        (Method::Get, "/api/communities/members"),
+        (Method::Get, "/api/communities/page-assignments"),
+        (Method::Get, "/api/communities/proposals"),
     ];
 
     let rows = sensitive_read_routes().collect::<Vec<_>>();
@@ -132,8 +138,8 @@ fn route_catalog_freezes_exact_global_and_scoped_keys() {
         .map(|row| (row.method, row.path))
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(rows.len(), 58);
-    assert_eq!(keys.len(), 58, "duplicate sensitive route key");
+    assert_eq!(rows.len(), 64);
+    assert_eq!(keys.len(), 64, "duplicate sensitive route key");
     assert_eq!(global, GLOBAL.iter().copied().collect());
     assert_eq!(scoped, SCOPED.iter().copied().collect());
 }
@@ -174,7 +180,7 @@ async fn page_serving_uses_retrieval_flag_not_projection_flag() {
 async fn episode_liveness_uses_episode_specific_eligibility() {
     let (db, _tmp) = test_db().await;
     insert_memory_with_content(&db, "short", "work", "too short", 2).await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute(
         "UPDATE memories SET source_text='one two three four five six seven eight' WHERE source_id='short'",
         (),
@@ -195,7 +201,7 @@ async fn episode_liveness_uses_episode_specific_eligibility() {
 #[tokio::test]
 async fn telemetry_and_reranker_inventory_reports_observed_configuration() {
     let (db, _tmp) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute(
         "INSERT INTO access_log (source_id,accessed_at) VALUES ('m',1)",
         (),
@@ -297,7 +303,7 @@ async fn insert_memory_with_content(
     content: &str,
     words: i64,
 ) {
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute(
         "INSERT INTO memories (id,content,source,source_id,title,chunk_index,last_modified,chunk_type,stability,supersede_mode,needs_reembed,memory_type,word_count,space,pending_revision,is_recap) VALUES (?1,?3,'memory',?1,?1,0,1,'text','new','hide',1,'fact',?4,?2,0,0)",
         libsql::params![id, space, content, words],

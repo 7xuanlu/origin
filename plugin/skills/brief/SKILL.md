@@ -1,162 +1,87 @@
 ---
 name: brief
 description: >
-  Session-start briefing from Wenlan. Reads the project status file (the
-  /handoff-maintained ledger of Active/Backlog work), then loads identity,
-  preferences, and topic-relevant memories so the agent walks in with context.
-  Surfaces any memories the daemon has flagged for human revision before the
-  session uses them. Invoked as `/brief [topic]`. Call FIRST at session start,
-  before any other Wenlan verb.
+  Read the current Space-owned project Brief from Wenlan. With an optional
+  topic, appends separately labeled related context from the same Space.
+  Invoked as `/brief [topic]` when resuming work or asking to catch up.
 argument-hint: "[topic]"
-allowed-tools: ["Bash", "mcp__plugin_wenlan_wenlan__context", "mcp__plugin_wenlan_wenlan__recall", "mcp__plugin_wenlan_wenlan__list_pending_revisions", "mcp__plugin_wenlan_wenlan__accept_revision", "mcp__plugin_wenlan_wenlan__dismiss_revision"]
+allowed-tools: ["Bash", "mcp__plugin_wenlan_wenlan__brief", "mcp__plugin_wenlan_wenlan__list_pending_revisions", "mcp__plugin_wenlan_wenlan__accept_revision", "mcp__plugin_wenlan_wenlan__dismiss_revision"]
 ---
 
 # /brief
 
-Pull a curated session brief from Wenlan. Three sources, in order:
+Read one Space's current project snapshot. The daemon Brief is authoritative;
+`~/.wenlan/sessions/_status/*.md` is only a one-way human-readable receipt and must
+never be read as product state.
 
-1. **Project status file** — what `/handoff` last wrote. Authoritative for
-   "what's left to do" right now.
-2. **`context` MCP** — identity, preferences, topic-relevant memories.
-   Background, not ledger.
-3. **`list_pending_revisions`** — daemon-flagged memories awaiting review.
+## 1. Resolve the Space
 
-Status file wins on "what's next" because memories rank by topic similarity
-and surface stale items alongside fresh ones; the status file is the live
-ledger maintained per session.
+Run the bundled resolver once:
 
-## 1. Read project status file first
-
-Detect project root:
-
-```
-Bash: cd_repo=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null); echo "${cd_repo:-no-git}"
+```bash
+raw_args="<the full argument string passed to /brief>"
+space_arg="$(printf '%s\n' "$raw_args" | grep -oE 'space:[A-Za-z0-9_-]+' | head -1 | cut -d: -f2)"
+topic_arg="$(printf '%s\n' "$raw_args" | sed -E 's/[[:space:]]*space:[A-Za-z0-9_-]+[[:space:]]*/ /g' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+resolved="$("$CLAUDE_PLUGIN_ROOT/bin/resolve-space.sh" --cwd "$PWD" ${space_arg:+--arg "$space_arg"} 2>/dev/null)"
+space="$(printf '%s\n' "$resolved" | cut -f1)"
+source_layer="$(printf '%s\n' "$resolved" | cut -f2)"
 ```
 
-- If output is a path → `<project>` = basename (e.g. `wenlan`).
-- If `no-git` → `<project>` = cwd basename.
+Print `Resolved space: <space> (from <source-layer>)`. If no Space resolves,
+print `Resolved space: none (unscoped)` and omit `space`.
 
-Read `~/.wenlan/sessions/_status/<project>.md`:
+## 2. Read the Brief
 
-```
-Bash: cat ~/.wenlan/sessions/_status/<project>.md
-```
+Call:
 
-If the file exists, render its `## Last session`, `## Active`, and `## Backlog`
-sections verbatim at the top of the brief output, under a heading like
-`Status (last session <date>)`. This is the authoritative "what's left" frame.
-
-If the file is missing, say nothing about it. First-time projects haven't
-been handed off yet.
-
-## 2. Resolve the active space
-
-Before any MCP call, resolve the active space by invoking the bundled
-resolver script via Bash:
-
-    "$CLAUDE_PLUGIN_ROOT/bin/resolve-space.sh" --cwd "$PWD" \
-        ${SPACE_ARG:+--arg "$SPACE_ARG"} \
-        ${TOPIC_ARG:+--topic "$TOPIC_ARG"}
-
-The script prints `<space>\t<source-layer>` on stdout. Capture both:
-the `<space>` value is what you pass as `space=...` to MCP tools when
-non-empty; the `<source-layer>` value is one of `arg`, `env`,
-`cwd-config`, `cwd-config-default`, `cwd-repo`, `topic`, `unscoped`.
-
-Print one line to the user before the MCP call:
-
-    Resolved space: <space> (from <source-layer>)
-
-If `<space>` is empty, print `Resolved space: none (unscoped)` and omit
-the `space` parameter from MCP calls.
-
-so the user can confirm the resolution before the brief proceeds.
-
-## 3. Call context
-
-Call the `wenlan` MCP server's `context` tool. If the user passed a topic
-argument, pass it through. Otherwise infer scope from the working directory and
-the conversation so far — don't ask the user.
-
-```
-context(topic="<args or inferred>"[, space="<resolved>"])
+```text
+mcp__plugin_wenlan_wenlan__brief(
+  topic="<topic_arg only when the user supplied one>",
+  space="<resolved only when non-empty>"
+)
 ```
 
-Omit `space` when the resolver returns an empty value.
+Do not invent or infer a topic when the argument is absent. No topic means the
+complete Brief alone. A topic means the same complete Brief plus a separate
+`Related Context` section scoped to that Space.
 
-**Scope inference rules:**
+Brief reads never create state. If the state is `brief_not_created`, explain
+that the first `/handoff` update will create it. If the state is
+`space_not_resolved`, ask for a Space only when the working directory and
+configuration cannot resolve one safely.
 
-- `topic`: if user omitted args, pass the most recent topic from the
-  conversation (file or feature being discussed), or omit for a fresh
-  general brief at session start.
-- `space`: use the value from the resolver script above when non-empty.
-  Omit it when the resolver reports `unscoped`.
+Render:
 
-## When to use
+1. Last-session summary.
+2. Active items.
+3. Backlog items.
+4. Related Context, only when returned.
 
-- Session start — call BEFORE any other Wenlan tool.
-- Major topic shift mid-session.
-- User says "catch me up", "what's the background on X", "remind me about Y".
-- Mid-session check-in to confirm assumptions.
+Keep stable item IDs and versions available for later `/handoff` reconciliation,
+but do not clutter the normal user-facing list with them.
 
-## When NOT to use
+## 3. Pending revisions
 
-- Specific factual lookup → use `/recall` (more targeted).
-- Storing a new memory → use `/capture`.
-- End of session → use `/handoff`.
+After the Brief, call:
 
-## How to use the result
-
-Treat the status file as the live ledger (what's next), and the `context`
-memories as background (how the user thinks). When the status file says an
-item is done but a memory still says it's pending, trust the status file —
-memories don't auto-supersede. If you see drift, flag it inline rather than
-parrot the stale memory.
-
-Model how the user thinks. Their preferences, corrections, and past decisions
-tell you how they want to be helped, not just what they already know. Don't
-just look things up: adjust your behavior.
-
-## 4. Pending revisions check
-
-After loading context, call:
-
-```
-list_pending_revisions(limit=10)
+```text
+mcp__plugin_wenlan_wenlan__list_pending_revisions(limit=10)
 ```
 
-If the result is empty, **say nothing**. Do not print "0 pending revisions" or any "all clear" line. The brief is already noisy enough.
+If empty, say nothing. If the call fails, emit one warning and keep the Brief.
+If non-empty, show at most the top three with `target_source_id`,
+`revision_content`, and source agent. Never auto-action them.
 
-If the MCP call errors, log a one-line warning and continue. Do not error out the brief.
+- accept:
+  `mcp__plugin_wenlan_wenlan__accept_revision(target_source_id="<id>")`
+- dismiss:
+  `mcp__plugin_wenlan_wenlan__dismiss_revision(target_source_id="<id>")`
+- skip: no call
 
-If the result is non-empty, render a block at the end of the brief (after the context summary, before handing back to the user). The daemon returns rows already sorted by `last_modified DESC`; just slice the first three.
+If more than three exist, point to `/curate revisions`.
 
-Each `PendingRevisionItem` carries `target_source_id`, `revision_source_id`, `revision_content`, `source_agent`, and `last_modified`. The original memory's content is **not** on this response. The block displays the proposed revision text and the target memory id; if the user wants to see the original before deciding, they can run `/recall <target_source_id>` first.
+## Boundary
 
-```
-Pending revisions (<N> total, top 3 shown):
-
-1. target: mem_abc123  (proposed by <source_agent or "daemon">)
-   revision: "Wenlan uses Turso libSQL fork (libSQL-server) for vectors..."
-   Action: accept (replace original) | dismiss (drop revision) | skip
-
-2. ...
-```
-
-Inline accept/dismiss verbs map to:
-
-- accept: `accept_revision(target_source_id="<id>")`
-- dismiss: `dismiss_revision(target_source_id="<id>")`
-- skip: no call; the revision stays pending for the next /brief
-
-If `<N> > 3`, end the block with one line:
-
-```
-Run `/curate revisions` to walk the rest.
-```
-
-Do not auto-action anything. The user picks per item.
-
-Note: this block surfaces *all* pending revisions, not just this session's, because revisions are about memories you may still be using right now, regardless of when the contradiction was flagged.
-
-The revision surface is **conflicts and merges only** — a same-entity contradiction, or a materially-richer re-capture worth folding into the original. A plain unconfirmed capture never lands here (captures are meant to decay unless they conflict), and a ~identical re-capture dedups silently. So an empty result is the normal, healthy case, not a sign you're behind.
+Use `/brief` to resume a Space or answer "catch me up." It is not a mandatory
+every-session boot step. Use `/recall` for a specific fact, `/capture` for a
+durable memory, and `/handoff` to close a work session.

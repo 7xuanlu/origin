@@ -179,7 +179,25 @@ async fn sync_one_file(
             // pick the canonical file; leave it as-is until a genuine re-distill
             // re-establishes the mapping. The page row is untouched either way.
             if writer.page_filename(&existing.id).is_some() {
-                writer.begin_projection_write().write_page(&existing)?;
+                // The permit is taken before the projection lock, not inside it,
+                // so no await happens while the lock is held. Skipping is right
+                // here — unlike the receipted repair path, this is an ambient
+                // reaction to a file the user touched, and the honest response
+                // to "this page may not be projected" is to leave it alone. The
+                // startup invariant is the only pass that evicts hidden pages,
+                // so an ungated rewrite here would outlive the ceremony.
+                match crate::truth_adapter::page_write_permit(db, &existing.id).await? {
+                    Some(permit) => {
+                        writer
+                            .begin_projection_write()
+                            .write_page_permitted(&permit, &existing)?;
+                    }
+                    None => log::info!(
+                        "[truth] not re-projecting page {} after an edit — an automatic \
+                         reader may not see it",
+                        existing.id
+                    ),
+                }
             }
         }
         return Ok(Outcome::Unchanged);
@@ -296,6 +314,8 @@ mod tests {
             review_status: "confirmed".to_string(),
             workspace: None,
             citations: Vec::new(),
+            kind: "concept".to_string(),
+            truth: None,
         }
     }
 
@@ -591,7 +611,10 @@ mod tests {
 
         // The block-free body means no `mem_*` rows reach the wikilink graph
         // via replace_page_links.
-        let links = db.get_page_outbound_links("page_edit").await.unwrap();
+        let links = db
+            .get_page_outbound_links_scoped("page_edit", &crate::read_scope::ReadScope::Global)
+            .await
+            .unwrap();
         assert!(
             !links.iter().any(|l| l.label.starts_with("mem_")),
             "no mem_* link rows should persist; got {:?}",
@@ -740,7 +763,10 @@ mod tests {
             .await
             .unwrap();
 
-        let links = db.get_page_outbound_links("page_links").await.unwrap();
+        let links = db
+            .get_page_outbound_links_scoped("page_links", &crate::read_scope::ReadScope::Global)
+            .await
+            .unwrap();
         let mem_links: Vec<_> = links
             .iter()
             .filter(|l| l.label.starts_with("mem_"))
@@ -802,7 +828,10 @@ mod tests {
             .join("mem_two.md")
             .exists());
         // No mem_* page_links.
-        let links = db.get_page_outbound_links("page_rt").await.unwrap();
+        let links = db
+            .get_page_outbound_links_scoped("page_rt", &crate::read_scope::ReadScope::Global)
+            .await
+            .unwrap();
         assert!(links.iter().all(|l| !l.label.starts_with("mem_")));
     }
 }

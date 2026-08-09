@@ -2,12 +2,13 @@
 //! Server state — shared application state for the standalone HTTP daemon.
 
 use crate::ingest_batcher::IngestBatcher;
+use crate::lifecycle::ShutdownHandle;
 use crate::maintenance_coordinator::MaintenanceCoordinator;
 use crate::reflection_debounce::ReflectionDebouncer;
 use crate::scheduler::WriteSignal;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use wenlan_core::access_tracker::AccessTracker;
 use wenlan_core::db::MemoryDB;
 use wenlan_core::lint::observation::{LintRunObserver, NoopLintRunObserver};
@@ -72,13 +73,25 @@ impl LintServerConfig {
 /// handlers actually need. It does NOT include Tauri-specific fields (app_handle,
 /// sensors, triggers, ambient overlay, etc.).
 pub struct ServerState {
+    /// Sticky daemon-lifecycle signal shared by HTTP and background workers.
+    pub shutdown: ShutdownHandle,
     pub db: Option<Arc<MemoryDB>>,
+    /// One-way, human-readable projection of the daemon-owned Space Brief.
+    /// `None` disables projection without affecting the authoritative DB state.
+    pub brief_status_root: Option<PathBuf>,
+    // Serializes the read-and-replace receipt projection so a stale handler
+    // cannot overwrite a newer committed Brief projection.
+    pub brief_projection_lock: Arc<Mutex<()>>,
     /// On-device LLM provider (Qwen via llama-cpp).
     pub llm: Option<Arc<dyn LlmProvider>>,
     /// Registry id of the currently-loaded on-device model (e.g. "qwen3-4b").
     /// Set whenever `llm` is populated with an `OnDeviceProvider`. `None` when
     /// the daemon has no on-device model loaded.
     pub loaded_on_device_model: Option<String>,
+    /// Sticky reservation spanning the two-sample admission window and the
+    /// blocking startup model load. The scheduler observes it so no automatic
+    /// heavy turn can race the load after both sampled the same quiet window.
+    pub startup_model_load_reserved: Arc<std::sync::atomic::AtomicBool>,
     /// API-based LLM provider for routine tasks (Anthropic Haiku by default).
     pub api_llm: Option<Arc<dyn LlmProvider>>,
     /// API-based LLM provider for synthesis tasks (Anthropic Sonnet by default).
@@ -132,6 +145,12 @@ pub struct ServerState {
     /// Core rejects repair operations on platforms without the required
     /// owner-only permissions and directory-sync durability.
     pub repair_root: Option<PathBuf>,
+    /// Where the app's per-install presence secret lives — the same data
+    /// directory the app passes this process as `WENLAN_DATA_DIR`. The daemon
+    /// only ever reads it. `None`, or a directory with no secret in it, means
+    /// presence cannot be checked, which refuses every presence-requiring
+    /// mutation rather than waving it through (threat model §5).
+    pub presence_root: Option<PathBuf>,
     /// True only while startup recovery intentionally suppresses optional
     /// providers, rerankers, and background runtime workers.
     pub optional_runtime_workers_suspended: bool,
@@ -142,9 +161,13 @@ pub struct ServerState {
 impl Default for ServerState {
     fn default() -> Self {
         Self {
+            shutdown: ShutdownHandle::default(),
             db: None,
+            brief_status_root: None,
+            brief_projection_lock: Arc::new(Mutex::new(())),
             llm: None,
             loaded_on_device_model: None,
+            startup_model_load_reserved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             api_llm: None,
             synthesis_llm: None,
             external_llm: None,
@@ -163,6 +186,7 @@ impl Default for ServerState {
             reflection_debouncer: ReflectionDebouncer::new(),
             ingest_batcher: None,
             repair_root: None,
+            presence_root: None,
             optional_runtime_workers_suspended: false,
             lint_config: LintServerConfig::default(),
             lint_observer: Arc::new(NoopLintRunObserver),
@@ -176,6 +200,18 @@ impl ServerState {
             lint_config: LintServerConfig::capture(),
             ..Self::default()
         }
+    }
+
+    /// Override the Page projection root for an isolated server instance.
+    pub fn with_page_root(mut self, page_root: PathBuf) -> Self {
+        self.lint_config.page_root = Some(page_root);
+        self
+    }
+
+    /// Override the human-readable Brief receipt root for an isolated server.
+    pub fn with_brief_status_root(mut self, root: PathBuf) -> Self {
+        self.brief_status_root = Some(root);
+        self
     }
 }
 

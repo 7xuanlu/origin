@@ -12,7 +12,6 @@ const TABLES: &[&str] = &[
     "child_vectors",
     "document_enrichment_queue",
     "document_tags",
-    "entities",
     "memories",
     "memories_fts",
     "narrative_cache",
@@ -26,7 +25,6 @@ const TABLES: &[&str] = &[
 ];
 const SEARCH_OBJECTS: &[&str] = &[
     "child_vectors_vec_idx",
-    "entities_vec_idx",
     "idx_pages_embedding",
     "idx_summary_nodes_embedding",
     "memories_fts",
@@ -194,7 +192,6 @@ fn qualified_values(columns: &str, qualifier: &str) -> String {
 fn valid_vector_index(name: &str, sql: &str) -> bool {
     let target = match name {
         "memories_vec_idx" => "memories",
-        "entities_vec_idx" => "entities",
         "child_vectors_vec_idx" => "child_vectors",
         "idx_pages_embedding" => "pages",
         "idx_summary_nodes_embedding" => "summary_nodes",

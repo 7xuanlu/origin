@@ -132,7 +132,7 @@ if ! printf '%s\n' "$output" | grep -q "Codex plugin release pin missing"; then
 fi
 echo "PASS test 9: Codex README runner pin missing detected"
 
-assert_release_job_pins_tag() {
+assert_release_job_pins_release_sha() {
     local workflow="$1"
     local job="$2"
     python3 - "$workflow" "$job" <<'PY'
@@ -147,20 +147,108 @@ if not match:
     raise SystemExit(1)
 body = match.group("body")
 checkout = re.search(r"^      - (?:name: Checkout\n        )?uses: actions/checkout@[^\n]+\n(?P<body>.*?)(?=^      - |\Z)", body, re.MULTILINE | re.DOTALL)
-if not checkout or not re.search(r"^          ref: refs/tags/\$\{\{ env\.RELEASE_TAG \}\}\s*$", checkout.group("body"), re.MULTILINE):
+if not checkout or not re.search(r"^          ref: \$\{\{ env\.RELEASE_SHA \}\}\s*$", checkout.group("body"), re.MULTILINE):
     raise SystemExit(1)
 verify = re.search(r"^      - name: Verify release checkout\n(?P<body>.*?)(?=^      - |\Z)", body, re.MULTILINE | re.DOTALL)
 if not verify or not re.search(r"^        shell: bash\s*$", verify.group("body"), re.MULTILINE):
     raise SystemExit(1)
-if 'git rev-parse HEAD' not in verify.group("body") or 'git rev-list -n1 "refs/tags/$RELEASE_TAG"' not in verify.group("body"):
+if any(marker not in verify.group("body") for marker in ['git rev-parse HEAD', 'RELEASE_SHA', '/git/ref/tags/$RELEASE_TAG']):
     raise SystemExit(1)
 PY
 }
 
-for job in prepare-release release docker publish-crates publish-npm; do
-    if ! assert_release_job_pins_tag "$REPO_ROOT/.github/workflows/release.yml" "$job"; then
-        echo "FAIL test 10: $job must checkout and verify RELEASE_TAG"
+for job in prepare-release publish-crates publish-npm; do
+    if ! assert_release_job_pins_release_sha "$REPO_ROOT/.github/workflows/release.yml" "$job"; then
+        echo "FAIL test 10: $job must checkout the resolved release SHA and verify RELEASE_TAG"
         exit 1
     fi
 done
-echo "PASS test 10: release-producing jobs checkout and verify RELEASE_TAG"
+if ! python3 - "$REPO_ROOT/.github/workflows/release.yml" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+workflow = Path(sys.argv[1]).read_text()
+match = re.search(
+    r"^  resolve-promotion:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+    workflow,
+    re.MULTILINE | re.DOTALL,
+)
+if not match:
+    raise SystemExit(1)
+body = match.group("body")
+if "ref: ${{ github.sha }}" not in body or "ref: ${{ env.RELEASE_SHA }}" in body:
+    raise SystemExit(1)
+for marker in [
+    'git rev-parse HEAD)" == "$GITHUB_SHA',
+    '/git/ref/tags/$RELEASE_TAG',
+    '--sha "$RELEASE_SHA"',
+    "scripts/release-promotion.py gate-main",
+    "scripts/release-promotion.py consume-main-receipt",
+    '"$GITHUB_REF" == "refs/heads/main"',
+    ".main_sha == $sha and .main_run == null",
+    ".receipt.run_id == $source_run_id",
+    ".receipt.run_attempt == $source_run_attempt",
+    "Tag does not match the validated release version.",
+]:
+    if marker not in body:
+        raise SystemExit(1)
+PY
+then
+    echo "FAIL test 10: release resolver must keep main control-plane code while binding RELEASE_TAG to the exact receipt"
+    exit 1
+fi
+if ! python3 - "$REPO_ROOT/.github/workflows/release.yml" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+workflow = Path(sys.argv[1]).read_text()
+
+
+def job_body(job):
+    match = re.search(
+        rf"^  {re.escape(job)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+        workflow,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        raise SystemExit(1)
+    return match.group("body")
+
+
+# promote-assets runs the same promotion resolver as resolve-promotion, so it
+# is control plane: pinning it to the release commit would run the release's
+# own copy of the tooling, and a resolver fix could never reach a recovery of
+# that release. It still revalidates the receipt-derived tag.
+# The docker job is the same shape: its checkout supplies only the runtime
+# Dockerfile and the image verifier, while the bytes placed in the image come
+# from the receipt-verified artifact.
+for job in ["promote-assets", "docker"]:
+    packaging = job_body(job)
+    if (
+        "ref: ${{ github.sha }}" not in packaging
+        or "ref: ${{ env.RELEASE_SHA }}" in packaging
+    ):
+        raise SystemExit(1)
+    if "/git/ref/tags/$RELEASE_TAG" not in packaging or "RELEASE_SHA" not in packaging:
+        raise SystemExit(1)
+
+for job in ["prepare-release", "publish-crates", "publish-npm"]:
+    body = job_body(job)
+    if "ref: ${{ env.RELEASE_SHA }}" not in body or "ref: ${{ github.sha }}" in body:
+        raise SystemExit(1)
+    if "/git/ref/tags/$RELEASE_TAG" not in body or "RELEASE_SHA" not in body:
+        raise SystemExit(1)
+PY
+then
+    echo "FAIL test 10: every release source/publish job must use RELEASE_SHA and revalidate the live tag"
+    exit 1
+fi
+echo "PASS test 10: promotion keeps immutable main control code; source/publish jobs pin RELEASE_SHA and verify RELEASE_TAG"
+
+python3 "$REPO_ROOT/scripts/release-workflow-contract.test.py"
+echo "PASS test 11: release promotion and public install contracts"
+
+bash "$REPO_ROOT/scripts/bump-version.test.sh"
+echo "PASS test 12: release version sync disables npm lifecycle scripts"

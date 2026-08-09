@@ -6,7 +6,7 @@ description: >
   the daemon couldn't (no LLM or cluster too big). Invoked as
   `/distill [target]`.
 argument-hint: "[target | rebuild <page-id> | deep]"
-allowed-tools: ["mcp__plugin_wenlan_wenlan__recall", "mcp__plugin_wenlan_wenlan__distill", "mcp__plugin_wenlan_wenlan__create_page", "mcp__plugin_wenlan_wenlan__update_page", "mcp__plugin_wenlan_wenlan__delete_page", "mcp__plugin_wenlan_wenlan__get_page_sources", "Bash"]
+allowed-tools: ["mcp__plugin_wenlan_wenlan__recall", "mcp__plugin_wenlan_wenlan__distill", "mcp__plugin_wenlan_wenlan__write_page", "mcp__plugin_wenlan_wenlan__delete_page", "mcp__plugin_wenlan_wenlan__get_page_sources", "Bash"]
 ---
 
 # /distill
@@ -185,23 +185,23 @@ For each coherent cluster:
 **New cluster** (no `existing_page_id`) — call the MCP tool:
 
 ```
-create_page(title="...", summary="...", content="...",
-            entity_id="<cluster.entity_id or omit>",
-            space="<cluster.space>",
-            source_memory_ids=[...])
+write_page(title="...", summary="...", content="...",
+           entity_id="<cluster.entity_id or omit>",
+           space="<cluster.space>",
+           source_memory_ids=[...])
 ```
 
 **Refresh candidate** (`existing_page_id` is set) — replace the body
-in place via the `update_page` MCP tool. This is a single atomic
+in place via the `write_page` MCP tool, passing `page_id`. This is a single atomic
 call: replaces content + source list + optional summary, clears the
 daemon's `stale_reason`, bumps version, preserves page_id +
 created_at so external `[[wikilinks]]` keep working.
 
 ```
-update_page(page_id=cluster.existing_page_id,
-            content="...",
-            source_memory_ids=cluster.source_ids,
-            summary="...")
+write_page(page_id=cluster.existing_page_id,
+           content="...",
+           source_memory_ids=cluster.source_ids,
+           summary="...")
 ```
 
 ### 3.5 Refresh stale pages
@@ -227,14 +227,14 @@ For each stale page:
   regenerate from sources.
 - **`user_edited == false`** → fetch source memories via
   `get_page_sources(page_id="<id>")`, run the same coherence check
-  used for clusters, then call `update_page` with the existing
+  used for clusters, then call `write_page` with `page_id` and the existing
   `source_memory_ids` and freshly synthesized prose.
 
 ```
-update_page(page_id=stale.page_id,
-            content="<refreshed prose>",
-            source_memory_ids=stale.source_memory_ids,
-            summary="<optional refreshed claim>")
+write_page(page_id=stale.page_id,
+           content="<refreshed prose>",
+           source_memory_ids=stale.source_memory_ids,
+           summary="<optional refreshed claim>")
 ```
 
 When `stale_truncated == true`, tell the user "more stale pages
@@ -242,7 +242,7 @@ remain — re-run `/distill` after this pass to continue."
 
 ### 3.6 Resolve markdown paths for the report
 
-After every successful `create_page` or `update_page`, resolve the
+After every successful `write_page`, resolve the
 on-disk markdown file by page id. Never derive the slug client-side;
 the daemon owns filename collision handling and punctuation rules.
 
@@ -263,9 +263,9 @@ print(f"~/.wenlan/pages/{filename}" if filename else "(no md projection on disk)
 ' "<page_id>"
 ```
 
-For new pages, parse `<page_id>` from the `create_page` result line
-(`Created page <id>`). For refreshes, use the known `existing_page_id`
-or `stale.page_id`.
+For new-page calls, parse `<page_id>` from either `Created page <id>` or
+`Attached to existing page <id>`. For refreshes, use the known
+`existing_page_id` or `stale.page_id`.
 
 ### 3.7 Surface orphan-topic suggestions
 
@@ -307,12 +307,12 @@ Distilled N page(s) from <total> memories in scope `<scope>`:
   ...
 ```
 
-For each page, parse the MCP tool result text:
+For each page, parse the `write_page` result text:
 
-- `create_page` returns `Created page <id>` plus optional
-  `warning: <delta>` lines.
-- `update_page` returns `Refreshed page <id>` today. Use the known
-  page id and fall back to `refreshed` unless the tool later returns a
+- A new-page call returns `Created page <id>` or
+  `Attached to existing page <id>`, plus optional `warning: <delta>` lines.
+- A refresh call returns `Refreshed page <id>` today. Use the known page id
+  and fall back to `refreshed` unless the tool later returns a
   `warning: <delta>` line.
 
 Render the first `warning: <delta>` payload verbatim after the title
@@ -345,7 +345,7 @@ Refreshed K stale page(s):
 ```
 
 Same delta-line rule as new/refresh clusters: render the first
-`warning: <delta>` payload from the `update_page` tool output verbatim;
+`warning: <delta>` payload from the `write_page` tool output verbatim;
 fall back to `refreshed` when absent.
 
 **If at least one stale page was skipped because `user_edited`:**
@@ -394,8 +394,10 @@ Bash: git -C ~/.wenlan add -A && \
 ```
 
 The retry handles index.lock races — the daemon may be writing to
-`~/.wenlan/` at the same moment (auto-commit from captures). One-second
-wait is enough for the daemon to release the lock.
+`~/.wenlan/` at the same moment. Commits land at session boundaries
+(handoff or daemon events), not per capture; uncommitted page edits
+between sessions are normal. One second is enough for the daemon to
+release the lock.
 
 ## When to use
 

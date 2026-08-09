@@ -136,7 +136,7 @@ fn page_req(
         content: content.to_string(),
         summary: Some(title.to_string()),
         entity_id: None,
-        space: Some(space.to_string()),
+        space: (Some(space.to_string())).into(),
         source_memory_ids: source_ids.iter().map(|id| id.to_string()).collect(),
         creation_kind: Some(creation_kind.to_string()),
         workspace: Some(space.to_string()),

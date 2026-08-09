@@ -233,12 +233,18 @@ pub async fn collections_and_precedence_are_scoped() {
     assert_eq!(status, StatusCode::OK, "{fallback}");
     assert_eq!(ids(&fallback, "pages"), vec![personal.clone()]);
 
+    // M1 (one honest column): `page_type` and `space` both filter c.space, so a
+    // page cannot carry a category independent of its scope -- the dual-axis
+    // `page_type=decision` + `space=work` cross-filter is the deleted three-state
+    // model. What survives, and what this case verifies, is scope precedence: an
+    // explicit body `space` wins over the header. (page_type's own
+    // filter-on-scope is covered by `search_pages_filters_by_page_type`.)
     let (status, body_wins) = json_body(
         fixture
             .send(
                 HttpMethod::POST,
                 "/api/pages/search",
-                Some(json!({"query":"workspace collection canary","limit":20,"page_type":"decision","space":"work"})),
+                Some(json!({"query":"workspace collection canary","limit":20,"space":"work"})),
                 Some("personal"),
             )
             .await,
@@ -247,12 +253,14 @@ pub async fn collections_and_precedence_are_scoped() {
     assert_eq!(status, StatusCode::OK, "{body_wins}");
     assert_eq!(ids(&body_wins, "pages"), vec![work.clone()]);
 
+    // Blank body `space` falls back to the header scope (same single-axis rule;
+    // page_type rider dropped for the reason above).
     let (status, header_fallback) = json_body(
         fixture
             .send(
                 HttpMethod::POST,
                 "/api/pages/search",
-                Some(json!({"query":"workspace collection canary","limit":20,"page_type":"recap","space":""})),
+                Some(json!({"query":"workspace collection canary","limit":20,"space":""})),
                 Some("personal"),
             )
             .await,

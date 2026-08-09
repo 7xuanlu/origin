@@ -1,0 +1,89 @@
+name: CI Observer
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  # A fixed group can retain only one pending run, silently dropping receipts
+  # during bursts. Keep every completed CI run/attempt independently observable.
+  group: ci-observer-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+  cancel-in-progress: false
+
+env:
+  CI_CACHE_BUDGET_GB: "10"
+  CI_REQUIRED_GATE_TARGET_MINUTES: "20"
+
+jobs:
+  collect:
+    name: collect completed-run evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # For workflow_run, github.sha is the trusted default-branch commit.
+      # The observed PR head SHA remains data and is never checked out.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Fetch read-only Actions metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/ci-observer"
+          mkdir -p "$out"
+
+          if [[ ! "$RUN_ID" =~ ^[0-9]+$ ]] || [[ ! "$RUN_ATTEMPT" =~ ^[0-9]+$ ]]; then
+            echo "::warning title=CI observer metadata::Invalid run identity; the receipt will record unavailable metadata."
+            exit 0
+          fi
+
+          fetch_metadata() {
+            local label="$1"
+            local destination="$2"
+            shift 2
+            local temporary="${destination}.tmp"
+            if "$@" > "$temporary"; then
+              mv "$temporary" "$destination"
+            else
+              rm -f "$temporary"
+              echo "::warning title=CI observer metadata::${label} metadata is unavailable; the receipt will record the failure."
+            fi
+          }
+
+          fetch_metadata "Jobs" "$out/jobs-pages.json" gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            --paginate --slurp \
+            "/repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100"
+          fetch_metadata "Cache usage" "$out/cache-usage.json" gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/actions/cache/usage"
+      - name: Build timing and cache receipt
+        if: always()
+        run: |
+          python3 scripts/ci-observer.py \
+            --event "$GITHUB_EVENT_PATH" \
+            --jobs-pages "$RUNNER_TEMP/ci-observer/jobs-pages.json" \
+            --cache-usage "$RUNNER_TEMP/ci-observer/cache-usage.json" \
+            --cache-budget-gb "$CI_CACHE_BUDGET_GB" \
+            --required-gate-target-minutes "$CI_REQUIRED_GATE_TARGET_MINUTES" \
+            --output "$RUNNER_TEMP/ci-observer/receipt.json"
+      - name: Upload CI observer receipt
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ci-observer-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          path: ${{ runner.temp }}/ci-observer/receipt.json
+          retention-days: 30
+          if-no-files-found: error

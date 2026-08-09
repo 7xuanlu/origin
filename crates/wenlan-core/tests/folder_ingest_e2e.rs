@@ -33,10 +33,11 @@
 //! test (reap-under-live-root, zero-delete-on-unmount, one canonical enrichment
 //! route) are the production ones.
 //!
-//! The LLM is `None`: `run_document_enrichment` then writes a deterministic stub
-//! SOURCE page and marks the document done, which keeps the whole test
-//! deterministic while still exercising all-chunk embedding (embedding happens in
-//! `upsert_documents`, before any LLM call) and the source-page contract.
+//! The LLM is `None`: `run_document_enrichment` writes a deterministic stub
+//! SOURCE page, publishes the sync receipt, and parks model-derived work at
+//! `waiting_for_provider`. This keeps the test deterministic while still
+//! exercising all-chunk embedding (embedding happens in `upsert_documents`,
+//! before any LLM call) and the source-page contract.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -115,10 +116,11 @@ struct SyncOutcome {
 /// root-liveness guard, scan + per-file mtime/hash skip, enqueue of changed
 /// files, and deletion propagation for tracked files that vanished under a live
 /// root. `source_sync_state` is deliberately NOT written here: production
-/// writes it in `run_document_enrichment` on terminal processing (§4), so the
-/// drain — not the sync loop — populates the tracked set the skip and deletion
-/// diffs read. Rename optimization is intentionally omitted — it is not part
-/// of the §6 assertions.
+/// writes it in `run_document_enrichment` after searchable preparation, whether
+/// the queue becomes terminal or waits for a provider (§4). The drain — not the
+/// sync loop — therefore populates the tracked set the skip and deletion diffs
+/// read. Rename optimization is intentionally omitted — it is not part of the
+/// §6 assertions.
 async fn directory_sync(db: &MemoryDB, root: &Path) -> SyncOutcome {
     // Root-guard (§4/§5): a missing/unreadable root means "source unavailable",
     // NOT "every file deleted". Diff nothing, delete zero rows.
@@ -202,9 +204,15 @@ async fn drain_queue(
     db: &MemoryDB,
     root: &Path,
     prompts: &PromptRegistry,
+    expected_max: usize,
 ) -> Vec<(String, DocumentEnrichmentOutcome)> {
     let mut out = Vec::new();
-    while let Some(entry) = db.claim_next_pending().await.unwrap() {
+    while let Some(entry) = db.claim_next_pending_for_provider(false).await.unwrap() {
+        assert!(
+            out.len() < expected_max,
+            "queue drain claimed more than the expected {expected_max} documents; \
+             a terminal or provider-waiting row was likely reclaimed"
+        );
         let file_path = entry.file_path.clone();
         let outcome = run_document_enrichment(db, &entry, Some(root), None, prompts).await;
         // With no LLM the route never pauses; guard against a stuck loop anyway.
@@ -215,6 +223,31 @@ async fn drain_queue(
         out.push((file_path, outcome));
     }
     out
+}
+
+#[tokio::test]
+async fn no_provider_drain_stops_after_searchable_preparation() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let db = MemoryDB::new(db_dir.path(), Arc::new(NoopEmitter))
+        .await
+        .expect("open temp MemoryDB");
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("vault");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("note.md");
+    std::fs::write(&path, include_str!("fixtures/folder/notes/linked.md")).unwrap();
+
+    let synced = directory_sync(&db, &root).await;
+    assert_eq!(synced.enqueued, 1);
+    let outcomes = drain_queue(&db, &root, &PromptRegistry::default(), 1).await;
+
+    assert_eq!(outcomes.len(), 1);
+    let queue = db
+        .get_queue_entry(SOURCE_ID, &path.to_string_lossy())
+        .await
+        .unwrap()
+        .expect("document queue row");
+    assert_eq!(queue.status, "waiting_for_provider");
 }
 
 async fn chunk_count(db: &MemoryDB, doc_source_id: &str) -> usize {
@@ -265,7 +298,7 @@ async fn folder_ingest_full_pipeline_e2e() {
     assert_eq!(synced.deleted, 0);
     assert_eq!(synced.errors, 0);
 
-    let outcomes = drain_queue(&db, &root, &prompts).await;
+    let outcomes = drain_queue(&db, &root, &prompts, 4).await;
     assert_eq!(outcomes.len(), 4, "every enqueued file is processed once");
 
     // Per-file chunk counts.
@@ -350,15 +383,26 @@ async fn folder_ingest_full_pipeline_e2e() {
         "exactly one SOURCE page per successfully-ingested document"
     );
 
-    // The queue drained: all four rows are terminal `done` (incl. the skip).
-    for (fp, done_expected) in [
-        (md_path.to_string_lossy().to_string(), "done"),
-        (txt_path.to_string_lossy().to_string(), "done"),
-        (pdf_path.to_string_lossy().to_string(), "done"),
+    // Deterministic preparation is searchable, but model-derived work remains
+    // parked until a provider is explicitly available. The image-only skip is
+    // terminal because it has no model-derived work to perform.
+    for (fp, expected_status) in [
+        (
+            md_path.to_string_lossy().to_string(),
+            "waiting_for_provider",
+        ),
+        (
+            txt_path.to_string_lossy().to_string(),
+            "waiting_for_provider",
+        ),
+        (
+            pdf_path.to_string_lossy().to_string(),
+            "waiting_for_provider",
+        ),
         (image_pdf_path.to_string_lossy().to_string(), "done"),
     ] {
         let q = db.get_queue_entry(SOURCE_ID, &fp).await.unwrap().unwrap();
-        assert_eq!(q.status, done_expected, "queue row {fp} is terminal");
+        assert_eq!(q.status, expected_status, "unexpected queue state for {fp}");
     }
 
     // Retrieval: each ingested document is findable by a marker unique to it,
@@ -406,7 +450,7 @@ async fn folder_ingest_full_pipeline_e2e() {
     );
     assert_eq!(resynced.deleted, 0, "no deletions when nothing vanished");
     // No new queue work.
-    let drained_again = drain_queue(&db, &root, &prompts).await;
+    let drained_again = drain_queue(&db, &root, &prompts, 0).await;
     assert!(
         drained_again.is_empty(),
         "a no-op sync enqueues nothing to drain"
@@ -430,7 +474,7 @@ async fn folder_ingest_full_pipeline_e2e() {
     assert_eq!(modified.enqueued, 1, "the modified file is re-enqueued");
     assert_eq!(modified.skipped, 3, "unchanged siblings still skip");
     assert_eq!(modified.deleted, 0);
-    let redrained = drain_queue(&db, &root, &prompts).await;
+    let redrained = drain_queue(&db, &root, &prompts, 1).await;
     assert_eq!(redrained.len(), 1, "only the modified file re-enriches");
     let txt_chunks = chunk_count(&db, &txt_doc).await;
     assert!(

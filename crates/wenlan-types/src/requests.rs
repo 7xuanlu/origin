@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! API request types for all HTTP endpoints.
 
+use crate::WriteSpaceTarget;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -11,8 +12,12 @@ pub struct StoreMemoryRequest {
     pub content: String,
     #[serde(default)]
     pub memory_type: Option<String>,
-    #[serde(default, alias = "domain")]
-    pub space: Option<String>,
+    #[serde(
+        default,
+        alias = "domain",
+        skip_serializing_if = "WriteSpaceTarget::is_inherit"
+    )]
+    pub space: WriteSpaceTarget,
     #[serde(default)]
     pub source_agent: Option<String>,
     #[serde(default)]
@@ -83,6 +88,8 @@ pub struct ImportMemoriesRequest {
     pub content: String,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "WriteSpaceTarget::is_inherit")]
+    pub space: WriteSpaceTarget,
 }
 
 // ===== General search/context =====
@@ -136,8 +143,12 @@ pub struct ChatContextRequest {
 pub struct CreateEntityRequest {
     pub name: String,
     pub entity_type: String,
-    #[serde(default, alias = "domain")]
-    pub space: Option<String>,
+    #[serde(
+        default,
+        alias = "domain",
+        skip_serializing_if = "WriteSpaceTarget::is_inherit"
+    )]
+    pub space: WriteSpaceTarget,
     #[serde(default)]
     pub source_agent: Option<String>,
     #[serde(default)]
@@ -158,6 +169,20 @@ pub struct CreateRelationRequest {
     pub explanation: Option<String>,
     #[serde(default)]
     pub source_memory_id: Option<String>,
+    /// Verbatim source-memory quote the relation was extracted from (M3g
+    /// span capture). Daemon-internal (KG extraction) only -- the
+    /// `/api/memory/relations` wire route strips this to `None` before the
+    /// core call, so an agent-triggered request can never set it.
+    #[serde(default)]
+    pub span: Option<String>,
+    /// Extraction model id/version that produced `span` (§6.6 versioning).
+    /// Daemon-internal only -- stripped on the wire route, same as `span`.
+    #[serde(default)]
+    pub model_version: Option<String>,
+    /// `extract_knowledge_graph` prompt version that produced `span`.
+    /// Daemon-internal only -- stripped on the wire route, same as `span`.
+    #[serde(default)]
+    pub prompt_version: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -237,6 +262,11 @@ pub struct UpdateSpaceRequest {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetDefaultSpaceRequest {
+    pub space_id: String,
+}
+
 // ===== Concepts =====
 
 #[doc(hidden)]
@@ -248,14 +278,20 @@ pub struct CreateConceptRequest {
     pub summary: Option<String>,
     #[serde(default)]
     pub entity_id: Option<String>,
-    #[serde(default, alias = "domain")]
-    pub space: Option<String>,
+    #[serde(
+        default,
+        alias = "domain",
+        skip_serializing_if = "WriteSpaceTarget::is_inherit"
+    )]
+    pub space: WriteSpaceTarget,
     #[serde(default)]
     pub source_memory_ids: Vec<String>,
     #[serde(default)]
     pub creation_kind: Option<String>,
-    /// Dedicated workspace axis (P3). When Some, persisted to `pages.workspace`.
-    /// Distinct from `space` (category column used for page_type filtering).
+    /// Dedicated workspace axis (P3), the authoritative axis for page
+    /// filtering. When Some, persisted to `pages.workspace`. Distinct from
+    /// `space`, the legacy scope input defaulted from the `X-Origin-Space`
+    /// header when the body omits it (see `handle_create_page`).
     #[serde(default)]
     pub workspace: Option<String>,
 }
@@ -868,4 +904,67 @@ mod tests {
             serde_json::from_str(r#"{"endpoint":"http://x","model":"m"}"#).unwrap();
         assert!(r.api_key.is_none());
     }
+}
+
+// ===== UI presence (M5 D7) =====
+
+/// A capability the app's Tauri backend minted for one gesture, as it crosses
+/// the wire.
+///
+/// Binding spec: `docs/plans/2026-07-27-m5-presence-threat-model.md`. `nonce`
+/// and `mac` are lowercase hex of the app's raw bytes; the daemon needs the
+/// raw nonce to recompute the HMAC, and stores only its digest.
+///
+/// **Deserialize only, on purpose.** The app's own `PresenceCapability`
+/// refuses to implement `Serialize` so no Tauri command can hand a capability
+/// to JavaScript (T1). This is the same guarantee facing the other way: with no
+/// `Serialize`, a receipt, a log line, or an error body physically cannot carry
+/// one, so §7's redaction contract holds by construction rather than by every
+/// future call site remembering it.
+#[derive(Clone, Deserialize)]
+pub struct PresenceCapability {
+    pub protocol_version: u32,
+    /// `attest_claim` or `review_page`. A string rather than an enum so an
+    /// unknown action is a refusal the daemon words, not a deserialize error
+    /// that echoes the submitted value back.
+    pub action: String,
+    pub target_ids: Vec<String>,
+    /// Digest of the exact content the gesture was made against (T6).
+    pub base_digest: String,
+    pub caller_id: String,
+    pub operation_id: String,
+    pub minted_at: u64,
+    pub expires_at: u64,
+    pub nonce: String,
+    pub mac: String,
+}
+
+/// Redacted by construction (§7): the derived `Debug` would print the HMAC and
+/// the raw nonce into the first log line that ever formatted a request.
+impl std::fmt::Debug for PresenceCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PresenceCapability")
+            .field("protocol_version", &self.protocol_version)
+            .field("action", &self.action)
+            .field("target_ids", &self.target_ids)
+            .field("base_digest", &self.base_digest)
+            .field("caller_id", &self.caller_id)
+            .field("operation_id", &self.operation_id)
+            .field("minted_at", &self.minted_at)
+            .field("expires_at", &self.expires_at)
+            .field("nonce", &"<redacted>")
+            .field("mac", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Mark one page as human-reviewed.
+///
+/// The capability already names the page and the exact content the human read,
+/// so there is nothing else to send. In particular the reviewed version is not
+/// a field: the daemon derives it from the row whose content matches
+/// `base_digest`, rather than believing a caller about which version it saw.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewPageRequest {
+    pub presence: PresenceCapability,
 }

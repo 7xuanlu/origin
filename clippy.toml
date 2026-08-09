@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "fastembed::TextEmbedding::try_new", reason = "all FastEmbed text initialization must hold the shared cross-process cache lock", replacement = "crate::db::init_text_embedding" },
+]

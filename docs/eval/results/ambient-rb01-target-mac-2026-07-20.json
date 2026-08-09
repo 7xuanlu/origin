@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-07-20",
+  "status": "lane_evidence_complete_persistent_daemon_soak_required",
+  "hardware": {
+    "arch": "arm64",
+    "model": "Mac14,10",
+    "total_memory_bytes": 17179869184
+  },
+  "source": {
+    "git_sha": "c8a87bfee2661b4c474b2df63b2d259563252d57",
+    "source_bundle_sha256": "52740615cfcc6e0c58b0e3f18907328cba9eca2a55c71d677977b5b97e7e7027",
+    "scheduler_sha256": "e84048ddc89cf7292ccf6398b7bc531b4b1b32d8fc00d4c6e9689da23066df10",
+    "profiler_sha256": "06a77b396f007d96894c33ddb0e35be2fdf7a85a5f91342cab33d84c003668fd",
+    "superseded_by": [
+      "unix_direct_exit_fix",
+      "two_minute_minimum_recovery"
+    ]
+  },
+  "isolated_lanes": [
+    {
+      "lane": "document",
+      "artifact": "20260721T021529Z-document",
+      "wall_ms": 4302,
+      "llm_calls": 1,
+      "rss_peak_bytes": 3090432000,
+      "system_cpu_before_percent": 16.026357650756836,
+      "system_cpu_after_percent": 34.59718322753906,
+      "thermal_before": 0,
+      "thermal_after": 0,
+      "durable_progress": true
+    },
+    {
+      "lane": "entity",
+      "artifact": "20260721T023021Z-entity",
+      "wall_ms": 5528,
+      "llm_calls": 1,
+      "rss_peak_bytes": 2266497024,
+      "system_cpu_before_percent": 15.506768226623535,
+      "system_cpu_after_percent": 25.862279891967773,
+      "thermal_before": 0,
+      "thermal_after": 0,
+      "durable_progress": true
+    },
+    {
+      "lane": "page-growth",
+      "artifact": "20260721T000621Z-page-growth",
+      "wall_ms": 154,
+      "llm_calls": 0,
+      "rss_peak_bytes": 3058450432,
+      "system_cpu_before_percent": 5.537748336791992,
+      "system_cpu_after_percent": 5.464042663574219,
+      "thermal_before": 0,
+      "thermal_after": 0,
+      "durable_progress": true,
+      "terminal_no_match": true
+    },
+    {
+      "lane": "reconcile",
+      "artifact": "20260721T024924Z-reconcile",
+      "wall_ms": 1833,
+      "llm_calls": 1,
+      "rss_peak_bytes": 3818110976,
+      "system_cpu_before_percent": 13.420578956604004,
+      "system_cpu_after_percent": 19.100168228149414,
+      "thermal_before": 0,
+      "thermal_after": 0,
+      "durable_progress": true
+    },
+    {
+      "lane": "citation",
+      "artifact": "20260721T030309Z-citation",
+      "wall_ms": 1885,
+      "llm_calls": 1,
+      "rss_peak_bytes": 4554539008,
+      "system_cpu_before_percent": 15.836735725402832,
+      "system_cpu_after_percent": 28.574846267700195,
+      "thermal_before": 0,
+      "thermal_after": 0,
+      "durable_progress": true
+    }
+  ],
+  "persistent_daemon_attempt": {
+    "artifact": "20260721T031717Z-daemon",
+    "exit_status": 101,
+    "model_load_events": 1,
+    "selected_jobs": [
+      "Classification",
+      "StructuredExtract"
+    ],
+    "llm_calls": [
+      1,
+      1
+    ],
+    "elapsed_ms": [
+      3222,
+      2331
+    ],
+    "cooldown_gap_ms": 600073,
+    "shutdown_failure": {
+      "signal": "SIGBUS",
+      "fault": "std::process::exit ran C exit handlers and ggml_metal_device_free raced the live persistent worker",
+      "crash_report": "wenlan-server-2026-07-20-204311.ips"
+    }
+  },
+  "approved_policy_candidate": {
+    "user_idle_horizon_seconds": 600,
+    "minimum_recovery_seconds": 120,
+    "recovery_multiplier": 19,
+    "max_observed_turn_ms": 5528,
+    "max_observed_duty_cycle_percent_at_floor": 4.4,
+    "counted_turns_without_nonzero_structured_allowance": 8547,
+    "conservative_turns_with_classification_sized_structured_allowance": 10990,
+    "conservative_days_at_minimum_recovery": 15.26,
+    "comparison_days_at_superseded_ten_minute_floor": 76.32
+  }
+}

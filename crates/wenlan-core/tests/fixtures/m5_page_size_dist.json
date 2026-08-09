@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "unit": "utf8_bytes",
+  "k_min": 5,
+  "sample_size": 1019,
+  "buckets": [
+    {
+      "min_inclusive": 0,
+      "max_exclusive": 256,
+      "count": 894
+    },
+    {
+      "min_inclusive": 256,
+      "max_exclusive": 1024,
+      "count": 12
+    },
+    {
+      "min_inclusive": 1024,
+      "max_exclusive": 2048,
+      "count": 36
+    },
+    {
+      "min_inclusive": 2048,
+      "max_exclusive": 4096,
+      "count": 48
+    },
+    {
+      "min_inclusive": 4096,
+      "max_exclusive": 8192,
+      "count": 19
+    },
+    {
+      "min_inclusive": 8192,
+      "max_exclusive": 16384,
+      "count": 10
+    }
+  ]
+}

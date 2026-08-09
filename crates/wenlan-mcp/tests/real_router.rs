@@ -15,14 +15,9 @@ use rmcp::model::{CallToolResult, RawContent};
 use wenlan_core::{db::MemoryDB, NoopEmitter};
 use wenlan_mcp::{
     client::WenlanClient,
-    tools::{
-        AcceptRevisionRequest, DismissContradictionRequest, DismissRevisionRequest, TransportMode,
-        WenlanMcpServer,
-    },
+    tools::{AcceptRevisionRequest, DismissRevisionRequest, TransportMode, WenlanMcpServer},
 };
-use wenlan_types::{
-    ContradictionDismissResponse, RawDocument, RevisionAcceptResponse, RevisionDismissResponse,
-};
+use wenlan_types::{RawDocument, RevisionAcceptResponse, RevisionDismissResponse};
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -116,23 +111,6 @@ async fn seed_pending_revision(db: &MemoryDB, target_source_id: &str, revision_s
     .unwrap();
 }
 
-/// Seed a contradiction refinement row (detect_contradiction, awaiting_review).
-async fn seed_contradiction(db: &MemoryDB, proposal_id: &str, source_id: &str) {
-    db.insert_refinement_proposal(
-        proposal_id,
-        "detect_contradiction",
-        &[source_id.to_string()],
-        None,
-        0.9,
-    )
-    .await
-    .unwrap();
-    // Upgrade from default 'pending' to 'awaiting_review' so dismiss finds it.
-    db.resolve_refinement_if_open(proposal_id, "awaiting_review")
-        .await
-        .unwrap();
-}
-
 /// Count agent_activity rows matching action + agent.
 async fn activity_count(db: &MemoryDB, action: &str, agent: &str) -> usize {
     db.list_agent_activity(100, Some(agent), None)
@@ -190,43 +168,5 @@ async fn dismiss_revision_aligns_with_real_router() {
     assert_eq!(
         activity_count(&db, "revision_dismiss", "test-agent").await,
         1
-    );
-}
-
-#[tokio::test]
-async fn dismiss_contradiction_aligns_with_real_router() {
-    let (base_url, db) = boot_test_server().await;
-    seed_contradiction(&db, "ref_real_contra", "mem_real_contra").await;
-
-    let server = make_server(&base_url);
-    let result = server
-        .dismiss_contradiction_impl(DismissContradictionRequest {
-            source_id: "mem_real_contra".into(),
-        })
-        .await
-        .unwrap();
-
-    let body = text_of(&result);
-    let parsed: ContradictionDismissResponse = serde_json::from_str(&body).unwrap();
-    assert_eq!(parsed.source_id, "mem_real_contra");
-    assert!(parsed.wrote);
-
-    // Activity row proves request reached the right route.
-    assert_eq!(
-        activity_count(&db, "contradiction_dismiss", "test-agent").await,
-        1,
-        "activity row should prove request reached the right route"
-    );
-
-    // State-flip is the adversarial guard for this test: silent-idempotent dismiss
-    // cannot be detected by 404, so we verify the row flipped to 'dismissed'.
-    let proposal = db
-        .get_refinement_proposal("ref_real_contra")
-        .await
-        .unwrap()
-        .expect("proposal should still exist");
-    assert_eq!(
-        proposal.status, "dismissed",
-        "refinement_queue row should be flipped to dismissed"
     );
 }

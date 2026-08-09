@@ -68,10 +68,54 @@ pub struct Page {
     /// Empty for pages never citation-distilled or citation-backfilled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub citations: Vec<PageCitation>,
+    /// Unified page-kind discriminator (migration 89). One of:
+    /// "entity" | "concept" | "source" | "overview" | "authored".
+    /// `kind = "entity"` marks the M3 dual-write shadow pages that mirror
+    /// `entities` rows. Q1 contract: they are browse/search-visible through the
+    /// explicit `_browse` read surfaces (page list, search, recent,
+    /// recent-changes, get-by-id and its sub-resources), but stay excluded from
+    /// retrieval/context, export, and every page mutation (archive/delete/update
+    /// fence on a `kind='entity'` id); the entity API is the only writer.
+    ///
+    /// `skip_serializing` freezes the wire shape (spec M3 D4): `kind` is an
+    /// internal discriminator the daemon uses for the visibility fence, but it
+    /// is deliberately absent from every serialized `Page` so the app-visible
+    /// contract is byte-identical to pre-M3. `default = "default_page_kind"`
+    /// stays so inbound JSON (which never carries `kind`) still deserializes.
+    #[serde(default = "default_page_kind", skip_serializing)]
+    pub kind: String,
+    /// Both M5 truth axes, present only on an entry a truth adapter reduced.
+    ///
+    /// `None` everywhere else, so the wire stays byte-identical for every reader
+    /// that did not ask for it. It is populated exclusively by the
+    /// `CollectionEntries` reduction, whose whole precondition is that an entry
+    /// carries its state: a provisional page listed without both axes is the
+    /// unearned trust the M5 rung exists to prevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truth: Option<PageTruth>,
+}
+
+/// The two M5 truth axes for one page.
+///
+/// Independent by construction: neither is inferred from the other, and neither
+/// is `review_status` — that is the distillation-faithfulness gate, machine
+/// despite the name. A page can be machine-supported and unreviewed, or
+/// human-reviewed and unsupported, and both facts have to reach the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageTruth {
+    /// The claim-entailment axis: are this page's claims entailed by its
+    /// evidence? Absence of a support record is not evidence of support.
+    pub supported: bool,
+    /// The human axis, bound to a page version + digest.
+    pub human_reviewed: bool,
 }
 
 fn default_creation_kind() -> String {
     "distilled".to_string()
+}
+
+fn default_page_kind() -> String {
+    "concept".to_string()
 }
 
 fn default_review_status() -> String {
@@ -168,5 +212,28 @@ mod citation_tests {
         )
         .unwrap();
         assert_eq!(legacy.scope, "sentence");
+    }
+
+    /// Wire freeze (spec M3 D4): the `kind` discriminator must never appear in a
+    /// serialized `Page`, so the app-visible contract stays byte-identical to
+    /// pre-M3. A shadow page (`kind = "entity"`) is fenced from readers, but even
+    /// a normal page must not leak the field.
+    #[test]
+    fn kind_is_never_serialized_onto_the_wire() {
+        let mut page: Page = serde_json::from_str(
+            r#"{"id":"p1","title":"T","content":"body","source_memory_ids":[],
+                "version":1,"status":"active","created_at":"x","last_compiled":"x",
+                "last_modified":"x","sources_updated_count":0,"user_edited":false}"#,
+        )
+        .unwrap();
+        // Deserialization still fills `kind` from its default when absent.
+        assert_eq!(page.kind, "concept");
+        page.kind = "entity".to_string();
+
+        let value: serde_json::Value = serde_json::to_value(&page).unwrap();
+        assert!(
+            value.get("kind").is_none(),
+            "serialized Page must not carry a `kind` key (wire freeze D4); got {value}"
+        );
     }
 }

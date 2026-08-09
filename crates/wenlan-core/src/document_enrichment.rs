@@ -43,6 +43,7 @@ use crate::prompts::PromptRegistry;
 use crate::sources::directory::{
     document_source_id, file_to_documents, provenance_path, FileOutcome,
 };
+#[cfg(test)]
 use wenlan_types::requests::CreateConceptRequest;
 
 /// Rolling-digest character cap (~15K).
@@ -107,13 +108,40 @@ impl DocumentEnrichmentOutcome {
 
 /// Enrich a single queued document end-to-end. See the module docs for the full
 /// contract. Never propagates an error: every failure mode maps to a returned
-/// [`DocumentEnrichmentOutcome`] plus a queue transition (done / paused).
+/// [`DocumentEnrichmentOutcome`] plus a queue transition
+/// (`done` / `paused` / `waiting_for_provider`).
 pub async fn run_document_enrichment(
     db: &MemoryDB,
     entry: &DocEnrichmentQueueEntry,
     knowledge_path: Option<&Path>,
     llm: Option<&Arc<dyn LlmProvider>>,
     prompts: &PromptRegistry,
+) -> DocumentEnrichmentOutcome {
+    run_document_enrichment_with_request_budget(db, entry, knowledge_path, llm, prompts, None).await
+}
+
+/// Advance a queued document by at most one LLM request, then yield its durable
+/// checkpoint back to the ambient scheduler. Parsing and initial embedding are
+/// still one bounded-by-file-size preparation step; map-fold and entity
+/// extraction never share the same ambient turn.
+pub async fn run_document_enrichment_slice(
+    db: &MemoryDB,
+    entry: &DocEnrichmentQueueEntry,
+    knowledge_path: Option<&Path>,
+    llm: Option<&Arc<dyn LlmProvider>>,
+    prompts: &PromptRegistry,
+) -> DocumentEnrichmentOutcome {
+    run_document_enrichment_with_request_budget(db, entry, knowledge_path, llm, prompts, Some(1))
+        .await
+}
+
+async fn run_document_enrichment_with_request_budget(
+    db: &MemoryDB,
+    entry: &DocEnrichmentQueueEntry,
+    knowledge_path: Option<&Path>,
+    llm: Option<&Arc<dyn LlmProvider>>,
+    prompts: &PromptRegistry,
+    mut requests_remaining: Option<usize>,
 ) -> DocumentEnrichmentOutcome {
     let source_id = entry.source_id.clone();
     let file_path = entry.file_path.clone();
@@ -126,6 +154,7 @@ pub async fn run_document_enrichment(
     let doc_source_id = document_source_id(&source_id, Path::new(&file_path), knowledge_path);
 
     let is_fresh = entry.last_completed_chunk < 0;
+    let mut prepared_chunks = None;
     let mut title = Path::new(&file_path)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -149,7 +178,7 @@ pub async fn run_document_enrichment(
                 // Still record sync_state so the next sync skips it instead of
                 // re-parsing it every tick.
                 log::warn!("[doc-enrich] {file_path}: not ingestable ({reason}); marking done");
-                if !complete_with_sync_receipt(db, entry).await {
+                if !complete_with_sync_receipt(db, entry, false).await {
                     return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
                 }
                 return DocumentEnrichmentOutcome::terminal_no_page(doc_source_id);
@@ -172,6 +201,49 @@ pub async fn run_document_enrichment(
             .collect::<Vec<_>>()
             .join("\n\n");
         let content_hash = docs.iter().find_map(|d| d.content_hash.clone());
+        let Some(parsed_hash) = content_hash.as_deref() else {
+            log::warn!("[doc-enrich] {file_path}: parsed document omitted content hash; pausing");
+            pause(db, entry, "parsed document omitted content hash").await;
+            return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
+        };
+        if entry.content_hash.as_deref() != Some(parsed_hash) {
+            log::info!(
+                "[doc-enrich] {file_path}: file hash changed after claim; requeueing current generation"
+            );
+            if let Err(error) = db
+                .enqueue_document(&source_id, &file_path, Some(parsed_hash))
+                .await
+            {
+                log::warn!("[doc-enrich] {file_path}: hash requeue failed: {error}");
+                pause(db, entry, "file hash changed and requeue failed").await;
+                return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
+            }
+            return DocumentEnrichmentOutcome {
+                page_id: source_page_id(&source_id, &file_path),
+                doc_source_id,
+                chunk_ids: Vec::new(),
+                summary: String::new(),
+                entities: Vec::new(),
+                completed: false,
+                paused: false,
+            };
+        }
+        match db
+            .prepared_document_generation(&doc_source_id, parsed_hash)
+            .await
+        {
+            Ok(Some(chunks)) => {
+                prepared_chunks = Some(chunks);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!(
+                    "[doc-enrich] {file_path}: prepared generation check failed: {error}; pausing"
+                );
+                pause(db, entry, "prepared generation check failed").await;
+                return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
+            }
+        }
         let last_modified = docs
             .first()
             .map(|d| d.last_modified)
@@ -193,28 +265,33 @@ pub async fn run_document_enrichment(
             content_hash,
             ..Default::default()
         };
-        if let Err(e) = db.upsert_documents(vec![doc]).await {
-            log::warn!("[doc-enrich] {file_path}: upsert failed: {e}; pausing");
-            pause(db, entry, "upsert failed").await;
-            return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
+        if prepared_chunks.is_none() {
+            if let Err(e) = db.upsert_documents(vec![doc]).await {
+                log::warn!("[doc-enrich] {file_path}: upsert failed: {e}; pausing");
+                pause(db, entry, "upsert failed").await;
+                return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
+            }
         }
     }
 
     // ── read the stored chunks (ordered by chunk_index) ──
-    let chunks = match db.get_memories_by_source_id("memory", &doc_source_id).await {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("[doc-enrich] {file_path}: read chunks failed: {e}; pausing");
-            pause(db, entry, "read chunks failed").await;
-            return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
-        }
+    let chunks = match prepared_chunks {
+        Some(chunks) => chunks,
+        None => match db.get_memories_by_source_id("memory", &doc_source_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("[doc-enrich] {file_path}: read chunks failed: {e}; pausing");
+                pause(db, entry, "read chunks failed").await;
+                return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
+            }
+        },
     };
     let chunk_ids: Vec<String> = chunks.iter().map(|c| c.id.clone()).collect();
     let page_id = source_page_id(&source_id, &file_path);
 
     if chunks.is_empty() {
         log::warn!("[doc-enrich] {file_path}: no chunks after upsert; marking done");
-        if !complete_with_sync_receipt(db, entry).await {
+        if !complete_with_sync_receipt(db, entry, false).await {
             return DocumentEnrichmentOutcome::paused_no_page(doc_source_id);
         }
         return DocumentEnrichmentOutcome::terminal_no_page(doc_source_id);
@@ -242,6 +319,13 @@ pub async fn run_document_enrichment(
     let mut llm_failed = false;
     if let Some(llm) = llm {
         for c in chunks.iter().filter(|c| (c.chunk_index as i64) >= start) {
+            if requests_remaining == Some(0) {
+                return yield_document_slice(db, entry, doc_source_id, page_id, chunk_ids, digest)
+                    .await;
+            }
+            if let Some(remaining) = requests_remaining.as_mut() {
+                *remaining = remaining.saturating_sub(1);
+            }
             let user_prompt = format!("Digest so far:\n{}\n\nNext section:\n{}", digest, c.content);
             match llm
                 .generate(LlmRequest {
@@ -256,28 +340,35 @@ pub async fn run_document_enrichment(
             {
                 Ok(analysis) => {
                     let analysis = analysis.trim().to_string();
-                    // Durable per-chunk checkpoint of the LLM work: a resumed run
-                    // rebuilds the digest from these stored summaries instead of
-                    // re-sending the chunk to the LLM.
+                    // The summary and resume point are one durable fact. Commit
+                    // them atomically before yielding this bounded slice.
                     if let Err(e) = db
-                        .set_chunk_summary(&doc_source_id, c.chunk_index as i64, &analysis)
+                        .persist_document_chunk_progress_at_hash(
+                            &doc_source_id,
+                            c.chunk_index as i64,
+                            &analysis,
+                            &source_id,
+                            &file_path,
+                            entry.content_hash.as_deref(),
+                        )
                         .await
                     {
                         log::warn!(
-                            "[doc-enrich] {file_path}: set_chunk_summary({}) failed: {e}",
+                            "[doc-enrich] {file_path}: durable chunk checkpoint({}) failed: {e}; pausing",
                             c.chunk_index
                         );
+                        pause(db, entry, "durable chunk checkpoint failed").await;
+                        return DocumentEnrichmentOutcome {
+                            doc_source_id,
+                            page_id,
+                            chunk_ids,
+                            summary: digest,
+                            entities: Vec::new(),
+                            completed: false,
+                            paused: true,
+                        };
                     }
                     fold_digest(&mut digest, &analysis);
-                    if let Err(e) = db
-                        .checkpoint_chunk(&source_id, &file_path, c.chunk_index as i64)
-                        .await
-                    {
-                        log::warn!(
-                            "[doc-enrich] {file_path}: checkpoint_chunk({}) failed: {e}",
-                            c.chunk_index
-                        );
-                    }
                 }
                 Err(e) => {
                     // LLM failure: do NOT burn retries in-loop. Fall through to the
@@ -294,11 +385,17 @@ pub async fn run_document_enrichment(
         }
     }
 
+    if !llm_failed && llm.is_some() && requests_remaining == Some(0) {
+        return yield_document_slice(db, entry, doc_source_id, page_id, chunk_ids, digest).await;
+    }
+
     // ── (4) outputs: exactly one SOURCE page (always), summary + entities ──
     if llm_failed || llm.is_none() {
         // Deterministic stub SOURCE page so the document is ALWAYS represented.
         let body = stub_page_body(&title, &chunks);
-        if let Err(e) = write_source_page(db, &page_id, &title, None, &body, &chunk_ids).await {
+        if let Err(e) =
+            write_document_source_page(db, entry, &page_id, &title, None, &body, &chunk_ids).await
+        {
             log::warn!("[doc-enrich] {file_path}: stub source page write failed: {e}");
         }
         if llm_failed {
@@ -313,8 +410,9 @@ pub async fn run_document_enrichment(
                 paused: true,
             };
         }
-        // No LLM configured: terminal (a retry can't do better without a provider).
-        if !complete_with_sync_receipt(db, entry).await {
+        // The deterministic preparation is searchable, but model-derived
+        // enrichment remains parked until the user authorizes a provider.
+        if !complete_with_sync_receipt(db, entry, true).await {
             return DocumentEnrichmentOutcome {
                 doc_source_id,
                 page_id,
@@ -339,6 +437,9 @@ pub async fn run_document_enrichment(
     // Success: best-effort entity extraction over the digest, then the real page.
     let entities = match llm {
         Some(llm) => {
+            if let Some(remaining) = requests_remaining.as_mut() {
+                *remaining = remaining.saturating_sub(1);
+            }
             let user_prompt: String = digest.chars().take(4000).collect();
             match llm
                 .generate(LlmRequest {
@@ -362,8 +463,9 @@ pub async fn run_document_enrichment(
     };
 
     let summary_line: String = digest.chars().take(280).collect();
-    if let Err(e) = write_source_page(
+    if let Err(e) = write_document_source_page(
         db,
+        entry,
         &page_id,
         &title,
         Some(&summary_line),
@@ -385,7 +487,7 @@ pub async fn run_document_enrichment(
         };
     }
 
-    if !complete_with_sync_receipt(db, entry).await {
+    if !complete_with_sync_receipt(db, entry, false).await {
         return DocumentEnrichmentOutcome {
             doc_source_id,
             page_id,
@@ -407,8 +509,68 @@ pub async fn run_document_enrichment(
     }
 }
 
+async fn yield_document_slice(
+    db: &MemoryDB,
+    entry: &DocEnrichmentQueueEntry,
+    doc_source_id: String,
+    page_id: String,
+    chunk_ids: Vec<String>,
+    summary: String,
+) -> DocumentEnrichmentOutcome {
+    match db
+        .yield_document_enrichment_at_hash(
+            &entry.source_id,
+            &entry.file_path,
+            entry.content_hash.as_deref(),
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            log::info!(
+                "[doc-enrich] {}: stale worker did not yield a newer generation",
+                entry.file_path
+            );
+            return DocumentEnrichmentOutcome {
+                doc_source_id,
+                page_id,
+                chunk_ids,
+                summary,
+                entities: Vec::new(),
+                completed: false,
+                paused: false,
+            };
+        }
+        Err(error) => {
+            log::warn!(
+                "[doc-enrich] {}: failed to yield ambient slice: {error}",
+                entry.file_path
+            );
+            pause(db, entry, "ambient slice yield failed").await;
+            return DocumentEnrichmentOutcome {
+                doc_source_id,
+                page_id,
+                chunk_ids,
+                summary,
+                entities: Vec::new(),
+                completed: false,
+                paused: true,
+            };
+        }
+    }
+    DocumentEnrichmentOutcome {
+        doc_source_id,
+        page_id,
+        chunk_ids,
+        summary,
+        entities: Vec::new(),
+        completed: false,
+        paused: false,
+    }
+}
+
 /// Atomically record the file's tracked `source_sync_state` and transition the
-/// queue row to terminal. A failed receipt pauses the row for retry.
+/// queue row to its next durable state. A failed receipt pauses the row for retry.
 /// The scan-side mtime+hash skip and the deletion diff both read this table:
 /// without the write, a directory file is re-enqueued on every sync and its
 /// chunks are never reaped after deletion.
@@ -419,7 +581,11 @@ pub async fn run_document_enrichment(
 /// the row is written with `mtime_ns = 0` and the ENQUEUE-time hash, so the
 /// next sync cannot mtime-skip it: it re-hashes, sees the drift, and re-enriches
 /// (or, for a vanished file, the deletion diff reaps the chunks just written).
-async fn complete_with_sync_receipt(db: &MemoryDB, entry: &DocEnrichmentQueueEntry) -> bool {
+async fn complete_with_sync_receipt(
+    db: &MemoryDB,
+    entry: &DocEnrichmentQueueEntry,
+    wait_for_provider: bool,
+) -> bool {
     let path = PathBuf::from(&entry.file_path);
     let stat = tokio::task::spawn_blocking(move || {
         let meta = std::fs::metadata(&path).ok()?;
@@ -447,12 +613,21 @@ async fn complete_with_sync_receipt(db: &MemoryDB, entry: &DocEnrichmentQueueEnt
         // the chunks this run just wrote.
         (None, eh) => (0, eh.unwrap_or_default().to_string()),
     };
-    if let Err(e) = db
-        .complete_document_enrichment(&entry.source_id, &entry.file_path, mtime_ns, &hash)
+    let receipt = if wait_for_provider {
+        db.defer_document_enrichment_until_provider(
+            &entry.source_id,
+            &entry.file_path,
+            mtime_ns,
+            &hash,
+        )
         .await
-    {
+    } else {
+        db.complete_document_enrichment(&entry.source_id, &entry.file_path, mtime_ns, &hash)
+            .await
+    };
+    if let Err(e) = receipt {
         log::warn!(
-            "[doc-enrich] {}: terminal receipt failed: {e}; pausing",
+            "[doc-enrich] {}: completion receipt failed: {e}; pausing",
             entry.file_path
         );
         pause(db, entry, "source sync receipt failed").await;
@@ -465,17 +640,65 @@ async fn complete_with_sync_receipt(db: &MemoryDB, entry: &DocEnrichmentQueueEnt
 /// bumps the attempt counter; the checkpoint is left intact.
 async fn pause(db: &MemoryDB, entry: &DocEnrichmentQueueEntry, reason: &str) {
     let retry_at = chrono::Utc::now().timestamp() + retry_backoff_secs(entry.attempt_count);
-    if let Err(e) = db
-        .mark_paused(&entry.source_id, &entry.file_path, reason, Some(retry_at))
+    match db
+        .mark_paused_at_hash(
+            &entry.source_id,
+            &entry.file_path,
+            entry.content_hash.as_deref(),
+            reason,
+            Some(retry_at),
+        )
         .await
     {
-        log::warn!("[doc-enrich] {}: mark_paused failed: {e}", entry.file_path);
+        Ok(true) => {}
+        Ok(false) => log::info!(
+            "[doc-enrich] {}: stale worker did not pause a newer generation",
+            entry.file_path
+        ),
+        Err(e) => log::warn!("[doc-enrich] {}: mark_paused failed: {e}", entry.file_path),
     }
+}
+
+/// Return the exact claimed generation to the retry queue after an unwind at
+/// an outer task boundary. The content-hash CAS prevents a stale worker from
+/// pausing a newer file generation, while preserving the durable checkpoint.
+pub async fn pause_document_enrichment_after_panic(db: &MemoryDB, entry: &DocEnrichmentQueueEntry) {
+    pause(db, entry, "document enrichment panicked").await;
+}
+
+async fn write_document_source_page(
+    db: &MemoryDB,
+    entry: &DocEnrichmentQueueEntry,
+    page_id: &str,
+    title: &str,
+    summary: Option<&str>,
+    content: &str,
+    chunk_ids: &[String],
+) -> Result<(), WenlanError> {
+    let expected_page_version = db.get_page(page_id).await?.map(|page| page.version);
+    page_write(
+        db,
+        PageWrite::DocumentSource {
+            page_id,
+            title,
+            summary,
+            content,
+            source_memory_ids: chunk_ids,
+            queue_source_id: &entry.source_id,
+            file_path: &entry.file_path,
+            expected_content_hash: entry.content_hash.as_deref(),
+            expected_page_version,
+            agent: "doc-enrich",
+        },
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Write (idempotently) the single `creation_kind='source'` page for a document,
 /// citing its chunks. Existing machine-owned source Pages update in place so a
 /// failed retry cannot delete the last valid Page or its provenance.
+#[cfg(test)]
 async fn write_source_page(
     db: &MemoryDB,
     page_id: &str,
@@ -504,7 +727,7 @@ async fn write_source_page(
         content: content.to_string(),
         summary: summary.map(str::to_string),
         entity_id: None,
-        space: None,
+        space: (None).into(),
         source_memory_ids: chunk_ids.to_vec(),
         creation_kind: Some("source".to_string()),
         workspace: None,
@@ -534,7 +757,7 @@ fn retry_backoff_secs(attempt_count: i64) -> i64 {
 }
 
 /// Deterministic SOURCE page id for a document, stable across retries.
-fn source_page_id(source_id: &str, file_path: &str) -> String {
+pub fn source_page_id(source_id: &str, file_path: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"source_page::");
@@ -681,10 +904,253 @@ mod tests {
             .collect()
     }
 
+    fn file_hash(path: &Path) -> String {
+        crate::sources::directory::sha256_hex(&std::fs::read(path).unwrap())
+    }
+
     fn mock(responses: &[String]) -> Arc<dyn LlmProvider> {
         Arc::new(SequencedMockProvider::new(
             responses.iter().map(String::as_str).collect(),
         ))
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MemoryInventoryRow {
+        id: String,
+        content: String,
+        title: String,
+        source: String,
+        source_id: String,
+        chunk_index: i64,
+        content_hash: Option<String>,
+        space: Option<String>,
+        version: i64,
+        summary: Option<String>,
+    }
+
+    async fn memory_inventory(db: &MemoryDB, source_id: &str) -> Vec<MemoryInventoryRow> {
+        let conn = db.test_primary_session().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, content, title, source, source_id, chunk_index,
+                        content_hash, space, version, summary
+                 FROM memories
+                 WHERE source = 'memory' AND source_id = ?1
+                 ORDER BY chunk_index ASC, id ASC",
+                [source_id],
+            )
+            .await
+            .unwrap();
+        let mut inventory = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            inventory.push(MemoryInventoryRow {
+                id: row.get::<String>(0).unwrap(),
+                content: row.get::<String>(1).unwrap(),
+                title: row.get::<String>(2).unwrap(),
+                source: row.get::<String>(3).unwrap(),
+                source_id: row.get::<String>(4).unwrap(),
+                chunk_index: row.get::<i64>(5).unwrap(),
+                content_hash: row.get::<Option<String>>(6).unwrap(),
+                space: row.get::<Option<String>>(7).unwrap(),
+                version: row.get::<i64>(8).unwrap(),
+                summary: row.get::<Option<String>>(9).unwrap(),
+            });
+        }
+        inventory
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum PreparedGenerationCorruption {
+        BlobContentHash,
+        BlobContent,
+        BlobSummary,
+        NullVersion,
+        MixedVersion,
+        ZeroVersion,
+        DuplicateChunkIndex,
+        GappedChunkIndex,
+        NonzeroStartChunkIndex,
+    }
+
+    impl PreparedGenerationCorruption {
+        fn expected_replacement_version(self) -> i64 {
+            match self {
+                Self::MixedVersion => 3,
+                Self::ZeroVersion => 1,
+                _ => 2,
+            }
+        }
+    }
+
+    async fn assert_corrupt_prepared_generation_is_replaced(
+        corruption: PreparedGenerationCorruption,
+    ) {
+        let (db, dir) = test_db().await;
+        let path = write_doc(dir.path());
+        let file_path = path.to_string_lossy().to_string();
+        let content_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
+            .await
+            .unwrap();
+        let first_entry = db.claim_next_pending().await.unwrap().expect("first claim");
+        let llm: Arc<dyn LlmProvider> = Arc::new(FailingProvider);
+        let first = run_document_enrichment(
+            &db,
+            &first_entry,
+            None,
+            Some(&llm),
+            &PromptRegistry::default(),
+        )
+        .await;
+        assert!(
+            first.paused,
+            "{corruption:?}: first attempt prepares chunks"
+        );
+        let mut expected_inventory = memory_inventory(&db, &first.doc_source_id).await;
+        assert!(
+            expected_inventory.len() >= 3,
+            "{corruption:?}: fixture is multi-chunk"
+        );
+        let first_id = expected_inventory[0].id.clone();
+        let second_id = expected_inventory[1].id.clone();
+        let last_id = expected_inventory.last().unwrap().id.clone();
+
+        {
+            let conn = db.test_primary_session().await;
+            match corruption {
+                PreparedGenerationCorruption::BlobContentHash => {
+                    conn.execute(
+                        "UPDATE memories SET content_hash = x'80' WHERE id = ?1",
+                        [first_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::BlobContent => {
+                    conn.execute(
+                        "UPDATE memories SET content = x'80' WHERE id = ?1",
+                        [first_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::BlobSummary => {
+                    conn.execute(
+                        "UPDATE memories SET summary = x'80' WHERE id = ?1",
+                        [first_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::NullVersion => {
+                    conn.execute(
+                        "UPDATE memories SET version = NULL WHERE id = ?1",
+                        [first_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::MixedVersion => {
+                    conn.execute(
+                        "UPDATE memories SET version = 2 WHERE id = ?1",
+                        [first_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::ZeroVersion => {
+                    conn.execute(
+                        "UPDATE memories SET version = 0
+                         WHERE source = 'memory' AND source_id = ?1",
+                        [first.doc_source_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::DuplicateChunkIndex => {
+                    conn.execute(
+                        "UPDATE memories SET chunk_index = 0 WHERE id = ?1",
+                        [second_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::GappedChunkIndex => {
+                    conn.execute(
+                        "UPDATE memories SET chunk_index = ?2 WHERE id = ?1",
+                        libsql::params![last_id.as_str(), expected_inventory.len() as i64],
+                    )
+                    .await
+                    .unwrap();
+                }
+                PreparedGenerationCorruption::NonzeroStartChunkIndex => {
+                    conn.execute(
+                        "UPDATE memories SET chunk_index = chunk_index + 1
+                         WHERE source = 'memory' AND source_id = ?1",
+                        [first.doc_source_id.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            conn.execute(
+                "UPDATE document_enrichment_queue
+                 SET next_retry_at = ?3
+                 WHERE source_id = ?1 AND file_path = ?2",
+                libsql::params![
+                    "folder-notes",
+                    file_path.as_str(),
+                    chrono::Utc::now().timestamp() - 1
+                ],
+            )
+            .await
+            .unwrap();
+        }
+
+        let retry_entry = db
+            .claim_next_pending()
+            .await
+            .unwrap()
+            .expect("same-hash retry claim");
+        let retry = run_document_enrichment(
+            &db,
+            &retry_entry,
+            None,
+            Some(&llm),
+            &PromptRegistry::default(),
+        )
+        .await;
+        assert!(
+            retry.paused,
+            "{corruption:?}: replacement reaches the expected provider failure"
+        );
+        let queue = db
+            .get_queue_entry("folder-notes", &file_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            queue.error_detail.as_deref(),
+            Some("analysis LLM failed"),
+            "{corruption:?}: corrupt preparation falls back to replacement before inference"
+        );
+
+        let expected_version = corruption.expected_replacement_version();
+        for row in &mut expected_inventory {
+            row.version = expected_version;
+        }
+        let repaired_inventory = memory_inventory(&db, &first.doc_source_id).await;
+        assert_eq!(
+            repaired_inventory, expected_inventory,
+            "{corruption:?}: atomic replacement restores the parsed inventory"
+        );
+        assert!(
+            db.prepared_document_generation(&first.doc_source_id, &content_hash)
+                .await
+                .unwrap()
+                .is_some(),
+            "{corruption:?}: repaired rows form one exact generation"
+        );
     }
 
     // ── pure-helper unit tests ───────────────────────────────────────────────
@@ -784,7 +1250,8 @@ mod tests {
         let (db, dir) = test_db().await;
         let path = write_doc(dir.path());
         let file_path = path.to_string_lossy().to_string();
-        db.enqueue_document("folder-notes", &file_path, Some("hashA"))
+        let content_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
             .await
             .unwrap();
         let entry = db.claim_next_pending().await.unwrap().expect("claim");
@@ -852,6 +1319,269 @@ mod tests {
         assert_eq!(q.status, "done");
     }
 
+    #[tokio::test]
+    async fn ambient_slice_yields_after_exactly_one_llm_request() {
+        let (db, dir) = test_db().await;
+        let path = write_doc(dir.path());
+        let file_path = path.to_string_lossy().to_string();
+        let content_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
+            .await
+            .unwrap();
+        let entry = db.claim_next_pending().await.unwrap().expect("claim");
+
+        let responses = analysis_responses();
+        let provider = Arc::new(SequencedMockProvider::new(
+            responses.iter().map(String::as_str).collect(),
+        ));
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+        let prompts = PromptRegistry::default();
+
+        let outcome = run_document_enrichment_slice(&db, &entry, None, Some(&llm), &prompts).await;
+
+        assert_eq!(provider.call_count(), 1, "one slice is one LLM request");
+        assert!(!outcome.completed, "more chunks remain for later slices");
+        assert!(!outcome.paused, "budget yield is not a provider failure");
+
+        let queued = db
+            .get_queue_entry("folder-notes", &file_path)
+            .await
+            .unwrap()
+            .expect("queue row");
+        assert_eq!(queued.status, "pending", "the next poll can reclaim it");
+        assert_eq!(queued.last_completed_chunk, 0, "the first chunk is durable");
+        assert_eq!(queued.attempt_count, 0, "yield does not burn a retry");
+    }
+
+    #[tokio::test]
+    async fn changed_file_requeues_new_hash_before_any_inference() {
+        let (db, dir) = test_db().await;
+        let path = write_doc(dir.path());
+        let file_path = path.to_string_lossy().to_string();
+        let queued_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&queued_hash))
+            .await
+            .unwrap();
+        let entry = db.claim_next_pending().await.unwrap().expect("claim");
+        std::fs::write(
+            &path,
+            "The file changed after discovery and must be requeued before inference. ".repeat(80),
+        )
+        .unwrap();
+        let new_hash = file_hash(&path);
+        assert_ne!(new_hash, queued_hash);
+        let provider = Arc::new(SequencedMockProvider::new(vec!["must not be called"]));
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        let outcome = run_document_enrichment_slice(
+            &db,
+            &entry,
+            None,
+            Some(&llm),
+            &PromptRegistry::default(),
+        )
+        .await;
+
+        assert_eq!(provider.call_count(), 0);
+        assert!(!outcome.completed);
+        assert!(!outcome.paused);
+        let queued = db
+            .get_queue_entry("folder-notes", &file_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.status, "pending");
+        assert_eq!(queued.content_hash.as_deref(), Some(new_hash.as_str()));
+        assert_eq!(queued.last_completed_chunk, -1);
+    }
+
+    #[tokio::test]
+    async fn changed_file_after_failed_preparation_requeues_before_any_retry_inference() {
+        let (db, dir) = test_db().await;
+        let path = write_doc(dir.path());
+        let file_path = path.to_string_lossy().to_string();
+        let queued_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&queued_hash))
+            .await
+            .unwrap();
+        let first_entry = db.claim_next_pending().await.unwrap().expect("first claim");
+        let failing_llm: Arc<dyn LlmProvider> = Arc::new(FailingProvider);
+
+        let first = run_document_enrichment(
+            &db,
+            &first_entry,
+            None,
+            Some(&failing_llm),
+            &PromptRegistry::default(),
+        )
+        .await;
+        assert!(first.paused, "first attempt prepares chunks, then pauses");
+
+        std::fs::write(
+            &path,
+            "The file changed after failed preparation and must be requeued before inference. "
+                .repeat(80),
+        )
+        .unwrap();
+        let new_hash = file_hash(&path);
+        assert_ne!(new_hash, queued_hash);
+        {
+            let conn = db.test_primary_session().await;
+            conn.execute(
+                "UPDATE document_enrichment_queue
+                 SET next_retry_at = ?3
+                 WHERE source_id = ?1 AND file_path = ?2",
+                libsql::params![
+                    "folder-notes",
+                    file_path.as_str(),
+                    chrono::Utc::now().timestamp() - 1
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        let retry_entry = db.claim_next_pending().await.unwrap().expect("retry claim");
+        assert_eq!(
+            retry_entry.content_hash.as_deref(),
+            Some(queued_hash.as_str())
+        );
+        let provider = Arc::new(SequencedMockProvider::new(vec!["must not be called"]));
+        let retry_llm: Arc<dyn LlmProvider> = provider.clone();
+
+        let retry = run_document_enrichment_slice(
+            &db,
+            &retry_entry,
+            None,
+            Some(&retry_llm),
+            &PromptRegistry::default(),
+        )
+        .await;
+
+        assert_eq!(provider.call_count(), 0);
+        assert!(!retry.completed);
+        assert!(!retry.paused);
+        let queued = db
+            .get_queue_entry("folder-notes", &file_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.status, "pending");
+        assert_eq!(queued.content_hash.as_deref(), Some(new_hash.as_str()));
+        assert_eq!(queued.last_completed_chunk, -1);
+    }
+
+    #[tokio::test]
+    async fn changed_hash_replacement_preserves_assigned_space_and_invalidates_projection() {
+        let (db, dir) = test_db().await;
+        let path = write_doc(dir.path());
+        let file_path = path.to_string_lossy().to_string();
+        let source_id = format!("folder-notes::{file_path}");
+        let initial_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&initial_hash))
+            .await
+            .unwrap();
+        let initial_entry = db.claim_next_pending().await.unwrap().expect("claim v1");
+        run_document_enrichment(&db, &initial_entry, None, None, &PromptRegistry::default()).await;
+
+        db.update_memory_space(&source_id, "m4-live").await.unwrap();
+        let from = db
+            .create_entity("M4 source", "concept", Some("m4-live"))
+            .await
+            .unwrap();
+        let to = db
+            .create_entity("M4 target", "concept", Some("m4-live"))
+            .await
+            .unwrap();
+        db.create_relation(
+            &from,
+            &to,
+            "related_to",
+            Some("document_enrichment"),
+            Some(0.9),
+            None,
+            Some(&source_id),
+        )
+        .await
+        .unwrap();
+        let edge_id = crate::provenance::compute_edge_id(
+            "relates",
+            "entity",
+            &from,
+            "entity",
+            &to,
+            "related_to",
+        );
+        assert_eq!(
+            db.edge_snapshot_for_test(&edge_id).await.unwrap()["valid_until"],
+            serde_json::Value::Null,
+            "fixture must begin with an active source-owned edge"
+        );
+
+        std::fs::write(
+            &path,
+            "The third semantic generation replaces the folder document body. ".repeat(80),
+        )
+        .unwrap();
+        let replacement_hash = file_hash(&path);
+        assert_ne!(replacement_hash, initial_hash);
+        db.enqueue_document("folder-notes", &file_path, Some(&replacement_hash))
+            .await
+            .unwrap();
+        let replacement_entry = db.claim_next_pending().await.unwrap().expect("claim v3");
+        run_document_enrichment(
+            &db,
+            &replacement_entry,
+            None,
+            None,
+            &PromptRegistry::default(),
+        )
+        .await;
+
+        let stored = db
+            .get_memories_by_source_id("memory", &source_id)
+            .await
+            .unwrap();
+        assert!(!stored.is_empty());
+        let (stored_spaces, stored_versions) = {
+            let conn = db.test_primary_session().await;
+            let mut rows = conn
+                .query(
+                    "SELECT space, version FROM memories
+                     WHERE source = 'memory' AND source_id = ?1
+                     ORDER BY chunk_index",
+                    libsql::params![source_id.as_str()],
+                )
+                .await
+                .unwrap();
+            let mut spaces = Vec::new();
+            let mut versions = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                spaces.push(row.get::<String>(0).unwrap());
+                versions.push(row.get::<i64>(1).unwrap());
+            }
+            (spaces, versions)
+        };
+        assert!(
+            stored_spaces.iter().all(|space| space == "m4-live"),
+            "replacement without an explicit space must preserve the assigned space"
+        );
+        assert!(
+            stored_versions.iter().all(|version| *version == 3),
+            "v1 ingest + v2 assignment + replacement must produce v3"
+        );
+        assert!(
+            db.list_relations_between(&from, &to)
+                .await
+                .unwrap()
+                .is_empty(),
+            "semantic replacement must delete the old source-owned relation"
+        );
+        assert!(
+            db.edge_snapshot_for_test(&edge_id).await.unwrap()["valid_until"].is_number(),
+            "semantic replacement must soft-invalidate the old source-owned edge"
+        );
+    }
+
     // ── integration: kill after 2 chunks (drop), then resume from checkpoint ──
 
     #[tokio::test]
@@ -859,7 +1589,8 @@ mod tests {
         let (db, dir) = test_db().await;
         let path = write_markdown_doc(dir.path());
         let file_path = path.to_string_lossy().to_string();
-        db.enqueue_document("folder-notes", &file_path, Some("hashA"))
+        let content_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
             .await
             .unwrap();
         let entry = db.claim_next_pending().await.unwrap().expect("claim");
@@ -991,7 +1722,8 @@ mod tests {
         let (db, dir) = test_db().await;
         let path = write_doc(dir.path());
         let file_path = path.to_string_lossy().to_string();
-        db.enqueue_document("folder-notes", &file_path, Some("hashA"))
+        let content_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
             .await
             .unwrap();
         let entry = db.claim_next_pending().await.unwrap().expect("claim");
@@ -1033,11 +1765,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_hash_retry_does_not_reupsert_prepared_generation_after_first_llm_failure() {
+        let (db, dir) = test_db().await;
+        let path = write_doc(dir.path());
+        let file_path = path.to_string_lossy().to_string();
+        let content_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
+            .await
+            .unwrap();
+        let first_entry = db.claim_next_pending().await.unwrap().expect("first claim");
+        let llm: Arc<dyn LlmProvider> = Arc::new(FailingProvider);
+
+        let first = run_document_enrichment(
+            &db,
+            &first_entry,
+            None,
+            Some(&llm),
+            &PromptRegistry::default(),
+        )
+        .await;
+        assert!(first.paused, "first attempt prepares chunks, then pauses");
+        let inventory_v1 = memory_inventory(&db, &first.doc_source_id).await;
+        assert!(!inventory_v1.is_empty(), "prepared generation is durable");
+        assert!(
+            inventory_v1.iter().all(|row| row.version == 1),
+            "fresh prepared generation starts at v1"
+        );
+        let first_queue = db
+            .get_queue_entry("folder-notes", &file_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_queue.attempt_count, 1);
+
+        {
+            let conn = db.test_primary_session().await;
+            conn.execute(
+                "UPDATE document_enrichment_queue
+                 SET next_retry_at = ?3
+                 WHERE source_id = ?1 AND file_path = ?2",
+                libsql::params![
+                    "folder-notes",
+                    file_path.as_str(),
+                    chrono::Utc::now().timestamp() - 1
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        let retry_entry = db
+            .claim_next_pending()
+            .await
+            .unwrap()
+            .expect("same-hash retry claim");
+        assert_eq!(
+            retry_entry.content_hash.as_deref(),
+            Some(content_hash.as_str())
+        );
+        let second = run_document_enrichment(
+            &db,
+            &retry_entry,
+            None,
+            Some(&llm),
+            &PromptRegistry::default(),
+        )
+        .await;
+        assert!(second.paused, "second provider failure pauses again");
+
+        let inventory_after_retry = memory_inventory(&db, &second.doc_source_id).await;
+        assert_eq!(
+            inventory_after_retry, inventory_v1,
+            "same-hash retry must not semantically replace the prepared generation"
+        );
+        assert!(
+            inventory_after_retry.iter().all(|row| row.version == 1),
+            "same-hash retry keeps the source-wide generation at v1"
+        );
+        let retry_queue = db
+            .get_queue_entry("folder-notes", &file_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry_queue.attempt_count, 2);
+    }
+
+    #[tokio::test]
+    async fn same_hash_retry_replaces_prepared_generation_with_malformed_hash_storage_type() {
+        assert_corrupt_prepared_generation_is_replaced(
+            PreparedGenerationCorruption::BlobContentHash,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn same_hash_retry_replaces_prepared_generation_with_malformed_required_text() {
+        assert_corrupt_prepared_generation_is_replaced(PreparedGenerationCorruption::BlobContent)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn same_hash_retry_replaces_prepared_generation_with_malformed_optional_text() {
+        assert_corrupt_prepared_generation_is_replaced(PreparedGenerationCorruption::BlobSummary)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn same_hash_retry_replaces_prepared_generation_with_invalid_version_or_chunk_shape() {
+        for corruption in [
+            PreparedGenerationCorruption::NullVersion,
+            PreparedGenerationCorruption::MixedVersion,
+            PreparedGenerationCorruption::DuplicateChunkIndex,
+            PreparedGenerationCorruption::GappedChunkIndex,
+            PreparedGenerationCorruption::NonzeroStartChunkIndex,
+            PreparedGenerationCorruption::ZeroVersion,
+        ] {
+            assert_corrupt_prepared_generation_is_replaced(corruption).await;
+        }
+    }
+
+    #[tokio::test]
     async fn document_source_page_creation_routes_through_pagewrite() {
         let (db, dir) = test_db().await;
         let path = write_doc(dir.path());
         let file_path = path.to_string_lossy().to_string();
-        db.enqueue_document("folder-notes", &file_path, Some("hashA"))
+        let content_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
             .await
             .unwrap();
         let entry = db.claim_next_pending().await.unwrap().expect("claim");
@@ -1070,6 +1922,228 @@ mod tests {
                 .all(|row| row.source_kind == "external_file"),
             "document source-page evidence must preserve folder chunk provenance, got {evidence:?}"
         );
+        let queued = db
+            .get_queue_entry("folder-notes", &file_path)
+            .await
+            .unwrap()
+            .expect("document queue row");
+        assert_eq!(queued.status, "waiting_for_provider");
+        assert!(
+            db.get_sync_state("folder-notes", &file_path)
+                .await
+                .unwrap()
+                .is_some(),
+            "searchable preparation must publish the sync receipt before waiting for model consent"
+        );
+        assert!(
+            db.claim_next_pending_for_provider(false)
+                .await
+                .unwrap()
+                .is_none(),
+            "without model consent, prepared documents must stay parked instead of spinning"
+        );
+        let resumed = db
+            .claim_next_pending_for_provider(true)
+            .await
+            .unwrap()
+            .expect("configured model must resume the parked document");
+        assert_eq!(resumed.source_id, "folder-notes");
+        assert_eq!(resumed.file_path, file_path);
+        assert_eq!(resumed.status, "in_progress");
+    }
+
+    #[tokio::test]
+    async fn document_source_page_write_routes_through_the_hash_guard() {
+        let (db, dir) = test_db().await;
+        let path = write_doc(dir.path());
+        let file_path = path.to_string_lossy().to_string();
+        let content_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
+            .await
+            .unwrap();
+        let entry = db.claim_next_pending().await.unwrap().expect("claim");
+        let outcome =
+            run_document_enrichment(&db, &entry, None, None, &PromptRegistry::default()).await;
+        let before = db.get_page(&outcome.page_id).await.unwrap().unwrap();
+        {
+            let conn = db.test_primary_session().await;
+            conn.execute(
+                "UPDATE document_enrichment_queue
+                 SET status='in_progress', content_hash='old-hash'
+                 WHERE source_id=?1 AND file_path=?2",
+                libsql::params!["folder-notes", file_path.as_str()],
+            )
+            .await
+            .unwrap();
+        }
+        let stale_entry = db
+            .get_queue_entry("folder-notes", &file_path)
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let conn = db.test_primary_session().await;
+            conn.execute(
+                "UPDATE document_enrichment_queue SET content_hash='new-hash'
+                 WHERE source_id=?1 AND file_path=?2",
+                libsql::params!["folder-notes", file_path.as_str()],
+            )
+            .await
+            .unwrap();
+        }
+
+        write_document_source_page(
+            &db,
+            &stale_entry,
+            &outcome.page_id,
+            "Stale title",
+            None,
+            "Stale folded body",
+            &outcome.chunk_ids,
+        )
+        .await
+        .expect_err("the production PageWrite route must reject an old queue hash");
+
+        let after = db.get_page(&outcome.page_id).await.unwrap().unwrap();
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.content, before.content);
+        assert_eq!(after.version, before.version);
+    }
+
+    /// G6 edges-parity repair: drives the real `write_document_source_page`
+    /// path (the production route, not the `#[cfg(test)]` `write_source_page`
+    /// shim) twice over the same folder-doc source page with a growing chunk
+    /// set -- the 29->48 shape from the incident, reduced to a deterministic
+    /// keep/drop/add triple. Both prior defects fired in this exact call
+    /// path: `replace_source_page_inner`'s over-retire of carried-over
+    /// evidence (fix b) and the page_sources/backfill kind-derivation
+    /// disagreement with the live writer (fix a). Folder-agent sids (source_id
+    /// containing "::") resolve via `resolve_page_evidence_source_kind` to
+    /// `external_file` -> `dst_kind="external"`, the same rule
+    /// `insert_resolved_page_evidence` uses.
+    ///
+    /// RED control (source mutation, run by hand 2026-08-05): reverting fix
+    /// (a) alone (hard-coding `dst_kind="memory"` back into the
+    /// `compute_edges_parity_report` page_sources contributor) fails the FIRST
+    /// `drift_count == 0` assertion (left=2, right=0), because the sweep then
+    /// expects a memory-kind edge no writer ever mints. Reverting fix (b)
+    /// alone (restoring `replace_source_page_inner`'s retire loop to run
+    /// AFTER `insert_resolved_page_evidence`, with the old memory-kind-only
+    /// subtraction) fails the SECOND `drift_count == 0` assertion instead
+    /// (left=1, right=0): the over-retire kills the carried-over `keep_sid`
+    /// edge after `insert_resolved_page_evidence` re-asserts it, and the
+    /// still-intact `page_sources`/`page_evidence` rows then disagree with
+    /// the now-retired live edge. Both reverts confirmed to fail by hand,
+    /// then the fix restored and this test re-confirmed green.
+    #[tokio::test]
+    async fn write_document_source_page_replace_keeps_carried_over_retires_dropped() {
+        use crate::sources::RawDocument;
+
+        let (db, _dir) = test_db().await;
+        let file_path = "fake/g6-red-control-doc.md".to_string();
+        db.enqueue_document("folder-notes", &file_path, Some("hash-v1"))
+            .await
+            .unwrap();
+        let entry = db.claim_next_pending().await.unwrap().expect("claim");
+
+        let keep_sid = "doc_g6_red::chunk_keep";
+        let drop_sid = "doc_g6_red::chunk_drop";
+        let new_sid = "doc_g6_red::chunk_new";
+        for sid in [keep_sid, drop_sid, new_sid] {
+            let doc = RawDocument {
+                source: "memory".to_string(),
+                source_id: sid.to_string(),
+                title: format!("chunk-{sid}"),
+                summary: None,
+                content: format!("Folder-doc content for {sid}."),
+                url: None,
+                last_modified: chrono::Utc::now().timestamp(),
+                metadata: std::collections::HashMap::new(),
+                memory_type: Some("fact".to_string()),
+                space: Some("work".to_string()),
+                source_agent: Some("folder".to_string()),
+                confidence: Some(0.9),
+                confirmed: Some(false),
+                ..Default::default()
+            };
+            db.upsert_documents(vec![doc]).await.unwrap();
+        }
+
+        write_document_source_page(
+            &db,
+            &entry,
+            "page_g6_red_control",
+            "Source page v1",
+            None,
+            "content v1",
+            &[keep_sid.to_string(), drop_sid.to_string()],
+        )
+        .await
+        .unwrap();
+        // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
+
+        write_document_source_page(
+            &db,
+            &entry,
+            "page_g6_red_control",
+            "Source page v2",
+            None,
+            "content v2, grown",
+            &[keep_sid.to_string(), new_sid.to_string()],
+        )
+        .await
+        .unwrap();
+        // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
+
+        let conn = db.test_primary_session().await;
+        let keep_edge_id = crate::provenance::compute_edge_id(
+            "cites",
+            "page",
+            "page_g6_red_control",
+            "external",
+            keep_sid,
+            keep_sid,
+        );
+        let drop_edge_id = crate::provenance::compute_edge_id(
+            "cites",
+            "page",
+            "page_g6_red_control",
+            "external",
+            drop_sid,
+            drop_sid,
+        );
+        let new_edge_id = crate::provenance::compute_edge_id(
+            "cites",
+            "page",
+            "page_g6_red_control",
+            "external",
+            new_sid,
+            new_sid,
+        );
+        for (edge_id, label, expect_active) in [
+            (keep_edge_id.as_str(), "carried-over", true),
+            (drop_edge_id.as_str(), "dropped", false),
+            (new_edge_id.as_str(), "newly added", true),
+        ] {
+            let mut rows = conn
+                .query(
+                    "SELECT valid_until FROM edges WHERE edge_id = ?1",
+                    libsql::params![edge_id],
+                )
+                .await
+                .unwrap();
+            let row = rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{label} edge must exist"));
+            let valid_until: Option<u64> = row.get(0).unwrap();
+            assert_eq!(
+                valid_until.is_none(),
+                expect_active,
+                "{label} locator's cites edge active-state mismatch"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1077,7 +2151,8 @@ mod tests {
         let (db, dir) = test_db().await;
         let path = write_doc(dir.path());
         let file_path = path.to_string_lossy().to_string();
-        db.enqueue_document("folder-notes", &file_path, Some("hashA"))
+        let content_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
             .await
             .unwrap();
         let entry = db.claim_next_pending().await.unwrap().expect("claim");
@@ -1088,7 +2163,7 @@ mod tests {
         assert!(!evidence_before.is_empty());
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute_batch(&format!(
                 "CREATE TRIGGER abort_source_page_replacement
                  BEFORE UPDATE OF content ON pages
@@ -1114,7 +2189,7 @@ mod tests {
         let evidence_after_failure = db.get_page_evidence(&outcome.page_id).await.unwrap();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute("DROP TRIGGER abort_source_page_replacement", ())
                 .await
                 .unwrap();
@@ -1147,12 +2222,13 @@ mod tests {
         let (db, dir) = test_db().await;
         let path = write_doc(dir.path());
         let file_path = path.to_string_lossy().to_string();
-        db.enqueue_document("folder-notes", &file_path, Some("hashA"))
+        let content_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
             .await
             .unwrap();
         let entry = db.claim_next_pending().await.unwrap().expect("claim");
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute_batch(
                 "CREATE TRIGGER abort_source_sync_receipt
                  BEFORE INSERT ON source_sync_state
@@ -1171,12 +2247,12 @@ mod tests {
         let receipt_after_failure = db.get_sync_state("folder-notes", &file_path).await.unwrap();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute("DROP TRIGGER abort_source_sync_receipt", ())
                 .await
                 .unwrap();
         }
-        db.enqueue_document("folder-notes", &file_path, Some("hashA"))
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
             .await
             .expect("connection and queue must remain reusable");
         let queue_after_reenqueue = db
@@ -1202,7 +2278,8 @@ mod tests {
         let (db, dir) = test_db().await;
         let path = write_doc(dir.path());
         let file_path = path.to_string_lossy().to_string();
-        db.enqueue_document("folder-notes", &file_path, Some("hashA"))
+        let content_hash = file_hash(&path);
+        db.enqueue_document("folder-notes", &file_path, Some(&content_hash))
             .await
             .unwrap();
         let entry = db.claim_next_pending().await.unwrap().expect("claim");
@@ -1333,7 +2410,7 @@ mod tests {
 
     /// Count active `creation_kind='source'` pages.
     async fn count_source_pages(db: &MemoryDB) -> i64 {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM pages WHERE creation_kind = 'source' AND status = 'active'",

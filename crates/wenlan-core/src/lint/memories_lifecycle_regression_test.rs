@@ -11,7 +11,7 @@ async fn assert_mixed_lifecycle(
     mode: [&str; 2],
 ) {
     let (db, _tmp) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute(
         "INSERT INTO memories (
             id, content, source, source_id, title, chunk_index, last_modified,

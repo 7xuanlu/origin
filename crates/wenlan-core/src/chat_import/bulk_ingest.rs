@@ -228,6 +228,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_import_registers_restart_safe_scheduler_origin() {
+        let (db, _tmp) = crate::db::tests::test_db().await;
+        let db_arc = Arc::new(db);
+        let source_id = Vendor::Claude.build_source_id("scheduler-origin");
+
+        bulk_import_conversations(
+            db_arc.clone(),
+            &[make_convo(
+                "scheduler-origin",
+                &["Imported conversation body"],
+            )],
+            noop_emitter(),
+            "imp_scheduler_origin",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db_arc.resolve_enrichment_origin(&source_id).await.unwrap(),
+            crate::db::EnrichmentOrigin {
+                memory_type_explicit: false,
+                structured_fields_explicit: false,
+                space_rejected: false,
+            }
+        );
+        assert_eq!(
+            db_arc
+                .get_classification_candidate(3)
+                .await
+                .unwrap()
+                .map(|candidate| candidate.source_id),
+            Some(source_id)
+        );
+    }
+
+    #[tokio::test]
     async fn bulk_import_skips_existing_conversations() {
         let (db, _tmp) = crate::db::tests::test_db().await;
         let db_arc = Arc::new(db);

@@ -78,22 +78,25 @@ pub struct Config {
     pub reranker_mode: Option<String>,
     /// Optional per-job routing pin for everyday work (recap, extraction, bulk
     /// enrich): `"anthropic"` | `"external"` | `"on_device"`. Selects the SOURCE
-    /// only; the model comes from that source's own knobs. Absent → auto chain.
+    /// only; the model comes from that source's own knobs. Absent disables
+    /// model-backed background work for this job class.
     #[serde(default)]
     pub everyday_source: Option<String>,
     /// Optional per-job routing pin for synthesis (page distillation):
-    /// `"anthropic"` | `"external"` (and `"on_device"` only when the compile gate
-    /// is set). Selects the SOURCE only. Absent → auto chain.
+    /// `"anthropic"` | `"external"` | `"on_device"`. Selects the SOURCE only.
+    /// Absent disables model-backed background work for this job class.
     #[serde(default)]
     pub synthesis_source: Option<String>,
     /// Gates ONLY the proactive Page-Map suggestion phase in the refinery
     /// scheduler (`Phase::PageMaps`). The explicit `POST /api/pages/{id}/map/improve`
-    /// route is NEVER gated by this flag. Default true (via serde on a missing
-    /// field); note `Config::default()` yields `false` — same quirk as
-    /// `private_browsing_detection`, since a derived `Default` ignores the serde
-    /// attribute. Fresh installs read config through `load_config`, which returns
-    /// `Config::default()` only when no file exists.
-    #[serde(default = "default_true")]
+    /// route is NEVER gated by this flag.
+    ///
+    /// DEFAULT FALSE since 2026-07-19: a Canvas that fills itself with a dozen
+    /// `suggested` boxes before the user has drawn anything reads as clutter to
+    /// triage, not as help — the user asked to start from blank and reach for
+    /// suggestions deliberately via the Improve button. Opt back in by setting
+    /// `page_map_auto_suggest: true` in config.json (or via `PUT /api/config`).
+    #[serde(default)]
     pub page_map_auto_suggest: bool,
 }
 
@@ -160,17 +163,58 @@ impl Config {
     }
 }
 
+/// The real config root: the platform data dir.
+#[cfg(not(any(test, feature = "scratch-config")))]
+fn default_config_root() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("wenlan")
+}
+
+/// A disposable per-process root, used when the crate is compiled for tests.
+///
+/// ~25 tests call `save_config`, and what keeps them off the developer's real
+/// `config.json` today is a *process-global env var*: seven hand-rolled copies
+/// of a `DataDirGuard` set `WENLAN_DATA_DIR` to a tempdir and remove it on drop.
+/// That is a race, not a guarantee — the guard's `remove_var` on one thread can
+/// land between another thread's `set_var` and its `save_config`, and then the
+/// write goes to the real file. `Config::default()` carries no API key and no
+/// reranker mode, so losing that race wipes both. One hole is still open:
+/// `spaces.rs` sets the same var raw, which `temp_env`'s lock does not see.
+///
+/// Redirecting the *default* root closes it at the one place that resolves it,
+/// so the env guards become a convenience rather than the safety mechanism.
+/// `WENLAN_DATA_DIR` still wins when set; the rest share one temp dir per
+/// process, which is the same save-then-load semantics they had before.
+#[cfg(any(test, feature = "scratch-config"))]
+fn default_config_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        // Under `cfg(test)` this is the point. Reached from a *binary*, it means
+        // the binary was built with the dev-dependency feature on (`cargo test`
+        // leaves such a `target/debug/wenlan-server` behind), so say so loudly:
+        // the config it reads is empty, not lost.
+        #[cfg(not(test))]
+        eprintln!(
+            "[wenlan] WARNING: built with wenlan-core/scratch-config — config \
+             reads and writes go to a temporary directory, not the real data \
+             dir. This is a test-only feature; rebuild without it."
+        );
+        let root =
+            std::env::temp_dir().join(format!("wenlan-scratch-config-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        root
+    })
+    .clone()
+}
+
 fn config_path() -> PathBuf {
     // Honor the `WENLAN_DATA_DIR` override so a scratch daemon (e.g.
     // `wenlan-server --data-dir /tmp/wenlan-demo`) reads and writes its own
     // config file rather than clobbering the user's real one.
     let root = crate::env_compat::var_compat("WENLAN_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("wenlan")
-        });
+        .unwrap_or_else(default_config_root);
     root.join("config.json")
 }
 
@@ -212,6 +256,33 @@ pub fn save_config(config: &Config) -> Result<(), WenlanError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test binary may never resolve the developer's real `config.json`.
+    /// ~25 test call sites reach `save_config`, which writes `Config::default()`
+    /// — no API key, no reranker mode — so a test that lost the env-var race
+    /// described on `default_config_root` wiped both. Unsets the legacy
+    /// `ORIGIN_DATA_DIR` too: `var_compat` falls back to it, so leaving it set
+    /// would mask the real default.
+    #[test]
+    fn config_path_never_resolves_the_real_data_dir_in_tests() {
+        temp_env::with_vars(
+            [
+                ("WENLAN_DATA_DIR", None::<&str>),
+                ("ORIGIN_DATA_DIR", None::<&str>),
+            ],
+            || {
+                let real = dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("wenlan")
+                    .join("config.json");
+                assert_ne!(
+                    config_path(),
+                    real,
+                    "test builds must not read or write the real config"
+                );
+            },
+        );
+    }
 
     #[test]
     fn test_config_default_values() {
@@ -399,21 +470,26 @@ mod tests {
     }
 
     #[test]
-    fn page_map_auto_suggest_defaults_true_on_missing_field() {
-        // A config file without the field deserializes to true (serde default).
+    fn page_map_auto_suggest_defaults_false_on_missing_field() {
+        // A config file without the field deserializes to false — a Canvas the
+        // user has not asked to populate stays blank. This is the teeth on the
+        // start-from-blank decision; flipping the serde default back to true
+        // fails here.
         let config: Config = serde_json::from_str(r#"{"clipboard_enabled": true}"#).unwrap();
-        assert!(config.page_map_auto_suggest);
+        assert!(!config.page_map_auto_suggest);
     }
 
     #[test]
-    fn page_map_auto_suggest_roundtrip_false() {
+    fn page_map_auto_suggest_roundtrip_true() {
+        // Opting back in survives a serialize/deserialize cycle, so a user who
+        // turns proactive suggestions on keeps them.
         let config = Config {
-            page_map_auto_suggest: false,
+            page_map_auto_suggest: true,
             ..Config::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let restored: Config = serde_json::from_str(&json).unwrap();
-        assert!(!restored.page_map_auto_suggest);
+        assert!(restored.page_map_auto_suggest);
     }
 
     #[test]

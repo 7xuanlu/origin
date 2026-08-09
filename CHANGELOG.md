@@ -1,5 +1,107 @@
 # Changelog
 
+## [0.15.5](https://github.com/7xuanlu/wenlan/compare/v0.15.4...v0.15.5) (2026-08-04)
+
+
+### Features
+
+* **m6:** gate the genesis shadow lane and fix its turn-driver livelock ([#469](https://github.com/7xuanlu/wenlan/issues/469)) ([7456f4f](https://github.com/7xuanlu/wenlan/commit/7456f4f6622b2b01415db268b90f9f2cbc8a8d59))
+
+
+### Bug Fixes
+
+* align the runtime image env contract with the nested data root ([#464](https://github.com/7xuanlu/wenlan/issues/464)) ([80a0d66](https://github.com/7xuanlu/wenlan/commit/80a0d66a3c63d502267b6c408ed109ba385d382b))
+* give the release runtime image its OpenMP runtime ([#462](https://github.com/7xuanlu/wenlan/issues/462)) ([e8a9f88](https://github.com/7xuanlu/wenlan/commit/e8a9f88ea7e7bba5878d583c4bb0cc7919c15fbf))
+* grant finalize-release the pull-requests scope it reads ([#465](https://github.com/7xuanlu/wenlan/issues/465)) ([1567515](https://github.com/7xuanlu/wenlan/commit/1567515f0e8b62003e7f14ac03aa4093a086bc95))
+* **kg:** ambient enrichment dual-writes canonical edges; migration 111 repairs parity ([#473](https://github.com/7xuanlu/wenlan/issues/473)) ([d31c1eb](https://github.com/7xuanlu/wenlan/commit/d31c1eb58cd950428ad703a677199751ecdf7fbc))
+* **kg:** ambient entity sweep dual-writes entity shadow pages; migration 113 repairs parity ([#479](https://github.com/7xuanlu/wenlan/issues/479)) ([c74ca3c](https://github.com/7xuanlu/wenlan/commit/c74ca3c9246787131a0980159b4321376ab01b46))
+* **kg:** migration 114 re-syncs stale entity shadow pages ([#480](https://github.com/7xuanlu/wenlan/issues/480)) ([cfa972b](https://github.com/7xuanlu/wenlan/commit/cfa972bf593470c8fbff087f937b38378f9e7ac5))
+* make release promotion and latest promotion fail closed ([#460](https://github.com/7xuanlu/wenlan/issues/460)) ([035e04e](https://github.com/7xuanlu/wenlan/commit/035e04ef0764f6138d0dba615b5b5b565445d4ee))
+* nest the runtime data root inside its writable volume ([#463](https://github.com/7xuanlu/wenlan/issues/463)) ([ebfd9ca](https://github.com/7xuanlu/wenlan/commit/ebfd9ca34fbcaec1e1781382f2d5cca4e21f5740))
+* repair the Homebrew and Docker publication lanes ([#461](https://github.com/7xuanlu/wenlan/issues/461)) ([e56c381](https://github.com/7xuanlu/wenlan/commit/e56c381e06290f88e858aa440176bc6f590f7136))
+* skip the release candidate observer when its source CI run did not succeed ([#474](https://github.com/7xuanlu/wenlan/issues/474)) ([c6ef28c](https://github.com/7xuanlu/wenlan/commit/c6ef28c43dac7a4bc120d1602507b76c8cf702b4))
+* **truth:** fence M5 claim edges out of the edges parity sweep ([#478](https://github.com/7xuanlu/wenlan/issues/478)) ([15909df](https://github.com/7xuanlu/wenlan/commit/15909df4518380f8e15fe67a991ac1f104e73ce6))
+* **truth:** make memory origin daemon-authoritative ([#475](https://github.com/7xuanlu/wenlan/issues/475)) ([20bb938](https://github.com/7xuanlu/wenlan/commit/20bb938e132e41a5ec29da3531702c65fb223be4))
+
+## [0.15.4](https://github.com/7xuanlu/wenlan/compare/v0.15.3...v0.15.4) (2026-08-03)
+
+
+### Features
+
+* add shadow claim support promoter ([#457](https://github.com/7xuanlu/wenlan/issues/457)) ([c620d7e](https://github.com/7xuanlu/wenlan/commit/c620d7e2a4977bb7b332851469314c022b52e283))
+* complete M6 migration 109 substrate follow-up ([#437](https://github.com/7xuanlu/wenlan/issues/437)) ([247185b](https://github.com/7xuanlu/wenlan/commit/247185ba215d3426a4a1f2b97ad76d924fd1b30d))
+* enforce truth-aware page exposure ([#429](https://github.com/7xuanlu/wenlan/issues/429)) ([5141f7b](https://github.com/7xuanlu/wenlan/commit/5141f7bf21586aee75a1204607651b1eba484c42))
+* land M6 deterministic identity primitives and genesis substrate ([#433](https://github.com/7xuanlu/wenlan/issues/433)) ([aa77814](https://github.com/7xuanlu/wenlan/commit/aa77814c6a736e8ffef128e013ece56357f33481))
+
+
+### Bug Fixes
+
+* fence M5 derivation runs and bound reconciliation ([#439](https://github.com/7xuanlu/wenlan/issues/439)) ([f9b0789](https://github.com/7xuanlu/wenlan/commit/f9b07890d34697cc058e139d50bb250773fed50a))
+* focus affected tests and harden release fallback ([#438](https://github.com/7xuanlu/wenlan/issues/438)) ([228576a](https://github.com/7xuanlu/wenlan/commit/228576a55d15bfc1c5af640302e4d0c4ab485add))
+* keep release candidate tree current ([#436](https://github.com/7xuanlu/wenlan/issues/436)) ([9098693](https://github.com/7xuanlu/wenlan/commit/90986936e949416f7b0faa90324f084ff7a11602))
+* publish tested release artifacts ([#431](https://github.com/7xuanlu/wenlan/issues/431)) ([096af3f](https://github.com/7xuanlu/wenlan/commit/096af3f9a9919162bd4966d82ba1ed6cfec18565))
+
+## [0.15.3](https://github.com/7xuanlu/wenlan/compare/v0.15.2...v0.15.3) (2026-08-01)
+
+
+### Features
+
+* close the M5 daemon gaps — cutover readiness, page review endpoint, named-page truth axes ([#418](https://github.com/7xuanlu/wenlan/issues/418)) ([1c903be](https://github.com/7xuanlu/wenlan/commit/1c903becb99eb19653acc0c0974a546d0b0bfcbd))
+
+## [0.15.2](https://github.com/7xuanlu/wenlan/compare/v0.15.1...v0.15.2) (2026-07-31)
+
+
+### Bug Fixes
+
+* skip the setup runtime repair when the daemon is newer than the plugin ([#415](https://github.com/7xuanlu/wenlan/issues/415)) ([22b401d](https://github.com/7xuanlu/wenlan/commit/22b401da132a975e58db047639f3eac35f3efd75))
+* stop test builds resolving the developer's real config.json ([#411](https://github.com/7xuanlu/wenlan/issues/411)) ([07afba7](https://github.com/7xuanlu/wenlan/commit/07afba7df820ab4d9a6cd3e4a6f89b8506a23a43))
+
+## [0.15.1](https://github.com/7xuanlu/wenlan/compare/v0.15.0...v0.15.1) (2026-07-29)
+
+
+### Features
+
+* add CLI Space Brief workflow ([e363754](https://github.com/7xuanlu/wenlan/commit/e363754a82e6dbc596a52934fbaf9df17506f8f5))
+* add daemon Space Brief routes ([d4f842d](https://github.com/7xuanlu/wenlan/commit/d4f842de27de30148fce87b259da9e5c13d1d1a7))
+* add Space Brief storage ([f00a5a6](https://github.com/7xuanlu/wenlan/commit/f00a5a676a44493491d8d7d0c8c50da3292b3100))
+* expose Space Brief workflow ([1178e18](https://github.com/7xuanlu/wenlan/commit/1178e18448feee2f5eef66a13951bbc19f46f55e))
+* replace session-start context with Space Briefs ([f416396](https://github.com/7xuanlu/wenlan/commit/f416396218bccca8b39b983274316d045329b1f3))
+
+
+### Bug Fixes
+
+* add daemon-owned default save space ([#399](https://github.com/7xuanlu/wenlan/issues/399)) ([79eadad](https://github.com/7xuanlu/wenlan/commit/79eadad0dc571457706a879e61be5a070d1ea3c9))
+* consolidate MCP surface and grounded review flows ([#397](https://github.com/7xuanlu/wenlan/issues/397)) ([0534517](https://github.com/7xuanlu/wenlan/commit/053451772de103f96903b88585fbf7096d81d5af))
+* harden Space Brief handoff ([82b63a0](https://github.com/7xuanlu/wenlan/commit/82b63a046fd8f3b38b8a3b06204061f6e852a1db))
+* land the M4 communities rung — durable substrate and reader cutover ([#396](https://github.com/7xuanlu/wenlan/issues/396)) ([5ba8a3b](https://github.com/7xuanlu/wenlan/commit/5ba8a3b43b53267a7d973ef377275a86e93ad01e))
+* land the M5 truth-exposure substrate, inert at generation 0 (PR-B) ([#408](https://github.com/7xuanlu/wenlan/issues/408)) ([f29c2c5](https://github.com/7xuanlu/wenlan/commit/f29c2c5496b2a60b1478e137641a084e29e53a3f))
+* load release-please config (release-type input bypassed it) ([#410](https://github.com/7xuanlu/wenlan/issues/410)) ([48bf0a7](https://github.com/7xuanlu/wenlan/commit/48bf0a798d1931a9c28403862de4483aeb180ff1))
+* M5 PR-A — durable claim identity substrate (schema + shadow derivation) ([#404](https://github.com/7xuanlu/wenlan/issues/404)) ([e4790ce](https://github.com/7xuanlu/wenlan/commit/e4790ce857056050a90a4adeef391375e8ce5f19))
+* wire the M5 truth adapters — the protecting half of the exposure contract (PR-C) ([3932e3d](https://github.com/7xuanlu/wenlan/commit/3932e3d557ec0201324446c7d15b582c605dbe20))
+
+## [0.15.0](https://github.com/7xuanlu/wenlan/compare/v0.14.1...v0.15.0) (2026-07-26)
+
+
+### Features
+
+* make background enrichment bounded and foreground-safe ([#379](https://github.com/7xuanlu/wenlan/issues/379)) ([9817e38](https://github.com/7xuanlu/wenlan/commit/9817e38661894fa3627580e8a09319ff44805c67))
+
+
+### Bug Fixes
+
+* accelerate Windows inference with Vulkan ([#382](https://github.com/7xuanlu/wenlan/issues/382)) ([6501345](https://github.com/7xuanlu/wenlan/commit/65013459b0909cbb1899e9fd1667f80bad981194))
+* bound daemon logs and preserve bootstrap errors ([#385](https://github.com/7xuanlu/wenlan/issues/385)) ([93451bf](https://github.com/7xuanlu/wenlan/commit/93451bf0ef58399e08400e3b4ac613942adcfec8))
+* defer observation provenance index to migrations ([#381](https://github.com/7xuanlu/wenlan/issues/381)) ([c8533a7](https://github.com/7xuanlu/wenlan/commit/c8533a7a825bab5830c73b0fe4998d2e7e6e0ec4))
+* load bundled ONNX Runtime on Windows ([#365](https://github.com/7xuanlu/wenlan/issues/365)) ([c66f9d8](https://github.com/7xuanlu/wenlan/commit/c66f9d8e3e2edc991a540a89d3c5f60e2c109a99))
+* M1 honest columns — migrate Page scope into unified `space` column ([#375](https://github.com/7xuanlu/wenlan/issues/375)) ([1b56c3a](https://github.com/7xuanlu/wenlan/commit/1b56c3a883c8f916fe3e604287a784898ec2167b))
+* M2 PR-2 — edges reader cutover, parity reconciliation + §6.9 online backup ([#378](https://github.com/7xuanlu/wenlan/issues/378)) ([3246e18](https://github.com/7xuanlu/wenlan/commit/3246e180b3d5f196d8bf6be4079d53cf98aac850))
+* M2 unified edges — schema expand + dual-write shadow (PR-1) ([#377](https://github.com/7xuanlu/wenlan/issues/377)) ([b256814](https://github.com/7xuanlu/wenlan/commit/b256814832be585e63888e997c6c7c6bf22fe119))
+* M3 PR-1 — entity→page dual-write foundation (schema 89–93) ([#380](https://github.com/7xuanlu/wenlan/issues/380)) ([24c45d8](https://github.com/7xuanlu/wenlan/commit/24c45d8ab74713191fea501c35c3cd98b38e9737))
+* M3 PR-2 — entity reader cutover, parity watermark + D6 + §6.5 soak ([#387](https://github.com/7xuanlu/wenlan/issues/387)) ([7f3bd7e](https://github.com/7xuanlu/wenlan/commit/7f3bd7ec3238acdaf2c5902bc424f033be264811))
+* M3 wire freeze — adapter seam, freeze teeth, Q1 stub-page fence lifts ([#390](https://github.com/7xuanlu/wenlan/issues/390)) ([084e39d](https://github.com/7xuanlu/wenlan/commit/084e39dfcfd0091e5143a9acdf458a4f92775e2a))
+* M3g edge-grounding promotion — span capture, default-OFF grounding sweep, gates made real ([#392](https://github.com/7xuanlu/wenlan/issues/392)) ([31e0fa6](https://github.com/7xuanlu/wenlan/commit/31e0fa6377a4537b0df7cb073b5fa403c5b118ac))
+* start Page-Map Canvas blank — proactive suggestions now opt-in ([#371](https://github.com/7xuanlu/wenlan/issues/371)) ([34beb24](https://github.com/7xuanlu/wenlan/commit/34beb24663590c3e62e9391e3f138960ef229021))
+
 ## [0.14.1](https://github.com/7xuanlu/wenlan/compare/v0.14.0...v0.14.1) (2026-07-20)
 
 

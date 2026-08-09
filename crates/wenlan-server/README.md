@@ -43,11 +43,13 @@ The libSQL store lives under the platform data directory (`dirs::data_local_dir(
 
 ```bash
 wenlan background on   # register with the host service manager (launchd / systemd-user / schtasks)
-wenlan background off  # remove from the service manager
-wenlan status       # service + runtime status
+wenlan background off  # stop the current daemon while preserving its registration
+wenlan status           # service + runtime status
 ```
 
-On Windows the install path uses `schtasks.exe` to register a per-user `OriginServer` ONLOGON task and triggers it immediately. wenlan-server stays a plain console app — no Windows Service Control Protocol dispatcher is needed.
+`background off` is a reversible runtime stop, not an uninstall. Run `wenlan background on` to start the registered daemon again.
+
+On Windows the install path uses `schtasks.exe` to register a per-user `WenlanServer` ONLOGON task and triggers it immediately. `background off` ends the running task without deleting that registration. wenlan-server stays a plain console app — no Windows Service Control Protocol dispatcher is needed.
 
 The daemon listens on `127.0.0.1:7878`. MCP clients, the Claude Code plugin, and local tools call that local API.
 

@@ -1,6 +1,7 @@
 use super::citations::{assess_citations, load_and_assess_citations};
 use super::source::{assess_sources, load_sources, ExtraEvidence, SourceRecord};
 use super::*;
+use crate::db::test_support::TestDbSession;
 use crate::db::tests::test_db;
 use crate::lint::context::{
     AppliedScope, CancellationToken, ExecutionGate, LintClock, LintContext,
@@ -152,7 +153,7 @@ fn malformed_or_unknown_citation_dimensions_are_errors() {
 #[tokio::test]
 async fn hundred_thousand_sql_rows_validate_all_and_cap_opaque_samples() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_page(&conn, "page-scale", "workspace-scale", None).await;
     conn.execute(
         "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 100000)
@@ -242,7 +243,7 @@ async fn hundred_thousand_sql_rows_validate_all_and_cap_opaque_samples() {
 #[tokio::test]
 async fn set_query_matches_writer_precedence_and_pages_workspace_scope() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_memory(
         &conn,
         "row-source-id",
@@ -387,7 +388,7 @@ async fn set_query_matches_writer_precedence_and_pages_workspace_scope() {
 #[tokio::test]
 async fn matching_evidence_cannot_mask_missing_logical_or_row_id_owner() {
     let (db, _tmp) = test_db().await;
-    let conn = db._db.connect().unwrap();
+    let conn = db.test_secondary_session().unwrap();
     insert_memory(&conn, "mem-owner-row", "owner-logical-id", "memory", None).await;
     insert_page(&conn, "page-owner-check", "workspace-a", None).await;
     for locator in [
@@ -438,6 +439,65 @@ async fn matching_evidence_cannot_mask_missing_logical_or_row_id_owner() {
     assert_eq!(result.evidence().len(), 2);
 }
 
+#[tokio::test]
+async fn uncategorized_scope_finds_unfiled_page_and_excludes_registered() {
+    let (db, _tmp) = test_db().await;
+    let conn = db.test_secondary_session().unwrap();
+    insert_memory(&conn, "mem-unfiled", "mem-unfiled", "memory", None).await;
+    insert_memory(&conn, "mem-alpha", "mem-alpha", "memory", None).await;
+    insert_page(
+        &conn,
+        "page-unfiled",
+        crate::db::UNFILED_SPACE_ID,
+        Some("[]"),
+    )
+    .await;
+    insert_page(&conn, "page-CANARY-alpha", "alpha", Some("[]")).await;
+    for (page, locator) in [
+        ("page-unfiled", "mem-unfiled"),
+        ("page-CANARY-alpha", "mem-alpha"),
+    ] {
+        conn.execute(
+            "INSERT INTO page_sources (page_id, memory_source_id, linked_at, link_reason) VALUES (?1, ?2, 1, 'test')",
+            libsql::params![page, locator],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO page_evidence (page_id, source_kind, locator, linked_at, link_reason) VALUES (?1, 'memory', ?2, 1, 'test')",
+            libsql::params![page, locator],
+        )
+        .await
+        .unwrap();
+    }
+
+    let snapshot = db.open_lint_snapshot().await.unwrap();
+    let scope = AppliedScope::uncategorized();
+    let clock = LintClock::fixed();
+    let gate = ExecutionGate::new(CancellationToken::new());
+    let context = LintContext::new(
+        &snapshot,
+        &scope,
+        None,
+        &clock,
+        &gate,
+        wenlan_types::lint::LintProfile::General,
+    );
+    // Shape-C regression guard: `workspace IS NULL` was permanently dead
+    // after migration 80's NOT NULL stamp, so a revert here would make both
+    // checks vacuously empty rather than actually excluding page-CANARY-alpha.
+    let records = load_sources(&context).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].locator, "mem-unfiled");
+
+    let citations = load_and_assess_citations(&context)
+        .await
+        .unwrap()
+        .result(CITATION_PARTITIONS_ID, 0)
+        .unwrap();
+    assert_eq!(citations.coverage().denominator(), 1);
+}
+
 fn metric(result: &LintCheckResult, code: LintMetricCode) -> u64 {
     result
         .metrics()
@@ -451,7 +511,7 @@ fn metric(result: &LintCheckResult, code: LintMetricCode) -> u64 {
 }
 
 async fn insert_memory(
-    conn: &libsql::Connection,
+    conn: &TestDbSession,
     id: &str,
     source_id: &str,
     source_name: &str,
@@ -465,12 +525,7 @@ async fn insert_memory(
     .unwrap();
 }
 
-async fn insert_page(
-    conn: &libsql::Connection,
-    id: &str,
-    workspace: &str,
-    citations: Option<&str>,
-) {
+async fn insert_page(conn: &TestDbSession, id: &str, workspace: &str, citations: Option<&str>) {
     conn.execute(
         "INSERT INTO pages (id, title, content, source_memory_ids, version, status, created_at, last_compiled, last_modified, workspace, citations) VALUES (?1, ?1, 'body', '[]', 1, 'active', 'now', 'now', 'now', ?2, ?3)",
         libsql::params![id, workspace, citations],

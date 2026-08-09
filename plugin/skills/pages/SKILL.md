@@ -6,7 +6,7 @@ description: >
   page when one matches, or shows a small native picker when 2-4 match. `/pages`
   lists recent pages. Invoked as `/pages [query]`.
 argument-hint: "[query]"
-allowed-tools: ["Bash", "AskUserQuestion"]
+allowed-tools: ["Bash", "AskUserQuestion", "mcp__plugin_wenlan_wenlan__get_page_revisions"]
 ---
 
 # /pages
@@ -67,6 +67,20 @@ tell the user to `/pages <query>` to open one. No picker over the whole set —
 that's the lossy, 4-cap case the CLI list avoids.
 
 If `wenlan` isn't found, the CLI isn't installed — tell the user to run `/setup`.
+
+## Explicit changelog lookup
+
+Only when the user explicitly asks for a page's changelog or version history,
+resolve its stable id without reading the page body. Resolve the page ID first
+with `wenlan pages "<query-or-filename>" --resolve-id`.
+
+```bash
+"$W" pages "<query-or-filename>" --resolve-id
+```
+
+If several pages match, use the same picker/narrowing flow above and rerun with
+the selected filename. Then call `get_page_revisions(page_id="<resolved-id>")`.
+Do not fetch changelogs during ordinary `/pages` list/open flows.
 
 ## When NOT to use
 

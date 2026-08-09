@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::error::ServerError;
-use crate::state::ServerState;
+use crate::route_registry::{delete, get, post, put, TrackedRouter};
+use crate::state::{ServerState, SharedState};
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -13,111 +14,64 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use wenlan_core::sources::compute_effective_confidence;
 use wenlan_types::requests::{
-    AddObservationRequest, ConfirmRequest, CreateConceptRequest, CreateEntityRequest,
-    CreateRelationRequest, ExportPagesRequest, ListMemoriesRequest, SearchMemoryRequest,
-    SearchPagesRequest, StoreMemoryRequest,
+    ConfirmRequest, ListMemoriesRequest, SearchMemoryRequest, StoreMemoryRequest,
 };
 use wenlan_types::responses::{
-    AddObservationResponse, ConfirmResponse, CreateEntityResponse, CreatePageResponse,
-    CreateRelationResponse, DeleteResponse, ListMemoriesResponse, SearchMemoryResponse,
+    ConfirmResponse, DeleteResponse, ListMemoriesResponse, SearchMemoryResponse,
     StoreMemoryResponse,
 };
 use wenlan_types::sources::{stability_tier, MemoryType, RawDocument, StabilityTier};
-
-pub(crate) async fn registered_request_space(
-    db: &wenlan_core::db::MemoryDB,
-    requested: &Option<String>,
-    context: &str,
-) -> Result<Option<String>, ServerError> {
-    let proposed = requested
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let registered = db
-        .registered_space_or_none(requested.as_deref())
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    if registered.is_none() {
-        if let Some(space) = proposed {
-            tracing::warn!(
-                "[memory] ignoring unregistered space {:?} for {}; using unscoped fallback",
-                space,
-                context
-            );
-        }
-    }
-    Ok(registered)
-}
-
-// ===== Profile Types =====
-
-#[derive(Debug, Serialize)]
-pub struct ProfileResponse {
-    pub id: String,
-    pub name: String,
-    pub display_name: Option<String>,
-    pub email: Option<String>,
-    pub bio: Option<String>,
-    pub avatar_path: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateProfileRequest {
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub display_name: Option<String>,
-    #[serde(default)]
-    pub email: Option<String>,
-    #[serde(default)]
-    pub bio: Option<String>,
-    #[serde(default)]
-    pub avatar_path: Option<String>,
-}
-
-// ===== Agent Types =====
-
-#[derive(Debug, Serialize)]
-pub struct AgentResponse {
-    pub id: String,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-    pub agent_type: String,
-    pub description: Option<String>,
-    pub enabled: bool,
-    pub trust_level: String,
-    pub last_seen_at: Option<i64>,
-    pub memory_count: i64,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateAgentRequest {
-    #[serde(default)]
-    pub agent_type: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    #[serde(default)]
-    pub trust_level: Option<String>,
-    #[serde(default)]
-    pub display_name: Option<String>,
-}
-
-// ===== Knowledge Graph Types =====
-
-#[derive(Debug, Deserialize)]
-pub struct LinkEntityRequest {
-    pub source_id: String,
-    pub entity_id: String,
-}
+use wenlan_types::{WriteOutcome, WriteSpaceSource};
 
 // ===== Route Handlers =====
+
+pub(crate) fn register_core(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route("/api/memory/recent", get(handle_recent_memories))
+        .route(
+            "/api/memory/unconfirmed",
+            get(handle_list_unconfirmed_memories),
+        )
+        .route("/api/memory/store", post(handle_store_memory))
+        .route("/api/memory/search", post(handle_search_memory))
+        .route(
+            "/api/memory/confirm/{source_id}",
+            post(handle_confirm_memory),
+        )
+        .route("/api/memory/list", post(handle_list_memories))
+        .route(
+            "/api/memory/delete/{source_id}",
+            delete(handle_delete_memory),
+        )
+        .route(
+            "/api/memory/reclassify/{source_id}",
+            post(handle_reclassify_memory),
+        )
+        .route(
+            "/api/memory/{source_id}/enrichment-status",
+            get(handle_get_enrichment_status),
+        )
+        .route(
+            "/api/memory/revision/{id}/accept",
+            post(handle_accept_revision),
+        )
+        .route(
+            "/api/memory/revision/{id}/dismiss",
+            post(handle_dismiss_revision),
+        )
+        .route(
+            "/api/memory/contradiction/{source_id}/dismiss",
+            post(handle_dismiss_contradiction),
+        )
+        .route("/api/memory/stats", get(handle_get_memory_stats))
+        .route("/api/home-stats", get(handle_get_home_stats))
+        .route("/api/memory/nurture", get(handle_get_nurture_cards))
+        .route("/api/memory/rejections", get(handle_get_rejections))
+        .route("/api/memory/{id}/versions", get(handle_get_version_chain))
+        .route("/api/memory/{id}/update", put(handle_update_memory))
+        .route("/api/memory/{id}/stability", put(handle_set_stability))
+        .route("/api/memory/{id}/correct", post(handle_correct_memory))
+}
 
 /// Compute schema-validation warnings and the extraction method label,
 /// replacing the prior three-branch warnings computation that conflated
@@ -191,47 +145,102 @@ fn compute_warnings_and_extraction(
     }
 }
 
+fn fixed_enrichment_origin(
+    caller_supplied_memory_type: bool,
+    caller_supplied_profile_alias: bool,
+    caller_supplied_structured_fields: bool,
+    rejected_explicit_space: bool,
+) -> wenlan_core::db::EnrichmentOrigin {
+    wenlan_core::db::EnrichmentOrigin {
+        memory_type_explicit: caller_supplied_memory_type && !caller_supplied_profile_alias,
+        structured_fields_explicit: caller_supplied_structured_fields,
+        space_rejected: rejected_explicit_space,
+    }
+}
+
 /// POST /api/memory/store
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreLockTestStage {
+    Dedup,
+    AgentGate,
+    EntityResolution,
+    ActivityAgentLookup,
+    ActivityLog,
+}
+
+#[cfg(test)]
+struct StoreLockTestHook {
+    stage: StoreLockTestStage,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+fn store_lock_test_hook() -> &'static std::sync::Mutex<Option<Arc<StoreLockTestHook>>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<Arc<StoreLockTestHook>>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+async fn wait_at_store_lock_test_hook(stage: StoreLockTestStage) {
+    let hook = store_lock_test_hook().lock().unwrap().clone();
+    if let Some(hook) = hook.filter(|hook| hook.stage == stage) {
+        hook.reached.notify_one();
+        hook.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+struct StoreLockTestHookRegistration(Arc<StoreLockTestHook>);
+
+#[cfg(test)]
+impl StoreLockTestHookRegistration {
+    fn install(stage: StoreLockTestStage) -> Self {
+        let hook = Arc::new(StoreLockTestHook {
+            stage,
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = store_lock_test_hook().lock().unwrap();
+        if slot.is_some() {
+            drop(slot);
+            panic!("store lock test hook already installed");
+        }
+        *slot = Some(hook.clone());
+        drop(slot);
+        Self(hook)
+    }
+
+    fn hook(&self) -> &Arc<StoreLockTestHook> {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for StoreLockTestHookRegistration {
+    fn drop(&mut self) {
+        *store_lock_test_hook().lock().unwrap() = None;
+        // notify_one stores a permit if the task cloned the hook but has not
+        // parked yet, so cleanup is safe even on a multi-thread test runtime.
+        self.0.release.notify_one();
+    }
+}
+
 pub async fn handle_store_memory(
     State(state): State<Arc<RwLock<ServerState>>>,
     headers: HeaderMap,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Json(mut req): Json<StoreMemoryRequest>,
+    Json(req): Json<StoreMemoryRequest>,
 ) -> Result<Json<StoreMemoryResponse>, ServerError> {
-    // Apply X-Origin-Space header as fallback only when body omits `space`.
-    if req.space.is_none() {
-        req.space = header_space;
-    }
-    let requested_space = req
-        .space
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let ignored_unregistered_space = if let Some(space) = requested_space {
-        let db = {
-            let s = state.read().await;
-            s.db.clone().ok_or(ServerError::DbNotInitialized)?
-        };
-        if let Some(registered_space) = db
-            .registered_space_or_none(Some(&space))
-            .await
-            .map_err(|e| ServerError::Internal(e.to_string()))?
-        {
-            req.space = Some(registered_space);
-            None
-        } else {
-            tracing::warn!(
-                "[memory] ignoring unregistered space {:?}; storing memory uncategorized",
-                space
-            );
-            req.space = None;
-            Some(space)
-        }
-    } else {
-        req.space = None;
-        None
+    let db = {
+        let state = state.read().await;
+        state.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
+    let resolved_write_space = db
+        .resolve_write_space(&req.space, header_space.as_deref())
+        .await?;
     let trimmed_content = req.content.trim();
     if trimmed_content.len() < 10 {
         return Err(ServerError::ValidationError(
@@ -240,19 +249,16 @@ pub async fn handle_store_memory(
     }
 
     // Dedup check
-    {
-        let s = state.read().await;
-        if let Some(db) = s.db.as_ref() {
-            if db.has_memory_content(&req.content).await.unwrap_or(false) {
-                return Err(ServerError::ValidationError(
-                    "Duplicate: a memory with this content already exists".into(),
-                ));
-            }
-        }
+    #[cfg(test)]
+    wait_at_store_lock_test_hook(StoreLockTestStage::Dedup).await;
+    if db.has_memory_content(&req.content).await.unwrap_or(false) {
+        return Err(ServerError::ValidationError(
+            "Duplicate: a memory with this content already exists".into(),
+        ));
     }
 
     // Validate caller-supplied memory_type — parse and keep it as-is. Profile
-    // aliases now resolve in the async enrichment path below; previously this
+    // aliases now resolve in the ambient classification lane; previously this
     // block made an LLM call (up to 5s sync) to resolve the subtype, which
     // dominated store-time latency. Caller-supplied alias flows through to the
     // deferred classifier which produces the concrete subtype.
@@ -265,7 +271,7 @@ pub async fn handle_store_memory(
     let validated_memory_type: Option<String> = match req.memory_type.as_deref() {
         None | Some("") => None,
         Some(mt) if MemoryType::is_profile_alias(mt) => {
-            // Stored as "identity" as a conservative placeholder; async classify
+            // Stored as "identity" as a conservative placeholder; ambient classify
             // replaces with the actual subtype (identity/preference/goal/fact).
             // Matches the prior fallback when no LLM was available.
             Some("identity".to_string())
@@ -289,7 +295,8 @@ pub async fn handle_store_memory(
         .title
         .unwrap_or_else(|| truncate_for_title(&req.content));
 
-    // Phase 1: Agent gating + note whether an LLM is available.
+    // Phase 1: Agent gating + resolve the same hard-pinned background route
+    // the scheduler will use. A loaded slot is capability, not consent.
     //
     // Resolve the agent name via `extract_agent_name` (header-canonical)
     // before gating. Previously this read `req.source_agent` (body-only),
@@ -298,27 +305,43 @@ pub async fn handle_store_memory(
     // and gating entirely (got `None → "full"` auto-trust).
     //
     // Prompts, classify/extract LLM calls, and classification writebacks all
-    // moved to the async enrichment spawn below — the sync path only needs
-    // to know whether an LLM is available so it can pick the right response
-    // hint and `enrichment` state.
+    // moved to the ambient scheduler — the sync path only needs
+    // to know whether automatic enrichment is authorized and currently
+    // available so it can return a truthful response state.
     let resolved_agent = extract_agent_name(&headers, req.source_agent.as_deref());
-    let (trust_level, llm_available) = {
+    let runtime_config = wenlan_core::config::load_config();
+    let everyday_pin =
+        wenlan_core::refinery::EverydaySource::parse(runtime_config.everyday_source.as_deref());
+    let (db, api_llm, external_llm, local_llm) = {
         let s = state.read().await;
-        let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-        let trust = if resolved_agent == "unknown" {
-            // No agent identified at all → local/first-party write, full trust.
-            "full".to_string()
-        } else {
-            db.check_agent_for_write(&resolved_agent)
-                .await
-                .map_err(|e| ServerError::Internal(e.to_string()))?
-        };
-        (trust, s.llm.is_some())
+        (
+            s.db.clone().ok_or(ServerError::DbNotInitialized)?,
+            s.api_llm.clone(),
+            s.external_llm.clone(),
+            s.llm.clone(),
+        )
     };
+    let trust_level = if resolved_agent == "unknown" {
+        // No agent identified at all → local/first-party write, full trust.
+        "full".to_string()
+    } else {
+        #[cfg(test)]
+        wait_at_store_lock_test_hook(StoreLockTestStage::AgentGate).await;
+        db.check_agent_for_write(&resolved_agent)
+            .await
+            .map_err(|e| ServerError::Internal(e.to_string()))?
+    };
+    let ambient_route_mode = wenlan_core::refinery::resolve_everyday(
+        everyday_pin,
+        api_llm.as_ref(),
+        external_llm.as_ref(),
+        local_llm.as_ref(),
+    )
+    .mode;
 
-    // Placeholder classification. The async enrichment path will replace
+    // Placeholder classification. The ambient classification lane may replace
     // these via `db.apply_enrichment(...)` and `db.set_document_tags(...)`
-    // once the LLM has run (typically within a few seconds).
+    // after the quiet/cooldown gates admit the memory.
     let memory_type_str = validated_memory_type
         .clone()
         .unwrap_or_else(|| "fact".to_string());
@@ -326,33 +349,38 @@ pub async fn handle_store_memory(
     let classified_quality: Option<String> = None;
 
     // Structured fields / retrieval_cue are caller-supplied or deferred to the
-    // async extractor. Sync path never runs the extract LLM call anymore.
+    // ambient extractor. Sync path never runs the extract LLM call anymore.
     let extracted_fields: Option<String> = None;
     let extracted_cue: Option<String> = None;
 
     // Capture before `req.structured_fields` is consumed into the RawDocument —
-    // the async enrichment spawn uses this to decide whether to run the LLM
+    // the durable enrichment origin uses this to decide whether the ambient
     // extract pass. If the caller already supplied fields, we skip extract.
     let caller_supplied_structured_fields = req.structured_fields.is_some();
+    let enrichment_origin = fixed_enrichment_origin(
+        caller_supplied_memory_type,
+        caller_supplied_a_profile_alias,
+        caller_supplied_structured_fields,
+        false,
+    );
 
     // Phase 2b-validate: split into warnings (schema-validation only) and extraction_method (status label).
-    let (mut warnings, extraction_method) = compute_warnings_and_extraction(
+    let (warnings, extraction_method) = compute_warnings_and_extraction(
         extracted_fields.as_deref(),
         req.structured_fields.as_ref(),
         &memory_type_str,
     );
-    if let Some(space) = ignored_unregistered_space.as_deref() {
-        warnings.push(format!(
-            "Space '{space}' is not registered; stored uncategorized. Run `wenlan spaces add {space}` before using it."
-        ));
-    }
-
     // Phase 2c: Entity resolution
     let resolved_entity_id = if let Some(ref direct_id) = req.entity_id {
         Some(direct_id.clone())
     } else if let Some(ref entity_name) = req.entity {
-        let s = state.read().await;
-        if let Some(db) = s.db.as_ref() {
+        let db = {
+            let s = state.read().await;
+            s.db.clone()
+        };
+        if let Some(db) = db {
+            #[cfg(test)]
+            wait_at_store_lock_test_hook(StoreLockTestStage::EntityResolution).await;
             match db.resolve_entity_by_name(entity_name).await {
                 Ok(Some(id)) => {
                     tracing::info!("[memory] resolved entity '{}' → {}", entity_name, id);
@@ -403,10 +431,14 @@ pub async fn handle_store_memory(
     let pending_revision = false;
     let final_supersedes = req.supersedes.clone();
 
-    let agent_for_activity = {
+    let db = {
         let s = state.read().await;
-        extract_agent_name_with_db(&headers, req.source_agent.as_deref(), s.db.as_deref()).await
+        s.db.clone()
     };
+    #[cfg(test)]
+    wait_at_store_lock_test_hook(StoreLockTestStage::ActivityAgentLookup).await;
+    let agent_for_activity =
+        extract_agent_name_with_db(&headers, req.source_agent.as_deref(), db.as_deref()).await;
     let supersedes_for_activity = final_supersedes.clone();
 
     let supersede_mode = if memory_type_str == "decision" {
@@ -415,12 +447,30 @@ pub async fn handle_store_memory(
         "hide".to_string()
     };
 
-    let final_domain = req.space;
-    let structured_fields_for_enrichment = req
-        .structured_fields
-        .as_ref()
-        .map(|v| v.to_string())
-        .or_else(|| extracted_fields.clone());
+    // Origin-honesty guard (spec §5.6; close plan Part A item 2). `source_agent`
+    // is origin-bearing: a value in `origin::DOCUMENT_INGEST_SOURCE_AGENTS`
+    // makes the row's relations promotion-eligible, exempts it from page
+    // genesis, and lets doc-reconcile treat it as the authoritative document in
+    // a contradiction. None of that may be selectable by a request, so a
+    // reserved claim is dropped here and logged. Normalising rather than
+    // rejecting keeps existing clients working.
+    //
+    // Deliberately applied to the PERSISTED value only, not to the agent
+    // identity resolved above: `extract_agent_name` treats an absent agent as a
+    // local first-party write and grants FULL trust, so blanking the claim
+    // before that resolution would turn a spoof attempt into a trust upgrade.
+    // Identity keeps judging the raw claim; the row keeps no false origin.
+    let (persisted_source_agent, rejected_origin_claim) =
+        wenlan_core::origin::normalize_wire_source_agent(req.source_agent);
+    if let Some(claimed) = rejected_origin_claim {
+        tracing::warn!(
+            "[origin-guard] /api/memory/store request claimed reserved source_agent \
+             '{claimed}' (resolved agent '{resolved_agent}'); dropped — origin is \
+             daemon-authoritative and no wire request may select it"
+        );
+    }
+
+    let final_domain = resolved_write_space.space_name.clone();
     let doc = RawDocument {
         source: "memory".to_string(),
         source_id: source_id.clone(),
@@ -432,7 +482,7 @@ pub async fn handle_store_memory(
         metadata: HashMap::new(),
         memory_type: Some(memory_type_str.clone()),
         space: final_domain.clone(),
-        source_agent: req.source_agent,
+        source_agent: persisted_source_agent,
         confidence: Some(effective_confidence),
         confirmed,
         stability: Some(stability.to_string()),
@@ -489,17 +539,28 @@ pub async fn handle_store_memory(
             s.quality_gate.clone(),
         )
     };
+    let origin_db = db_fallback.clone().ok_or(ServerError::DbNotInitialized)?;
+    origin_db
+        .upsert_enrichment_origin(&source_id, enrichment_origin)
+        .await
+        .map_err(|e| ServerError::IngestFailed(e.to_string()))?;
 
     let chunks_created = if let Some(batcher) = ingest_batcher {
         // Coalesced path: concurrent callers share one FastEmbed call +
         // one libSQL transaction. Gate runs inside the coalescer flush.
         // See `ingest_batcher.rs` for details.
         use crate::ingest_batcher::StoreOutcome;
-        match batcher
-            .submit(doc, chunks_predicted)
+        let outcome = match batcher
+            .submit_with_space(doc, chunks_predicted, resolved_write_space.clone())
             .await
-            .map_err(ServerError::IngestFailed)?
         {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = origin_db.delete_enrichment_origin(&source_id).await;
+                return Err(ServerError::IngestFailed(error));
+            }
+        };
+        match outcome {
             StoreOutcome::Stored { chunks_created } => chunks_created,
             StoreOutcome::GateRejected {
                 reason,
@@ -541,6 +602,7 @@ pub async fn handle_store_memory(
                     doc_agent_for_log.as_deref().unwrap_or("unknown"),
                     detail,
                 );
+                let _ = origin_db.delete_enrichment_origin(&source_id).await;
                 return Err(ServerError::QualityGateRejected {
                     reason,
                     detail,
@@ -548,7 +610,12 @@ pub async fn handle_store_memory(
                 });
             }
             StoreOutcome::UpsertFailed(msg) => {
+                let _ = origin_db.delete_enrichment_origin(&source_id).await;
                 return Err(ServerError::IngestFailed(msg));
+            }
+            StoreOutcome::WriteSpaceInvalid(msg) => {
+                let _ = origin_db.delete_enrichment_origin(&source_id).await;
+                return Err(ServerError::ValidationError(msg));
             }
         }
     } else {
@@ -616,190 +683,97 @@ pub async fn handle_store_memory(
                 .reason
                 .map(|r| (r.as_str().to_string(), r.detail()))
                 .unwrap_or_else(|| ("unknown".to_string(), "Quality gate rejected".to_string()));
+            let _ = origin_db.delete_enrichment_origin(&source_id).await;
             return Err(ServerError::QualityGateRejected {
                 reason: rej_reason,
                 detail: rej_detail,
                 similar_to: similar_source_id,
             });
         }
-        db.upsert_documents(vec![doc])
+        match db
+            .upsert_documents_with_write_spaces(vec![(doc, Some(resolved_write_space.clone()))])
             .await
-            .map_err(|e| ServerError::IngestFailed(e.to_string()))?
+        {
+            Ok(chunks) => chunks,
+            Err(wenlan_core::WenlanError::Validation(message)) => {
+                let _ = origin_db.delete_enrichment_origin(&source_id).await;
+                return Err(ServerError::ValidationError(message));
+            }
+            Err(error) => {
+                let _ = origin_db.delete_enrichment_origin(&source_id).await;
+                return Err(ServerError::IngestFailed(error.to_string()));
+            }
+        }
     };
 
     if chunks_created == 0 {
+        let _ = origin_db.delete_enrichment_origin(&source_id).await;
         return Err(ServerError::ValidationError(
             "Memory produced no indexable content after processing".into(),
         ));
     }
 
-    // Classified tags are now written in the async enrichment spawn below —
+    let persisted_space = origin_db
+        .get_memory_space(&source_id)
+        .await
+        .map_err(|error| ServerError::Internal(error.to_string()))?;
+    let persisted_space_source = if persisted_space.is_some() {
+        resolved_write_space.source
+    } else {
+        WriteSpaceSource::Uncategorized
+    };
+
+    // Classified tags are now written by the ambient classification lane —
     // `classified_tags` is always empty at this point because classify moved
     // off the sync path. Kept as a no-op branch for the rare caller that
     // pre-supplies tags in the future; can be removed with an API cleanup.
     let _ = classified_tags; // intentionally unused
 
     // Log agent activity
-    {
+    let db = {
         let s = state.read().await;
-        if let Some(db) = s.db.as_ref() {
-            if let Some(ref old_id) = supersedes_for_activity {
-                let ids = vec![source_id.clone(), old_id.clone()];
-                if let Err(e) = db
-                    .log_agent_activity(
-                        &agent_for_activity,
-                        "refine",
-                        &ids,
-                        None,
-                        "updated with new reasoning",
-                    )
-                    .await
-                {
-                    tracing::warn!("Failed to log agent refine activity: {}", e);
-                }
-            } else {
-                let ids = vec![source_id.clone()];
-                let detail = format!("stored a {} memory", memory_type_str);
-                if let Err(e) = db
-                    .log_agent_activity(&agent_for_activity, "store", &ids, None, &detail)
-                    .await
-                {
-                    tracing::warn!("Failed to log agent store activity: {}", e);
-                }
+        s.db.clone()
+    };
+    if let Some(db) = db {
+        #[cfg(test)]
+        wait_at_store_lock_test_hook(StoreLockTestStage::ActivityLog).await;
+        if let Some(ref old_id) = supersedes_for_activity {
+            let ids = vec![source_id.clone(), old_id.clone()];
+            if let Err(e) = db
+                .log_agent_activity(
+                    &agent_for_activity,
+                    "refine",
+                    &ids,
+                    None,
+                    "updated with new reasoning",
+                )
+                .await
+            {
+                tracing::warn!("Failed to log agent refine activity: {}", e);
+            }
+        } else {
+            let ids = vec![source_id.clone()];
+            let detail = format!("stored a {} memory", memory_type_str);
+            if let Err(e) = db
+                .log_agent_activity(&agent_for_activity, "store", &ids, None, &detail)
+                .await
+            {
+                tracing::warn!("Failed to log agent store activity: {}", e);
             }
         }
     }
 
-    // Record write event for the steep scheduler's burst detection.
-    // Must be called BEFORE spawning post-ingest — captures the write
-    // timestamp immediately, not after LLM enrichment completes.
+    // Record the write event for steep burst detection and recap batching.
+    // Capture the timestamp immediately after the durable store, never after
+    // background enrichment.
     {
         let s = state.read().await;
         s.write_signal.record(&resolved_agent);
     }
 
-    // Deferred enrichment (async, non-blocking).
-    //
-    // Two phases run here, off the request's critical path:
-    //
-    //   1. LLM classify + extract + `db.apply_enrichment(...)` + tags write —
-    //      replaces the inline LLM calls that used to gate the HTTP response.
-    //      Sync path stored placeholder values (memory_type="fact" unless the
-    //      caller supplied one; no domain/quality/structured_fields from LLM);
-    //      this phase fills them in via a combined UPDATE. Tags are written
-    //      directly to MemoryDB via `db.set_document_tags(...)`.
-    //
-    //   2. `run_post_ingest_enrichment(...)` — entity auto-linking, title
-    //      enrichment, page growth. Runs with the enriched fields phase 1 produced.
-    //
-    // IMPORTANT: extract Arcs/clones from the read guard and drop it BEFORE
-    // entering any `.await` on LLM or DB work. Holding a read guard across an
-    // await would block writers (e.g., config updates, space edits) for the
-    // full duration of enrichment — which can take several seconds per LLM
-    // call. See docs/superpowers/specs/2026-04-09-core-app-separation-design.md.
-    {
-        let state_clone = state.clone();
-        let source_id_clone = source_id.clone();
-        let content_clone = req.content.clone();
-        let entity_id_clone = resolved_entity_id.clone();
-        let initial_memory_type = memory_type_str.clone();
-        let initial_domain = final_domain.clone();
-        let rejected_explicit_domain = ignored_unregistered_space.is_some();
-        // Already moved into the doc above — rebuild from the same formula
-        // the RawDocument constructor used.
-        let initial_supersede_mode = if memory_type_str == "decision" {
-            "archive".to_string()
-        } else {
-            "hide".to_string()
-        };
-        let initial_structured_fields = structured_fields_for_enrichment.clone();
-        let agent_supplied_memory_type = caller_supplied_memory_type;
-        let agent_supplied_profile_alias = caller_supplied_a_profile_alias;
-        let agent_supplied_structured_fields = caller_supplied_structured_fields;
-        // Deferred-enrichment body, parameterised on a cooperative-cancel flag.
-        // `cancel = None` (the default-OFF path) keeps every step running to
-        // completion exactly as before. When debounced reflection is enabled,
-        // the debouncer passes `Some(flag)` and flips it on a newer same-agent
-        // write so this body short-circuits at the next clean step boundary.
-        let run_reflection =
-            move |cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>| async move {
-                // Snapshot everything we need, then drop the guard.
-                let (db, llm, prompts, refinery, distillation, knowledge_path, maintenance) = {
-                    let s = state_clone.read().await;
-                    let Some(db) = s.db.clone() else {
-                        return;
-                    };
-                    (
-                        db,
-                        s.llm.clone(),
-                        s.prompts.clone(),
-                        s.tuning.refinery.clone(),
-                        s.tuning.distillation.clone(),
-                        Some(wenlan_core::config::load_config().knowledge_path_or_default()),
-                        s.maintenance_coordinator.clone(),
-                    )
-                }; // read guard dropped here — writers may proceed
-                let _maintenance_guard = maintenance.begin_background().await;
-
-                // Canonical post-store enrichment (Phase 1 classify/extract/
-                // apply_enrichment/tags + Phase 2 post-ingest + Phase 3 dual-pool)
-                // now lives in `wenlan_core::ingest` so the daemon, the eval seed
-                // pipeline, and the importer all enrich through ONE path. The
-                // snapshot above dropped the read guard; everything below operates on
-                // the cloned Arcs, so no RwLock guard is held across `.await`.
-                let opts = wenlan_core::ingest::EnrichmentOpts {
-                    initial_memory_type: initial_memory_type.clone(),
-                    initial_domain: initial_domain.clone(),
-                    rejected_explicit_domain,
-                    initial_supersede_mode: initial_supersede_mode.clone(),
-                    initial_structured_fields: initial_structured_fields.clone(),
-                    agent_supplied_memory_type,
-                    agent_supplied_profile_alias,
-                    agent_supplied_structured_fields,
-                };
-                wenlan_core::ingest::run_canonical_enrichment(
-                    &db,
-                    &source_id_clone,
-                    &content_clone,
-                    entity_id_clone.as_deref(),
-                    llm.as_ref(),
-                    &prompts,
-                    &refinery,
-                    &distillation,
-                    knowledge_path.as_deref(),
-                    &opts,
-                    cancel.as_deref(),
-                )
-                .await;
-            };
-
-        // Dispatch: opt-in debounced reflection vs. verbatim detached spawn.
-        //
-        // Default OFF (`WENLAN_ENABLE_REFLECTION_DEBOUNCE` unset/falsey): spawn
-        // immediately with `cancel = None` — byte-identical to the pre-T22 path
-        // (no debouncer touched, no coalescing, every store gets its own task).
-        //
-        // ON: route through the per-agent `ReflectionDebouncer`. A burst of
-        // rapid same-agent stores collapses to a single reflection of the last
-        // write — earlier in-flight reflections are cancelled at a clean step
-        // boundary, never dropped (the latest always runs). Snapshot the
-        // debouncer handle + window from the read guard, then DROP the guard
-        // before scheduling so no RwLock guard is held across the spawn/await.
-        if wenlan_core::db::reflection_debounce_enabled() {
-            let (debouncer, window) = {
-                let s = state.read().await;
-                (
-                    s.reflection_debouncer.clone(),
-                    std::time::Duration::from_secs(s.tuning.refinery.reflection_debounce_secs),
-                )
-            };
-            debouncer.schedule(&resolved_agent, window, move |flag| {
-                run_reflection(Some(flag))
-            });
-        } else {
-            tokio::spawn(run_reflection(None));
-        }
-    }
+    // Automatic enrichment is intentionally not spawned from the request path.
+    // The ambient scheduler owns admission, ordering, retries, and the one-call
+    // budget for every automatic inference stage.
 
     // Fire-once onboarding milestone checks (ingest side).
     //
@@ -837,21 +811,28 @@ pub async fn handle_store_memory(
         }
     }
 
-    // Build caller-facing status. Enrichment is pending whenever an LLM is
-    // wired — classify + extract + apply_enrichment runs asynchronously and
-    // will backfill `memory_type`, `domain`, `quality`, tags, and structured
-    // fields within a few seconds. When no LLM is available, the memory
-    // stays as caller-supplied — no enrichment will run, and callers should
-    // not poll for enriched fields.
-    let (enrichment, hint) = if llm_available {
-        (
+    // Build caller-facing status from the effective hard-pin route. Recall is
+    // available immediately in every state; only a healthy explicit pin may
+    // promise that automatic enrichment will eventually run.
+    let (enrichment, hint) = match ambient_route_mode {
+        wenlan_core::refinery::RouteMode::Pinned => (
             "pending".to_string(),
-            "Stored. Wenlan is compiling classification + page links in the \
-             background (~2s). Recall will surface the enriched form shortly."
+            "Stored. Recall is available now; Wenlan will quietly enrich \
+             classification and page links in the background."
                 .to_string(),
-        )
-    } else {
-        ("not_needed".to_string(), String::new())
+        ),
+        wenlan_core::refinery::RouteMode::Unconfigured => (
+            "paused".to_string(),
+            "Stored. Recall is available now; background enrichment is paused \
+             until you choose a model source."
+                .to_string(),
+        ),
+        wenlan_core::refinery::RouteMode::PinnedUnavailable => (
+            "paused".to_string(),
+            "Stored. Recall is available now; background enrichment is paused \
+             because the selected model source is unavailable."
+                .to_string(),
+        ),
     };
 
     Ok(Json(StoreMemoryResponse {
@@ -864,6 +845,9 @@ pub async fn handle_store_memory(
         extraction_method,
         enrichment,
         hint,
+        space: persisted_space,
+        space_source: Some(persisted_space_source),
+        write_outcome: Some(WriteOutcome::Created),
     }))
 }
 
@@ -889,6 +873,7 @@ pub async fn handle_search_memory(
     State(state): State<Arc<RwLock<ServerState>>>,
     headers: HeaderMap,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     Json(req): Json<SearchMemoryRequest>,
 ) -> Result<Json<SearchMemoryResponse>, ServerError> {
     let start = std::time::Instant::now();
@@ -1046,6 +1031,24 @@ pub async fn handle_search_memory(
         }
     };
 
+    // Both branches above land here, so the gate is total over the field. A
+    // page-channel row is a `SearchResult` carrying the page's PROSE in
+    // `content`, not a `Page`, so it rides on `Full` -- there is no entry form
+    // for a search hit, and reducing one would leave a titled row with an empty
+    // body. `source_id` is the page id (`search_result_from_page`, db.rs).
+    let supplemental_pages = match supplemental_pages {
+        Some(pages) => {
+            let kept =
+                wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, pages, |row| {
+                    row.source_id.as_str()
+                })
+                .await
+                .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+            (!kept.is_empty()).then_some(kept)
+        }
+        None => None,
+    };
+
     Ok(Json(SearchMemoryResponse {
         results,
         took_ms,
@@ -1145,317 +1148,6 @@ pub async fn handle_delete_memory(
     }
 
     Ok(Json(DeleteResponse { deleted: true }))
-}
-
-// ===== Knowledge Graph Handlers =====
-
-pub async fn handle_create_entity(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    headers: HeaderMap,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Json(mut req): Json<CreateEntityRequest>,
-) -> Result<Json<CreateEntityResponse>, ServerError> {
-    // Apply X-Origin-Space header as fallback only when body omits `space`.
-    if req.space.is_none() {
-        req.space = header_space;
-    }
-    let agent = extract_agent_name(&headers, None);
-    let db = {
-        let s = state.read().await;
-        s.db.as_ref()
-            .cloned()
-            .ok_or(ServerError::DbNotInitialized)?
-    };
-    req.space = registered_request_space(&db, &req.space, "create_entity").await?;
-    let result = wenlan_core::post_write::create_entity(&db, req, &agent).await?;
-    Ok(Json(CreateEntityResponse {
-        id: result.id,
-        warnings: result.warnings,
-    }))
-}
-
-pub async fn handle_create_relation(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<CreateRelationRequest>,
-) -> Result<Json<CreateRelationResponse>, ServerError> {
-    let agent = extract_agent_name(&headers, req.source_agent.as_deref());
-    let db = {
-        let s = state.read().await;
-        s.db.as_ref()
-            .cloned()
-            .ok_or(ServerError::DbNotInitialized)?
-    };
-    let result = wenlan_core::post_write::create_relation(&db, req, &agent).await?;
-    Ok(Json(CreateRelationResponse {
-        id: result.id,
-        warnings: result.warnings,
-    }))
-}
-
-pub async fn handle_add_observation(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    headers: HeaderMap,
-    Json(req): Json<AddObservationRequest>,
-) -> Result<Json<AddObservationResponse>, ServerError> {
-    let agent = extract_agent_name(&headers, req.source_agent.as_deref());
-    let db = {
-        let s = state.read().await;
-        s.db.as_ref()
-            .cloned()
-            .ok_or(ServerError::DbNotInitialized)?
-    };
-    let result = wenlan_core::post_write::add_observation(&db, req, &agent).await?;
-    Ok(Json(AddObservationResponse {
-        id: result.id,
-        warnings: result.warnings,
-    }))
-}
-
-pub async fn handle_link_entity(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Json(req): Json<LinkEntityRequest>,
-) -> Result<Json<serde_json::Value>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-    db.update_memory_entity_id(&req.source_id, &req.entity_id)
-        .await
-        .map_err(|e| ServerError::IngestFailed(e.to_string()))?;
-    Ok(Json(serde_json::json!({"linked": true})))
-}
-
-// ===== Profile Handlers =====
-
-pub async fn handle_get_profile(
-    State(state): State<Arc<RwLock<ServerState>>>,
-) -> Result<Json<ProfileResponse>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-    let profile = db
-        .get_profile()
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    match profile {
-        Some(p) => Ok(Json(ProfileResponse {
-            id: p.id,
-            name: p.name,
-            display_name: p.display_name,
-            email: p.email,
-            bio: p.bio,
-            avatar_path: p.avatar_path,
-            created_at: p.created_at,
-            updated_at: p.updated_at,
-        })),
-        None => Err(ServerError::NotFound("No profile found".to_string())),
-    }
-}
-
-pub async fn handle_update_profile(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Json(req): Json<UpdateProfileRequest>,
-) -> Result<Json<ProfileResponse>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-    let profile = db
-        .get_profile()
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or(ServerError::NotFound("No profile found".to_string()))?;
-    db.update_profile(
-        &profile.id,
-        req.name.as_deref(),
-        req.display_name.as_deref(),
-        req.email.as_deref(),
-        req.bio.as_deref(),
-        req.avatar_path.as_deref(),
-    )
-    .await
-    .map_err(|e| ServerError::Internal(e.to_string()))?;
-    let updated = db
-        .get_profile()
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or(ServerError::NotFound("No profile found".to_string()))?;
-    Ok(Json(ProfileResponse {
-        id: updated.id,
-        name: updated.name,
-        display_name: updated.display_name,
-        email: updated.email,
-        bio: updated.bio,
-        avatar_path: updated.avatar_path,
-        created_at: updated.created_at,
-        updated_at: updated.updated_at,
-    }))
-}
-
-// ===== Agent Handlers =====
-
-pub async fn handle_list_agents(
-    State(state): State<Arc<RwLock<ServerState>>>,
-) -> Result<Json<Vec<AgentResponse>>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-    let agents = db
-        .list_agents()
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(agents.into_iter().map(agent_to_response).collect()))
-}
-
-pub async fn handle_get_agent(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(name): Path<String>,
-) -> Result<Json<AgentResponse>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-    let agent = db
-        .get_agent(&name)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or(ServerError::NotFound(format!("Agent '{}' not found", name)))?;
-    Ok(Json(agent_to_response(agent)))
-}
-
-pub async fn handle_update_agent(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(name): Path<String>,
-    Json(req): Json<UpdateAgentRequest>,
-) -> Result<Json<AgentResponse>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-    db.get_agent(&name)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or(ServerError::NotFound(format!("Agent '{}' not found", name)))?;
-    db.update_agent(
-        &name,
-        req.agent_type.as_deref(),
-        req.description.as_deref(),
-        req.enabled,
-        req.trust_level.as_deref(),
-        req.display_name.as_deref(),
-    )
-    .await
-    .map_err(|e| ServerError::Internal(e.to_string()))?;
-    let updated = db
-        .get_agent(&name)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or(ServerError::NotFound(format!("Agent '{}' not found", name)))?;
-    Ok(Json(agent_to_response(updated)))
-}
-
-pub async fn handle_delete_agent(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(name): Path<String>,
-) -> Result<Json<serde_json::Value>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-    db.delete_agent(&name)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(serde_json::json!({ "deleted": name })))
-}
-
-fn agent_to_response(a: wenlan_core::db::AgentConnection) -> AgentResponse {
-    AgentResponse {
-        id: a.id,
-        name: a.name,
-        display_name: a.display_name,
-        agent_type: a.agent_type,
-        description: a.description,
-        enabled: a.enabled,
-        trust_level: a.trust_level,
-        last_seen_at: a.last_seen_at,
-        memory_count: a.memory_count,
-        created_at: a.created_at,
-        updated_at: a.updated_at,
-    }
-}
-
-// ===== Knowledge Graph Retrieval Handlers =====
-
-#[derive(Debug, Deserialize)]
-pub struct ListEntitiesRequest {
-    #[serde(default)]
-    pub entity_type: Option<String>,
-    #[serde(default, alias = "domain")]
-    pub space: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ListEntitiesResponse {
-    pub entities: Vec<wenlan_core::db::Entity>,
-}
-
-pub async fn handle_list_entities(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Json(req): Json<ListEntitiesRequest>,
-) -> Result<Json<ListEntitiesResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope =
-        crate::read_scope::effective_read_scope(&db, req.space.as_deref(), header_space.as_deref())
-            .await?;
-    let entities = db
-        .list_entities_scoped(req.entity_type.as_deref(), &scope)
-        .await
-        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
-    Ok(Json(ListEntitiesResponse { entities }))
-}
-
-pub async fn handle_get_entity_detail(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Path(entity_id): Path<String>,
-) -> Result<Json<wenlan_core::db::EntityDetail>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let detail = db.get_entity_detail_scoped(&entity_id, &scope).await?;
-    Ok(Json(detail))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SearchEntitiesRequest {
-    pub query: String,
-    #[serde(default = "default_entity_search_limit")]
-    pub limit: usize,
-    #[serde(default, alias = "domain")]
-    pub space: Option<String>,
-}
-
-fn default_entity_search_limit() -> usize {
-    20
-}
-
-#[derive(Debug, Serialize)]
-pub struct SearchEntitiesResponse {
-    pub results: Vec<wenlan_core::db::EntitySearchResult>,
-}
-
-pub async fn handle_search_entities(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Json(req): Json<SearchEntitiesRequest>,
-) -> Result<Json<SearchEntitiesResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope =
-        crate::read_scope::effective_read_scope(&db, req.space.as_deref(), header_space.as_deref())
-            .await?;
-    let results = db
-        .search_entities_by_vector_scoped(&req.query, req.limit, &scope)
-        .await
-        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
-    Ok(Json(SearchEntitiesResponse { results }))
 }
 
 #[derive(Debug, Serialize)]
@@ -1624,48 +1316,6 @@ pub async fn handle_get_enrichment_status(
     Ok(Json(status))
 }
 
-// ===== Entity Suggestions =====
-
-#[derive(Debug, Serialize)]
-pub struct EntitySuggestion {
-    pub id: String,
-    pub entity_name: Option<String>,
-    pub source_ids: Vec<String>,
-    pub confidence: f64,
-    pub created_at: String,
-}
-
-pub async fn handle_get_entity_suggestions(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-) -> Result<Json<Vec<EntitySuggestion>>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let pending = db
-        .list_entity_suggestions_scoped(&scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-
-    let suggestions: Vec<EntitySuggestion> = pending
-        .iter()
-        .filter(|p| {
-            p.action == "suggest_entity" && (p.status == "pending" || p.status == "awaiting_review")
-        })
-        .map(|p| EntitySuggestion {
-            id: p.id.clone(),
-            entity_name: p.payload.clone(),
-            source_ids: p.source_ids.clone(),
-            confidence: p.confidence,
-            created_at: p.created_at.clone(),
-        })
-        .collect();
-
-    Ok(Json(suggestions))
-}
-
 // ===== Helpers =====
 
 fn truncate_for_title(content: &str) -> String {
@@ -1731,95 +1381,6 @@ async fn extract_agent_name_with_db(
     extract_agent_name(headers, deprecated_body_agent)
 }
 
-// ===== Space CRUD Handlers =====
-
-#[derive(Debug, Deserialize)]
-pub struct CreateSpaceRequest {
-    pub name: String,
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateSpaceRequest {
-    pub new_name: Option<String>,
-    pub description: Option<String>,
-}
-
-pub async fn handle_list_spaces(
-    State(state): State<Arc<RwLock<ServerState>>>,
-) -> Result<Json<Vec<wenlan_core::db::Space>>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let spaces = db
-        .list_spaces()
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(spaces))
-}
-
-pub async fn handle_create_space(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Json(req): Json<CreateSpaceRequest>,
-) -> Result<Json<wenlan_core::db::Space>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let space = db
-        .create_space(&req.name, req.description.as_deref(), false)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(space))
-}
-
-pub async fn handle_update_space(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(name): Path<String>,
-    Json(req): Json<UpdateSpaceRequest>,
-) -> Result<Json<wenlan_core::db::Space>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let new_name = req.new_name.as_deref().unwrap_or(&name);
-    let space = db
-        .update_space(&name, new_name, req.description.as_deref())
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(space))
-}
-
-pub async fn handle_delete_space(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(name): Path<String>,
-) -> Result<Json<serde_json::Value>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.delete_space(&name, "keep")
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(serde_json::json!({"deleted": name})))
-}
-
-pub async fn handle_move_space(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path((from, to)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let affected = db
-        .reassign_memories_space(&from, &to)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(serde_json::json!({"affected": affected})))
-}
-
 // ===== Nurture Cards =====
 
 #[derive(Debug, Deserialize)]
@@ -1881,845 +1442,9 @@ pub async fn handle_get_rejections(
     Ok(Json(records))
 }
 
-/// GET /api/pages
-pub async fn handle_list_pages(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, ServerError> {
-    let status = params.get("status").map(|s| s.as_str()).unwrap_or("active");
-    let space = params
-        .get("space")
-        .or_else(|| params.get("domain"))
-        .cloned();
-    let limit: usize = params
-        .get("limit")
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(50);
-    let offset: usize = params
-        .get("offset")
-        .and_then(|o| o.parse().ok())
-        .unwrap_or(0);
-
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope =
-        crate::read_scope::effective_read_scope(&db, space.as_deref(), header_space.as_deref())
-            .await?;
-    let pages = db
-        .list_pages_scoped(status, limit as i64, offset as i64, &scope)
-        .await
-        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
-    Ok(Json(serde_json::json!({ "pages": pages })))
-}
-
-/// GET /api/pages/:id
-pub async fn handle_get_page(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    match db.get_page_scoped(&id, &scope).await {
-        Ok(Some(page)) => Ok(Json(serde_json::json!({ "page": page }))),
-        Ok(None) => Err(ServerError::NotFound("page not found".to_string())),
-        Err(e) => Err(ServerError::SearchFailed(e.to_string())),
-    }
-}
-
-/// GET /api/pages/{id}/sources
-///
-/// Returns all source memories linked to a concept via the concept_sources join table,
-/// enriched with memory metadata for display.
-pub async fn handle_get_page_sources(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<wenlan_types::PageSourceWithMemory>>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let sources = db.get_page_sources_scoped(&id, &scope).await?;
-
-    let source_id_strings: Vec<String> =
-        sources.iter().map(|s| s.memory_source_id.clone()).collect();
-    let memories = match &scope {
-        wenlan_core::read_scope::ReadScope::Global => {
-            db.get_memories_by_source_ids(&source_id_strings).await
-        }
-        _ => {
-            db.get_memories_by_source_ids_scoped(&source_id_strings, &scope)
-                .await
-        }
-    }
-    .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
-
-    let result: Vec<wenlan_types::PageSourceWithMemory> = sources
-        .iter()
-        .map(|s| {
-            let memory = memories
-                .iter()
-                .find(|m| m.source_id == s.memory_source_id)
-                .cloned();
-            wenlan_types::PageSourceWithMemory {
-                source: s.clone(),
-                memory,
-            }
-        })
-        .collect();
-
-    Ok(Json(result))
-}
-
-/// POST /api/pages/{id}/archive
-pub async fn handle_archive_page(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-    db.archive_page(&id)
-        .await
-        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
-    Ok(Json(serde_json::json!({"status": "archived"})))
-}
-
-/// DELETE /api/pages/{id}
-///
-/// Removes both the DB row and the projected `.origin/pages/<slug>.md`
-/// file. DB-first so a transient md removal failure leaves a stale file
-/// (cheap to clean up) rather than a stranded DB row (invisible to the
-/// user). The md side failing is logged but not surfaced as an error —
-/// the caller's intent (delete the page) succeeded as far as queries
-/// are concerned.
-pub async fn handle_delete_page(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.as_ref()
-            .cloned()
-            .ok_or(ServerError::DbNotInitialized)?
-    };
-
-    let knowledge_path = wenlan_core::config::load_config().knowledge_path_or_default();
-    let projection =
-        wenlan_core::export::knowledge::KnowledgeProjectionWrite::new(knowledge_path, &db);
-    db.delete_page(&id)
-        .await
-        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
-
-    if let Err(e) = projection.remove_page(&id) {
-        tracing::warn!(
-            "[page] DB row deleted but md projection cleanup failed for {}: {}",
-            id,
-            e
-        );
-    }
-
-    Ok(Json(serde_json::json!({"status": "deleted"})))
-}
-
-/// POST /api/pages/search
-pub async fn handle_search_pages(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Json(req): Json<SearchPagesRequest>,
-) -> Result<Json<serde_json::Value>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope =
-        crate::read_scope::effective_read_scope(&db, req.space.as_deref(), header_space.as_deref())
-            .await?;
-    let results = db
-        .search_pages_scoped(
-            &req.query,
-            req.limit.unwrap_or(20),
-            req.page_type.as_deref(),
-            &scope,
-        )
-        .await
-        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
-    Ok(Json(serde_json::json!({ "pages": results })))
-}
-
-/// POST /api/pages
-///
-/// Atomic md-first + DB-index. The `.origin/pages/<slug>.md` file is the
-/// human-readable canonical form; the DB row is the hybrid index over it.
-/// If the DB insert fails after the md write succeeds, the md file is
-/// removed so the two stores stay consistent.
-pub async fn handle_create_page(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    headers: HeaderMap,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Json(mut req): Json<CreateConceptRequest>,
-) -> Result<Json<CreatePageResponse>, ServerError> {
-    let agent = extract_agent_name(&headers, None);
-    let (db, page_min_cluster_size, page_match_threshold) = {
-        let s = state.read().await;
-        (
-            s.db.as_ref()
-                .cloned()
-                .ok_or(ServerError::DbNotInitialized)?,
-            s.tuning.distillation.page_min_cluster_size,
-            s.tuning.distillation.page_match_threshold,
-        )
-    };
-
-    // Apply X-Origin-Space header as fallback only when body omits `space`.
-    // Clone before consuming so workspace fallback can use the same value.
-    if req.space.is_none() {
-        req.space = header_space.clone();
-    }
-    // HTTP/MCP `space` remains the legacy scope input. Persist it only when it
-    // names a registered space, and mirror it to `workspace` for P3 scoping when
-    // no explicit workspace was supplied.
-    req.space = registered_request_space(&db, &req.space, "create_page space").await?;
-    if req.workspace.is_none() {
-        req.workspace = req.space.clone();
-    } else {
-        req.workspace =
-            registered_request_space(&db, &req.workspace, "create_page workspace").await?;
-    }
-    let knowledge_path = wenlan_core::config::load_config().knowledge_path_or_default();
-    let result = wenlan_core::post_write::create_page_with_tuning(
-        &db,
-        req,
-        &agent,
-        Some(knowledge_path.as_path()),
-        page_min_cluster_size,
-        page_match_threshold,
-    )
-    .await?;
-    Ok(Json(CreatePageResponse {
-        id: result.id,
-        attached_to: result.attached_to,
-        warnings: result.warnings,
-    }))
-}
-
-/// POST /api/pages/export
-pub async fn handle_export_pages(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Json(req): Json<ExportPagesRequest>,
-) -> Result<Json<wenlan_types::ExportStats>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let pages = db
-        .list_pages_scoped("active", 1000, 0, &scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    let vault_path = req
-        .vault_path
-        .unwrap_or_else(|| "~/obsidian-vault/Wenlan/pages".to_string());
-    let expanded = if let Some(rest) = vault_path.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{}/{}", home, rest)
-    } else {
-        vault_path
-    };
-    let exporter =
-        wenlan_core::export::obsidian::ObsidianExporter::new(std::path::PathBuf::from(expanded));
-    use wenlan_core::export::PageExporter;
-    let stats = exporter
-        .export_all(&pages)
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(stats))
-}
-
-/// POST /api/pages/{id}/export
-pub async fn handle_export_page(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Path(page_id): Path<String>,
-    Json(req): Json<wenlan_types::requests::ExportPageRequest>,
-) -> Result<Json<wenlan_types::responses::ExportPageResponse>, ServerError> {
-    // Clone Arc out of the guard so we don't hold the RwLock read guard
-    // across the DB await. (CLAUDE.md: never hold tokio::sync::RwLock guards
-    // across .await.)
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let page = db
-        .get_page_scoped(&page_id, &scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or_else(|| ServerError::NotFound("page not found".to_string()))?;
-
-    let expanded = if let Some(rest) = req.vault_path.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{}/{}", home, rest)
-    } else {
-        req.vault_path
-    };
-
-    let exporter =
-        wenlan_core::export::obsidian::ObsidianExporter::new(std::path::PathBuf::from(expanded));
-    use wenlan_core::export::PageExporter;
-    let result = exporter
-        .export(&page)
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-
-    Ok(Json(wenlan_types::responses::ExportPageResponse {
-        path: result.path,
-    }))
-}
-
 // =====================================================================
-// Batch 2 — Indexed files / chunks
+// Batch 5 — Version and memory updates
 // =====================================================================
-
-/// GET /api/indexed-files
-pub async fn handle_list_indexed_files(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-) -> Result<Json<wenlan_types::responses::IndexedFilesResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let files = db
-        .list_indexed_files_scoped(&scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::IndexedFilesResponse {
-        files,
-    }))
-}
-
-/// GET /api/chunks/{source_id}
-pub async fn handle_get_chunks(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Path(source_id): Path<String>,
-) -> Result<Json<Vec<wenlan_core::db::MemoryDetail>>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let chunks = db
-        .get_chunks_scoped(&source_id, &scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or_else(|| ServerError::NotFound("memory not found".to_string()))?;
-    Ok(Json(chunks))
-}
-
-/// PUT /api/chunks/{id}/update
-pub async fn handle_update_chunk(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-    Json(req): Json<wenlan_types::requests::UpdateChunkRequest>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.update_memory(&id, &req.content)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// DELETE /api/chunks/time-range
-pub async fn handle_delete_by_time_range(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Json(req): Json<wenlan_types::requests::DeleteByTimeRangeRequest>,
-) -> Result<Json<wenlan_types::responses::DeleteCountResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let deleted = db
-        .delete_by_time_range(req.start, req.end)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::DeleteCountResponse {
-        deleted,
-    }))
-}
-
-/// POST /api/chunks/delete-bulk
-pub async fn handle_delete_bulk(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Json(req): Json<wenlan_types::requests::BulkDeleteRequest>,
-) -> Result<Json<wenlan_types::responses::DeleteCountResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let mut deleted = 0usize;
-    for item in &req.items {
-        if db
-            .delete_by_source_id(&item.source, &item.source_id)
-            .await
-            .is_ok()
-        {
-            deleted += 1;
-        }
-    }
-    Ok(Json(wenlan_types::responses::DeleteCountResponse {
-        deleted,
-    }))
-}
-
-// =====================================================================
-// Batch 3 — Entity / Observation CRUD
-// =====================================================================
-
-/// PUT /api/memory/entities/{id}/confirm
-pub async fn handle_confirm_entity(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-    Json(req): Json<wenlan_types::requests::ConfirmEntityRequest>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.confirm_entity(&id, req.confirmed)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// DELETE /api/memory/entities/{id}/delete
-pub async fn handle_delete_entity(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.delete_entity(&id)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// POST /api/memory/entities/{entity_id}/observations
-pub async fn handle_add_entity_observation(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(entity_id): Path<String>,
-    Json(req): Json<wenlan_types::requests::AddEntityObservationRequest>,
-) -> Result<Json<wenlan_types::responses::AddObservationResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let id = db
-        .add_observation(
-            &entity_id,
-            &req.content,
-            req.source_agent.as_deref(),
-            req.confidence,
-        )
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::AddObservationResponse {
-        id,
-        warnings: vec![],
-    }))
-}
-
-/// PUT /api/memory/observations/{id}
-pub async fn handle_update_observation(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-    Json(req): Json<wenlan_types::requests::UpdateObservationRequest>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.update_observation(&id, &req.content)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// DELETE /api/memory/observations/{id}
-pub async fn handle_delete_observation(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.delete_observation(&id)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// PUT /api/memory/observations/{id}/confirm
-pub async fn handle_confirm_observation(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-    Json(req): Json<wenlan_types::requests::ConfirmObservationRequest>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.confirm_observation(&id, req.confirmed)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-// =====================================================================
-// Batch 4 — Space CRUD
-// =====================================================================
-
-/// POST /api/spaces/{name}/pin — toggle space pinned (starred) state
-pub async fn handle_pin_space(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(name): Path<String>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    // pin_space maps to toggle_space_starred in the DB
-    db.toggle_space_starred(&name)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// POST /api/spaces/{name}/confirm
-pub async fn handle_confirm_space(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(name): Path<String>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.confirm_space(&name)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// POST /api/spaces/reorder
-pub async fn handle_reorder_space(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Json(req): Json<wenlan_types::requests::ReorderSpaceRequest>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.reorder_space(&req.name, req.new_order)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// POST /api/spaces/{name}/star — toggle starred state
-pub async fn handle_toggle_space_starred(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(name): Path<String>,
-) -> Result<Json<serde_json::Value>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let starred = db
-        .toggle_space_starred(&name)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(serde_json::json!({ "starred": starred })))
-}
-
-/// POST /api/documents/{source_id}/space — assign a document to a space (domain)
-pub async fn handle_set_document_space(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(source_id): Path<String>,
-    Json(req): Json<wenlan_types::requests::SetDocumentSpaceRequest>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let requested_space = Some(req.space_name);
-    let registered_space =
-        registered_request_space(&db, &requested_space, "set_document_space").await?;
-    db.update_memory_space_opt(&source_id, registered_space.as_deref())
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-// =====================================================================
-// Batch 5 — Activity, tags, capture stats, memory detail
-// =====================================================================
-
-/// GET /api/activities
-pub async fn handle_list_activities(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
-) -> Result<Json<wenlan_types::responses::ActivityResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let limit: usize = params
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(50);
-    let agent_name = params.get("agent_name").cloned();
-    let since: Option<i64> = params.get("since").and_then(|v| v.parse().ok());
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let activities = db
-        .list_agent_activity_scoped(limit, agent_name.as_deref(), since, &scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::ActivityResponse {
-        activities,
-    }))
-}
-
-/// GET /api/tags
-pub async fn handle_list_tags(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-) -> Result<Json<wenlan_types::responses::TagsResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let projection = db
-        .list_tags_scoped(&scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::TagsResponse {
-        tags: projection.tags,
-        document_tags: projection.document_tags,
-    }))
-}
-
-/// DELETE /api/tags/{name}
-pub async fn handle_delete_tag(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(name): Path<String>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.delete_tag(&name)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// PUT /api/documents/{source_id}/tags
-pub async fn handle_set_document_tags(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(source_id): Path<String>,
-    Json(req): Json<wenlan_types::requests::SetDocumentTagsRequest>,
-) -> Result<Json<wenlan_types::responses::TagsResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let source = document_tag_source(&req).to_string();
-    let tags = db
-        .set_document_tags(&source, &source_id, req.tags)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::TagsResponse {
-        tags,
-        document_tags: HashMap::new(),
-    }))
-}
-
-fn document_tag_source(req: &wenlan_types::requests::SetDocumentTagsRequest) -> &str {
-    req.source
-        .as_deref()
-        .map(str::trim)
-        .filter(|source| !source.is_empty())
-        .unwrap_or("memory")
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SuggestTagsQuery {
-    pub source: String,
-    pub source_id: String,
-    /// Optional caller-side hint — the Tauri app passes the name of the
-    /// active application at the document's timestamp (activities are
-    /// tracked in-process there, not in the DB).
-    #[serde(default)]
-    pub activity_app: Option<String>,
-}
-
-/// GET /api/suggest-tags?source=...&source_id=...&activity_app=...
-///
-/// Returns candidate tag names derived from a document's chunked content
-/// and title, optionally augmented with a caller-supplied activity app
-/// name, and with already-assigned tags filtered out.
-pub async fn handle_suggest_tags(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    axum::extract::Query(query): axum::extract::Query<SuggestTagsQuery>,
-) -> Result<Json<wenlan_types::responses::TagsResponse>, ServerError> {
-    // Read phase: clone db Arc, drop guard, then fetch existing tags from DB.
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let (existing, chunks) = db
-        .get_tag_suggestion_inputs_scoped(&query.source, &query.source_id, &scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or_else(|| ServerError::NotFound("memory not found".to_string()))?;
-
-    let chunk_contents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-    let title = chunks.first().map(|c| c.title.clone()).unwrap_or_default();
-
-    let mut tags = wenlan_core::tags::suggest_tags_for_document(&chunk_contents, &title, &existing);
-
-    // Merge caller-side activity hint (app name), respecting dedup + the
-    // "not already assigned" filter.
-    if let Some(app) = query.activity_app {
-        let normalized = app.trim().to_lowercase();
-        if !normalized.is_empty()
-            && !existing.iter().any(|t| t == &normalized)
-            && !tags.iter().any(|t| t == &normalized)
-        {
-            tags.push(normalized);
-            tags.sort();
-        }
-    }
-
-    Ok(Json(wenlan_types::responses::TagsResponse {
-        tags,
-        document_tags: HashMap::new(),
-    }))
-}
-
-#[cfg(test)]
-mod tag_route_tests {
-    use super::*;
-
-    #[test]
-    fn document_tag_source_prefers_request_source() {
-        let req = wenlan_types::requests::SetDocumentTagsRequest {
-            source: Some("manual".to_string()),
-            tags: vec!["rust".to_string()],
-        };
-
-        assert_eq!(document_tag_source(&req), "manual");
-    }
-
-    #[test]
-    fn document_tag_source_defaults_to_memory_for_old_payloads() {
-        let req = wenlan_types::requests::SetDocumentTagsRequest {
-            source: None,
-            tags: vec!["rust".to_string()],
-        };
-
-        assert_eq!(document_tag_source(&req), "memory");
-    }
-}
-
-/// GET /api/capture-stats
-pub async fn handle_capture_stats(
-    State(state): State<Arc<RwLock<ServerState>>>,
-) -> Result<Json<serde_json::Value>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let count = db.count().await.unwrap_or(0);
-    Ok(Json(serde_json::json!({
-        "total_chunks": count,
-    })))
-}
-
-/// GET /api/memory/{id}/detail
-pub async fn handle_get_memory_detail(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::responses::MemoryDetailResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let memory = db
-        .get_memory_detail_scoped(&id, &scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or_else(|| ServerError::NotFound("memory not found".to_string()))?;
-    Ok(Json(wenlan_types::responses::MemoryDetailResponse {
-        memory: Some(memory),
-    }))
-}
-
-/// GET /api/memory/by-ids?ids=mem_a,mem_b,...
-///
-/// Batch-fetch multiple memories by source_id in a single round trip.
-/// The response preserves input order; missing ids are silently omitted.
-/// Used by ConceptDetail to load all source memories at once.
-pub async fn handle_get_memories_by_ids(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<wenlan_types::responses::PinnedMemoriesResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let ids: Vec<String> = params
-        .get("ids")
-        .map(|s| {
-            s.split(',')
-                .filter(|p| !p.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let memories = db
-        .get_memories_by_source_ids_scoped(&ids, &scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::PinnedMemoriesResponse {
-        memories,
-    }))
-}
 
 /// GET /api/memory/{id}/versions
 pub async fn handle_get_version_chain(
@@ -2760,19 +1485,12 @@ pub async fn handle_update_memory(
         .transpose()
         .map_err(ServerError::BadRequest)?
         .map(|memory_type| memory_type.to_string());
-    let registered_space = match &req.space {
-        Some(space) => {
-            Some(registered_request_space(&db, &Some(space.clone()), "update_memory").await?)
-        }
-        None => None,
-    };
-
     wenlan_core::post_write::update_memory(
         &db,
         &id,
         wenlan_core::post_write::MemoryUpdate {
             content: req.content.as_deref(),
-            space: registered_space.as_ref().map(|space| space.as_deref()),
+            space: req.space.as_deref().map(Some),
             confirm: req.confirmed == Some(true),
             memory_type: memory_type.as_deref(),
         },
@@ -3038,724 +1756,8 @@ pub async fn handle_correct_memory(
 }
 
 // =====================================================================
-// Batch 6 — Decisions, briefing, working memory, profile narrative, pinned
+// Batch 6 — Working memory
 // =====================================================================
-
-/// GET /api/decisions
-pub async fn handle_list_decisions(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
-) -> Result<Json<wenlan_types::responses::DecisionsResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let space = params
-        .get("space")
-        .or_else(|| params.get("domain"))
-        .cloned();
-    let scope =
-        crate::read_scope::effective_read_scope(&db, space.as_deref(), header_space.as_deref())
-            .await?;
-    let limit: usize = params
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
-    let decisions = db
-        .list_memories_scoped(&scope, Some("decision"), None, None, limit)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::DecisionsResponse {
-        decisions,
-    }))
-}
-
-/// GET /api/decisions/domains
-/// (Path kept as "domains" for back-compat; will rename to "spaces" in PR-A+1.)
-pub async fn handle_list_decision_domains(
-    State(state): State<Arc<RwLock<ServerState>>>,
-) -> Result<Json<wenlan_types::responses::DecisionDomainsResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let domains = db
-        .list_decision_spaces()
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::DecisionDomainsResponse {
-        domains,
-    }))
-}
-
-/// GET /api/briefing
-pub async fn handle_get_briefing(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-) -> Result<Json<wenlan_core::briefing::BriefingResponse>, ServerError> {
-    let (db, llm, prompts, tuning) = {
-        let s = state.read().await;
-        let db = s.db.clone().ok_or(ServerError::DbNotInitialized)?;
-        let llm = s.llm.clone();
-        let prompts = s.prompts.clone();
-        let tuning = s.tuning.briefing.clone();
-        (db, llm, prompts, tuning)
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let briefing = wenlan_core::briefing::generate_briefing_scoped(
-        &db,
-        llm.as_deref(),
-        &prompts,
-        &tuning,
-        &scope,
-    )
-    .await?;
-    Ok(Json(briefing))
-}
-
-/// GET /api/profile/narrative
-///
-/// Cache-first: returns the cached narrative immediately if present, so the
-/// profile page loads instantly instead of waiting on an LLM call every time.
-/// Falls through to `generate_narrative` (which writes to cache on success)
-/// when the cache is empty. Explicit regeneration still goes through
-/// `/api/profile/narrative/regenerate`.
-pub async fn handle_get_profile_narrative(
-    State(state): State<Arc<RwLock<ServerState>>>,
-) -> Result<Json<wenlan_core::narrative::NarrativeResponse>, ServerError> {
-    let (db, llm, prompts, tuning) = {
-        let s = state.read().await;
-        let db = s.db.clone().ok_or(ServerError::DbNotInitialized)?;
-        let llm = s.llm.clone();
-        let prompts = s.prompts.clone();
-        let tuning = s.tuning.narrative.clone();
-        (db, llm, prompts, tuning)
-    };
-
-    // 1. Try the cache first. If we have a stored narrative with content,
-    //    return it immediately — no LLM round-trip on page load.
-    if let Ok(Some((content, generated_at, memory_count))) = db.get_cached_narrative().await {
-        if !content.is_empty() {
-            return Ok(Json(wenlan_core::narrative::NarrativeResponse {
-                content,
-                generated_at,
-                is_stale: false,
-                memory_count,
-            }));
-        }
-    }
-
-    // 2. Nothing cached — generate fresh (this call also writes to the cache
-    //    so subsequent loads are instant).
-    let narrative =
-        wenlan_core::narrative::generate_narrative(&db, llm.as_deref(), &prompts, &tuning)
-            .await
-            .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(narrative))
-}
-
-/// POST /api/profile/narrative/regenerate
-pub async fn handle_regenerate_narrative(
-    State(state): State<Arc<RwLock<ServerState>>>,
-) -> Result<Json<wenlan_core::narrative::NarrativeResponse>, ServerError> {
-    // Same as get, but always regenerates (no cache)
-    let (db, llm, prompts, tuning) = {
-        let s = state.read().await;
-        let db = s.db.clone().ok_or(ServerError::DbNotInitialized)?;
-        let llm = s.llm.clone();
-        let prompts = s.prompts.clone();
-        let tuning = s.tuning.narrative.clone();
-        (db, llm, prompts, tuning)
-    };
-    let narrative =
-        wenlan_core::narrative::generate_narrative(&db, llm.as_deref(), &prompts, &tuning)
-            .await
-            .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(narrative))
-}
-
-/// GET /api/memory/pinned
-pub async fn handle_list_pinned_memories(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-) -> Result<Json<wenlan_types::responses::PinnedMemoriesResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let memories = db
-        .list_pinned_memories_scoped(&scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::PinnedMemoriesResponse {
-        memories,
-    }))
-}
-
-/// POST /api/memory/{id}/pin
-pub async fn handle_pin_memory(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.pin_memory(&id)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-/// POST /api/memory/{id}/unpin
-pub async fn handle_unpin_memory(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.unpin_memory(&id)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PendingRevisionsQuery {
-    #[serde(default = "default_pending_revisions_limit")]
-    pub limit: usize,
-}
-
-fn default_pending_revisions_limit() -> usize {
-    50
-}
-
-/// GET /api/memory/pending-revisions?limit=N
-pub async fn handle_list_pending_revisions(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    axum::extract::Query(q): axum::extract::Query<PendingRevisionsQuery>,
-) -> Result<Json<Vec<wenlan_types::responses::PendingRevisionItem>>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let limit = q.limit.clamp(1, 500);
-    let items = db
-        .list_pending_revisions_scoped(limit, &scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(items))
-}
-
-/// GET /api/memory/pending-revision/{source_id}
-pub async fn handle_get_pending_revision(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Path(source_id): Path<String>,
-) -> Result<Json<Option<wenlan_core::db::PendingRevision>>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let revision = db
-        .get_pending_revision_for_scoped(&source_id, &scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or_else(|| ServerError::NotFound("memory not found".to_string()))?;
-    Ok(Json(Some(revision)))
-}
-
-/// POST /api/snapshots/{id}/delete
-pub async fn handle_delete_snapshot(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.delete_snapshot(&id)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-}
-
-// ===== Session Snapshots =====
-
-#[derive(Debug, Deserialize)]
-pub struct SnapshotsQuery {
-    #[serde(default = "default_snapshots_limit")]
-    pub limit: usize,
-}
-
-fn default_snapshots_limit() -> usize {
-    10
-}
-
-/// GET /api/snapshots?limit=N
-///
-/// Returns the N most recent session snapshots (default 10).
-pub async fn handle_list_snapshots(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    axum::extract::Query(query): axum::extract::Query<SnapshotsQuery>,
-) -> Result<Json<Vec<wenlan_types::SessionSnapshot>>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let rows = db
-        .get_recent_snapshots(query.limit)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    let snapshots = rows
-        .into_iter()
-        .map(|r| wenlan_types::SessionSnapshot {
-            id: r.id,
-            activity_id: r.activity_id,
-            started_at: r.started_at,
-            ended_at: r.ended_at,
-            primary_apps: r.primary_apps,
-            summary: r.summary,
-            tags: r.tags,
-            capture_count: r.capture_count as u64,
-        })
-        .collect();
-    Ok(Json(snapshots))
-}
-
-/// GET /api/snapshots/{id}/captures
-///
-/// Returns capture metadata (no full text) for a snapshot.
-pub async fn handle_get_snapshot_captures(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-) -> Result<Json<Vec<wenlan_types::SnapshotCapture>>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let rows = db.get_captures_for_snapshot_scoped(&id, &scope).await?;
-    let captures = rows
-        .into_iter()
-        .map(|c| wenlan_types::SnapshotCapture {
-            source_id: c.source_id,
-            app_name: c.app_name,
-            window_title: c.window_title,
-            timestamp: c.timestamp,
-            source: c.source,
-        })
-        .collect();
-    Ok(Json(captures))
-}
-
-/// GET /api/snapshots/{id}/captures-with-content
-///
-/// Returns captures for a snapshot plus their full chunked text and LLM
-/// summary.
-pub async fn handle_get_snapshot_captures_with_content(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-) -> Result<Json<Vec<wenlan_types::SnapshotCaptureWithContent>>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let captures = db
-        .get_snapshot_captures_with_content_scoped(&id, &scope)
-        .await?;
-    Ok(Json(captures))
-}
-
-/// POST /api/memory/{id}/update-page
-/// GET /api/pages/{id}/links
-///
-/// Returns the wikilink graph centered on a page: outbound (labels parsed
-/// out of this page's body, with resolved target_page_id when matched) and
-/// inbound (every active page whose body links to this title). Used by
-/// `/pages` to surface "3 inbound, 2 broken" without the caller having to
-/// fetch + parse the full body.
-pub async fn handle_get_page_links(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::responses::PageLinksResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let outbound_raw = db.get_page_outbound_links_scoped(&id, &scope).await?;
-    let inbound_raw = db.get_page_inbound_links_scoped(&id, &scope).await?;
-    let outbound = outbound_raw
-        .into_iter()
-        .map(|l| wenlan_types::responses::PageLinkOutbound {
-            label: l.label,
-            target_page_id: l.target_page_id,
-        })
-        .collect();
-    let inbound = inbound_raw
-        .into_iter()
-        .map(|(src, label)| wenlan_types::responses::PageLinkInbound {
-            source_page_id: src,
-            label,
-        })
-        .collect();
-    Ok(Json(wenlan_types::responses::PageLinksResponse {
-        outbound,
-        inbound,
-    }))
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-pub struct OrphanLinksQuery {
-    /// Minimum number of distinct source pages reaching for the same label.
-    /// Default 2 — single-source orphans are usually typos, not emergence
-    /// signal.
-    #[serde(default)]
-    pub min_count: Option<i64>,
-}
-
-/// GET /api/pages/orphan-links
-///
-/// Group every unresolved wikilink label across the graph by hit count. A
-/// label reached for by N independent pages is a topic-discovery signal:
-/// emergence can prioritize building a page on it. Capped at 100 rows;
-/// callers needing more should raise min_count and re-issue.
-pub async fn handle_list_orphan_links(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    axum::extract::Query(q): axum::extract::Query<OrphanLinksQuery>,
-) -> Result<Json<wenlan_types::responses::OrphanLinksResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let min_count = q.min_count.unwrap_or(2).max(1);
-    let labels = db
-        .list_orphan_link_labels_scoped(min_count, &scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-    let orphan_labels = labels
-        .into_iter()
-        .map(|(label, count)| wenlan_types::responses::OrphanLink { label, count })
-        .collect();
-    Ok(Json(wenlan_types::responses::OrphanLinksResponse {
-        min_count: min_count as usize,
-        orphan_labels,
-    }))
-}
-
-/// POST /api/memory/{id}/update-page
-///
-/// Manual edit from the app. Goes through the one page-write gate, so a hand
-/// edit is treated like every other write: version CAS, changelog entry,
-/// history row, and an md re-projection. It used to call the DB directly and
-/// got none of those — an in-app edit left no trail and could silently
-/// overwrite a change that landed while the editor was open.
-///
-/// `expected_version` is optional. Sending it makes the edit a precondition
-/// (refused outright if the page moved); omitting it guards on the version the
-/// server itself loaded, so the write still cannot clobber an interleaved one.
-pub async fn handle_update_page(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-    Json(req): Json<wenlan_types::requests::UpdatePageRequest>,
-) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    // Preserve existing source_memory_ids — the HTTP request only carries
-    // the new content body. Passing &[] here would wipe the page's
-    // source list, causing silent data loss.
-    let existing = db
-        .get_page(&id)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or_else(|| ServerError::NotFound(format!("page {id} not found")))?;
-
-    // knowledge_path=None: this route does not re-project the md, so an
-    // in-app edit leaves the vault copy stale until the next re-distill (the
-    // watcher sees the daemon ahead and skips rather than reverting, so the
-    // DB stays authoritative and nothing is lost). Projecting here needs the
-    // knowledge path to come from ServerState — reading global config inside
-    // a handler would point tests at the user's real vault. Tracked separately.
-    let result = wenlan_core::post_write::update_page(
-        &db,
-        &id,
-        wenlan_types::requests::UpdatePageRequest {
-            content: req.content,
-            // ponytail: these are the page's current sources, not the caller's,
-            // and they go into the retry digest. If another writer changes the
-            // source list between a write and its retry, the digest shifts and an
-            // honest retry is told its operation id was reused for a different
-            // write. Wrong error, but no double-write — the receipt still guards
-            // the mutation. Fix by digesting the caller's request only.
-            source_memory_ids: existing.source_memory_ids,
-            expected_version: req.expected_version,
-            caller_id: req.caller_id,
-            operation_id: req.operation_id,
-        },
-        "manual_edit",
-        false,
-        None,
-        None,
-    )
-    .await?;
-
-    // A refused write is a conflict, not a success — reporting ok:true would
-    // tell the editor its text was saved when the page still holds somebody
-    // else's. But "nothing changed" is not a conflict, and this route sends the
-    // page's own sources back, so saving a page without editing it lands on the
-    // no-change path. Branching on `wrote` alone answered that routine save with
-    // "somebody else edited this," which is both wrong and unactionable.
-    use wenlan_core::post_write::WriteOutcome;
-    match result.outcome {
-        WriteOutcome::Wrote | WriteOutcome::Unchanged => {
-            Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
-        }
-        WriteOutcome::Refused => Err(ServerError::Conflict(format!(
-            "page {id} changed while this edit was open; reload and reapply"
-        ))),
-        WriteOutcome::Contended => Err(ServerError::Conflict(format!(
-            "page {id} is being written too fast to edit safely; try again"
-        ))),
-        // Unreachable: gating is for machine writers, and this route is
-        // `manual_edit`. Answered honestly rather than folded into a catch-all.
-        WriteOutcome::Gated => Err(ServerError::Conflict(format!(
-            "edit to page {id} was staged for review instead of applied"
-        ))),
-    }
-}
-
-/// PUT /api/pages/{id}
-///
-/// Agent-side refresh of a page from its current sources. Replaces content,
-/// source list, optional summary; clears `stale_reason` so the refinery's
-/// re-distill skips on its next tick (CAS pattern — see refinery
-/// `re_distill_stale_pages`). Distinct from POST `/api/memory/{id}/update-page`
-/// (manual edit, flips `user_edited`, preserves sources).
-///
-/// Atomicity mirrors `handle_create_page`: write md first, persist DB index
-/// second, roll back md on DB failure. Old md content is held in memory
-/// for the rollback path so a failed DB update doesn't leave a stale .md
-/// without a matching row.
-pub async fn handle_refresh_page(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Path(id): Path<String>,
-    Json(req): Json<wenlan_types::requests::RefreshPageRequest>,
-) -> Result<Json<wenlan_types::responses::PageWriteResponse>, ServerError> {
-    // Validate the body before touching the filesystem. Empty content would
-    // produce an empty md; empty source list would orphan the page from its
-    // provenance trail — both contradict the route's documented contract.
-    if req.content.trim().is_empty() {
-        return Err(ServerError::ValidationError(
-            "content must not be empty".into(),
-        ));
-    }
-    if req.source_memory_ids.is_empty() {
-        return Err(ServerError::ValidationError(
-            "source_memory_ids must not be empty — refresh keeps the page \
-             linked to its sources"
-                .into(),
-        ));
-    }
-    wenlan_core::export::provenance::validate_canonical_page_content(&req.content)
-        .map_err(ServerError::from)?;
-
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-
-    let existing = db
-        .get_page(&id)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or_else(|| ServerError::ValidationError(format!("page {} not found", id)))?;
-
-    // Ownership gate (spec §5.1/§5.2): agent refresh is a machine write, so a
-    // human-owned page (user_edited=1 OR creation_kind='authored') must never be
-    // overwritten in place. Stage a pending revision card instead and return the
-    // gating flag; the page prose stays byte-unchanged until the human accepts.
-    if wenlan_core::post_write::page_is_human_owned(&existing) {
-        let result = wenlan_core::post_write::stage_page_revision_card(
-            &db,
-            &existing,
-            &req.content,
-            &req.source_memory_ids,
-            "agent_refresh",
-        )
-        .await
-        .map_err(ServerError::from)?;
-        return Ok(Json(wenlan_types::responses::PageWriteResponse {
-            ok: true,
-            revision_card_id: result.revision_card_id,
-            gated: true,
-        }));
-    }
-
-    let knowledge_path = wenlan_core::config::load_config().knowledge_path_or_default();
-    let writer = wenlan_core::export::knowledge::KnowledgeWriter::new(knowledge_path.clone(), &db);
-
-    // Snapshot the current md content for rollback. If the file is missing
-    // we tolerate it — the page may have been created before the projection
-    // existed; the rollback then becomes a remove_page.
-    let existing_state_file = writer.page_filename(&id);
-    let existing_md_content = existing_state_file
-        .as_ref()
-        .and_then(|f| std::fs::read_to_string(knowledge_path.join(f)).ok());
-    let projection = writer.begin_projection_write();
-
-    // Build the refreshed Page for md rendering. Bump version + last_modified
-    // mirror what `update_page_content` writes to the DB row.
-    //
-    // Summary semantics: `None` keeps the existing summary. `Some(s)` where
-    // `s` is non-empty replaces it. `Some("")` clears it — empty string maps
-    // to NULL in the DB so `IS NULL` filters work (per wenlan-core's NULL
-    // semantics rule). The MCP tool description documents this; normalize
-    // here so the daemon never stores a literal empty string.
-    let now = chrono::Utc::now().to_rfc3339();
-    let summary_update: Option<Option<String>> = match &req.summary {
-        Some(s) if s.is_empty() => Some(None),
-        Some(s) => Some(Some(s.clone())),
-        None => None,
-    };
-    let refreshed_summary = match &summary_update {
-        Some(opt) => opt.clone(),
-        None => existing.summary.clone(),
-    };
-    let refreshed_page = wenlan_core::pages::Page {
-        id: existing.id.clone(),
-        title: existing.title.clone(),
-        summary: refreshed_summary.clone(),
-        content: req.content.clone(),
-        entity_id: existing.entity_id.clone(),
-        space: existing.space.clone(),
-        source_memory_ids: req.source_memory_ids.clone(),
-        version: existing.version + 1,
-        status: existing.status.clone(),
-        created_at: existing.created_at.clone(),
-        last_compiled: now.clone(),
-        last_modified: now.clone(),
-        sources_updated_count: 0,
-        stale_reason: None,
-        pending_rebuild: None,
-        user_edited: existing.user_edited,
-        relevance_score: 0.0,
-        last_edited_by: None,
-        last_edited_at: None,
-        last_delta_summary: None,
-        changelog: None,
-        creation_kind: existing.creation_kind.clone(),
-        review_status: existing.review_status.clone(),
-        workspace: existing.workspace.clone(),
-        // Content update without fresh citations resets citations to []
-        // (Global Constraints: stale claim-maps must not survive a content edit).
-        citations: Vec::new(),
-    };
-
-    // 1. md-first
-    projection
-        .write_page(&refreshed_page)
-        .map_err(|e| ServerError::IngestFailed(format!("write_page: {}", e)))?;
-
-    use wenlan_core::post_write::WriteOutcome;
-    let db_result: Result<wenlan_core::post_write::WriteResult, wenlan_core::error::WenlanError> =
-        async {
-            let result = wenlan_core::post_write::update_page(
-                &db,
-                &id,
-                wenlan_types::requests::UpdatePageRequest {
-                    content: req.content.clone(),
-                    source_memory_ids: req.source_memory_ids.clone(),
-                    expected_version: None,
-                    caller_id: None,
-                    operation_id: None,
-                },
-                "agent_refresh",
-                false,
-                None,
-                None,
-            )
-            .await?;
-            // Carry the rest of the refresh only when the DB agrees with what the
-            // agent asked for. A Gated/Refused/Contended outcome means a human owns
-            // this prose right now — rewriting its summary or clearing its staleness
-            // would apply half of a refresh the gate just declined.
-            if matches!(
-                result.outcome,
-                WriteOutcome::Wrote | WriteOutcome::Unchanged
-            ) {
-                if let Some(opt) = &summary_update {
-                    db.update_page_summary(&id, opt.as_deref()).await?;
-                }
-                db.clear_page_staleness(&id).await?;
-            }
-            Ok(result)
-        }
-        .await;
-
-    // Roll back md to the snapshotted content so the two stores stay consistent.
-    // If the file existed before and we have its bytes, rewrite them; otherwise
-    // drop the projection.
-    let roll_back_md = || match (&existing_state_file, &existing_md_content) {
-        (Some(filename), Some(prev)) => {
-            std::fs::write(knowledge_path.join(filename), prev).map_err(|io| io.to_string())
-        }
-        _ => projection.remove_page(&id).map_err(|err| err.to_string()),
-    };
-
-    let result = match db_result {
-        Ok(result) => result,
-        Err(e) => {
-            if let Err(rb) = roll_back_md() {
-                tracing::warn!(
-                    "[page] PUT failed and md rollback also failed for {}: db_err={}, rollback_err={}",
-                    id,
-                    e,
-                    rb
-                );
-            }
-            return Err(ServerError::from(e));
-        }
-    };
-
-    // The md was written before the gate ran, stamped `version + 1`. If the write
-    // did not land, that stamp is a lie the page watcher will act on: it ingests
-    // any md whose `origin_version` is >= the DB version as an `fs_edit`
-    // (sources/page_watcher.rs), which would re-apply this agent content AS A
-    // HUMAN WRITE and flip `user_edited` — laundering it straight past the gate
-    // that just refused it. Restore the vault to what the DB actually holds.
-    if result.outcome != WriteOutcome::Wrote {
-        if let Err(rb) = roll_back_md() {
-            tracing::warn!(
-                "[page] PUT did not write ({:?}) and md rollback failed for {}: {}",
-                result.outcome,
-                id,
-                rb
-            );
-        }
-    }
-
-    Ok(Json(wenlan_types::responses::PageWriteResponse {
-        ok: true,
-        revision_card_id: result.revision_card_id,
-        gated: result.gated,
-    }))
-}
 
 // ===== Recent activity feed =====
 
@@ -3811,8 +1813,454 @@ pub async fn handle_list_unconfirmed_memories(
 }
 
 #[cfg(test)]
+mod store_scheduler_handoff_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    struct DataDirGuard {
+        previous: Option<std::ffi::OsString>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl DataDirGuard {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let previous = std::env::var_os("WENLAN_DATA_DIR");
+            std::env::set_var("WENLAN_DATA_DIR", tmp.path());
+            Self {
+                previous,
+                _tmp: tmp,
+            }
+        }
+    }
+
+    impl Drop for DataDirGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("WENLAN_DATA_DIR", value),
+                None => std::env::remove_var("WENLAN_DATA_DIR"),
+            }
+        }
+    }
+
+    struct CountingProvider {
+        calls: AtomicUsize,
+        called: Notify,
+    }
+
+    #[async_trait]
+    impl wenlan_core::llm_provider::LlmProvider for CountingProvider {
+        async fn generate(
+            &self,
+            _request: wenlan_core::llm_provider::LlmRequest,
+        ) -> Result<String, wenlan_core::llm_provider::LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.called.notify_one();
+            Ok(
+                r#"{"memory_type":"fact","domain":null,"quality":"high","importance":5,"tags":[]}"#
+                    .to_string(),
+            )
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "store-handoff-test"
+        }
+
+        fn backend(&self) -> wenlan_core::llm_provider::LlmBackend {
+            wenlan_core::llm_provider::LlmBackend::Api
+        }
+
+        fn kind(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn store_releases_server_state_before_all_db_awaits() {
+        let _lock = crate::TEST_DATA_DIR_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let _env = DataDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            wenlan_core::db::MemoryDB::new(dir.path(), Arc::new(wenlan_core::events::NoopEmitter))
+                .await
+                .unwrap(),
+        );
+        let gate = wenlan_core::quality_gate::QualityGate::new(wenlan_core::tuning::GateConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db),
+            quality_gate: gate,
+            ..Default::default()
+        }));
+        wenlan_core::config::save_config(&wenlan_core::config::Config::default()).unwrap();
+
+        let mut blocked_stages = Vec::new();
+        for (index, stage) in [
+            StoreLockTestStage::Dedup,
+            StoreLockTestStage::AgentGate,
+            StoreLockTestStage::EntityResolution,
+            StoreLockTestStage::ActivityAgentLookup,
+            StoreLockTestStage::ActivityLog,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let registration = StoreLockTestHookRegistration::install(stage);
+            let hook = registration.hook().clone();
+            let request = StoreMemoryRequest {
+                content: format!(
+                    "Store lock stage {stage:?} must release ServerState before DB await {index}."
+                ),
+                memory_type: None,
+                space: (None).into(),
+                source_agent: Some(format!("lock-lifetime-test-agent-{index}")),
+                title: None,
+                confidence: None,
+                supersedes: None,
+                entity: (stage == StoreLockTestStage::EntityResolution)
+                    .then(|| "missing-lock-test-entity".to_string()),
+                entity_id: None,
+                structured_fields: None,
+                retrieval_cue: None,
+            };
+            let task_state = state.clone();
+            let store_task = tokio::spawn(async move {
+                handle_store_memory(
+                    State(task_state),
+                    HeaderMap::new(),
+                    crate::space_header::SpaceHeader(None),
+                    Json(request),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), hook.reached.notified())
+                .await
+                .unwrap_or_else(|_| panic!("store route never reached lock stage {stage:?}"));
+
+            let writer =
+                tokio::time::timeout(std::time::Duration::from_millis(500), state.write()).await;
+            let writer_acquired = writer.is_ok();
+            drop(writer);
+            hook.release.notify_one();
+            let _response = store_task.await.unwrap().unwrap();
+            drop(registration);
+            if !writer_acquired {
+                blocked_stages.push(stage);
+            }
+        }
+
+        assert!(
+            blocked_stages.is_empty(),
+            "ServerState read guard remained held across DB awaits at {blocked_stages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_with_unconfigured_provider_reports_paused_without_calling_provider() {
+        let _lock = crate::TEST_DATA_DIR_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let _env = DataDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            wenlan_core::db::MemoryDB::new(dir.path(), Arc::new(wenlan_core::events::NoopEmitter))
+                .await
+                .unwrap(),
+        );
+        let provider = Arc::new(CountingProvider {
+            calls: AtomicUsize::new(0),
+            called: Notify::new(),
+        });
+        let gate = wenlan_core::quality_gate::QualityGate::new(wenlan_core::tuning::GateConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db.clone()),
+            llm: Some(provider.clone()),
+            quality_gate: gate,
+            ..Default::default()
+        }));
+        let req = StoreMemoryRequest {
+            content: "Store must hand enrichment to the ambient scheduler only.".to_string(),
+            memory_type: None,
+            space: (None).into(),
+            source_agent: Some("test-agent".to_string()),
+            title: None,
+            confidence: None,
+            supersedes: None,
+            entity: None,
+            entity_id: None,
+            structured_fields: None,
+            retrieval_cue: None,
+        };
+
+        wenlan_core::config::save_config(&wenlan_core::config::Config::default()).unwrap();
+        let response = handle_store_memory(
+            State(state),
+            HeaderMap::new(),
+            crate::space_header::SpaceHeader(None),
+            Json(req),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.enrichment, "paused");
+        assert!(response.0.hint.contains("Recall is available now"));
+        assert!(response.0.hint.contains("choose a model source"));
+        assert!(
+            !response.0.hint.contains("~2s"),
+            "ambient work must not promise a foreground-style completion ETA"
+        );
+        assert!(db.get_classification_candidate(3).await.unwrap().is_some());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                provider.called.notified()
+            )
+            .await
+            .is_err(),
+            "the HTTP store path must never forward an enrichment inference"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Close plan Part A item 2 / spec §5.6: `source_agent` is origin-bearing,
+    /// so a wire request may not select one of the values that decide
+    /// grounding. Before this guard, any MCP agent could send
+    /// `source_agent: "folder"` and have its own extracted relations become
+    /// promotion-eligible.
+    ///
+    /// The eligibility half of the claim is proven where it lives:
+    /// `origin::classify_origin(None) == Generated` (unit test in
+    /// `wenlan-core/src/origin.rs`) and a `generated` source never grounds
+    /// (`edge_grounding::tests::non_external_source_stays_grounded_zero`).
+    /// What this test owns is the one link those cannot see — that the row
+    /// reaches storage with the spoofed string gone.
+    #[tokio::test]
+    async fn store_drops_a_spoofed_origin_bearing_source_agent() {
+        let _lock = crate::TEST_DATA_DIR_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let _env = DataDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            wenlan_core::db::MemoryDB::new(dir.path(), Arc::new(wenlan_core::events::NoopEmitter))
+                .await
+                .unwrap(),
+        );
+        let gate = wenlan_core::quality_gate::QualityGate::new(wenlan_core::tuning::GateConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db.clone()),
+            quality_gate: gate,
+            ..Default::default()
+        }));
+        wenlan_core::config::save_config(&wenlan_core::config::Config::default()).unwrap();
+
+        for claimed in ["folder", "obsidian", "  FOLDER "] {
+            let content = format!(
+                "An agent claiming to be '{claimed}' asserts that Alice works on ProjectX."
+            );
+            let response = handle_store_memory(
+                State(state.clone()),
+                HeaderMap::new(),
+                crate::space_header::SpaceHeader(None),
+                Json(StoreMemoryRequest {
+                    content: content.clone(),
+                    memory_type: None,
+                    space: (None).into(),
+                    source_agent: Some(claimed.to_string()),
+                    title: None,
+                    confidence: None,
+                    supersedes: None,
+                    entity: None,
+                    entity_id: None,
+                    structured_fields: None,
+                    retrieval_cue: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+            let stored = db
+                .get_memory_detail(&response.0.source_id)
+                .await
+                .unwrap()
+                .expect("the store must still succeed — the claim is normalized, not rejected");
+            assert_eq!(
+                stored.source_agent, None,
+                "claimed '{claimed}' must not be persisted: it would also buy \
+                 page-genesis and doc-reconcile document privileges"
+            );
+        }
+    }
+
+    /// The guard must be narrow: an ordinary agent name is origin-neutral and
+    /// survives untouched, so attribution keeps working.
+    #[tokio::test]
+    async fn store_keeps_an_ordinary_source_agent() {
+        let _lock = crate::TEST_DATA_DIR_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let _env = DataDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            wenlan_core::db::MemoryDB::new(dir.path(), Arc::new(wenlan_core::events::NoopEmitter))
+                .await
+                .unwrap(),
+        );
+        let gate = wenlan_core::quality_gate::QualityGate::new(wenlan_core::tuning::GateConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db.clone()),
+            quality_gate: gate,
+            ..Default::default()
+        }));
+        wenlan_core::config::save_config(&wenlan_core::config::Config::default()).unwrap();
+
+        let response = handle_store_memory(
+            State(state),
+            HeaderMap::new(),
+            crate::space_header::SpaceHeader(None),
+            Json(StoreMemoryRequest {
+                content: "Alice prefers the ranking work over the ingest work.".to_string(),
+                memory_type: None,
+                space: (None).into(),
+                source_agent: Some("claude-code".to_string()),
+                title: None,
+                confidence: None,
+                supersedes: None,
+                entity: None,
+                entity_id: None,
+                structured_fields: None,
+                retrieval_cue: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_memory_detail(&response.0.source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.source_agent.as_deref(), Some("claude-code"));
+    }
+
+    #[tokio::test]
+    async fn store_with_healthy_external_pin_reports_pending_without_inline_inference() {
+        let _lock = crate::TEST_DATA_DIR_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let _env = DataDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            wenlan_core::db::MemoryDB::new(dir.path(), Arc::new(wenlan_core::events::NoopEmitter))
+                .await
+                .unwrap(),
+        );
+        let provider = Arc::new(CountingProvider {
+            calls: AtomicUsize::new(0),
+            called: Notify::new(),
+        });
+        let gate = wenlan_core::quality_gate::QualityGate::new(wenlan_core::tuning::GateConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db.clone()),
+            external_llm: Some(provider.clone()),
+            quality_gate: gate,
+            ..Default::default()
+        }));
+        let req = StoreMemoryRequest {
+            content: "A healthy explicit pin should authorize only deferred enrichment."
+                .to_string(),
+            memory_type: None,
+            space: (None).into(),
+            source_agent: Some("test-agent".to_string()),
+            title: None,
+            confidence: None,
+            supersedes: None,
+            entity: None,
+            entity_id: None,
+            structured_fields: None,
+            retrieval_cue: None,
+        };
+
+        wenlan_core::config::save_config(&wenlan_core::config::Config {
+            everyday_source: Some("external".to_string()),
+            ..wenlan_core::config::Config::default()
+        })
+        .unwrap();
+        let response = handle_store_memory(
+            State(state),
+            HeaderMap::new(),
+            crate::space_header::SpaceHeader(None),
+            Json(req),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.enrichment, "pending");
+        assert!(response.0.hint.contains("quietly enrich"));
+        assert!(db.get_classification_candidate(3).await.unwrap().is_some());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                provider.called.notified()
+            )
+            .await
+            .is_err(),
+            "the request path must not spend the authorized provider call"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
 mod split_tests {
     use super::*;
+
+    #[test]
+    fn fixed_origin_folds_profile_alias_but_preserves_other_explicit_inputs() {
+        assert_eq!(
+            fixed_enrichment_origin(true, true, true, true),
+            wenlan_core::db::EnrichmentOrigin {
+                memory_type_explicit: false,
+                structured_fields_explicit: true,
+                space_rejected: true,
+            }
+        );
+        assert_eq!(
+            fixed_enrichment_origin(true, false, false, false),
+            wenlan_core::db::EnrichmentOrigin {
+                memory_type_explicit: true,
+                structured_fields_explicit: false,
+                space_rejected: false,
+            }
+        );
+    }
 
     // Helper: construct a StoreMemoryResponse from the post-refactor helper and assert shape.
     #[test]
@@ -3932,388 +2380,6 @@ mod recent_memory_endpoint_tests {
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-}
-
-#[cfg(test)]
-mod create_page_endpoint_tests {
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use serde_json::json;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-    use tower::ServiceExt;
-
-    use crate::state::ServerState;
-    use wenlan_types::requests::CreateConceptRequest;
-
-    struct DataDirGuard {
-        previous: Option<std::ffi::OsString>,
-        _tmp: tempfile::TempDir,
-    }
-
-    impl DataDirGuard {
-        fn new() -> Self {
-            let tmp = tempfile::tempdir().unwrap();
-            let pages = tmp.path().join("pages");
-            std::fs::create_dir_all(&pages).unwrap();
-            std::fs::write(
-                tmp.path().join("config.json"),
-                serde_json::json!({ "knowledge_path": pages.to_string_lossy() }).to_string(),
-            )
-            .unwrap();
-            let previous = std::env::var_os("WENLAN_DATA_DIR");
-            std::env::set_var("WENLAN_DATA_DIR", tmp.path());
-            Self {
-                previous,
-                _tmp: tmp,
-            }
-        }
-    }
-
-    impl Drop for DataDirGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var("WENLAN_DATA_DIR", value),
-                None => std::env::remove_var("WENLAN_DATA_DIR"),
-            }
-        }
-    }
-
-    async fn build_state_with_db(
-        page_min_cluster_size: usize,
-    ) -> (Arc<RwLock<ServerState>>, tempfile::TempDir) {
-        build_state_with_db_and_page_match_threshold(
-            page_min_cluster_size,
-            wenlan_core::tuning::DistillationConfig::default().page_match_threshold,
-        )
-        .await
-    }
-
-    async fn build_state_with_db_and_page_match_threshold(
-        page_min_cluster_size: usize,
-        page_match_threshold: f64,
-    ) -> (Arc<RwLock<ServerState>>, tempfile::TempDir) {
-        let tmp = tempfile::tempdir().expect("failed to create tempdir");
-        let emitter: Arc<dyn wenlan_core::events::EventEmitter> =
-            Arc::new(wenlan_core::events::NoopEmitter);
-        let db = wenlan_core::db::MemoryDB::new(tmp.path(), emitter)
-            .await
-            .expect("MemoryDB::new should succeed");
-        db.upsert_documents(vec![
-            wenlan_core::sources::RawDocument {
-                source: "memory".to_string(),
-                source_id: "mem-page-floor-a".to_string(),
-                title: "mem-page-floor-a".to_string(),
-                content: "Rust ownership prevents memory safety bugs".to_string(),
-                last_modified: chrono::Utc::now().timestamp(),
-                memory_type: Some("fact".to_string()),
-                source_agent: Some("test".to_string()),
-                confidence: Some(0.9),
-                ..Default::default()
-            },
-            wenlan_core::sources::RawDocument {
-                source: "memory".to_string(),
-                source_id: "mem-page-floor-b".to_string(),
-                title: "mem-page-floor-b".to_string(),
-                content: "Rust borrowing validates references at compile time".to_string(),
-                last_modified: chrono::Utc::now().timestamp(),
-                memory_type: Some("fact".to_string()),
-                source_agent: Some("test".to_string()),
-                confidence: Some(0.9),
-                ..Default::default()
-            },
-            wenlan_core::sources::RawDocument {
-                source: "memory".to_string(),
-                source_id: "mem-page-floor-c".to_string(),
-                title: "mem-page-floor-c".to_string(),
-                content: "Rust lifetimes describe how long references remain valid".to_string(),
-                last_modified: chrono::Utc::now().timestamp(),
-                memory_type: Some("fact".to_string()),
-                source_agent: Some("test".to_string()),
-                confidence: Some(0.9),
-                ..Default::default()
-            },
-        ])
-        .await
-        .unwrap();
-        let mut tuning = wenlan_core::tuning::TuningConfig::default();
-        tuning.distillation.page_min_cluster_size = page_min_cluster_size;
-        tuning.distillation.page_match_threshold = page_match_threshold;
-        let server_state = ServerState {
-            db: Some(Arc::new(db)),
-            tuning,
-            ..Default::default()
-        };
-        (Arc::new(RwLock::new(server_state)), tmp)
-    }
-
-    async fn seed_distilled_page(
-        db: &wenlan_core::db::MemoryDB,
-        title: &str,
-        summary: Option<&str>,
-        content: &str,
-        space: Option<&str>,
-        source_ids: &[&str],
-    ) -> String {
-        db.upsert_documents(
-            source_ids
-                .iter()
-                .map(|source_id| wenlan_core::sources::RawDocument {
-                    source: "memory".to_string(),
-                    source_id: (*source_id).to_string(),
-                    title: (*source_id).to_string(),
-                    content: content.to_string(),
-                    last_modified: chrono::Utc::now().timestamp(),
-                    memory_type: Some("fact".to_string()),
-                    source_agent: Some("test".to_string()),
-                    confidence: Some(0.9),
-                    confirmed: Some(true),
-                    ..Default::default()
-                })
-                .collect(),
-        )
-        .await
-        .unwrap();
-        let result = wenlan_core::post_write::create_page_with_floor(
-            db,
-            CreateConceptRequest {
-                title: title.to_string(),
-                content: content.to_string(),
-                summary: summary.map(str::to_string),
-                entity_id: None,
-                space: space.map(str::to_string),
-                source_memory_ids: source_ids.iter().map(|id| (*id).to_string()).collect(),
-                creation_kind: Some("distilled".to_string()),
-                workspace: space.map(str::to_string),
-            },
-            "test",
-            None,
-            source_ids.len(),
-        )
-        .await
-        .unwrap();
-        db.set_page_review_status(&result.id, "confirmed")
-            .await
-            .unwrap();
-        result.id
-    }
-
-    #[tokio::test]
-    async fn create_distilled_page_with_two_sources_returns_422() {
-        let _lock = crate::TEST_DATA_DIR_LOCK
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await;
-        let _env = DataDirGuard::new();
-        let (state, _tmp) = build_state_with_db(3).await;
-        let app = crate::router::build_router(state);
-        let body = json!({
-            "title": "Rust Safety",
-            "content": "Rust ownership and borrowing prevent memory safety bugs by validating references",
-            "summary": "Rust safety",
-            "source_memory_ids": ["mem-page-floor-a", "mem-page-floor-b"],
-            "creation_kind": "distilled"
-        });
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/pages")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let bytes = axum::body::to_bytes(response.into_body(), 1_048_576)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            body["error"], "distilled page requires at least 3 distinct source memories (got 2)",
-            "error should explain the exact source floor: {body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_distilled_page_uses_configured_source_floor() {
-        let _lock = crate::TEST_DATA_DIR_LOCK
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await;
-        let _env = DataDirGuard::new();
-        let (state, _tmp) = build_state_with_db(4).await;
-        let app = crate::router::build_router(state);
-        let body = json!({
-            "title": "Rust References",
-            "content": "Rust ownership, borrowing, and lifetimes keep references memory safe by validating references",
-            "summary": "Rust references",
-            "source_memory_ids": [
-                "mem-page-floor-a",
-                "mem-page-floor-b",
-                "mem-page-floor-c"
-            ],
-            "creation_kind": "distilled"
-        });
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/pages")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let bytes = axum::body::to_bytes(response.into_body(), 1_048_576)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            body["error"], "distilled page requires at least 4 distinct source memories (got 3)",
-            "error should reflect ServerState tuning: {body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_distilled_near_duplicate_returns_attached_to() {
-        let _lock = crate::TEST_DATA_DIR_LOCK
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await;
-        let _env = DataDirGuard::new();
-        let (state, _tmp) = build_state_with_db(3).await;
-        let db = {
-            let s = state.read().await;
-            s.db.as_ref().cloned().unwrap()
-        };
-        db.create_space("work", None, false).await.unwrap();
-        let existing_id = seed_distilled_page(
-            &db,
-            "Rust Workspace Operations",
-            Some("Rust workspace operations"),
-            "Rust workspaces share Cargo lockfiles, inherited metadata, and all-crate checks",
-            Some("work"),
-            &["mem-page-floor-a", "mem-page-floor-b", "mem-page-floor-c"],
-        )
-        .await;
-        let app = crate::router::build_router(state);
-        let body = json!({
-            "title": "Rust Workspace Operations",
-            "content": "Rust workspaces share Cargo lockfiles, inherited metadata, and all-crate checks",
-            "summary": "Rust workspace operations",
-            "space": "work",
-            "source_memory_ids": [
-                "mem-page-floor-a",
-                "mem-page-floor-b",
-                "mem-page-floor-c"
-            ],
-            "creation_kind": "distilled"
-        });
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/pages")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1_048_576)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["id"].as_str(), Some(existing_id.as_str()));
-        assert_eq!(
-            body["attached_to"].as_str(),
-            Some(existing_id.as_str()),
-            "create_page response must expose the attach target: {body}"
-        );
-        let pages = db.list_pages("active", 10, 0).await.unwrap();
-        assert_eq!(pages.len(), 1, "HTTP near-duplicate attach must not mint");
-    }
-
-    #[tokio::test]
-    async fn create_distilled_near_duplicate_uses_configured_page_match_threshold() {
-        let _lock = crate::TEST_DATA_DIR_LOCK
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await;
-        let _env = DataDirGuard::new();
-        let (state, _tmp) = build_state_with_db_and_page_match_threshold(3, 1.1).await;
-        let db = {
-            let s = state.read().await;
-            s.db.as_ref().cloned().unwrap()
-        };
-        db.create_space("work", None, false).await.unwrap();
-        let existing_id = seed_distilled_page(
-            &db,
-            "Rust Workspace Operations",
-            Some("Rust workspace operations"),
-            "Rust workspaces share Cargo lockfiles, inherited metadata, and all-crate checks",
-            Some("recap"),
-            &["mem-page-floor-a", "mem-page-floor-b", "mem-page-floor-c"],
-        )
-        .await;
-        let app = crate::router::build_router(state);
-        let body = json!({
-            "title": "Rust Workspace Operations",
-            "content": "Rust workspaces share Cargo lockfiles, inherited metadata, and all-crate checks",
-            "summary": "Rust workspace operations",
-            "space": "work",
-            "source_memory_ids": [
-                "mem-page-floor-a",
-                "mem-page-floor-b",
-                "mem-page-floor-c"
-            ],
-            "creation_kind": "distilled"
-        });
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/pages")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1_048_576)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_ne!(
-            body["id"].as_str(),
-            Some(existing_id.as_str()),
-            "configured threshold above possible cosine must force a new page: {body}"
-        );
-        assert!(
-            body.get("attached_to").is_none(),
-            "new page response must omit attached_to: {body}"
-        );
-        let pages = db.list_pages("active", 10, 0).await.unwrap();
-        assert_eq!(
-            pages.len(),
-            2,
-            "below configured threshold should mint a new page"
-        );
     }
 }
 
@@ -4704,7 +2770,7 @@ mod search_quick_path_page_tests {
                 entity_id: None,
                 source_memory_ids: vec![source_id.to_string()],
                 creation_kind: Some("distilled".to_string()),
-                space: Some(space.to_string()),
+                space: (Some(space.to_string())).into(),
                 workspace: Some(space.to_string()),
             },
             "test",
@@ -5074,62 +3140,4 @@ mod dismiss_revision_tests {
             "the original target must remain after dismiss"
         );
     }
-}
-
-// ===== Revision history endpoints =====
-
-/// GET /api/memory/{id}/revisions
-///
-/// Walk the supersede chain for a memory and return all revision entries.
-pub async fn handle_get_memory_revisions(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::responses::ListMemoryRevisionsResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let entries = db
-        .walk_supersede_chain_scoped(&id, &scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or_else(|| ServerError::NotFound("memory not found".to_string()))?;
-    let chain_depth = entries.last().map(|e| e.depth).unwrap_or(0);
-    Ok(Json(wenlan_types::responses::ListMemoryRevisionsResponse {
-        current_source_id: id,
-        chain_depth,
-        entries,
-    }))
-}
-
-/// GET /api/pages/{id}/revisions
-///
-/// Return the changelog entries for a page, plus envelope metadata.
-pub async fn handle_get_page_revisions(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::responses::ListPageRevisionsResponse>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let page = db
-        .get_page_scoped(&id, &scope)
-        .await?
-        .ok_or_else(|| ServerError::NotFound("page not found".to_string()))?;
-    let changelog_str = db.get_page_changelog_scoped(&id, &scope).await?;
-    let entries: Vec<wenlan_types::responses::PageChangelogEntry> =
-        serde_json::from_str(&changelog_str)
-            .map_err(|e| ServerError::Internal(format!("parse changelog: {e}")))?;
-    Ok(Json(wenlan_types::responses::ListPageRevisionsResponse {
-        page_id: id,
-        current_version: page.version,
-        user_edited: page.user_edited,
-        stale_reason: page.stale_reason.clone(),
-        entries,
-    }))
 }

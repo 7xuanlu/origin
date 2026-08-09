@@ -1,48 +1,65 @@
 name: Coverage (informational)
 
-# Non-blocking coverage report posted to PRs. Pre-push and the main CI lane
-# both skip coverage; this workflow exists to give visibility without slowing
-# the merge gate. See AGENTS.md "Local vs CI test responsibilities".
+# Non-blocking coverage report for main and manual runs. Pre-push and the main
+# CI lane both skip instrumentation; this workflow keeps visibility without
+# slowing the merge gate. See AGENTS.md "Local vs CI test responsibilities".
 
 on:
-  # Coverage was running on every PR (~7 min). Coverage is informational
-  # and rarely changes the merge decision; restrict to main pushes and
-  # manual dispatch so PRs aren't gated on it.
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/pull_request_template.md'
-      - 'LICENSE'
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Don't run on every push — only PRs and manual triggers.
-# Cancel in-flight runs when a new commit lands on the PR.
-concurrency:
-  group: coverage-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  measure-plan:
+    name: route main measurements
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      coverage-required: ${{ steps.plan.outputs.coverage-required }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Plan main measurements
+        id: plan
+        env:
+          MEASURE_EVENT_NAME: ${{ github.event_name }}
+          MEASURE_BEFORE: ${{ github.event.before }}
+          MEASURE_HEAD: ${{ github.sha }}
+        run: |
+          python3 scripts/ci_measure_plan.py \
+            --event-name "$MEASURE_EVENT_NAME" \
+            --before "$MEASURE_BEFORE" \
+            --head "$MEASURE_HEAD" \
+            --github-output "$GITHUB_OUTPUT"
+
   coverage:
     name: Coverage report
+    needs: measure-plan
     runs-on: ubuntu-24.04
     if: >-
-      github.event_name != 'pull_request' ||
-      !startsWith(github.head_ref, 'release-please--branches--')
-    # Informational: never blocks merges. Failing this job is a warning, not a
-    # gate. Required-status-checks should NOT include this job.
-    continue-on-error: true
+      always() &&
+      (needs.measure-plan.result != 'success' ||
+       needs.measure-plan.outputs.coverage-required == 'true')
+    timeout-minutes: 60
+    # Keep concurrency on the expensive job: a non-owner push must not cancel
+    # a valid measurement that is already running.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      # Runtime consumers use the absolute workspace path. The cache action below
+      # uses ci.yml's exact relative spelling because the path affects cache version.
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
@@ -56,17 +73,19 @@ jobs:
           # Coverage builds with `-C instrument-coverage`, so artifacts are not
           # interchangeable with the `clippy` or `test` caches in ci.yml.
           shared-key: coverage
+          cache-targets: "false"
+          cache-all-crates: "false"
+          # Manual feature-branch runs may restore main's cache but must not
+          # create branch-scoped entries that no other ref can reuse.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache FastEmbed ONNX model
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Restore portable FastEmbed model
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
-          # Wenlan's `resolve_fastembed_cache_dir` writes to
-          # `dirs::data_dir()/wenlan/memorydb/fastembed_cache` on Linux when
-          # no per-DB path or WENLAN_TEST_FASTEMBED_CACHE override is given.
-          path: ~/.local/share/wenlan/memorydb/fastembed_cache
-          key: fastembed-bge-base-en-v1.5-q-v2
-          restore-keys: |
-            fastembed-bge-base-en-v1.5-q-
+          path: .fastembed_cache
+          key: fastembed-bge-base-en-v1.5-q-v3-portable
+          enableCrossOsArchive: "true"
+          fail-on-cache-miss: "true"
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2
@@ -76,13 +95,15 @@ jobs:
       - name: Run Rust coverage (wenlan-core + wenlan-server)
         run: |
           cargo llvm-cov --package wenlan-core --package wenlan-server \
+            --no-report
+          cargo llvm-cov report \
             --summary-only --json --output-path rust-coverage.json
-          cargo llvm-cov --package wenlan-core --package wenlan-server \
-            --summary-only
+          cargo llvm-cov report
 
       - name: Upload coverage artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: coverage-reports
           path: rust-coverage.json
           retention-days: 7
+          if-no-files-found: error

@@ -54,6 +54,43 @@ pub struct ExtractedRelation {
     pub relation_type: String,
     pub confidence: Option<f64>,
     pub explanation: Option<String>,
+    /// Verbatim quote from the source memory's content that the relation
+    /// was extracted from (M3g span capture, `docs/plans/2026-07-25-m3g-
+    /// promotion-mechanics.md` §2.3). The model supplies the quote; it may
+    /// never supply offsets -- CODE locates it as an exact substring at
+    /// write time (see `locate_span_chars`).
+    pub span: Option<String>,
+}
+
+/// Version stamp for `prompts.extract_knowledge_graph`, recorded on every
+/// span-carrying `relates` edge (§6.6 model/prompt versioning,
+/// `docs/plans/2026-07-25-m3g-promotion-mechanics.md` §8). Bump when the
+/// prompt's extraction semantics change (fields requested, span
+/// instructions, etc.) so a later audit can tell which prompt version
+/// produced a given span.
+pub const EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION: &str = "v1";
+
+/// Locate `quote` as an exact CHAR-wise substring of `content`, returning
+/// `(char_start, char_end)` -- **character** offsets, never byte offsets
+/// (AGENTS.md UTF-8 safety rule). Used at capture time (M3g span capture,
+/// `docs/plans/2026-07-25-m3g-promotion-mechanics.md` §2.3): the model
+/// supplies the verbatim quote, CODE (never the model) locates it. Returns
+/// `None` when `quote` is empty or is not an exact substring of `content`
+/// (a fabricated or altered clause) -- callers store `char_start`/
+/// `char_end` as null rather than guess.
+pub(crate) fn locate_span_chars(content: &str, quote: &str) -> Option<(usize, usize)> {
+    if quote.is_empty() {
+        return None;
+    }
+    let content_chars: Vec<char> = content.chars().collect();
+    let quote_chars: Vec<char> = quote.chars().collect();
+    if quote_chars.len() > content_chars.len() {
+        return None;
+    }
+    content_chars
+        .windows(quote_chars.len())
+        .position(|w| w == quote_chars.as_slice())
+        .map(|start| (start, start + quote_chars.len()))
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -239,5 +276,78 @@ mod tests {
         let results = parse_kg_response(raw, &memories);
         assert_eq!(results[0].relations[0].confidence, None);
         assert_eq!(results[0].relations[0].explanation, None);
+    }
+
+    #[test]
+    fn test_parse_kg_response_missing_span_defaults_none() {
+        let raw = r#"[{"i": 0, "entities": [], "observations": [], "relations": [{"from": "A", "to": "B", "type": "uses"}]}]"#;
+        let memories = vec![(0, "test".to_string())];
+        let results = parse_kg_response(raw, &memories);
+        assert_eq!(results[0].relations[0].span, None);
+    }
+
+    #[test]
+    fn test_parse_kg_response_with_span() {
+        let raw = r#"[{"i": 0, "entities": [], "observations": [], "relations": [{"from": "A", "to": "B", "type": "uses", "span": "A uses B daily"}]}]"#;
+        let memories = vec![(0, "test".to_string())];
+        let results = parse_kg_response(raw, &memories);
+        assert_eq!(
+            results[0].relations[0].span.as_deref(),
+            Some("A uses B daily")
+        );
+    }
+
+    #[test]
+    fn test_locate_span_chars_found() {
+        let content = "Alice leads the backend team at Acme.";
+        let quote = "leads the backend team";
+        let result = locate_span_chars(content, quote);
+        assert!(result.is_some());
+        let (start, end) = result.unwrap();
+        let sliced: String = content.chars().skip(start).take(end - start).collect();
+        assert_eq!(sliced, quote);
+    }
+
+    #[test]
+    fn test_locate_span_chars_not_found() {
+        let content = "Alice leads the backend team.";
+        let quote = "Bob owns the frontend team.";
+        assert_eq!(locate_span_chars(content, quote), None);
+    }
+
+    #[test]
+    fn test_locate_span_chars_empty_quote() {
+        assert_eq!(locate_span_chars("some content", ""), None);
+    }
+
+    #[test]
+    fn test_locate_span_chars_quote_longer_than_content() {
+        assert_eq!(
+            locate_span_chars("short", "this quote is way longer than the content"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_locate_span_chars_multibyte_unicode() {
+        // Multi-byte chars (CJK + a ZWJ emoji sequence) make byte offsets
+        // diverge sharply from char offsets -- the regression case for the
+        // "never byte-index" rule (AGENTS.md UTF-8 safety).
+        let content = "爱丽丝 (Alice) 👩‍💻 leads the 后端 team.";
+        let quote = "leads the 后端 team";
+        let result = locate_span_chars(content, quote);
+        assert!(result.is_some(), "expected quote to be located");
+        let (start, end) = result.unwrap();
+        let sliced: String = content.chars().skip(start).take(end - start).collect();
+        assert_eq!(sliced, quote);
+    }
+
+    #[test]
+    fn test_locate_span_chars_altered_quote_not_found() {
+        // Same words, different substring -- an "altered clause" case: span
+        // validation must reject this, never fuzzy-match.
+        let content = "Alice does not work on Project X.";
+        let quote = "Alice works on Project X";
+        assert_eq!(locate_span_chars(content, quote), None);
     }
 }

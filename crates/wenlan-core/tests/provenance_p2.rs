@@ -85,7 +85,7 @@ async fn create_page_fixture(db: &MemoryDB, fixture: PageFixture<'_>) -> String 
         content: content.to_string(),
         summary: summary.map(str::to_string),
         entity_id: None,
-        space: space.map(str::to_string),
+        space: (space.map(str::to_string)).into(),
         source_memory_ids: source_ids.iter().map(|id| (*id).to_string()).collect(),
         creation_kind: Some(creation_kind.to_string()),
         workspace: workspace.map(str::to_string),
@@ -160,20 +160,16 @@ async fn pagewrite_create_records_resolved_source_kinds_for_file_and_url_sources
         "Web docs explain Rust workspace member crates.",
     )
     .await;
-    let req = CreateConceptRequest {
-        title: "Rust Workspaces".to_string(),
-        content: "Rust workspaces share Cargo configuration. Folder documents describe Rust workspace layouts. Web docs explain Rust workspace member crates.".to_string(),
-        summary: Some("Rust workspace sources".to_string()),
-        entity_id: None,
-        space: Some("technology".to_string()),
-        source_memory_ids: vec![
-            "mem_a".to_string(),
-            "folder-notes::rust/workspace.md".to_string(),
-            "https://example.com/rust-workspaces".to_string(),
-        ],
-        creation_kind: Some("distilled".to_string()),
-        workspace: None,
-    };
+    let req = CreateConceptRequest { title: "Rust Workspaces".to_string(),
+    content: "Rust workspaces share Cargo configuration. Folder documents describe Rust workspace layouts. Web docs explain Rust workspace member crates.".to_string(),
+    summary: Some("Rust workspace sources".to_string()),
+    entity_id: None, space: (Some("technology".to_string())).into(), source_memory_ids: vec![
+        "mem_a".to_string(),
+        "folder-notes::rust/workspace.md".to_string(),
+        "https://example.com/rust-workspaces".to_string(),
+    ],
+    creation_kind: Some("distilled".to_string()),
+    workspace: None, };
 
     let result = wenlan_core::post_write::create_page(&db, req, "test", None)
         .await
@@ -311,70 +307,13 @@ async fn dual_write_keeps_page_evidence_consistent_with_page_sources() {
     assert_eq!(ev, ps, "link_page_source diverged");
 }
 
-#[tokio::test]
-async fn update_prunes_memory_evidence_but_preserves_external() {
-    let (db, _d) = make_db().await;
-    seed_memory(&db, "mem_a", "alpha").await;
-    seed_memory(&db, "mem_b", "beta").await;
-    let page_id = create_page_fixture(
-        &db,
-        PageFixture {
-            title: "T",
-            summary: Some("s"),
-            content: "body",
-            space: None,
-            source_ids: &["mem_a", "mem_b"],
-            creation_kind: "distilled",
-            workspace: None,
-        },
-    )
-    .await;
-    // Attach a non-memory evidence row directly (the row a memory-source edit must NOT touch).
-    db.link_page_evidence(
-        &page_id,
-        "external_url",
-        Some("https://example.com"),
-        Some("Example"),
-        "manual",
-    )
-    .await
-    .unwrap();
-
-    // Edit drops mem_b. Memory rows reconcile; the external row must survive.
-    db.update_page_content(&page_id, "body2", &["mem_a"], "manual_edit")
-        .await
-        .unwrap();
-    let ev = db.get_page_evidence(&page_id).await.unwrap();
-    let mem: Vec<String> = ev
-        .iter()
-        .filter(|e| e.source_kind == "memory")
-        .filter_map(|e| e.locator.clone())
-        .collect();
-    assert_eq!(
-        mem,
-        vec!["mem_a".to_string()],
-        "memory evidence reconciled to new set"
-    );
-    assert!(
-        ev.iter().any(|e| e.source_kind == "external_url"
-            && e.locator.as_deref() == Some("https://example.com")),
-        "external evidence must survive a memory-source edit"
-    );
-
-    // Empty-source edit: prune ALL memory rows; external still preserved.
-    db.update_page_content(&page_id, "body3", &[], "manual_edit")
-        .await
-        .unwrap();
-    let ev = db.get_page_evidence(&page_id).await.unwrap();
-    assert!(
-        !ev.iter().any(|e| e.source_kind == "memory"),
-        "empty-source edit prunes all memory evidence"
-    );
-    assert!(
-        ev.iter().any(|e| e.source_kind == "external_url"),
-        "external evidence preserved on empty-source edit"
-    );
-}
+// `update_prunes_memory_evidence_but_preserves_external` relocated to
+// `crates/wenlan-core/src/db/main_tests.rs` (G6 Stage 2 PR 2b): its one
+// manual `external_url` evidence attach called `link_page_evidence`, which
+// closed to `#[cfg(test)]` under the Q2 ruling (the authored/typed-manual
+// entry point had zero live rows). `#[cfg(test)]` does not cross the
+// `tests/` integration-binary boundary, so the test moved into the crate's
+// own unit-test suite where it compiles. Assertions unchanged.
 
 #[tokio::test]
 async fn distilled_page_defaults_creation_kind_distilled() {
@@ -483,7 +422,7 @@ async fn distilled_zero_source_page_rejected() {
         content: "body".into(),
         summary: Some("s".into()),
         entity_id: None,
-        space: None,
+        space: (None).into(),
         source_memory_ids: vec![],
         creation_kind: Some("distilled".into()),
         workspace: None,
@@ -503,7 +442,7 @@ async fn authored_zero_source_page_accepted_unconfirmed() {
         content: "hand written body".into(),
         summary: Some("sum".into()),
         entity_id: None,
-        space: None,
+        space: (None).into(),
         source_memory_ids: vec![],
         creation_kind: Some("authored".into()),
         workspace: None,
@@ -528,7 +467,7 @@ async fn garbage_creation_kind_rejected() {
         content: "body".into(),
         summary: None,
         entity_id: None,
-        space: None,
+        space: (None).into(),
         source_memory_ids: vec![],
         creation_kind: Some("garbage".into()),
         workspace: None,

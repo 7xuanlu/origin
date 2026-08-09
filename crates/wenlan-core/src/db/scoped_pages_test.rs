@@ -54,6 +54,8 @@ fn page(id: &str, workspace: Option<&str>) -> Page {
         review_status: "confirmed".to_string(),
         workspace: workspace.map(str::to_string),
         citations: Vec::new(),
+        kind: "concept".to_string(),
+        truth: None,
     }
 }
 
@@ -394,13 +396,18 @@ async fn selected_page_visibility_requires_matching_workspace() {
 }
 
 #[tokio::test]
-async fn search_pages_route_helpers_bind_workspace_independently_from_category() {
+async fn search_pages_route_helpers_bind_by_scope() {
     let (db, _tmp) = test_db().await;
     let now = chrono::Utc::now().to_rfc3339();
-    for (id, category, workspace) in [
-        ("work-page-route", "decision", Some("work")),
-        ("personal-page-route", "recap", Some("personal")),
-        ("null-page-route", "decision", None),
+    // Single-axis (spec §1): a page's scope is one honest column. `workspace`
+    // wins when present; otherwise `space` is the scope. An uncategorized page
+    // has NEITHER set (both resolve to 'unfiled'). The former "category
+    // independent of workspace" premise is exactly what M1 deletes -- so
+    // null-page-route seeds no scope at all rather than a leftover category.
+    for (id, space, workspace) in [
+        ("work-page-route", None, Some("work")),
+        ("personal-page-route", None, Some("personal")),
+        ("null-page-route", None, None),
     ] {
         db.insert_page_with_kind(
             id,
@@ -408,7 +415,7 @@ async fn search_pages_route_helpers_bind_workspace_independently_from_category()
             None,
             "page route scope canary",
             None,
-            Some(category),
+            space,
             &[],
             &now,
             "authored",
@@ -506,18 +513,36 @@ async fn page_links_scoped_gate_parent_and_filter_source_pages() {
         .await
         .unwrap();
     }
-    let conn = db.conn.lock().await;
-    conn.execute(
-        "INSERT INTO page_links (source_page_id, target_page_id, label, label_key)
-         VALUES ('work-source', 'work-target', 'Work target', 'work target'),
-                ('personal-source', 'work-target', 'Work target', 'work target'),
-                ('work-source', NULL, 'Work orphan', 'work orphan'),
-                ('personal-source', NULL, 'Personal orphan', 'personal orphan')",
-        (),
+    db.replace_page_links(
+        "work-source",
+        &[
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("work-target".to_string()),
+                label: "Work target".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: None,
+                label: "Work orphan".to_string(),
+            },
+        ],
     )
     .await
     .unwrap();
-    drop(conn);
+    db.replace_page_links(
+        "personal-source",
+        &[
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("work-target".to_string()),
+                label: "Work target".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: None,
+                label: "Personal orphan".to_string(),
+            },
+        ],
+    )
+    .await
+    .unwrap();
 
     let scope = ReadScope::Space("work".to_string());
     let outbound = db
@@ -543,6 +568,205 @@ async fn page_links_scoped_gate_parent_and_filter_source_pages() {
         db.get_page_sources_scoped("personal-parent", &scope).await,
         Err(crate::WenlanError::NotFound(message)) if message == "page not found"
     ));
+}
+
+#[tokio::test]
+async fn page_links_scoped_outbound_merges_edges_and_orphans_by_label_key() {
+    let (db, _tmp) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, title) in [
+        ("outbound-source", "Outbound source"),
+        ("outbound-alpha", "Alpha"),
+        ("outbound-zulu", "Zulu"),
+    ] {
+        db.insert_page_with_kind(
+            id,
+            title,
+            None,
+            "outbound label ordering",
+            None,
+            Some("work"),
+            &[],
+            &now,
+            "authored",
+            "confirmed",
+            Some("work"),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    db.replace_page_links(
+        "outbound-source",
+        &[
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("outbound-zulu".to_string()),
+                label: "zUlU".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("outbound-alpha".to_string()),
+                label: "ALPHA".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: None,
+                label: "Bravo".to_string(),
+            },
+        ],
+    )
+    .await
+    .unwrap();
+
+    let links = db
+        .get_page_outbound_links_scoped("outbound-source", &ReadScope::Global)
+        .await
+        .unwrap();
+    assert_eq!(
+        links,
+        vec![
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("outbound-alpha".to_string()),
+                label: "ALPHA".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: None,
+                label: "Bravo".to_string(),
+            },
+            crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("outbound-zulu".to_string()),
+                label: "zUlU".to_string(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn page_links_scoped_inbound_reads_edges_orders_and_filters_sources() {
+    let (db, _tmp) = test_db().await;
+    for (id, workspace, modified) in [
+        ("inbound-target", "work", "2026-08-04T00:00:00Z"),
+        ("inbound-new", "work", "2026-08-04T03:00:00Z"),
+        ("inbound-old", "work", "2026-08-04T02:00:00Z"),
+        ("inbound-other-space", "personal", "2026-08-04T01:00:00Z"),
+    ] {
+        db.insert_page_with_kind(
+            id,
+            id,
+            None,
+            "inbound edge ordering",
+            None,
+            Some(workspace),
+            &[],
+            modified,
+            "authored",
+            "confirmed",
+            Some(workspace),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    for (source, label) in [
+        ("inbound-new", "New label"),
+        ("inbound-old", "Old label"),
+        ("inbound-other-space", "Other label"),
+    ] {
+        db.replace_page_links(
+            source,
+            &[crate::synthesis::wikilinks::Wikilink {
+                target_page_id: Some("inbound-target".to_string()),
+                label: label.to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.get_page_inbound_links_scoped("inbound-target", &ReadScope::Global)
+            .await
+            .unwrap(),
+        vec![
+            ("inbound-new".to_string(), "New label".to_string()),
+            ("inbound-old".to_string(), "Old label".to_string()),
+            ("inbound-other-space".to_string(), "Other label".to_string()),
+        ]
+    );
+    assert_eq!(
+        db.get_page_inbound_links_scoped("inbound-target", &ReadScope::Space("work".to_string()),)
+            .await
+            .unwrap(),
+        vec![
+            ("inbound-new".to_string(), "New label".to_string()),
+            ("inbound-old".to_string(), "Old label".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn page_links_scoped_outbound_reads_edges_not_resolved_page_links() {
+    let (db, _tmp) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for id in [
+        "reader-swap-source",
+        "reader-swap-legacy-target",
+        "reader-swap-edge-target",
+    ] {
+        db.insert_page_with_kind(
+            id,
+            id,
+            None,
+            "reader swap control",
+            None,
+            Some("work"),
+            &[],
+            &now,
+            "authored",
+            "confirmed",
+            Some("work"),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO page_links (source_page_id, target_page_id, label_key, label)
+         VALUES ('reader-swap-source', 'reader-swap-legacy-target',
+                 'legacy-only', 'Legacy only')",
+        (),
+    )
+    .await
+    .unwrap();
+    let edge_id = crate::provenance::compute_edge_id(
+        "links",
+        "page",
+        "reader-swap-source",
+        "page",
+        "reader-swap-edge-target",
+        "edge-only",
+    );
+    conn.execute(
+        "INSERT INTO edges (
+             edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+             lineage, grounded, space, payload, created_at
+         ) VALUES (?1, 'reader-swap-source', 'page', 'reader-swap-edge-target',
+                   'page', 'links', 'synthesis', 0, 'work', ?2, 0)",
+        libsql::params![edge_id, r#"{"label":"Edge only"}"#],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    assert_eq!(
+        db.get_page_outbound_links_scoped("reader-swap-source", &ReadScope::Global)
+            .await
+            .unwrap(),
+        vec![crate::synthesis::wikilinks::Wikilink {
+            target_page_id: Some("reader-swap-edge-target".to_string()),
+            label: "Edge only".to_string(),
+        }]
+    );
 }
 
 #[tokio::test]
@@ -614,4 +838,152 @@ async fn selected_summary_requires_nonempty_all_matching_sources() {
             .collect::<Vec<_>>(),
         vec!["work-summary"]
     );
+}
+
+// ---- fold_orphan_labels ----
+//
+// Pure and DB-free: these assert that the Rust fold reproduces the SQL
+// aggregate it replaced (`GROUP BY label_key HAVING n >= ? ORDER BY n DESC,
+// display_label ASC LIMIT 100`). That equivalence is the load-bearing claim --
+// the truth adapter can only filter orphan rows before the fold if the fold is
+// the same grouping the aggregate did.
+
+use super::scoped_pages::OrphanLinkRow;
+use crate::db::MemoryDB;
+
+fn orphan_row(label_key: &str, label: &str, source_page_id: &str) -> OrphanLinkRow {
+    OrphanLinkRow {
+        label_key: label_key.to_string(),
+        label: label.to_string(),
+        source_page_id: source_page_id.to_string(),
+    }
+}
+
+#[test]
+fn fold_orphan_labels_applies_the_min_count_threshold() {
+    let rows = vec![
+        orphan_row("rust", "Rust", "page_a"),
+        orphan_row("rust", "Rust", "page_b"),
+        orphan_row("zig", "Zig", "page_a"),
+    ];
+
+    assert_eq!(
+        MemoryDB::fold_orphan_labels(rows.clone(), 2),
+        vec![("Rust".to_string(), 2)]
+    );
+    // Below the threshold the single-source label comes back too, ordered
+    // after the 2-source one.
+    assert_eq!(
+        MemoryDB::fold_orphan_labels(rows, 1),
+        vec![("Rust".to_string(), 2), ("Zig".to_string(), 1)]
+    );
+}
+
+#[test]
+fn fold_orphan_labels_picks_the_lexicographic_min_label_like_sql_min() {
+    // Same key, three casings. `MIN(pl.label)` under BINARY collation is byte
+    // order, so uppercase wins over lowercase.
+    let rows = vec![
+        orphan_row("rust", "rust", "page_a"),
+        orphan_row("rust", "Rust", "page_b"),
+        orphan_row("rust", "RUST", "page_c"),
+    ];
+
+    assert_eq!(
+        MemoryDB::fold_orphan_labels(rows, 1),
+        vec![("RUST".to_string(), 3)]
+    );
+}
+
+#[test]
+fn fold_orphan_labels_orders_by_count_desc_then_label_asc() {
+    let rows = vec![
+        orphan_row("beta", "Beta", "page_a"),
+        orphan_row("alpha", "Alpha", "page_a"),
+        orphan_row("alpha", "Alpha", "page_b"),
+        orphan_row("gamma", "Gamma", "page_a"),
+        orphan_row("gamma", "Gamma", "page_b"),
+    ];
+
+    // Alpha and Gamma tie at 2 and break on label ASC; Beta trails at 1.
+    assert_eq!(
+        MemoryDB::fold_orphan_labels(rows, 1),
+        vec![
+            ("Alpha".to_string(), 2),
+            ("Gamma".to_string(), 2),
+            ("Beta".to_string(), 1),
+        ]
+    );
+}
+
+#[test]
+fn fold_orphan_labels_counts_distinct_source_pages() {
+    // A repeated (source_page_id, label_key) pair cannot exist under the
+    // `page_links` primary key, but the count is DISTINCT regardless of it.
+    let rows = vec![
+        orphan_row("rust", "Rust", "page_a"),
+        orphan_row("rust", "Rust", "page_a"),
+        orphan_row("rust", "Rust", "page_b"),
+    ];
+
+    assert_eq!(
+        MemoryDB::fold_orphan_labels(rows, 2),
+        vec![("Rust".to_string(), 2)]
+    );
+}
+
+#[tokio::test]
+async fn orphan_link_rows_scoped_agrees_with_the_aggregate_twin() {
+    // The rows query exists so a reader can filter by source page BEFORE the
+    // grouping happens. That only holds if rows + fold == the aggregate, so
+    // assert the equivalence against a real DB on both scope arms.
+    let (db, _tmp) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, workspace) in [
+        ("work-a", "work"),
+        ("work-b", "work"),
+        ("personal-a", "personal"),
+    ] {
+        db.insert_page_with_kind(
+            id,
+            id,
+            None,
+            "orphan row canary",
+            None,
+            Some("decision"),
+            &[],
+            &now,
+            "authored",
+            "confirmed",
+            Some(workspace),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO page_links (source_page_id, target_page_id, label, label_key)
+         VALUES ('work-a', NULL, 'Shared topic', 'shared topic'),
+                ('work-b', NULL, 'shared topic', 'shared topic'),
+                ('personal-a', NULL, 'Shared topic', 'shared topic'),
+                ('work-a', NULL, 'Lone topic', 'lone topic')",
+        (),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    for scope in [ReadScope::Global, ReadScope::Space("work".to_string())] {
+        for min_count in [1, 2, 3] {
+            let rows = db.list_orphan_link_rows_scoped(&scope).await.unwrap();
+            assert_eq!(
+                MemoryDB::fold_orphan_labels(rows, min_count),
+                db.list_orphan_link_labels_scoped(min_count, &scope)
+                    .await
+                    .unwrap(),
+                "rows+fold diverged from the aggregate at {scope:?} min_count={min_count}"
+            );
+        }
+    }
 }

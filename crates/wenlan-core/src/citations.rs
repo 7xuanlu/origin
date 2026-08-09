@@ -165,8 +165,9 @@ fn strip_out_of_range(body: &str, num_sources: usize, stripped: &mut usize) -> S
 /// citation records in body order, and aggregate stats.
 ///
 /// Sentence boundaries are computed on a marker-free "bare" copy of the
-/// body: `split_sentences` requires the terminal punctuation to be directly
-/// followed by whitespace, but a marker sits between them (`"claim.[1] Next"`).
+/// body: `faithfulness::sentence_spans` requires the terminal punctuation to
+/// be directly followed by whitespace, but a marker sits between them
+/// (`"claim.[1] Next"`).
 /// Removing the marker restores that adjacency (`"claim. Next"`) while each
 /// marker's removal position (recorded before it is dropped) still tells us
 /// which sentence it belonged to.
@@ -191,16 +192,11 @@ pub fn process_citation_output(
     }
     bare_body.push_str(&clean_body[last_end..]);
 
-    // Sentence spans over the bare body, using the same delimiter
-    // `faithfulness::split_sentences` splits on.
-    let delim_re = regex::Regex::new(r"(?m)[.!?]+\s+").expect("static regex");
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut prev = 0;
-    for m in delim_re.find_iter(&bare_body) {
-        spans.push((prev, m.start()));
-        prev = m.end();
-    }
-    spans.push((prev, bare_body.len()));
+    // Sentence spans over the bare body. The boundary rule lives in
+    // `faithfulness::sentence_spans` and only there — this path needs the
+    // offsets (to attribute each marker to its sentence), which is why it
+    // takes the span form rather than `split_sentences`.
+    let spans = crate::faithfulness::sentence_spans(&bare_body);
 
     // Paragraph spans (blank-line delimited) for the fallback scope: small
     // on-device models attach markers to a paragraph's closing elaboration
@@ -311,15 +307,17 @@ pub fn process_citation_output(
 
 /// Max legacy pages annotated per sweep tick.
 const BACKFILL_BATCH_SIZE: usize = 5;
-/// Consecutive guard-rejected annotate attempts before a page is poison-pilled
+/// Consecutive failed annotation calls before a page is poison-pilled
 /// (`citations = '[]'`, changelog notes the giveup).
 const MAX_ANNOTATE_ATTEMPTS: i64 = 3;
 /// Changelog cap, matching `post_write.rs`'s `DEFAULT_CHANGELOG_CAP`.
 const CHANGELOG_CAP: usize = 20;
 
-/// `app_metadata` key tracking consecutive guard-rejected attempts for a page.
-fn attempt_key(page_id: &str) -> String {
-    format!("citation_backfill_attempts:{page_id}")
+/// `app_metadata` key tracking consecutive failed annotation calls for one
+/// exact Page generation. A stale inference can only touch its old-version
+/// budget, never consume retries for the current Page.
+fn attempt_key(page_id: &str, page_version: i64) -> String {
+    format!("citation_backfill_attempts:{page_id}:v{page_version}")
 }
 
 /// Collapse all whitespace runs to a single space and trim. Used by the
@@ -353,18 +351,19 @@ async fn build_backfill_changelog(
         .unwrap_or_else(|_| "[]".to_string())
 }
 
-/// Record a failed annotate attempt (guard rejection OR zero markers, per
-/// spec §6) against the page's attempt counter. On the 3rd consecutive
-/// failure, poison-pills the page (`citations = '[]'`, changelog notes the
-/// giveup with `giveup_reason`) and clears the counter; otherwise bumps it.
+/// Record a failed annotate attempt (provider error, guard rejection, or zero
+/// markers) against the page's attempt counter. On the 3rd consecutive failure,
+/// poison-pills the page (`citations = '[]'`, changelog notes the giveup with
+/// `giveup_reason`) and clears the counter; otherwise bumps it.
 async fn record_annotate_failure(
     db: &MemoryDB,
     page_id: &str,
     page_version: i64,
     giveup_reason: &str,
 ) -> Result<(), WenlanError> {
+    let key = attempt_key(page_id, page_version);
     let attempts = db
-        .get_app_metadata(&attempt_key(page_id))
+        .get_app_metadata(&key)
         .await?
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(0)
@@ -372,13 +371,16 @@ async fn record_annotate_failure(
     if attempts >= MAX_ANNOTATE_ATTEMPTS {
         let changelog = build_backfill_changelog(db, page_id, page_version, giveup_reason).await;
         let _ = db
-            .set_page_citations_with_changelog(page_id, Some("[]"), &changelog)
+            .set_page_citations_with_changelog_at_version(
+                page_id,
+                Some("[]"),
+                &changelog,
+                page_version,
+            )
             .await;
-        let _ = db.set_app_metadata(&attempt_key(page_id), "0").await;
+        let _ = db.set_app_metadata(&key, "0").await;
     } else {
-        let _ = db
-            .set_app_metadata(&attempt_key(page_id), &attempts.to_string())
-            .await;
+        let _ = db.set_app_metadata(&key, &attempts.to_string()).await;
         log::info!(
             "[citation_backfill] page {page_id} annotate attempt failed (attempt {attempts})"
         );
@@ -398,7 +400,31 @@ pub async fn run_citation_backfill_tick(
     llm: &Arc<dyn LlmProvider>,
     prompts: &PromptRegistry,
 ) -> Result<(), WenlanError> {
-    for page_id in db.get_pages_missing_citations(BACKFILL_BATCH_SIZE).await? {
+    run_citation_backfill_with_page_limit(db, llm, prompts, BACKFILL_BATCH_SIZE)
+        .await
+        .map(|_| ())
+}
+
+/// Advance citation backfill by one selected page. A page without source
+/// evidence may finish without an LLM call; a page with evidence performs at
+/// most one annotate request.
+pub async fn run_citation_backfill_slice(
+    db: &MemoryDB,
+    llm: &Arc<dyn LlmProvider>,
+    prompts: &PromptRegistry,
+) -> Result<usize, WenlanError> {
+    run_citation_backfill_with_page_limit(db, llm, prompts, 1).await
+}
+
+async fn run_citation_backfill_with_page_limit(
+    db: &MemoryDB,
+    llm: &Arc<dyn LlmProvider>,
+    prompts: &PromptRegistry,
+    page_limit: usize,
+) -> Result<usize, WenlanError> {
+    let page_ids = db.get_pages_missing_citations(page_limit).await?;
+    let selected = page_ids.len();
+    for page_id in page_ids {
         let Some(page) = db.get_page(&page_id).await? else {
             continue;
         };
@@ -425,7 +451,12 @@ pub async fn run_citation_backfill_tick(
             )
             .await;
             let _ = db
-                .set_page_citations_with_changelog(&page_id, Some("[]"), &changelog)
+                .set_page_citations_with_changelog_at_version(
+                    &page_id,
+                    Some("[]"),
+                    &changelog,
+                    page.version,
+                )
                 .await;
             continue;
         }
@@ -455,7 +486,7 @@ pub async fn run_citation_backfill_tick(
             page.content,
             build_numbered_block(&numbered)
         );
-        let raw = llm
+        let raw = match llm
             .generate(LlmRequest {
                 system_prompt: Some(prompts.annotate_citations.clone()),
                 user_prompt,
@@ -465,7 +496,20 @@ pub async fn run_citation_backfill_tick(
                 timeout_secs: None,
             })
             .await
-            .map_err(|e| WenlanError::Llm(e.to_string()))?;
+        {
+            Ok(raw) => raw,
+            Err(error) => {
+                log::warn!("[citation_backfill] page {page_id} provider error: {error}");
+                record_annotate_failure(
+                    db,
+                    &page_id,
+                    page.version,
+                    "citation backfill gave up: provider error after 3 attempts",
+                )
+                .await?;
+                continue;
+            }
+        };
         let out = crate::llm_provider::strip_think_tags(&raw)
             .trim()
             .to_string();
@@ -496,32 +540,23 @@ pub async fn run_citation_backfill_tick(
                         .await;
                 let existing_sources: Vec<&str> =
                     page.source_memory_ids.iter().map(String::as_str).collect();
-                // CAS on the version this annotation was generated from: the LLM
-                // call above is slow, and a human edit landing in that window
-                // must win. Losing the CAS drops the annotation rather than
-                // overwriting the edit — the next sweep regenerates it.
-                match db
-                    .try_update_page_content_with_changelog(
+                let committed = db
+                    .try_update_page_content_with_changelog_at_version(
                         &page_id,
                         &body,
                         &existing_sources,
                         "citation_backfill",
-                        false,
                         &changelog,
                         Some(&json),
-                        Some(page.version),
+                        page.version,
                         None,
                     )
-                    .await
-                {
-                    Ok(false) => log::info!(
-                        "[citation_backfill] {page_id} changed under v{}; discarding annotation",
-                        page.version
-                    ),
-                    Ok(true) => {}
-                    Err(e) => log::warn!("[citation_backfill] {page_id} write failed: {e}"),
+                    .await?;
+                if committed {
+                    let _ = db
+                        .set_app_metadata(&attempt_key(&page_id, page.version), "0")
+                        .await;
                 }
-                let _ = db.set_app_metadata(&attempt_key(&page_id), "0").await;
             }
         } else {
             record_annotate_failure(
@@ -533,7 +568,7 @@ pub async fn run_citation_backfill_tick(
             .await?;
         }
     }
-    Ok(())
+    Ok(selected)
 }
 
 #[cfg(test)]
@@ -713,9 +748,41 @@ mod tests {
 
     // -- Task 7: annotate-only backfill tick --
 
-    use crate::llm_provider::{LlmProvider, MockProvider};
+    use crate::llm_provider::{LlmBackend, LlmError, LlmProvider, MockProvider};
     use crate::prompts::PromptRegistry;
     use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    struct BlockingCitationProvider {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        response: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for BlockingCitationProvider {
+        async fn generate(&self, _request: LlmRequest) -> Result<String, LlmError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(self.response.clone())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "blocking-citation"
+        }
+
+        fn backend(&self) -> LlmBackend {
+            LlmBackend::OnDevice
+        }
+
+        fn kind(&self) -> &'static str {
+            "test"
+        }
+    }
 
     /// Insert a bare `memories` row so `get_memories_by_source_ids` can find it.
     /// Mirrors the raw-insert pattern used by `synthesis::distill` tests.
@@ -730,10 +797,10 @@ mod tests {
         source_agent: &str,
     ) {
         let now_ts = chrono::Utc::now().timestamp();
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         conn.execute(
-            "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
-             VALUES (?1, ?1, ?1, ?2, 0, 'text', 'fact', NULL, ?3, ?4, ?4, 1, 'confirmed', 'memory')",
+            "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, source_agent, created_at, last_modified, confirmed, stability, source) \
+             VALUES (?1, ?1, ?1, ?2, 0, 'text', 'fact', ?3, ?4, ?4, 1, 'confirmed', 'memory')",
             libsql::params![
                 source_id.to_string(),
                 content.to_string(),
@@ -788,6 +855,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn citation_result_for_old_page_version_is_dropped() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        insert_test_memory(&db, "mem_citation_old", BACKFILL_MEM_CONTENT).await;
+        insert_test_memory(&db, "mem_citation_new", "The current replacement source").await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_page(
+            "p_citation_cas",
+            "T",
+            None,
+            BACKFILL_BODY,
+            None,
+            None,
+            &["mem_citation_old"],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let llm: Arc<dyn LlmProvider> = Arc::new(BlockingCitationProvider {
+            entered: entered.clone(),
+            release: release.clone(),
+            response: format!("{BACKFILL_BODY}[1]"),
+        });
+        let db = Arc::new(db);
+        let task = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                run_citation_backfill_slice(&db, &llm, &PromptRegistry::default()).await
+            })
+        };
+
+        entered.notified().await;
+        db.update_page_content(
+            "p_citation_cas",
+            "The user replaced this Page while citation inference was running.",
+            &["mem_citation_new"],
+            "manual_edit",
+        )
+        .await
+        .unwrap();
+        release.notify_one();
+        task.await.unwrap().unwrap();
+
+        let page = db.get_page("p_citation_cas").await.unwrap().unwrap();
+        assert_eq!(page.version, 2, "stale citation output must not commit");
+        assert_eq!(
+            page.content,
+            "The user replaced this Page while citation inference was running."
+        );
+        assert_eq!(
+            page.source_memory_ids,
+            vec!["mem_citation_new".to_string()],
+            "stale evidence must not be restored"
+        );
+    }
+
+    #[tokio::test]
+    async fn citation_result_is_dropped_when_page_is_archived() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        seed_backfill_page(&db, "p_citation_archived", true).await;
+        let initial_version = db
+            .get_page("p_citation_archived")
+            .await
+            .unwrap()
+            .unwrap()
+            .version;
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let llm: Arc<dyn LlmProvider> = Arc::new(BlockingCitationProvider {
+            entered: entered.clone(),
+            release: release.clone(),
+            response: format!("{BACKFILL_BODY}[1]"),
+        });
+        let db = Arc::new(db);
+        let task = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                run_citation_backfill_slice(&db, &llm, &PromptRegistry::default()).await
+            })
+        };
+
+        entered.notified().await;
+        db.archive_page("p_citation_archived").await.unwrap();
+        release.notify_one();
+        task.await.unwrap().unwrap();
+
+        let page = db.get_page("p_citation_archived").await.unwrap().unwrap();
+        assert_eq!(page.status, "archived");
+        assert_eq!(
+            page.version,
+            initial_version + 1,
+            "archive must advance the Page generation"
+        );
+        assert_eq!(
+            page.content, BACKFILL_BODY,
+            "in-flight citation output must not rewrite an archived Page"
+        );
+        assert!(page.citations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ambient_backfill_slice_processes_at_most_one_page() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        insert_test_memory(&db, "mem_slice", BACKFILL_MEM_CONTENT).await;
+        for page_id in ["p_slice_a", "p_slice_b"] {
+            db.insert_page(page_id, "T", None, BACKFILL_BODY, None, None, &[], &now)
+                .await
+                .unwrap();
+            db.link_page_evidence(page_id, "memory", Some("mem_slice"), None, "test")
+                .await
+                .unwrap();
+        }
+
+        let annotated = format!("{BACKFILL_BODY}[1]");
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(&annotated));
+        let prompts = PromptRegistry::default();
+
+        let processed = run_citation_backfill_slice(&db, &llm, &prompts)
+            .await
+            .unwrap();
+        assert_eq!(processed, 1);
+
+        let remaining = db.get_pages_missing_citations(10).await.unwrap();
+        assert_eq!(remaining.len(), 1, "one ambient turn processes one page");
+    }
+
+    #[tokio::test]
+    async fn ambient_backfill_slice_reports_empty_backlog() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::new("unused"));
+
+        let processed = run_citation_backfill_slice(&db, &llm, &PromptRegistry::default())
+            .await
+            .unwrap();
+
+        assert_eq!(processed, 0);
+    }
+
+    #[tokio::test]
     async fn backfill_preserves_external_file_source_kind() {
         let (db, _dir) = crate::db::tests::test_db().await;
         let page_id = "p_external_file";
@@ -838,7 +1048,11 @@ mod tests {
                 .contains(&"p_guard".to_string()),
             "citations should still be NULL (not processed)"
         );
-        let attempts = db.get_app_metadata(&attempt_key("p_guard")).await.unwrap();
+        let version = db.get_page("p_guard").await.unwrap().unwrap().version;
+        let attempts = db
+            .get_app_metadata(&attempt_key("p_guard", version))
+            .await
+            .unwrap();
         assert_eq!(attempts.as_deref(), Some("1"));
     }
 
@@ -872,11 +1086,53 @@ mod tests {
             log.contains("citation backfill gave up"),
             "changelog: {log}"
         );
-        let attempts = db.get_app_metadata(&attempt_key("p_poison")).await.unwrap();
+        let version = db.get_page("p_poison").await.unwrap().unwrap().version;
+        let attempts = db
+            .get_app_metadata(&attempt_key("p_poison", version))
+            .await
+            .unwrap();
         assert_eq!(
             attempts.as_deref(),
             Some("0"),
             "attempt key must be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_provider_error_at_attempt_cap_is_recorded_and_terminal() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        seed_backfill_page(&db, "p_provider_error", true).await;
+        let version = db
+            .get_page("p_provider_error")
+            .await
+            .unwrap()
+            .unwrap()
+            .version;
+        let key = attempt_key("p_provider_error", version);
+        db.set_app_metadata(&key, "2").await.unwrap();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::unavailable());
+        let selected = run_citation_backfill_slice(&db, &llm, &PromptRegistry::default())
+            .await
+            .expect("a provider failure must advance durable retry state");
+
+        assert_eq!(selected, 1);
+        assert!(
+            !db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&"p_provider_error".to_string()),
+            "the third provider failure must terminally drain this Page generation"
+        );
+        assert_eq!(
+            db.get_app_metadata(&key).await.unwrap().as_deref(),
+            Some("0"),
+            "the terminal attempt must clear the generation-scoped counter"
+        );
+        let log = db.get_page_changelog("p_provider_error").await.unwrap();
+        assert!(
+            log.contains("provider error after 3 attempts"),
+            "changelog: {log}"
         );
     }
 
@@ -944,7 +1200,11 @@ mod tests {
                 .contains(&"p_zero".to_string()),
             "citations should still be NULL after one zero-marker attempt (retry, not drain)"
         );
-        let attempts = db.get_app_metadata(&attempt_key("p_zero")).await.unwrap();
+        let version = db.get_page("p_zero").await.unwrap().unwrap().version;
+        let attempts = db
+            .get_app_metadata(&attempt_key("p_zero", version))
+            .await
+            .unwrap();
         assert_eq!(attempts.as_deref(), Some("1"));
 
         // Two more zero-marker ticks trigger the poison-pill.
@@ -994,6 +1254,123 @@ mod tests {
         assert!(
             log.contains("citation backfill gave up"),
             "changelog: {log}"
+        );
+    }
+
+    /// Relocated from `tests/page_citations_e2e.rs` (G6 Stage 2 PR 2b):
+    /// `link_page_evidence` closed to `#[cfg(test)]` (Q2 ruling), and
+    /// `#[cfg(test)]` is invisible across the `tests/` integration-binary
+    /// boundary, so this helper's manual evidence attach no longer compiled
+    /// there. Moved into the crate's own unit-test suite, where it does.
+    /// Exercises the real `create_page` API (not the lower-level
+    /// `insert_page`), unlike this module's other `seed_backfill_page`.
+    async fn seed_backfill_page_via_create_page(
+        db: &crate::db::MemoryDB,
+        body: &str,
+        mem_id: &str,
+        mem_content: &str,
+    ) -> String {
+        insert_test_memory(db, mem_id, mem_content).await;
+        let result = crate::post_write::create_page(
+            db,
+            wenlan_types::requests::CreateConceptRequest {
+                title: "T".to_string(),
+                content: body.to_string(),
+                summary: None,
+                entity_id: None,
+                space: None.into(),
+                source_memory_ids: vec![],
+                creation_kind: Some("authored".to_string()),
+                workspace: None,
+            },
+            "test",
+            None,
+        )
+        .await
+        .unwrap();
+        db.link_page_evidence(&result.id, "memory", Some(mem_id), None, "test")
+            .await
+            .unwrap();
+        result.id
+    }
+
+    /// Relocated from `tests/page_citations_e2e.rs::backfill_annotates_legacy_page`.
+    /// Assertions unchanged.
+    #[tokio::test]
+    async fn backfill_annotates_legacy_page_via_create_page() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let page_id =
+            seed_backfill_page_via_create_page(&db, BACKFILL_BODY, "mem_a", BACKFILL_MEM_CONTENT)
+                .await;
+        assert!(db
+            .get_pages_missing_citations(10)
+            .await
+            .unwrap()
+            .contains(&page_id));
+
+        let annotated = format!("{BACKFILL_BODY}[1]");
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(&annotated));
+        let prompts = PromptRegistry::default();
+
+        run_citation_backfill_tick(&db, &llm, &prompts)
+            .await
+            .unwrap();
+
+        let page = db.get_page(&page_id).await.unwrap().unwrap();
+        assert_eq!(
+            page.content, annotated,
+            "prose stays byte-identical modulo the inserted marker"
+        );
+        assert_eq!(page.citations.len(), 1, "citations: {:?}", page.citations);
+        assert_eq!(page.citations[0].status, "verified");
+        assert!(
+            !db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&page_id),
+            "page should no longer be citations-missing"
+        );
+        let changelog = db.get_page_changelog(&page_id).await.unwrap();
+        assert!(
+            changelog.contains("citation_backfill"),
+            "changelog: {changelog}"
+        );
+    }
+
+    /// Relocated from `tests/page_citations_e2e.rs::backfill_guard_rejects_rewrite_then_poison_pills`.
+    /// Assertions unchanged.
+    #[tokio::test]
+    async fn backfill_guard_rejects_rewrite_then_poison_pills_via_create_page() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let page_id =
+            seed_backfill_page_via_create_page(&db, BACKFILL_BODY, "mem_a", BACKFILL_MEM_CONTENT)
+                .await;
+
+        let rewritten = "A completely different sentence about something else entirely.[1]";
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(rewritten));
+        let prompts = PromptRegistry::default();
+
+        // 3 consecutive rejected ticks poison-pill the page.
+        for _ in 0..3 {
+            run_citation_backfill_tick(&db, &llm, &prompts)
+                .await
+                .unwrap();
+        }
+
+        let page = db.get_page(&page_id).await.unwrap().unwrap();
+        assert_eq!(page.content, BACKFILL_BODY, "prose must never be rewritten");
+        assert!(page.citations.is_empty());
+        assert!(
+            !db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&page_id),
+            "citations should be '[]' (gave up), not NULL"
+        );
+        let changelog = db.get_page_changelog(&page_id).await.unwrap();
+        assert!(
+            changelog.contains("citation backfill gave up"),
+            "changelog: {changelog}"
         );
     }
 }

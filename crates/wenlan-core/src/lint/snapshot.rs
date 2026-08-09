@@ -1,4 +1,3 @@
-use crate::db::MemoryDB;
 use crate::lint::observation::{LintRunEvent, LintRunObserver, NoopLintRunObserver};
 use sha2::{Digest, Sha256};
 use std::future::Future;
@@ -238,19 +237,6 @@ impl<'database> LintReadSnapshot<'database> {
         Fut: Future<Output = ()>,
     {
         self.finish_inner(post_snapshot_pinned).await
-    }
-}
-
-impl MemoryDB {
-    pub async fn open_lint_snapshot(&self) -> Result<LintReadSnapshot<'_>, SnapshotError> {
-        LintReadSnapshot::open_with_freshness(&self._db, Arc::clone(&self.lint_freshness)).await
-    }
-
-    pub(crate) async fn open_unpinned_lint_snapshot(
-        &self,
-        observer: Arc<dyn LintRunObserver>,
-    ) -> Result<LintReadSnapshot<'_>, SnapshotError> {
-        LintReadSnapshot::open_unpinned(&self._db, Arc::clone(&self.lint_freshness), observer).await
     }
 }
 

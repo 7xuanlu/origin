@@ -21,11 +21,14 @@ pub use crate::kg::reweave::reweave_entity_links;
 // Internal re-imports for refinery code that still calls into the moved
 // distillation helpers (distill_one_cluster + refine_clusters_with_llm).
 use crate::synthesis::detect::detect_page_candidates;
-use crate::synthesis::distill::{distill_pages_scoped_gated, refresh_page, RefreshReason};
+use crate::synthesis::distill::{
+    automatic_refresh_exceeds_source_cap, distill_pages_scoped_gated, refresh_page, RefreshReason,
+    AUTOMATIC_PAGE_REFRESH_SOURCE_CAP,
+};
 use crate::synthesis::refinement_queue::process_refinement_queue;
 
 use crate::activity::ACTIVITY_GAP_SECS;
-use crate::db::MemoryDB;
+use crate::db::{MemoryDB, StalePageCursor};
 use crate::error::WenlanError;
 use crate::llm_provider::{LlmBackend, LlmProvider, LlmRequest};
 use crate::prompts::PromptRegistry;
@@ -57,9 +60,9 @@ pub async fn compile_queue_depth(db: &MemoryDB) -> Result<usize, WenlanError> {
         .unwrap_or(0))
 }
 
-/// Whether on-device models may serve synthesis/compile work. Gated behind
-/// `WENLAN_PREFER_ON_DEVICE_COMPILE` because on-device synthesis is slow and
-/// lower quality; the daemon and the config PATCH validation both consult this.
+/// Whether legacy explicit foreground routing may fall back to on-device
+/// synthesis. Background work ignores this preference and instead requires an
+/// explicit `synthesis_source` pin.
 pub fn on_device_compile_preferred() -> bool {
     std::env::var("WENLAN_PREFER_ON_DEVICE_COMPILE")
         .ok()
@@ -111,16 +114,13 @@ pub struct EverydayRoute<'a> {
     pub llm: Option<&'a Arc<dyn LlmProvider>>,
 }
 
-/// AUTO fallback for everyday routing: Anthropic (api) → external → on-device.
+/// Legacy explicit fallback for foreground callers: Anthropic → external →
+/// on-device.
 ///
-/// This order is a MIGRATION FALLBACK for configs that predate explicit per-job
-/// source pins — it is NOT a product statement that Anthropic deserves priority
-/// over any other peer cloud model. When an `everyday_source` pin is set (the
-/// path new UI always writes), [`resolve_everyday`] honors it and only falls
-/// back to this chain when the pinned source is unavailable. The order here is
-/// retained purely so pre-pin configs behave as they did before, and it matches
-/// the chain the desktop app historically displayed. Callers that must respect
-/// a pin call [`resolve_everyday`], not this function directly.
+/// Background work must call [`resolve_everyday`], which requires an explicit
+/// source pin and never crosses sources. This helper remains only for callers
+/// whose operation itself is explicit and whose legacy fallback contract is
+/// therefore independent of background consent.
 pub fn everyday_llm<'a>(
     api_llm: Option<&'a Arc<dyn LlmProvider>>,
     external_llm: Option<&'a Arc<dyn LlmProvider>>,
@@ -171,8 +171,8 @@ impl SynthesisSource {
 
     /// Parse a config `synthesis_source` pin. `None` (the "nothing resolved"
     /// label) is not a pinnable source. `on_device` is a first-class pin — it
-    /// carries no capability restriction; the compile gate affects only the
-    /// unpinned auto chain.
+    /// carries no capability restriction; the legacy compile gate affects only
+    /// explicit callers of [`synthesis_route`].
     pub fn parse(s: Option<&str>) -> Option<Self> {
         match s {
             Some("anthropic") => Some(SynthesisSource::Anthropic),
@@ -189,17 +189,12 @@ pub struct SynthesisRoute<'a> {
     pub llm: Option<&'a Arc<dyn LlmProvider>>,
 }
 
-/// Resolve the synthesis (compile) route for display purposes.
+/// Resolve the legacy synthesis fallback for explicit foreground callers.
 ///
-/// Mirrors the Emergence phase compile routing in
-/// [`run_periodic_steep_with_api`]: prefer any cloud (Api-backed) slot in
-/// `synthesis → api → external` order, otherwise the on-device slot iff the
-/// compile gate (`WENLAN_PREFER_ON_DEVICE_COMPILE`) is set and it is available,
-/// otherwise nothing. On-device is only reachable via the gate branch because
-/// every on-device provider is `OnDevice`-backed, matching the phase for all
-/// real slot configurations. The phase itself is deliberately left inline; this
-/// function exists so the endpoint reflects the same policy without re-deriving
-/// it in the app, and the unit tests lock the two together.
+/// It prefers an Api-backed slot in `synthesis → api → external` order, then an
+/// available on-device slot only when `WENLAN_PREFER_ON_DEVICE_COMPILE` is set.
+/// Background Emergence must call [`resolve_synthesis`], which requires an
+/// explicit source pin and never crosses sources.
 pub fn synthesis_route<'a>(
     synthesis_llm: Option<&'a Arc<dyn LlmProvider>>,
     api_llm: Option<&'a Arc<dyn LlmProvider>>,
@@ -236,13 +231,13 @@ pub fn synthesis_route<'a>(
     }
 }
 
-/// How a resolved route was chosen: an explicit pin, a pin that degraded to the
-/// auto chain because its source was unavailable, or no pin.
+/// How a background route was chosen: an explicit ready pin, an explicit pin
+/// whose source is unavailable, or no user-authorized source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteMode {
     Pinned,
-    PinnedDegraded,
-    Auto,
+    PinnedUnavailable,
+    Unconfigured,
 }
 
 impl RouteMode {
@@ -250,8 +245,8 @@ impl RouteMode {
     pub fn as_str(self) -> &'static str {
         match self {
             RouteMode::Pinned => "pinned",
-            RouteMode::PinnedDegraded => "pinned_degraded",
-            RouteMode::Auto => "auto",
+            RouteMode::PinnedUnavailable => "pinned_unavailable",
+            RouteMode::Unconfigured => "unconfigured",
         }
     }
 }
@@ -263,17 +258,23 @@ pub struct EverydayResolution<'a> {
     pub mode: RouteMode,
 }
 
+/// Provider health is part of the hard pin boundary, not a fallback signal.
+/// A provider may panic while probing a partially initialized runtime; treat
+/// that exactly like `false` so automatic work remains pending instead of
+/// escaping the scheduler boundary or burning retry receipts.
+fn pinned_provider_available(llm: &Arc<dyn LlmProvider>) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| llm.is_available())).unwrap_or(false)
+}
+
 /// Resolve everyday routing, honoring an optional per-job source pin.
 ///
-/// - pin set and its slot present → that source, mode `Pinned`.
-/// - pin set but its slot absent → the [`everyday_llm`] auto chain, mode
-///   `PinnedDegraded`.
-/// - no pin → the auto chain, mode `Auto`.
+/// - pin set and its slot present + healthy → that source, mode `Pinned`.
+/// - pin set but its slot absent/unhealthy → no provider, mode `PinnedUnavailable`.
+/// - no pin → no provider, mode `Unconfigured`.
 ///
-/// "Present" matches the auto chain's own notion of availability — a slot is
-/// only built when its source is configured. This is the single entry point
-/// the refinery everyday phases and the resolved-routing endpoint both call,
-/// so pinned behavior and its display cannot drift.
+/// A slot is present only when that source has been loaded. This is the single
+/// entry point the refinery everyday phases and resolved-routing endpoint both
+/// call, so behavior and display cannot drift.
 pub fn resolve_everyday<'a>(
     pin: Option<EverydaySource>,
     api_llm: Option<&'a Arc<dyn LlmProvider>>,
@@ -287,25 +288,23 @@ pub fn resolve_everyday<'a>(
             EverydaySource::OnDevice => on_device,
             EverydaySource::Basic => None,
         };
-        if let Some(llm) = slot {
+        if let Some(llm) = slot.filter(|llm| pinned_provider_available(llm)) {
             return EverydayResolution {
                 source: pinned,
                 llm: Some(llm),
                 mode: RouteMode::Pinned,
             };
         }
-        let auto = everyday_llm(api_llm, external_llm, on_device);
         return EverydayResolution {
-            source: auto.source,
-            llm: auto.llm,
-            mode: RouteMode::PinnedDegraded,
+            source: pinned,
+            llm: None,
+            mode: RouteMode::PinnedUnavailable,
         };
     }
-    let auto = everyday_llm(api_llm, external_llm, on_device);
     EverydayResolution {
-        source: auto.source,
-        llm: auto.llm,
-        mode: RouteMode::Auto,
+        source: EverydaySource::Basic,
+        llm: None,
+        mode: RouteMode::Unconfigured,
     }
 }
 
@@ -322,8 +321,8 @@ pub struct SynthesisResolution<'a> {
 /// the routine Anthropic slot (both are the Anthropic source). The `on_device`
 /// pin is honored whenever the on-device slot is present — pins carry no
 /// capability restriction, symmetric with [`resolve_everyday`]; the compile
-/// gate governs only the unpinned auto chain in [`synthesis_route`]. A pinned-
-/// but-unavailable source degrades to the [`synthesis_route`] auto chain.
+/// gate governs only explicit callers of [`synthesis_route`]. A pinned-but-
+/// unavailable source remains pinned and pauses instead of crossing providers.
 pub fn resolve_synthesis<'a>(
     pin: Option<SynthesisSource>,
     synthesis_llm: Option<&'a Arc<dyn LlmProvider>>,
@@ -338,25 +337,23 @@ pub fn resolve_synthesis<'a>(
             SynthesisSource::OnDevice => on_device,
             SynthesisSource::None => None,
         };
-        if let Some(llm) = slot {
+        if let Some(llm) = slot.filter(|llm| pinned_provider_available(llm)) {
             return SynthesisResolution {
                 source: pinned,
                 llm: Some(llm),
                 mode: RouteMode::Pinned,
             };
         }
-        let auto = synthesis_route(synthesis_llm, api_llm, external_llm, on_device);
         return SynthesisResolution {
-            source: auto.source,
-            llm: auto.llm,
-            mode: RouteMode::PinnedDegraded,
+            source: pinned,
+            llm: None,
+            mode: RouteMode::PinnedUnavailable,
         };
     }
-    let auto = synthesis_route(synthesis_llm, api_llm, external_llm, on_device);
     SynthesisResolution {
-        source: auto.source,
-        llm: auto.llm,
-        mode: RouteMode::Auto,
+        source: SynthesisSource::None,
+        llm: None,
+        mode: RouteMode::Unconfigured,
     }
 }
 
@@ -607,14 +604,166 @@ pub async fn run_periodic_steep_with_api(
     knowledge_path: Option<&std::path::Path>,
     trigger: TriggerKind,
 ) -> Result<SteepResult, WenlanError> {
+    run_periodic_steep_with_api_scope(
+        db,
+        llm,
+        api_llm,
+        synthesis_llm,
+        external_llm,
+        prompts,
+        tuning,
+        _confidence_cfg,
+        distillation,
+        knowledge_path,
+        trigger,
+        None,
+    )
+    .await
+}
+
+/// Run exactly one trigger-eligible phase and return to the caller. This is the
+/// automatic scheduler seam: foreground/explicit callers keep the full-cycle
+/// API above, while background turns gain a cooperative yield boundary between
+/// phases.
+#[derive(Debug)]
+pub struct SteepPhaseSliceReport {
+    pub result: SteepResult,
+    pub selected: bool,
+    pub progressed: bool,
+    pub more: bool,
+    pub retryable: bool,
+    pub paused: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_periodic_steep_phase_with_api(
+    db: &MemoryDB,
+    llm: Option<&Arc<dyn LlmProvider>>,
+    api_llm: Option<&Arc<dyn LlmProvider>>,
+    synthesis_llm: Option<&Arc<dyn LlmProvider>>,
+    external_llm: Option<&Arc<dyn LlmProvider>>,
+    prompts: &PromptRegistry,
+    tuning: &crate::tuning::RefineryConfig,
+    confidence_cfg: &crate::tuning::ConfidenceConfig,
+    distillation: &crate::tuning::DistillationConfig,
+    knowledge_path: Option<&std::path::Path>,
+    trigger: TriggerKind,
+    phase: Phase,
+) -> Result<SteepPhaseSliceReport, WenlanError> {
+    // Re-distill historically scanned every changed Page and then every stale
+    // Page inside one phase. Automatic callers must use the cooperative
+    // one-Page seam; the explicit full-cycle API intentionally keeps the
+    // legacy batch behavior above.
+    if phase == Phase::ReDistill && trigger.runs_phase(phase) {
+        let routing_config = crate::config::load_config();
+        let synthesis_pin = SynthesisSource::parse(routing_config.synthesis_source.as_deref());
+        let compile_llm =
+            resolve_synthesis(synthesis_pin, synthesis_llm, api_llm, external_llm, llm).llm;
+        let started = std::time::Instant::now();
+        return match run_redistill_page_slice(db, compile_llm, prompts, knowledge_path).await {
+            Ok(slice) => {
+                let refreshed = slice.items_processed;
+                let (nudge, headline) = classify_redistill(refreshed);
+                Ok(SteepPhaseSliceReport {
+                    result: SteepResult {
+                        memories_decayed: 0,
+                        recaps_generated: 0,
+                        distilled: 0,
+                        pending_remaining: 0,
+                        phases: vec![PhaseResult {
+                            name: phase.as_str().to_string(),
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            items_processed: refreshed,
+                            error: None,
+                            nudge,
+                            headline,
+                        }],
+                    },
+                    selected: slice.selected,
+                    progressed: slice.progressed,
+                    more: slice.more,
+                    retryable: slice.retryable,
+                    paused: slice.paused,
+                })
+            }
+            Err(error) => Ok(SteepPhaseSliceReport {
+                result: SteepResult {
+                    memories_decayed: 0,
+                    recaps_generated: 0,
+                    distilled: 0,
+                    pending_remaining: 0,
+                    phases: vec![PhaseResult {
+                        name: phase.as_str().to_string(),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        items_processed: 0,
+                        error: Some(error.to_string()),
+                        nudge: Nudge::Silent,
+                        headline: None,
+                    }],
+                },
+                selected: false,
+                progressed: false,
+                more: false,
+                retryable: true,
+                paused: false,
+            }),
+        };
+    }
+
+    let result = run_periodic_steep_with_api_scope(
+        db,
+        llm,
+        api_llm,
+        synthesis_llm,
+        external_llm,
+        prompts,
+        tuning,
+        confidence_cfg,
+        distillation,
+        knowledge_path,
+        trigger,
+        Some(phase),
+    )
+    .await?;
+    let selected = !result.phases.is_empty();
+    let retryable = result.phases.iter().any(|phase| phase.error.is_some());
+    Ok(SteepPhaseSliceReport {
+        result,
+        selected,
+        progressed: selected && !retryable,
+        more: false,
+        retryable,
+        paused: false,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_periodic_steep_with_api_scope(
+    db: &MemoryDB,
+    llm: Option<&Arc<dyn LlmProvider>>,
+    api_llm: Option<&Arc<dyn LlmProvider>>,
+    synthesis_llm: Option<&Arc<dyn LlmProvider>>,
+    external_llm: Option<&Arc<dyn LlmProvider>>,
+    prompts: &PromptRegistry,
+    tuning: &crate::tuning::RefineryConfig,
+    _confidence_cfg: &crate::tuning::ConfidenceConfig,
+    distillation: &crate::tuning::DistillationConfig,
+    knowledge_path: Option<&std::path::Path>,
+    trigger: TriggerKind,
+    only_phase: Option<Phase>,
+) -> Result<SteepResult, WenlanError> {
     let steep_start = std::time::Instant::now();
     let deadline = trigger.deadline_secs(tuning.steep_deadline_secs);
-    // Config read once per cycle. `everyday_pin` drives the recap and
-    // entity-extraction phases (absent/unknown → auto chain);
-    // `page_map_auto_suggest` gates the proactive Page-Map phase below.
-    let cfg = crate::config::load_config();
-    let everyday_pin = EverydaySource::parse(cfg.everyday_source.as_deref());
-    let page_map_auto_suggest = cfg.page_map_auto_suggest;
+    // Per-job source pins are read once per cycle. Missing pins authorize no
+    // background inference; deterministic phases still run with `None`.
+    let routing_config = crate::config::load_config();
+    let everyday_pin = EverydaySource::parse(routing_config.everyday_source.as_deref());
+    let synthesis_pin = SynthesisSource::parse(routing_config.synthesis_source.as_deref());
+    let page_map_auto_suggest = routing_config.page_map_auto_suggest;
+    let everyday_route_llm = resolve_everyday(everyday_pin, api_llm, external_llm, llm).llm;
+    let runs_phase = |phase: Phase| {
+        trigger.runs_phase(phase) && only_phase.is_none_or(|selected| selected == phase)
+    };
     let mut phases: Vec<PhaseResult> = Vec::new();
     #[allow(unused_assignments)]
     let mut deadline_hit = false; // track if we've logged the first skip
@@ -627,7 +776,7 @@ pub async fn run_periodic_steep_with_api(
 
     // Phase 1: Decay pass
     let db_ref = db;
-    if trigger.runs_phase(Phase::Decay) {
+    if runs_phase(Phase::Decay) {
         let phase = run_phase(Phase::Decay, || async {
             let decayed = db_ref.decay_update_confidence().await? as usize;
             log::info!("[refinery] decay steep: updated {} memories", decayed);
@@ -644,7 +793,7 @@ pub async fn run_periodic_steep_with_api(
     }
 
     // Phase 1b: Promote uncontradicted memories from 'new' to 'learned'
-    if trigger.runs_phase(Phase::Promote) {
+    if runs_phase(Phase::Promote) {
         let phase = run_phase(Phase::Promote, || async {
             let promoted = db_ref.promote_uncontradicted(7).await?;
             if promoted > 0 {
@@ -661,10 +810,10 @@ pub async fn run_periodic_steep_with_api(
         phases.push(phase);
     }
 
-    // Phase 2: Recap generation (everyday job — honors the everyday_source pin,
-    // else the auto chain Anthropic → external → on-device).
-    let recap_llm = resolve_everyday(everyday_pin, api_llm, external_llm, llm).llm;
-    if trigger.runs_phase(Phase::Recaps) {
+    // Phase 2: Recap generation (everyday job — requires an explicit
+    // everyday_source pin; otherwise deterministic no-LLM behavior applies).
+    let recap_llm = everyday_route_llm;
+    if runs_phase(Phase::Recaps) {
         let phase = run_phase(Phase::Recaps, || async {
             let generated =
                 crate::synthesis::recaps::generate_recaps(db_ref, recap_llm, prompts, tuning)
@@ -685,7 +834,7 @@ pub async fn run_periodic_steep_with_api(
     }
 
     // Phase 3: Reweave entity links (link unlinked memories to recently-created entities)
-    if trigger.runs_phase(Phase::Reweave)
+    if runs_phase(Phase::Reweave)
         && {
             let elapsed = steep_start.elapsed().as_secs();
             if elapsed >= deadline {
@@ -718,7 +867,7 @@ pub async fn run_periodic_steep_with_api(
     }
 
     // Phase 4b: Re-embed memories with stale embeddings (structured content model)
-    if trigger.runs_phase(Phase::Reembed)
+    if runs_phase(Phase::Reembed)
         && {
             let elapsed = steep_start.elapsed().as_secs();
             if elapsed >= deadline {
@@ -745,10 +894,10 @@ pub async fn run_periodic_steep_with_api(
         phases.push(phase);
     }
 
-    // Phase 5: Entity extraction — everyday job (honors the everyday_source pin,
-    // else the auto chain Anthropic → external → on-device).
-    let extract_llm = resolve_everyday(everyday_pin, api_llm, external_llm, llm).llm;
-    if trigger.runs_phase(Phase::EntityExtraction)
+    // Phase 5: Entity extraction — everyday job (requires an explicit
+    // everyday_source pin; otherwise deterministic no-LLM behavior applies).
+    let extract_llm = everyday_route_llm;
+    if runs_phase(Phase::EntityExtraction)
         && {
             let elapsed = steep_start.elapsed().as_secs();
             if elapsed >= deadline {
@@ -776,7 +925,7 @@ pub async fn run_periodic_steep_with_api(
     }
 
     // Phase 5b: Community detection (runs before distillation to inform clustering)
-    if trigger.runs_phase(Phase::CommunityDetection)
+    if runs_phase(Phase::CommunityDetection)
         && {
             let elapsed = steep_start.elapsed().as_secs();
             if elapsed >= deadline {
@@ -791,7 +940,29 @@ pub async fn run_periodic_steep_with_api(
         }
     {
         let phase = run_phase(Phase::CommunityDetection, || async {
-            let count = db_ref.detect_communities().await?;
+            // Keep the legacy label-prop producer live throughout PR-1 so the
+            // default-OFF flag and rollback path remain byte-compatible.
+            let legacy_count = db_ref.detect_communities().await?;
+            let shadow_count = if crate::db::community_leiden_enabled() {
+                let published_members = match db_ref
+                    .run_next_community_grouping_cycle()
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!("M4 community grouping: {error}"))
+                    })? {
+                    Some(crate::community_grouping::CommunityGroupingOutcome::Published(
+                        receipt,
+                    )) => receipt.member_count,
+                    Some(crate::community_grouping::CommunityGroupingOutcome::Held(_))
+                    | Some(crate::community_grouping::CommunityGroupingOutcome::Stale(_))
+                    | None => 0,
+                };
+                db_ref.reconcile_pending_community_readers().await?;
+                published_members
+            } else {
+                0
+            };
+            let count = legacy_count + shadow_count;
             let (nudge, headline) = classify_backfill(count);
             Ok(PhaseOutput {
                 items_processed: count,
@@ -806,7 +977,7 @@ pub async fn run_periodic_steep_with_api(
     // Phase 5c: DETECT — embedding/cosine-only page candidate pass. It runs
     // before compile/emergence so cheap attach-to-existing-page opportunities
     // are consumed through PageWrite before any LLM synthesis lane is touched.
-    if trigger.runs_phase(Phase::Detect) {
+    if runs_phase(Phase::Detect) {
         let phase = run_phase(Phase::Detect, || async {
             let report = detect_page_candidates(db_ref, distillation).await?;
             if report.candidates_processed > 0
@@ -831,31 +1002,18 @@ pub async fn run_periodic_steep_with_api(
         phases.push(phase);
     }
 
-    // Phase 6: Normal distill — create new concepts from clusters
-    // Prefer synthesis LLM, API LLM, external/BYOK API, then on-device.
-    let compile_llm = synthesis_llm.or(api_llm).or(external_llm).or(llm);
+    // Phase 6: Normal distill — create new concepts from clusters. Background
+    // synthesis requires an explicit source pin; unavailable pins stay paused.
+    let compile_llm =
+        resolve_synthesis(synthesis_pin, synthesis_llm, api_llm, external_llm, llm).llm;
     let kp_ref = knowledge_path;
-    if trigger.runs_phase(Phase::Emergence) {
+    if runs_phase(Phase::Emergence) {
         let phase = run_phase(Phase::Emergence, || async {
-            let cloud_compile_llm = [synthesis_llm, api_llm, external_llm, llm]
-                .into_iter()
-                .flatten()
-                .find(|l| matches!(l.backend(), LlmBackend::Api));
-            let on_device_llm = [synthesis_llm, api_llm, external_llm, llm]
-                .into_iter()
-                .flatten()
-                .find(|l| matches!(l.backend(), LlmBackend::OnDevice));
-            let run_coherence_gate = cloud_compile_llm.is_some();
-            let routed_llm = if cloud_compile_llm.is_some() {
-                cloud_compile_llm
-            } else if on_device_compile_preferred() {
-                on_device_llm.filter(|provider| provider.is_available())
-            } else {
-                None
-            };
+            let run_coherence_gate =
+                compile_llm.is_some_and(|provider| matches!(provider.backend(), LlmBackend::Api));
             let result = distill_pages_scoped_gated(
                 db_ref,
-                routed_llm,
+                compile_llm,
                 prompts,
                 distillation,
                 kp_ref,
@@ -896,7 +1054,7 @@ pub async fn run_periodic_steep_with_api(
     // so an unset flag means zero build cost. Sequenced after Emergence so the
     // community grouping the buckets key on is fresh. Degrades to a
     // deterministic template when no LLM is available (no silent-zero).
-    if trigger.runs_phase(Phase::SummaryRollup) && crate::db::global_prelude_enabled() {
+    if runs_phase(Phase::SummaryRollup) && crate::db::global_prelude_enabled() {
         let phase = run_phase(Phase::SummaryRollup, || async {
             let count =
                 summary::build_summary_nodes(db_ref, compile_llm.map(|a| a.as_ref())).await?;
@@ -911,7 +1069,7 @@ pub async fn run_periodic_steep_with_api(
     }
 
     // Phase 6b: Re-distill — refresh concepts whose source memories changed
-    if trigger.runs_phase(Phase::ReDistill)
+    if runs_phase(Phase::ReDistill)
         && {
             let elapsed = steep_start.elapsed().as_secs();
             if elapsed >= deadline {
@@ -944,7 +1102,7 @@ pub async fn run_periodic_steep_with_api(
         phases.push(phase);
     }
 
-    if trigger.runs_phase(Phase::Overview)
+    if runs_phase(Phase::Overview)
         && {
             let elapsed = steep_start.elapsed().as_secs();
             if elapsed >= deadline {
@@ -972,9 +1130,10 @@ pub async fn run_periodic_steep_with_api(
     }
 
     // Phase 6c: Process refinement queue (contradictions + entity suggestions only)
-    if trigger.runs_phase(Phase::RefinementQueue) {
+    if runs_phase(Phase::RefinementQueue) {
         let phase = run_phase(Phase::RefinementQueue, || async {
-            let count = process_refinement_queue(db_ref, llm, prompts, tuning).await?;
+            let count =
+                process_refinement_queue(db_ref, everyday_route_llm, prompts, tuning).await?;
             let (nudge, headline) = classify_refinement_queue(count);
             Ok(PhaseOutput {
                 items_processed: count,
@@ -989,7 +1148,7 @@ pub async fn run_periodic_steep_with_api(
     // Phase 7: Decision log generation (lightweight recap for decisions).
     // Last deadline-gated phase: omit `deadline_hit = true` — no phase after
     // this reads the flag, so the assignment would be dead code (clippy -D).
-    if trigger.runs_phase(Phase::DecisionLogs)
+    if runs_phase(Phase::DecisionLogs)
         && {
             let elapsed = steep_start.elapsed().as_secs();
             if elapsed >= deadline {
@@ -1004,7 +1163,10 @@ pub async fn run_periodic_steep_with_api(
     {
         let phase = run_phase(Phase::DecisionLogs, || async {
             let count = crate::synthesis::decision_logs::generate_decision_logs(
-                db_ref, llm, prompts, tuning,
+                db_ref,
+                everyday_route_llm,
+                prompts,
+                tuning,
             )
             .await?;
             let (nudge, headline) = crate::synthesis::decision_logs::classify_decision_logs(count);
@@ -1024,7 +1186,9 @@ pub async fn run_periodic_steep_with_api(
     // the SAME pass but is NEVER gated by `page_map_auto_suggest` — only this
     // background phase is. Bounded to 5 pages per pass. Always Silent (no
     // user-facing nudge; suggestions surface in the map UI, not as a toast).
-    if page_map_auto_suggest && trigger.runs_phase(Phase::PageMaps) {
+    // `runs_phase` (not `trigger.runs_phase`): a phase-sliced background turn
+    // must not leak page_maps into another phase's slice when auto-suggest is on.
+    if page_map_auto_suggest && runs_phase(Phase::PageMaps) {
         let phase = run_phase(Phase::PageMaps, || async {
             let improved = crate::page_map_improve::run_proactive_page_maps(db_ref, 5).await?;
             let (nudge, headline) = classify_backfill(improved);
@@ -1045,7 +1209,7 @@ pub async fn run_periodic_steep_with_api(
     // Promoted from tail cleanup to a proper phase in PR A so it can be
     // gated uniformly by TriggerKind and tracked in result.phases like
     // every other phase.
-    if trigger.runs_phase(Phase::PruneRejections) {
+    if runs_phase(Phase::PruneRejections) {
         let phase = run_phase(Phase::PruneRejections, || async {
             let count = db_ref.prune_rejections(30).await?;
             // Clean up concept_sources rows whose source memories were deleted.
@@ -1076,7 +1240,7 @@ pub async fn run_periodic_steep_with_api(
     // (run_phase captures the error into PhaseResult) — they never crash the
     // cycle. Event surfacing flows through PhaseResult nudge/headline; MemoryDB
     // has no emitter.
-    if trigger.runs_phase(Phase::Evict) && crate::db::eviction_enabled() {
+    if runs_phase(Phase::Evict) && crate::db::eviction_enabled() {
         let phase = run_phase(Phase::Evict, || async {
             let report = db_ref
                 .evict_stale(&crate::tuning::EvictionConfig::default())
@@ -1100,7 +1264,7 @@ pub async fn run_periodic_steep_with_api(
     // Rate-limited by `kg_rethink_interval_hours` (default 168h = weekly)
     // via `app_metadata.last_kg_rethink_ts`. All five sub-phases are cheap
     // when the graph is clean; the gate mainly avoids redundant log spam.
-    if trigger.runs_phase(Phase::KgRethink) {
+    if runs_phase(Phase::KgRethink) {
         let interval_secs = (tuning.kg_rethink_interval_hours as i64).saturating_mul(3600);
         let now = chrono::Utc::now().timestamp();
         let last_ts: i64 = db
@@ -1160,11 +1324,13 @@ pub async fn run_periodic_steep_with_api(
     // per steep after all phases complete, so entity-extraction (phase 5) and
     // distillation (phase 6) writes are both visible. Each evaluator call is
     // idempotent via DB uniqueness, so repeated passes are harmless.
-    let emitter_for_ms: std::sync::Arc<dyn crate::events::EventEmitter> =
-        std::sync::Arc::new(crate::events::NoopEmitter);
-    let ev = crate::onboarding::MilestoneEvaluator::new(db, emitter_for_ms);
-    if let Err(e) = ev.check_after_refinery_pass().await {
-        log::warn!("onboarding: check_after_refinery_pass failed: {e}");
+    if only_phase.is_none() {
+        let emitter_for_ms: std::sync::Arc<dyn crate::events::EventEmitter> =
+            std::sync::Arc::new(crate::events::NoopEmitter);
+        let ev = crate::onboarding::MilestoneEvaluator::new(db, emitter_for_ms);
+        if let Err(e) = ev.check_after_refinery_pass().await {
+            log::warn!("onboarding: check_after_refinery_pass failed: {e}");
+        }
     }
 
     Ok(SteepResult {
@@ -1321,6 +1487,236 @@ pub(crate) async fn re_distill_stale_pages(
         log::info!("[re-distill-stale] refreshed {} stale concepts", recompiled);
     }
     Ok(recompiled)
+}
+
+// v1 stored a numeric OFFSET that cannot be translated after stale-set
+// mutation. v2 deliberately starts a fresh keyset pass on upgrade.
+const REDISTILL_STALE_CURSOR_KEY: &str = "background_redistill_stale_cursor_v2";
+const REDISTILL_SCAN_CURSOR_KEY: &str = "background_redistill_scan_cursor_v1";
+
+/// Outcome of one cooperative background re-distill turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RedistillSliceReport {
+    /// One stale Page was refreshed, or one active Page was checked for change.
+    pub selected: bool,
+    /// Durable state advanced (content/card/staleness lifecycle or scan cursor).
+    pub progressed: bool,
+    /// Actual Page refreshes or staged revision cards. Cursor-only progress is
+    /// deliberately zero so a cheap unchanged scan cannot emit an Activity
+    /// nudge claiming that Wenlan refreshed user data.
+    pub items_processed: usize,
+    /// Another item is safe to schedule after the global thermal cooldown.
+    pub more: bool,
+    /// The selected Page remains retryable, but should wait for a later trigger
+    /// when it is the only pending item so a poison Page cannot hot-loop.
+    pub retryable: bool,
+    /// Work exists conceptually but no authorized/available provider can run it.
+    pub paused: bool,
+}
+
+async fn load_background_cursor(db: &MemoryDB, key: &str) -> usize {
+    db.get_app_metadata(key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+async fn persist_background_cursor(
+    db: &MemoryDB,
+    key: &str,
+    cursor: usize,
+) -> Result<(), WenlanError> {
+    db.set_app_metadata(key, &cursor.to_string()).await
+}
+
+async fn load_background_stale_cursor(db: &MemoryDB) -> Option<StalePageCursor> {
+    db.get_app_metadata(REDISTILL_STALE_CURSOR_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str(&value).ok())
+}
+
+async fn persist_background_stale_cursor(
+    db: &MemoryDB,
+    cursor: Option<&StalePageCursor>,
+) -> Result<(), WenlanError> {
+    let value = cursor
+        .map(serde_json::to_string)
+        .transpose()?
+        .unwrap_or_default();
+    db.set_app_metadata(REDISTILL_STALE_CURSOR_KEY, &value)
+        .await
+}
+
+fn over_cap_redistill_report() -> RedistillSliceReport {
+    RedistillSliceReport {
+        selected: true,
+        progressed: true,
+        more: true,
+        retryable: true,
+        ..RedistillSliceReport::default()
+    }
+}
+
+/// Refresh at most one stale/changed Page, then return to the scheduler.
+///
+/// Explicit stale work has priority. A persisted cursor rotates failures so a
+/// citation-gated or otherwise retryable Page cannot pin every later Page. When
+/// no stale Page exists, exactly one active Page is inspected for legacy
+/// timestamp-based change detection; the scan cursor survives daemon restarts.
+pub async fn run_redistill_page_slice(
+    db: &MemoryDB,
+    llm: Option<&Arc<dyn LlmProvider>>,
+    prompts: &PromptRegistry,
+    knowledge_path: Option<&std::path::Path>,
+) -> Result<RedistillSliceReport, WenlanError> {
+    let Some(provider) = llm.filter(|provider| provider.is_available()) else {
+        return Ok(RedistillSliceReport {
+            paused: true,
+            ..RedistillSliceReport::default()
+        });
+    };
+
+    let cursor = load_background_stale_cursor(db).await;
+    let selected = match db
+        .get_stale_page_after("source_updated", cursor.as_ref())
+        .await?
+    {
+        Some(page) => Some(page),
+        None if cursor.is_some() => {
+            persist_background_stale_cursor(db, None).await?;
+            db.get_stale_page_after("source_updated", None).await?
+        }
+        None => None,
+    };
+    if let Some(page) = selected {
+        // Advance before provider code so a panic cannot pin the same Page.
+        // Persisting the selected identity, rather than its mutable row index,
+        // keeps the next Page reachable when this one leaves the stale set.
+        let selected_cursor = StalePageCursor::for_page(&page);
+        persist_background_stale_cursor(db, Some(&selected_cursor)).await?;
+        if automatic_refresh_exceeds_source_cap(db, &page).await? {
+            log::warn!(
+                "[re-distill-slice] page '{}' exceeds the automatic {}-source cap; keeping it stale for explicit refresh",
+                page.id,
+                AUTOMATIC_PAGE_REFRESH_SOURCE_CAP
+            );
+            return Ok(over_cap_redistill_report());
+        }
+        let outcome = refresh_page(
+            db,
+            provider,
+            prompts,
+            &page.id,
+            RefreshReason::SourceChanged,
+            knowledge_path,
+        )
+        .await;
+        return match outcome {
+            Ok(outcome) if outcome.wrote || outcome.gated => {
+                db.clear_page_staleness(&page.id).await?;
+                Ok(RedistillSliceReport {
+                    selected: true,
+                    progressed: true,
+                    items_processed: 1,
+                    more: true,
+                    ..RedistillSliceReport::default()
+                })
+            }
+            Ok(_) => Ok(RedistillSliceReport {
+                selected: true,
+                more: true,
+                retryable: true,
+                ..RedistillSliceReport::default()
+            }),
+            Err(error) => {
+                log::warn!(
+                    "[re-distill-slice] refresh error for '{}': {}",
+                    page.id,
+                    error
+                );
+                Ok(RedistillSliceReport {
+                    selected: true,
+                    more: true,
+                    retryable: true,
+                    ..RedistillSliceReport::default()
+                })
+            }
+        };
+    }
+
+    let cursor = load_background_cursor(db, REDISTILL_SCAN_CURSOR_KEY).await;
+    let page = db.list_pages("active", 1, cursor as i64).await?;
+    let Some(page) = page.first() else {
+        persist_background_cursor(db, REDISTILL_SCAN_CURSOR_KEY, 0).await?;
+        return Ok(RedistillSliceReport::default());
+    };
+    if automatic_refresh_exceeds_source_cap(db, page).await? {
+        persist_background_cursor(db, REDISTILL_SCAN_CURSOR_KEY, cursor.wrapping_add(1)).await?;
+        log::warn!(
+            "[re-distill-slice] page '{}' exceeds the automatic {}-source cap; leaving it for explicit refresh",
+            page.id,
+            AUTOMATIC_PAGE_REFRESH_SOURCE_CAP
+        );
+        return Ok(over_cap_redistill_report());
+    }
+    let changed = db.has_page_sources_changed(page).await?;
+    if !changed {
+        persist_background_cursor(db, REDISTILL_SCAN_CURSOR_KEY, cursor.wrapping_add(1)).await?;
+        return Ok(RedistillSliceReport {
+            selected: true,
+            progressed: true,
+            more: true,
+            ..RedistillSliceReport::default()
+        });
+    }
+
+    // The canonical SourceChanged write uses a stale-state CAS. Marking the
+    // selected Page first both makes that CAS valid and prevents the historical
+    // spend-inference-then-drop loop for timestamp-only changes.
+    db.set_page_stale(&page.id, "source_updated").await?;
+    let outcome = refresh_page(
+        db,
+        provider,
+        prompts,
+        &page.id,
+        RefreshReason::SourceChanged,
+        knowledge_path,
+    )
+    .await;
+    persist_background_cursor(db, REDISTILL_SCAN_CURSOR_KEY, cursor.wrapping_add(1)).await?;
+    match outcome {
+        Ok(outcome) if outcome.wrote || outcome.gated => {
+            db.clear_page_staleness(&page.id).await?;
+            Ok(RedistillSliceReport {
+                selected: true,
+                progressed: true,
+                items_processed: 1,
+                more: true,
+                ..RedistillSliceReport::default()
+            })
+        }
+        Ok(_) => Ok(RedistillSliceReport {
+            selected: true,
+            retryable: true,
+            ..RedistillSliceReport::default()
+        }),
+        Err(error) => {
+            log::warn!(
+                "[re-distill-slice] refresh error for '{}': {}",
+                page.id,
+                error
+            );
+            Ok(RedistillSliceReport {
+                selected: true,
+                retryable: true,
+                ..RedistillSliceReport::default()
+            })
+        }
+    }
 }
 
 /// Spec §5.3: refresh the reserved, machine-owned Overview page as part of
@@ -1589,8 +1985,7 @@ mod tests {
     #[tokio::test]
     async fn changed_explicit_source_is_enqueued_without_running_an_llm() {
         let (db, _dir) = test_db().await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "INSERT INTO memories
@@ -1627,11 +2022,92 @@ mod tests {
     struct RouteTestProvider {
         backend: LlmBackend,
         model: &'static str,
+        available: bool,
+        panic_on_availability: bool,
     }
 
     impl RouteTestProvider {
         fn arc(backend: LlmBackend, model: &'static str) -> Arc<dyn LlmProvider> {
-            Arc::new(Self { backend, model })
+            Arc::new(Self {
+                backend,
+                model,
+                available: true,
+                panic_on_availability: false,
+            })
+        }
+
+        fn unavailable(backend: LlmBackend, model: &'static str) -> Arc<dyn LlmProvider> {
+            Arc::new(Self {
+                backend,
+                model,
+                available: false,
+                panic_on_availability: false,
+            })
+        }
+
+        fn panicking(backend: LlmBackend, model: &'static str) -> Arc<dyn LlmProvider> {
+            Arc::new(Self {
+                backend,
+                model,
+                available: true,
+                panic_on_availability: true,
+            })
+        }
+    }
+
+    struct SelectiveRedistillProvider {
+        seen_prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SelectiveRedistillProvider {
+        fn new() -> Self {
+            Self {
+                seen_prompts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn saw_good_page(&self) -> bool {
+            self.seen_prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|prompt| prompt.contains("good-eleventh bounded source"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SelectiveRedistillProvider {
+        async fn generate(
+            &self,
+            request: crate::llm_provider::LlmRequest,
+        ) -> Result<String, crate::llm_provider::LlmError> {
+            self.seen_prompts
+                .lock()
+                .unwrap()
+                .push(request.user_prompt.clone());
+            if request.user_prompt.contains("good-eleventh bounded source") {
+                Ok("good-eleventh bounded source [1]".to_string())
+            } else {
+                Err(crate::llm_provider::LlmError::InferenceFailed(
+                    "poison page".to_string(),
+                ))
+            }
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "selective-redistill"
+        }
+
+        fn backend(&self) -> LlmBackend {
+            LlmBackend::OnDevice
+        }
+
+        fn kind(&self) -> &'static str {
+            "mock"
         }
     }
 
@@ -1644,7 +2120,8 @@ mod tests {
             unreachable!("route helpers never call generate()")
         }
         fn is_available(&self) -> bool {
-            true
+            assert!(!self.panic_on_availability, "simulated availability panic");
+            self.available
         }
         fn name(&self) -> &str {
             self.model
@@ -1750,24 +2227,48 @@ mod tests {
     }
 
     #[test]
-    fn resolve_everyday_pin_absent_source_degrades_to_auto() {
-        // Pinned to external, but no external provider is configured → the auto
-        // chain runs (Anthropic here) and the mode reports the degrade.
+    fn resolve_everyday_pin_absent_source_stays_unavailable_without_fallback() {
+        // A pin is a spending/source boundary. Missing external must not cross
+        // to the configured Anthropic or on-device providers.
         let api = RouteTestProvider::arc(LlmBackend::Api, "claude-haiku");
         let dev = RouteTestProvider::arc(LlmBackend::OnDevice, "qwen3-4b");
         let r = resolve_everyday(Some(EverydaySource::External), Some(&api), None, Some(&dev));
-        assert_eq!(r.source, EverydaySource::Anthropic);
-        assert_eq!(r.mode, RouteMode::PinnedDegraded);
-        assert_eq!(r.llm.unwrap().model_id(), "claude-haiku");
+        assert_eq!(r.source, EverydaySource::External);
+        assert_eq!(r.mode.as_str(), "pinned_unavailable");
+        assert!(r.llm.is_none());
     }
 
     #[test]
-    fn resolve_everyday_no_pin_is_auto() {
+    fn resolve_everyday_runtime_unavailable_pin_stays_pending_without_fallback() {
+        let api = RouteTestProvider::arc(LlmBackend::Api, "claude-haiku");
+        let external = RouteTestProvider::unavailable(LlmBackend::Api, "offline-external");
+        let r = resolve_everyday(
+            Some(EverydaySource::External),
+            Some(&api),
+            Some(&external),
+            None,
+        );
+        assert_eq!(r.source, EverydaySource::External);
+        assert_eq!(r.mode, RouteMode::PinnedUnavailable);
+        assert!(r.llm.is_none(), "an unavailable pin must not be invoked");
+    }
+
+    #[test]
+    fn resolve_everyday_availability_panic_fails_closed() {
+        let provider = RouteTestProvider::panicking(LlmBackend::OnDevice, "panicking-local");
+        let r = resolve_everyday(Some(EverydaySource::OnDevice), None, None, Some(&provider));
+        assert_eq!(r.mode, RouteMode::PinnedUnavailable);
+        assert!(r.llm.is_none());
+    }
+
+    #[test]
+    fn resolve_everyday_no_pin_is_unconfigured_even_with_providers() {
         let api = RouteTestProvider::arc(LlmBackend::Api, "claude-haiku");
         let ext = RouteTestProvider::arc(LlmBackend::Api, "ollama-llama3");
         let r = resolve_everyday(None, Some(&api), Some(&ext), None);
-        assert_eq!(r.source, EverydaySource::Anthropic);
-        assert_eq!(r.mode, RouteMode::Auto);
+        assert_eq!(r.source, EverydaySource::Basic);
+        assert_eq!(r.mode.as_str(), "unconfigured");
+        assert!(r.llm.is_none());
     }
 
     #[test]
@@ -1807,9 +2308,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_synthesis_pin_on_device_absent_degrades_to_auto() {
-        // Pinned to on-device but no on-device slot loaded → the synthesis auto
-        // chain runs (the Anthropic slot here) and the mode reports the degrade.
+    fn resolve_synthesis_pin_on_device_absent_stays_unavailable_without_fallback() {
+        // Missing on-device must not cross to the configured Anthropic source.
         let synth = RouteTestProvider::arc(LlmBackend::Api, "claude-sonnet");
         let r = resolve_synthesis(
             Some(SynthesisSource::OnDevice),
@@ -1818,9 +2318,35 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r.source, SynthesisSource::Anthropic);
-        assert_eq!(r.mode, RouteMode::PinnedDegraded);
-        assert_eq!(r.llm.unwrap().model_id(), "claude-sonnet");
+        assert_eq!(r.source, SynthesisSource::OnDevice);
+        assert_eq!(r.mode.as_str(), "pinned_unavailable");
+        assert!(r.llm.is_none());
+    }
+
+    #[test]
+    fn resolve_synthesis_runtime_unavailable_pin_stays_pending_without_fallback() {
+        let synth = RouteTestProvider::arc(LlmBackend::Api, "claude-sonnet");
+        let external = RouteTestProvider::unavailable(LlmBackend::Api, "offline-external");
+        let r = resolve_synthesis(
+            Some(SynthesisSource::External),
+            Some(&synth),
+            None,
+            Some(&external),
+            None,
+        );
+        assert_eq!(r.source, SynthesisSource::External);
+        assert_eq!(r.mode, RouteMode::PinnedUnavailable);
+        assert!(r.llm.is_none(), "an unavailable pin must not be invoked");
+    }
+
+    #[test]
+    fn resolve_synthesis_no_pin_is_unconfigured_even_with_providers() {
+        let synth = RouteTestProvider::arc(LlmBackend::Api, "claude-sonnet");
+        let ext = RouteTestProvider::arc(LlmBackend::Api, "ollama-llama3");
+        let r = resolve_synthesis(None, Some(&synth), None, Some(&ext), None);
+        assert_eq!(r.source, SynthesisSource::None);
+        assert_eq!(r.mode.as_str(), "unconfigured");
+        assert!(r.llm.is_none());
     }
 
     #[test]
@@ -2101,6 +2627,57 @@ mod tests {
         .unwrap();
 
         assert!(!result.phases.is_empty(), "Backstop should produce phases");
+    }
+
+    #[tokio::test]
+    async fn background_steep_phase_slice_runs_only_the_requested_phase() {
+        let _env_serial = COMPILE_ROUTING_ENV_LOCK.lock().await;
+        let (db, _dir) = test_db().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_dir_var = data_dir.path().to_string_lossy().to_string();
+        db.upsert_documents(vec![make_memory(
+            "phase_slice_smoke",
+            "A background turn must return after one refinery phase.",
+            "fact",
+            "engineering",
+        )])
+        .await
+        .unwrap();
+
+        let result =
+            temp_env::async_with_vars([("WENLAN_DATA_DIR", Some(data_dir_var.as_str()))], async {
+                let config = crate::config::Config {
+                    page_map_auto_suggest: true,
+                    ..crate::config::Config::default()
+                };
+                crate::config::save_config(&config).unwrap();
+
+                run_periodic_steep_phase_with_api(
+                    &db,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &PromptRegistry::default(),
+                    &crate::tuning::RefineryConfig::default(),
+                    &crate::tuning::ConfidenceConfig::default(),
+                    &crate::tuning::DistillationConfig::default(),
+                    None,
+                    TriggerKind::Backstop,
+                    Phase::Decay,
+                )
+                .await
+            })
+            .await
+            .unwrap();
+
+        let phases: Vec<&str> = result
+            .result
+            .phases
+            .iter()
+            .map(|phase| phase.name.as_str())
+            .collect();
+        assert_eq!(phases, vec!["decay"]);
     }
 
     #[tokio::test]
@@ -2933,6 +3510,186 @@ mod tests {
 
     static COMPILE_ROUTING_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    async fn seed_emergence_routing_fixture(db: &MemoryDB, prefix: &str) {
+        for (i, content) in [
+            "The daemon persists chunks in a vector-enabled libSQL table and keeps lexical indexes synchronized through database triggers for dependable hybrid retrieval.",
+            "Hybrid retrieval combines semantic similarity with lexical rank through reciprocal rank fusion so exact identifiers and paraphrased concepts remain discoverable together.",
+            "Durable source evidence lets synthesized pages cite the memories they were compiled from and be rebuilt when those source memories change.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            db.upsert_documents(vec![crate::sources::RawDocument {
+                source: "memory".to_string(),
+                source_id: format!("{prefix}_{i}"),
+                title: content.to_string(),
+                content: content.to_string(),
+                space: Some("hard-pin-routing".to_string()),
+                ..Default::default()
+            }])
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn emergence_tick_without_synthesis_pin_does_not_call_configured_cloud_provider() {
+        let _serial = COMPILE_ROUTING_ENV_LOCK.lock().await;
+        let (db, _dir) = test_db().await;
+        seed_emergence_routing_fixture(&db, "no_synthesis_pin").await;
+
+        let provider = Arc::new(EmergenceRoutingProvider::new(LlmBackend::Api));
+        let synthesis: Arc<dyn LlmProvider> = provider.clone();
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_dir_var = data_dir.path().to_string_lossy().to_string();
+
+        let result =
+            temp_env::async_with_vars([("WENLAN_DATA_DIR", Some(data_dir_var.as_str()))], async {
+                crate::config::save_config(&crate::config::Config::default()).unwrap();
+                run_periodic_steep_with_api(
+                    &db,
+                    None,
+                    None,
+                    Some(&synthesis),
+                    None,
+                    &PromptRegistry::default(),
+                    &crate::tuning::RefineryConfig::default(),
+                    &crate::tuning::ConfidenceConfig::default(),
+                    &crate::tuning::DistillationConfig::default(),
+                    None,
+                    TriggerKind::Idle,
+                )
+                .await
+            })
+            .await
+            .unwrap();
+
+        let emergence = result
+            .phases
+            .iter()
+            .find(|phase| phase.name == "emergence")
+            .expect("Idle must run emergence");
+        assert!(emergence.error.is_none());
+        assert!(
+            !provider.saw_label("distill_body"),
+            "configured cloud capability without an explicit synthesis pin must not authorize background page synthesis"
+        );
+        assert!(
+            compile_queue_depth(&db).await.unwrap() > 0,
+            "eligible page work must remain durable while synthesis consent is unconfigured"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_tick_without_everyday_pin_does_not_call_ondevice_decision_log_provider() {
+        let _serial = COMPILE_ROUTING_ENV_LOCK.lock().await;
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..4 {
+            let mut doc = make_memory(
+                &format!("hard_pin_decision_{i}"),
+                &format!("Decided to use bounded background scheduling approach {i}"),
+                "decision",
+                "scheduler",
+            );
+            doc.last_modified = now - 60 * i as i64;
+            db.upsert_documents(vec![doc]).await.unwrap();
+        }
+
+        let provider = Arc::new(EmergenceRoutingProvider::new(LlmBackend::OnDevice));
+        let everyday: Arc<dyn LlmProvider> = provider.clone();
+        let prompts = PromptRegistry::default();
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_dir_var = data_dir.path().to_string_lossy().to_string();
+
+        temp_env::async_with_vars([("WENLAN_DATA_DIR", Some(data_dir_var.as_str()))], async {
+            crate::config::save_config(&crate::config::Config::default()).unwrap();
+            run_periodic_steep_with_api(
+                &db,
+                Some(&everyday),
+                None,
+                None,
+                None,
+                &prompts,
+                &crate::tuning::RefineryConfig::default(),
+                &crate::tuning::ConfidenceConfig::default(),
+                &crate::tuning::DistillationConfig::default(),
+                None,
+                TriggerKind::Idle,
+            )
+            .await
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !provider.saw_system_prompt(&prompts.summarize_decisions),
+            "an installed on-device model without an everyday pin must not authorize background decision-log inference"
+        );
+    }
+
+    #[tokio::test]
+    async fn burst_end_without_everyday_pin_does_not_call_refinement_provider() {
+        let _serial = COMPILE_ROUTING_ENV_LOCK.lock().await;
+        let (db, _dir) = test_db().await;
+        db.upsert_documents(vec![
+            make_memory(
+                "hard_pin_existing",
+                "The scheduler cooldown is ten minutes.",
+                "fact",
+                "scheduler",
+            ),
+            make_memory(
+                "hard_pin_incoming",
+                "The scheduler cooldown is two minutes.",
+                "fact",
+                "scheduler",
+            ),
+        ])
+        .await
+        .unwrap();
+        db.insert_refinement_proposal(
+            "hard_pin_refinement",
+            "detect_contradiction",
+            &["hard_pin_incoming".into(), "hard_pin_existing".into()],
+            None,
+            0.9,
+        )
+        .await
+        .unwrap();
+
+        let provider = Arc::new(EmergenceRoutingProvider::new(LlmBackend::OnDevice));
+        let everyday: Arc<dyn LlmProvider> = provider.clone();
+        let prompts = PromptRegistry::default();
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_dir_var = data_dir.path().to_string_lossy().to_string();
+
+        temp_env::async_with_vars([("WENLAN_DATA_DIR", Some(data_dir_var.as_str()))], async {
+            crate::config::save_config(&crate::config::Config::default()).unwrap();
+            run_periodic_steep_with_api(
+                &db,
+                Some(&everyday),
+                None,
+                None,
+                None,
+                &prompts,
+                &crate::tuning::RefineryConfig::default(),
+                &crate::tuning::ConfidenceConfig::default(),
+                &crate::tuning::DistillationConfig::default(),
+                None,
+                TriggerKind::BurstEnd,
+            )
+            .await
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !provider.saw_system_prompt(&prompts.detect_contradiction),
+            "an installed provider without an everyday pin must not judge background refinement proposals"
+        );
+    }
+
     #[tokio::test]
     async fn emergence_tick_without_cloud_defers_healthy_ondevice_engine_to_agent_lane_by_default()
     {
@@ -3012,7 +3769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emergence_tick_with_on_device_preference_uses_healthy_ondevice_engine() {
+    async fn emergence_tick_with_on_device_pin_uses_healthy_ondevice_engine() {
         let _serial = COMPILE_ROUTING_ENV_LOCK.lock().await;
         let (db, _dir) = test_db().await;
 
@@ -3038,25 +3795,33 @@ mod tests {
         let provider = Arc::new(EmergenceRoutingProvider::new(LlmBackend::OnDevice));
         let llm: Arc<dyn LlmProvider> = provider.clone();
         let prompts = PromptRegistry::default();
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_dir_var = data_dir.path().to_string_lossy().to_string();
 
-        let result = temp_env::async_with_vars(
-            [("WENLAN_PREFER_ON_DEVICE_COMPILE", Some("1"))],
-            run_periodic_steep_with_api(
-                &db,
-                None,
-                None,
-                Some(&llm),
-                None,
-                &prompts,
-                &crate::tuning::RefineryConfig::default(),
-                &crate::tuning::ConfidenceConfig::default(),
-                &crate::tuning::DistillationConfig::default(),
-                None,
-                TriggerKind::Idle,
-            ),
-        )
-        .await
-        .unwrap();
+        let result =
+            temp_env::async_with_vars([("WENLAN_DATA_DIR", Some(data_dir_var.as_str()))], async {
+                crate::config::save_config(&crate::config::Config {
+                    synthesis_source: Some("on_device".to_string()),
+                    ..crate::config::Config::default()
+                })
+                .unwrap();
+                run_periodic_steep_with_api(
+                    &db,
+                    Some(&llm),
+                    None,
+                    None,
+                    None,
+                    &prompts,
+                    &crate::tuning::RefineryConfig::default(),
+                    &crate::tuning::ConfidenceConfig::default(),
+                    &crate::tuning::DistillationConfig::default(),
+                    None,
+                    TriggerKind::Idle,
+                )
+                .await
+            })
+            .await
+            .unwrap();
 
         let emergence = result
             .phases
@@ -3070,23 +3835,23 @@ mod tests {
         );
         assert!(
             !provider.saw_system_prompt(&prompts.refine_clusters),
-            "an opted-in healthy on-device compile must skip the LLM coherence gate"
+            "an explicitly pinned on-device compile must skip the LLM coherence gate"
         );
         assert!(
             provider.saw_label("distill_body"),
-            "without a cloud provider, opted-in on-device routing must invoke the healthy on-device provider \
+            "an on-device synthesis pin must invoke the healthy on-device provider \
              to compile eligible clusters"
         );
         let cluster_page = db.find_active_page_id_by_title("Test Topic").await.unwrap();
         assert!(
             cluster_page.is_some(),
-            "opted-in on-device routing must synthesize a page from the eligible cluster \
+            "pinned on-device routing must synthesize a page from the eligible cluster \
              via the healthy on-device engine"
         );
         let queue_depth_after = compile_queue_depth(&db).await.unwrap();
         assert_eq!(
             queue_depth_after, 0,
-            "opted-in on-device routing must resolve eligible clusters through the healthy on-device engine, \
+            "pinned on-device routing must resolve eligible clusters through the healthy on-device engine, \
              got queue depth {queue_depth_after}"
         );
     }
@@ -3196,7 +3961,7 @@ mod tests {
             content: mem_content.to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: None.into(),
             source_memory_ids: vec!["overview_wiring_rust".to_string()],
             creation_kind: Some("research".to_string()),
             workspace: None,
@@ -3213,15 +3978,16 @@ mod tests {
             temp_env::async_with_vars([("WENLAN_DATA_DIR", Some(data_dir_var.as_str()))], async {
                 let config = crate::config::Config {
                     knowledge_path: Some(knowledge_path),
+                    synthesis_source: Some("on_device".to_string()),
                     ..crate::config::Config::default()
                 };
                 crate::config::save_config(&config).unwrap();
 
                 run_periodic_steep_with_api(
                     &db,
-                    None,
-                    None,
                     Some(&llm),
+                    None,
+                    None,
                     None,
                     &PromptRegistry::default(),
                     &crate::tuning::RefineryConfig::default(),
@@ -3278,7 +4044,7 @@ mod tests {
             content: mem_content.to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: None.into(),
             source_memory_ids: vec!["overview_daily_rust".to_string()],
             creation_kind: Some("research".to_string()),
             workspace: None,
@@ -3295,15 +4061,16 @@ mod tests {
             temp_env::async_with_vars([("WENLAN_DATA_DIR", Some(data_dir_var.as_str()))], async {
                 let config = crate::config::Config {
                     knowledge_path: Some(knowledge_path),
+                    synthesis_source: Some("on_device".to_string()),
                     ..crate::config::Config::default()
                 };
                 crate::config::save_config(&config).unwrap();
 
                 run_periodic_steep_with_api(
                     &db,
-                    None,
-                    None,
                     Some(&llm),
+                    None,
+                    None,
                     None,
                     &PromptRegistry::default(),
                     &crate::tuning::RefineryConfig::default(),
@@ -3317,11 +4084,21 @@ mod tests {
             .await
             .unwrap();
 
-        let phase_names: Vec<&str> = result.phases.iter().map(|p| p.name.as_str()).collect();
+        let overview = result
+            .phases
+            .iter()
+            .find(|phase| phase.name == "overview")
+            .unwrap_or_else(|| {
+                let phase_names: Vec<&str> =
+                    result.phases.iter().map(|phase| phase.name.as_str()).collect();
+                panic!(
+                    "Daily maintenance must run the reserved Overview refresh phase, got {phase_names:?}"
+                )
+            });
         assert!(
-            phase_names.contains(&"overview"),
-            "Daily maintenance must run the reserved Overview refresh phase, got {:?}",
-            phase_names
+            overview.error.is_none(),
+            "Daily Overview phase must not error: {:?}",
+            overview.error
         );
 
         let overview_id = db.find_active_page_id_by_title("Overview").await.unwrap();
@@ -3863,7 +4640,7 @@ mod tests {
         // tokens with the mock body ("refreshed body") so the fail-closed
         // faithfulness gate passes.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'refreshed body reference material', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -3931,7 +4708,7 @@ mod tests {
 
         // Seed source memory so refresh_page has content to synthesize from.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'refreshed body reference material', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -4008,7 +4785,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'retryable source material', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -4060,7 +4837,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'The target topic should retain the valid wikilink to Related Page when refreshed.', 0, 'text', 'fact', 'work', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -4169,7 +4946,7 @@ mod tests {
         // Seed the cited memory. The re-distilled body echoes its content so the
         // [1] marker verifies and yields a non-empty citation map.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'Tokio is an async runtime for Rust', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -4223,6 +5000,468 @@ mod tests {
         assert!(
             latest.get("citations_summary").is_some(),
             "content+citations must commit atomically: the re-distill changelog entry must carry citations_summary (the two-step leaves it absent); changelog={changelog_raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_redistill_slice_processes_exactly_one_page_and_reports_more() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let now_ts = chrono::Utc::now().timestamp();
+        for (memory_id, page_id) in [
+            ("redistill_slice_mem_a", "redistill_slice_page_a"),
+            ("redistill_slice_mem_b", "redistill_slice_page_b"),
+        ] {
+            {
+                let conn = db.test_primary_session().await;
+                conn.execute(
+                    "INSERT INTO memories
+                         (id, source_id, title, content, chunk_index, chunk_type,
+                          memory_type, source_agent, created_at, last_modified,
+                          confirmed, stability, source)
+                     VALUES (?1, ?1, ?1, 'bounded ambient source material', 0,
+                             'text', 'fact', 'test', ?2, ?2, 1, 'confirmed', 'memory')",
+                    libsql::params![memory_id, now_ts],
+                )
+                .await
+                .unwrap();
+            }
+            db.insert_page(
+                page_id,
+                page_id,
+                None,
+                "old body",
+                None,
+                None,
+                &[memory_id],
+                &now,
+            )
+            .await
+            .unwrap();
+            db.set_page_stale(page_id, "source_updated").await.unwrap();
+        }
+        let provider = Arc::new(crate::llm_provider::SequencedMockProvider::new(vec![
+            "bounded ambient source material [1]",
+            "bounded ambient source material [1]",
+        ]));
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        let report = run_redistill_page_slice(&db, Some(&llm), &PromptRegistry::default(), None)
+            .await
+            .unwrap();
+
+        assert!(report.selected);
+        assert!(report.progressed);
+        assert!(report.more);
+        assert!(!report.retryable);
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(
+            db.list_stale_pages("source_updated").await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn background_redistill_success_does_not_skip_row_shifted_by_stale_removal() {
+        let (db, _dir) = test_db().await;
+        let now_ts = chrono::Utc::now().timestamp();
+        for (suffix, last_modified) in [
+            ("a", "2026-07-16T03:00:00+00:00"),
+            ("b", "2026-07-16T02:00:00+00:00"),
+            ("c", "2026-07-16T01:00:00+00:00"),
+        ] {
+            let memory_id = format!("redistill_shift_memory_{suffix}");
+            let page_id = format!("redistill_shift_page_{suffix}");
+            {
+                let conn = db.test_primary_session().await;
+                conn.execute(
+                    "INSERT INTO memories
+                         (id, source_id, title, content, chunk_index, chunk_type,
+                          memory_type, source_agent, created_at, last_modified,
+                          confirmed, stability, source)
+                     VALUES (?1, ?1, ?1, 'ordered redistill source material', 0,
+                             'text', 'fact', 'test', ?2, ?2, 1, 'confirmed', 'memory')",
+                    libsql::params![memory_id.as_str(), now_ts],
+                )
+                .await
+                .unwrap();
+            }
+            db.insert_page(
+                &page_id,
+                &page_id,
+                None,
+                "old body",
+                None,
+                None,
+                &[memory_id.as_str()],
+                last_modified,
+            )
+            .await
+            .unwrap();
+            db.set_page_stale(&page_id, "source_updated").await.unwrap();
+        }
+        let provider = Arc::new(crate::llm_provider::SequencedMockProvider::new(vec![
+            "ordered redistill source material [1]",
+            "ordered redistill source material [1]",
+        ]));
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        for _ in 0..2 {
+            run_redistill_page_slice(&db, Some(&llm), &PromptRegistry::default(), None)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            db.get_page_stale_reason("redistill_shift_page_a")
+                .await
+                .unwrap()
+                .is_none(),
+            "the first stale Page should complete"
+        );
+        assert!(
+            db.get_page_stale_reason("redistill_shift_page_b")
+                .await
+                .unwrap()
+                .is_none(),
+            "removing the first row must not shift the second Page behind a persisted OFFSET"
+        );
+        assert_eq!(
+            db.get_page_stale_reason("redistill_shift_page_c")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("source_updated"),
+            "two slices should leave only the third Page stale"
+        );
+        assert_eq!(provider.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn background_redistill_over_source_cap_makes_zero_provider_calls_and_stays_stale() {
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let now_ts = chrono::Utc::now().timestamp();
+        let source_ids = (0..65)
+            .map(|index| format!("redistill_over_cap_mem_{index:02}"))
+            .collect::<Vec<_>>();
+        {
+            let conn = db.test_primary_session().await;
+            for source_id in &source_ids {
+                conn.execute(
+                    "INSERT INTO memories
+                         (id, source_id, title, content, chunk_index, chunk_type,
+                          memory_type, source_agent, created_at, last_modified,
+                          confirmed, stability, source)
+                     VALUES (?1, ?1, ?1, 'bounded over cap source', 0,
+                             'text', 'fact', 'test', ?2, ?2, 1, 'confirmed', 'memory')",
+                    libsql::params![source_id.clone(), now_ts],
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let source_refs = source_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        db.insert_page(
+            "redistill_over_cap_page",
+            "ReDistill over source cap",
+            None,
+            "old body",
+            None,
+            None,
+            &source_refs,
+            &now,
+        )
+        .await
+        .unwrap();
+        db.set_page_stale("redistill_over_cap_page", "source_updated")
+            .await
+            .unwrap();
+        let provider = Arc::new(crate::llm_provider::SequencedMockProvider::new(vec![
+            "bounded over cap source [1]",
+        ]));
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        let report = run_redistill_page_slice(&db, Some(&llm), &PromptRegistry::default(), None)
+            .await
+            .unwrap();
+
+        assert!(report.selected);
+        assert!(
+            report.progressed,
+            "advancing the durable cursor is progress"
+        );
+        assert!(report.more);
+        assert!(report.retryable);
+        assert_eq!(report.items_processed, 0);
+        assert_eq!(provider.call_count(), 0);
+        assert_eq!(
+            db.get_page_stale_reason("redistill_over_cap_page")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("source_updated")
+        );
+
+        // Legacy Pages can have only the JSON source list. The same cap must
+        // apply when the normalized join table has no rows.
+        {
+            let conn = db.test_primary_session().await;
+            conn.execute(
+                "DELETE FROM page_sources WHERE page_id='redistill_over_cap_page'",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        persist_background_stale_cursor(&db, None).await.unwrap();
+        let legacy_report =
+            run_redistill_page_slice(&db, Some(&llm), &PromptRegistry::default(), None)
+                .await
+                .unwrap();
+        assert!(legacy_report.retryable);
+        assert_eq!(provider.call_count(), 0);
+        assert_eq!(
+            db.get_page_stale_reason("redistill_over_cap_page")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("source_updated")
+        );
+    }
+
+    #[tokio::test]
+    async fn background_redistill_phase_uses_one_page_slice_not_legacy_batch() {
+        let _serial = COMPILE_ROUTING_ENV_LOCK.lock().await;
+        let (db, _dir) = test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let now_ts = chrono::Utc::now().timestamp();
+        for (memory_id, page_id) in [
+            ("redistill_phase_mem_a", "redistill_phase_page_a"),
+            ("redistill_phase_mem_b", "redistill_phase_page_b"),
+        ] {
+            {
+                let conn = db.test_primary_session().await;
+                conn.execute(
+                    "INSERT INTO memories
+                         (id, source_id, title, content, chunk_index, chunk_type,
+                          memory_type, source_agent, created_at, last_modified,
+                          confirmed, stability, source)
+                     VALUES (?1, ?1, ?1, 'bounded phase source material', 0,
+                             'text', 'fact', 'test', ?2, ?2, 1, 'confirmed', 'memory')",
+                    libsql::params![memory_id, now_ts],
+                )
+                .await
+                .unwrap();
+            }
+            db.insert_page(
+                page_id,
+                page_id,
+                None,
+                "old body",
+                None,
+                None,
+                &[memory_id],
+                &now,
+            )
+            .await
+            .unwrap();
+            db.set_page_stale(page_id, "source_updated").await.unwrap();
+        }
+        let provider = Arc::new(crate::llm_provider::SequencedMockProvider::new(vec![
+            "bounded phase source material [1]",
+            "bounded phase source material [1]",
+        ]));
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_dir_var = data_dir.path().to_string_lossy().to_string();
+
+        let report =
+            temp_env::async_with_vars([("WENLAN_DATA_DIR", Some(data_dir_var.as_str()))], async {
+                crate::config::save_config(&crate::config::Config {
+                    synthesis_source: Some("on_device".to_string()),
+                    ..crate::config::Config::default()
+                })
+                .unwrap();
+                run_periodic_steep_phase_with_api(
+                    &db,
+                    Some(&llm),
+                    None,
+                    None,
+                    None,
+                    &PromptRegistry::default(),
+                    &crate::tuning::RefineryConfig::default(),
+                    &crate::tuning::ConfidenceConfig::default(),
+                    &crate::tuning::DistillationConfig::default(),
+                    None,
+                    TriggerKind::Idle,
+                    Phase::ReDistill,
+                )
+                .await
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(report.result.phases.len(), 1);
+        assert_eq!(report.result.phases[0].name, "re-distill");
+        assert!(report.selected);
+        assert!(report.progressed);
+        assert!(report.more);
+        assert!(!report.retryable);
+        assert!(!report.paused);
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(
+            db.list_stale_pages("source_updated").await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn background_redistill_unchanged_scan_progress_is_silent() {
+        let _serial = COMPILE_ROUTING_ENV_LOCK.lock().await;
+        let (db, _dir) = test_db().await;
+        let now_ts = chrono::Utc::now().timestamp();
+        let compiled = chrono::Utc::now().to_rfc3339();
+        {
+            let conn = db.test_primary_session().await;
+            conn.execute(
+                "INSERT INTO memories
+                     (id, source_id, title, content, chunk_index, chunk_type,
+                      memory_type, source_agent, created_at, last_modified,
+                      confirmed, stability, source)
+                 VALUES ('unchanged_scan_mem', 'unchanged_scan_mem', 'unchanged',
+                         'already compiled', 0, 'text', 'fact', 'test', ?1, ?1,
+                         1, 'confirmed', 'memory')",
+                libsql::params![now_ts],
+            )
+            .await
+            .unwrap();
+        }
+        db.insert_page(
+            "unchanged_scan_page",
+            "Unchanged scan page",
+            None,
+            "already compiled",
+            None,
+            None,
+            &["unchanged_scan_mem"],
+            &compiled,
+        )
+        .await
+        .unwrap();
+        let provider = Arc::new(crate::llm_provider::SequencedMockProvider::new(vec![]));
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_dir_var = data_dir.path().to_string_lossy().to_string();
+
+        let report =
+            temp_env::async_with_vars([("WENLAN_DATA_DIR", Some(data_dir_var.as_str()))], async {
+                crate::config::save_config(&crate::config::Config {
+                    synthesis_source: Some("on_device".to_string()),
+                    ..crate::config::Config::default()
+                })
+                .unwrap();
+                run_periodic_steep_phase_with_api(
+                    &db,
+                    Some(&llm),
+                    None,
+                    None,
+                    None,
+                    &PromptRegistry::default(),
+                    &crate::tuning::RefineryConfig::default(),
+                    &crate::tuning::ConfidenceConfig::default(),
+                    &crate::tuning::DistillationConfig::default(),
+                    None,
+                    TriggerKind::Idle,
+                    Phase::ReDistill,
+                )
+                .await
+            })
+            .await
+            .unwrap();
+
+        assert!(report.selected);
+        assert!(
+            report.progressed,
+            "advancing the durable scan cursor is progress"
+        );
+        assert_eq!(report.result.phases[0].items_processed, 0);
+        assert_eq!(report.result.phases[0].nudge, Nudge::Silent);
+        assert_eq!(provider.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn background_redistill_cursor_reaches_page_beyond_ten_retryable_rows() {
+        let (db, _dir) = test_db().await;
+        let base = chrono::Utc::now();
+        for index in 0..11 {
+            let is_good = index == 10;
+            let memory_id = if is_good {
+                "good-eleventh-memory".to_string()
+            } else {
+                format!("poison-memory-{index:02}")
+            };
+            let page_id = if is_good {
+                "good-eleventh-page".to_string()
+            } else {
+                format!("poison-page-{index:02}")
+            };
+            let content = if is_good {
+                "good-eleventh bounded source".to_string()
+            } else {
+                format!("poison bounded source {index:02}")
+            };
+            let timestamp = (base - chrono::Duration::seconds(index as i64)).timestamp();
+            let compiled = (base - chrono::Duration::seconds(index as i64)).to_rfc3339();
+            {
+                let conn = db.test_primary_session().await;
+                conn.execute(
+                    "INSERT INTO memories
+                         (id, source_id, title, content, chunk_index, chunk_type,
+                          memory_type, source_agent, created_at, last_modified,
+                          confirmed, stability, source)
+                     VALUES (?1, ?1, ?1, ?2, 0, 'text', 'fact', 'test', ?3, ?3,
+                             1, 'confirmed', 'memory')",
+                    libsql::params![memory_id.as_str(), content.as_str(), timestamp],
+                )
+                .await
+                .unwrap();
+            }
+            db.insert_page(
+                &page_id,
+                &page_id,
+                None,
+                "old body",
+                None,
+                None,
+                &[memory_id.as_str()],
+                &compiled,
+            )
+            .await
+            .unwrap();
+            db.set_page_stale(&page_id, "source_updated").await.unwrap();
+        }
+        let provider = Arc::new(SelectiveRedistillProvider::new());
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        for _ in 0..11 {
+            run_redistill_page_slice(&db, Some(&llm), &PromptRegistry::default(), None)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            provider.saw_good_page(),
+            "ten retryable rows must not permanently hide the eleventh Page"
+        );
+        assert!(
+            db.get_page("good-eleventh-page")
+                .await
+                .unwrap()
+                .unwrap()
+                .stale_reason
+                .is_none(),
+            "the reachable healthy Page should complete even while ten poison Pages remain"
         );
     }
 }

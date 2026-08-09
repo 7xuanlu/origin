@@ -595,8 +595,7 @@ async fn current_schema_diagnostic_distinguishes_old_and_future_versions() {
         ),
     ] {
         let (db, _dir) = crate::db::tests::test_db().await;
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(&format!("PRAGMA user_version={version}"), ())
             .await
@@ -647,8 +646,7 @@ async fn missing_search_object_selects_the_canonical_rebuild_action() {
     use wenlan_types::lint::LintQuery;
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute("DROP TRIGGER memories_fts_update", ())
         .await
@@ -708,8 +706,7 @@ async fn general_only_plan_refuses_a_stale_source_report() {
         )
         .await
         .unwrap();
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO spaces (id,name,created_at,updated_at) VALUES ('stale','stale',1,1)",
@@ -815,8 +812,7 @@ async fn lint_review_enqueue_is_idempotent_and_does_not_resurrect_terminal_items
         .insert_lint_review_if_absent(&review_id, &source_ids, &payload)
         .await
         .unwrap());
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE refinement_queue SET status = 'dismissed' WHERE id = ?1",
@@ -847,8 +843,7 @@ async fn prepare_plan_emits_exact_manifest_without_mutating_canonical_memory() {
     use wenlan_types::lint::{LintProfile, LintQuery};
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -898,8 +893,7 @@ async fn prepare_plan_emits_exact_manifest_without_mutating_canonical_memory() {
             if manifest.writer() == wenlan_types::repair::RepairWriter::NormalizeMemorySourceAgent
     )));
     let source_agent = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .query(
             "SELECT source_agent FROM memories WHERE source_id='mem_exact'",
@@ -928,8 +922,7 @@ async fn deep_plan_keeps_deterministic_manifest_general_only_and_pageable() {
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -1021,8 +1014,7 @@ async fn deep_only_deterministic_finding_is_visible_but_not_general_only_ready()
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -1096,9 +1088,7 @@ async fn approved_general_only_deterministic_manifest_applies_and_verifies_exact
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
-        .await
+    db.test_primary_session().await
         .execute_batch(
             "INSERT INTO memories
                  (id,content,source,source_id,title,chunk_index,last_modified,chunk_type,
@@ -1241,10 +1231,8 @@ async fn approved_general_only_deterministic_manifest_applies_and_verifies_exact
         .await
         .unwrap();
 
-    let mut rows = db
-        .conn
-        .lock()
-        .await
+    let session = db.test_primary_session().await;
+    let mut rows = session
         .query(
             "SELECT content,title,last_modified,memory_type,source_agent
              FROM memories WHERE source_id='mem_apply'",
@@ -1259,6 +1247,7 @@ async fn approved_general_only_deterministic_manifest_applies_and_verifies_exact
     assert_eq!(row.get::<String>(3).unwrap(), "fact");
     assert_eq!(row.get::<Option<String>>(4).unwrap(), None);
     drop(rows);
+    drop(session);
 
     assert_eq!(
         manifest.post_assertions().target_check_id(),
@@ -1369,8 +1358,7 @@ async fn incomplete_tag_source_check_cannot_be_replaced_by_a_ready_manifest() {
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO document_tags(source,source_id,tag)
@@ -1429,6 +1417,9 @@ async fn incomplete_tag_source_check_cannot_be_replaced_by_a_ready_manifest() {
 
 #[tokio::test]
 async fn tag_manifests_from_global_plan_verify_sequentially_across_ordinal_shifts() {
+    use crate::db::repair_verification::{
+        with_repair_verification_test_control, RepairVerificationTestControl,
+    };
     use crate::lint::{
         context::{CancellationToken, LintClock},
         runner::LintRunner,
@@ -1439,8 +1430,7 @@ async fn tag_manifests_from_global_plan_verify_sequentially_across_ordinal_shift
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO spaces (id,name,created_at,updated_at)
@@ -1537,18 +1527,43 @@ async fn tag_manifests_from_global_plan_verify_sequentially_across_ordinal_shift
         )
         .await
         .unwrap();
-    crate::repair::record_repair_verification(
-        &db,
-        &store,
-        VerifyRepairRequest::try_new_general_only(
-            first.manifest_id().to_string(),
-            first.manifest_digest().clone(),
-            first_apply.receipt_digest().clone(),
-            after_first,
-        )
-        .unwrap(),
-        None,
-        1_721_000_002,
+    let tag_lock_path = store.root().join(format!(
+        ".tag-record-set-{}.lock",
+        first
+            .post_assertions()
+            .target_record_set()
+            .expect("tag record set")
+            .digest()
+            .as_str()
+    ));
+    with_repair_verification_test_control(
+        RepairVerificationTestControl {
+            after_commit_before_pending_clear: Some(Box::new(move || {
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&tag_lock_path)
+                    .unwrap();
+                assert_eq!(
+                    fs2::FileExt::try_lock_exclusive(&lock).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            })),
+            ..Default::default()
+        },
+        crate::repair::record_repair_verification(
+            &db,
+            &store,
+            VerifyRepairRequest::try_new_general_only(
+                first.manifest_id().to_string(),
+                first.manifest_digest().clone(),
+                first_apply.receipt_digest().clone(),
+                after_first,
+            )
+            .unwrap(),
+            None,
+            1_721_000_002,
+        ),
     )
     .await
     .unwrap();
@@ -1613,8 +1628,7 @@ async fn verify_large_tag_window_repair(
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "WITH RECURSIVE sequence(value) AS (
@@ -1668,8 +1682,7 @@ async fn verify_large_tag_window_repair(
         .unwrap();
 
     if matches!(drift, TagDriftAfterPrepare::Replace) {
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "DELETE FROM document_tags
@@ -1680,8 +1693,7 @@ async fn verify_large_tag_window_repair(
             .unwrap();
     }
     if !matches!(drift, TagDriftAfterPrepare::None) {
-        db.conn
-            .lock()
+        db.test_primary_session()
             .await
             .execute(
                 "INSERT INTO document_tags(source,source_id,tag)
@@ -1710,7 +1722,7 @@ async fn verify_large_tag_window_repair(
     let apply = match apply_result {
         Ok(apply) => apply,
         Err(error) => {
-            let connection = db.conn.lock().await;
+            let connection = db.test_primary_session().await;
             let mut rows = connection
                 .query(
                     "SELECT COUNT(*) FROM document_tags
@@ -1804,8 +1816,7 @@ async fn semantic_finding_becomes_one_stable_review_item() {
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -1910,8 +1921,7 @@ async fn semantic_finding_becomes_one_stable_review_item() {
             .unwrap()
     );
     let count = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .query(
             "SELECT COUNT(*) FROM refinement_queue WHERE id=?1",
@@ -1947,8 +1957,7 @@ async fn review_item_contract_reclassification_prepare_requires_plan_item() {
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -2021,8 +2030,7 @@ async fn review_item_contract_reclassification_prepare_requires_plan_item() {
             _ => None,
         })
         .expect("classification Review Item");
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "DELETE FROM refinement_queue WHERE id=?1",
@@ -2292,8 +2300,7 @@ async fn review_item_contract_failed_entity_plan_can_prepare_manifest() {
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO spaces (id,name,created_at,updated_at)
@@ -2303,15 +2310,20 @@ async fn review_item_contract_failed_entity_plan_can_prepare_manifest() {
                   pending_revision,is_recap,supersede_mode,memory_type,space)
              VALUES ('row-entity','Target memory','memory','mem-entity','target',0,10,
                      'text',0,0,'hide','fact','work');
-             INSERT INTO entities
-                 (id,name,entity_type,space,created_at,updated_at)
-             VALUES ('ent-new','New','concept','work',1,1);
              INSERT INTO enrichment_steps
                  (source_id,step_name,status,error,attempts,updated_at)
              VALUES ('mem-entity','entity_extract','failed','transient',2,1721000000);",
         )
         .await
         .unwrap();
+    // G6 Stage 3: the selected-entity existence guard reads the canonical
+    // shadow page (`entity_page_map` JOIN `pages`), and migration 123 dropped
+    // `entities`, so the shadow IS the seed.
+    db.test_seed_entity_shadow_page(
+        crate::db::TestEntity::new("ent-new", "New", "concept").space("work"),
+    )
+    .await
+    .unwrap();
     let runner = || LintRunner::new(LintClock::fixed(), CancellationToken::new());
     let general = runner()
         .run(
@@ -2396,8 +2408,7 @@ async fn deterministic_db_writers_apply_exactly_and_orphan_binding_fails_when_am
 
     let (db, _dir) = crate::db::tests::test_db().await;
     let page_root = tempfile::tempdir().unwrap();
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -2546,8 +2557,7 @@ async fn deterministic_db_writers_apply_exactly_and_orphan_binding_fails_when_am
             .unwrap();
     }
     let supersedes = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .query(
             "SELECT supersedes FROM memories WHERE source_id='mem_self'",
@@ -2563,8 +2573,7 @@ async fn deterministic_db_writers_apply_exactly_and_orphan_binding_fails_when_am
         .unwrap();
     assert_eq!(supersedes, None);
     let tag_count = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .query(
             "SELECT COUNT(*) FROM document_tags
@@ -2600,8 +2609,7 @@ async fn deterministic_db_writers_apply_exactly_and_orphan_binding_fails_when_am
             .unwrap_err();
     assert!(error.to_string().contains("repair_target_stale"));
     let target = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .query(
             "SELECT target_page_id FROM page_links
@@ -2619,8 +2627,159 @@ async fn deterministic_db_writers_apply_exactly_and_orphan_binding_fails_when_am
     assert_eq!(target, None);
 }
 
+/// The repair tool's orphan-bind (`RepairWriter::BindPageLink`) is a second
+/// writer of `page_links.target_page_id` beside `resolve_orphan_page_links`;
+/// a successful bind must mint the now-implied canonical `links` edge, or the
+/// row is permanent "missing" parity drift (G6 Stage 0).
+#[tokio::test]
+async fn bind_page_link_repair_mints_the_links_edge() {
+    use crate::lint::{
+        context::{CancellationToken, LintClock},
+        runner::LintRunner,
+    };
+    use wenlan_types::{
+        lint::LintQuery,
+        repair::{ApplyRepairRequest, RepairWriter},
+    };
+
+    let (db, _dir) = crate::db::tests::test_db().await;
+    let page_root = tempfile::tempdir().unwrap();
+    let now = "2026-07-15T00:00:00Z";
+    db.insert_page(
+        "source_link",
+        "Source Link",
+        None,
+        "see [[Unique Link Target]]",
+        None,
+        Some("work"),
+        &[],
+        now,
+    )
+    .await
+    .unwrap();
+    db.insert_page(
+        "target_link_a",
+        "Unique Link Target",
+        None,
+        "target",
+        None,
+        Some("work"),
+        &[],
+        now,
+    )
+    .await
+    .unwrap();
+    let runner = || LintRunner::new(LintClock::fixed(), CancellationToken::new());
+    let general = runner()
+        .run(
+            &db,
+            &LintQuery::new(Some(LintProfile::General), None),
+            Some(page_root.path()),
+            true,
+        )
+        .await
+        .unwrap();
+    let deep = runner()
+        .run(
+            &db,
+            &LintQuery::new(Some(LintProfile::Deep), None),
+            Some(page_root.path()),
+            true,
+        )
+        .await
+        .unwrap();
+    let repair_root = tempfile::tempdir().unwrap();
+    let store = crate::repair::RepairArtifactStore::new(repair_root.path().to_path_buf());
+    let plan = prepare_repair_plan(
+        &db,
+        &store,
+        RepairPlanRequest::try_new(RepairLintScope::global(), general, Some(deep)).unwrap(),
+        Some(page_root.path()),
+        1_721_000_000,
+    )
+    .await
+    .unwrap();
+    let manifest = plan
+        .entries()
+        .iter()
+        .find_map(|entry| match entry.resolution() {
+            RepairResolution::Ready { manifest }
+                if manifest.writer() == RepairWriter::BindPageLink =>
+            {
+                Some(manifest.as_ref().clone())
+            }
+            _ => None,
+        })
+        .expect("bind manifest ready");
+    let request = ApplyRepairRequest::try_new(
+        manifest.manifest_id().to_string(),
+        manifest.manifest_digest().clone(),
+        format!(
+            "apply repair {} {}",
+            manifest.manifest_id(),
+            manifest.manifest_digest().as_str()
+        ),
+    )
+    .unwrap();
+    crate::repair::apply_repair(&db, &store, request, 1_721_000_001)
+        .await
+        .unwrap();
+
+    // G6 Stage 2 PR 2b (item 3): resolving a bind stops writing the
+    // resolved row into `page_links` -- the row is deleted once bound, not
+    // updated in place. The edge minted below is now the sole canonical
+    // representation of "row bound".
+    let orphan_row_gone = db
+        .test_primary_session()
+        .await
+        .query(
+            "SELECT 1 FROM page_links WHERE source_page_id='source_link'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .is_none();
+    assert!(
+        orphan_row_gone,
+        "resolved orphan row is deleted, not updated in place"
+    );
+
+    // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
+    let edge_id = crate::provenance::compute_edge_id(
+        "links",
+        "page",
+        "source_link",
+        "page",
+        "target_link_a",
+        "unique link target",
+    );
+    let valid_until = db
+        .test_primary_session()
+        .await
+        .query(
+            "SELECT valid_until FROM edges WHERE edge_id = ?1",
+            libsql::params![edge_id.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .expect("minted links edge exists")
+        .get::<Option<i64>>(0)
+        .unwrap();
+    assert!(valid_until.is_none(), "minted links edge is active");
+}
+
 #[tokio::test]
 async fn page_projection_manifest_repairs_only_the_named_page_projection() {
+    use crate::db::repair_verification::{
+        assert_repair_verification_transaction_reusable, with_repair_verification_test_control,
+        RepairVerificationTestControl,
+    };
     use crate::lint::{
         context::{CancellationToken, LintClock},
         runner::LintRunner,
@@ -2656,8 +2815,7 @@ async fn page_projection_manifest_repairs_only_the_named_page_projection() {
     let projected_path = page_root.path().join("projection-repair.md");
     let before_projection = std::fs::read(&projected_path).unwrap();
     std::fs::write(page_root.path().join("unrelated.txt"), b"leave me alone").unwrap();
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET version=version+1 WHERE id='page_projection_repair'",
@@ -2801,35 +2959,55 @@ async fn page_projection_manifest_repairs_only_the_named_page_projection() {
         )
         .await
         .unwrap();
-    let error = crate::repair::record_repair_verification(
-        &db,
-        &store,
-        VerifyRepairRequest::try_new_general_only(
-            manifest.manifest_id().to_string(),
-            manifest.manifest_digest().clone(),
-            apply_receipt.receipt_digest().clone(),
-            general,
-        )
-        .unwrap(),
-        Some(page_root.path()),
-        1_721_000_002,
+    let manifest_dir = store.manifest_dir(manifest.manifest_id()).unwrap();
+    let verification_receipt = manifest_dir.join("verification-receipt.json");
+    let receipt_at_begin = verification_receipt.clone();
+    let pending = manifest_dir.join(".apply-receipt.json.pending");
+    std::fs::hard_link(manifest_dir.join("apply-receipt.json"), &pending).unwrap();
+    let error = with_repair_verification_test_control(
+        RepairVerificationTestControl {
+            after_begin: Some(Box::new(move || {
+                assert!(!receipt_at_begin.exists());
+            })),
+            ..Default::default()
+        },
+        crate::repair::record_repair_verification(
+            &db,
+            &store,
+            VerifyRepairRequest::try_new_general_only(
+                manifest.manifest_id().to_string(),
+                manifest.manifest_digest().clone(),
+                apply_receipt.receipt_digest().clone(),
+                general,
+            )
+            .unwrap(),
+            Some(page_root.path()),
+            1_721_000_002,
+        ),
     )
     .await
     .unwrap_err();
     assert!(error
         .to_string()
         .contains("repair_non_target_state_changed"));
+    assert!(!verification_receipt.exists());
+    assert!(pending.is_file());
+    assert_repair_verification_transaction_reusable(&db).await;
 }
 
 #[tokio::test]
 async fn page_projection_manifests_from_one_plan_apply_sequentially() {
+    use crate::db::repair_verification::{
+        with_repair_verification_test_control, RepairVerificationDbContender,
+        RepairVerificationTestControl,
+    };
     use crate::lint::{
         context::{CancellationToken, LintClock},
         runner::LintRunner,
     };
     use wenlan_types::{
         lint::{LintProfile, LintQuery},
-        repair::{ApplyRepairRequest, RepairTarget, RepairWriter},
+        repair::{ApplyRepairRequest, RepairTarget, RepairWriter, VerifyRepairRequest},
     };
 
     let (db, _dir) = crate::db::tests::test_db().await;
@@ -2865,8 +3043,7 @@ async fn page_projection_manifests_from_one_plan_apply_sequentially() {
         .join("_sources")
         .join("mem_projection_shared.md");
     std::fs::write(&shared_stub, b"shared provenance canary").unwrap();
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET version=version+1
@@ -2935,7 +3112,7 @@ async fn page_projection_manifests_from_one_plan_apply_sequentially() {
             ),
         )
         .unwrap();
-        crate::repair::apply_repair_with_pages(
+        let receipt = crate::repair::apply_repair_with_pages(
             &db,
             &store,
             request,
@@ -2944,6 +3121,69 @@ async fn page_projection_manifests_from_one_plan_apply_sequentially() {
         )
         .await
         .unwrap();
+        let general = runner()
+            .run(
+                &db,
+                &LintQuery::new(Some(LintProfile::General), None),
+                Some(page_root.path()),
+                true,
+            )
+            .await
+            .unwrap();
+        let projection_lock = page_root.path().join(".wenlan/.projection.lock");
+        let before_lock = projection_lock.clone();
+        let contender = RepairVerificationDbContender::new(&db);
+        let start_contender = contender.clone();
+        let contender_before_persist = contender.clone();
+        let contender_after_persist = contender.clone();
+        with_repair_verification_test_control(
+            RepairVerificationTestControl {
+                after_begin: Some(Box::new(move || {
+                    start_contender.start_and_observe_pending();
+                })),
+                before_receipt_persist: Some(Box::new(move || {
+                    contender_before_persist.assert_pending();
+                    let lock = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&before_lock)
+                        .unwrap();
+                    assert_eq!(
+                        fs2::FileExt::try_lock_exclusive(&lock).unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                })),
+                after_receipt_persist: Some(Box::new(move || {
+                    contender_after_persist.assert_pending();
+                    let lock = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&projection_lock)
+                        .unwrap();
+                    assert_eq!(
+                        fs2::FileExt::try_lock_exclusive(&lock).unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                })),
+                ..Default::default()
+            },
+            crate::repair::record_repair_verification(
+                &db,
+                &store,
+                VerifyRepairRequest::try_new_general_only(
+                    manifest.manifest_id().to_string(),
+                    manifest.manifest_digest().clone(),
+                    receipt.receipt_digest().clone(),
+                    general,
+                )
+                .unwrap(),
+                Some(page_root.path()),
+                1_721_000_003 + i64::try_from(offset).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        contender.assert_entered_after_verification();
     }
 
     for path in ["projection-first.md", "projection-second.md"] {
@@ -2994,8 +3234,7 @@ async fn page_projection_apply_preserves_non_target_shared_state_on_effect_escap
         .write_page(&page)
         .unwrap();
     }
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET version=version+1 WHERE id='page_projection_target'",
@@ -3128,8 +3367,7 @@ async fn page_projection_invalid_pending_with_changed_target_fails_closed() {
         .write_page(&page)
         .unwrap();
     }
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET version=version+1

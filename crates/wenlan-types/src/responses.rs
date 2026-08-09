@@ -5,6 +5,7 @@ use crate::entities::{Entity, EntitySearchResult};
 use crate::memory::{IndexedFileInfo, MemoryItem, MemoryStats, SearchResult};
 use crate::pages::Page;
 use crate::repair::RepairDigest;
+use crate::{Space, WriteOutcome, WriteSpaceSource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -28,12 +29,13 @@ pub struct StoreMemoryResponse {
     /// How structured fields were populated. "agent" | "llm" | "none" | "unknown" (forward-compat default).
     #[serde(default = "default_extraction_method")]
     pub extraction_method: String,
-    /// Enrichment state for the memory. `"pending"` when background
-    /// classification + entity extraction + concept linking will run;
-    /// `"not_needed"` when no LLM is available and the memory stays as
-    /// caller-supplied. Machine-readable — Tauri app uses this to drive
+    /// Enrichment state for the memory. `"pending"` when the quiet/cooldown-
+    /// gated ambient scheduler has authorized derived work remaining;
+    /// `"paused"` when no source is pinned or the pinned source is unavailable.
+    /// `"not_needed"` remains accepted as a legacy wire value from older
+    /// daemons. Machine-readable — Tauri app uses this to drive
     /// polling / live-update UI, MCP callers can choose to relay state.
-    /// Defaulted for backward compatibility with pre-async-enrichment clients.
+    /// Defaulted for backward compatibility with older clients.
     #[serde(default)]
     pub enrichment: String,
     /// Prose cue for caller agents — safe to relay to the user verbatim.
@@ -42,6 +44,12 @@ pub struct StoreMemoryResponse {
     /// fields as failure. Empty when the store completed fully sync.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub hint: String,
+    #[serde(default)]
+    pub space: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_source: Option<WriteSpaceSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_outcome: Option<WriteOutcome>,
 }
 
 fn default_extraction_method() -> String {
@@ -143,6 +151,81 @@ pub enum QueueStatus {
     },
 }
 
+/// Observable runtime selected for the local llama.cpp model.
+///
+/// This is additive to `/api/status`: older daemons omit it and deserialize as
+/// `backend = "disabled"`. A GPU failure is visible through
+/// `fallback_reason` even when the provider recovered and is serving on CPU.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDeviceInferenceStatus {
+    #[serde(default = "default_disabled_backend")]
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_index: Option<usize>,
+    #[serde(default)]
+    pub gpu_layers: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+fn default_disabled_backend() -> String {
+    "disabled".to_string()
+}
+
+impl Default for OnDeviceInferenceStatus {
+    fn default() -> Self {
+        Self {
+            backend: default_disabled_backend(),
+            device: None,
+            device_index: None,
+            gpu_layers: 0,
+            fallback_reason: None,
+        }
+    }
+}
+
+/// Where this daemon stands on the M5 truth cutover.
+///
+/// The one thing a client cannot otherwise ask. Until this shipped, the durable
+/// cutover generation was reachable only from the daemon's own maintenance
+/// subcommand, so an app had no way to tell an enforcing daemon from a
+/// pass-through one — and the M5 review action, whose whole precondition is
+/// "the cutover is live", had nothing to gate itself on.
+///
+/// Carries no page identity, no title and no prose, which is why `/api/status`
+/// keeps its `page_bearing: no` classification in the reader manifest. It
+/// describes the daemon, not anything the daemon stores.
+///
+/// Additive on both sides of the wire, and **present only when the cutover is
+/// live**. A daemon that predates the field omits it, a daemon at generation 0
+/// omits it, and a daemon that could not read its own generation omits it —
+/// three situations with one honest reading, which is why they share one
+/// spelling. `None` is that reading: a client that cannot confirm the cutover is
+/// live must behave as though it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruthStatus {
+    /// The durable cutover generation, always `> 0` as served by this daemon —
+    /// `0` means every truth adapter is pass-through, and that state is reported
+    /// by omitting the whole object rather than by sending a zero.
+    pub cutover_generation: i64,
+    /// The newest truth-contract version this daemon serves. A client declaring
+    /// a higher version is treated as legacy, so a client that reads this can
+    /// declare what the daemon actually understands instead of guessing.
+    pub contract_version: u32,
+}
+
+impl TruthStatus {
+    /// Is fail-closed provisional enforcement live?
+    ///
+    /// Presence of the object is the signal; this is the redundant floor for a
+    /// client holding a `TruthStatus` from somewhere that did send a zero.
+    pub const fn cutover_live(&self) -> bool {
+        self.cutover_generation > 0
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub is_running: bool,
@@ -173,6 +256,19 @@ pub struct StatusResponse {
     /// daemons that predate `WENLAN_RERANKER_MODE`.
     #[serde(default)]
     pub reranker_mode: String,
+    /// llama.cpp runtime used by the selected on-device provider. Additive:
+    /// defaults to `disabled` for older daemons and for installations without
+    /// a local model.
+    #[serde(default)]
+    pub on_device_inference: OnDeviceInferenceStatus,
+    /// Additive daemon capabilities. Clients must negotiate against this list
+    /// instead of inferring support from a version string.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// M5 truth-cutover state. Absent on daemons that predate it, which a
+    /// client must read as "not live" rather than "unknown, proceed anyway".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truth: Option<TruthStatus>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -285,6 +381,12 @@ pub struct CreateEntityResponse {
     pub id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub space: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_source: Option<WriteSpaceSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_outcome: Option<WriteOutcome>,
 }
 
 #[doc(hidden)]
@@ -310,6 +412,12 @@ pub struct CreatePageResponse {
     pub attached_to: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub space: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_source: Option<WriteSpaceSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_outcome: Option<WriteOutcome>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -361,6 +469,15 @@ pub struct ImportMemoriesResponse {
     pub observations_added: usize,
     pub relations_created: usize,
     pub batch_id: String,
+    #[serde(default)]
+    pub space: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_source: Option<WriteSpaceSource>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DefaultSpaceResponse {
+    pub space: Option<Space>,
 }
 
 // ===== Steep =====
@@ -1221,8 +1338,8 @@ mod tests {
 
     #[test]
     fn store_memory_response_exposes_enrichment_and_hint() {
-        // Post-async-refactor shape: the daemon returns immediately after
-        // upsert and reports deferred enrichment via `enrichment` + `hint`.
+        // The daemon returns immediately after upsert and reports quiet
+        // deferred enrichment via `enrichment` + `hint`.
         let json = r#"{
             "source_id": "mem_xyz",
             "chunks_created": 1,
@@ -1230,11 +1347,11 @@ mod tests {
             "warnings": [],
             "extraction_method": "unknown",
             "enrichment": "pending",
-            "hint": "Stored. Wenlan is compiling classification + concept links in the background (~2s). Recall will surface the enriched form shortly."
+            "hint": "Stored. Recall is available now; Wenlan will quietly enrich classification and page links in the background."
         }"#;
         let parsed: StoreMemoryResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.enrichment, "pending");
-        assert!(parsed.hint.contains("compiling"));
+        assert!(parsed.hint.contains("quietly enrich"));
     }
 
     #[test]
@@ -1280,8 +1397,7 @@ mod tests {
 
     #[test]
     fn store_memory_response_roundtrips_not_needed_state() {
-        // Daemon reports `not_needed` when no LLM is available. Hint is empty
-        // (skip_serializing_if) so the JSON shrinks accordingly.
+        // Keep accepting the legacy state emitted by older daemons.
         let response = StoreMemoryResponse {
             source_id: "mem_no_llm".into(),
             chunks_created: 1,
@@ -1292,6 +1408,9 @@ mod tests {
             extraction_method: "none".into(),
             enrichment: "not_needed".into(),
             hint: String::new(),
+            space: None,
+            space_source: None,
+            write_outcome: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"enrichment\":\"not_needed\""));
@@ -1302,6 +1421,29 @@ mod tests {
         let parsed: StoreMemoryResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.enrichment, "not_needed");
         assert_eq!(parsed.hint, "");
+    }
+
+    #[test]
+    fn store_memory_response_roundtrips_paused_state_with_hint() {
+        let response = StoreMemoryResponse {
+            source_id: "mem_paused".into(),
+            chunks_created: 1,
+            memory_type: "fact".into(),
+            entity_id: None,
+            quality: None,
+            warnings: vec![],
+            extraction_method: "none".into(),
+            enrichment: "paused".into(),
+            hint: "Stored; choose a model source to enable enrichment.".into(),
+            space: None,
+            space_source: None,
+            write_outcome: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"enrichment\":\"paused\""));
+        let parsed: StoreMemoryResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.enrichment, "paused");
+        assert!(parsed.hint.contains("choose a model source"));
     }
 
     #[test]
@@ -1399,6 +1541,37 @@ mod queue_status_tests {
             r#"{"is_running":true,"files_indexed":0,"files_total":0,"sources_connected":[]}"#;
         let parsed: StatusResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.queue, QueueStatus::Idle);
+        assert_eq!(
+            parsed.on_device_inference,
+            OnDeviceInferenceStatus::default()
+        );
+    }
+
+    #[test]
+    fn on_device_inference_status_round_trips_vulkan_device_and_fallback() {
+        let status = OnDeviceInferenceStatus {
+            backend: "vulkan".into(),
+            device: Some("NVIDIA GeForce RTX 3060 Laptop GPU".into()),
+            device_index: Some(2),
+            gpu_layers: 99,
+            fallback_reason: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: OnDeviceInferenceStatus = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, status);
+        assert!(json.contains("\"backend\":\"vulkan\""));
+        assert!(json.contains("RTX 3060"));
+
+        let fallback: OnDeviceInferenceStatus = serde_json::from_str(
+            r#"{"backend":"cpu","gpu_layers":0,"fallback_reason":"Vulkan context creation failed"}"#,
+        )
+        .unwrap();
+        assert_eq!(fallback.backend, "cpu");
+        assert_eq!(
+            fallback.fallback_reason.as_deref(),
+            Some("Vulkan context creation failed")
+        );
     }
 
     #[test]
@@ -1466,6 +1639,9 @@ mod reranker_status_tests {
                 model_id: "JINARerankerV1TurboEn".into(),
             },
             reranker_mode: "full".into(),
+            on_device_inference: OnDeviceInferenceStatus::default(),
+            capabilities: vec!["default_save_space".into()],
+            truth: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
@@ -1587,4 +1763,26 @@ mod search_response_tests {
             "empty array should deserialize to empty vec"
         );
     }
+}
+
+/// What a successful page review records, and what a retry of it replays.
+///
+/// This is the whole of §7's allowed payload and nothing else: protocol
+/// version, nonce **digest**, verification time, the page version and content
+/// digest the human actually read, and caller/operation identity. No HMAC, no
+/// raw nonce, no secret — which is why this type can be stored as the receipt,
+/// returned in the response, and logged, all from one shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageReviewReceipt {
+    pub page_id: String,
+    pub human_reviewed: bool,
+    /// The version the digest below belongs to, read from the row rather than
+    /// taken from the request.
+    pub reviewed_page_version: i64,
+    pub reviewed_page_digest: String,
+    pub protocol_version: u32,
+    pub nonce_digest: String,
+    pub verified_at: i64,
+    pub caller_id: String,
+    pub operation_id: String,
 }

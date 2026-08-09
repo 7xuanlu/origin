@@ -6,7 +6,7 @@ use crate::lint::runner::LintRunner;
 use wenlan_types::lint::{LintMetricCode, LintMetricValue, LintOutcome, LintQuery};
 
 async fn insert_head(db: &crate::db::MemoryDB, id: &str) {
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute(
         "INSERT INTO memories (
             id, content, source, source_id, title, chunk_index, last_modified,
@@ -101,7 +101,7 @@ async fn fact_liveness_differentiates_rows_from_real_vector_index_visibility() {
             .collect::<Vec<_>>()
             .join(",")
     );
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     conn.execute(
         "INSERT INTO child_vectors (id, parent_kind, parent_id, field, content, embedding)
          VALUES ('child-indexed', 'memory', 'mem-indexed', 'narrative', 'body', vector32(?1)),

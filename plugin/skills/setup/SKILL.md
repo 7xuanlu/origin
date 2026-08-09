@@ -5,7 +5,7 @@ description: >
   configures local memory, and verifies the full plugin -> MCP -> local runtime
   round-trip. Run after `/plugin install wenlan@7xuanlu-wenlan`, or any time the user
   says "set up wenlan", "is wenlan working", "fix wenlan".
-allowed-tools: ["Bash", "mcp__plugin_wenlan_wenlan__doctor", "mcp__plugin_wenlan_wenlan__context"]
+allowed-tools: ["Bash", "mcp__plugin_wenlan_wenlan__brief"]
 ---
 
 # /setup
@@ -53,7 +53,14 @@ fi
 - If the probe cannot run because the runtime is down: continue to bootstrap.
 - If `PLUGIN_JSON` is unreadable or `python3` is missing: continue to doctor;
   the session hook will keep surfacing a mismatch if one exists.
-- If mismatch, repair the runtime:
+- If mismatch, check the direction before repairing. Compare the release part
+  of `daemon=` (strip the `+g<sha>` suffix) against `release=`, numeric per
+  component, not lexicographic. Daemon release equal or newer → the plugin
+  cache is stale, not the runtime: skip the repair below (it would only
+  reinstall the same-or-latest runtime and restart a healthy daemon) and go
+  straight to the stop message in step 4 — update the plugin, restart, rerun.
+- Only if the daemon release is older than the plugin release, repair the
+  runtime:
 
 ```bash
 PLUGIN_JSON="${CLAUDE_PLUGIN_ROOT:-plugin}/.claude-plugin/plugin.json"
@@ -81,7 +88,7 @@ command -v wenlan >/dev/null 2>&1 && echo present || echo absent
 If absent, install and configure local memory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/v0.14.1/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/v0.15.5/install.sh | bash
 export PATH="$HOME/.wenlan/bin:$PATH"
 wenlan setup --basic
 wenlan background on
@@ -125,20 +132,21 @@ code.
 
 ### 5. Doctor
 
-Call the Wenlan MCP `doctor` tool.
+Run the Wenlan CLI doctor through the resolved binary path:
 
-```text
-doctor()
+```bash
+W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
+"$W" doctor
 ```
 
 Expected: local memory configured. Capture the mode string for the final report.
 
 ### 6. MCP round-trip
 
-Call the Wenlan MCP `context` tool.
+Call the Wenlan MCP `brief` tool as a read-only round-trip.
 
 ```text
-context()
+brief()
 ```
 
 Pass: continue. Fail: MCP is not wired. Tell the user:
@@ -152,7 +160,7 @@ Print:
 ```text
 Wenlan ready.
   Runtime:  up on 127.0.0.1:7878
-  Mode:     <mode from doctor()>
+  Mode:     <mode from CLI doctor>
   MCP:      connected
   Data:     ~/.wenlan/  (pages, sessions, db symlink)
   Try:      /brief, /capture <thing>, /recall <query>, /help
@@ -168,8 +176,18 @@ Mention these only if the user asks for richer synthesis:
 - `wenlan models install` for local model-backed distillation.
 - `wenlan keys set anthropic` for stronger synthesis.
 
+Installing a model or key only makes that provider available; it does not
+authorize background inference. If the user wants automatic enrichment, run
+`wenlan enrichment status`, help them choose the exact Everyday and Synthesis
+sources, then run `wenlan enrichment configure --everyday <source> --synthesis
+<source>`. The CLI itself shows the task mapping and cloud/on-device disclosure
+and obtains the one confirmation. Never add `--yes` unless the user already
+stated that exact mapping. `wenlan enrichment disable` reverses the consent
+without deleting the model or key.
+
 Default flow ignores both. Storage, search, recall, and MCP memory all work in
-local memory mode.
+local memory mode; deterministic indexing and sync continue while model-backed
+background enrichment is off.
 
 ## When to use
 
@@ -181,4 +199,5 @@ local memory mode.
 ## When NOT to use
 
 - Runtime already verified this session: `/brief` instead.
-- Editing one config field: `wenlan doctor` or settings file directly.
+- Editing one config field: rerun the CLI doctor command from Step 5 or edit the
+  settings file directly.

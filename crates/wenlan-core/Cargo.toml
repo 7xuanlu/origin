@@ -10,6 +10,13 @@ description = "Core business logic for Wenlan — memory storage, retrieval, and
 default = []
 closed-core-eval = []
 eval-harness = []
+# Redirect config reads/writes to a disposable per-process directory so a test
+# binary can never resolve to the developer's real `config.json` (rationale on
+# `default_config_root` in src/config.rs). Enabled from `wenlan-server`'s
+# `[dev-dependencies]`; with resolver 2 a dev-dependency feature is not unified
+# into a normal build, so a shipped daemon never has it. `wenlan-core`'s own
+# tests get the same behaviour through `cfg(test)`.
+scratch-config = []
 
 [dependencies]
 wenlan-types = { workspace = true }
@@ -36,8 +43,8 @@ encoding_rs = { workspace = true }
 # Memory DB (phase 3c)
 tokio = { workspace = true }
 libsql = { workspace = true }
-fastembed = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
 hex = { workspace = true }
 lru = { workspace = true }
 
@@ -73,11 +80,39 @@ env_logger = "0.11"
 # eval modules are not feature-gated, so their deps are regular deps.
 tiktoken-rs = "0.6"
 futures = { workspace = true }
+# M4 gate-stage candidate: exact-pinned and sequential-only so a fixed seed plus
+# stable node indexing can make the partition byte-deterministic. Persistence
+# remains blocked until the authored Gate 1 and Gate 2 harnesses pass.
+leiden-rs = { version = "=0.8.1", default-features = false }
+# Unicode NFC normalization for provenance-root content canonicalization
+# (Q6-locked recipe: NFC + line-ending + whitespace, nothing semantic).
+# Already present transitively (text-splitter -> ... -> unicode-normalization
+# 0.1.25), so this pins it as a direct dep rather than growing the resolved
+# graph. Root Cargo.toml is release-please-locked, so this is a per-crate
+# dep like text-splitter/tiktoken-rs above rather than a workspace one.
+unicode-normalization = "0.1"
+# Unicode general categories for the M6 wikilink-key gate (S0-38: reject every
+# Cc *and* Cf scalar). std only offers `char::is_control()` = Cc, which would
+# miss the entire Cf class — RLO, ZWSP, and the BOM are all Cf, and Cf is where
+# the invisible-label attacks live. Already in the lock file transitively, so
+# this pins it as a direct dep rather than growing the resolved graph.
+unicode-properties = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+fastembed = { workspace = true, features = ["ort-load-dynamic"] }
+
+[target.'cfg(not(windows))'.dependencies]
+# Keep the existing static ORT path outside Windows. The native-TLS download
+# feature is intentional: its rustls variant does not fetch ort-sys binaries.
+fastembed = { workspace = true, features = ["ort-download-binaries-native-tls"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 llama-cpp-2 = { version = "0.1", features = ["metal", "sampler"] }
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
+llama-cpp-2 = { version = "0.1", features = ["vulkan", "sampler"] }
+
+[target.'cfg(all(not(target_os = "macos"), not(target_os = "windows")))'.dependencies]
 llama-cpp-2 = { version = "0.1", features = ["sampler"] }
 
 [build-dependencies]
@@ -86,6 +121,11 @@ sha2 = { workspace = true }
 [[bin]]
 name = "compare-baselines"
 path = "src/bin/compare_baselines.rs"
+required-features = ["eval-harness"]
+
+[[bin]]
+name = "m5_export_page_size_dist"
+path = "src/bin/m5_export_page_size_dist.rs"
 required-features = ["eval-harness"]
 
 [dev-dependencies]
@@ -97,3 +137,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # lopdf pdf-extract parses with). default-features=false keeps it to the writer
 # path only, so no new crates enter the graph (mirrors the tokenizers/tempfile note).
 lopdf = { version = "0.38", default-features = false }
+# R4 test-support source teeth parse Rust syntax and retain stable source
+# locations. Exact pins keep the manifest identities deterministic.
+syn = { version = "=2.0.117", features = ["full", "visit"] }
+proc-macro2 = { version = "=1.0.106", features = ["span-locations"] }

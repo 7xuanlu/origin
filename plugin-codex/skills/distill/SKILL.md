@@ -4,7 +4,7 @@ description: >
   Synthesize or refresh source-backed Wenlan pages from Codex. Invoked as
   /distill [target], /distill deep, or /distill rebuild <page-id>.
 argument-hint: "[target | deep | rebuild <page-id>]"
-allowed-tools: ["Bash", "mcp__wenlan__recall", "mcp__wenlan__distill", "mcp__wenlan__create_page", "mcp__wenlan__update_page", "mcp__wenlan__delete_page", "mcp__wenlan__get_page_sources"]
+allowed-tools: ["Bash", "mcp__wenlan__recall", "mcp__wenlan__distill", "mcp__wenlan__write_page", "mcp__wenlan__delete_page", "mcp__wenlan__get_page_sources"]
 user-invocable: true
 ---
 
@@ -26,7 +26,7 @@ target="$(printf '%s\n' "$raw_args" | sed -E 's/[[:space:]]*space:[A-Za-z0-9_-]+
 Resolve space:
 
 ```bash
-resolved="$(plugin-codex/bin/resolve-space.sh --cwd "$PWD" ${space_arg:+--arg "$space_arg"} ${target:+--topic "$target"} 2>/dev/null)"
+resolved="$(plugin-codex/bin/resolve-space.sh --cwd "$PWD" ${space_arg:+--arg "$space_arg"} 2>/dev/null)"
 space="$(printf '%s\n' "$resolved" | cut -f1)"
 source_layer="$(printf '%s\n' "$resolved" | cut -f2)"
 ```
@@ -89,7 +89,7 @@ For each `pending` cluster:
 3. For a new cluster, call:
 
 ```text
-mcp__wenlan__create_page(
+mcp__wenlan__write_page(
   title="<short noun phrase>",
   summary="<one durable claim>",
   content="<3-7 paragraphs with inline (source: mem_...) citations>",
@@ -102,7 +102,7 @@ mcp__wenlan__create_page(
 4. For a refresh candidate, call:
 
 ```text
-mcp__wenlan__update_page(
+mcp__wenlan__write_page(
   page_id="<existing_page_id>",
   content="<refreshed source-cited prose>",
   source_memory_ids=[...],
@@ -120,7 +120,7 @@ For each `stale_pages` item:
   the user they can run `/distill rebuild <page-id>` if they want to wipe edits.
 - If `user_edited == false`, call `mcp__wenlan__get_page_sources(page_id=...)`,
   synthesize refreshed prose from the sources, then call
-  `mcp__wenlan__update_page`.
+  `mcp__wenlan__write_page` with that `page_id`.
 
 ## Resolve Markdown paths
 

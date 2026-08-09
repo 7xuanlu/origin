@@ -17,6 +17,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::db::MemoryDB;
+use crate::error::WenlanError;
 use crate::events::{EventEmitter, NoopEmitter};
 use crate::llm_provider::LlmProvider;
 use crate::prompts::PromptRegistry;
@@ -247,6 +248,257 @@ pub async fn run_classification_enrichment(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClassificationSliceReport {
+    pub selected: bool,
+    pub committed: bool,
+    pub llm_calls: usize,
+}
+
+/// Advance one durable memory classification stage with at most one provider
+/// call. Field/tag writes and the versioned receipt share one guarded commit.
+pub async fn run_classification_enrichment_slice(
+    db: &MemoryDB,
+    llm: &Arc<dyn LlmProvider>,
+    prompts: &PromptRegistry,
+) -> Result<ClassificationSliceReport, WenlanError> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let Some(input) = db.get_classification_candidate(MAX_ATTEMPTS).await? else {
+        return Ok(ClassificationSliceReport::default());
+    };
+
+    let request = crate::llm_provider::LlmRequest {
+        system_prompt: Some(prompts.classify_memory_quality.clone()),
+        user_prompt: input.content.chars().take(1000).collect(),
+        max_tokens: 128,
+        temperature: 0.1,
+        label: Some("classify".into()),
+        timeout_secs: None,
+    };
+    let generated =
+        tokio::time::timeout(std::time::Duration::from_secs(30), llm.generate(request)).await;
+    let classification = match generated {
+        Ok(Ok(output)) => crate::llm_provider::parse_classify_response(&output),
+        Ok(Err(error)) => {
+            let attempt = input.prior_attempts.saturating_add(1);
+            let status = if attempt >= MAX_ATTEMPTS {
+                "abandoned"
+            } else {
+                "needs_retry"
+            };
+            let committed = db
+                .record_enrichment_step_at_version(
+                    &input.source_id,
+                    "classify",
+                    status,
+                    Some(&error.to_string()),
+                    input.version,
+                )
+                .await?;
+            return Ok(ClassificationSliceReport {
+                selected: true,
+                committed,
+                llm_calls: 1,
+            });
+        }
+        Err(_) => {
+            let attempt = input.prior_attempts.saturating_add(1);
+            let status = if attempt >= MAX_ATTEMPTS {
+                "abandoned"
+            } else {
+                "needs_retry"
+            };
+            let committed = db
+                .record_enrichment_step_at_version(
+                    &input.source_id,
+                    "classify",
+                    status,
+                    Some("classification timed out after 30s"),
+                    input.version,
+                )
+                .await?;
+            return Ok(ClassificationSliceReport {
+                selected: true,
+                committed,
+                llm_calls: 1,
+            });
+        }
+    };
+    let Some(classification) = classification else {
+        let attempt = input.prior_attempts.saturating_add(1);
+        let status = if attempt >= MAX_ATTEMPTS {
+            "abandoned"
+        } else {
+            "needs_retry"
+        };
+        let committed = db
+            .record_enrichment_step_at_version(
+                &input.source_id,
+                "classify",
+                status,
+                Some("classification response was invalid"),
+                input.version,
+            )
+            .await?;
+        return Ok(ClassificationSliceReport {
+            selected: true,
+            committed,
+            llm_calls: 1,
+        });
+    };
+
+    let derived_memory_type =
+        (!input.origin.memory_type_explicit).then_some(classification.memory_type.as_str());
+    let derived_supersede_mode = derived_memory_type.map(|memory_type| {
+        if memory_type == "decision" {
+            "archive"
+        } else {
+            "hide"
+        }
+    });
+    let derived_space = if input.space.is_none() && !input.origin.space_rejected {
+        db.registered_space_or_none(classification.space.as_deref())
+            .await?
+    } else {
+        None
+    };
+    let committed = db
+        .commit_classification_at_version(
+            &input.source_id,
+            input.version,
+            derived_memory_type,
+            derived_space.as_deref(),
+            classification.quality.as_deref(),
+            derived_supersede_mode,
+            classification.importance,
+            &classification.tags,
+        )
+        .await?;
+    Ok(ClassificationSliceReport {
+        selected: true,
+        committed,
+        llm_calls: 1,
+    })
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StructuredExtractSliceReport {
+    pub selected: bool,
+    pub committed: bool,
+    pub llm_calls: usize,
+}
+
+/// Advance one durable structured-extraction stage. Explicit structured fields
+/// consume no provider budget and receive only a current-version receipt.
+pub async fn run_structured_extract_slice(
+    db: &MemoryDB,
+    llm: &Arc<dyn LlmProvider>,
+    prompts: &PromptRegistry,
+) -> Result<StructuredExtractSliceReport, WenlanError> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let Some(input) = db.get_structured_extract_candidate(MAX_ATTEMPTS).await? else {
+        return Ok(StructuredExtractSliceReport::default());
+    };
+    if input.origin.structured_fields_explicit {
+        let committed = db
+            .commit_structured_extract_at_version(
+                &input.source_id,
+                input.version,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        return Ok(StructuredExtractSliceReport {
+            selected: true,
+            committed,
+            llm_calls: 0,
+        });
+    }
+
+    let memory_type = input.memory_type.as_deref().unwrap_or("fact");
+    let prompt = crate::memory_schema::extraction_prompt_with_template(
+        memory_type,
+        &prompts.extract_structured_fields,
+    );
+    let generated = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        llm.generate(crate::llm_provider::LlmRequest {
+            system_prompt: Some(prompt),
+            user_prompt: input.content.chars().take(1500).collect(),
+            max_tokens: 256,
+            temperature: 0.1,
+            label: Some("structured_extract".into()),
+            timeout_secs: None,
+        }),
+    )
+    .await;
+    let output = match generated {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            let attempt = input.prior_attempts.saturating_add(1);
+            let status = if attempt >= MAX_ATTEMPTS {
+                "abandoned"
+            } else {
+                "needs_retry"
+            };
+            let committed = db
+                .record_enrichment_step_at_version(
+                    &input.source_id,
+                    "structured_extract",
+                    status,
+                    Some(&error.to_string()),
+                    input.version,
+                )
+                .await?;
+            return Ok(StructuredExtractSliceReport {
+                selected: true,
+                committed,
+                llm_calls: 1,
+            });
+        }
+        Err(_) => {
+            let attempt = input.prior_attempts.saturating_add(1);
+            let status = if attempt >= MAX_ATTEMPTS {
+                "abandoned"
+            } else {
+                "needs_retry"
+            };
+            let committed = db
+                .record_enrichment_step_at_version(
+                    &input.source_id,
+                    "structured_extract",
+                    status,
+                    Some("structured extraction timed out after 30s"),
+                    input.version,
+                )
+                .await?;
+            return Ok(StructuredExtractSliceReport {
+                selected: true,
+                committed,
+                llm_calls: 1,
+            });
+        }
+    };
+    let extracted = crate::llm_provider::parse_extraction_response(&output);
+    let committed = db
+        .commit_structured_extract_at_version(
+            &input.source_id,
+            input.version,
+            extracted.structured_fields.as_deref(),
+            extracted.retrieval_cue.as_deref(),
+            extracted.event_date,
+            extracted.event_end,
+        )
+        .await?;
+    Ok(StructuredExtractSliceReport {
+        selected: true,
+        committed,
+        llm_calls: 1,
+    })
+}
+
 /// Run the canonical post-store enrichment for a single already-upserted memory.
 ///
 /// Behaviour is log-and-degrade at every step (an LLM/DB error warns and the
@@ -360,6 +612,7 @@ pub async fn run_canonical_enrichment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::EnrichmentOrigin;
     use crate::llm_provider::SequencedMockProvider;
     use crate::sources::RawDocument;
 
@@ -414,6 +667,120 @@ mod tests {
             agent_supplied_profile_alias: false,
             agent_supplied_structured_fields: false,
         }
+    }
+
+    #[tokio::test]
+    async fn classification_slice_preserves_explicit_type_and_commits_one_receipt() {
+        let (db, _dir) = test_db().await;
+        db.create_space("work", None, false).await.unwrap();
+        let mut doc = seed_doc(
+            "mem_classification_slice",
+            "The launch decision belongs to the work project and is high priority.",
+        );
+        doc.memory_type = Some("decision".to_string());
+        db.upsert_enrichment_origin(
+            "mem_classification_slice",
+            EnrichmentOrigin {
+                memory_type_explicit: true,
+                structured_fields_explicit: false,
+                space_rejected: false,
+            },
+        )
+        .await
+        .unwrap();
+        db.upsert_documents(vec![doc]).await.unwrap();
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedMockProvider::new(vec![
+            r#"{"memory_type":"preference","domain":"work","quality":"high","importance":8,"tags":["launch","priority"]}"#,
+        ]));
+
+        let report = run_classification_enrichment_slice(&db, &llm, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert!(report.selected);
+        assert!(report.committed);
+        assert_eq!(report.llm_calls, 1);
+        let (memory_type, space) = db
+            .get_memory_classification("mem_classification_slice")
+            .await
+            .unwrap();
+        assert_eq!(memory_type.as_deref(), Some("decision"));
+        assert_eq!(space.as_deref(), Some("work"));
+        assert_eq!(
+            db.get_document_tags("memory", "mem_classification_slice")
+                .await
+                .unwrap(),
+            vec!["launch".to_string(), "priority".to_string()]
+        );
+        let steps = db
+            .get_enrichment_steps("mem_classification_slice")
+            .await
+            .unwrap();
+        let classify = steps
+            .iter()
+            .find(|step| step.step == "classify")
+            .expect("classification receipt");
+        assert_eq!(classify.status, "ok");
+        assert_eq!(classify.input_version, Some(1));
+    }
+
+    #[tokio::test]
+    async fn structured_slice_skips_inference_for_explicit_fields() {
+        let (db, _dir) = test_db().await;
+        let mut doc = seed_doc(
+            "mem_structured_explicit",
+            "Explicit structured input must survive every background retry.",
+        );
+        doc.memory_type = Some("decision".to_string());
+        doc.structured_fields = Some(r#"{"claim":"keep me"}"#.to_string());
+        db.upsert_enrichment_origin(
+            "mem_structured_explicit",
+            EnrichmentOrigin {
+                memory_type_explicit: true,
+                structured_fields_explicit: true,
+                space_rejected: false,
+            },
+        )
+        .await
+        .unwrap();
+        db.upsert_documents(vec![doc]).await.unwrap();
+        assert!(
+            db.record_enrichment_step_at_version(
+                "mem_structured_explicit",
+                "classify",
+                "ok",
+                None,
+                1,
+            )
+            .await
+            .unwrap()
+        );
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedMockProvider::new(vec![]));
+
+        let report = run_structured_extract_slice(&db, &llm, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert!(report.selected);
+        assert!(report.committed);
+        assert_eq!(report.llm_calls, 0);
+        let detail = db
+            .get_memory_detail("mem_structured_explicit")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            detail.structured_fields.as_deref(),
+            Some(r#"{"claim":"keep me"}"#)
+        );
+        let steps = db
+            .get_enrichment_steps("mem_structured_explicit")
+            .await
+            .unwrap();
+        let structured = steps
+            .iter()
+            .find(|step| step.step == "structured_extract")
+            .expect("structured receipt");
+        assert_eq!(structured.status, "ok");
+        assert_eq!(structured.input_version, Some(1));
     }
 
     /// The canonical enrichment must classify + extract via the LLM and persist

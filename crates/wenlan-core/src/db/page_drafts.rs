@@ -8,7 +8,8 @@ const PAGE_COLUMNS: &str = "id, title, summary, content, entity_id, space,
     source_memory_ids, version, status, created_at, last_compiled, last_modified,
     COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0),
     COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'),
-    COALESCE(review_status, 'confirmed'), workspace, citations";
+    COALESCE(review_status, 'confirmed'), workspace, citations,
+    COALESCE(kind, 'concept')";
 
 fn ensure_meaningful_snapshot(title: &str, content: &str) -> Result<(), WenlanError> {
     if title.trim().is_empty() && content.trim().is_empty() {
@@ -277,25 +278,34 @@ impl MemoryDB {
             super::page_drafts_test::transaction_test_hooks::after_space_validation(id).await;
         }
 
+        // M1: the pages scope columns are NOT NULL. Resolve the draft's scope via
+        // the Option A ladder (workspace wins, else space, else the reserved
+        // sentinel id) and mirror it onto BOTH columns so the read-collapse reads
+        // a single honest scope. The create-request ledger below keeps the raw
+        // (possibly-None) values so replaying the original request still matches.
+        let page_scope = normalized_workspace
+            .as_deref()
+            .or(normalized_space.as_deref())
+            .unwrap_or(super::UNFILED_SPACE_ID);
         tx.execute(
             "INSERT INTO pages (
                     id, title, summary, content, entity_id, space, source_memory_ids,
                     version, status, embedding, created_at, last_compiled,
                     last_modified, sources_updated_count, stale_reason, user_edited,
-                    changelog, creation_kind, review_status, workspace, citations
+                    changelog, creation_kind, review_status, workspace, citations, kind
                  ) VALUES (
                     ?1, ?2, NULL, ?3, NULL, ?4, '[]',
                     1, 'draft', NULL, ?5, ?5,
                     ?5, 0, NULL, 1,
-                    '[]', 'authored', 'unconfirmed', ?6, '[]'
+                    '[]', 'authored', 'unconfirmed', ?4, '[]', ?6
                  )",
             libsql::params![
                 id,
                 title,
                 content,
-                normalized_space.as_deref(),
+                page_scope,
                 now,
-                normalized_workspace.as_deref()
+                crate::pages::page_kind_for(title, "authored", "draft")
             ],
         )
         .await
@@ -396,11 +406,26 @@ impl MemoryDB {
 
         let current = Self::required_page_draft_on_conn(&tx, id).await?;
         ensure_draft(&current)?;
+        // M1 read-collapse: the write below mirrors ONE resolved scope onto both
+        // NOT NULL columns via the Option A ladder (workspace wins, else space,
+        // else the reserved sentinel id), and `row_to_page` translates that
+        // sentinel back to None. An exact retry must therefore compare against
+        // that SAME resolved wire scope, not the raw (possibly-divergent)
+        // requested columns -- otherwise a divergent-but-idempotent replay
+        // (e.g. Some("work"), None, which stores space=workspace="work") misses
+        // the fast-path and falls through to a spurious VersionConflict. Both
+        // callers agree here: on the registered path requested_space ==
+        // requested_workspace, so the ladder is a no-op. The filter drops the
+        // sentinel id (not the word "unfiled", which is a legal user scope) so a
+        // caller passing it aligns with the wire-hidden `current.space` (None).
+        let requested_scope = requested_workspace
+            .as_deref()
+            .or(requested_space.as_deref())
+            .filter(|s| *s != super::UNFILED_SPACE_ID);
         if expected_version.checked_add(1) == Some(current.version)
             && current.title == title
             && current.content == content
-            && current.space.as_deref() == requested_space.as_deref()
-            && current.workspace.as_deref() == requested_workspace.as_deref()
+            && current.space.as_deref() == requested_scope
         {
             return Ok(PageDraftUpdateOutcome::Updated(current));
         }
@@ -423,21 +448,22 @@ impl MemoryDB {
         if validate_space {
             super::page_drafts_test::transaction_test_hooks::after_space_validation(id).await;
         }
+        // M1: mirror the resolved scope onto both NOT NULL columns via the Option A
+        // ladder (workspace wins, else space, else the reserved sentinel id), so
+        // an uncategorized draft update writes the sentinel instead of a NULL that
+        // the NOT NULL constraint rejects. The idempotency/replay comparison above
+        // reads translated (sentinel-hidden) values, so it is unaffected.
+        let page_scope = normalized_workspace
+            .as_deref()
+            .or(normalized_space.as_deref())
+            .unwrap_or(super::UNFILED_SPACE_ID);
         let affected = tx
             .execute(
                 "UPDATE pages
-                     SET title=?1, content=?2, space=?3, workspace=?4,
-                         version=version+1, last_modified=?5
-                     WHERE id=?6 AND status='draft' AND version=?7",
-                libsql::params![
-                    title,
-                    content,
-                    normalized_space,
-                    normalized_workspace,
-                    now,
-                    id,
-                    expected_version
-                ],
+                     SET title=?1, content=?2, space=?3, workspace=?3,
+                         version=version+1, last_modified=?4
+                     WHERE id=?5 AND status='draft' AND version=?6",
+                libsql::params![title, content, page_scope, now, id, expected_version],
             )
             .await
             .map_err(|error| WenlanError::VectorDb(format!("update Page draft row: {error}")))?;

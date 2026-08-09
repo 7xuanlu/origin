@@ -3,6 +3,9 @@ use clap::{Parser, Subcommand};
 use output::OutputFormat;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use wenlan_cli::space_context::{
+    resolve_agent_name, resolve_cli_space, resolve_native_read_space, CliSpaceOperation,
+};
 use wenlan_cli::{client, commands, output};
 use wenlan_types::lint::LintProfile;
 
@@ -23,6 +26,18 @@ struct Cli {
     /// Suppress all non-error output. Useful for scripts.
     #[arg(long, short, global = true)]
     quiet: bool,
+
+    /// Identify the caller in X-Agent-Name audit metadata.
+    #[arg(long, global = true)]
+    agent_name: Option<String>,
+
+    /// Use one registered Space for scope-aware reads and writes.
+    #[arg(long, global = true, conflicts_with = "all_spaces")]
+    space: Option<String>,
+
+    /// Read across every Space. Invalid for writes and strict WENLAN_SPACE pins.
+    #[arg(long, global = true)]
+    all_spaces: bool,
 }
 
 #[derive(Subcommand)]
@@ -57,9 +72,6 @@ enum Commands {
     Lint {
         #[arg(long)]
         profile: Option<LintProfile>,
-        /// Limit checks to one registered space, or `uncategorized`.
-        #[arg(long)]
-        space: Option<String>,
         /// Permit a deep semantic pass to use an already configured external provider.
         #[arg(long)]
         allow_external: bool,
@@ -80,6 +92,11 @@ enum Commands {
         #[command(subcommand)]
         command: commands::setup::KeyCommand,
     },
+    /// Configure, inspect, or disable model-backed background enrichment.
+    Enrichment {
+        #[command(subcommand)]
+        command: commands::setup::EnrichmentCommand,
+    },
     /// Connect Wenlan to a supported agent or editor.
     Connect(commands::mcp::ConnectArgs),
     /// Search memories by query (vector + FTS hybrid).
@@ -90,11 +107,13 @@ enum Commands {
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
     },
-    /// Recall the working memory bundle for a query.
+    /// Recall memories relevant to a query.
     Recall {
-        /// Query to recall context for.
+        /// Query to recall memories for.
         query: String,
     },
+    /// Read the current Space Brief, optionally with related context.
+    Brief(commands::brief::BriefArgs),
     /// Browse distilled pages, or open one in your editor by title query.
     Pages {
         /// Title/filename substring. Omit to list pages newest-first.
@@ -102,6 +121,9 @@ enum Commands {
         /// Max pages to list (newest-first). 0 = all. Ignored when a query opens a page.
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
+        /// Print the matched page's stable internal id instead of opening it.
+        #[arg(long)]
+        resolve_id: bool,
     },
     /// Manage folders and files Wenlan should learn from.
     Sources {
@@ -111,6 +133,7 @@ enum Commands {
     /// Capture a memory. Provide text positionally, or use --file, or pipe via stdin.
     Capture {
         /// Content text. If omitted and --file unset, read from stdin.
+        #[arg(conflicts_with = "file")]
         text: Option<String>,
         /// Read content from a file.
         #[arg(short, long)]
@@ -148,7 +171,67 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
-    let client = client::WenlanClient::from_env();
+    if cli.all_spaces && matches!(&cli.command, Commands::Brief(_)) {
+        anyhow::bail!("Brief is owned by one Space; --all-spaces is not supported");
+    }
+    let environment_agent = std::env::var("WENLAN_AGENT_NAME").ok();
+    let agent_name = resolve_agent_name(cli.agent_name.as_deref(), environment_agent.as_deref());
+    let base_client = client::WenlanClient::from_env_with_context(agent_name.as_deref(), None)?;
+    let is_brief_update = matches!(
+        &cli.command,
+        Commands::Brief(args) if args.command.is_some()
+    );
+    let operation = match &cli.command {
+        Commands::Search { .. }
+        | Commands::Recall { .. }
+        | Commands::Brief(commands::brief::BriefArgs { command: None, .. })
+        | Commands::Memories { .. } => Some(CliSpaceOperation::Read),
+        Commands::Capture { .. } => Some(CliSpaceOperation::Write),
+        _ => None,
+    };
+    let is_lint = matches!(&cli.command, Commands::Lint { .. });
+    let mut effective_cli_space = cli.space.clone();
+    let client = if let Some(operation) = operation {
+        let registered = base_client
+            .list_spaces()
+            .await?
+            .into_iter()
+            .map(|space| space.name)
+            .collect();
+        let context = resolve_cli_space(
+            cli.space.clone(),
+            cli.all_spaces,
+            std::env::current_dir().ok(),
+            operation,
+            &registered,
+        )?;
+        effective_cli_space = context.space.clone();
+        client::WenlanClient::from_env_with_context(
+            agent_name.as_deref(),
+            context.space.as_deref(),
+        )?
+    } else if is_brief_update {
+        let strict_space = std::env::var("WENLAN_SPACE").ok();
+        effective_cli_space =
+            resolve_native_read_space(strict_space.as_deref(), cli.space.as_deref(), false)?;
+        client::WenlanClient::from_env_with_context(
+            agent_name.as_deref(),
+            effective_cli_space.as_deref(),
+        )?
+    } else if is_lint {
+        let strict_space = std::env::var("WENLAN_SPACE").ok();
+        effective_cli_space = resolve_native_read_space(
+            strict_space.as_deref(),
+            cli.space.as_deref(),
+            cli.all_spaces,
+        )?;
+        base_client
+    } else {
+        if cli.space.is_some() || cli.all_spaces {
+            anyhow::bail!("--space/--all-spaces are not supported by this command");
+        }
+        base_client
+    };
     // Resolve Auto once based on stdout TTY state. Subcommands receive Json or Table only.
     let format = cli.format.resolve();
     match cli.command {
@@ -167,12 +250,11 @@ async fn main() -> anyhow::Result<ExitCode> {
             })
             .await?
         }
-        Commands::Background { command } => commands::service::run_background(command)?,
+        Commands::Background { command } => commands::service::run_background(command).await?,
         Commands::Restart => commands::service::restart()?,
         Commands::Doctor => commands::setup::run_doctor().await?,
         Commands::Lint {
             profile,
-            space,
             allow_external,
             agent_assist,
             agent_submission,
@@ -182,7 +264,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                 format,
                 cli.quiet,
                 profile,
-                space,
+                effective_cli_space,
                 allow_external,
                 agent_assist,
                 agent_submission,
@@ -191,6 +273,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Commands::Models { command } => commands::setup::run_model(command).await?,
         Commands::Keys { command } => commands::setup::run_key(command).await?,
+        Commands::Enrichment { command } => commands::setup::run_enrichment(command).await?,
         Commands::Connect(args) => commands::mcp::run_connect(args, cli.quiet)?,
         Commands::Search { query, limit } => {
             commands::search::run(&client, format, cli.quiet, query, limit).await?
@@ -198,7 +281,14 @@ async fn main() -> anyhow::Result<ExitCode> {
         Commands::Recall { query } => {
             commands::recall::run(&client, format, cli.quiet, query).await?
         }
-        Commands::Pages { query, limit } => commands::pages::run(format, cli.quiet, query, limit)?,
+        Commands::Brief(args) => {
+            commands::brief::run(&client, format, cli.quiet, args, effective_cli_space).await?
+        }
+        Commands::Pages {
+            query,
+            limit,
+            resolve_id,
+        } => commands::pages::run(format, cli.quiet, query, limit, resolve_id)?,
         Commands::Sources { command } => {
             commands::ingest::run_sources(&client, format, cli.quiet, command).await?
         }

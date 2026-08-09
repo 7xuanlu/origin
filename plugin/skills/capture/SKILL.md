@@ -5,7 +5,7 @@ description: >
   when the user states a preference, makes a decision, corrects you, or
   shares a durable fact. Invoked as `/capture <content>`.
 argument-hint: "<content>"
-allowed-tools: ["mcp__plugin_wenlan_wenlan__capture", "mcp__plugin_wenlan_wenlan__recall", "mcp__plugin_wenlan_wenlan__create_entity", "mcp__plugin_wenlan_wenlan__create_relation", "mcp__plugin_wenlan_wenlan__accept_revision", "mcp__plugin_wenlan_wenlan__dismiss_revision", "Bash"]
+allowed-tools: ["mcp__plugin_wenlan_wenlan__capture", "mcp__plugin_wenlan_wenlan__recall", "mcp__plugin_wenlan_wenlan__create_entity", "mcp__plugin_wenlan_wenlan__create_relation", "mcp__plugin_wenlan_wenlan__list_rejections", "mcp__plugin_wenlan_wenlan__accept_revision", "mcp__plugin_wenlan_wenlan__dismiss_revision", "Bash"]
 ---
 
 # /capture
@@ -43,8 +43,17 @@ If `space` is empty, print:
 
     Resolved space: none (unscoped)
 
-Unknown spaces are not auto-created. Register a new space first with
-`wenlan spaces add <space>`, or omit `space` to store uncategorized.
+This line reports the proposed client context. After capture, relay the tool's
+returned `space`, `space_source`, and `write_outcome`; those fields describe
+what the daemon actually persisted and are authoritative.
+
+Unknown spaces are not auto-created. Register one through the resolved CLI
+binary, or omit `space` to store uncategorized:
+
+```bash
+W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
+"$W" spaces add <space>
+```
 
 ## How to invoke
 
@@ -84,32 +93,38 @@ project, tool, place. Use the exact name. Example: "Alice prefers TDD
 because…" → `entity="Alice"`. If the content has no named anchor,
 omit `entity`.
 
-### `topic` / `space` inference
+### Space inference
 
 - cwd inside a repo → repo name (e.g. `~/Repos/wenlan/...` → `"wenlan"`).
-- Outside any repo → most recent topic from the conversation, or omit.
-- Pass `space` only when scope is known; if uncertain, run `list_spaces`
-  later (post-PR-C) or omit.
+- Outside configured or registered repo context → omit the client Space and
+  let the daemon Default decide the write.
+- Pass `space` only when scope is known. If uncertain, omit it or inspect the
+  registered spaces first:
+
+```bash
+W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
+"$W" spaces list
+```
 
 ### Multiple entities or relations
 
-The MCP `capture` tool takes a single primary `entity`. For additional
-entities or relations, use the dedicated MCP tools. If the content
-names more than one entity, capture the memory first, then for each
-additional entity:
+Ordinary captures stop after `capture`: pass the single most important named
+anchor through `capture.entity` and let daemon enrichment handle routine
+extraction. Do not call `create_entity` for ordinary captures. Never infer a
+relation the user did not state.
 
-```
-create_entity(name="<entity>", entity_type="<person|project|tool|place>")
-```
+Use the explicit KG tools only when the user explicitly states a durable relation:
 
-For a relation between two entities:
+1. Call `create_entity` for both named endpoints first and collect their stable
+   ids. This is idempotent and may return an existing id.
+2. Call `capture` with the complete relation statement and pass the primary
+   entity name as `entity` so the memory resolves and links to it.
+3. Call `create_relation` with `from_entity_id`, `to_entity_id`,
+   `relation_type`, and the capture result's required `source_memory_id`.
 
-```
-create_relation(from_entity="<a>", to_entity="<b>", relation_type="<verb>")
-```
-
-Skip these calls when the daemon has an LLM — its post-ingest enrichment
-covers extraction.
+For a durable named entity explicitly established by the user, `create_entity`
+may also be used alone when its stable id is needed. Its `Entity <id> ready`
+result does not imply that a new row was created.
 
 ## What to capture
 
@@ -145,6 +160,10 @@ one.
 
 - End of session bulk store → use `/handoff` (multi-item batch).
 - Pulling memories back out → use `/recall`.
+
+If a capture the user expected is missing or the user explicitly asks why it
+was rejected, call `list_rejections` to diagnose the quality gate. Do not list
+rejections after successful ordinary captures.
 
 ## Post-capture contradiction signal
 

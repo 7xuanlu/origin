@@ -165,7 +165,7 @@ fn check_service_unit_absent(unit: &std::path::Path) -> Result<()> {
 
 /// Returns Ok if no service manager has the origin daemon registered.
 /// Returns Err with instructions if a service unit file is present.
-fn check_service_unloaded() -> Result<()> {
+pub(crate) fn check_service_unloaded() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         // `sc.exe query <label>` exits 0 when the service is registered with
@@ -193,7 +193,7 @@ fn check_service_unloaded() -> Result<()> {
     }
 }
 
-async fn check_daemon_not_running() -> Result<()> {
+pub(crate) async fn check_daemon_not_running() -> Result<()> {
     // Mirror the port-reading logic from cmd_status in main.rs.
     let port: u16 = std::env::var("WENLAN_PORT")
         .ok()
@@ -228,15 +228,13 @@ async fn check_daemon_not_running() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn check_service_unloaded_returns_ok_when_no_service_installed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let unit = tmp.path().join("com.wenlan.server.plist");
 
-        check_service_unit_absent(&unit).expect("expected Ok for absent test unit");
+        super::check_service_unit_absent(&unit).expect("expected Ok for absent test unit");
     }
 
     /// Pin both copies (CLI + server) to the on-disk paths `service-manager`

@@ -5,7 +5,7 @@ use crate::db::tests::test_db;
 async fn full_population_is_checked_through_read_only_capability_without_db_mutation() {
     // Given
     let (db, _tmp) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     for index in 0..101 {
         conn.execute(
             "INSERT INTO document_enrichment_queue

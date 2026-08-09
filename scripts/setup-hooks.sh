@@ -8,5 +8,5 @@ cd "$REPO_ROOT"
 git config core.hooksPath .githooks
 chmod +x .githooks/*
 echo "Git hooks configured. Pre-commit and pre-push hooks active."
-echo "  Pre-commit: cargo fmt + clippy on changed crates (fast)"
-echo "  Pre-push:   workspace clippy + library tests"
+echo "  Pre-commit: formatting check + clippy on directly changed crates (fast)"
+echo "  Pre-push:   clippy + tests for the affected reverse-dependency closure"

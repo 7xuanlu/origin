@@ -34,16 +34,34 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 futures = { workspace = true }
+sysinfo = { workspace = true }
 fs2 = { workspace = true }
 sha2 = "0.10"
+file-rotate = "0.8"
+tracing-throttle = "0.4"
 # Pulls openssl-sys with the vendored feature (declared at workspace level).
 # wenlan-server doesn't call openssl_sys directly, but the dep needs to land
 # in at least one workspace-member's tree for cargo feature unification to
 # apply the vendored feature to every transitive consumer.
 openssl-sys = { workspace = true }
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
+# Test builds resolve `config.json` to a temp dir instead of the developer's
+# real one, so the hand-rolled `DataDirGuard` env juggling stops being what
+# keeps `save_config` off it (see `default_config_root` in wenlan-core).
+# Resolver 2 keeps a dev-dependency feature out of `cargo build`, so the
+# shipped daemon never has it.
+wenlan-core = { workspace = true, features = ["scratch-config"] }
 async-trait = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
 libsql = { workspace = true }
+sha2 = { workspace = true }
+temp-env = { version = "0.3" }
 tempfile = { workspace = true }
+tokio-tungstenite = "0.28"
 tower = { workspace = true }
+zip = { workspace = true }

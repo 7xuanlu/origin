@@ -1,0 +1,66 @@
+name: Release PR Maintenance
+
+on:
+  push:
+    branches: [main]
+
+# Serialize every release-branch writer without sharing a pending slot with the
+# receipt-gated tag workflow. The successful-CI fallback uses this same group.
+concurrency:
+  group: release-pr-maintenance-main
+  cancel-in-progress: false
+  queue: max
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  maintain-release-pr:
+    name: Maintain release PR only
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: googleapis/release-please-action@0dfd8538845b8e92600d271a895a5372865d4062 # v5
+        id: release
+        with:
+          # This push-triggered path may propose a Release PR, but only the
+          # successful-main receipt gate in release-please.yml may create a tag.
+          skip-github-release: true
+          manifest-file: .release-please-manifest.json
+          config-file: release-please-config.json
+          target-branch: main
+          token: ${{ secrets.RELEASE_TOKEN }}
+      - name: Checkout trusted release PR synchronizer
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Resolve exact pending Release PR
+        id: release_pr
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          cp scripts/sync-release-pr.py "$RUNNER_TEMP/sync-release-pr.py"
+          cp scripts/bump-version.sh "$RUNNER_TEMP/bump-version.sh"
+          python3 "$RUNNER_TEMP/sync-release-pr.py" resolve \
+            --repository "$GITHUB_REPOSITORY" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Checkout exact release PR head
+        if: steps.release_pr.outputs.release_pr_state == 'present'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ steps.release_pr.outputs.release_pr_head_sha }}
+          token: ${{ secrets.RELEASE_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Merge main and sync release PR branch
+        if: steps.release_pr.outputs.release_pr_state == 'present'
+        run: |
+          python3 "$RUNNER_TEMP/sync-release-pr.py" sync \
+            --expected-head-sha "${{ steps.release_pr.outputs.release_pr_head_sha }}" \
+            --bump-script "$RUNNER_TEMP/bump-version.sh"

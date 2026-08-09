@@ -139,8 +139,7 @@ async fn database_drift_is_incomplete_when_page_projection_is_disabled() {
             .await
     });
     control.wait_until_reached().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE pages SET title='changed' WHERE id='same-count-update'",

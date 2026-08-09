@@ -709,7 +709,17 @@ async fn load_memories(context: &LintContext<'_, '_>) -> Result<LoadedMemories, 
         let chunk_index: i64 = row.get(2).map_err(|_| ())?;
         let content: String = row.get(3).map_err(|_| ())?;
         let memory_type: Option<String> = row.get(4).map_err(|_| ())?;
-        let space: Option<String> = row.get(5).map_err(|_| ())?;
+        // M3 PR-1 stage e: `memories.space` is NOT NULL as of migration 91,
+        // so an unscoped memory now carries the reserved `UNFILED_SPACE_ID`
+        // sentinel rather than NULL. Translate it back to None here, same as
+        // load_pages already does for `p.workspace` (M1), so uncategorized
+        // memories keep grouping/matching against uncategorized (NULL-space)
+        // entities in build_entity_matchers/mentioned_entity_indexes and
+        // same_scope below.
+        let space: Option<String> = row
+            .get::<Option<String>>(5)
+            .map_err(|_| ())?
+            .filter(|s| s != crate::db::UNFILED_SPACE_ID);
         let last_modified: i64 = row.get(6).map_err(|_| ())?;
         digest_value(&mut digest, row_id.as_bytes());
         digest_value(&mut digest, source_id.as_bytes());
@@ -737,13 +747,39 @@ async fn load_memories(context: &LintContext<'_, '_>) -> Result<LoadedMemories, 
 
 async fn load_entities(context: &LintContext<'_, '_>) -> Result<Vec<Entity>, ()> {
     let (scope, params) = entity_scope_clause(context.scope().filter());
-    let mut rows = context.snapshot().query(
-        &format!("SELECT e.id,e.name,e.space FROM entities e WHERE TRIM(e.name)!=''{scope} ORDER BY e.id"),
-        params,
-    ).await.map_err(|_| ())?;
+    // G6 Stage 2 PR 2c sub-step 3 item 6 (lead ruling): `entities e` ported
+    // to a projected subquery over the canonical `entity_page_map`/`pages`
+    // shadow -- `e.id` still resolves to the ENTITY id (not the page id),
+    // so every downstream `e.*` reference (here and in
+    // `entity_scope_clause` below) is unchanged. A shadow-only entity
+    // (post-item-5 `store_entity`, no `entities` row) is now discoverable
+    // here; a scan still reading `entities` directly would never see it.
+    let mut rows = context
+        .snapshot()
+        .query(
+            &format!(
+                "SELECT e.id,e.name,e.space FROM \
+             (SELECT epm.entity_id AS id, p.title AS name, p.space AS space \
+              FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id \
+              WHERE p.kind='entity' AND p.status='active') e \
+             WHERE TRIM(e.name)!=''{scope} ORDER BY e.id"
+            ),
+            params,
+        )
+        .await
+        .map_err(|_| ())?;
     let mut output = Vec::new();
     while let Some(row) = rows.next().await.map_err(|_| ())? {
-        let space: Option<String> = row.get(2).map_err(|_| ())?;
+        // G6 Stage 1.5b: `entities.space` is NOT NULL as of the space-sentinel
+        // fold migration, so an unfiled entity now carries the reserved
+        // `UNFILED_SPACE_ID` sentinel rather than NULL. Translate it back to
+        // None here, same as load_memories already does for `m.space` (M3
+        // PR-1 stage e), so scope_matches's Uncategorized branch still sees
+        // "no space" as None instead of the sentinel.
+        let space: Option<String> = row
+            .get::<Option<String>>(2)
+            .map_err(|_| ())?
+            .filter(|s| s != crate::db::UNFILED_SPACE_ID);
         output.push(Entity {
             id: row.get(0).map_err(|_| ())?,
             name: row.get(1).map_err(|_| ())?,
@@ -756,6 +792,7 @@ async fn load_entities(context: &LintContext<'_, '_>) -> Result<Vec<Entity>, ()>
 
 fn entity_scope_clause(scope: &ScopeFilter) -> (String, libsql::params::Params) {
     let memory_filter = "m.source='memory' AND m.pending_revision=0 AND COALESCE(m.is_recap,0)=0 AND m.supersede_mode!='evicted'";
+    let unfiled = crate::db::UNFILED_SPACE_ID;
     match scope {
         ScopeFilter::Global => (String::new(), libsql::params::Params::None),
         ScopeFilter::Registered(value) => (
@@ -767,25 +804,38 @@ fn entity_scope_clause(scope: &ScopeFilter) -> (String, libsql::params::Params) 
                         WHERE {memory_filter} AND m.space=?1
                     )
                     OR e.id IN (
-                        SELECT r.to_entity FROM relations r
-                        JOIN entities source ON source.id=r.from_entity
-                        WHERE source.space=?1
+                        SELECT r.dst_id FROM edges r
+                        JOIN (SELECT epm.entity_id AS id, p.space AS space
+                              FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
+                              WHERE p.kind='entity' AND p.status='active') source
+                          ON source.id=r.src_id
+                        WHERE r.edge_type='relates' AND r.valid_until IS NULL
+                          AND source.space=?1
                     ))"
             ),
             libsql::params::Params::Positional(vec![libsql::Value::Text(value.clone())]),
         ),
+        // G6 Stage 1.5b: `entities.space` is folded (never NULL; unfiled rows
+        // carry `UNFILED_SPACE_ID`), so the `e.space`/`source.space` legs
+        // below match the sentinel too. `m.space` is untouched here — that's
+        // `memories.space`'s own pre-existing fold (M3 PR-1 stage e),
+        // unrelated to this migration.
         ScopeFilter::Uncategorized => (
             format!(
-                " AND (e.space IS NULL
+                " AND ((e.space IS NULL OR e.space = '{unfiled}')
                     OR e.id IN (
                         SELECT me.entity_id FROM memory_entities me
                         JOIN memories m ON m.source_id=me.memory_id
                         WHERE {memory_filter} AND m.space IS NULL
                     )
                     OR e.id IN (
-                        SELECT r.to_entity FROM relations r
-                        JOIN entities source ON source.id=r.from_entity
-                        WHERE source.space IS NULL
+                        SELECT r.dst_id FROM edges r
+                        JOIN (SELECT epm.entity_id AS id, p.space AS space
+                              FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
+                              WHERE p.kind='entity' AND p.status='active') source
+                          ON source.id=r.src_id
+                        WHERE r.edge_type='relates' AND r.valid_until IS NULL
+                          AND (source.space IS NULL OR source.space = '{unfiled}')
                     ))"
             ),
             libsql::params::Params::None,
@@ -816,12 +866,37 @@ async fn load_memory_entity_links(
     Ok(output)
 }
 
+// G6 Stage 2 PR 2c fix round (Codex Sol review finding 3): the disposition
+// above ("audits the legacy `entities` store's own data quality... stays on
+// `entities` through Stage 2") was written when writers dual-wrote and the
+// `entities` join was lossless. It no longer is: this function feeds
+// user-facing semantic candidates (EntityRelations), not a legacy-store
+// audit, and after the writer flip (item 5) a canonical-only entity has no
+// `entities` row -- the unfixed INNER JOIN silently dropped its real edges
+// from `relation_pairs`, so semantic lint proposed false AddEntityRelation
+// repairs for relations that already existed. Ported to the same canonical
+// projected subquery `entity_scope_clause` above already uses for its
+// `source`-aliased edges joins; `source.space` still resolves the same way,
+// so `scope_clause_folded` needs no change.
 async fn load_relations(context: &LintContext<'_, '_>) -> Result<Vec<Relation>, ()> {
-    let (scope, params) = scope_clause(context.scope().filter(), "source.space");
-    let mut rows = context.snapshot().query(
-        &format!("SELECT r.from_entity,r.to_entity,r.relation_type FROM relations r JOIN entities source ON source.id=r.from_entity WHERE 1=1{scope} ORDER BY r.from_entity,r.to_entity,r.id"),
-        params,
-    ).await.map_err(|_| ())?;
+    let (scope, params) = scope_clause_folded(context.scope().filter(), "source.space");
+    let mut rows = context
+        .snapshot()
+        .query(
+            &format!(
+                "SELECT r.src_id,r.dst_id,r.semantic_type FROM edges r \
+             JOIN (SELECT epm.entity_id AS id, p.space AS space \
+                   FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id \
+                   WHERE p.kind='entity' AND p.status='active') source \
+               ON source.id=r.src_id \
+             WHERE r.edge_type='relates' AND r.valid_until IS NULL \
+               AND r.semantic_type IS NOT NULL{scope} \
+             ORDER BY r.src_id,r.dst_id,r.edge_id"
+            ),
+            params,
+        )
+        .await
+        .map_err(|_| ())?;
     let mut output = Vec::new();
     while let Some(row) = rows.next().await.map_err(|_| ())? {
         output.push(Relation {
@@ -836,7 +911,7 @@ async fn load_relations(context: &LintContext<'_, '_>) -> Result<Vec<Relation>, 
 async fn load_pages(context: &LintContext<'_, '_>) -> Result<Vec<Page>, ()> {
     let (scope, params) = scope_clause(context.scope().filter(), "p.workspace");
     let mut rows = context.snapshot().query(
-        &format!("SELECT p.id,p.content,p.workspace,p.creation_kind,p.review_status FROM pages p WHERE p.status='active'{scope} ORDER BY p.id"),
+        &format!("SELECT p.id,p.content,p.workspace,p.creation_kind,p.review_status FROM pages p WHERE p.status='active' AND COALESCE(p.kind,'concept') <> 'entity'{scope} ORDER BY p.id"),
         params,
     ).await.map_err(|_| ())?;
     let mut output = Vec::new();
@@ -846,7 +921,13 @@ async fn load_pages(context: &LintContext<'_, '_>) -> Result<Vec<Page>, ()> {
             id: row.get(0).map_err(|_| ())?,
             content_tokens: content_tokens(&content),
             content,
-            workspace: row.get(2).map_err(|_| ())?,
+            // M1: pages store the reserved scope sentinel id; translate it back
+            // to None here (as row_to_page does) so uncategorized pages compare
+            // symmetric with uncategorized memories (space = NULL) in same_scope.
+            workspace: row
+                .get::<Option<String>>(2)
+                .map_err(|_| ())?
+                .filter(|s| s != crate::db::UNFILED_SPACE_ID),
             creation_kind: row.get(3).map_err(|_| ())?,
             review_status: row.get(4).map_err(|_| ())?,
         });
@@ -854,10 +935,14 @@ async fn load_pages(context: &LintContext<'_, '_>) -> Result<Vec<Page>, ()> {
     Ok(output)
 }
 
+// G6 Stage 1.3: reads `edges` (`cites`) instead of `page_evidence`. `source_kind`
+// is COALESCE-total over the payload-mirrored value and the NOT NULL `dst_kind`
+// column (NULL-payload discipline); the old `locator IS NOT NULL` filter is
+// redundant now that `dst_id` is a NOT NULL edge column.
 async fn load_page_evidence(context: &LintContext<'_, '_>) -> Result<Vec<PageEvidence>, ()> {
     let (scope, params) = scope_clause(context.scope().filter(), "p.workspace");
     let mut rows = context.snapshot().query(
-        &format!("SELECT pe.page_id,pe.source_kind,pe.locator FROM page_evidence pe JOIN pages p ON p.id=pe.page_id WHERE pe.locator IS NOT NULL{scope} ORDER BY pe.page_id,pe.source_kind,pe.locator"),
+        &format!("SELECT pe.src_id, COALESCE(json_extract(pe.payload,'$.source_kind'), CASE pe.dst_kind WHEN 'memory' THEN 'memory' ELSE 'external' END) AS resolved_kind, pe.dst_id FROM edges pe JOIN pages p ON p.id=pe.src_id WHERE pe.edge_type='cites' AND pe.valid_until IS NULL{scope} ORDER BY pe.src_id,resolved_kind,pe.dst_id"),
         params,
     ).await.map_err(|_| ())?;
     let mut output = Vec::new();
@@ -880,6 +965,27 @@ fn scope_clause(scope: &ScopeFilter, column: &str) -> (String, libsql::params::P
         ),
         ScopeFilter::Uncategorized => (
             format!(" AND {column} IS NULL"),
+            libsql::params::Params::None,
+        ),
+    }
+}
+
+/// Same as `scope_clause`, but for an `entities.space` column folded by the
+/// 1.5b space-sentinel migration: an unfiled row stores `UNFILED_SPACE_ID`,
+/// not SQL NULL, so `Uncategorized` must match either. Mirrors
+/// `push_read_scope_filter_folded` (db.rs).
+fn scope_clause_folded(scope: &ScopeFilter, column: &str) -> (String, libsql::params::Params) {
+    match scope {
+        ScopeFilter::Global => (String::new(), libsql::params::Params::None),
+        ScopeFilter::Registered(value) => (
+            format!(" AND {column}=?1"),
+            libsql::params::Params::Positional(vec![libsql::Value::Text(value.clone())]),
+        ),
+        ScopeFilter::Uncategorized => (
+            format!(
+                " AND ({column} IS NULL OR {column} = '{}')",
+                crate::db::UNFILED_SPACE_ID
+            ),
             libsql::params::Params::None,
         ),
     }
@@ -1220,5 +1326,66 @@ mod excerpt_tests {
 
         assert_eq!(excerpt, "[lint_context scope=redacted]\nvisible evidence");
         assert!(!excerpt.contains("/Users/alice"));
+    }
+}
+
+#[cfg(test)]
+mod scope_matches_tests {
+    use super::load_entities;
+    use crate::db::tests::test_db;
+    use crate::lint::context::{
+        AppliedScope, CancellationToken, ExecutionGate, LintClock, LintContext,
+    };
+
+    /// G6 Stage 1.5b Part 2 (space-sentinel fold, migration 118): pins
+    /// `scope_matches`'s Uncategorized branch against the folded sentinel via
+    /// its real consumer, `load_entities`/`entity_scope_clause`. An unfiled
+    /// entity now stores `UNFILED_SPACE_ID` in `entities.space`, never NULL;
+    /// without the sentinel-aware translation this entity would silently
+    /// drop out of "uncategorized" scope after the fold.
+    #[tokio::test]
+    async fn uncategorized_scope_selects_the_unfiled_sentinel_entity() {
+        let (db, _tmp) = test_db().await;
+        let unfiled_id = db
+            .store_entity("G6 Unfiled", "person", None, None, None)
+            .await
+            .unwrap();
+        let filed_id = db
+            .store_entity("G6 Filed", "person", Some("space_a"), None, None)
+            .await
+            .unwrap();
+
+        let snapshot = db
+            .open_isolated_lint_snapshot_for_test()
+            .await
+            .expect("snapshot");
+        let scope = AppliedScope::uncategorized();
+        let clock = LintClock::fixed();
+        let gate = ExecutionGate::new(CancellationToken::new());
+        let context = LintContext::new(
+            &snapshot,
+            &scope,
+            None,
+            &clock,
+            &gate,
+            wenlan_types::lint::LintProfile::General,
+        );
+
+        let entities = load_entities(&context).await.expect("load_entities");
+
+        let unfiled = entities
+            .iter()
+            .find(|e| e.id == unfiled_id)
+            .expect("unfiled entity must be visible under Uncategorized scope");
+        assert!(
+            unfiled.selected,
+            "the unfiled sentinel entity must be selected under Uncategorized scope"
+        );
+        assert!(
+            entities.iter().all(|e| e.id != filed_id),
+            "a space-filed entity must not appear under Uncategorized scope"
+        );
+
+        snapshot.finish().await.expect("finish snapshot");
     }
 }

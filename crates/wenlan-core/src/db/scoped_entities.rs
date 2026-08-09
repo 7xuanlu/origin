@@ -6,7 +6,7 @@ use super::{
 };
 use crate::read_scope::ReadScope;
 use crate::WenlanError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 impl MemoryDB {
     pub async fn list_entities_scoped(
@@ -18,20 +18,31 @@ impl MemoryDB {
             return self.list_entities(entity_type, None).await;
         }
 
+        let conn = self.conn.lock().await;
+        // G6 Stage 1.5b Part 3: unconditional hard cutover onto the
+        // `kind='entity'` shadow page (same program contract as 1.5a; spec
+        // item 9 collapses this reader's `reader_uses_entity_pages` gate --
+        // Part 1's scalar mirror extension and Part 2's space fold made
+        // every remaining field safe to trust off the mirror, so this
+        // never touches `entities` directly).
         let mut conditions = Vec::new();
         let mut values = Vec::new();
         if let Some(entity_type) = entity_type {
-            conditions.push("entity_type = ?".to_string());
+            conditions.push("p.entity_type = ?".to_string());
             values.push(libsql::Value::Text(entity_type.to_string()));
         }
-        super::push_read_scope_filter(scope, "space", &mut conditions, &mut values);
+        // G6 Stage 1.5b: `entities.space` is folded (never NULL; unfiled rows
+        // carry `UNFILED_SPACE_ID`), so `Uncategorized` must match either.
+        super::push_read_scope_filter_folded(scope, "p.space", &mut conditions, &mut values);
         let sql = format!(
-            "SELECT id, name, entity_type, space, source_agent, confidence, confirmed, \
-                    created_at, updated_at \
-             FROM entities WHERE {} ORDER BY updated_at DESC, id ASC",
+            "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
+                    p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at \
+             FROM entity_page_map epm \
+             JOIN pages p ON p.id = epm.page_id \
+             WHERE p.kind = 'entity' AND p.status = 'active' AND {} \
+             ORDER BY p.entity_updated_at DESC, epm.entity_id ASC",
             conditions.join(" AND ")
         );
-        let conn = self.conn.lock().await;
         let mut rows = conn
             .query(&sql, libsql::params_from_iter(values))
             .await
@@ -58,16 +69,30 @@ impl MemoryDB {
             return self.get_entity_detail(entity_id).await;
         }
 
-        let mut conditions = vec!["id = ?".to_string()];
+        let conn = self.conn.lock().await;
+        // G6 Stage 1.5b Part 3: unconditional hard cutover onto the
+        // `kind='entity'` shadow page, for the primary entity row and (G6
+        // Stage 2 PR 2c sub-step 3 item 5) the relations query's endpoint
+        // hydration below -- `store_entity` no longer writes `entities`, so
+        // the old `entities` JOIN silently excluded any shadow-only
+        // endpoint. Ported onto `entity_page_map`/`pages`, same shape as
+        // `list_recent_relations_scoped` below. The observations query
+        // never touched `entities`, so it's unchanged. Spec item 9
+        // collapses this reader's `reader_uses_entity_pages` gate (same
+        // program contract as 1.5a and `list_entities_scoped` above).
+        let mut conditions = vec!["epm.entity_id = ?".to_string()];
         let mut values = vec![libsql::Value::Text(entity_id.to_string())];
-        super::push_read_scope_filter(scope, "space", &mut conditions, &mut values);
+        // G6 Stage 1.5b: `entities.space` is folded (never NULL; unfiled rows
+        // carry `UNFILED_SPACE_ID`), so `Uncategorized` must match either.
+        super::push_read_scope_filter_folded(scope, "p.space", &mut conditions, &mut values);
         let entity_sql = format!(
-            "SELECT id, name, entity_type, space, source_agent, confidence, confirmed, \
-                    created_at, updated_at \
-             FROM entities WHERE {} LIMIT 1",
+            "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
+                    p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at \
+             FROM entity_page_map epm \
+             JOIN pages p ON p.id = epm.page_id \
+             WHERE p.kind = 'entity' AND p.status = 'active' AND {} LIMIT 1",
             conditions.join(" AND ")
         );
-        let conn = self.conn.lock().await;
         let mut rows = conn
             .query(&entity_sql, libsql::params_from_iter(values))
             .await
@@ -143,25 +168,40 @@ impl MemoryDB {
         }
         drop(observation_rows);
 
+        // G6 Stage 1.5b: `entities.space` is folded (never NULL; unfiled rows
+        // carry `UNFILED_SPACE_ID`), so `Uncategorized` must match either.
         let (endpoint_filter, endpoint_value) = match scope {
             ReadScope::Space(space) => {
                 ("AND e.space = ?2", Some(libsql::Value::Text(space.clone())))
             }
-            ReadScope::Uncategorized => ("AND e.space IS NULL", None),
+            ReadScope::Uncategorized => (
+                "AND (e.space IS NULL OR e.space = '00000000-0000-4000-8000-000000000001')",
+                None,
+            ),
             ReadScope::Global => unreachable!(),
         };
         let relation_sql = format!(
-            "SELECT r.id, r.relation_type, r.source_agent, r.created_at, \
-                    'outgoing' AS direction, r.to_entity AS entity_id, \
-                    e.name AS entity_name, e.entity_type AS entity_type \
-             FROM relations r JOIN entities e ON e.id = r.to_entity \
-             WHERE r.from_entity = ?1 {endpoint_filter} \
+            "SELECT r.edge_id, r.semantic_type, json_extract(r.payload, '$.source_agent'), \
+                    COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at), \
+                    'outgoing' AS direction, r.dst_id AS entity_id, \
+                    e.title AS entity_name, e.entity_type AS entity_type \
+             FROM edges r \
+             JOIN entity_page_map epm ON epm.entity_id = r.dst_id \
+             JOIN pages e ON e.id = epm.page_id AND e.kind = 'entity' AND e.status = 'active' \
+             WHERE r.edge_type = 'relates' AND r.valid_until IS NULL \
+               AND r.semantic_type IS NOT NULL \
+               AND r.src_id = ?1 {endpoint_filter} \
              UNION ALL \
-             SELECT r.id, r.relation_type, r.source_agent, r.created_at, \
-                    'incoming' AS direction, r.from_entity AS entity_id, \
-                    e.name AS entity_name, e.entity_type AS entity_type \
-             FROM relations r JOIN entities e ON e.id = r.from_entity \
-             WHERE r.to_entity = ?1 {endpoint_filter} \
+             SELECT r.edge_id, r.semantic_type, json_extract(r.payload, '$.source_agent'), \
+                    COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at), \
+                    'incoming' AS direction, r.src_id AS entity_id, \
+                    e.title AS entity_name, e.entity_type AS entity_type \
+             FROM edges r \
+             JOIN entity_page_map epm ON epm.entity_id = r.src_id \
+             JOIN pages e ON e.id = epm.page_id AND e.kind = 'entity' AND e.status = 'active' \
+             WHERE r.edge_type = 'relates' AND r.valid_until IS NULL \
+               AND r.semantic_type IS NOT NULL \
+               AND r.dst_id = ?1 {endpoint_filter} \
              ORDER BY 4 DESC"
         );
         let mut relation_values = vec![libsql::Value::Text(entity_id.to_string())];
@@ -237,25 +277,43 @@ impl MemoryDB {
             return self.list_recent_relations(limit, since_ms).await;
         }
 
+        let conn = self.conn.lock().await;
+        // G6 Stage 1.5b Part 3: unconditional hard cutover onto the
+        // `kind='entity'` shadow page (spec item 9 collapses this reader's
+        // `reader_uses_entity_pages` gate -- the last of the four
+        // `scoped_entities.rs` call sites). Item 7's structural rework: the
+        // join itself now runs on `entity_page_map`/`pages` for both row set
+        // and scope filter, replacing the former tie-safe-flip design (base
+        // query always legacy `entities`, gated hydration query overlaying
+        // just the display title).
         let (scope_filter, scope_value) = match scope {
             ReadScope::Space(space) => (
-                "AND e1.space = ?3 AND e2.space = ?3",
+                "AND p1.space = ?3 AND p2.space = ?3",
                 Some(libsql::Value::Text(space.clone())),
             ),
-            ReadScope::Uncategorized => ("AND e1.space IS NULL AND e2.space IS NULL", None),
+            ReadScope::Uncategorized => (
+                "AND (p1.space IS NULL OR p1.space = '00000000-0000-4000-8000-000000000001') \
+                 AND (p2.space IS NULL OR p2.space = '00000000-0000-4000-8000-000000000001')",
+                None,
+            ),
             ReadScope::Global => unreachable!(),
         };
         let sql = format!(
-            "SELECT r.id, r.from_entity, r.relation_type, r.to_entity, \
-                    e1.name, e2.name, r.created_at \
-             FROM relations r \
-             JOIN entities e1 ON r.from_entity = e1.id \
-             JOIN entities e2 ON r.to_entity = e2.id \
-             WHERE (?1 IS NULL OR r.created_at >= ?1) \
-               AND e1.name IS NOT NULL AND e1.name != '' \
-               AND e2.name IS NOT NULL AND e2.name != '' \
+            "SELECT r.edge_id, r.src_id, r.semantic_type, r.dst_id, \
+                    p1.title, p2.title, \
+                    COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at) AS asserted_ts \
+             FROM edges r \
+             JOIN entity_page_map epm1 ON r.src_id = epm1.entity_id \
+             JOIN pages p1 ON p1.id = epm1.page_id AND p1.kind = 'entity' AND p1.status = 'active' \
+             JOIN entity_page_map epm2 ON r.dst_id = epm2.entity_id \
+             JOIN pages p2 ON p2.id = epm2.page_id AND p2.kind = 'entity' AND p2.status = 'active' \
+             WHERE r.edge_type = 'relates' AND r.valid_until IS NULL \
+               AND r.semantic_type IS NOT NULL \
+               AND (?1 IS NULL OR COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at) >= ?1) \
+               AND p1.title IS NOT NULL AND p1.title != '' \
+               AND p2.title IS NOT NULL AND p2.title != '' \
                {scope_filter} \
-             ORDER BY r.created_at DESC LIMIT ?2"
+             ORDER BY asserted_ts DESC, r.edge_id DESC LIMIT ?2"
         );
         let mut values = vec![
             since_ms
@@ -266,7 +324,6 @@ impl MemoryDB {
         if let Some(value) = scope_value {
             values.push(value);
         }
-        let conn = self.conn.lock().await;
         let mut rows = conn
             .query(&sql, libsql::params_from_iter(values))
             .await
@@ -311,6 +368,7 @@ impl MemoryDB {
                 })?,
             });
         }
+
         Ok(relations)
     }
 
@@ -322,6 +380,12 @@ impl MemoryDB {
             return self.get_pending_refinements().await;
         }
 
+        let conn = self.conn.lock().await;
+        // M3 PR-2 stage c: NOT a cutover consumer. A suggestion proposes an
+        // entity that does not exist yet, so this query sources nothing
+        // from `entities`/`pages` (it reads `refinement_queue` + `memories`
+        // only) -- it stays on its own substrate until the retirement rung
+        // widens the mirror.
         let safe_sources = "CASE WHEN json_valid(rq.source_ids) \
                             THEN rq.source_ids ELSE '[]' END";
         let (matching_owner, mismatching_owner, values) = match scope {
@@ -330,7 +394,11 @@ impl MemoryDB {
                 "(m.space IS NULL OR m.space != ?1)",
                 vec![libsql::Value::Text(space.clone())],
             ),
-            ReadScope::Uncategorized => ("m.space IS NULL", "m.space IS NOT NULL", Vec::new()),
+            ReadScope::Uncategorized => (
+                "(m.space IS NULL OR m.space = '00000000-0000-4000-8000-000000000001')",
+                "(m.space IS NOT NULL AND m.space != '00000000-0000-4000-8000-000000000001')",
+                Vec::new(),
+            ),
             ReadScope::Global => unreachable!(),
         };
         let sql = format!(
@@ -358,7 +426,6 @@ impl MemoryDB {
                ) \
              ORDER BY rq.created_at, rq.id"
         );
-        let conn = self.conn.lock().await;
         let mut rows = conn
             .query(&sql, libsql::params_from_iter(values))
             .await
@@ -412,6 +479,15 @@ impl MemoryDB {
         Ok(proposals)
     }
 
+    /// G6 Stage 1.5a: scope-filters via the `kind='entity'` shadow page's
+    /// `space` column (through `entity_page_map`) instead of `entities.space`
+    /// directly. Safe under the space-sentinel fold: `ReadScope::Uncategorized`
+    /// matches `pages.space = UNFILED_SPACE_ID` (the NULL fold target), and
+    /// `ReadScope::Space(name)` only ever carries a name resolved through
+    /// `resolve_read_scope`/`db.get_space` against a REGISTERED space —
+    /// `create_space`/`update_space` reject `UNFILED_SPACE_ID` as a
+    /// user-supplied name (db.rs `UNFILED_SPACE_ID` doc comment), so the two
+    /// branches can never collide.
     pub(super) async fn filter_entity_ids_scoped(
         &self,
         entity_ids: &[String],
@@ -427,13 +503,20 @@ impl MemoryDB {
         let scope_index = entity_ids.len() + 1;
         let (scope_sql, scope_value) = match scope {
             ReadScope::Space(space) => (
-                format!("AND space = ?{scope_index}"),
+                format!("AND p.space = ?{scope_index}"),
                 Some(libsql::Value::Text(space.clone())),
             ),
-            ReadScope::Uncategorized => ("AND space IS NULL".to_string(), None),
+            ReadScope::Uncategorized => (
+                format!("AND p.space = ?{scope_index}"),
+                Some(libsql::Value::Text(crate::db::UNFILED_SPACE_ID.to_string())),
+            ),
             ReadScope::Global => unreachable!(),
         };
-        let sql = format!("SELECT id FROM entities WHERE id IN ({placeholders}) {scope_sql}");
+        let sql = format!(
+            "SELECT epm.entity_id FROM entity_page_map epm
+             JOIN pages p ON p.id = epm.page_id
+             WHERE epm.entity_id IN ({placeholders}) AND p.kind = 'entity' AND p.status = 'active' {scope_sql}"
+        );
         let mut params: Vec<libsql::Value> = entity_ids
             .iter()
             .map(|id| libsql::Value::Text(id.clone()))
@@ -460,7 +543,7 @@ impl MemoryDB {
     }
 
     /// Route/retrieval-facing Entity vector search. The Global path retains
-    /// DiskANN; selected scopes rank only rows satisfying `entities.space`.
+    /// DiskANN; selected scopes rank via a brute-force scan.
     pub async fn search_entities_by_vector_scoped(
         &self,
         query: &str,
@@ -473,19 +556,40 @@ impl MemoryDB {
 
         let embedding = self.get_or_compute_embedding(query)?;
         let vec_str = Self::vec_to_sql(&embedding);
+
+        let conn = self.conn.lock().await;
+        // G6 Stage 2 PR 2c sub-step 1: selection now ranks on the
+        // `kind='entity'` shadow page's own embedding/space (via
+        // `entity_page_map` joined to `pages`) instead of brute-forcing
+        // `entities`. The hydration query below re-reads the same shadow
+        // page for the same rows, so it's now a no-op overlay -- kept
+        // in place (rather than deleted) for the same unconditional
+        // program contract 1.5a established, and because dropping it is
+        // a structural change outside this sub-step's query-swap scope.
+        // Both queries still run under this one held `conn` guard, no
+        // re-lock in between.
+
+        // G6 Stage 2 PR 2c item 2: `pages.space` is folded the same way
+        // `entities.space` was (never NULL; unfiled rows carry
+        // `UNFILED_SPACE_ID`, confirmed by the same parity receipt), so
+        // `Uncategorized` must match either.
         let (scope_sql, scope_value) = match scope {
             ReadScope::Space(space) => {
-                ("AND e.space = ?3", Some(libsql::Value::Text(space.clone())))
+                ("AND p.space = ?3", Some(libsql::Value::Text(space.clone())))
             }
-            ReadScope::Uncategorized => ("AND e.space IS NULL", None),
+            ReadScope::Uncategorized => (
+                "AND (p.space IS NULL OR p.space = '00000000-0000-4000-8000-000000000001')",
+                None,
+            ),
             ReadScope::Global => unreachable!(),
         };
         let sql = format!(
-            "SELECT e.id, e.name, e.entity_type, e.space, e.source_agent, e.confidence, \
-                    e.confirmed, e.created_at, e.updated_at, \
-                    vector_distance_cos(e.embedding, vector32(?1)) AS distance \
-             FROM entities e \
-             WHERE e.embedding IS NOT NULL {scope_sql} \
+            "SELECT m.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, \
+                    p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
+                    vector_distance_cos(p.embedding, vector32(?1)) AS distance \
+             FROM entity_page_map m \
+             JOIN pages p ON p.id = m.page_id \
+             WHERE p.kind = 'entity' AND p.status = 'active' AND p.embedding IS NOT NULL {scope_sql} \
              ORDER BY distance ASC LIMIT ?2"
         );
         let mut params = vec![
@@ -495,7 +599,6 @@ impl MemoryDB {
         if let Some(value) = scope_value {
             params.push(value);
         }
-        let conn = self.conn.lock().await;
         let mut rows = conn.query(&sql, params).await.map_err(|error| {
             WenlanError::VectorDb(format!("search_entities_by_vector_scoped: {error}"))
         })?;
@@ -512,6 +615,92 @@ impl MemoryDB {
                 })? as f32,
             });
         }
+
+        if !results.is_empty() {
+            struct Mirror {
+                title: String,
+                entity_type: String,
+                confidence: Option<f64>,
+                confirmed: i64,
+            }
+            let entity_ids: Vec<String> = results
+                .iter()
+                .map(|result| result.entity.id.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let placeholders = (1..=entity_ids.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let hydrate_sql = format!(
+                "SELECT m.entity_id, p.title, p.entity_type, p.confidence, p.entity_confirmed \
+                 FROM entity_page_map m \
+                 JOIN pages p ON p.id = m.page_id AND p.kind = 'entity' AND p.status = 'active' \
+                 WHERE m.entity_id IN ({placeholders})"
+            );
+            let hydrate_params: Vec<libsql::Value> = entity_ids
+                .iter()
+                .map(|id| libsql::Value::Text(id.clone()))
+                .collect();
+            let mut hydrate_rows =
+                conn.query(&hydrate_sql, hydrate_params)
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "search_entities_by_vector_scoped hydrate: {error}"
+                        ))
+                    })?;
+            let mut mirrors: HashMap<String, Mirror> = HashMap::new();
+            while let Some(row) = hydrate_rows.next().await.map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "search_entities_by_vector_scoped hydrate next: {error}"
+                ))
+            })? {
+                let entity_id: String = row.get(0).map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "search_entities_by_vector_scoped hydrate entity_id: {error}"
+                    ))
+                })?;
+                mirrors.insert(
+                    entity_id,
+                    Mirror {
+                        title: row.get(1).map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "search_entities_by_vector_scoped hydrate title: {error}"
+                            ))
+                        })?,
+                        entity_type: row.get(2).map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "search_entities_by_vector_scoped hydrate entity_type: {error}"
+                            ))
+                        })?,
+                        confidence: row.get::<Option<f64>>(3).map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "search_entities_by_vector_scoped hydrate confidence: {error}"
+                            ))
+                        })?,
+                        confirmed: row.get::<i64>(4).map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "search_entities_by_vector_scoped hydrate confirmed: {error}"
+                            ))
+                        })?,
+                    },
+                );
+            }
+            // A hydration miss (id with no live shadow row -- unreachable
+            // under a clean gate) keeps the legacy-sourced fields already in
+            // `results` rather than dropping or erroring the row.
+            for result in &mut results {
+                if let Some(mirror) = mirrors.get(&result.entity.id) {
+                    result.entity.name = mirror.title.clone();
+                    result.entity.entity_type = mirror.entity_type.clone();
+                    result.entity.confidence = mirror.confidence.map(|value| value as f32);
+                    result.entity.confirmed = mirror.confirmed != 0;
+                }
+            }
+        }
+
         Ok(results)
     }
 
@@ -530,6 +719,12 @@ impl MemoryDB {
             return Ok(Vec::new());
         }
 
+        let conn = self.conn.lock().await;
+        // M3 PR-2 stage c: NOT a cutover consumer. This query returns
+        // MEMORIES linked to the given entity ids (`c.*`/`memory_entities`),
+        // not entity rows, and sources no entity/page-mirrored field -- it
+        // stays on its own substrate until the retirement rung widens the
+        // mirror.
         let anchor_rank: HashMap<&str, usize> = ranked_anchor_ids
             .iter()
             .enumerate()
@@ -545,7 +740,11 @@ impl MemoryDB {
                 format!("AND c.space = ?{scope_index}"),
                 Some(libsql::Value::Text(space.clone())),
             ),
-            ReadScope::Uncategorized => ("AND c.space IS NULL".to_string(), None),
+            ReadScope::Uncategorized => (
+                "AND (c.space IS NULL OR c.space = '00000000-0000-4000-8000-000000000001')"
+                    .to_string(),
+                None,
+            ),
             ReadScope::Global => unreachable!(),
         };
         let sql = format!(
@@ -569,7 +768,6 @@ impl MemoryDB {
         if let Some(value) = scope_value {
             params.push(value);
         }
-        let conn = self.conn.lock().await;
         let mut rows = conn.query(&sql, params).await.map_err(|error| {
             WenlanError::VectorDb(format!("get_memories_for_entities_scoped: {error}"))
         })?;
@@ -618,8 +816,10 @@ impl MemoryDB {
             .join(",");
         let limit_parameter = visible_ids.len() + 1;
         let sql = format!(
-            "SELECT o.id, o.content, e.name, o.created_at, o.source_agent, o.confidence \
-             FROM observations o JOIN entities e ON o.entity_id = e.id \
+            "SELECT o.id, o.content, e.title, o.created_at, o.source_agent, o.confidence \
+             FROM observations o \
+             JOIN entity_page_map epm ON o.entity_id = epm.entity_id \
+             JOIN pages e ON e.id = epm.page_id AND e.kind = 'entity' AND e.status = 'active' \
              WHERE o.entity_id IN ({placeholders}) \
              ORDER BY o.confidence DESC NULLS LAST, o.created_at DESC \
              LIMIT ?{limit_parameter}"
@@ -691,9 +891,14 @@ fn entity_from_row(row: &libsql::Row, context: &str) -> Result<Entity, WenlanErr
         entity_type: row
             .get(2)
             .map_err(|error| WenlanError::VectorDb(format!("{context} type: {error}")))?,
-        space: row
-            .get::<Option<String>>(3)
-            .map_err(|error| WenlanError::VectorDb(format!("{context} space: {error}")))?,
+        // G6 Stage 1.5b Part 2: `entities.space` is folded (never NULL;
+        // unfiled rows carry `UNFILED_SPACE_ID`), but the wire contract
+        // keeps `null` for "unfiled" -- normalize at this serialization
+        // boundary.
+        space: crate::space_context::normalize_unfiled_space(
+            row.get::<Option<String>>(3)
+                .map_err(|error| WenlanError::VectorDb(format!("{context} space: {error}")))?,
+        ),
         source_agent: row
             .get::<Option<String>>(4)
             .map_err(|error| WenlanError::VectorDb(format!("{context} source_agent: {error}")))?,

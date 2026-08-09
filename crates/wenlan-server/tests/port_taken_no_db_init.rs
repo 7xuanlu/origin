@@ -10,9 +10,8 @@ use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn binary_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_wenlan-server"))
-}
+#[path = "common/daemon_binary.rs"]
+mod daemon_binary;
 
 /// Minimal "healthy daemon": answers HTTP 200 to every request on an
 /// ephemeral port.
@@ -48,7 +47,7 @@ fn port_taken_by_mute_listener_errors_instead_of_hanging() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
 
-    let mut child = Command::new(binary_path())
+    let mut child = Command::new(daemon_binary::wenlan_server_binary())
         .env("WENLAN_PORT", port.to_string())
         .env_remove("WENLAN_BIND_ADDR")
         .env_remove("XPC_SERVICE_NAME")
@@ -87,7 +86,7 @@ fn port_taken_by_healthy_daemon_exits_before_db_init() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
 
-    let mut child = Command::new(binary_path())
+    let mut child = Command::new(daemon_binary::wenlan_server_binary())
         .env("WENLAN_PORT", port.to_string())
         .env_remove("WENLAN_BIND_ADDR")
         // Non-launchd path: a healthy daemon on the port means clean exit 0.

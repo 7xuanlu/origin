@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# Stop hook: block agent declaring done if changes show signs of stupid work.
+# Stop hook: block agent declaring done if changes contain high-signal unfinished work.
 # - Scope drift (diff stat shown for info, not blocking)
-# - Fake/disabled tests (assert!(true), #[ignore], todo!(), unimplemented!())
-# - Silent swallows (.ok();  let _ = ; #[allow(unused)] added)
-# - Test compile failure (cargo test --no-run)
+# - High-signal unfinished markers (assert!(true), todo!(), unimplemented!(), FIXME)
 # Exit 2 + stderr → Claude must address.
 
 set -eo pipefail
@@ -41,8 +39,12 @@ if [ "${#FILES[@]}" -gt 0 ]; then
     '^\s*//.*FIXME'
   )
 
-  # git diff for added lines on changed files (untracked counted whole-file via cat below)
-  ADDED_LINES="$(git diff --unified=0 -- "${FILES[@]}" 2>/dev/null | grep -E '^\+[^+]' || true)"
+  # Added lines from both unstaged and staged changes. Untracked files are counted
+  # whole-file below.
+  ADDED_LINES="$({
+    git diff --unified=0 -- "${FILES[@]}" 2>/dev/null
+    git diff --cached --unified=0 -- "${FILES[@]}" 2>/dev/null
+  } | grep -E '^\+[^+]' || true)"
   # For untracked .rs files, include all lines
   for f in "${FILES[@]}"; do
     if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then continue; fi
@@ -58,10 +60,9 @@ if [ "${#FILES[@]}" -gt 0 ]; then
 fi
 
 # NOTE: no cargo invocation here by design. A workspace test-compile on every Stop
-# starved on the target/ build lock (rust-analyzer holds it), hit its timeout, and
-# false-blocked. The pre-push git hook already runs clippy + lib tests before any
-# code leaves the machine, so the interactive compile was pure redundancy. The gate
-# is now an instant pattern grep — zero compile, zero lock contention.
+# starved on the target/ build lock, timed out, and false-blocked. Verification scope
+# belongs to the task, explicit repo commands, and CI; this hook is only an instant
+# pattern scan.
 
 if [ "${#PROBLEMS[@]}" -gt 0 ]; then
   {
@@ -87,7 +88,7 @@ STAGED="$(git diff --cached --shortstat 2>/dev/null | sed 's/^ *//')"
   echo "[$TS] branch=$BRANCH head=$HEAD_SHA"
   [ -n "$CHANGED" ] && echo "  unstaged: $CHANGED"
   [ -n "$STAGED" ]  && echo "  staged:   $STAGED"
-  echo "  files: ${#FILES[@]} .rs touched, gates green"
+  echo "  files: ${#FILES[@]} .rs touched, pattern scan clear"
 } >> "$PROGRESS"
 
 exit 0

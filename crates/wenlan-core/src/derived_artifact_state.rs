@@ -2,32 +2,79 @@ use crate::db::MemoryDB;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-mod sweep;
-
 pub(crate) fn summary_eligible_predicate(alias: &str) -> String {
     let minimum = crate::refinery::summary::min_bucket_members();
+    let durable_gate = crate::db::community_reader_durable_gate_sql(
+        crate::db::COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
+    );
+    // G6 Stage 1.5b Part 3: reads `community_id` off the entity's `kind='entity'`
+    // shadow page via `entity_page_map`/`pages` rather than `entities` directly
+    // (unconditional hard cutover, same program contract as `load_summary_buckets`
+    // above) -- the column is mirrored 1:1 off `entities.community_id` by
+    // `insert_entity_shadow_page`/`update_entity_shadow_page`.
+    let legacy = format!(
+        "{alias}.entity_id IN (
+             SELECT owner_epm.entity_id
+               FROM entity_page_map owner_epm
+               JOIN pages owner_p
+                 ON owner_p.id=owner_epm.page_id
+                AND owner_p.kind='entity' AND owner_p.status='active'
+             JOIN (
+                 SELECT peer_p.community_id
+                   FROM memories peer
+                   JOIN entity_page_map peer_epm ON peer.entity_id=peer_epm.entity_id
+                   JOIN pages peer_p
+                     ON peer_p.id=peer_epm.page_id
+                    AND peer_p.kind='entity' AND peer_p.status='active'
+                  WHERE peer.source='memory' AND peer.chunk_index=0
+                    AND peer.is_recap=0 AND peer.supersede_mode<>'archive'
+                    AND peer.source_id NOT LIKE 'merged_%'
+                    AND peer.source_id NOT LIKE 'recap_%'
+                    AND peer.embedding IS NOT NULL
+                    AND peer_p.community_id IS NOT NULL
+                  GROUP BY peer_p.community_id
+                 HAVING COUNT(*) >= {minimum}
+             ) eligible ON eligible.community_id=owner_p.community_id
+         )"
+    );
+    let durable = format!(
+        "{alias}.entity_id IN (
+             SELECT owner.node_id FROM community_members owner
+             JOIN space_graph_state owner_state
+               ON owner_state.space=owner.space
+              AND owner.published_generation=owner_state.published_generation
+             JOIN (
+                 SELECT peer_member.space, peer_member.community_id
+                   FROM memories peer
+                   JOIN community_members peer_member
+                     ON peer.entity_id=peer_member.node_id
+                    AND peer.space=peer_member.space
+                   JOIN space_graph_state peer_state
+                     ON peer_state.space=peer_member.space
+                    AND peer_member.published_generation=peer_state.published_generation
+                   JOIN communities peer_community
+                     ON peer_community.community_id=peer_member.community_id
+                    AND peer_community.space=peer_member.space
+                    AND peer_community.retired_at IS NULL
+                  WHERE peer.source='memory' AND peer.chunk_index=0
+                    AND peer.is_recap=0 AND peer.supersede_mode<>'archive'
+                    AND peer.source_id NOT LIKE 'merged_%'
+                    AND peer.source_id NOT LIKE 'recap_%'
+                    AND peer.embedding IS NOT NULL
+                  GROUP BY peer_member.space, peer_member.community_id
+                 HAVING COUNT(*) >= {minimum}
+             ) eligible
+               ON eligible.space=owner.space
+              AND eligible.community_id=owner.community_id
+         )"
+    );
     format!(
         "{alias}.is_recap=0
          AND {alias}.supersede_mode<>'archive'
          AND {alias}.source_id NOT LIKE 'merged_%'
          AND {alias}.source_id NOT LIKE 'recap_%'
          AND {alias}.embedding IS NOT NULL
-         AND {alias}.entity_id IN (
-             SELECT owner.id FROM entities owner
-             JOIN (
-                 SELECT peer_entity.community_id
-                   FROM memories peer
-                   JOIN entities peer_entity ON peer.entity_id=peer_entity.id
-                  WHERE peer.source='memory' AND peer.chunk_index=0
-                    AND peer.is_recap=0 AND peer.supersede_mode<>'archive'
-                    AND peer.source_id NOT LIKE 'merged_%'
-                    AND peer.source_id NOT LIKE 'recap_%'
-                    AND peer.embedding IS NOT NULL
-                    AND peer_entity.community_id IS NOT NULL
-                  GROUP BY peer_entity.community_id
-                 HAVING COUNT(*) >= {minimum}
-             ) eligible ON eligible.community_id=owner.community_id
-         )"
+         AND CASE WHEN ({durable_gate}) THEN ({durable}) ELSE ({legacy}) END"
     )
 }
 
@@ -126,7 +173,7 @@ mod tests {
               WHERE m.source='memory' AND ({})",
             summary_eligible_predicate("m")
         );
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn.query(&sql, ()).await.unwrap();
         let mut details = Vec::new();
         while let Some(row) = rows.next().await.unwrap() {
@@ -141,19 +188,24 @@ mod tests {
     #[tokio::test]
     async fn summary_eligibility_requires_a_qualifying_community_and_candidate() {
         let (db, _tmp) = test_db().await;
-        let conn = db.conn.lock().await;
-        conn.execute_batch(
-            "INSERT INTO entities
-               (id,name,entity_type,confirmed,created_at,updated_at,community_id)
-             VALUES
-               ('large-a','large-a','concept',0,1,1,1),
-               ('large-b','large-b','concept',0,1,1,1),
-               ('large-c','large-c','concept',0,1,1,1),
-               ('small-a','small-a','concept',0,1,1,2),
-               ('small-b','small-b','concept',0,1,1,2);",
-        )
-        .await
-        .unwrap();
+        // G6 Stage 3: `summary_eligible_predicate`'s legacy branch reads
+        // `community_id` off the entity's shadow page, and migration 123
+        // dropped `entities`, so the shadow IS the seed.
+        for (entity_id, community_id) in [
+            ("large-a", 1),
+            ("large-b", 1),
+            ("large-c", 1),
+            ("small-a", 2),
+            ("small-b", 2),
+        ] {
+            db.test_seed_entity_shadow_page(
+                crate::db::TestEntity::new(entity_id, entity_id, "concept")
+                    .community_id(community_id),
+            )
+            .await
+            .unwrap();
+        }
+        let conn = db.test_primary_session().await;
         let vector = format!(
             "[{}]",
             std::iter::repeat_n("0", 768).collect::<Vec<_>>().join(",")

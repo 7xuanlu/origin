@@ -229,7 +229,7 @@ mod tests {
     use std::time::Duration;
 
     /// Settle helper: advance wall-clock so spawned delay+work tasks complete.
-    /// Used by the time-tolerant tests (single-schedule, pre-delay abort, etc.)
+    /// Used by time-tolerant tests such as the pre-delay abort cases
     /// whose assertions don't depend on a real-sleep loop finishing inside a
     /// fixed budget. The force-run / ceiling tests use the event-driven
     /// `wait_signal` / `wait_until` helpers below instead.
@@ -272,7 +272,7 @@ mod tests {
                 c.fetch_add(1, Ordering::Relaxed);
             }
         });
-        settle(120).await;
+        wait_until(|| counter.load(Ordering::Relaxed) == 1).await;
         assert_eq!(
             counter.load(Ordering::Relaxed),
             1,
@@ -321,12 +321,16 @@ mod tests {
         let deb = ReflectionDebouncer::new();
         let observed_cancel = Arc::new(AtomicUsize::new(0));
         let work2_done = Arc::new(AtomicUsize::new(0));
+        let work1_started = Arc::new(AtomicUsize::new(0));
 
         // work1 starts quickly, then polls the cancel flag in a loop.
         let oc = observed_cancel.clone();
+        let ws = work1_started.clone();
         deb.schedule("agentA", Duration::from_millis(10), move |cancel| {
             let oc = oc.clone();
+            let ws = ws.clone();
             async move {
+                ws.fetch_add(1, Ordering::Relaxed);
                 for _ in 0..200 {
                     if cancel.load(Ordering::SeqCst) {
                         oc.fetch_add(1, Ordering::Relaxed);
@@ -337,9 +341,10 @@ mod tests {
             }
         });
 
-        // Let work1 start running (past its 10ms delay) before rescheduling, so
-        // we exercise the in-flight AtomicBool path, not the pre-delay abort.
-        settle(40).await;
+        // Wait until work1 is provably past its delay and inside its body, so
+        // the reschedule exercises the in-flight AtomicBool path, not the
+        // pre-delay abort. A fixed settle(40) raced this on loaded CI runners.
+        wait_until(|| work1_started.load(Ordering::Relaxed) == 1).await;
 
         let wd = work2_done.clone();
         deb.schedule("agentA", Duration::from_millis(10), move |_c| {
@@ -349,7 +354,10 @@ mod tests {
             }
         });
 
-        settle(200).await;
+        wait_until(|| {
+            observed_cancel.load(Ordering::Relaxed) == 1 && work2_done.load(Ordering::Relaxed) == 1
+        })
+        .await;
         assert_eq!(
             observed_cancel.load(Ordering::Relaxed),
             1,

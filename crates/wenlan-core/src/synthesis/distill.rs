@@ -16,6 +16,8 @@ use crate::refinery::helpers::{
 };
 use crate::sources::StabilityTier;
 use crate::synthesis::refinement_queue::{resolve_proposal, ResolveStatus};
+use crate::truth_adapter::{filter_page_refs, page_write_permit};
+use crate::truth_contract::TruthGrant;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use wenlan_types::requests::{CreateConceptRequest, UpdatePageRequest};
@@ -24,6 +26,8 @@ const FORMATION_SWEEP_THRESHOLDS: [f64; 4] = [0.55, 0.60, 0.65, 0.70];
 const DISTILL_CLUSTER_DOCUMENT_MAX_SHARE_NUMERATOR: usize = 1;
 const DISTILL_CLUSTER_DOCUMENT_MAX_SHARE_DENOMINATOR: usize = 2;
 const EXISTING_TITLES_HINT_LIMIT: usize = 100;
+const EXISTING_TITLE_CHAR_CAP: usize = 128;
+const PAGE_TOPIC_CHAR_CAP: usize = 192;
 const NO_SPACE_KEY: &str = "(none)";
 
 /// What a distillation pass is scoped to. Resolved from a free-form string
@@ -79,27 +83,36 @@ pub(crate) async fn build_existing_titles_hint(
     topic: &str,
     workspace: Option<&str>,
 ) -> String {
+    let capped_topic: String = topic.chars().take(PAGE_TOPIC_CHAR_CAP).collect();
     let mut titles = db
-        .list_relevant_active_page_titles(topic, workspace, EXISTING_TITLES_HINT_LIMIT)
+        .list_relevant_active_page_titles(&capped_topic, workspace, EXISTING_TITLES_HINT_LIMIT)
         .await
         .unwrap_or_default();
     if titles.is_empty() {
         titles = db
-            .list_pages("active", 1000, 0)
+            .list_active_page_titles_scoped(workspace, EXISTING_TITLES_HINT_LIMIT)
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|page| workspace.is_none_or(|w| page_workspace(page) == Some(w)))
-            .map(|page| page.title)
-            .take(EXISTING_TITLES_HINT_LIMIT)
-            .collect();
+            .unwrap_or_default();
     }
+    if titles.is_empty() {
+        return String::new();
+    }
+    // An unsupported page is not a safe wikilink target: the title would ride
+    // into another page's prose, where any Full-visibility reader sees it with
+    // no gate in front of it. `Automatic` because a distill prompt build has no
+    // caller grant to pass, same reasoning as `page_write_permit`.
+    let titles = filter_page_refs(db, &TruthGrant::Automatic, titles, |item| item.0.as_str())
+        .await
+        .unwrap_or_default();
     if titles.is_empty() {
         return String::new();
     }
     let formatted = titles
         .iter()
-        .map(|t| format!("[[{t}]]"))
+        .map(|(_, title)| {
+            let capped: String = title.chars().take(EXISTING_TITLE_CHAR_CAP).collect();
+            format!("[[{capped}]]")
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -120,7 +133,8 @@ pub(crate) async fn build_page_compile_user_prompt(
     memories_block: &str,
 ) -> String {
     let titles_hint = build_existing_titles_hint(db, topic, workspace).await;
-    format!("{titles_hint}Topic: {topic}\n\n{memories_block}")
+    let capped_topic: String = topic.chars().take(PAGE_TOPIC_CHAR_CAP).collect();
+    format!("{titles_hint}Topic: {capped_topic}\n\n{memories_block}")
 }
 
 /// LLM cluster refinement: for entities with multiple clusters, ask the LLM to merge/split/rename.
@@ -324,33 +338,7 @@ async fn load_cluster_content_hashes(
         return Ok(HashMap::new());
     }
 
-    let placeholders = source_ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT source_id, content_hash FROM memories WHERE source = 'memory' AND chunk_index = 0 AND source_id IN ({placeholders})"
-    );
-    let params: Vec<libsql::Value> = source_ids.into_iter().map(libsql::Value::Text).collect();
-    let conn = db.conn.lock().await;
-    let mut rows = conn
-        .query(&sql, libsql::params_from_iter(params))
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("distill content_hash fetch: {e}")))?;
-
-    let mut hashes = HashMap::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("distill content_hash row: {e}")))?
-    {
-        let source_id = row.get::<String>(0).unwrap_or_default();
-        let content_hash = row.get::<Option<String>>(1).unwrap_or(None);
-        hashes.insert(source_id, content_hash);
-    }
-    Ok(hashes)
+    db.memory_content_hashes_for_source_ids(&source_ids).await
 }
 
 fn cap_one_document_majority(
@@ -753,7 +741,7 @@ async fn distill_one_cluster_with_tuning(
                         content: content.clone(),
                         summary: summary.clone(),
                         entity_id: cluster.entity_id.clone(),
-                        space: cluster.space.clone(),
+                        space: (cluster.space.clone()).into(),
                         source_memory_ids: cluster.source_ids.clone(),
                         creation_kind: Some("distilled".to_string()),
                         workspace: cluster.space.clone(),
@@ -793,8 +781,9 @@ async fn distill_one_cluster_with_tuning(
 
             if let Some(ref projection) = projection {
                 if let Ok(Some(c)) = db.get_page(&page_id).await {
-                    match projection.write_page(&c) {
-                        Ok(p) => log::info!("[distill] wrote page to {p}"),
+                    match projection.write_page_gated(db, &c).await {
+                        Ok(Some(p)) => log::info!("[distill] wrote page to {p}"),
+                        Ok(None) => {}
                         Err(e) => log::warn!("[distill] knowledge write failed: {e}"),
                     }
                 }
@@ -1175,6 +1164,26 @@ pub struct RefreshOutcome {
     pub revision_card_id: Option<String>,
 }
 
+pub(crate) const AUTOMATIC_PAGE_REFRESH_SOURCE_CAP: usize = 64;
+
+/// Reject an oversized automatic Page refresh before source contents are
+/// materialized. The normalized join table is authoritative when present;
+/// legacy Pages with no join rows fall back to their JSON source list.
+pub(crate) async fn automatic_refresh_exceeds_source_cap(
+    db: &MemoryDB,
+    page: &crate::pages::Page,
+) -> Result<bool, WenlanError> {
+    let joined = db
+        .count_page_sources_up_to(&page.id, AUTOMATIC_PAGE_REFRESH_SOURCE_CAP)
+        .await?;
+    let source_count = if joined == 0 {
+        page.source_memory_ids.len()
+    } else {
+        joined
+    };
+    Ok(source_count > AUTOMATIC_PAGE_REFRESH_SOURCE_CAP)
+}
+
 /// Rebuild a page's prose from its CURRENT sources via the DISTILL_PAGE prompt,
 /// verify per-claim `[N]` citations against the numbered sources, and write the
 /// result atomically through the canonical PageWrite path.
@@ -1232,6 +1241,17 @@ pub(crate) async fn refresh_page_with_prompt(
     reason: RefreshReason,
     knowledge_path: Option<&std::path::Path>,
 ) -> Result<RefreshOutcome, WenlanError> {
+    // The ambient sweep (`SourceChanged`) is not an HTTP route, so there is no
+    // caller grant to pass -- it asks the automatic-reader permit directly,
+    // same reasoning as `write_page_gated`. An `Explicit` request already
+    // carries its own wire-level grant and is unaffected.
+    if reason == RefreshReason::SourceChanged && page_write_permit(db, page_id).await?.is_none() {
+        log::info!(
+            "[refresh] not re-distilling page {page_id} — an automatic reader may not see it"
+        );
+        return Ok(RefreshOutcome::default());
+    }
+
     let page = db
         .get_page(page_id)
         .await?
@@ -1441,6 +1461,10 @@ pub(crate) async fn apply_merge_by_tier(
 }
 
 #[cfg(test)]
+#[path = "distill_truth_test.rs"]
+mod distill_truth_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::llm_provider::{LlmBackend, LlmError, MockProvider};
@@ -1638,7 +1662,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'orphaned unregistered space content', 0, 'text', 'fact', 'ghost', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -1786,7 +1810,7 @@ mod tests {
         // Insert a seed memory row directly so get_memory_contents_by_ids
         // returns it. The mock body's [1] marker verifies against this content.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'recompiled body reference material', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -1846,7 +1870,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'The target topic should retain the valid wikilink to Related Page when refreshed.', 0, 'text', 'fact', 'work', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -1930,6 +1954,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn page_compile_prompt_caps_topic_and_existing_title_text() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let long_title = "T".repeat(600);
+        let long_topic = "Q".repeat(600);
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_page(
+            "bounded_prompt_existing_page",
+            &long_title,
+            None,
+            "short body",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        let prompt =
+            build_page_compile_user_prompt(&db, &long_topic, None, "[1] bounded source").await;
+
+        assert!(
+            prompt.chars().count() < 600,
+            "fixed-count title hints still need a hard character bound; got {} chars",
+            prompt.chars().count()
+        );
+        assert!(prompt.ends_with("[1] bounded source"));
+    }
+
     // ── refresh_page: the ONE re-distill/repair op ──────────────────────────
 
     #[tokio::test]
@@ -1941,7 +1995,7 @@ mod tests {
         // Seed the cited memory. The synthesized body echoes it so the [1]
         // marker verifies and the citation gate passes.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'Tokio is an async runtime for Rust programs', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -2100,7 +2154,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'Tokio is an async runtime for Rust programs', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -2186,7 +2240,7 @@ mod tests {
         let mem_doc = "folder-notes::rust/cluster.md";
         let mem_extra = "mem_cluster_kind_extra";
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'Rust ownership rules prevent data races and dangling pointers at compile time without a garbage collector', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -2273,7 +2327,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'Tokio is an async runtime for Rust programs', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -2297,7 +2351,7 @@ mod tests {
         db.set_page_stale("page_h", "source_updated").await.unwrap();
         // Mark the page human-owned so a machine write is gated to a card.
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "UPDATE pages SET user_edited = 1 WHERE id = ?1",
                 libsql::params!["page_h".to_string()],
@@ -2339,7 +2393,7 @@ mod tests {
         );
 
         // The staged card is a pending revision that supersedes the page.
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
                 "SELECT supersedes FROM memories WHERE source_id = ?1 AND pending_revision = 1",
@@ -2363,7 +2417,7 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             conn.execute(
                 "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
                  VALUES (?1, ?1, ?1, 'Tokio is an async runtime for Rust programs', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
@@ -2647,7 +2701,7 @@ mod tests {
         }
 
         let pages_before = {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut r = conn
                 .query("SELECT COUNT(*) FROM pages WHERE status='active'", ())
                 .await
@@ -2676,7 +2730,7 @@ mod tests {
         );
 
         let pages_after = {
-            let conn = db.conn.lock().await;
+            let conn = db.test_primary_session().await;
             let mut r = conn
                 .query("SELECT COUNT(*) FROM pages WHERE status='active'", ())
                 .await

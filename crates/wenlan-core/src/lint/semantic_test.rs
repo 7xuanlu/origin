@@ -98,8 +98,7 @@ impl LlmProvider for FakeProvider {
 
 async fn fixture() -> (crate::db::MemoryDB, tempfile::TempDir) {
     let (db, dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -109,9 +108,6 @@ async fn fixture() -> (crate::db::MemoryDB, tempfile::TempDir) {
                      'memory','mem-a','secret title',0,0,'text',0,0,'hide','fact'),
                     ('mem-row-b','Project Atlas changed direction last year','memory','mem-b',
                      'second title',0,1,'text',0,0,'hide','fact');
-             INSERT INTO entities
-                 (id,name,entity_type,confirmed,created_at,updated_at)
-             VALUES ('entity-atlas','Project Atlas','concept',1,1,1);
              INSERT INTO memory_entities (memory_id,entity_id)
              VALUES ('mem-a','entity-atlas'),('mem-b','entity-atlas');
              INSERT INTO pages
@@ -125,6 +121,13 @@ async fn fixture() -> (crate::db::MemoryDB, tempfile::TempDir) {
         )
         .await
         .unwrap();
+    // G6 Stage 3: `load_entities` reads the canonical `kind='entity'` shadow
+    // page, and migration 123 dropped `entities`, so the shadow IS the seed.
+    db.test_seed_entity_shadow_page(
+        crate::db::TestEntity::new("entity-atlas", "Project Atlas", "concept").confirmed(true),
+    )
+    .await
+    .unwrap();
     (db, dir)
 }
 
@@ -245,8 +248,7 @@ async fn provider_cannot_change_reason_or_self_supply_second_judge() {
 #[tokio::test]
 async fn candidate_generation_distinguishes_missing_wrong_and_cross_space_links() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -256,17 +258,26 @@ async fn candidate_generation_distinguishes_missing_wrong_and_cross_space_links(
                  'atlas',0,100,'text',0,0,'hide','work','fact'),
                 ('mem-wenlan-row','文蘭是本地記憶系統','memory','mem-wenlan',
                  'wenlan',0,100,'text',0,0,'hide','work','fact');
-         INSERT INTO entities
-             (id,name,entity_type,space,confirmed,created_at,updated_at)
-         VALUES ('entity-atlas-work','Project Atlas','concept','work',1,1,1),
-                ('entity-atlas-personal','Project Atlas','concept','personal',1,1,1),
-                ('entity-wrong','Budget Plan','concept','work',1,1,1),
-                ('entity-wenlan','文蘭','concept','work',1,1,1);
          INSERT INTO memory_entities (memory_id,entity_id)
          VALUES ('mem-atlas','entity-wrong');",
         )
         .await
         .unwrap();
+    // G6 Stage 3: see fixture() above -- the shadow page IS the entity.
+    for (entity_id, name, space) in [
+        ("entity-atlas-work", "Project Atlas", "work"),
+        ("entity-atlas-personal", "Project Atlas", "personal"),
+        ("entity-wrong", "Budget Plan", "work"),
+        ("entity-wenlan", "文蘭", "work"),
+    ] {
+        db.test_seed_entity_shadow_page(
+            crate::db::TestEntity::new(entity_id, name, "concept")
+                .space(space)
+                .confirmed(true),
+        )
+        .await
+        .unwrap();
+    }
 
     let report = prepare(&db, None).await;
     let work = report.agent_work().unwrap();
@@ -291,8 +302,7 @@ async fn candidate_generation_distinguishes_missing_wrong_and_cross_space_links(
 #[tokio::test]
 async fn scoped_candidates_hydrate_cross_space_existing_link_endpoints() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO spaces (id,name,created_at,updated_at)
@@ -302,17 +312,31 @@ async fn scoped_candidates_hydrate_cross_space_existing_link_endpoints() {
                   pending_revision,is_recap,supersede_mode,space,memory_type)
              VALUES ('mem-work-row','Work Entity launch note','memory','mem-work','work',0,100,
                      'text',0,0,'hide','work','fact');
-             INSERT INTO entities
-                 (id,name,entity_type,space,confirmed,created_at,updated_at)
-             VALUES ('entity-work','Work Entity','concept','work',1,1,1),
-                    ('entity-personal','Personal Entity','concept','personal',1,1,1);
              INSERT INTO memory_entities (memory_id,entity_id)
              VALUES ('mem-work','entity-personal');
              INSERT INTO relations (id,from_entity,to_entity,relation_type,created_at)
-             VALUES ('relation-cross','entity-work','entity-personal','related',1);",
+             VALUES ('relation-cross','entity-work','entity-personal','related',1);
+             -- G6 Stage 1.2: entity_scope_clause/load_relations (reader #4)
+             -- read `edges`, not `relations` -- mirror the dual-write here.
+             INSERT INTO edges
+                 (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type)
+             VALUES ('edge-relation-cross','entity-work','entity','entity-personal','entity','relates','legacy',0,'work',1,'related');",
         )
         .await
         .unwrap();
+    // G6 Stage 3: see fixture() above -- the shadow page IS the entity.
+    for (entity_id, name, space) in [
+        ("entity-work", "Work Entity", "work"),
+        ("entity-personal", "Personal Entity", "personal"),
+    ] {
+        db.test_seed_entity_shadow_page(
+            crate::db::TestEntity::new(entity_id, name, "concept")
+                .space(space)
+                .confirmed(true),
+        )
+        .await
+        .unwrap();
+    }
 
     let report = prepare(&db, Some("work")).await;
     let work = report.agent_work().unwrap();
@@ -359,10 +383,56 @@ async fn scoped_candidates_hydrate_cross_space_existing_link_endpoints() {
 }
 
 #[tokio::test]
+async fn load_relations_sees_a_canonical_only_entitys_existing_edge() {
+    let (db, _dir) = test_db().await;
+    // Both entities are canonical-only: created via `store_entity` (item 5,
+    // G6 Stage 2 PR 2c), which no longer writes an `entities` row. The
+    // Codex Sol review's finding 3: `load_relations`'s unfixed `JOIN
+    // entities source` is an INNER join, so an edge whose endpoints have no
+    // `entities` row is silently dropped from `relation_pairs` -- the
+    // relation already exists, but the candidate generator can't see it.
+    let alpha_id = db
+        .store_entity("Alpha Widget", "concept", Some("work"), None, None)
+        .await
+        .unwrap();
+    let beta_id = db
+        .store_entity("Beta Gadget", "concept", Some("work"), None, None)
+        .await
+        .unwrap();
+    db.test_primary_session()
+        .await
+        .execute_batch(&format!(
+            "INSERT INTO memories
+             (id,content,source,source_id,title,chunk_index,last_modified,chunk_type,
+              pending_revision,is_recap,supersede_mode,space,memory_type)
+         VALUES ('mem-widgets-row','Alpha Widget connects to Beta Gadget','memory','mem-widgets',
+                 'widgets',0,100,'text',0,0,'hide','work','fact');
+         INSERT INTO edges
+             (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type)
+         VALUES ('edge-widgets-relates','{alpha_id}','entity','{beta_id}','entity','relates','assertion',1,'work',1,'related');",
+        ))
+        .await
+        .unwrap();
+
+    let report = prepare(&db, None).await;
+    let work = report.agent_work().unwrap();
+    // Both entities are co-mentioned in the memory above, and their edge
+    // already records the relation. A `load_relations` that can see
+    // canonical-only entities must NOT propose adding it again.
+    let false_add = candidates_for(work, LintSemanticCheckId::EntityRelations)
+        .into_iter()
+        .find(|candidate| candidate.proposed_action() == LintSemanticAction::AddEntityRelation);
+    assert!(
+        false_add.is_none(),
+        "load_relations dropped a canonical-only entity's existing edge, proposing a false \
+         AddEntityRelation for a relation that already exists: {false_add:?}"
+    );
+}
+
+#[tokio::test]
 async fn approved_link_repair_removes_candidate_on_rerun() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -370,12 +440,18 @@ async fn approved_link_repair_removes_candidate_on_rerun() {
               pending_revision,is_recap,supersede_mode,space,memory_type)
          VALUES ('mem-atlas-row','Project Atlas is active','memory','mem-atlas',
                  'atlas',0,100,'text',0,0,'hide','work','fact');
-         INSERT INTO entities
-             (id,name,entity_type,space,confirmed,created_at,updated_at)
-         VALUES ('entity-atlas','Project Atlas','concept','work',1,1,1);",
+         ",
         )
         .await
         .unwrap();
+    // G6 Stage 3: see fixture() above -- the shadow page IS the entity.
+    db.test_seed_entity_shadow_page(
+        crate::db::TestEntity::new("entity-atlas", "Project Atlas", "concept")
+            .space("work")
+            .confirmed(true),
+    )
+    .await
+    .unwrap();
 
     let before = prepare(&db, None).await;
     assert_eq!(
@@ -387,8 +463,7 @@ async fn approved_link_repair_removes_candidate_on_rerun() {
         1
     );
 
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO memory_entities (memory_id,entity_id) VALUES (?1,?2)",
@@ -408,8 +483,7 @@ async fn approved_link_repair_removes_candidate_on_rerun() {
 #[tokio::test]
 async fn suspicious_existing_page_and_entity_links_are_distinct_candidates() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -417,14 +491,39 @@ async fn suspicious_existing_page_and_entity_links_are_distinct_candidates() {
               pending_revision,is_recap,supersede_mode,space,memory_type)
          VALUES ('mem-source-row','alpha support statement','memory','mem-source',
                  'source',0,100,'text',0,0,'hide','work','fact');
-         INSERT INTO entities
-             (id,name,entity_type,space,confirmed,created_at,updated_at)
-         VALUES ('entity-work','Work Entity','concept','work',1,1,1),
-                ('entity-work-peer','Peer Entity','concept','work',1,1,1),
-                ('entity-personal','Personal Entity','concept','personal',1,1,1);
          INSERT INTO relations (id,from_entity,to_entity,relation_type,created_at)
          VALUES ('relation-same','entity-work','entity-work-peer','related',1),
-                ('relation-cross','entity-work','entity-personal','related',1);
+                ('relation-cross','entity-work','entity-personal','related',1);",
+        )
+        .await
+        .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 (RULING-ESC-1): entities get real
+    // canonical shadow pages, so `edges_space_fence`'s entity arm (migration
+    // 121) and the ported `load_entities` both resolve them directly -- no
+    // more dropping/recreating the fence to simulate legacy pre-shadow-page
+    // data. `load_pages` now excludes `kind='entity'` (semantic_candidates.rs
+    // `load_pages`), so these shadow pages can't leak into the
+    // PageProvenanceAdequacy scan as false candidates.
+    for (entity_id, name, space) in [
+        ("entity-work", "Work Entity", "work"),
+        ("entity-work-peer", "Peer Entity", "work"),
+        ("entity-personal", "Personal Entity", "personal"),
+    ] {
+        db.test_seed_entity_shadow_page(
+            crate::db::TestEntity::new(entity_id, name, "concept")
+                .space(space)
+                .confirmed(true),
+        )
+        .await
+        .unwrap();
+    }
+    db.test_primary_session()
+        .await
+        .execute_batch(
+            "INSERT INTO edges
+             (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type)
+         VALUES ('edge-relation-same','entity-work','entity','entity-work-peer','entity','relates','assertion',0,'work',1,'related'),
+                ('edge-relation-cross','entity-work','entity','entity-personal','entity','relates','legacy',0,'work',1,'related');
          INSERT INTO pages
              (id,title,content,source_memory_ids,version,status,created_at,last_compiled,
               last_modified,workspace,creation_kind,review_status)
@@ -434,7 +533,14 @@ async fn suspicious_existing_page_and_entity_links_are_distinct_candidates() {
                  'now','now','now','work','research','confirmed');
          INSERT INTO page_evidence (page_id,source_kind,locator,linked_at,link_reason)
          VALUES ('page-unrelated','memory','mem-source',0,'test'),
-                ('page-external','external_url','https://example.test/source',0,'test');",
+                ('page-external','external_url','https://example.test/source',0,'test');
+         -- G6 Stage 1.3: PageEvidenceLinks/PageProvenanceAdequacy candidate
+         -- generation reads `edges`, not `page_evidence` -- mirror the
+         -- dual-write here too (dst_kind drives the memory/external split).
+         INSERT INTO edges
+             (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at)
+         VALUES ('edge-evidence-unrelated','page-unrelated','page','mem-source','memory','cites','legacy',0,'work',0),
+                ('edge-evidence-external','page-external','page','https://example.test/source','external','cites','legacy',0,'work',0);",
         )
         .await
         .unwrap();
@@ -463,10 +569,17 @@ async fn suspicious_existing_page_and_entity_links_are_distinct_candidates() {
 #[tokio::test]
 async fn candidate_generator_failure_is_incomplete() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    // G6 Stage 1.3: `load_page_evidence`/`load_relations` moved onto `edges`,
+    // so dropping `page_evidence` no longer breaks the up-front candidate
+    // load batch (`candidates::load` in semantic_candidates.rs). `pages` and
+    // most other loader tables have FK dependents SQLite refuses to drop
+    // (`PRAGMA foreign_keys=ON`); `memory_entities` is still read directly by
+    // `load_memory_entity_links` in that same `?`-chained batch and has no
+    // incoming FK references, so dropping it reproduces the same "one query
+    // fails, every check reports FailedToRun" cascade this test exercises.
+    db.test_primary_session()
         .await
-        .execute_batch("DROP TABLE page_evidence;")
+        .execute_batch("DROP TABLE memory_entities;")
         .await
         .unwrap();
 
@@ -477,18 +590,27 @@ async fn candidate_generator_failure_is_incomplete() {
         LintOutcome::FailedToRun,
         LintReasonCode::SemanticCandidateGenerationFailure,
     );
+    // `MemoryClassification`'s own loader (`load_memories`) runs and succeeds
+    // BEFORE `load_memory_entity_links` in the `?`-chain (semantic_candidates.rs
+    // `load()`), so this check's inputs are intact. It still comes back
+    // FailedToRun: a single loader failure aborts `load()` as a whole, and
+    // `run()`'s fallback (`failed_generation`) blanket-marks every
+    // `LintSemanticCheckId`, not just the one whose loader threw. Asserting on
+    // `MemoryEntityLinks` alone (the check that OWNS the dropped table) cannot
+    // tell cascade propagation apart from a plain local failure; a check with
+    // healthy inputs still going down is the property this test exists to pin.
+    assert_reason(
+        &report,
+        LintSemanticCheckId::MemoryClassification,
+        LintOutcome::FailedToRun,
+        LintReasonCode::SemanticCandidateGenerationFailure,
+    );
 }
 
 #[tokio::test]
 async fn candidate_truncation_completes_after_bounded_adjudication() {
     let (db, _dir) = test_db().await;
-    let conn = db.conn.lock().await;
-    conn.execute_batch(
-        "INSERT INTO entities (id,name,entity_type,confirmed,created_at,updated_at)
-         VALUES ('entity-atlas','Project Atlas','concept',1,1,1);",
-    )
-    .await
-    .unwrap();
+    let conn = db.test_primary_session().await;
     for index in 0..8 {
         conn.execute(
             "INSERT INTO memories
@@ -501,6 +623,14 @@ async fn candidate_truncation_completes_after_bounded_adjudication() {
         .unwrap();
     }
     drop(conn);
+    // G6 Stage 3: see fixture() above -- the shadow page IS the entity.
+    // `conn`'s owned lock must be dropped first -- `test_seed_entity_shadow_page`
+    // takes its own lock on the same non-reentrant connection mutex.
+    db.test_seed_entity_shadow_page(
+        crate::db::TestEntity::new("entity-atlas", "Project Atlas", "concept").confirmed(true),
+    )
+    .await
+    .unwrap();
     let report = prepare(&db, None).await;
     let work = report.agent_work().unwrap();
     let population = population_for(work, LintSemanticCheckId::MemoryEntityLinks);
@@ -536,7 +666,7 @@ async fn candidate_truncation_completes_after_bounded_adjudication() {
 #[tokio::test]
 async fn page_evidence_candidates_ignore_high_frequency_token_noise() {
     let (db, _dir) = test_db().await;
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     for index in 0..100 {
         conn.execute(
             "INSERT INTO memories
@@ -645,8 +775,7 @@ async fn disagreement_and_missing_second_judge_remain_incomplete() {
 #[tokio::test]
 async fn temporal_evolution_and_related_page_can_be_cleared_without_fabricating_links() {
     let (db, _dir) = fixture().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute("DELETE FROM page_evidence", libsql::params::Params::None)
         .await
@@ -776,8 +905,7 @@ async fn stale_work_is_rejected_and_general_never_calls_a_model() {
 #[tokio::test]
 async fn work_digest_binds_scope_and_records_outside_the_packet() {
     let (db, _dir) = fixture().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
             "INSERT INTO memories
@@ -797,8 +925,7 @@ async fn work_digest_binds_scope_and_records_outside_the_packet() {
         .iter()
         .all(|record| !record.excerpt().contains("outside packet")));
     let submission = submission_for(work, None, false);
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE memories SET content='outside packet bravo' WHERE source_id='zz-hidden'",
@@ -816,8 +943,7 @@ async fn work_digest_binds_scope_and_records_outside_the_packet() {
 
     let prepared = prepare(&db, None).await;
     let submission = submission_for(prepared.agent_work().unwrap(), None, false);
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "UPDATE memories SET content='zzzz hidden chunk bravo' WHERE id='zz-hidden-row-1'",
@@ -847,8 +973,7 @@ async fn work_digest_binds_scope_and_records_outside_the_packet() {
 #[tokio::test]
 async fn zero_heuristic_candidates_are_clean_after_full_candidate_generation() {
     let (db, _dir) = test_db().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute(
             "INSERT INTO memories
@@ -882,17 +1007,21 @@ async fn empty_semantic_population_is_clean() {
 #[tokio::test]
 async fn duplicate_pair_paths_consume_one_candidate_slot() {
     let (db, _dir) = fixture().await;
-    db.conn
-        .lock()
+    db.test_primary_session()
         .await
         .execute_batch(
-            "INSERT INTO entities (id,name,entity_type,confirmed,created_at,updated_at)
-         VALUES ('entity-launch','launch','concept',1,1,1);
-         INSERT INTO memory_entities (memory_id,entity_id)
+            "INSERT INTO memory_entities (memory_id,entity_id)
          VALUES ('mem-a','entity-launch'),('mem-b','entity-launch');",
         )
         .await
         .unwrap();
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above
+    // (fixture() already seeds entity-atlas; this test adds its own entity).
+    db.test_seed_entity_shadow_page(
+        crate::db::TestEntity::new("entity-launch", "launch", "concept").confirmed(true),
+    )
+    .await
+    .unwrap();
     let report = prepare(&db, None).await;
     assert_eq!(
         population_for(
@@ -907,13 +1036,7 @@ async fn duplicate_pair_paths_consume_one_candidate_slot() {
 #[tokio::test]
 async fn contradiction_cap_keeps_highest_signal_pair_not_first_ids() {
     let (db, _dir) = test_db().await;
-    let conn = db.conn.lock().await;
-    conn.execute_batch(
-        "INSERT INTO entities (id,name,entity_type,confirmed,created_at,updated_at)
-         VALUES ('entity-atlas','Project Atlas','concept',1,1,1);",
-    )
-    .await
-    .unwrap();
+    let conn = db.test_primary_session().await;
     for index in 0..8 {
         let content = if index >= 6 {
             format!("Project Atlas critical launch date budget owner shared-marker-{index}")
@@ -938,6 +1061,14 @@ async fn contradiction_cap_keeps_highest_signal_pair_not_first_ids() {
         .unwrap();
     }
     drop(conn);
+    // G6 Stage 2 PR 2c sub-step 3 item 6 fallout fix: see fixture() above.
+    // `conn`'s owned lock must be dropped first -- `test_seed_entity_shadow_page`
+    // takes its own lock on the same non-reentrant connection mutex.
+    db.test_seed_entity_shadow_page(
+        crate::db::TestEntity::new("entity-atlas", "Project Atlas", "concept").confirmed(true),
+    )
+    .await
+    .unwrap();
 
     let report = prepare(&db, None).await;
     let work = report.agent_work().unwrap();

@@ -5,11 +5,12 @@ use tokio::sync::Barrier;
 
 #[tokio::test]
 async fn lint_snapshot_baseline_primary_connection_answers_independently() {
-    // Given: a separate read-only libSQL transaction is open.
+    // Given: a separate read-only test session is open.
     let (db, _dir) = test_db().await;
-    let secondary = db._db.connect().expect("secondary connection opens");
-    let transaction = secondary
-        .transaction_with_behavior(libsql::TransactionBehavior::ReadOnly)
+    let transaction = db
+        .test_secondary_session()
+        .expect("secondary connection opens")
+        .begin_read_only()
         .await
         .expect("read-only transaction starts");
 
@@ -45,9 +46,13 @@ async fn snapshot_keeps_multiple_reads_coherent_while_writer_commits() {
     writer_ready.wait().await;
 
     // When: a writer commits between two reads from the open snapshot.
+    // G6 Stage 3 retirement lint track: migration 123 drops `entities`
+    // outright, and `create_entity` (the writer below) is canonical-only --
+    // the count moves onto `entity_page_map`, 1:1 with an active
+    // `kind='entity'` shadow page by the shadow-page invariant.
     let mut before_rows = snapshot
         .query(
-            "SELECT COUNT(*) FROM entities",
+            "SELECT COUNT(*) FROM entity_page_map",
             libsql::params::Params::None,
         )
         .await
@@ -73,7 +78,7 @@ async fn snapshot_keeps_multiple_reads_coherent_while_writer_commits() {
         .expect("writer commits");
     let mut after_rows = snapshot
         .query(
-            "SELECT COUNT(*) FROM entities",
+            "SELECT COUNT(*) FROM entity_page_map",
             libsql::params::Params::None,
         )
         .await
@@ -111,12 +116,15 @@ async fn snapshot_receipt_detects_same_row_count_update() {
     let writer = tokio::spawn(async move {
         writer_ready_for_task.wait().await;
         writer_release_for_task.wait().await;
+        // G6 Stage 3 retirement lint track: migration 123 drops `entities`
+        // outright -- an entity's name now lives on its `kind='entity'`
+        // shadow page, reached through `entity_page_map`.
         writer_db
-            .conn
-            .lock()
+            .test_primary_session()
             .await
             .execute(
-                "UPDATE entities SET name = ?1 WHERE id = ?2",
+                "UPDATE pages SET title = ?1
+                 WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?2)",
                 libsql::params!["after update", writer_id],
             )
             .await
@@ -160,8 +168,7 @@ async fn completed_receipt_is_invalidated_by_a_later_same_row_update() {
 
     // When: a canonical UPDATE commits without changing schema or row counts.
     let changed = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute("UPDATE profiles SET updated_at = updated_at + 1", ())
         .await
@@ -186,7 +193,9 @@ async fn completed_receipt_is_invalidated_by_a_later_same_row_update() {
 async fn structural_snapshot_work_is_independent_of_table_payload_bytes() {
     // Given: an ordinary table whose schema is fixed before the receipt work starts.
     let (db, _dir) = test_db().await;
-    let connection = db._db.connect().expect("receipt probe connection opens");
+    let connection = db
+        .test_secondary_session()
+        .expect("receipt probe connection opens");
     connection
         .execute(
             "CREATE TABLE lint_payload_probe (payload BLOB NOT NULL)",
@@ -194,7 +203,8 @@ async fn structural_snapshot_work_is_independent_of_table_payload_bytes() {
         )
         .await
         .expect("receipt probe table is created");
-    let before = super::structural_digest(&connection)
+    let before = connection
+        .structural_digest()
         .await
         .expect("pre-payload structural digest succeeds");
 
@@ -206,7 +216,8 @@ async fn structural_snapshot_work_is_independent_of_table_payload_bytes() {
         )
         .await
         .expect("large payload is inserted");
-    let after = super::structural_digest(&connection)
+    let after = connection
+        .structural_digest()
         .await
         .expect("post-payload structural digest succeeds");
 
@@ -222,9 +233,8 @@ async fn replacing_the_freshness_observer_invalidates_prior_receipts() {
     db.bootstrap_profile()
         .await
         .expect("profile fixture exists");
-    let old_clock =
-        Arc::new(super::LintFreshnessClock::new(&db._db).expect("old freshness observer opens"));
-    let old = super::LintReadSnapshot::open_with_freshness(&db._db, old_clock)
+    let old = db
+        .open_isolated_lint_snapshot_for_test()
         .await
         .expect("old snapshot opens")
         .finish()
@@ -234,8 +244,7 @@ async fn replacing_the_freshness_observer_invalidates_prior_receipts() {
     // When: a same-row canonical write commits and a new daemon lifetime opens
     // a fresh observer connection over the same database.
     let changed = db
-        .conn
-        .lock()
+        .test_primary_session()
         .await
         .execute("UPDATE profiles SET updated_at = updated_at + 1", ())
         .await
@@ -244,9 +253,8 @@ async fn replacing_the_freshness_observer_invalidates_prior_receipts() {
         changed, 1,
         "the probe must update exactly one canonical row"
     );
-    let new_clock =
-        Arc::new(super::LintFreshnessClock::new(&db._db).expect("new freshness observer opens"));
-    let new = super::LintReadSnapshot::open_with_freshness(&db._db, new_clock)
+    let new = db
+        .open_isolated_lint_snapshot_for_test()
         .await
         .expect("new snapshot opens")
         .finish()
@@ -331,9 +339,21 @@ async fn snapshot_read_only_transaction_rejects_mutation() {
     let snapshot = db.open_lint_snapshot().await.expect("lint snapshot opens");
 
     // When: a lint query attempts a write.
+    // G6 Stage 3 retirement lint track: migration 123 drops `entities`
+    // outright, so an INSERT into it would fail with "no such table" even
+    // outside a read-only transaction -- that would test table absence, not
+    // the read-only rejection this test exists for. `pages` stays a real,
+    // always-present table; this INSERT mirrors the minimal valid column set
+    // already used elsewhere in this lint fixture family (see deep_test.rs).
     let write_result = snapshot
         .query(
-            "INSERT INTO entities (id, name, entity_type, confirmed, created_at, updated_at) VALUES ('lint-write', 'lint-write', 'test', 0, 1, 1) RETURNING id",
+            "INSERT INTO pages
+                 (id,title,content,source_memory_ids,version,status,created_at,
+                  last_compiled,last_modified,creation_kind,review_status)
+             VALUES
+                 ('lint-write','lint-write','lint-write','[]',1,'active','now','now','now',
+                  'distilled','confirmed')
+             RETURNING id",
             libsql::params::Params::None,
         )
         .await;
@@ -358,9 +378,13 @@ async fn snapshot_query_failure_cleans_up_without_passing() {
     let snapshot = db.open_lint_snapshot().await.expect("lint snapshot opens");
 
     // When: a malformed lint query fails and the snapshot is dropped.
+    // G6 Stage 3 retirement lint track: migration 123 drops `entities`
+    // outright, so this query would fail on table absence rather than the
+    // missing-column malformation this test exists to exercise. `pages`
+    // stays a real, always-present table.
     let query_result = snapshot
         .query(
-            "SELECT missing_column FROM entities",
+            "SELECT missing_column FROM pages",
             libsql::params::Params::None,
         )
         .await;
@@ -381,10 +405,15 @@ async fn snapshot_query_failure_cleans_up_without_passing() {
         .expect("next snapshot finishes");
 }
 
+// G6 Stage 3 retirement lint track: migration 123 drops `entities` outright --
+// an entity's name now lives on its `kind='entity'` shadow page, reached
+// through `entity_page_map`.
 async fn entity_name(snapshot: &super::LintReadSnapshot<'_>, entity_id: &str) -> String {
     let mut rows = snapshot
         .query(
-            "SELECT name FROM entities WHERE id = ?1",
+            "SELECT p.title FROM pages p
+             JOIN entity_page_map epm ON epm.page_id = p.id
+             WHERE epm.entity_id = ?1",
             libsql::params::Params::Positional(vec![libsql::Value::Text(entity_id.to_owned())]),
         )
         .await

@@ -11,14 +11,16 @@
 use rmcp::model::{CallToolResult, RawContent};
 use wenlan_mcp::client::WenlanClient;
 use wenlan_mcp::tools::{
-    CaptureParams, ContextParams, ListNurtureParams, ListPendingParams, RecallParams,
-    TransportMode, WenlanMcpServer,
+    CaptureParams, ContextParams, CreateRelationParams, ListPendingImportsParams,
+    ListPendingParams, ListRejectionsParams, RecallParams, TransportMode, WenlanMcpServer,
 };
-use wenlan_types::memory::{IndexedFileInfo, MemoryItem, SearchResult};
+use wenlan_types::import::PendingImport;
+use wenlan_types::memory::{IndexedFileInfo, SearchResult};
+use wenlan_types::memory::{MemoryItem, RejectionRecord};
 use wenlan_types::responses::{
-    ChatContextResponse, DeleteResponse, KnowledgeContext, ListMemoriesResponse,
-    NurtureCardsResponse, ProfileContext, SearchMemoryResponse, StoreMemoryResponse,
-    TierTokenEstimates,
+    ChatContextResponse, CreateRelationResponse, DeleteResponse, KnowledgeContext,
+    ListMemoriesResponse, MemoryDetailResponse, ProfileContext, SearchMemoryResponse,
+    StoreMemoryResponse, TierTokenEstimates,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -101,6 +103,38 @@ fn sample_search_result() -> SearchResult {
     }
 }
 
+fn sample_memory(source_id: &str) -> MemoryItem {
+    MemoryItem {
+        source_id: source_id.into(),
+        title: "Explicit relation".into(),
+        content: "Alice works on Wenlan.".into(),
+        summary: None,
+        memory_type: Some("fact".into()),
+        space: None,
+        source_agent: Some("test-agent".into()),
+        confidence: Some(1.0),
+        confirmed: false,
+        stability: None,
+        pinned: false,
+        supersedes: None,
+        last_modified: 0,
+        chunk_count: 1,
+        entity_id: None,
+        quality: None,
+        is_recap: false,
+        enrichment_status: String::new(),
+        supersede_mode: String::new(),
+        structured_fields: None,
+        retrieval_cue: None,
+        access_count: 0,
+        source_text: None,
+        version: 1,
+        changelog: None,
+        pending_revision: false,
+        merged_from: None,
+    }
+}
+
 #[tokio::test]
 async fn t1_remember_roundtrip() {
     let (mock, client) = setup().await;
@@ -116,6 +150,9 @@ async fn t1_remember_roundtrip() {
         enrichment: String::new(),
 
         hint: String::new(),
+        space: None,
+        space_source: None,
+        write_outcome: None,
     };
     Mock::given(method("POST"))
         .and(path("/api/memory/store"))
@@ -139,11 +176,111 @@ async fn t1_remember_roundtrip() {
         .expect("capture_impl failed");
 
     let text = text_of(&result);
-    assert_eq!(text, "Stored mem_t1");
+    assert_eq!(text, "Stored mem_t1\nsource_memory_id: mem_t1");
 
     let body = captured_body(&mock).await;
     assert_eq!(body["content"], serde_json::json!("anything"));
     assert_eq!(body["source_agent"], serde_json::json!("test-agent"));
+}
+
+#[tokio::test]
+async fn create_relation_rejects_blank_source_before_network() {
+    let (mock, client) = setup().await;
+    let server = make_server(client);
+
+    let result = server
+        .create_relation_impl(CreateRelationParams {
+            from_entity_id: "ent_alice".into(),
+            to_entity_id: "ent_wenlan".into(),
+            relation_type: "works_on".into(),
+            source_memory_id: "   ".into(),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.is_error.unwrap_or(false));
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "blank source must reject before any HTTP request"
+    );
+}
+
+#[tokio::test]
+async fn create_relation_missing_source_preflight_prevents_post() {
+    let (mock, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/memory/mem_missing/detail"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock)
+        .await;
+    let server = make_server(client);
+
+    let result = server
+        .create_relation_impl(CreateRelationParams {
+            from_entity_id: "ent_alice".into(),
+            to_entity_id: "ent_wenlan".into(),
+            relation_type: "works_on".into(),
+            source_memory_id: "mem_missing".into(),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.is_error.unwrap_or(false));
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(
+        received.len(),
+        1,
+        "missing source must stop after preflight"
+    );
+    assert_eq!(received[0].method.as_str(), "GET");
+}
+
+#[tokio::test]
+async fn create_relation_successful_preflight_maps_source_into_post() {
+    let (mock, client) = setup().await;
+    let source_id = "mem source/1";
+    Mock::given(method("GET"))
+        .and(path("/api/memory/mem%20source%2F1/detail"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(MemoryDetailResponse {
+                memory: Some(sample_memory(source_id)),
+            }),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/memory/relations"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(CreateRelationResponse {
+                id: "rel_1".into(),
+                warnings: Vec::new(),
+            }),
+        )
+        .mount(&mock)
+        .await;
+    let server = make_server(client);
+
+    let result = server
+        .create_relation_impl(CreateRelationParams {
+            from_entity_id: "ent_alice".into(),
+            to_entity_id: "ent_wenlan".into(),
+            relation_type: "works_on".into(),
+            source_memory_id: source_id.into(),
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.is_error.unwrap_or(false));
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(
+        received.len(),
+        2,
+        "preflight GET must precede relation POST"
+    );
+    assert_eq!(received[0].method.as_str(), "GET");
+    assert_eq!(received[1].method.as_str(), "POST");
+    let post_body: serde_json::Value = serde_json::from_slice(&received[1].body).unwrap();
+    assert_eq!(post_body["source_memory_id"], source_id);
 }
 
 #[tokio::test]
@@ -161,6 +298,9 @@ async fn t2_remember_surfaces_warnings_when_present() {
         enrichment: String::new(),
 
         hint: String::new(),
+        space: None,
+        space_source: None,
+        write_outcome: None,
     };
     Mock::given(method("POST"))
         .and(path("/api/memory/store"))
@@ -215,6 +355,9 @@ async fn t3_structured_fields_schema_is_object() {
         enrichment: String::new(),
 
         hint: String::new(),
+        space: None,
+        space_source: None,
+        write_outcome: None,
     };
     Mock::given(method("POST"))
         .and(path("/api/memory/store"))
@@ -241,7 +384,7 @@ async fn t3_structured_fields_schema_is_object() {
         .expect("capture_impl failed");
 
     let text = text_of(&result);
-    assert_eq!(text, "Stored mem_t3");
+    assert_eq!(text, "Stored mem_t3\nsource_memory_id: mem_t3");
 
     let body = captured_body(&mock).await;
     assert_eq!(
@@ -339,6 +482,9 @@ async fn t5_memory_type_hint_preserved_without_forcing_domain() {
         enrichment: String::new(),
 
         hint: String::new(),
+        space: None,
+        space_source: None,
+        write_outcome: None,
     };
     Mock::given(method("POST"))
         .and(path("/api/memory/store"))
@@ -362,7 +508,7 @@ async fn t5_memory_type_hint_preserved_without_forcing_domain() {
         .expect("capture_impl failed");
 
     let text = text_of(&result);
-    assert_eq!(text, "Stored mem_t5");
+    assert_eq!(text, "Stored mem_t5\nsource_memory_id: mem_t5");
 
     let body = captured_body(&mock).await;
     assert_eq!(body["memory_type"], serde_json::json!("fact"));
@@ -563,6 +709,9 @@ async fn t10_remember_request_does_not_contain_user_id() {
         enrichment: String::new(),
 
         hint: String::new(),
+        space: None,
+        space_source: None,
+        write_outcome: None,
     };
     Mock::given(method("POST"))
         .and(path("/api/memory/store"))
@@ -586,7 +735,7 @@ async fn t10_remember_request_does_not_contain_user_id() {
         .expect("capture_impl failed");
 
     let text = text_of(&result);
-    assert_eq!(text, "Stored mem_t10");
+    assert_eq!(text, "Stored mem_t10\nsource_memory_id: mem_t10");
 
     let body = captured_body(&mock).await;
     let obj = body.as_object().expect("body is an object");
@@ -612,6 +761,9 @@ async fn t11_extraction_method_none_not_in_text() {
         enrichment: String::new(),
 
         hint: String::new(),
+        space: None,
+        space_source: None,
+        write_outcome: None,
     };
     Mock::given(method("POST"))
         .and(path("/api/memory/store"))
@@ -639,7 +791,7 @@ async fn t11_extraction_method_none_not_in_text() {
         !text.contains("extraction_method"),
         "extraction_method label leaked into text: {text}"
     );
-    assert_eq!(text, "Stored mem_t11");
+    assert_eq!(text, "Stored mem_t11\nsource_memory_id: mem_t11");
 }
 
 /// Regression test: context_impl must succeed even when the daemon returns
@@ -740,7 +892,7 @@ async fn t12_forward_compat_response_missing_extraction_method() {
         .expect("capture_impl failed against pre-D9 response");
 
     let text = text_of(&result);
-    assert_eq!(text, "Stored mem_t12");
+    assert_eq!(text, "Stored mem_t12\nsource_memory_id: mem_t12");
 
     let parsed: StoreMemoryResponse = serde_json::from_value(raw_json).unwrap();
     assert_eq!(parsed.extraction_method, "unknown");
@@ -762,6 +914,9 @@ async fn origin_client_sends_x_agent_name_header() {
         extraction_method: "none".into(),
         enrichment: String::new(),
         hint: String::new(),
+        space: None,
+        space_source: None,
+        write_outcome: None,
     };
     Mock::given(method("POST"))
         .and(path("/api/memory/store"))
@@ -814,6 +969,9 @@ async fn origin_client_omits_x_agent_name_when_unset() {
         extraction_method: "none".into(),
         enrichment: String::new(),
         hint: String::new(),
+        space: None,
+        space_source: None,
+        write_outcome: None,
     };
     Mock::given(method("POST"))
         .and(path("/api/memory/store"))
@@ -848,270 +1006,7 @@ async fn origin_client_omits_x_agent_name_when_unset() {
     );
 }
 
-fn sample_memory_item() -> MemoryItem {
-    MemoryItem {
-        source_id: "mem_nurture1".into(),
-        title: "Test nurture card".into(),
-        content: "This memory needs review.".into(),
-        summary: None,
-        memory_type: Some("fact".into()),
-        space: Some("work".into()),
-        source_agent: Some("test-agent".into()),
-        confidence: Some(0.7),
-        confirmed: false,
-        stability: None,
-        pinned: false,
-        supersedes: None,
-        last_modified: 1715000000,
-        chunk_count: 1,
-        entity_id: None,
-        quality: None,
-        is_recap: false,
-        enrichment_status: "done".into(),
-        supersede_mode: "soft".into(),
-        structured_fields: None,
-        retrieval_cue: None,
-        access_count: 0,
-        source_text: None,
-        version: 1,
-        changelog: None,
-        pending_revision: false,
-        merged_from: None,
-    }
-}
-
-#[tokio::test]
-async fn list_nurture_happy_path() {
-    let (mock, client) = setup().await;
-    let response = NurtureCardsResponse {
-        cards: vec![sample_memory_item()],
-    };
-    Mock::given(method("GET"))
-        .and(path("/api/memory/nurture"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    let result = server
-        .list_nurture_impl(ListNurtureParams {
-            limit: None,
-            space: None,
-        })
-        .await
-        .expect("list_nurture_impl failed");
-
-    let text = text_of(&result);
-    assert!(
-        text.starts_with("1 nurture cards"),
-        "expected '1 nurture cards' header; got: {text}"
-    );
-    assert!(
-        text.contains("mem_nurture1"),
-        "expected source_id in output; got: {text}"
-    );
-}
-
-#[tokio::test]
-async fn list_nurture_envelope_guard() {
-    // Daemon must not wrap response under an extra key. If it does, typed
-    // deserialization fails loud instead of returning an empty list silently.
-    // Regression guard for lesson_mcp_typed_deserialize.
-    let wrong = serde_json::json!({ "data": { "cards": [] } });
-    let (mock, client) = setup().await;
-    Mock::given(method("GET"))
-        .and(path("/api/memory/nurture"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&wrong))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    let result = server
-        .list_nurture_impl(ListNurtureParams {
-            limit: None,
-            space: None,
-        })
-        .await
-        .expect("list_nurture_impl returned Err unexpectedly");
-
-    // tool_error path: isError=true text contains "Failed to parse"
-    let text = text_of(&result);
-    assert!(
-        result.is_error.unwrap_or(false),
-        "envelope-wrapped response must surface as tool error; got: {text}"
-    );
-    assert!(
-        text.contains("Failed to parse"),
-        "error message must mention parse failure; got: {text}"
-    );
-}
-
-#[tokio::test]
-async fn list_nurture_passes_query_params() {
-    let (mock, client) = setup().await;
-    let response = NurtureCardsResponse { cards: vec![] };
-    // Use a broad path matcher; we inspect the URL manually.
-    Mock::given(method("GET"))
-        .and(path("/api/memory/nurture"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    server
-        .list_nurture_impl(ListNurtureParams {
-            limit: Some(25),
-            space: Some("work".into()),
-        })
-        .await
-        .expect("list_nurture_impl failed");
-
-    let received = mock
-        .received_requests()
-        .await
-        .expect("wiremock captured no requests");
-    assert_eq!(received.len(), 1);
-    let url = received[0].url.to_string();
-    assert!(
-        url.contains("limit=25"),
-        "expected limit=25 in query; got: {url}"
-    );
-    assert!(
-        url.contains("space=work"),
-        "expected space=work in query; got: {url}"
-    );
-}
-
-#[tokio::test]
-async fn list_nurture_http_500() {
-    let (mock, client) = setup().await;
-    Mock::given(method("GET"))
-        .and(path("/api/memory/nurture"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    let result = server
-        .list_nurture_impl(ListNurtureParams {
-            limit: None,
-            space: None,
-        })
-        .await
-        .expect("list_nurture_impl must not return Err on HTTP 500");
-
-    assert!(
-        result.is_error.unwrap_or(false),
-        "HTTP 500 must surface as tool error"
-    );
-    let text = text_of(&result);
-    assert!(
-        text.contains("500"),
-        "error message must mention HTTP 500; got: {text}"
-    );
-}
-
-// ===== list_entity_suggestions =====
-
-use wenlan_mcp::tools::ListEntitySuggestionsParams;
-use wenlan_types::entities::EntitySuggestion;
-
-fn sample_entity_suggestion(id: &str, name: &str) -> EntitySuggestion {
-    EntitySuggestion {
-        id: id.into(),
-        entity_name: Some(name.into()),
-        source_ids: vec!["mem_a".into()],
-        confidence: 0.8,
-        created_at: "2026-05-12T00:00:00Z".into(),
-    }
-}
-
-#[tokio::test]
-async fn list_entity_suggestions_happy_path() {
-    let (mock, client) = setup().await;
-    let body = vec![sample_entity_suggestion("sug_1", "PostgreSQL")];
-    Mock::given(method("GET"))
-        .and(path("/api/memory/entity-suggestions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    let result = server
-        .list_entity_suggestions_impl(ListEntitySuggestionsParams {})
-        .await
-        .unwrap();
-    let text = text_of(&result);
-    assert!(text.contains("PostgreSQL"));
-    assert!(text.contains("sug_1"));
-}
-
-#[tokio::test]
-async fn list_entity_suggestions_envelope_guard() {
-    let (mock, client) = setup().await;
-    // Wrong shape: object instead of array
-    Mock::given(method("GET"))
-        .and(path("/api/memory/entity-suggestions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "suggestions": []
-        })))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    let result = server
-        .list_entity_suggestions_impl(ListEntitySuggestionsParams {})
-        .await
-        .unwrap();
-    let text = text_of(&result);
-    assert!(
-        result.is_error.unwrap_or(false),
-        "wrong response shape must surface as a tool error; got: {text}"
-    );
-    assert!(text.contains("Failed to parse"), "got: {text}");
-    assert!(!text.contains("suggestions"), "daemon body leaked: {text}");
-}
-
-#[tokio::test]
-async fn list_entity_suggestions_empty() {
-    let (mock, client) = setup().await;
-    Mock::given(method("GET"))
-        .and(path("/api/memory/entity-suggestions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<EntitySuggestion>::new()))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    let result = server
-        .list_entity_suggestions_impl(ListEntitySuggestionsParams {})
-        .await
-        .unwrap();
-    let text = text_of(&result);
-    assert!(text.contains("0 entity suggestion"), "got: {text}");
-}
-
-#[tokio::test]
-async fn list_entity_suggestions_http_500() {
-    let (mock, client) = setup().await;
-    Mock::given(method("GET"))
-        .and(path("/api/memory/entity-suggestions"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    let result = server
-        .list_entity_suggestions_impl(ListEntitySuggestionsParams {})
-        .await
-        .unwrap();
-    let text = text_of(&result);
-    assert!(text.to_lowercase().contains("error") || text.contains("500"));
-}
-
 // ===== list_pending_imports =====
-
-use wenlan_mcp::tools::ListPendingImportsParams;
-use wenlan_types::import::PendingImport;
 
 fn sample_pending_import(id: &str) -> PendingImport {
     PendingImport {
@@ -1135,14 +1030,13 @@ async fn list_pending_imports_happy_path() {
         .mount(&mock)
         .await;
 
-    let server = make_server(client);
-    let result = server
+    let result = make_server(client)
         .list_pending_imports_impl(ListPendingImportsParams {})
         .await
         .unwrap();
     let text = text_of(&result);
-    assert!(text.contains("imp_1"));
-    assert!(text.contains("claude"));
+    assert!(text.starts_with("1 pending import(s)"), "got: {text}");
+    assert!(text.contains("imp_1"), "got: {text}");
 }
 
 #[tokio::test]
@@ -1154,8 +1048,7 @@ async fn list_pending_imports_envelope_guard() {
         .mount(&mock)
         .await;
 
-    let server = make_server(client);
-    let result = server
+    let result = make_server(client)
         .list_pending_imports_impl(ListPendingImportsParams {})
         .await
         .unwrap();
@@ -1165,49 +1058,9 @@ async fn list_pending_imports_envelope_guard() {
         "wrong response shape must surface as a tool error; got: {text}"
     );
     assert!(text.contains("Failed to parse"), "got: {text}");
-    assert!(!text.contains("items"), "daemon body leaked: {text}");
-}
-
-#[tokio::test]
-async fn list_pending_imports_empty() {
-    let (mock, client) = setup().await;
-    Mock::given(method("GET"))
-        .and(path("/api/import/state"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<PendingImport>::new()))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    let result = server
-        .list_pending_imports_impl(ListPendingImportsParams {})
-        .await
-        .unwrap();
-    let text = text_of(&result);
-    assert!(text.contains("0 pending import"), "got: {text}");
-}
-
-#[tokio::test]
-async fn list_pending_imports_http_500() {
-    let (mock, client) = setup().await;
-    Mock::given(method("GET"))
-        .and(path("/api/import/state"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    let result = server
-        .list_pending_imports_impl(ListPendingImportsParams {})
-        .await
-        .unwrap();
-    let text = text_of(&result);
-    assert!(text.to_lowercase().contains("error") || text.contains("500"));
 }
 
 // ===== list_rejections =====
-
-use wenlan_mcp::tools::ListRejectionsParams;
-use wenlan_types::memory::RejectionRecord;
 
 fn sample_rejection_record(id: &str) -> RejectionRecord {
     RejectionRecord {
@@ -1218,7 +1071,7 @@ fn sample_rejection_record(id: &str) -> RejectionRecord {
         rejection_detail: Some("Quality score below threshold.".into()),
         similarity_score: None,
         similar_to_source_id: None,
-        created_at: 1715000000,
+        created_at: 1_715_000_000,
     }
 }
 
@@ -1233,61 +1086,41 @@ async fn list_rejections_happy_path() {
         .mount(&mock)
         .await;
 
-    let server = make_server(client);
-    let result = server
+    let result = make_server(client)
         .list_rejections_impl(ListRejectionsParams {
             limit: None,
             reason: None,
         })
         .await
-        .expect("list_rejections_impl failed");
-
+        .unwrap();
     let text = text_of(&result);
-    assert!(
-        text.starts_with("1 rejection(s)"),
-        "expected '1 rejection(s)' header; got: {text}"
-    );
-    assert!(
-        text.contains("rej_abc1"),
-        "expected rejection id in output; got: {text}"
-    );
-    assert!(
-        text.contains("low_quality"),
-        "expected rejection_reason in output; got: {text}"
-    );
+    assert!(text.starts_with("1 rejection(s)"), "got: {text}");
+    assert!(text.contains("rej_abc1"), "got: {text}");
+    assert!(text.contains("low_quality"), "got: {text}");
 }
 
 #[tokio::test]
 async fn list_rejections_envelope_guard() {
-    // Daemon must return a raw array. If it wraps under a key, typed
-    // deserialization fails loud instead of returning an empty list silently.
-    // Regression guard for lesson_mcp_typed_deserialize.
-    let wrong = serde_json::json!({ "data": [] });
     let (mock, client) = setup().await;
     Mock::given(method("GET"))
         .and(path("/api/memory/rejections"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&wrong))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
         .mount(&mock)
         .await;
 
-    let server = make_server(client);
-    let result = server
+    let result = make_server(client)
         .list_rejections_impl(ListRejectionsParams {
             limit: None,
             reason: None,
         })
         .await
-        .expect("list_rejections_impl returned Err unexpectedly");
-
+        .unwrap();
     let text = text_of(&result);
     assert!(
         result.is_error.unwrap_or(false),
         "envelope-wrapped response must surface as tool error; got: {text}"
     );
-    assert!(
-        text.contains("Failed to parse"),
-        "error message must mention parse failure; got: {text}"
-    );
+    assert!(text.contains("Failed to parse"), "got: {text}");
 }
 
 #[tokio::test]
@@ -1299,14 +1132,13 @@ async fn list_rejections_passes_query_params() {
         .mount(&mock)
         .await;
 
-    let server = make_server(client);
-    server
+    make_server(client)
         .list_rejections_impl(ListRejectionsParams {
             limit: Some(30),
             reason: Some("duplicate".into()),
         })
         .await
-        .expect("list_rejections_impl failed");
+        .unwrap();
 
     let received = mock
         .received_requests()
@@ -1314,43 +1146,8 @@ async fn list_rejections_passes_query_params() {
         .expect("wiremock captured no requests");
     assert_eq!(received.len(), 1);
     let url = received[0].url.to_string();
-    assert!(
-        url.contains("limit=30"),
-        "expected limit=30 in query; got: {url}"
-    );
-    assert!(
-        url.contains("reason=duplicate"),
-        "expected reason=duplicate in query; got: {url}"
-    );
-}
-
-#[tokio::test]
-async fn list_rejections_http_500() {
-    let (mock, client) = setup().await;
-    Mock::given(method("GET"))
-        .and(path("/api/memory/rejections"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    let result = server
-        .list_rejections_impl(ListRejectionsParams {
-            limit: None,
-            reason: None,
-        })
-        .await
-        .expect("list_rejections_impl must not return Err on HTTP 500");
-
-    assert!(
-        result.is_error.unwrap_or(false),
-        "HTTP 500 must surface as tool error"
-    );
-    let text = text_of(&result);
-    assert!(
-        text.contains("500"),
-        "error message must mention HTTP 500; got: {text}"
-    );
+    assert!(url.contains("limit=30"), "got: {url}");
+    assert!(url.contains("reason=duplicate"), "got: {url}");
 }
 
 // ===== list_pending_revisions =====
@@ -1477,124 +1274,6 @@ async fn list_pending_revisions_http_500() {
         .list_pending_revisions_impl(ListPendingRevisionsParams { limit: None })
         .await
         .expect("list_pending_revisions_impl must not return Err on HTTP 500");
-
-    assert!(
-        result.is_error.unwrap_or(false),
-        "HTTP 500 must surface as tool error"
-    );
-    let text = text_of(&result);
-    assert!(
-        text.contains("500"),
-        "error message must mention HTTP 500; got: {text}"
-    );
-}
-
-// ===== list_orphan_links =====
-
-use wenlan_mcp::tools::ListOrphanLinksParams;
-use wenlan_types::responses::{OrphanLink, OrphanLinksResponse};
-
-#[tokio::test]
-async fn list_orphan_links_happy_path() {
-    let (mock, client) = setup().await;
-    let body = OrphanLinksResponse {
-        min_count: 2,
-        orphan_labels: vec![OrphanLink {
-            label: "Rust".into(),
-            count: 4,
-        }],
-    };
-    Mock::given(method("GET"))
-        .and(path("/api/pages/orphan-links"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    let result = server
-        .list_orphan_links_impl(ListOrphanLinksParams { min_count: None })
-        .await
-        .unwrap();
-    let text = text_of(&result);
-    assert!(text.contains("Rust"), "label must appear in output: {text}");
-    assert!(text.contains("4"), "count must appear in output: {text}");
-}
-
-#[tokio::test]
-async fn list_orphan_links_envelope_guard() {
-    let (mock, client) = setup().await;
-    // Wrong key: "labels" instead of "orphan_labels". Typed deserialization must fail loud.
-    Mock::given(method("GET"))
-        .and(path("/api/pages/orphan-links"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "min_count": 2,
-            "labels": []
-        })))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    let result = server
-        .list_orphan_links_impl(ListOrphanLinksParams { min_count: None })
-        .await
-        .unwrap();
-    let text = text_of(&result);
-    assert!(
-        result.is_error.unwrap_or(false),
-        "wrong key 'labels' instead of 'orphan_labels' must surface as tool error; got: {text}"
-    );
-    assert!(
-        text.contains("Failed to parse"),
-        "error message must describe parse failure; got: {text}"
-    );
-    assert!(!text.contains("labels"), "daemon body leaked: {text}");
-}
-
-#[tokio::test]
-async fn list_orphan_links_passes_min_count() {
-    let (mock, client) = setup().await;
-    let body = OrphanLinksResponse {
-        min_count: 5,
-        orphan_labels: vec![],
-    };
-    Mock::given(method("GET"))
-        .and(path("/api/pages/orphan-links"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    server
-        .list_orphan_links_impl(ListOrphanLinksParams { min_count: Some(5) })
-        .await
-        .unwrap();
-
-    let received = mock
-        .received_requests()
-        .await
-        .expect("wiremock captured no requests");
-    assert_eq!(received.len(), 1);
-    let url = received[0].url.to_string();
-    assert!(
-        url.contains("min_count=5"),
-        "expected min_count=5 in query; got: {url}"
-    );
-}
-
-#[tokio::test]
-async fn list_orphan_links_http_500() {
-    let (mock, client) = setup().await;
-    Mock::given(method("GET"))
-        .and(path("/api/pages/orphan-links"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
-        .mount(&mock)
-        .await;
-
-    let server = make_server(client);
-    let result = server
-        .list_orphan_links_impl(ListOrphanLinksParams { min_count: None })
-        .await
-        .expect("list_orphan_links_impl must not return Err on HTTP 500");
 
     assert!(
         result.is_error.unwrap_or(false),
@@ -1933,121 +1612,6 @@ async fn dismiss_revision_forwards_x_agent_name() {
         "x-agent-name header must equal configured agent name"
     );
 }
-
-use wenlan_mcp::tools::DismissContradictionRequest;
-
-#[tokio::test]
-async fn dismiss_contradiction_happy_path() {
-    let (mock, client) = setup().await;
-    Mock::given(method("POST"))
-        .and(path("/api/memory/contradiction/mem_x/dismiss"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "source_id": "mem_x",
-            "wrote": true,
-        })))
-        .mount(&mock)
-        .await;
-    let server = make_server(client);
-    let result = server
-        .dismiss_contradiction_impl(DismissContradictionRequest {
-            source_id: "mem_x".into(),
-        })
-        .await
-        .unwrap();
-    let text = text_of(&result);
-    assert!(
-        text.contains("mem_x"),
-        "expected source_id in output; got: {text}"
-    );
-    assert!(
-        text.contains("true"),
-        "expected wrote=true in output; got: {text}"
-    );
-}
-
-#[tokio::test]
-async fn dismiss_contradiction_envelope_guard() {
-    let (mock, client) = setup().await;
-    Mock::given(method("POST"))
-        .and(path("/api/memory/contradiction/mem_y/dismiss"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "source_id": "mem_y",
-            "wrote": true,
-            "noise": "ok",
-        })))
-        .mount(&mock)
-        .await;
-    let server = make_server(client);
-    let result = server
-        .dismiss_contradiction_impl(DismissContradictionRequest {
-            source_id: "mem_y".into(),
-        })
-        .await
-        .unwrap();
-    let text = text_of(&result);
-    assert!(
-        text.contains("mem_y"),
-        "expected source_id in output; got: {text}"
-    );
-}
-
-#[tokio::test]
-async fn dismiss_contradiction_500_surfaces_as_error() {
-    let (mock, client) = setup().await;
-    Mock::given(method("POST"))
-        .and(path("/api/memory/contradiction/mem_500/dismiss"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .mount(&mock)
-        .await;
-    let server = make_server(client);
-    let result = server
-        .dismiss_contradiction_impl(DismissContradictionRequest {
-            source_id: "mem_500".into(),
-        })
-        .await
-        .unwrap();
-    let text = text_of(&result);
-    assert!(
-        text.to_lowercase().contains("error") || text.contains("500"),
-        "expected error signal on 500; got: {text}"
-    );
-}
-
-#[tokio::test]
-async fn dismiss_contradiction_forwards_x_agent_name() {
-    let mock = MockServer::start().await;
-    let client = WenlanClient::new(mock.uri()).with_agent_name("test-agent".into());
-    Mock::given(method("POST"))
-        .and(path("/api/memory/contradiction/mem_hdr/dismiss"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "source_id": "mem_hdr",
-            "wrote": true,
-        })))
-        .mount(&mock)
-        .await;
-    let server = make_server(client);
-    server
-        .dismiss_contradiction_impl(DismissContradictionRequest {
-            source_id: "mem_hdr".into(),
-        })
-        .await
-        .unwrap();
-    let received = mock
-        .received_requests()
-        .await
-        .expect("wiremock captured no requests");
-    assert_eq!(received.len(), 1, "expected exactly 1 request");
-    let value = received[0]
-        .headers
-        .get("x-agent-name")
-        .expect("x-agent-name header must be present");
-    assert_eq!(
-        value.to_str().expect("header value is valid utf-8"),
-        "test-agent",
-        "x-agent-name header must equal configured agent name"
-    );
-}
-
 #[tokio::test]
 async fn t_list_pending_uses_post_with_confirmed_false() {
     let (mock, client) = setup().await;

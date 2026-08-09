@@ -141,7 +141,12 @@ async fn run_with_flags(
 }
 
 async fn insert_memory(db: &crate::db::MemoryDB, id: &str, space: Option<&str>) {
-    let conn = db.conn.lock().await;
+    // M3 PR-1 stage e honest columns: memories.space is NOT NULL since
+    // migration 91, so a caller who wants "no space" must bind the reserved
+    // sentinel id -- binding an explicit NULL now violates the column
+    // constraint here too, same as insert_page below has since M1.
+    let space = space.unwrap_or(crate::db::UNFILED_SPACE_ID);
+    let conn = db.test_primary_session().await;
     conn.execute(
         "INSERT INTO memories (id, content, source, source_id, title, chunk_index,
          last_modified, chunk_type, stability, supersede_mode, needs_reembed, memory_type,
@@ -154,7 +159,11 @@ async fn insert_memory(db: &crate::db::MemoryDB, id: &str, space: Option<&str>) 
 }
 
 async fn insert_page(db: &crate::db::MemoryDB, id: &str, workspace: Option<&str>) {
-    let conn = db.conn.lock().await;
+    // M1 honest columns: pages.workspace is NOT NULL since migration 80, so a
+    // caller who wants "no workspace" must bind the reserved sentinel id --
+    // binding an explicit NULL always violates the column constraint here.
+    let workspace = workspace.unwrap_or(crate::db::UNFILED_SPACE_ID);
+    let conn = db.test_primary_session().await;
     conn.execute(
         "INSERT INTO pages (id, title, content, source_memory_ids, version, status,
          created_at, last_compiled, last_modified, workspace, creation_kind, review_status)
@@ -167,7 +176,7 @@ async fn insert_page(db: &crate::db::MemoryDB, id: &str, workspace: Option<&str>
 }
 
 async fn telemetry_counts(db: &crate::db::MemoryDB) -> (i64, i64) {
-    let conn = db.conn.lock().await;
+    let conn = db.test_primary_session().await;
     let mut rows = conn
         .query(
             "SELECT (SELECT COUNT(*) FROM access_log), (SELECT COUNT(*) FROM agent_activity)",

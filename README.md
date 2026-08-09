@@ -8,7 +8,7 @@
 Useful work with AI shouldn't disappear when a conversation ends. Wenlan builds the right pages and keeps them current as sources change, asking only when judgment is needed.
 
 <p align="center">
-  English | <a href="./README.zh-Hans.md">简体中文</a> | <a href="./README.zh-Hant.md">繁體中文</a>
+  English | <a href="./README.zh-Hans.md">简体中文</a> | <a href="./README.zh-Hant.md">繁體中文</a> | <a href="./README.es-ES.md">Español</a>
 </p>
 
 <p align="center">
@@ -259,9 +259,9 @@ The system above becomes a small daily loop: start with relevant knowledge, capt
 
 The loop has four steps:
 
-1. **Find current knowledge.** Open a relevant Page, search, or use `/recall <query>`; `/brief [topic]` can optionally assemble a broader session-start snapshot. Clients without plugin commands use the equivalent page, search, recall, and context tools.
+1. **Find current knowledge.** Open a relevant Page, search, or use `/recall <query>`; `/brief [topic]` reads the current Space Brief, and a topic appends separately labeled context from that same Space. Clients without plugin commands use the equivalent page, search, recall, and brief tools.
 2. **Capture and find knowledge while you work.** `/capture <thing>` saves a decision, lesson, gotcha, or fact with its source. `/recall <query>` retrieves only what is relevant instead of loading your whole history.
-3. **Close the loop.** `/handoff` records what changed, what remains open, and where the next session should continue.
+3. **Close the loop.** `/handoff` records what changed and applies typed item-level updates to the current Space Brief.
 4. **Keep the wiki current.** `/distill` deliberately creates or refreshes pages. Between sessions, optional model-backed passes can enrich captures, connect related entities, and refresh eligible pages. `/lint` checks knowledge health; `/curate` brings proposed revisions and any conflict-review items created by the optional reconcile pass to you.
 
 ### Models and privacy

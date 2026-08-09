@@ -4,61 +4,125 @@ This document covers releases of the local runtime: `wenlan` CLI, `wenlan-server
 
 ## How release-please works
 
-Merge conventional commits to `main` (e.g. `feat:`, `fix:`, `chore:`). The `release-please` workflow opens a "Release PR" automatically, bumping the version and updating `CHANGELOG.md`. Merge that PR to cut the release. Release-please then creates the git tag, which triggers the `release.yml` build workflow.
+Merge conventional commits to `main` (for example, `feat:`, `fix:`, or `chore:`). The push-only `release-pr-maintenance` workflow immediately opens or updates the Release PR, bumps the version, and updates `CHANGELOG.md` while main CI runs in parallel. It sets `skip-github-release: true`: this path may maintain the PR but cannot create a tag or GitHub Release. The later successful-main `workflow_run` keeps the same PR-only operation as a no-op fallback for transient push-workflow failures. Merging the Release PR cuts a release only after the trusted promotion gate binds that exact merge tree to the archives already built and tested by the PR. The gate then creates the exact `v*` tag, which triggers artifact-only publication in `release.yml`.
 
-> The coding-time rules — which commit prefix bumps what (`feat:` = minor, `fix:` = patch), the "review the squash-merge PR title before merging" warning, the version-file-sync rule, and how to undo a release — live in the root [`AGENTS.md`](AGENTS.md) 'Releasing (release-please)' section so every agent has them in-context. This document is the human operator procedure.
+> The coding-time rules—why every release bumps patch (`"versioning": "always-bump-patch"`), how to force a deliberate minor via `release-as`, the version-file-sync rule, and how to undo a release—live in the root [`AGENTS.md`](AGENTS.md) "Releasing (release-please)" section. This document is the human operator procedure.
 
-The `.release-please-manifest.json` is the canonical version source; check the pending version with `cat .release-please-manifest.json`. The release-please workflow syncs Cargo manifests, npm package manifests, plugin metadata, and pinned install URLs from `version.txt`. It also syncs the daemon workspace `Cargo.toml` version on the release branch, because release-please can't handle Cargo workspaces reliably with the `simple` release type.
+The `.release-please-manifest.json` is the canonical version source; check the pending version with `cat .release-please-manifest.json`. The release-please workflow syncs Cargo manifests, npm package manifests, plugin metadata, and pinned install URLs from `version.txt`. It also syncs the workspace `Cargo.toml` version on the release branch because release-please cannot reliably handle Cargo workspaces with the `simple` release type.
 
-**Config files:**
-- `release-please-config.json` — release type, version-bump behavior
+Config files:
+
+- `release-please-config.json` — release type and version-bump behavior
 - `.release-please-manifest.json` — current version
-- `.github/workflows/release-please.yml` — creates/updates the release PR, syncs daemon Cargo.toml versions
-- `.github/workflows/release.yml` — builds the daemon + uploads artifacts on `v*` tag push
+- `.github/workflows/release-pr-maintenance.yml` — immediately maintains the Release PR on `main` pushes; it has no tag, release, or lifecycle-label API path
+- `.github/workflows/release-please.yml` — revalidates successful main CI, provides the delayed ordinary-maintenance fallback, and creates a tag only for a receipt-validated Release PR merge
+- `.github/workflows/release.yml` — consumes exact validated archives and publishes them on the receipt-derived `v*` tag; it does not recompile Rust
 
-## Manual override: bump-version.sh
+## Manual version override
 
-If you need to cut a release without release-please (hotfix, first release, version correction):
+For a hotfix, first release, or version correction, use the version script on a branch:
 
 ```bash
 bash scripts/bump-version.sh 0.2.0
 ```
 
-This updates workspace Cargo versions, npm package manifests, plugin metadata, and pinned plugin URLs. Review the diff, stage the files, and push. Then create and push the tag manually:
+This updates workspace Cargo versions, npm package manifests, plugin metadata, and pinned plugin URLs. Review the diff and send it through the normal Release PR CI, observer, merge, and promotion path. Do not manually push a release tag: a tag without the exact main-promotion receipt has no validated archive identity and `release.yml` fails closed. For a normal transient publication failure, rerun only its failed jobs; do not select an artifact named "latest".
+
+## Recovering an unavailable tag-trigger release
+
+If a merged Release PR has a valid closed observer receipt but its historical tag-trigger workflow cannot be rerun (for example, a GitHub REST-version regression in the old workflow), first merge the release-recovery workflow fix to `main`. Then dispatch **Release** from `main` with all four exact values from the receipt and the successful Release PR CI run:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+gh workflow run Release --repo 7xuanlu/wenlan --ref main \
+  -f release_sha=<40-character-merged-release-sha> \
+  -f release_tag=v<receipt-version> \
+  -f source_run_id=<successful-release-pr-ci-run-id> \
+  -f source_run_attempt=<successful-release-pr-ci-attempt>
 ```
 
-The `release.yml` workflow triggers on any `v*` tag push.
+The read-only resolver freshly proves the release merge, tree, version, closed-receipt artifact digest, and source run/attempt against those inputs. It requires `main` to remain the default control branch and the Release PR to still have `autorelease: pending` but not `autorelease: tagged`. Only then does a separate no-checkout job, with a dedicated `contents: write` grant and the sole tag-writing authority, create or verify the lightweight tag at `release_sha`. Every source/publish checkout uses that resolved SHA, not the tag name or the current `main` commit. The `GITHUB_TOKEN` tag does not start a second tag workflow; the dispatch run continues the existing artifact-only publication DAG. A stale, mismatched, already-tagged, or ambiguous release fails before creating or using a tag.
 
 ## Version consistency gate
 
-The `release.yml` workflow validates that the pushed tag version matches `version.txt`, workspace Cargo, npm package manifests, and plugin metadata before building. If out of sync, the build fails with instructions to run `bump-version.sh`.
+Release PR CI validates that the proposed version is synchronized across `version.txt`, workspace Cargo, npm package manifests, and plugin metadata before producing archives. The observer independently verifies the strict release-managed diff and version policy. The tag workflow rechecks the receipt-derived tag, version, commit, and asset inventory before publishing; it never repairs drift or rebuilds different bytes.
+
+## Validated release-candidate promotion
+
+The exact same-repository `release-please--branches--main` PR builds and smoke-tests the six canonical final archives once during `release-preflight`. Before CI omits duplicate base-tree Rust tests, Clippy, canonical acceptance, contract integration, or platform compiles, it requires two independent proofs: the release validator's exact owner/repository/branch identity, current-`main` base, closed release-managed path set, unchanged Git modes, and canonical version-only transforms; and a read-only control-plane check that the exact base SHA's unique active `ci.yml` push run on `main` completed successfully. These proofs run from immutable base code. Any API, parse, identity, path, content, run, or workflow uncertainty fails closed; a lookalike branch never grants a skip. Release-managed plugin/npm/docs/version checks and all four shipped-target preflights remain required. The base-CI proof and preflights run in parallel, so safety does not serialize the release critical path. Those hostile-PR outputs are named by source run, producing attempt, and target. A separate default-branch `workflow_run` observer checks out trusted default-branch code, has read-only permissions, treats every downloaded byte as untrusted data, and verifies the upstream CI identity through the Actions API. GitHub can rerun only failed or selected jobs, so a successful terminal run may legitimately contain target artifacts from different attempts; the attempt jobs API also re-emits inherited jobs with the new attempt number. The observer therefore indexes the attempt-scoped artifacts first, selects each target's newest available artifact, then requires the exact matrix job on that artifact's attempt to have completed successfully and requires its embedded manifest attempt to agree. The terminal source run must itself be successful, so a genuinely failed rerun cannot fall back to an older artifact. It then reconciles the Release PR and strict version-only diff, checks the exact four-wrapper/six-asset inventory, hashes every layer, and safely inspects each archive without executing it. To tolerate the merge/observer scheduling race, it accepts either the still-open Release PR or a merged Release PR whose merge tree is byte-for-byte the candidate head tree; a closed-unmerged PR or different tree fails.
+
+A passing observer uploads the exact six inspected files as `validated-release-assets-{source-run}-{source-attempt}-{observer-run}-{observer-attempt}` and closes a receipt over the upload action's artifact ID and SHA-256 digest. Both observer outputs are retained for 30 days. The receipt artifact name, `validated-release-receipt-{source-run}-{source-attempt}`, is deliberately only a locator. On an observer rerun, `upload-artifact` replaces this source-only locator with a new immutable artifact ID because GitHub requires artifact names to be unique within one workflow run. Consumers still distrust the name: they require the exact active observer workflow identity and newest terminal attempt, then validate the closed schema, artifact ID/digest, and source/observer identities. Semantically conflicting evidence fails the release instead of letting the consumer choose whichever one passes.
+
+On the Release PR merge, main CI waits up to 12 minutes for this small closed receipt. The gate reuses the single commit-to-PR association snapshot that identified the release branch; it does not immediately repeat GitHub's eventually consistent association query and risk contradictory results just after a squash merge. If that index is initially empty, an exact release squash title can recover only its embedded PR number, after which the same full PR identity, merge SHA, file inventory, check, tree, and receipt proof remains mandatory. Ordinary commits without that release identity stay on the normal CI path without waiting. A release-like merge with missing, invalid, expired, or conflicting evidence fails closed; it cannot silently fall back to a full rebuild or ordinary release-please behavior. For valid evidence, the successful `detect-changes` execution emits `main-release-promotion-receipt-{main-run}-{producer-attempt}`, bound to the exact main SHA/tree, source CI run/attempt, observer run/attempt, validated-assets artifact ID/digest, PR, version, and tag. A failed-jobs-only rerun may leave that producer in an earlier attempt; the later `release-please` workflow therefore validates the terminal successful main run, locates the receipt's claimed producer attempt, proves that exact `detect-changes` job succeeded in that attempt, and freshly revalidates the receipt before it creates the exact tag. Future, failed-producer, or semantically conflicting receipts fail closed.
+
+Fast maintenance uses the fixed `release-pr-maintenance-main` concurrency group, and the successful-CI fallback joins the same group at job scope, so release-branch writers are serialized. Both set `queue: max`, preserving a bounded FIFO queue instead of letting a newer pending writer replace an older one during a merge burst. Receipt routing and validated tagging retain the separate fixed `release-please-main` group, so ordinary maintenance cannot displace a pending tag operation. `release-please-config.json` keeps package-level `always-update: true` so the action refreshes a pending proposal whenever it has a release change, but that option alone does not move the PR for a changelog-inert commit such as `ci:`. After the action, both maintenance paths therefore ignore its optional PR output and independently require zero or one exact open, non-draft, owner-authored, same-repository `release-please--branches--main` PR against `main`. Zero safely skips; multiple or mismatched identities fail. A trusted default-branch synchronizer checks out the resolved immutable head SHA with `RELEASE_TOKEN`, merges the latest `origin/main` without rebasing, runs the trusted version sync, and always performs the exact normal push `HEAD:refs/heads/release-please--branches--main`. A moved or deleted branch fails before that push, and any remaining race is rejected by the non-force push. That token-authenticated update automatically triggers candidate PR CI. A Release PR merge also produces a `main` push; running the action in its official PR-only `skip-github-release` mode does not create the tag or move the pending lifecycle to tagged. Those mutations remain exclusively in the successful-main receipt path and the final publication job.
+
+The closed receipt is an internal chain-of-custody record, not a Sigstore attestation or third-party provenance statement. Its trust comes from the default-branch workflow code, exact GitHub workflow/run identities, immutable artifact IDs, and verified SHA-256 digests. This design follows GitHub's warning that `workflow_run` can receive secrets and write tokens even when its source run cannot, so the observer is kept read-only and never executes candidate bytes.
+
+Official behavior relied on by this design:
+
+- [GitHub `workflow_run` security and default-branch behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run)
+- [GitHub rerunning failed or selected jobs and run-attempt semantics](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)
+- [GitHub REST API for the jobs in one workflow-run attempt](https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2026-03-10#get-jobs-for-a-workflow-run-attempt)
+- [GitHub Actions artifact REST metadata and exact-name query](https://docs.github.com/en/rest/actions/artifacts?apiVersion=2026-03-10)
+- [GitHub `push` event commit SHA semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#push)
+- [GitHub workflow-trigger behavior for `GITHUB_TOKEN`, GitHub Apps, and PATs](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow)
+- [GitHub concurrency groups and queued-run behavior](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
+- [GitHub REST API for reading an exact tag ref](https://docs.github.com/en/rest/git/refs?apiVersion=2026-03-10#get-a-reference)
+- [GitHub REST API permissions for creating a historical tag ref](https://docs.github.com/en/rest/git/refs?apiVersion=2026-03-10#create-a-reference)
+- [GitHub REST API for filtering workflow runs by event and head SHA](https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2026-03-10#list-workflow-runs-for-a-workflow)
+- [GitHub REST API for cancelling the exact duplicate workflow run](https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2026-03-10#cancel-a-workflow-run)
+- [`upload-artifact` immutability, replacement semantics, artifact ID/digest outputs, and retention](https://github.com/actions/upload-artifact)
+- [`upload-artifact` same-run artifact-name uniqueness](https://github.com/actions/upload-artifact#not-uploading-to-the-same-artifact)
+- [Release Please's `skip-github-release` split between PR creation and tagging](https://github.com/googleapis/release-please-action#configuration)
+- [Cargo publish packaging, verification, upload, and `--dry-run` semantics](https://doc.rust-lang.org/cargo/commands/cargo-publish.html)
 
 ## What the release workflow does
 
-The `v*` tag push triggers `.github/workflows/release.yml`. Its **first** job immediately demotes the freshly-created release to a **prerelease**, so `releases/latest` keeps resolving to the last good version while the build runs; only after every build + publish step below succeeds does the `finalize-release` job clear the prerelease flag.
+The receipt-derived `v*` tag normally triggers `.github/workflows/release.yml`. A constrained `workflow_dispatch` recovery runs from current `main` but accepts only a fully specified historical release SHA, tag, and Release PR CI run identity. `resolve-promotion` is read-only and checks out its immutable control SHA (`${{ github.sha }}`); it fresh-validates the exact receipt chain before the isolated tag-binding job may create a lightweight tag. GitHub requires Workflows write when a new ref targets a historical commit whose workflow files differ from the default branch, and `GITHUB_TOKEN` cannot receive that permission, so recovery confines `RELEASE_TOKEN` to that one exact ref POST. The PAT-created tag necessarily emits a second, legacy `push` run. Before any publication continues, recovery finds the unique run by workflow path, event, tag, and SHA, cancels it with the job's separate Actions-write `GITHUB_TOKEN`, and confirms its terminal `cancelled` result. Missing, pre-existing, or multiple matching runs fail closed. Every other source checkout is pinned to `${{ env.RELEASE_SHA }}`, never to the mutable tag name or current `main`, and every publication boundary re-reads the live tag ref and requires it still to equal that resolved SHA. `promote-assets` downloads the one receipt-bound `validated-release-assets-*` artifact by exact ID and digest, safely extracts its six archives, and verifies every archive size and SHA-256 from the closed receipt. There is no `cargo build`, toolchain setup, cache restore, or source checkout that could produce different release binaries. Short-lived artifacts used only inside this trusted workflow (`release-promotion-plan-{run}`, Homebrew inputs, Docker inputs, and per-architecture digest receipts) deliberately use stable run-scoped names with `overwrite: true`: a full rerun replaces the old immutable artifact with a new ID, while a failed-jobs-only rerun can reuse a successful producer. These names are retry locators, not trust anchors; the run's concurrency is serialized and downstream steps still strictly parse the plan, verify the closed receipt and archive hashes, or inspect the registry digests before public promotion.
 
-1. Validates version consistency.
-2. Builds `wenlan`, `wenlan-server`, and `wenlan-mcp` for `aarch64-apple-darwin`.
-3. Smoke-tests `wenlan --help` and `wenlan-server --help`.
-4. Creates the GitHub release with standalone binaries attached.
-5. Publishes `wenlan-types` and `wenlan-mcp` to crates.io.
+`prepare-release` immediately places a new GitHub Release behind a prerelease gate, or refreshes an existing prerelease during a retry, and checks that `7xuanlu/homebrew-tap` is anonymously readable and its credential exists. An existing stable release is never incrementally filled: the workflow fails closed, because a partial public release cannot be made safe by uploading whichever assets happen to be missing. Recover a failed publication by rerunning its failed jobs while the release remains a prerelease. Package publishing and per-architecture runtime-image work can then fan out from the same verified archive directory. The Docker image copies the already validated `wenlan-server` from the matching Linux archive into a digest-pinned distroless runtime base; it does not compile or strip it. Before registry login/push, each architecture is loaded locally, checked for exact binary hash, numeric non-root user, environment and entrypoint, writable `/data`, architecture, and successful health/store/search behavior. Public GHCR manifests and `latest` remain behind the full publication barrier. Only after all channels succeed does `finalize-release` promote the GitHub prerelease and transition the Release PR label by adding `autorelease: tagged` before removing `autorelease: pending`.
+
+1. Resolves and validates the exact main-promotion and closed candidate receipts.
+2. Downloads the receipt-bound validated assets once and verifies all six archive digests and sizes.
+3. Creates or refreshes the gated GitHub prerelease and release notes; an existing stable release fails closed.
+4. Uploads the already tested standalone archives to the gated GitHub prerelease.
+5. Publishes `wenlan-types` and `wenlan-mcp` to crates.io. Each real `cargo publish` retains Cargo's package-build verification; there is no duplicate preflight `--dry-run` compilation. `scripts/publish-crate.py` first checks the exact sparse-index name and version, then performs a short bounded visibility check. If Cargo reports its documented post-upload index timeout, the helper accepts the immutable version only after that same exact index proof; otherwise it preserves Cargo's failure. A missing registry token fails unless the exact version is already present.
 6. Publishes `wenlan-mcp` and `wenlan` to npm.
-7. Updates the Homebrew tap for `wenlan-mcp`.
+7. Updates the public Homebrew tap for `wenlan` and `wenlan-mcp`, then anonymously taps, installs, and runs both formula tests on macOS arm64.
+8. Builds runtime-only GHCR images from the exact validated Linux server binaries, proves binary equality and runtime behavior, then publishes the multi-architecture version manifest and, for stable tags only, moves `latest`.
+9. Promotes the GitHub prerelease and moves the Release PR lifecycle from pending to tagged.
 
-`wenlan-mcp` now lives in this monorepo under `crates/wenlan-mcp` and shares the workspace Apache-2.0 license. The desktop app is likewise in-tree as the `app/` crate (AGPL-3.0); its signed DMG + updater pipeline (`.github/workflows/app-release.yml`) is dispatch-only until code-signing secrets land, at which point it wires into the tag-triggered release flow.
+The complete four-target Rust compilation and archive smoke happen only once, in Release PR CI. Those shipped-profile builds use `lto = "off"`: Cargo documents that `false` still performs thin local LTO, while `"off"` fully removes that unnecessary link pass; the explicit `codegen-units = 16` matches Cargo's non-incremental default. A release-sensitive main push retains only the Windows release-profile build so it can warm the one expensive target cache that CI persists; CI-only pushes skip that unrelated work, and a validated Release PR merge downloads only a small receipt. GitHub cache entries are immutable, so any shipped release-profile or target-layout change must rotate the `release-vN` shared key; the first successful release-sensitive main run then seeds the new schema. If that Windows restore is coherently cold, CI waits 25 seconds and makes one pinned restore-only retry before selecting four Cargo jobs for an exact restore, three for a fallback, or two when it remains cold; partial state fails closed. The manual P6 receipt records requested and observed cache state separately: Windows proves coherent filesystem state, while non-Windows restore-only rows report an exact key hit or the honest `fallback-or-miss` ambiguity exposed by the pinned cache action, never the requested label as measured fact. Its Linux/macOS static-ORT build remains online because `cargo fetch` cannot prefetch the native archive downloaded by `ort-sys`'s build script; Windows remains Cargo-offline after its runtime is staged explicitly. The tag workflow downloads the validated asset bundle once rather than compiling four targets again. The expected release critical path is therefore external registry publication, Homebrew installation, and runtime-image smoke—not duplicate Cargo work. Every remaining external publication job now has an explicit 10–20 minute bound (the reconciled crates.io job is 15 minutes) instead of GitHub's six-hour default. If release time regresses, inspect those job durations separately before changing test coverage or weakening artifact validation.
+
+Release workflow changes have static mutation-tested contracts in `scripts/release-workflow-contract.test.py`, but external registries and a revised job DAG are proved end-to-end only by the next real tag. Do not cite an older successful tag as evidence for a newer workflow topology.
+
+`wenlan-mcp` lives in this monorepo under `crates/wenlan-mcp` and shares the workspace Apache-2.0 license. The desktop app is likewise in-tree as the `app/` crate (AGPL-3.0); its signed DMG + updater pipeline (`.github/workflows/app-release.yml`) is dispatch-only until code-signing secrets land, at which point it wires into the tag-triggered release flow.
 
 Nothing is notified when the prerelease flag clears: the Claude Code plugin ships from this repo's own `.claude-plugin/marketplace.json`, which sources `plugin/` by `git-subdir` with no `ref` pin, so it tracks the default branch and has no release-time pin to sync.
 
 ## Required secrets
 
-Configure these in the repository settings (Settings, Secrets and variables, Actions):
+Configure these in repository Settings → Secrets and variables → Actions:
 
 | Secret | Purpose |
 | ------ | ------- |
-| `CARGO_REGISTRY_TOKEN` | Publish `wenlan-types` to crates.io. Create at crates.io under Account Settings, API Tokens. |
-| `RELEASE_TOKEN` | Fine-grained PAT (contents:write) used by release-please-action so its push triggers the next workflow run. GITHUB_TOKEN-driven pushes never fire downstream workflows. |
-| `GITHUB_TOKEN` | Built-in. Used for GitHub release creation and release-please PR management. No setup needed. |
+| `CARGO_REGISTRY_TOKEN` | Publishes `wenlan-types` and `wenlan-mcp` to crates.io. Create it under crates.io Account Settings → API Tokens. |
+| `RELEASE_TOKEN` | Fine-grained PAT with contents:write and pull-requests:write. It updates the Release PR and creates the validated tag; unlike `GITHUB_TOKEN`, its pushes trigger downstream workflows. |
+| `HOMEBREW_TAP_TOKEN` | Fine-grained PAT with contents:write on the public `7xuanlu/homebrew-tap` repository. The workflow verifies anonymous clone/install separately. |
+| `GITHUB_TOKEN` | Built in. Reads workflow and artifact identity, uploads GitHub release assets, and publishes GHCR. No setup is needed. |
+
+Before merging a Release PR, verify the tap is public without credentials:
+
+```bash
+GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/7xuanlu/homebrew-tap.git HEAD
+```
+
+If this fails or prompts for credentials, make the tap public before cutting the tag. The release preflight stops while the GitHub release is still a prerelease and before crates.io, npm, or GHCR promotion.
+
+## Version-steering policy
+
+Moved out of the root `AGENTS.md` — an agent needs these only at release time.
+
+**A deliberate minor or major is a config change, not a commit-message trick.** Add `"release-as": "0.16.0"` under `packages["."]` (or switch `versioning`), merge it to main, let release-please open the PR, then remove the override. Never rewrite history to steer a version bump.
+
+**Undoing a release: edit the manifest, don't rewrite history.** In manifest mode the "last version" comes from `.release-please-manifest.json`, so a rollback is a normal PR that resets it (plus `version.txt` and the workspace `Cargo.toml`, per teeth #3) alongside deleting the tag + GitHub Release. Leave the merged release PR's `autorelease: tagged` label alone — that label is what stops release-please re-releasing it. No commit-message rewrite, no PR rename.

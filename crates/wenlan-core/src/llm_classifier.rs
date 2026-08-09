@@ -82,9 +82,11 @@ pub fn classify_content(
 
     // Create context
     let n_batch = tokens.len().max(512) as u32;
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(Some(NonZeroU32::new(CLASSIFY_CTX_SIZE).unwrap()))
-        .with_n_batch(n_batch);
+    let ctx_params = engine.context_params(
+        LlamaContextParams::default()
+            .with_n_ctx(Some(NonZeroU32::new(CLASSIFY_CTX_SIZE).unwrap()))
+            .with_n_batch(n_batch),
+    );
 
     let mut ctx = match engine.model.new_context(&engine.backend, ctx_params) {
         Ok(c) => c,

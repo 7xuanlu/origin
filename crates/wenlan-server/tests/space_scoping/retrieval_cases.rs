@@ -32,6 +32,14 @@ pub async fn unknown_selectors_are_rejected() {
             None,
         ),
         (
+            CatalogMethod::Post,
+            HttpMethod::POST,
+            "/api/brief",
+            "/api/brief",
+            Some(json!({"space":"missing"})),
+            None,
+        ),
+        (
             CatalogMethod::Get,
             HttpMethod::GET,
             "/api/memory/recent",
@@ -103,6 +111,7 @@ pub async fn primary_and_header_precedence() {
     for (uri, body) in [
         ("/api/search", json!({"query":"probe","space":"work"})),
         ("/api/context", json!({"query":"probe","space":"work"})),
+        ("/api/brief", json!({"space":"work"})),
         (
             "/api/memory/search",
             json!({"query":"probe","space":"work"}),
@@ -261,22 +270,13 @@ pub async fn ranked_routes_exclude_cross_scope_rows() {
             json!({"query":"scope canary","space":"work","limit":20}),
             "results",
         ),
-        (
-            "/api/context",
-            json!({"query":"scope canary","space":"work","max_chunks":20}),
-            "knowledge.relevant_memories",
-        ),
     ] {
         let response = fixture
             .send(HttpMethod::POST, uri, Some(body), Some("personal"))
             .await;
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
         let payload = json_body(response).await;
-        let rows = if envelope == "knowledge.relevant_memories" {
-            &payload["knowledge"]["relevant_memories"]
-        } else {
-            &payload[envelope]
-        };
+        let rows = &payload[envelope];
         let rows = rows.as_array().unwrap();
         assert!(
             rows.iter()

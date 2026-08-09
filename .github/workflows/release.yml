@@ -1,44 +1,69 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact merged release commit to promote
+        required: true
+        type: string
+      release_tag:
+        description: Exact vX.Y.Z tag bound to the merged release commit
+        required: true
+        type: string
+      source_run_id:
+        description: Successful release-PR CI run that produced the closed receipt
+        required: true
+        type: string
+      source_run_attempt:
+        description: Exact successful attempt of source_run_id
+        required: true
+        type: string
   push:
     tags:
       - 'v*'
-  # Manual trigger for re-running a release build (e.g. after transient CI failure).
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Existing git tag to build (e.g. v0.1.2)'
-        required: true
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  # Resolved once, used everywhere. workflow_dispatch supplies the tag via input;
-  # push supplies it via GITHUB_REF.
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  RELEASE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.release_sha || github.sha }}
 
 jobs:
   prepare-release:
     name: Create GitHub Release
+    needs: [resolve-promotion, bind-release-tag]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Verify release checkout
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          expected=$(git rev-list -n1 "refs/tags/$RELEASE_TAG")
-          actual=$(git rev-parse HEAD)
-          if [[ "$actual" != "$expected" ]]; then
-            echo "ERROR: checkout $actual does not match refs/tags/$RELEASE_TAG ($expected)"
+          set -euo pipefail
+          checkout_sha="$(git rev-parse HEAD)"
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$checkout_sha" != "$RELEASE_SHA" || "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: release SHA $RELEASE_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
             exit 1
           fi
 
@@ -104,278 +129,419 @@ jobs:
 
       - name: Gate the release behind a prerelease
         run: |
-          # release-please already created this release — published, carrying the
-          # changelog body — and pushed the tag that triggered this run. Demote it
-          # to a prerelease at once: prereleases are excluded from
-          # `releases/latest`, so installers keep resolving the last good version
-          # while the builds below run. finalize-release promotes it back only
-          # after every build + publish job succeeds.
+          # This workflow creates a prerelease after release-please pushes the
+          # receipt-derived tag. Prereleases are excluded from `releases/latest`,
+          # so installers keep resolving the last good version while publication
+          # runs. finalize-release promotes it only after every channel succeeds.
           #
           # A draft cannot serve as the gate. Drafts carry no git tag, and GitHub
           # does not enforce tag uniqueness for drafts, so `gh release create
           # --draft` forged a second, empty release beside the real v0.12.0.
           # `--repo` is passed explicitly so this never depends on git context.
-          gh release edit "$RELEASE_TAG" \
-            --prerelease \
-            --notes-file release-body.md \
-            --repo "$GITHUB_REPOSITORY" \
-            || gh release create "$RELEASE_TAG" \
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
+            exit 1
+          fi
+          if state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease 2>/dev/null)"; then
+            if [[ "$(jq -r '.isDraft' <<<"$state")" == true ]]; then
+              echo "Existing release is unexpectedly a draft."
+              exit 1
+            fi
+            if [[ "$(jq -r '.isPrerelease' <<<"$state")" != true ]]; then
+              echo "Existing stable release cannot enter an incremental publication rerun."
+              exit 1
+            fi
+            gh release edit "$RELEASE_TAG" \
+              --prerelease=true \
+              --notes-file release-body.md \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" \
               --prerelease \
               --title "$RELEASE_TAG" \
               --notes-file release-body.md \
               --repo "$GITHUB_REPOSITORY"
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  release:
-    name: Build & Publish ${{ matrix.target }}
-    needs: prepare-release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-14
-            archive: tar.gz
-            artifact_name: wenlan-darwin-arm64
-          # x86_64-apple-darwin dropped from v0.7.0: `ort` 2.x does not
-          # publish prebuilt ONNX Runtime binaries for Intel Mac. Adding it
-          # back requires compiling ONNX from source (~15min build) or
-          # switching to the `ort-tract` backend. Tracked as follow-up.
-          # Native ARM Linux runner is free for public repos
-          # (ubuntu-24.04-arm, 4 vCPU Cortex / 16GB). Drops cross entirely
-          # for aarch64: no Docker container, no Cross.toml, no OpenSSL
-          # version chasing. Same setup as x86 below.
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            archive: tar.gz
-            artifact_name: wenlan-linux-arm64
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-24.04
-            archive: tar.gz
-            artifact_name: wenlan-linux-x64
-          - target: x86_64-pc-windows-msvc
-            os: windows-2022
-            archive: zip
-            artifact_name: wenlan-windows-x64
-    runs-on: ${{ matrix.os }}
+      # A token-authenticated push can succeed against a private tap while every
+      # documented `brew tap` command returns 404. Fail before any package or
+      # image publishing unless both the credential and anonymous read path are
+      # ready. The release is already demoted above, so a failed preflight cannot
+      # leave a half-built version as GitHub's latest release.
+      - name: Require a public Homebrew tap
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          if [[ -z "$HOMEBREW_TAP_TOKEN" ]]; then
+            echo "ERROR: HOMEBREW_TAP_TOKEN is required to update 7xuanlu/homebrew-tap."
+            exit 1
+          fi
+          if ! git ls-remote https://github.com/7xuanlu/homebrew-tap.git HEAD >/dev/null; then
+            echo "ERROR: https://github.com/7xuanlu/homebrew-tap is not anonymously readable."
+            echo "Make the tap public before cutting a release; authenticated push access is not an installation proof."
+            exit 1
+          fi
+          echo "Homebrew tap is anonymously readable."
+
+  resolve-promotion:
+    name: Resolve validated release promotion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      release-gate-state: ${{ steps.release-gate.outputs.release-gate-state }}
+      release-tag: ${{ steps.release-gate.outputs.release-tag }}
+      release-pr-number: ${{ steps.release-gate.outputs.release-pr-number }}
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           fetch-tags: true
-
-      - name: Verify release checkout
-        shell: bash
+          persist-credentials: false
+      - name: Resolve release SHA to the trusted observer receipt
+        id: release-gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          RELEASE_SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
         run: |
-          expected=$(git rev-list -n1 "refs/tags/$RELEASE_TAG")
-          actual=$(git rev-parse HEAD)
-          if [[ "$actual" != "$expected" ]]; then
-            echo "ERROR: checkout $actual does not match refs/tags/$RELEASE_TAG ($expected)"
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+              echo "ERROR: recovery dispatch must use the default main control plane."
+              exit 1
+            }
+            [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]] || {
+              echo "ERROR: recovery resolver checkout does not match its immutable main control SHA."
+              exit 1
+            }
+            [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "ERROR: release_sha must be a canonical lowercase SHA."
+              exit 1
+            }
+            [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
+              echo "ERROR: release_tag must be a canonical v-version."
+              exit 1
+            }
+            [[ "$RELEASE_SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ && "$RELEASE_SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || {
+              echo "ERROR: source run identity must be positive integers."
+              exit 1
+            }
+            [[ "$(gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY" --jq '.default_branch')" == "main" ]] || {
+              echo "ERROR: recovery control plane is no longer the repository default branch."
+              exit 1
+            }
+            python3 scripts/release-promotion.py gate-main \
+              --repository "$GITHUB_REPOSITORY" \
+              --sha "$RELEASE_SHA" \
+              --temp-root "$RUNNER_TEMP" \
+              --github-output "$GITHUB_OUTPUT" \
+              --plan-output "$RUNNER_TEMP/release-promotion-plan.json"
+            jq -e \
+              --arg sha "$RELEASE_SHA" \
+              --arg tag "$RELEASE_TAG" \
+              --argjson source_run_id "$RELEASE_SOURCE_RUN_ID" \
+              --argjson source_run_attempt "$RELEASE_SOURCE_RUN_ATTEMPT" \
+              '.main_sha == $sha and .main_run == null and
+               .receipt.run_id == $source_run_id and
+               .receipt.run_attempt == $source_run_attempt and
+               .main_tree_sha == .receipt.tree_sha and
+               ("v" + .receipt.version) == $tag' \
+              "$RUNNER_TEMP/release-promotion-plan.json" >/dev/null || {
+                echo "ERROR: fresh recovery gate does not exactly match dispatch inputs."
+                exit 1
+              }
+          elif [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            tag_sha="$(gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+            if [[ "$tag_sha" != "$RELEASE_SHA" || "$(git rev-parse HEAD)" != "$RELEASE_SHA" ]]; then
+              echo "ERROR: release tag or checkout differs from immutable release SHA $RELEASE_SHA."
+              exit 1
+            fi
+            python3 scripts/release-promotion.py consume-main-receipt \
+              --repository "$GITHUB_REPOSITORY" \
+              --sha "$RELEASE_SHA" \
+              --temp-root "$RUNNER_TEMP" \
+              --github-output "$GITHUB_OUTPUT" \
+              --plan-output "$RUNNER_TEMP/release-promotion-plan.json"
+          else
+            echo "ERROR: unsupported release trigger $GITHUB_EVENT_NAME."
+            exit 1
+          fi
+      - name: Require exact receipt-derived tag
+        run: |
+          if [[ "${{ steps.release-gate.outputs.release-gate-state }}" != "validated" || "${{ steps.release-gate.outputs.release-tag }}" != "$RELEASE_TAG" ]]; then
+            echo "Tag does not match the validated release version."
+            exit 1
+          fi
+      - name: Upload small promotion plan
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          # This is a same-workflow locator, not a trust anchor. A full rerun
+          # replaces it with a new immutable artifact ID; a failed-jobs-only
+          # rerun reuses the last successful resolver output. The consumer
+          # strictly parses the plan and revalidates every closed receipt/hash.
+          name: release-promotion-plan-${{ github.run_id }}
+          path: ${{ runner.temp }}/release-promotion-plan.json
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true
+
+  bind-release-tag:
+    name: Bind exact release tag
+    needs: resolve-promotion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+      issues: read
+    steps:
+      - name: Create or verify the lightweight receipt-derived tag
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+          GH_TAG_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GATE_STATE: ${{ needs.resolve-promotion.outputs.release-gate-state }}
+          GATE_TAG: ${{ needs.resolve-promotion.outputs.release-tag }}
+          RELEASE_PR_NUMBER: ${{ needs.resolve-promotion.outputs.release-pr-number }}
+        run: |
+          set -euo pipefail
+          [[ "$GATE_STATE" == "validated" && "$GATE_TAG" == "$RELEASE_TAG" ]] || {
+            echo "ERROR: resolver did not produce the requested validated tag."
+            exit 1
+          }
+          [[ "$RELEASE_PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
+            echo "ERROR: resolver did not produce a canonical release PR number."
+            exit 1
+          }
+          labels="$(GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/issues/$RELEASE_PR_NUMBER/labels?per_page=100")"
+          jq -e \
+            '([.[].name] | index("autorelease: pending") != null) and
+             ([.[].name] | index("autorelease: tagged") == null)' \
+            <<<"$labels" >/dev/null || {
+              echo "ERROR: release PR lifecycle is no longer pending and untagged."
+              exit 1
+            }
+          tag_sha=""
+          if tag_sha="$(GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha' 2>/dev/null)"; then
+            [[ "$tag_sha" == "$RELEASE_SHA" ]] || {
+              echo "ERROR: existing $RELEASE_TAG points at $tag_sha, not $RELEASE_SHA."
+              exit 1
+            }
+            exit 0
+          fi
+          [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]] || {
+            echo "ERROR: tag-push release requires its existing immutable event tag."
+            exit 1
+          }
+          [[ -n "$GH_TAG_TOKEN" ]] || {
+            echo "ERROR: RELEASE_TOKEN is required for historical workflow tag recovery."
+            exit 1
+          }
+
+          # A historical release commit changes workflow files relative to the
+          # default branch. GitHub therefore rejects GITHUB_TOKEN for the ref
+          # write and requires a token with Workflows write. Such a token also
+          # emits a push event, so take ownership of exactly one resulting
+          # legacy Release run and cancel it before publication may continue.
+          legacy_runs() {
+            GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?event=push&head_sha=$RELEASE_SHA&per_page=100" \
+              --jq ".workflow_runs[] | select(.event == \"push\" and .head_sha == \"$RELEASE_SHA\" and .head_branch == \"$RELEASE_TAG\" and .path == \".github/workflows/release.yml\") | .id"
+          }
+          if [[ -n "$(legacy_runs)" ]]; then
+            echo "ERROR: a tag-push Release run already exists before recovery binds the absent tag."
             exit 1
           fi
 
-      - name: Validate version consistency
-        if: runner.os != 'Windows'
-        run: bash scripts/validate-versions.sh
-        env:
-          RELEASE_TAG: ${{ env.RELEASE_TAG }}
-
-      # rust-toolchain.toml pins the workspace to 1.95.0. The previous
-      # `@stable` install installed targets against the stable channel and
-      # cargo ran with 1.95.0 (per rust-toolchain.toml override), so
-      # `--target x86_64-apple-darwin` failed with `can't find crate for core`
-      # — the target was added to the wrong toolchain. Pin explicitly to
-      # mirror ci.yml.
-      - name: Install Rust 1.95.0 with matrix target
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
-        with:
-          toolchain: 1.95.0
-          targets: ${{ matrix.target }}
-
-      # sccache caches rustc + build-script outputs to GHA. Big win on the
-      # C/C++-heavy crates we pull (openssl-src, ring, llama-cpp-sys).
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-
-      # vcpkg sqlite3 for Windows — libsql 0.9 needs `sqlite3.lib` at link
-      # time and does not bundle SQLite on Windows. Mirrors ci.yml's test
-      # step. GitHub `windows-2022` runner ships vcpkg preinstalled.
-      - name: Install sqlite3 (Windows only)
-        if: matrix.os == 'windows-2022'
-        shell: pwsh
-        run: |
-          vcpkg install sqlite3:x64-windows-static-md
-          "LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-${{ matrix.target }}
-          cache-all-crates: "true"
-
-      # rust-lld shipped with the Rust toolchain (~3-5min faster link
-      # than MSVC link.exe on our binary sizes). rustup does NOT proxy
-      # rust-lld, so its path must be discovered via `rustc --print
-      # sysroot`. Export RUSTFLAGS via $GITHUB_ENV so the Build step
-      # picks it up.
-      - name: Configure rust-lld linker (Windows)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $sysroot = (rustc --print sysroot).Trim()
-          $lld = Join-Path $sysroot "lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
-          if (-not (Test-Path $lld)) {
-            Write-Host "rust-lld.exe not found at $lld, listing sysroot:"
-            Get-ChildItem -Recurse -Filter rust-lld.exe -Path $sysroot
-            throw "rust-lld.exe missing"
-          }
-          $rustflags = "-C linker=$lld -C linker-flavor=lld-link"
-          "RUSTFLAGS=$rustflags" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "RUSTFLAGS=$rustflags"
-
-      # All targets build natively now. aarch64-unknown-linux-gnu uses the
-      # free ubuntu-24.04-arm runner, x86_64-unknown-linux-gnu uses
-      # ubuntu-24.04. No cross / zigbuild / QEMU needed. Eliminates an
-      # entire class of openssl-sys/system-OpenSSL/container-version traps
-      # that consumed several PRs for v0.7.0.
-      - name: Build
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: cargo build --release -p wenlan -p wenlan-server -p wenlan-mcp --target ${{ matrix.target }}
-
-      - name: Smoke
-        shell: bash
-        run: |
-          ./target/${{ matrix.target }}/release/wenlan${{ runner.os == 'Windows' && '.exe' || '' }} --help
-          ./target/${{ matrix.target }}/release/wenlan-server${{ runner.os == 'Windows' && '.exe' || '' }} --help
-
-      - name: List Windows build artifacts
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: bash
-        run: |
-          find "target/${{ matrix.target }}/release" -maxdepth 1 -mindepth 1 -print | sort | head -30
-
-      # ort 2.x caches link-time `.lib` artifacts under
-      # `%LOCALAPPDATA%\ort.pyke.io\...` but does NOT keep onnxruntime.dll
-      # there on Windows — the build script needs only the import lib for
-      # link time. The bundled zip needs the runtime DLL co-located with
-      # the .exe so users get a self-contained extract. Download ONNX
-      # Runtime 1.20.0 (matches ort 2.0.0-rc.11) from Microsoft's releases
-      # and stage onnxruntime.dll into target/release before packaging.
-      - name: Bundle onnxruntime.dll (Windows)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $ortVersion = "1.20.0"
-          $zipUrl = "https://github.com/microsoft/onnxruntime/releases/download/v$ortVersion/onnxruntime-win-x64-$ortVersion.zip"
-          $zipPath = "$env:RUNNER_TEMP\onnxruntime.zip"
-          Write-Host "Downloading $zipUrl"
-          Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
-          Expand-Archive -Path $zipPath -DestinationPath "$env:RUNNER_TEMP\ort-extracted" -Force
-          $dll = Get-ChildItem -Path "$env:RUNNER_TEMP\ort-extracted" -Recurse -Filter onnxruntime.dll | Select-Object -First 1
-          if (-not $dll) {
-            Get-ChildItem -Path "$env:RUNNER_TEMP\ort-extracted" -Recurse | Format-Table FullName, Length
-            throw "onnxruntime.dll not found in extracted zip"
-          }
-          $dest = "target\${{ matrix.target }}\release\onnxruntime.dll"
-          Copy-Item -Path $dll.FullName -Destination $dest -Force
-          Write-Host "Copied $($dll.FullName) -> $dest"
-
-      - name: Package
-        shell: bash
-        run: |
-          mkdir -p dist
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            # No winsw.exe: service-manager 0.11's WinSwServiceManager invokes
-            # an API winsw v2 doesn't support. Windows users install via the
-            # sc.exe path which requires Administrator elevation. Documented
-            # in AGENTS.md.
-            7z a "dist/${{ matrix.artifact_name }}.zip" \
-              "./target/${{ matrix.target }}/release/wenlan.exe" \
-              "./target/${{ matrix.target }}/release/wenlan-server.exe" \
-              "./target/${{ matrix.target }}/release/wenlan-mcp.exe" \
-              "./target/${{ matrix.target }}/release/onnxruntime.dll"
-          else
-            tar -C "target/${{ matrix.target }}/release" -czf "dist/${{ matrix.artifact_name }}.tar.gz" \
-              wenlan wenlan-server wenlan-mcp
+          if ! GH_TOKEN="$GH_TAG_TOKEN" gh api --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/refs" \
+            -f "ref=refs/tags/$RELEASE_TAG" \
+            -f "sha=$RELEASE_SHA" >/dev/null; then
+            tag_sha="$(GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+            [[ "$tag_sha" == "$RELEASE_SHA" ]] || {
+              echo "ERROR: concurrent tag bind does not match $RELEASE_SHA."
+              exit 1
+            }
           fi
 
-      # Per-binary archive for wenlan-mcp consumed by the Homebrew tap formula.
-      # Produced only on the darwin-arm64 leg to match the existing tap entry.
-      - name: Package wenlan-mcp tarball for Homebrew (darwin-arm64 only)
-        if: matrix.target == 'aarch64-apple-darwin'
-        shell: bash
-        run: |
-          cp "target/${{ matrix.target }}/release/wenlan-mcp" wenlan-mcp
-          tar -czf dist/wenlan-mcp-darwin-arm64.tar.gz wenlan-mcp
-          rm wenlan-mcp
-
-      # Per-binary archive for the wenlan CLI consumed by the Homebrew tap
-      # formula. Darwin-arm64 only — matches the wenlan-mcp tap pattern.
-      # Filename intentionally distinct from the multi-binary release tarball
-      # `wenlan-darwin-arm64.tar.gz` to avoid clobbering it in `dist/`.
-      - name: Package wenlan CLI tarball for Homebrew (darwin-arm64 only)
-        if: matrix.target == 'aarch64-apple-darwin'
-        shell: bash
-        run: |
-          cp "target/${{ matrix.target }}/release/wenlan" wenlan
-          tar -czf dist/wenlan-cli-darwin-arm64.tar.gz wenlan
-          rm wenlan
-
-      # Smoke test: verify the multi-binary release archive contains all three
-      # binaries before upload. Catches regressions like a same-named Homebrew
-      # tarball clobbering the install.sh-consumed archive (v0.7.0 bug).
-      - name: Verify release archive contains wenlan, wenlan-server, wenlan-mcp
-        shell: bash
-        run: |
-          set -e
-          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
-            contents=$(tar -tzf "dist/${{ matrix.artifact_name }}.tar.gz")
-            suffix=""
-          else
-            contents=$(unzip -l "dist/${{ matrix.artifact_name }}.zip" | awk '{print $NF}')
-            suffix=".exe"
-          fi
-          for bin in wenlan wenlan-server wenlan-mcp; do
-            if ! printf '%s\n' "$contents" | grep -qE "(^|/)${bin}${suffix}$"; then
-              echo "ERROR: dist/${{ matrix.artifact_name }}.${{ matrix.archive }} missing ${bin}${suffix}"
-              echo "--- archive contents ---"
-              printf '%s\n' "$contents"
+          legacy_run_id=""
+          for _ in $(seq 1 60); do
+            matching="$(legacy_runs)"
+            count="$(sed '/^$/d' <<<"$matching" | wc -l | tr -d ' ')"
+            if [[ "$count" == "1" ]]; then
+              legacy_run_id="$matching"
+              break
+            fi
+            if [[ "$count" != "0" ]]; then
+              echo "ERROR: tag recovery triggered $count matching legacy Release runs."
               exit 1
             fi
+            sleep 2
           done
-          echo "OK: archive contains wenlan, wenlan-server, wenlan-mcp"
+          [[ "$legacy_run_id" =~ ^[1-9][0-9]*$ ]] || {
+            echo "ERROR: no unique legacy tag-push Release run appeared after recovery tag creation."
+            exit 1
+          }
+          GH_TOKEN="$GH_READ_TOKEN" gh api --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/actions/runs/$legacy_run_id/cancel" >/dev/null
+          for _ in $(seq 1 30); do
+            state="$(GH_TOKEN="$GH_READ_TOKEN" gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/actions/runs/$legacy_run_id" \
+              --jq '[.status, (.conclusion // "")] | @tsv')"
+            if [[ "$state" == $'completed\tcancelled' ]]; then
+              echo "Cancelled duplicate legacy tag-push Release run $legacy_run_id."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ERROR: legacy tag-push Release run $legacy_run_id did not reach cancelled."
+          exit 1
 
-      - name: Upload archives to release
-        uses: softprops/action-gh-release@v2
+  promote-assets:
+    name: Promote exact validated release assets
+    needs: [resolve-promotion, bind-release-tag, prepare-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      # Promotion tooling is control plane, not product: check out the same ref
+      # resolve-promotion uses so both run one promotion resolver. The promoted
+      # bytes come from the validated artifact and are verified against the
+      # closed receipt by size and SHA-256, never from this checkout.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          files: dist/*
-          tag_name: ${{ env.RELEASE_TAG }}
-          # Hold the release as a prerelease while assets upload; finalize-release
-          # promotes it only after every build + publish job succeeds.
-          prerelease: true
-          # Don't touch the release body composed in prepare-release.
-          append_body: false
-          fail_on_unmatched_files: true
-
-      - name: Upload Homebrew artifacts (wenlan + wenlan-mcp)
-        if: matrix.target == 'aarch64-apple-darwin'
-        uses: actions/upload-artifact@v4
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-promotion-plan-${{ github.run_id }}
+          path: ${{ runner.temp }}/promotion-plan
+      - name: Download exact validated wrapper once
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/release-promotion.py download-assets \
+            --repository "$GITHUB_REPOSITORY" \
+            --plan "$RUNNER_TEMP/promotion-plan/release-promotion-plan.json" \
+            --output-dir "$RUNNER_TEMP/promoted-assets"
+      - name: Upload without clobbering existing release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          existing="$RUNNER_TEMP/existing-release-assets"
+          mkdir -p "$existing"
+          for asset in "$RUNNER_TEMP"/promoted-assets/*; do
+            tag_sha="$(gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+            if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+              echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
+              exit 1
+            fi
+            name="$(basename "$asset")"
+            if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name' | grep -Fxq "$name"; then
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --pattern "$name" --dir "$existing"
+              cmp "$asset" "$existing/$name" || {
+                echo "Existing release asset $name differs; refusing to clobber."
+                exit 1
+              }
+              echo "$name already exists with identical bytes."
+            else
+              gh release upload "$RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY"
+            fi
+          done
+      - name: Publish exact Homebrew inputs for this run
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: homebrew-artifacts
           path: |
-            dist/wenlan-cli-darwin-arm64.tar.gz
-            dist/wenlan-mcp-darwin-arm64.tar.gz
+            ${{ runner.temp }}/promoted-assets/wenlan-cli-darwin-arm64.tar.gz
+            ${{ runner.temp }}/promoted-assets/wenlan-mcp-darwin-arm64.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+          # Internal retry locator. The uploaded archives are still the exact
+          # receipt-validated bytes, and every rerun creates a fresh artifact ID.
+          overwrite: true
+      # upload-artifact roots the archive at the common ancestor of its paths,
+      # so listing promoted-assets/ and promotion-plan/ together nests both
+      # under the runner temp root while the Docker job reads them flat. Stage
+      # one directory so the producer and the consumer agree on the layout.
+      - name: Stage exact Docker runtime inputs
+        run: |
+          set -euo pipefail
+          staged="$RUNNER_TEMP/docker-runtime-staging"
+          mkdir -p "$staged"
+          cp "$RUNNER_TEMP/promoted-assets/wenlan-linux-x64.tar.gz" "$staged/"
+          cp "$RUNNER_TEMP/promoted-assets/wenlan-linux-arm64.tar.gz" "$staged/"
+          cp "$RUNNER_TEMP/promotion-plan/release-promotion-plan.json" "$staged/"
+      - name: Publish exact Docker runtime inputs for this run
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: docker-runtime-inputs
+          path: ${{ runner.temp }}/docker-runtime-staging
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+          # Internal retry locator; Docker revalidates the receipt and archive
+          # hashes before it executes the copied server binary.
+          overwrite: true
 
   docker:
-    name: Build & Push Docker Image (${{ matrix.platform }})
-    needs: release
+    name: Verify & Push Runtime Image (${{ matrix.platform }})
+    # Package the exact observer-validated server bytes. The semantic smoke
+    # runs before registry login, so candidate code never executes with the
+    # GHCR write credential in its environment.
+    needs: [promote-assets, bind-release-tag]
     runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 12
     permissions:
+      actions: read
       contents: read
       packages: write
     strategy:
@@ -385,91 +551,227 @@ jobs:
           - platform: linux/amd64
             runs-on: ubuntu-24.04
             tag-suffix: amd64
-          # Native ARM runner — free for public repos. Building arm64
-          # under QEMU emulation took 90+min and is the dominant cost
-          # of the release pipeline. Native is ~10min instead.
+            target: x86_64-unknown-linux-gnu
           - platform: linux/arm64
             runs-on: ubuntu-24.04-arm
             tag-suffix: arm64
+            target: aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v4
+      # This checkout supplies only tooling — the runtime Dockerfile and the
+      # verifier. The bytes that reach the image come from the validated
+      # artifact and are checked against the closed receipt by size and
+      # SHA-256, so packaging is control plane exactly like promotion is.
+      # Pinning it to the release commit would strand image fixes behind the
+      # very release that needs them, which is how v0.15.4 shipped no image.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
-          fetch-depth: 0
-          fetch-tags: true
-      - name: Verify release checkout
-        shell: bash
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: docker-runtime-inputs
+          path: ${{ runner.temp }}/docker-runtime-inputs
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Revalidate bytes, build runtime-only image, and smoke
+        env:
+          LOCAL_IMAGE: ghcr.io/7xuanlu/wenlan-server:staging-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.tag-suffix }}
         run: |
-          expected=$(git rev-list -n1 "refs/tags/$RELEASE_TAG")
-          actual=$(git rev-parse HEAD)
-          if [[ "$actual" != "$expected" ]]; then
-            echo "ERROR: checkout $actual does not match refs/tags/$RELEASE_TAG ($expected)"
+          set -euo pipefail
+          jq -e '.receipt' \
+            "$RUNNER_TEMP/docker-runtime-inputs/release-promotion-plan.json" \
+            > "$RUNNER_TEMP/docker-runtime-inputs/closed-receipt.json"
+          python3 scripts/verify-release-runtime-image.py \
+            --receipt "$RUNNER_TEMP/docker-runtime-inputs/closed-receipt.json" \
+            --assets-dir "$RUNNER_TEMP/docker-runtime-inputs" \
+            --target "${{ matrix.target }}" \
+            --image "$LOCAL_IMAGE" \
+            --dockerfile docker/Dockerfile.release-runtime \
+            --output "$RUNNER_TEMP/runtime-image-evidence-${{ matrix.tag-suffix }}.json"
+      - name: Require immutable release tag before registry credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
             exit 1
           fi
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      # No untrusted binary runs after this point.
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - name: Push content-scoped staging image and record registry digest
+        env:
+          LOCAL_IMAGE: ghcr.io/7xuanlu/wenlan-server:staging-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.tag-suffix }}
+          DIGEST_FILE: ${{ runner.temp }}/docker-image-digest-${{ matrix.tag-suffix }}.txt
+        run: |
+          set -euo pipefail
+          push_log="$RUNNER_TEMP/docker-push-${{ matrix.tag-suffix }}.log"
+          docker push "$LOCAL_IMAGE" 2>&1 | tee "$push_log"
+          digest="$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' "$push_log" | tail -1)"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Registry did not return a canonical image digest."
+            exit 1
+          fi
+          printf '%s@%s\n' "${LOCAL_IMAGE%:*}" "$digest" > "$DIGEST_FILE"
+          docker buildx imagetools inspect "$(cat "$DIGEST_FILE")" >/dev/null
+      - name: Publish immutable image digest receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          context: .
-          file: docker/Dockerfile.daemon
-          platforms: ${{ matrix.platform }}
-          push: true
-          tags: ghcr.io/7xuanlu/wenlan-server:${{ env.RELEASE_TAG }}-${{ matrix.tag-suffix }}
+          name: docker-image-digest-${{ matrix.tag-suffix }}
+          path: |
+            ${{ runner.temp }}/docker-image-digest-${{ matrix.tag-suffix }}.txt
+            ${{ runner.temp }}/runtime-image-evidence-${{ matrix.tag-suffix }}.json
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+          # One stable locator per architecture lets a failed matrix leg be
+          # retried without discarding the successful leg. Registry digests are
+          # re-inspected before any public manifest is created.
+          overwrite: true
 
   docker-manifest:
     name: Combine Docker Manifest (multi-arch)
-    needs: docker
+    # Public aliases are promotion outputs. Consume registry digests rather
+    # than mutable staging tags and expose them only after every channel passes.
+    needs: [docker, promote-assets, publish-crates, publish-npm, update-homebrew, bind-release-tag]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
+      actions: read
+      contents: read
       packages: write
     steps:
-      - uses: docker/login-action@v3
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: docker-image-digest-*
+          path: ${{ runner.temp }}/docker-digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Require immutable release tag before manifest credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
+            exit 1
+          fi
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create + push multi-arch manifest
+      - name: Create or verify digest-bound multi-arch manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
+            exit 1
+          fi
           TAG="${{ env.RELEASE_TAG }}"
           IMG="ghcr.io/7xuanlu/wenlan-server"
-          docker buildx imagetools create -t "$IMG:$TAG" "$IMG:$TAG-amd64" "$IMG:$TAG-arm64"
-          docker buildx imagetools create -t "$IMG:latest"  "$IMG:$TAG-amd64" "$IMG:$TAG-arm64"
+          amd="$(cat "$RUNNER_TEMP/docker-digests/docker-image-digest-amd64.txt")"
+          arm="$(cat "$RUNNER_TEMP/docker-digests/docker-image-digest-arm64.txt")"
+          [[ "$amd" =~ ^${IMG}@sha256:[0-9a-f]{64}$ ]]
+          [[ "$arm" =~ ^${IMG}@sha256:[0-9a-f]{64}$ ]]
+
+          verify_manifest() {
+            local ref="$1" raw amd_actual arm_actual
+            raw="$(docker buildx imagetools inspect "$ref" --raw)"
+            amd_actual="$(jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest] | if length == 1 then .[0] else error("expected one amd64 manifest") end' <<<"$raw")"
+            arm_actual="$(jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest] | if length == 1 then .[0] else error("expected one arm64 manifest") end' <<<"$raw")"
+            [[ "$amd_actual" == "${amd#*@}" && "$arm_actual" == "${arm#*@}" ]]
+          }
+
+          if docker buildx imagetools inspect "$IMG:$TAG" >/dev/null 2>&1; then
+            verify_manifest "$IMG:$TAG" || {
+              echo "Existing $IMG:$TAG differs from validated platform digests."
+              exit 1
+            }
+          else
+            docker buildx imagetools create -t "$IMG:$TAG" "$amd" "$arm"
+            verify_manifest "$IMG:$TAG"
+          fi
+
+          if [[ "$TAG" == *-* ]]; then
+            echo "$TAG is a prerelease tag; latest remains unchanged."
+            exit 0
+          fi
+          set +e
+          refs="$(gh api --paginate \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" \
+            --jq '.[].ref')"
+          tag_list_status=$?
+          set -e
+          if [[ "$tag_list_status" -ne 0 ]]; then
+            echo "Unable to list release tags; refusing to decide latest."
+            exit 1
+          fi
+          tags="$(printf '%s\n' "$refs" | sed 's#^refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+          highest="$(printf '%s\n' "$tags" | sed '/^$/d' | sort -V | tail -1)"
+          if [[ -z "$highest" ]]; then
+            echo "No stable release tags resolved; refusing to decide latest."
+            exit 1
+          fi
+          if [[ "$highest" != "$TAG" ]]; then
+            echo "$TAG is not the highest stable tag ($highest); latest remains unchanged."
+            exit 0
+          fi
+          docker buildx imagetools create -t "$IMG:latest" "$amd" "$arm"
+          verify_manifest "$IMG:latest"
 
   publish-crates:
     name: Publish crates.io (wenlan-types + wenlan-mcp)
-    needs: release
+    needs: [promote-assets, bind-release-tag]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Verify release checkout
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          expected=$(git rev-list -n1 "refs/tags/$RELEASE_TAG")
-          actual=$(git rev-parse HEAD)
-          if [[ "$actual" != "$expected" ]]; then
-            echo "ERROR: checkout $actual does not match refs/tags/$RELEASE_TAG ($expected)"
+          set -euo pipefail
+          checkout_sha="$(git rev-parse HEAD)"
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$checkout_sha" != "$RELEASE_SHA" || "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: release SHA $RELEASE_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
             exit 1
           fi
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Pre-flight cargo publish dry-run
-        # Only wenlan-types — wenlan-mcp's --dry-run resolves wenlan-types from
-        # crates.io which doesn't have the new version until the publish step
-        # runs. Real wenlan-mcp publish happens after wenlan-types is indexed.
-        run: cargo publish -p wenlan-types --dry-run
 
       - name: Resolve workspace version
         id: version
@@ -479,89 +781,83 @@ jobs:
           echo "Workspace version: $VERSION"
 
       - name: Publish wenlan-types to crates.io
-        # Source-of-truth registry check uses the sparse index (same as the
-        # downstream `Wait for ... available` step). The v1 web API lags
-        # behind by minutes-to-hours under load and gave false "not
-        # published" answers that caused cargo publish to attempt a
-        # duplicate upload, failing the job.
-        if: env.CARGO_REGISTRY_TOKEN != ''
+        # Cargo publish performs the packaged-crate build verification and then
+        # polls the index itself. The helper preserves that verification, adds
+        # an exact sparse-index precheck, and reconciles Cargo's documented
+        # post-upload timeout without another ten-minute workflow loop.
         run: |
-          VERSION="${{ steps.version.outputs.value }}"
-          if curl -sf "https://index.crates.io/we/nl/wenlan-types" | grep -q "\"vers\":\"$VERSION\""; then
-            echo "wenlan-types ${VERSION} already on sparse index, skipping publish"
-          else
-            cargo publish -p wenlan-types
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
+            exit 1
           fi
+          VERSION="${{ steps.version.outputs.value }}"
+          python3 scripts/publish-crate.py \
+            --package wenlan-types \
+            --version "$VERSION"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for wenlan-types to be available on crates.io
-        # Poll the sparse index (https://index.crates.io) — that's what
-        # the wenlan-mcp publish step reads to resolve its
-        # `wenlan-types = "^X.Y.Z"` dep. The v1 web API
-        # (`crates.io/api/v1/crates/<name>/<version>`) lags behind the
-        # sparse index by minutes-to-hours during load, which caused
-        # false negatives (publish succeeded, web API still 404). The
-        # sparse index path for any crate `name` is
-        # `/<prefix>/<name>` where prefix depends on name length;
-        # for 4+ chars: `<first2>/<chars 3-4>/<name>`. `wenlan-types`
-        # → `we/nl/wenlan-types`. The index returns NDJSON, one record
-        # per published version.
-        run: |
-          VERSION="${{ steps.version.outputs.value }}"
-          INDEX_URL="https://index.crates.io/we/nl/wenlan-types"
-          for i in $(seq 1 60); do
-            if curl -sf "$INDEX_URL" | grep -q "\"vers\":\"$VERSION\""; then
-              echo "wenlan-types ${VERSION} visible on sparse index"; exit 0
-            fi
-            echo "Waiting for sparse index to publish wenlan-types ${VERSION}... ($i/60)"
-            sleep 10
-          done
-          echo "ERROR: wenlan-types ${VERSION} not visible on sparse index after 10 min"
-          echo "Last index response:"
-          curl -s "$INDEX_URL" | tail -5
-          exit 1
+          GH_TOKEN: ${{ github.token }}
 
       - name: Publish wenlan-mcp to crates.io
-        # Sparse index check (see wenlan-types step) avoids the v1 web API
-        # propagation lag that previously caused duplicate-publish failures.
-        if: env.CARGO_REGISTRY_TOKEN != ''
+        # The successful wenlan-types helper return includes a short exact
+        # sparse-index visibility proof, so Cargo can resolve that dependency.
         run: |
-          VERSION="${{ steps.version.outputs.value }}"
-          if curl -sf "https://index.crates.io/we/nl/wenlan-mcp" | grep -q "\"vers\":\"$VERSION\""; then
-            echo "wenlan-mcp ${VERSION} already on sparse index, skipping publish"
-          else
-            cargo publish -p wenlan-mcp
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
+            exit 1
           fi
+          VERSION="${{ steps.version.outputs.value }}"
+          python3 scripts/publish-crate.py \
+            --package wenlan-mcp \
+            --version "$VERSION"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
 
   publish-npm:
     name: Publish to npm
-    needs: publish-crates
+    needs: [promote-assets, bind-release-tag]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       id-token: write    # OIDC trusted publishing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 0
           fetch-tags: true
       - name: Verify release checkout
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          expected=$(git rev-list -n1 "refs/tags/$RELEASE_TAG")
-          actual=$(git rev-parse HEAD)
-          if [[ "$actual" != "$expected" ]]; then
-            echo "ERROR: checkout $actual does not match refs/tags/$RELEASE_TAG ($expected)"
+          set -euo pipefail
+          checkout_sha="$(git rev-parse HEAD)"
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$checkout_sha" != "$RELEASE_SHA" || "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: release SHA $RELEASE_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
             exit 1
           fi
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
       - name: Ensure npm supports OIDC trusted publishing
         # Trusted publishing (tokenless OIDC) requires npm >= 11.5.1. Node 24's
         # bundled npm may lag; pin to latest so the OIDC handshake is available.
@@ -570,12 +866,12 @@ jobs:
         working-directory: crates/wenlan-mcp/npm
         run: |
           VERSION="${RELEASE_TAG#v}"
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npm version "$VERSION" --no-git-tag-version --allow-same-version --ignore-scripts
       - name: Sync setup package version from tag
         working-directory: crates/wenlan-cli/npm
         run: |
           VERSION="${RELEASE_TAG#v}"
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npm version "$VERSION" --no-git-tag-version --allow-same-version --ignore-scripts
       - name: Copy root README and LICENSE into npm packages
         # npm renders README.md on the package page and surfaces LICENSE on
         # the package metadata. Copying root files ensures both packages
@@ -593,46 +889,85 @@ jobs:
         # previously published versions". `npm view <pkg>@<v> version`
         # exits 0 + prints the version when published, exits 1 otherwise.
         run: |
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
+            exit 1
+          fi
           VERSION="${RELEASE_TAG#v}"
           if npm view "wenlan-mcp@$VERSION" version >/dev/null 2>&1; then
             echo "wenlan-mcp@$VERSION already on npm, skipping"
           else
             npm publish --provenance --access public
           fi
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Publish wenlan
         working-directory: crates/wenlan-cli/npm
         run: |
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
+            exit 1
+          fi
           VERSION="${RELEASE_TAG#v}"
           if npm view "wenlan@$VERSION" version >/dev/null 2>&1; then
             echo "wenlan@$VERSION already on npm, skipping"
           else
             npm publish --provenance --access public
           fi
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   update-homebrew:
     name: Update Homebrew tap
-    needs: release
-    runs-on: ubuntu-latest
+    needs: [promote-assets, bind-release-tag]
+    # The tap ships macOS arm64 archives. Validate the formulas with the real
+    # Homebrew client on the same architecture instead of stopping at `ruby -c`.
+    runs-on: macos-14
+    timeout-minutes: 20
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: homebrew-artifacts
           merge-multiple: true
       - name: Compute checksums and update formulae
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          require_event_tag() {
+            local tag_sha
+            tag_sha="$(gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+            if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+              echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha."
+              exit 1
+            fi
+          }
+          require_event_tag
           VERSION="${RELEASE_TAG#v}"
-          SHA_MCP_DARWIN_ARM64=$(sha256sum wenlan-mcp-darwin-arm64.tar.gz | cut -d' ' -f1)
-          SHA_CLI_DARWIN_ARM64=$(sha256sum wenlan-cli-darwin-arm64.tar.gz | cut -d' ' -f1)
+          SHA_MCP_DARWIN_ARM64=$(shasum -a 256 wenlan-mcp-darwin-arm64.tar.gz | cut -d' ' -f1)
+          SHA_CLI_DARWIN_ARM64=$(shasum -a 256 wenlan-cli-darwin-arm64.tar.gz | cut -d' ' -f1)
 
           git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/7xuanlu/homebrew-tap.git" tap
           mkdir -p tap/Formula
 
           cat > tap/Formula/wenlan-mcp.rb << 'FORMULA'
           class WenlanMcp < Formula
-            desc "MCP server for Wenlan — personal agent memory layer"
+            desc "MCP server for Wenlan â€” personal agent memory layer"
             homepage "https://github.com/7xuanlu/wenlan"
             version "VERSION_PLACEHOLDER"
             url "https://github.com/7xuanlu/wenlan/releases/download/vVERSION_PLACEHOLDER/wenlan-mcp-darwin-arm64.tar.gz"
@@ -658,12 +993,17 @@ jobs:
           end
           FORMULA
 
-          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" tap/Formula/wenlan-mcp.rb
-          sed -i "s/SHA_PLACEHOLDER/${SHA_MCP_DARWIN_ARM64}/g" tap/Formula/wenlan-mcp.rb
+          # This job runs on macOS, whose sed reads `-i` as the backup suffix
+          # and would swallow the script. perl -pi edits in place identically
+          # on BSD and GNU hosts, and reading the values from the environment
+          # keeps a SHA or version out of the expression itself.
+          VERSION="$VERSION" SHA="$SHA_MCP_DARWIN_ARM64" perl -pi \
+            -e 's/VERSION_PLACEHOLDER/$ENV{VERSION}/g; s/SHA_PLACEHOLDER/$ENV{SHA}/g' \
+            tap/Formula/wenlan-mcp.rb
 
           cat > tap/Formula/wenlan.rb << 'FORMULA'
           class Wenlan < Formula
-            desc "Wenlan CLI — local-first memory + knowledge layer for AI agents"
+            desc "Wenlan CLI â€” local-first memory + knowledge layer for AI agents"
             homepage "https://github.com/7xuanlu/wenlan"
             version "VERSION_PLACEHOLDER"
             url "https://github.com/7xuanlu/wenlan/releases/download/vVERSION_PLACEHOLDER/wenlan-cli-darwin-arm64.tar.gz"
@@ -689,42 +1029,148 @@ jobs:
           end
           FORMULA
 
-          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" tap/Formula/wenlan.rb
-          sed -i "s/SHA_PLACEHOLDER/${SHA_CLI_DARWIN_ARM64}/g" tap/Formula/wenlan.rb
+          VERSION="$VERSION" SHA="$SHA_CLI_DARWIN_ARM64" perl -pi \
+            -e 's/VERSION_PLACEHOLDER/$ENV{VERSION}/g; s/SHA_PLACEHOLDER/$ENV{SHA}/g' \
+            tap/Formula/wenlan.rb
 
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/wenlan-mcp.rb Formula/wenlan.rb
-          git commit -m "wenlan + wenlan-mcp ${VERSION}"
-          git push origin HEAD:main
+          if git diff --cached --quiet; then
+            echo "Homebrew formulas already describe ${VERSION}; nothing to commit."
+          else
+            git commit -m "wenlan + wenlan-mcp ${VERSION}"
+            require_event_tag
+            git push origin HEAD:main
+          fi
 
       - name: Verify formula syntax
         run: |
           ruby -c tap/Formula/wenlan-mcp.rb
           ruby -c tap/Formula/wenlan.rb
 
+      - name: Verify anonymous Homebrew install path
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          rm -rf public-tap
+          git clone https://github.com/7xuanlu/homebrew-tap.git public-tap
+          cmp tap/Formula/wenlan-mcp.rb public-tap/Formula/wenlan-mcp.rb
+          cmp tap/Formula/wenlan.rb public-tap/Formula/wenlan.rb
+
+          brew untap 7xuanlu/tap >/dev/null 2>&1 || true
+          brew tap 7xuanlu/tap https://github.com/7xuanlu/homebrew-tap.git
+          brew install 7xuanlu/tap/wenlan 7xuanlu/tap/wenlan-mcp
+          brew test 7xuanlu/tap/wenlan
+          brew test 7xuanlu/tap/wenlan-mcp
+
   finalize-release:
     name: Promote the prerelease
     # Runs only after EVERY build + publish job succeeds. A failure in any of
     # them skips this job (GitHub requires all `needs` to succeed), so the
-    # release stays a prerelease — never a `releases/latest` without artifacts.
-    needs: [release, docker-manifest, publish-crates, publish-npm, update-homebrew]
+    # release stays a prerelease â€” never a `releases/latest` without artifacts.
+    # docker-manifest is itself the fail-closed promotion barrier over every
+    # required channel; only after it publishes the aliases may GitHub's
+    # prerelease become the latest stable release.
+    needs: [docker-manifest, bind-release-tag]
+    timeout-minutes: 10
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      # The lifecycle target is the merged release PR, so every call here is a
+      # pull-requests scope: GET /commits/{sha}/pulls to find it, then POST and
+      # DELETE on /issues/{pr}/labels to move it from pending to tagged. The
+      # /issues/ path is only the REST spelling — a pull request routes label
+      # WRITES through pull-requests, which is why `maintain-release-pr` labels
+      # this same PR with pull-requests: write and no issues scope at all.
+      # Granting only read here returned 403 after `gh release edit` had already
+      # promoted the release, leaving v0.15.5 stable but still labelled pending.
+      pull-requests: write
     steps:
       - name: Promote
         run: |
-          # A genuine prerelease tag (v1.0.0-rc.1) stays a prerelease.
+          set -euo pipefail
+          require_event_tag() {
+            local current
+            current="$(gh api --method GET \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+            if [[ "$current" != "$RELEASE_SHA" ]]; then
+              echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $current." >&2
+              exit 1
+            fi
+            printf '%s' "$current"
+          }
+          tag_sha="$(require_event_tag)"
           if [[ "$RELEASE_TAG" == *-* ]]; then
             echo "$RELEASE_TAG is a prerelease tag; leaving it unpromoted."
-            exit 0
+          else
+            set +e
+            refs="$(gh api --paginate \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" \
+              --jq '.[].ref')"
+            tag_list_status=$?
+            set -e
+            if [[ "$tag_list_status" -ne 0 ]]; then
+              echo "Unable to list release tags; refusing to decide latest." >&2
+              exit 1
+            fi
+            tags="$(printf '%s\n' "$refs" | sed 's#^refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+            highest="$(printf '%s\n' "$tags" | sed '/^$/d' | sort -V | tail -1)"
+            if [[ -z "$highest" ]]; then
+              echo "No stable release tags resolved; refusing to decide latest." >&2
+              exit 1
+            fi
+            latest_args=()
+            if [[ "$highest" == "$RELEASE_TAG" ]]; then
+              latest_args+=(--latest)
+            else
+              echo "$RELEASE_TAG is not the highest stable tag ($highest); not moving latest."
+            fi
+            tag_sha="$(require_event_tag)"
+            gh release edit "$RELEASE_TAG" \
+              --prerelease=false \
+              "${latest_args[@]}" \
+              --repo "$GITHUB_REPOSITORY"
           fi
-          # This job has no actions/checkout, so gh has no git context and
-          # `gh release edit` died with "fatal: not a git repository" on every
-          # release since the job was added. --repo supplies the context.
-          gh release edit "$RELEASE_TAG" \
-            --prerelease=false \
-            --latest \
-            --repo "$GITHUB_REPOSITORY"
+
+          tag_sha="$(require_event_tag)"
+          pr_number="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/commits/$tag_sha/pulls?per_page=100" \
+            --jq '[.[] | select(.head.ref == "release-please--branches--main" and .base.ref == "main" and .merged_at != null)] | if length == 1 then .[0].number else error("expected one merged release PR") end')"
+          # Add first so a transient second API failure is recoverable on rerun
+          # without losing the release lifecycle marker entirely.
+          gh api --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/issues/$pr_number/labels" \
+            --input - <<<'{"labels":["autorelease: tagged"]}' >/dev/null
+          labels="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/issues/$pr_number/labels?per_page=100")"
+          if jq -e '[.[].name] | index("autorelease: pending") != null' \
+            <<<"$labels" >/dev/null; then
+            gh api --method DELETE \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/$GITHUB_REPOSITORY/issues/$pr_number/labels/autorelease%3A%20pending" \
+              >/dev/null
+          fi
+          labels="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/issues/$pr_number/labels?per_page=100")"
+          jq -e \
+            '([.[].name] | index("autorelease: tagged") != null) and
+             ([.[].name] | index("autorelease: pending") == null)' \
+            <<<"$labels" >/dev/null
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

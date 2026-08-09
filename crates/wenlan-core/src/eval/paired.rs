@@ -83,21 +83,8 @@ pub struct PerQueryRow {
 /// A missing `summary_nodes` table reads as zero (the query errors, which we
 /// treat as "absent, fine"); only a positive count trips the assert.
 pub async fn assert_summary_nodes_empty(db: &crate::db::MemoryDB) {
-    let conn = db.conn.lock().await;
-    let count = match conn
-        .query("SELECT COUNT(*) FROM summary_nodes", libsql::params![])
-        .await
-    {
-        Ok(mut rows) => rows
-            .next()
-            .await
-            .ok()
-            .flatten()
-            .and_then(|r| r.get::<i64>(0).ok())
-            .unwrap_or(0),
-        // Missing table (or any read error) -> treat as empty.
-        Err(_) => 0,
-    };
+    // Missing table (or any read error) -> treat as empty.
+    let count = db.eval_paired_summary_node_count().await.unwrap_or(0);
     assert_eq!(
         count, 0,
         "summary_nodes is non-empty ({count} rows): the global-prelude prepend \

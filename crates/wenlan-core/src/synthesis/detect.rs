@@ -164,7 +164,7 @@ mod tests {
         last_modified: i64,
     ) {
         let embedding_sql = vec_to_sql(embedding);
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         conn.execute(
             "INSERT INTO memories (
                 id, content, source, source_id, title, chunk_index, last_modified,
@@ -199,7 +199,7 @@ mod tests {
     ) {
         let now = chrono::Utc::now().to_rfc3339();
         let embedding_sql = vec_to_sql(embedding);
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         conn.execute(
             "INSERT INTO pages (
                 id, title, summary, content, space, source_memory_ids, version,
@@ -238,11 +238,26 @@ mod tests {
         }
     }
 
+    /// Count the links a DETECT tick actually wrote.
+    ///
+    /// G6 Stage 2 PR 2b: counted `page_sources WHERE link_reason =
+    /// 'detect_attach'` until `link_page_source` went canonical-only, at which
+    /// point `page_sources` stops growing and this returned 0 for every tick.
+    /// The `detect_attach` discriminator DID carry over: `page_write`'s Attach
+    /// arm passes `link_reason` down to `insert_resolved_page_evidence`, which
+    /// stamps it into the canonical `cites` edge's semantic payload
+    /// (`cites_semantic_patch` -> `payload.$.link_reason`), so the same
+    /// "produced by the detect-attach path" question is answerable off `edges`
+    /// alone. `valid_until IS NULL` scopes the count to live links, matching
+    /// what the frozen join table used to hold.
     async fn detect_link_count(db: &MemoryDB) -> i64 {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
         let mut rows = conn
             .query(
-                "SELECT COUNT(*) FROM page_sources WHERE link_reason = 'detect_attach'",
+                "SELECT COUNT(*) FROM edges \
+                 WHERE edge_type = 'cites' AND src_kind = 'page' \
+                   AND valid_until IS NULL \
+                   AND json_extract(payload, '$.link_reason') = 'detect_attach'",
                 (),
             )
             .await

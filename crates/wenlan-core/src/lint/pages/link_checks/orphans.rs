@@ -14,11 +14,9 @@ pub(super) async fn load(context: &LintContext<'_, '_>) -> Result<Assessment, ()
          LEFT JOIN pages target \
            ON LOWER(target.title) = LOWER(pl.label_key) \
           AND target.status = 'active' \
-          AND ((COALESCE(p.workspace, p.space) IS NULL \
-                AND COALESCE(target.workspace, target.space) IS NULL) \
-               OR COALESCE(target.workspace, target.space) = COALESCE(p.workspace, p.space)) \
+          AND target.space = p.space \
          WHERE pl.target_page_id IS NULL AND p.status = 'active'{where_sql} \
-         GROUP BY pl.source_page_id, pl.label_key, COALESCE(p.workspace, p.space) \
+         GROUP BY pl.source_page_id, pl.label_key, p.space \
          ORDER BY pl.source_page_id, pl.label_key"
     );
     let mut rows = context
@@ -60,11 +58,11 @@ fn scoped_active_source_filter(filter: &ScopeFilter) -> (&'static str, libsql::p
     match filter {
         ScopeFilter::Global => ("", libsql::params::Params::None),
         ScopeFilter::Registered(workspace) => (
-            " AND COALESCE(p.workspace, p.space) = ?1",
+            " AND p.space = ?1",
             libsql::params::Params::Positional(vec![libsql::Value::Text(workspace.clone())]),
         ),
         ScopeFilter::Uncategorized => (
-            " AND COALESCE(p.workspace, p.space) IS NULL",
+            " AND p.space = '00000000-0000-4000-8000-000000000001'",
             libsql::params::Params::None,
         ),
     }

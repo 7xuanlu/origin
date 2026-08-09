@@ -175,9 +175,15 @@ async fn load_record_inventory(
         &mut inventory,
     )
     .await?;
+    // G6 Stage 1.5a: id-only enumeration moved onto `entity_page_map` (1:1
+    // with `entities` by the shadow-page invariant); no space touch, order
+    // is by the entity id itself (not a name), so it is unaffected by the
+    // mirror-invariant name equivalence.
     load_simple_records(
         snapshot,
-        "SELECT id FROM entities ORDER BY id",
+        "SELECT epm.entity_id AS id FROM entity_page_map epm
+         JOIN pages p ON p.id = epm.page_id
+         WHERE p.kind = 'entity' AND p.status = 'active' ORDER BY epm.entity_id",
         "entity",
         RepairAffectedRecordKind::Entity,
         &mut inventory,
@@ -192,10 +198,17 @@ async fn load_record_inventory(
     )
     .await?;
 
+    // G6 Stage 1.2 reader #12: read `edges`, matching #13's
+    // (`lint::semantic_candidates::load_relations`) query shape -- the two
+    // readers mint the same `relation-entity:{id}:{type}:{endpoint}` keys, so
+    // reading different stores here would leave an edge-only relation with no
+    // inventory record, permanently Blocking its repair.
     let mut rows = snapshot
         .query(
-            "SELECT from_entity,to_entity,relation_type
-             FROM relations ORDER BY from_entity,to_entity,relation_type,id",
+            "SELECT src_id,dst_id,semantic_type
+             FROM edges WHERE edge_type='relates' AND valid_until IS NULL
+                   AND semantic_type IS NOT NULL
+             ORDER BY src_id,dst_id,edge_id",
             libsql::params::Params::None,
         )
         .await

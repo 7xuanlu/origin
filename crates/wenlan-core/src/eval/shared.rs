@@ -144,12 +144,12 @@ static EVAL_EMBEDDER: LazyLock<Arc<std::sync::Mutex<fastembed::TextEmbedding>>> 
         // otherwise every git worktree starts from an empty cwd cache and re-downloads the
         // model. Mirrors the db.rs production/test embedder via `resolve_fastembed_cache_dir`;
         // the `db_path` here is a sentinel, so only the env + default tiers apply.
-        if let Some(cache) =
-            crate::db::resolve_fastembed_cache_dir(std::path::Path::new(".nonexistent"))
-        {
-            opts = opts.with_cache_dir(cache);
+        let cache_dir =
+            crate::db::resolve_fastembed_cache_dir(std::path::Path::new(".nonexistent"));
+        if let Some(cache) = &cache_dir {
+            opts = opts.with_cache_dir(cache.clone());
         }
-        let embedder = fastembed::TextEmbedding::try_new(opts)
+        let embedder = crate::db::init_text_embedding(opts)
             .expect("failed to load BGE-Base-EN-v1.5-Q ONNX model");
         let arc = Arc::new(std::sync::Mutex::new(embedder));
         // Leak one strong ref so the Arc never reaches zero and the destructor never runs.
@@ -745,12 +745,7 @@ where
                 mem_count
             )));
         }
-        {
-            let conn = db.conn.lock().await;
-            crate::eval::seed_contract::assert_feature_substrate_live(&conn, "temporal").await?;
-            crate::eval::seed_contract::assert_feature_substrate_live(&conn, "graph").await?;
-            crate::eval::seed_contract::assert_feature_substrate_live(&conn, "pages").await?;
-        }
+        db.assert_eval_migration_substrates_live().await?;
         log::info!(
             "[scenario_db] migrate_stale: schema migrated, substrate live at {} ({} memories) — \
              falling through to shared Phase-1 classification backfill",
@@ -2526,7 +2521,7 @@ async fn store_batch_distilled_page(
             content: page.content,
             summary: page.summary,
             entity_id: page.entity_id,
-            space: page.space.clone(),
+            space: page.space.clone().into(),
             source_memory_ids: page.source_memory_ids,
             creation_kind: Some("distilled".to_string()),
             workspace: page.space,
@@ -3139,10 +3134,12 @@ mod tests {
     /// step records instead.
     #[derive(Debug, PartialEq, Eq)]
     struct SubstrateFingerprint {
-        /// Sorted set of (name, entity_type) across all entities.
+        /// Sorted set of (name, entity_type) across all entities, read off the
+        /// canonical shadow pages (`entity_page_map` JOIN `pages`).
         entities: Vec<(String, String)>,
         /// Sorted list of (source_id, entity_name) derived from
-        /// `memories.entity_id → entities.name` for chunk_index=0 primary memories.
+        /// `memories.entity_id → entity_page_map → pages.title` for
+        /// chunk_index=0 primary memories.
         memory_entity_links: Vec<(String, String)>,
         /// Sorted list of (source_id, title) for chunk_index=0 primary memories.
         titles: Vec<(String, String)>,
@@ -3153,14 +3150,18 @@ mod tests {
     }
 
     async fn collect_fingerprint(db: &MemoryDB) -> SubstrateFingerprint {
-        let conn = db.conn.lock().await;
+        let conn = db.test_primary_session().await;
 
         // 1. Entities — (name, entity_type) sorted.
         let mut entities = Vec::new();
         {
             let mut rows = conn
                 .query(
-                    "SELECT name, entity_type FROM entities ORDER BY name, entity_type",
+                    "SELECT p.title, p.entity_type
+                       FROM entity_page_map epm
+                       JOIN pages p ON p.id = epm.page_id
+                      WHERE p.kind = 'entity' AND p.status = 'active'
+                      ORDER BY p.title, p.entity_type",
                     (),
                 )
                 .await
@@ -3180,9 +3181,11 @@ mod tests {
         {
             let mut rows = conn
                 .query(
-                    "SELECT m.source_id, e.name
+                    "SELECT m.source_id, p.title
                      FROM memories m
-                     JOIN entities e ON e.id = m.entity_id
+                     JOIN entity_page_map epm ON epm.entity_id = m.entity_id
+                     JOIN pages p ON p.id = epm.page_id
+                          AND p.kind = 'entity' AND p.status = 'active'
                      WHERE m.chunk_index = 0 AND m.source = 'memory'
                      ORDER BY m.source_id",
                     (),
@@ -3529,7 +3532,7 @@ mod tests {
     /// graph channel would ship starved.
     #[tokio::test]
     async fn batched_path_meets_graph_contract() {
-        use crate::eval::seed_contract::{check_seed_contract, SeedExpectations};
+        use crate::eval::seed_contract::SeedExpectations;
         use crate::llm_provider::{CannedLlmProvider, LlmProvider};
         use crate::prompts::PromptRegistry;
         use crate::tuning::{DistillationConfig, RefineryConfig};
@@ -3579,8 +3582,9 @@ mod tests {
             expect_fixture_sha256: None,
         };
 
-        let conn = db.conn.lock().await;
-        let report = check_seed_contract(&conn, &expect)
+        let conn = db.test_primary_session().await;
+        let report = conn
+            .check_seed_contract(&expect)
             .await
             .expect("check_seed_contract should not error");
 

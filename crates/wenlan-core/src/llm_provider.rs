@@ -3,7 +3,7 @@
 //!
 //! Provides a uniform abstraction over multiple LLM backends:
 //! - [`OnDeviceProvider`] — wraps [`crate::engine::LlmEngine`] on a dedicated
-//!   `std::thread` for GPU inference (Qwen3-4B via Metal).
+//!   `std::thread` for local Qwen inference.
 //! - [`ApiProvider`] — calls the Anthropic Claude API via `reqwest`.
 //! - `MockProvider` — test double, only compiled under `#[cfg(test)]`.
 //!
@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -125,10 +126,48 @@ pub trait LlmProvider: Send + Sync {
     fn model_id(&self) -> String {
         "unknown".to_string()
     }
+    /// Immutable model artifact version when the provider can prove one.
+    fn model_version(&self) -> Option<String> {
+        None
+    }
+    /// Runtime backend selected for an on-device provider. Non-local
+    /// providers return `None`; callers can expose this as optional status
+    /// without downcasting the trait object.
+    fn inference_runtime_info(&self) -> Option<wenlan_types::responses::OnDeviceInferenceStatus> {
+        None
+    }
+}
+
+/// Build an immutable model version from the hf-hub snapshot path that was loaded.
+pub(crate) fn hf_snapshot_model_version(repo_id: &str, model_path: &Path) -> Option<String> {
+    if repo_id.trim().is_empty() {
+        return None;
+    }
+
+    for snapshot_dir in model_path.ancestors() {
+        let snapshots_dir = snapshot_dir.parent()?;
+        if snapshots_dir.file_name()? != "snapshots" {
+            continue;
+        }
+
+        let snapshot_hash = snapshot_dir.file_name()?.to_str()?;
+        let filename = model_path
+            .strip_prefix(snapshot_dir)
+            .ok()?
+            .to_str()?
+            .replace('\\', "/");
+        if snapshot_hash.is_empty() || filename.is_empty() {
+            return None;
+        }
+
+        return Some(format!("hf:{repo_id}@{snapshot_hash}/{filename}"));
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
-// OnDeviceProvider — wraps LlmEngine on a dedicated GPU inference thread
+// OnDeviceProvider — wraps LlmEngine on a dedicated inference thread
 // ---------------------------------------------------------------------------
 
 /// Wrap a user/system prompt pair in the Qwen ChatML template.
@@ -177,8 +216,8 @@ const BACKFILL_DRAIN_FACTOR: usize = 4;
 
 /// Continuous-batch slot backfill (`WENLAN_LLM_SLOT_BACKFILL`). OFF by default
 /// (opt-in); enable with `1`/`true`/`yes`/`on`. Default-OFF because this is a
-/// structural rewrite of the SHARED on-device inference path that CI cannot
-/// validate on Metal hardware — it ships behind an explicit opt-in for the
+/// structural rewrite of the shared on-device inference path that CI cannot
+/// validate across every runtime backend — it ships behind an explicit opt-in for the
 /// throughput-bound paths (bulk ingest, eval seed) until staged-rollout
 /// confidence accrues. When ON the coalescer may drain more than `m`
 /// immediately-available requests into one call so the engine keeps all `m`
@@ -347,9 +386,10 @@ fn parse_batch_log_line(line: &str) -> Option<BatchLogRecord> {
 
 /// On-device LLM provider that runs inference on a dedicated `std::thread`.
 ///
-/// Construction downloads the model (cached), loads it via Metal GPU, and
+/// Construction downloads the model (cached), loads it using the GPU backend
+/// exposed by this llama.cpp binary or CPU/OpenMP when none is available, and
 /// spawns a worker thread that processes [`InferenceRequest`]s received over a
-/// bounded `SyncSender` channel (capacity 8).
+/// bounded `SyncSender` channel.
 pub struct OnDeviceProvider {
     tx: std::sync::mpsc::SyncSender<InferenceRequest>,
     available: Arc<AtomicBool>,
@@ -357,6 +397,8 @@ pub struct OnDeviceProvider {
     model_context_size: u32,
     model_max_output: u32,
     resolved_model_id: String,
+    resolved_model_version: String,
+    runtime_info: wenlan_types::responses::OnDeviceInferenceStatus,
 }
 
 impl OnDeviceProvider {
@@ -364,7 +406,7 @@ impl OnDeviceProvider {
     /// MTLCommandQueue per context, and macOS limits live queues per process.
     /// Retrying after a delay lets the Objective-C autorelease pool drain
     /// queues from dropped contexts.
-    fn probe_with_retries(engine: &crate::engine::LlmEngine, label: &str) -> bool {
+    fn probe_metal_with_retries(engine: &crate::engine::LlmEngine, label: &str) -> bool {
         for attempt in 0..3 {
             if engine.probe_metal_context() {
                 if attempt > 0 {
@@ -391,9 +433,10 @@ impl OnDeviceProvider {
     /// fall back to the default with a warning (so stale config values from
     /// older releases don't break startup). If None, uses the default model.
     ///
-    /// This downloads the model (if not cached), loads it onto the GPU, and
-    /// spawns a background thread for inference. All of this is blocking, so
-    /// call from a context that can block (e.g. `spawn_blocking`).
+    /// This downloads the model (if not cached), loads it using the selected
+    /// runtime backend, and spawns a background thread for inference. All of
+    /// this is blocking, so call from a context that can block (for example
+    /// `spawn_blocking`).
     pub fn new_with_model(model_id: Option<&str>) -> Result<Self, crate::error::WenlanError> {
         let model_spec = crate::on_device_models::resolve_or_default(model_id);
         log::info!(
@@ -403,52 +446,99 @@ impl OnDeviceProvider {
         );
         let model_path =
             LlmEngine::download_model_by_spec(model_spec.repo_id, model_spec.filename)?;
+        let resolved_model_version = hf_snapshot_model_version(model_spec.repo_id, &model_path)
+            .ok_or_else(|| {
+                crate::error::WenlanError::Llm(format!(
+                    "model path is not an hf-hub snapshot artifact: {}",
+                    model_path.display()
+                ))
+            })?;
         let prompts =
             crate::prompts::PromptRegistry::load(&crate::prompts::PromptRegistry::override_dir());
 
-        // Auto-degrade Metal init with retries.
-        //
-        // ggml's Metal backend (llama-cpp-2 v0.1.143) creates a new
-        // MTLCommandQueue per context. macOS enforces a per-process limit on
-        // live command queues. When queues from prior probe/drop cycles haven't
-        // been reclaimed by the Objective-C autorelease pool, newCommandQueue
-        // returns nil. Retrying after a short delay lets the pool drain.
-        //
-        // Additionally, GGML_METAL_NO_RESIDENCY disables residency sets that
-        // can accumulate and block queue creation under memory pressure.
-        //
-        // Fallback chain: BF16 with retries -> BF16 disabled with retries -> error.
+        // This variable controls only Metal context allocation. Set it before
+        // loading the model on macOS, and never export a Metal-specific setting
+        // into Windows/Linux initialization.
+        #[cfg(target_os = "macos")]
         std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
 
         let engine = LlmEngine::new(&model_path, prompts.clone())?;
-        let engine = if Self::probe_with_retries(&engine, "BF16") {
-            log::info!("[on_device_provider] Metal context probe passed (BF16 OK)");
-            engine
-        } else {
-            log::warn!(
-                "[on_device_provider] Metal context probe failed after retries. \
-                 Retrying with BF16 disabled (macOS Metal compatibility)."
-            );
-            std::env::set_var("GGML_METAL_BF16_DISABLE", "1");
-            drop(engine);
-            // Sleep to let autorelease pool fully drain queues from the dropped engine.
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let fallback = LlmEngine::new(&model_path, prompts)?;
-            if !Self::probe_with_retries(&fallback, "BF16-disabled") {
-                log::error!(
-                    "[on_device_provider] Metal context still fails with BF16 disabled \
-                     after retries. On-device inference unavailable."
+        let backend_plan = engine.inference_backend_plan().clone();
+        log::info!(
+            "[on_device_provider] selected inference backend: {}",
+            backend_plan.label()
+        );
+
+        let engine = if backend_plan.uses_metal_compatibility_fallback() {
+            // Auto-degrade Metal init with retries.
+            //
+            // ggml's Metal backend (llama-cpp-2 v0.1.143) creates a new
+            // MTLCommandQueue per context. macOS enforces a per-process limit on
+            // live command queues. When queues from prior probe/drop cycles haven't
+            // been reclaimed by the Objective-C autorelease pool, newCommandQueue
+            // returns nil. Retrying after a short delay lets the pool drain.
+            //
+            // Additionally, GGML_METAL_NO_RESIDENCY disables residency sets that
+            // can accumulate and block queue creation under memory pressure.
+            //
+            // Fallback chain: BF16 with retries -> BF16 disabled with retries -> error.
+            if Self::probe_metal_with_retries(&engine, "BF16") {
+                log::info!("[on_device_provider] Metal context probe passed (BF16 OK)");
+                engine
+            } else {
+                log::warn!(
+                    "[on_device_provider] Metal context probe failed after retries. \
+                     Retrying with BF16 disabled (macOS Metal compatibility)."
                 );
-                return Err(crate::error::WenlanError::Llm(
-                    "Metal context creation failed even with BF16 disabled".into(),
-                ));
+                std::env::set_var("GGML_METAL_BF16_DISABLE", "1");
+                drop(engine);
+                // Sleep to let autorelease pool fully drain queues from the dropped engine.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let fallback = LlmEngine::new(&model_path, prompts)?;
+                if !Self::probe_metal_with_retries(&fallback, "BF16-disabled") {
+                    log::error!(
+                        "[on_device_provider] Metal context still fails with BF16 disabled \
+                         after retries. On-device inference unavailable."
+                    );
+                    return Err(crate::error::WenlanError::Llm(
+                        "Metal context creation failed even with BF16 disabled".into(),
+                    ));
+                }
+                log::warn!(
+                    "[on_device_provider] running in degraded mode (BF16 disabled, slower inference). \
+                     Update macOS to restore full Metal performance."
+                );
+                fallback
             }
-            log::warn!(
-                "[on_device_provider] running in degraded mode (BF16 disabled, slower inference). \
-                 Update macOS to restore full Metal performance."
-            );
-            fallback
+        } else {
+            if let Err(cause) = engine.probe_context() {
+                let message = backend_plan.context_failure_message(&cause);
+                if backend_plan.supports_cpu_fallback() {
+                    log::warn!("[on_device_provider] {message}; reloading the model on CPU");
+                    drop(engine);
+                    let fallback = LlmEngine::reload_on_cpu(&model_path, prompts, message.clone())?;
+                    fallback.probe_context().map_err(|cpu_cause| {
+                        crate::error::WenlanError::Llm(format!(
+                            "{message}; CPU fallback context creation failed: {cpu_cause}"
+                        ))
+                    })?;
+                    log::warn!(
+                        "[on_device_provider] GPU context failed; CPU fallback context probe passed"
+                    );
+                    fallback
+                } else {
+                    log::error!("[on_device_provider] {message}. On-device inference unavailable.");
+                    return Err(crate::error::WenlanError::Llm(message));
+                }
+            } else {
+                log::info!(
+                    "[on_device_provider] {} context probe passed",
+                    backend_plan.label()
+                );
+                engine
+            }
         };
+        let runtime_info = engine.inference_runtime_info();
 
         // Channel capacity sized for concurrent MCP bursts: a 10-store
         // `remember` burst fires ~4 LLM requests per store (classify +
@@ -463,7 +553,7 @@ impl OnDeviceProvider {
         // Multi-context worker pool. WENLAN_LLM_WORKERS controls the number of
         // parallel inference threads, each owning a persistent LlamaContext.
         // Workers compete on a shared receiver: lock is held only during recv(),
-        // released before GPU inference, so contention is minimal.
+        // released before inference, so contention is minimal.
         //
         // WENLAN_LLM_PARALLEL_SEQS (Option B / S2) controls how many sequences
         // each worker decodes in parallel inside its single LlamaContext via
@@ -476,11 +566,11 @@ impl OnDeviceProvider {
         // M sequences in one context still share the same `n_ctx` allocation,
         // so per-worker KV memory does NOT scale linearly with M — but each
         // sequence's effective per-seq budget shrinks to ctx_size / M.
-        // N=4 workers = 3.2 GB KV + 2.7 GB shared weights ≈ safe on 16 GB Mac.
+        // N=4 workers = 3.2 GB KV + 2.7 GB shared weights ≈ safe on a 16 GB system.
         // Default N=1, M=1 is identical to the previous single-thread behavior.
         //
-        // GGML_METAL_NO_RESIDENCY (set above) mitigates Metal command queue
-        // exhaustion from multiple simultaneous contexts.
+        // On Metal, GGML_METAL_NO_RESIDENCY (set above) mitigates command queue
+        // exhaustion from multiple simultaneous contexts. Other backends ignore it.
         let n_workers = parse_clamped_usize_env("WENLAN_LLM_WORKERS", 1, 1, MAX_LLM_WORKERS);
         let parallel_seqs =
             parse_clamped_usize_env("WENLAN_LLM_PARALLEL_SEQS", 1, 1, MAX_LLM_PARALLEL_SEQS);
@@ -501,7 +591,7 @@ impl OnDeviceProvider {
         // Wrap the receiver so it can be shared across worker threads.
         // std::sync::mpsc::Receiver is Send but not Sync, so we guard it with
         // a Mutex. Only one worker holds the lock at a time (during recv()),
-        // then releases it before the actual GPU inference call.
+        // then releases it before the actual inference call.
         let rx_shared = Arc::new(std::sync::Mutex::new(rx));
 
         // Shared engine across all workers. LlmEngine holds the model weights
@@ -537,8 +627,8 @@ impl OnDeviceProvider {
                     // Persistent LlamaContext: build lazily on first request,
                     // then reuse across all subsequent requests by clearing the
                     // KV cache between calls. Saves the per-call cost of
-                    // `new_context()` (KV cache allocation + Metal pipeline
-                    // rebuild) which was the dominant overhead under serial
+                    // `new_context()` (KV cache and backend pipeline
+                    // setup) which was the dominant overhead under serial
                     // inference. If a request arrives with a different
                     // ctx_size or n_seq_max requirement, the context is rebuilt.
                     //
@@ -814,8 +904,8 @@ impl OnDeviceProvider {
                         }
                     }
 
-                    // Drop the persistent context before exiting so Metal
-                    // queues are released cleanly.
+                    // Drop the persistent context before exiting so backend
+                    // resources are released cleanly.
                     drop(persistent_ctx);
                     log::info!("[on_device_provider] worker {i} thread exiting");
                     // Mark available=false only when the last worker exits.
@@ -840,6 +930,8 @@ impl OnDeviceProvider {
             model_context_size: model_spec.context_size,
             model_max_output: model_spec.max_output_tokens,
             resolved_model_id: model_spec.id.to_string(),
+            resolved_model_version,
+            runtime_info,
         })
     }
 
@@ -905,8 +997,16 @@ impl LlmProvider for OnDeviceProvider {
         "on-device"
     }
 
+    fn inference_runtime_info(&self) -> Option<wenlan_types::responses::OnDeviceInferenceStatus> {
+        Some(self.runtime_info.clone())
+    }
+
     fn model_id(&self) -> String {
         self.resolved_model_id.clone()
+    }
+
+    fn model_version(&self) -> Option<String> {
+        Some(self.resolved_model_version.clone())
     }
 
     fn recommended_max_output(&self) -> u32 {
@@ -1628,6 +1728,21 @@ impl LlmProvider for CannedLlmProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hf_snapshot_model_version_includes_repo_snapshot_and_filename() {
+        let path = Path::new(
+            "/cache/huggingface/hub/models--Qwen--Qwen3/snapshots/012345abcdef/models/qwen.gguf",
+        );
+
+        assert_eq!(
+            hf_snapshot_model_version("Qwen/Qwen3", path).as_deref(),
+            Some("hf:Qwen/Qwen3@012345abcdef/models/qwen.gguf")
+        );
+        assert!(
+            hf_snapshot_model_version("Qwen/Qwen3", Path::new("/cache/blobs/qwen.gguf")).is_none()
+        );
+    }
 
     #[tokio::test]
     async fn canned_llm_returns_by_prompt() {

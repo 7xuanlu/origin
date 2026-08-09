@@ -80,7 +80,7 @@ async fn ensure_overview_page(
         content: OVERVIEW_PLACEHOLDER_CONTENT.to_string(),
         summary: None,
         entity_id: None,
-        space: None,
+        space: None.into(),
         source_memory_ids: Vec::new(),
         // "research" is machine-owned (never `user_edited`/"authored") and
         // floor-exempt (spec §5.1: only `distilled` requires >=
@@ -236,7 +236,7 @@ mod tests {
             content: content.to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: None.into(),
             source_memory_ids: vec![mem_id.to_string()],
             creation_kind: Some("research".to_string()),
             workspace: None,
@@ -370,6 +370,43 @@ mod tests {
             !linked_ids.contains(&mem_ids[1].as_str()),
             "second-earliest cycling page's source must also be pruned, evidence: {:?}",
             linked_ids
+        );
+    }
+
+    /// Fix wave (stage c review, Critical-1 leak site 2): a fresh
+    /// kind='entity' dual-write shadow (stamped `now`, so it would sort into
+    /// the top of a `last_modified DESC` window ahead of every real page)
+    /// must never consume one of the OVERVIEW_TOP_PAGES evidence slots or
+    /// contribute its (always-empty) source_memory_ids.
+    #[tokio::test]
+    async fn top_page_source_ids_excludes_entity_kind_shadow() {
+        let (db, _dir) = test_db().await;
+
+        let mut mem_ids = Vec::new();
+        for i in 1..=OVERVIEW_TOP_PAGES {
+            let mem_id = format!("mem_overview_shadow_guard_{i}");
+            let content =
+                format!("Topic{i} is a specific programming concept with unique details.");
+            create_research_page(&db, &format!("Topic{i}"), &mem_id, &content).await;
+            mem_ids.push(mem_id);
+        }
+        // Seeded after the real pages, so store_entity's `now` timestamp
+        // sorts it first without the fence.
+        db.store_entity("Overview Shadow Marker", "person", None, None, None)
+            .await
+            .unwrap();
+
+        let ids = top_page_source_ids(&db, None).await.unwrap();
+        for mem_id in &mem_ids {
+            assert!(
+                ids.contains(mem_id),
+                "real page source {mem_id} must not be displaced by the entity shadow, got: {ids:?}"
+            );
+        }
+        assert_eq!(
+            ids.len(),
+            mem_ids.len(),
+            "the shadow must contribute zero source ids of its own, got: {ids:?}"
         );
     }
 

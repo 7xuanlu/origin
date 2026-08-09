@@ -193,6 +193,87 @@ async fn create_relation_missing_entities_returns_422() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+/// M3g fence: `span`/`model_version`/`prompt_version` are daemon-internal (KG
+/// extraction) only. An agent hitting `/api/memory/relations` directly must
+/// never be able to set them -- the handler strips all three before the
+/// core call.
+#[tokio::test]
+async fn create_relation_strips_agent_supplied_span_capture_fields() {
+    let (app, dir) = test_app().await;
+
+    let (_, e1) = json_post(
+        &app,
+        "/api/memory/entities",
+        Some("test"),
+        serde_json::json!({"name": "Carol", "entity_type": "person"}),
+    )
+    .await;
+    let (_, e2) = json_post(
+        &app,
+        "/api/memory/entities",
+        Some("test"),
+        serde_json::json!({"name": "Dave", "entity_type": "person"}),
+    )
+    .await;
+    let from = e1["id"].as_str().expect("e1 missing id");
+    let to = e2["id"].as_str().expect("e2 missing id");
+
+    let (status, body) = json_post(
+        &app,
+        "/api/memory/relations",
+        Some("test"),
+        serde_json::json!({
+            "from_entity": from,
+            "to_entity": to,
+            "relation_type": "knows",
+            "span": "Carol knows Dave",
+            "model_version": "forged-model",
+            "prompt_version": "forged-prompt",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let db_file = dir.path().join("origin_memory.db");
+    let raw_db = libsql::Builder::new_local(db_file.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let mut rows = raw_db
+        .connect()
+        .unwrap()
+        .query(
+            "SELECT payload FROM edges WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
+            libsql::params![from, to],
+        )
+        .await
+        .unwrap();
+    let payload: Option<String> = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("relates edge row")
+        .get(0)
+        .unwrap();
+    // G6 Stage 1.2: every relates mint now stamps `asserted_at` (mirrors the
+    // stored relations row's created_at), so the payload is no longer empty.
+    // The provenance-stripping contract this test guards is that agent-
+    // supplied span/model_version/prompt_version never land in it.
+    let payload_json: serde_json::Value =
+        serde_json::from_str(payload.as_deref().expect("payload must carry asserted_at"))
+            .expect("payload must be valid JSON");
+    assert!(
+        payload_json.get("span").is_none()
+            && payload_json.get("model_version").is_none()
+            && payload_json.get("prompt_version").is_none(),
+        "agent-supplied span/model_version/prompt_version must be stripped, got payload: {payload_json}"
+    );
+    assert!(
+        payload_json.get("asserted_at").is_some(),
+        "payload must still carry asserted_at, got: {payload_json}"
+    );
+}
+
 // ── handle_add_observation ──────────────────────────────────────────────────
 
 #[tokio::test]
@@ -273,7 +354,7 @@ async fn create_distilled_page_fixture(
         content: content.to_string(),
         summary: None,
         entity_id: None,
-        space: None,
+        space: (None).into(),
         source_memory_ids: source_ids.iter().map(|id| (*id).to_string()).collect(),
         creation_kind: Some("distilled".to_string()),
         workspace: None,
@@ -294,7 +375,7 @@ async fn create_authored_page_fixture(db: &MemoryDB, title: &str, content: &str)
         content: content.to_string(),
         summary: None,
         entity_id: None,
-        space: None,
+        space: (None).into(),
         source_memory_ids: Vec::new(),
         creation_kind: Some("authored".to_string()),
         workspace: None,

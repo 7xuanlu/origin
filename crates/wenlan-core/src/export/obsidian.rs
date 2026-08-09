@@ -130,6 +130,8 @@ mod tests {
             review_status: "confirmed".to_string(),
             workspace: None,
             citations: Vec::new(),
+            kind: "concept".to_string(),
+            truth: None,
         }
     }
 

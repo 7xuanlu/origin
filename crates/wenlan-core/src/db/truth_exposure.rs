@@ -1,0 +1,874 @@
+// SPDX-License-Identifier: Apache-2.0
+//! The durable half of the M5 exposure contract: the marker audit log, the
+//! cutover generation that decides whether any of it is live yet, and the fence
+//! that keeps page writers from crossing the ceremony.
+//!
+//! Three small things, all here because they are properties of the database
+//! rather than of a request.
+//!
+//! **The audit log** is the *only* compensating control for the one attack D3
+//! concedes. `Collection` and `NamedPage` compose: a caller willing to forge the
+//! intent marker can list unsupported page IDs and then fetch them one at a
+//! time. Nothing at cooperative tier prevents that -- the daemon is loopback and
+//! unauthenticated, and cannot tell a forged gesture from a real one. What it
+//! can do is leave a trail, so page-at-a-time extraction is a visible pattern
+//! instead of an invisible one. An untested audit row is a sentence, not a
+//! control, which is why `truth_guard` has a test that goes RED when the write
+//! is removed.
+//!
+//! **The cutover generation** is the durable result of the prior reader
+//! ceremony. `0` keeps every adapter pass-through; a committed nonzero value is
+//! forward-only and is not rolled back when a later machine policy returns to
+//! shadow mode.
+//!
+//! **Machine enforcement is separate from promotion.** Existing installations
+//! may already have a committed cutover generation, but M6 claim promotion must
+//! first run shadow/advisory against the real corpus. Its scores and evaluated
+//! outcomes stay durable while `claim_promoter_enforcement` is absent; only the
+//! exact value `1` lets an evaluated machine failure affect whole-page exposure.
+//!
+//! **The fence** is what makes "advances it once" true rather than aspirational.
+//! Pages are projected at runtime, so a page written while the ceremony is
+//! mid-flight would slip past the pass that just ran and land in the vault
+//! unexamined. [`MemoryDB::begin_cutover`] closes the window, and
+//! [`crate::truth_adapter::page_write_permit`] is where every page writer feels
+//! it.
+
+use super::MemoryDB;
+use crate::truth_contract::{visible_at, MarkerOutcome, TruthGrant, Visibility};
+use crate::WenlanError;
+use std::collections::HashMap;
+
+/// `app_metadata` key holding the durable cutover generation. Absent or `0`
+/// means every truth adapter is inert.
+pub const TRUTH_CUTOVER_GENERATION_KEY: &str = "truth_cutover_generation";
+
+/// Separate switch for enforcing machine claim verdicts against whole-page
+/// visibility. Absent (and every value except `"1"`) keeps promoter output in
+/// shadow/advisory mode while preserving its durable scores and outcomes.
+const CLAIM_PROMOTER_ENFORCEMENT_KEY: &str = "claim_promoter_enforcement";
+
+/// `app_metadata` key holding the durable cutover fence, as `"<epoch>:<phase>"`.
+/// Absent is the initial fence: epoch 0, phase off.
+pub const TRUTH_CUTOVER_FENCE_KEY: &str = "truth_cutover_fence";
+
+/// Where the cutover ceremony currently stands.
+///
+/// `Committed` never returns to `Off`. Rebuilding the full legacy directory is
+/// exactly the flip the rollback contract forbids -- every provisional page's
+/// prose would reappear at a path `wenlan pages` reads directly, with nothing
+/// able to stop it. After commit the only moves are forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutoverPhase {
+    Off,
+    Preparing,
+    Committed,
+}
+
+impl CutoverPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Preparing => "preparing",
+            Self::Committed => "committed",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "off" => Some(Self::Off),
+            "preparing" => Some(Self::Preparing),
+            "committed" => Some(Self::Committed),
+            _ => None,
+        }
+    }
+}
+
+/// The durable writer fence: an epoch paired with a phase.
+///
+/// # Why the phase alone is not enough
+///
+/// `off -> preparing -> off` on an abort would let a writer that captured `off`
+/// before the ceremony compare-and-swap successfully afterwards -- a textbook
+/// ABA. The phase enum cannot distinguish "the `off` I read" from "a later
+/// `off`", and the writer that wins that CAS is exactly the one whose page the
+/// ceremony never examined.
+///
+/// So every transition bumps the epoch, monotonically, and a writer swaps the
+/// *pair*. A stale `off` capture then fails against a higher epoch even when the
+/// phase matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutoverFence {
+    pub epoch: i64,
+    pub phase: CutoverPhase,
+}
+
+impl CutoverFence {
+    /// What a database with no fence row means: nothing has ever run.
+    pub const INITIAL: Self = Self {
+        epoch: 0,
+        phase: CutoverPhase::Off,
+    };
+
+    fn encode(&self) -> String {
+        format!("{}:{}", self.epoch, self.phase.as_str())
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        let (epoch, phase) = raw.split_once(':')?;
+        Some(Self {
+            epoch: epoch.trim().parse().ok()?,
+            phase: CutoverPhase::parse(phase.trim())?,
+        })
+    }
+
+    fn next(&self, phase: CutoverPhase) -> Self {
+        Self {
+            epoch: self.epoch + 1,
+            phase,
+        }
+    }
+}
+
+/// Proof that this process holds the cutover lease.
+///
+/// The field is private, so a caller cannot fabricate one: the only way to hold
+/// a lease is to have won [`MemoryDB::begin_cutover`], and the only way to spend
+/// it is to hand it back to commit or abort. Same discipline as
+/// [`crate::truth_adapter::PagePermit`], for the same reason -- the ceremony
+/// runs outside the request path, where there is no guard to forget to call.
+///
+/// Deliberately **not** `Clone`, and commit/abort take it **by value**, so it is
+/// linear: usable exactly once, checked by the compiler. Borrowing it instead
+/// left a real hole, because the lease check and the generation write are
+/// separate statements under a mutex that serializes statements, not protocols.
+/// Two aliases could both pass the check, then one could write its generation
+/// after the other had already committed and returned success -- leaving the
+/// database at a generation nobody was told about. There is no way to express
+/// that now: the second call does not compile.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CutoverLease {
+    fence: CutoverFence,
+}
+
+impl CutoverLease {
+    /// The fence this lease was minted at. A commit that finds anything else in
+    /// the database has lost the lease.
+    pub fn fence(&self) -> CutoverFence {
+        self.fence
+    }
+}
+
+/// The two truth axes for one page.
+///
+/// Independent by construction: neither is inferred from the other. A page can
+/// be machine-supported and unreviewed, or human-reviewed and unsupported, and
+/// both facts have to reach the reader for a `collection` entry to be legal.
+///
+/// The machine axis is a three-state [`Support`] rather than a bool, so an
+/// unjudged page cannot be mistaken for a judged-and-failed one. It was a bool
+/// until the ceremony review: `support_status` has only ever held `supported`
+/// or `provisional`, and reading `provisional` as "the evidence does not back
+/// this" made every page that predates claim derivation an eviction target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageTruth {
+    pub support: crate::truth_contract::Support,
+    pub human_reviewed: bool,
+}
+
+/// A page nothing knows anything about: unjudged, unreviewed. The right answer
+/// for a missing row, because absence of a judgement is not a judgement.
+impl Default for PageTruth {
+    fn default() -> Self {
+        Self {
+            support: crate::truth_contract::Support::Unevaluated,
+            human_reviewed: false,
+        }
+    }
+}
+
+impl PageTruth {
+    /// Whether the evidence has been checked and found to back the prose.
+    ///
+    /// Kept as a method rather than a field so `unevaluated` can never silently
+    /// read as `supported` at a call site that only wanted the happy case.
+    pub fn supported(&self) -> bool {
+        self.support == crate::truth_contract::Support::Supported
+    }
+}
+
+/// One recorded marked call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruthMarkerAudit {
+    pub marked_at: i64,
+    /// Who called, from `x-agent-name`. `unknown` when the caller did not say --
+    /// honest-unknown beats guessing, same as the rest of agent attribution.
+    pub caller: String,
+    pub method: String,
+    /// The route *template*, not the concrete URI: `/api/pages/{id}`. The IDs
+    /// live in `page_ids`, where they can be counted.
+    pub path: String,
+    pub outcome: String,
+    /// The page IDs this call named, in path order.
+    pub page_ids: Vec<String>,
+}
+
+impl MemoryDB {
+    /// Migration 101 DDL. Additive and idempotent.
+    pub(super) async fn ensure_truth_exposure_tables(
+        tx: &libsql::Transaction,
+    ) -> Result<(), WenlanError> {
+        tx.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS truth_marker_audit (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                marked_at  INTEGER NOT NULL,
+                caller     TEXT    NOT NULL,
+                method     TEXT    NOT NULL,
+                path       TEXT    NOT NULL,
+                outcome    TEXT    NOT NULL CHECK (outcome IN (
+                               'refused', 'automatic',
+                               'granted_collection', 'granted_named_page')),
+                -- JSON array, empty for a collection call. Stored as text
+                -- because the interesting query is 'which IDs did this caller
+                -- name over the last hour', which reads the whole row anyway.
+                page_ids   TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_truth_marker_audit_recent
+                ON truth_marker_audit(marked_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_truth_marker_audit_caller
+                ON truth_marker_audit(caller, marked_at DESC);
+            ",
+        )
+        .await
+        .map_err(|error| WenlanError::VectorDb(format!("m101 truth exposure tables: {error}")))?;
+        Ok(())
+    }
+
+    /// Record one marked call.
+    ///
+    /// Called for every request carrying the intent marker, granted or refused.
+    /// A refusal is the signature of a misconfigured integration and costs one
+    /// row to keep.
+    pub async fn record_truth_marker(
+        &self,
+        caller: &str,
+        method: &str,
+        path: &str,
+        outcome: MarkerOutcome,
+        page_ids: &[String],
+    ) -> Result<(), WenlanError> {
+        let ids = serde_json::to_string(page_ids)
+            .map_err(|e| WenlanError::VectorDb(format!("record_truth_marker page_ids: {e}")))?;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO truth_marker_audit (marked_at, caller, method, path, outcome, page_ids)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            libsql::params![
+                chrono::Utc::now().timestamp(),
+                caller,
+                method,
+                path,
+                outcome.as_str(),
+                ids
+            ],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("record_truth_marker: {e}")))?;
+        Ok(())
+    }
+
+    /// The most recent marked calls, newest first.
+    pub async fn recent_truth_markers(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<TruthMarkerAudit>, WenlanError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT marked_at, caller, method, path, outcome, page_ids
+                   FROM truth_marker_audit
+                  ORDER BY marked_at DESC, id DESC
+                  LIMIT ?1",
+                libsql::params![limit as i64],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("recent_truth_markers: {e}")))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("recent_truth_markers next: {e}")))?
+        {
+            let ids: String = row.get(5).unwrap_or_default();
+            out.push(TruthMarkerAudit {
+                marked_at: row.get(0).unwrap_or_default(),
+                caller: row.get(1).unwrap_or_default(),
+                method: row.get(2).unwrap_or_default(),
+                path: row.get(3).unwrap_or_default(),
+                outcome: row.get(4).unwrap_or_default(),
+                page_ids: serde_json::from_str(&ids).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// The durable cutover generation. `0` means every truth adapter is
+    /// pass-through. A nonzero generation does not, by itself, enforce M6 claim
+    /// promoter failures; that policy has its own default-off switch.
+    ///
+    /// ponytail: one indexed `app_metadata` read per request. Cache it on
+    /// `MemoryDB` behind an atomic if it ever shows up in a profile; a
+    /// single-user loopback daemon is nowhere near needing that today.
+    pub async fn truth_cutover_generation(&self) -> Result<i64, WenlanError> {
+        Ok(self
+            .get_app_metadata(TRUTH_CUTOVER_GENERATION_KEY)
+            .await?
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// Both truth axes for a batch of pages, in one query.
+    ///
+    /// A page with no `page_truth_state` row reads as [`Support::Unevaluated`],
+    /// NOT as unsupported. Absence of a record is absence of a judgement, and a
+    /// judgement that never ran is not a judgement that failed -- post-migration
+    /// that absence is the normal case, so reading it as "unsupported" would
+    /// condemn every page. `evaluated_at` is what separates the two, and it is
+    /// NULL for every row migration 99's backfill wrote.
+    ///
+    /// An evaluated provisional row is likewise exposed as `Unevaluated` while
+    /// the promoter-enforcement switch is off. The raw evaluated row remains in
+    /// place for corpus measurement; only its page-visibility consequence is
+    /// shadowed.
+    ///
+    /// `human_reviewed` is **computed, not read**. The stored bit is a
+    /// historical receipt — "somebody approved this page, at this version, with
+    /// this content digest" — and nothing clears it when the page is edited: the
+    /// update bumps `version` and rewrites `content`, and the truth row is not in
+    /// its reach. Left as-is, a page could be reviewed once, rewritten into
+    /// something else entirely, and stay both "reviewed" and (post-cutover)
+    /// fully visible on the strength of an approval of text nobody can see any
+    /// more.
+    ///
+    /// So the review is in force only while both `reviewed_page_version` and
+    /// `reviewed_page_digest` still match the current page. An edited page falls
+    /// back to unreviewed by itself, and back to whatever its machine verdict
+    /// earns it — fail-closed, with no new write path and nothing to migrate.
+    ///
+    /// Content is pulled only for rows that claim a review, so the ordinary page
+    /// carries no extra cost.
+    ///
+    /// # A verdict about a version that is gone is not a verdict
+    ///
+    /// `page_truth_state` holds one row per PAGE and records which
+    /// `page_version` the verdict was reached on, so a page edited after being
+    /// judged carries a row describing text it no longer holds. Matrix row 8
+    /// requires that edit to cost the old verdict, and nothing else here can
+    /// make it: the enqueue trigger queues the *work*, and until a worker gets
+    /// to it — on a branch with no producer, never — a `supported` v1 row keeps
+    /// v2's prose readable on the strength of a judgement of different text.
+    ///
+    /// So the version is compared at the read, where it holds for every consumer
+    /// at once rather than once per caller who remembers to. A stale row reads
+    /// as [`Support::Unevaluated`] in both directions, the same fail-safe the
+    /// NULL `evaluated_at` case gets: the page keeps its file and stops being
+    /// asserted as supported. De-stamping a stale `Refuted` is that same call
+    /// seen from the other side — v1's refutation is not evidence about v2, and
+    /// letting it stand would archive a page over a judgement nobody made of it.
+    ///
+    /// A row whose page is missing reads as [`Support::Unevaluated`] too: with
+    /// no live text there is nothing to compare the marker against, and a
+    /// comparison that cannot be made is not a comparison that passed.
+    /// `page_truth_state` cascades from `pages`, so the case does not arise from
+    /// a delete in the first place.
+    ///
+    /// [`Support::Unevaluated`]: crate::truth_contract::Support::Unevaluated
+    pub async fn page_truth_states(
+        &self,
+        page_ids: &[String],
+    ) -> Result<HashMap<String, PageTruth>, WenlanError> {
+        let mut out = HashMap::new();
+        if page_ids.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.conn.lock().await;
+        // Read the reconciliation frontier, shadow switch, truth rows, and
+        // eligibility registry under one connection guard. Judge activation
+        // atomically changes the registry generation and resets the frontier;
+        // releasing the guard between those reads would permit a torn snapshot
+        // that combines the new registry with a stale completed frontier.
+        let (unproved_after, enforce_promoter) = {
+            let mut rows = conn
+                .query(
+                    "SELECT key, value FROM app_metadata WHERE key IN (?1, ?2)",
+                    libsql::params![
+                        super::claim_derivation::SUPPORT_RECONCILE_FRONTIER_KEY,
+                        CLAIM_PROMOTER_ENFORCEMENT_KEY,
+                    ],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("truth read controls: {e}")))?;
+            let mut frontier = None;
+            let mut enforce = false;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("truth read controls next: {e}")))?
+            {
+                let key: String = row
+                    .get(0)
+                    .map_err(|e| WenlanError::VectorDb(format!("truth read controls key: {e}")))?;
+                let value: String = row.get(1).map_err(|e| {
+                    WenlanError::VectorDb(format!("truth read controls value: {e}"))
+                })?;
+                if key == super::claim_derivation::SUPPORT_RECONCILE_FRONTIER_KEY {
+                    if value != super::claim_derivation::SUPPORT_RECONCILE_COMPLETE {
+                        frontier = Some(value);
+                    }
+                } else if key == CLAIM_PROMOTER_ENFORCEMENT_KEY {
+                    enforce = value.trim() == "1";
+                }
+            }
+            (frontier, enforce)
+        };
+        // Chunked because SQLite caps bound parameters, and a page list comes
+        // from a response payload whose length nobody here controls.
+        for chunk in page_ids.chunks(400) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT t.page_id, t.support_status, t.human_reviewed, t.evaluated_at,
+                        t.page_version, p.version, p.content,
+                        t.reviewed_page_version, t.reviewed_page_digest,
+                        m.page_version_digest, m.extractor_version,
+                        m.inventory_count > 0
+                        AND (
+                            SELECT COUNT(*)
+                              FROM page_version_claims membership
+                             WHERE membership.page_id = t.page_id
+                               AND membership.page_version = t.page_version
+                        ) = m.inventory_count
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM page_version_claims pvc
+                             WHERE pvc.page_id = t.page_id
+                               AND pvc.page_version = t.page_version
+                               AND NOT EXISTS (
+                                   SELECT 1
+                                     FROM edges e
+                                     JOIN claim_judge_eligibility j
+                                       ON j.model_id = json_extract(e.payload, '$.model_id')
+                                      AND j.model_version = json_extract(e.payload, '$.model_version')
+                                      AND j.prompt_version = json_extract(e.payload, '$.prompt_version')
+                                    WHERE e.edge_type = 'supports'
+                                      AND e.src_kind = 'claim_revision'
+                                      AND e.src_id = pvc.claim_revision_id
+                                      AND e.valid_until IS NULL
+                                      AND e.superseded_by IS NULL
+                                      AND j.state IN ('active', 'draining')
+                                      AND json_type(e.payload, '$.score') IN ('integer', 'real')
+                                      AND json_extract(e.payload, '$.score') >= j.threshold
+                               )
+                        ) AS live_support_eligible
+                   FROM page_truth_state t
+                   LEFT JOIN pages p ON p.id = t.page_id
+                   LEFT JOIN claim_derivation_markers m
+                     ON m.page_id = t.page_id AND m.page_version = t.page_version
+                  WHERE t.page_id IN ({placeholders})"
+            );
+            let params = chunk
+                .iter()
+                .map(|id| libsql::Value::from(id.as_str()))
+                .collect::<Vec<_>>();
+            let mut rows = conn
+                .query(&sql, params)
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("page_truth_states: {e}")))?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("page_truth_states next: {e}")))?
+            {
+                let page_id: String = row.get(0).unwrap_or_default();
+                let status: String = row.get(1).unwrap_or_default();
+                let reviewed: i64 = row.get(2).unwrap_or(0);
+                // `support_status` cannot answer this alone. Its only
+                // non-supported value is `provisional`, which migration 99
+                // stamps on every pre-existing page with the reason "never
+                // evaluated: predates claim derivation" -- so `provisional`
+                // covers both "nobody looked" and "looked, and the evidence
+                // fell short". `evaluated_at` is what separates them, and it is
+                // a nullable column rather than a third `support_status` value
+                // because SQLite cannot widen a CHECK without rebuilding the
+                // table.
+                //
+                // `unwrap_or(None)` puts a malformed or absent column on the
+                // unjudged side -- the side that keeps a page's file.
+                let evaluated_at: Option<i64> = row.get(3).unwrap_or(None);
+                // The version the verdict was reached on, and the one the page
+                // is at now. A malformed or absent either side means the
+                // comparison cannot be made, so it is not made -- the same
+                // "unknown is not a judgement" rule as the column above, applied
+                // to the question of whether the judgement is still about this
+                // text.
+                let judged_version: Option<i64> = row.get(4).unwrap_or(None);
+                let live_version: Option<i64> = row.get(5).unwrap_or(None);
+                let live_content: Option<String> = row.get(6).unwrap_or(None);
+                let reviewed_version: Option<i64> = row.get(7).unwrap_or(None);
+                let reviewed_digest: Option<String> = row.get(8).unwrap_or(None);
+                // The derivation marker for the version this verdict was reached
+                // on. The version number alone cannot see a same-version content
+                // replacement: an edit that rewrites the prose without bumping
+                // `version` leaves a verdict about text the page no longer
+                // holds, and the numbers still agree.
+                let marker_digest: Option<String> = row.get(9).unwrap_or(None);
+                let marker_extractor: Option<i64> = row.get(10).unwrap_or(None);
+                let live_support_eligible: i64 = row.get(11).unwrap_or(0);
+                let live_digest = live_content
+                    .as_deref()
+                    .map(crate::provenance::revision_content_digest);
+                let versions_agree = match (judged_version, live_version) {
+                    (Some(judged), Some(live)) => judged == live,
+                    _ => true,
+                };
+                // A verdict is readable only while the derivation it came out
+                // of still describes this page. All three parts are required
+                // and an absent one is a failure, not a pass.
+                //
+                // The marker must EXIST. Defaulting a missing marker to
+                // agreement was the hole: `evaluate_page_support` treats a
+                // missing marker as `Unevaluated` — condition 1 — so the writer
+                // and the reader disagreed about the same page, and the reader
+                // was the lenient one. Nothing reclassifies by tightening it,
+                // because a row can only read as `Supported` or `Unsupported` in
+                // the first place if `support_status = 'supported'` or
+                // `evaluated_at` is set, and both of those come from
+                // finalization, which required a matching marker. Migration 99's
+                // backfilled rows have neither, so they are `Unevaluated` under
+                // either rule.
+                //
+                // The EXTRACTOR must be current, for the reason
+                // `claim_derivation_markers` records it at all: identical page
+                // text under a changed extractor yields a different claim set,
+                // so an old marker no longer describes the inventory the verdict
+                // was reached over. Bumping `EXTRACTOR_VERSION` re-queues every
+                // page, and until this check the stored `supported` went on
+                // being served the whole time that queue drained.
+                let derivation_is_current = match (&marker_digest, marker_extractor, &live_digest) {
+                    (Some(marker), Some(extractor), Some(live)) => {
+                        marker == live && extractor == super::claim_derivation::EXTRACTOR_VERSION
+                    }
+                    _ => false,
+                };
+                let describes_live_text = versions_agree && derivation_is_current;
+                // Ordered by `page_id` because that is the order the reconciler
+                // walks in, so one scalar comparison decides whether this page
+                // is behind the cursor. `None` means nothing is withheld: the
+                // pass finished, or none has ever begun here.
+                let reconciled = unproved_after
+                    .as_deref()
+                    .is_none_or(|cursor| page_id.as_str() <= cursor);
+                let support = match (status.as_str(), evaluated_at) {
+                    _ if !describes_live_text => crate::truth_contract::Support::Unevaluated,
+                    // A stored `supported` the current pass has not re-proved
+                    // is not a verdict yet, and lands on the same fail-safe
+                    // every other unknown here does -- the page keeps its file
+                    // and stops being asserted as supported.
+                    ("supported", _) if !reconciled => crate::truth_contract::Support::Unevaluated,
+                    // Materialized reconciliation is deliberately bounded, but
+                    // registry changes take effect immediately. Every claim in
+                    // this exact page version must still have a live support
+                    // edge whose exact judge triple is eligible at its current
+                    // threshold; the stored row remains a reconciliation receipt.
+                    ("supported", _) if live_support_eligible != 1 => {
+                        crate::truth_contract::Support::Unevaluated
+                    }
+                    ("supported", _) => crate::truth_contract::Support::Supported,
+                    (_, Some(_)) if enforce_promoter => crate::truth_contract::Support::Unsupported,
+                    // Keep the durable evaluated outcome for corpus measurement,
+                    // but do not let it hide or archive the whole page while the
+                    // promoter is running shadow/advisory.
+                    (_, Some(_)) => crate::truth_contract::Support::Unevaluated,
+                    (_, None) => crate::truth_contract::Support::Unevaluated,
+                };
+                // Human approval outranks every machine verdict
+                // (`truth_contract::visible_at` returns Full on it alone), which
+                // is exactly why it may not be trusted raw. A person approves a
+                // SPECIFIC text: the schema stores the version and digest they
+                // approved, and the CHECK constraint guarantees both are present
+                // whenever the flag is set. Unlike the machine axis above, an
+                // unverifiable approval is DENIED rather than waved through --
+                // granting perpetual visibility on an unreadable page or an
+                // absent digest is the fail-open direction, and the fallback is
+                // merely the machine state, never a deletion.
+                let human_reviewed = reviewed == 1
+                    && matches!((reviewed_version, live_version), (Some(a), Some(b)) if a == b)
+                    && matches!(
+                        (reviewed_digest.as_deref(), live_digest.as_deref()),
+                        (Some(a), Some(b)) if a == b
+                    );
+                out.insert(
+                    page_id,
+                    PageTruth {
+                        support,
+                        human_reviewed,
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// One call's verdict for a batch of pages -- **the** entry point every
+    /// adapter uses.
+    ///
+    /// At generation 0 this is a single `app_metadata` read and every page comes
+    /// back `Full`, so an inert adapter costs one cheap lookup and never touches
+    /// `page_truth_state` at all. That is what makes installing 79 of them
+    /// before the cutover affordable.
+    ///
+    /// A page ID with no entry in the result was not asked about; adapters
+    /// should treat a missing key the same as `Hidden` rather than as
+    /// permission, but the map is total over `page_ids` by construction.
+    pub async fn page_visibility(
+        &self,
+        grant: &TruthGrant,
+        page_ids: &[String],
+    ) -> Result<HashMap<String, Visibility>, WenlanError> {
+        let generation = self.truth_cutover_generation().await?;
+        if generation == 0 {
+            return Ok(page_ids
+                .iter()
+                .map(|id| (id.clone(), Visibility::Full))
+                .collect());
+        }
+        let states = self.page_truth_states(page_ids).await?;
+        Ok(page_ids
+            .iter()
+            .map(|id| {
+                // A page with no row at all has never been judged either, so it
+                // gets the unjudged verdict rather than the failed one. Same
+                // reasoning as the NULL `evaluated_at` above: absence of a
+                // judgement is not a judgement.
+                let truth = states.get(id).copied().unwrap_or(PageTruth {
+                    support: crate::truth_contract::Support::Unevaluated,
+                    human_reviewed: false,
+                });
+                (
+                    id.clone(),
+                    visible_at(generation, grant, id, truth.support, truth.human_reviewed),
+                )
+            })
+            .collect())
+    }
+
+    /// Advance (or roll back) the cutover generation.
+    ///
+    /// PR-B calls this only from tests. PR-C owns the production advance, which
+    /// is a two-phase fenced ceremony this setter is merely the last step of --
+    /// so nothing here should be read as permission to flip it.
+    ///
+    /// # Advancing this alone is destructive, not protective
+    ///
+    /// As of PR-B the ONLY production consumer of [`Self::page_visibility`] is
+    /// the projection-directory invariant in `export::knowledge`, which DELETES
+    /// the `.md` file of every page the verdict hides. No HTTP adapter reads the
+    /// grant the guard resolves -- `select_visible_pages` filters on scope,
+    /// trust tier and `kind`, and never consults truth state at all.
+    ///
+    /// So the destructive half of this contract is wired and the protective half
+    /// is not. Advancing the generation today would evict pages from the user's
+    /// vault while every page route kept serving them. PR-C must land the
+    /// adapters BEFORE the ceremony, not alongside it.
+    pub async fn set_truth_cutover_generation(&self, generation: i64) -> Result<(), WenlanError> {
+        self.set_app_metadata(TRUTH_CUTOVER_GENERATION_KEY, &generation.to_string())
+            .await
+    }
+
+    // ==================== the writer fence ====================
+
+    /// The durable cutover fence. Absent means [`CutoverFence::INITIAL`].
+    ///
+    /// A value that does not parse is an **error**, not a default. Every other
+    /// gate in this module fails toward inert, but "inert" for a fence means
+    /// letting writers through, and an indeterminate fence is precisely the
+    /// state where that is unsafe -- recovery consults durable state, never a
+    /// guess. The error propagates into
+    /// [`crate::truth_adapter::page_write_permit`], which then refuses the write.
+    pub async fn cutover_fence(&self) -> Result<CutoverFence, WenlanError> {
+        let Some(raw) = self.get_app_metadata(TRUTH_CUTOVER_FENCE_KEY).await? else {
+            return Ok(CutoverFence::INITIAL);
+        };
+        CutoverFence::parse(raw.trim()).ok_or_else(|| {
+            WenlanError::VectorDb(format!(
+                "cutover fence is unreadable ({raw:?}); refusing to guess whether a \
+                 ceremony is in flight"
+            ))
+        })
+    }
+
+    /// Swap the fence from `observed` to `next`, atomically. `false` means
+    /// somebody else moved it first.
+    ///
+    /// `set_app_metadata` cannot express this: it is an unconditional upsert,
+    /// with nowhere to put the `WHERE value = ?3` predicate that makes the swap
+    /// a compare-and-set rather than a clobber. The second statement exists only
+    /// for the first ceremony a database ever runs, where the row is absent
+    /// rather than holding the initial value; both run under the same connection
+    /// guard, and `app_metadata.key` is a primary key, so exactly one of two
+    /// racing callers can see `changed == 1`.
+    async fn swap_cutover_fence(
+        &self,
+        observed: CutoverFence,
+        next: CutoverFence,
+    ) -> Result<bool, WenlanError> {
+        let conn = self.conn.lock().await;
+        let mut changed = conn
+            .execute(
+                "UPDATE app_metadata SET value = ?2 WHERE key = ?1 AND value = ?3",
+                libsql::params![TRUTH_CUTOVER_FENCE_KEY, next.encode(), observed.encode()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("swap_cutover_fence update: {e}")))?;
+        if changed == 0 && observed == CutoverFence::INITIAL {
+            changed = conn
+                .execute(
+                    "INSERT INTO app_metadata (key, value)
+                     SELECT ?1, ?2
+                      WHERE NOT EXISTS (SELECT 1 FROM app_metadata WHERE key = ?1)",
+                    libsql::params![TRUTH_CUTOVER_FENCE_KEY, next.encode()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("swap_cutover_fence insert: {e}")))?;
+        }
+        Ok(changed == 1)
+    }
+
+    /// Take the cutover lease: `off` -> `preparing`, at a new epoch.
+    ///
+    /// From here until commit or abort, [`crate::truth_adapter::page_write_permit`]
+    /// refuses every page write, so nothing lands in the vault behind the pass
+    /// the ceremony is about to run.
+    pub async fn begin_cutover(&self) -> Result<CutoverLease, WenlanError> {
+        let observed = self.cutover_fence().await?;
+        if observed.phase != CutoverPhase::Off {
+            return Err(WenlanError::VectorDb(format!(
+                "cannot begin a cutover: the fence is at epoch {} phase {}",
+                observed.epoch,
+                observed.phase.as_str()
+            )));
+        }
+        let next = observed.next(CutoverPhase::Preparing);
+        if !self.swap_cutover_fence(observed, next).await? {
+            return Err(WenlanError::VectorDb(
+                "cannot begin a cutover: the fence moved underneath us".to_string(),
+            ));
+        }
+        Ok(CutoverLease { fence: next })
+    }
+
+    /// Commit the cutover: write the generation, *then* release the fence.
+    ///
+    /// That order is the §7.5 ordering invariant. Releasing first would reopen
+    /// page writes against a generation that has not been committed yet, which
+    /// is the window the whole fence exists to close.
+    ///
+    /// Refuses unless the fence still reads exactly what the lease was minted
+    /// at -- an epoch bump by anyone else means this lease is stale.
+    pub async fn commit_cutover(
+        &self,
+        lease: CutoverLease,
+        generation: i64,
+    ) -> Result<(), WenlanError> {
+        let observed = self.cutover_fence().await?;
+        if observed != lease.fence {
+            return Err(WenlanError::VectorDb(format!(
+                "cannot commit the cutover: lease is epoch {} phase {}, fence is epoch {} phase {}",
+                lease.fence.epoch,
+                lease.fence.phase.as_str(),
+                observed.epoch,
+                observed.phase.as_str()
+            )));
+        }
+        self.set_truth_cutover_generation(generation).await?;
+        if !self
+            .swap_cutover_fence(observed, observed.next(CutoverPhase::Committed))
+            .await?
+        {
+            return Err(WenlanError::VectorDb(
+                "the cutover generation is committed but the fence could not be released; \
+                 the fence moved underneath us"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Give the lease back without committing: `preparing` -> `off`, at a new
+    /// epoch.
+    ///
+    /// The new epoch is the point. Returning to the *same* `off` would let a
+    /// writer that captured the pre-ceremony fence swap successfully, and that
+    /// writer's page is one the aborted ceremony may already have examined.
+    pub async fn abort_cutover(&self, lease: CutoverLease) -> Result<(), WenlanError> {
+        let observed = self.cutover_fence().await?;
+        if observed != lease.fence || observed.phase != CutoverPhase::Preparing {
+            return Err(WenlanError::VectorDb(format!(
+                "cannot abort the cutover: lease is epoch {} phase {}, fence is epoch {} phase {}",
+                lease.fence.epoch,
+                lease.fence.phase.as_str(),
+                observed.epoch,
+                observed.phase.as_str()
+            )));
+        }
+        if !self
+            .swap_cutover_fence(observed, observed.next(CutoverPhase::Off))
+            .await?
+        {
+            return Err(WenlanError::VectorDb(
+                "cannot abort the cutover: the fence moved underneath us".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Release a fence stranded at `preparing`, at a new epoch. `true` means one
+    /// was found and released.
+    ///
+    /// [`Self::abort_cutover`] cannot do this: it needs a [`CutoverLease`], and a
+    /// lease dies with the process that minted it. A ceremony killed between
+    /// `begin_cutover` and `commit_cutover` -- SIGINT during the eviction loop,
+    /// a panic, a power cut -- therefore leaves `preparing` on disk with nothing
+    /// alive that can take it back, and `preparing` refuses **every** page write.
+    /// Fail-closed, but permanently, and the only remaining move would be editing
+    /// `app_metadata` by hand against a live WAL.
+    ///
+    /// Only the daemon's startup calls this, and only because a ceremony and a
+    /// running daemon are mutually exclusive by construction: `truth-cutover`
+    /// takes the data-root lock, refuses while the port answers, and refuses
+    /// while the service unit exists. So a fence still reading `preparing` when
+    /// the daemon boots belongs to a ceremony that died -- there is no live lease
+    /// to invalidate.
+    ///
+    /// A lease that somehow survived cannot commit onto the released fence: the
+    /// phase alone already differs, so the tuple compare refuses. The epoch still
+    /// bumps, to keep it monotone the way every other transition does -- not
+    /// because the bump is what closes that case. And `committed` is untouched:
+    /// only `preparing` is releasable, so the forward-only rule still holds.
+    pub async fn release_stranded_cutover_fence(&self) -> Result<bool, WenlanError> {
+        let observed = self.cutover_fence().await?;
+        if observed.phase != CutoverPhase::Preparing {
+            return Ok(false);
+        }
+        self.swap_cutover_fence(observed, observed.next(CutoverPhase::Off))
+            .await
+    }
+}
+
+#[cfg(test)]
+#[path = "truth_exposure_test.rs"]
+mod tests;

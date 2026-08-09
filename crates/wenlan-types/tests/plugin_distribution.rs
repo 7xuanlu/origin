@@ -43,7 +43,8 @@ fn plugin_setup_repairs_stale_daemon_versions() {
     for text in [&setup, &codex_setup] {
         for needle in [
             "Compare daemon version vs plugin manifest version",
-            "If mismatch, repair the runtime",
+            "If mismatch, check the direction before repairing.",
+            "Only if the daemon release is older than the plugin release, repair the",
             "curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/v${RELEASE_VER}/install.sh | bash",
             "wenlan setup --basic",
             "wenlan background on",
@@ -168,7 +169,7 @@ fn lint_is_the_only_public_repair_flow_on_both_surfaces() {
             "apply repair <manifest-id> <manifest-digest>",
             "Never call apply_lint_repair in the same turn as prepare_lint_repair",
             "applied_unverified",
-            "no CLI or HTTP fallback",
+            "CLI fallback: `wenlan lint --profile deep --agent-assist`",
         ] {
             assert!(text.contains(needle), "{path} missing guardrail: {needle}");
         }

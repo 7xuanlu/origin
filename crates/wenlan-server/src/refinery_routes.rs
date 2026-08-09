@@ -21,7 +21,21 @@ use wenlan_types::responses::{
 
 use crate::error::ServerError;
 use crate::memory_routes::extract_agent_name;
-use crate::state::ServerState;
+use crate::route_registry::{get, post, TrackedRouter};
+use crate::state::{ServerState, SharedState};
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route("/api/refinery/queue", get(handle_list_refinements))
+        .route(
+            "/api/refinery/queue/{id}/reject",
+            post(handle_reject_refinement),
+        )
+        .route(
+            "/api/refinery/queue/{id}/accept",
+            post(handle_accept_refinement),
+        )
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ListRefinementsQuery {

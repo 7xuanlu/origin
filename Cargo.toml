@@ -21,15 +21,15 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.14.1"   # x-release-please-version
+version = "0.15.5"   # x-release-please-version
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/7xuanlu/wenlan"
 
 [workspace.dependencies]
 # Internal crates — both path AND version required for cargo publish
-wenlan-types = { path = "crates/wenlan-types", version = "0.14.1" }
-wenlan-core  = { path = "crates/wenlan-core",  version = "0.14.1" }
+wenlan-types = { path = "crates/wenlan-types", version = "0.15.5" }
+wenlan-core  = { path = "crates/wenlan-core",  version = "0.15.5" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -71,23 +71,13 @@ tower-http = { version = "0.6", features = ["cors"] }
 libsql = { version = "0.9", default-features = false, features = ["core", "replication"] }
 
 # Embeddings & LLM
-# fastembed defaults are: hf-hub, hf-hub-native-tls, image-models,
-# ort-download-binaries-native-tls. Swap both TLS features to the rustls
-# variants to keep native-tls (and its openssl-sys transitive) out of the
-# dep graph. Keep `hf-hub` + `image-models` so the public surface stays
-# identical.
+# FastEmbed's shared surface is target-independent. wenlan-core selects the
+# ONNX Runtime linkage mode per target: dynamic on Windows so the release DLL
+# is actually exercised, downloaded static binaries elsewhere.
 fastembed = { version = "5", default-features = false, features = [
     "hf-hub",
     "hf-hub-rustls-tls",
     "image-models",
-    # ort-download-binaries-native-tls (NOT the rustls variant) because the
-    # rustls variant didn't trigger ort-sys's prebuilt-onnxruntime download
-    # in cross (build failed with "could not find native static library
-    # onnxruntime"). native-tls drags openssl-sys back into the graph, but
-    # the workspace `openssl-sys = { features = ["vendored"] }` declaration
-    # below compiles OpenSSL from source so cross's stale system OpenSSL is
-    # irrelevant.
-    "ort-download-binaries-native-tls",
 ] }
 
 # openssl-sys vendored — belt + suspenders. Even with fastembed swapped to
@@ -101,6 +91,7 @@ openssl-sys = { version = "0.9", features = ["vendored"] }
 # Utilities
 regex = "1"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 dirs = "6"
 hf-hub = "0.4"
@@ -113,20 +104,19 @@ pdf-extract = "0.10"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 service-manager = "0.11"
 serde_yaml = "0.9"
-sysinfo = "0.33"
+sysinfo = "=0.38.3"
 toml = "0.8"
 fs2 = "0.4"
 cap-std = "=4.0.2"
 cap-fs-ext = "=4.0.2"
 
-# Release profile tuned for CI throughput. Default is `codegen-units = 1`
-# + no `lto`, optimized for runtime perf at the cost of long link times.
-# Wenlan's bottleneck is build time, not the last 5% of release-binary
-# perf. `codegen-units = 16` lets rustc fan out across cores; `lto =
-# "thin"` keeps the LTO pass cheap but still inlines hot paths. Net:
-# ~30-50% off link time on Linux/Windows, binary ~5-10% larger.
+# Release profile tuned for CI throughput. Cargo's non-incremental default is
+# already `codegen-units = 16`; keep it explicit as a measured build contract.
+# `lto = "off"` is the only setting that fully disables LTO: `false` still
+# performs thin local LTO, while `"thin"` adds cross-crate link work. See
+# https://doc.rust-lang.org/cargo/reference/profiles.html#lto.
 [profile.release]
 codegen-units = 16
-lto = "thin"
+lto = "off"
 strip = "debuginfo"
 incremental = false

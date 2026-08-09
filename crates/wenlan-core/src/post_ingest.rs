@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Post-ingest enrichment pipeline.
 //!
-//! Runs asynchronously after `store_memory` returns. Each step is
-//! best-effort: failures are logged but do not block the store response
-//! or subsequent steps.
+//! Legacy one-shot enrichment entrypoint retained for eval and explicit core
+//! callers. Production store/import requests only register durable inputs;
+//! fixed-stage ambient slices below own background work.
 //!
 //! Steps:
 //! 1. Entity auto-linking (vector search entities > 0.85 distance → set entity_id)
 //!    1b. Store-time entity extraction (LLM extract if auto-link found no match)
-//! 2. Entity creation suggestion (stub — full impl in refinery Task 5)
-//! 3. Title enrichment (LLM short title if current looks truncated)
+//! 2. Title enrichment (LLM short title if current looks truncated)
 //! 4. (Removed — recaps now handled by event-driven scheduler)
 //! 5. Concept growth (update matching page with new memory)
 //! 6. (Removed -- enrichment status derived from per-step outcomes in enrichment_steps table)
@@ -39,6 +38,336 @@ pub(crate) enum TitleEnrichResult {
     NotNeeded,
     /// Title IS truncated but LLM output was rejected (too long, generic, etc.).
     LlmRejected,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TitleEnrichmentSliceReport {
+    pub selected: bool,
+    pub committed: bool,
+    pub llm_calls: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageGrowthSliceReport {
+    pub selected: bool,
+    pub matched: bool,
+    pub terminal_no_match: bool,
+    pub committed: bool,
+    pub llm_calls: usize,
+}
+
+/// Advance one durable title stage. The selector admits only titles that still
+/// look automatically truncated; the derived title and receipt commit together
+/// against both the memory generation and the title snapshot.
+pub async fn run_title_enrichment_slice(
+    db: &MemoryDB,
+    llm: &Arc<dyn LlmProvider>,
+) -> Result<TitleEnrichmentSliceReport, WenlanError> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let Some(input) = db.get_title_enrichment_candidate(MAX_ATTEMPTS).await? else {
+        return Ok(TitleEnrichmentSliceReport::default());
+    };
+    let Some(title) = crate::refinery::generate_short_title(llm, &input.content).await else {
+        let attempt = input.prior_attempts.saturating_add(1);
+        let status = if attempt >= MAX_ATTEMPTS {
+            "abandoned"
+        } else {
+            "needs_retry"
+        };
+        let committed = db
+            .record_enrichment_step_at_version(
+                &input.source_id,
+                "title_enrich",
+                status,
+                Some("title generation failed or output was rejected"),
+                input.version,
+            )
+            .await?;
+        return Ok(TitleEnrichmentSliceReport {
+            selected: true,
+            committed,
+            llm_calls: 1,
+        });
+    };
+    let committed = db
+        .commit_title_at_version(&input.source_id, input.version, &input.title, &title)
+        .await?;
+    Ok(TitleEnrichmentSliceReport {
+        selected: true,
+        committed,
+        llm_calls: 1,
+    })
+}
+
+async fn record_page_growth_failure(
+    db: &MemoryDB,
+    input: &crate::db::PageGrowthInput,
+    error: &str,
+) -> Result<bool, WenlanError> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let attempt = input.prior_attempts.saturating_add(1);
+    let status = if attempt >= MAX_ATTEMPTS {
+        "abandoned"
+    } else {
+        "needs_retry"
+    };
+    db.record_enrichment_step_at_version(
+        &input.source_id,
+        "page_growth",
+        status,
+        Some(error),
+        input.version,
+    )
+    .await
+}
+
+/// Advance one restart-safe Page-growth item. Matching is CPU-only and occurs
+/// before admission to the model. A no-match result is terminal for the
+/// current memory generation; a match gets exactly one model request and a
+/// dual Memory/Page CAS commit.
+pub async fn run_page_growth_slice(
+    db: &MemoryDB,
+    llm: &Arc<dyn LlmProvider>,
+    prompts: &PromptRegistry,
+    growth_threshold: f64,
+    knowledge_path: Option<&std::path::Path>,
+) -> Result<PageGrowthSliceReport, WenlanError> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let Some(input) = db
+        .get_page_growth_candidate(MAX_ATTEMPTS, crate::db::entity_sweep_enabled())
+        .await?
+    else {
+        return Ok(PageGrowthSliceReport::default());
+    };
+
+    let mem_embedding = match db.generate_embeddings(std::slice::from_ref(&input.content)) {
+        Ok(mut embeddings) => embeddings.pop(),
+        Err(error) => {
+            let committed =
+                record_page_growth_failure(db, &input, &format!("memory embedding: {error}"))
+                    .await?;
+            return Ok(PageGrowthSliceReport {
+                selected: true,
+                committed,
+                ..Default::default()
+            });
+        }
+    };
+    let Some(mem_embedding) = mem_embedding else {
+        let committed =
+            record_page_growth_failure(db, &input, "memory embedding was empty").await?;
+        return Ok(PageGrowthSliceReport {
+            selected: true,
+            committed,
+            ..Default::default()
+        });
+    };
+
+    let Some(page) = db
+        .find_matching_page_scoped(
+            input.entity_id.as_deref(),
+            &mem_embedding,
+            growth_threshold,
+            input.space.as_deref(),
+            false,
+        )
+        .await?
+    else {
+        let committed = db
+            .record_enrichment_step_at_version(
+                &input.source_id,
+                "page_growth",
+                "ok",
+                None,
+                input.version,
+            )
+            .await?;
+        return Ok(PageGrowthSliceReport {
+            selected: true,
+            matched: false,
+            terminal_no_match: true,
+            committed,
+            llm_calls: 0,
+        });
+    };
+    let expected_source_revision = db.get_page_source_revision(&page.id).await?;
+
+    let clean_current = crate::citations::strip_markers(&page.content);
+    let evidence = db.get_page_evidence(&page.id).await.unwrap_or_default();
+    let mut locators: Vec<String> = evidence
+        .iter()
+        .filter(|item| item.source_kind == "memory")
+        .filter_map(|item| item.locator.clone())
+        .filter(|locator| locator != &input.source_id)
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    locators.retain(|locator| seen.insert(locator.clone()));
+    locators.push(input.source_id.clone());
+
+    let memories = db.get_memories_by_source_ids(&locators).await?;
+    let by_source: std::collections::HashMap<_, _> = memories
+        .into_iter()
+        .map(|memory| (memory.source_id.clone(), memory))
+        .collect();
+    let kinds = db.resolve_source_kinds(&locators).await.unwrap_or_default();
+    let numbered: Vec<crate::citations::NumberedSource> = locators
+        .iter()
+        .filter_map(|locator| by_source.get(locator))
+        .enumerate()
+        .map(|(index, memory)| crate::citations::NumberedSource {
+            index: (index + 1) as u32,
+            source_kind: kinds
+                .get(&memory.source_id)
+                .cloned()
+                .unwrap_or_else(|| "memory".to_string()),
+            locator: memory.source_id.clone(),
+            text: memory.content.chars().take(800).collect(),
+        })
+        .collect();
+    if numbered
+        .last()
+        .is_none_or(|source| source.locator != input.source_id)
+    {
+        let committed = record_page_growth_failure(
+            db,
+            &input,
+            "triggering memory could not be resolved for citation",
+        )
+        .await?;
+        return Ok(PageGrowthSliceReport {
+            selected: true,
+            matched: true,
+            terminal_no_match: false,
+            committed,
+            llm_calls: 0,
+        });
+    }
+    if db.get_page_source_revision(&page.id).await? != expected_source_revision {
+        return Ok(PageGrowthSliceReport {
+            selected: true,
+            matched: true,
+            terminal_no_match: false,
+            committed: false,
+            llm_calls: 0,
+        });
+    }
+    let existing_sources = &numbered[..numbered.len() - 1];
+    let user_prompt = format!(
+        "## Current Concept\n{}\n\n## Numbered Sources\n{}\n\n## New Memory\n[{}] {}",
+        clean_current,
+        crate::citations::build_numbered_block(existing_sources),
+        numbered.len(),
+        input.content,
+    );
+
+    let response = match llm
+        .generate(crate::llm_provider::LlmRequest {
+            system_prompt: Some(prompts.update_page.clone()),
+            user_prompt,
+            max_tokens: 1024,
+            temperature: 0.1,
+            label: Some("update_page".to_string()),
+            timeout_secs: None,
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let committed =
+                record_page_growth_failure(db, &input, &format!("page growth LLM: {error}"))
+                    .await?;
+            return Ok(PageGrowthSliceReport {
+                selected: true,
+                matched: true,
+                terminal_no_match: false,
+                committed,
+                llm_calls: 1,
+            });
+        }
+    };
+    let updated = crate::llm_provider::strip_think_tags(&response);
+    let updated = updated.trim();
+    if updated.is_empty() {
+        let committed =
+            record_page_growth_failure(db, &input, "page growth output was empty").await?;
+        return Ok(PageGrowthSliceReport {
+            selected: true,
+            matched: true,
+            terminal_no_match: false,
+            committed,
+            llm_calls: 1,
+        });
+    }
+
+    let (updated_body, citations, stats) =
+        crate::citations::process_citation_output(updated, &numbered);
+    if let Some(threshold) = crate::post_write::merge_shrink_threshold() {
+        if !crate::retrieval::integrity::body_shrink_ok(&page.content, &updated_body, threshold) {
+            let committed =
+                record_page_growth_failure(db, &input, "page growth shrink guard rejected output")
+                    .await?;
+            return Ok(PageGrowthSliceReport {
+                selected: true,
+                matched: true,
+                terminal_no_match: false,
+                committed,
+                llm_calls: 1,
+            });
+        }
+    }
+
+    let mut source_ids = page.source_memory_ids.clone();
+    if !source_ids.contains(&input.source_id) {
+        source_ids.push(input.source_id.clone());
+    }
+    let citations_json = serde_json::to_string(&citations).unwrap_or_else(|_| "[]".to_string());
+    let write = crate::post_write::update_page_growth_at_versions(
+        db,
+        &page.id,
+        UpdatePageRequest {
+            content: updated_body,
+            source_memory_ids: source_ids,
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        page.version,
+        expected_source_revision,
+        &input.source_id,
+        input.version,
+        knowledge_path,
+        Some((citations_json, stats.summary())),
+    )
+    .await?;
+    if write.wrote {
+        let agent = db
+            .get_memory_source_agent(&input.source_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "system".to_string());
+        let source_ids = vec![input.source_id.clone()];
+        if let Err(error) = db
+            .log_agent_activity(
+                &agent,
+                "page_grow",
+                &source_ids,
+                None,
+                &format!("grew \"{}\"", page.title),
+            )
+            .await
+        {
+            log::warn!("[page_growth] activity log failed: {error}");
+        }
+    }
+
+    Ok(PageGrowthSliceReport {
+        selected: true,
+        matched: true,
+        terminal_no_match: false,
+        committed: write.wrote,
+        llm_calls: 1,
+    })
 }
 
 /// True iff the caller has signalled cancellation. `None` (the default-OFF
@@ -124,11 +453,14 @@ pub async fn run_post_ingest_enrichment(
         if let Some(llm_ref) = llm {
             // Look up source_agent from the DB for batch window queries
             let agent = db.get_memory_source_agent(source_id).await.unwrap_or(None);
+            let persisted_space = db.get_memory_space(source_id).await.unwrap_or(None);
 
-            // Check for recent memories from the same agent for batched extraction
+            // Check for recent memories from the same agent and persisted Space
+            // for batched extraction. Space is a provenance boundary for
+            // derived writes even though entity identity remains global.
             let batch = match &agent {
                 Some(a) => db
-                    .find_recent_batch(a, tuning.batch_window_secs)
+                    .find_recent_batch(a, tuning.batch_window_secs, persisted_space.as_deref())
                     .await
                     .unwrap_or_default(),
                 None => Vec::new(),
@@ -150,12 +482,40 @@ pub async fn run_post_ingest_enrichment(
                     batch.len()
                 );
 
-                // Extract from combined content, link entities to all batch memories
-                match crate::refinery::extract_single_memory_entities(
-                    db, llm_ref, prompts, source_id, &combined,
-                )
-                .await
-                {
+                // Extract from combined content, then commit against the anchor's
+                // own content so span offsets stay char offsets into
+                // `memories.content` of the stamped `source_memory_id` (§2.2) --
+                // never against the combined batch blob.
+                let extraction = crate::refinery::extract_kg(llm_ref, prompts, &combined).await;
+                let commit_result = match extraction {
+                    Ok(mut kg) => {
+                        // A batch-extracted quote may belong to a non-anchor
+                        // window member. Re-locate it against the anchor's real
+                        // content and drop it on a miss -- never guess, never
+                        // fuzzy-match, never keep blob-based offsets.
+                        for kg_item in &mut kg {
+                            for rel in &mut kg_item.relations {
+                                if let Some(quote) = &rel.span {
+                                    if crate::extract::locate_span_chars(content, quote).is_none() {
+                                        rel.span = None;
+                                    }
+                                }
+                            }
+                        }
+                        crate::refinery::commit_kg(
+                            db,
+                            source_id,
+                            &kg,
+                            content,
+                            Some(&llm_ref.model_id()),
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+
+                // Link entities to all batch memories
+                match commit_result {
                     Ok(Some(eid)) => {
                         // Link all batch memories to the extracted entity
                         for (batch_sid, _) in &batch {
@@ -194,7 +554,16 @@ pub async fn run_post_ingest_enrichment(
                 // (skipping the inline LLM extract). Otherwise, run the LLM extract
                 // as today. Both paths return Result<Option<String>, WenlanError>.
                 match match precomputed_kg {
-                    Some(kg) => crate::refinery::commit_kg(db, source_id, &kg).await,
+                    Some(kg) => {
+                        crate::refinery::commit_kg(
+                            db,
+                            source_id,
+                            &kg,
+                            content,
+                            Some(&llm_ref.model_id()),
+                        )
+                        .await
+                    }
                     None => {
                         crate::refinery::extract_single_memory_entities(
                             db, llm_ref, prompts, source_id, content,
@@ -227,10 +596,6 @@ pub async fn run_post_ingest_enrichment(
                     }
                 }
             }
-        } else {
-            db.record_enrichment_step(source_id, "entity_extract", "skipped", None)
-                .await
-                .ok();
         }
     } else {
         db.record_enrichment_step(source_id, "entity_extract", "skipped", None)
@@ -241,52 +606,6 @@ pub async fn run_post_ingest_enrichment(
     if is_cancelled(cancel) {
         log::info!("[post_ingest] {source_id}: cancelled after entity_extract");
         return Ok(());
-    }
-
-    // 3. Concept contradiction check — flag related concepts for re-distill if new memory contradicts
-    match check_page_contradiction(db, source_id, content).await {
-        Ok(n) if n > 0 => {
-            log::info!("[post_ingest] {source_id}: flagged {n} page(s) for re-distill");
-            db.record_enrichment_step(source_id, "page_contradiction", "ok", None)
-                .await
-                .ok();
-        }
-        Ok(_) => {
-            db.record_enrichment_step(source_id, "page_contradiction", "ok", None)
-                .await
-                .ok();
-        }
-        Err(e) => {
-            log::warn!("[post_ingest] page contradiction check failed: {e}");
-            db.record_enrichment_step(
-                source_id,
-                "page_contradiction",
-                "failed",
-                Some(&e.to_string()),
-            )
-            .await
-            .ok();
-        }
-    }
-
-    // 4. Entity creation suggestion (stub — full extraction runs in refinery steep)
-    match suggest_entity_creation(db, content).await {
-        Ok(()) => {
-            db.record_enrichment_step(source_id, "entity_suggestion", "ok", None)
-                .await
-                .ok();
-        }
-        Err(e) => {
-            log::warn!("[post_ingest] entity suggestion failed: {e}");
-            db.record_enrichment_step(
-                source_id,
-                "entity_suggestion",
-                "failed",
-                Some(&e.to_string()),
-            )
-            .await
-            .ok();
-        }
     }
 
     if is_cancelled(cancel) {
@@ -450,98 +769,6 @@ pub(crate) async fn auto_link_entity(
         }
     }
     Ok(false)
-}
-
-/// Check if new memory content contradicts any related page.
-/// Uses FTS5 search to find related concepts, then checks for negation signals
-/// with topic overlap. Flags contradicting concepts for re-distill by adding the
-/// new memory to their source list.
-pub(crate) async fn check_page_contradiction(
-    db: &MemoryDB,
-    source_id: &str,
-    content: &str,
-) -> Result<usize, WenlanError> {
-    // Find concepts related to this memory via FTS5 (use first 100 chars as query)
-    let query: String = content
-        .split_whitespace()
-        .take(15)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let concepts = db.search_pages(&query, 3, None).await.unwrap_or_default();
-    if concepts.is_empty() {
-        return Ok(0);
-    }
-
-    let mut flagged = 0usize;
-    let content_lower = content.to_lowercase();
-
-    for page in &concepts {
-        // Quick heuristic: if the memory contains negation/update signals,
-        // it might contradict existing page content
-        let contradiction_signals = [
-            "not ",
-            "no longer",
-            "instead of",
-            "rather than",
-            "changed from",
-            "replaced",
-            "deprecated",
-            "wrong",
-            "incorrect",
-            "actually ",
-        ];
-
-        let has_signal = contradiction_signals
-            .iter()
-            .any(|s| content_lower.contains(s));
-        if !has_signal {
-            continue;
-        }
-
-        // Check if memory overlaps with page topic (bigram jaccard >= 0.15)
-        let overlap = crate::contradiction::bigram_jaccard(content, &page.title);
-        if overlap < 0.15 {
-            continue;
-        }
-
-        // This memory likely contradicts or updates the page — add it to sources and flag for re-distill
-        if !page.source_memory_ids.contains(&source_id.to_string()) {
-            let mut new_sources = page.source_memory_ids.clone();
-            new_sources.push(source_id.to_string());
-            // Update sources without changing content — re-distill will recompile
-            let _ = crate::post_write::update_page(
-                db,
-                &page.id,
-                UpdatePageRequest {
-                    content: page.content.clone(),
-                    source_memory_ids: new_sources,
-                    expected_version: None,
-                    caller_id: None,
-                    operation_id: None,
-                },
-                "page_growth",
-                false,
-                None,
-                None,
-            )
-            .await;
-            log::info!("[post_ingest] page '{}' flagged for re-distill due to potential contradiction from {}",
-                page.title, source_id);
-            flagged += 1;
-        }
-    }
-
-    Ok(flagged)
-}
-
-/// Stub for entity creation suggestion. Full implementation in Task 5 (refinery).
-pub(crate) async fn suggest_entity_creation(
-    _db: &MemoryDB,
-    _content: &str,
-) -> Result<(), WenlanError> {
-    // TODO: Detect entity-like proper nouns in content and queue
-    // 'suggest_entity' refinement action if no matching entity exists.
-    Ok(())
 }
 
 /// Generate a short topic title if the current title looks like a content truncation.
@@ -768,8 +995,16 @@ async fn write_grown_page(
     projection: &crate::export::knowledge::KnowledgeProjectionWrite,
 ) {
     match db.find_page_by_source_memory(source_id).await {
-        Ok(Some(page)) => match projection.write_page(&page) {
-            Ok(path) => log::info!("[post_ingest] wrote page to {path}"),
+        Ok(Some(page)) => match projection.write_page_gated(db, &page).await {
+            Ok(Some(path)) => log::info!("[post_ingest] wrote page to {path}"),
+            // Debug, not info: past the cutover this is the steady state for
+            // every provisional page, so at info it would be pure noise. It is
+            // still worth a line -- a page that silently stops being projected
+            // is exactly the thing someone will come looking for.
+            Ok(None) => log::debug!(
+                "[post_ingest] not projecting page {} — an automatic reader may not see it",
+                page.id
+            ),
             Err(e) => log::warn!("[post_ingest] knowledge write failed: {e}"),
         },
         Ok(None) => {}
@@ -837,12 +1072,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_suggest_entity_creation_stub() {
+    async fn title_slice_commits_one_current_result() {
         let (db, _dir) = test_db().await;
-        // Stub should always succeed
-        suggest_entity_creation(&db, "Alice uses PostgreSQL")
+        let content = "The ambient scheduler keeps enrichment invisible to users.";
+        db.upsert_documents(vec![make_doc("mem_title_slice", content)])
             .await
             .unwrap();
+        {
+            let conn = db.test_primary_session().await;
+            conn.execute(
+                "UPDATE memories SET title=?1 WHERE source_id='mem_title_slice'",
+                libsql::params![content],
+            )
+            .await
+            .unwrap();
+        }
+        let llm: Arc<dyn LlmProvider> =
+            Arc::new(crate::llm_provider::SequencedMockProvider::new(vec![
+                "Invisible Ambient Enrichment",
+            ]));
+
+        let report = run_title_enrichment_slice(&db, &llm).await.unwrap();
+
+        assert!(report.selected);
+        assert!(report.committed);
+        assert_eq!(report.llm_calls, 1);
+        let detail = db
+            .get_memory_detail("mem_title_slice")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.title, "Invisible Ambient Enrichment");
+        let receipt = db
+            .get_enrichment_steps("mem_title_slice")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|step| step.step == "title_enrich")
+            .expect("title receipt");
+        assert_eq!(receipt.status, "ok");
+        assert_eq!(receipt.input_version, Some(1));
     }
 
     #[tokio::test]
@@ -904,9 +1173,18 @@ mod tests {
         let steps = db.get_enrichment_steps("mem_step_record").await.unwrap();
         assert!(!steps.is_empty(), "should have recorded enrichment steps");
 
-        // entity_extract should be skipped (no LLM)
-        let extract = steps.iter().find(|s| s.step == "entity_extract").unwrap();
-        assert_eq!(extract.status, "skipped");
+        // No provider is deferred work, not a terminal successful skip. Leaving
+        // the step absent lets the ambient entity lane pick it up later.
+        assert!(
+            steps.iter().all(|s| s.step != "entity_extract"),
+            "no-provider entity extraction must remain ambient backlog"
+        );
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.step != "entity_suggestion" && step.step != "page_contradiction"),
+            "obsolete stub/heuristic stages must not emit receipts"
+        );
 
         // title_enrich should be skipped (no LLM)
         let title = steps.iter().find(|s| s.step == "title_enrich").unwrap();
@@ -971,7 +1249,10 @@ mod tests {
             .unwrap();
 
         let window_secs = 600; // 10 min — generous, covers any test timing jitter
-        let batch = db.find_recent_batch(agent, window_secs).await.unwrap();
+        let batch = db
+            .find_recent_batch(agent, window_secs, None)
+            .await
+            .unwrap();
         let ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
         assert!(ids.contains(&"mem_batch_a".to_string()));
         assert!(ids.contains(&"mem_batch_b".to_string()));
@@ -988,7 +1269,10 @@ mod tests {
         db.update_memory_entity_id("mem_batch_b", "entity_alice")
             .await
             .unwrap();
-        let batch_after = db.find_recent_batch(agent, window_secs).await.unwrap();
+        let batch_after = db
+            .find_recent_batch(agent, window_secs, None)
+            .await
+            .unwrap();
         let ids_after: Vec<String> = batch_after.iter().map(|(id, _)| id.clone()).collect();
         assert!(
             !ids_after.contains(&"mem_batch_b".to_string()),
@@ -1015,13 +1299,207 @@ mod tests {
             .await
             .unwrap();
 
-        let claude_batch = db.find_recent_batch("claude-code", 600).await.unwrap();
-        let cursor_batch = db.find_recent_batch("cursor", 600).await.unwrap();
+        let claude_batch = db
+            .find_recent_batch("claude-code", 600, None)
+            .await
+            .unwrap();
+        let cursor_batch = db.find_recent_batch("cursor", 600, None).await.unwrap();
         let claude_ids: Vec<String> = claude_batch.iter().map(|(id, _)| id.clone()).collect();
         let cursor_ids: Vec<String> = cursor_batch.iter().map(|(id, _)| id.clone()).collect();
 
         assert_eq!(claude_ids, vec!["mem_iso_claude"]);
         assert_eq!(cursor_ids, vec!["mem_iso_cursor"]);
+    }
+
+    #[tokio::test]
+    async fn find_recent_batch_never_mixes_persisted_spaces() {
+        let (db, _dir) = test_db().await;
+        db.create_space("work", None, false).await.unwrap();
+        db.create_space("personal", None, false).await.unwrap();
+
+        let agent = "space-partition-test";
+        let mut work_a = make_doc("mem_space_work_a", "Work Space batch item A.");
+        work_a.source_agent = Some(agent.to_string());
+        work_a.space = Some("work".to_string());
+        let mut work_b = make_doc("mem_space_work_b", "Work Space batch item B.");
+        work_b.source_agent = Some(agent.to_string());
+        work_b.space = Some("work".to_string());
+        let mut personal = make_doc("mem_space_personal", "Personal Space batch item.");
+        personal.source_agent = Some(agent.to_string());
+        personal.space = Some("personal".to_string());
+        let mut uncategorized =
+            make_doc("mem_space_uncategorized", "Uncategorized Space batch item.");
+        uncategorized.source_agent = Some(agent.to_string());
+
+        db.upsert_documents(vec![work_a, work_b, personal, uncategorized])
+            .await
+            .unwrap();
+
+        let work_batch = db
+            .find_recent_batch(agent, 600, Some("work"))
+            .await
+            .unwrap();
+        let work_ids: Vec<&str> = work_batch.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            work_ids,
+            vec!["mem_space_work_a", "mem_space_work_b"],
+            "derived extraction must stay inside the persisted work Space"
+        );
+
+        let uncategorized_batch = db.find_recent_batch(agent, 600, None).await.unwrap();
+        let uncategorized_ids: Vec<&str> = uncategorized_batch
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(uncategorized_ids, vec!["mem_space_uncategorized"]);
+    }
+
+    // ---- M3g Important-1: batch span base must be the anchor's own content ----
+
+    /// A CannedLlmProvider that always returns one Alice-works_on-Acme
+    /// relation carrying `quote` as its span, keyed on the
+    /// extract_knowledge_graph prompt (same pattern as `canned_alice` in
+    /// `kg/entity_extraction.rs`).
+    fn canned_relation_with_span(
+        quote: &str,
+    ) -> (
+        crate::prompts::PromptRegistry,
+        std::sync::Arc<dyn crate::llm_provider::LlmProvider>,
+    ) {
+        use crate::llm_provider::CannedLlmProvider;
+        let prompts = crate::prompts::PromptRegistry::default();
+        let key_fragment: String = prompts.extract_knowledge_graph.chars().take(30).collect();
+        let kg_json = serde_json::json!([{
+            "entities": [{"name": "Alice", "type": "person"}, {"name": "Acme", "type": "org"}],
+            "observations": [],
+            "relations": [{"from": "Alice", "to": "Acme", "type": "works_on", "span": quote}]
+        }])
+        .to_string();
+        let canned: std::sync::Arc<dyn crate::llm_provider::LlmProvider> =
+            std::sync::Arc::new(CannedLlmProvider::new("DEFAULT").with(key_fragment, kg_json));
+        (prompts, canned)
+    }
+
+    /// Fetch the `relates` edge payload between two entities by name.
+    async fn relates_payload_between(
+        db: &MemoryDB,
+        from_name: &str,
+        to_name: &str,
+    ) -> Option<String> {
+        let conn = db.test_primary_session().await;
+        let mut rows = conn
+            .query(
+                "SELECT e.payload FROM edges e \
+                 JOIN entity_page_map fm ON fm.entity_id = e.src_id \
+                 JOIN pages fp ON fp.id = fm.page_id \
+                     AND fp.kind = 'entity' AND fp.status = 'active' \
+                 JOIN entity_page_map tm ON tm.entity_id = e.dst_id \
+                 JOIN pages tp ON tp.id = tm.page_id \
+                     AND tp.kind = 'entity' AND tp.status = 'active' \
+                 WHERE e.edge_type = 'relates' AND fp.title = ?1 AND tp.title = ?2",
+                libsql::params![from_name, to_name],
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .and_then(|row| row.get::<Option<String>>(0).unwrap_or(None))
+    }
+
+    /// A quote that is real text from the combined batch blob but belongs to
+    /// the non-anchor window member must be dropped entirely, never located
+    /// against the blob and never left as a null-offset placeholder.
+    #[tokio::test]
+    async fn batch_extraction_span_not_in_anchor_is_dropped() {
+        let (db, _dir) = test_db().await;
+        let anchor_content = "Alice joined Acme in 2020.";
+        let other_content = "Bob left Beta Corp last year.";
+        db.upsert_documents(vec![
+            make_doc("mem_batch_anchor", anchor_content),
+            make_doc("mem_batch_other", other_content),
+        ])
+        .await
+        .unwrap();
+
+        let (prompts, canned) = canned_relation_with_span("Bob left Beta Corp");
+
+        run_post_ingest_enrichment(
+            &db,
+            "mem_batch_anchor",
+            anchor_content,
+            None,
+            Some("fact"),
+            None,
+            None,
+            Some(&canned),
+            &prompts,
+            &crate::tuning::RefineryConfig::default(),
+            &crate::tuning::DistillationConfig::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let payload = relates_payload_between(&db, "Alice", "Acme").await.expect(
+            "payload must be written -- model_version/prompt_version are always Some on this path",
+        );
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(
+            payload["span"].is_null(),
+            "a quote that only locates in a non-anchor batch member must be dropped entirely, got {payload}"
+        );
+    }
+
+    /// A quote that is genuinely the anchor's own text must locate with
+    /// correct anchor-based char offsets, exactly as the single-memory path
+    /// already does.
+    #[tokio::test]
+    async fn batch_extraction_span_in_anchor_locates_with_anchor_offsets() {
+        let (db, _dir) = test_db().await;
+        let anchor_content = "Alice joined Acme in 2020.";
+        let other_content = "Bob left Beta Corp last year.";
+        db.upsert_documents(vec![
+            make_doc("mem_batch_anchor", anchor_content),
+            make_doc("mem_batch_other", other_content),
+        ])
+        .await
+        .unwrap();
+
+        let quote = "Alice joined Acme";
+        let (prompts, canned) = canned_relation_with_span(quote);
+
+        run_post_ingest_enrichment(
+            &db,
+            "mem_batch_anchor",
+            anchor_content,
+            None,
+            Some("fact"),
+            None,
+            None,
+            Some(&canned),
+            &prompts,
+            &crate::tuning::RefineryConfig::default(),
+            &crate::tuning::DistillationConfig::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let payload = relates_payload_between(&db, "Alice", "Acme")
+            .await
+            .expect("payload must be written");
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["span"]["quote"], serde_json::json!(quote));
+        assert_eq!(payload["span"]["char_start"], serde_json::json!(0));
+        assert_eq!(
+            payload["span"]["char_end"],
+            serde_json::json!(quote.chars().count())
+        );
     }
 
     // ---- T22: cooperative-cancellation (debounced reflection) ----
@@ -1063,8 +1541,8 @@ mod tests {
             "entity_link must run when cancel=false"
         );
         assert!(
-            names.contains("entity_extract"),
-            "entity_extract must run when cancel=false"
+            !names.contains("entity_extract"),
+            "cancel=false must not turn a missing provider into a terminal entity result"
         );
         assert!(
             names.contains("title_enrich"),
@@ -1124,15 +1602,9 @@ mod tests {
     /// the enrichment make progress in parallel.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_enrichment_cancel_midway_preserves_committed_steps() {
-        // Canonical order steps are recorded in for the no-LLM path.
-        const CANON: [&str; 6] = [
-            "entity_link",
-            "entity_extract",
-            "page_contradiction",
-            "entity_suggestion",
-            "title_enrich",
-            "page_growth",
-        ];
+        // Canonical order recorded by the no-LLM path. Entity extraction is
+        // deliberately absent: it remains backlog until a provider exists.
+        const CANON: [&str; 3] = ["entity_link", "title_enrich", "page_growth"];
 
         let (db, _dir) = test_db().await;
         let doc = make_doc("mem_t22_midway", "The capital of France is Paris");
@@ -1462,6 +1934,92 @@ mod tests {
         }
     }
 
+    enum GrowthMutation {
+        None,
+        Memory { source_id: String },
+        Page { page_id: String, source_id: String },
+    }
+
+    struct MutatingGrowthProvider {
+        db: Arc<MemoryDB>,
+        response: String,
+        mutation: GrowthMutation,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MutatingGrowthProvider {
+        async fn generate(
+            &self,
+            _request: crate::llm_provider::LlmRequest,
+        ) -> Result<String, crate::llm_provider::LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.mutation {
+                GrowthMutation::None => {}
+                GrowthMutation::Memory { source_id } => {
+                    self.db
+                        .apply_memory_update(
+                            source_id,
+                            Some("newer memory content won the race"),
+                            None,
+                            false,
+                            None,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                GrowthMutation::Page { page_id, source_id } => {
+                    let page = self.db.get_page(page_id).await.unwrap().unwrap();
+                    assert!(self
+                        .db
+                        .try_update_page_content_with_changelog_at_version(
+                            page_id,
+                            "human edit won the race",
+                            &[source_id.as_str()],
+                            "fs_edit",
+                            "[]",
+                            None,
+                            page.version,
+                            None,
+                        )
+                        .await
+                        .unwrap());
+                }
+            }
+            Ok(self.response.clone())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "mutating-growth"
+        }
+
+        fn backend(&self) -> crate::llm_provider::LlmBackend {
+            crate::llm_provider::LlmBackend::OnDevice
+        }
+    }
+
+    async fn seed_page_growth_memory(
+        db: &MemoryDB,
+        source_id: &str,
+        content: &str,
+        entity_id: Option<&str>,
+        space: Option<&str>,
+    ) {
+        let mut doc = make_doc(source_id, content);
+        doc.entity_id = entity_id.map(str::to_string);
+        doc.space = space.map(str::to_string);
+        db.upsert_documents(vec![doc]).await.unwrap();
+        assert!(db
+            .record_enrichment_step_at_version(source_id, "entity_extract", "ok", None, 1,)
+            .await
+            .unwrap());
+    }
+
     async fn insert_growth_page(
         db: &MemoryDB,
         id: &str,
@@ -1485,6 +2043,315 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn page_growth_slice_commits_one_current_result() {
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        let entity_id = db
+            .create_entity("Ambient Growth", "Topic", Some("work"))
+            .await
+            .unwrap();
+        insert_growth_page(
+            &db,
+            "ambient-growth-page",
+            &entity_id,
+            "work",
+            "existing machine-owned page body",
+        )
+        .await;
+        seed_page_growth_memory(
+            &db,
+            "ambient-growth-memory",
+            "new evidence for the ambient page",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+        let provider = Arc::new(MutatingGrowthProvider {
+            db: db.clone(),
+            response: "existing machine-owned page body. New evidence.[1]".to_string(),
+            mutation: GrowthMutation::None,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        let report = run_page_growth_slice(&db, &llm, &PromptRegistry::default(), 2.0, None)
+            .await
+            .unwrap();
+
+        assert!(report.selected);
+        assert!(report.matched);
+        assert!(report.committed);
+        assert_eq!(report.llm_calls, 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let page = db.get_page("ambient-growth-page").await.unwrap().unwrap();
+        assert!(page
+            .source_memory_ids
+            .contains(&"ambient-growth-memory".to_string()));
+        let receipt = db
+            .get_enrichment_steps("ambient-growth-memory")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|step| step.step == "page_growth")
+            .expect("page growth receipt");
+        assert_eq!(receipt.status, "ok");
+        assert_eq!(receipt.input_version, Some(1));
+    }
+
+    #[tokio::test]
+    async fn page_growth_slice_no_match_is_terminal_without_inference() {
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        seed_page_growth_memory(
+            &db,
+            "ambient-growth-no-match",
+            "evidence with no matching page",
+            None,
+            Some("work"),
+        )
+        .await;
+        let provider = Arc::new(MutatingGrowthProvider {
+            db: db.clone(),
+            response: "must never be used".to_string(),
+            mutation: GrowthMutation::None,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        let first = run_page_growth_slice(&db, &llm, &PromptRegistry::default(), 0.85, None)
+            .await
+            .unwrap();
+        let second = run_page_growth_slice(&db, &llm, &PromptRegistry::default(), 0.85, None)
+            .await
+            .unwrap();
+
+        assert!(first.selected);
+        assert!(!first.matched);
+        assert!(first.committed);
+        assert!(
+            first.terminal_no_match,
+            "the scheduler needs an explicit signal before exempting this measured outcome"
+        );
+        assert_eq!(first.llm_calls, 0);
+        assert!(
+            !second.selected,
+            "terminal no-match receipt must stop re-spins"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn page_growth_slice_rejects_memory_changed_during_inference() {
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        let entity_id = db
+            .create_entity("Memory CAS", "Topic", Some("work"))
+            .await
+            .unwrap();
+        insert_growth_page(
+            &db,
+            "memory-cas-page",
+            &entity_id,
+            "work",
+            "page before memory race",
+        )
+        .await;
+        seed_page_growth_memory(
+            &db,
+            "memory-cas-source",
+            "memory before race",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(MutatingGrowthProvider {
+            db: db.clone(),
+            response: "stale generated page.[1]".to_string(),
+            mutation: GrowthMutation::Memory {
+                source_id: "memory-cas-source".to_string(),
+            },
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let report = run_page_growth_slice(&db, &llm, &PromptRegistry::default(), 2.0, None)
+            .await
+            .unwrap();
+
+        assert!(report.selected);
+        assert!(report.matched);
+        assert!(!report.committed);
+        assert_eq!(report.llm_calls, 1);
+        let page = db.get_page("memory-cas-page").await.unwrap().unwrap();
+        assert_eq!(page.content, "page before memory race");
+        assert!(db
+            .get_enrichment_steps("memory-cas-source")
+            .await
+            .unwrap()
+            .iter()
+            .all(|step| step.step != "page_growth"));
+
+        assert!(
+            db.record_enrichment_step_at_version(
+                "memory-cas-source",
+                "entity_extract",
+                "ok",
+                None,
+                2,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(db
+            .get_page_growth_candidate(3, true)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn page_growth_slice_rejects_linked_source_changed_during_inference() {
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        let entity_id = db
+            .create_entity("Linked Source CAS", "Topic", Some("work"))
+            .await
+            .unwrap();
+        insert_growth_page(
+            &db,
+            "linked-source-cas-page",
+            &entity_id,
+            "work",
+            "page before linked source race",
+        )
+        .await;
+        seed_page_growth_memory(
+            &db,
+            "linked-source-existing",
+            "existing linked evidence before race",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+        db.link_page_source(
+            "linked-source-cas-page",
+            "linked-source-existing",
+            "test_existing_source",
+        )
+        .await
+        .unwrap();
+        seed_page_growth_memory(
+            &db,
+            "linked-source-trigger",
+            "new evidence that triggers page growth",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+        let page_version_before = db
+            .get_page("linked-source-cas-page")
+            .await
+            .unwrap()
+            .unwrap()
+            .version;
+        let source_revision_before = db
+            .get_page_source_revision("linked-source-cas-page")
+            .await
+            .unwrap();
+        let llm: Arc<dyn LlmProvider> = Arc::new(MutatingGrowthProvider {
+            db: db.clone(),
+            response: "stale generated page.[1][2]".to_string(),
+            mutation: GrowthMutation::Memory {
+                source_id: "linked-source-existing".to_string(),
+            },
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let report = run_page_growth_slice(&db, &llm, &PromptRegistry::default(), 2.0, None)
+            .await
+            .unwrap();
+
+        assert!(report.selected);
+        assert!(report.matched);
+        assert!(!report.committed);
+        assert_eq!(report.llm_calls, 1);
+        let page = db
+            .get_page("linked-source-cas-page")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.content, "page before linked source race");
+        assert_eq!(
+            page.version, page_version_before,
+            "linked source invalidation must not need a Page content-version bump"
+        );
+        assert_eq!(
+            db.get_page_source_revision("linked-source-cas-page")
+                .await
+                .unwrap(),
+            source_revision_before + 1
+        );
+        assert!(db
+            .get_enrichment_steps("linked-source-trigger")
+            .await
+            .unwrap()
+            .iter()
+            .all(|step| step.step != "page_growth"));
+    }
+
+    #[tokio::test]
+    async fn page_growth_slice_rejects_page_changed_during_inference() {
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        let entity_id = db
+            .create_entity("Page CAS", "Topic", Some("work"))
+            .await
+            .unwrap();
+        insert_growth_page(
+            &db,
+            "page-cas-page",
+            &entity_id,
+            "work",
+            "page before human race",
+        )
+        .await;
+        seed_page_growth_memory(
+            &db,
+            "page-cas-source",
+            "memory for page race",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(MutatingGrowthProvider {
+            db: db.clone(),
+            response: "stale generated page.[1]".to_string(),
+            mutation: GrowthMutation::Page {
+                page_id: "page-cas-page".to_string(),
+                source_id: "page-cas-source".to_string(),
+            },
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let report = run_page_growth_slice(&db, &llm, &PromptRegistry::default(), 2.0, None)
+            .await
+            .unwrap();
+
+        assert!(report.selected);
+        assert!(report.matched);
+        assert!(!report.committed);
+        assert_eq!(report.llm_calls, 1);
+        let page = db.get_page("page-cas-page").await.unwrap().unwrap();
+        assert_eq!(page.content, "human edit won the race");
+        assert!(page.user_edited);
+        assert!(db
+            .get_enrichment_steps("page-cas-source")
+            .await
+            .unwrap()
+            .iter()
+            .all(|step| step.step != "page_growth"));
     }
 
     #[tokio::test]
@@ -1556,6 +2423,30 @@ mod tests {
         assert!(
             work.source_memory_ids.contains(&source_id.to_string()),
             "same-scope Page must receive the new source"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_growth_dependency_waits_for_enabled_entity_lane_only() {
+        let (db, _dir) = test_db().await;
+        db.upsert_documents(vec![make_doc(
+            "growth-dependency",
+            "memory waiting on an enabled entity lane",
+        )])
+        .await
+        .unwrap();
+
+        assert!(db
+            .get_page_growth_candidate(3, true)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.get_page_growth_candidate(3, false)
+                .await
+                .unwrap()
+                .map(|input| input.source_id),
+            Some("growth-dependency".to_string()),
         );
     }
 
@@ -1653,7 +2544,7 @@ mod tests {
             content: format!("{v1_content}.[3]"),
             summary: None,
             entity_id: None,
-            space: None,
+            space: None.into(),
             source_memory_ids: vec![mem_v1.to_string()],
             // Machine-owned kind on purpose: this test exercises the in-place
             // grow + citation-persistence path. An `authored` (human-owned) page
@@ -1736,7 +2627,7 @@ mod tests {
             content: v1_content.to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: None.into(),
             source_memory_ids: vec![mem_v1.to_string()],
             creation_kind: Some("research".to_string()),
             workspace: None,
@@ -1809,7 +2700,7 @@ mod tests {
             content: v1_content.to_string(),
             summary: None,
             entity_id: None,
-            space: None,
+            space: None.into(),
             source_memory_ids: vec![mem_v1.to_string()],
             creation_kind: Some("authored".to_string()),
             workspace: None,

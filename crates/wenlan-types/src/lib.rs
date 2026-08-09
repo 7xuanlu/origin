@@ -6,7 +6,9 @@
 //! limited to serde and serde_json -- no heavy runtime deps.
 
 pub mod brand;
+pub mod brief;
 pub mod briefing;
+pub mod communities;
 pub mod entities;
 pub mod events;
 pub mod import;
@@ -22,11 +24,20 @@ pub mod repair_plan;
 pub mod requests;
 pub mod responses;
 pub mod sources;
+pub mod space_context;
 pub mod system_info;
 pub mod working_memory;
 
 // Re-export commonly used types at crate root for convenience.
+pub use brief::*;
 pub use briefing::{BriefingResponse, ContradictionItem};
+pub use communities::{
+    CommunityListResponse, CommunityMember, CommunityMemberCursor, CommunityMembersResponse,
+    CommunityPageAssignment, CommunityPageAssignmentsResponse, CommunityProposalAcceptResponse,
+    CommunityProposalAction, CommunityProposalPayload, CommunityProposalRejectResponse,
+    CommunityProposalSummary, CommunityReadScope, CommunitySummary, ListCommunityProposalsResponse,
+    PageCommunityAssignmentState,
+};
 pub use entities::{
     Entity, EntityDetail, EntitySearchResult, EntitySuggestion, Observation, RecentRelation,
     Relation, RelationWithEntity,
@@ -57,6 +68,7 @@ pub use responses::{
     RevisionAcceptResponse, RevisionDismissResponse,
 };
 pub use sources::{MemoryType, RawDocument, SourceType, StabilityTier, SyncStatus};
+pub use space_context::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};
 
 use serde::{Deserialize, Serialize};
 
@@ -107,6 +119,10 @@ mod repair_tests;
 #[cfg(test)]
 #[path = "repair_plan_tests.rs"]
 mod repair_plan_tests;
+
+#[cfg(test)]
+#[path = "entities_freeze_tests.rs"]
+mod entities_freeze_tests;
 
 #[cfg(test)]
 mod tests {

@@ -428,11 +428,11 @@ async fn accept_entity_merge_flow() {
     let (app, _tmp, db) = test_app().await;
 
     let new_id = db
-        .create_entity("Acme Corporation", "organization", None)
+        .store_entity("Acme Corporation", "organization", None, None, None)
         .await
         .unwrap();
     let existing_id = db
-        .create_entity("Acme Corp", "organization", None)
+        .store_entity("Acme Corp", "organization", None, None, None)
         .await
         .unwrap();
     db.insert_refinement_proposal(
@@ -716,11 +716,11 @@ async fn accept_returns_422_for_already_resolved() {
 async fn accept_logs_apply_and_resolve_activity_with_agent() {
     let (app, _tmp, db) = test_app().await;
     let new_id = db
-        .create_entity("Acme Corporation", "organization", None)
+        .store_entity("Acme Corporation", "organization", None, None, None)
         .await
         .unwrap();
     let existing_id = db
-        .create_entity("Acme Corp", "organization", None)
+        .store_entity("Acme Corp", "organization", None, None, None)
         .await
         .unwrap();
     db.insert_refinement_proposal(

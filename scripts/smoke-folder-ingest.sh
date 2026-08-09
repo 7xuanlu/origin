@@ -63,13 +63,13 @@ done
 [ -n "$healthy" ] || fail "daemon did not become healthy within 120s"
 
 echo "==> Creating fixture folder"
-cat >"$FIXTURE_DIR/notes.md" <<'EOF'
+cat >"$FIXTURE_DIR/99-notes.md" <<'EOF'
 # Smoke note
 
 Ordinary markdown content to give the chunker something to work with.
 The zebra-quokka-7139 sentinel sentence lives in the markdown fixture.
 EOF
-cat >"$FIXTURE_DIR/plain.txt" <<'EOF'
+cat >"$FIXTURE_DIR/00-plain.txt" <<'EOF'
 Plain text fixture for the folder ingest smoke test.
 The xylophone-birch-4242 sentinel sentence is buried here.
 EOF
@@ -89,7 +89,10 @@ fi
 
 echo "==> Searching for the buried sentinel sentence"
 hit=""
-for i in $(seq 1 60); do
+# First ambient admission is intentionally bounded by the 60s startup delay
+# plus two 30s resource samples. Keep two poll windows of CI jitter beyond
+# that 120s floor; the loop still exits immediately when the document lands.
+for i in $(seq 1 90); do
     RESP="$(curl -sf -X POST "$HOST/api/memory/search" \
         -H 'Content-Type: application/json' \
         -d '{"query":"xylophone birch buried sentinel sentence","limit":5}')" || RESP=""
@@ -100,10 +103,25 @@ for i in $(seq 1 60); do
     fi
     sleep 2
 done
-[ -n "$hit" ] || fail "buried sentence not retrievable within 120s"
+[ -n "$hit" ] || fail "buried sentence not retrievable within 180s"
 
-echo "==> Deletion propagation: remove plain.txt, re-sync, sentence must vanish"
-rm "$FIXTURE_DIR/plain.txt"
+echo "==> Waiting for the sibling document in the next bounded thermal turn"
+sibling_hit=""
+for i in $(seq 1 90); do
+    RESP="$(curl -sf -X POST "$HOST/api/memory/search" \
+        -H 'Content-Type: application/json' \
+        -d '{"query":"zebra quokka sentinel markdown fixture","limit":5}')" || RESP=""
+    if echo "$RESP" | grep -q "zebra-quokka-7139"; then
+        echo "    sibling hit after ${i} poll(s)"
+        sibling_hit=1
+        break
+    fi
+    sleep 2
+done
+[ -n "$sibling_hit" ] || fail "sibling document not retrievable within 180s"
+
+echo "==> Deletion propagation: remove 00-plain.txt, re-sync, sentence must vanish"
+rm "$FIXTURE_DIR/00-plain.txt"
 WENLAN_HOST="$HOST" "$BIN/wenlan" sources add "$FIXTURE_DIR"
 gone=""
 for i in $(seq 1 15); do
@@ -118,7 +136,7 @@ for i in $(seq 1 15); do
     sleep 2
 done
 [ -n "$gone" ] || fail "deleted file's chunks still retrievable after re-sync"
-# The sibling markdown must survive the sibling's deletion.
+# The sibling's indexed chunks must survive deletion of the first file.
 RESP="$(curl -sf -X POST "$HOST/api/memory/search" \
     -H 'Content-Type: application/json' \
     -d '{"query":"zebra quokka sentinel markdown fixture","limit":5}')" || RESP=""

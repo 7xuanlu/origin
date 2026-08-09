@@ -7,18 +7,23 @@
 //! point the CLI at a remote daemon over a tunnel.
 //!
 //! The methods exposed here are the subset the CLI subcommands need:
-//! status, ping, search, context, store, list, agents.
+//! status, ping, search, recall, brief, store, list, agents.
 
 use anyhow::{Context, Result};
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use wenlan_types::{
-    requests::{ListMemoriesRequest, SearchRequest, StoreMemoryRequest, UpdateAgentRequest},
+    requests::{
+        ListMemoriesRequest, SearchMemoryRequest, SearchRequest, SetDefaultSpaceRequest,
+        StoreMemoryRequest, UpdateAgentRequest,
+    },
     responses::{
-        AgentResponse, HealthResponse, KnowledgeContext, ListMemoriesResponse,
+        AgentResponse, DefaultSpaceResponse, HealthResponse, ListMemoriesResponse,
         MemoryDetailResponse, PendingRevisionItem, RevisionAcceptResponse, RevisionDismissResponse,
-        SearchResponse, StoreMemoryResponse,
+        SearchMemoryResponse, SearchResponse, StoreMemoryResponse,
     },
     sources::Source,
+    BriefReadRequest, BriefReadResponse, BriefUpdateReceipt, BriefUpdateRequest,
 };
 
 mod lint;
@@ -50,11 +55,34 @@ pub struct WenlanClient {
 impl WenlanClient {
     /// Create a client using `WENLAN_HOST` env var, or default to `http://127.0.0.1:7878`.
     pub fn from_env() -> Self {
+        Self::from_env_with_context(None, None)
+            .expect("empty Wenlan client context always builds valid headers")
+    }
+
+    /// Create a client that consistently identifies the caller and supplies
+    /// client-local Space context through the common request headers.
+    pub fn from_env_with_context(agent_name: Option<&str>, space: Option<&str>) -> Result<Self> {
         let base_url = origin_host_from_env();
-        Self {
-            base_url,
-            http: reqwest::Client::new(),
+        let mut headers = HeaderMap::new();
+        if let Some(agent_name) = agent_name {
+            headers.insert(
+                "x-agent-name",
+                HeaderValue::from_str(agent_name).context("invalid --agent-name header value")?,
+            );
         }
+        if let Some(space) = space {
+            headers.insert(
+                "x-wenlan-space",
+                HeaderValue::from_str(space).context("invalid Space header value")?,
+            );
+        }
+        Ok(Self {
+            base_url,
+            http: reqwest::Client::builder()
+                .default_headers(headers)
+                .build()
+                .context("building Wenlan HTTP client")?,
+        })
     }
 
     /// GET /api/health — daemon liveness + version.
@@ -94,31 +122,63 @@ impl WenlanClient {
         resp.json().await.context("parsing /api/search response")
     }
 
-    /// POST /api/context — contextual knowledge bundle for a query.
-    ///
-    /// Note: `/api/context` (the older endpoint) takes `current_file` +
-    /// `cursor_prefix` and is hidden from the public API. The CLI uses
-    /// `/api/context` which accepts a free-form query and returns
-    /// the same `KnowledgeContext` shape inside its response.
-    pub async fn context(&self, query: String) -> Result<KnowledgeContext> {
-        let url = format!("{}/api/context", self.base_url);
-        let req = serde_json::json!({ "query": query });
-        let resp = self
+    /// POST /api/memory/search — semantic recall for one query.
+    pub async fn recall(&self, query: String, limit: usize) -> Result<SearchMemoryResponse> {
+        let url = format!("{}/api/memory/search", self.base_url);
+        let request = SearchMemoryRequest {
+            query,
+            limit,
+            memory_type: None,
+            space: None,
+            source_agent: None,
+            rerank: false,
+        };
+        let response = self
             .http
             .post(&url)
-            .json(&req)
+            .json(&request)
             .send()
             .await
-            .with_context(|| format!("POST {} failed", url))?;
-        let resp = resp
+            .with_context(|| format!("POST {url} failed"))?
             .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        let full: serde_json::Value = resp.json().await.context("parsing /api/context response")?;
-        let knowledge = full
-            .get("knowledge")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("/api/context response missing `knowledge`"))?;
-        serde_json::from_value(knowledge).context("parsing knowledge subobject")
+            .with_context(|| format!("daemon returned error for {url}"))?;
+        response
+            .json()
+            .await
+            .context("parsing /api/memory/search response")
+    }
+
+    /// POST /api/brief — complete Brief plus optional same-Space recall.
+    pub async fn brief(&self, request: &BriefReadRequest) -> Result<BriefReadResponse> {
+        let url = format!("{}/api/brief", self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .json(request)
+            .send()
+            .await
+            .with_context(|| format!("POST {url} failed"))?
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {url}"))?;
+        response.json().await.context("parsing /api/brief response")
+    }
+
+    /// PATCH /api/brief — item-level handoff deltas.
+    pub async fn update_brief(&self, request: &BriefUpdateRequest) -> Result<BriefUpdateReceipt> {
+        let url = format!("{}/api/brief", self.base_url);
+        let response = self
+            .http
+            .patch(&url)
+            .json(request)
+            .send()
+            .await
+            .with_context(|| format!("PATCH {url} failed"))?
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {url}"))?;
+        response
+            .json()
+            .await
+            .context("parsing PATCH /api/brief response")
     }
 
     /// POST /api/memory/store — write a memory.
@@ -131,7 +191,7 @@ impl WenlanClient {
         let req = StoreMemoryRequest {
             content,
             memory_type,
-            space: None,
+            space: (None).into(),
             source_agent: None,
             title: None,
             confidence: None,
@@ -319,6 +379,52 @@ impl WenlanClient {
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
         resp.json().await.context("parsing /api/spaces response")
+    }
+
+    /// GET /api/spaces/default — fetch the daemon-owned default save Space.
+    pub async fn get_default_space(&self) -> Result<DefaultSpaceResponse> {
+        let url = format!("{}/api/spaces/default", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {} failed", url))?
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        resp.json()
+            .await
+            .context("parsing /api/spaces/default response")
+    }
+
+    /// PUT /api/spaces/default — replace the daemon-owned default save Space.
+    pub async fn set_default_space(&self, space_id: String) -> Result<DefaultSpaceResponse> {
+        let url = format!("{}/api/spaces/default", self.base_url);
+        let resp = self
+            .http
+            .put(&url)
+            .json(&SetDefaultSpaceRequest { space_id })
+            .send()
+            .await
+            .with_context(|| format!("PUT {} failed", url))?
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        resp.json()
+            .await
+            .context("parsing /api/spaces/default response")
+    }
+
+    /// DELETE /api/spaces/default — clear the daemon-owned default save Space.
+    pub async fn clear_default_space(&self) -> Result<()> {
+        let url = format!("{}/api/spaces/default", self.base_url);
+        self.http
+            .delete(&url)
+            .send()
+            .await
+            .with_context(|| format!("DELETE {} failed", url))?
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        Ok(())
     }
 
     /// PUT /api/agents/{name} — update an agent's metadata.

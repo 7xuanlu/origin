@@ -23,6 +23,7 @@ fn cli_with_isolated_runtime(runtime: &IsolatedRuntime) -> Command {
         .env("USERPROFILE", runtime.home.path())
         .env("WENLAN_DATA_DIR", runtime.data.path())
         .env("WENLAN_HOST", "http://127.0.0.1:9")
+        .env("WENLAN_BIND_ADDR", "127.0.0.1:9")
         .env("PATH", &joined);
     cmd
 }
@@ -75,7 +76,7 @@ fn write_fake_launchctl(fake_bin: &Path) {
     let path = fake_bin.join("launchctl");
     fs::write(
         &path,
-        "#!/bin/sh\nif [ -n \"$WENLAN_TEST_LAUNCHCTL_LOG\" ]; then echo \"$@\" >> \"$WENLAN_TEST_LAUNCHCTL_LOG\"; fi\ncase \"$1\" in\n  list) exit 0 ;;\n  load|unload) echo \"fake launchctl $1 $2\"; exit 0 ;;\n  *) echo \"fake launchctl $@\"; exit 0 ;;\nesac\n",
+        "#!/bin/sh\nif [ -n \"$WENLAN_TEST_LAUNCHCTL_LOG\" ]; then echo \"$@\" >> \"$WENLAN_TEST_LAUNCHCTL_LOG\"; fi\ncase \"$1\" in\n  list) exit 0 ;;\n  load|unload) echo \"fake launchctl $1 $2\"; exit 0 ;;\n  bootout) echo \"fake launchctl $@\"; exit \"${WENLAN_TEST_LAUNCHCTL_BOOTOUT_EXIT:-0}\" ;;\n  print) echo \"fake launchctl $@\"; exit \"${WENLAN_TEST_LAUNCHCTL_PRINT_EXIT:-0}\" ;;\n  *) echo \"fake launchctl $@\"; exit 0 ;;\nesac\n",
     )
     .expect("write fake launchctl");
     #[cfg(unix)]
@@ -87,6 +88,261 @@ fn write_fake_launchctl(fake_bin: &Path) {
         perms.set_mode(0o755);
         fs::set_permissions(path, perms).expect("chmod fake launchctl");
     }
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_shutdown_stub() -> (String, std::sync::mpsc::Receiver<String>) {
+    spawn_shutdown_stub_response("200 OK", "shutting down")
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_shutdown_failure_stub() -> (String, std::sync::mpsc::Receiver<String>) {
+    spawn_shutdown_stub_response("500 Internal Server Error", "")
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_respawning_shutdown_stub() -> String {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind respawning shutdown stub");
+    let address = listener.local_addr().expect("respawning stub address");
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept shutdown request");
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .expect("read shutdown request line");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read shutdown header");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        reader
+            .get_mut()
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nshutting down",
+            )
+            .expect("write shutdown response");
+        drop(reader);
+        drop(listener);
+
+        thread::sleep(std::time::Duration::from_millis(400));
+        let restarted = TcpListener::bind(address).expect("rebind respawned daemon stub");
+        let (health, _) = restarted
+            .accept()
+            .expect("accept health probe after respawn");
+        let mut health_reader = BufReader::new(health);
+        let mut request_line = String::new();
+        health_reader
+            .read_line(&mut request_line)
+            .expect("read respawned health request line");
+        loop {
+            let mut line = String::new();
+            health_reader
+                .read_line(&mut line)
+                .expect("read respawned health header");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        health_reader
+            .get_mut()
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
+            )
+            .expect("write respawned health response");
+    });
+    format!("http://{address}")
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_hanging_health_probe_stub() -> String {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow-closing shutdown stub");
+    let address = listener.local_addr().expect("slow-closing stub address");
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept shutdown request");
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .expect("read shutdown request line");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read shutdown header");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        reader
+            .get_mut()
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nshutting down",
+            )
+            .expect("write shutdown response");
+        drop(reader);
+
+        // A real server can stop servicing health requests before its socket
+        // is fully closed. Hold one accepted probe open long enough for the
+        // client's per-request timeout, then close the listener for real.
+        let (health, _) = listener.accept().expect("accept transient health probe");
+        thread::sleep(std::time::Duration::from_millis(2_200));
+        drop(health);
+        drop(listener);
+    });
+    format!("http://{address}")
+}
+
+#[cfg(unix)]
+fn spawn_keepalive_shutdown_stub() -> (String, std::sync::mpsc::Receiver<bool>) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind keepalive shutdown stub");
+    let address = listener.local_addr().expect("keepalive stub address");
+    let (close_header_tx, close_header_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept shutdown request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(12)))
+            .expect("set keepalive stub timeout");
+        let mut reader = BufReader::new(stream);
+
+        let read_request =
+            |reader: &mut BufReader<std::net::TcpStream>| -> Option<(String, Vec<String>)> {
+                let mut request_line = String::new();
+                match reader.read_line(&mut request_line) {
+                    Ok(0) => return None,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::UnexpectedEof
+                        ) =>
+                    {
+                        return None;
+                    }
+                    Err(error) => panic!("read keepalive request line: {error}"),
+                }
+                let mut headers = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    reader
+                        .read_line(&mut line)
+                        .expect("read keepalive request header");
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    headers.push(line);
+                }
+                Some((request_line, headers))
+            };
+
+        let (shutdown, shutdown_headers) = read_request(&mut reader).expect("shutdown request");
+        assert_eq!(shutdown, "POST /api/shutdown HTTP/1.1\r\n");
+        let close_requested = shutdown_headers.iter().any(|header| {
+            header.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("connection")
+                    && value.trim().eq_ignore_ascii_case("close")
+            })
+        });
+        close_header_tx
+            .send(close_requested)
+            .expect("report shutdown connection header");
+
+        if close_requested {
+            // Hyper 1.x marks an HTTP/1.1 connection non-persistent when the
+            // request carries `Connection: close`, then closes it after the
+            // response. Model that server contract instead of leaving a raw
+            // TCP socket alive in a state Hyper would never expose.
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                .expect("write closing shutdown response");
+            drop(reader);
+            drop(listener);
+            return;
+        }
+
+        reader
+            .get_mut()
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .expect("write shutdown response");
+
+        // Model hyper graceful shutdown: stop accepting fresh connections,
+        // but keep the already-open HTTP/1.1 connection alive until its client
+        // releases it. Reusing this connection for health probes prevents the
+        // server from ever reaching its process-exit path.
+        drop(listener);
+        while let Some((request, _)) = read_request(&mut reader) {
+            assert_eq!(request, "GET /api/health HTTP/1.1\r\n");
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}")
+                .expect("write keepalive health response");
+        }
+    });
+    (format!("http://{address}"), close_header_rx)
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_shutdown_stub_response(
+    status: &'static str,
+    body: &'static str,
+) -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind shutdown stub");
+    let base = format!(
+        "http://{}",
+        listener.local_addr().expect("shutdown stub address")
+    );
+    let (sent, received) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept shutdown request");
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .expect("read shutdown request line");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read shutdown header");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        sent.send(request_line).expect("record shutdown request");
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        reader
+            .get_mut()
+            .write_all(response.as_bytes())
+            .expect("write shutdown response");
+    });
+    (base, received)
+}
+
+fn bind_addr_from_stub_host(host: &str) -> &str {
+    host.strip_prefix("http://")
+        .expect("shutdown stub host must use http")
 }
 
 fn write_fake_command(fake_bin: &Path, name: &str) {
@@ -201,6 +457,7 @@ fn each_subcommand_has_help() {
         "status",
         "search",
         "recall",
+        "brief",
         "capture",
         "memories",
         "agents",
@@ -449,6 +706,9 @@ fn setup_subcommands_have_help() {
         &["keys", "status", "--help"][..],
         &["keys", "set", "--help"][..],
         &["keys", "clear", "--help"][..],
+        &["enrichment", "status", "--help"][..],
+        &["enrichment", "configure", "--help"][..],
+        &["enrichment", "disable", "--help"][..],
     ] {
         cli().args(args).assert().success();
     }
@@ -460,13 +720,14 @@ fn invalid_subcommand_fails() {
 }
 
 #[test]
-fn capture_text_and_file_conflict_bails() {
-    // text=Some, file=Some -> bail at runtime (mutual exclusion)
+fn capture_text_and_file_conflict_bails_before_daemon_access() {
+    // Invalid local syntax must be rejected before Space resolution contacts the daemon.
     cli()
+        .env("WENLAN_HOST", "http://127.0.0.1:9")
         .args(["capture", "some text", "--file", "/dev/null"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("either"));
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 #[test]
@@ -592,7 +853,7 @@ fn background_on_over_running_daemon_stops_first_isolated() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn background_off_removes_keepalive_job_without_stop_restart_race() {
+fn background_off_boots_out_keepalive_job_without_stop_restart_race() {
     let runtime = IsolatedRuntime::new();
     let log = runtime.data.path().join("launchctl.log");
 
@@ -610,8 +871,8 @@ fn background_off_removes_keepalive_job_without_stop_restart_race() {
 
     let calls = fs::read_to_string(&log).unwrap_or_default();
     assert!(
-        calls.lines().any(|line| line.starts_with("remove ")),
-        "background off must remove the KeepAlive job; launchctl calls were:\n{calls}"
+        calls.lines().any(|line| line.starts_with("bootout ")),
+        "background off must boot out the KeepAlive job while preserving its plist; launchctl calls were:\n{calls}"
     );
     assert!(
         !calls.lines().any(|line| line.starts_with("stop ")),
@@ -631,7 +892,9 @@ fn setup_background_status_roundtrip_isolated() {
         .stdout(predicate::str::contains(
             "Wenlan is set up for local memory",
         ))
-        .stdout(predicate::str::contains("Distill cycles stay off"));
+        .stdout(predicate::str::contains(
+            "Model-backed background enrichment is off",
+        ));
 
     let config = fs::read_to_string(runtime.config_path()).expect("config written");
     assert!(config.contains(r#""setup_completed": true"#));
@@ -650,23 +913,23 @@ fn setup_background_status_roundtrip_isolated() {
     assert!(plist.contains("<string>com.wenlan.server</string>"));
     assert!(plist.contains("wenlan-server"));
     assert!(!plist.contains("origin</string>"));
-    // Launchd parity with the legacy embedded plist: stdout/stderr go to the
-    // data-root `logs/` dir and `RUST_LOG=info` survives across reboots.
+    // The daemon owns bounded file logging. launchd must not append an
+    // unbounded second copy of stdout/stderr across every restart.
     assert!(
         plist.contains("<key>StandardOutPath</key>"),
         "missing StandardOutPath in plist: {plist}"
     );
     assert!(
-        plist.contains("wenlan-server.stdout.log"),
-        "stdout log path not threaded into plist: {plist}"
+        plist.contains("<string>/dev/null</string>"),
+        "launchd stdout/stderr must be discarded after daemon-owned logging: {plist}"
     );
     assert!(
         plist.contains("<key>StandardErrorPath</key>"),
         "missing StandardErrorPath in plist: {plist}"
     );
     assert!(
-        plist.contains("wenlan-server.stderr.log"),
-        "stderr log path not threaded into plist: {plist}"
+        !plist.contains("wenlan-server.stdout.log") && !plist.contains("wenlan-server.stderr.log"),
+        "unbounded legacy launchd log paths remain in plist: {plist}"
     );
     assert!(
         plist.contains("<key>EnvironmentVariables</key>"),
@@ -694,18 +957,242 @@ fn setup_background_status_roundtrip_isolated() {
         .success()
         .stdout(predicate::str::contains("\"status\": \"unreachable\""));
 
+    let launchctl_log = runtime.data.path().join("background-off-launchctl.log");
+    let (host, shutdown_requests) = spawn_shutdown_stub();
     cli_with_isolated_runtime(&runtime)
+        .env("WENLAN_TEST_LAUNCHCTL_LOG", &launchctl_log)
+        .env("WENLAN_BIND_ADDR", bind_addr_from_stub_host(&host))
         .args(["background", "off"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Uninstalled com.wenlan.server"));
+        .stdout(predicate::str::contains("Stopped com.wenlan.server"))
+        .stdout(predicate::str::contains("Uninstalled").not());
 
     assert!(
-        !runtime.service_unit_path().exists(),
-        "uninstall removes launchd plist"
+        runtime.service_unit_path().exists(),
+        "background off preserves the launchd plist"
+    );
+    let calls = fs::read_to_string(&launchctl_log).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|line| line.starts_with("bootout ")),
+        "graceful shutdown must not boot out the registered LaunchAgent; calls were:\n{calls}"
+    );
+    assert_eq!(
+        shutdown_requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("CLI must request graceful daemon shutdown"),
+        "POST /api/shutdown HTTP/1.1\r\n"
     );
     assert!(
         runtime.root_exists(),
         "temp runtime remains alive until test end"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn background_off_without_registration_is_a_successful_noop() {
+    let runtime = IsolatedRuntime::new();
+
+    cli_with_isolated_runtime(&runtime)
+        .args(["background", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "already stopped; no registration found",
+        ))
+        .stdout(predicate::str::contains("Uninstalled").not());
+
+    assert!(!runtime.service_unit_path().exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn background_off_with_registration_and_unreachable_daemon_stops_manager_but_keeps_registration() {
+    let runtime = IsolatedRuntime::new();
+    let plist = runtime.service_unit_path();
+    fs::create_dir_all(plist.parent().expect("launch agent directory"))
+        .expect("create fake launch agent directory");
+    fs::write(&plist, "fake registered launch agent").expect("write fake registration");
+
+    // Reserve an ephemeral address, then release it immediately so the shutdown
+    // request deterministically takes the connection-refused path. A registered
+    // job may be between supervisor attempts here; `background off` must still
+    // stop the manager job rather than merely report success.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve unused port");
+    let bind_addr = listener.local_addr().expect("reserved loopback address");
+    drop(listener);
+
+    let launchctl_log = runtime.data.path().join("unreachable-background-off.log");
+    cli_with_isolated_runtime(&runtime)
+        .env("WENLAN_TEST_LAUNCHCTL_LOG", &launchctl_log)
+        .env("WENLAN_BIND_ADDR", bind_addr.to_string())
+        .args(["background", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Stopped com.wenlan.server"))
+        .stdout(predicate::str::contains("Uninstalled").not());
+
+    let calls = fs::read_to_string(&launchctl_log).unwrap_or_default();
+    assert!(
+        calls.lines().any(|line| line.starts_with("bootout ")),
+        "an unreachable registered daemon may still be starting; background off must stop its manager job; calls were:\n{calls}"
+    );
+    assert!(
+        plist.exists(),
+        "manager fallback must stop the daemon without deleting its registration"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn background_off_without_registration_stops_reachable_daemon() {
+    let runtime = IsolatedRuntime::new();
+    let (host, requests) = spawn_shutdown_stub();
+
+    cli_with_isolated_runtime(&runtime)
+        .env("WENLAN_BIND_ADDR", bind_addr_from_stub_host(&host))
+        .args(["background", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Stopped com.wenlan.server"))
+        .stdout(predicate::str::contains("No background registration found"));
+
+    assert_eq!(
+        requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("CLI must request daemon shutdown"),
+        "POST /api/shutdown HTTP/1.1\r\n"
+    );
+    assert!(!runtime.service_unit_path().exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn background_off_rejects_daemon_that_respawns_after_initial_disconnect() {
+    let runtime = IsolatedRuntime::new();
+    let host = spawn_respawning_shutdown_stub();
+
+    cli_with_isolated_runtime(&runtime)
+        .env("WENLAN_BIND_ADDR", bind_addr_from_stub_host(&host))
+        .args(["background", "off"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("daemon remained reachable"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn background_off_tolerates_transient_probe_timeout_before_socket_closes() {
+    let runtime = IsolatedRuntime::new();
+    let host = spawn_hanging_health_probe_stub();
+
+    cli_with_isolated_runtime(&runtime)
+        .env("WENLAN_BIND_ADDR", bind_addr_from_stub_host(&host))
+        .args(["background", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Stopped com.wenlan.server. No background registration found.",
+        ));
+}
+
+#[cfg(unix)]
+#[test]
+fn background_off_does_not_keep_graceful_shutdown_connection_alive() {
+    let runtime = IsolatedRuntime::new();
+    let (host, close_header) = spawn_keepalive_shutdown_stub();
+
+    let assertion = cli_with_isolated_runtime(&runtime)
+        .env("WENLAN_BIND_ADDR", bind_addr_from_stub_host(&host))
+        .args(["background", "off"])
+        .assert();
+    assert!(
+        close_header
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("shutdown stub must report the request header"),
+        "shutdown POST must request connection close"
+    );
+    assertion.success().stdout(predicate::str::contains(
+        "Stopped com.wenlan.server. No background registration found.",
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn background_off_ignores_remote_wenlan_host_for_local_lifecycle() {
+    let runtime = IsolatedRuntime::new();
+    let (local_host, local_requests) = spawn_shutdown_stub();
+    let (remote_host, remote_requests) = spawn_shutdown_stub();
+
+    cli_with_isolated_runtime(&runtime)
+        .env("WENLAN_HOST", remote_host)
+        .env("WENLAN_BIND_ADDR", bind_addr_from_stub_host(&local_host))
+        .args(["background", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Stopped com.wenlan.server"));
+
+    assert_eq!(
+        local_requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("CLI must shut down the local bind address"),
+        "POST /api/shutdown HTTP/1.1\r\n"
+    );
+    assert!(
+        remote_requests
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "background lifecycle must never target remote WENLAN_HOST"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn background_off_succeeds_when_launchd_job_is_already_absent() {
+    let runtime = IsolatedRuntime::new();
+    let log = runtime.data.path().join("already-absent-launchctl.log");
+    let (host, _requests) = spawn_shutdown_failure_stub();
+
+    cli_with_isolated_runtime(&runtime)
+        .args(["background", "on"])
+        .assert()
+        .success();
+
+    cli_with_isolated_runtime(&runtime)
+        .env("WENLAN_TEST_LAUNCHCTL_LOG", &log)
+        .env("WENLAN_BIND_ADDR", bind_addr_from_stub_host(&host))
+        .env("WENLAN_TEST_LAUNCHCTL_BOOTOUT_EXIT", "3")
+        .env("WENLAN_TEST_LAUNCHCTL_PRINT_EXIT", "113")
+        .args(["background", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Stopped com.wenlan.server"));
+
+    let calls = fs::read_to_string(&log).expect("already-absent launchctl log");
+    assert!(calls.lines().any(|line| line.starts_with("print gui/")));
+    assert!(runtime.service_unit_path().exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn background_off_surfaces_unconfirmed_launchd_failure() {
+    let runtime = IsolatedRuntime::new();
+    let (host, _requests) = spawn_shutdown_failure_stub();
+
+    cli_with_isolated_runtime(&runtime)
+        .args(["background", "on"])
+        .assert()
+        .success();
+
+    cli_with_isolated_runtime(&runtime)
+        .env("WENLAN_TEST_LAUNCHCTL_BOOTOUT_EXIT", "5")
+        .env("WENLAN_TEST_LAUNCHCTL_PRINT_EXIT", "0")
+        .env("WENLAN_BIND_ADDR", bind_addr_from_stub_host(&host))
+        .args(["background", "off"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("launchctl bootout failed"));
+
+    assert!(runtime.service_unit_path().exists());
 }

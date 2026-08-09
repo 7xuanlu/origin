@@ -5,7 +5,7 @@ description: >
   states a preference, makes a decision, corrects you, or shares a durable
   fact. Invoked as /capture <content>.
 argument-hint: "<content>"
-allowed-tools: ["Bash", "mcp__wenlan__capture", "mcp__wenlan__recall", "mcp__wenlan__create_entity", "mcp__wenlan__create_relation", "mcp__wenlan__accept_revision", "mcp__wenlan__dismiss_revision"]
+allowed-tools: ["Bash", "mcp__wenlan__capture", "mcp__wenlan__recall", "mcp__wenlan__create_entity", "mcp__wenlan__create_relation", "mcp__wenlan__list_rejections", "mcp__wenlan__accept_revision", "mcp__wenlan__dismiss_revision"]
 user-invocable: true
 ---
 
@@ -32,7 +32,7 @@ If `content` is empty, ask the user what they want to capture.
 Call the Codex resolver:
 
 ```bash
-resolved="$(plugin-codex/bin/resolve-space.sh --cwd "$PWD" ${space_arg:+--arg "$space_arg"} --topic "$content" 2>/dev/null)"
+resolved="$(plugin-codex/bin/resolve-space.sh --cwd "$PWD" ${space_arg:+--arg "$space_arg"} 2>/dev/null)"
 space="$(printf '%s\n' "$resolved" | cut -f1)"
 source_layer="$(printf '%s\n' "$resolved" | cut -f2)"
 ```
@@ -41,11 +41,9 @@ If `space` is non-empty, print `Resolved space: <space> (from <source-layer>)`
 and pass it to the `capture` MCP tool. If `space` is empty, print
 `Resolved space: none (unscoped)` and omit the `space` parameter.
 
-If `source_layer` is `arg`, also print:
-
-```text
-Created new space '<space>' from arg. Register it later if you want it pinned.
-```
+After capture, relay the tool's returned `space`, `space_source`, and
+`write_outcome`; those fields describe what the daemon actually persisted and
+are authoritative.
 
 ## How to invoke
 
@@ -82,14 +80,23 @@ If two types fit, pick the one closest to why the memory matters.
 Pick the single most important named anchor: person, project, tool, or place.
 Use the exact name. If there is no named anchor, omit `entity`.
 
-For additional entities or explicit relations, capture first, then call:
+Pass the single most important named anchor through `capture.entity`. Ordinary
+captures stop there; daemon enrichment handles routine extraction. Do not call
+`mcp__wenlan__create_entity` for ordinary captures. Never infer a relation the
+user did not state.
 
-```text
-create_entity(name="<entity>", entity_type="<person|project|tool|place>")
-create_relation(from_entity="<a>", to_entity="<b>", relation_type="<verb>")
-```
+Use the explicit KG tools only when the user explicitly states a durable relation:
 
-Skip those calls when daemon enrichment is configured.
+1. Call `mcp__wenlan__create_entity` for both named endpoints first and collect
+   their stable ids. The call is idempotent and may return an existing id.
+2. Call `mcp__wenlan__capture` with the complete relation statement and pass
+   the primary entity name as `entity` so the memory resolves and links to it.
+3. Call `mcp__wenlan__create_relation` with `from_entity_id`, `to_entity_id`,
+   `relation_type`, and the capture result's required `source_memory_id`.
+
+For a durable named entity explicitly established by the user,
+`mcp__wenlan__create_entity` may also be used alone when its stable id is
+needed. `Entity <id> ready` does not imply that a new row was created.
 
 ## What to capture
 
@@ -105,6 +112,10 @@ Skip those calls when daemon enrichment is configured.
 - File paths or git history the user can re-derive.
 - Agent operating rules that belong in AGENTS.md or another obey-tier file.
 - Single-word acknowledgments.
+
+If a capture the user expected is missing or the user explicitly asks why it
+was rejected, call `mcp__wenlan__list_rejections`. Do not list rejections after
+successful ordinary captures.
 
 ## Post-capture contradiction signal
 

@@ -48,9 +48,10 @@ pub(super) async fn load_records(context: &LintContext<'_, '_>) -> Result<Vec<Me
              EXISTS(SELECT 1 FROM child_vectors c
                      WHERE c.parent_kind='memory' AND c.parent_id=m.source_id
                        AND c.embedding IS NOT NULL) AS fact,
-             EXISTS(SELECT 1 FROM page_sources p WHERE p.memory_source_id=m.source_id)
-               OR EXISTS(SELECT 1 FROM page_evidence pe
-                          WHERE pe.source_kind='memory' AND pe.locator=m.source_id) AS page_link,
+             -- G6 Stage 1.3: collapses the page_sources/page_evidence OR-of-two
+             -- EXISTS into one EXISTS over `edges` (`cites`, `dst_kind='memory'`).
+             EXISTS(SELECT 1 FROM edges p WHERE p.edge_type='cites' AND p.valid_until IS NULL
+                     AND p.dst_kind='memory' AND p.dst_id=m.source_id) AS page_link,
              EXISTS(SELECT 1 FROM summary_node_sources s
                      WHERE s.memory_source_id=m.source_id) AS summary,
              MAX(CASE WHEN m.chunk_index=0 THEN m.source_text END) AS episode_source_text,

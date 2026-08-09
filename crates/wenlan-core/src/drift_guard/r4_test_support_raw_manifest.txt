@@ -1,0 +1,17 @@
+crates/wenlan-core/src/eval/seed_contract.rs|crate::eval::seed_contract::tests::graph_links_count_tolerates_missing_table|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/eval/seed_contract.rs|crate::eval::seed_contract::tests::mem_conn|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/eval/seed_contract.rs|crate::eval::seed_contract::tests::real_lme_v1_has_no_dupes_and_is_classified|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/lint/pages/diagnostic_scale_test.rs|crate::lint::pages::diagnostic_scale_test::generate_fixture|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/lint/pages/diagnostic_scale_test.rs|crate::lint::pages::diagnostic_scale_test::run_fixture|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/lint/pages/link_checks_test/orphans.rs|crate::lint::pages::link_checks::tests::orphans::query_failure_propagates_without_a_mutating_fallback|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/lint/test_support_tests.rs|crate::lint::test_support::tests::semantic_fingerprint_detects_same_count_mutation_in_every_catalogued_table|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/m6/frontier_policy_test.rs|crate::m6::frontier_policy_test::TestDb::new|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/m6/genesis_test_support.rs|crate::m6::genesis_test_support::GenesisDb::new|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/m6/independence_test.rs|crate::m6::independence_test::TestDb::new|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/m6/oracle_test.rs|crate::m6::oracle_test::TestDb::new|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/m6/overview_subscriptions_test.rs|crate::m6::overview_subscriptions_test::test_connection|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/m6/refresh_readiness_test.rs|crate::m6::refresh_readiness_test::connection|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/m6/relevance_test.rs|crate::m6::relevance_test::relevance_db|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/m6/remaining_substrate_test.rs|crate::m6::remaining_substrate_test::j5_migration_refuses_an_unresolvable_existing_space_identity|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/m6/remaining_substrate_test.rs|crate::m6::remaining_substrate_test::test_connection|StandaloneLibsqlOrigin|1
+crates/wenlan-core/src/m6/signals_test.rs|crate::m6::signals_test::TestDb::new|StandaloneLibsqlOrigin|1

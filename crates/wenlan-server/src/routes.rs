@@ -1,19 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::error::ServerError;
-use crate::state::ServerState;
+use crate::route_registry::{get, post, TrackedRouter};
+use crate::state::{ServerState, SharedState};
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::Json,
+    Extension,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use wenlan_core::router::classify::{classify_query, estimate_tokens, tier_allowed};
+use wenlan_core::router::classify::estimate_tokens;
 use wenlan_types::requests::ChatContextRequest;
 use wenlan_types::responses::{
     ChatContextResponse, KnowledgeContext, ProfileContext, TierTokenEstimates,
 };
+
+pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
+    router
+        .route("/api/health", get(handle_health))
+        .route("/api/status", get(handle_status))
+        .route("/api/search", post(handle_search))
+        .route("/api/context", post(handle_context))
+        .route("/api/ping", get(handle_ping))
+        .route("/api/llm/test", post(handle_test_llm))
+        .route("/api/shutdown", post(handle_shutdown))
+        .route("/api/debug/pipeline", get(handle_pipeline_status))
+        .route("/api/retrievals/recent", get(handle_recent_retrievals))
+        .route("/api/pages/recent", get(handle_recent_pages))
+        .route("/api/steep", post(handle_steep))
+        .route("/api/distill", post(handle_distill))
+        .route("/api/distill/{page_id}", post(handle_redistill))
+}
 
 // ===== Request/Response Types =====
 
@@ -91,14 +110,37 @@ fn queue_status_wire(
 pub async fn handle_status(
     State(state): State<Arc<RwLock<ServerState>>>,
 ) -> Result<Json<wenlan_types::responses::StatusResponse>, ServerError> {
-    let (db, reranker_status, reranker_light_status, reranker_mode) = {
+    let (db, reranker_status, reranker_light_status, reranker_mode, on_device_inference) = {
         let s = state.read().await;
         (
             s.db.clone(),
             s.reranker_status.clone(),
             s.reranker_light_status.clone(),
             s.reranker_mode.clone(),
+            s.llm
+                .as_ref()
+                .and_then(|provider| provider.inference_runtime_info())
+                .unwrap_or_default(),
         )
+    };
+
+    // Present only when the cutover is actually live. There is one contract —
+    // "absent means not live" — and reporting generation 0 would give a client a
+    // second way to spell it, so a client that checks for the field without also
+    // checking its value would conclude enforcement is on. A generation that
+    // cannot be read is absent for the same reason: a daemon that just failed to
+    // look has no standing to report a state.
+    let truth = match &db {
+        Some(db) => db
+            .truth_cutover_generation()
+            .await
+            .ok()
+            .filter(|generation| *generation > 0)
+            .map(|generation| wenlan_types::responses::TruthStatus {
+                cutover_generation: generation,
+                contract_version: wenlan_core::truth_contract::TRUTH_CONTRACT_VERSION,
+            }),
+        None => None,
     };
 
     let (files_indexed, queue, compile_queue) = if let Some(db) = &db {
@@ -133,6 +175,9 @@ pub async fn handle_status(
         reranker: reranker_status,
         reranker_light: reranker_light_status,
         reranker_mode,
+        on_device_inference,
+        capabilities: vec!["default_save_space".to_string()],
+        truth,
     }))
 }
 
@@ -141,6 +186,7 @@ pub async fn handle_search(
     State(state): State<Arc<RwLock<ServerState>>>,
     headers: HeaderMap,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, ServerError> {
     let start = std::time::Instant::now();
@@ -218,16 +264,21 @@ pub async fn handle_search(
         let visible = db
             .select_visible_pages_scoped(raw, &scope, &ids, &trust_level, 3)
             .await;
-        if visible.is_empty() {
-            None
-        } else {
-            Some(
-                visible
-                    .into_iter()
-                    .map(wenlan_core::db::MemoryDB::search_result_from_page)
-                    .collect(),
-            )
-        }
+        // A surfaced page arrives as a `SearchResult` carrying the page's PROSE
+        // in `content`, not as a `Page`, so it rides on `Full` -- there is no
+        // entry form for a search hit. `source_id` is the page id
+        // (`search_result_from_page`, db.rs).
+        let surfaced: Vec<wenlan_types::memory::SearchResult> = visible
+            .into_iter()
+            .map(wenlan_core::db::MemoryDB::search_result_from_page)
+            .collect();
+        let surfaced =
+            wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, surfaced, |row| {
+                row.source_id.as_str()
+            })
+            .await
+            .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+        (!surfaced.is_empty()).then_some(surfaced)
     };
 
     Ok(Json(SearchResponse {
@@ -239,418 +290,128 @@ pub async fn handle_search(
 
 // ===== Context Endpoints =====
 
-/// POST /api/context - Trust-gated tiered memory retrieval for LLM context injection
+fn render_brief_for_legacy(response: &wenlan_types::BriefReadResponse) -> String {
+    use wenlan_types::BriefReadState;
+
+    let Some(brief) = response.brief.as_ref() else {
+        return match response.state {
+            BriefReadState::SpaceNotResolved => {
+                "## Space Brief\nNo Space resolved. Specify a Space to load its Brief.".into()
+            }
+            BriefReadState::BriefNotCreated => format!(
+                "## Space Brief — {}\nNo Brief has been created for this Space.",
+                response.space.as_deref().unwrap_or("unknown")
+            ),
+            BriefReadState::Ready => "## Space Brief\nBrief unavailable.".into(),
+        };
+    };
+
+    let mut output = format!("## Space Brief — {}\n", brief.space);
+    output.push_str("\n### Last session\n");
+    if brief.last_session_summary.trim().is_empty() {
+        output.push_str("_No session summary._\n");
+    } else {
+        output.push_str(brief.last_session_summary.trim());
+        output.push('\n');
+    }
+    for (heading, items) in [("Active", &brief.active), ("Backlog", &brief.backlog)] {
+        output.push_str(&format!("\n### {heading}\n"));
+        if items.is_empty() {
+            output.push_str("_None._\n");
+            continue;
+        }
+        for item in items {
+            output.push_str("- ");
+            output.push_str(&item.text);
+            if let Some(gate) = item.gate.as_deref() {
+                output.push_str(" (gated: ");
+                output.push_str(gate);
+                output.push(')');
+            }
+            output.push('\n');
+        }
+    }
+    output
+}
+
+/// POST /api/context — deprecated compatibility adapter over Space Brief.
+/// No-topic calls are storage reads only; a topic composes the same Brief with
+/// separately-labelled, same-Space recall results.
 pub async fn handle_context(
     State(state): State<Arc<RwLock<ServerState>>>,
-    headers: HeaderMap,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     Json(req): Json<ChatContextRequest>,
 ) -> Result<Json<ChatContextResponse>, ServerError> {
     let start = std::time::Instant::now();
-
-    let query = req
-        .query
-        .as_deref()
-        .or(req.conversation_id.as_deref())
-        .unwrap_or("recent context");
-
-    let agent_name = headers
-        .get("x-agent-name")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("unknown");
-
-    // Snapshot the Arc handles and drop the ServerState read guard BEFORE
-    // the multi-second chain of DB awaits below. Holding the guard across
-    // ~15 sequential awaits (load_memories_by_type, search_*, log_accesses,
-    // etc.) would block every writer to ServerState — e.g. store_memory's
-    // deferred async work — for the full duration. See CLAUDE.md locking rules.
-    let (db_arc, access_tracker, reranker_light, maintenance) = {
-        let s = state.read().await;
-        let db = s.db.clone().ok_or(ServerError::DbNotInitialized)?;
-        (
-            db,
-            s.access_tracker.clone(),
-            s.reranker_light.clone(),
-            s.maintenance_coordinator.clone(),
-        )
-    }; // guard dropped here
-    let scope = crate::read_scope::effective_read_scope(
-        &db_arc,
-        req.space.as_deref(),
-        header_space.as_deref(),
+    let topic = req.query.or(req.conversation_id);
+    let request = wenlan_types::BriefReadRequest {
+        topic,
+        space: req.space,
+        legacy_context_limit: Some(req.max_chunks),
+    };
+    // `/api/context` reaches every page it serves through the Brief handler, so
+    // the grant this route resolved travels with the call rather than being
+    // re-derived there.
+    let Json(brief_response) = crate::brief_routes::handle_read_brief(
+        State(state),
+        crate::space_header::SpaceHeader(header_space),
+        view,
+        Json(request),
     )
     .await?;
-    let db = db_arc.as_ref();
 
-    let agent_trust = if agent_name == "unknown" {
-        "unknown".to_string()
-    } else {
-        db.get_agent(agent_name)
-            .await
-            .ok()
-            .flatten()
-            .map(|a| a.trust_level)
-            .unwrap_or_else(|| "unknown".to_string())
-    };
-
-    let classification = classify_query(query, agent_name, &agent_trust, true);
-    // Tier 1 (identity + preferences)
-    let (identity, preferences) = if tier_allowed(&classification.trust_level, 1) {
-        let id_mems = db
-            .load_memories_by_type_scoped("identity", 10, &scope)
-            .await
-            .unwrap_or_default();
-        let pref_mems = db
-            .load_memories_by_type_scoped("preference", 10, &scope)
-            .await
-            .unwrap_or_default();
-
-        (
-            id_mems
-                .iter()
-                .map(|m| m.content.clone())
-                .collect::<Vec<_>>(),
-            pref_mems
-                .iter()
-                .map(|m| m.content.clone())
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    // Tier 2 (corrections + decisions). Goal taxonomy folded into Identity by
-    // migration 45 (Phase 0); the goals Vec stays for ProfileContext wire compat
-    // but is always empty now. Both `req.include_goals` and `ProfileContext.goals`
-    // are deprecated and will be removed in wenlan-types 0.4.
-    let goals: Vec<String> = Vec::new();
-
-    let decisions: Vec<String> = if tier_allowed(&classification.trust_level, 2) {
-        db.load_memories_by_type_scoped("decision", 5, &scope)
-            .await
-            .unwrap_or_default()
-            .iter()
-            .map(|m| m.content.clone())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let corrections = if tier_allowed(&classification.trust_level, 2) && query != "recent context" {
-        db.search_corrections_by_topic_scoped(query, 5, &scope)
-            .await
-            .unwrap_or_default()
-            .iter()
-            .map(|r| r.content.clone())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    // Tier 3 (search). Plain search_memory by default (it beat the old LLM reranker
-    // on LongMemEval, 0.790 base vs 0.722). Under WENLAN_RERANKER_MODE lite/full the
-    // context path adds a turbo cross-encoder pass at the HANDLER layer over a widened
-    // pool; search_memory itself stays CE-free so internal callers are unaffected.
-    let search_results = match &reranker_light {
-        Some(reranker) => {
-            let pool = wenlan_core::db::compute_rerank_fetch_pool(req.max_chunks, None, None);
-            let pooled = db
-                .search_memory(query, pool, None, &scope, None, None, None, None)
-                .await
-                .unwrap_or_default();
-            wenlan_core::db::rerank_results_light(reranker.clone(), query, pooled, req.max_chunks)
-                .await
-        }
-        None => db
-            .search_memory(query, req.max_chunks, None, &scope, None, None, None, None)
-            .await
-            .unwrap_or_default(),
-    };
-
-    let threshold = req.relevance_threshold.unwrap_or(0.0) as f32;
-    let filtered_search: Vec<_> = search_results
-        .into_iter()
-        .filter(|r| r.score >= threshold)
-        .collect();
-
-    // Source IDs from search results — used to gate page relevance.
-    // A page is only included if its source memories overlap with the
-    // memories that search_memory returned for this query.
-    let search_source_ids: std::collections::HashSet<String> = filtered_search
-        .iter()
-        .map(|r| r.source_id.clone())
-        .collect();
-
-    let page_results: Vec<String> =
-        if tier_allowed(&classification.trust_level, 2) && query != "recent context" {
-            let raw_pages = db
-                .search_pages_scoped(query, 3, None, &scope)
-                .await
-                .unwrap_or_default();
-            // Space-scope + effective-tier gate (the ONE shared visibility helper):
-            // drop pages whose dedicated workspace is a different caller's space
-            // (with no source-memory overlap) and pages whose effective read-tier
-            // (the max trust tier over their source memories) the caller's trust
-            // does not clear; then rank confirmed pages by relevance and cap at 3.
-            // Closes the cross-space + tier-declassification leaks the un-gated
-            // `select_pages_for_context` selector had on this shipped path.
-            let pages = db
-                .select_visible_pages_scoped(
-                    raw_pages,
-                    &scope,
-                    &search_source_ids,
-                    &classification.trust_level,
-                    3,
-                )
-                .await;
-            pages
-                .iter()
-                .map(|c| {
-                    let summary = c.summary.as_deref().unwrap_or("");
-                    format!("**{}**: {}\n{}", c.title, summary, c.content)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-    // T18 global-context prelude (opt-in, ship-dark). Read-only: surfaces the
-    // pre-built summary_nodes as a `## Corpus Overview` section. The build path
-    // is the refinery's SummaryRollup phase; here we only read. Honors the
-    // space filter via the source-overlap gate (a summary surfaces iff >=1 of
-    // its provenance memories survived the memory-side filter). Empty/absent
-    // unless WENLAN_ENABLE_GLOBAL_PRELUDE is on, so the default response shape
-    // is byte-identical to pre-T18.
-    let corpus_overview: Vec<String> = if wenlan_core::db::global_prelude_enabled() {
-        let nodes = db
-            .search_summary_nodes_scoped(query, 3, &scope)
-            .await
-            .unwrap_or_default();
-        let mut out = Vec::new();
-        for node in nodes {
-            out.push(format!("**{}**: {}", node.title, node.body));
-        }
-        out
-    } else {
-        Vec::new()
-    };
-
-    let narrative = db
-        .get_cached_narrative()
-        .await
-        .ok()
-        .flatten()
-        .filter(|(content, _, _)| !content.is_empty())
-        .map(|(content, _, _)| content)
+    let brief_context = render_brief_for_legacy(&brief_response);
+    let relevant_memories = brief_response
+        .related_context
+        .as_ref()
+        .map(|related| related.results.clone())
         .unwrap_or_default();
-    let narrative_brief: Option<&str> = if narrative.is_empty() {
-        None
-    } else {
-        Some(&narrative)
-    };
-
-    // Token estimates
-    let brief_text = narrative_brief.unwrap_or("");
-    let tier1_text = format!(
-        "{} {} {}",
-        brief_text,
-        identity.join(" "),
-        preferences.join(" ")
-    );
-    let tier2_text = format!(
-        "{} {} {} {}",
-        goals.join(" "),
-        corrections.join(" "),
-        decisions.join(" "),
-        page_results.join(" ")
-    );
-    let tier3_text = filtered_search
+    let related_context = brief_response.related_context.as_ref().map(|related| {
+        let mut section = format!("## Related Context — {}\n", related.query);
+        if related.results.is_empty() {
+            section.push_str("_No related memories found._\n");
+        } else {
+            for result in &related.results {
+                section.push_str(&format!("[{}] {}\n\n", result.title, result.content));
+            }
+        }
+        section
+    });
+    let context = related_context
+        .map(|related| format!("{brief_context}\n\n{related}"))
+        .unwrap_or_else(|| brief_context.clone());
+    let tier2 = estimate_tokens(&brief_context);
+    let tier3 = relevant_memories
         .iter()
-        .map(|r| r.content.as_str())
+        .map(|result| result.content.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    let t1 = estimate_tokens(&tier1_text);
-    let t2 = estimate_tokens(&tier2_text);
-    let t3 = estimate_tokens(&tier3_text);
-    let token_estimates = TierTokenEstimates {
-        tier1_identity: t1,
-        tier2_project: t2,
-        tier3_relevant: t3,
-        total: t1 + t2 + t3,
-    };
+    let tier3 = estimate_tokens(&tier3);
 
-    // Build combined context string
-    let mut sections: Vec<String> = Vec::new();
-
-    if tier_allowed(&classification.trust_level, 1) {
-        if let Some(brief) = narrative_brief {
-            sections.push(format!("## About the User\n{}\n", brief));
-        }
-    }
-
-    if !identity.is_empty() {
-        let mut s = String::from("## Identity\n");
-        for item in &identity {
-            s.push_str(&format!("- {}\n", item));
-        }
-        sections.push(s);
-    }
-
-    if !preferences.is_empty() {
-        let mut s = String::from("## Preferences\n");
-        for item in &preferences {
-            s.push_str(&format!("- {}\n", item));
-        }
-        sections.push(s);
-    }
-
-    if !goals.is_empty() {
-        let mut s = String::from("## Goals\n");
-        for item in &goals {
-            s.push_str(&format!("- {}\n", item));
-        }
-        sections.push(s);
-    }
-
-    if !decisions.is_empty() {
-        let mut sec = String::from("## Relevant Decisions\n");
-        for item in &decisions {
-            sec.push_str(&format!("- {}\n", item));
-        }
-        sections.push(sec);
-    }
-
-    if !corrections.is_empty() {
-        let mut sec = String::from("## Corrections\n");
-        for item in &corrections {
-            sec.push_str(&format!("- {}\n", item));
-        }
-        sections.push(sec);
-    }
-
-    if !corpus_overview.is_empty() {
-        let mut sec = String::from("## Corpus Overview\n");
-        for item in &corpus_overview {
-            sec.push_str(&format!("{}\n\n", item));
-        }
-        sections.push(sec);
-    }
-
-    if !page_results.is_empty() {
-        let mut sec = String::from("## Compiled Knowledge\n");
-        for item in &page_results {
-            sec.push_str(&format!("{}\n\n---\n\n", item));
-        }
-        sections.push(sec);
-    }
-
-    if !filtered_search.is_empty() {
-        let mut sec = String::from("## Relevant Memories\n");
-        for r in &filtered_search {
-            sec.push_str(&format!("[{}] {}\n\n", r.title, r.content));
-        }
-        sections.push(sec);
-    }
-
-    let context = sections.join("\n");
-
-    // Track accesses
-    let all_source_ids: Vec<String> = filtered_search
-        .iter()
-        .map(|r| r.source_id.clone())
-        .collect();
-    if !all_source_ids.is_empty() {
-        access_tracker.record_accesses(&all_source_ids);
-        if let Err(e) = db.log_accesses(&all_source_ids).await {
-            tracing::warn!("Failed to log accesses: {}", e);
-        }
-    }
-
-    if !all_source_ids.is_empty() {
-        let detail = format!("used {} memories", all_source_ids.len());
-        if let Err(e) = db
-            .log_agent_activity(
-                agent_name,
-                "read",
-                &all_source_ids,
-                req.query.as_deref(),
-                &detail,
-            )
-            .await
-        {
-            tracing::warn!("Failed to log agent read activity: {}", e);
-        }
-    }
-
-    let took_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-    // Fire-once onboarding milestone check (recall side).
-    //
-    // Only fires when the caller identified itself via `x-agent-name`. The
-    // evaluator skips empty-result recalls internally, so we pass the real
-    // hit count from `filtered_search` (the post-threshold search results
-    // surfaced back to the agent as `knowledge.relevant_memories`). The
-    // daemon has no UI to notify, so a fresh `NoopEmitter` is used inline —
-    // milestones are still persisted via `record_milestone` and surfaced
-    // to the frontend through /api/onboarding/*.
-    if agent_name != "unknown" {
-        let agent_for_ms = agent_name.to_string();
-        let results_count = filtered_search.len();
-        // Quote the top-ranked hit so the first-recall toast can show WHAT
-        // was just surfaced, not just who asked. Char-safe truncation
-        // (UTF-8 rule: never byte-index a Rust string).
-        let top_preview_for_ms: Option<String> = filtered_search.first().map(|r| {
-            let s = &r.content;
-            let truncated: String = s.chars().take(100).collect();
-            if truncated.chars().count() < s.chars().count() {
-                format!("{}…", truncated.trim_end())
-            } else {
-                truncated
-            }
-        });
-        let db_for_ms = db_arc.clone();
-        let emitter_for_ms: Arc<dyn wenlan_core::events::EventEmitter> =
-            Arc::new(wenlan_core::events::NoopEmitter);
-        tokio::spawn(async move {
-            let _maintenance_guard = maintenance.begin_background().await;
-            let ev = wenlan_core::onboarding::MilestoneEvaluator::new(&db_for_ms, emitter_for_ms);
-            if let Err(e) = ev
-                .check_after_context_call(
-                    &agent_for_ms,
-                    results_count,
-                    top_preview_for_ms.as_deref(),
-                )
-                .await
-            {
-                tracing::warn!(?e, "onboarding: check_after_context_call failed");
-            }
-        });
-    }
-
-    // ProfileContext.goals is deprecated (migration 45 folded goal -> identity);
-    // we still emit it as an empty Vec for wire backward compat with wenlan-mcp
-    // and any external consumers of /api/context until wenlan-types 0.4
-    // drops the field entirely.
     #[allow(deprecated)]
     let profile = ProfileContext {
-        narrative,
-        identity,
-        preferences,
-        goals,
+        narrative: String::new(),
+        identity: Vec::new(),
+        preferences: Vec::new(),
+        goals: Vec::new(),
     };
-
     Ok(Json(ChatContextResponse {
         context,
         profile,
         knowledge: KnowledgeContext {
-            pages: page_results,
-            decisions,
-            relevant_memories: filtered_search,
+            pages: Vec::new(),
+            decisions: Vec::new(),
+            relevant_memories,
             graph_context: Vec::new(),
         },
-        took_ms,
-        token_estimates,
+        took_ms: start.elapsed().as_secs_f64() * 1000.0,
+        token_estimates: TierTokenEstimates {
+            tier1_identity: 0,
+            tier2_project: tier2,
+            tier3_relevant: tier3,
+            total: tier2 + tier3,
+        },
     }))
 }
 
@@ -766,8 +527,18 @@ pub struct DistillRequest {
 }
 
 /// POST /api/distill
+/// The write half of this route is gated downstream, but the RESPONSE is a page
+/// reader three times over: stale pages carry title/summary/stale_reason and
+/// their source ids, each pending cluster can name the page it overlaps, and the
+/// orphan feed is text lifted out of page bodies. All three go through the
+/// adapter below.
+///
+/// Its manifest shape is `MarkerShape::None`, so `view.grant` always resolves to
+/// `Automatic` today. Taking the view anyway is what keeps that a fact about the
+/// manifest rather than an assumption baked into the handler.
 pub async fn handle_distill(
     State(state): State<Arc<RwLock<ServerState>>>,
+    view: crate::truth_guard::TruthView,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let req: DistillRequest = if body.is_empty() {
@@ -923,14 +694,51 @@ pub async fn handle_distill(
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
 
+    // The overlap match names a page, and the cluster payload publishes that
+    // name. Resolve the whole loop's candidates in ONE adapter call up front --
+    // per-cluster calls would be one `page_visibility` query per pending
+    // cluster, and the overlap itself is a pure in-memory scan of `page_index`.
+    let best_per_cluster: Vec<_> = result
+        .pending
+        .iter()
+        .map(|cluster| {
+            wenlan_core::db::best_overlapping_page_in_index(&page_index, &cluster.source_ids)
+        })
+        .collect();
+    let overlap_candidates: Vec<String> = best_per_cluster
+        .iter()
+        .flatten()
+        .map(|m| m.page_id.clone())
+        .collect();
+    let visible_overlaps: std::collections::HashSet<String> =
+        wenlan_core::truth_adapter::filter_page_refs(
+            &db,
+            &view.grant,
+            overlap_candidates,
+            |page_id| page_id.as_str(),
+        )
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?
+        .into_iter()
+        .collect();
+
     let mut filtered_pending: Vec<serde_json::Value> = Vec::new();
-    for cluster in &result.pending {
+    for (cluster, best) in result.pending.iter().zip(best_per_cluster) {
         let cluster_size = cluster.source_ids.len();
-        let best =
-            wenlan_core::db::best_overlapping_page_in_index(&page_index, &cluster.source_ids);
 
         let (existing_page_id, existing_page_title, new_memory_count) = match best {
+            // Gate the disclosure, keep the suppression. A fully-covered cluster
+            // is dropped whether or not the caller may see the page that covers
+            // it: suppressing a duplicate uses the knowledge without disclosing
+            // it, and surfacing the cluster instead would have the agent mint a
+            // second page for a topic that already has one.
             Some(m) if m.intersection >= cluster_size || m.jaccard >= 0.8 => continue,
+            // For this caller the overlapping page does not exist, so neither
+            // its id nor its title is emitted -- and every memory in the cluster
+            // is new. `cluster_size - m.intersection` is derived from the hidden
+            // page's own source list, so publishing it would leak how much of
+            // this cluster that page already covers.
+            Some(m) if !visible_overlaps.contains(&m.page_id) => (None, None, cluster_size),
             Some(m) => (
                 Some(m.page_id),
                 Some(m.page_title),
@@ -969,6 +777,22 @@ pub async fn handle_distill(
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
 
+    // 10 is the LIMIT inside list_stale_pages_scoped. Surface a hint so the
+    // skill can tell the user to re-run instead of silently dropping rows.
+    // Read PRE-filter on purpose: the flag means "the query hit its cap", not
+    // "you were shown ten", so the adapter below must not move it.
+    let stale_truncated = stale_pages_list.len() == 10;
+
+    // The payload quotes page prose -- title, summary, and `stale_reason`, which
+    // names why the page changed -- and hands out `source_memory_ids` on top, so
+    // the pages are reduced before it is built rather than after. Filtering here
+    // means an `EntryOnly` page arrives with those fields already blanked and
+    // flows through the map below unchanged.
+    let stale_pages_list =
+        wenlan_core::truth_adapter::filter_pages(&db, &view.grant, stale_pages_list)
+            .await
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
+
     let stale_pages_payload: Vec<serde_json::Value> = stale_pages_list
         .iter()
         .map(|p| {
@@ -983,9 +807,6 @@ pub async fn handle_distill(
             })
         })
         .collect();
-    // 10 is the LIMIT inside list_stale_pages_scoped. Surface a hint so the
-    // skill can tell the user to re-run instead of silently dropping rows.
-    let stale_truncated = stale_pages_list.len() == 10;
 
     // Walk orphan rows in case a page minted earlier in this pass (or by
     // a concurrent create_page call) now matches an existing orphan label.
@@ -1010,11 +831,22 @@ pub async fn handle_distill(
     let orphan_topics: Vec<serde_json::Value> = if scoped {
         Vec::new()
     } else {
-        let raw = db
-            .list_orphan_link_labels(2)
+        // Same rows-then-fold shape as GET /api/pages/orphan-links, and for the
+        // same reason: a label leaks the page whose body it was lifted out of,
+        // and the aggregate twin would compute its counts and its 100-row cap
+        // over pages this caller cannot see. `Global` keeps this feed's existing
+        // unscoped reach -- the route already ignored the request's Space here.
+        let rows = db
+            .list_orphan_link_rows_scoped(&wenlan_core::read_scope::ReadScope::Global)
             .await
             .map_err(|e| ServerError::Internal(e.to_string()))?;
-        raw.into_iter()
+        let rows = wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, rows, |row| {
+            row.source_page_id.as_str()
+        })
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
+        wenlan_core::db::MemoryDB::fold_orphan_labels(rows, 2)
+            .into_iter()
             .map(|(label, count)| serde_json::json!({"label": label, "count": count}))
             .collect()
     };
@@ -1102,6 +934,7 @@ pub struct RecentLimitQuery {
 pub async fn handle_recent_retrievals(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     axum::extract::Query(q): axum::extract::Query<RecentLimitQuery>,
 ) -> Result<Json<Vec<wenlan_types::RetrievalEvent>>, ServerError> {
     let limit = q.limit.unwrap_or(10).clamp(1, 100);
@@ -1111,10 +944,53 @@ pub async fn handle_recent_retrievals(
     };
     let db = db.ok_or(ServerError::DbNotInitialized)?;
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let events = db
+    let mut events = db
         .list_recent_retrievals_scoped(limit, &scope)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
+    // A retrieval event is not a page, but `page_titles` is page prose -- here
+    // the title IS the disclosure, so a title survives only when its page does.
+    // `page_ids` is documented as corresponding 1:1 with `page_titles`, so the
+    // pair is the unit that lives or dies, and there is no entry form for half
+    // of one: `Full` or dropped.
+    //
+    // The event itself is never dropped. Its query, agent and timestamp are the
+    // caller's own activity rather than anything about a page, and an event that
+    // vanished would say more than one that came back with no titles.
+    //
+    // One adapter call for the whole feed: every candidate id across every
+    // event goes in, the survivors come back as a set, and each event rebuilds
+    // its pairs from that. Per-event calls would be one `page_visibility` query
+    // per row of a 100-row feed.
+    let page_ids: Vec<String> = events
+        .iter()
+        .filter(|event| event.page_ids.len() == event.page_titles.len())
+        .flat_map(|event| event.page_ids.iter().cloned())
+        .collect();
+    let visible: std::collections::HashSet<String> =
+        wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, page_ids, |id| id.as_str())
+            .await
+            .map_err(|e| ServerError::Internal(e.to_string()))?
+            .into_iter()
+            .collect();
+    for event in &mut events {
+        // Legacy rows recorded before `page_ids` existed carry titles and no
+        // ids, and any other length mismatch is the same situation: nothing
+        // attributes a title to a page, so nothing can be checked against a
+        // verdict. Unknown is not permission -- both vectors clear.
+        if event.page_ids.len() != event.page_titles.len() {
+            event.page_ids.clear();
+            event.page_titles.clear();
+            continue;
+        }
+        let (ids, titles): (Vec<String>, Vec<String>) = std::mem::take(&mut event.page_ids)
+            .into_iter()
+            .zip(std::mem::take(&mut event.page_titles))
+            .filter(|(id, _)| visible.contains(id))
+            .unzip();
+        event.page_ids = ids;
+        event.page_titles = titles;
+    }
     Ok(Json(events))
 }
 
@@ -1122,6 +998,7 @@ pub async fn handle_recent_retrievals(
 pub async fn handle_recent_page_changes(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     axum::extract::Query(q): axum::extract::Query<RecentLimitQuery>,
 ) -> Result<Json<Vec<wenlan_types::PageChange>>, ServerError> {
     let limit = q.limit.unwrap_or(10).clamp(1, 100);
@@ -1135,6 +1012,15 @@ pub async fn handle_recent_page_changes(
         .list_recent_changes_scoped(limit, &scope)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
+    // A change row hangs off a page (id + title + what happened to it) rather
+    // than being one, and it carries no truth axes of its own, so there is no
+    // entry form for it: `Full` or dropped.
+    let changes =
+        wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, changes, |change| {
+            change.page_id.as_str()
+        })
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
     Ok(Json(changes))
 }
 
@@ -1143,6 +1029,7 @@ pub async fn handle_recent_page_changes(
 pub async fn handle_recent_pages(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     axum::extract::Query(q): axum::extract::Query<crate::memory_routes::RecentActivityQuery>,
 ) -> Result<Json<Vec<wenlan_types::RecentActivityItem>>, ServerError> {
     let db = {
@@ -1151,10 +1038,29 @@ pub async fn handle_recent_pages(
     };
     let db = db.ok_or(ServerError::DbNotInitialized)?;
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let items = db
+    let mut items = db
         .list_recent_pages_with_badges_scoped(q.limit.unwrap_or(10), q.since_ms, &scope)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
+    // The feed interleaves pages and memories under one `id` field, so only the
+    // page rows may be keyed on it -- a memory source_id carries no truth state
+    // and would read as unsupported, dropping memories that this contract says
+    // nothing about. An item carries a `snippet` of the page's prose, so the
+    // page rows ride on `Full` with no entry form.
+    let page_ids: Vec<String> = items
+        .iter()
+        .filter(|item| item.kind == wenlan_types::memory::ActivityKind::Page)
+        .map(|item| item.id.clone())
+        .collect();
+    let visible: std::collections::HashSet<String> =
+        wenlan_core::truth_adapter::filter_page_refs(&db, &view.grant, page_ids, |id| id.as_str())
+            .await
+            .map_err(|e| ServerError::Internal(e.to_string()))?
+            .into_iter()
+            .collect();
+    items.retain(|item| {
+        item.kind != wenlan_types::memory::ActivityKind::Page || visible.contains(&item.id)
+    });
     Ok(Json(items))
 }
 
@@ -1183,14 +1089,20 @@ pub async fn handle_test_llm(
     Ok(Json(wenlan_types::requests::TestLlmResponse { response }))
 }
 
-/// POST /api/shutdown — exits the daemon process cleanly.
-/// Returns 200 OK, then exits 0 after a brief delay so the response is delivered.
-pub async fn handle_shutdown() -> &'static str {
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        std::process::exit(0);
-    });
-    "shutting down"
+/// POST /api/shutdown — request cooperative, bounded daemon shutdown.
+/// The lifecycle coordinator stops accepting new HTTP work, drains owned work,
+/// and retains a hard deadline for tasks that cannot cooperate.
+pub async fn handle_shutdown(
+    Extension(shutdown): Extension<crate::lifecycle::ShutdownHandle>,
+) -> (HeaderMap, &'static str) {
+    shutdown.request();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-wenlan-process-id",
+        HeaderValue::from_str(&std::process::id().to_string())
+            .expect("process id is always a valid HTTP header value"),
+    );
+    (headers, "shutting down")
 }
 
 #[cfg(test)]
@@ -1204,6 +1116,54 @@ mod recent_endpoints_tests {
     use wenlan_core::llm_provider::{LlmBackend, LlmError, LlmProvider, LlmRequest};
 
     use crate::state::ServerState;
+
+    struct WenlanDataDirGuard {
+        previous: Option<std::ffi::OsString>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl WenlanDataDirGuard {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let previous = std::env::var_os("WENLAN_DATA_DIR");
+            std::env::set_var("WENLAN_DATA_DIR", tmp.path());
+            Self {
+                previous,
+                _tmp: tmp,
+            }
+        }
+    }
+
+    impl Drop for WenlanDataDirGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("WENLAN_DATA_DIR", value),
+                None => std::env::remove_var("WENLAN_DATA_DIR"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_control_does_not_wait_for_server_state_lock() {
+        let state = Arc::new(RwLock::new(ServerState::default()));
+        let shutdown = state.read().await.shutdown.clone();
+        let app = crate::router::build_router_with_shutdown(state.clone(), shutdown.clone());
+        let _write_guard = state.write().await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/shutdown")
+            .body(Body::empty())
+            .unwrap();
+        let response =
+            tokio::time::timeout(std::time::Duration::from_millis(100), app.oneshot(request))
+                .await
+                .expect("shutdown control path must bypass the workload-state lock")
+                .unwrap();
+
+        assert!(response.status().is_success());
+        assert!(shutdown.is_requested());
+    }
 
     struct ExternalCompileProvider {
         state: Arc<RwLock<ServerState>>,
@@ -1245,6 +1205,39 @@ mod recent_endpoints_tests {
 
         fn kind(&self) -> &'static str {
             "mock"
+        }
+    }
+
+    struct VulkanStatusProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for VulkanStatusProvider {
+        async fn generate(&self, _request: LlmRequest) -> Result<String, LlmError> {
+            Ok("unused".into())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "vulkan-status-test"
+        }
+
+        fn backend(&self) -> LlmBackend {
+            LlmBackend::OnDevice
+        }
+
+        fn inference_runtime_info(
+            &self,
+        ) -> Option<wenlan_types::responses::OnDeviceInferenceStatus> {
+            Some(wenlan_types::responses::OnDeviceInferenceStatus {
+                backend: "vulkan".into(),
+                device: Some("NVIDIA GeForce RTX 3060 Laptop GPU".into()),
+                device_index: Some(2),
+                gpu_layers: 99,
+                fallback_reason: None,
+            })
         }
     }
 
@@ -1328,8 +1321,19 @@ mod recent_endpoints_tests {
         assert_eq!(response.status(), 503);
     }
 
-    #[tokio::test]
-    async fn steep_routes_external_provider_without_holding_state_lock_across_compile() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn steep_routes_pinned_external_provider_without_holding_state_lock_across_compile() {
+        let _lock = crate::TEST_DATA_DIR_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let _env = WenlanDataDirGuard::new();
+        let routing = wenlan_core::config::Config {
+            synthesis_source: Some("external".to_string()),
+            ..wenlan_core::config::Config::default()
+        };
+        wenlan_core::config::save_config(&routing).unwrap();
+
         let tmp = tempfile::tempdir().expect("tempdir");
         let emitter: Arc<dyn wenlan_core::events::EventEmitter> =
             Arc::new(wenlan_core::events::NoopEmitter);
@@ -1418,6 +1422,35 @@ mod recent_endpoints_tests {
             parsed.reranker,
             wenlan_types::responses::RerankerStatus::Disabled
         );
+        assert_eq!(parsed.on_device_inference.backend, "disabled");
+    }
+
+    #[tokio::test]
+    async fn status_reports_selected_vulkan_device() {
+        let state = Arc::new(RwLock::new(ServerState {
+            llm: Some(Arc::new(VulkanStatusProvider)),
+            ..ServerState::default()
+        }));
+        let app = crate::router::build_router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/status")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: wenlan_types::responses::StatusResponse =
+            serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(parsed.on_device_inference.backend, "vulkan");
+        assert_eq!(
+            parsed.on_device_inference.device.as_deref(),
+            Some("NVIDIA GeForce RTX 3060 Laptop GPU")
+        );
+        assert_eq!(parsed.on_device_inference.device_index, Some(2));
     }
 
     #[tokio::test]
@@ -1457,9 +1490,13 @@ mod recent_endpoints_tests {
             .map(|offset| start + offset)
             .expect("handle_search marker should follow handle_status");
         let body = &source[start..end];
+        let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
 
         assert!(
-            body.contains("let (db, reranker_status, reranker_light_status, reranker_mode) = {"),
+            normalized.contains(
+                "let (db, reranker_status, reranker_light_status, reranker_mode, \
+                 on_device_inference) = { let s = state.read().await;"
+            ),
             "handle_status must snapshot cloned state out of ServerState before awaiting DB work"
         );
     }
@@ -1793,7 +1830,7 @@ mod redistill_contract_tests {
                 content: "original body".to_string(),
                 summary: None,
                 entity_id: None,
-                space: None,
+                space: (None).into(),
                 source_memory_ids: Vec::new(),
                 creation_kind: Some("authored".to_string()),
                 workspace: None,
@@ -1902,15 +1939,8 @@ mod redistill_contract_tests {
 
 #[cfg(test)]
 mod context_page_selection_tests {
-    use crate::state::ServerState;
-    use axum::body::Body;
-    use axum::http::Request;
     use std::collections::HashSet;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-    use tower::ServiceExt;
     use wenlan_core::pages::{filter_pages_by_source_overlap, select_pages_for_context, Page};
-    use wenlan_types::requests::CreateConceptRequest;
 
     fn make_page(id: &str, source_ids: &[&str], relevance_score: f32, review_status: &str) -> Page {
         Page {
@@ -1939,67 +1969,13 @@ mod context_page_selection_tests {
             review_status: review_status.to_string(),
             workspace: None,
             citations: Vec::new(),
+            kind: "concept".to_string(),
+            truth: None,
         }
     }
 
-    async fn seed_confirmed_distilled_page(
-        db: &wenlan_core::db::MemoryDB,
-        title: &str,
-        content: &str,
-        source_id: &str,
-        source_type: &str,
-        space: &str,
-    ) {
-        let source = wenlan_core::sources::RawDocument {
-            source: "memory".to_string(),
-            source_id: source_id.to_string(),
-            title: format!("memory-{source_id}"),
-            content: if space == "other" {
-                "unrelated source memory outside the query result set".to_string()
-            } else {
-                content.to_string()
-            },
-            memory_type: Some(source_type.to_string()),
-            space: Some(space.to_string()),
-            source_agent: Some("test-agent".to_string()),
-            confidence: Some(0.9),
-            confirmed: Some(true),
-            ..Default::default()
-        };
-        db.upsert_documents(vec![source]).await.unwrap();
-        if space == "other" {
-            return;
-        }
-        let result = wenlan_core::post_write::create_page_with_tuning(
-            db,
-            CreateConceptRequest {
-                title: title.to_string(),
-                content: content.to_string(),
-                summary: None,
-                entity_id: None,
-                source_memory_ids: vec![source_id.to_string()],
-                creation_kind: Some("distilled".to_string()),
-                space: Some(space.to_string()),
-                workspace: Some(space.to_string()),
-            },
-            "test",
-            None,
-            1,
-            1.1,
-        )
-        .await
-        .unwrap();
-        db.set_page_review_status(&result.id, "confirmed")
-            .await
-            .unwrap();
-    }
-
-    /// Unit-locks the `select_pages_for_context` SELECTOR (the ranking stage inside
-    /// the `/api/context` gate): a high-relevance page whose source memories do NOT
-    /// intersect the memory hit pool MUST still surface — the exact case the prior
-    /// `filter_pages_by_source_overlap(.., >=1)` hard gate dropped. The full handler
-    /// wiring (now `db.select_visible_pages`, applying space-scope + effective-tier)
-    /// is locked separately by `context_page_block_enforces_space_scope_and_effective_tier`.
+    /// Unit-locks the `select_pages_for_context` ranking selector. A high-relevance
+    /// page with no source overlap still surfaces; the prior hard overlap gate dropped it.
     #[test]
     fn context_surfaces_zero_overlap_page_that_old_gate_dropped() {
         // Memory hit pool returned by search_memory for this query.
@@ -2022,128 +1998,11 @@ mod context_page_selection_tests {
             "old source-overlap gate should drop the zero-overlap page"
         );
 
-        // The NEW wiring (cap = 3, matching the handler's literal) surfaces it.
+        // The selector surfaces it when the caller requests a three-page cap.
         let selected = select_pages_for_context(&raw_pages, &search_source_ids, 3);
         assert!(
             selected.iter().any(|p| p.id == "page_zero_overlap"),
-            "un-gated context path must surface the high-relevance zero-overlap page"
-        );
-    }
-
-    /// Handler-level wiring lock (Task 5): `/api/context` routes its page block
-    /// through `db.select_visible_pages(..)`, which applies the space-scope +
-    /// effective-tier gate. Before the rewire the handler called the un-gated
-    /// `select_pages_for_context`, so for a tier-2 caller a cross-space page AND
-    /// a page distilled from a tier-1 (identity) source both leaked into the
-    /// response. This drives the real handler and asserts both leaks are closed
-    /// while a same-space, tier-3-sourced page still surfaces.
-    #[tokio::test]
-    async fn context_page_block_enforces_space_scope_and_effective_tier() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let emitter: Arc<dyn wenlan_core::events::EventEmitter> =
-            Arc::new(wenlan_core::events::NoopEmitter);
-        let db = wenlan_core::db::MemoryDB::new(tmp.path(), emitter)
-            .await
-            .expect("MemoryDB::new");
-        db.create_space("work", None, false).await.unwrap();
-
-        // A tier-2 caller: trust "review" allows tier 2, denies tier 1.
-        db.register_agent("test-agent").await.unwrap();
-        db.update_agent("test-agent", None, None, None, Some("review"), None)
-            .await
-            .unwrap();
-
-        // Source memories: an identity memory (tier 1, most sensitive) and a fact
-        // memory (tier 3). Only their presence in the `memories` table matters —
-        // the effective-tier lookup reads memory_type by source_id.
-        let mem = |source_id: &str, memory_type: &str| wenlan_core::sources::RawDocument {
-            source: "memory".to_string(),
-            source_id: source_id.to_string(),
-            title: format!("memory-{source_id}"),
-            content: "zorblax source memory".to_string(),
-            memory_type: Some(memory_type.to_string()),
-            space: Some("work".to_string()),
-            source_agent: Some("test-agent".to_string()),
-            confidence: Some(0.9),
-            confirmed: Some(true),
-            ..Default::default()
-        };
-        db.upsert_documents(vec![mem("m_identity", "identity"), mem("m_fact", "fact")])
-            .await
-            .unwrap();
-
-        // Three confirmed, active pages, all matching the query keyword "zorblax"
-        // so search_pages returns each as a candidate.
-        // Cross-space: workspace != caller space, source not in result set → DROP.
-        seed_confirmed_distilled_page(
-            &db,
-            "Crossmarker",
-            "crossmarker body outside query",
-            "unrelated",
-            "fact",
-            "other",
-        )
-        .await;
-        // Same space, only source is a tier-1 identity memory → DROP for review.
-        seed_confirmed_distilled_page(
-            &db,
-            "Zorblax Identmarker",
-            "zorblax identmarker body",
-            "m_identity",
-            "identity",
-            "work",
-        )
-        .await;
-        // Same space, tier-3 fact source → KEEP.
-        seed_confirmed_distilled_page(
-            &db,
-            "Zorblax Samemarker",
-            "zorblax samemarker body",
-            "m_fact",
-            "fact",
-            "work",
-        )
-        .await;
-
-        let state = Arc::new(RwLock::new(ServerState {
-            db: Some(Arc::new(db)),
-            ..Default::default()
-        }));
-        let app = crate::router::build_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/context")
-                    .header("x-agent-name", "test-agent")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"query":"zorblax","space":"work","max_chunks":5}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "context call should succeed");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let parsed: wenlan_types::responses::ChatContextResponse =
-            serde_json::from_slice(&bytes).unwrap();
-        let pages = parsed.knowledge.pages.join("\n");
-
-        assert!(
-            pages.contains("samemarker"),
-            "same-space tier-3 page must surface, got pages: {pages:?}"
-        );
-        assert!(
-            !pages.contains("crossmarker"),
-            "cross-space page must be dropped by the space-scope gate, got pages: {pages:?}"
-        );
-        assert!(
-            !pages.contains("identmarker"),
-            "tier-1-sourced page must be dropped for review trust, got pages: {pages:?}"
+            "selector must surface the high-relevance zero-overlap page"
         );
     }
 }
@@ -2198,7 +2057,7 @@ mod search_supplemental_pages_tests {
                 entity_id: None,
                 source_memory_ids: vec![source_id.to_string()],
                 creation_kind: Some("distilled".to_string()),
-                space: Some(space.to_string()),
+                space: (Some(space.to_string())).into(),
                 workspace: Some(space.to_string()),
             },
             "test",
