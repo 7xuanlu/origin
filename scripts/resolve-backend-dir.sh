@@ -6,11 +6,15 @@ DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="${1:-$DEFAULT_REPO_ROOT}"
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 
+# The monorepo checkout is the normal backend source. Sibling probes below are
+# legacy fallbacks for standalone app checkouts and older worktrees.
+
 is_wenlan_backend_dir() {
   local dir="$1"
   [[ -f "$dir/Cargo.toml" && -d "$dir/crates/wenlan-server" && -d "$dir/crates/wenlan-mcp" && -d "$dir/crates/wenlan-cli" ]]
 }
 
+# An explicit WENLAN_BACKEND_DIR override always has the highest priority.
 if [[ -n "${WENLAN_BACKEND_DIR:-}" ]]; then
   candidate="$WENLAN_BACKEND_DIR"
   if [[ "$candidate" != /* ]]; then
@@ -25,6 +29,7 @@ if [[ -n "${WENLAN_BACKEND_DIR:-}" ]]; then
 fi
 
 for candidate in \
+  "$REPO_ROOT" \
   "$REPO_ROOT/../wenlan" \
   "$REPO_ROOT/../../../wenlan" \
   "$REPO_ROOT/../.."
