@@ -1,0 +1,413 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Existing hardcoded English UI copy debt. The guard permits these counts to shrink,
+# but CI fails when a file adds untranslated copy or increases an existing count.
+# Format: relative file path, copy, count. Prefer localizing strings over editing this file.
+src/components/ChunkViewer.tsx	‹ Back	1
+src/components/ChunkViewer.tsx	AI is summarizing…	1
+src/components/ChunkViewer.tsx	Cancel	1
+src/components/ChunkViewer.tsx	Copied!	1
+src/components/ChunkViewer.tsx	Copy	1
+src/components/ChunkViewer.tsx	Edit	1
+src/components/ChunkViewer.tsx	Loading chunks...	1
+src/components/ChunkViewer.tsx	No chunks found	1
+src/components/ChunkViewer.tsx	No chunks match	1
+src/components/ChunkViewer.tsx	Save	1
+src/components/ChunkViewer.tsx	Saving...	1
+src/components/ChunkViewer.tsx	Search chunks…	2
+src/components/intelligence/IntelligenceSetup.tsx	sk-ant-api03-...	2
+src/components/memory/ActivityFeed.tsx	&ldquo;	1
+src/components/memory/ActivityFeed.tsx	&rdquo;	1
+src/components/memory/ConnectionsList.tsx	patterns and themes the refinery surfaced this week	1
+src/components/memory/ConnectionsList.tsx	What Wenlan learned	1
+src/components/memory/ConstellationMap.tsx	Connection	1
+src/components/memory/ConstellationMap.tsx	Explore	1
+src/components/memory/ConstellationMap.tsx	Memory	1
+src/components/memory/ConstellationMap.tsx	Page	1
+src/components/memory/ConstellationMap.tsx	Your constellation will appear as knowledge grows	1
+src/components/memory/ContentRenderer.tsx	No content	2
+src/components/memory/DecisionLog.tsx	Alternatives considered	1
+src/components/memory/DecisionLog.tsx	Decisions	1
+src/components/memory/DecisionLog.tsx	Go back	2
+src/components/memory/DecisionLog.tsx	No decisions recorded yet	1
+src/components/memory/DecisionLog.tsx	Not easily reversible	1
+src/components/memory/DecisionLog.tsx	Reversible	1
+src/components/memory/DecisionLog.tsx	View full memory	1
+src/components/memory/DistillReviewPanel.tsx	Back	2
+src/components/memory/DistillReviewPanel.tsx	linked to an existing page	1
+src/components/memory/DistillReviewPanel.tsx	New page candidates	1
+src/components/memory/DistillReviewPanel.tsx	No new page candidates.	1
+src/components/memory/DistillReviewPanel.tsx	No page review loaded.	1
+src/components/memory/DistillReviewPanel.tsx	No repeated unlinked topics.	1
+src/components/memory/DistillReviewPanel.tsx	Page changes and new page candidates	1
+src/components/memory/DistillReviewPanel.tsx	Page review	1
+src/components/memory/DistillReviewPanel.tsx	Pages are current.	1
+src/components/memory/DistillReviewPanel.tsx	Pages with new sources	1
+src/components/memory/DistillReviewPanel.tsx	Refresh	1
+src/components/memory/DistillReviewPanel.tsx	Refreshing...	1
+src/components/memory/DistillReviewPanel.tsx	Showing the first 10 stale pages returned by the daemon.	1
+src/components/memory/DistillReviewPanel.tsx	Unlinked topics	1
+src/components/memory/EntitySuggestions.tsx	Dismiss	1
+src/components/memory/EntitySuggestions.tsx	Suggested Entities	1
+src/components/memory/Greeting.tsx	Good	1
+src/components/memory/Greeting.tsx	your library holds	1
+src/components/memory/IdentityDetail.tsx	&rarr;	1
+src/components/memory/IdentityDetail.tsx	+ add observation	1
+src/components/memory/IdentityDetail.tsx	About	1
+src/components/memory/IdentityDetail.tsx	archived	1
+src/components/memory/IdentityDetail.tsx	Cancel	1
+src/components/memory/IdentityDetail.tsx	Connections	1
+src/components/memory/IdentityDetail.tsx	Delete	1
+src/components/memory/IdentityDetail.tsx	Delete this entity?	1
+src/components/memory/IdentityDetail.tsx	Linked Memories	1
+src/components/memory/IdentityDetail.tsx	New observation...	2
+src/components/memory/ImportView.tsx	Continue	1
+src/components/memory/ImportView.tsx	Copied!	1
+src/components/memory/ImportView.tsx	Copy prompt	1
+src/components/memory/ImportView.tsx	done	1
+src/components/memory/ImportView.tsx	entities,	1
+src/components/memory/ImportView.tsx	Export prompt	1
+src/components/memory/ImportView.tsx	Import	1
+src/components/memory/ImportView.tsx	Import Memories	1
+src/components/memory/ImportView.tsx	Import more	1
+src/components/memory/ImportView.tsx	Instructions	1
+src/components/memory/ImportView.tsx	lines	1
+src/components/memory/ImportView.tsx	memories	1
+src/components/memory/ImportView.tsx	memories imported from	1
+src/components/memory/ImportView.tsx	observations discovered	1
+src/components/memory/ImportView.tsx	Paste any list of facts or memories, one per line. Each line becomes a separate memory in Wenlan. Empty lines and separators (---, ===) are skipped. Optionally prefix lines with a type tag: [identity] - Lives in San Francisco [preference] - Prefers concise responses [lesson] - TDD caught a config regression before launch [gotcha] - Tauri rolling::daily suffixes file names with the date [fact] - Building Wenlan, a local-first AI memory app Lines without a tag are stored as facts.	1
+src/components/memory/ImportView.tsx	Paste output	1
+src/components/memory/ImportView.tsx	Paste your memories here, one per line...	2
+src/components/memory/ImportView.tsx	Processing your memories...	1
+src/components/memory/ImportView.tsx	Skip	1
+src/components/memory/ImportView.tsx	skipped (duplicates or empty)	1
+src/components/memory/ImportView.tsx	Upload file	1
+src/components/memory/ImportView.tsx	View memories	1
+src/components/memory/MemoryCard.tsx	&middot;	8
+src/components/memory/MemoryCard.tsx	&middot;&middot;&middot;	1
+src/components/memory/MemoryCard.tsx	&times;	1
+src/components/memory/MemoryCard.tsx	Accept	1
+src/components/memory/MemoryCard.tsx	Activity Recap	1
+src/components/memory/MemoryCard.tsx	Confirm this memory	1
+src/components/memory/MemoryCard.tsx	confirmed	2
+src/components/memory/MemoryCard.tsx	Delete memory	2
+src/components/memory/MemoryCard.tsx	Delete recap	2
+src/components/memory/MemoryCard.tsx	Dismiss	1
+src/components/memory/MemoryCard.tsx	distilled	1
+src/components/memory/MemoryCard.tsx	From	1
+src/components/memory/MemoryCard.tsx	More actions	2
+src/components/memory/MemoryCard.tsx	not yet confirmed	1
+src/components/memory/MemoryCard.tsx	Pin memory	2
+src/components/memory/MemoryCard.tsx	pinned	1
+src/components/memory/MemoryCard.tsx	Pinned	1
+src/components/memory/MemoryCard.tsx	Proposed update	1
+src/components/memory/MemoryCard.tsx	Refined from earlier memories	1
+src/components/memory/MemoryCard.tsx	Unconfirm	1
+src/components/memory/MemoryCard.tsx	Unpin memory	2
+src/components/memory/MemoryCard.tsx	used	1
+src/components/memory/MemoryDetail.tsx	&#x25BE;	1
+src/components/memory/MemoryDetail.tsx	Accept	1
+src/components/memory/MemoryDetail.tsx	Agent	1
+src/components/memory/MemoryDetail.tsx	Assign space	1
+src/components/memory/MemoryDetail.tsx	Cancel	1
+src/components/memory/MemoryDetail.tsx	Cmd+Enter to save	1
+src/components/memory/MemoryDetail.tsx	confirmed	1
+src/components/memory/MemoryDetail.tsx	Confirmed	1
+src/components/memory/MemoryDetail.tsx	Content	1
+src/components/memory/MemoryDetail.tsx	Copied!	1
+src/components/memory/MemoryDetail.tsx	Copy as context	1
+src/components/memory/MemoryDetail.tsx	Copy structured recap for LLM context	2
+src/components/memory/MemoryDetail.tsx	current	1
+src/components/memory/MemoryDetail.tsx	Delete memory	2
+src/components/memory/MemoryDetail.tsx	depth	1
+src/components/memory/MemoryDetail.tsx	Details	1
+src/components/memory/MemoryDetail.tsx	Dismiss	1
+src/components/memory/MemoryDetail.tsx	Done	1
+src/components/memory/MemoryDetail.tsx	Edit	1
+src/components/memory/MemoryDetail.tsx	Edit tags	2
+src/components/memory/MemoryDetail.tsx	Enrichment	1
+src/components/memory/MemoryDetail.tsx	Entity	1
+src/components/memory/MemoryDetail.tsx	Linked	1
+src/components/memory/MemoryDetail.tsx	Low quality	1
+src/components/memory/MemoryDetail.tsx	Metadata	1
+src/components/memory/MemoryDetail.tsx	Pinned	1
+src/components/memory/MemoryDetail.tsx	Proposed update	1
+src/components/memory/MemoryDetail.tsx	Quality	1
+src/components/memory/MemoryDetail.tsx	Related Entities	1
+src/components/memory/MemoryDetail.tsx	Related Memories	1
+src/components/memory/MemoryDetail.tsx	Remove from space	1
+src/components/memory/MemoryDetail.tsx	Revision History	1
+src/components/memory/MemoryDetail.tsx	Save	1
+src/components/memory/MemoryDetail.tsx	Source Memories	1
+src/components/memory/MemoryDetail.tsx	Space	1
+src/components/memory/MemoryDetail.tsx	Tags	1
+src/components/memory/MemoryDetail.tsx	Type	1
+src/components/memory/MemoryDetail.tsx	Unpin	1
+src/components/memory/MemoryDetail.tsx	Version History	1
+src/components/memory/MemorySearchResult.tsx	&middot;	2
+src/components/memory/MemorySearchResult.tsx	keyword	1
+src/components/memory/MemorySearchResult.tsx	semantic	1
+src/components/memory/MemoryStream.tsx	Curated	1
+src/components/memory/MemoryStream.tsx	Go back Home to clear.	1
+src/components/memory/MemoryStream.tsx	grid	1
+src/components/memory/MemoryStream.tsx	Memory deleted	1
+src/components/memory/MemoryStream.tsx	No memories match your filters.	1
+src/components/memory/MemoryStream.tsx	Nothing here yet — agents will fill this in	1
+src/components/memory/MemoryStream.tsx	Oldest	1
+src/components/memory/MemoryStream.tsx	Recent	1
+src/components/memory/MemoryStream.tsx	Switch to grid view	1
+src/components/memory/MemoryStream.tsx	Switch to list view	1
+src/components/memory/MemoryStream.tsx	Undo	1
+src/components/memory/NurtureCard.tsx	&#10003; confirmed	1
+src/components/memory/NurtureCard.tsx	&middot;	1
+src/components/memory/NurtureCard.tsx	Cancel	1
+src/components/memory/NurtureCard.tsx	Delete	1
+src/components/memory/NurtureCard.tsx	Describe what's wrong...	2
+src/components/memory/NurtureCard.tsx	fixing...	1
+src/components/memory/NurtureCard.tsx	Not quite&hellip;	1
+src/components/memory/NurtureCard.tsx	Save &amp; Confirm	1
+src/components/memory/NurtureCard.tsx	Show less	1
+src/components/memory/NurtureCard.tsx	Show more	1
+src/components/memory/NurtureCard.tsx	Yes, that&apos;s right	1
+src/components/memory/page/CitationPopover.tsx	Open file →	1
+src/components/memory/page/CitationPopover.tsx	Open in browser →	1
+src/components/memory/page/CitationPopover.tsx	Open memory →	1
+src/components/memory/page/CitationPopover.tsx	This source memory no longer exists — it was deleted or merged after distillation. Re-distill the page to refresh its citations.	1
+src/components/memory/page/CitationPopover.tsx	unverified	1
+src/components/memory/page/CitationPopover.tsx	Written by you in this page — kept unchanged when the page is re-distilled from its sources.	1
+src/components/memory/page/PageInfo.tsx	Backlinks	1
+src/components/memory/page/PageInfo.tsx	incoming	1
+src/components/memory/page/PageInfo.tsx	memories	1
+src/components/memory/page/PageInfo.tsx	memory	1
+src/components/memory/page/PageInfo.tsx	Page info	3
+src/components/memory/page/PageInfo.tsx	revisions	1
+src/components/memory/page/PageInfo.tsx	Revisions	1
+src/components/memory/page/PageInfo.tsx	Show all	2
+src/components/memory/page/PageInfo.tsx	sources	1
+src/components/memory/page/PageInfo.tsx	Sources	1
+src/components/memory/page/PageInfo.tsx	unverified	1
+src/components/memory/page/RelatedPages.tsx	No page exists for this link yet	2
+src/components/memory/page/RelatedPages.tsx	not distilled yet	1
+src/components/memory/page/RelatedPages.tsx	Related Pages	1
+src/components/memory/page/RelatedPages.tsx	Related pages	2
+src/components/memory/PageDetail.tsx	&middot;	2
+src/components/memory/PageDetail.tsx	Add an Obsidian source in Settings to export	2
+src/components/memory/PageDetail.tsx	Back	1
+src/components/memory/PageDetail.tsx	Cancel (Esc)	1
+src/components/memory/PageDetail.tsx	Copied!	1
+src/components/memory/PageDetail.tsx	Copy as context	1
+src/components/memory/PageDetail.tsx	Delete page	2
+src/components/memory/PageDetail.tsx	Edit page	2
+src/components/memory/PageDetail.tsx	Export to Obsidian	1
+src/components/memory/PageDetail.tsx	Exported!	1
+src/components/memory/PageDetail.tsx	from	1
+src/components/memory/PageDetail.tsx	Last distilled	1
+src/components/memory/PageDetail.tsx	memories	1
+src/components/memory/PageDetail.tsx	memory	1
+src/components/memory/PageDetail.tsx	needs review	1
+src/components/memory/PageDetail.tsx	Page not found	1
+src/components/memory/PageDetail.tsx	Re-distill page	2
+src/components/memory/PageDetail.tsx	Re-distilling page	1
+src/components/memory/PageDetail.tsx	Re-distilling...	1
+src/components/memory/PageDetail.tsx	Save (Cmd+Enter)	1
+src/components/memory/PageDetail.tsx	Saving...	1
+src/components/memory/PageDetail.tsx	updating...	1
+src/components/memory/ProfileAvatar.tsx	Profile initials	1
+src/components/memory/ProfileNarrative.tsx	AI's Understanding of You	1
+src/components/memory/ProfileNarrative.tsx	No narrative yet — confirm some memories to get started.	1
+src/components/memory/ProfileNarrative.tsx	Regenerate	1
+src/components/memory/ProfileNarrative.tsx	Updated	1
+src/components/memory/ProfileNarrative.tsx	Updating...	1
+src/components/memory/ProfileNarrativeCompact.tsx	Updated	1
+src/components/memory/ProfilePage.tsx	Add email	2
+src/components/memory/ProfilePage.tsx	Change profile photo	2
+src/components/memory/ProfilePage.tsx	How Wenlan sees you	1
+src/components/memory/ProfilePage.tsx	how you like things done	1
+src/components/memory/ProfilePage.tsx	identity facts that shape every conversation	1
+src/components/memory/ProfilePage.tsx	Joined	1
+src/components/memory/ProfilePage.tsx	memories	1
+src/components/memory/ProfilePage.tsx	Name	2
+src/components/memory/ProfilePage.tsx	No narrative yet. Confirm some memories to get started.	1
+src/components/memory/ProfilePage.tsx	Preferences	1
+src/components/memory/ProfilePage.tsx	Regenerate	1
+src/components/memory/ProfilePage.tsx	Remove photo	2
+src/components/memory/ProfilePage.tsx	synthesized from	1
+src/components/memory/ProfilePage.tsx	What Wenlan knows	1
+src/components/memory/ProfileSummaryCard.tsx	Collapse	1
+src/components/memory/ProfileSummaryCard.tsx	Expand	1
+src/components/memory/ProfileSummaryCard.tsx	View all &rarr;	1
+src/components/memory/RefiningList.tsx	quality settling in as you keep working	1
+src/components/memory/RefiningList.tsx	Refining	1
+src/components/memory/RetrievalsList.tsx	archived	1
+src/components/memory/RetrievalsList.tsx	on "	1
+src/components/memory/RetrievalsList.tsx	recent assistants pulling from your library	1
+src/components/memory/RetrievalsList.tsx	searched, found nothing relevant	1
+src/components/memory/RetrievalsList.tsx	This page has been archived	2
+src/components/memory/RetrievalsList.tsx	View all recaps &rarr;	1
+src/components/memory/RetrievalsList.tsx	Where AI looked	1
+src/components/memory/settings/SettingsSidebar.tsx	Wenlan	1
+src/components/memory/SourceList.tsx	+ Add folder or vault	1
+src/components/memory/SourceList.tsx	Add source	2
+src/components/memory/SourceList.tsx	Sources	1
+src/components/memory/sources/AddSourceDialog.tsx	✓ Detected .obsidian/ — Obsidian vault	1
+src/components/memory/sources/AddSourceDialog.tsx	Add a folder	1
+src/components/memory/sources/AddSourceDialog.tsx	Add source	1
+src/components/memory/sources/AddSourceDialog.tsx	Adding…	1
+src/components/memory/sources/AddSourceDialog.tsx	Browse…	1
+src/components/memory/sources/AddSourceDialog.tsx	Cancel	1
+src/components/memory/sources/AddSourceDialog.tsx	file	1
+src/components/memory/sources/AddSourceDialog.tsx	files	1
+src/components/memory/sources/AddSourceDialog.tsx	found	1
+src/components/memory/sources/AddSourceDialog.tsx	No supported files (.md, .txt, .pdf) found in this folder	1
+src/components/memory/sources/AddSourceDialog.tsx	Scanning folder…	1
+src/components/memory/sources/AddSourceDialog.tsx	Select a folder…	2
+src/components/memory/sources/AddSourceDialog.tsx	supported	1
+src/components/memory/sources/AddSourceDialog.tsx	Wenlan reads .md, .txt, and .pdf files from the folder you choose — Obsidian vaults, note folders, books, and papers.	1
+src/components/memory/sources/AddSourceMenu.tsx	Add a folder	1
+src/components/memory/sources/AddSourceMenu.tsx	Add a source	1
+src/components/memory/sources/AddSourceMenu.tsx	Add files	1
+src/components/memory/sources/AddSourceMenu.tsx	Adding…	1
+src/components/memory/sources/AddSourceMenu.tsx	Update Wenlan	1
+src/components/memory/sources/AddSourceMenu.tsx	Your daemon needs an update to index files.	1
+src/components/memory/sources/SourcesSection.tsx	· updates automatically	1
+src/components/memory/sources/SourcesSection.tsx	&rdquo;?	1
+src/components/memory/sources/SourcesSection.tsx	Add your first source	1
+src/components/memory/sources/SourcesSection.tsx	Cancel	1
+src/components/memory/sources/SourcesSection.tsx	files ·	1
+src/components/memory/sources/SourcesSection.tsx	ingested memories will remain in your Wenlan library but stop updating.	1
+src/components/memory/sources/SourcesSection.tsx	Knowledge Directory	1
+src/components/memory/sources/SourcesSection.tsx	Loading…	1
+src/components/memory/sources/SourcesSection.tsx	More	2
+src/components/memory/sources/SourcesSection.tsx	No sources yet	1
+src/components/memory/sources/SourcesSection.tsx	Remove &ldquo;	1
+src/components/memory/sources/SourcesSection.tsx	Remove source	2
+src/components/memory/sources/SourcesSection.tsx	Removing…	1
+src/components/memory/sources/SourcesSection.tsx	Retry sync	1
+src/components/memory/sources/SourcesSection.tsx	Reveal in Finder	2
+src/components/memory/sources/SourcesSection.tsx	Syncing…	2
+src/components/memory/SourcesView.tsx	+ Add source	1
+src/components/memory/SourcesView.tsx	+ Add your first source	1
+src/components/memory/SourcesView.tsx	✓ Synced	1
+src/components/memory/SourcesView.tsx	Auto-synced	1
+src/components/memory/SourcesView.tsx	couldn't be indexed	1
+src/components/memory/SourcesView.tsx	Couldn't read this file.	1
+src/components/memory/SourcesView.tsx	file	1
+src/components/memory/SourcesView.tsx	Indexed as	1
+src/components/memory/SourcesView.tsx	Indexing…	1
+src/components/memory/SourcesView.tsx	Loading…	1
+src/components/memory/SourcesView.tsx	Manage sources ⚙	1
+src/components/memory/SourcesView.tsx	Nothing on the shelf yet	1
+src/components/memory/SourcesView.tsx	Open	1
+src/components/memory/SourcesView.tsx	passage	1
+src/components/memory/SourcesView.tsx	passages	1
+src/components/memory/SourcesView.tsx	Remove	1
+src/components/memory/SourcesView.tsx	Reveal	1
+src/components/memory/SourcesView.tsx	Reveal in Finder	3
+src/components/memory/SourcesView.tsx	source	1
+src/components/memory/SourcesView.tsx	sources	1
+src/components/memory/SourcesView.tsx	Sources	1
+src/components/memory/SourcesView.tsx	Sync	1
+src/components/memory/SourcesView.tsx	Syncing…	1
+src/components/memory/SourcesView.tsx	This folder can't be read — it may have been moved or renamed.	1
+src/components/memory/SourcesView.tsx	This source can't be read — the folder may have been moved, renamed, or unmounted.	1
+src/components/memory/SourcesView.tsx	Wenlan builds its wiki from the folders and vaults you add here. Point it at a notes folder or an Obsidian vault to lay the first stone.	1
+src/components/memory/SpaceDetail.tsx	Add a description...	2
+src/components/memory/SpaceDetail.tsx	Auto-created by an agent	1
+src/components/memory/SpaceDetail.tsx	Cancel	2
+src/components/memory/SpaceDetail.tsx	Cmd+Enter	1
+src/components/memory/SpaceDetail.tsx	Confirm delete space	2
+src/components/memory/SpaceDetail.tsx	Delete space	3
+src/components/memory/SpaceDetail.tsx	Discard	1
+src/components/memory/SpaceDetail.tsx	Edit description	2
+src/components/memory/SpaceDetail.tsx	entities	1
+src/components/memory/SpaceDetail.tsx	Entities	1
+src/components/memory/SpaceDetail.tsx	entity	1
+src/components/memory/SpaceDetail.tsx	from	1
+src/components/memory/SpaceDetail.tsx	Keep	1
+src/components/memory/SpaceDetail.tsx	memories	2
+src/components/memory/SpaceDetail.tsx	Memories (	1
+src/components/memory/SpaceDetail.tsx	Memories keep their current space tag after this daemon removes the space.	1
+src/components/memory/SpaceDetail.tsx	memory	1
+src/components/memory/SpaceDetail.tsx	No memories in this space yet	1
+src/components/memory/SpaceDetail.tsx	Pages	1
+src/components/memory/SpaceDetail.tsx	Save	1
+src/components/memory/SpaceDetail.tsx	Show all	1
+src/components/memory/SpaceDetail.tsx	Show less	1
+src/components/memory/SpaceDetail.tsx	Wenlan learned something new	1
+src/components/memory/WorthAGlanceScroll.tsx	&rarr;	1
+src/components/memory/WorthAGlanceScroll.tsx	&times;	1
+src/components/memory/WorthAGlanceScroll.tsx	Confirm	1
+src/components/memory/WorthAGlanceScroll.tsx	Delete	1
+src/components/memory/WorthAGlanceScroll.tsx	Dismiss	2
+src/components/memory/WorthAGlanceScroll.tsx	Dismiss (Esc)	2
+src/components/memory/WorthAGlanceScroll.tsx	Edit memory	1
+src/components/memory/WorthAGlanceScroll.tsx	esc dismiss	1
+src/components/memory/WorthAGlanceScroll.tsx	Loading...	1
+src/components/memory/WorthAGlanceScroll.tsx	Memory content...	2
+src/components/memory/WorthAGlanceScroll.tsx	recap	1
+src/components/memory/WorthAGlanceScroll.tsx	Saving...	1
+src/components/memory/WorthAGlanceScroll.tsx	Title	2
+src/components/memory/WorthAGlanceScroll.tsx	unconfirmed memories and items Wenlan flagged for a second look	1
+src/components/memory/WorthAGlanceScroll.tsx	Worth a glance	1
+src/components/MemoryView.tsx	AI processing	1
+src/components/MemoryView.tsx	All types	1
+src/components/MemoryView.tsx	Cancel	1
+src/components/MemoryView.tsx	Cancel selection	2
+src/components/MemoryView.tsx	chunk	1
+src/components/MemoryView.tsx	Clear filter	1
+src/components/MemoryView.tsx	Clear session	2
+src/components/MemoryView.tsx	Delete	2
+src/components/MemoryView.tsx	Deleting...	1
+src/components/MemoryView.tsx	Filter by type	2
+src/components/MemoryView.tsx	Idle	1
+src/components/MemoryView.tsx	Import Memories	2
+src/components/MemoryView.tsx	item	2
+src/components/MemoryView.tsx	Latest	1
+src/components/MemoryView.tsx	Live	1
+src/components/MemoryView.tsx	No captures found	1
+src/components/MemoryView.tsx	No indexed items yet	1
+src/components/MemoryView.tsx	No memories indexed yet	1
+src/components/MemoryView.tsx	Other	1
+src/components/MemoryView.tsx	Quick Capture	2
+src/components/MemoryView.tsx	Recap	1
+src/components/MemoryView.tsx	Recaps	1
+src/components/MemoryView.tsx	Search activity...	2
+src/components/MemoryView.tsx	selected	1
+src/components/MemoryView.tsx	Settings	2
+src/components/MemoryView.tsx	Sort	2
+src/components/MemoryView.tsx	Tags	1
+src/components/MemoryView.tsx	This action cannot be undone.	1
+src/components/RecapDetail.tsx	&#8249; Back	1
+src/components/RecapDetail.tsx	&middot;	2
+src/components/RecapDetail.tsx	Copied!	1
+src/components/RecapDetail.tsx	Copy as context	1
+src/components/RecapDetail.tsx	Delete	1
+src/components/RecapDetail.tsx	No summary available	1
+src/components/RecapDetail.tsx	Recap	1
+src/components/RecapDetail.tsx	Source Memories	1
+src/components/RecapDetail.tsx	This recap has no content	1
+src/components/ResultCard.tsx	chunk	1
+src/components/ResultCard.tsx	Copied!	1
+src/components/ResultCard.tsx	Copy	1
+src/components/SearchInput.tsx	Search...	2
+src/components/SearchInput.tsx	Wenlan	2
+src/components/Spotlight.tsx	capture	1
+src/components/Spotlight.tsx	Capture	1
+src/components/Spotlight.tsx	Clip	1
+src/components/Spotlight.tsx	Copy	1
+src/components/Spotlight.tsx	Entities	1
+src/components/Spotlight.tsx	Just Now	1
+src/components/Spotlight.tsx	No results found	1
+src/components/Spotlight.tsx	Note	1
+src/components/Spotlight.tsx	Recap	1
+src/components/Spotlight.tsx	Recaps	1
+src/components/Spotlight.tsx	Screen	1
+src/components/StatusBar.tsx	↑↓ navigate · ↵ open · ⌘C copy · ⌘↵ all · esc close	1
+src/components/StatusBar.tsx	indexed	1
+src/components/StatusBar.tsx	Indexing	1
+src/components/StatusBar.tsx	Reranker failed	1
+src/components/StatusBar.tsx	results	1
+src/components/TagEditor.tsx	&quot;	1
+src/components/TagEditor.tsx	Add a tag...	2
+src/components/TagEditor.tsx	Create &quot;	1
+src/components/TagEditor.tsx	Suggested	1
+src/components/TagEditor.tsx	Tags	1

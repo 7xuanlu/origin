@@ -32,7 +32,7 @@ A required CI check failed intermittently? Follow [`docs/ci-flake-policy.md`](do
 
 - **GPU evals (LongMemEval / LoCoMo runner functions, Qwen3.5-9B inference)** — GitHub macOS runners have no Metal acceleration. The tests are `#[ignore]`d so they don't accidentally run.
 - **Anthropic API batch judge** — costs $0.35/run and requires `ANTHROPIC_API_KEY` which we don't expose to PR runs from forks.
-- **Tauri / desktop coverage** — the desktop app lives in [7xuanlu/wenlan-app](https://github.com/7xuanlu/wenlan-app) and runs its own CI there. This repo's coverage is scoped to `wenlan-core + wenlan-server`.
+- **Tauri / desktop coverage** — the desktop app (`app/`) is format/clippy/test-checked and e2e-run by the path-filtered `app-check` CI job on macos-14. Line/branch coverage (`.github/workflows/coverage.yml`) stays scoped to `wenlan-core + wenlan-server`.
 
 ### Why pre-push doesn't run coverage
 

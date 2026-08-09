@@ -1,0 +1,75 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+.entity-detail-dossier {
+  --mem-text-tertiary: var(--mem-text-meta-aa);
+  box-sizing: border-box;
+  max-width: 100%;
+  padding: 4px clamp(16px, 2.4vw, 28px) 48px;
+  color: var(--mem-text);
+}
+
+.entity-detail-dossier button {
+  font-family: inherit;
+}
+
+.entity-detail-reading {
+  display: grid;
+  min-width: 0;
+  gap: 16px;
+}
+
+.entity-detail-dossier .page-detail-grid,
+.entity-detail-dossier .page-detail-rail {
+  min-width: 0;
+}
+
+.entity-detail-dossier .memory-detail-rail {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.entity-detail-dossier .memory-detail-rail > .memory-detail-rail-section {
+  grid-column: 1;
+  grid-row: auto;
+  min-width: 0;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.entity-detail-dossier .entity-graph-verb {
+  max-width: min(28%, 144px);
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-align: center;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.entity-detail-dossier .entity-graph.is-compact .entity-graph-node {
+  max-width: calc(100% - 24px);
+  transform: translate(-50%, -50%);
+  flex-direction: row;
+  text-align: left;
+}
+
+.entity-detail-dossier .entity-graph.is-compact .entity-graph-node-name {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.entity-detail-dossier .entity-graph.is-compact .entity-graph-verb {
+  max-width: calc(100% - 48px);
+}
+
+.entity-detail-dossier .entity-graph.is-compact .entity-graph-center {
+  max-width: 70%;
+}
+
+@media (max-width: 640px) {
+  .entity-detail-dossier {
+    padding-inline: 12px;
+  }
+
+  .entity-detail-dossier .entity-dossier-hero-row {
+    flex-direction: column;
+  }
+}

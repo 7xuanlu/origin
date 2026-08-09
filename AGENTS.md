@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This repo holds the **daemon** (`wenlan-server`), the **CLI** (`wenlan`), shared **wire types** (`wenlan-types`), the **business-logic core** (`wenlan-core`), and the **MCP server** (`wenlan-mcp`). All five ship from this monorepo. The Tauri desktop app (`wenlan-app`) ships from a separate repo: [7xuanlu/wenlan-app](https://github.com/7xuanlu/wenlan-app). Public product surface lives at [wenlan.app](https://wenlan.app) (marketing, docs at `/docs`, longer-form writing at `/learn`).
+This repo holds the **daemon** (`wenlan-server`), the **CLI** (`wenlan`), shared **wire types** (`wenlan-types`), the **business-logic core** (`wenlan-core`), the **MCP server** (`wenlan-mcp`), and the **Tauri desktop app** (`wenlan-app`, in `app/`). All six ship from this monorepo (the app was folded back in on 2026-07-20, reversing a 2026-05-07 split). Public product surface lives at [wenlan.app](https://wenlan.app) (marketing, docs at `/docs`, longer-form writing at `/learn`).
 
 ## Repo map
 
@@ -19,7 +19,7 @@ Where things live. Subtree `AGENTS.md` files load automatically when you work un
 
 ## Build & Dev Commands
 
-Wenlan is a Cargo workspace with 5 crates: `wenlan-types`, `wenlan-core`, `wenlan-server`, `wenlan` (CLI in `crates/wenlan-cli`), and `wenlan-mcp`.
+Wenlan is a Cargo workspace with 6 crates: `wenlan-types`, `wenlan-core`, `wenlan-server`, `wenlan` (CLI in `crates/wenlan-cli`), `wenlan-mcp`, and `wenlan-app` (the desktop app, in `app/`). `default-members` covers the 5 daemon crates only, so routine `cargo build`/`test`/`clippy` never compile the desktop app; build it explicitly with `-p wenlan-app`.
 
 ```bash
 # Daemon as a managed launchd/systemd/schtasks service (not a plain cargo run):
@@ -77,7 +77,7 @@ Releases are automated via [release-please](https://github.com/googleapis/releas
 
 **Squash merge commit messages still matter — for the changelog.** When GitHub squash-merges a PR, the commit message defaults to the PR title. The prefix no longer changes the bump size (always patch), but it decides whether and where the change appears in `CHANGELOG.md`, and a title without a conventional `type:` prefix is invisible to release-please entirely. Keep PR titles valid conventional commits.
 
-**Version files must stay in sync:** `version.txt`, `.release-please-manifest.json`, and the root workspace `Cargo.toml` (`# x-release-please-version` marker on the `[workspace.package]` version line; the 4 crates inherit it via `version.workspace = true`). Teeth #3 enforces this; the release-please workflow syncs them on the release branch, so any manual version edit must touch all three. The desktop app version lives in [7xuanlu/wenlan-app](https://github.com/7xuanlu/wenlan-app) and bumps independently.
+**Version files must stay in sync:** `version.txt`, `.release-please-manifest.json`, and the root workspace `Cargo.toml` (`# x-release-please-version` marker on the `[workspace.package]` version line; the 4 crates inherit it via `version.workspace = true`). Teeth #3 enforces this; the release-please workflow syncs them on the release branch, so any manual version edit must touch all three. The desktop app crate (`app/`) still carries its own version across `app/Cargo.toml`, `app/tauri.conf.json`, and `package.json` (kept mutually in sync by `scripts/release-version-sync.test.ts`, pinned to `.wenlan-backend-version`); folding it into the workspace-version lockstep is a tracked follow-up.
 
 ### Branch protection
 
@@ -129,7 +129,7 @@ See `app/eval/AGENTS.md` "eval citation discipline" section for the full rules (
 
 ### Crate boundaries
 - **wenlan-core must have NO tauri or axum dependencies.** Verify with `grep -rn "use tauri\|use axum" crates/wenlan-core/src/` — expect zero hits. Any event emission goes through the `EventEmitter` trait.
-- **wenlan-types must be lightweight.** Only serde + serde_json + anyhow. No chrono, no tokio, no heavy deps. These types are shared with `wenlan-mcp` (same workspace, Apache-2.0) and `wenlan-app` (AGPL-3.0 separate repo, consumes via crates.io), so adding heavy deps forces them downstream.
+- **wenlan-types must be lightweight.** Only serde + serde_json + anyhow. No chrono, no tokio, no heavy deps. These types are shared with `wenlan-mcp` (Apache-2.0) and `wenlan-app` (AGPL-3.0), both in this workspace — `wenlan-app` takes them as a path dep (`workspace = true`) — so adding heavy deps forces them downstream.
 - **Don't add business logic to wenlan-server.** Route handlers should call `wenlan-core` functions with state snapshots — the server's job is HTTP framing, not logic.
 - **Don't add new HTTP endpoints to the CLI.** Use existing daemon endpoints. If a CLI subcommand needs new data, add a daemon endpoint first.
 - **MCP wrappers in `wenlan-mcp` always typed-deserialize.** Every `_impl` method in `crates/wenlan-mcp/src/tools.rs` deserializes the daemon response into a typed wire struct from `wenlan-types` (e.g. `SearchPagesResponse { pages: Vec<Page> }`), never into `serde_json::Value`. Untyped responses silently emit whatever shape the daemon returns; typed deserialization fails loud on envelope-key drift. Mirror commit `4f545869` and PR #77.
@@ -169,8 +169,8 @@ Squash-merge lands a fresh SHA on `main`, so the branch's original commits still
 - `WENLAN_DEFAULT_SPACE=<name>`: overridable default save Space for CLI and MCP writes when no explicit Space is supplied. `WENLAN_SPACE` remains the strict lock and wins over explicit and default values.
 - Log filter default is `warn` — add modules explicitly for `info` logs (e.g., `wenlan_core::db=info`, `wenlan_server=info`)
 - All local data stored in the platform data directory (`dirs::data_local_dir()/origin/`; on macOS, `~/Library/Application Support/wenlan/`) — MemoryDB, config, activities, tags
-- Crate names: `wenlan-types`, `wenlan-core`, `wenlan-server`, `wenlan` (CLI), `wenlan-mcp` — all in this workspace. The desktop app crate `wenlan-app` lives in [7xuanlu/wenlan-app](https://github.com/7xuanlu/wenlan-app).
-- **Licenses**: all five workspace crates (`wenlan-types`, `wenlan-core`, `wenlan-server`, `wenlan` CLI, `wenlan-mcp`) are **Apache-2.0** via workspace inheritance. The desktop app in `wenlan-app` is **AGPL-3.0-only** (separate repo).
+- Crate names: `wenlan-types`, `wenlan-core`, `wenlan-server`, `wenlan` (CLI), `wenlan-mcp`, and `wenlan-app` (the `app/` desktop crate) — all in this workspace.
+- **Licenses**: the five runtime crates (`wenlan-types`, `wenlan-core`, `wenlan-server`, `wenlan` CLI, `wenlan-mcp`) are **Apache-2.0** via workspace inheritance. The `wenlan-app` desktop crate (`app/`) is **AGPL-3.0-only** via its own `license` field, overriding the workspace default.
 - `wenlan-mcp` is in-tree at `crates/wenlan-mcp/` (merged from the old `7xuanlu/wenlan-mcp` repo on 2026-05-09 via `git subtree`). It talks to the daemon via HTTP at runtime and is published to npm as a standalone binary (`npx -y wenlan-mcp`).
 
 ### Retrieval helpers location (PR-A, 2026-05-27)

@@ -11952,14 +11952,20 @@ fn page_kind_routing_guard_separates_reads_from_writes() {
     // pointing at the derivation to re-run rather than letting the claim rot.
     let lock = std::fs::read_to_string(repo_root().join("Cargo.lock"))
         .expect("Cargo.lock must be readable to check the syn pin");
+    // The lock can carry several syn major versions: the app (Tauri) subgraph
+    // pulls syn 1.x/3.x duplicates that wenlan-core never compiles against.
+    // The macro links whatever satisfies wenlan-core's own `syn = "=2.0.117"`
+    // requirement, and cargo unifies all 2.x into one entry — so the subject
+    // here is the sole 2.x block, not the first block named "syn".
     let pinned = lock
         .split("[[package]]")
-        .find(|block| block.contains("\nname = \"syn\"\n"))
-        .and_then(|block| {
+        .filter(|block| block.contains("\nname = \"syn\"\n"))
+        .filter_map(|block| {
             block
                 .lines()
                 .find_map(|line| line.strip_prefix("version = ").map(|v| v.trim_matches('"')))
-        });
+        })
+        .find(|version| version.starts_with("2."));
     assert_eq!(
         pinned,
         Some("2.0.117"),

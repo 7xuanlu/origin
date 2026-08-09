@@ -95,3 +95,13 @@ plugin-codex/bin/wenlan-mcp.local
 # Python bytecode (analyze_paired.py + tests)
 __pycache__/
 *.pyc
+
+# Desktop app frontend (Tauri + React) build outputs — merged from wenlan-app
+# 2026-07-20. Most are already covered above (node_modules/, dist/, app/gen/,
+# app/binaries/, .fastembed_cache); these are the remaining app-specific ones.
+playwright-report/
+test-results/
+app/dist/
+*.tsbuildinfo
+.omo/
+DESIGN.md

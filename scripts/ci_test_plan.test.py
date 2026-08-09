@@ -97,6 +97,7 @@ def cargo_metadata() -> dict:
             "wenlan-types",
             "wenlan-server",
             "wenlan-mcp",
+            "wenlan-app",
         ],
         "packages": [
             package(
@@ -128,6 +129,12 @@ def cargo_metadata() -> dict:
                 "crates/wenlan-mcp",
                 ("wenlan-core", "wenlan-server", "wenlan-types"),
                 ("real_router",),
+            ),
+            package(
+                "wenlan-app",
+                "app",
+                ("wenlan-types",),
+                ("sources_integration",),
             ),
         ],
     }
@@ -892,6 +899,55 @@ class NonRustOwnerTests(unittest.TestCase):
         self.assertTrue(required_suite_outputs(plan)["rust-ci-required"])
 
 
+class AppOwnerTests(unittest.TestCase):
+    def test_types_source_change_never_selects_wenlan_app(self) -> None:
+        # wenlan-app path-depends on wenlan-types in real Cargo metadata, but
+        # the app crate carries its own CI lane and must stay out of the
+        # reverse-dependency closure the Rust planner selects.
+        plan = plan_for("crates/wenlan-types/src/responses.rs")
+
+        self.assertEqual(plan["workspace_lib"]["mode"], "packages")
+        self.assertNotIn("wenlan-app", plan["workspace_lib"]["packages"])
+
+    def test_app_only_diff_has_no_rust_suites(self) -> None:
+        plan = plan_for("app/src/main.rs", "src/App.tsx", "package.json")
+
+        self.assertEqual(plan["mode"], "differential")
+        self.assertEqual(plan["workspace_lib"], {"mode": "skip"})
+        self.assertEqual(plan["cli_server_integration"], {"mode": "skip"})
+        self.assertEqual(plan["core_integration"], {"mode": "skip"})
+        self.assertEqual(plan["contract_integration"], {"mode": "skip"})
+        self.assertEqual(plan["canonical_smokes"], {"mode": "skip"})
+        # App paths keep the fast fmt/clippy gate (rustfmt/clippy don't need
+        # GTK to lint text), but select zero packages, so the workspace lint
+        # step still runs with no wenlan-app compile in scope.
+        outputs = required_suite_outputs(plan)
+        self.assertFalse(outputs["workspace-lib-required"])
+        self.assertFalse(outputs["cli-server-integration-required"])
+        self.assertFalse(outputs["core-integration-required"])
+        self.assertFalse(outputs["contract-integration-required"])
+        self.assertFalse(outputs["canonical-smokes-required"])
+        self.assertFalse(outputs["rust-ci-required"])
+        self.assertEqual(clippy_command_for(plan, cargo_metadata()), [])
+
+    def test_app_eval_fixture_falls_through_to_full_plan(self) -> None:
+        # app/eval/** is consumed by wenlan-core tests, not app-only, so it
+        # must keep the full-plan fallback rather than being swallowed by the
+        # app-job classifier.
+        plan = plan_for("app/eval/somefixture.json")
+
+        self.assertEqual(plan["mode"], "full")
+        self.assertIn("unowned changed path: app/eval/somefixture.json", plan["reasons"])
+
+    def test_app_cargo_toml_is_app_owned_not_a_full_plan_trigger(self) -> None:
+        plan = plan_for("app/Cargo.toml")
+
+        self.assertEqual(plan["mode"], "differential")
+        self.assertEqual(plan["workspace_lib"], {"mode": "skip"})
+        self.assertFalse(required_suite_outputs(plan)["rust-ci-required"])
+        self.assertEqual(clippy_command_for(plan, cargo_metadata()), [])
+
+
 class SuiteOutputTests(unittest.TestCase):
     def test_behavioral_source_requires_lib_integration_and_canonical_smokes(
         self,
@@ -1260,10 +1316,23 @@ class CommandGenerationTests(unittest.TestCase):
                 "cargo",
                 "clippy",
                 "--workspace",
+                "--exclude",
+                "wenlan-app",
                 "--all-targets",
                 "--",
                 "-D",
                 "warnings",
+            ],
+        )
+
+    def test_main_plan_local_tests_exclude_wenlan_app(self) -> None:
+        plan = plan_for("Cargo.lock")
+
+        self.assertEqual(
+            local_test_commands_for(plan, cargo_metadata()),
+            [
+                ["cargo", "test", "--workspace", "--exclude", "wenlan-app", "--lib"],
+                ["cargo", "test", "-p", "wenlan-server", "--bin", "wenlan-server"],
             ],
         )
 
@@ -1486,11 +1555,39 @@ class CommandGenerationTests(unittest.TestCase):
                     "nextest",
                     "run",
                     "--workspace",
+                    "--exclude",
+                    "wenlan-app",
                     "--lib",
                     "--bin",
                     "wenlan-server",
                     "--partition",
                     "slice:1/2",
+                ]
+            ],
+        )
+
+    def test_live_workspace_full_run_excludes_wenlan_app_without_an_archive(
+        self,
+    ) -> None:
+        # A direct `run --suite workspace-lib` without --archive-file hits the
+        # unarchived nextest-run branch of a full plan. A full plan must never
+        # compile wenlan-app through this surface either, not just the
+        # archive-file path exercised above.
+        plan = plan_for("Cargo.lock")
+
+        self.assertEqual(
+            command_groups_for("workspace-lib", plan, cargo_metadata()),
+            [
+                [
+                    "cargo",
+                    "nextest",
+                    "run",
+                    "--workspace",
+                    "--exclude",
+                    "wenlan-app",
+                    "--lib",
+                    "--bin",
+                    "wenlan-server",
                 ]
             ],
         )
@@ -1532,6 +1629,8 @@ class CommandGenerationTests(unittest.TestCase):
                 "--archive-file",
                 "/tmp/workspace-lib.tar.zst",
                 "--workspace",
+                "--exclude",
+                "wenlan-app",
                 "--lib",
                 "--bin",
                 "wenlan-server",
@@ -1558,6 +1657,8 @@ class CommandGenerationTests(unittest.TestCase):
                 "--archive-file",
                 str(Path("/tmp/macos-nextest/workspace-lib.tar.zst")),
                 "--workspace",
+                "--exclude",
+                "wenlan-app",
                 "--lib",
                 "--bin",
                 "wenlan-server",

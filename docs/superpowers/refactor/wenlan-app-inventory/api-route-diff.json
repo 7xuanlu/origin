@@ -1,0 +1,2291 @@
+{
+  "appRoot": ".",
+  "backendRoot": "wenlan",
+  "counts": {
+    "backendRoutes": 123,
+    "appSourceRoutes": 115,
+    "missingInApp": 8,
+    "classifiedMissingInApp": 8,
+    "unclassifiedMissingInApp": 0,
+    "appOnly": 0
+  },
+  "backendRoutes": [
+    {
+      "normalized": "/api/activities",
+      "paths": [
+        "/api/activities"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/agents",
+      "paths": [
+        "/api/agents"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/agents/{}",
+      "paths": [
+        "/api/agents/{name}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/briefing",
+      "paths": [
+        "/api/briefing"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/capture-stats",
+      "paths": [
+        "/api/capture-stats"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/chunks/{}",
+      "paths": [
+        "/api/chunks/{source_id}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/chunks/{}/update",
+      "paths": [
+        "/api/chunks/{id}/update"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/chunks/delete-bulk",
+      "paths": [
+        "/api/chunks/delete-bulk"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/chunks/time-range",
+      "paths": [
+        "/api/chunks/time-range"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/config",
+      "paths": [
+        "/api/config"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/config/skip-apps",
+      "paths": [
+        "/api/config/skip-apps"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/context",
+      "paths": [
+        "/api/context"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/debug/pipeline",
+      "paths": [
+        "/api/debug/pipeline"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/decisions",
+      "paths": [
+        "/api/decisions"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/decisions/domains",
+      "paths": [
+        "/api/decisions/domains"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/distill",
+      "paths": [
+        "/api/distill"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/distill/{}",
+      "paths": [
+        "/api/distill/{page_id}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/documents/{}/{}",
+      "paths": [
+        "/api/documents/{source}/{source_id}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/documents/{}/space",
+      "paths": [
+        "/api/documents/{source_id}/space"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/documents/{}/tags",
+      "paths": [
+        "/api/documents/{source_id}/tags"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/health",
+      "paths": [
+        "/api/health"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/home-stats",
+      "paths": [
+        "/api/home-stats"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/import/chat-export",
+      "paths": [
+        "/api/import/chat-export"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/import/memories",
+      "paths": [
+        "/api/import/memories"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/import/state",
+      "paths": [
+        "/api/import/state"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/indexed-files",
+      "paths": [
+        "/api/indexed-files"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/ingest/memory",
+      "paths": [
+        "/api/ingest/memory"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/ingest/text",
+      "paths": [
+        "/api/ingest/text"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/ingest/webpage",
+      "paths": [
+        "/api/ingest/webpage"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/knowledge/count",
+      "paths": [
+        "/api/knowledge/count"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/knowledge/path",
+      "paths": [
+        "/api/knowledge/path"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/knowledge/recent-relations",
+      "paths": [
+        "/api/knowledge/recent-relations"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/llm/test",
+      "paths": [
+        "/api/llm/test"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/correct",
+      "paths": [
+        "/api/memory/{id}/correct"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/detail",
+      "paths": [
+        "/api/memory/{id}/detail"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/enrichment-status",
+      "paths": [
+        "/api/memory/{source_id}/enrichment-status"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/pin",
+      "paths": [
+        "/api/memory/{id}/pin"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/revisions",
+      "paths": [
+        "/api/memory/{id}/revisions"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/stability",
+      "paths": [
+        "/api/memory/{id}/stability"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/unpin",
+      "paths": [
+        "/api/memory/{id}/unpin"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/update",
+      "paths": [
+        "/api/memory/{id}/update"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/update-page",
+      "paths": [
+        "/api/memory/{id}/update-page"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/versions",
+      "paths": [
+        "/api/memory/{id}/versions"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/by-ids",
+      "paths": [
+        "/api/memory/by-ids"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/confirm/{}",
+      "paths": [
+        "/api/memory/confirm/{source_id}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/contradiction/{}/dismiss",
+      "paths": [
+        "/api/memory/contradiction/{source_id}/dismiss"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/delete/{}",
+      "paths": [
+        "/api/memory/delete/{source_id}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entities",
+      "paths": [
+        "/api/memory/entities"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entities/{}",
+      "paths": [
+        "/api/memory/entities/{entity_id}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entities/{}/confirm",
+      "paths": [
+        "/api/memory/entities/{id}/confirm"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entities/{}/delete",
+      "paths": [
+        "/api/memory/entities/{id}/delete"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entities/{}/observations",
+      "paths": [
+        "/api/memory/entities/{entity_id}/observations"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entities/list",
+      "paths": [
+        "/api/memory/entities/list"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entities/search",
+      "paths": [
+        "/api/memory/entities/search"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entity-suggestions",
+      "paths": [
+        "/api/memory/entity-suggestions"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/link-entity",
+      "paths": [
+        "/api/memory/link-entity"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/list",
+      "paths": [
+        "/api/memory/list"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/nurture",
+      "paths": [
+        "/api/memory/nurture"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/observations",
+      "paths": [
+        "/api/memory/observations"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/observations/{}",
+      "paths": [
+        "/api/memory/observations/{id}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/observations/{}/confirm",
+      "paths": [
+        "/api/memory/observations/{id}/confirm"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/pending-revision/{}",
+      "paths": [
+        "/api/memory/pending-revision/{source_id}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/pending-revisions",
+      "paths": [
+        "/api/memory/pending-revisions"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/pinned",
+      "paths": [
+        "/api/memory/pinned"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/recent",
+      "paths": [
+        "/api/memory/recent"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/reclassify/{}",
+      "paths": [
+        "/api/memory/reclassify/{source_id}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/rejections",
+      "paths": [
+        "/api/memory/rejections"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/relations",
+      "paths": [
+        "/api/memory/relations"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/revision/{}/accept",
+      "paths": [
+        "/api/memory/revision/{id}/accept"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/revision/{}/dismiss",
+      "paths": [
+        "/api/memory/revision/{id}/dismiss"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/search",
+      "paths": [
+        "/api/memory/search"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/stats",
+      "paths": [
+        "/api/memory/stats"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/store",
+      "paths": [
+        "/api/memory/store"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/unconfirmed",
+      "paths": [
+        "/api/memory/unconfirmed"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/on-device-model",
+      "paths": [
+        "/api/on-device-model"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/on-device-model/download",
+      "paths": [
+        "/api/on-device-model/download"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/onboarding/milestones",
+      "paths": [
+        "/api/onboarding/milestones"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/onboarding/milestones/{}/acknowledge",
+      "paths": [
+        "/api/onboarding/milestones/{id}/acknowledge"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/onboarding/reset",
+      "paths": [
+        "/api/onboarding/reset"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages",
+      "paths": [
+        "/api/pages"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/{}",
+      "paths": [
+        "/api/pages/{id}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/{}/archive",
+      "paths": [
+        "/api/pages/{id}/archive"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/{}/export",
+      "paths": [
+        "/api/pages/{id}/export"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/{}/links",
+      "paths": [
+        "/api/pages/{id}/links"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/{}/revisions",
+      "paths": [
+        "/api/pages/{id}/revisions"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/{}/sources",
+      "paths": [
+        "/api/pages/{id}/sources"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/export",
+      "paths": [
+        "/api/pages/export"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/orphan-links",
+      "paths": [
+        "/api/pages/orphan-links"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/recent",
+      "paths": [
+        "/api/pages/recent"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/recent-changes",
+      "paths": [
+        "/api/pages/recent-changes"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/search",
+      "paths": [
+        "/api/pages/search"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/ping",
+      "paths": [
+        "/api/ping"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/profile",
+      "paths": [
+        "/api/profile"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/profile/narrative",
+      "paths": [
+        "/api/profile/narrative"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/profile/narrative/regenerate",
+      "paths": [
+        "/api/profile/narrative/regenerate"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/refinery/queue",
+      "paths": [
+        "/api/refinery/queue"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/refinery/queue/{}/accept",
+      "paths": [
+        "/api/refinery/queue/{id}/accept"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/refinery/queue/{}/reject",
+      "paths": [
+        "/api/refinery/queue/{id}/reject"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/retrievals/recent",
+      "paths": [
+        "/api/retrievals/recent"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/search",
+      "paths": [
+        "/api/search"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/setup/anthropic-key",
+      "paths": [
+        "/api/setup/anthropic-key"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/setup/status",
+      "paths": [
+        "/api/setup/status"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/shutdown",
+      "paths": [
+        "/api/shutdown"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/snapshots",
+      "paths": [
+        "/api/snapshots"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/snapshots/{}/captures",
+      "paths": [
+        "/api/snapshots/{id}/captures"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/snapshots/{}/captures-with-content",
+      "paths": [
+        "/api/snapshots/{id}/captures-with-content"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/snapshots/{}/delete",
+      "paths": [
+        "/api/snapshots/{id}/delete"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/sources",
+      "paths": [
+        "/api/sources"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/sources/{}",
+      "paths": [
+        "/api/sources/{id}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/sources/{}/sync",
+      "paths": [
+        "/api/sources/{id}/sync"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces",
+      "paths": [
+        "/api/spaces"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces/{}",
+      "paths": [
+        "/api/spaces/{name}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces/{}/confirm",
+      "paths": [
+        "/api/spaces/{name}/confirm"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces/{}/move-to/{}",
+      "paths": [
+        "/api/spaces/{from}/move-to/{to}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces/{}/pin",
+      "paths": [
+        "/api/spaces/{name}/pin"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces/{}/star",
+      "paths": [
+        "/api/spaces/{name}/star"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces/reorder",
+      "paths": [
+        "/api/spaces/reorder"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/status",
+      "paths": [
+        "/api/status"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/steep",
+      "paths": [
+        "/api/steep"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/suggest-tags",
+      "paths": [
+        "/api/suggest-tags"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/tags",
+      "paths": [
+        "/api/tags"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/api/tags/{}",
+      "paths": [
+        "/api/tags/{name}"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    },
+    {
+      "normalized": "/ws/updates",
+      "paths": [
+        "/ws/updates"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ]
+    }
+  ],
+  "appRoutes": [
+    {
+      "normalized": "/api/activities",
+      "paths": [
+        "/api/activities?limit={}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/agents",
+      "paths": [
+        "/api/agents"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/agents/{}",
+      "paths": [
+        "/api/agents/{}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/briefing",
+      "paths": [
+        "/api/briefing"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/capture-stats",
+      "paths": [
+        "/api/capture-stats"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/chunks/{}",
+      "paths": [
+        "/api/chunks/{}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/chunks/{}/update",
+      "paths": [
+        "/api/chunks/{}/update"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/chunks/delete-bulk",
+      "paths": [
+        "/api/chunks/delete-bulk"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/chunks/time-range",
+      "paths": [
+        "/api/chunks/time-range"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/config",
+      "paths": [
+        "/api/config"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/debug/pipeline",
+      "paths": [
+        "/api/debug/pipeline"
+      ],
+      "files": [
+        "app/src/api.rs",
+        "src/components/memory/settings/DiagnosticsSection.tsx"
+      ]
+    },
+    {
+      "normalized": "/api/decisions",
+      "paths": [
+        "/api/decisions?limit=200"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/decisions/domains",
+      "paths": [
+        "/api/decisions/domains"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/distill",
+      "paths": [
+        "/api/distill"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/distill/{}",
+      "paths": [
+        "/api/distill/{}"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/documents/{}/{}",
+      "paths": [
+        "/api/documents/{}/{}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/documents/{}/space",
+      "paths": [
+        "/api/documents/{}/space"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/documents/{}/tags",
+      "paths": [
+        "/api/documents/{}/tags"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/health",
+      "paths": [
+        "/api/health"
+      ],
+      "files": [
+        "app/src/api.rs",
+        "app/src/tray_health.rs"
+      ]
+    },
+    {
+      "normalized": "/api/home-stats",
+      "paths": [
+        "/api/home-stats"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/import/chat-export",
+      "paths": [
+        "/api/import/chat-export"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/import/memories",
+      "paths": [
+        "/api/import/memories"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/import/state",
+      "paths": [
+        "/api/import/state"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/indexed-files",
+      "paths": [
+        "/api/indexed-files"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/ingest/memory",
+      "paths": [
+        "/api/ingest/memory"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/ingest/text",
+      "paths": [
+        "/api/ingest/text"
+      ],
+      "files": [
+        "app/src/indexer.rs",
+        "app/src/router/intent.rs",
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/ingest/webpage",
+      "paths": [
+        "/api/ingest/webpage"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/knowledge/count",
+      "paths": [
+        "/api/knowledge/count"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/knowledge/path",
+      "paths": [
+        "/api/knowledge/path"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/knowledge/recent-relations",
+      "paths": [
+        "/api/knowledge/recent-relations?limit={}"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/llm/test",
+      "paths": [
+        "/api/llm/test"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/correct",
+      "paths": [
+        "/api/memory/{}/correct"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/detail",
+      "paths": [
+        "/api/memory/{}/detail"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/enrichment-status",
+      "paths": [
+        "/api/memory/{}/enrichment-status"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/pin",
+      "paths": [
+        "/api/memory/{}/pin"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/revisions",
+      "paths": [
+        "/api/memory/{}/revisions"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/stability",
+      "paths": [
+        "/api/memory/{}/stability"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/unpin",
+      "paths": [
+        "/api/memory/{}/unpin"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/update",
+      "paths": [
+        "/api/memory/{}/update"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/update-page",
+      "paths": [
+        "/api/memory/{}/update-page"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/{}/versions",
+      "paths": [
+        "/api/memory/{}/versions"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/by-ids",
+      "paths": [
+        "/api/memory/by-ids?ids={}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/confirm/{}",
+      "paths": [
+        "/api/memory/confirm/{}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/contradiction/{}/dismiss",
+      "paths": [
+        "/api/memory/contradiction/{}/dismiss"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/delete/{}",
+      "paths": [
+        "/api/memory/delete/{}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entities",
+      "paths": [
+        "/api/memory/entities"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entities/{}",
+      "paths": [
+        "/api/memory/entities/{}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entities/{}/confirm",
+      "paths": [
+        "/api/memory/entities/{}/confirm"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entities/{}/delete",
+      "paths": [
+        "/api/memory/entities/{}/delete"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entities/list",
+      "paths": [
+        "/api/memory/entities/list"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entities/search",
+      "paths": [
+        "/api/memory/entities/search"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/entity-suggestions",
+      "paths": [
+        "/api/memory/entity-suggestions"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/list",
+      "paths": [
+        "/api/memory/list"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/nurture",
+      "paths": [
+        "/api/memory/nurture"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/observations",
+      "paths": [
+        "/api/memory/observations"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/observations/{}",
+      "paths": [
+        "/api/memory/observations/{}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/observations/{}/confirm",
+      "paths": [
+        "/api/memory/observations/{}/confirm"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/pending-revision/{}",
+      "paths": [
+        "/api/memory/pending-revision/{}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/pending-revisions",
+      "paths": [
+        "/api/memory/pending-revisions",
+        "/api/memory/pending-revisions?limit={limit}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/pinned",
+      "paths": [
+        "/api/memory/pinned"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/recent",
+      "paths": [
+        "/api/memory/recent?limit={}",
+        "/api/memory/recent?limit={}&since_ms={}"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/reclassify/{}",
+      "paths": [
+        "/api/memory/reclassify/{}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/rejections",
+      "paths": [
+        "/api/memory/rejections"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/revision/{}/accept",
+      "paths": [
+        "/api/memory/revision/{}/accept"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/revision/{}/dismiss",
+      "paths": [
+        "/api/memory/revision/{}/dismiss"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/search",
+      "paths": [
+        "/api/memory/search"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/stats",
+      "paths": [
+        "/api/memory/stats"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/store",
+      "paths": [
+        "/api/memory/store"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/memory/unconfirmed",
+      "paths": [
+        "/api/memory/unconfirmed?limit={}"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/on-device-model",
+      "paths": [
+        "/api/on-device-model"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/on-device-model/download",
+      "paths": [
+        "/api/on-device-model/download"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/onboarding/milestones",
+      "paths": [
+        "/api/onboarding/milestones"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/onboarding/milestones/{}/acknowledge",
+      "paths": [
+        "/api/onboarding/milestones/{}/acknowledge"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/onboarding/reset",
+      "paths": [
+        "/api/onboarding/reset"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages",
+      "paths": [
+        "/api/pages",
+        "/api/pages?{}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/{}",
+      "paths": [
+        "/api/pages/{}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/{}/archive",
+      "paths": [
+        "/api/pages/{}/archive"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/{}/export",
+      "paths": [
+        "/api/pages/{}/export"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/{}/links",
+      "paths": [
+        "/api/pages/{}/links"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/{}/revisions",
+      "paths": [
+        "/api/pages/{}/revisions"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/{}/sources",
+      "paths": [
+        "/api/pages/{}/sources"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/export",
+      "paths": [
+        "/api/pages/export"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/orphan-links",
+      "paths": [
+        "/api/pages/orphan-links",
+        "/api/pages/orphan-links?min_count={}"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/recent",
+      "paths": [
+        "/api/pages/recent?limit={}",
+        "/api/pages/recent?limit={}&since_ms={}"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/recent-changes",
+      "paths": [
+        "/api/pages/recent-changes?limit={}"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/pages/search",
+      "paths": [
+        "/api/pages/search"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/profile",
+      "paths": [
+        "/api/profile"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/profile/narrative",
+      "paths": [
+        "/api/profile/narrative"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/profile/narrative/regenerate",
+      "paths": [
+        "/api/profile/narrative/regenerate"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/refinery/queue",
+      "paths": [
+        "/api/refinery/queue"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/refinery/queue/{}/accept",
+      "paths": [
+        "/api/refinery/queue/{id}/accept"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/refinery/queue/{}/reject",
+      "paths": [
+        "/api/refinery/queue/{id}/reject"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/retrievals/recent",
+      "paths": [
+        "/api/retrievals/recent?limit={}"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/search",
+      "paths": [
+        "/api/search"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/setup/anthropic-key",
+      "paths": [
+        "/api/setup/anthropic-key"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/setup/status",
+      "paths": [
+        "/api/setup/status"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/shutdown",
+      "paths": [
+        "/api/shutdown"
+      ],
+      "files": [
+        "app/src/lifecycle.rs"
+      ]
+    },
+    {
+      "normalized": "/api/snapshots",
+      "paths": [
+        "/api/snapshots?limit={}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/snapshots/{}/captures",
+      "paths": [
+        "/api/snapshots/{}/captures"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/snapshots/{}/captures-with-content",
+      "paths": [
+        "/api/snapshots/{}/captures-with-content"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/snapshots/{}/delete",
+      "paths": [
+        "/api/snapshots/{}/delete"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/sources",
+      "paths": [
+        "/api/sources"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/sources/{}",
+      "paths": [
+        "/api/sources/{}"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/sources/{}/sync",
+      "paths": [
+        "/api/sources/{}/sync"
+      ],
+      "files": [
+        "app/src/api.rs",
+        "app/src/sources/sync.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces",
+      "paths": [
+        "/api/spaces"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces/{}",
+      "paths": [
+        "/api/spaces/{}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces/{}/confirm",
+      "paths": [
+        "/api/spaces/{}/confirm"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces/{}/move-to/{}",
+      "paths": [
+        "/api/spaces/{}/move-to/{}"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces/{}/pin",
+      "paths": [
+        "/api/spaces/{}/pin"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces/{}/star",
+      "paths": [
+        "/api/spaces/{}/star"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/spaces/reorder",
+      "paths": [
+        "/api/spaces/reorder"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/status",
+      "paths": [
+        "/api/status"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/suggest-tags",
+      "paths": [
+        "/api/suggest-tags?source="
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    },
+    {
+      "normalized": "/api/tags",
+      "paths": [
+        "/api/tags"
+      ],
+      "files": [
+        "app/src/api.rs"
+      ]
+    },
+    {
+      "normalized": "/api/tags/{}",
+      "paths": [
+        "/api/tags/{}"
+      ],
+      "files": [
+        "app/src/search.rs"
+      ]
+    }
+  ],
+  "missingInApp": [
+    {
+      "normalized": "/api/config/skip-apps",
+      "paths": [
+        "/api/config/skip-apps"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ],
+      "classification": {
+        "category": "superseded_route",
+        "status": "intentional",
+        "rationale": "The desktop app reads and patches skip-app settings through the stronger sparse /api/config contract.",
+        "next_action": "No app work unless the daemon removes the legacy route."
+      }
+    },
+    {
+      "normalized": "/api/context",
+      "paths": [
+        "/api/context"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ],
+      "classification": {
+        "category": "agent_route",
+        "status": "intentional",
+        "rationale": "Context bundles are trust-gated MCP/agent calls, not a desktop user command.",
+        "next_action": "Keep hidden unless a diagnostics context panel is designed."
+      }
+    },
+    {
+      "normalized": "/api/memory/entities/{}/observations",
+      "paths": [
+        "/api/memory/entities/{entity_id}/observations"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ],
+      "classification": {
+        "category": "alternate_route",
+        "status": "intentional",
+        "rationale": "IdentityDetail already adds observations through /api/memory/observations with a typed entity_id request body.",
+        "next_action": "No direct wrapper unless the generic observation route is deprecated."
+      }
+    },
+    {
+      "normalized": "/api/memory/link-entity",
+      "paths": [
+        "/api/memory/link-entity"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ],
+      "classification": {
+        "category": "graph_authoring",
+        "status": "design_required",
+        "rationale": "Linking memories to entities mutates knowledge-graph provenance and needs review/undo semantics.",
+        "next_action": "Design a graph-authoring or entity-suggestion acceptance flow before exposing."
+      }
+    },
+    {
+      "normalized": "/api/memory/relations",
+      "paths": [
+        "/api/memory/relations"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ],
+      "classification": {
+        "category": "graph_authoring",
+        "status": "design_required",
+        "rationale": "Direct relation creation can corrupt the knowledge graph if exposed as a blind write.",
+        "next_action": "Design a relation editor/review flow with provenance and undo states."
+      }
+    },
+    {
+      "normalized": "/api/ping",
+      "paths": [
+        "/api/ping"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ],
+      "classification": {
+        "category": "redundant_health",
+        "status": "intentional",
+        "rationale": "The app uses typed /api/health and /api/status for health and status checks.",
+        "next_action": "No app work."
+      }
+    },
+    {
+      "normalized": "/api/steep",
+      "paths": [
+        "/api/steep"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ],
+      "classification": {
+        "category": "operator_maintenance",
+        "status": "deferred",
+        "rationale": "Manual steep/refinery work can invoke maintenance phases and should not be a raw desktop button.",
+        "next_action": "Keep deferred; do not expose until a separate maintenance design covers cost, capability, progress, and failure states."
+      }
+    },
+    {
+      "normalized": "/ws/updates",
+      "paths": [
+        "/ws/updates"
+      ],
+      "files": [
+        "crates/wenlan-server/src/router.rs"
+      ],
+      "classification": {
+        "category": "architecture_gap",
+        "status": "deferred",
+        "rationale": "The current app uses Tauri events, query invalidation, and status polling instead of daemon WebSocket subscriptions.",
+        "next_action": "Revisit only if replacing the app event flow with daemon events becomes an explicit product goal."
+      }
+    }
+  ],
+  "appOnly": []
+}

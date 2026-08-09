@@ -1,0 +1,52 @@
+{
+  "routes": {
+    "/api/config/skip-apps": {
+      "category": "superseded_route",
+      "status": "intentional",
+      "rationale": "The desktop app reads and patches skip-app settings through the stronger sparse /api/config contract.",
+      "next_action": "No app work unless the daemon removes the legacy route."
+    },
+    "/api/context": {
+      "category": "agent_route",
+      "status": "intentional",
+      "rationale": "Context bundles are trust-gated MCP/agent calls, not a desktop user command.",
+      "next_action": "Keep hidden unless a diagnostics context panel is designed."
+    },
+    "/api/memory/entities/{entity_id}/observations": {
+      "category": "alternate_route",
+      "status": "intentional",
+      "rationale": "IdentityDetail already adds observations through /api/memory/observations with a typed entity_id request body.",
+      "next_action": "No direct wrapper unless the generic observation route is deprecated."
+    },
+    "/api/memory/link-entity": {
+      "category": "graph_authoring",
+      "status": "design_required",
+      "rationale": "Linking memories to entities mutates knowledge-graph provenance and needs review/undo semantics.",
+      "next_action": "Design a graph-authoring or entity-suggestion acceptance flow before exposing."
+    },
+    "/api/memory/relations": {
+      "category": "graph_authoring",
+      "status": "design_required",
+      "rationale": "Direct relation creation can corrupt the knowledge graph if exposed as a blind write.",
+      "next_action": "Design a relation editor/review flow with provenance and undo states."
+    },
+    "/api/ping": {
+      "category": "redundant_health",
+      "status": "intentional",
+      "rationale": "The app uses typed /api/health and /api/status for health and status checks.",
+      "next_action": "No app work."
+    },
+    "/api/steep": {
+      "category": "operator_maintenance",
+      "status": "deferred",
+      "rationale": "Manual steep/refinery work can invoke maintenance phases and should not be a raw desktop button.",
+      "next_action": "Keep deferred; do not expose until a separate maintenance design covers cost, capability, progress, and failure states."
+    },
+    "/ws/updates": {
+      "category": "architecture_gap",
+      "status": "deferred",
+      "rationale": "The current app uses Tauri events, query invalidation, and status polling instead of daemon WebSocket subscriptions.",
+      "next_action": "Revisit only if replacing the app event flow with daemon events becomes an explicit product goal."
+    }
+  }
+}
