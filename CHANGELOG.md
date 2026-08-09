@@ -1,32 +1,5 @@
 # Changelog
 
-## [0.15.6](https://github.com/7xuanlu/wenlan/compare/v0.15.5...v0.15.6) (2026-08-09)
-
-
-### Features
-
-* G6 Stage 3 — migration 123 retires the legacy entities/entity_aliases tables ([#499](https://github.com/7xuanlu/wenlan/issues/499)) ([0aaa695](https://github.com/7xuanlu/wenlan/commit/0aaa695eb4d02ca8458032710f8947281a1e3e9d))
-* **kg:** edges carry their semantic payload — one source of truth (G6 Stage 1) ([#486](https://github.com/7xuanlu/wenlan/issues/486)) ([8100223](https://github.com/7xuanlu/wenlan/commit/8100223e6539d842c1e25de91aca36e108e1faab))
-* **kg:** G6 Stage 1.1 — resolved page-link readers cut over to canonical links edges ([#488](https://github.com/7xuanlu/wenlan/issues/488)) ([f44ea66](https://github.com/7xuanlu/wenlan/commit/f44ea66cb386d21b771170d60443c4befc88b37b))
-* **kg:** G6 Stage 1.2 — relations readers cut over to canonical relates edges ([#489](https://github.com/7xuanlu/wenlan/issues/489)) ([8105cac](https://github.com/7xuanlu/wenlan/commit/8105cac6f646ba8b9398764ad3178b2eb5a2c875))
-* **kg:** G6 Stage 1.3 — page_sources/page_evidence readers cut over to canonical cites edges ([#490](https://github.com/7xuanlu/wenlan/issues/490)) ([9ac0fe3](https://github.com/7xuanlu/wenlan/commit/9ac0fe3f9b92aa1d9097bf7ab42149056d273691))
-* **kg:** G6 Stage 1.5a — clean entity readers cut over to kind='entity' shadow pages ([#491](https://github.com/7xuanlu/wenlan/issues/491)) ([2a08ca6](https://github.com/7xuanlu/wenlan/commit/2a08ca640e113c7b62f96374a781809e5700f7bb))
-* **kg:** G6 Stage 1.5b — scalar mirror extension + entity reader completion ([#492](https://github.com/7xuanlu/wenlan/issues/492)) ([ba89434](https://github.com/7xuanlu/wenlan/commit/ba894341b6d3f15ea1bd4111c62a00b4ffbc8bec))
-* **kg:** G6 Stage 2 PR 2a — retire edges/entity-page parity-oracle machinery (m120) ([#494](https://github.com/7xuanlu/wenlan/issues/494)) ([9d5eb29](https://github.com/7xuanlu/wenlan/commit/9d5eb296b92580cb3483cf5e50b6298d1b65e521))
-* **kg:** G6 Stage 2 PR 2c — entity writers and readers canonical-only; entity parity oracle retires ([#498](https://github.com/7xuanlu/wenlan/issues/498)) ([892e724](https://github.com/7xuanlu/wenlan/commit/892e72440f95f77ef0e98c055e2e2a0d659128fc))
-
-
-### Bug Fixes
-
-* grant release finalization the pull-requests write it uses ([#483](https://github.com/7xuanlu/wenlan/issues/483)) ([573f45c](https://github.com/7xuanlu/wenlan/commit/573f45ce785d615283a0b81fea962fe073e0670a))
-* **kg:** carry the label on rebind re-mints; survive the m81 pre-semantic_type crash window ([#487](https://github.com/7xuanlu/wenlan/issues/487)) ([29f51db](https://github.com/7xuanlu/wenlan/commit/29f51dbb3188fbe850e22f752a1b68f129b976c8))
-* **kg:** edges-parity repair — doc-source-page over-retire + kind-derivation drift (m119) ([#493](https://github.com/7xuanlu/wenlan/issues/493)) ([6e55889](https://github.com/7xuanlu/wenlan/commit/6e5588949b3ef6494a05409d7e3847c719c9d7f7))
-* **kg:** G6 Stage 0 part 1 — three writers re-drifting edges parity ([#481](https://github.com/7xuanlu/wenlan/issues/481)) ([b2c8280](https://github.com/7xuanlu/wenlan/commit/b2c828057dc1b284cc73174f87d9749af2b7528a))
-* **kg:** G6 Stage 0 part 2 — five secondary writers re-drifting edges parity ([#482](https://github.com/7xuanlu/wenlan/issues/482)) ([1658e4d](https://github.com/7xuanlu/wenlan/commit/1658e4dc4ac8e367c7c5231a29b88f0ba26d66c0))
-* **kg:** writers canonical-only for legacy KG stores; discovery-scan sweep (G6 Stage 2b) ([#495](https://github.com/7xuanlu/wenlan/issues/495)) ([7a8287f](https://github.com/7xuanlu/wenlan/commit/7a8287fe08e13c05c3beabec7d54f344ecbee34b))
-* **test:** quarantine remaining high-risk flake patterns ([#497](https://github.com/7xuanlu/wenlan/issues/497)) ([dd0e617](https://github.com/7xuanlu/wenlan/commit/dd0e6177056652ec2d96cb331a40cd0b5d245b79))
-* **test:** quarantine three flaky tests behind serialization and CI retries ([#496](https://github.com/7xuanlu/wenlan/issues/496)) ([71e9196](https://github.com/7xuanlu/wenlan/commit/71e9196d42e634566553e79f30e2563a668544d3))
-
 ## [0.15.5](https://github.com/7xuanlu/wenlan/compare/v0.15.4...v0.15.5) (2026-08-04)
 
 
