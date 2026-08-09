@@ -9,6 +9,9 @@ VTXT_VER=$(cat version.txt | tr -d '[:space:]')
 WS_VER=$(grep -E '^version = ' Cargo.toml | head -1 | sed -E 's/version = "([^"]+)".*/\1/')
 WENLAN_TYPES_DEP_VER=$(grep -E '^wenlan-types[[:space:]]+=' Cargo.toml | sed -E 's/.*version = "([^"]+)".*/\1/')
 WENLAN_CORE_DEP_VER=$(grep -E '^wenlan-core[[:space:]]+=' Cargo.toml | sed -E 's/.*version = "([^"]+)".*/\1/')
+APP_CARGO_VER=$(grep -E '^version = ' app/Cargo.toml | head -1 | sed -E 's/version = "([^"]+)".*/\1/')
+APP_TAURI_VER=$(jq -r .version app/tauri.conf.json)
+APP_PKG_VER=$(jq -r .version package.json)
 LOCK_VERSIONS=$(awk '
   $0 == "[[package]]" { in_pkg=1; name=""; version=""; next }
   in_pkg && $1 == "name" && $2 == "=" {
@@ -39,6 +42,9 @@ echo "version.txt: $VTXT_VER"
 echo "Cargo:       $WS_VER"
 echo "wenlan-types dep: $WENLAN_TYPES_DEP_VER"
 echo "wenlan-core dep:  $WENLAN_CORE_DEP_VER"
+echo "app/Cargo.toml:   $APP_CARGO_VER"
+echo "app/tauri.conf:   $APP_TAURI_VER"
+echo "package.json:     $APP_PKG_VER"
 echo "Cargo.lock:"
 printf '%s\n' "$LOCK_VERSIONS" | sed 's/^/  /'
 echo "wenlan-mcp npm: $MCP_NPM_VER"
@@ -52,7 +58,7 @@ printf '%s\n' "$CODEX_README_PINS" | sed 's/^/  /'
 echo "Codex setup tags:"
 printf '%s\n' "$CODEX_SETUP_TAGS" | sed 's/^/  /'
 
-if [[ "$VTXT_VER" != "$TAG_VER" || "$WS_VER" != "$TAG_VER" || "$WENLAN_TYPES_DEP_VER" != "$TAG_VER" || "$WENLAN_CORE_DEP_VER" != "$TAG_VER" || "$MCP_NPM_VER" != "$TAG_VER" || "$WENLAN_NPM_VER" != "$TAG_VER" || "$PLUGIN_VER" != "$TAG_VER" || "$CODEX_PLUGIN_VER" != "$TAG_VER" ]]; then
+if [[ "$VTXT_VER" != "$TAG_VER" || "$WS_VER" != "$TAG_VER" || "$WENLAN_TYPES_DEP_VER" != "$TAG_VER" || "$WENLAN_CORE_DEP_VER" != "$TAG_VER" || "$MCP_NPM_VER" != "$TAG_VER" || "$WENLAN_NPM_VER" != "$TAG_VER" || "$PLUGIN_VER" != "$TAG_VER" || "$CODEX_PLUGIN_VER" != "$TAG_VER" || "$APP_CARGO_VER" != "$TAG_VER" || "$APP_TAURI_VER" != "$TAG_VER" || "$APP_PKG_VER" != "$TAG_VER" ]]; then
     echo "ERROR: version drift — bump-version.sh likely failed in release-please.yml"
     exit 1
 fi

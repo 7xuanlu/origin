@@ -9,39 +9,60 @@ function jsonVersion(path: string): string {
   return JSON.parse(readFileSync(resolve(root, path), "utf8")).version;
 }
 
-function cargoVersion(): string {
-  const cargoToml = readFileSync(resolve(root, "app/Cargo.toml"), "utf8");
-  const match = cargoToml.match(/^version = "([^"]+)"/m);
+function cargoVersionLine(path: string): string {
+  const cargoToml = readFileSync(resolve(root, path), "utf8");
+  const match = cargoToml.match(/^version = "([^"]+)"(.*)$/m);
   if (!match) {
-    throw new Error("app/Cargo.toml is missing a package version");
+    throw new Error(`${path} is missing a package version`);
   }
-  return match[1];
+  return match[0];
 }
 
-function pinnedDaemonVersion(): string {
-  const pin = readFileSync(resolve(root, ".wenlan-backend-version"), "utf8")
-    .split(/\r?\n/)
-    .find((line) => line.trim().length > 0);
-  if (!pin) {
-    throw new Error(".wenlan-backend-version is missing a daemon tag");
-  }
-  return pin.replace(/^v/, "");
+function workspaceVersion(): string {
+  return readFileSync(resolve(root, "version.txt"), "utf8").trim();
 }
 
 describe("release version sync", () => {
-  it("keeps the public app release version in lockstep with the pinned daemon release", () => {
+  it("keeps the desktop app version in lockstep with the workspace version", () => {
+    const workspace = workspaceVersion();
+    const appCargoLine = cargoVersionLine("app/Cargo.toml");
+    const appCargoMatch = appCargoLine.match(/^version = "([^"]+)"/);
     const versions = {
       tauri: jsonVersion("app/tauri.conf.json"),
       packageJson: jsonVersion("package.json"),
-      cargo: cargoVersion(),
-      pinnedDaemon: pinnedDaemonVersion(),
+      appCargo: appCargoMatch ? appCargoMatch[1] : undefined,
     };
 
     expect(versions).toEqual({
-      tauri: versions.pinnedDaemon,
-      packageJson: versions.pinnedDaemon,
-      cargo: versions.pinnedDaemon,
-      pinnedDaemon: versions.pinnedDaemon,
+      tauri: workspace,
+      packageJson: workspace,
+      appCargo: workspace,
+    });
+  });
+
+  it("keeps the x-release-please-version marker on the app/Cargo.toml version line", () => {
+    // release-please's generic updater locates the line to bump via this marker;
+    // losing it silently breaks lockstep instead of failing loud.
+    const appCargoLine = cargoVersionLine("app/Cargo.toml");
+    expect(appCargoLine).toContain("# x-release-please-version");
+  });
+
+  it("registers the app version trio as release-please extra-files", () => {
+    const config = JSON.parse(
+      readFileSync(resolve(root, "release-please-config.json"), "utf8"),
+    );
+    const extraFiles: unknown[] = config.packages["."]["extra-files"];
+
+    expect(extraFiles).toContain("app/Cargo.toml");
+    expect(extraFiles).toContainEqual({
+      type: "json",
+      path: "app/tauri.conf.json",
+      jsonpath: "$.version",
+    });
+    expect(extraFiles).toContainEqual({
+      type: "json",
+      path: "package.json",
+      jsonpath: "$.version",
     });
   });
 });

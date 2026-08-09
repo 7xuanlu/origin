@@ -3,7 +3,20 @@
     ".": {
       "release-type": "simple",
       "always-update": true,
-      "versioning": "always-bump-patch"
+      "versioning": "always-bump-patch",
+      "extra-files": [
+        "app/Cargo.toml",
+        {
+          "type": "json",
+          "path": "app/tauri.conf.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "package.json",
+          "jsonpath": "$.version"
+        }
+      ]
     }
   },
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json"
