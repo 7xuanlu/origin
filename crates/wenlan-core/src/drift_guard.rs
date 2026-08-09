@@ -4925,7 +4925,12 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     if job_needs(&release, "bind-release-tag") != ["resolve-promotion"]
         || job_needs(&release, "prepare-release") != ["resolve-promotion", "bind-release-tag"]
         || job_needs(&release, "promote-assets")
-            != ["resolve-promotion", "bind-release-tag", "prepare-release", "app-bundle"]
+            != [
+                "resolve-promotion",
+                "bind-release-tag",
+                "prepare-release",
+                "app-bundle",
+            ]
     {
         violations.push("tag release artifact-promotion DAG bypasses receipt resolution".into());
     }
@@ -6073,7 +6078,12 @@ fn release_promotion_contract_violations(
         || !resolve.contains(".main_sha == $sha and .main_run == null")
         || job_needs(&release, "prepare-release") != ["resolve-promotion", "bind-release-tag"]
         || job_needs(&release, "promote-assets")
-            != ["resolve-promotion", "bind-release-tag", "prepare-release", "app-bundle"]
+            != [
+                "resolve-promotion",
+                "bind-release-tag",
+                "prepare-release",
+                "app-bundle",
+            ]
     {
         violations
             .push("tag release does not resolve the main receipt before asset promotion".into());
