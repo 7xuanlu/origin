@@ -567,6 +567,11 @@ fn coverage_single_test_execution_violations(workflow: &str) -> Vec<String> {
     violations
 }
 
+// Daemon promotion assets must still come from receipt-bound archives without
+// rebuilding; the app-bundle job is the sanctioned exception that compiles the
+// desktop app (and its sidecar daemon binary) from the tag-verified SHA, because no
+// receipt path exists for the app. The forbidden-string list intentionally still
+// bans compiler caches everywhere, including that job.
 fn release_rust_cache_violations(workflow: &str) -> Vec<String> {
     let parsed: serde_yaml::Value = serde_yaml::from_str(workflow).expect("parse release.yml");
     let mut violations = Vec::new();
@@ -786,9 +791,11 @@ fn release_reuses_receipt_bound_archives_without_compiling() {
     let violations = release_rust_cache_violations(&workflow);
     assert!(
         violations.is_empty(),
-        "Release artifact-reuse contract drift — release.yml must consume receipt-bound \
-         archives without compiling or restoring compiler caches. Fix \
-         .github/workflows/release.yml; an intentional contract change also updates \
+        "Release artifact-reuse contract drift — daemon promotion assets in release.yml \
+         must still come from receipt-bound archives without compiling or restoring \
+         compiler caches; the app-bundle job is the sole sanctioned exception, compiling \
+         the desktop app from the tag-verified SHA because no receipt path exists for it. \
+         Fix .github/workflows/release.yml; an intentional contract change also updates \
          release_rust_cache_violations() and its positive control:\n{}",
         violations.join("\n")
     );
@@ -4918,7 +4925,12 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
     if job_needs(&release, "bind-release-tag") != ["resolve-promotion"]
         || job_needs(&release, "prepare-release") != ["resolve-promotion", "bind-release-tag"]
         || job_needs(&release, "promote-assets")
-            != ["resolve-promotion", "bind-release-tag", "prepare-release"]
+            != [
+                "resolve-promotion",
+                "bind-release-tag",
+                "prepare-release",
+                "app-bundle",
+            ]
     {
         violations.push("tag release artifact-promotion DAG bypasses receipt resolution".into());
     }
@@ -6066,7 +6078,12 @@ fn release_promotion_contract_violations(
         || !resolve.contains(".main_sha == $sha and .main_run == null")
         || job_needs(&release, "prepare-release") != ["resolve-promotion", "bind-release-tag"]
         || job_needs(&release, "promote-assets")
-            != ["resolve-promotion", "bind-release-tag", "prepare-release"]
+            != [
+                "resolve-promotion",
+                "bind-release-tag",
+                "prepare-release",
+                "app-bundle",
+            ]
     {
         violations
             .push("tag release does not resolve the main receipt before asset promotion".into());
