@@ -146,6 +146,10 @@ APP_JOB_FILES = {
     "playwright.review.config.ts",
     "scripts/prepare-sidecars.sh",
     "scripts/prepare-tauri-build-sidecars.sh",
+    "scripts/open-review-app.mjs",
+    "scripts/refactor/api-route-diff.mjs",
+    "scripts/resolve-backend-dir.sh",
+    "scripts/verify-review-bundle.mjs",
     ".github/workflows/app-release.yml",
 }
 
