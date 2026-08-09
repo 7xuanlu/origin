@@ -165,7 +165,6 @@ jobs:
               - 'scripts/refactor/api-route-diff.mjs'
               - 'scripts/resolve-backend-dir.sh'
               - 'scripts/verify-review-bundle.mjs'
-              - '.github/workflows/app-release.yml'
               - '.github/workflows/ci.yml'
               # The app compiles wenlan-types by path and shares the workspace
               # lockfile, so a types change or a shared-dep bump can break the
@@ -2285,8 +2284,8 @@ jobs:
         run: pnpm install
       # Tauri's build script resolves externalBin sidecars (wenlan, wenlan-server,
       # wenlan-mcp, cloudflared) at compile time. PR CI doesn't ship the daemon;
-      # empty placeholders satisfy the resolver. Real DMG builds (app-release.yml)
-      # supply true binaries.
+      # empty placeholders satisfy the resolver. Real DMG builds (the app-bundle
+      # job in release.yml) supply true binaries.
       - name: Create sidecar placeholders for Tauri build script
         run: |
           mkdir -p app/binaries
