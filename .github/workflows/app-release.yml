@@ -123,7 +123,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            wenlan-app/app
+            wenlan-app
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6

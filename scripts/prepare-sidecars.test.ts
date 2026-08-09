@@ -136,7 +136,16 @@ describe("prepare-sidecars backend discovery", () => {
   });
 
   it("defaults to the monorepo root when no backend override is set", () => {
-    expect(resolveBackend(root)).toBe(root);
+    const base = makeTempRoot();
+    // Deliberately not named "wenlan": the old resolver's sibling probe
+    // ($REPO_ROOT/../wenlan) would otherwise resolve back to this same
+    // directory whenever the checkout happens to be named "wenlan" (true
+    // locally and on GitHub runners), making this case pass vacuously.
+    const monoRoot = resolve(base, "monorepo");
+    writeAppScripts(monoRoot);
+    writeBackendRepo(monoRoot);
+
+    expect(resolveBackend(monoRoot)).toBe(monoRoot);
   });
 
   it("keeps relative WENLAN_BACKEND_DIR overrides relative to the app checkout", () => {
