@@ -43,18 +43,23 @@ El trabajo útil con IA no debería desaparecer cuando termina una conversación
 
 ## Primeros pasos
 
+Wenlan funciona como un único daemon local. La aplicación de escritorio lo lleva dentro; la instalación sin interfaz te da ese mismo daemon sin ventana. En ambos casos, tus clientes de IA acceden a la misma base de conocimiento.
+
 <a id="start-with-the-app"></a>
 <a id="open-the-wiki"></a>
+<a id="desktop-app"></a>
 
-### Aplicación de escritorio
-
-La aplicación de escritorio es la forma más rápida de ver el flujo de trabajo completo: leer páginas, inspeccionar sus fuentes y gestionar el sistema de conocimiento. La vista previa actual para macOS Apple Silicon aún no está notarizada, por lo que este instalador comprueba la versión publicada en GitHub, instala Wenlan, elimina la cuarentena solo para esta aplicación y la abre sin cambiar la configuración de seguridad de macOS:
+### Aplicación de escritorio (macOS Apple Silicon)
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-El [instalador es inspeccionable](scripts/install-macos-app.sh). Verifica el archivo de la versión contra el SHA-256 publicado en GitHub antes de reemplazar una aplicación existente. ¿Prefieres el DMG o quieres inspeccionar el código fuente de la aplicación? Consulta las [versiones de wenlan](https://github.com/7xuanlu/wenlan/releases/latest) o el crate [`app/`](app/) dentro de este repositorio.
+No hay nada más que instalar. La aplicación incluye el daemon, la CLI y el conector MCP, arranca el daemon al abrirse y ofrece conectar los clientes de IA que detecta: el plugin para Claude Code y Codex, una entrada MCP para el resto. A partir de ahí lees Páginas, inspeccionas la Fuente detrás de cualquier cita y gestionas el sistema de conocimiento.
+
+Esta vista previa aún no está notarizada, así que el [instalador](scripts/install-macos-app.sh) comprueba la descarga contra el SHA-256 publicado en GitHub, elimina la cuarentena solo para esta aplicación y no cambia ninguna configuración de seguridad de macOS. ¿Prefieres el DMG o el código fuente? [Última versión](https://github.com/7xuanlu/wenlan/releases/latest) · crate [`app/`](app/).
+
+En Windows o Linux, usa el entorno de ejecución sin interfaz de abajo.
 
 <a id="claude-code-in-30-seconds"></a>
 
@@ -152,11 +157,11 @@ Durante la recuperación, la coincidencia densa de entidades encuentra entidades
 
 La búsqueda central de Wenlan es un pipeline híbrido local, no una simple búsqueda de vectores. Cada etapa tiene una tarea diferente:
 
-- **Coincidencia literal — [SQLite FTS5](https://www.sqlite.org/fts5.html):** un índice de texto completo encuentra términos literales, identificadores y frases.
-- **Significado similar — FastEmbed + [`Qdrant/bge-base-en-v1.5-onnx-Q`](https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q):** un modelo inglés cuantizado crea embeddings de 768 dimensiones; [libSQL cosine DiskANN](https://turso.tech/blog/approximate-nearest-neighbor-search-with-diskann-in-libsql) los indexa para la recuperación de vecinos más cercanos aproximados.
-- **Clasificación combinada — [RRF](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf) ponderado (`k = 60`):** las listas de clasificación léxica y semántica se fusionan sin fingir que sus puntuaciones brutas comparten una escala; la similitud de coseno también pondera la contribución del vector.
-- **Contexto conectado — flujo de grafo-memoria:** los enlaces de entidad elegibles añaden una tercera señal RRF mientras que el alcance de lectura activo sigue filtrando las Memorias devueltas.
-- **Precisión opcional — re-clasificación por cross-encoder:** a diferencia de los embeddings, [`jinaai/jina-reranker-v1-turbo-en`](https://huggingface.co/jinaai/jina-reranker-v1-turbo-en) o [`BAAI/bge-reranker-base`](https://huggingface.co/BAAI/bge-reranker-base) lee cada par consulta-candidato y reordena el grupo más pequeño; la re-clasificación está desactivada por defecto.
+- **Coincidencia literal, [SQLite FTS5](https://www.sqlite.org/fts5.html):** un índice de texto completo encuentra términos literales, identificadores y frases.
+- **Significado similar, FastEmbed + [`Qdrant/bge-base-en-v1.5-onnx-Q`](https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q):** un modelo inglés cuantizado crea embeddings de 768 dimensiones; [libSQL cosine DiskANN](https://turso.tech/blog/approximate-nearest-neighbor-search-with-diskann-in-libsql) los indexa para la recuperación de vecinos más cercanos aproximados.
+- **Clasificación combinada, [RRF](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf) ponderado (`k = 60`):** las listas de clasificación léxica y semántica se fusionan sin fingir que sus puntuaciones brutas comparten una escala; la similitud de coseno también pondera la contribución del vector.
+- **Contexto conectado, flujo de grafo-memoria:** los enlaces de entidad elegibles añaden una tercera señal RRF mientras que el alcance de lectura activo sigue filtrando las Memorias devueltas.
+- **Precisión opcional, re-clasificación por cross-encoder:** a diferencia de los embeddings, [`jinaai/jina-reranker-v1-turbo-en`](https://huggingface.co/jinaai/jina-reranker-v1-turbo-en) o [`BAAI/bge-reranker-base`](https://huggingface.co/BAAI/bge-reranker-base) lee cada par consulta-candidato y reordena el grupo más pequeño; la re-clasificación está desactivada por defecto.
 
 Los canales de Página, episódicos y de hechos son opcionales y recurren a las señales de búsqueda restantes si no están disponibles. El Espacio sigue limitando el alcance de lectura. [Métodos, valores predeterminados y limitaciones ->](docs/technical-foundations.md)
 

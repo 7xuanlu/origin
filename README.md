@@ -41,18 +41,23 @@ Useful work with AI shouldn't disappear when a conversation ends. Wenlan builds 
 
 ## Get started
 
+Wenlan runs as one local daemon. The desktop app carries that daemon inside it; the headless install gives you the same daemon without a window. Your AI clients reach the same knowledge base either way.
+
 <a id="start-with-the-app"></a>
 <a id="open-the-wiki"></a>
+<a id="desktop-app"></a>
 
-### Desktop app
-
-The desktop app is the fastest way to see the complete workflow: read pages, inspect their sources, and curate the knowledge system. The current macOS Apple Silicon preview is not yet notarized, so this installer verifies the GitHub release, installs Wenlan, clears quarantine for this app only, and opens it without changing macOS security settings:
+### Desktop app (macOS Apple Silicon)
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-The [installer is inspectable](scripts/install-macos-app.sh). It checks the release archive against GitHub's published SHA-256 before replacing an existing app. Prefer the DMG or want to inspect the app source? See [wenlan releases](https://github.com/7xuanlu/wenlan/releases/latest) or the in-tree [`app/`](app/) crate.
+Nothing else to install. The app bundles the daemon, CLI, and MCP connector, starts the daemon on launch, and offers to connect the AI clients it detects: the plugin for Claude Code and Codex, an MCP entry for the rest. From there you read Pages, inspect the Source behind any citation, and curate the knowledge system.
+
+This preview is not notarized yet, so the [installer](scripts/install-macos-app.sh) checks the download against GitHub's published SHA-256, clears quarantine for this app alone, and changes no macOS security settings. Prefer a DMG, or want the app source? [Latest release](https://github.com/7xuanlu/wenlan/releases/latest) · [`app/`](app/) crate.
+
+On Windows or Linux, use the headless runtime below.
 
 <a id="claude-code-in-30-seconds"></a>
 
@@ -150,11 +155,11 @@ During retrieval, dense entity matching finds query-relevant entities. When elig
 
 Wenlan's core search is a local hybrid pipeline, not a single vector lookup. Each stage has a different job:
 
-- **Exact wording — [SQLite FTS5](https://www.sqlite.org/fts5.html):** a full-text index finds literal terms, identifiers, and phrases.
-- **Similar meaning — FastEmbed + [`Qdrant/bge-base-en-v1.5-onnx-Q`](https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q):** a quantized English model creates 768-dimensional embeddings; [libSQL cosine DiskANN](https://turso.tech/blog/approximate-nearest-neighbor-search-with-diskann-in-libsql) indexes them for approximate nearest-neighbor retrieval.
-- **Combined ranking — weighted [RRF](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf) (`k = 60`):** lexical and semantic rank lists are fused without pretending their raw scores share a scale; cosine similarity also weights the vector contribution.
-- **Connected context — graph-memory stream:** eligible entity links add a third RRF signal while the active read scope still filters returned Memories.
-- **Optional precision — cross-encoder reranking:** unlike embeddings, [`jinaai/jina-reranker-v1-turbo-en`](https://huggingface.co/jinaai/jina-reranker-v1-turbo-en) or [`BAAI/bge-reranker-base`](https://huggingface.co/BAAI/bge-reranker-base) reads each query-candidate pair and reorders the smaller pool; reranking is off by default.
+- **Exact wording, [SQLite FTS5](https://www.sqlite.org/fts5.html):** a full-text index finds literal terms, identifiers, and phrases.
+- **Similar meaning, FastEmbed + [`Qdrant/bge-base-en-v1.5-onnx-Q`](https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q):** a quantized English model creates 768-dimensional embeddings; [libSQL cosine DiskANN](https://turso.tech/blog/approximate-nearest-neighbor-search-with-diskann-in-libsql) indexes them for approximate nearest-neighbor retrieval.
+- **Combined ranking, weighted [RRF](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf) (`k = 60`):** lexical and semantic rank lists are fused without pretending their raw scores share a scale; cosine similarity also weights the vector contribution.
+- **Connected context, graph-memory stream:** eligible entity links add a third RRF signal while the active read scope still filters returned Memories.
+- **Optional precision, cross-encoder reranking:** unlike embeddings, [`jinaai/jina-reranker-v1-turbo-en`](https://huggingface.co/jinaai/jina-reranker-v1-turbo-en) or [`BAAI/bge-reranker-base`](https://huggingface.co/BAAI/bge-reranker-base) reads each query-candidate pair and reorders the smaller pool; reranking is off by default.
 
 Page, episodic, and fact channels are opt-in and degrade to the remaining search signals if unavailable. Space still limits the read scope. [Methods, defaults, and limitations ->](docs/technical-foundations.md)
 

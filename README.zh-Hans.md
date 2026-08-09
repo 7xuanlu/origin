@@ -43,18 +43,23 @@
 
 ## 开始使用
 
+Wenlan 以单个本地 daemon 运行。桌面 app 内置这个 daemon；无 GUI 的安装方式提供的是同一个 daemon，只是没有窗口。两种方式下，你的 AI 客户端访问的都是同一个知识库。
+
 <a id="start-with-the-app"></a>
 <a id="open-the-wiki"></a>
+<a id="desktop-app"></a>
 
-### 桌面 app
-
-桌面 app 是最快看到完整工作流程的方式：阅读页面、检查来源并整理知识体系。目前仅提供 macOS Apple Silicon 预览版，尚未经过 Apple notarization。下面的安装器会验证 GitHub release，只为 Wenlan 清除 quarantine，安装后直接打开，不会更改 macOS 系统安全设置：
+### 桌面 app（macOS Apple Silicon）
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-你可以直接[检查安装器源码](scripts/install-macos-app.sh)。安装器会先用 GitHub 发布的 SHA-256 核对下载文件，再替换现有 app。偏好 DMG 或想查看 app 源码？请前往 [wenlan releases](https://github.com/7xuanlu/wenlan/releases/latest)，或查看本仓库内的 [`app/`](app/) crate。
+不需要再安装别的东西。App 内已打包 daemon、CLI 与 MCP 连接器，启动时会自动运行 daemon，并会为检测到的 AI 客户端提供接入：Claude Code 与 Codex 安装 plugin，其余客户端写入 MCP 配置。之后你就可以阅读 Page、检查任一引用背后的 Source，并整理整个知识体系。
+
+这个预览版尚未经过 Apple notarization，因此[安装器](scripts/install-macos-app.sh)会先用 GitHub 发布的 SHA-256 核对下载文件，只为这一个 app 清除 quarantine，不会更改任何 macOS 安全设置。偏好 DMG，或想查看 app 源码？[最新 release](https://github.com/7xuanlu/wenlan/releases/latest) · [`app/`](app/) crate。
+
+Windows 或 Linux 请使用下面的无 GUI runtime。
 
 <a id="claude-code-in-30-seconds"></a>
 
@@ -152,11 +157,11 @@ Wenlan 把文档、笔记和过去的 AI 对话整理成会随工作持续更新
 
 Wenlan 的核心搜索是本地混合检索流程，不是单一的向量查询。每个阶段负责不同工作：
 
-- **原词匹配 — [SQLite FTS5](https://www.sqlite.org/fts5.html)：** 全文索引查找字面关键词、标识符与短语。
-- **相近含义 — FastEmbed + [`Qdrant/bge-base-en-v1.5-onnx-Q`](https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q)：** 量化的英文模型会产生 768 维语义向量；[libSQL cosine DiskANN](https://turso.tech/blog/approximate-nearest-neighbor-search-with-diskann-in-libsql) 再以近似最近邻搜索（ANN）快速取得候选。
-- **合并排名 — 加权 [RRF](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf)（`k = 60`）：** 融合原词与语义排名，不假设两者的原始分数采用同一尺度；向量信号还会由余弦相似度加权。
-- **关联脉络 — 图谱记忆信号（graph-memory stream）：** 符合条件的实体链接会加入第三路 RRF 信号，返回的记忆仍受当前读取范围限制。
-- **可选精排 — 交叉编码器（cross-encoder）：** 与分别编码查询和记忆的 embedding 不同，[`jinaai/jina-reranker-v1-turbo-en`](https://huggingface.co/jinaai/jina-reranker-v1-turbo-en) 或 [`BAAI/bge-reranker-base`](https://huggingface.co/BAAI/bge-reranker-base) 会同时读取查询与单个候选，再对较小的候选池重新排名；默认关闭。
+- **原词匹配，[SQLite FTS5](https://www.sqlite.org/fts5.html)：** 全文索引查找字面关键词、标识符与短语。
+- **相近含义，FastEmbed + [`Qdrant/bge-base-en-v1.5-onnx-Q`](https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q)：** 量化的英文模型会产生 768 维语义向量；[libSQL cosine DiskANN](https://turso.tech/blog/approximate-nearest-neighbor-search-with-diskann-in-libsql) 再以近似最近邻搜索（ANN）快速取得候选。
+- **合并排名，加权 [RRF](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf)（`k = 60`）：** 融合原词与语义排名，不假设两者的原始分数采用同一尺度；向量信号还会由余弦相似度加权。
+- **关联脉络，图谱记忆信号（graph-memory stream）：** 符合条件的实体链接会加入第三路 RRF 信号，返回的记忆仍受当前读取范围限制。
+- **可选精排，交叉编码器（cross-encoder）：** 与分别编码查询和记忆的 embedding 不同，[`jinaai/jina-reranker-v1-turbo-en`](https://huggingface.co/jinaai/jina-reranker-v1-turbo-en) 或 [`BAAI/bge-reranker-base`](https://huggingface.co/BAAI/bge-reranker-base) 会同时读取查询与单个候选，再对较小的候选池重新排名；默认关闭。
 
 页面、情节记忆与事实（fact）通道都需要主动启用；不可用时会退回其余搜索信号。Space 仍负责限制读取范围。[查看方法、默认值与限制 ->](docs/technical-foundations.md)
 
