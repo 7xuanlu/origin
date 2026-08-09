@@ -65,18 +65,22 @@ describe("release version sync", () => {
     }
   });
 
-  it("registers the app version trio as release-managed paths in validate-release-candidate.py", () => {
-    const validator = readFileSync(
-      resolve(root, "scripts/validate-release-candidate.py"),
-      "utf8",
-    );
-    const match = validator.match(/RELEASE_MANAGED_PATHS = frozenset\(\s*\{([\s\S]*?)\}\s*\)/);
-    if (!match) {
-      throw new Error("RELEASE_MANAGED_PATHS block not found in validate-release-candidate.py");
-    }
-    const block = match[1];
-    for (const path of ["app/Cargo.toml", "app/tauri.conf.json", "package.json"]) {
-      expect(block).toContain(`"${path}"`);
-    }
-  });
+  it.each([
+    "scripts/validate-release-candidate.py",
+    "scripts/verify-release-merge.py",
+    "scripts/ci_measure_plan.py",
+  ])(
+    "registers the app version trio as release-managed paths in %s",
+    (relativePath) => {
+      const source = readFileSync(resolve(root, relativePath), "utf8");
+      const match = source.match(/RELEASE_MANAGED_PATHS = frozenset\(\s*\{([\s\S]*?)\}\s*\)/);
+      if (!match) {
+        throw new Error(`RELEASE_MANAGED_PATHS block not found in ${relativePath}`);
+      }
+      const block = match[1];
+      for (const path of ["app/Cargo.toml", "app/tauri.conf.json", "package.json"]) {
+        expect(block).toContain(`"${path}"`);
+      }
+    },
+  );
 });

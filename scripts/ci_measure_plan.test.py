@@ -18,6 +18,14 @@ assert SPEC and SPEC.loader
 PLANNER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PLANNER)
 
+VALIDATOR_MODULE_PATH = Path(__file__).with_name("validate-release-candidate.py")
+VALIDATOR_SPEC = importlib.util.spec_from_file_location(
+    "validate_release_candidate", VALIDATOR_MODULE_PATH
+)
+assert VALIDATOR_SPEC and VALIDATOR_SPEC.loader
+VALIDATOR = importlib.util.module_from_spec(VALIDATOR_SPEC)
+VALIDATOR_SPEC.loader.exec_module(VALIDATOR)
+
 
 def run_git(repository: Path, *arguments: str) -> str:
     result = subprocess.run(
@@ -264,6 +272,28 @@ class MeasurementPlanTests(unittest.TestCase):
         self.assertIn("main-canary-required=true", lines)
         self.assertIn("coverage-required=true", lines)
         self.assertTrue(any(line.startswith("reason=") for line in lines))
+
+
+class ReleaseManagedPathsConsistencyTests(unittest.TestCase):
+    """A stale copy of RELEASE_MANAGED_PATHS must not silently drift.
+
+    Unlike verify-release-merge.py (which only rejects unexpected paths, so a
+    superset is safe), _is_exact_release_transform above requires
+    ``set(records) == {("M", path) for path in RELEASE_MANAGED_PATHS}``: this
+    copy must name the *exact* file set a genuine release-please PR touches, so
+    the contract with the canonical validate-release-candidate.py list is
+    equality, not superset.
+    """
+
+    def test_release_managed_paths_equals_validator_required_paths(self) -> None:
+        self.assertEqual(
+            PLANNER.RELEASE_MANAGED_PATHS,
+            VALIDATOR.REQUIRED_RELEASE_PATHS,
+            "ci_measure_plan.py RELEASE_MANAGED_PATHS has drifted from "
+            "validate-release-candidate.py REQUIRED_RELEASE_PATHS: "
+            f"missing={sorted(VALIDATOR.REQUIRED_RELEASE_PATHS - PLANNER.RELEASE_MANAGED_PATHS)} "
+            f"extra={sorted(PLANNER.RELEASE_MANAGED_PATHS - VALIDATOR.REQUIRED_RELEASE_PATHS)}",
+        )
 
 
 if __name__ == "__main__":
