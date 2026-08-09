@@ -1,6 +1,6 @@
 [package]
 name = "wenlan-app"
-version = "0.15.7" # x-release-please-version
+version = "0.15.8" # x-release-please-version
 edition = "2021"
 license = "AGPL-3.0-only"
 default-run = "wenlan-app"
