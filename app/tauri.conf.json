@@ -1,0 +1,83 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui/nicegui/tauri/tauri-v2-schema.json",
+  "productName": "Wenlan",
+  "version": "0.14.0",
+  "identifier": "com.wenlan.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "pnpm prepare:sidecars && pnpm dev",
+    "beforeBuildCommand": "pnpm prepare:sidecars:tauri-build && pnpm build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Wenlan",
+        "width": 1280,
+        "height": 760,
+        "resizable": true,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 16,
+          "y": 28
+        },
+        "alwaysOnTop": false,
+        "center": true,
+        "visible": true,
+        "zoomHotkeysEnabled": true
+      }
+    ],
+    "macOSPrivateApi": true,
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": {
+          "allow": [
+            "$LOCALDATA/wenlan/avatars/**",
+            "$DATA/origin/avatars/**"
+          ]
+        }
+      }
+    },
+    "trayIcon": {
+      "iconPath": "icons/tray-icon.png",
+      "iconAsTemplate": true
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-",
+      "entitlements": "./Entitlements.plist"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/wenlan",
+      "binaries/wenlan-server",
+      "binaries/wenlan-mcp",
+      "binaries/cloudflared"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/7xuanlu/wenlan-app/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI0REU1Mzc1REZDMTNCRTUKUldUbE84SGZkVlBlSkxxSzlEV2tJZWE1UVlsOFVhaE1za2IxWFdMNk9sTFo5WWhNa1FPWTBYSHgK"
+    }
+  }
+}

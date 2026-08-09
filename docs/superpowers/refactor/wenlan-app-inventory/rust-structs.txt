@@ -1,0 +1,338 @@
+app/src/activity.rs:12:pub struct Activity {
+app/src/activity.rs:13:    pub id: String,
+app/src/activity.rs:14:    pub started_at: i64,
+app/src/activity.rs:15:    pub ended_at: i64,
+app/src/activity.rs:16:}
+app/src/activity.rs:19:pub struct ActivitySummary {
+app/src/activity.rs:20:    pub id: String,
+app/src/activity.rs:21:    pub started_at: i64,
+app/src/activity.rs:22:    pub ended_at: i64,
+app/src/activity.rs:23:    pub is_live: bool,
+app/src/activity.rs:24:    pub app_names: Vec<String>,
+app/src/activity.rs:25:}
+app/src/api.rs:15:pub struct WenlanClient {
+app/src/api.rs:16:    client: Client,
+app/src/api.rs:17:    base_url: String,
+app/src/api.rs:18:}
+app/src/api.rs:21:pub struct SetupStatusResponse {
+app/src/api.rs:22:    pub setup_completed: bool,
+app/src/api.rs:23:    pub mode: String,
+app/src/api.rs:24:    pub anthropic_key_configured: bool,
+app/src/api.rs:25:    pub local_model_selected: Option<String>,
+app/src/api.rs:26:    pub local_model_loaded: Option<String>,
+app/src/api.rs:27:    pub local_model_cached: bool,
+app/src/api.rs:28:}
+app/src/api.rs:36:pub struct PipelineStatusResponse {
+app/src/api.rs:37:    pub enrichment: BTreeMap<String, u64>,
+app/src/api.rs:38:    pub entity_linking: PipelineEntityLinkingStatus,
+app/src/api.rs:39:    pub refinement_queue: Vec<PipelineQueueEntry>,
+app/src/api.rs:40:    pub recaps: u64,
+app/src/api.rs:41:    pub types: BTreeMap<String, u64>,
+app/src/api.rs:42:    pub quality: BTreeMap<String, u64>,
+app/src/api.rs:43:}
+app/src/api.rs:46:pub struct PipelineEntityLinkingStatus {
+app/src/api.rs:47:    pub linked: u64,
+app/src/api.rs:48:    pub unlinked: u64,
+app/src/api.rs:49:}
+app/src/api.rs:52:pub struct PipelineQueueEntry {
+app/src/api.rs:53:    pub action: String,
+app/src/api.rs:54:    pub status: String,
+app/src/api.rs:55:    pub count: u64,
+app/src/api.rs:56:}
+app/src/api.rs:59:pub(crate) struct TagInventoryResponse {
+app/src/api.rs:60:    pub(crate) tags: Vec<String>,
+app/src/api.rs:61:    #[serde(default)]
+app/src/api.rs:62:    pub(crate) document_tags: HashMap<String, Vec<String>>,
+app/src/api.rs:63:}
+app/src/api.rs:66:pub struct OnDeviceModelEntry {
+app/src/api.rs:67:    pub id: String,
+app/src/api.rs:68:    pub display_name: String,
+app/src/api.rs:69:    pub param_count: String,
+app/src/api.rs:70:    pub ram_required_gb: f64,
+app/src/api.rs:71:    pub file_size_gb: f64,
+app/src/api.rs:72:    pub cached: bool,
+app/src/api.rs:73:}
+app/src/api.rs:76:pub struct OnDeviceModelResponse {
+app/src/api.rs:77:    pub loaded: Option<String>,
+app/src/api.rs:78:    pub selected: Option<String>,
+app/src/api.rs:79:    pub models: Vec<OnDeviceModelEntry>,
+app/src/api.rs:80:}
+app/src/api.rs:83:pub struct MoveSpaceResponse {
+app/src/api.rs:84:    pub affected: usize,
+app/src/api.rs:85:}
+app/src/api.rs:95:pub struct DistillReviewResponse {
+app/src/api.rs:96:    pub pages_created: usize,
+app/src/api.rs:97:    pub scoped: bool,
+app/src/api.rs:98:    pub created_ids: Vec<String>,
+app/src/api.rs:99:    pub pending: Vec<DistillPendingCluster>,
+app/src/api.rs:100:    pub stale_pages: Vec<DistillStalePage>,
+app/src/api.rs:101:    pub stale_truncated: bool,
+app/src/api.rs:102:    pub orphan_topics: Vec<DistillOrphanTopic>,
+app/src/api.rs:103:}
+app/src/api.rs:107:pub struct DistillPendingCluster {
+app/src/api.rs:108:    pub source_ids: Vec<String>,
+app/src/api.rs:109:    pub contents: Vec<String>,
+app/src/api.rs:110:    pub entity_id: Option<String>,
+app/src/api.rs:111:    pub entity_name: Option<String>,
+app/src/api.rs:112:    pub space: Option<String>,
+app/src/api.rs:113:    pub estimated_tokens: usize,
+app/src/api.rs:114:    pub centroid_embedding: Option<Vec<f32>>,
+app/src/api.rs:115:    pub existing_page_id: Option<String>,
+app/src/api.rs:116:    pub existing_page_title: Option<String>,
+app/src/api.rs:117:    pub new_memory_count: Option<usize>,
+app/src/api.rs:118:}
+app/src/api.rs:122:pub struct DistillStalePage {
+app/src/api.rs:123:    pub page_id: String,
+app/src/api.rs:124:    pub title: String,
+app/src/api.rs:125:    pub summary: Option<String>,
+app/src/api.rs:126:    pub source_memory_ids: Vec<String>,
+app/src/api.rs:127:    pub sources_updated_count: Option<usize>,
+app/src/api.rs:128:    pub stale_reason: Option<String>,
+app/src/api.rs:129:    pub user_edited: Option<bool>,
+app/src/api.rs:130:}
+app/src/api.rs:134:pub struct DistillOrphanTopic {
+app/src/api.rs:135:    pub label: String,
+app/src/api.rs:136:    pub count: usize,
+app/src/api.rs:137:}
+app/src/api.rs:141:pub struct PageRedistillResponse {
+app/src/api.rs:142:    pub status: String,
+app/src/api.rs:143:    pub updated: bool,
+app/src/api.rs:144:    pub hint: Option<String>,
+app/src/api.rs:145:}
+app/src/config.rs:45:pub struct Config {
+app/src/config.rs:46:    /// Legacy field — kept for backward compat with old config files.
+app/src/config.rs:47:    /// Use `sources` instead. Migrated to Source structs by `migrate()`.
+app/src/config.rs:48:    #[serde(default)]
+app/src/config.rs:49:    pub watch_paths: Vec<PathBuf>,
+app/src/config.rs:50:    #[serde(default)]
+app/src/config.rs:51:    pub sources: Vec<Source>,
+app/src/config.rs:52:    #[serde(default)]
+app/src/config.rs:53:    pub knowledge_path: Option<PathBuf>,
+app/src/config.rs:54:    #[serde(default)]
+app/src/config.rs:55:    pub clipboard_enabled: bool,
+app/src/config.rs:56:    #[serde(default = "default_skip_apps")]
+app/src/config.rs:57:    pub skip_apps: Vec<String>,
+app/src/config.rs:58:    #[serde(default = "default_skip_title_patterns")]
+app/src/config.rs:59:    pub skip_title_patterns: Vec<String>,
+app/src/config.rs:60:    #[serde(default = "default_true")]
+app/src/config.rs:61:    pub private_browsing_detection: bool,
+app/src/config.rs:62:    #[serde(default)]
+app/src/config.rs:63:    pub setup_completed: bool,
+app/src/config.rs:64:    #[serde(default)]
+app/src/config.rs:65:    pub anthropic_api_key: Option<String>,
+app/src/config.rs:66:    #[serde(default)]
+app/src/config.rs:67:    pub routine_model: Option<String>,
+app/src/config.rs:68:    #[serde(default)]
+app/src/config.rs:69:    pub synthesis_model: Option<String>,
+app/src/config.rs:70:    #[serde(default)]
+app/src/config.rs:71:    pub remote_access_enabled: bool,
+app/src/config.rs:72:    #[serde(default)]
+app/src/config.rs:73:    pub screen_capture_enabled: bool,
+app/src/config.rs:74:    #[serde(default)]
+app/src/config.rs:75:    pub on_device_model: Option<String>,
+app/src/config.rs:76:    #[serde(default)]
+app/src/config.rs:77:    pub external_llm_endpoint: Option<String>,
+app/src/config.rs:78:    #[serde(default)]
+app/src/config.rs:79:    pub external_llm_model: Option<String>,
+app/src/config.rs:80:}
+app/src/events.rs:12:pub struct TauriEmitter {
+app/src/events.rs:13:    handle: tauri::AppHandle,
+app/src/events.rs:14:}
+app/src/mcp_config.rs:7:pub struct McpClient {
+app/src/mcp_config.rs:8:    pub name: String,
+app/src/mcp_config.rs:9:    pub client_type: String,
+app/src/mcp_config.rs:10:    pub config_path: String,
+app/src/mcp_config.rs:11:    pub detected: bool,
+app/src/mcp_config.rs:12:    pub already_configured: bool,
+app/src/mcp_config.rs:13:}
+app/src/mcp_config.rs:16:pub struct WenlanMcpEntry {
+app/src/mcp_config.rs:17:    pub command: String,
+app/src/mcp_config.rs:18:    pub args: Vec<String>,
+app/src/mcp_config.rs:19:}
+app/src/remote_access.rs:125:pub struct RemoteAccessState {
+app/src/remote_access.rs:126:    pub status: RemoteAccessStatus,
+app/src/remote_access.rs:127:    pub mcp_child: Option<tauri_plugin_shell::process::CommandChild>,
+app/src/remote_access.rs:128:    pub tunnel_child: Option<tauri_plugin_shell::process::CommandChild>,
+app/src/remote_access.rs:129:    pub port: Option<u16>,
+app/src/remote_access.rs:130:    /// When Cloudflare returned 429 for our most recent tunnel creation.
+app/src/remote_access.rs:131:    /// Used by `tunnel_health_loop` to enforce a cooldown before burning another quick tunnel.
+app/src/remote_access.rs:132:    pub last_rate_limit_at: Option<std::time::Instant>,
+app/src/remote_access.rs:133:}
+app/src/router/bundle.rs:41:pub struct WindowSnapshot {
+app/src/router/bundle.rs:42:    pub app_name: String,
+app/src/router/bundle.rs:43:    pub window_title: String,
+app/src/router/bundle.rs:44:    pub text: String,
+app/src/router/bundle.rs:45:    #[allow(dead_code)]
+app/src/router/bundle.rs:46:    pub observations: Vec<TextObservation>,
+app/src/router/bundle.rs:47:    pub focused: bool,
+app/src/router/bundle.rs:48:    pub url: Option<String>,
+app/src/router/bundle.rs:49:}
+app/src/router/bundle.rs:53:pub struct ContextBundle {
+app/src/router/bundle.rs:54:    pub trigger_type: TriggerSource,
+app/src/router/bundle.rs:55:    pub timestamp: DateTime<Utc>,
+app/src/router/bundle.rs:56:    #[allow(dead_code)]
+app/src/router/bundle.rs:57:    pub intent: Option<IntentClassification>,
+app/src/router/bundle.rs:58:    pub windows: Vec<WindowSnapshot>,
+app/src/router/bundle.rs:59:    pub raw_text: Option<String>,
+app/src/router/bundle.rs:60:}
+app/src/router/keywords.rs:17:pub struct IntentClassification {
+app/src/router/keywords.rs:18:    pub intent: Intent,
+app/src/router/keywords.rs:19:    pub confidence: f64,
+app/src/router/keywords.rs:20:}
+app/src/search.rs:30:pub struct QuickCaptureRequest {
+app/src/search.rs:31:    pub title: Option<String>,
+app/src/search.rs:32:    pub content: String,
+app/src/search.rs:33:    pub tags: Option<Vec<String>>,
+app/src/search.rs:34:    pub memory_type: Option<String>,
+app/src/search.rs:35:    pub domain: Option<String>,
+app/src/search.rs:36:}
+app/src/search.rs:39:pub struct StoreMemoryRequest {
+app/src/search.rs:40:    pub content: String,
+app/src/search.rs:41:    pub memory_type: Option<String>,
+app/src/search.rs:42:    pub domain: Option<String>,
+app/src/search.rs:43:    pub source_agent: Option<String>,
+app/src/search.rs:44:    pub title: Option<String>,
+app/src/search.rs:45:    pub tags: Option<Vec<String>>,
+app/src/search.rs:46:    pub confidence: Option<f32>,
+app/src/search.rs:47:    pub supersedes: Option<String>,
+app/src/search.rs:48:    pub structured_fields: Option<serde_json::Value>,
+app/src/search.rs:49:    pub retrieval_cue: Option<String>,
+app/src/search.rs:50:}
+app/src/search.rs:53:pub struct SearchMemoryRequest {
+app/src/search.rs:54:    pub query: String,
+app/src/search.rs:55:    pub limit: Option<usize>,
+app/src/search.rs:56:    pub memory_type: Option<String>,
+app/src/search.rs:57:    pub domain: Option<String>,
+app/src/search.rs:58:    pub source_agent: Option<String>,
+app/src/search.rs:59:}
+app/src/search.rs:62:pub struct ListMemoriesRequest {
+app/src/search.rs:63:    pub memory_type: Option<String>,
+app/src/search.rs:64:    pub domain: Option<String>,
+app/src/search.rs:65:    pub limit: Option<usize>,
+app/src/search.rs:66:}
+app/src/search.rs:71:pub struct StoreMemoryResponse {
+app/src/search.rs:72:    pub source_id: String,
+app/src/search.rs:73:    pub warnings: Vec<String>,
+app/src/search.rs:74:    /// Background-enrichment state from the daemon — `"pending"` when
+app/src/search.rs:75:    /// classify + extract will run asynchronously, `"not_needed"` when
+app/src/search.rs:76:    /// no LLM is available. The frontend uses this to drive live-update
+app/src/search.rs:77:    /// UI (invalidate the stored-memory query once background work lands).
+app/src/search.rs:78:    /// Defaulted so older daemon responses still deserialize cleanly.
+app/src/search.rs:79:    #[serde(default)]
+app/src/search.rs:80:    pub enrichment: String,
+app/src/search.rs:81:    /// Prose nudge for callers — safe to show to the user. Empty when no
+app/src/search.rs:82:    /// enrichment will run.
+app/src/search.rs:83:    #[serde(default)]
+app/src/search.rs:84:    pub hint: String,
+app/src/search.rs:85:    /// Protected memories now flagged for human revision by the daemon.
+app/src/search.rs:86:    #[serde(default)]
+app/src/search.rs:87:    pub triggered_revisions: Vec<String>,
+app/src/search.rs:88:    /// Protected memories auto-accepted by a full-trust agent write.
+app/src/search.rs:89:    #[serde(default)]
+app/src/search.rs:90:    pub auto_superseded: Vec<String>,
+app/src/search.rs:91:}
+app/src/search.rs:691:pub struct RemoteConnectionTest {
+app/src/search.rs:692:    pub ok: bool,
+app/src/search.rs:693:    pub latency_ms: Option<u64>,
+app/src/search.rs:694:    pub error: Option<String>,
+app/src/search.rs:695:}
+app/src/search.rs:1468:pub struct BulkDeleteItem {
+app/src/search.rs:1469:    pub source: String,
+app/src/search.rs:1470:    pub source_id: String,
+app/src/search.rs:1471:}
+app/src/search.rs:2324:pub struct EntitySuggestion {
+app/src/search.rs:2325:    pub id: String,
+app/src/search.rs:2326:    pub entity_name: Option<String>,
+app/src/search.rs:2327:    pub source_ids: Vec<String>,
+app/src/search.rs:2328:    pub confidence: f64,
+app/src/search.rs:2329:    pub created_at: String,
+app/src/search.rs:2330:}
+app/src/search.rs:2658:pub struct TagData {
+app/src/search.rs:2659:    pub tags: Vec<String>,
+app/src/search.rs:2660:    pub document_tags: HashMap<String, Vec<String>>,
+app/src/search.rs:2661:    pub categories: Vec<String>,
+app/src/search.rs:2662:    pub document_categories: HashMap<String, String>,
+app/src/search.rs:2663:}
+app/src/sensor/vision.rs:5:pub struct WindowCapture {
+app/src/sensor/vision.rs:6:    pub image: image::DynamicImage,
+app/src/sensor/vision.rs:7:    pub app_name: String,
+app/src/sensor/vision.rs:8:    pub window_name: String,
+app/src/sensor/vision.rs:9:    pub focused: bool,
+app/src/sensor/vision.rs:10:}
+app/src/sensor/vision.rs:14:pub struct TextObservation {
+app/src/sensor/vision.rs:15:    pub text: String,
+app/src/sensor/vision.rs:16:    pub confidence: f64,
+app/src/sensor/vision.rs:17:}
+app/src/sensor/vision.rs:21:pub struct WindowOcrResult {
+app/src/sensor/vision.rs:22:    pub window_name: String,
+app/src/sensor/vision.rs:23:    pub app_name: String,
+app/src/sensor/vision.rs:24:    pub text: String,
+app/src/sensor/vision.rs:25:    pub observations: Vec<TextObservation>,
+app/src/sensor/vision.rs:26:    pub focused: bool,
+app/src/sensor/vision.rs:27:    #[allow(dead_code)]
+app/src/sensor/vision.rs:28:    pub confidence: f64,
+app/src/sensor/vision.rs:29:}
+app/src/sources/local_files.rs:40:pub struct LocalFilesSource {
+app/src/sources/local_files.rs:41:    watch_paths: Vec<PathBuf>,
+app/src/sources/local_files.rs:42:    last_sync: Option<i64>,
+app/src/sources/local_files.rs:43:    document_count: u64,
+app/src/sources/local_files.rs:44:}
+app/src/sources/sync.rs:19:pub struct SyncStats {
+app/src/sources/sync.rs:20:    pub files_found: usize,
+app/src/sources/sync.rs:21:    pub ingested: usize,
+app/src/sources/sync.rs:22:    pub skipped: usize,
+app/src/sources/sync.rs:23:    pub errors: usize,
+app/src/sources/sync.rs:24:    /// Categorized error detail when `errors > 0`. Known values:
+app/src/sources/sync.rs:25:    /// "google_drive_offline", "file_read_errors".
+app/src/sources/sync.rs:26:    #[serde(default, skip_serializing_if = "Option::is_none")]
+app/src/sources/sync.rs:27:    pub error_detail: Option<String>,
+app/src/sources/sync.rs:28:}
+app/src/state.rs:26:pub struct CaptureEvent {
+app/src/state.rs:27:    pub source: String,
+app/src/state.rs:28:    pub source_id: String,
+app/src/state.rs:29:    pub summary: String,
+app/src/state.rs:30:    pub chunks: usize,
+app/src/state.rs:31:    /// When true, AI is still processing this capture (LLM Pass 2 pending).
+app/src/state.rs:32:    pub processing: bool,
+app/src/state.rs:33:}
+app/src/state.rs:36:pub struct IndexStatus {
+app/src/state.rs:37:    pub is_running: bool,
+app/src/state.rs:38:    pub files_indexed: u64,
+app/src/state.rs:39:    pub files_total: u64,
+app/src/state.rs:40:    pub last_error: Option<String>,
+app/src/state.rs:41:    pub sources_connected: Vec<String>,
+app/src/state.rs:42:    pub reranker: wenlan_types::responses::RerankerStatus,
+app/src/state.rs:43:    pub reranker_light: wenlan_types::responses::RerankerStatus,
+app/src/state.rs:44:    pub reranker_mode: String,
+app/src/state.rs:45:}
+app/src/state.rs:47:pub struct AppState {
+app/src/state.rs:48:    /// HTTP client for the Wenlan daemon.
+app/src/state.rs:49:    pub client: WenlanClient,
+app/src/state.rs:50:    pub index_status: IndexStatus,
+app/src/state.rs:51:    pub sources: HashMap<String, Box<dyn DataSource>>,
+app/src/state.rs:52:    pub watch_paths: Vec<PathBuf>,
+app/src/state.rs:53:    pub clipboard_enabled: bool,
+app/src/state.rs:54:    pub last_ingestion_at: i64,
+app/src/state.rs:55:    pub current_activity: Option<Activity>,
+app/src/state.rs:56:    pub completed_activities: Vec<Activity>,
+app/src/state.rs:57:    pub app_handle: Option<tauri::AppHandle>,
+app/src/state.rs:58:    /// Unified trigger channel sender.
+app/src/state.rs:59:    pub trigger_tx: Option<tokio::sync::mpsc::Sender<crate::trigger::types::TriggerEvent>>,
+app/src/state.rs:60:    /// Last context bundle received from the router.
+app/src/state.rs:61:    pub last_context_bundle: Option<crate::router::bundle::ContextBundle>,
+app/src/state.rs:62:    /// Screen capture enabled.
+app/src/state.rs:63:    pub screen_capture_enabled: bool,
+app/src/state.rs:64:    /// Remote access tunnel state.
+app/src/state.rs:65:    pub remote_access: tokio::sync::Mutex<RemoteAccessState>,
+app/src/state.rs:66:    /// Rolling in-memory buffer of recent captures for zero-query Spotlight.
+app/src/state.rs:67:    ///
+app/src/state.rs:68:    /// Populated by the context consumer (`router/intent.rs`) when it ingests
+app/src/state.rs:69:    /// a screen/quick-thought capture. Served by the `get_working_memory`
+app/src/state.rs:70:    /// Tauri command. Lives in the app process because only the app has
+app/src/state.rs:71:    /// active sensors — captures happen only in the app process.
+app/src/state.rs:72:    pub working_memory: Arc<tokio::sync::Mutex<WorkingMemory>>,
+app/src/state.rs:73:}
+app/src/tray_health.rs:32:pub struct HealthSignal {
+app/src/tray_health.rs:33:    state: Arc<AtomicU8>,
+app/src/tray_health.rs:34:    consecutive_down: Arc<AtomicU8>,
+app/src/tray_health.rs:35:}

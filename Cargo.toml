@@ -6,6 +6,18 @@ members = [
     "crates/wenlan-core",
     "crates/wenlan-server",
     "crates/wenlan-mcp",
+    "app",
+]
+# default-members keeps `cargo build`/`test`/`clippy` (no -p/--workspace) on the
+# daemon crates only. The Tauri app crate builds explicitly via `-p wenlan-app`,
+# so routine daemon work never compiles the desktop app (target/ bloat + GTK on
+# Linux runners). Workspace-wide CI/hook invocations pass --exclude wenlan-app.
+default-members = [
+    "crates/wenlan-cli",
+    "crates/wenlan-types",
+    "crates/wenlan-core",
+    "crates/wenlan-server",
+    "crates/wenlan-mcp",
 ]
 
 [workspace.package]

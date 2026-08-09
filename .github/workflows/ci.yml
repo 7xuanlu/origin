@@ -41,6 +41,7 @@ jobs:
       plugin-rust-contract: ${{ steps.filter.outputs.plugin-rust-contract }}
       plugin-version-contract: ${{ steps.filter.outputs.plugin-version-contract }}
       npm:     ${{ steps.filter.outputs.npm }}
+      app:     ${{ steps.filter.outputs.app }}
       macos:   ${{ steps.filter.outputs.macos }}
       windows: ${{ steps.filter.outputs.windows }}
       windows-lint: ${{ steps.filter.outputs.windows-lint }}
@@ -133,6 +134,39 @@ jobs:
             # decides which tests those already-scheduled jobs execute.
             impact:
               - '**'
+            # Desktop app (Tauri + React). Most frontend lives at repo ROOT
+            # (src/, e2e/, vite/tsconfig/package.json), not under app/. Without
+            # this filter an app-only PR matches no filter and every job skips,
+            # so `conclusion` reports green with zero jobs run (silent-green).
+            app:
+              - 'app/**'
+              - 'src/**'
+              - 'e2e/**'
+              - 'preview/**'
+              - 'review/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'index.html'
+              - 'tsconfig.json'
+              - 'vite.config.ts'
+              - 'vite.preview.config.ts'
+              - 'vite.review.config.ts'
+              - 'vitest.config.ts'
+              - 'playwright.config.ts'
+              - 'playwright.review.config.ts'
+              - 'scripts/prepare-sidecars.sh'
+              - 'scripts/prepare-tauri-build-sidecars.sh'
+              - '.github/workflows/app-release.yml'
+              - '.github/workflows/ci.yml'
+              # The app compiles wenlan-types by path and shares the workspace
+              # lockfile, so a types change or a shared-dep bump can break the
+              # app build while touching only rust-filter paths. Release PRs
+              # also match these — the trusted-release-candidate guard on
+              # app-check's `if:` skips them.
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/wenlan-types/**'
             rust:
               # Positive-only globs. With dorny/paths-filter's default
               # `some` quantifier, a negative glob like `!crates/*/npm/**`
@@ -2114,7 +2148,7 @@ jobs:
   # with no matching diff must be skipped.
   conclusion:
     name: conclusion
-    needs: [detect-changes, release-base-proof, fmt, lint, linux-nextest-build, linux-nextest, macos-nextest-build, macos-nextest, test, mcp-platform, canonical-acceptance, contract-integration, release-preflight, docs, plugin, plugin-rust-contract, npm, runtime-image]
+    needs: [detect-changes, release-base-proof, fmt, lint, linux-nextest-build, linux-nextest, macos-nextest-build, macos-nextest, test, mcp-platform, canonical-acceptance, contract-integration, release-preflight, docs, plugin, plugin-rust-contract, npm, runtime-image, app-check]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     steps:
@@ -2165,6 +2199,7 @@ jobs:
           expect_job plugin-rust-contract '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.plugin-rust-contract == 'true' }}' '${{ needs.plugin-rust-contract.result }}'
           expect_job npm '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.npm == 'true' }}' '${{ needs.npm.result }}'
           expect_job runtime-image '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.runtime-image == 'true' }}' '${{ needs.runtime-image.result }}'
+          expect_job app-check '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.app == 'true' }}' '${{ needs.app-check.result }}'
 
   plugin:
     needs: detect-changes
@@ -2211,3 +2246,63 @@ jobs:
         run: |
           npm pack --dry-run
           node -c run.js
+
+  # Desktop app (Tauri + React). Ported from the app's pre-merge ci.yml `check`
+  # job. Runs only when app/frontend paths change (detect-changes.app). macos-14
+  # because Tauri needs the macOS toolchain and the app targets darwin-arm64.
+  # Release PRs are skipped via the trusted-release-candidate classifier, the
+  # same guard the other path-owned jobs use.
+  app-check:
+    name: app-check
+    needs: detect-changes
+    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate != 'true' && needs.detect-changes.outputs.app == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: app-check
+          cache-all-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: pnpm
+      - name: Install frontend dependencies
+        run: pnpm install
+      # Tauri's build script resolves externalBin sidecars (wenlan, wenlan-server,
+      # wenlan-mcp, cloudflared) at compile time. PR CI doesn't ship the daemon;
+      # empty placeholders satisfy the resolver. Real DMG builds (app-release.yml)
+      # supply true binaries.
+      - name: Create sidecar placeholders for Tauri build script
+        run: |
+          mkdir -p app/binaries
+          touch app/binaries/wenlan-aarch64-apple-darwin
+          touch app/binaries/wenlan-server-aarch64-apple-darwin
+          touch app/binaries/wenlan-mcp-aarch64-apple-darwin
+          touch app/binaries/cloudflared-aarch64-apple-darwin
+      - name: Rust format (app)
+        run: cargo fmt --check -p wenlan-app
+      - name: Clippy (app)
+        run: cargo clippy -p wenlan-app --all-targets -- -D warnings
+      - name: Rust tests (app)
+        run: cargo test -p wenlan-app --lib
+      - name: TypeScript check
+        run: pnpm exec tsc -b
+      - name: i18n gates
+        run: pnpm test:i18n
+      - name: Frontend unit tests
+        run: pnpm test
+      - name: Build + verify fixture-only Review app
+        run: pnpm review:build && pnpm review:verify
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install chromium
+      - name: Frontend e2e
+        run: pnpm test:e2e
+      - name: Review e2e
+        run: pnpm test:e2e:review

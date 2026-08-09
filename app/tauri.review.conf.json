@@ -1,0 +1,57 @@
+{
+  "productName": "Wenlan Review",
+  "mainBinaryName": "wenlan-review",
+  "identifier": "com.wenlan.desktop.review",
+  "build": {
+    "frontendDist": "../dist/review",
+    "devUrl": "http://localhost:1422",
+    "beforeDevCommand": "pnpm dev:review:web",
+    "beforeBuildCommand": "pnpm build:review:web"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Wenlan Review",
+        "width": 1280,
+        "height": 760,
+        "resizable": true,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 16,
+          "y": 28
+        },
+        "alwaysOnTop": false,
+        "center": true,
+        "visible": true,
+        "zoomHotkeysEnabled": true
+      }
+    ],
+    "macOSPrivateApi": true,
+    "trayIcon": null,
+    "security": {
+      "csp": "default-src 'self'; connect-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; frame-src 'none'; object-src 'none'",
+      "assetProtocol": {
+        "enable": true,
+        "scope": []
+      },
+      "capabilities": [
+        {
+          "identifier": "review-shell",
+          "description": "Fixture-only Wenlan Review window",
+          "windows": ["main"],
+          "permissions": ["core:default"]
+        }
+      ]
+    }
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "externalBin": []
+  },
+  "plugins": {
+    "updater": null
+  }
+}

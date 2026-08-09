@@ -8,7 +8,7 @@ This directory contains project documentation intended for contributors and main
 
 ## Reading `plans/` safely
 
-Many plan files reflect the architecture at the time they were authored. Some are now superseded by the current daemon-centric layout (`crates/wenlan-types`, `crates/wenlan-core`, `crates/wenlan-server`, `crates/wenlan-cli`). The Tauri desktop app referenced by older plans now lives in [7xuanlu/wenlan-app](https://github.com/7xuanlu/wenlan-app).
+Many plan files reflect the architecture at the time they were authored. Some are now superseded by the current daemon-centric layout (`crates/wenlan-types`, `crates/wenlan-core`, `crates/wenlan-server`, `crates/wenlan-cli`). The Tauri desktop app referenced by older plans is the `app/` crate in this monorepo (it lived in a separate `7xuanlu/wenlan-app` repo from 2026-05-07 until it was folded back in on 2026-07-20).
 
 If a plan starts with a **Superseded** note, treat it as historical context rather than current implementation guidance.
 

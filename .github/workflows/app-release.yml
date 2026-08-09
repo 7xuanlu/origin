@@ -1,0 +1,278 @@
+name: Release
+
+# Ported from the old origin monorepo's .github/workflows/release.yml (last
+# present at SHA 7e99d8ac^, before the Tauri app was extracted into this
+# repo). That extraction PR said release.yml would "point users to the
+# origin-app repo for the .dmg" but a release workflow was never added here —
+# this repo has only ever had the test-only ci.yml. This file closes that
+# gap. Renamed origin -> wenlan throughout; adapted to the current
+# cross-repo sidecar build (scripts/prepare-sidecars.sh, which needs a
+# sibling wenlan backend checkout) and current secret names.
+#
+# Signing key: rotated 2026-07-01 to ~/.tauri/wenlan-updater.key (the prior
+# origin-updater.key was retired after its encrypted blob was accidentally
+# printed in full to a chat transcript). app/tauri.conf.json's
+# updater.pubkey and the TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) secrets on this
+# repo are already updated to match.
+#
+# One open item before this produces a real signed build:
+#
+# The tauri-action projectPath/TAURI_DIR wiring below is unverified. Local
+# dev invokes `pnpm tauri dev` (= `TAURI_DIR=app tauri`) from the repo root,
+# so this workflow mirrors that (projectPath: wenlan-app, TAURI_DIR=app env)
+# rather than the old monorepo's `projectPath: app` — but that's a guess
+# until a real CI run confirms it. Safe to find out via a draft
+# workflow_dispatch run first.
+
+on:
+  # ponytail: dispatch-only after the monorepo merge — the unified v* tag is
+  # owned by wenlan/release.yml. Release unification (Milestone B) grafts this
+  # job's .dmg build into release.yml; until then this stays a manual dry-run.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag, or SHA to build'
+        required: false
+        default: 'main'
+      draft:
+        description: 'Create a draft release (safe dry run, not public, no updater impact)'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: wenlan-app
+
+    steps:
+      - name: Checkout wenlan-app
+        uses: actions/checkout@v6
+        with:
+          path: wenlan-app
+          ref: ${{ inputs.ref || github.ref_name }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Release tag is always derived from the checked-out app version, not
+      # from the git ref — this lets workflow_dispatch build off a branch
+      # (no tag needed) while a real `git push --tags` still produces the
+      # same tag name tauri-action creates (v__VERSION__).
+      - name: Resolve release tag
+        id: resolve
+        run: |
+          TAURI_VERSION=$(node -p "require('./app/tauri.conf.json').version")
+          RELEASE_TAG="v$TAURI_VERSION"
+          if [ "${{ github.event_name }}" = "push" ] && [ "$RELEASE_TAG" != "${{ github.ref_name }}" ]; then
+            echo "ERROR: pushed tag ${{ github.ref_name }} does not match app/tauri.conf.json version $TAURI_VERSION"
+            exit 1
+          fi
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "Building $RELEASE_TAG (event: ${{ github.event_name }})"
+
+      - name: Validate version consistency
+        run: |
+          TAG="${RELEASE_TAG#v}"
+
+          CARGO_VERSION=$(grep '^version = ' app/Cargo.toml | head -1 | sed 's/version = "\([^"]*\)".*/\1/')
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          PINNED_DAEMON_TAG=$(sed -n '1p' .wenlan-backend-version | tr -d '[:space:]')
+          PINNED_DAEMON_VERSION="${PINNED_DAEMON_TAG#v}"
+
+          echo "Release tag (from app/tauri.conf.json): $TAG"
+          echo "app/Cargo.toml:                          $CARGO_VERSION"
+          echo "package.json:                             $PKG_VERSION"
+          echo ".wenlan-backend-version:                  $PINNED_DAEMON_TAG"
+
+          MISMATCH=0
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "ERROR: app/tauri.conf.json version $TAG does not match app/Cargo.toml version $CARGO_VERSION"
+            MISMATCH=1
+          fi
+          if [ "$TAG" != "$PKG_VERSION" ]; then
+            echo "ERROR: app/tauri.conf.json version $TAG does not match package.json version $PKG_VERSION"
+            MISMATCH=1
+          fi
+          if [ "$TAG" != "$PINNED_DAEMON_VERSION" ]; then
+            echo "ERROR: app/tauri.conf.json version $TAG does not match pinned daemon release $PINNED_DAEMON_TAG"
+            MISMATCH=1
+          fi
+
+          if [ "$MISMATCH" -eq 1 ]; then
+            echo "Fix: bump versions in app/Cargo.toml, app/tauri.conf.json, package.json, and .wenlan-backend-version to the same release."
+            exit 1
+          fi
+
+          echo "All versions consistent: $TAG"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            wenlan-app/app
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          # pnpm/action-setup reads packageManager from $GITHUB_WORKSPACE/package.json
+          # by default; ours lives under wenlan-app/ because the checkout step above
+          # uses path: wenlan-app (needed to check out the sibling wenlan backend too).
+          package_json_file: wenlan-app/package.json
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: wenlan-app/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Download cloudflared sidecar
+        run: |
+          mkdir -p app/binaries
+          curl -fsSL -o /tmp/cloudflared.tgz \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz
+          tar -xzf /tmp/cloudflared.tgz -C /tmp
+          chmod 755 /tmp/cloudflared
+          xattr -cr /tmp/cloudflared
+          echo "CLOUDFLARED_BIN=/tmp/cloudflared" >> "$GITHUB_ENV"
+
+      - name: Import code signing certificate
+        if: env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 12)
+
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          echo "Certificate imported successfully"
+          security find-identity -v "$KEYCHAIN_PATH"
+
+      # ponytail: no CHANGELOG.md / release-please here yet (never wired up
+      # for this repo), so notes are raw commit subjects since the previous
+      # tag rather than a curated changelog. Add release-please if this
+      # needs to look nicer.
+      - name: Compose release body
+        run: |
+          # HEAD, not $RELEASE_TAG: RELEASE_TAG is only a real git ref for a
+          # push: tags: v* trigger (the tag was just pushed). workflow_dispatch
+          # builds off a branch/SHA before tauri-action creates the tag, so
+          # $RELEASE_TAG doesn't exist as a ref yet at this point in the job.
+          PREV_TAG=$(git tag --sort=-version:refname | grep '^v' | sed -n '2p')
+          {
+            echo "## What's Changed"
+            echo
+            if [ -n "$PREV_TAG" ]; then
+              git log --pretty=format:'- %s' "$PREV_TAG..HEAD"
+              echo
+              echo
+              echo "**Full Changelog**: https://github.com/7xuanlu/wenlan-app/compare/${PREV_TAG}...${RELEASE_TAG}"
+            else
+              git log --pretty=format:'- %s' HEAD
+            fi
+            echo
+            echo
+            echo "## Install"
+            echo
+            echo "**macOS (Apple Silicon):**"
+            echo "Download the \`.dmg\` below, open it, drag to Applications."
+            echo "Then run: \`xattr -cr /Applications/Wenlan.app\`"
+          } > release-body.md
+          echo "Release body written ($(wc -c < release-body.md) bytes)"
+
+      - name: Build and publish Tauri app
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: wenlan-app
+          tagName: v__VERSION__
+          releaseName: 'v__VERSION__'
+          releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
+          releaseBody: 'Building...'
+          args: --target aarch64-apple-darwin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_DIR: app
+          CXXFLAGS: "-std=c++17"
+          CLOUDFLARED_BIN: ${{ env.CLOUDFLARED_BIN }}
+          # Daemon sidecars come from the pinned RELEASED asset: tauri's
+          # beforeBuildCommand runs prepare-tauri-build-sidecars.sh, which honors
+          # WENLAN_DOWNLOAD_SIDECARS=1 to download instead of compiling from a
+          # backend checkout. GH_TOKEN authenticates the cross-repo gh download.
+          WENLAN_DOWNLOAD_SIDECARS: '1'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Ad-hoc sign ("-") when no Apple Developer cert is configured.
+          # APPLE_ID/PASSWORD/TEAM_ID must be omitted (not empty) or Tauri
+          # attempts notarization and fails on "Team ID must be at least 3 characters".
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Verify updater metadata
+        run: |
+          if ! gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | grep -qx latest.json; then
+            echo "ERROR: latest.json was not uploaded. Check bundle.createUpdaterArtifacts and TAURI_SIGNING_PRIVATE_KEY."
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update release body with changelog
+        run: |
+          gh release edit "$RELEASE_TAG" --notes-file release-body.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # tauri-action bakes the `releaseBody` input ('Building...') into
+      # latest.json's notes field and uploads the asset before the step above
+      # runs. `gh release edit` rewrites only the GitHub release body, never the
+      # uploaded asset — so without this, every in-app updater shows the literal
+      # string "Building..." as the release notes. Caught by the v0.14.0 draft
+      # dry run (workflow_dispatch 29717367885).
+      - name: Sync updater notes with changelog
+        run: |
+          gh release download "$RELEASE_TAG" --pattern latest.json --clobber -O latest.json
+          node -e '
+            const fs = require("fs");
+            const j = JSON.parse(fs.readFileSync("latest.json", "utf8"));
+            j.notes = fs.readFileSync("release-body.md", "utf8").trim();
+            fs.writeFileSync("latest.json", JSON.stringify(j, null, 2));
+          '
+          gh release upload "$RELEASE_TAG" latest.json --clobber
+          node -e '
+            const n = JSON.parse(require("fs").readFileSync("latest.json", "utf8")).notes;
+            if (/^Building\.\.\.$/.test(n.trim()) || n.trim() === "") {
+              console.error("ERROR: latest.json notes still a placeholder after sync");
+              process.exit(1);
+            }
+            console.log("latest.json notes synced (" + n.length + " chars)");
+          '
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,6 +1,6 @@
 # Releasing Wenlan (daemon side)
 
-This document covers releases of the local runtime: `wenlan` CLI, `wenlan-server` daemon, `wenlan-mcp` connector, and shared crates (`wenlan-types`, `wenlan-core`). The desktop app ships from [7xuanlu/wenlan-app](https://github.com/7xuanlu/wenlan-app) on its own release cadence.
+This document covers releases of the local runtime: `wenlan` CLI, `wenlan-server` daemon, `wenlan-mcp` connector, and shared crates (`wenlan-types`, `wenlan-core`). The desktop app (`app/` crate) was folded into this monorepo on 2026-07-20; its signed-bundle build lives in `.github/workflows/app-release.yml` and is dispatch-only until code-signing secrets land.
 
 ## How release-please works
 
@@ -96,7 +96,7 @@ The complete four-target Rust compilation and archive smoke happen only once, in
 
 Release workflow changes have static mutation-tested contracts in `scripts/release-workflow-contract.test.py`, but external registries and a revised job DAG are proved end-to-end only by the next real tag. Do not cite an older successful tag as evidence for a newer workflow topology.
 
-`wenlan-mcp` lives in this monorepo under `crates/wenlan-mcp` and shares the workspace Apache-2.0 license. The desktop DMG is still built from [wenlan-app](https://github.com/7xuanlu/wenlan-app); see its `RELEASING.md` for that pipeline.
+`wenlan-mcp` lives in this monorepo under `crates/wenlan-mcp` and shares the workspace Apache-2.0 license. The desktop app is likewise in-tree as the `app/` crate (AGPL-3.0); its signed DMG + updater pipeline (`.github/workflows/app-release.yml`) is dispatch-only until code-signing secrets land, at which point it wires into the tag-triggered release flow.
 
 Nothing is notified when the prerelease flag clears: the Claude Code plugin ships from this repo's own `.claude-plugin/marketplace.json`, which sources `plugin/` by `git-subdir` with no `ref` pin, so it tracks the default branch and has no release-time pin to sync.
 

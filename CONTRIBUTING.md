@@ -2,7 +2,7 @@
 
 Wenlan is a local-first personal AI memory layer. We welcome bug fixes, features, tests, docs, and design feedback.
 
-This repo holds the daemon (`wenlan-server`), the CLI (`wenlan`), the MCP server (`wenlan-mcp`), and the shared types/core (`wenlan-types`, `wenlan-core`). The Tauri desktop app lives in [7xuanlu/wenlan-app](https://github.com/7xuanlu/wenlan-app). Bug reports for the local runtime, CLI, MCP server, and plugin are welcome here.
+This repo holds the daemon (`wenlan-server`), the CLI (`wenlan`), the MCP server (`wenlan-mcp`), the shared types/core (`wenlan-types`, `wenlan-core`), and the Tauri desktop app (`wenlan-app`, in `app/`). Bug reports for the local runtime, CLI, MCP server, desktop app, and plugin are welcome here.
 
 ## Development Setup
 
@@ -55,12 +55,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Architecture Overview
 
-- **Shared types**: `crates/wenlan-types` (Apache-2.0). Lightweight wire types shared with `wenlan-mcp` and `wenlan-app` via crates.io.
+- **Shared types**: `crates/wenlan-types` (Apache-2.0). Lightweight wire types shared with `wenlan-mcp` and `wenlan-app` as in-workspace path deps.
 - **Core logic**: `crates/wenlan-core` (Apache-2.0). DB, embeddings, LLM engine, search, knowledge graph, distill cycles, eval. No tauri / no axum dependencies.
 - **HTTP daemon**: `crates/wenlan-server` (Apache-2.0), serves `127.0.0.1:7878`.
 - **CLI binary**: `crates/wenlan-cli` (Apache-2.0). The `wenlan` command for setup, service management, search, recall, etc.
 - **MCP server**: `crates/wenlan-mcp` (Apache-2.0). The connector spawned by Claude Code, Cursor, Codex, and other MCP clients.
-- **Desktop app** (separate repo): [7xuanlu/wenlan-app](https://github.com/7xuanlu/wenlan-app), AGPL-3.0-only.
+- **Desktop app**: `wenlan-app` in `app/` (AGPL-3.0-only). Tauri + React; folded into this monorepo on 2026-07-20.
 - **Database**: libSQL (vectors + knowledge graph + FTS).
 
 See `CLAUDE.md` for a full module-by-module breakdown.
@@ -95,7 +95,7 @@ These conventions keep the codebase consistent. See `CLAUDE.md` for the full lis
 
 ## License
 
-This repo is Apache-2.0: `crates/wenlan-types`, `crates/wenlan-core`, `crates/wenlan-server`, `crates/wenlan-cli`, `crates/wenlan-mcp`, and the Claude Code plugin files. The desktop app in [wenlan-app](https://github.com/7xuanlu/wenlan-app) is AGPL-3.0-only.
+This repo is Apache-2.0: `crates/wenlan-types`, `crates/wenlan-core`, `crates/wenlan-server`, `crates/wenlan-cli`, `crates/wenlan-mcp`, and the Claude Code plugin files. The `wenlan-app` desktop crate (`app/`) is AGPL-3.0-only via its own `license` field.
 
 By contributing, you agree that your changes will be licensed under the license that applies to the files you modify.
 

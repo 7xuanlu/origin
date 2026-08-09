@@ -1,0 +1,66 @@
+.review-environment {
+  border-top: 1px solid var(--mem-border);
+  color: var(--mem-text-meta-aa);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 11px;
+  padding-top: 10px;
+  width: 100%;
+}
+
+.review-environment-heading {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+.review-environment-stamp {
+  border: 1px solid color-mix(in srgb, var(--mem-accent-warm) 55%, transparent);
+  border-radius: 2px;
+  color: var(--mem-accent-warm-text);
+  font-family: var(--mem-font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  line-height: 1;
+  padding: 3px 6px 2px;
+  white-space: nowrap;
+}
+
+.review-environment-notice {
+  font-family: var(--mem-font-mono);
+  font-size: 9px;
+  letter-spacing: 0.005em;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.review-environment-reset {
+  align-items: center;
+  border-radius: 3px;
+  color: var(--mem-text-tertiary);
+  display: inline-flex;
+  height: 22px;
+  justify-content: center;
+  width: 22px;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.review-environment-reset:hover {
+  background: color-mix(in srgb, var(--mem-accent-warm) 11%, transparent);
+  color: var(--mem-accent-warm-text);
+}
+
+.review-environment-reset:focus-visible {
+  outline: 2px solid var(--mem-accent-page);
+  outline-offset: 1px;
+}
+
+.review-environment-compact {
+  border-top: 0;
+  display: inline-flex;
+  margin: 0;
+  padding: 0;
+  width: auto;
+}

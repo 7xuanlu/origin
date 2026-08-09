@@ -1,0 +1,50 @@
+app/src/api.rs
+  15: pub struct WenlanClient
+        field: client, base_url
+  21: pub struct SetupStatusResponse
+        field: setup_completed, mode, anthropic_key_configured, local_model_selected, local_model_loaded, local_model_cached
+  31: struct CaptureStatsResponse
+        field: total_chunks
+  36: pub struct PipelineStatusResponse
+        field: enrichment, entity_linking, refinement_queue, recaps, types, quality
+  46: pub struct PipelineEntityLinkingStatus
+        field: linked, unlinked
+  52: pub struct PipelineQueueEntry
+        field: action, status, count
+  59: pub(crate) struct TagInventoryResponse
+        field: tags, document_tags
+  66: pub struct OnDeviceModelEntry
+        field: id, display_name, param_count, ram_required_gb, file_size_gb, cached
+  76: pub struct OnDeviceModelResponse
+        field: loaded, selected, models
+  83: pub struct MoveSpaceResponse
+        field: affected
+  88: struct DistillReviewRequest
+  91: struct PageRedistillRequest
+  95: pub struct DistillReviewResponse
+        field: pages_created, scoped, created_ids, pending, stale_pages, stale_truncated, orphan_topics
+ 107: pub struct DistillPendingCluster
+        field: source_ids, contents, entity_id, entity_name, space, estimated_tokens, centroid_embedding, existing_page_id, existing_page_title, new_memory_count
+ 122: pub struct DistillStalePage
+        field: page_id, title, summary, source_memory_ids, sources_updated_count, stale_reason, user_edited
+ 134: pub struct DistillOrphanTopic
+        field: label, count
+ 141: pub struct PageRedistillResponse
+        field: status, updated, hint
+ 148: struct OnDeviceModelRequest
+        field: model_id
+ 152: impl Default for WenlanClient
+        method: default
+ 158: impl WenlanClient
+        method: new, get_json, post_json, put_json, delete_path, delete_json, post_empty, health, status, get_capture_stats, pipeline_status, list_tags, list_tag_inventory, ingest_webpage, distill_review, redistill_page, move_space, import_chat_export, list_pending_imports, list_sources, add_source, remove_source, sync_source, list_onboarding_milestones, acknowledge_onboarding_milestone, reset_onboarding_milestones, list_recent_retrievals, list_recent_changes, list_recent_memories, get_enrichment_status, get_memory_revisions, list_unconfirmed_memories, list_recent_pages, list_recent_relations, get_page_sources, get_page_links, get_page_revisions, list_orphan_links, test_llm, get_on_device_model, download_on_device_model, list_refinements, accept_refinement, reject_refinement, get_config, update_config, get_setup_status, set_setup_completed, get_model_choice, set_model_choice, get_external_llm, set_external_llm, get_clipboard_enabled, set_clipboard_enabled, get_screen_capture_enabled, set_screen_capture_enabled, get_private_browsing_detection, set_private_browsing_detection, set_remote_access_enabled, get_skip_apps, set_skip_apps, get_skip_title_patterns, set_skip_title_patterns, url, delete_empty
+ 748: fn daemon_port() -> u16
+ 760: fn percent_encode_path_segment(value: &str) -> String
+ 776: fn empty_update() -> wenlan_types::requests::UpdateConfigRequest
+ 792: fn sparse_update_config(
+ 803: trait UpdateConfigBuilder
+        method: with_skip_apps, with_skip_title_patterns, with_clipboard_enabled, with_screen_capture_enabled, with_private_browsing_detection, with_remote_access_enabled, with_setup_completed, with_model_choice, with_external_llm
+ 819: impl UpdateConfigBuilder for wenlan_types::requests::UpdateConfigRequest
+        method: with_skip_apps, with_skip_title_patterns, with_clipboard_enabled, with_screen_capture_enabled, with_private_browsing_detection, with_remote_access_enabled, with_setup_completed, with_model_choice, with_external_llm
+ 865: mod tests
+        struct: PortEnvGuard
+        function: env_lock, serve_json_once, update_config_builder_can_set_setup_completed, update_config_builder_patches_capture_toggles_without_touching_other_config, update_config_builder_patches_privacy_fields_without_touching_other_config, request_body, capture_toggles_use_daemon_config_endpoint, privacy_config_fields_use_daemon_patch_endpoint, update_config_builder_patches_model_fields_without_touching_other_config, update_config_builder_patches_external_llm_fields_without_touching_models, setup_status_response_deserializes_daemon_payload, wenlan_client_prefers_wenlan_port_over_legacy_origin_port, wenlan_client_falls_back_to_legacy_origin_port, capture_stats_uses_daemon_capture_stats_endpoint, pipeline_status_uses_daemon_debug_pipeline_endpoint, pipeline_status_response_deserializes_daemon_payload, list_tags_uses_daemon_tags_endpoint, list_tag_inventory_preserves_document_tag_map, ingest_webpage_uses_daemon_webpage_ingest_endpoint, move_space_uses_daemon_space_move_endpoint, move_space_percent_encodes_space_names_as_path_segments, distill_review_posts_empty_global_request_to_daemon, redistill_page_posts_empty_page_specific_request_to_daemon, distill_review_deserializes_daemon_review_payload_with_centroid_embedding, distill_review_rejects_unresolved_target_hint_shape, status_uses_daemon_status_endpoint, wenlan_client_exposes_enrichment_status_method, enrichment_status_response_deserializes_daemon_payload, wenlan_client_exposes_refinery_queue_methods, wenlan_client_exposes_daemon_model_config_methods, test_llm_uses_daemon_response_envelope, test_llm_response_type_is_checked, on_device_model_uses_typed_response, download_on_device_model_uses_typed_request, on_device_model_response_type_is_checked, wenlan_client_exposes_source_registry_methods, wenlan_client_exposes_page_link_methods, wenlan_client_exposes_revision_history_methods, revision_history_responses_deserialize_daemon_payloads

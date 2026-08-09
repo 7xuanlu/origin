@@ -128,6 +128,27 @@ DOCS_JOB_FILES = {
     "scripts/validate-versions.test.sh",
 }
 
+# The Tauri desktop app crate plus the root-level frontend dirs it shares a
+# release pipeline with. All of it runs under the separate app-check job
+# (macos-14), never the Rust workspace plan.
+APP_JOB_PREFIXES = ("app", "src", "e2e", "preview", "review")
+APP_JOB_FILES = {
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "index.html",
+    "tsconfig.json",
+    "vite.config.ts",
+    "vite.preview.config.ts",
+    "vite.review.config.ts",
+    "vitest.config.ts",
+    "playwright.config.ts",
+    "playwright.review.config.ts",
+    "scripts/prepare-sidecars.sh",
+    "scripts/prepare-tauri-build-sidecars.sh",
+    ".github/workflows/app-release.yml",
+}
+
 SUITE_OUTPUT_KEYS = {
     "workspace-lib-required": "workspace_lib",
     "cli-server-integration-required": "cli_server_integration",
@@ -226,6 +247,12 @@ def _workspace(metadata: object) -> tuple[dict[str, dict], dict[str, str]]:
             raise PlanError(
                 f"workspace manifest is outside workspace_root: {manifest_path}"
             ) from error
+        if name == "wenlan-app":
+            # wenlan-app is a workspace member but ships its own CI lane
+            # (app-check, macos-14). Ubuntu runners lack GTK, so the planner
+            # must never select it, and app/ must never be treated as
+            # rust-plan-owned territory.
+            continue
         by_name[name] = package
         directories[directory] = name
 
@@ -310,6 +337,23 @@ def _docs_job_owns(path: str) -> bool:
     ):
         return True
     return path.endswith(".md") and not _rust_fixture_owns(path)
+
+
+def _app_job_owns(path: str) -> bool:
+    # app/eval/** holds eval fixtures consumed by wenlan-core tests, so those
+    # changes must keep falling through to the full-plan path rather than
+    # being classified as app-only. Root Cargo.toml / Cargo.lock and
+    # crates/wenlan-types/** deliberately stay OUT of this classifier too —
+    # they keep their rust-plan meaning; ci.yml's own `app:` path filter
+    # triggers app-check for them independently.
+    if path == "app/eval" or path.startswith("app/eval/"):
+        return False
+    if path in APP_JOB_FILES:
+        return True
+    return any(
+        path == prefix or path.startswith(f"{prefix}/")
+        for prefix in APP_JOB_PREFIXES
+    )
 
 
 def _is_clippy_input(path: str) -> bool:
@@ -456,6 +500,10 @@ def _build_test_plan(
 
         if path in DETECT_CONTRACT_INPUTS:
             reasons.append(f"detect contract job owns changed path: {path}")
+            continue
+
+        if _app_job_owns(path):
+            reasons.append(f"app contract job owns changed path: {path}")
             continue
 
         if (
@@ -873,7 +921,17 @@ def clippy_command_for(plan: object, cargo_metadata: object) -> list[str]:
     if not names:
         return []
     if isinstance(plan, dict) and plan.get("mode") == "full":
-        return ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+        return [
+            "cargo",
+            "clippy",
+            "--workspace",
+            "--exclude",
+            "wenlan-app",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ]
     direct_test_change = any(
         isinstance(plan.get(suite_name), dict)
         and plan[suite_name].get("mode") == "targets"
@@ -909,7 +967,9 @@ def local_test_commands_for(plan: object, cargo_metadata: object) -> list[list[s
         raise PlanError("test plan has no suite 'workspace_lib'")
     workspace_mode = workspace.get("mode")
     if workspace_mode == "full":
-        commands.append(["cargo", "test", "--workspace", "--lib"])
+        commands.append(
+            ["cargo", "test", "--workspace", "--exclude", "wenlan-app", "--lib"]
+        )
         commands.append(
             ["cargo", "test", "-p", "wenlan-server", "--bin", "wenlan-server"]
         )
@@ -1024,7 +1084,15 @@ def archive_command_for(
         _validated_path_argument(archive_file, name="archive-file"),
     ]
     if mode == "full":
-        return [*cargo, "--workspace", "--lib", "--bin", "wenlan-server"]
+        return [
+            *cargo,
+            "--workspace",
+            "--exclude",
+            "wenlan-app",
+            "--lib",
+            "--bin",
+            "wenlan-server",
+        ]
     if mode in {"packages", "filterset"}:
         if mode == "filterset":
             filterset = suite.get("filterset")
@@ -1259,7 +1327,15 @@ def command_groups_for(
         if mode == "full":
             return [
                 workspace_command(
-                    [*cargo, "--workspace", "--lib", "--bin", "wenlan-server"]
+                    [
+                        *cargo,
+                        "--workspace",
+                        "--exclude",
+                        "wenlan-app",
+                        "--lib",
+                        "--bin",
+                        "wenlan-server",
+                    ]
                 )
             ]
         if mode == "packages":

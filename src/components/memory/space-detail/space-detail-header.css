@@ -1,0 +1,316 @@
+.space-dossier {
+  --mem-text-tertiary: var(--mem-text-meta-aa);
+  width: 100%;
+  max-width: 1130px;
+  margin: 0 auto;
+  padding: 4px 0 48px;
+  color: var(--mem-text);
+  font-family: var(--mem-font-body);
+  overflow-x: clip;
+}
+
+.space-dossier-parent,
+.space-dossier-title-edit,
+.space-dossier-overflow-trigger,
+.space-dossier-menu button,
+.space-dossier-identity-editor button,
+.space-dossier-text-action,
+.space-dossier-archive-trigger {
+  border: 0;
+  background: none;
+  color: var(--mem-text-secondary);
+  cursor: pointer;
+}
+
+.space-dossier-parent {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  margin-bottom: 24px;
+  font-size: 13px;
+}
+
+.space-dossier-parent svg,
+.space-dossier-title-edit svg,
+.space-dossier-actions svg,
+.space-dossier-page-list svg,
+.space-dossier-review-list svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+}
+
+.space-dossier-suggested,
+.space-dossier-delete-confirmation {
+  border: 1px solid var(--mem-border);
+  background: var(--mem-detail-surface-raised);
+}
+
+.space-dossier-identity-editor {
+  border: 1px solid var(--mem-control-border);
+  background: var(--mem-detail-surface-raised);
+}
+
+.space-dossier-suggested {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  margin-bottom: 24px;
+  color: var(--mem-text-secondary);
+  font-size: 13px;
+}
+
+.space-dossier-suggested div,
+.space-dossier-actions,
+.space-dossier-delete-confirmation {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.space-dossier-actions .space-dossier-overflow-icon {
+  fill: currentColor;
+  stroke: none;
+}
+
+.space-dossier-suggested button,
+.space-dossier-identity-editor button,
+.space-dossier-delete-confirmation button {
+  border: 1px solid var(--mem-border);
+  background: var(--mem-surface);
+  color: var(--mem-text-secondary);
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.space-dossier-identity-editor button,
+.space-dossier-delete-confirmation button {
+  min-height: var(--mem-control-height);
+  border-radius: var(--mem-control-radius);
+  font: 500 var(--mem-control-font-size)/1 var(--mem-font-body);
+  padding: 0 10px;
+}
+
+.space-dossier-suggestion-action {
+  border-radius: var(--mem-control-radius);
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+.space-dossier-suggestion-keep {
+  border-color: transparent;
+  background: transparent;
+  color: var(--mem-accent-indigo);
+}
+
+.space-dossier-suggestion-keep:hover {
+  background: var(--mem-indigo-bg);
+  color: var(--mem-accent-indigo);
+}
+
+.space-dossier-suggestion-discard {
+  border-color: transparent;
+  background: transparent;
+  color: var(--mem-text-tertiary);
+}
+
+.space-dossier-header {
+  margin-bottom: 40px;
+}
+
+.space-dossier-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding-bottom: 28px;
+  border-bottom: 1px solid var(--mem-border);
+}
+
+.space-dossier-title-block {
+  min-width: 0;
+}
+
+.space-dossier-identity-editor {
+  display: grid;
+  width: min(100%, 760px);
+  gap: 14px;
+  padding: 14px;
+}
+
+.space-dossier-title-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.space-dossier-title-block h1,
+.space-dossier-title-input {
+  margin: 0;
+  font-family: var(--mem-font-heading);
+  font-size: clamp(24px, 1.6vw + 14px, 30px);
+  font-weight: 500;
+  line-height: 1.12;
+  letter-spacing: -0.02em;
+  color: var(--mem-text);
+}
+
+.space-dossier-title-edit {
+  display: grid;
+  flex: 0 0 32px;
+  width: var(--mem-icon-action-size);
+  height: var(--mem-icon-action-size);
+  place-items: center;
+  border: 0;
+  background: none;
+  color: var(--mem-text-secondary);
+  cursor: pointer;
+}
+
+.space-dossier-title-edit:hover {
+  color: var(--mem-text);
+  background: var(--mem-hover);
+}
+
+.space-dossier-title-input {
+  width: min(100%, 720px);
+  border: 0;
+  border-bottom: 1px solid var(--mem-control-border);
+  background: transparent;
+  outline: 0;
+}
+
+.space-dossier-description {
+  max-width: 720px;
+  margin: 14px 0 0;
+  color: var(--mem-text-secondary);
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+.space-dossier-actions {
+  position: relative;
+  padding-top: 10px;
+}
+
+.space-dossier-overflow-trigger {
+  display: grid;
+  width: var(--mem-icon-action-size);
+  height: var(--mem-icon-action-size);
+  place-items: center;
+}
+
+.space-dossier-overflow-trigger:hover,
+.space-dossier-menu button:hover,
+.space-dossier-parent:hover {
+  color: var(--mem-text);
+  background: var(--mem-hover);
+}
+
+.space-dossier-description-editor {
+  width: 100%;
+  min-height: 88px;
+  resize: vertical;
+  border: 1px solid var(--mem-control-border);
+  border-radius: var(--mem-control-radius);
+  background: transparent;
+  color: var(--mem-text);
+  font: 14px/1.65 var(--mem-font-body);
+  outline: 0;
+  padding: 9px 10px;
+}
+
+.space-dossier-description-editor:focus-visible {
+  border-color: var(--mem-accent-page);
+  outline: 2px solid var(--mem-accent-page);
+  outline-offset: 2px;
+}
+
+.space-dossier-identity-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--mem-border);
+}
+
+.space-dossier-identity-editor-actions span {
+  margin-left: auto;
+  color: var(--mem-text-tertiary);
+  font: 10px var(--mem-font-mono);
+}
+
+.space-dossier-menu {
+  position: absolute;
+  z-index: 20;
+  top: 44px;
+  right: 0;
+  display: grid;
+  width: 154px;
+  padding: 4px;
+  border: 1px solid var(--mem-popover-border);
+  border-radius: var(--mem-popover-radius);
+  background: var(--mem-popover);
+  box-shadow: var(--mem-popover-shadow);
+}
+
+.space-dossier-menu button {
+  width: 100%;
+  min-height: var(--mem-control-height);
+  border-radius: var(--mem-control-radius);
+  font: 500 var(--mem-control-font-size)/1 var(--mem-font-body);
+  padding: 0 9px;
+  text-align: left;
+}
+
+.space-dossier-menu-danger {
+  color: var(--mem-status-warning-text) !important;
+}
+
+.space-dossier-delete-confirmation {
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  margin-top: 16px;
+  color: var(--mem-text-secondary);
+  font-size: 12px;
+}
+
+.space-dossier-error {
+  color: var(--mem-status-warning-text);
+}
+
+.space-dossier-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  padding: 24px 0 0;
+}
+
+.space-dossier-metrics div {
+  padding: 0 28px;
+  border-left: 1px solid var(--mem-border);
+}
+
+.space-dossier-metrics div:first-child {
+  padding-left: 28px;
+}
+
+.space-dossier-metrics dd {
+  margin: 0;
+  color: var(--mem-text);
+  font: 15px var(--mem-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.space-dossier-metrics dt {
+  margin: 0 0 7px;
+  color: var(--mem-text-tertiary);
+  font: 11px var(--mem-font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}

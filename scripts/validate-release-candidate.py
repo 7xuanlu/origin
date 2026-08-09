@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import datetime
 import difflib
 import hashlib
@@ -15,6 +16,7 @@ import re
 import shutil
 import sys
 import tempfile
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,6 +71,19 @@ RELEASE_MANAGED_PATHS = frozenset(
     }
 )
 REQUIRED_RELEASE_PATHS = RELEASE_MANAGED_PATHS
+# Cargo.lock aggregates third-party versions, so a workspace release version can
+# legitimately collide with a dependency's version string (hashbrown 0.15.5 vs
+# release 0.15.5 → 0.15.6). Its transform is therefore scoped to exactly these
+# workspace package stanzas instead of a whole-file version replace.
+WORKSPACE_LOCK_PACKAGES = frozenset(
+    {"wenlan", "wenlan-core", "wenlan-mcp", "wenlan-server", "wenlan-types"}
+)
+WORKSPACE_LOCK_QUALIFIED_REF_PATTERNS = {
+    name: re.compile(
+        rf"(?:^|\s){re.escape(name)} [0-9]+\.[0-9]+\.[0-9]+(?![0-9A-Za-z])"
+    )
+    for name in WORKSPACE_LOCK_PACKAGES
+}
 
 
 class CandidateError(RuntimeError):
@@ -296,6 +311,125 @@ def _version(value: str, label: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in value.split("."))
 
 
+def _expected_lock_transform(old: str, old_version: str, new_version: str) -> str:
+    """Bump workspace versions in Cargo.lock, refusing ambiguous stanza shapes.
+
+    Only ``[[package]]`` stanzas that name a workspace member and carry no
+    ``source`` key (path dependencies) are rewritten, and each member must match
+    the base version exactly once. Every other line — including a registry
+    package that squats a workspace name, and ``[[patch.unused]]`` stanzas — is
+    preserved byte-for-byte, so the candidate has zero degrees of freedom
+    against the returned content. A version-qualified dependency reference to a
+    workspace member ("wenlan-core 0.15.5", emitted only when a same-name
+    package shadows a member) is rejected outright rather than transformed —
+    extend this function before releasing such a lock. That rejection runs on
+    the TOML-decoded strings, so escape sequences cannot smuggle one past it.
+    """
+    lines = old.split("\n")
+    expected = list(lines)
+    replaced = dict.fromkeys(WORKSPACE_LOCK_PACKAGES, 0)
+    index = 0
+    total = len(lines)
+    while index < total:
+        if lines[index] != "[[package]]":
+            index += 1
+            continue
+        start = index + 1
+        index = start
+        while index < total and not lines[index].startswith("["):
+            index += 1
+        name: str | None = None
+        has_source = False
+        version_rows: list[int] = []
+        for row in range(start, index):
+            line = lines[row]
+            if line.startswith('name = "') and line.endswith('"'):
+                name = line[len('name = "') : -1]
+            elif line == f'version = "{old_version}"':
+                version_rows.append(row)
+            elif line.startswith("source = "):
+                has_source = True
+        if name not in WORKSPACE_LOCK_PACKAGES or has_source:
+            continue
+        if len(version_rows) != 1:
+            raise CandidateError(
+                f"Cargo.lock workspace stanza for {name!r} does not pin exactly the base version"
+            )
+        expected[version_rows[0]] = f'version = "{new_version}"'
+        replaced[name] += 1
+    for name in sorted(replaced):
+        if replaced[name] != 1:
+            raise CandidateError(
+                f"Cargo.lock does not contain exactly one workspace stanza for {name!r}"
+            )
+    try:
+        parsed = tomllib.loads(old)
+    except tomllib.TOMLDecodeError as error:
+        raise CandidateError("Cargo.lock base content is not valid TOML") from error
+    _reject_qualified_workspace_refs(parsed)
+    expected_content = "\n".join(expected)
+    try:
+        parsed_expected = tomllib.loads(expected_content)
+    except tomllib.TOMLDecodeError as error:
+        raise CandidateError("Cargo.lock expected transform is not valid TOML") from error
+
+    packages = parsed.get("package", [])
+    selected = [
+        package
+        for package in packages
+        if isinstance(package, dict)
+        and isinstance(package.get("name"), str)
+        and package["name"] in WORKSPACE_LOCK_PACKAGES
+        and "source" not in package
+    ] if isinstance(packages, list) else []
+    selected_names = {package["name"] for package in selected}
+    if (
+        len(selected) != len(WORKSPACE_LOCK_PACKAGES)
+        or selected_names != WORKSPACE_LOCK_PACKAGES
+    ):
+        raise CandidateError("Cargo.lock does not contain exactly the workspace package set")
+    for package in selected:
+        if package.get("version") != old_version:
+            raise CandidateError(
+                f"Cargo.lock workspace package {package['name']!r} is not at the base version"
+            )
+
+    bumped = copy.deepcopy(parsed)
+    bumped_packages = bumped.get("package", [])
+    if isinstance(bumped_packages, list):
+        for package in bumped_packages:
+            if (
+                isinstance(package, dict)
+                and isinstance(package.get("name"), str)
+                and package["name"] in WORKSPACE_LOCK_PACKAGES
+                and "source" not in package
+            ):
+                package["version"] = new_version
+    if bumped != parsed_expected:
+        raise CandidateError(
+            "Cargo.lock transform does not reduce to the exact workspace version bump"
+        )
+    return expected_content
+
+
+def _reject_qualified_workspace_refs(value: object) -> None:
+    if isinstance(value, str):
+        for name in sorted(WORKSPACE_LOCK_PACKAGES):
+            if WORKSPACE_LOCK_QUALIFIED_REF_PATTERNS[name].search(value):
+                raise CandidateError(
+                    f"Cargo.lock contains a version-qualified reference to"
+                    f" workspace package {name!r}; extend the validator before"
+                    " releasing it"
+                )
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _reject_qualified_workspace_refs(key)
+            _reject_qualified_workspace_refs(item)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_qualified_workspace_refs(item)
+
+
 def _validate_content_delta(path: str, old: str, new: str, old_version: str, new_version: str) -> None:
     removed: list[str] = []
     added: list[str] = []
@@ -311,6 +445,13 @@ def _validate_content_delta(path: str, old: str, new: str, old_version: str, new
     if path == "CHANGELOG.md":
         if removed or not any(line.startswith(f"## [{new_version}]") for line in added):
             raise CandidateError("CHANGELOG.md is not an additive current-version entry")
+        return
+    if path == "Cargo.lock":
+        if new != _expected_lock_transform(old, old_version, new_version):
+            raise CandidateError(
+                "release-managed file 'Cargo.lock' is not the exact"
+                " workspace-stanza version-only transform"
+            )
         return
     if old_version not in old:
         raise CandidateError(f"release-managed file {path!r} has no base version to replace")

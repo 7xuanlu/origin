@@ -1,0 +1,25 @@
+.page-create-action {
+  align-items: center;
+  background: transparent;
+  border: 1px solid var(--mem-control-border);
+  border-radius: var(--mem-control-radius);
+  color: var(--mem-text-secondary);
+  cursor: pointer;
+  display: inline-flex;
+  font: 500 var(--mem-control-font-size)/1 var(--mem-font-body);
+  min-height: var(--mem-control-height);
+  padding: 0 13px;
+  transition: background-color 150ms, border-color 150ms, color 150ms;
+  white-space: nowrap;
+}
+
+.page-create-action:hover {
+  background: var(--mem-indigo-bg);
+  border-color: var(--mem-accent-indigo);
+  color: var(--mem-accent-indigo);
+}
+
+.page-create-action:focus-visible {
+  outline: 2px solid var(--mem-accent-page);
+  outline-offset: 2px;
+}
