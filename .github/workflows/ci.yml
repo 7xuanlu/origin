@@ -157,6 +157,7 @@ jobs:
               - 'playwright.review.config.ts'
               - 'scripts/prepare-sidecars.sh'
               - 'scripts/prepare-tauri-build-sidecars.sh'
+              - '.github/workflows/app-release.yml'
               - '.github/workflows/ci.yml'
               # The app compiles wenlan-types by path and shares the workspace
               # lockfile, so a types change or a shared-dep bump can break the
