@@ -1069,10 +1069,9 @@ mod tests {
     // `page_map_auto_suggest` config flag (that flag gates only the background
     // `refinery::Phase::PageMaps` scheduler phase). We write a config with the
     // flag OFF into a temp data dir, then confirm the handler still produces
-    // suggestions. Because the handler does not read config at all, this test
-    // is race-safe under cargo's parallel test threads (a concurrently-set
-    // `WENLAN_DATA_DIR` cannot change the handler's behavior); its teeth are on
-    // a *future* regression that wrongly wires the flag into this route.
+    // suggestions. `TEST_DATA_DIR_LOCK` guards `save_config` against a
+    // concurrent test's `WENLAN_DATA_DIR` swap landing mid-write; its teeth
+    // are on a *future* regression that wrongly wires the flag into this route.
     #[tokio::test]
     async fn improve_page_map_runs_when_auto_suggest_disabled() {
         struct DataDirGuard {
@@ -1099,6 +1098,10 @@ mod tests {
             }
         }
 
+        let _lock = crate::TEST_DATA_DIR_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
         let _env = DataDirGuard::new();
         // Empty temp data dir → load_config returns defaults; set the flag OFF
         // explicitly and persist it, so a hypothetical future gating of this

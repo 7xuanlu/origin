@@ -10740,6 +10740,7 @@ impl MemoryDB {
     /// Not for production use -- normal writes stay on `store_entity`, which
     /// does the same thing in its own transaction.
     #[cfg(test)]
+    #[allow(clippy::type_complexity)]
     pub(crate) async fn test_seed_entity_shadow_page(
         &self,
         entity: TestEntity<'_>,
