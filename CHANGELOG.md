@@ -5,6 +5,7 @@
 
 ### Features
 
+* fold the wenlan-app desktop crate into the monorepo (app/), reversing the 2026-05-07 split. App-aware CI planner, app-check job, workspace lock with app subgraph. ([df73d30](https://github.com/7xuanlu/wenlan/commit/df73d304bb45c29a2b3c111c6704866ee7d00f6b))
 * G6 Stage 3 — migration 123 retires the legacy entities/entity_aliases tables ([#499](https://github.com/7xuanlu/wenlan/issues/499)) ([0aaa695](https://github.com/7xuanlu/wenlan/commit/0aaa695eb4d02ca8458032710f8947281a1e3e9d))
 * **kg:** edges carry their semantic payload — one source of truth (G6 Stage 1) ([#486](https://github.com/7xuanlu/wenlan/issues/486)) ([8100223](https://github.com/7xuanlu/wenlan/commit/8100223e6539d842c1e25de91aca36e108e1faab))
 * **kg:** G6 Stage 1.1 — resolved page-link readers cut over to canonical links edges ([#488](https://github.com/7xuanlu/wenlan/issues/488)) ([f44ea66](https://github.com/7xuanlu/wenlan/commit/f44ea66cb386d21b771170d60443c4befc88b37b))
@@ -18,6 +19,7 @@
 
 ### Bug Fixes
 
+* **app:** adapt to wenlan-types HEAD — WriteSpaceTarget + StatusResponse fields ([7649f2f](https://github.com/7xuanlu/wenlan/commit/7649f2ff74d3c69f833061135c33e7faaac48d25))
 * grant release finalization the pull-requests write it uses ([#483](https://github.com/7xuanlu/wenlan/issues/483)) ([573f45c](https://github.com/7xuanlu/wenlan/commit/573f45ce785d615283a0b81fea962fe073e0670a))
 * **kg:** carry the label on rebind re-mints; survive the m81 pre-semantic_type crash window ([#487](https://github.com/7xuanlu/wenlan/issues/487)) ([29f51db](https://github.com/7xuanlu/wenlan/commit/29f51dbb3188fbe850e22f752a1b68f129b976c8))
 * **kg:** edges-parity repair — doc-source-page over-retire + kind-derivation drift (m119) ([#493](https://github.com/7xuanlu/wenlan/issues/493)) ([6e55889](https://github.com/7xuanlu/wenlan/commit/6e5588949b3ef6494a05409d7e3847c719c9d7f7))
@@ -26,6 +28,7 @@
 * **kg:** writers canonical-only for legacy KG stores; discovery-scan sweep (G6 Stage 2b) ([#495](https://github.com/7xuanlu/wenlan/issues/495)) ([7a8287f](https://github.com/7xuanlu/wenlan/commit/7a8287fe08e13c05c3beabec7d54f344ecbee34b))
 * **test:** quarantine remaining high-risk flake patterns ([#497](https://github.com/7xuanlu/wenlan/issues/497)) ([dd0e617](https://github.com/7xuanlu/wenlan/commit/dd0e6177056652ec2d96cb331a40cd0b5d245b79))
 * **test:** quarantine three flaky tests behind serialization and CI retries ([#496](https://github.com/7xuanlu/wenlan/issues/496)) ([71e9196](https://github.com/7xuanlu/wenlan/commit/71e9196d42e634566553e79f30e2563a668544d3))
+* unify sysinfo on the workspace =0.38.3 pin ([007fc98](https://github.com/7xuanlu/wenlan/commit/007fc9816a105f5099f1225f3e7a2633797426ea))
 
 ## [0.15.5](https://github.com/7xuanlu/wenlan/compare/v0.15.4...v0.15.5) (2026-08-04)
 
