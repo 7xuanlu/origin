@@ -54,10 +54,24 @@ pub fn legacy_mcp_config_dir() -> PathBuf {
 
 #[allow(dead_code)]
 pub fn mcp_config_dir() -> PathBuf {
+    if let Some(state_dir) = isolated_dev_state_dir() {
+        return state_dir.join("mcp-config");
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
         .join("wenlan-mcp")
+}
+
+pub fn isolated_dev_state_dir() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os("WENLAN_DEV_STATE_DIR").map(PathBuf::from)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -227,13 +241,16 @@ mod mcp_tests {
 
     struct HomeGuard {
         home: Option<OsString>,
+        dev_state: Option<OsString>,
     }
 
     impl HomeGuard {
         fn set(path: &std::path::Path) -> Self {
             let home = std::env::var_os("HOME");
+            let dev_state = std::env::var_os("WENLAN_DEV_STATE_DIR");
             std::env::set_var("HOME", path);
-            Self { home }
+            std::env::remove_var("WENLAN_DEV_STATE_DIR");
+            Self { home, dev_state }
         }
     }
 
@@ -242,6 +259,10 @@ mod mcp_tests {
             match &self.home {
                 Some(value) => std::env::set_var("HOME", value),
                 None => std::env::remove_var("HOME"),
+            }
+            match &self.dev_state {
+                Some(value) => std::env::set_var("WENLAN_DEV_STATE_DIR", value),
+                None => std::env::remove_var("WENLAN_DEV_STATE_DIR"),
             }
         }
     }
@@ -260,5 +281,17 @@ mod mcp_tests {
         let tmp = tempfile::tempdir().unwrap();
         let _home = HomeGuard::set(tmp.path());
         assert!(legacy_mcp_config_dir().ends_with(".config/origin-mcp"));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[serial_test::serial]
+    fn dev_mcp_config_dir_is_scoped_to_the_worktree_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let state = tmp.path().join("worktree-state");
+        std::env::set_var("WENLAN_DEV_STATE_DIR", &state);
+
+        assert_eq!(mcp_config_dir(), state.join("mcp-config"));
     }
 }

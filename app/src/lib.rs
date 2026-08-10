@@ -26,6 +26,8 @@ mod search;
 pub mod sources;
 pub mod state;
 pub mod system_info;
+#[cfg(test)]
+mod test_env;
 // Public surface consumed by tray_menu (Task 15); suppress dead_code until then.
 #[allow(dead_code)]
 pub(crate) mod tray_health;
@@ -54,6 +56,9 @@ fn set_main_window_dock_visibility<R: tauri::Runtime>(app: &tauri::AppHandle<R>,
 fn set_main_window_dock_visibility<R: tauri::Runtime>(_app: &tauri::AppHandle<R>, _visible: bool) {}
 
 fn app_log_dir() -> std::path::PathBuf {
+    if let Some(state_dir) = crate::identity_paths::isolated_dev_state_dir() {
+        return state_dir.join("logs");
+    }
     dirs::home_dir()
         .map(|h| h.join("Library/Logs/com.wenlan.desktop"))
         .unwrap_or_else(std::env::temp_dir)
@@ -61,6 +66,116 @@ fn app_log_dir() -> std::path::PathBuf {
 
 fn app_log_file_name() -> &'static str {
     "wenlan.log"
+}
+
+#[cfg(debug_assertions)]
+fn validate_debug_runtime_isolation() -> Result<(), String> {
+    fn required(name: &str) -> Result<std::ffi::OsString, String> {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{name} is required"))
+    }
+
+    fn required_port(name: &str) -> Result<u16, String> {
+        required(name)?
+            .to_string_lossy()
+            .parse::<u16>()
+            .map_err(|_| format!("{name} must be a valid TCP port"))
+    }
+
+    let daemon_port = required_port("WENLAN_PORT")?;
+    let ui_port = required_port("WENLAN_DEV_UI_PORT")?;
+    let remote_port_start = required_port("WENLAN_DEV_REMOTE_PORT_START")?;
+    if daemon_port == 7878 {
+        return Err("WENLAN_PORT must not use the production port 7878".to_string());
+    }
+    if ui_port == 1420 {
+        return Err("WENLAN_DEV_UI_PORT must not use the production port 1420".to_string());
+    }
+    if remote_port_start > 65532 {
+        return Err(
+            "WENLAN_DEV_REMOTE_PORT_START must leave room for a four-port range".to_string(),
+        );
+    }
+    if remote_port_start <= 18083 && remote_port_start.saturating_add(3) >= 18080 {
+        return Err(
+            "WENLAN_DEV_REMOTE_PORT_START must not overlap production ports 18080-18083"
+                .to_string(),
+        );
+    }
+
+    let app_id = required("WENLAN_DEV_APP_ID")?;
+    if !app_id
+        .to_string_lossy()
+        .starts_with("com.wenlan.desktop.dev.")
+    {
+        return Err("WENLAN_DEV_APP_ID must use the isolated dev namespace".to_string());
+    }
+
+    let state_dir = std::path::PathBuf::from(required("WENLAN_DEV_STATE_DIR")?);
+    let data_dir = std::path::PathBuf::from(required("WENLAN_DATA_DIR")?);
+    let socket_path = std::path::PathBuf::from(required("WENLAN_DEV_TAURI_MCP_SOCKET")?);
+    let state_dir = std::fs::canonicalize(&state_dir)
+        .map_err(|error| format!("WENLAN_DEV_STATE_DIR is unavailable: {error}"))?;
+    let data_dir = std::fs::canonicalize(&data_dir)
+        .map_err(|error| format!("WENLAN_DATA_DIR is unavailable: {error}"))?;
+    let socket_parent = socket_path
+        .parent()
+        .ok_or_else(|| "WENLAN_DEV_TAURI_MCP_SOCKET has no parent directory".to_string())?;
+    let socket_parent = std::fs::canonicalize(socket_parent)
+        .map_err(|error| format!("WENLAN_DEV_TAURI_MCP_SOCKET parent is unavailable: {error}"))?;
+    let socket_path = socket_parent.join(
+        socket_path
+            .file_name()
+            .ok_or_else(|| "WENLAN_DEV_TAURI_MCP_SOCKET has no file name".to_string())?,
+    );
+    if !data_dir.starts_with(&state_dir) {
+        return Err("WENLAN_DATA_DIR must be contained by WENLAN_DEV_STATE_DIR".to_string());
+    }
+    if !socket_parent.starts_with(&state_dir) {
+        return Err(
+            "WENLAN_DEV_TAURI_MCP_SOCKET must be contained by WENLAN_DEV_STATE_DIR".to_string(),
+        );
+    }
+    let production_socket_parent =
+        std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    if socket_path == production_socket_parent.join("tauri-mcp.sock") {
+        return Err("WENLAN_DEV_TAURI_MCP_SOCKET must not use the production socket".to_string());
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        for protected in [
+            home.join("Library/Application Support/wenlan"),
+            home.join("Library/Application Support/origin"),
+            home.join("Library/LaunchAgents"),
+            home.join("Library/Logs/com.wenlan.desktop"),
+            home.join("Library/Logs/com.origin.desktop"),
+            home.join(".config/wenlan-mcp"),
+            home.join(".config/origin-mcp"),
+            home.join(".wenlan"),
+            home.join(".origin"),
+        ] {
+            if let Ok(protected) = std::fs::canonicalize(protected) {
+                if [&state_dir, &data_dir, &socket_path]
+                    .iter()
+                    .any(|path| path.starts_with(&protected))
+                {
+                    return Err(
+                        "WENLAN_DEV_STATE_DIR must not use a production runtime root".to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn resolve_tauri_mcp_socket_path(override_path: Option<&std::ffi::OsStr>) -> std::path::PathBuf {
+    override_path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/tauri-mcp.sock"))
 }
 
 static QUIT_GUARD_PENDING: std::sync::atomic::AtomicBool =
@@ -128,8 +243,14 @@ fn startup_reveal_fallback_needed(ready: bool, visible: bool) -> bool {
 #[cfg(not(feature = "review-fixtures"))]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Log sinks: stderr (for terminal launches, `pnpm tauri dev`) AND a
-    // file at ~/Library/Logs/com.wenlan.desktop/wenlan.log.
+    #[cfg(debug_assertions)]
+    if let Err(error) = validate_debug_runtime_isolation() {
+        panic!("unsafe debug runtime refused: {error}. Start the app with `pnpm dev:all`");
+    }
+
+    // Log sinks: stderr (for terminal launches, `pnpm dev:all`) AND a file
+    // under the selected app identity. Debug builds write into the worktree
+    // state directory; production uses ~/Library/Logs/com.wenlan.desktop.
     // GUI launches send stderr to /dev/null, so without the file sink any
     // setup() error — e.g. a sidecar spawn ENOENT — is silent. That is
     // exactly how the origin-server spawn regression hid for ~15 minutes
@@ -190,11 +311,15 @@ pub fn run() {
         }));
 
     #[cfg(debug_assertions)]
-    let builder = builder.plugin(tauri_plugin_mcp::init_with_config(
-        tauri_plugin_mcp::PluginConfig::new("wenlan".to_string())
-            .start_socket_server(true)
-            .socket_path("/tmp/tauri-mcp.sock".into()),
-    ));
+    let builder = {
+        let socket_override = std::env::var_os("WENLAN_DEV_TAURI_MCP_SOCKET");
+        let socket_path = resolve_tauri_mcp_socket_path(socket_override.as_deref());
+        builder.plugin(tauri_plugin_mcp::init_with_config(
+            tauri_plugin_mcp::PluginConfig::new("wenlan".to_string())
+                .start_socket_server(true)
+                .socket_path(socket_path),
+        ))
+    };
 
     builder
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -704,9 +829,10 @@ pub fn run() {
                             // while breaking newer API calls.
                             if health.version != env!("CARGO_PKG_VERSION") {
                                 log::warn!(
-                                    "[init] Daemon version mismatch: daemon v{}, app v{} — a stale daemon may be holding port 7878; restart it (e.g. `wenlan restart`)",
+                                    "[init] Daemon version mismatch: daemon v{}, app v{} at {}; restart it (e.g. `wenlan restart`)",
                                     health.version,
-                                    env!("CARGO_PKG_VERSION")
+                                    env!("CARGO_PKG_VERSION"),
+                                    client.base_url()
                                 );
                             }
                             break;
@@ -1045,6 +1171,21 @@ pub fn run() {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+    use crate::test_env::EnvGuard;
+
+    /// Every variable `validate_debug_runtime_isolation` reads, plus the home
+    /// directory the protected production roots hang off.
+    #[cfg(debug_assertions)]
+    const RUNTIME_ENV_KEYS: &[&str] = &[
+        "HOME",
+        "WENLAN_PORT",
+        "WENLAN_DEV_UI_PORT",
+        "WENLAN_DEV_REMOTE_PORT_START",
+        "WENLAN_DEV_APP_ID",
+        "WENLAN_DEV_TAURI_MCP_SOCKET",
+        "WENLAN_DATA_DIR",
+        "WENLAN_DEV_STATE_DIR",
+    ];
 
     #[test]
     fn visible_main_window_uses_regular_activation_policy() {
@@ -1070,9 +1211,198 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn app_log_identity_uses_wenlan() {
+        let _env = EnvGuard::capture(&["WENLAN_DEV_STATE_DIR"]);
+        std::env::remove_var("WENLAN_DEV_STATE_DIR");
+
         assert!(app_log_dir().ends_with("Library/Logs/com.wenlan.desktop"));
         assert_eq!(app_log_file_name(), "wenlan.log");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[serial_test::serial]
+    fn dev_app_log_is_scoped_to_the_worktree_state() {
+        let _env = EnvGuard::capture(&["WENLAN_DEV_STATE_DIR"]);
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("WENLAN_DEV_STATE_DIR", tmp.path());
+
+        assert_eq!(app_log_dir(), tmp.path().join("logs"));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn dev_tauri_mcp_socket_accepts_a_worktree_override() {
+        assert_eq!(
+            resolve_tauri_mcp_socket_path(Some(std::ffi::OsStr::new(
+                "/tmp/worktree/tauri-mcp.sock"
+            ))),
+            std::path::PathBuf::from("/tmp/worktree/tauri-mcp.sock")
+        );
+        assert_eq!(
+            resolve_tauri_mcp_socket_path(None),
+            std::path::PathBuf::from("/tmp/tauri-mcp.sock")
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[serial_test::serial]
+    fn debug_app_fails_closed_without_an_isolated_runtime_identity() {
+        let _env = EnvGuard::capture(RUNTIME_ENV_KEYS);
+        for key in RUNTIME_ENV_KEYS.iter().filter(|key| **key != "HOME") {
+            std::env::remove_var(key);
+        }
+
+        assert_eq!(
+            validate_debug_runtime_isolation(),
+            Err("WENLAN_PORT is required".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[serial_test::serial]
+    fn debug_app_accepts_a_complete_worktree_scoped_runtime_identity() {
+        let _env = EnvGuard::capture(RUNTIME_ENV_KEYS);
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let data = state.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::env::set_var("WENLAN_PORT", "17777");
+        std::env::set_var("WENLAN_DEV_UI_PORT", "18777");
+        std::env::set_var("WENLAN_DEV_REMOTE_PORT_START", "22000");
+        std::env::set_var("WENLAN_DEV_APP_ID", "com.wenlan.desktop.dev.123");
+        std::env::set_var("WENLAN_DEV_TAURI_MCP_SOCKET", state.join("tauri-mcp.sock"));
+        std::env::set_var("WENLAN_DATA_DIR", &data);
+        std::env::set_var("WENLAN_DEV_STATE_DIR", &state);
+
+        assert_eq!(validate_debug_runtime_isolation(), Ok(()));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[serial_test::serial]
+    fn debug_app_rejects_complete_but_production_touching_runtime_identities() {
+        // Each case starts from an identity the guard accepts and changes one
+        // field, so only the rule the case names can reject it, and each
+        // assertion pins that rule's own message. Bare `is_err()` on a
+        // multi-field mutation proves nothing here: the data-dir containment
+        // rule runs ahead of most others and fires first or not depending on
+        // where this machine puts TMPDIR.
+        let _env = EnvGuard::capture(RUNTIME_ENV_KEYS);
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path().join("home");
+        let state = fake_home.join("state");
+        let data = state.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::env::set_var("HOME", &fake_home);
+
+        let set_valid_identity = || {
+            std::env::set_var("WENLAN_PORT", "17777");
+            std::env::set_var("WENLAN_DEV_UI_PORT", "18777");
+            std::env::set_var("WENLAN_DEV_REMOTE_PORT_START", "22000");
+            std::env::set_var("WENLAN_DEV_APP_ID", "com.wenlan.desktop.dev.123");
+            std::env::set_var("WENLAN_DEV_STATE_DIR", &state);
+            std::env::set_var("WENLAN_DATA_DIR", &data);
+            std::env::set_var("WENLAN_DEV_TAURI_MCP_SOCKET", state.join("tauri-mcp.sock"));
+        };
+
+        set_valid_identity();
+        assert_eq!(
+            validate_debug_runtime_isolation(),
+            Ok(()),
+            "the baseline identity must pass, or every case below proves nothing"
+        );
+
+        for (key, value, expected) in [
+            (
+                "WENLAN_PORT",
+                "7878",
+                "WENLAN_PORT must not use the production port 7878",
+            ),
+            (
+                "WENLAN_DEV_UI_PORT",
+                "1420",
+                "WENLAN_DEV_UI_PORT must not use the production port 1420",
+            ),
+            (
+                "WENLAN_DEV_REMOTE_PORT_START",
+                "65533",
+                "WENLAN_DEV_REMOTE_PORT_START must leave room for a four-port range",
+            ),
+            (
+                "WENLAN_DEV_REMOTE_PORT_START",
+                "18080",
+                "WENLAN_DEV_REMOTE_PORT_START must not overlap production ports 18080-18083",
+            ),
+            (
+                "WENLAN_DEV_APP_ID",
+                "com.wenlan.desktop",
+                "WENLAN_DEV_APP_ID must use the isolated dev namespace",
+            ),
+        ] {
+            set_valid_identity();
+            std::env::set_var(key, value);
+            assert_eq!(
+                validate_debug_runtime_isolation(),
+                Err(expected.to_string()),
+                "{key}={value} must be rejected by its own rule"
+            );
+        }
+
+        set_valid_identity();
+        std::env::set_var("WENLAN_DATA_DIR", tmp.path());
+        assert_eq!(
+            validate_debug_runtime_isolation(),
+            Err("WENLAN_DATA_DIR must be contained by WENLAN_DEV_STATE_DIR".to_string())
+        );
+
+        set_valid_identity();
+        std::env::set_var("WENLAN_DEV_TAURI_MCP_SOCKET", fake_home.join("dev.sock"));
+        assert_eq!(
+            validate_debug_runtime_isolation(),
+            Err(
+                "WENLAN_DEV_TAURI_MCP_SOCKET must be contained by WENLAN_DEV_STATE_DIR".to_string()
+            )
+        );
+
+        // The production socket lives directly in /tmp and the socket must sit
+        // inside the state dir, so /tmp is the only anchor from which this rule
+        // is reachable without tripping containment first.
+        set_valid_identity();
+        std::env::set_var("WENLAN_DEV_STATE_DIR", "/tmp");
+        std::env::set_var("WENLAN_DATA_DIR", "/tmp");
+        std::env::set_var("WENLAN_DEV_TAURI_MCP_SOCKET", "/tmp/tauri-mcp.sock");
+        assert_eq!(
+            validate_debug_runtime_isolation(),
+            Err("WENLAN_DEV_TAURI_MCP_SOCKET must not use the production socket".to_string())
+        );
+
+        for production_root in [
+            "Library/Application Support/wenlan",
+            "Library/Application Support/origin",
+            "Library/LaunchAgents",
+            "Library/Logs/com.wenlan.desktop",
+            "Library/Logs/com.origin.desktop",
+            ".config/wenlan-mcp",
+            ".config/origin-mcp",
+            ".wenlan",
+            ".origin",
+        ] {
+            let root = fake_home.join(production_root);
+            std::fs::create_dir_all(&root).unwrap();
+            set_valid_identity();
+            std::env::set_var("WENLAN_DEV_STATE_DIR", &fake_home);
+            std::env::set_var("WENLAN_DATA_DIR", &root);
+            std::env::set_var("WENLAN_DEV_TAURI_MCP_SOCKET", fake_home.join("dev.sock"));
+            assert_eq!(
+                validate_debug_runtime_isolation(),
+                Err("WENLAN_DEV_STATE_DIR must not use a production runtime root".to_string()),
+                "a data dir inside {production_root} must be rejected"
+            );
+        }
     }
 
     #[test]
