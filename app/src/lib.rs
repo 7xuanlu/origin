@@ -1300,6 +1300,15 @@ pub fn run() {
             search::delete_page,
             search::list_pages,
             search::search_pages,
+            // Page map commands
+            search::get_page_map,
+            search::improve_page_map,
+            search::create_page_map_node,
+            search::patch_page_map_node,
+            search::delete_page_map_node,
+            search::put_page_map_layout,
+            search::patch_page_map_edge,
+            search::reset_page_map,
             // Home delta feed commands
             search::list_recent_retrievals,
             search::list_recent_changes,

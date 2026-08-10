@@ -407,6 +407,13 @@ html[data-theme="dark"] {
      same pixels, so ConstellationMap is unchanged. */
   --kg-edge: #3D414C;
   --kg-edge-strong: #5D616F;
+  /* The Canvas draws its spokes as SVG strokes on the page surface, not as
+     sigma edges over the graph's own ground, and at that size the graph inks
+     above disappear — the strokes are what make thirteen boxes read as a tree
+     rather than as scattered pills. Lifted here only; AtlasView, FocusGraph and
+     ConstellationMap keep the pre-composited values they were tuned against. */
+  --canvas-edge: #565B69;
+  --canvas-edge-strong: #7C8291;
   /* Cartography layer (design-mockup artifact, screen 01). Hull/graticule are
      painted by AtlasView's 2D underlay canvas — real alpha is fine there (the
      opaque-only rule above is sigma-WebGL-specific). Bridge IS a sigma edge
@@ -492,6 +499,10 @@ html[data-theme="light"] {
      rgba(88,97,116,.42/.72) pre-composited over #FFFFFF. */
   --kg-edge: #B9BDC5;
   --kg-edge-strong: #878D9B;
+  /* Canvas spokes — see the dark block. Light needed no lift, so these are the
+     graph values, named separately so the two can move independently. */
+  --canvas-edge: #B9BDC5;
+  --canvas-edge-strong: #878D9B;
   /* Cartography layer — light variants (see the dark block's note). */
   --kg-hull: rgba(94, 88, 200, 0.045);
   --kg-hull-border: rgba(94, 88, 200, 0.15);
@@ -3224,4 +3235,513 @@ p.entity-error {
   .mem-infotip-pop {
     transition: none;
   }
+}
+
+/* ── Page tabs + canvas (PageDetail.tsx, PageCanvas.tsx) ───────────── */
+
+/* A view switch, not an action — so it sits at the head of the icon cluster
+   with a hairline between it and the things that actually change the page. */
+.page-detail-canvas-toggle {
+  margin-right: 2px;
+  padding-right: 6px;
+  border-right: 1px solid var(--mem-border);
+  border-radius: 6px 0 0 6px;
+}
+
+/* Held down while the canvas is up: the only control here with a persistent
+   state, so it is the only one that stays lit. */
+.page-detail-canvas-toggle.is-active {
+  background-color: color-mix(in srgb, var(--mem-accent-page) 16%, transparent);
+  color: var(--mem-accent-page);
+}
+
+.page-detail-canvas-toggle.is-active:hover {
+  background-color: color-mix(in srgb, var(--mem-accent-page) 26%, transparent);
+}
+
+.page-canvas {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* The two acts float over the dot grid rather than sitting in a row above it:
+   the canvas is the object here, and its chrome should not push it down the
+   page. */
+.page-canvas-actions {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  max-width: min(280px, calc(100% - 20px));
+}
+
+.page-canvas-action-cluster {
+  display: flex;
+  overflow: hidden;
+  border: 1px solid var(--mem-border);
+  border-radius: 8px;
+  background-color: var(--mem-surface);
+}
+
+.page-canvas-action {
+  padding: 5px 12px;
+  border: none;
+  background: none;
+  color: var(--mem-text-secondary);
+  font-family: var(--mem-font-body);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.page-canvas-action:hover:not(:disabled) {
+  background-color: var(--mem-hover);
+  color: var(--mem-text);
+}
+
+.page-canvas-action:focus-visible {
+  outline: 2px solid var(--mem-accent-page);
+  outline-offset: -2px;
+}
+
+.page-canvas-action:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Improve runs the model and rewrites the whole map, and it is now the only act
+   up here, so it carries the only filled ink. It had a hairline down its left
+   edge to divide it from "Add section"; with nothing to divide from, that line
+   was just a mark on the outside of a button. */
+.page-canvas-action.is-improve {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background-color: color-mix(in srgb, var(--mem-accent-page) 14%, transparent);
+  color: var(--mem-accent-page);
+  font-weight: 600;
+}
+
+.page-canvas-action.is-improve:hover:not(:disabled) {
+  background-color: color-mix(in srgb, var(--mem-accent-page) 24%, transparent);
+  color: var(--mem-accent-page);
+}
+
+.page-canvas-action-glyph {
+  font-size: 11px;
+  line-height: 1;
+}
+
+.page-canvas-action-glyph.is-spinning {
+  animation: page-canvas-spin 900ms linear infinite;
+}
+
+@keyframes page-canvas-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* A count of what the canvas is withholding, and the only way to see it. It sits
+   below the command cluster, in its own pill, so it does not read as a third
+   verb beside Improve — but tertiary text on a plain surface at 11px read as a
+   disabled badge, which is the one thing it must not be: nothing else on the
+   surface reveals suggestions. The dot carries the accent so the pill reads as
+   live, the label stays secondary so it stays state rather than a command. */
+.page-canvas-reveal {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border: 1px solid color-mix(in srgb, var(--mem-accent-page) 30%, var(--mem-border));
+  border-radius: 999px;
+  background-color: var(--mem-surface);
+  color: var(--mem-text-secondary);
+  font-family: var(--mem-font-body);
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+/* Filled, and smaller than the label: a ring glyph at label size lost most of
+   its ink to antialiasing on the dark ground, which is where the pill needed the
+   colour most. */
+.page-canvas-reveal-dot {
+  color: var(--mem-accent-page);
+  font-size: 8px;
+}
+
+.page-canvas-reveal:hover {
+  border-color: var(--mem-accent-page);
+  color: var(--mem-text-primary);
+}
+
+.page-canvas-reveal:focus-visible {
+  outline: 2px solid var(--mem-accent-page);
+  outline-offset: 1px;
+}
+
+.page-canvas-badge {
+  padding: 2px 6px;
+  border: 1px solid var(--mem-border);
+  border-radius: 5px;
+  color: var(--mem-text-tertiary);
+  font-family: var(--mem-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.page-canvas-notice {
+  padding: 4px 8px;
+  border: 1px solid var(--mem-border);
+  border-radius: 7px;
+  background-color: var(--mem-surface);
+  color: var(--mem-accent-amber);
+  font-family: var(--mem-font-body);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.page-canvas-banner {
+  margin: 0;
+  color: var(--mem-text-tertiary);
+  font-family: var(--mem-font-body);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.page-canvas-surface {
+  position: relative;
+  height: min(68vh, 620px);
+  overflow: hidden;
+  border: 1px solid var(--mem-border);
+  border-radius: 12px;
+  background-color: var(--mem-surface);
+  /* A map is dragged, not read: any drag that starts off the pane — on a
+     control, on the frame's own padding — used to start a text selection
+     instead, and a select-all from anywhere in the window painted the
+     browser's opaque highlight over the whole map. React Flow does this for
+     its boxes already; the frame around them was left out. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* The one thing in here that is text: the field a box is named in. */
+.page-canvas-surface input {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* The surface takes focus so its shortcuts fire on a fresh canvas, but a ring
+   around the whole 620px box on every click is noise. Keyboard focus still
+   shows. */
+.page-canvas-surface:focus {
+  outline: none;
+}
+
+.page-canvas-surface .page-canvas-badge {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 5;
+  background-color: var(--mem-surface);
+}
+
+.page-canvas-surface:focus-visible {
+  outline: 2px solid var(--mem-accent-page, var(--mem-text-secondary));
+  outline-offset: -2px;
+}
+
+/* Right-click menu. Anchored to the surface, so it is clipped by the canvas
+   rather than escaping over the page around it. */
+.page-canvas-surface .react-flow__handle.page-canvas-grow {
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid var(--mem-surface);
+  background-color: var(--mem-text-secondary);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.page-canvas-surface .react-flow__node:hover .page-canvas-grow,
+.page-canvas-surface .react-flow__node.selected .page-canvas-grow {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .page-canvas-surface .react-flow__handle.page-canvas-grow,
+  .page-canvas-action,
+  .page-canvas-reveal,
+  .page-canvas-help-button {
+    transition: none;
+  }
+
+  .page-canvas-action-glyph.is-spinning {
+    animation: none;
+  }
+}
+
+.page-canvas-menu {
+  position: absolute;
+  z-index: 5;
+  min-width: 168px;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  border: 1px solid var(--mem-border);
+  border-radius: 8px;
+  background-color: var(--mem-surface);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 22%);
+}
+
+.page-canvas-menu-item {
+  display: block;
+  width: 100%;
+  padding: 5px 9px;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  color: var(--mem-text-secondary);
+  font-family: var(--mem-font-body);
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.page-canvas-menu-item:hover,
+.page-canvas-menu-item:focus-visible {
+  background-color: var(--mem-hover);
+  color: var(--mem-text);
+  outline: none;
+}
+
+/* Deleting a box takes the boxes under it too and there is no undo, so the
+   one destructive verb does not look like the others. */
+.page-canvas-menu-item.is-danger {
+  color: var(--mem-danger, #d4645f);
+}
+
+.page-canvas-menu-item.is-separated {
+  margin-top: 4px;
+  border-top: 1px solid var(--mem-border);
+  border-radius: 0 0 5px 5px;
+  padding-top: 8px;
+}
+
+.page-canvas-menu-item.is-danger:hover,
+.page-canvas-menu-item.is-danger:focus-visible {
+  background-color: var(--mem-danger, #d4645f);
+  color: var(--mem-surface);
+}
+
+/* Shortcuts hide behind a corner disclosure so the canvas keeps its full
+   height. The button borrows the zoom controls' treatment below so the two
+   bottom corners read as one family. */
+.page-canvas-help {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 5;
+}
+
+.page-canvas-help-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--mem-border);
+  border-radius: 8px;
+  background-color: var(--mem-surface);
+  color: var(--mem-text-secondary);
+  font-family: var(--mem-font-body);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.page-canvas-help-button:hover {
+  background-color: var(--mem-hover);
+  color: var(--mem-text);
+}
+
+.page-canvas-help-button:focus-visible {
+  outline: 2px solid var(--mem-accent-page);
+  outline-offset: 1px;
+}
+
+/* Anchored above the button and inside the surface, so it is clipped by the
+   canvas rather than escaping over the page around it. */
+.page-canvas-help-panel {
+  position: absolute;
+  right: 0;
+  bottom: 32px;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 10px;
+  /* Wide enough for the longest action on one line. At 192px "Zoom to
+     selection" and "Show these keys" each wrapped, which added two rows to a
+     panel that already covers a third of the canvas. */
+  min-width: 236px;
+  padding: 10px 12px;
+  border: 1px solid var(--mem-border);
+  border-radius: 8px;
+  background-color: var(--mem-surface);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 22%);
+}
+
+/* The row is a grouping wrapper only: `contents` drops it out of the layout so
+   every keycap shares one column and the labels line up down the panel. */
+.page-canvas-help-note {
+  grid-column: 1 / -1;
+  margin: 6px 0 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--mem-border);
+  color: var(--mem-text-tertiary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.page-canvas-help-row {
+  display: contents;
+}
+
+.page-canvas-help-row kbd {
+  justify-self: start;
+  /* A long action ("Zoom to selection") wraps to two lines, and a grid item
+     stretches to its row by default — which left the keycap a tall empty
+     box next to the wrapped text. Pin it to the first line. */
+  align-self: start;
+  padding: 1px 5px;
+  border: 1px solid var(--mem-border);
+  border-radius: 4px;
+  color: var(--mem-text-secondary);
+  font-family: var(--mem-font-mono);
+  font-size: 10px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.page-canvas-help-row span {
+  color: var(--mem-text-tertiary);
+  font-family: var(--mem-font-body);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+/* React Flow's stylesheet ships a light-only control bar — on the dark canvas
+   it renders as a white block with near-invisible icons. Restyle it from the
+   app's own tokens so it follows whichever theme is active instead of
+   fighting it. Scoped to .page-canvas-surface so Atlas keeps its own look. */
+.page-canvas-surface .react-flow__controls {
+  border: 1px solid var(--mem-border);
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: none;
+  background-color: var(--mem-surface);
+}
+
+.page-canvas-surface .react-flow__controls-button {
+  width: 26px;
+  height: 26px;
+  padding: 6px;
+  border: none;
+  border-bottom: 1px solid var(--mem-border);
+  background-color: var(--mem-surface);
+  color: var(--mem-text-secondary);
+}
+
+.page-canvas-surface .react-flow__controls-button:last-child {
+  border-bottom: none;
+}
+
+.page-canvas-surface .react-flow__controls-button:hover {
+  background-color: var(--mem-hover);
+  color: var(--mem-text);
+}
+
+.page-canvas-surface .react-flow__controls-button:focus-visible {
+  outline: 2px solid var(--mem-accent-page, currentColor);
+  outline-offset: -2px;
+}
+
+/* The default rule is `fill: #fff` on the glyph, which is why the icons
+   vanish once the button background follows the theme. */
+.page-canvas-surface .react-flow__controls-button svg {
+  max-width: 12px;
+  max-height: 12px;
+  fill: currentColor;
+}
+
+/* Waiting, empty, and failed all happen inside the frame the map would fill, so
+   the page keeps its shape and the trouble reads as the canvas's rather than the
+   whole screen's. Text stays ranged left inside the centered block: a centered
+   paragraph is harder to read and this one has something to say. */
+.page-canvas-surface.is-message {
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.page-canvas-message {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: 46ch;
+}
+
+.page-canvas-message-title {
+  margin: 0;
+  color: var(--mem-text);
+  font-family: var(--mem-font-heading);
+  font-size: 16px;
+}
+
+.page-canvas-message-action {
+  padding: 5px 12px;
+  border: 1px solid var(--mem-border);
+  border-radius: 7px;
+  background-color: var(--mem-surface);
+  color: var(--mem-text-secondary);
+  font-family: var(--mem-font-body);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.page-canvas-message-action:hover:not(:disabled) {
+  background-color: var(--mem-hover);
+  color: var(--mem-text);
+}
+
+.page-canvas-message-action:focus-visible {
+  outline: 2px solid var(--mem-accent-page);
+  outline-offset: 1px;
+}
+
+.page-canvas-message-action:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.page-canvas-message-body {
+  margin: 0;
+  max-width: 46ch;
+  color: var(--mem-text-tertiary);
+  font-family: var(--mem-font-body);
+  font-size: 13px;
+  line-height: 1.6;
 }

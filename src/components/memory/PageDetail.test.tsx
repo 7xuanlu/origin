@@ -237,7 +237,9 @@ describe("PageDetail", () => {
     expect(within(menu).getByRole("menuitem", { name: "Copy as context" })).toBeInTheDocument();
     expect(within(menu).getByRole("menuitem", { name: "Delete page" })).toBeInTheDocument();
 
-    expect(within(menu).getByRole("menuitem", { name: "Re-distill page" })).toHaveFocus();
+    // Opening the menu focuses its first item, which is Canvas: the menu
+    // mirrors the icon row it stands in for, and Canvas leads there too.
+    expect(within(menu).getByRole("menuitem", { name: "Canvas" })).toHaveFocus();
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("menu", { name: "Page actions" })).toBeNull();
     expect(trigger).toHaveFocus();
