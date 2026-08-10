@@ -520,6 +520,22 @@ export const HANDLERS: Record<string, (a: any) => Promise<unknown>> = {
   delete_page_map_node: (a) =>
     http("DELETE", `/api/pages/${enc(a.pageId)}/map/nodes/${enc(a.nodeId)}`, a.body),
   put_page_map_layout: (a) => put(`/api/pages/${enc(a.pageId)}/map/layout`, a.body),
+
+  // Communities (M6 cartography) — mirrors WenlanClient::list_communities /
+  // list_community_members in app/src/api.rs.
+  list_communities: (a) =>
+    get(`/api/communities${qs({ space: a.space, cursor: a.cursor, limit: a.limit })}`),
+  list_community_members: (a) => {
+    const cursor = a.cursor as { space: string; node_id: string } | null | undefined;
+    return get(
+      `/api/communities/members${qs({
+        space: a.space,
+        cursor_space: cursor?.space,
+        cursor_node_id: cursor?.node_id,
+        limit: a.limit,
+      })}`,
+    );
+  },
   get_page_revisions: (a) => get(`/api/pages/${enc(a.pageId)}/revisions`),
   redistill_page: (a) => post(`/api/distill/${enc(a.pageId)}`, {}),
   update_page: async (a) => {

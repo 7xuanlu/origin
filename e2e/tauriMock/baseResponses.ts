@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { UnknownTauriCommandError } from "./errors";
 
+// Mirrors `COMMUNITY_READ_SCHEMA_VERSION` in src/lib/tauri.ts; kept as a
+// literal here for the same reason runtime.ts keeps PAGE_EDIT_DAEMON_FLOOR —
+// the mock must not import back through the review invoke alias.
+const COMMUNITY_READ_SCHEMA_VERSION = "community-read-v1";
+
 type BaseResponseContext = {
   readonly activityRows: readonly Record<string, unknown>[];
   readonly memoryCount: number;
@@ -28,6 +33,8 @@ export function baseResponse(command: string, args: unknown, context: BaseRespon
     case "list_all_tags": return { tags: [], document_tags: {}, categories: [], document_categories: {} };
     case "get_page_links": return { outbound: [], inbound: [] };
     case "get_page_sources": case "list_registered_sources": return [];
+    case "list_communities": return { schema_version: COMMUNITY_READ_SCHEMA_VERSION, communities: [], next_cursor: null };
+    case "list_community_members": return { schema_version: COMMUNITY_READ_SCHEMA_VERSION, members: [], next_cursor: null };
     case "get_page_revisions": return { page_id: optionalString(args, "pageId") ?? "", current_version: 1, user_edited: false, entries: [] };
     default: throw new UnknownTauriCommandError(command);
   }

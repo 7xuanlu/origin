@@ -2613,3 +2613,84 @@ export async function putPageMapLayout(
 ): Promise<PageMap> {
   return invoke("put_page_map_layout", { pageId, body });
 }
+
+// ── Communities (M6 cartography) ────────────────────────────────────────
+// Wire shapes hand-mirrored from `crates/wenlan-types/src/communities.rs`
+// (`community-read-v1`): the community read routes are merged to the daemon
+// but the pinned wenlan-types release predates the crate module — same
+// situation as the page-map types above.
+
+export const COMMUNITY_READ_SCHEMA_VERSION = "community-read-v1";
+
+export interface CommunitySummary {
+  community_id: string;
+  space: string;
+  display_name: string | null;
+  member_count: number;
+  published_generation: number;
+  algo_version: string;
+  projection_version: string;
+}
+
+export interface CommunityListResponse {
+  schema_version: string;
+  communities: CommunitySummary[];
+  next_cursor: string | null;
+}
+
+export interface CommunityMember {
+  space: string;
+  node_id: string;
+  node_kind: string;
+  community_id: string;
+  published_generation: number;
+  attachment: string;
+}
+
+export interface CommunityMemberCursor {
+  space: string;
+  node_id: string;
+}
+
+export interface CommunityMembersResponse {
+  schema_version: string;
+  members: CommunityMember[];
+  next_cursor: CommunityMemberCursor | null;
+}
+
+export interface CommunityApiError {
+  status: number;
+  message: string;
+}
+
+/** Decodes the `{"status":N,"error":"..."}` payload community commands
+ *  reject with (same envelope as `asPageMapApiError`). Returns null for
+ *  transport/parse failures, which callers treat as a generic error. */
+export function asCommunityApiError(e: unknown): CommunityApiError | null {
+  if (typeof e !== "string") return null;
+  try {
+    const parsed = JSON.parse(e);
+    if (parsed && typeof parsed.status === "number") {
+      return { status: parsed.status, message: String(parsed.error ?? "") };
+    }
+  } catch {
+    // not JSON — transport/parse failure, treat as a generic error
+  }
+  return null;
+}
+
+export async function listCommunities(
+  space: string,
+  cursor?: string | null,
+  limit?: number,
+): Promise<CommunityListResponse> {
+  return invoke("list_communities", { space, cursor: cursor ?? null, limit: limit ?? null });
+}
+
+export async function listCommunityMembers(
+  space: string,
+  cursor?: CommunityMemberCursor | null,
+  limit?: number,
+): Promise<CommunityMembersResponse> {
+  return invoke("list_community_members", { space, cursor: cursor ?? null, limit: limit ?? null });
+}

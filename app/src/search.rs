@@ -3910,6 +3910,34 @@ pub async fn put_page_map_layout(
     client.put_page_map_layout(&page_id, body).await
 }
 
+// ── Communities (M6 cartography) ────────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_communities(
+    state: tauri::State<'_, State>,
+    space: String,
+    cursor: Option<String>,
+    limit: Option<usize>,
+) -> Result<crate::api::CommunityListResponse, String> {
+    let client = { state.read().await.client.clone() };
+    client
+        .list_communities(&space, cursor.as_deref(), limit)
+        .await
+}
+
+#[tauri::command]
+pub async fn list_community_members(
+    state: tauri::State<'_, State>,
+    space: String,
+    cursor: Option<crate::api::CommunityMemberCursor>,
+    limit: Option<usize>,
+) -> Result<crate::api::CommunityMembersResponse, String> {
+    let client = { state.read().await.client.clone() };
+    client
+        .list_community_members(&space, cursor.as_ref(), limit)
+        .await
+}
+
 #[tauri::command]
 pub async fn export_pages_to_obsidian(
     state: tauri::State<'_, State>,

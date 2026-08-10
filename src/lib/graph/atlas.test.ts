@@ -47,7 +47,7 @@ function node(overrides: Partial<GraphNode> = {}): GraphNode {
     // and ?? would silently promote it to confirmed.
     confirmed: "confirmed" in overrides ? (overrides.confirmed as boolean | null) : true,
     degree: overrides.degree ?? 0,
-    communityId: overrides.communityId ?? null,
+    space: "space" in overrides ? (overrides.space as string | null) : null,
     createdAt: overrides.createdAt ?? 100,
     updatedAt: overrides.updatedAt ?? 200,
   };
@@ -162,13 +162,13 @@ describe("buildAtlasGraph", () => {
         edge({ id: "bridge", source: "a1", target: "b1" }),
       ],
     );
-    const communities = new Map<string, number>([
-      ["a1", 0],
-      ["a2", 0],
-      ["a3", 0],
-      ["b1", 1],
-      ["b2", 1],
-      ["b3", 1],
+    const communities = new Map<string, string>([
+      ["a1", "0"],
+      ["a2", "0"],
+      ["a3", "0"],
+      ["b1", "1"],
+      ["b2", "1"],
+      ["b3", "1"],
     ]);
     const graph = buildAtlasGraph(model, PALETTE, communities);
     expect(graph.getEdgeAttribute("bridge", "color")).toBe(PALETTE.bridge);

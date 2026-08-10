@@ -35,7 +35,7 @@ function nodeSizeFor(confirmed: boolean | null, degree: number): number {
 export function buildAtlasGraph(
   model: GraphModel,
   palette: GraphPalette,
-  communities?: Map<string, number>,
+  communities?: Map<string, string>,
 ): Graph {
   const graph = new Graph({ multi: true });
   // ponytail: the old graph's confirmed-glow halo (r+3 disc at 0.1 alpha) is

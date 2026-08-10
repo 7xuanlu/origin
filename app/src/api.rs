@@ -231,6 +231,86 @@ struct OnDeviceModelRequest {
     model_id: String,
 }
 
+// ── Communities (M6 cartography) ────────────────────────────────────────
+// Wire shapes hand-mirrored from `crates/wenlan-types/src/communities.rs`
+// (`community-read-v1`). This section deliberately TYPES the response, unlike
+// the page-map section below, which forwards `serde_json::Value` untouched:
+// the community read is classified here in Rust-adjacent code and by
+// src/lib/graph/community.ts, and a field-level mismatch has to fail where a
+// test can see it.
+//
+// The types are hand-mirrored rather than taken from `wenlan_types` (which
+// the app now depends on directly, so the module IS reachable) because
+// `CommunityReadScope` is an internally tagged enum: a `kind` the app has not
+// been taught would fail the WHOLE response to deserialize, and the response
+// is a read the UI must degrade on rather than lose. `kind: String` here
+// accepts a future variant and lets the frontend decide. Everything else is
+// read-tolerant for the same reason: no `deny_unknown_fields`, so additions
+// are ignored rather than rejected. `scope` is carried (not ignored) — these
+// structs are re-serialized verbatim for the frontend by the Tauri commands
+// below, so a field this struct doesn't declare doesn't just go unread here,
+// it's dropped from what the frontend ever sees.
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommunityScope {
+    pub kind: String,
+    /// Present only on the `space` variant. The daemon's `CommunityReadScope`
+    /// is an internally tagged enum, so `global` and `uncategorized` serialize
+    /// as `{"kind":"global"}` with no `name` at all — a required String here
+    /// would fail the whole read for those scopes, and every space is then
+    /// stuck reporting `partial-error`. A Space is resolved as
+    /// `uncategorized` whenever an entity carries that literal as its space or
+    /// domain and no Space by that name is registered, which is exactly how
+    /// the Atlas enumerates spaces, so this is reachable and not theoretical.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommunitySummary {
+    pub community_id: String,
+    pub space: String,
+    pub display_name: Option<String>,
+    pub member_count: u64,
+    pub published_generation: i64,
+    pub algo_version: String,
+    pub projection_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommunityListResponse {
+    pub schema_version: String,
+    #[serde(default)]
+    pub scope: Option<CommunityScope>,
+    pub communities: Vec<CommunitySummary>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityMember {
+    pub space: String,
+    pub node_id: String,
+    pub node_kind: String,
+    pub community_id: String,
+    pub published_generation: i64,
+    pub attachment: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityMemberCursor {
+    pub space: String,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommunityMembersResponse {
+    pub schema_version: String,
+    #[serde(default)]
+    pub scope: Option<CommunityScope>,
+    pub members: Vec<CommunityMember>,
+    pub next_cursor: Option<CommunityMemberCursor>,
+}
+
 impl Default for WenlanClient {
     fn default() -> Self {
         Self::new()
@@ -767,6 +847,30 @@ impl WenlanClient {
             .map_err(|e| format!("Parse {}: {}", path, e))
     }
 
+    /// Like `get_json`, but on non-2xx returns `Err(json)` where json is
+    /// `{"status":<u16>,"error":"<body text>"}` (same envelope as
+    /// `page_map_call`) instead of a formatted string. The community
+    /// readiness engine needs the raw status to distinguish an old daemon
+    /// (404/405 — route doesn't exist yet) from any other failure.
+    async fn get_json_with_status<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+        let resp = self
+            .client
+            .get(self.url(path))
+            .send()
+            .await
+            .map_err(|e| format!("HTTP GET {}: {}", path, e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(
+                serde_json::json!({ "status": status.as_u16(), "error": text }).to_string(),
+            );
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("Parse {}: {}", path, e))
+    }
+
     pub async fn get_page_map(&self, page_id: &str) -> Result<serde_json::Value, String> {
         let path = format!("/api/pages/{}/map", page_id);
         self.page_map_call(reqwest::Method::GET, &path, None).await
@@ -818,6 +922,50 @@ impl WenlanClient {
         let path = format!("/api/pages/{}/map/layout", page_id);
         self.page_map_call(reqwest::Method::PUT, &path, Some(body))
             .await
+    }
+
+    // ── Communities (M6 cartography) ────────────────────────────────────
+
+    pub async fn list_communities(
+        &self,
+        space: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<CommunityListResponse, String> {
+        let mut path = format!(
+            "/api/communities?space={}",
+            percent_encode_path_segment(space)
+        );
+        if let Some(cursor) = cursor {
+            path.push_str(&format!("&cursor={}", percent_encode_path_segment(cursor)));
+        }
+        if let Some(limit) = limit {
+            path.push_str(&format!("&limit={}", limit));
+        }
+        self.get_json_with_status(&path).await
+    }
+
+    pub async fn list_community_members(
+        &self,
+        space: &str,
+        cursor: Option<&CommunityMemberCursor>,
+        limit: Option<usize>,
+    ) -> Result<CommunityMembersResponse, String> {
+        let mut path = format!(
+            "/api/communities/members?space={}",
+            percent_encode_path_segment(space)
+        );
+        if let Some(cursor) = cursor {
+            path.push_str(&format!(
+                "&cursor_space={}&cursor_node_id={}",
+                percent_encode_path_segment(&cursor.space),
+                percent_encode_path_segment(&cursor.node_id)
+            ));
+        }
+        if let Some(limit) = limit {
+            path.push_str(&format!("&limit={}", limit));
+        }
+        self.get_json_with_status(&path).await
     }
 
     pub async fn test_llm(
@@ -2227,5 +2375,182 @@ mod tests {
             page.entries[0].incoming_source_ids.as_ref().unwrap(),
             &vec!["mem-1".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn list_communities_builds_scoped_query_and_parses_the_response() {
+        let (base_url, request) = serve_json_once(
+            r#"{"schema_version":"community-read-v1","scope":{"kind":"space","name":"Work"},"communities":[{"community_id":"c1","space":"Work","display_name":"Core","member_count":5,"published_generation":3,"algo_version":"v1","projection_version":"v1"}],"next_cursor":"c1"}"#,
+        )
+        .await;
+        let client = WenlanClient {
+            client: reqwest::Client::new(),
+            base_url,
+        };
+
+        let response = client
+            .list_communities("Work", None, None)
+            .await
+            .expect("list_communities succeeds");
+
+        assert_eq!(response.schema_version, "community-read-v1");
+        assert_eq!(response.communities.len(), 1);
+        assert_eq!(response.communities[0].community_id, "c1");
+        assert_eq!(response.communities[0].published_generation, 3);
+        assert_eq!(response.next_cursor.as_deref(), Some("c1"));
+        // The daemon's `scope` must survive the round trip — the Tauri
+        // command re-serializes this struct verbatim for the frontend, so a
+        // field the struct doesn't carry is silently dropped, not merely
+        // unread.
+        assert_eq!(
+            response.scope,
+            Some(CommunityScope {
+                kind: "space".to_string(),
+                name: Some("Work".to_string()),
+            })
+        );
+        let request = request.await.unwrap();
+        assert_eq!(
+            request.lines().next().unwrap_or_default(),
+            "GET /api/communities?space=Work HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_communities_parses_the_nameless_scopes() {
+        // `CommunityReadScope` is internally tagged: only the `space` variant
+        // carries a name. A required `name` here failed the entire read for a
+        // global or uncategorized scope, which surfaced as a permanent
+        // `partial-error` for that space rather than as anything diagnosable.
+        const BODIES: [(&str, &str); 2] = [
+            (
+                "global",
+                r#"{"schema_version":"community-read-v1","scope":{"kind":"global"},"communities":[],"next_cursor":null}"#,
+            ),
+            (
+                "uncategorized",
+                r#"{"schema_version":"community-read-v1","scope":{"kind":"uncategorized"},"communities":[],"next_cursor":null}"#,
+            ),
+        ];
+
+        for (kind, body) in BODIES {
+            let (base_url, _request) = serve_json_once(body).await;
+            let client = WenlanClient {
+                client: reqwest::Client::new(),
+                base_url,
+            };
+
+            let response = client
+                .list_communities("uncategorized", None, None)
+                .await
+                .unwrap_or_else(|e| panic!("{kind} scope parses: {e}"));
+
+            assert_eq!(
+                response.scope,
+                Some(CommunityScope {
+                    kind: kind.to_string(),
+                    name: None,
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_community_members_tolerates_a_response_with_no_scope_field() {
+        // Read-tolerant: an older daemon (or a members route that never
+        // added scope) omitting the field entirely must still parse.
+        let (base_url, _request) = serve_json_once(
+            r#"{"schema_version":"community-read-v1","members":[],"next_cursor":null}"#,
+        )
+        .await;
+        let client = WenlanClient {
+            client: reqwest::Client::new(),
+            base_url,
+        };
+
+        let response = client
+            .list_community_members("Work", None, None)
+            .await
+            .expect("list_community_members succeeds");
+
+        assert_eq!(response.scope, None);
+    }
+
+    #[tokio::test]
+    async fn list_communities_percent_encodes_space_and_cursor_and_appends_limit() {
+        let (base_url, request) = serve_json_once(
+            r#"{"schema_version":"community-read-v1","communities":[],"next_cursor":null}"#,
+        )
+        .await;
+        let client = WenlanClient {
+            client: reqwest::Client::new(),
+            base_url,
+        };
+
+        client
+            .list_communities("Work/Clients", Some("cursor?"), Some(50))
+            .await
+            .expect("list_communities succeeds");
+
+        let request = request.await.unwrap();
+        assert_eq!(
+            request.lines().next().unwrap_or_default(),
+            "GET /api/communities?space=Work%2FClients&cursor=cursor%3F&limit=50 HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_community_members_builds_scoped_query_with_cursor_and_parses_the_response() {
+        let (base_url, request) = serve_json_once(
+            r#"{"schema_version":"community-read-v1","members":[{"space":"Work","node_id":"e1","node_kind":"entity","community_id":"c1","published_generation":3,"attachment":"core"}],"next_cursor":{"space":"Work","node_id":"e2"}}"#,
+        )
+        .await;
+        let client = WenlanClient {
+            client: reqwest::Client::new(),
+            base_url,
+        };
+
+        let cursor = CommunityMemberCursor {
+            space: "Work".to_string(),
+            node_id: "e0".to_string(),
+        };
+        let response = client
+            .list_community_members("Work", Some(&cursor), Some(25))
+            .await
+            .expect("list_community_members succeeds");
+
+        assert_eq!(response.members.len(), 1);
+        assert_eq!(response.members[0].node_id, "e1");
+        assert_eq!(response.members[0].published_generation, 3);
+        assert_eq!(
+            response.next_cursor,
+            Some(CommunityMemberCursor {
+                space: "Work".to_string(),
+                node_id: "e2".to_string(),
+            })
+        );
+        let request = request.await.unwrap();
+        assert_eq!(
+            request.lines().next().unwrap_or_default(),
+            "GET /api/communities/members?space=Work&cursor_space=Work&cursor_node_id=e0&limit=25 HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_communities_surfaces_status_for_an_old_daemon_missing_the_route() {
+        let (base_url, _request) =
+            serve_response_once("404 Not Found", r#"{"error":"no route"}"#).await;
+        let client = WenlanClient {
+            client: reqwest::Client::new(),
+            base_url,
+        };
+
+        let err = client
+            .list_communities("Work", None, None)
+            .await
+            .expect_err("404 surfaces as an error");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&err).expect("status envelope is JSON");
+        assert_eq!(parsed["status"], 404);
     }
 }
