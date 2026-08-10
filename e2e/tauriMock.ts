@@ -4,7 +4,14 @@ import { APP_LOCALE_STORAGE_KEY, type AppLocale } from "../src/i18n/locales";
 import type { MemoryItem } from "../src/lib/tauri";
 import { createSpacesNavigationFixture } from "./fixtures/spacesNavigation";
 import { TauriMockRuntime } from "./tauriMock/runtime";
-import type { BrowserErrorCapture, InstallTauriMockOptions, MockCommandCall } from "./tauriMock/types";
+import type {
+  BrowserErrorCapture,
+  InstallTauriMockOptions,
+  MockCommandCall,
+  TauriMockPageScenario,
+} from "./tauriMock/types";
+
+export type { TauriMockPageScenario } from "./tauriMock/types";
 
 export type TauriMockController = {
   readonly calls: () => readonly MockCommandCall[];
@@ -26,7 +33,12 @@ export async function installTauriMock(
 ): Promise<TauriMockController> {
   const defaults = createSpacesNavigationFixture();
   const fixture = { ...defaults, ...(options.fixture ?? {}), memories: options.memories ?? options.fixture?.memories ?? defaults.memories };
-  const runtime = new TauriMockRuntime(fixture, options.failures, options.rawActions);
+  const runtime = new TauriMockRuntime(
+    fixture,
+    options.failures,
+    options.rawActions,
+    options.pageScenario,
+  );
   await page.exposeBinding("__wenlanTauriInvoke", (_source, command: string, args?: unknown) => runtime.invoke(command, args));
   await page.addInitScript(({ locale, localeStorageKey, storageEntries }) => {
     window.localStorage.clear();

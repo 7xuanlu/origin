@@ -980,11 +980,16 @@ describe("Main search", () => {
     renderMain();
 
     const searchAction = screen.getByRole("button", { name: "Search" });
+    const searchInput = screen.getByPlaceholderText(
+      "Search pages, memories, sources...",
+    );
     expect(searchAction).toHaveAttribute("aria-expanded", "false");
     await user.click(searchAction);
 
     expect(searchAction).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByPlaceholderText("Search pages, memories, sources...")).toHaveFocus();
+    expect(searchInput).toHaveFocus();
+    fireEvent.keyDown(searchInput, { key: "Escape" });
+    expect(searchAction).toHaveAttribute("aria-expanded", "false");
   });
 
   it("opens URL-backed source search results through the file bridge", async () => {

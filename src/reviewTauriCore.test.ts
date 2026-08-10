@@ -25,6 +25,18 @@ describe("Review fixture IPC", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("exposes deterministic Page editor prerequisites", async () => {
+    await expect(invoke("daemon_version")).resolves.toBe("0.14.1");
+    await expect(invoke("get_system_info")).resolves.toMatchObject({
+      os: "macos",
+    });
+    await expect(invoke("record_page_editor_diagnostic", {
+      event: "daemon_floor_blocked",
+      reportedVersion: null,
+      requiredFloor: "0.14.1",
+    })).resolves.toBeNull();
+  });
+
   it("exposes deterministic Page candidate and cleanup review states", async () => {
     const discovery = await invoke("distill_review") as {
       pending: Array<{ existing_page_id?: string | null; source_ids: string[] }>;

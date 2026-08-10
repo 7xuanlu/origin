@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import PageDetail from "./PageDetail";
+import {
+  editorViewFromTextbox,
+  installCodeMirrorDomPolyfills,
+  replaceDocument,
+} from "./editor/editorTestUtils";
 
 const tauriMocks = vi.hoisted(() => ({
   getPage: vi.fn(),
@@ -15,6 +20,10 @@ const tauriMocks = vi.hoisted(() => ({
   listPages: vi.fn(),
   redistillPage: vi.fn(),
   updatePage: vi.fn(),
+  getDaemonVersion: vi.fn(),
+  getSystemInfo: vi.fn(),
+  daemonMeetsFloor: vi.fn(),
+  recordPageEditorDiagnostic: vi.fn(),
   deletePage: vi.fn(),
   clipboardWrite: vi.fn(),
   exportPageToObsidian: vi.fn(),
@@ -50,6 +59,10 @@ function renderWithQuery(ui: React.ReactElement, client = new QueryClient({ defa
   };
 }
 
+beforeAll(() => {
+  installCodeMirrorDomPolyfills();
+});
+
 describe("PageDetail page links", () => {
   const defaultProps = {
     pageId: "page-1",
@@ -74,7 +87,11 @@ describe("PageDetail page links", () => {
     });
     tauriMocks.listPages.mockResolvedValue([]);
     tauriMocks.redistillPage.mockResolvedValue({ status: "ok", updated: true });
-    tauriMocks.updatePage.mockResolvedValue(undefined);
+    tauriMocks.updatePage.mockResolvedValue({ outcome: "saved" });
+    tauriMocks.getDaemonVersion.mockResolvedValue("0.14.1");
+    tauriMocks.getSystemInfo.mockResolvedValue({ os: "macos" });
+    tauriMocks.daemonMeetsFloor.mockReturnValue(true);
+    tauriMocks.recordPageEditorDiagnostic.mockResolvedValue(undefined);
     tauriMocks.deletePage.mockResolvedValue(undefined);
     tauriMocks.clipboardWrite.mockResolvedValue(undefined);
     tauriMocks.exportPageToObsidian.mockResolvedValue({ path: "/tmp/page.md" });
@@ -118,16 +135,25 @@ describe("PageDetail page links", () => {
 
     expect(await screen.findByText("Link Test Page")).toBeInTheDocument();
     await user.click(screen.getByTitle("Edit page"));
-    const editor = screen.getByRole("textbox");
-    fireEvent.change(editor, {
-      target: { value: "Intro sentence.\n\nThis page now links [[New Link]]." },
-    });
+    const editor = await screen.findByRole("textbox", { name: "Page editor" });
+    await waitFor(() => expect(editor).toHaveFocus());
+    act(() =>
+      replaceDocument(
+        editorViewFromTextbox(editor),
+        "Intro sentence.\n\nThis page now links [[New Link]].",
+      ),
+    );
     await user.click(screen.getByRole("button", { name: /Save/ }));
 
     await waitFor(() => {
       expect(tauriMocks.updatePage).toHaveBeenCalledWith(
-        "page-1",
-        "Intro sentence.\n\nThis page now links [[New Link]].",
+        expect.objectContaining({
+          id: "page-1",
+          content: "Intro sentence.\n\nThis page now links [[New Link]].",
+          expectedVersion: 1,
+          callerId: "wenlan-app",
+          operationId: expect.any(String),
+        }),
       );
     });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["page-links", "page-1"] });

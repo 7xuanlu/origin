@@ -2372,6 +2372,270 @@ html[data-theme="light"] {
   padding: 0 13px;
 }
 
+.page-editor-notice {
+  border: 1px solid var(--mem-border);
+  border-radius: 8px;
+  background: var(--mem-detail-surface-raised);
+  color: var(--mem-text-secondary);
+  font-family: var(--mem-font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 11px 13px;
+}
+
+.page-editor-stack {
+  width: 100%;
+  max-width: 730px;
+  min-width: 0;
+}
+
+.page-editor-description {
+  margin: 0;
+  color: var(--mem-text-tertiary);
+  font-family: var(--mem-font-body);
+  font-size: var(--mem-text-sm);
+  line-height: 1.5;
+}
+
+.page-editor-notice strong,
+.page-editor-notice summary {
+  color: var(--mem-text);
+}
+
+.page-editor-notice strong {
+  display: block;
+  font-weight: 600;
+}
+
+.page-editor-notice summary {
+  cursor: pointer;
+}
+
+.page-editor-notice pre {
+  max-height: 180px;
+  overflow: auto;
+  margin: 8px 0;
+  border: 1px solid var(--mem-border);
+  border-radius: 6px;
+  background: var(--mem-bg);
+  color: var(--mem-text-secondary);
+  font-family: var(--mem-font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 9px 10px;
+  white-space: pre-wrap;
+}
+
+.page-editor-action {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--mem-border);
+  border-radius: 6px;
+  background: var(--mem-surface);
+  color: var(--mem-text-secondary);
+  cursor: pointer;
+  font-family: var(--mem-font-body);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  padding: 7px 10px;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+}
+
+.page-editor-action:hover:not(:disabled) {
+  border-color: var(--mem-accent-indigo-border);
+  background: var(--mem-hover);
+  color: var(--mem-text);
+}
+
+.page-editor-action:focus-visible {
+  outline: 2px solid var(--mem-accent-page);
+  outline-offset: 2px;
+}
+
+.page-editor-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.page-editor-native-surface:focus {
+  border-color: var(--mem-accent-page) !important;
+}
+
+.page-editor-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  box-sizing: border-box;
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: var(--mem-space-2);
+  overflow: hidden;
+  border: 1px solid var(--mem-border);
+  border-radius: var(--mem-radius-md);
+  background: var(--mem-detail-surface-raised);
+  color: var(--mem-text-secondary);
+  font-family: var(--mem-font-body);
+  padding: var(--mem-space-2);
+}
+
+.page-editor-persistence-actions,
+.page-editor-format-group,
+.page-editor-format-row {
+  display: flex;
+  align-items: center;
+}
+
+.page-editor-persistence-actions {
+  flex: 0 0 auto;
+  gap: var(--mem-space-1);
+  margin-left: auto;
+  border-left: 1px solid var(--mem-detail-divider);
+  padding-left: var(--mem-space-2);
+}
+
+.page-editor-persistence-actions button,
+.page-editor-format-row button,
+.page-editor-format-row select {
+  min-height: 32px;
+  border: 1px solid var(--mem-border);
+  border-radius: var(--mem-radius-sm);
+  background: var(--mem-surface);
+  color: var(--mem-text-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--mem-text-sm);
+  font-weight: 500;
+  line-height: 1;
+  padding: 0 9px;
+  white-space: nowrap;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+}
+
+.page-editor-format-row .page-editor-format-action {
+  display: inline-flex;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.page-editor-format-action svg {
+  display: block;
+  flex: 0 0 auto;
+}
+
+.page-editor-persistence-actions button:first-child {
+  border-color: var(--mem-accent-indigo-border);
+  background: var(--mem-indigo-bg);
+  color: var(--mem-accent-page);
+}
+
+.page-editor-persistence-actions button:hover:not(:disabled),
+.page-editor-format-row button:hover:not(:disabled),
+.page-editor-format-row select:hover:not(:disabled) {
+  border-color: var(--mem-accent-indigo-border);
+  background: var(--mem-hover);
+  color: var(--mem-text);
+}
+
+.page-editor-persistence-actions button:focus-visible,
+.page-editor-format-row button:focus-visible,
+.page-editor-format-row select:focus-visible {
+  outline: 2px solid var(--mem-accent-page);
+  outline-offset: 2px;
+}
+
+.page-editor-persistence-actions button:disabled,
+.page-editor-format-row button:disabled,
+.page-editor-format-row select:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.page-editor-persistence-actions button[data-composition-blocked="true"]:disabled,
+.page-editor-format-row button[data-composition-blocked="true"]:disabled,
+.page-editor-format-row select[data-composition-blocked="true"]:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.page-editor-format-row {
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 0;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  padding: 0;
+  scrollbar-color: var(--mem-accent-indigo-border) transparent;
+  scrollbar-width: thin;
+  transition: box-shadow 120ms ease;
+}
+
+.page-editor-format-row[data-overflow-cue="end"] {
+  box-shadow:
+    inset -3px 0 0 var(--mem-accent-indigo-border),
+    inset -18px 0 18px -18px var(--mem-accent-page);
+}
+
+.page-editor-format-row[data-overflow-cue="start"] {
+  box-shadow:
+    inset 3px 0 0 var(--mem-accent-indigo-border),
+    inset 18px 0 18px -18px var(--mem-accent-page);
+}
+
+.page-editor-format-row[data-overflow-cue="both"] {
+  box-shadow:
+    inset 3px 0 0 var(--mem-accent-indigo-border),
+    inset -3px 0 0 var(--mem-accent-indigo-border),
+    inset 18px 0 18px -18px var(--mem-accent-page),
+    inset -18px 0 18px -18px var(--mem-accent-page);
+}
+
+.page-editor-format-group {
+  flex: 0 0 auto;
+  gap: var(--mem-space-1);
+}
+
+.page-editor-format-group + .page-editor-format-group {
+  margin-left: var(--mem-space-2);
+  border-left: 1px solid var(--mem-detail-divider);
+  padding-left: var(--mem-space-2);
+}
+
+.page-editor-format-row select {
+  min-width: 112px;
+}
+
+@media (max-width: 480px) {
+  .page-editor-persistence-actions {
+    min-height: 32px;
+  }
+
+  .page-editor-persistence-actions button,
+  .page-editor-format-row button,
+  .page-editor-format-row select {
+    min-height: 32px;
+  }
+
+  .page-editor-format-row {
+    flex-basis: 0;
+    max-width: 100%;
+  }
+}
+
 .page-detail-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 300px;

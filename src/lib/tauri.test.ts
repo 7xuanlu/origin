@@ -57,6 +57,28 @@ describe('getPipelineStatus', () => {
   });
 });
 
+describe('guarded quit bridge', () => {
+  it('acknowledges the exact native quit delivery', async () => {
+    mockInvoke.mockResolvedValue(true);
+
+    await expect(tauri.acknowledgeGuardedQuitRequest(7, 3)).resolves.toBe(true);
+    expect(mockInvoke).toHaveBeenCalledWith('acknowledge_guarded_quit_request', {
+      requestId: 7,
+      deliveryId: 3,
+    });
+  });
+
+  it('cancels only the current native quit request', async () => {
+    mockInvoke.mockResolvedValue(true);
+
+    await expect(tauri.cancelGuardedQuitRequest(7, 2)).resolves.toBe(true);
+    expect(mockInvoke).toHaveBeenCalledWith('cancel_guarded_quit_request', {
+      requestId: 7,
+      deliveryId: 2,
+    });
+  });
+});
+
 describe('addWatchPath', () => {
   it('calls invoke with path arg', async () => {
     await tauri.addWatchPath('/home/user/docs');
@@ -839,6 +861,58 @@ describe('page domain compatibility', () => {
   });
 });
 
+describe("updatePage", () => {
+  it("sends exact source, CAS version, caller, and operation identity", async () => {
+    const outcome: tauri.UpdatePageOutcome = { outcome: "saved" };
+    mockInvoke.mockResolvedValue(outcome);
+    const input: tauri.UpdatePageInput = {
+      id: "page-1",
+      content: "  # Exact source\r\n\r\nBody  \r\n",
+      expectedVersion: 7,
+      callerId: "wenlan-app",
+      operationId: "operation-123",
+    };
+
+    await expect(tauri.updatePage(input)).resolves.toEqual(outcome);
+    expect(mockInvoke).toHaveBeenCalledWith("update_page", input);
+  });
+
+  it("returns the typed daemon-upgrade outcome with camelCase version fields", async () => {
+    const outcome: tauri.UpdatePageOutcome = {
+      outcome: "upgrade_required",
+      reportedVersion: "0.14.0",
+      requiredFloor: "0.14.1",
+    };
+    mockInvoke.mockResolvedValue(outcome);
+
+    await expect(
+      tauri.updatePage({
+        id: "page-1",
+        content: "# Draft\n",
+        expectedVersion: 7,
+        callerId: "wenlan-app",
+        operationId: "operation-upgrade",
+      }),
+    ).resolves.toEqual(outcome);
+  });
+});
+
+describe("recordPageEditorDiagnostic", () => {
+  it("sends only the content-free daemon floor diagnostic fields", async () => {
+    await tauri.recordPageEditorDiagnostic({
+      event: "daemon_floor_blocked",
+      reportedVersion: "0.13.9",
+      requiredFloor: "0.14.0",
+    });
+
+    expect(mockInvoke).toHaveBeenCalledWith("record_page_editor_diagnostic", {
+      event: "daemon_floor_blocked",
+      reportedVersion: "0.13.9",
+      requiredFloor: "0.14.0",
+    });
+  });
+});
+
 describe('Page draft lifecycle wrappers', () => {
   const draftPage: tauri.Page = {
     id: 'draft-1',
@@ -1001,13 +1075,33 @@ describe("daemonMeetsFloor", () => {
   it("rejects the live 0.9.5 daemon (below floor)", () => {
     expect(daemonMeetsFloor("0.9.5")).toBe(false);
   });
-  it("accepts exactly the floor and above", () => {
+  it("accepts stable versions exactly at the floor and above", () => {
     expect(daemonMeetsFloor("0.10.0")).toBe(true);
     expect(daemonMeetsFloor("0.10.1")).toBe(true);
     expect(daemonMeetsFloor("0.11.0")).toBe(true);
     expect(daemonMeetsFloor("1.0.0")).toBe(true);
+    expect(daemonMeetsFloor("0.14.0+build.7", "0.14.0")).toBe(true);
   });
-  it("tolerates a pre-release suffix", () => {
-    expect(daemonMeetsFloor("0.11.0-rc.1")).toBe(true);
+  it("rejects prereleases even when their numeric core reaches the floor", () => {
+    expect(daemonMeetsFloor("0.14.0-alpha.1", "0.14.0")).toBe(false);
+    expect(daemonMeetsFloor("0.14.0-rc.1", "0.14.0")).toBe(false);
+    expect(daemonMeetsFloor("0.15.0-beta.1", "0.14.0")).toBe(false);
+  });
+  it("matches Rust by rejecting decorated or whitespace-padded SemVer", () => {
+    expect(daemonMeetsFloor("v0.14.1", "0.14.1")).toBe(false);
+    expect(daemonMeetsFloor(" 0.14.1", "0.14.1")).toBe(false);
+    expect(daemonMeetsFloor("0.14.1 ", "0.14.1")).toBe(false);
+    expect(daemonMeetsFloor("0.14.1+build.7", "0.14.1")).toBe(true);
+  });
+  it("fails closed for malformed, partial, or missing versions", () => {
+    expect(daemonMeetsFloor("", "0.14.0")).toBe(false);
+    expect(daemonMeetsFloor("not-a-version", "0.14.0")).toBe(false);
+    expect(daemonMeetsFloor("0.14", "0.14.0")).toBe(false);
+    expect(daemonMeetsFloor(null, "0.14.0")).toBe(false);
+    expect(daemonMeetsFloor(undefined, "0.14.0")).toBe(false);
+  });
+  it("preserves a generic exact floor parameter", () => {
+    expect(daemonMeetsFloor("0.12.9", "0.13.0")).toBe(false);
+    expect(daemonMeetsFloor("0.13.0", "0.13.0")).toBe(true);
   });
 });

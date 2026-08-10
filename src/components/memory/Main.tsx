@@ -100,7 +100,25 @@ export default function Main({
   const pendingDraftSearchCancelRef = useRef<(() => void) | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const sidebarToggleRef = useRef<HTMLButtonElement>(null);
-  const externalMemoryIdRef = useRef<string | null>(initialMemoryId ?? null);
+  const initialViewRequestRef = useRef({
+    observed: initialView ?? null,
+    pending: false,
+  });
+  const initialPageRequestRef = useRef<{
+    observed: string | null;
+    pending: string | null;
+  }>({ observed: initialPageId ?? null, pending: null });
+  const initialMemoryRequestRef = useRef<{
+    observed: string | null;
+    active: string | null;
+    pending: { memoryId: string | null } | null;
+  }>({
+    observed: initialMemoryId ?? null,
+    active: initialMemoryId ?? null,
+    pending: null,
+  });
+  const pageSavePendingRef = useRef(false);
+  const pageEditDirtyRef = useRef(false);
   const [view, setView] = useState<View>(
     initialMemoryId ? { kind: "memory", sourceId: initialMemoryId }
     : initialPageId ? { kind: "page", pageId: initialPageId }
@@ -112,13 +130,31 @@ export default function Main({
   const [viewHistory, setViewHistory] = useState<View[]>([]);
   const [activeTab, setActiveTab] = useState<"home" | "activity">("home");
   const [aboutOpen, setAboutOpen] = useState(false);
+  const [pageSavePending, setPageSavePending] = useState(false);
+  const [pageEditDirty, setPageEditDirty] = useState(false);
   const [recentPagesRevision, setRecentPagesRevision] = useState(0);
   const [recentSpacesRevision, setRecentSpacesRevision] = useState(0);
   const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
   const [pendingDraftSearchQuery, setPendingDraftSearchQuery] = useState<string | null>(null);
   const viewScrollDestination = scrollDestinationKey(view);
+  pageSavePendingRef.current = pageSavePending;
+  pageEditDirtyRef.current = pageEditDirty;
+
+  const canLeaveCurrentPage = () => {
+    if (pageSavePending) return false;
+    if (
+      view.kind === "page"
+      && pageEditDirty
+      && !confirm(t("pageDetail.editor.discardConfirm"))
+    ) {
+      return false;
+    }
+    if (pageEditDirty) setPageEditDirty(false);
+    return true;
+  };
 
   const prepareForQuit = useCallback(async (): Promise<boolean> => {
+    if (pageSavePendingRef.current || pageEditDirtyRef.current) return false;
     const editor = pageDraftEditorRef.current;
     if (viewRef.current.kind !== "page-draft" || !editor) return true;
     return editor.flush();
@@ -178,45 +214,97 @@ export default function Main({
     return cancel;
   };
 
-  // Respond to externally requested destinations only after the current draft is durable.
+  const afterNavigationGuards = (
+    action: (sourceView: View) => void,
+  ): (() => void) => {
+    if (!canLeaveCurrentPage()) return () => {};
+    return afterPageDraftFlush(action);
+  };
+
+  // Respond to externally requested destinations only after the current editor is safe to leave.
   useEffect(() => {
-    if (initialView === "import") {
-      return afterPageDraftFlush(() => setView({ kind: "import" }));
+    const request = initialViewRequestRef.current;
+    const next = initialView ?? null;
+    if (request.observed !== next) {
+      request.observed = next;
+      request.pending = next === "import";
     }
-  }, [initialView]);
+    if (!request.pending || pageSavePending) return;
+    request.pending = false;
+    if (view.kind === "import" || !canLeaveCurrentPage()) return;
+    return afterPageDraftFlush(() => setView({ kind: "import" }));
+  }, [initialView, pageSavePending]);
 
   useEffect(() => {
-    if (initialPageId) {
-      return afterPageDraftFlush(() => setView({ kind: "page", pageId: initialPageId }));
+    const request = initialPageRequestRef.current;
+    const next = initialPageId ?? null;
+    if (request.observed !== next) {
+      request.observed = next;
+      request.pending = next;
     }
-  }, [initialPageId]);
+    const target = request.pending;
+    if (!target || pageSavePending) return;
+    request.pending = null;
+    if (
+      (view.kind === "page" && view.pageId === target)
+      || !canLeaveCurrentPage()
+    ) {
+      return;
+    }
+    return afterPageDraftFlush(() => setView({ kind: "page", pageId: target }));
+  }, [initialPageId, pageSavePending]);
 
   useEffect(() => {
-    if (initialMemoryId) {
-      return afterPageDraftFlush(() => {
-        externalMemoryIdRef.current = initialMemoryId;
-        setViewHistory([]);
-        setView({ kind: "memory", sourceId: initialMemoryId });
-      });
-    } else if (externalMemoryIdRef.current) {
-      return afterPageDraftFlush(() => {
-        externalMemoryIdRef.current = null;
-        setViewHistory([]);
-        setView({ kind: activeTab });
-      });
+    const request = initialMemoryRequestRef.current;
+    const next = initialMemoryId ?? null;
+    if (request.observed !== next) {
+      request.observed = next;
+      request.pending = next || request.active ? { memoryId: next } : null;
     }
-  }, [initialMemoryId, activeTab]);
+    const target = request.pending;
+    if (!target || pageSavePending) return;
+    request.pending = null;
+    if (target.memoryId) {
+      if (
+        view.kind === "memory"
+        && view.sourceId === target.memoryId
+      ) {
+        request.active = target.memoryId;
+        return;
+      }
+    } else if (view.kind === activeTab) {
+      request.active = null;
+      return;
+    }
+    if (!canLeaveCurrentPage()) return;
+    return afterPageDraftFlush(() => {
+      request.active = target.memoryId;
+      setViewHistory([]);
+      setView(
+        target.memoryId
+          ? { kind: "memory", sourceId: target.memoryId }
+          : { kind: activeTab },
+      );
+    });
+  }, [initialMemoryId, activeTab, pageSavePending]);
 
   // Navigate forward — pushes current view onto history stack
   const navigateTo = (next: View) => {
-    afterPageDraftFlush((sourceView) => {
+    if (
+      view.kind === "page"
+      && next.kind === "page"
+      && view.pageId === next.pageId
+    ) {
+      return;
+    }
+    afterNavigationGuards((sourceView) => {
       setViewHistory((prev) => [...prev, sourceView]);
       setView(next);
     });
   };
 
   const navigateHome = () => {
-    afterPageDraftFlush(() => {
+    afterNavigationGuards(() => {
       setView({ kind: "home" });
       setActiveTab("home");
       setViewHistory([]);
@@ -224,21 +312,20 @@ export default function Main({
   };
 
   const navigateSpaces = (create: boolean) => {
-    afterPageDraftFlush(() => {
+    afterNavigationGuards(() => {
       setView(create ? { kind: "spaces", create: true } : { kind: "spaces" });
       setViewHistory([]);
     });
   };
 
   const navigatePages = () => {
-    afterPageDraftFlush(() => {
+    afterNavigationGuards(() => {
       setView({ kind: "pages" });
       setViewHistory([]);
     });
   };
 
-  // Navigate back — pops from history stack, falls back to activeTab
-  const navigateBack = () => {
+  const applyBackNavigation = () => {
     setViewHistory((prev) => {
       if (prev.length === 0) {
         setView({ kind: activeTab });
@@ -249,6 +336,19 @@ export default function Main({
       return prev.slice(0, -1);
     });
   };
+
+  // PageDraftEditor owns its own flush before invoking Back.
+  const navigateBack = () => {
+    if (!canLeaveCurrentPage()) return;
+    applyBackNavigation();
+  };
+
+  // PageDetail already confirms its editor Back before invoking this callback.
+  const navigateBackFromPageDetail = () => {
+    if (pageSavePending) return;
+    setPageEditDirty(false);
+    applyBackNavigation();
+  };
   const [statusMessage, _setStatusMessage] = useState<string | null>(null);
   const [sortMode, setSortMode] = useState<SortMode>("recent");
   const [stabilityFilter, setStabilityFilter] = useState<string | null>(null);
@@ -257,6 +357,7 @@ export default function Main({
   });
   const { query, setQuery, results } = useSearch();
   const handleSearchQueryChange = (nextQuery: string) => {
+    if (!query && nextQuery && !canLeaveCurrentPage()) return;
     if (!query && nextQuery && view.kind === "page-draft") {
       pendingDraftSearchCancelRef.current?.();
       setPendingDraftSearchQuery(nextQuery);
@@ -277,8 +378,8 @@ export default function Main({
   const sourceResults = results.filter((result) => searchResultTarget(result).kind === "file");
 
   useEffect(() => {
-    if (mobileSearchOpen) searchInputRef.current?.focus();
-  }, [mobileSearchOpen]);
+    if (mobileSearchOpen && !pageSavePending) searchInputRef.current?.focus();
+  }, [mobileSearchOpen, pageSavePending]);
 
   useEffect(() => {
     if (view.kind !== "page-draft") setPendingDraftSearchQuery(null);
@@ -392,19 +493,34 @@ export default function Main({
   // Cmd+K global shortcut (fired from App.tsx) — focus the header search input.
   useEffect(() => {
     const unlisten = listen("focus-search", () => {
+      if (pageSavePending) return;
       setMobileSearchOpen(true);
       searchInputRef.current?.focus();
       searchInputRef.current?.select();
     });
     return () => { unlisten.then((f) => f()); };
-  }, []);
+  }, [pageSavePending]);
 
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing) return;
+      const target = e.target;
+      const closesOpenSearch =
+        e.key === "Escape"
+        && mobileSearchOpen
+        && target === searchInputRef.current;
+      if (
+        target instanceof Element
+        && target.closest(
+          'input, textarea, select, [contenteditable]:not([contenteditable="false"])',
+        )
+        && !closesOpenSearch
+      ) {
+        return;
+      }
       if (e.key === "/" && !e.metaKey && !e.ctrlKey) {
-        const active = document.activeElement;
-        if (active?.tagName === "INPUT" || active?.tagName === "TEXTAREA") return;
+        if (pageSavePending) return;
         e.preventDefault();
         setMobileSearchOpen(true);
         searchInputRef.current?.focus();
@@ -425,7 +541,7 @@ export default function Main({
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [mobileSearchOpen, query, responsiveSidebar.open, responsiveSidebar.presentation, view]);
+  }, [mobileSearchOpen, pageEditDirty, pageSavePending, query, responsiveSidebar.open, responsiveSidebar.presentation, view]);
 
   // Close dropdowns on outside click
   const handleEntityClick = (entityId: string) => {
@@ -484,7 +600,10 @@ export default function Main({
               aria-expanded={mobileSearchOpen}
               aria-label={t("main.searchButton")}
               className="lg:hidden rounded-md p-1.5 transition-colors duration-150 hover:bg-[var(--mem-hover-strong)]"
-              onClick={() => setMobileSearchOpen((open) => !open)}
+              disabled={pageSavePending}
+              onClick={() => {
+                if (!pageSavePending) setMobileSearchOpen((open) => !open);
+              }}
               style={{ color: "var(--mem-text-secondary)" }}
               type="button"
             >
@@ -496,7 +615,7 @@ export default function Main({
               aria-current={view.kind === "activity" ? "page" : undefined}
               className="flex items-center gap-2 rounded-md px-2 py-1.5 transition-colors duration-150 hover:bg-[var(--mem-hover-strong)]"
               onClick={() => {
-                afterPageDraftFlush(() => {
+                afterNavigationGuards(() => {
                   setActiveTab("activity");
                   setView({ kind: "activity" });
                   setViewHistory([]);
@@ -547,6 +666,7 @@ export default function Main({
             <input
               ref={searchInputRef}
               data-wenlan-search-input
+              disabled={pageSavePending}
               value={displayedSearchQuery}
               onChange={(e) => handleSearchQueryChange(e.target.value)}
               placeholder={t("main.searchPlaceholder")}
@@ -596,7 +716,7 @@ export default function Main({
             currentSpaceId={view.kind === "space" ? view.spaceId : null}
             onEntityClick={handleEntityClick}
             onNavigateLog={() => {
-              afterPageDraftFlush(() => {
+              afterNavigationGuards(() => {
                 setView({ kind: "stream" });
                 setViewHistory([]);
               });
@@ -858,11 +978,13 @@ export default function Main({
           ) : view.kind === "page" ? (
             <PageDetail
               pageId={view.pageId}
-              onBack={navigateBack}
+              onBack={navigateBackFromPageDetail}
+              onEditDirtyChange={setPageEditDirty}
               onMemoryClick={(sid) => navigateTo({ kind: "memory", sourceId: sid })}
               onPageLoaded={handlePageLoaded}
               onPageClick={(id) => navigateTo({ kind: "page", pageId: id })}
               onEntityClick={handleEntityClick}
+              onSavePendingChange={setPageSavePending}
             />
           ) : view.kind === "distill-review" ? (
             <DistillReviewPanel

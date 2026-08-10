@@ -3,13 +3,18 @@
 // (proxied at /daemon → http://127.0.0.1:7878), mirroring app/src/search.rs.
 // Commands with no daemon route get app-local defaults; unknown ones warn.
 
+import { daemonMeetsFloor } from "../../src/lib/daemonVersion";
+
 type Args = Record<string, unknown> | undefined;
+const PAGE_EDIT_DAEMON_FLOOR = "0.14.1";
 
 class HttpError extends Error {
   status: number;
-  constructor(status: number, msg: string) {
+  body: string;
+  constructor(status: number, msg: string, body: string) {
     super(msg);
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -24,6 +29,7 @@ async function http(method: string, path: string, body?: unknown): Promise<any> 
     throw new HttpError(
       res.status,
       text || `${method} ${path} → ${res.status}`,
+      text,
     );
   }
   return text ? JSON.parse(text) : null;
@@ -34,6 +40,39 @@ const put = (p: string, b: unknown = {}) => http("PUT", p, b);
 const del = (p: string) => http("DELETE", p);
 
 const enc = encodeURIComponent;
+const pageUpdateErrorMessage = (
+  error: HttpError,
+  fallback: string,
+): string => {
+  try {
+    const body = JSON.parse(error.body) as { error?: unknown };
+    return typeof body.error === "string" && body.error.trim()
+      ? body.error
+      : fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+const pageUpdateFailureKind = (
+  status: number,
+):
+  | "not_found"
+  | "auth_required"
+  | "payload_too_large"
+  | "validation"
+  | "rate_limited"
+  | "server"
+  | "other" => {
+  if (status === 404) return "not_found";
+  if (status === 401 || status === 403) return "auth_required";
+  if (status === 413) return "payload_too_large";
+  if (status === 400 || status === 422) return "validation";
+  if (status === 429) return "rate_limited";
+  if (status >= 500) return "server";
+  return "other";
+};
+
 const qs = (obj: Record<string, unknown>) => {
   const parts = Object.entries(obj)
     .filter(([, v]) => v !== undefined && v !== null)
@@ -67,6 +106,15 @@ let downloadingModelId: string | null = null;
 const PREVIEW_PROBES = new Map<string, unknown>();
 let previewProbeSeq = 0;
 const PREVIEW_AUTHORED_PAGES = new Map<string, Record<string, unknown>>();
+type PreviewPageUpdateRequest = {
+  readonly id: string;
+  readonly content: string;
+  readonly expectedVersion: number;
+};
+const PREVIEW_PAGE_UPDATE_RECEIPTS = new Map<
+  string,
+  { readonly input: PreviewPageUpdateRequest; readonly outcome: { outcome: "saved" } }
+>();
 const PREVIEW_DELETED_PAGE_IDS = new Set<string>();
 const PREVIEW_SPACE_OVERRIDES = new Map<string, Record<string, unknown>>();
 const PREVIEW_REMOVED_SPACE_NAMES = new Set<string>();
@@ -256,6 +304,8 @@ function downloadComplete(): boolean {
 // Exported (not just module-local) so the parity test below can read the
 // covered-command key sets without re-parsing this file.
 export const HANDLERS: Record<string, (a: any) => Promise<unknown>> = {
+  daemon_version: () =>
+    get("/api/health").then((response) => String(response?.version ?? "")),
   // --- pages (mirrors search.rs exactly) ---
   get_page: async (a) => {
     const id = String(a.id);
@@ -460,19 +510,96 @@ export const HANDLERS: Record<string, (a: any) => Promise<unknown>> = {
   get_page_links: (a) => get(`/api/pages/${enc(a.pageId)}/links`),
   get_page_revisions: (a) => get(`/api/pages/${enc(a.pageId)}/revisions`),
   redistill_page: (a) => post(`/api/distill/${enc(a.pageId)}`, {}),
-  update_page: (a) => {
+  update_page: async (a) => {
+    const health = await get("/api/health");
+    const reportedVersion = String(health?.version ?? "");
+    if (!daemonMeetsFloor(reportedVersion, PAGE_EDIT_DAEMON_FLOOR)) {
+      return {
+        outcome: "upgrade_required",
+        reportedVersion,
+        requiredFloor: PAGE_EDIT_DAEMON_FLOOR,
+      };
+    }
+
     const id = String(a.id);
     const local = PREVIEW_AUTHORED_PAGES.get(id);
     if (local?.status === "active") {
+      const input: PreviewPageUpdateRequest = {
+        id,
+        content: String(a.content),
+        expectedVersion: Number(a.expectedVersion),
+      };
+      const receiptKey = `${String(a.callerId)}\u0000${String(a.operationId)}`;
+      const receipt = PREVIEW_PAGE_UPDATE_RECEIPTS.get(receiptKey);
+      if (receipt) {
+        const sameRequest =
+          receipt.input.id === input.id
+          && receipt.input.content === input.content
+          && receipt.input.expectedVersion === input.expectedVersion;
+        return sameRequest
+          ? structuredClone(receipt.outcome)
+          : {
+              outcome: "conflict",
+              message:
+                "operation identity was already used for different page content",
+            };
+      }
+      if (Number(local.version) !== input.expectedVersion) {
+        return {
+          outcome: "conflict",
+          message: "This page changed elsewhere.",
+        };
+      }
       PREVIEW_AUTHORED_PAGES.set(id, {
         ...local,
-        content: String(a.content),
+        content: input.content,
         version: Number(local.version) + 1,
         last_modified: new Date().toISOString(),
       });
-      return Promise.resolve(null);
+      const outcome = { outcome: "saved" } as const;
+      PREVIEW_PAGE_UPDATE_RECEIPTS.set(receiptKey, {
+        input: structuredClone(input),
+        outcome: structuredClone(outcome),
+      });
+      return outcome;
     }
-    return post(`/api/memory/${enc(a.id)}/update-page`, { content: a.content });
+    try {
+      const response = await post(`/api/memory/${enc(a.id)}/update-page`, {
+        content: a.content,
+        source_memory_ids: [],
+        expected_version: a.expectedVersion,
+        caller_id: a.callerId,
+        operation_id: a.operationId,
+      });
+      if (!response?.ok || response?.gated) {
+        return {
+          outcome: "failure",
+          kind: "other",
+          status: 200,
+          message: response?.gated
+            ? "Daemon staged the page update instead of saving it."
+            : "Daemon did not confirm the page update.",
+        };
+      }
+      return { outcome: "saved" };
+    } catch (error) {
+      if (!(error instanceof HttpError)) throw error;
+      if (error.status === 409) {
+        return {
+          outcome: "conflict",
+          message: pageUpdateErrorMessage(
+            error,
+            "This page changed elsewhere.",
+          ),
+        };
+      }
+      return {
+        outcome: "failure",
+        kind: pageUpdateFailureKind(error.status),
+        status: error.status,
+        message: pageUpdateErrorMessage(error, error.message),
+      };
+    }
   },
   delete_page: (a) => {
     const id = String(a.id);
@@ -829,7 +956,9 @@ export const DEFAULTS: Record<string, unknown> = {
   get_skip_apps: [],
   get_skip_title_patterns: [],
   suggest_tags: [],
-  cancel_guarded_quit_request: null,
+  record_page_editor_diagnostic: null,
+  acknowledge_guarded_quit_request: true,
+  cancel_guarded_quit_request: true,
   quit_wenlan_full: null,
   quit_origin_full: null,
   // Preview's daemon is reachable (wire_state above), so a Start would find it up.

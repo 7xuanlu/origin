@@ -37,6 +37,12 @@ pub struct WenlanClient {
     base_url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PageUpdateRequestError {
+    TransportOrDecode(String),
+    Http { status: u16, body: String },
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct SetupStatusResponse {
     pub setup_completed: bool,
@@ -322,6 +328,33 @@ impl WenlanClient {
         resp.json()
             .await
             .map_err(|e| format!("Parse {}: {}", path, e))
+    }
+
+    pub(crate) async fn post_page_update(
+        &self,
+        page_id: &str,
+        body: &wenlan_types::requests::UpdatePageRequest,
+    ) -> Result<wenlan_types::responses::PageWriteResponse, PageUpdateRequestError> {
+        let path = format!("/api/memory/{page_id}/update-page");
+        let response = self
+            .client
+            .post(self.url(&path))
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| {
+                PageUpdateRequestError::TransportOrDecode(format!("HTTP POST {path}: {error}"))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(PageUpdateRequestError::Http { status, body });
+        }
+
+        response.json().await.map_err(|error| {
+            PageUpdateRequestError::TransportOrDecode(format!("Parse {path}: {error}"))
+        })
     }
 
     pub async fn put_json<Req: Serialize, Resp: DeserializeOwned>(
@@ -1060,6 +1093,98 @@ mod tests {
             request
         });
         (format!("http://{}", addr), handle)
+    }
+
+    async fn serve_response_once(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn post_page_update_serializes_the_complete_lossless_request() {
+        let (base_url, request) =
+            serve_response_once("200 OK", r#"{"ok":true,"revision_card_id":"rev-1"}"#).await;
+        let client = WenlanClient {
+            client: reqwest::Client::new(),
+            base_url,
+        };
+        let update = wenlan_types::requests::UpdatePageRequest {
+            content: "  # Exact source\r\n\r\nBody  \r\n".to_string(),
+            source_memory_ids: Vec::new(),
+            expected_version: Some(7),
+            caller_id: Some("wenlan-app".to_string()),
+            operation_id: Some("operation-123".to_string()),
+        };
+
+        let response = client
+            .post_page_update("page-1", &update)
+            .await
+            .expect("page update succeeds");
+
+        assert!(response.ok);
+        assert_eq!(response.revision_card_id.as_deref(), Some("rev-1"));
+        let request = request.await.unwrap();
+        assert_eq!(
+            request.lines().next().unwrap_or_default(),
+            "POST /api/memory/page-1/update-page HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({
+                "content": "  # Exact source\r\n\r\nBody  \r\n",
+                "source_memory_ids": [],
+                "expected_version": 7,
+                "caller_id": "wenlan-app",
+                "operation_id": "operation-123",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn post_page_update_retains_http_status_and_body() {
+        let (base_url, request) =
+            serve_response_once("409 Conflict", r#"{"error":"page changed"}"#).await;
+        let client = WenlanClient {
+            client: reqwest::Client::new(),
+            base_url,
+        };
+        let update = wenlan_types::requests::UpdatePageRequest {
+            content: "# Draft".to_string(),
+            source_memory_ids: Vec::new(),
+            expected_version: Some(7),
+            caller_id: Some("wenlan-app".to_string()),
+            operation_id: Some("operation-123".to_string()),
+        };
+
+        let error = client
+            .post_page_update("page-1", &update)
+            .await
+            .expect_err("409 must remain typed");
+
+        assert_eq!(
+            error,
+            PageUpdateRequestError::Http {
+                status: 409,
+                body: r#"{"error":"page changed"}"#.to_string(),
+            }
+        );
+        request.await.unwrap();
     }
 
     async fn serve_status_once(

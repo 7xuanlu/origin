@@ -44,6 +44,26 @@ describe("liveInvoke list_all_tags", () => {
   });
 });
 
+describe("liveInvoke Page editor support", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("reads the daemon version and records diagnostics without network content", async () => {
+    const fetch = vi.fn(async () =>
+      new Response(JSON.stringify({ version: "0.14.1" }), { status: 200 })
+    );
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(liveInvoke("daemon_version")).resolves.toBe("0.14.1");
+    await expect(liveInvoke("record_page_editor_diagnostic", {
+      event: "editor_fallback",
+      reason: "load",
+    })).resolves.toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("liveInvoke authored Page preview", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -379,7 +399,9 @@ describe("liveInvoke authored Page preview", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
-        new Response(JSON.stringify({ pages: [] }), { status: 200 })
+        new Response(JSON.stringify({ pages: [], version: "0.14.1" }), {
+          status: 200,
+        })
       ),
     );
     const draft = await liveInvoke("create_page_draft", {
@@ -416,6 +438,9 @@ describe("liveInvoke authored Page preview", () => {
     await liveInvoke("update_page", {
       id: draft.id,
       content: "Later edit",
+      expectedVersion: draft.version + 1,
+      callerId: "wenlan-app",
+      operationId: "op_publish-retry-later-edit",
     });
     await expect(liveInvoke("get_page", { id: draft.id })).resolves.toMatchObject({
       content: "Later edit",
@@ -460,6 +485,78 @@ describe("liveInvoke authored Page preview", () => {
 
     expect(published).toMatchObject({ content: expected });
     expect(stored).toMatchObject({ content: expected });
+  });
+
+  it("replays an exact published Page update receipt and rejects a divergent operation identity", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ pages: [], version: "0.14.1" }), {
+          status: 200,
+        })
+      ),
+    );
+    const draft = await liveInvoke("create_page_draft", {
+      clientDraftId: "page_99999999-9999-4999-8999-999999999998",
+      title: "Published update replay",
+      content: "Initial body",
+      space: null,
+    }) as { id: string; version: number };
+    const published = await liveInvoke("publish_page_draft", {
+      id: draft.id,
+      expectedVersion: draft.version,
+    }) as { version: number };
+    const request = {
+      id: draft.id,
+      content: "Exact updated body  \n",
+      expectedVersion: published.version,
+      callerId: "wenlan-app",
+      operationId: "op_published_exact_replay",
+    };
+
+    await expect(liveInvoke("update_page", request)).resolves.toEqual({
+      outcome: "saved",
+    });
+    await expect(liveInvoke("update_page", request)).resolves.toEqual({
+      outcome: "saved",
+    });
+    await expect(liveInvoke("update_page", {
+      ...request,
+      content: "Divergent body",
+    })).resolves.toEqual({
+      outcome: "conflict",
+      message: "operation identity was already used for different page content",
+    });
+    await expect(liveInvoke("get_page", { id: draft.id })).resolves.toMatchObject({
+      content: request.content,
+      version: published.version + 1,
+    });
+  });
+
+  it("rechecks the daemon floor before a daemon-backed Page save", async () => {
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/daemon/api/health") {
+        return new Response(JSON.stringify({ version: "0.14.0" }), {
+          status: 200,
+        });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(liveInvoke("update_page", {
+      id: "remote-page-save-floor",
+      content: "# Local draft\n",
+      expectedVersion: 7,
+      callerId: "wenlan-app",
+      operationId: "op_remote_save_floor",
+    })).resolves.toEqual({
+      outcome: "upgrade_required",
+      reportedVersion: "0.14.0",
+      requiredFloor: "0.14.1",
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("does not treat a reserved Sources block as meaningful draft content", async () => {
@@ -822,7 +919,7 @@ describe("liveInvoke on-device model download ramp", () => {
   });
 });
 
-// DEBT: 79 commands with no harness stub as of 2026-07-13, predating this fix
+// DEBT: 78 commands with no harness stub as of 2026-07-13, predating this fix
 // and out of scope for it — spaces CRUD, entity/observation CRUD, snapshots,
 // agent management, obsidian export/import, avatar, remote-access token
 // rotation, native file/dialog commands, and a handful of others. None are
@@ -848,7 +945,6 @@ const UNSTUBBED_DEBT = new Set([
   "correct_memory_cmd",
   "create_entity_cmd",
   "create_space",
-  "daemon_version",
   "delete_agent",
   "delete_bulk",
   "delete_by_time_range",
