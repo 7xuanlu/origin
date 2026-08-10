@@ -1888,11 +1888,34 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
+    #[serial_test::serial]
     fn test_find_available_port_returns_first_available() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+
+        // HomeGuard::set already cleared WENLAN_DEV_REMOTE_PORT_START, so this
+        // is the no-override fallback -- the one case the ephemeral-port scan
+        // below can't exercise, since it always sets the override.
+        assert_eq!(port_range_start(), PORT_RANGE_START);
+
+        // Scan from an OS-assigned held port instead of the fixed default range,
+        // which flakes under machine load. Re-bind if the port is above
+        // u16::MAX - 3: the 4-port scan window would otherwise overflow.
+        let (_held, held_port) = loop {
+            let held = TcpListener::bind("127.0.0.1:0").unwrap();
+            let held_port = held.local_addr().unwrap().port();
+            if held_port <= u16::MAX - 3 {
+                break (held, held_port);
+            }
+        };
+        std::env::set_var("WENLAN_DEV_REMOTE_PORT_START", held_port.to_string());
+
         let port = find_available_port();
         assert!(port.is_some());
         let p = port.unwrap();
-        assert!((PORT_RANGE_START..=PORT_RANGE_START + 3).contains(&p));
+        assert_ne!(p, held_port, "must skip the port already held");
+        assert!((held_port..=held_port + 3).contains(&p));
     }
 
     #[test]
@@ -2068,11 +2091,23 @@ mod tests {
     fn dev_remote_access_uses_its_worktree_port_range() {
         let tmp = tempfile::tempdir().unwrap();
         let _home = HomeGuard::set(tmp.path());
-        std::env::set_var("WENLAN_DEV_REMOTE_PORT_START", "23000");
+
+        // Scan from an OS-assigned held port instead of the fixed default range,
+        // which flakes under machine load. Re-bind if the port is above
+        // u16::MAX - 3: the 4-port scan window would otherwise overflow.
+        let (_held, held_port) = loop {
+            let held = TcpListener::bind("127.0.0.1:0").unwrap();
+            let held_port = held.local_addr().unwrap().port();
+            if held_port <= u16::MAX - 3 {
+                break (held, held_port);
+            }
+        };
+        std::env::set_var("WENLAN_DEV_REMOTE_PORT_START", held_port.to_string());
 
         let port = find_available_port().expect("dev remote access port");
 
-        assert!((23000..=23003).contains(&port));
+        assert_ne!(port, held_port, "must skip the port already held");
+        assert!((held_port..=held_port + 3).contains(&port));
     }
 
     #[test]
