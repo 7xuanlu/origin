@@ -47,17 +47,19 @@ Wenlan runs as one local daemon. The desktop app carries that daemon inside it; 
 <a id="open-the-wiki"></a>
 <a id="desktop-app"></a>
 
-### Desktop app (macOS Apple Silicon)
+### Desktop app
+
+**[Download Wenlan for macOS](https://github.com/7xuanlu/wenlan/releases/latest)** (Apple Silicon), open the `.dmg`, and drag the app to Applications.
+
+Nothing else to install. The app bundles the daemon, CLI, and MCP connector, starts the daemon on launch, and offers to connect the AI clients it detects: the plugin for Claude Code and Codex, an MCP entry for the rest. From there you read Pages, inspect the Source behind any citation, and curate the knowledge system.
+
+This preview is not notarized yet, so macOS blocks the first launch. Allow it once under System Settings, Privacy & Security, "Open Anyway". One command skips that step: it verifies the download against GitHub's published SHA-256, clears quarantine for this app alone, and changes no macOS security settings.
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-Nothing else to install. The app bundles the daemon, CLI, and MCP connector, starts the daemon on launch, and offers to connect the AI clients it detects: the plugin for Claude Code and Codex, an MCP entry for the rest. From there you read Pages, inspect the Source behind any citation, and curate the knowledge system.
-
-This preview is not notarized yet, so the [installer](scripts/install-macos-app.sh) checks the download against GitHub's published SHA-256, clears quarantine for this app alone, and changes no macOS security settings. Prefer a DMG, or want the app source? [Latest release](https://github.com/7xuanlu/wenlan/releases/latest) · [`app/`](app/) crate.
-
-On Windows or Linux, use the headless runtime below.
+Windows and Linux run the headless runtime below. The desktop app is Apple Silicon only for now.
 
 <a id="claude-code-in-30-seconds"></a>
 

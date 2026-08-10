@@ -49,17 +49,19 @@ Wenlan funciona como un único daemon local. La aplicación de escritorio lo lle
 <a id="open-the-wiki"></a>
 <a id="desktop-app"></a>
 
-### Aplicación de escritorio (macOS Apple Silicon)
+### Aplicación de escritorio
+
+**[Descarga Wenlan para macOS](https://github.com/7xuanlu/wenlan/releases/latest)** (Apple Silicon), abre el `.dmg` y arrastra la aplicación a Aplicaciones.
+
+No hay nada más que instalar. La aplicación incluye el daemon, la CLI y el conector MCP, arranca el daemon al abrirse y ofrece conectar los clientes de IA que detecta: el plugin para Claude Code y Codex, una entrada MCP para el resto. A partir de ahí lees Páginas, inspeccionas la Fuente detrás de cualquier cita y gestionas el sistema de conocimiento.
+
+Esta vista previa aún no está notarizada, así que macOS bloquea el primer arranque. Permítelo una vez en Ajustes del Sistema, Privacidad y seguridad, "Abrir de todos modos". Un comando se salta ese paso: comprueba la descarga contra el SHA-256 publicado en GitHub, elimina la cuarentena solo para esta aplicación y no cambia ninguna configuración de seguridad de macOS.
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-No hay nada más que instalar. La aplicación incluye el daemon, la CLI y el conector MCP, arranca el daemon al abrirse y ofrece conectar los clientes de IA que detecta: el plugin para Claude Code y Codex, una entrada MCP para el resto. A partir de ahí lees Páginas, inspeccionas la Fuente detrás de cualquier cita y gestionas el sistema de conocimiento.
-
-Esta vista previa aún no está notarizada, así que el [instalador](scripts/install-macos-app.sh) comprueba la descarga contra el SHA-256 publicado en GitHub, elimina la cuarentena solo para esta aplicación y no cambia ninguna configuración de seguridad de macOS. ¿Prefieres el DMG o el código fuente? [Última versión](https://github.com/7xuanlu/wenlan/releases/latest) · crate [`app/`](app/).
-
-En Windows o Linux, usa el entorno de ejecución sin interfaz de abajo.
+Windows y Linux usan el entorno de ejecución sin interfaz de abajo. La aplicación de escritorio es solo para Apple Silicon por ahora.
 
 <a id="claude-code-in-30-seconds"></a>
 

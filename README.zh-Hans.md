@@ -49,17 +49,19 @@ Wenlan 以单个本地 daemon 运行。桌面 app 内置这个 daemon；无 GUI 
 <a id="open-the-wiki"></a>
 <a id="desktop-app"></a>
 
-### 桌面 app（macOS Apple Silicon）
+### 桌面 app
+
+**[下载 macOS 版 Wenlan](https://github.com/7xuanlu/wenlan/releases/latest)**（Apple Silicon），打开 `.dmg`，把 app 拖进「应用程序」。
+
+不需要再安装别的东西。App 内已打包 daemon、CLI 与 MCP 连接器，启动时会自动运行 daemon，并会为检测到的 AI 客户端提供接入：Claude Code 与 Codex 安装 plugin，其余客户端写入 MCP 配置。之后你就可以阅读 Page、检查任一引用背后的 Source，并整理整个知识体系。
+
+这个预览版尚未经过 Apple notarization，首次启动会被 macOS 拦下，在「系统设置」的「隐私与安全性」里点一次「仍要打开」即可。一条命令可以跳过这一步：它会用 GitHub 发布的 SHA-256 核对下载文件，只为这一个 app 清除 quarantine，不会更改任何 macOS 安全设置。
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-不需要再安装别的东西。App 内已打包 daemon、CLI 与 MCP 连接器，启动时会自动运行 daemon，并会为检测到的 AI 客户端提供接入：Claude Code 与 Codex 安装 plugin，其余客户端写入 MCP 配置。之后你就可以阅读 Page、检查任一引用背后的 Source，并整理整个知识体系。
-
-这个预览版尚未经过 Apple notarization，因此[安装器](scripts/install-macos-app.sh)会先用 GitHub 发布的 SHA-256 核对下载文件，只为这一个 app 清除 quarantine，不会更改任何 macOS 安全设置。偏好 DMG，或想查看 app 源码？[最新 release](https://github.com/7xuanlu/wenlan/releases/latest) · [`app/`](app/) crate。
-
-Windows 或 Linux 请使用下面的无 GUI runtime。
+Windows 与 Linux 请使用下面的无 GUI runtime。桌面 app 目前仅支持 Apple Silicon。
 
 <a id="claude-code-in-30-seconds"></a>
 
