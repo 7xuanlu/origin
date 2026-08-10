@@ -1,12 +1,12 @@
-import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { readSourceText } from "../../../test/sourceText";
 
 const memoryDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function stylesheet(path: string): string {
-  return readFileSync(resolve(memoryDirectory, path), "utf8");
+  return readSourceText(resolve(memoryDirectory, path));
 }
 
 function declaration(source: string, selector: string, property: string): string | undefined {

@@ -33,10 +33,13 @@ export const REVIEW_COMMAND_CAPABILITIES = {
     "acknowledge_onboarding_milestone",
     "get_briefing",
     "get_pending_contradictions",
+    "get_truth_status",
   ],
   wikiAndPages: [
     "list_pages",
     "get_page",
+    "list_pages_explicit_browse",
+    "get_page_explicit_browse",
     "create_page",
     "update_page",
     "delete_page",
@@ -54,6 +57,14 @@ export const REVIEW_COMMAND_CAPABILITIES = {
     "update_page_draft",
     "publish_page_draft",
     "discard_page_draft",
+  ],
+  pageMap: [
+    "get_page_map",
+    "improve_page_map",
+    "create_page_map_node",
+    "patch_page_map_node",
+    "delete_page_map_node",
+    "put_page_map_layout",
   ],
   refinement: [
     "distill_review",
@@ -95,6 +106,10 @@ export const REVIEW_COMMAND_CAPABILITIES = {
     "confirm_observation_cmd",
     "confirm_entity_cmd",
     "delete_entity_cmd",
+  ],
+  cartography: [
+    "list_communities",
+    "list_community_members",
   ],
   existingUtilityReads: [
     "get_clipboard_enabled",

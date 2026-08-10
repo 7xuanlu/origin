@@ -5,6 +5,7 @@
 import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import { repoRelativePath } from "./test/sourceText";
 
 const SRC_DIR = path.resolve("src");
 const CSS_FILE = path.resolve("src/index.css");
@@ -46,7 +47,7 @@ describe("CSS custom property guard", () => {
     const missing: string[] = [];
     for (const file of listTsxFiles(SRC_DIR)) {
       const text = fs.readFileSync(file, "utf8");
-      const relativeFile = path.relative(process.cwd(), file);
+      const relativeFile = repoRelativePath(file);
       const seenInFile = new Set<string>();
       let match: RegExpExecArray | null;
       TOKEN_RE.lastIndex = 0;

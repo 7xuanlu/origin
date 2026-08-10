@@ -488,7 +488,8 @@ describe("SetupWizard", () => {
 
     renderWizard({ initialStep: "connect" });
 
-    await screen.findByRole("checkbox", { name: "Cursor" });
+    const cursorCheckbox = await screen.findByRole("checkbox", { name: "Cursor" });
+    await waitFor(() => expect(cursorCheckbox).toBeChecked());
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
     // Settle first: wait for the row to actually reach its failed state before
@@ -580,7 +581,8 @@ describe("SetupWizard", () => {
 
     renderWizard({ initialStep: "connect" });
 
-    await screen.findByRole("checkbox", { name: "Codex CLI" });
+    const codexCheckbox = await screen.findByRole("checkbox", { name: "Codex CLI" });
+    await waitFor(() => expect(codexCheckbox).toBeChecked());
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
     await waitFor(() => {
@@ -637,17 +639,26 @@ describe("SetupWizard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
     // Step 4: both detected tools start checked — take both.
-    await screen.findByRole("checkbox", { name: "Cursor" });
+    const cursor = await screen.findByRole("checkbox", { name: "Cursor" });
+    const claudeCode = await screen.findByRole("checkbox", { name: "Claude Code" });
+    await waitFor(() => {
+      expect(cursor).toBeChecked();
+      expect(claudeCode).toBeChecked();
+    });
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
-    const rows = within(screen.getByTestId("setting-up-tasks")).getAllByTestId(/^task-status-/);
-    expect(rows.map((el) => el.getAttribute("data-testid"))).toEqual([
-      "task-status-daemon",
-      "task-status-cursor",
-      "task-status-claude_code",
-      "task-status-import",
-      "task-status-on-device-model",
-    ]);
+    await waitFor(() => {
+      const rows = within(screen.getByTestId("setting-up-tasks")).getAllByTestId(
+        /^task-status-/,
+      );
+      expect(rows.map((el) => el.getAttribute("data-testid"))).toEqual([
+        "task-status-daemon",
+        "task-status-cursor",
+        "task-status-claude_code",
+        "task-status-import",
+        "task-status-on-device-model",
+      ]);
+    });
   });
 
   // (f) The returning-user bug. VerifyStep used to call onNext() from an effect
@@ -670,7 +681,8 @@ describe("SetupWizard", () => {
 
     renderWizard({ initialStep: "connect" });
 
-    await screen.findByRole("checkbox", { name: "Cursor" });
+    const cursorCheckbox = await screen.findByRole("checkbox", { name: "Cursor" });
+    await waitFor(() => expect(cursorCheckbox).toBeChecked());
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
     // Settle on a real state change first — otherwise the "did not advance"
@@ -886,7 +898,8 @@ describe("SetupWizard", () => {
 
     renderWizard({ initialStep: "connect" });
 
-    await screen.findByRole("checkbox", { name: "Gemini CLI" });
+    const geminiCheckbox = await screen.findByRole("checkbox", { name: "Gemini CLI" });
+    await waitFor(() => expect(geminiCheckbox).toBeChecked());
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
     await waitFor(() => {
@@ -1045,7 +1058,8 @@ describe("SetupWizard", () => {
 
     renderWizard({ initialStep: "connect" });
 
-    await screen.findByRole("checkbox", { name: "Cursor" });
+    const cursorCheckbox = await screen.findByRole("checkbox", { name: "Cursor" });
+    await waitFor(() => expect(cursorCheckbox).toBeChecked());
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
     await waitFor(() => {
@@ -1663,7 +1677,8 @@ describe("SetupWizard", () => {
 
     renderWizard({ initialStep: "connect" });
 
-    await screen.findByRole("checkbox", { name: "Cursor" });
+    const cursorCheckbox = await screen.findByRole("checkbox", { name: "Cursor" });
+    await waitFor(() => expect(cursorCheckbox).toBeChecked());
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
     await waitFor(() => {
@@ -1730,7 +1745,8 @@ describe("SetupWizard", () => {
 
     renderWizard({ initialStep: "connect" });
 
-    await screen.findByRole("checkbox", { name: "Cursor" });
+    const cursorCheckbox = await screen.findByRole("checkbox", { name: "Cursor" });
+    await waitFor(() => expect(cursorCheckbox).toBeChecked());
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
     await waitFor(() => {

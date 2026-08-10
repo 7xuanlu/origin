@@ -988,6 +988,26 @@ export interface PageCitation {
   scope: "sentence" | "paragraph";
 }
 
+/**
+ * Both M5 truth axes for one page. Only ever present when this `Page` came
+ * back from an explicit-browse call (`listPagesExplicitBrowse`,
+ * `getPage(id, "explicit")`) against a daemon
+ * whose truth cutover has begun — see `useTruthStatus`. `supported` and
+ * `human_reviewed` are independent axes; neither implies the other, and
+ * neither is the same thing as `Page.review_status` above (a pre-existing,
+ * separate distillation-faithfulness signal).
+ */
+export interface PageTruth {
+  supported: boolean;
+  human_reviewed: boolean;
+}
+
+/** Where the daemon stands on the M5 truth cutover. See `useTruthStatus`. */
+export interface TruthStatus {
+  cutover_generation: number;
+  contract_version: number;
+}
+
 export interface Page {
   id: string;
   title: string;
@@ -1011,6 +1031,12 @@ export interface Page {
   stale_reason?: string | null;
   user_edited?: boolean;
   citations?: PageCitation[];
+  /**
+   * Both M5 truth axes, present only when this page was fetched via an
+   * explicit-browse call and the daemon's truth cutover is live. Absent
+   * (not `null`) on every automatic/background read by daemon contract.
+   */
+  truth?: PageTruth | null;
 }
 
 export interface CreatePageInput {
@@ -1643,9 +1669,37 @@ export async function dismissEntitySuggestion(id: string): Promise<RejectRefinem
 
 // ===== Pages =====
 
-export async function getPage(id: string): Promise<Page | null> {
-  const page = await invoke<Page | null>("get_page", { id });
+/**
+ * `intent: "explicit"` marks this as a human-initiated wiki browse, so a
+ * daemon with a live truth cutover attaches `Page.truth`
+ * (`crates/wenlan-core/src/truth_manifest.rs`: `GET /api/pages/{id}` is a
+ * NamedPage route). Pass it only for a page a person navigated to — a
+ * background poll or an agent-driven read must stay `"automatic"` (the
+ * default), since the daemon durably records every explicit call.
+ */
+export async function getPage(
+  id: string,
+  intent: "automatic" | "explicit" = "automatic",
+): Promise<Page | null> {
+  const command = intent === "explicit" ? "get_page_explicit_browse" : "get_page";
+  const page = await invoke<Page | null>(command, { id });
   return page ? withDomain(page) : null;
+}
+
+/** Explicit-browse sibling of {@link getPage}, for call sites that always browse. */
+export async function getPageExplicitBrowse(id: string): Promise<Page | null> {
+  return getPage(id, "explicit");
+}
+
+/**
+ * Where the daemon stands on the M5 truth cutover. `null` on a daemon that
+ * predates the field or has not begun the cutover — read both as "not live"
+ * (`crates/wenlan-types/src/responses.rs::TruthStatus::cutover_live`). This
+ * is itself an automatic read: cutover state is not page prose, so it
+ * carries no explicit-browse marker. See `useTruthStatus`.
+ */
+export async function getTruthStatus(): Promise<TruthStatus | null> {
+  return invoke<TruthStatus | null>("get_truth_status");
 }
 
 export async function createPage(input: CreatePageInput): Promise<CreatePageResponse> {
@@ -1813,6 +1867,21 @@ export async function listConcepts(
   offset?: number,
 ): Promise<Page[]> {
   return listPages(status, domain, limit, offset);
+}
+
+/**
+ * Explicit-browse sibling of {@link listPages}: same request, marked as a
+ * human-initiated wiki browse so the daemon attaches `Page.truth` on each
+ * result entry when its cutover is live.
+ */
+export async function listPagesExplicitBrowse(
+  status?: string,
+  domain?: string,
+  limit?: number,
+  offset?: number,
+): Promise<Page[]> {
+  const pages = await invoke<Page[]>("list_pages_explicit_browse", { status, domain, limit, offset });
+  return withDomainArray(pages);
 }
 
 // ── Home delta feed ────────────────────────────────────────────────────
@@ -2612,4 +2681,85 @@ export async function putPageMapLayout(
   },
 ): Promise<PageMap> {
   return invoke("put_page_map_layout", { pageId, body });
+}
+
+// ── Communities (M6 cartography) ────────────────────────────────────────
+// Wire shapes hand-mirrored from `crates/wenlan-types/src/communities.rs`
+// (`community-read-v1`): the community read routes are merged to the daemon
+// but the pinned wenlan-types release predates the crate module — same
+// situation as the page-map types above.
+
+export const COMMUNITY_READ_SCHEMA_VERSION = "community-read-v1";
+
+export interface CommunitySummary {
+  community_id: string;
+  space: string;
+  display_name: string | null;
+  member_count: number;
+  published_generation: number;
+  algo_version: string;
+  projection_version: string;
+}
+
+export interface CommunityListResponse {
+  schema_version: string;
+  communities: CommunitySummary[];
+  next_cursor: string | null;
+}
+
+export interface CommunityMember {
+  space: string;
+  node_id: string;
+  node_kind: string;
+  community_id: string;
+  published_generation: number;
+  attachment: string;
+}
+
+export interface CommunityMemberCursor {
+  space: string;
+  node_id: string;
+}
+
+export interface CommunityMembersResponse {
+  schema_version: string;
+  members: CommunityMember[];
+  next_cursor: CommunityMemberCursor | null;
+}
+
+export interface CommunityApiError {
+  status: number;
+  message: string;
+}
+
+/** Decodes the `{"status":N,"error":"..."}` payload community commands
+ *  reject with (same envelope as `asPageMapApiError`). Returns null for
+ *  transport/parse failures, which callers treat as a generic error. */
+export function asCommunityApiError(e: unknown): CommunityApiError | null {
+  if (typeof e !== "string") return null;
+  try {
+    const parsed = JSON.parse(e);
+    if (parsed && typeof parsed.status === "number") {
+      return { status: parsed.status, message: String(parsed.error ?? "") };
+    }
+  } catch {
+    // not JSON — transport/parse failure, treat as a generic error
+  }
+  return null;
+}
+
+export async function listCommunities(
+  space: string,
+  cursor?: string | null,
+  limit?: number,
+): Promise<CommunityListResponse> {
+  return invoke("list_communities", { space, cursor: cursor ?? null, limit: limit ?? null });
+}
+
+export async function listCommunityMembers(
+  space: string,
+  cursor?: CommunityMemberCursor | null,
+  limit?: number,
+): Promise<CommunityMembersResponse> {
+  return invoke("list_community_members", { space, cursor: cursor ?? null, limit: limit ?? null });
 }

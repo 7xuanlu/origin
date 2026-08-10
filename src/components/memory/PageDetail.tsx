@@ -27,6 +27,8 @@ import {
 // Imported from its own module, not the lib/tauri barrel: tests mock that
 // barrel, and a mocked module would shadow the value this must stay bound to.
 import { PAGE_EDIT_DAEMON_FLOOR } from "../../lib/daemonVersion";
+import { EXPLICIT_BROWSE_QUERY_POLICY, useTruthStatus } from "../../hooks/useTruthStatus";
+import { PageTruthBadges } from "./PageTruthBadges";
 import ContentRenderer from "./ContentRenderer";
 import RelatedPages from "./page/RelatedPages";
 import PageInfo from "./page/PageInfo";
@@ -283,8 +285,10 @@ export default function PageDetail({
     refetch: refetchPage,
   } = useQuery({
     queryKey: ["page", pageId],
-    queryFn: () => getPage(pageId),
+    queryFn: () => getPage(pageId, "explicit"),
+    ...EXPLICIT_BROWSE_QUERY_POLICY,
   });
+  const { cutoverLive } = useTruthStatus();
 
   useEffect(() => {
     if (page == null) return;
@@ -474,7 +478,7 @@ export default function PageDetail({
           : { kind: "loading", operationId },
       );
       try {
-        const latest = await getPage(pageId);
+        const latest = await getPage(pageId, "explicit");
         const current = saveStateRef.current;
         if (
           current.phase !== "conflict" ||
@@ -1322,6 +1326,11 @@ export default function PageDetail({
                 </span>
               )}
             </div>
+            <PageTruthBadges
+              cutoverLive={cutoverLive}
+              truth={page.truth}
+              wrapperClassName="mt-2 flex flex-wrap items-center gap-2"
+            />
           </div>
 
           {!editing && (

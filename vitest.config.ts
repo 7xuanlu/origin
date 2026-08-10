@@ -13,6 +13,10 @@ export default defineConfig({
     setupFiles: ['./src/test/setup.ts'],
     include: ['src/**/*.test.{ts,tsx}', 'scripts/**/*.test.ts', 'preview/**/*.test.ts'],
     passWithNoTests: true,
+    // The suite includes several jsdom-heavy CodeMirror and graph files.
+    // Vitest otherwise uses every available core in run mode, which can
+    // starve their async DOM work on developer laptops and Windows runners.
+    maxWorkers: 4,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'html', 'lcov'],

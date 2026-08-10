@@ -2,6 +2,7 @@
 import type Graph from "graphology";
 import type { GraphModel } from "./model";
 import type { GraphPalette } from "./palette";
+import type { SpaceCartography } from "./community";
 
 // The Atlas cartography layer (design-mockup artifact, screen 01 —
 // "Cartography, not physics"): named community regions wrapped in translucent
@@ -23,38 +24,55 @@ function pushInto<K, V>(map: Map<K, V[]>, key: K, value: V): void {
 }
 
 /**
- * Node id -> community id. Daemon truth wins: if ANY node carries a daemon
- * community_id, those ids are used verbatim and nodes without one become
- * singletons (never guessed into a group — the model.ts "absent stays null"
- * rule). Only when the daemon exposes nothing (wenlan-types 0.12.0 today)
- * does the client-side fallback run: steepest-ascent peak-climbing — every
- * node follows its highest-degree neighbor (strictly higher than its own
+ * "No space" is represented OUT OF BAND, never as a magic string. The daemon
+ * forbids only its own UUID sentinel in `create_space`, so ANY in-band value
+ * — NUL-prefixed included — is forgeable by a real space literally named it,
+ * and a forged one lands in the null bucket: a cross-space bridge, which
+ * D13/App-PR forbids.
+ *
+ * The space component of every community id is therefore TAG-DISCRIMINATED:
+ * a real space renders as `s` + encodeURIComponent(space), the unscoped
+ * bucket as the bare token `u`. No real segment can spell `u` (they all start
+ * with `s`), and encodeURIComponent is injective, so two segments compare
+ * equal iff they came from the same space. Neither tag can contain an
+ * unescaped ":", so the 3-segment split below still reads the space back
+ * whole.
+ */
+const UNSCOPED_SEGMENT = "u";
+
+/** Everything that lands in the unscoped bucket: null, undefined, and the
+ *  empty string alike — an empty space string is no more a space than a
+ *  missing one. AtlasView asks this same question of raw entities for the
+ *  fallback badge, so the rule lives here rather than in two places. */
+export function isUnscopedSpace(space: string | null | undefined): boolean {
+  return !space;
+}
+
+function spaceSegment(space: string | null | undefined): string {
+  return isUnscopedSpace(space) ? UNSCOPED_SEGMENT : `s${encodeURIComponent(space as string)}`;
+}
+
+/**
+ * Steepest-ascent peak-climbing over ONE space's nodes: every node follows
+ * its highest-degree same-space neighbor (strictly higher than its own
  * degree) upward until a local degree peak, and the peak is the community.
  * Deterministic (degree ties break on the smaller id), terminating (degree
  * strictly increases along a climb), and it can't leak across a hub–hub
  * bridge the way deterministic label propagation does: two equal-degree hubs
  * are each their own peak. ponytail: crude next to Louvain, but zero deps
- * and hub-shaped like this data; dies the day entities.community_id lands.
+ * and hub-shaped like this data. Returns node id -> a LOCAL (unqualified,
+ * still colliding across spaces) community id — callers namespace it.
  */
-export function communitiesFor(model: GraphModel): Map<string, number> {
-  const fromDaemon = model.nodes.some((n) => n.communityId !== null);
-  if (fromDaemon) {
-    const result = new Map<string, number>();
-    // Singletons start after the daemon's id range so they can never collide.
-    let nextSingleton =
-      Math.max(...model.nodes.map((n) => n.communityId ?? -1)) + 1;
-    for (const node of model.nodes) {
-      result.set(node.id, node.communityId ?? nextSingleton++);
-    }
-    return result;
-  }
-
+function climbFallback(nodeIds: string[], edges: { source: string; target: string }[]): Map<string, string> {
+  const idsInPartition = new Set(nodeIds);
   // Distinct-neighbor adjacency: parallel edges and self-loops must not
-  // inflate the degree that drives the climb.
+  // inflate the degree that drives the climb; edges leaving the partition
+  // (a different space, or the unscoped bucket) are simply not adjacency.
   const adjacency = new Map<string, Set<string>>();
-  for (const node of model.nodes) adjacency.set(node.id, new Set());
-  for (const edge of model.edges) {
+  for (const id of nodeIds) adjacency.set(id, new Set());
+  for (const edge of edges) {
     if (edge.source === edge.target) continue;
+    if (!idsInPartition.has(edge.source) || !idsInPartition.has(edge.target)) continue;
     adjacency.get(edge.source)?.add(edge.target);
     adjacency.get(edge.target)?.add(edge.source);
   }
@@ -85,20 +103,110 @@ export function communitiesFor(model: GraphModel): Map<string, number> {
     return peak;
   };
 
-  const peaks = [...new Set(model.nodes.map((n) => climb(n.id)))].sort();
+  const peaks = [...new Set(nodeIds.map(climb))].sort();
   const peakIndex = new Map(peaks.map((peak, i) => [peak, i]));
-  return new Map(model.nodes.map((n) => [n.id, peakIndex.get(peakOf.get(n.id)!)!]));
+  return new Map(nodeIds.map((id) => [id, String(peakIndex.get(peakOf.get(id)!))]));
+}
+
+/**
+ * Node id -> opaque community id, partitioned per space (D13/App-PR: no
+ * region or bridge edge may span spaces). Each space is handled
+ * independently and resolves to exactly one of three id families, never
+ * more than one per space:
+ *
+ * - READY (`cartographyBySpace.get(space)?.status === "ready"`): the
+ *   daemon's own community_id, namespaced `durable:<spaceSegment>:
+ *   <enc(community_id)>`.
+ * - a member the daemon's read didn't cover gets its own singleton under a
+ *   SEPARATE top-level family, `unassigned:<spaceSegment>:<enc(node id)>` —
+ *   never nested under `durable:`, so a daemon-assigned community_id that
+ *   happens to spell out the literal string "unassigned:<id>" can't forge
+ *   one (see the collision note below).
+ * - anything else (not ready — no durable data published yet, or a
+ *   partial-error): the client-side fallback climb, namespaced
+ *   `fallback:<spaceSegment>:<enc(local id)>`.
+ *
+ * The space component is the tag-discriminated segment above (`s<enc>` or
+ * `u`); community_id and node id are encodeURIComponent-escaped before
+ * joining. That does two things:
+ *   1. Collision-proofs the join itself — encodeURIComponent never leaves a
+ *      literal ":" unescaped, so `<prefix>:<encSpace>:<encRest>` always
+ *      splits back into exactly 3 parts; two different (space, id) pairs
+ *      can never concatenate to the same raw string the way an unescaped
+ *      join would (`("a","b:c")` vs `("a:b","c")`).
+ *   2. Keeps the three top-level prefixes (`durable:`, `unassigned:`,
+ *      `fallback:`) reserved: since escaped, space/id components can never
+ *      contain an unescaped ":", no daemon-controlled string can forge a
+ *      different family's prefix.
+ * Together, two different spaces' — or families' — community/local ids can
+ * never compare equal, so bridgeEdgeTest and communityRegions can't
+ * accidentally group members across a space boundary purely from id
+ * collision (bridgeEdgeTest also checks the space explicitly — see below —
+ * since namespacing alone only prevents accidental MERGING, not a
+ * cross-space pair from being flagged a bridge).
+ */
+export function communitiesFor(
+  model: GraphModel,
+  cartographyBySpace: Map<string, SpaceCartography>,
+): Map<string, string> {
+  // null keys the one unscoped bucket — an out-of-band key no space string
+  // can occupy, so the partition itself is unforgeable, not just the ids.
+  const bySpace = new Map<string | null, string[]>();
+  for (const node of model.nodes) {
+    pushInto(bySpace, isUnscopedSpace(node.space) ? null : node.space, node.id);
+  }
+
+  const result = new Map<string, string>();
+  for (const [space, nodeIds] of bySpace) {
+    const segment = spaceSegment(space);
+    const cartography = space !== null ? cartographyBySpace.get(space) : undefined;
+    if (cartography?.status === "ready" && cartography.memberCommunityId) {
+      for (const id of nodeIds) {
+        const communityId = cartography.memberCommunityId.get(id);
+        result.set(
+          id,
+          communityId !== undefined
+            ? `durable:${segment}:${encodeURIComponent(communityId)}`
+            : `unassigned:${segment}:${encodeURIComponent(id)}`,
+        );
+      }
+      continue;
+    }
+    const local = climbFallback(nodeIds, model.edges);
+    for (const [id, localId] of local) {
+      result.set(id, `fallback:${segment}:${encodeURIComponent(localId)}`);
+    }
+  }
+  return result;
+}
+
+/** Extract the tagged space segment from a namespaced community id
+ *  (`durable:<segment>:…` / `fallback:<segment>:…` / `unassigned:<segment>:…`)
+ *  — every family shares this exact 3-segment shape (see communitiesFor), so
+ *  a single split index reads the space regardless of prefix. Compared as the
+ *  tagged segment itself: `s<enc>` is injective in the space and `u` is
+ *  unreachable from any real name, so two ids carry the same space iff their
+ *  segments are equal, and unscoped only ever matches unscoped. */
+function communitySpace(id: string): string {
+  return id.split(":")[1] ?? "";
 }
 
 /**
  * Per-edge bridge test, sizes precomputed once. A bridge spans two DIFFERENT
- * communities that are both real regions (>= MIN_REGION_SIZE members) — an
- * edge poking out of a 2-node islet is not map furniture.
+ * communities, in the SAME space, that are both real regions
+ * (>= MIN_REGION_SIZE members) — an edge poking out of a 2-node islet is
+ * not map furniture, and a cross-space edge is never a bridge no matter how
+ * large the two communities are (D13/App-PR: no bridge may span spaces).
+ * Community ids are space-namespaced (see communitiesFor), which makes two
+ * same-space communities compare unequal when they should, but a
+ * cross-space PAIR also compares unequal — namespacing alone can't tell
+ * "different community" from "different space", so the space check below
+ * is required, not redundant.
  */
 export function bridgeEdgeTest(
-  communities: Map<string, number>,
+  communities: Map<string, string>,
 ): (source: string, target: string) => boolean {
-  const sizes = new Map<number, number>();
+  const sizes = new Map<string, number>();
   for (const community of communities.values()) {
     sizes.set(community, (sizes.get(community) ?? 0) + 1);
   }
@@ -109,6 +217,7 @@ export function bridgeEdgeTest(
       a !== undefined &&
       b !== undefined &&
       a !== b &&
+      communitySpace(a) === communitySpace(b) &&
       (sizes.get(a) ?? 0) >= MIN_REGION_SIZE &&
       (sizes.get(b) ?? 0) >= MIN_REGION_SIZE
     );
@@ -180,8 +289,8 @@ export function regionLeader<T extends { id: string; name: string; degree: numbe
   return hub;
 }
 
-export function communityRegions(graph: Graph, communities: Map<string, number>): Region[] {
-  const members = new Map<number, string[]>();
+export function communityRegions(graph: Graph, communities: Map<string, string>): Region[] {
+  const members = new Map<string, string[]>();
   for (const [id, community] of communities) {
     if (!graph.hasNode(id)) continue;
     pushInto(members, community, id);
@@ -226,7 +335,7 @@ export interface CartographyScene {
 }
 
 /** Everything drawCartography needs, computed once per paint from live state. */
-export function cartographyScene(graph: Graph, communities: Map<string, number>): CartographyScene {
+export function cartographyScene(graph: Graph, communities: Map<string, string>): CartographyScene {
   let maxNodeRadius = 0;
   graph.forEachNode((_id, attrs) => {
     maxNodeRadius = Math.max(maxNodeRadius, Math.hypot(attrs.x as number, attrs.y as number));

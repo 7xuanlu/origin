@@ -20,12 +20,16 @@ export interface GraphNode {
   name: string;
   /** Daemon vocabulary string, verbatim (e.g. "person", "technology"). */
   entityType: string;
-  /** null = unknown (matches the communityId convention below). */
+  /** null = unknown (matches the space convention below). */
   confirmed: boolean | null;
   /** Number of distinct edges touching this node in THIS model (a self-loop counts once, not twice). */
   degree: number;
-  /** null until wenlan-types exposes community_id on Entity. */
-  communityId: number | null;
+  /** Entity's space (falling back to domain), matching the entity page's
+   *  `space ?? domain` precedent. null for relation-only synthesized
+   *  neighbors, whose owning space this model never learns — the M6
+   *  cartography partition (see cartography.ts) treats that as its own
+   *  bucket rather than guessing. */
+  space: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -49,17 +53,23 @@ export interface GraphModel {
   coverage: { relationsFetchedFor: number; totalEntities: number };
 }
 
-// wenlan-types 0.12.0 carries neither field; read them defensively so the day
-// the daemon adds them the model lights up with zero call-site changes. Never
-// fabricate a value — absent stays null.
-function communityIdOf(entity: Entity): number | null {
-  const value = (entity as { community_id?: number | null }).community_id;
-  return typeof value === "number" ? value : null;
-}
-
+// wenlan-types 0.12.0 carries no confidence field; read it defensively so
+// the day the daemon adds it the model lights up with zero call-site
+// changes. Never fabricate a value — absent stays null.
 function confidenceOf(rel: RelationWithEntity): number | null {
   const value = (rel as { confidence?: number | null }).confidence;
   return typeof value === "number" ? value : null;
+}
+
+/**
+ * The space an entity is grouped under: its own `space`, else its `domain`.
+ * `||`, not `??` — an entity carrying an empty-string space still has a domain
+ * worth grouping under, and `??` would keep the "" and read as unscoped
+ * downstream (cartography's isUnscopedSpace treats it as falsy). Every place
+ * that derives a space from an entity goes through here so the rules agree.
+ */
+export function entitySpace(entity: Pick<Entity, "space" | "domain">): string | null {
+  return entity.space || entity.domain || null;
 }
 
 function nodeFromEntity(entity: Entity): GraphNode {
@@ -70,7 +80,7 @@ function nodeFromEntity(entity: Entity): GraphNode {
     entityType: entity.entity_type,
     confirmed: entity.confirmed,
     degree: 0,
-    communityId: communityIdOf(entity),
+    space: entitySpace(entity),
     createdAt: entity.created_at,
     updatedAt: entity.updated_at,
   };
@@ -90,7 +100,7 @@ function nodeFromRelation(rel: RelationWithEntity): GraphNode {
     entityType: rel.entity_type,
     confirmed: null,
     degree: 0,
-    communityId: null,
+    space: null,
     createdAt: rel.created_at,
     updatedAt: rel.created_at,
   };

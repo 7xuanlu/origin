@@ -3,10 +3,16 @@ import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { formatLocaleDate } from "../../../lib/dateFormat";
 import { listRefinements, type DistillReviewResponse, type Page } from "../../../lib/tauri";
+import { useTruthStatus } from "../../../hooks/useTruthStatus";
+import { PageTruthBadges } from "../PageTruthBadges";
 import ReviewDialog from "../ReviewDialog";
 import { reviewSuppressKey, useSuppressedReviewItems } from "../reviewSuppression";
 import { REVIEW_QUEUE_LIMIT, reviewItemId, type ReviewItem } from "../useReviewQueue";
-import { listAllActivePages, listAllDraftPages } from "./listAllPages";
+import {
+  EXPLICIT_BROWSE_QUERY_POLICY,
+  listAllActivePagesExplicitBrowse,
+  listAllDraftPagesExplicitBrowse,
+} from "./listAllPages";
 import {
   DISTILL_REVIEW_SESSION_QUERY_KEY,
   DISTILL_REVIEW_SESSION_QUERY_POLICY,
@@ -127,13 +133,16 @@ export function PagesOverview({
   const [pageIndex, setPageIndex] = useState(0);
   const [openCandidateId, setOpenCandidateId] = useState<string | null>(null);
   const { hiddenKeys, hide: hideReviewItem } = useSuppressedReviewItems();
+  const { cutoverLive } = useTruthStatus();
   const activePagesQuery = useQuery({
     queryKey: ["pages", "active"],
-    queryFn: listAllActivePages,
+    queryFn: listAllActivePagesExplicitBrowse,
+    ...EXPLICIT_BROWSE_QUERY_POLICY,
   });
   const draftPagesQuery = useQuery({
     queryKey: ["pages", "draft"],
-    queryFn: listAllDraftPages,
+    queryFn: listAllDraftPagesExplicitBrowse,
+    ...EXPLICIT_BROWSE_QUERY_POLICY,
   });
   const pages = useMemo(
     () => Array.from(new Map([
@@ -389,6 +398,7 @@ export function PagesOverview({
                                 {t("pages.overview.cleanupSuggested")}
                               </span>
                             )}
+                            <PageTruthBadges cutoverLive={cutoverLive} truth={page.truth} />
                           </span>
                         </button>
                         {page.summary && <p>{page.summary}</p>}

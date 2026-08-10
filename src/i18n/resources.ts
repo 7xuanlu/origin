@@ -296,6 +296,14 @@ const en = {
       paginationRange: "{{start}}–{{end}} of {{total}}",
       previous: "Previous",
       next: "Next",
+      truth: {
+        supportAxis: "Support",
+        humanReviewAxis: "Human review",
+        supported: "Supported",
+        provisional: "Provisional",
+        reviewed: "Reviewed",
+        unreviewed: "Unreviewed",
+      },
     },
   },
   spaces: {
@@ -929,6 +937,9 @@ const en = {
     regionsToggle: "Regions",
     spaceLabel: "Space",
     spaceAll: "All spaces",
+    cartographyReady: "Durable regions",
+    cartographyFallback: "Estimated regions",
+    cartographyPartialError: "Region sync issue",
     rail: {
       gapTitle: "Gap",
       bridgeTitle: "Bridge",
@@ -1840,6 +1851,14 @@ const zhHans = {
       paginationRange: "{{start}}–{{end}}，共 {{total}} 个",
       previous: "上一页",
       next: "下一页",
+      truth: {
+        supportAxis: "支持状态",
+        humanReviewAxis: "人工审核",
+        supported: "已支持",
+        provisional: "暂定",
+        reviewed: "已审核",
+        unreviewed: "未审核",
+      },
     },
   },
   spaces: {
@@ -2465,6 +2484,9 @@ const zhHans = {
     regionsToggle: "区域",
     spaceLabel: "空间",
     spaceAll: "全部空间",
+    cartographyReady: "稳定区域",
+    cartographyFallback: "估计区域",
+    cartographyPartialError: "区域同步异常",
     rail: {
       gapTitle: "缺口",
       bridgeTitle: "桥接",
@@ -3357,6 +3379,14 @@ const zhHant = {
       paginationRange: "{{start}}–{{end}}，共 {{total}} 個",
       previous: "上一頁",
       next: "下一頁",
+      truth: {
+        supportAxis: "支持狀態",
+        humanReviewAxis: "人工審核",
+        supported: "已支持",
+        provisional: "暫定",
+        reviewed: "已審核",
+        unreviewed: "未審核",
+      },
     },
   },
   spaces: {
@@ -3982,6 +4012,9 @@ const zhHant = {
     regionsToggle: "區域",
     spaceLabel: "空間",
     spaceAll: "全部空間",
+    cartographyReady: "穩定區域",
+    cartographyFallback: "估計區域",
+    cartographyPartialError: "區域同步異常",
     rail: {
       gapTitle: "缺口",
       bridgeTitle: "橋接",

@@ -180,13 +180,37 @@ describe("buildGraphModel / buildEgoModel", () => {
     expect(model.edges.find((e) => e.id === "r2")!.confidence).toBeNull();
   });
 
-  it("reads community_id when the entity carries it, else null", () => {
-    const withCid = { ...makeEntity({ id: "E" }), community_id: 7 } as Entity;
-    const withCidModel = buildGraphModel([withCid], [makeDetail(withCid, [])]);
-    expect(withCidModel.nodes.find((n) => n.id === "E")!.communityId).toBe(7);
-    const plain = makeEntity({ id: "F" });
-    const plainModel = buildGraphModel([plain], [makeDetail(plain, [])]);
-    expect(plainModel.nodes.find((n) => n.id === "F")!.communityId).toBeNull();
+  it("reads space from the entity, falling back to domain, else null", () => {
+    const withSpace = makeEntity({ id: "E", space: "Work", domain: "legacy" });
+    const withSpaceModel = buildGraphModel([withSpace], [makeDetail(withSpace, [])]);
+    expect(withSpaceModel.nodes.find((n) => n.id === "E")!.space).toBe("Work");
+
+    const domainOnly = makeEntity({ id: "F", space: null, domain: "legacy" });
+    const domainOnlyModel = buildGraphModel([domainOnly], [makeDetail(domainOnly, [])]);
+    expect(domainOnlyModel.nodes.find((n) => n.id === "F")!.space).toBe("legacy");
+
+    const neither = makeEntity({ id: "G", space: null, domain: null });
+    const neitherModel = buildGraphModel([neither], [makeDetail(neither, [])]);
+    expect(neitherModel.nodes.find((n) => n.id === "G")!.space).toBeNull();
+
+    // An empty space string is not a space. It has to fall through to the
+    // domain, or the node reads as unscoped and loses its grouping.
+    const emptySpace = makeEntity({ id: "H", space: "", domain: "legacy" });
+    const emptySpaceModel = buildGraphModel([emptySpace], [makeDetail(emptySpace, [])]);
+    expect(emptySpaceModel.nodes.find((n) => n.id === "H")!.space).toBe("legacy");
+
+    const bothEmpty = makeEntity({ id: "I", space: "", domain: "" });
+    const bothEmptyModel = buildGraphModel([bothEmpty], [makeDetail(bothEmpty, [])]);
+    expect(bothEmptyModel.nodes.find((n) => n.id === "I")!.space).toBeNull();
+  });
+
+  it("leaves a relation-synthesized neighbor's space unknown (null), never guessed from the home entity", () => {
+    const e = makeEntity({ id: "E", space: "Work" });
+    const detail = makeDetail(e, [
+      makeRel({ id: "r1", direction: "outgoing", entity_id: "NEW", entity_name: "Newcomer" }),
+    ]);
+    const model = buildGraphModel([e], [detail]);
+    expect(model.nodes.find((n) => n.id === "NEW")!.space).toBeNull();
   });
 
   it("buildEgoModel keeps full center entity data and 1/1 coverage", () => {

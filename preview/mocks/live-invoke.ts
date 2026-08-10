@@ -18,10 +18,18 @@ class HttpError extends Error {
   }
 }
 
-async function http(method: string, path: string, body?: unknown): Promise<any> {
+async function http(
+  method: string,
+  path: string,
+  body?: unknown,
+  extraHeaders?: Record<string, string>,
+): Promise<any> {
   const res = await fetch(`/daemon${path}`, {
     method,
-    headers: body !== undefined ? { "content-type": "application/json" } : undefined,
+    headers: {
+      ...(body !== undefined ? { "content-type": "application/json" } : undefined),
+      ...extraHeaders,
+    },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
@@ -34,10 +42,21 @@ async function http(method: string, path: string, body?: unknown): Promise<any> 
   }
   return text ? JSON.parse(text) : null;
 }
-const get = (p: string) => http("GET", p);
-const post = (p: string, b: unknown = {}) => http("POST", p, b);
+const get = (p: string, headers?: Record<string, string>) => http("GET", p, undefined, headers);
+const post = (p: string, b: unknown = {}, headers?: Record<string, string>) => http("POST", p, b, headers);
 const put = (p: string, b: unknown = {}) => http("PUT", p, b);
 const del = (p: string) => http("DELETE", p);
+
+// M5 truth axes: the same two-header marker app/src/api.rs attaches on its
+// `*_explicit_browse` client methods. Only ever pass this to a route the
+// daemon manifest marks Collection or NamedPage (`GET /api/pages`,
+// `POST /api/pages/search`, `GET /api/pages/{id}`) — the daemon records
+// every marked call, so a preview handler must not send it on an automatic
+// read masquerading as a browse.
+const EXPLICIT_BROWSE_HEADERS = {
+  "x-wenlan-truth-contract": "1",
+  "x-wenlan-reader-intent": "explicit",
+};
 
 const enc = encodeURIComponent;
 const pageUpdateErrorMessage = (
@@ -268,18 +287,17 @@ function samePreviewPageScope(
 async function listAllRemotePages(
   status: string,
   domain: string | null,
+  headers?: Record<string, string>,
 ): Promise<Record<string, unknown>[]> {
   const pages: Record<string, unknown>[] = [];
   const seenIds = new Set<string>();
   let offset = 0;
 
   while (true) {
-    const wire = await get(`/api/pages${qs({
-      status,
-      domain,
-      limit: PAGE_BATCH_SIZE,
-      offset,
-    })}`);
+    const wire = await get(
+      `/api/pages${qs({ status, domain, limit: PAGE_BATCH_SIZE, offset })}`,
+      headers,
+    );
     const batch = (Array.isArray(wire?.pages) ? wire.pages : wire) as unknown;
     if (!Array.isArray(batch)) return pages;
 
@@ -301,25 +319,56 @@ function downloadComplete(): boolean {
   return downloadStartedAt !== null && Date.now() - downloadStartedAt >= MODEL_DOWNLOAD_DURATION_MS;
 }
 
+async function listPagesVia(a: any, headers?: Record<string, string>): Promise<unknown> {
+  const status = typeof a?.status === "string" ? a.status : "active";
+  const domain = normalizedSpace(a?.domain);
+  const remote = await listAllRemotePages(status, domain, headers);
+  const local = [...PREVIEW_AUTHORED_PAGES.values()].filter((page) => {
+    const statusMatches = page.status === status;
+    const domainMatches = !domain || page.domain === domain || page.space === domain;
+    return statusMatches && domainMatches;
+  });
+  const localIds = new Set(local.map((page) => page.id));
+  const combined = [...local, ...remote.filter((page) => !localIds.has(page.id))];
+  const offset = typeof a?.offset === "number" ? a.offset : 0;
+  const limit = typeof a?.limit === "number" ? a.limit : undefined;
+  return combined.slice(offset, limit === undefined ? undefined : offset + limit);
+}
+
+function searchPagesVia(a: any, headers?: Record<string, string>): Promise<unknown> {
+  return post(
+    "/api/pages/search",
+    { query: a.query, limit: a.limit ?? null, page_type: null },
+    headers,
+  ).then((r) => r.pages ?? r);
+}
+
+async function getPageVia(a: any, headers?: Record<string, string>): Promise<unknown> {
+  const id = String(a.id);
+  const previewPage = PREVIEW_AUTHORED_PAGES.get(id);
+  if (previewPage) return previewPage;
+  if (PREVIEW_DELETED_PAGE_IDS.has(id)) return null;
+  try {
+    const wire = await get(`/api/pages/${enc(a.id)}`, headers);
+    return wire?.page ?? null;
+  } catch (e) {
+    if (e instanceof HttpError && e.status === 404) return null;
+    throw e;
+  }
+}
+
 // Exported (not just module-local) so the parity test below can read the
 // covered-command key sets without re-parsing this file.
 export const HANDLERS: Record<string, (a: any) => Promise<unknown>> = {
   daemon_version: () =>
     get("/api/health").then((response) => String(response?.version ?? "")),
   // --- pages (mirrors search.rs exactly) ---
-  get_page: async (a) => {
-    const id = String(a.id);
-    const previewPage = PREVIEW_AUTHORED_PAGES.get(id);
-    if (previewPage) return previewPage;
-    if (PREVIEW_DELETED_PAGE_IDS.has(id)) return null;
-    try {
-      const wire = await get(`/api/pages/${enc(a.id)}`);
-      return wire?.page ?? null;
-    } catch (e) {
-      if (e instanceof HttpError && e.status === 404) return null;
-      throw e;
-    }
-  },
+  get_page: (a) => getPageVia(a),
+  // M5 truth axes: same lookup, marked as a human-initiated wiki browse so
+  // the daemon attaches `Page.truth` once its cutover is live. Only
+  // PageDetail (a page a person navigated to) calls this — see
+  // app/src/search.rs::get_page_explicit_browse.
+  get_page_explicit_browse: (a) => getPageVia(a, EXPLICIT_BROWSE_HEADERS),
   create_page: (a) => {
     const title = String(a?.title ?? "").trim();
     const content = String(a?.content ?? "").trim();
@@ -481,25 +530,16 @@ export const HANDLERS: Record<string, (a: any) => Promise<unknown>> = {
     PREVIEW_PAGE_DRAFT_CREATE_REQUESTS.set(id, null);
     return Promise.resolve(null);
   },
-  list_pages: async (a) => {
-    const status = typeof a?.status === "string" ? a.status : "active";
-    const domain = normalizedSpace(a?.domain);
-    const remote = await listAllRemotePages(status, domain);
-    const local = [...PREVIEW_AUTHORED_PAGES.values()].filter((page) => {
-      const statusMatches = page.status === status;
-      const domainMatches = !domain || page.domain === domain || page.space === domain;
-      return statusMatches && domainMatches;
-    });
-    const localIds = new Set(local.map((page) => page.id));
-    const combined = [...local, ...remote.filter((page) => !localIds.has(page.id))];
-    const offset = typeof a?.offset === "number" ? a.offset : 0;
-    const limit = typeof a?.limit === "number" ? a.limit : undefined;
-    return combined.slice(offset, limit === undefined ? undefined : offset + limit);
-  },
-  search_pages: (a) =>
-    post("/api/pages/search", { query: a.query, limit: a.limit ?? null, page_type: null }).then(
-      (r) => r.pages ?? r,
-    ),
+  list_pages: (a) => listPagesVia(a),
+  // M5 truth axes: PagesOverview is the one deliberate wiki-browse screen,
+  // so it — and only it — calls these two marked siblings. Everything else
+  // that lists pages (sidebar recents, the home feed, space counts) stays on
+  // the automatic handlers above; see the `SpaceList.tsx` polling note in
+  // crates/wenlan-core/src/truth_contract.rs for why that split matters.
+  list_pages_explicit_browse: (a) => listPagesVia(a, EXPLICIT_BROWSE_HEADERS),
+  search_pages: (a) => searchPagesVia(a),
+  get_truth_status: () =>
+    get("/api/status").then((r) => r?.truth ?? null),
   list_recent_pages: (a) =>
     get(`/api/pages/recent${qs({ limit: a?.limit, since_ms: a?.sinceMs })}`).then(
       (r) => r.pages ?? r,
@@ -520,6 +560,22 @@ export const HANDLERS: Record<string, (a: any) => Promise<unknown>> = {
   delete_page_map_node: (a) =>
     http("DELETE", `/api/pages/${enc(a.pageId)}/map/nodes/${enc(a.nodeId)}`, a.body),
   put_page_map_layout: (a) => put(`/api/pages/${enc(a.pageId)}/map/layout`, a.body),
+
+  // Communities (M6 cartography) — mirrors WenlanClient::list_communities /
+  // list_community_members in app/src/api.rs.
+  list_communities: (a) =>
+    get(`/api/communities${qs({ space: a.space, cursor: a.cursor, limit: a.limit })}`),
+  list_community_members: (a) => {
+    const cursor = a.cursor as { space: string; node_id: string } | null | undefined;
+    return get(
+      `/api/communities/members${qs({
+        space: a.space,
+        cursor_space: cursor?.space,
+        cursor_node_id: cursor?.node_id,
+        limit: a.limit,
+      })}`,
+    );
+  },
   get_page_revisions: (a) => get(`/api/pages/${enc(a.pageId)}/revisions`),
   redistill_page: (a) => post(`/api/distill/${enc(a.pageId)}`, {}),
   update_page: async (a) => {

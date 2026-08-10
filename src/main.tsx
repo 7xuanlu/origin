@@ -13,7 +13,10 @@ import "./index.css";
 // Apply theme before first render to prevent flash
 applyTheme();
 
-void bootstrap();
+void bootstrap().catch((error: unknown) => {
+  console.error("[bootstrap] failed to initialize the Wenlan UI", error);
+  document.documentElement.dataset.bootstrapFailed = "true";
+});
 
 async function bootstrap() {
   await initializeI18n();

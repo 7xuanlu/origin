@@ -2,11 +2,18 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { i18n } from "../../i18n";
 
-vi.mock("../../lib/tauri", () => ({
-  listEntities: vi.fn(),
-  getEntityDetail: vi.fn(),
-}));
+vi.mock("../../lib/tauri", async () => {
+  const actual = await vi.importActual<typeof import("../../lib/tauri")>("../../lib/tauri");
+  return {
+    ...actual,
+    listEntities: vi.fn(),
+    getEntityDetail: vi.fn(),
+    listCommunities: vi.fn(),
+    listCommunityMembers: vi.fn(),
+  };
+});
 
 // jsdom has no WebGL context — a real Sigma would throw trying to acquire
 // one. Mocked at module level per repo convention for canvas/WebGL surfaces;
@@ -76,18 +83,25 @@ vi.mock("sigma", () => {
       y: pos.y,
       ratio,
     }));
-    refresh() {}
+    // Real sigma renders synchronously on refresh() and fires afterRender at
+    // the end of the frame. The underlay repaint hangs off that event, so a
+    // no-op here would silently pass any "it repainted" assertion.
+    refresh() {
+      this.handlers.get("afterRender")?.({});
+    }
     setSetting(_key: string, _value: unknown) {}
     kill() {}
   }
   return { default: SigmaMock };
 });
 
-import { listEntities, getEntityDetail } from "../../lib/tauri";
+import { listEntities, getEntityDetail, listCommunities, listCommunityMembers } from "../../lib/tauri";
 import AtlasView from "./AtlasView";
 
 const mockListEntities = vi.mocked(listEntities);
 const mockGetEntityDetail = vi.mocked(getEntityDetail);
+const mockListCommunities = vi.mocked(listCommunities);
+const mockListCommunityMembers = vi.mocked(listCommunityMembers);
 
 function renderWithQuery(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
@@ -100,6 +114,9 @@ function makeEntity(overrides: Partial<import("../../lib/tauri").Entity> = {}): 
     name: overrides.name ?? "Entity",
     entity_type: overrides.entity_type ?? "concept",
     domain: overrides.domain ?? null,
+    // Kept distinct from domain: an entity can carry space: null or the empty
+    // string while domain says nothing, and all of those mean "unscoped".
+    space: overrides.space ?? null,
     source_agent: overrides.source_agent ?? null,
     confidence: overrides.confidence ?? null,
     confirmed: overrides.confirmed ?? false,
@@ -112,6 +129,19 @@ describe("AtlasView", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     capturedSigmaInstances.length = 0;
+    // Ordinary "no durable data published yet" default — most tests carry
+    // no space at all (so this never fires), and the ones that do only care
+    // about entities/relations, not cartography.
+    mockListCommunities.mockResolvedValue({
+      schema_version: "community-read-v1",
+      communities: [],
+      next_cursor: null,
+    });
+    mockListCommunityMembers.mockResolvedValue({
+      schema_version: "community-read-v1",
+      members: [],
+      next_cursor: null,
+    });
   });
 
   it("shows a distinct loading state while entities are in flight, then resolves to empty", async () => {
@@ -903,6 +933,441 @@ describe("AtlasView", () => {
     // Toolbar is provably rendered (Regions chip present) before the absence claim.
     expect(screen.getByRole("button", { name: "Regions" })).toBeInTheDocument();
     expect(screen.queryByRole("combobox", { name: "Space" })).not.toBeInTheDocument();
+  });
+
+  // A single entity carrying a space — the minimum needed to put the
+  // cartography query in flight for the badge tests below.
+  function mockOneSpaceEntity(domain = "wenlan-dev") {
+    const entity = makeEntity({ id: "e1", domain });
+    mockListEntities.mockResolvedValue([entity]);
+    mockGetEntityDetail.mockResolvedValue({ entity, observations: [], relations: [] });
+    return entity;
+  }
+
+  function readyCommunityPages(space: string) {
+    return {
+      communities: {
+        schema_version: "community-read-v1" as const,
+        communities: [
+          {
+            community_id: "c1",
+            space,
+            display_name: null,
+            member_count: 1,
+            published_generation: 1,
+            algo_version: "v1",
+            projection_version: "v1",
+          },
+        ],
+        next_cursor: null,
+      },
+      members: {
+        schema_version: "community-read-v1" as const,
+        members: [
+          {
+            space,
+            node_id: "e1",
+            node_kind: "entity",
+            community_id: "c1",
+            published_generation: 1,
+            attachment: "core",
+          },
+        ],
+        next_cursor: null,
+      },
+    };
+  }
+
+  it("badges the toolbar with durable-regions once the space's community read comes back ready", async () => {
+    mockOneSpaceEntity();
+    const pages = readyCommunityPages("wenlan-dev");
+    mockListCommunities.mockResolvedValue(pages.communities);
+    mockListCommunityMembers.mockResolvedValue(pages.members);
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    expect(await screen.findByText("Durable regions")).toBeInTheDocument();
+  });
+
+  it("keeps the badge honest when a null-space relation neighbor sits beside an otherwise-ready space", async () => {
+    // "e1" carries a real space and its own community read comes back
+    // ready; "ghost" only ever appears as a relation target (model.ts
+    // synthesizes it with space: null) — the aggregate must never read as
+    // all-durable while that unreported fallback node is on the map.
+    const entity = mockOneSpaceEntity();
+    mockGetEntityDetail.mockResolvedValue({
+      entity,
+      observations: [],
+      relations: [
+        {
+          id: "rel-1",
+          relation_type: "knows",
+          direction: "outgoing" as const,
+          entity_id: "ghost",
+          entity_name: "Ghost",
+          entity_type: "concept",
+          source_agent: null,
+          created_at: Math.floor(Date.now() / 1000),
+        },
+      ],
+    });
+    const pages = readyCommunityPages("wenlan-dev");
+    mockListCommunities.mockResolvedValue(pages.communities);
+    mockListCommunityMembers.mockResolvedValue(pages.members);
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    expect(await screen.findByText("Estimated regions")).toBeInTheDocument();
+    expect(screen.queryByText("Durable regions")).not.toBeInTheDocument();
+  });
+
+  it("badges the toolbar with estimated-regions while no durable data has been published for the space yet", async () => {
+    mockOneSpaceEntity();
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    expect(await screen.findByText("Estimated regions")).toBeInTheDocument();
+  });
+
+  // An entity's OWN space can be null or empty (model.ts's GraphNode.space) —
+  // it does not take a relation-only neighbor to put unscoped nodes on the
+  // map. Such a graph renders entirely on the fallback climb, so the badge
+  // must say so even though there is no relation, and no known space, to give
+  // it away.
+  it.each([
+    ["null", null],
+    ["empty-string", ""],
+  ])("badges the toolbar as estimated for a relation-free graph whose entity carries a %s space", async (_label, space) => {
+    const entity = makeEntity({ id: "e1", name: "Alice", domain: null, space });
+    mockListEntities.mockResolvedValue([entity]);
+    mockGetEntityDetail.mockResolvedValue({ entity, observations: [], relations: [] });
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    // Toolbar is provably rendered before the badge claim.
+    expect(screen.getByRole("button", { name: "Regions" })).toBeInTheDocument();
+    expect(await screen.findByText("Estimated regions")).toBeInTheDocument();
+  });
+
+  // Scoping to a space drops the other space's entities from the model inputs
+  // but keeps the relations pointing at them, so buildGraphModel synthesizes
+  // those endpoints with space: null — real unscoped nodes, drawn on the
+  // fallback climb, that exist ONLY in the filtered model. A badge derived
+  // from the unfiltered entity list cannot see them and keeps claiming
+  // durable while the map shows otherwise.
+  it("badges the toolbar as estimated once a space filter synthesizes an unscoped bridge neighbor", async () => {
+    const entities = [
+      makeEntity({ id: "e1", name: "Alice", domain: "Work" }),
+      makeEntity({ id: "e2", name: "Bob", domain: "Personal" }),
+    ];
+    mockListEntities.mockResolvedValue(entities);
+    mockGetEntityDetail.mockImplementation(async (id: string) => ({
+      entity: entities.find((e) => e.id === id)!,
+      observations: [],
+      relations:
+        id === "e1"
+          ? [
+              {
+                id: "rel-1",
+                relation_type: "knows",
+                direction: "outgoing" as const,
+                entity_id: "e2",
+                entity_name: "Bob",
+                entity_type: "person",
+                source_agent: null,
+                created_at: Math.floor(Date.now() / 1000),
+              },
+            ]
+          : [],
+    }));
+    // Both spaces publish durable cartography, so nothing about the daemon
+    // reads is degraded — only the filtered view is.
+    const communityId = (space: string) => (space === "Work" ? "c1" : "c2");
+    const nodeId = (space: string) => (space === "Work" ? "e1" : "e2");
+    mockListCommunities.mockImplementation(async (space: string) => ({
+      schema_version: "community-read-v1" as const,
+      communities: [
+        {
+          community_id: communityId(space),
+          space,
+          display_name: null,
+          member_count: 1,
+          published_generation: 1,
+          algo_version: "v1",
+          projection_version: "v1",
+        },
+      ],
+      next_cursor: null,
+    }));
+    mockListCommunityMembers.mockImplementation(async (space: string) => ({
+      schema_version: "community-read-v1" as const,
+      members: [
+        {
+          space,
+          node_id: nodeId(space),
+          node_kind: "entity",
+          community_id: communityId(space),
+          published_generation: 1,
+          attachment: "core",
+        },
+      ],
+      next_cursor: null,
+    }));
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    // Unfiltered, every rendered node carries a ready space.
+    expect(await screen.findByText("Durable regions")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Space" }), {
+      target: { value: "Work" },
+    });
+
+    // Bob is now a synthesized, space-less endpoint on the map.
+    expect(await screen.findByText("Estimated regions")).toBeInTheDocument();
+    expect(screen.queryByText("Durable regions")).not.toBeInTheDocument();
+  });
+
+  it("badges the toolbar with an alerting sync-issue state when a space's community read fails", async () => {
+    mockOneSpaceEntity();
+    mockListCommunities.mockRejectedValue(new Error("connection reset"));
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    const badge = await screen.findByText("Region sync issue");
+    expect(badge).toHaveAttribute("role", "alert");
+  });
+
+  // Same two-triangles-one-bridge shape as mockTwoTriangles, but every
+  // entity carries a space so the cartography query actually fires (a bare
+  // mockTwoTriangles never puts the constellation-cartography query in
+  // flight — see mockOneSpaceEntity's comment above).
+  function mockTwoTrianglesInSpace(domain = "wenlan-dev") {
+    const names: Record<string, string> = {
+      a1: "Alice",
+      a2: "Anna",
+      a3: "Ada",
+      b1: "Bob",
+      b2: "Ben",
+      b3: "Bea",
+    };
+    const entities = Object.entries(names).map(([id, name]) => makeEntity({ id, name, domain }));
+    const rel = (id: string, target: string) => ({
+      id,
+      relation_type: "knows",
+      direction: "outgoing" as const,
+      entity_id: target,
+      entity_name: names[target],
+      entity_type: "concept",
+      source_agent: null,
+      created_at: Math.floor(Date.now() / 1000),
+    });
+    mockListEntities.mockResolvedValue(entities);
+    mockGetEntityDetail.mockImplementation(async (id: string) => {
+      const relations =
+        id === "a1"
+          ? [rel("r1", "a2"), rel("r2", "a3"), rel("rb", "b1")]
+          : id === "a2"
+            ? [rel("r3", "a3")]
+            : id === "b1"
+              ? [rel("r4", "b2"), rel("r5", "b3")]
+              : id === "b2"
+                ? [rel("r6", "b3")]
+                : [];
+      return { entity: entities.find((e) => e.id === id)!, observations: [], relations };
+    });
+  }
+
+  // Records what the cartography underlay actually painted. drawCartography
+  // clears once per paint before drawing, so resetting on clearRect leaves
+  // `regionNames` holding the MOST RECENT paint only — immune to however many
+  // extra repaints a render happens to trigger — while `paints` counts them.
+  function recordingUnderlayCtx() {
+    const state = { paints: 0, regionNames: [] as string[] };
+    const ctx = {
+      strokeStyle: "",
+      fillStyle: "",
+      lineWidth: 0,
+      lineJoin: "",
+      lineCap: "",
+      font: "",
+      letterSpacing: "",
+      textAlign: "",
+      textBaseline: "",
+      setTransform: vi.fn(),
+      clearRect: vi.fn(() => {
+        state.paints += 1;
+        state.regionNames.length = 0;
+      }),
+      save: vi.fn(),
+      restore: vi.fn(),
+      beginPath: vi.fn(),
+      closePath: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      bezierCurveTo: vi.fn(),
+      arc: vi.fn(),
+      setLineDash: vi.fn(),
+      stroke: vi.fn(),
+      fill: vi.fn(),
+      fillText: vi.fn((text: string) => {
+        state.regionNames.push(text);
+      }),
+    };
+    return { ctx, state };
+  }
+
+  it("paints the underlay on mount through the post-mount effects, with no second draw of its own", async () => {
+    mockTwoTrianglesInSpace();
+    // The underlay canvas only exists once the mount effect has run, so stub
+    // the prototype to catch the very first paint.
+    const painter = recordingUnderlayCtx();
+    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(painter.ctx) as any;
+    try {
+      renderWithQuery(<AtlasView />);
+      await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+      // Nothing here fired afterRender by hand: the theme and cartography
+      // effects both refresh() right after the mount effect, and that is the
+      // whole initial paint path — so the mount effect must not draw as well.
+      expect(painter.state.paints).toBeGreaterThan(0);
+      expect(painter.state.regionNames).toEqual(["Alice", "Bob"]);
+    } finally {
+      HTMLCanvasElement.prototype.getContext = originalGetContext;
+    }
+  });
+
+  it("re-renders bridges and hulls when a space's cartography status changes, without a full remount", async () => {
+    mockTwoTrianglesInSpace();
+    // Starts on the default (empty) fallback climb: two 3-cliques, "rb" is
+    // the one cross-region bridge.
+    const { qc } = renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    const instance = capturedSigmaInstances[0];
+    const graph = instance.graph;
+
+    expect(graph.getEdgeAttribute("rb", "bridge")).toBe(true);
+
+    // Watch the hulls, not just the edge colours: on the fallback climb the
+    // two triangles are two named regions (leaders a1/b1 — the degree-3 hubs).
+    const underlay = document.querySelector(
+      'canvas[data-testid="atlas-cartography"]',
+    ) as HTMLCanvasElement;
+    const painter = recordingUnderlayCtx();
+    underlay.getContext = vi.fn().mockReturnValue(painter.ctx) as any;
+    instance.handlers.get("afterRender")!({});
+    expect(painter.state.regionNames).toEqual(["Alice", "Bob"]);
+    const paintsBeforeChange = painter.state.paints;
+
+    // Durable arrives: the daemon puts all 6 members in ONE community, so
+    // the bridge collapses into an ordinary intra-region edge.
+    const allOneCommunity = {
+      communities: {
+        schema_version: "community-read-v1" as const,
+        communities: [
+          {
+            community_id: "one",
+            space: "wenlan-dev",
+            display_name: null,
+            member_count: 6,
+            published_generation: 1,
+            algo_version: "v1",
+            projection_version: "v1",
+          },
+        ],
+        next_cursor: null,
+      },
+      members: {
+        schema_version: "community-read-v1" as const,
+        members: ["a1", "a2", "a3", "b1", "b2", "b3"].map((node_id) => ({
+          space: "wenlan-dev",
+          node_id,
+          node_kind: "entity",
+          community_id: "one",
+          published_generation: 1,
+          attachment: "core",
+        })),
+        next_cursor: null,
+      },
+    };
+    mockListCommunities.mockResolvedValue(allOneCommunity.communities);
+    mockListCommunityMembers.mockResolvedValue(allOneCommunity.members);
+    await qc.invalidateQueries({ queryKey: ["constellation-cartography"] });
+
+    await waitFor(() => expect(graph.getEdgeAttribute("rb", "bridge")).toBe(false));
+    // The hulls repainted on their OWN — no test-fired afterRender here — and
+    // the two regions have become the one merged region the daemon declared.
+    // Recolouring the edges alone would leave the old two-hull picture on the
+    // underlay, which is exactly what the round-1 test could not see.
+    expect(painter.state.paints).toBeGreaterThan(paintsBeforeChange);
+    expect(painter.state.regionNames).toEqual(["Alice"]);
+    // Same sigma instance and the same graphology graph — no remount, no
+    // layout/camera reset.
+    expect(capturedSigmaInstances).toHaveLength(1);
+    expect(capturedSigmaInstances[0].graph).toBe(graph);
+
+    // ready -> error: the space's community read starts failing, so the
+    // renderer must fall back to the client-side climb again — bridge back.
+    mockListCommunities.mockRejectedValue(new Error("connection reset"));
+    await qc.invalidateQueries({ queryKey: ["constellation-cartography"] });
+
+    await waitFor(() => expect(graph.getEdgeAttribute("rb", "bridge")).toBe(true));
+    expect(capturedSigmaInstances).toHaveLength(1);
+  });
+
+  it("aggregates worst-first across spaces: one failed space taints the badge even though another is ready", async () => {
+    const entities = [
+      makeEntity({ id: "e1", domain: "wenlan-dev" }),
+      makeEntity({ id: "e2", domain: "personal" }),
+    ];
+    mockListEntities.mockResolvedValue(entities);
+    mockGetEntityDetail.mockImplementation(async (id: string) => ({
+      entity: entities.find((e) => e.id === id)!,
+      observations: [],
+      relations: [],
+    }));
+    const ready = readyCommunityPages("wenlan-dev");
+    mockListCommunities.mockImplementation(async (space: string) =>
+      space === "wenlan-dev" ? ready.communities : Promise.reject(new Error("connection reset")),
+    );
+    mockListCommunityMembers.mockImplementation(async (space: string) =>
+      space === "wenlan-dev"
+        ? ready.members
+        : { schema_version: "community-read-v1" as const, members: [], next_cursor: null },
+    );
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    expect(await screen.findByText("Region sync issue")).toBeInTheDocument();
+  });
+
+  it("renders the badge text in zh-Hans and zh-Hant, not just English", async () => {
+    mockOneSpaceEntity();
+    const pages = readyCommunityPages("wenlan-dev");
+    mockListCommunities.mockResolvedValue(pages.communities);
+    mockListCommunityMembers.mockResolvedValue(pages.members);
+
+    await i18n.changeLanguage("zh-Hans");
+    const simplified = renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    expect(await screen.findByText("稳定区域")).toBeInTheDocument();
+    simplified.unmount();
+    capturedSigmaInstances.length = 0;
+
+    await i18n.changeLanguage("zh-Hant");
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    expect(await screen.findByText("穩定區域")).toBeInTheDocument();
+
+    await i18n.changeLanguage("en");
   });
 
   it("jumps the camera instantly on search select under prefers-reduced-motion", async () => {
