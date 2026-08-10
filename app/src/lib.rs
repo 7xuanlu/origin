@@ -105,12 +105,9 @@ fn production_runtime_roots(
             home.join(".origin"),
         ]);
     }
-    #[cfg(target_os = "windows")]
     if let Some(local_app_data) = local_app_data {
         roots.extend([local_app_data.join("wenlan"), local_app_data.join("origin")]);
     }
-    #[cfg(not(target_os = "windows"))]
-    let _ = local_app_data;
     roots
 }
 
@@ -464,12 +461,6 @@ fn request_full_quit(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
         }
     }
     Ok(())
-}
-
-#[cfg(not(feature = "review-fixtures"))]
-#[tauri::command]
-fn request_guarded_quit(app: tauri::AppHandle) -> Result<(), String> {
-    request_full_quit(&app).map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -1391,7 +1382,6 @@ pub fn run() {
             search::set_run_at_login,
             search::quit_wenlan_full,
             search::quit_origin_full,
-            request_guarded_quit,
             acknowledge_guarded_quit_request,
             cancel_guarded_quit_request,
             daemon_start::start_daemon_sidecar,
@@ -1692,6 +1682,21 @@ mod platform_tests {
         assert!(guard.force_if_in_flight());
         assert!(!guard.force_if_in_flight());
     }
+
+    /// `production_runtime_roots` is unconditional now, so this runs on every
+    /// host — a Linux dev run that resolves to `~/.local/share/wenlan` needs
+    /// this list to protect it exactly as much as a Windows one does.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn windows_production_roots_include_local_app_data() {
+        let fake_home = std::path::PathBuf::from(r"C:\fake-home");
+        let fake_local_app_data = std::path::PathBuf::from(r"C:\fake-local-app-data");
+
+        let roots = production_runtime_roots(Some(fake_home), Some(fake_local_app_data.clone()));
+
+        assert!(roots.contains(&fake_local_app_data.join("wenlan")));
+        assert!(roots.contains(&fake_local_app_data.join("origin")));
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1960,17 +1965,5 @@ mod windows_tests {
             Some(value) => std::env::set_var("WENLAN_DEV_STATE_DIR", value),
             None => std::env::remove_var("WENLAN_DEV_STATE_DIR"),
         }
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    fn windows_production_roots_include_local_app_data() {
-        let fake_home = std::path::PathBuf::from(r"C:\fake-home");
-        let fake_local_app_data = std::path::PathBuf::from(r"C:\fake-local-app-data");
-
-        let roots = production_runtime_roots(Some(fake_home), Some(fake_local_app_data.clone()));
-
-        assert!(roots.contains(&fake_local_app_data.join("wenlan")));
-        assert!(roots.contains(&fake_local_app_data.join("origin")));
     }
 }

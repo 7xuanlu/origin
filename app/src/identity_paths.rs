@@ -155,13 +155,8 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn app_data_dir_uses_legacy_default_when_current_absent_and_legacy_has_config() {
-        let _guard = env_lock();
-        let _env = EnvGuard::capture();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::remove_var("WENLAN_DATA_DIR");
-        std::env::remove_var("ORIGIN_DATA_DIR");
         let legacy = tmp.path().join("origin");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("config.json"), "{}").unwrap();
@@ -169,13 +164,8 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn app_data_dir_uses_legacy_default_when_current_empty_and_legacy_has_config() {
-        let _guard = env_lock();
-        let _env = EnvGuard::capture();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::remove_var("WENLAN_DATA_DIR");
-        std::env::remove_var("ORIGIN_DATA_DIR");
         let current = tmp.path().join("wenlan");
         let legacy = tmp.path().join("origin");
         std::fs::create_dir_all(&current).unwrap();
@@ -185,13 +175,8 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn app_data_dir_uses_legacy_default_when_current_empty_and_legacy_has_activities() {
-        let _guard = env_lock();
-        let _env = EnvGuard::capture();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::remove_var("WENLAN_DATA_DIR");
-        std::env::remove_var("ORIGIN_DATA_DIR");
         let current = tmp.path().join("wenlan");
         let legacy = tmp.path().join("origin");
         std::fs::create_dir_all(&current).unwrap();
@@ -212,13 +197,8 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn app_data_dir_uses_wenlan_default_when_current_has_app_state() {
-        let _guard = env_lock();
-        let _env = EnvGuard::capture();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::remove_var("WENLAN_DATA_DIR");
-        std::env::remove_var("ORIGIN_DATA_DIR");
         let current = tmp.path().join("wenlan");
         let legacy = tmp.path().join("origin");
         std::fs::create_dir_all(&current).unwrap();
@@ -229,13 +209,8 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn app_data_dir_uses_wenlan_default_when_neither_exists() {
-        let _guard = env_lock();
-        let _env = EnvGuard::capture();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::remove_var("WENLAN_DATA_DIR");
-        std::env::remove_var("ORIGIN_DATA_DIR");
         assert_eq!(app_data_dir_for_base(tmp.path()), tmp.path().join("wenlan"));
     }
 }

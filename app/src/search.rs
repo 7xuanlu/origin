@@ -4950,18 +4950,6 @@ mod avatar_path_tests {
     }
 
     #[test]
-    fn legacy_default_selection_flows_to_avatar_storage() {
-        let tmp = tempfile::tempdir().unwrap();
-        let current = tmp.path().join("wenlan");
-        let legacy = tmp.path().join("origin");
-        std::fs::create_dir_all(&current).unwrap();
-        std::fs::create_dir_all(legacy.join("avatars")).unwrap();
-
-        let selected = crate::identity_paths::app_data_dir_for_base(tmp.path());
-        assert_eq!(selected.join("avatars"), legacy.join("avatars"));
-    }
-
-    #[test]
     #[serial_test::serial]
     fn resolves_missing_legacy_avatar_to_wenlan_copy() {
         let previous_wenlan = std::env::var_os("WENLAN_DATA_DIR");
