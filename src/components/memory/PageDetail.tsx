@@ -24,6 +24,9 @@ import {
   type UpdatePageInput,
   type UpdatePageFailureKind,
 } from "../../lib/tauri";
+// Imported from its own module, not the lib/tauri barrel: tests mock that
+// barrel, and a mocked module would shadow the value this must stay bound to.
+import { PAGE_EDIT_DAEMON_FLOOR } from "../../lib/daemonVersion";
 import ContentRenderer from "./ContentRenderer";
 import RelatedPages from "./page/RelatedPages";
 import PageInfo from "./page/PageInfo";
@@ -117,7 +120,6 @@ function localShortcutModifier(): "Cmd" | "Ctrl" {
 }
 
 const PAGE_LINK_ANCHOR_PREFIX = "#concept:";
-const PAGE_EDIT_DAEMON_FLOOR = "0.14.1";
 type MenuInitialFocus = "first" | "last";
 
 type PageEditGate =

@@ -17,7 +17,7 @@ const acknowledgeGuardedQuitRequestMock = vi.hoisted(
   () => vi.fn<(requestId: number, deliveryId: number) => Promise<boolean>>(),
 );
 const cancelGuardedQuitRequestMock = vi.hoisted(
-  () => vi.fn<(requestId: number) => Promise<boolean>>(),
+  () => vi.fn<(requestId: number, deliveryId: number) => Promise<boolean>>(),
 );
 const hideWindowMock = vi.hoisted(() => vi.fn<() => Promise<void>>());
 const showWindowMock = vi.hoisted(() => vi.fn<() => Promise<void>>());
@@ -344,7 +344,7 @@ describe("App - first-run wizard gate", () => {
     expect(showWindowMock).toHaveBeenCalledTimes(1);
     expect(focusWindowMock).toHaveBeenCalledTimes(1);
     expect(cancelGuardedQuitRequestMock).toHaveBeenCalledTimes(1);
-    expect(cancelGuardedQuitRequestMock).toHaveBeenCalledWith(1);
+    expect(cancelGuardedQuitRequestMock).toHaveBeenCalledWith(1, 1);
     expect(emitMock).not.toHaveBeenCalledWith("quit-cancelled");
 
     await act(async () => {
@@ -376,7 +376,7 @@ describe("App - first-run wizard gate", () => {
     expect(hideWindowMock).toHaveBeenCalledTimes(1);
     expect(focusWindowMock).toHaveBeenCalledTimes(1);
     expect(cancelGuardedQuitRequestMock).toHaveBeenCalledTimes(1);
-    expect(cancelGuardedQuitRequestMock).toHaveBeenCalledWith(1);
+    expect(cancelGuardedQuitRequestMock).toHaveBeenCalledWith(1, 1);
     expect(emitMock).not.toHaveBeenCalledWith("quit-cancelled");
     expect(title).toHaveFocus();
   });

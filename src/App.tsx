@@ -78,9 +78,9 @@ export default function App() {
   // keystroke durable. A failed save aborts quit and reveals the existing retry
   // surface instead of silently dropping text.
   useEffect(() => {
-    const cancelQuitRequest = async (requestId: number) => {
+    const cancelQuitRequest = async (requestId: number, deliveryId: number) => {
       try {
-        await cancelGuardedQuitRequest(requestId);
+        await cancelGuardedQuitRequest(requestId, deliveryId);
       } catch {
         // A failed cancellation signal must not hide the editor recovery path.
       }
@@ -111,8 +111,16 @@ export default function App() {
 
           const activeAttempt = quitAttemptRef.current;
           if (activeAttempt?.requestId === requestId) return;
+          // Reachable only in a narrow race: an attempt that already cancelled
+          // itself (a rejected hide(), or a failed save) has returned the
+          // coordinator to Idle, but quitAttemptRef is not cleared until the
+          // finally microtask runs. A Cmd-Q landing inside that gap opens a new
+          // request that we acknowledge and then discard here, so the press
+          // appears to do nothing. It is not silent: discarding counts as a
+          // refusal in the Rust coordinator, so a user who keeps pressing hits
+          // the escape hatch and gets out on the third press.
           if (activeAttempt) {
-            await cancelQuitRequest(requestId);
+            await cancelQuitRequest(requestId, deliveryId);
             return;
           }
 
@@ -123,7 +131,7 @@ export default function App() {
             try {
               await getCurrentWindow().hide();
             } catch {
-              await cancelQuitRequest(requestId);
+              await cancelQuitRequest(requestId, deliveryId);
               await revealMainWindow(focusTarget);
               return;
             }
@@ -134,7 +142,7 @@ export default function App() {
               persisted = false;
             }
             if (!persisted) {
-              await cancelQuitRequest(requestId);
+              await cancelQuitRequest(requestId, deliveryId);
               await revealMainWindow(focusTarget);
               return;
             }
@@ -144,7 +152,7 @@ export default function App() {
           quitAttemptRef.current = trackedAttempt;
           void attempt
             .catch(async () => {
-              await cancelQuitRequest(requestId);
+              await cancelQuitRequest(requestId, deliveryId);
               await revealMainWindow(focusTarget);
             })
             .finally(() => {

@@ -2460,8 +2460,11 @@ export async function acknowledgeGuardedQuitRequest(
   return invoke("acknowledge_guarded_quit_request", { requestId, deliveryId });
 }
 
-export async function cancelGuardedQuitRequest(requestId: number): Promise<boolean> {
-  return invoke("cancel_guarded_quit_request", { requestId });
+export async function cancelGuardedQuitRequest(
+  requestId: number,
+  deliveryId: number,
+): Promise<boolean> {
+  return invoke("cancel_guarded_quit_request", { requestId, deliveryId });
 }
 
 /** @deprecated Use quitWenlanFull. Kept as a legacy Origin bridge alias. */

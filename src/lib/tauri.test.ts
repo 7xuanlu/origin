@@ -71,9 +71,10 @@ describe('guarded quit bridge', () => {
   it('cancels only the current native quit request', async () => {
     mockInvoke.mockResolvedValue(true);
 
-    await expect(tauri.cancelGuardedQuitRequest(7)).resolves.toBe(true);
+    await expect(tauri.cancelGuardedQuitRequest(7, 2)).resolves.toBe(true);
     expect(mockInvoke).toHaveBeenCalledWith('cancel_guarded_quit_request', {
       requestId: 7,
+      deliveryId: 2,
     });
   });
 });

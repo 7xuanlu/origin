@@ -238,9 +238,10 @@ describe("sources, page export, and knowledge wrappers", () => {
     const { invoke } = await import("@tauri-apps/api/core");
     const { cancelGuardedQuitRequest } = await import("../tauri");
     (invoke as ReturnType<typeof vi.fn>).mockResolvedValue(true);
-    await cancelGuardedQuitRequest(8);
+    await cancelGuardedQuitRequest(8, 3);
     expect(invoke).toHaveBeenCalledWith("cancel_guarded_quit_request", {
       requestId: 8,
+      deliveryId: 3,
     });
   });
 

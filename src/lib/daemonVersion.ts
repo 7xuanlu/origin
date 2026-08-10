@@ -2,6 +2,17 @@
 import { gte, parse } from "semver";
 
 /**
+ * First released daemon proven to preserve exact page source while keeping the
+ * v0.14.0 CAS/idempotency contract, so the first one page edits may target.
+ *
+ * The native bridge carries its own copy in `app/src/search.rs`, because a Rust
+ * command cannot import this module. `daemonVersion.test.ts` reads that file and
+ * fails if the two ever disagree — the UI must not offer an edit the backing
+ * command will refuse.
+ */
+export const PAGE_EDIT_DAEMON_FLOOR = "0.14.1";
+
+/**
  * Return whether a daemon version meets a stable SemVer floor.
  *
  * Rust's semver parser rejects loose forms such as `v1.2.3` and surrounding
