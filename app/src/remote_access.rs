@@ -1894,6 +1894,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _home = HomeGuard::set(tmp.path());
 
+        // HomeGuard::set already cleared WENLAN_DEV_REMOTE_PORT_START, so this
+        // is the no-override fallback -- the one case the ephemeral-port scan
+        // below can't exercise, since it always sets the override.
+        assert_eq!(port_range_start(), PORT_RANGE_START);
+
         // Scan from an OS-assigned held port instead of the fixed default range,
         // which flakes under machine load. Re-bind if the port is above
         // u16::MAX - 3: the 4-port scan window would otherwise overflow.
