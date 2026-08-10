@@ -13,6 +13,20 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$MAIN/target}"
 BIN="$CARGO_TARGET_DIR/debug/wenlan-app"
 LOG="${TMPDIR:-/tmp}"
 
+# A debug wenlan-app refuses to start without a complete isolated runtime
+# identity (see validate_debug_runtime_isolation in app/src/lib.rs), so the
+# driver takes the same worktree-scoped config `pnpm dev:all` uses. This is
+# also what keeps an agent launch off the user's daemon and LaunchAgents.
+load_dev_runtime_config() {
+  while IFS='=' read -r key value; do
+    case "$key" in
+      WENLAN_PORT | WENLAN_DEV_UI_PORT | WENLAN_DEV_REMOTE_PORT_START | WENLAN_DEV_APP_ID | WENLAN_DEV_TAURI_MCP_SOCKET | WENLAN_DATA_DIR | WENLAN_DEV_STATE_DIR)
+        export "$key=$value"
+        ;;
+    esac
+  done < <(bash "$ROOT/scripts/dev-runtime.sh" print-config)
+}
+
 case "${1:-}" in
   build)
     # Decoupled from `tauri dev`: its beforeDevCommand compiles sidecars and
@@ -23,8 +37,11 @@ case "${1:-}" in
     ;;
   vite)
     cd "$ROOT"
+    # Pinned to :1420 on purpose: a directly-launched prebuilt binary loads the
+    # devUrl baked into app/tauri.conf.json, which the tauri CLI's --config
+    # override (used by scripts/dev-all.sh) cannot reach here.
     if ! curl -s -o /dev/null http://localhost:1420/; then
-      nohup pnpm dev >"$LOG/wenlan-vite.log" 2>&1 &
+      WENLAN_DEV_UI_PORT=1420 nohup pnpm dev >"$LOG/wenlan-vite.log" 2>&1 &
     fi
     for _ in $(seq 1 30); do
       curl -s -o /dev/null http://localhost:1420/ && break
@@ -47,6 +64,11 @@ case "${1:-}" in
       echo "command with the sandbox disabled." >&2
       exit 1
     fi
+    load_dev_runtime_config
+    # The app now selects the worktree daemon port, so give it a daemon there.
+    # This never touches the user's :7878 instance.
+    bash "$ROOT/scripts/dev-runtime.sh" start >"$LOG/wenlan-dev-daemon.log" 2>&1 ||
+      echo "warning: isolated dev daemon did not start; see $LOG/wenlan-dev-daemon.log" >&2
     "$0" vite
     [ -x "$BIN" ] || "$0" build
     # Launch the binary directly: spawning through the pnpm/tauri chain in a
@@ -68,9 +90,11 @@ case "${1:-}" in
     swift "$(dirname "$0")/wincap.swift" "${2:-$LOG/wenlan-shot.png}"
     ;;
   stop)
-    # Only what we started. NEVER kill the user's daemon on :7878.
+    # Only what we started. NEVER kill the user's daemon on :7878 —
+    # dev-runtime.sh stop refuses any PID it did not record for this worktree.
     pkill -f 'target/debug/wenlan-app' || true
     lsof -ti:1420 | xargs kill 2>/dev/null || true
+    bash "$ROOT/scripts/dev-runtime.sh" stop || true
     ;;
   *)
     echo "usage: driver.sh build|vite|launch|shot [out.png]|stop"

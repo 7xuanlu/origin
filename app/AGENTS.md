@@ -39,8 +39,20 @@ app/
 
 ## CONVENTIONS
 
+- **Debug builds refuse to run outside an isolated dev runtime.** `run()` calls
+  `validate_debug_runtime_isolation()` and panics unless every one of
+  `WENLAN_PORT`, `WENLAN_DEV_UI_PORT`, `WENLAN_DEV_REMOTE_PORT_START`,
+  `WENLAN_DEV_APP_ID`, `WENLAN_DEV_TAURI_MCP_SOCKET`, `WENLAN_DATA_DIR`, and
+  `WENLAN_DEV_STATE_DIR` names a non-production value contained by the worktree
+  state directory. `scripts/dev-runtime.sh` derives them all from the worktree
+  path and `pnpm dev:all` exports them, so start a dev app that way.
+  `WENLAN_DEV_PORT` and `WENLAN_DEV_DATA_DIR` override the derived daemon port
+  and data dir; `WENLAN_DEV_PRESERVE_DAEMON_ON_QUIT=1` marks a daemon this
+  session reused rather than started. Release builds read none of these.
 - Keep daemon access behind `WenlanClient` in `src/api.rs`; do not scatter raw
-  URLs or response-shape parsing through command handlers.
+  URLs or response-shape parsing through command handlers. Anything that talks
+  to "the daemon" must go through `client.base_url()`, never a literal
+  `127.0.0.1:7878` — an isolated dev app selects a different port.
 - Register new Tauri commands in `src/lib.rs` after adding the command function.
 - Prefer module-local Rust unit tests near the behavior under `#[cfg(test)]`.
   Use `app/tests/*.rs` only for cross-module or daemon-backed integration.

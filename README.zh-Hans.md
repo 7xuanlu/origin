@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=4a3802a3bebf6dd84fdff116e3a9f5582876770641175974ee226853ee49956b -->
+<!-- README_SYNC: source=README.md sha256=4d8de3d174d0275f76214201a920601fa1d4cd2780f4589c3c1965f483f41d56 -->
 
 <p align="center">
   <picture>
@@ -333,11 +333,11 @@ cargo test
 # 桌面 app（Cargo target 与根目录的前端工具链）
 cargo build -p wenlan-app
 pnpm install
-pnpm tauri dev
+pnpm dev:all
 pnpm build:all
 ```
 
-需要从全新的 daemon 开始运行 app 时，请在本 repository 使用 `pnpm dev:all`。完整开发流程见本 repository 的 [AGENTS.md](AGENTS.md) 与 [CONTRIBUTING.md](CONTRIBUTING.md)，以及仓库内的 [app/AGENTS.md](app/AGENTS.md)。安全性问题请见 [SECURITY.md](SECURITY.md)，也请阅读 [Code of Conduct](CODE_OF_CONDUCT.md)。
+`pnpm dev:all` 是桌面 app 受支持的开发入口。它让开发用的端口、数据、进程归属、app 标识、MCP socket 与 Remote Access 状态都与已安装的生产运行时隔离；未处于该隔离环境的 debug build 会拒绝启动。完整开发流程见本 repository 的 [AGENTS.md](AGENTS.md) 与 [CONTRIBUTING.md](CONTRIBUTING.md)，以及仓库内的 [app/AGENTS.md](app/AGENTS.md)。安全性问题请见 [SECURITY.md](SECURITY.md)，也请阅读 [Code of Conduct](CODE_OF_CONDUCT.md)。
 
 ---
 

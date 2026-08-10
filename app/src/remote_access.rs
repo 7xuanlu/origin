@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -12,6 +12,19 @@ const MCP_SIDECAR_NAME: &str = "wenlan-mcp";
 
 /// Port range for wenlan-mcp serve (high ports to avoid collisions).
 pub const PORT_RANGE_START: u16 = 18080;
+const PORT_RANGE_LEN: u16 = 4;
+
+fn port_range_start() -> u16 {
+    #[cfg(debug_assertions)]
+    if let Some(port) = std::env::var("WENLAN_DEV_REMOTE_PORT_START")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port <= u16::MAX - (PORT_RANGE_LEN - 1))
+    {
+        return port;
+    }
+    PORT_RANGE_START
+}
 
 /// Relay URL for stable MCP endpoint.
 // Intentionally still the legacy Origin relay. Do not rename this constant
@@ -104,6 +117,24 @@ async fn register_with_relay(tunnel_url: &str) -> Option<String> {
 static TUNNEL_URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"https://[a-z0-9-]+\.trycloudflare\.com").unwrap());
 
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct CloudflaredOwner {
+    pid: u32,
+    port: u16,
+    identity: String,
+}
+
+fn cloudflared_owner_authorizes_signal(
+    owner: &CloudflaredOwner,
+    expected: Option<&CloudflaredOwner>,
+    range_start: u16,
+    live_identity: Option<&str>,
+) -> bool {
+    expected.is_none_or(|expected| expected == owner)
+        && (range_start..=range_start + (PORT_RANGE_LEN - 1)).contains(&owner.port)
+        && live_identity == Some(owner.identity.as_str())
+}
+
 /// Status of the remote access tunnel.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -121,12 +152,62 @@ pub enum RemoteAccessStatus {
     },
 }
 
+fn generation_is_current(generation: u64, expected: u64) -> bool {
+    generation == expected
+}
+
+fn try_begin_start(
+    status: &mut RemoteAccessStatus,
+    generation: &mut u64,
+    expected_generation: Option<u64>,
+) -> Option<u64> {
+    if matches!(
+        status,
+        RemoteAccessStatus::Starting | RemoteAccessStatus::Connected { .. }
+    ) {
+        return None;
+    }
+    if let Some(expected) = expected_generation {
+        if !generation_is_current(*generation, expected) {
+            return None;
+        }
+    } else {
+        *generation = generation.wrapping_add(1);
+    }
+    *status = RemoteAccessStatus::Starting;
+    Some(*generation)
+}
+
+fn mark_off(status: &mut RemoteAccessStatus, generation: &mut u64) -> u64 {
+    *generation = generation.wrapping_add(1);
+    *status = RemoteAccessStatus::Off;
+    *generation
+}
+
+async fn remote_generation_is_current(
+    app_handle: &tauri::AppHandle,
+    expected_generation: u64,
+) -> bool {
+    let state = app_handle.state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
+    let app_state = state.read().await;
+    let ra = app_state.remote_access.lock().await;
+    generation_is_current(ra.generation, expected_generation)
+}
+
+async fn wait_for_generation_change(app_handle: &tauri::AppHandle, expected_generation: u64) {
+    while remote_generation_is_current(app_handle, expected_generation).await {
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Runtime state for remote access — holds process handles and port.
 pub struct RemoteAccessState {
     pub status: RemoteAccessStatus,
     pub mcp_child: Option<tauri_plugin_shell::process::CommandChild>,
     pub tunnel_child: Option<tauri_plugin_shell::process::CommandChild>,
     pub port: Option<u16>,
+    /// Invalidates stale start/reconnect tasks when the user turns access off.
+    pub generation: u64,
     /// When Cloudflare returned 429 for our most recent tunnel creation.
     /// Used by `tunnel_health_loop` to enforce a cooldown before burning another quick tunnel.
     pub last_rate_limit_at: Option<std::time::Instant>,
@@ -139,6 +220,7 @@ impl Default for RemoteAccessState {
             mcp_child: None,
             tunnel_child: None,
             port: None,
+            generation: 0,
             last_rate_limit_at: None,
         }
     }
@@ -152,7 +234,8 @@ const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 /// its child processes (the in-memory handles are lost on restart).
 pub fn cleanup_orphaned_mcp() {
     let my_pid = std::process::id();
-    for port in PORT_RANGE_START..=PORT_RANGE_START + 3 {
+    let range_start = port_range_start();
+    for port in range_start..=range_start + (PORT_RANGE_LEN - 1) {
         // Use lsof to find the PID holding this port
         let output = std::process::Command::new("lsof")
             .args(["-i", &format!(":{}", port), "-t", "-sTCP:LISTEN"])
@@ -165,6 +248,14 @@ pub fn cleanup_orphaned_mcp() {
                     if pid == my_pid {
                         continue;
                     }
+                    let Some(process_identity) = wenlan_mcp_process_identity(pid, port) else {
+                        log::warn!(
+                            "[remote-access] refusing to kill non-wenlan-mcp listener {} on port {}",
+                            pid,
+                            port
+                        );
+                        continue;
+                    };
                     log::warn!(
                         "[remote-access] Killing orphaned process {} on port {}",
                         pid,
@@ -175,10 +266,15 @@ pub fn cleanup_orphaned_mcp() {
                         .arg(pid.to_string())
                         .output();
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                    // Force kill if still alive
-                    let _ = std::process::Command::new("kill")
-                        .args(["-9", &pid.to_string()])
-                        .output();
+                    // Force kill only if the PID still identifies the exact
+                    // remote-access child we inspected before SIGTERM.
+                    if wenlan_mcp_process_identity(pid, port).as_deref()
+                        == Some(process_identity.as_str())
+                    {
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &pid.to_string()])
+                            .output();
+                    }
                 }
             }
         }
@@ -187,9 +283,324 @@ pub fn cleanup_orphaned_mcp() {
     std::thread::sleep(std::time::Duration::from_millis(200));
 }
 
-/// Find an available port in the range 18080-18083.
+fn cloudflared_owner_path() -> PathBuf {
+    crate::identity_paths::mcp_config_dir().join("cloudflared-owner.json")
+}
+
+fn cloudflared_owner_lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    PathBuf::from(lock_path)
+}
+
+struct CloudflaredOwnerLock<'a> {
+    path: &'a Path,
+    _file: std::fs::File,
+}
+
+impl CloudflaredOwnerLock<'_> {
+    fn read(&self) -> Result<Option<CloudflaredOwner>, String> {
+        let contents = match std::fs::read(self.path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "Failed to read cloudflared ownership receipt at {}: {error}",
+                    self.path.display()
+                ));
+            }
+        };
+        restrict_private_file(self.path, "cloudflared ownership receipt")?;
+        serde_json::from_slice(&contents)
+            .map(Some)
+            .map_err(|error| {
+                format!(
+                    "Invalid cloudflared ownership receipt at {}: {error}",
+                    self.path.display()
+                )
+            })
+    }
+
+    fn write(&self, owner: &CloudflaredOwner) -> Result<(), String> {
+        use std::io::Write;
+
+        let contents = serde_json::to_vec(owner).map_err(|error| {
+            format!("Failed to serialize cloudflared ownership receipt: {error}")
+        })?;
+        let parent = self.path.parent().ok_or_else(|| {
+            format!(
+                "Cloudflared ownership receipt has no parent: {}",
+                self.path.display()
+            )
+        })?;
+        let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+            format!(
+                "Failed to stage cloudflared ownership receipt beside {}: {error}",
+                self.path.display()
+            )
+        })?;
+        staged.write_all(&contents).map_err(|error| {
+            format!(
+                "Failed to write staged cloudflared ownership receipt for {}: {error}",
+                self.path.display()
+            )
+        })?;
+        staged.as_file().sync_all().map_err(|error| {
+            format!(
+                "Failed to sync staged cloudflared ownership receipt for {}: {error}",
+                self.path.display()
+            )
+        })?;
+        staged.persist(self.path).map_err(|error| {
+            format!(
+                "Failed to atomically replace cloudflared ownership receipt at {}: {}",
+                self.path.display(),
+                error.error
+            )
+        })?;
+        restrict_private_file(self.path, "cloudflared ownership receipt")
+    }
+
+    fn remove_if_matches(&self, expected: &CloudflaredOwner) -> Result<(), String> {
+        if self.read()?.as_ref() != Some(expected) {
+            return Ok(());
+        }
+        match std::fs::remove_file(self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "Failed to remove cloudflared ownership receipt at {}: {error}",
+                self.path.display()
+            )),
+        }
+    }
+}
+
+fn with_cloudflared_owner_lock<T>(
+    path: &Path,
+    operation: impl FnOnce(&CloudflaredOwnerLock<'_>) -> Result<T, String>,
+) -> Result<T, String> {
+    let lock_path = cloudflared_owner_lock_path(path);
+    prepare_private_parent(&lock_path, "cloudflared ownership lock")?;
+    #[cfg(unix)]
+    let lock_file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+    };
+    #[cfg(not(unix))]
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path);
+    let lock_file = lock_file.map_err(|error| {
+        format!(
+            "Failed to open cloudflared ownership lock at {}: {error}",
+            lock_path.display()
+        )
+    })?;
+    restrict_private_file(&lock_path, "cloudflared ownership lock")?;
+    lock_file.lock().map_err(|error| {
+        format!(
+            "Failed to lock cloudflared ownership receipt at {}: {error}",
+            lock_path.display()
+        )
+    })?;
+    operation(&CloudflaredOwnerLock {
+        path,
+        _file: lock_file,
+    })
+}
+
+#[cfg(test)]
+fn read_cloudflared_owner_at(path: &Path) -> Result<Option<CloudflaredOwner>, String> {
+    with_cloudflared_owner_lock(path, |receipt| receipt.read())
+}
+
+fn write_cloudflared_owner_at(path: &Path, owner: &CloudflaredOwner) -> Result<(), String> {
+    with_cloudflared_owner_lock(path, |receipt| receipt.write(owner))
+}
+
+fn record_cloudflared_owner(pid: u32, port: u16) -> Result<CloudflaredOwner, String> {
+    let identity = cloudflared_process_identity(pid, port).ok_or_else(|| {
+        format!("Spawned cloudflared PID {pid} does not match the expected tunnel for port {port}")
+    })?;
+    let owner = CloudflaredOwner {
+        pid,
+        port,
+        identity,
+    };
+    write_cloudflared_owner_at(&cloudflared_owner_path(), &owner)?;
+    Ok(owner)
+}
+
+fn cleanup_owned_cloudflared(expected: Option<&CloudflaredOwner>) {
+    let path = cloudflared_owner_path();
+    if let Err(error) = with_cloudflared_owner_lock(&path, |receipt| {
+        let owner = match receipt.read()? {
+            Some(owner) => owner,
+            None => return Ok(()),
+        };
+        let range_start = port_range_start();
+        let live_identity = cloudflared_process_identity(owner.pid, owner.port);
+        if !cloudflared_owner_authorizes_signal(
+            &owner,
+            expected,
+            range_start,
+            live_identity.as_deref(),
+        ) {
+            log::warn!(
+                "[remote-access] refusing to signal cloudflared PID {} because its ownership receipt, selected range, or live identity does not match",
+                owner.pid
+            );
+            if expected.is_none_or(|expected| expected == &owner) {
+                receipt.remove_if_matches(&owner)?;
+            }
+            return Ok(());
+        }
+        log::warn!(
+            "[remote-access] Killing owned cloudflared process {} for port {}",
+            owner.pid,
+            owner.port
+        );
+        let _ = std::process::Command::new("kill")
+            .arg(owner.pid.to_string())
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if cloudflared_process_identity(owner.pid, owner.port).as_deref()
+            == Some(owner.identity.as_str())
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &owner.pid.to_string()])
+                .output();
+        }
+        receipt.remove_if_matches(&owner)
+    }) {
+        log::warn!("[remote-access] {error}; refusing cloudflared cleanup");
+    }
+}
+
+fn is_expected_remote_mcp_command(command: &str, port: u16) -> bool {
+    let args: Vec<_> = command.split_whitespace().collect();
+    let Some(executable) = args.first() else {
+        return false;
+    };
+    let file_name = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let expected_executable = matches!(
+        file_name,
+        "wenlan-mcp"
+            | "wenlan-mcp.exe"
+            | "wenlan-mcp-aarch64-apple-darwin"
+            | "wenlan-mcp-x86_64-unknown-linux-gnu"
+            | "wenlan-mcp-aarch64-unknown-linux-gnu"
+            | "wenlan-mcp-x86_64-pc-windows-msvc.exe"
+    );
+    let has_pair = |flag: &str, value: &str| {
+        args.windows(2)
+            .any(|pair| pair[0] == flag && pair[1] == value)
+    };
+    expected_executable
+        && args.contains(&"serve")
+        && has_pair("--port", &port.to_string())
+        && has_pair("--agent-name", "remote-mcp")
+}
+
+fn wenlan_mcp_process_identity(pid: u32, port: u16) -> Option<String> {
+    let pid = pid.to_string();
+    let command_output = std::process::Command::new("ps")
+        .args(["-ww", "-p", &pid, "-o", "command="])
+        .output()
+        .ok()?;
+    let command = String::from_utf8(command_output.stdout).ok()?;
+    if !is_expected_remote_mcp_command(command.trim(), port) {
+        return None;
+    }
+    let started_output = std::process::Command::new("ps")
+        .args(["-p", &pid, "-o", "lstart="])
+        .output()
+        .ok()?;
+    let started = String::from_utf8(started_output.stdout).ok()?;
+    Some(format!("{}\n{}", started.trim(), command.trim()))
+}
+
+fn is_expected_remote_tunnel_command(command: &str, port: u16) -> bool {
+    let args: Vec<_> = command.split_whitespace().collect();
+    let Some(executable) = args.first() else {
+        return false;
+    };
+    let file_name = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let expected_executable = matches!(
+        file_name,
+        "cloudflared"
+            | "cloudflared.exe"
+            | "cloudflared-aarch64-apple-darwin"
+            | "cloudflared-x86_64-apple-darwin"
+            | "cloudflared-x86_64-unknown-linux-gnu"
+            | "cloudflared-aarch64-unknown-linux-gnu"
+            | "cloudflared-x86_64-pc-windows-msvc.exe"
+    );
+    let expected_url = format!("http://localhost:{port}");
+    expected_executable
+        && args.get(1) == Some(&"tunnel")
+        && args
+            .windows(2)
+            .any(|pair| pair[0] == "--url" && pair[1] == expected_url)
+}
+
+fn cloudflared_process_identity(pid: u32, port: u16) -> Option<String> {
+    let pid = pid.to_string();
+    let command_output = std::process::Command::new("ps")
+        .args(["-ww", "-p", &pid, "-o", "command="])
+        .output()
+        .ok()?;
+    let command = String::from_utf8(command_output.stdout).ok()?;
+    if !is_expected_remote_tunnel_command(command.trim(), port) {
+        return None;
+    }
+    let started_output = std::process::Command::new("ps")
+        .args(["-p", &pid, "-o", "lstart="])
+        .output()
+        .ok()?;
+    let started = String::from_utf8(started_output.stdout).ok()?;
+    Some(format!("{}\n{}", started.trim(), command.trim()))
+}
+
+fn terminate_owned_cloudflared(
+    child: tauri_plugin_shell::process::CommandChild,
+    owner: &CloudflaredOwner,
+) {
+    let _ = child.kill();
+    cleanup_owned_cloudflared(Some(owner));
+}
+
+fn listener_pid_for_port(port: u16) -> Option<u32> {
+    let output = std::process::Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .output()
+        .ok()?;
+    String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .find_map(|line| line.trim().parse::<u32>().ok())
+}
+
+/// Find an available port in the selected four-port range.
 pub fn find_available_port() -> Option<u16> {
-    (PORT_RANGE_START..=PORT_RANGE_START + 3)
+    let range_start = port_range_start();
+    (range_start..=range_start + (PORT_RANGE_LEN - 1))
         .find(|&port| TcpListener::bind(("127.0.0.1", port)).is_ok())
 }
 
@@ -358,10 +769,11 @@ fn relay_id_path_for_dirs(current_dir: &Path) -> PathBuf {
 /// wenlan-mcp stores tokens at ~/.config/wenlan-mcp/token (XDG convention),
 /// NOT ~/Library/Application Support/ (macOS convention from dirs::config_dir).
 fn token_file_path() -> Result<PathBuf, String> {
-    token_file_path_for_dirs(
-        &crate::identity_paths::mcp_config_dir(),
-        &crate::identity_paths::legacy_mcp_config_dir(),
-    )
+    let current = crate::identity_paths::mcp_config_dir();
+    if crate::identity_paths::isolated_dev_state_dir().is_some() {
+        return token_file_path_for_dirs(&current, &current);
+    }
+    token_file_path_for_dirs(&current, &crate::identity_paths::legacy_mcp_config_dir())
 }
 
 fn relay_id_path() -> PathBuf {
@@ -393,70 +805,120 @@ pub fn toggle_on(
     app_handle: tauri::AppHandle,
     is_retry: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    Box::pin(toggle_on_inner(app_handle, if is_retry { 1 } else { 0 }))
+    Box::pin(toggle_on_inner(
+        app_handle,
+        if is_retry { 1 } else { 0 },
+        None,
+    ))
 }
 
 /// Start with explicit retry count (used by monitor auto-restart).
 fn toggle_on_with_retries(
     app_handle: tauri::AppHandle,
     retry_count: u32,
+    expected_generation: u64,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    Box::pin(toggle_on_inner(app_handle, retry_count))
+    Box::pin(toggle_on_inner(
+        app_handle,
+        retry_count,
+        Some(expected_generation),
+    ))
 }
 
-async fn toggle_on_inner(app_handle: tauri::AppHandle, retry_count: u32) {
+async fn toggle_on_inner(
+    app_handle: tauri::AppHandle,
+    retry_count: u32,
+    expected_generation: Option<u64>,
+) {
     use tauri::Emitter;
 
     // Guard: don't start if already starting or connected
-    {
+    let operation_generation = {
         let state =
             app_handle.state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
         let app_state = state.read().await;
-        let ra = app_state.remote_access.lock().await;
-        match &ra.status {
-            RemoteAccessStatus::Starting | RemoteAccessStatus::Connected { .. } => {
-                log::warn!("[remote-access] Already active, skipping duplicate toggle_on");
-                return;
-            }
-            _ => {}
-        }
-    }
+        let mut ra = app_state.remote_access.lock().await;
+        let RemoteAccessState {
+            status, generation, ..
+        } = &mut *ra;
+        let Some(operation_generation) = try_begin_start(status, generation, expected_generation)
+        else {
+            log::warn!("[remote-access] Already active, skipping duplicate toggle_on");
+            return;
+        };
+        let _ = app_handle.emit("remote-access-status", &RemoteAccessStatus::Starting);
+        operation_generation
+    };
 
-    let _ = app_handle.emit("remote-access-status", &RemoteAccessStatus::Starting);
-
-    let result = start_tunnel(&app_handle).await;
+    let result = start_tunnel(&app_handle, operation_generation).await;
 
     match result {
-        Ok((tunnel_url, token, mcp_child, tunnel_child, port, mcp_rx, tunnel_rx)) => {
+        Ok((tunnel_url, token, mcp_child, tunnel_child, tunnel_owner, port, mcp_rx, tunnel_rx)) => {
+            {
+                let state = app_handle
+                    .state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
+                let app_state = state.read().await;
+                let ra = app_state.remote_access.lock().await;
+                if !generation_is_current(ra.generation, operation_generation)
+                    || !matches!(ra.status, RemoteAccessStatus::Starting)
+                {
+                    let _ = mcp_child.kill();
+                    terminate_owned_cloudflared(tunnel_child, &tunnel_owner);
+                    return;
+                }
+            }
+
             // Register with relay for a stable URL
-            let relay_url = register_with_relay(&tunnel_url).await;
+            let relay_url = tokio::select! {
+                relay_url = register_with_relay(&tunnel_url) => relay_url,
+                _ = wait_for_generation_change(&app_handle, operation_generation) => {
+                    let _ = mcp_child.kill();
+                    terminate_owned_cloudflared(tunnel_child, &tunnel_owner);
+                    return;
+                }
+            };
 
             let status = RemoteAccessStatus::Connected {
                 tunnel_url: tunnel_url.clone(),
                 token: token.clone(),
                 relay_url: relay_url.clone(),
             };
-            let _ = app_handle.emit("remote-access-status", &status);
-
             // Store process handles in state
             let state =
                 app_handle.state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
             let app_state = state.read().await;
             let mut ra = app_state.remote_access.lock().await;
-            ra.status = status;
+            if !generation_is_current(ra.generation, operation_generation)
+                || !matches!(ra.status, RemoteAccessStatus::Starting)
+            {
+                drop(ra);
+                drop(app_state);
+                let _ = mcp_child.kill();
+                terminate_owned_cloudflared(tunnel_child, &tunnel_owner);
+                return;
+            }
+            ra.status = status.clone();
             ra.mcp_child = Some(mcp_child);
             ra.tunnel_child = Some(tunnel_child);
             ra.port = Some(port);
             // We just successfully created a tunnel → we're not currently
             // rate-limited, so clear any stale 429 stamp from an earlier attempt.
             ra.last_rate_limit_at = None;
+            let _ = app_handle.emit("remote-access-status", &status);
             drop(ra);
             drop(app_state);
 
             // Spawn background monitor for crash recovery
             let handle_for_monitor = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                monitor_processes(handle_for_monitor, mcp_rx, tunnel_rx, retry_count).await;
+                monitor_processes(
+                    handle_for_monitor,
+                    mcp_rx,
+                    tunnel_rx,
+                    retry_count,
+                    operation_generation,
+                )
+                .await;
             });
 
             // Spawn periodic tunnel health check (detects broken tunnels after sleep)
@@ -464,19 +926,29 @@ async fn toggle_on_inner(app_handle: tauri::AppHandle, retry_count: u32) {
             let health_tunnel_url = tunnel_url.clone();
             let health_retry_count = retry_count;
             tauri::async_runtime::spawn(async move {
-                tunnel_health_loop(handle_for_health, health_tunnel_url, health_retry_count).await;
+                tunnel_health_loop(
+                    handle_for_health,
+                    health_tunnel_url,
+                    health_retry_count,
+                    operation_generation,
+                )
+                .await;
             });
         }
         Err(e) => {
             log::error!("[remote-access] toggle_on failed: {}", e);
             let status = RemoteAccessStatus::Error { error: e.clone() };
-            let _ = app_handle.emit("remote-access-status", &status);
 
             let state =
                 app_handle.state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
             let app_state = state.read().await;
             let mut ra = app_state.remote_access.lock().await;
-            ra.status = status;
+            if !generation_is_current(ra.generation, operation_generation)
+                || !matches!(ra.status, RemoteAccessStatus::Starting)
+            {
+                return;
+            }
+            ra.status = status.clone();
             // Stamp rate-limit time so `tunnel_health_loop` enforces cooldown before
             // burning another quick tunnel. Only when the error is an actual 429.
             if e.contains("429") || e.contains("rate limit") {
@@ -486,6 +958,9 @@ async fn toggle_on_inner(app_handle: tauri::AppHandle, retry_count: u32) {
                     RATE_LIMIT_COOLDOWN.as_secs() / 60
                 );
             }
+            let _ = app_handle.emit("remote-access-status", &status);
+            drop(ra);
+            drop(app_state);
         }
     }
 }
@@ -553,6 +1028,7 @@ const MAX_TUNNEL_RETRIES: u32 = 3;
 async fn spawn_mcp(
     app_handle: &tauri::AppHandle,
     port: u16,
+    generation: u64,
 ) -> Result<
     (
         tokio::sync::mpsc::Receiver<tauri_plugin_shell::process::CommandEvent>,
@@ -565,45 +1041,64 @@ async fn spawn_mcp(
         MCP_SIDECAR_NAME,
         port
     );
+    let origin_url = crate::api::WenlanClient::new().base_url().to_string();
+    let port_string = port.to_string();
     let (mcp_rx, mcp_child) = app_handle
         .shell()
         .sidecar(MCP_SIDECAR_NAME)
         .map_err(|e| format!("{} sidecar not found: {}", MCP_SIDECAR_NAME, e))?
         .args([
-            "serve",
-            "--port",
-            &port.to_string(),
-            "--no-auth",
-            "--agent-name",
-            "remote-mcp",
-            "--allowed-origins",
-            "https://claude.ai,https://chatgpt.com",
+            "--origin-url".to_string(),
+            origin_url,
+            "serve".to_string(),
+            "--port".to_string(),
+            port_string,
+            "--no-auth".to_string(),
+            "--agent-name".to_string(),
+            "remote-mcp".to_string(),
+            "--allowed-origins".to_string(),
+            "https://claude.ai,https://chatgpt.com".to_string(),
         ])
         .spawn()
         .map_err(|e| format!("Failed to spawn {} serve: {}", MCP_SIDECAR_NAME, e))?;
 
-    let health_url = format!("http://127.0.0.1:{}/health", port);
-    let health_ok = timeout(Duration::from_secs(5), async {
+    let child_pid = mcp_child.pid();
+    let health_url = format!("http://127.0.0.1:{port}/health");
+    let readiness = timeout(Duration::from_secs(5), async {
         loop {
+            if !remote_generation_is_current(app_handle, generation).await {
+                return Err("Remote access start cancelled.".to_string());
+            }
             if reqwest::get(&health_url)
                 .await
                 .map(|r| r.status().is_success())
                 .unwrap_or(false)
             {
-                return true;
+                match listener_pid_for_port(port) {
+                    Some(listener_pid) if listener_pid == child_pid => return Ok(()),
+                    Some(listener_pid) => {
+                        return Err(format!(
+                            "remote access port {port} is owned by PID {listener_pid}, not spawned {} PID {child_pid}",
+                            MCP_SIDECAR_NAME
+                        ));
+                    }
+                    None => {}
+                }
             }
             sleep(Duration::from_millis(200)).await;
         }
     })
     .await
-    .unwrap_or(false);
-
-    if !health_ok {
-        let _ = mcp_child.kill();
-        return Err(format!(
+    .unwrap_or_else(|_| {
+        Err(format!(
             "{} serve failed to start (health check timeout).",
             MCP_SIDECAR_NAME
-        ));
+        ))
+    });
+
+    if let Err(error) = readiness {
+        let _ = mcp_child.kill();
+        return Err(error);
     }
 
     Ok((mcp_rx, mcp_child))
@@ -623,6 +1118,7 @@ pub async fn monitor_processes(
     mut mcp_rx: tokio::sync::mpsc::Receiver<tauri_plugin_shell::process::CommandEvent>,
     mut tunnel_rx: tokio::sync::mpsc::Receiver<tauri_plugin_shell::process::CommandEvent>,
     tunnel_retry_count: u32,
+    generation: u64,
 ) {
     use tauri::Emitter;
 
@@ -633,6 +1129,18 @@ pub async fn monitor_processes(
             event = wait_for_exit(&mut mcp_rx) => ExitedProcess::Mcp(event),
             event = wait_for_exit(&mut tunnel_rx) => ExitedProcess::Tunnel(event),
         };
+
+        {
+            let state =
+                app_handle.state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
+            let app_state = state.read().await;
+            let ra = app_state.remote_access.lock().await;
+            if !generation_is_current(ra.generation, generation)
+                || !matches!(ra.status, RemoteAccessStatus::Connected { .. })
+            {
+                return;
+            }
+        }
 
         match exited {
             ExitedProcess::Mcp(reason) => {
@@ -648,6 +1156,11 @@ pub async fn monitor_processes(
                         .state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
                     let app_state = state.read().await;
                     let mut ra = app_state.remote_access.lock().await;
+                    if !generation_is_current(ra.generation, generation)
+                        || !matches!(ra.status, RemoteAccessStatus::Connected { .. })
+                    {
+                        return;
+                    }
                     if let Some(child) = ra.mcp_child.take() {
                         let _ = child.kill();
                     }
@@ -676,13 +1189,33 @@ pub async fn monitor_processes(
                 );
                 sleep(Duration::from_secs(delay)).await;
 
-                match spawn_mcp(&app_handle, port).await {
+                {
+                    let state = app_handle
+                        .state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
+                    let app_state = state.read().await;
+                    let ra = app_state.remote_access.lock().await;
+                    if !generation_is_current(ra.generation, generation)
+                        || !matches!(ra.status, RemoteAccessStatus::Connected { .. })
+                    {
+                        return;
+                    }
+                }
+
+                match spawn_mcp(&app_handle, port, generation).await {
                     Ok((new_rx, new_child)) => {
                         // Store new child in state
                         let state = app_handle
                             .state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
                         let app_state = state.read().await;
                         let mut ra = app_state.remote_access.lock().await;
+                        if !generation_is_current(ra.generation, generation)
+                            || !matches!(ra.status, RemoteAccessStatus::Connected { .. })
+                        {
+                            drop(ra);
+                            drop(app_state);
+                            let _ = new_child.kill();
+                            return;
+                        }
                         ra.mcp_child = Some(new_child);
                         drop(ra);
                         drop(app_state);
@@ -710,7 +1243,9 @@ pub async fn monitor_processes(
     }
 
     // Full restart path — kills both processes, creates new tunnel
-    toggle_off(&app_handle).await;
+    let Some(restart_generation) = transition_off(&app_handle, Some(generation)).await else {
+        return;
+    };
 
     if tunnel_retry_count >= MAX_TUNNEL_RETRIES {
         log::error!(
@@ -723,12 +1258,17 @@ pub async fn monitor_processes(
                 MAX_TUNNEL_RETRIES
             ),
         };
-        let _ = app_handle.emit("remote-access-status", &status);
         let state =
             app_handle.state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
         let app_state = state.read().await;
         let mut ra = app_state.remote_access.lock().await;
-        ra.status = status;
+        if !generation_is_current(ra.generation, restart_generation) {
+            return;
+        }
+        ra.status = status.clone();
+        let _ = app_handle.emit("remote-access-status", &status);
+        drop(ra);
+        drop(app_state);
         return;
     }
 
@@ -742,7 +1282,17 @@ pub async fn monitor_processes(
             delay_secs, attempt, MAX_TUNNEL_RETRIES
         ),
     };
-    let _ = app_handle.emit("remote-access-status", &status);
+    {
+        let state =
+            app_handle.state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
+        let app_state = state.read().await;
+        let mut ra = app_state.remote_access.lock().await;
+        if !generation_is_current(ra.generation, restart_generation) {
+            return;
+        }
+        ra.status = status.clone();
+        let _ = app_handle.emit("remote-access-status", &status);
+    }
 
     sleep(Duration::from_secs(delay_secs)).await;
 
@@ -751,7 +1301,7 @@ pub async fn monitor_processes(
         attempt,
         MAX_TUNNEL_RETRIES
     );
-    toggle_on_with_retries(app_handle, attempt).await;
+    toggle_on_with_retries(app_handle, attempt, restart_generation).await;
 }
 
 /// Wait for a process exit or error event on the command event receiver.
@@ -796,6 +1346,7 @@ async fn tunnel_health_loop(
     app_handle: tauri::AppHandle,
     tunnel_url: String,
     reconnect_count: u32,
+    generation: u64,
 ) {
     use tauri::Emitter;
 
@@ -812,7 +1363,9 @@ async fn tunnel_health_loop(
                 app_handle.state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
             let app_state = state.read().await;
             let ra = app_state.remote_access.lock().await;
-            if !matches!(ra.status, RemoteAccessStatus::Connected { .. }) {
+            if !generation_is_current(ra.generation, generation)
+                || !matches!(ra.status, RemoteAccessStatus::Connected { .. })
+            {
                 // No longer connected — stop health checking
                 return;
             }
@@ -895,18 +1448,25 @@ async fn tunnel_health_loop(
             );
             // toggle_off emits `Off` internally. We emit `Error` AFTER it so the
             // frontend's last event is the error message, not Off.
-            toggle_off(&app_handle).await;
+            let Some(off_generation) = transition_off(&app_handle, Some(generation)).await else {
+                return;
+            };
             let error = format!(
                 "Tunnel kept dropping after {} reconnect attempts. Re-enable to try again.",
                 MAX_TUNNEL_RETRIES
             );
             let status = RemoteAccessStatus::Error { error };
-            let _ = app_handle.emit("remote-access-status", &status);
             let state =
                 app_handle.state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
             let app_state = state.read().await;
             let mut ra = app_state.remote_access.lock().await;
-            ra.status = status;
+            if !generation_is_current(ra.generation, off_generation) {
+                return;
+            }
+            ra.status = status.clone();
+            let _ = app_handle.emit("remote-access-status", &status);
+            drop(ra);
+            drop(app_state);
             return;
         }
 
@@ -938,22 +1498,26 @@ async fn tunnel_health_loop(
             next_count,
             MAX_TUNNEL_RETRIES
         );
-        toggle_off(&app_handle).await;
+        let Some(restart_generation) = transition_off(&app_handle, Some(generation)).await else {
+            return;
+        };
         sleep(Duration::from_secs(delay_secs)).await;
-        toggle_on_with_retries(app_handle, next_count).await;
+        toggle_on_with_retries(app_handle, next_count, restart_generation).await;
         return; // New toggle_on spawns its own health loop with next_count.
     }
 }
 
 async fn start_tunnel(
     app_handle: &tauri::AppHandle,
+    generation: u64,
 ) -> Result<
     (
         String,                                                                 // tunnel_url
         String,                                                                 // token
         tauri_plugin_shell::process::CommandChild,                              // mcp_child
         tauri_plugin_shell::process::CommandChild,                              // tunnel_child
-        u16,                                                                    // port
+        CloudflaredOwner, // tunnel owner receipt
+        u16,              // port
         tokio::sync::mpsc::Receiver<tauri_plugin_shell::process::CommandEvent>, // mcp_rx
         tokio::sync::mpsc::Receiver<tauri_plugin_shell::process::CommandEvent>, // tunnel_rx
     ),
@@ -961,10 +1525,20 @@ async fn start_tunnel(
 > {
     // 0. Clean up any orphaned MCP processes from previous app sessions
     cleanup_orphaned_mcp();
+    cleanup_owned_cloudflared(None);
+    if !remote_generation_is_current(app_handle, generation).await {
+        return Err("Remote access start cancelled.".to_string());
+    }
 
     // 1. Find available port
-    let port = find_available_port()
-        .ok_or_else(|| "All remote access ports (18080-18083) are in use.".to_string())?;
+    let range_start = port_range_start();
+    let port = find_available_port().ok_or_else(|| {
+        format!(
+            "All remote access ports ({}-{}) are in use.",
+            range_start,
+            range_start + (PORT_RANGE_LEN - 1)
+        )
+    })?;
 
     // 2. Ensure token exists
     let token_path = token_file_path()?;
@@ -1000,40 +1574,73 @@ async fn start_tunnel(
         restrict_private_file(&token_path, "token")?;
     }
     let token = read_token()?;
+    if !remote_generation_is_current(app_handle, generation).await {
+        return Err("Remote access start cancelled.".to_string());
+    }
 
     // 3. Spawn wenlan-mcp serve (with health check)
-    let (mcp_rx, mcp_child) = spawn_mcp(app_handle, port).await?;
+    let (mcp_rx, mcp_child) = spawn_mcp(app_handle, port, generation).await?;
 
     // 4. Spawn cloudflared tunnel
-    let (mut tunnel_rx, tunnel_child) = app_handle
-        .shell()
-        .sidecar("cloudflared")
-        .map_err(|e| format!("cloudflared sidecar not found: {}", e))?
+    let tunnel_command = match app_handle.shell().sidecar("cloudflared") {
+        Ok(command) => command,
+        Err(error) => {
+            let _ = mcp_child.kill();
+            return Err(format!("cloudflared sidecar not found: {error}"));
+        }
+    };
+    let (mut tunnel_rx, tunnel_child) = match tunnel_command
         .args(["tunnel", "--url", &format!("http://localhost:{}", port)])
         .spawn()
-        .map_err(|e| format!("Failed to spawn cloudflared: {}", e))?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = mcp_child.kill();
+            return Err(format!("Failed to spawn cloudflared: {error}"));
+        }
+    };
+    let tunnel_owner = match record_cloudflared_owner(tunnel_child.pid(), port) {
+        Ok(owner) => owner,
+        Err(error) => {
+            let _ = mcp_child.kill();
+            let _ = tunnel_child.kill();
+            return Err(error);
+        }
+    };
+    if !remote_generation_is_current(app_handle, generation).await {
+        let _ = mcp_child.kill();
+        terminate_owned_cloudflared(tunnel_child, &tunnel_owner);
+        return Err("Remote access start cancelled.".to_string());
+    }
 
     // 5. Parse tunnel URL from cloudflared output (it logs to stderr)
-    let tunnel_url = match timeout(
-        Duration::from_secs(20),
-        parse_tunnel_url_from_events(&mut tunnel_rx),
-    )
-    .await
-    {
+    let tunnel_result = tokio::select! {
+        result = timeout(
+            Duration::from_secs(20),
+            parse_tunnel_url_from_events(&mut tunnel_rx),
+        ) => result,
+        _ = wait_for_generation_change(app_handle, generation) => {
+            let _ = mcp_child.kill();
+            terminate_owned_cloudflared(tunnel_child, &tunnel_owner);
+            return Err("Remote access start cancelled.".to_string());
+        }
+    };
+    let tunnel_url = match tunnel_result {
         Ok(Ok(url)) => url,
         Ok(Err(Some(msg))) => {
             // Known error (rate limit, etc.) — kill mcp and propagate
             let _ = mcp_child.kill();
-            let _ = tunnel_child.kill();
+            terminate_owned_cloudflared(tunnel_child, &tunnel_owner);
             return Err(msg);
         }
         Ok(Err(None)) => {
             let _ = mcp_child.kill();
+            terminate_owned_cloudflared(tunnel_child, &tunnel_owner);
             return Err("cloudflared exited without producing a tunnel URL.".to_string());
         }
         Err(_) => {
             let _ = mcp_child.kill();
-            let _ = tunnel_child.kill();
+            terminate_owned_cloudflared(tunnel_child, &tunnel_owner);
             return Err("Failed to get tunnel URL from cloudflared (timeout).".to_string());
         }
     };
@@ -1069,36 +1676,56 @@ async fn start_tunnel(
         token,
         mcp_child,
         tunnel_child,
+        tunnel_owner,
         port,
         mcp_rx,
         tunnel_rx,
     ))
 }
 
-/// Stop the remote access tunnel — kill both processes.
-pub async fn toggle_off(app_handle: &tauri::AppHandle) {
+async fn transition_off(
+    app_handle: &tauri::AppHandle,
+    expected_generation: Option<u64>,
+) -> Option<u64> {
     use tauri::Emitter;
 
     let state = app_handle.state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
     let app_state = state.read().await;
     let mut ra = app_state.remote_access.lock().await;
-
-    if let Some(child) = ra.tunnel_child.take() {
-        let _ = child.kill();
-    }
-    if let Some(child) = ra.mcp_child.take() {
-        let _ = child.kill();
+    if expected_generation.is_some_and(|expected| !generation_is_current(ra.generation, expected)) {
+        return None;
     }
 
-    ra.status = RemoteAccessStatus::Off;
+    let tunnel_child = ra.tunnel_child.take();
+    let mcp_child = ra.mcp_child.take();
+    let generation = {
+        let RemoteAccessState {
+            status, generation, ..
+        } = &mut *ra;
+        mark_off(status, generation)
+    };
     ra.port = None;
-    drop(ra);
-    drop(app_state);
+
+    if let Some(child) = tunnel_child {
+        let _ = child.kill();
+    }
+    if let Some(child) = mcp_child {
+        let _ = child.kill();
+    }
 
     // Sweep for any orphaned processes the handles didn't cover
     cleanup_orphaned_mcp();
+    cleanup_owned_cloudflared(None);
 
     let _ = app_handle.emit("remote-access-status", &RemoteAccessStatus::Off);
+    drop(ra);
+    drop(app_state);
+    Some(generation)
+}
+
+/// Stop the remote access tunnel — kill both processes and invalidate stale tasks.
+pub async fn toggle_off(app_handle: &tauri::AppHandle) {
+    let _ = transition_off(app_handle, None).await;
 }
 
 /// Rotate the bearer token — generate a new token then kill the old wenlan-mcp.
@@ -1155,13 +1782,23 @@ mod tests {
 
     struct HomeGuard {
         home: Option<OsString>,
+        dev_state: Option<OsString>,
+        dev_remote_port_start: Option<OsString>,
     }
 
     impl HomeGuard {
         fn set(path: &Path) -> Self {
             let home = std::env::var_os("HOME");
+            let dev_state = std::env::var_os("WENLAN_DEV_STATE_DIR");
+            let dev_remote_port_start = std::env::var_os("WENLAN_DEV_REMOTE_PORT_START");
             std::env::set_var("HOME", path);
-            Self { home }
+            std::env::remove_var("WENLAN_DEV_STATE_DIR");
+            std::env::remove_var("WENLAN_DEV_REMOTE_PORT_START");
+            Self {
+                home,
+                dev_state,
+                dev_remote_port_start,
+            }
         }
     }
 
@@ -1171,6 +1808,14 @@ mod tests {
                 Some(value) => std::env::set_var("HOME", value),
                 None => std::env::remove_var("HOME"),
             }
+            match &self.dev_state {
+                Some(value) => std::env::set_var("WENLAN_DEV_STATE_DIR", value),
+                None => std::env::remove_var("WENLAN_DEV_STATE_DIR"),
+            }
+            match &self.dev_remote_port_start {
+                Some(value) => std::env::set_var("WENLAN_DEV_REMOTE_PORT_START", value),
+                None => std::env::remove_var("WENLAN_DEV_REMOTE_PORT_START"),
+            }
         }
     }
 
@@ -1179,6 +1824,40 @@ mod tests {
         let state = RemoteAccessState::default();
         assert!(matches!(state.status, RemoteAccessStatus::Off));
         assert!(state.port.is_none());
+    }
+
+    #[test]
+    fn starting_transition_is_atomic_against_duplicate_attempts() {
+        let mut status = RemoteAccessStatus::Off;
+        let mut generation = 0;
+
+        let start_generation = try_begin_start(&mut status, &mut generation, None).unwrap();
+        assert!(matches!(status, RemoteAccessStatus::Starting));
+        assert!(try_begin_start(&mut status, &mut generation, Some(start_generation)).is_none());
+    }
+
+    #[test]
+    fn explicit_off_invalidates_in_flight_start_and_delayed_retry() {
+        let mut status = RemoteAccessStatus::Off;
+        let mut generation = 0;
+
+        let in_flight = try_begin_start(&mut status, &mut generation, None).unwrap();
+        let recovery = mark_off(&mut status, &mut generation);
+        assert_ne!(in_flight, recovery);
+
+        let explicit_off = mark_off(&mut status, &mut generation);
+        assert_ne!(recovery, explicit_off);
+        assert!(try_begin_start(&mut status, &mut generation, Some(recovery)).is_none());
+        assert!(!generation_is_current(generation, in_flight));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn listener_identity_resolves_the_process_that_owns_the_port() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        assert_eq!(listener_pid_for_port(port), Some(std::process::id()));
     }
 
     #[test]
@@ -1214,6 +1893,186 @@ mod tests {
         assert!(port.is_some());
         let p = port.unwrap();
         assert!((PORT_RANGE_START..=PORT_RANGE_START + 3).contains(&p));
+    }
+
+    #[test]
+    fn orphan_cleanup_requires_the_exact_remote_mcp_process_identity() {
+        assert!(is_expected_remote_mcp_command(
+            "/tmp/wenlan-mcp-aarch64-apple-darwin --origin-url http://127.0.0.1:17777 serve --port 22000 --no-auth --agent-name remote-mcp",
+            22000,
+        ));
+        assert!(!is_expected_remote_mcp_command(
+            "/tmp/wenlan-mcp-malicious serve --port 22000 --agent-name remote-mcp",
+            22000,
+        ));
+        assert!(!is_expected_remote_mcp_command(
+            "/tmp/wenlan-mcp-aarch64-apple-darwin serve --port 22001 --agent-name remote-mcp",
+            22000,
+        ));
+        assert!(!is_expected_remote_mcp_command(
+            "/tmp/wenlan-mcp-aarch64-apple-darwin serve --port 22000 --agent-name another-agent",
+            22000,
+        ));
+    }
+
+    #[test]
+    fn orphan_cleanup_requires_the_exact_remote_tunnel_process_identity() {
+        assert!(is_expected_remote_tunnel_command(
+            "/tmp/cloudflared-aarch64-apple-darwin tunnel --url http://localhost:22000",
+            22000,
+        ));
+        assert!(is_expected_remote_tunnel_command(
+            "/tmp/cloudflared tunnel --url http://localhost:22000",
+            22000,
+        ));
+        assert!(!is_expected_remote_tunnel_command(
+            "/tmp/cloudflared tunnel --url http://localhost:22001",
+            22000,
+        ));
+        assert!(!is_expected_remote_tunnel_command(
+            "/tmp/not-cloudflared tunnel --url http://localhost:22000",
+            22000,
+        ));
+        assert!(!is_expected_remote_tunnel_command(
+            "/tmp/cloudflared access tcp --url http://localhost:22000",
+            22000,
+        ));
+    }
+
+    #[test]
+    fn cloudflared_signal_requires_the_persisted_owner_and_live_identity() {
+        let owner = CloudflaredOwner {
+            pid: 42,
+            port: 22000,
+            identity: "started\ncloudflared tunnel".to_string(),
+        };
+        let other = CloudflaredOwner {
+            pid: 43,
+            ..owner.clone()
+        };
+
+        assert!(cloudflared_owner_authorizes_signal(
+            &owner,
+            Some(&owner),
+            22000,
+            Some(owner.identity.as_str()),
+        ));
+        assert!(cloudflared_owner_authorizes_signal(
+            &owner,
+            None,
+            22000,
+            Some(owner.identity.as_str()),
+        ));
+        assert!(!cloudflared_owner_authorizes_signal(
+            &owner,
+            Some(&other),
+            22000,
+            Some(owner.identity.as_str()),
+        ));
+        assert!(!cloudflared_owner_authorizes_signal(
+            &owner,
+            Some(&owner),
+            22000,
+            Some("different process start"),
+        ));
+        assert!(!cloudflared_owner_authorizes_signal(
+            &owner,
+            Some(&owner),
+            23000,
+            Some(owner.identity.as_str()),
+        ));
+    }
+
+    #[test]
+    fn owner_lock_serializes_receipt_replacement_after_compare_remove() {
+        use std::sync::{mpsc, Arc};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("cloudflared-owner.json"));
+        let old_owner = CloudflaredOwner {
+            pid: 42,
+            port: 22000,
+            identity: "old".to_string(),
+        };
+        let new_owner = CloudflaredOwner {
+            pid: 43,
+            port: 22001,
+            identity: "new".to_string(),
+        };
+        write_cloudflared_owner_at(&path, &old_owner).unwrap();
+
+        let (validated_tx, validated_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let cleanup_path = Arc::clone(&path);
+        let cleanup_owner = old_owner.clone();
+        let cleanup = std::thread::spawn(move || {
+            with_cloudflared_owner_lock(&cleanup_path, |receipt| {
+                let current = receipt.read()?.unwrap();
+                assert_eq!(current, cleanup_owner);
+                validated_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+                receipt.remove_if_matches(&cleanup_owner)
+            })
+            .unwrap();
+        });
+
+        validated_rx.recv().unwrap();
+        let (replacement_done_tx, replacement_done_rx) = mpsc::channel();
+        let replacement_path = Arc::clone(&path);
+        let replacement_owner = new_owner.clone();
+        let replacement = std::thread::spawn(move || {
+            write_cloudflared_owner_at(&replacement_path, &replacement_owner).unwrap();
+            replacement_done_tx.send(()).unwrap();
+        });
+
+        assert!(replacement_done_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        continue_tx.send(()).unwrap();
+        cleanup.join().unwrap();
+        replacement.join().unwrap();
+
+        assert_eq!(read_cloudflared_owner_at(&path).unwrap(), Some(new_owner));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owner_replacement_swaps_the_receipt_inode_instead_of_truncating_in_place() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloudflared-owner.json");
+        let old_owner = CloudflaredOwner {
+            pid: 42,
+            port: 22000,
+            identity: "old".to_string(),
+        };
+        let new_owner = CloudflaredOwner {
+            pid: 43,
+            port: 22001,
+            identity: "new".to_string(),
+        };
+
+        write_cloudflared_owner_at(&path, &old_owner).unwrap();
+        let old_inode = std::fs::metadata(&path).unwrap().ino();
+        write_cloudflared_owner_at(&path, &new_owner).unwrap();
+        let new_inode = std::fs::metadata(&path).unwrap().ino();
+
+        assert_ne!(old_inode, new_inode);
+        assert_eq!(read_cloudflared_owner_at(&path).unwrap(), Some(new_owner));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[serial_test::serial]
+    fn dev_remote_access_uses_its_worktree_port_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        std::env::set_var("WENLAN_DEV_REMOTE_PORT_START", "23000");
+
+        let port = find_available_port().expect("dev remote access port");
+
+        assert!((23000..=23003).contains(&port));
     }
 
     #[test]
@@ -1321,6 +2180,27 @@ mod tests {
 
         assert_eq!(path, current.join("token"));
         assert!(!current.join("token").exists());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[serial_test::serial]
+    fn dev_token_path_does_not_import_production_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let production_legacy = tmp.path().join(".config/origin-mcp");
+        std::fs::create_dir_all(&production_legacy).unwrap();
+        std::fs::write(production_legacy.join("token"), "production-token\n").unwrap();
+        let dev_state = tmp.path().join("dev-state");
+        std::env::set_var("WENLAN_DEV_STATE_DIR", &dev_state);
+
+        let path = token_file_path().unwrap();
+
+        assert_eq!(path, dev_state.join("mcp-config/token"));
+        assert!(
+            !path.exists(),
+            "production token must not be copied into dev"
+        );
     }
 
     #[test]

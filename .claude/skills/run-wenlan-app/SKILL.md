@@ -7,9 +7,14 @@ description: Build, launch, screenshot, and drive the wenlan-app Tauri desktop a
 
 Tauri 2 desktop app (Rust `app/` + React/Vite frontend on :1420). Drive it
 with `.claude/skills/run-wenlan-app/driver.sh` — all paths below are relative
-to the unit root (repo or worktree root). macOS host only; the daemon the app
-talks to is the user's live `wenlan-server` on `:7878` — **never kill it,
-never run `pnpm clean:dev`** (that would restart it).
+to the unit root (repo or worktree root). macOS host only.
+
+A debug build refuses to start without a complete isolated runtime identity
+(`validate_debug_runtime_isolation` in `app/src/lib.rs`), so `launch` takes the
+worktree-scoped config from `scripts/dev-runtime.sh` and starts its **own**
+daemon on the worktree port. The user's live `wenlan-server` on `:7878` is
+never the daemon under test and **must never be killed**; `stop` only ends the
+daemon this worktree recorded.
 
 ## Prerequisites
 
@@ -24,9 +29,9 @@ never run `pnpm clean:dev`** (that would restart it).
 
 ```bash
 .claude/skills/run-wenlan-app/driver.sh build    # sidecars + cargo build (decoupled from tauri dev)
-.claude/skills/run-wenlan-app/driver.sh launch   # vite up + launch target/debug/wenlan-app directly → "APP UP"
+.claude/skills/run-wenlan-app/driver.sh launch   # isolated daemon + vite up + launch target/debug/wenlan-app directly → "APP UP"
 .claude/skills/run-wenlan-app/driver.sh shot /tmp/shot.png   # window PNG, works while occluded
-.claude/skills/run-wenlan-app/driver.sh stop     # kills only the dev app + vite, never :7878
+.claude/skills/run-wenlan-app/driver.sh stop     # kills only the dev app, vite, and this worktree's daemon; never :7878
 ```
 
 Logs land in `$TMPDIR/wenlan-app.log` and `$TMPDIR/wenlan-vite.log`.
@@ -45,9 +50,10 @@ revert the edit. Mark such edits `// TEMP (do not commit)`.
 
 ## Run (human path)
 
-`pnpm dev:all` — full chain including daemon restart. Useless for agents
-(restarts the user's daemon) and `pnpm tauri dev` alone dies on cold caches
-(see Gotchas). Ctrl-C to stop.
+`pnpm dev:all` — the supported entry point: an isolated worktree daemon plus
+`pnpm tauri dev` with a dev bundle identifier and the worktree UI port. Agents
+use `driver.sh` instead because `tauri dev` dies on cold caches (see Gotchas).
+Ctrl-C to stop.
 
 ## Test
 
@@ -68,6 +74,10 @@ revert the edit. Mark such edits `// TEMP (do not commit)`.
   The driver decouples: sidecars → vite → `cargo build` → direct launch.
 - `app/Cargo.toml` has `default = []` (no `custom-protocol`), so a plain
   debug `cargo build` produces the dev binary that loads `devUrl` :1420.
+  That URL is baked in at build time and no runtime env var overrides it, so
+  `driver.sh vite` pins vite to :1420 even though the isolated runtime config
+  also carries a worktree-scoped `WENLAN_DEV_UI_PORT` (which `pnpm dev:all`
+  does use, since the tauri CLI can rewrite `devUrl` via `--config`).
 - `scripts/resolve-backend-dir.sh` fallbacks don't reach worktrees under
   `.claude/worktrees/<name>` (3 levels deep) — the driver exports
   `WENLAN_BACKEND_DIR` explicitly.

@@ -532,6 +532,13 @@ pub fn uninstall_server_plist_via_subprocess() -> Result<()> {
 /// whitespace-separated field with `==`; a substring match would treat
 /// `com.origin.server.staging` as `com.origin.server` (H4).
 pub fn is_run_at_login_enabled(launchctl: &dyn LaunchctlExec) -> bool {
+    // An isolated dev app has its own bundle identifier and never owns the
+    // installed LaunchAgents, so reporting the user's production state here
+    // would be a lie the Settings toggle cannot act on.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("WENLAN_DEV_APP_ID").is_some() {
+        return false;
+    }
     let out = match launchctl.run(&["list"]) {
         Ok(o) => o,
         Err(_) => return false,
@@ -557,16 +564,6 @@ pub fn first_run_install_if_needed(launchctl: &dyn LaunchctlExec) -> Result<()> 
         return Ok(());
     }
 
-    if user_opted_out() {
-        if let Err(e) = remove_legacy_app_plist_file_if_owned() {
-            log::warn!("[first-run] legacy app plist cleanup failed: {e}");
-        }
-        if let Err(e) = cleanup_legacy_server_plist(launchctl) {
-            log::warn!("[first-run] legacy server plist cleanup failed: {e}");
-        }
-        return Ok(());
-    }
-
     let exe_canonical = match current_app_path() {
         Ok(path) => path,
         Err(e) => {
@@ -574,12 +571,30 @@ pub fn first_run_install_if_needed(launchctl: &dyn LaunchctlExec) -> Result<()> 
             return Ok(());
         }
     };
+    first_run_install_if_needed_at_path(launchctl, &exe_canonical)
+}
 
-    if !is_stable_launch_agent_target(&exe_canonical) {
+/// The eligibility check runs before the opted-out branch: a dev or
+/// human-review binary must not unload the user's legacy LaunchAgents either.
+fn first_run_install_if_needed_at_path(
+    launchctl: &dyn LaunchctlExec,
+    exe_canonical: &Path,
+) -> Result<()> {
+    if !is_stable_launch_agent_target(exe_canonical) {
         log::warn!(
             "[first-run] skipping LaunchAgent install from non-stable app path: {}",
             exe_canonical.display()
         );
+        return Ok(());
+    }
+
+    if user_opted_out() {
+        if let Err(e) = remove_legacy_app_plist_file_if_owned() {
+            log::warn!("[first-run] legacy app plist cleanup failed: {e}");
+        }
+        if let Err(e) = cleanup_legacy_server_plist(launchctl) {
+            log::warn!("[first-run] legacy server plist cleanup failed: {e}");
+        }
         return Ok(());
     }
 
@@ -676,6 +691,10 @@ pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> R
     Ok(())
 }
 
+fn shutdown_url_for(client: &crate::api::WenlanClient) -> String {
+    format!("{}/api/shutdown", client.base_url())
+}
+
 pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
     // Debounce: tray menu Quit Wenlan item stays clickable during the 500ms
     // shutdown sleep; double-click would otherwise spawn 2× POSTs (H1).
@@ -708,14 +727,12 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
         log::warn!("[quit] cleanup_legacy_server_plist failed: {e}");
     }
 
-    // 1. Tell daemon to shut down cleanly
+    // 1. Tell the daemon this app selected to shut down cleanly.
+    let shutdown_url = shutdown_url_for(&crate::api::WenlanClient::new());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
-    let _ = client
-        .post("http://127.0.0.1:7878/api/shutdown")
-        .send()
-        .await;
+    let _ = client.post(shutdown_url).send().await;
 
     // 2. Wait briefly for daemon to flush
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -748,6 +765,7 @@ mod tests {
         home: Option<std::ffi::OsString>,
         wenlan: Option<std::ffi::OsString>,
         origin: Option<std::ffi::OsString>,
+        dev_app_id: Option<std::ffi::OsString>,
     }
 
     impl EnvGuard {
@@ -756,6 +774,7 @@ mod tests {
                 home: std::env::var_os("HOME"),
                 wenlan: std::env::var_os("WENLAN_DATA_DIR"),
                 origin: std::env::var_os("ORIGIN_DATA_DIR"),
+                dev_app_id: std::env::var_os("WENLAN_DEV_APP_ID"),
             }
         }
     }
@@ -773,6 +792,10 @@ mod tests {
             match &self.origin {
                 Some(value) => std::env::set_var("ORIGIN_DATA_DIR", value),
                 None => std::env::remove_var("ORIGIN_DATA_DIR"),
+            }
+            match &self.dev_app_id {
+                Some(value) => std::env::set_var("WENLAN_DEV_APP_ID", value),
+                None => std::env::remove_var("WENLAN_DEV_APP_ID"),
             }
         }
     }
@@ -1437,7 +1460,13 @@ mod tests {
         set_user_opted_out(true).unwrap();
 
         let mock = MockLaunchctl::default();
-        first_run_install_if_needed(&mock).unwrap();
+        // The legacy cleanup is reachable only from an installed app path, so
+        // the stable-path seam stands in for one here.
+        first_run_install_if_needed_at_path(
+            &mock,
+            Path::new("/Applications/Wenlan.app/Contents/MacOS/wenlan-app"),
+        )
+        .unwrap();
 
         assert!(!legacy_app.exists(), "owned legacy app plist removed");
         assert!(!legacy_server.exists(), "owned legacy server plist removed");
@@ -1453,6 +1482,68 @@ mod tests {
                 .iter()
                 .any(|c| c[0] == "unload" && c[1] == legacy_app.to_string_lossy()),
             "first-run migration must not unload the legacy app job before replacement exists"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn non_stable_first_run_preserves_opted_out_legacy_registrations() {
+        let _env = EnvGuard::capture();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        std::env::remove_var("WENLAN_DATA_DIR");
+        std::env::remove_var("ORIGIN_DATA_DIR");
+        set_user_opted_out(true).unwrap();
+
+        let current_exe = current_app_path().unwrap();
+        assert_eq!(
+            classify_stable_launch_agent_target(&current_exe),
+            StableLaunchAgentTarget::Rejected,
+            "the test executable must exercise the non-stable startup path"
+        );
+
+        let legacy_app = legacy_app_plist_path().unwrap();
+        let legacy_server = legacy_server_plist_path().unwrap();
+        std::fs::create_dir_all(legacy_app.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_app, owned_legacy_app_plist()).unwrap();
+        std::fs::write(&legacy_server, owned_legacy_server_plist()).unwrap();
+
+        let mock = MockLaunchctl::default();
+        first_run_install_if_needed(&mock).unwrap();
+
+        assert!(
+            legacy_app.exists(),
+            "a non-stable startup must preserve the legacy app registration"
+        );
+        assert!(
+            legacy_server.exists(),
+            "a non-stable startup must preserve the legacy server registration"
+        );
+        assert!(
+            mock.calls.lock().unwrap().is_empty(),
+            "a non-stable startup must not unload global legacy LaunchAgents"
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[serial_test::serial]
+    fn isolated_dev_app_reports_run_at_login_disabled_without_querying_launchctl() {
+        let _env = EnvGuard::capture();
+        std::env::set_var("WENLAN_DEV_APP_ID", "com.wenlan.desktop.dev.123");
+        let mock = MockLaunchctl::default();
+
+        assert!(!is_run_at_login_enabled(&mock));
+        assert!(mock.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn quit_targets_the_selected_daemon_base_url() {
+        let client = crate::api::WenlanClient::with_base_url("http://127.0.0.1:17734".to_string());
+
+        assert_eq!(
+            shutdown_url_for(&client),
+            "http://127.0.0.1:17734/api/shutdown"
         );
     }
 
