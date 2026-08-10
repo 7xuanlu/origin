@@ -82,6 +82,7 @@ vi.mock("../../lib/tauri", () => ({
   getPendingRevision: vi.fn().mockResolvedValue(null),
   acceptPendingRevision: vi.fn(),
   dismissPendingRevision: vi.fn(),
+  getTruthStatus: vi.fn().mockResolvedValue(null),
 }));
 
 function renderWithQuery(

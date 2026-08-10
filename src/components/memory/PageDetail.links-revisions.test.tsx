@@ -27,6 +27,7 @@ const tauriMocks = vi.hoisted(() => ({
   deletePage: vi.fn(),
   clipboardWrite: vi.fn(),
   exportPageToObsidian: vi.fn(),
+  getTruthStatus: vi.fn(),
 }));
 
 vi.mock("../../lib/tauri", () => ({
@@ -95,6 +96,7 @@ describe("PageDetail page links", () => {
     tauriMocks.deletePage.mockResolvedValue(undefined);
     tauriMocks.clipboardWrite.mockResolvedValue(undefined);
     tauriMocks.exportPageToObsidian.mockResolvedValue({ path: "/tmp/page.md" });
+    tauriMocks.getTruthStatus.mockResolvedValue(null);
   });
 
   it("uses daemon page links for related pages and wikilink navigation", async () => {

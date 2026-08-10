@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   distillReview,
-  listPages,
+  listPagesExplicitBrowse,
   listRefinements,
   listSpaces,
   type DistillReviewResponse,
@@ -16,7 +16,7 @@ import { DISTILL_REVIEW_SESSION_QUERY_KEY } from "./pageReviewSignals";
 vi.mock("../../../lib/tauri", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../../lib/tauri")>()),
   distillReview: vi.fn(),
-  listPages: vi.fn(),
+  listPagesExplicitBrowse: vi.fn(),
   listRefinements: vi.fn(),
   listSpaces: vi.fn(),
 }));
@@ -68,7 +68,7 @@ function renderOverview({
 
 describe("PagesOverview", () => {
   beforeEach(() => {
-    vi.mocked(listPages).mockReset();
+    vi.mocked(listPagesExplicitBrowse).mockReset();
     vi.mocked(listRefinements).mockReset();
     vi.mocked(listRefinements).mockResolvedValue({ proposals: [] });
     vi.mocked(distillReview).mockReset();
@@ -77,7 +77,7 @@ describe("PagesOverview", () => {
   });
 
   it("opens a standalone Page editor directly from the Wiki header", async () => {
-    vi.mocked(listPages).mockResolvedValue([]);
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([]);
     const user = userEvent.setup();
     const { onCreatePage } = renderOverview();
 
@@ -89,7 +89,7 @@ describe("PagesOverview", () => {
   });
 
   it("combines active and draft inventories without treating a draft as Unconfirmed", async () => {
-    vi.mocked(listPages).mockImplementation(async (status) => status === "draft"
+    vi.mocked(listPagesExplicitBrowse).mockImplementation(async (status) => status === "draft"
       ? [
           page({
             id: "draft-titled",
@@ -140,7 +140,7 @@ describe("PagesOverview", () => {
   });
 
   it("renders the approved full-width Wiki inventory without inventing a label for empty Space", async () => {
-    vi.mocked(listPages).mockResolvedValue([
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([
       page({ id: "independent", space: null }),
       page({ id: "entity", title: "Nash Su", entity_id: "entity-1", space: "Research" }),
       page({ id: "decision", title: "Why citations stay visible", content: "Decision: keep citations visible.", space: "Wenlan" }),
@@ -163,14 +163,14 @@ describe("PagesOverview", () => {
     for (const rejected of ["Independent", "Optional", "Unassigned", "No Space", "Browse by type", "Independent pages", "In spaces"]) {
       expect(screen.queryByText(rejected)).not.toBeInTheDocument();
     }
-    expect(listPages).toHaveBeenCalledWith("active", undefined, 500, 0);
+    expect(listPagesExplicitBrowse).toHaveBeenCalledWith("active", undefined, 500, 0);
 
     await user.click(screen.getByRole("button", { name: "Open Independent research note" }));
     expect(onSelectPage).toHaveBeenCalledWith("independent");
   });
 
   it("treats persisted unconfirmed Pages as an inventory status, not a new-page candidate", async () => {
-    vi.mocked(listPages).mockResolvedValue([
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([
       page({ id: "confirmed", title: "Confirmed note" }),
       page({ id: "unconfirmed", title: "Needs verification", review_status: "unconfirmed" }),
     ]);
@@ -187,7 +187,7 @@ describe("PagesOverview", () => {
   });
 
   it("marks a persisted Page when Review has a page cleanup suggestion", async () => {
-    vi.mocked(listPages).mockResolvedValue([
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([
       page({ id: "thin-page", title: "Thin research note" }),
     ]);
     vi.mocked(listRefinements).mockResolvedValue({
@@ -215,7 +215,7 @@ describe("PagesOverview", () => {
   });
 
   it("includes every visible persisted state in the Page action name without changing row navigation", async () => {
-    vi.mocked(listPages).mockResolvedValue([
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([
       page({
         id: "review-page",
         title: "Review boundary",
@@ -254,7 +254,7 @@ describe("PagesOverview", () => {
   });
 
   it("does not treat cleanup evidence memory ids as Page ids", async () => {
-    vi.mocked(listPages).mockResolvedValue([
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([
       page({ id: "memory-evidence", title: "Ordinary page" }),
     ]);
     vi.mocked(listRefinements).mockResolvedValue({
@@ -277,7 +277,7 @@ describe("PagesOverview", () => {
   });
 
   it("shows only cached page candidates, routes linked candidates, and previews or hides unlinked candidates", async () => {
-    vi.mocked(listPages).mockResolvedValue([page({ id: "page-existing", title: "Temporal page refresh" })]);
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([page({ id: "page-existing", title: "Temporal page refresh" })]);
     const discovery: DistillReviewResponse = {
       pages_created: 0,
       scoped: false,
@@ -323,7 +323,7 @@ describe("PagesOverview", () => {
   it("keeps explicit Review candidates after leaving Wiki for longer than the default query GC window", () => {
     vi.useFakeTimers();
     try {
-      vi.mocked(listPages).mockResolvedValue([]);
+      vi.mocked(listPagesExplicitBrowse).mockResolvedValue([]);
       const discovery: DistillReviewResponse = {
         pages_created: 0,
         scoped: false,
@@ -373,7 +373,7 @@ describe("PagesOverview", () => {
   });
 
   it("never starts a distill review when Wiki mounts", async () => {
-    vi.mocked(listPages).mockResolvedValue([page({ title: "Quiet Wiki mount" })]);
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([page({ title: "Quiet Wiki mount" })]);
     renderOverview();
 
     expect(await screen.findByRole("button", { name: "Open Quiet Wiki mount" })).toBeInTheDocument();
@@ -381,7 +381,7 @@ describe("PagesOverview", () => {
   });
 
   it("opens the Page from any non-Space cell while keeping Space as its own destination", async () => {
-    vi.mocked(listPages).mockResolvedValue([
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([
       page({ id: "entity", title: "Nash Su", entity_id: "entity-1", space: "Research" }),
     ]);
     const user = userEvent.setup();
@@ -406,7 +406,7 @@ describe("PagesOverview", () => {
   });
 
   it("renders Page and Entity kinds with one restrained 16px glyph system", async () => {
-    vi.mocked(listPages).mockResolvedValue([
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([
       page({ id: "topic", title: "Research methods" }),
       page({ id: "entity", title: "Nash Su", entity_id: "entity-1" }),
       page({ id: "decision", title: "Keep citations", content: "Decision: keep citations." }),
@@ -430,7 +430,7 @@ describe("PagesOverview", () => {
   });
 
   it("filters by Page kind and Space, sorts by title, and paginates seven rows at a time", async () => {
-    vi.mocked(listPages).mockResolvedValue([
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([
       page({ id: "topic-z", title: "Zulu topic", space: null }),
       page({ id: "entity", title: "Nash Su", entity_id: "entity-1", space: "Research" }),
       page({ id: "decision", title: "Why citations stay visible", content: "Decision: keep citations visible.", space: "Wenlan" }),
@@ -468,7 +468,7 @@ describe("PagesOverview", () => {
   });
 
   it("shows a quiet empty state without inventing a Space requirement", async () => {
-    vi.mocked(listPages).mockResolvedValue([]);
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([]);
     renderOverview();
 
     expect(await screen.findByText("No pages yet")).toBeInTheDocument();

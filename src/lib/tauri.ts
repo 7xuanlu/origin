@@ -988,6 +988,26 @@ export interface PageCitation {
   scope: "sentence" | "paragraph";
 }
 
+/**
+ * Both M5 truth axes for one page. Only ever present when this `Page` came
+ * back from an explicit-browse call (`listPagesExplicitBrowse`,
+ * `getPage(id, "explicit")`) against a daemon
+ * whose truth cutover has begun — see `useTruthStatus`. `supported` and
+ * `human_reviewed` are independent axes; neither implies the other, and
+ * neither is the same thing as `Page.review_status` above (a pre-existing,
+ * separate distillation-faithfulness signal).
+ */
+export interface PageTruth {
+  supported: boolean;
+  human_reviewed: boolean;
+}
+
+/** Where the daemon stands on the M5 truth cutover. See `useTruthStatus`. */
+export interface TruthStatus {
+  cutover_generation: number;
+  contract_version: number;
+}
+
 export interface Page {
   id: string;
   title: string;
@@ -1011,6 +1031,12 @@ export interface Page {
   stale_reason?: string | null;
   user_edited?: boolean;
   citations?: PageCitation[];
+  /**
+   * Both M5 truth axes, present only when this page was fetched via an
+   * explicit-browse call and the daemon's truth cutover is live. Absent
+   * (not `null`) on every automatic/background read by daemon contract.
+   */
+  truth?: PageTruth | null;
 }
 
 export interface CreatePageInput {
@@ -1643,9 +1669,37 @@ export async function dismissEntitySuggestion(id: string): Promise<RejectRefinem
 
 // ===== Pages =====
 
-export async function getPage(id: string): Promise<Page | null> {
-  const page = await invoke<Page | null>("get_page", { id });
+/**
+ * `intent: "explicit"` marks this as a human-initiated wiki browse, so a
+ * daemon with a live truth cutover attaches `Page.truth`
+ * (`crates/wenlan-core/src/truth_manifest.rs`: `GET /api/pages/{id}` is a
+ * NamedPage route). Pass it only for a page a person navigated to — a
+ * background poll or an agent-driven read must stay `"automatic"` (the
+ * default), since the daemon durably records every explicit call.
+ */
+export async function getPage(
+  id: string,
+  intent: "automatic" | "explicit" = "automatic",
+): Promise<Page | null> {
+  const command = intent === "explicit" ? "get_page_explicit_browse" : "get_page";
+  const page = await invoke<Page | null>(command, { id });
   return page ? withDomain(page) : null;
+}
+
+/** Explicit-browse sibling of {@link getPage}, for call sites that always browse. */
+export async function getPageExplicitBrowse(id: string): Promise<Page | null> {
+  return getPage(id, "explicit");
+}
+
+/**
+ * Where the daemon stands on the M5 truth cutover. `null` on a daemon that
+ * predates the field or has not begun the cutover — read both as "not live"
+ * (`crates/wenlan-types/src/responses.rs::TruthStatus::cutover_live`). This
+ * is itself an automatic read: cutover state is not page prose, so it
+ * carries no explicit-browse marker. See `useTruthStatus`.
+ */
+export async function getTruthStatus(): Promise<TruthStatus | null> {
+  return invoke<TruthStatus | null>("get_truth_status");
 }
 
 export async function createPage(input: CreatePageInput): Promise<CreatePageResponse> {
@@ -1813,6 +1867,21 @@ export async function listConcepts(
   offset?: number,
 ): Promise<Page[]> {
   return listPages(status, domain, limit, offset);
+}
+
+/**
+ * Explicit-browse sibling of {@link listPages}: same request, marked as a
+ * human-initiated wiki browse so the daemon attaches `Page.truth` on each
+ * result entry when its cutover is live.
+ */
+export async function listPagesExplicitBrowse(
+  status?: string,
+  domain?: string,
+  limit?: number,
+  offset?: number,
+): Promise<Page[]> {
+  const pages = await invoke<Page[]>("list_pages_explicit_browse", { status, domain, limit, offset });
+  return withDomainArray(pages);
 }
 
 // ── Home delta feed ────────────────────────────────────────────────────

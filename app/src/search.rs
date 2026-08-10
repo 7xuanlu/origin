@@ -3815,6 +3815,76 @@ pub async fn search_pages(
     Ok(resp.pages)
 }
 
+// ── M5 truth axes: explicit-browse variants ─────────────────────────────
+// Same requests as `list_pages`/`search_pages`/`get_page` above, but carrying
+// the two-header marker the daemon's truth guard requires before it will
+// attach `Page.truth` to a Collection- or NamedPage-shaped response
+// (`crates/wenlan-core/src/truth_manifest.rs`). Call these only from a
+// human-initiated wiki browse (the pages list, search results, or a page
+// detail view a person navigated to) — never from a background poll or an
+// agent-driven read, since the daemon durably records every marked call.
+
+#[tauri::command]
+pub async fn list_pages_explicit_browse(
+    state: tauri::State<'_, State>,
+    status: Option<String>,
+    domain: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<Page>, String> {
+    let client = state.read().await.client.clone();
+    let mut params: Vec<String> = Vec::new();
+    if let Some(s) = status {
+        params.push(format!("status={}", s));
+    }
+    if let Some(d) = domain {
+        params.push(format!("domain={}", d));
+    }
+    if let Some(l) = limit {
+        params.push(format!("limit={}", l));
+    }
+    if let Some(o) = offset {
+        params.push(format!("offset={}", o));
+    }
+    let path = if params.is_empty() {
+        "/api/pages".to_string()
+    } else {
+        format!("/api/pages?{}", params.join("&"))
+    };
+    let resp: responses::SearchPagesResponse = client.get_json_explicit_browse(&path).await?;
+    Ok(resp.pages)
+}
+
+#[tauri::command]
+pub async fn get_page_explicit_browse(
+    state: tauri::State<'_, State>,
+    id: String,
+) -> Result<Option<serde_json::Value>, String> {
+    let client = state.read().await.client.clone();
+    match client
+        .get_json_explicit_browse::<serde_json::Value>(&format!("/api/pages/{}", id))
+        .await
+    {
+        Ok(wire) => Ok(page_from_wire(wire)),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("404") || msg.to_lowercase().contains("not found") {
+                Ok(None)
+            } else {
+                Err(format!("get_page_explicit_browse failed: {}", msg))
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn get_truth_status(
+    state: tauri::State<'_, State>,
+) -> Result<Option<crate::api::TruthStatus>, String> {
+    let client = state.read().await.client.clone();
+    client.truth_status().await
+}
+
 #[tauri::command]
 pub async fn get_page_sources(
     state: tauri::State<'_, State>,

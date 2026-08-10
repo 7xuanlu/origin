@@ -185,6 +185,14 @@ export class TauriMockRuntime {
       case "record_page_editor_diagnostic": return null;
       case "list_pages": return this.listPages(args);
       case "get_page": return this.pages.find((page) => page.id === requiredString(command, args, "id")) ?? null;
+      // Explicit-browse variants attach a human-intent header at the HTTP
+      // layer; this fixture has no HTTP layer, so they resolve identically
+      // to their automatic counterparts.
+      case "list_pages_explicit_browse": return this.listPages(args);
+      case "get_page_explicit_browse": return this.pages.find((page) => page.id === requiredString(command, args, "id")) ?? null;
+      // No fixture models a live M5 truth cutover yet, so this always
+      // reports "not cut over" — the same state as production before cutover.
+      case "get_truth_status": return null;
       case "create_page": return this.createPage(args);
       case "update_page": return this.updatePage(args);
       case "delete_page": return this.deletePage(args);
