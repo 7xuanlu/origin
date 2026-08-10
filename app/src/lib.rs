@@ -1307,8 +1307,6 @@ pub fn run() {
             search::patch_page_map_node,
             search::delete_page_map_node,
             search::put_page_map_layout,
-            search::patch_page_map_edge,
-            search::reset_page_map,
             // Home delta feed commands
             search::list_recent_retrievals,
             search::list_recent_changes,

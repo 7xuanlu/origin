@@ -958,6 +958,56 @@ describe("PageCanvas direct manipulation", () => {
     expect(order).toEqual(["n_leaf", "n_branch"]);
   });
 
+  it("says how many boxes it already destroyed when a subtree delete is cut short", async () => {
+    const { getPageMap, deletePageMapNode } = await tauri();
+    (getPageMap as ReturnType<typeof vi.fn>).mockResolvedValue(nestedMap());
+    // The leaf goes; the branch is refused because the canvas moved under us.
+    // Tombstones are terminal, so the leaf is gone for good and saying only
+    // "conflict" would hide that.
+    (deletePageMapNode as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(node({ id: "n_leaf", status: "dismissed" }))
+      .mockRejectedValue(
+        new Error(JSON.stringify({ status: 409, error: "revision mismatch" })),
+      );
+    const { user } = renderCanvas();
+    await screen.findByTestId("react-flow");
+
+    await user.click(screen.getByLabelText("contextmenu n_branch"));
+    await user.click(
+      screen.getByRole("menuitem", { name: "Delete, with everything inside" }),
+    );
+
+    const notice = await screen.findByRole("status");
+    expect(notice.textContent).toContain("“Branch”");
+    expect(notice.textContent).toContain("1 box was already deleted");
+    expect(notice.textContent).toContain("1 left alone");
+  });
+
+  it("tells the user the page moved when the heading write hits a conflict", async () => {
+    const { getPageMap, getPage, updatePage, createPageMapNode } = await tauri();
+    (getPageMap as ReturnType<typeof vi.fn>).mockResolvedValue(nestedMap());
+    (getPage as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: "p1",
+      content: "# Page One\n\nBody.",
+      version: 3,
+    });
+    (updatePage as ReturnType<typeof vi.fn>).mockResolvedValue({
+      outcome: "conflict",
+    });
+    const { user } = renderCanvas();
+    await screen.findByTestId("react-flow");
+
+    await user.click(screen.getByLabelText("connectend empty n_branch"));
+    const field = await screen.findByRole("textbox", { name: "Section name" });
+    await user.type(field, "Offshoot{Enter}");
+
+    // A conflict is not a generic failure: the markdown never changed, and the
+    // fix is to reload rather than to retry.
+    const notice = await screen.findByRole("status");
+    expect(notice.textContent).toContain("Reload the page and try again.");
+    expect(createPageMapNode).not.toHaveBeenCalled();
+  });
+
   it("keeps double-click for drawing and hands panning to scroll", async () => {
     const { getPageMap } = await tauri();
     (getPageMap as ReturnType<typeof vi.fn>).mockResolvedValue(makeMap());

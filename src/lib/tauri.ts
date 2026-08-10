@@ -2529,11 +2529,6 @@ export interface PageMapNodeMutation {
   node: PageMapNode;
 }
 
-export interface PageMapEdgeMutation {
-  revision: number;
-  edge: PageMapEdge;
-}
-
 export interface PageMapLayoutPosition {
   node_id: string;
   x: number;
@@ -2617,19 +2612,4 @@ export async function putPageMapLayout(
   },
 ): Promise<PageMap> {
   return invoke("put_page_map_layout", { pageId, body });
-}
-
-export async function patchPageMapEdge(
-  pageId: string,
-  edgeId: string,
-  body: { base_revision: number; status?: PageMapStatus; label?: string | null },
-): Promise<PageMapEdgeMutation> {
-  return invoke("patch_page_map_edge", { pageId, edgeId, body });
-}
-
-/** Drops the whole map. Unlike every other mutation this is unconditional —
- *  the daemon's `handle_reset_page_map` takes no `base_revision` and answers
- *  `{"status":"reset"}` rather than the map, so the caller must refetch. */
-export async function resetPageMap(pageId: string): Promise<{ status: string }> {
-  return invoke("reset_page_map", { pageId });
 }

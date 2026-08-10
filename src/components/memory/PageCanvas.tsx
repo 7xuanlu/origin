@@ -39,6 +39,7 @@ import {
   type PageMapLayoutPosition,
   type PageMapNode,
   type PageMapStatus,
+  type UpdatePageOutcome,
 } from "../../lib/tauri";
 import { layoutMap, nodeBoxSize, NODE_HEIGHT } from "../../lib/pageMap/tree";
 import { slugify, withHeading } from "../../lib/pageMap/slug";
@@ -180,6 +181,38 @@ interface MenuItem {
   label: string;
   run: () => void;
   danger?: boolean;
+}
+
+/**
+ * A subtree delete that stopped partway. The daemon tombstones one node per
+ * call and every tombstone is terminal, so a failure on box four of seven is
+ * not a no-op the user can retry — three boxes are already gone for good.
+ * Carries the count so the notice can say so.
+ */
+class PartialSubtreeDelete extends Error {
+  constructor(
+    readonly reason: unknown,
+    readonly label: string,
+    readonly deleted: number,
+    readonly total: number,
+  ) {
+    super("page map subtree delete stopped partway");
+    this.name = "PartialSubtreeDelete";
+  }
+}
+
+/**
+ * The page write that has to land before a new box can point at anything was
+ * refused. `updatePage` reports refusals as a value, so this carries the whole
+ * outcome rather than flattening it to a message — `conflict` is the page
+ * moving underneath, which the user recovers from by reloading, and the other
+ * outcomes are genuine failures.
+ */
+class PageWriteRefused extends Error {
+  constructor(readonly outcome: UpdatePageOutcome) {
+    super(`page update ${outcome.outcome}`);
+    this.name = "PageWriteRefused";
+  }
 }
 
 const nodeTypes: NodeTypes = { pageMapNode: CanvasNode as NodeTypes[string] };
@@ -391,17 +424,28 @@ function PageCanvasInner({
       };
       for (const id of roots) walk(id);
 
+      // Named while `views` still describes it — after the refetch these nodes
+      // are gone and there is nothing left to read a label off. Read before the
+      // loop so a failure partway can still say what it was working on.
+      const label = views.find((v) => v.node.id === roots[0])?.label ?? "";
+
       let revision = revisionRef.current;
-      for (let i = 0; i < ordered.length; i += 1) {
-        await deletePageMapNode(pageId, ordered[i], { base_revision: revision });
-        if (i + 1 < ordered.length) revision = (await getPageMap(pageId)).revision;
+      let deleted = 0;
+      try {
+        for (let i = 0; i < ordered.length; i += 1) {
+          await deletePageMapNode(pageId, ordered[i], { base_revision: revision });
+          deleted += 1;
+          if (i + 1 < ordered.length) revision = (await getPageMap(pageId)).revision;
+        }
+      } catch (e) {
+        // Every tombstone already written is terminal. Stopping here is the
+        // right call — the rest of the subtree may no longer be what the user
+        // selected — but the boxes that did go are not coming back, so the
+        // count travels with the error instead of being swallowed by a notice
+        // that says only "conflict".
+        throw new PartialSubtreeDelete(e, label, deleted, ordered.length);
       }
-      // What went, named while `views` still describes it — after the refetch
-      // these nodes are gone and there is nothing left to read a label off.
-      return {
-        label: views.find((v) => v.node.id === roots[0])?.label ?? "",
-        count: ordered.length,
-      };
+      return { label, count: ordered.length };
     },
     [views, pageId],
   );
@@ -425,7 +469,23 @@ function PageCanvasInner({
           : t("pageCanvas.deletedOne", { label }),
       );
     },
-    onError: handleMutationError,
+    onError: (error: unknown) => {
+      if (error instanceof PartialSubtreeDelete && error.deleted > 0) {
+        // The map on screen is stale either way, so refresh it exactly as the
+        // shared handler would — then say what the refresh is about to reveal.
+        void invalidate();
+        void refetch();
+        setNotice(
+          t("pageCanvas.deletedPartial", {
+            label: error.label,
+            count: error.deleted,
+            remaining: error.total - error.deleted,
+          }),
+        );
+        return;
+      }
+      handleMutationError(error instanceof PartialSubtreeDelete ? error.reason : error);
+    },
   });
 
   // A new box is a new section of the page. The daemon recomputes a section
@@ -451,7 +511,9 @@ function PageCanvasInner({
       // write goes through the same guarded path the editor uses — it reports
       // refusals as a value rather than throwing, and a heading that silently
       // did not land would leave the box with nothing to point at, so anything
-      // but `saved` becomes the error the notice already knows how to show.
+      // but `saved` stops the create. The outcome travels with the error
+      // because `conflict` is a different situation from a failed write and
+      // deserves to be told apart downstream.
       if (next !== content && page) {
         const outcome = await updatePage({
           id: pageId,
@@ -461,9 +523,15 @@ function PageCanvasInner({
           operationId: globalThis.crypto.randomUUID(),
         });
         if (outcome.outcome !== "saved") {
-          throw new Error(`page update ${outcome.outcome}`);
+          throw new PageWriteRefused(outcome);
         }
       }
+      // Residual, deliberately not fixed here: the heading write and the node
+      // create are two calls with no transaction over them, so a create that
+      // fails after the write leaves the page carrying a heading with no box
+      // on the canvas. It is visible and self-correcting — the next Improve
+      // pass proposes a node for that heading — and closing it properly needs
+      // the daemon to accept both halves in one request.
       const created = await createPageMapNode(pageId, {
         base_revision: revisionRef.current,
         parent_id: parentId,
@@ -512,17 +580,23 @@ function PageCanvasInner({
     },
     onError: (error: unknown) => {
       setPending(null);
+      // A conflict is not a broken write: the page moved under us, and the fix
+      // is to reload rather than to try again. The editor's own banner, with
+      // its copy-the-draft and reload escapes, lives in PageDetail and would
+      // have to be lifted through two components to reach here — so the canvas
+      // says the same thing in a sentence instead of showing the generic
+      // "something went wrong", which is what sent the user looking for a bug.
+      if (error instanceof PageWriteRefused && error.outcome.outcome === "conflict") {
+        void invalidate();
+        void refetch();
+        setNotice(t("pageCanvas.pageChanged"));
+        return;
+      }
       handleMutationError(error);
     },
   });
 
   const layoutTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(
-    () => () => {
-      if (layoutTimer.current) clearTimeout(layoutTimer.current);
-    },
-    [],
-  );
 
   const flushLayout = useCallback(async () => {
     // Snapshot the stamps this PUT is answering for, so a drop that lands
@@ -577,6 +651,27 @@ function PageCanvasInner({
     setNotice(null);
     void invalidate();
   }, [getViewport, pageId, refetch, invalidate, t]);
+
+  // Unmount inside the debounce window used to drop the drag on the floor:
+  // move a box, then hit Edit page or the canvas toggle within 600ms, and the
+  // position was gone. The teardown flushes instead of just cancelling, so the
+  // last thing the user did is the thing that gets saved. Read through a ref
+  // because this effect must run only on unmount, and flushLayout is a fresh
+  // closure on every render.
+  const flushLayoutRef = useRef(flushLayout);
+  flushLayoutRef.current = flushLayout;
+  useEffect(
+    () => () => {
+      if (!layoutTimer.current) return;
+      clearTimeout(layoutTimer.current);
+      layoutTimer.current = null;
+      // Nothing is left to render the outcome, so this is deliberately
+      // fire-and-forget: the PUT still goes out, and a failure surfaces on the
+      // next open as the stale position it is.
+      void flushLayoutRef.current();
+    },
+    [],
+  );
 
   // One PUT per burst: every move restarts the timer, so dragging five nodes in
   // a row — or holding an arrow key down — sends one request carrying them all.

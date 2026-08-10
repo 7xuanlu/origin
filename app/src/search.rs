@@ -3911,26 +3911,6 @@ pub async fn put_page_map_layout(
 }
 
 #[tauri::command]
-pub async fn patch_page_map_edge(
-    state: tauri::State<'_, State>,
-    page_id: String,
-    edge_id: String,
-    body: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let client = { state.read().await.client.clone() };
-    client.patch_page_map_edge(&page_id, &edge_id, body).await
-}
-
-#[tauri::command]
-pub async fn reset_page_map(
-    state: tauri::State<'_, State>,
-    page_id: String,
-) -> Result<serde_json::Value, String> {
-    let client = { state.read().await.client.clone() };
-    client.reset_page_map(&page_id).await
-}
-
-#[tauri::command]
 pub async fn export_pages_to_obsidian(
     state: tauri::State<'_, State>,
     vault_path: String,

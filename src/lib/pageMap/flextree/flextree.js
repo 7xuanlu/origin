@@ -1,8 +1,9 @@
 /*
- * Vendored from d3-flextree 2.1.2 (https://github.com/Klortho/d3-flextree),
- * WTFPL — see LICENSE in this directory. Decision + rationale:
- * docs/superpowers/plans/2026-07-18-page-map-mind-map.md "Tooling decision".
- * Local changes: removed the package.json version import; no algorithm edits.
+ * Vendored from d3-flextree 2.1.2, WTFPL — see LICENSE in this directory.
+ * Upstream: https://github.com/Klortho/d3-flextree
+ * It is vendored rather than depended on because the published package reads
+ * its own package.json at import time, which no bundler here can satisfy.
+ * Local changes: removed that version import; no algorithm edits.
  */
 import {hierarchy} from 'd3-hierarchy';
 

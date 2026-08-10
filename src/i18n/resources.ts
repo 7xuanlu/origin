@@ -489,6 +489,10 @@ const en = {
     deletedWith_one: "Deleted “{{label}}” and the 1 box inside it. This can't be undone.",
     deletedWith_other:
       "Deleted “{{label}}” and the {{count}} boxes inside it. This can't be undone.",
+    deletedPartial_one:
+      "This canvas changed somewhere else partway through deleting “{{label}}”. 1 box was already deleted and can't be brought back; {{remaining}} left alone.",
+    deletedPartial_other:
+      "This canvas changed somewhere else partway through deleting “{{label}}”. {{count}} boxes were already deleted and can't be brought back; {{remaining}} left alone.",
     showSuggestions_one: "{{count}} suggestion",
     showSuggestions_other: "{{count}} suggestions",
     hintsLabel: "Canvas shortcuts",
@@ -535,6 +539,8 @@ const en = {
     dangling: "What this node points at is gone",
     danglingNode: "{{label}} \u2014 what this node points at is gone",
     conflict: "This canvas changed somewhere else. Your last move was not saved.",
+    pageChanged:
+      "This page changed somewhere else, so the new section was not added. Reload the page and try again.",
     mutationError: "That change could not be saved.",
     daemonOutdatedTitle: "Canvas needs a newer local runtime",
     daemonOutdatedBody: "The local Wenlan runtime does not serve page canvases yet. Update it, then reopen this page.",
@@ -2020,6 +2026,10 @@ const zhHans = {
     deletedOne: "已删除“{{label}}”，无法撤销。",
     deletedWith_one: "已删除“{{label}}”及其中的 1 个方块，无法撤销。",
     deletedWith_other: "已删除“{{label}}”及其中的 {{count}} 个方块，无法撤销。",
+    deletedPartial_one:
+      "删除“{{label}}”的过程中，这张画布已在别处被修改。已删除 1 个方块且无法恢复，其余 {{remaining}} 个保持不变。",
+    deletedPartial_other:
+      "删除“{{label}}”的过程中，这张画布已在别处被修改。已删除 {{count}} 个方块且无法恢复，其余 {{remaining}} 个保持不变。",
     showSuggestions_one: "{{count}} 条建议",
     showSuggestions_other: "{{count}} 条建议",
     hintsLabel: "画布快捷键",
@@ -2066,6 +2076,7 @@ const zhHans = {
     dangling: "该节点指向的内容已不存在",
     danglingNode: "{{label}} \u2014 该节点指向的内容已不存在",
     conflict: "这张画布已在别处被修改，刚才的调整没有保存。",
+    pageChanged: "这个页面已在别处被修改，新章节没有添加。请重新加载页面后再试。",
     mutationError: "这次修改没能保存。",
     daemonOutdatedTitle: "画布需要更新本地服务",
     daemonOutdatedBody: "当前的 Wenlan 本地服务还不支持页面画布。请更新后重新打开此页面。",
@@ -3532,6 +3543,10 @@ const zhHant = {
     deletedOne: "已刪除「{{label}}」，無法復原。",
     deletedWith_one: "已刪除「{{label}}」及其中的 1 個方塊，無法復原。",
     deletedWith_other: "已刪除「{{label}}」及其中的 {{count}} 個方塊，無法復原。",
+    deletedPartial_one:
+      "刪除「{{label}}」的過程中，這張畫布已在別處變更。已刪除 1 個方塊且無法復原，其餘 {{remaining}} 個維持不變。",
+    deletedPartial_other:
+      "刪除「{{label}}」的過程中，這張畫布已在別處變更。已刪除 {{count}} 個方塊且無法復原，其餘 {{remaining}} 個維持不變。",
     showSuggestions_one: "{{count}} 則建議",
     showSuggestions_other: "{{count}} 則建議",
     hintsLabel: "畫布快捷鍵",
@@ -3578,6 +3593,7 @@ const zhHant = {
     dangling: "該節點指向的內容已不存在",
     danglingNode: "{{label}} \u2014 該節點指向的內容已不存在",
     conflict: "這張畫布已在別處變更，剛才的調整沒有儲存。",
+    pageChanged: "這個頁面已在別處變更，新章節沒有加入。請重新載入頁面後再試。",
     mutationError: "這次變更沒能儲存。",
     daemonOutdatedTitle: "畫布需要更新本機服務",
     daemonOutdatedBody: "目前的 Wenlan 本機服務尚不支援頁面畫布。請更新後重新開啟此頁面。",

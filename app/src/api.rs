@@ -820,26 +820,6 @@ impl WenlanClient {
             .await
     }
 
-    pub async fn patch_page_map_edge(
-        &self,
-        page_id: &str,
-        edge_id: &str,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        let path = format!("/api/pages/{}/map/edges/{}", page_id, edge_id);
-        self.page_map_call(reqwest::Method::PATCH, &path, Some(body))
-            .await
-    }
-
-    /// The one map call with no `base_revision`: `handle_reset_page_map` takes
-    /// no body at all and answers `{"status":"reset"}`, so there is nothing to
-    /// send and no revision to conflict on.
-    pub async fn reset_page_map(&self, page_id: &str) -> Result<serde_json::Value, String> {
-        let path = format!("/api/pages/{}/map", page_id);
-        self.page_map_call(reqwest::Method::DELETE, &path, None)
-            .await
-    }
-
     pub async fn test_llm(
         &self,
         endpoint: String,

@@ -511,7 +511,7 @@ export const HANDLERS: Record<string, (a: any) => Promise<unknown>> = {
 
   // Page map (Canvas) — mirrors WenlanClient::page_map_call in app/src/api.rs.
   // The node DELETE carries a JSON body (base_revision), so it cannot use the
-  // `del()` helper, which sends none; the map reset takes no body and can.
+  // `del()` helper, which sends none.
   get_page_map: (a) => get(`/api/pages/${enc(a.pageId)}/map`),
   improve_page_map: (a) => post(`/api/pages/${enc(a.pageId)}/map/improve`, {}),
   create_page_map_node: (a) => post(`/api/pages/${enc(a.pageId)}/map/nodes`, a.body),
@@ -520,9 +520,6 @@ export const HANDLERS: Record<string, (a: any) => Promise<unknown>> = {
   delete_page_map_node: (a) =>
     http("DELETE", `/api/pages/${enc(a.pageId)}/map/nodes/${enc(a.nodeId)}`, a.body),
   put_page_map_layout: (a) => put(`/api/pages/${enc(a.pageId)}/map/layout`, a.body),
-  patch_page_map_edge: (a) =>
-    http("PATCH", `/api/pages/${enc(a.pageId)}/map/edges/${enc(a.edgeId)}`, a.body),
-  reset_page_map: (a) => del(`/api/pages/${enc(a.pageId)}/map`),
   get_page_revisions: (a) => get(`/api/pages/${enc(a.pageId)}/revisions`),
   redistill_page: (a) => post(`/api/distill/${enc(a.pageId)}`, {}),
   update_page: async (a) => {
