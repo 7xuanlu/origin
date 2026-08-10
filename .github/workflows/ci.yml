@@ -2427,11 +2427,27 @@ jobs:
       # binary directly, so bash sets TAURI_DIR the way the script intended.
       # Making package.json itself portable is the real fix and belongs with
       # whatever change first teaches release.yml to publish a Windows app.
+      # tauri.conf.json carries an updater pubkey, so `tauri build` refuses to
+      # bundle without the matching private key. This job publishes nothing and
+      # no one installs its output, so it mints a throwaway keypair per run
+      # rather than borrowing the real release secret. Signatures produced here
+      # are deliberately worthless; only the bundle layout is being proven.
+      - name: Mint a throwaway updater signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm exec tauri signer generate -w "$RUNNER_TEMP/ci-only.key" --password ""
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY=$RUNNER_TEMP/ci-only.key"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD="
+          } >> "$GITHUB_ENV"
       - name: Build Windows desktop app bundle
         shell: bash
         env:
           CLOUDFLARED_BIN: ${{ env.CLOUDFLARED_BIN }}
           TAURI_DIR: app
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm exec tauri build --target x86_64-pc-windows-msvc
       # What the bundle actually contains decides where the two DLLs have to go.
       # Read this listing before wiring bundle.resources in app/tauri.conf.json.
