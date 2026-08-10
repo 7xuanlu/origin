@@ -80,7 +80,8 @@ app/eval/data/longmemeval_*.json
 app/eval/baselines/
 
 # Working design docs — plans, specs, research, prototypes. Local only.
-# Live contracts that code or CI actually reads belong in docs/contracts/ instead.
+# A spec that code or CI actually reads is a test fixture: keep it next to the
+# test, e.g. crates/wenlan-core/contracts/, never here.
 docs/plans/
 docs/superpowers/
 .superpowers/

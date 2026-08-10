@@ -90,8 +90,9 @@ These conventions keep the codebase consistent. See `CLAUDE.md` for the full lis
 
 ## Docs Layout
 
-- In-repo docs live under `docs/`. `docs/contracts/` holds the live specs that code and CI actually read, so those files are load-bearing: changing one changes what a test asserts.
+- In-repo docs live under `docs/` and are documentation only. Nothing there is read by code or CI.
 - Working design docs (plans, specs, research) are deliberately not tracked. `docs/plans/` and `docs/superpowers/` are gitignored local scratch space, so nothing you need to contribute lives there.
+- `crates/wenlan-core/contracts/` holds two markdown files that are test fixtures rather than documentation: `crates/wenlan-core/src/truth_manifest_test.rs` compiles one in with `include_str!`, and `crates/wenlan-core/src/m6/catalog_test.rs` reads the other at test time. Editing either changes what a test asserts.
 
 ## License
 

@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 
 /// The inventory document, compiled in so it cannot be edited out from under
 /// the table without this test noticing.
-const INVENTORY: &str = include_str!("../../../docs/contracts/m5-reader-manifest-inventory.md");
+const INVENTORY: &str = include_str!("../contracts/m5-reader-manifest-inventory.md");
 
 fn clean(cell: &str) -> String {
     cell.replace(['*', '`'], "").trim().to_string()

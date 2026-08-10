@@ -65,7 +65,7 @@ pub struct NoopEmitter;
 ### M5 reader inventory identity
 
 `scripts/m5-reader-sweep.py --check` owns the executable page-prose reader
-contract in `docs/contracts/m5-reader-manifest-inventory.md`. Its stable
+contract in `contracts/m5-reader-manifest-inventory.md`. Its stable
 identity is `short/path.rs::function[#ordinal]`; never put source line numbers
 back into the committed block. Lines belong only in `--json` diagnostics, and
 unowned relevant callsites fail closed. The required check includes mutation

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Enumerate internal page-prose readers for the M5 reader manifest.
 
-The M5 Stage 0 reader manifest (docs/contracts/m5-reader-manifest-inventory.md)
+The M5 Stage 0 reader manifest (crates/wenlan-core/contracts/m5-reader-manifest-inventory.md)
 carries a set of internal call sites that read page prose. Three review rounds
 produced three different counts because the predicate lived in prose and each
 implementation interpreted it differently. The predicate now lives here, and the
@@ -94,7 +94,7 @@ DEPTH_TITLES = (
 )
 MAX_DEPTH = len(DEPTH_TITLES) - 1
 TRUNCATED = []
-INVENTORY = 'docs/contracts/m5-reader-manifest-inventory.md'
+INVENTORY = 'crates/wenlan-core/contracts/m5-reader-manifest-inventory.md'
 INVENTORY_BEGIN = '<!-- m5-reader-sweep:begin -->'
 INVENTORY_END = '<!-- m5-reader-sweep:end -->'
 REPO_ROOT = Path(__file__).resolve().parents[1]
