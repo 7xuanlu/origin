@@ -17,7 +17,7 @@ describe("GitHub Actions runtime floor", () => {
     const workflow = readFileSync(resolve(path), "utf8");
 
     expect(workflow).not.toMatch(
-      /(?:actions\/checkout|actions\/setup-node|pnpm\/action-setup)@v4/,
+      /(?:actions\/checkout|actions\/setup-node|actions\/upload-artifact|pnpm\/action-setup)@v4/,
     );
   });
 

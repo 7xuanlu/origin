@@ -129,6 +129,8 @@ describe("runtime product identity", () => {
     expect(lib).toContain("acknowledge_guarded_quit_request,");
     expect(lib).toContain("fn cancel_guarded_quit_request(");
     expect(lib).toContain("cancel_guarded_quit_request,");
+    expect(lib).toContain("fn request_guarded_quit(");
+    expect(lib).toContain("request_guarded_quit,");
     expect(lib).not.toContain('handle.listen("quit-cancelled"');
     const exitBranch = lib.slice(lib.indexOf("RunEvent::ExitRequested"));
     expect(exitBranch.indexOf("request_full_quit(app)")).toBeLessThan(

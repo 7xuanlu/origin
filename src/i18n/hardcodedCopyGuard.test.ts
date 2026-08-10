@@ -3,6 +3,10 @@ import { describe, expect, it } from "vitest";
 import ts from "typescript";
 import fs from "node:fs";
 import path from "node:path";
+import {
+  readSourceText,
+  repoRelativePath,
+} from "../test/sourceText";
 
 const COMPONENTS_DIR = path.resolve("src/components");
 const USER_FACING_ATTRIBUTES = new Set([
@@ -112,9 +116,9 @@ describe("hardcoded UI copy guard", () => {
     const baselineCounts = readBaselineCounts();
 
     for (const file of listTsxFiles(COMPONENTS_DIR)) {
-      const sourceText = fs.readFileSync(file, "utf8");
+      const sourceText = readSourceText(file);
       const sourceFile = ts.createSourceFile(file, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-      const relativeFile = path.relative(process.cwd(), file);
+      const relativeFile = repoRelativePath(file);
       const constStringValues = new Map<string, string>();
 
       const record = (value: string) => {

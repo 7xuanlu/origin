@@ -83,11 +83,15 @@ impl Config {
     /// Returns the configured knowledge path, or the product default.
     /// Existing `~/Origin/knowledge` directories remain readable during rename.
     pub fn knowledge_path_or_default(&self) -> PathBuf {
+        self.knowledge_path_or_default_for_home(&home_dir())
+    }
+
+    fn knowledge_path_or_default_for_home(&self, home: &std::path::Path) -> PathBuf {
         if let Some(path) = self.knowledge_path.clone() {
             return path;
         }
-        let current = default_knowledge_path();
-        let legacy = legacy_knowledge_path();
+        let current = home.join("Wenlan").join("knowledge");
+        let legacy = home.join("Origin").join("knowledge");
         if !current.exists() && legacy.exists() {
             return legacy;
         }
@@ -111,14 +115,6 @@ fn config_path() -> PathBuf {
 
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn default_knowledge_path() -> PathBuf {
-    home_dir().join("Wenlan/knowledge")
-}
-
-fn legacy_knowledge_path() -> PathBuf {
-    home_dir().join("Origin/knowledge")
 }
 
 pub fn load_config() -> Config {
@@ -399,26 +395,26 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn config_knowledge_path_default_uses_wenlan_when_no_legacy_exists() {
-        let _env = EnvGuard::capture();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path());
         let config: Config = serde_json::from_str("{}").unwrap();
-        let default_path = tmp.path().join("Wenlan/knowledge");
-        assert_eq!(config.knowledge_path_or_default(), default_path);
+        let default_path = tmp.path().join("Wenlan").join("knowledge");
+        assert_eq!(
+            config.knowledge_path_or_default_for_home(tmp.path()),
+            default_path
+        );
     }
 
     #[test]
-    #[serial_test::serial]
     fn config_knowledge_path_default_uses_legacy_when_only_legacy_exists() {
-        let _env = EnvGuard::capture();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        let legacy = tmp.path().join("Origin/knowledge");
+        let legacy = tmp.path().join("Origin").join("knowledge");
         std::fs::create_dir_all(&legacy).unwrap();
         let config: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(config.knowledge_path_or_default(), legacy);
+        assert_eq!(
+            config.knowledge_path_or_default_for_home(tmp.path()),
+            legacy
+        );
     }
 
     #[test]

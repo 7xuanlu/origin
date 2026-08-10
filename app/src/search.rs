@@ -114,6 +114,8 @@ pub fn set_traffic_lights_visible(window: tauri::Window, visible: bool) -> Resul
             }
         }
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (&window, visible);
     Ok(())
 }
 
@@ -163,6 +165,8 @@ pub async fn position_quick_capture(app: tauri::AppHandle) -> Result<(), String>
     let win = app
         .get_webview_window("quick-capture")
         .ok_or("quick-capture window not found")?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = &win;
 
     #[cfg(target_os = "macos")]
     #[allow(deprecated)]
@@ -4750,12 +4754,16 @@ pub async fn list_recent_relations(
 
 #[tauri::command]
 pub async fn is_run_at_login_enabled() -> Result<bool, String> {
+    if crate::lifecycle::run_at_login_capability(std::env::consts::OS).is_err() {
+        return Ok(false);
+    }
     use crate::lifecycle::{is_run_at_login_enabled as inner, SystemLaunchctl};
     Ok(inner(&SystemLaunchctl))
 }
 
 #[tauri::command]
 pub async fn set_run_at_login(enabled: bool) -> Result<(), String> {
+    crate::lifecycle::run_at_login_capability(std::env::consts::OS).map_err(str::to_string)?;
     use crate::lifecycle::{set_run_at_login as inner, SystemLaunchctl};
     inner(enabled, &SystemLaunchctl)
         .await
@@ -4942,27 +4950,15 @@ mod avatar_path_tests {
     }
 
     #[test]
-    #[serial_test::serial]
-    fn avatar_storage_dir_uses_legacy_default_when_current_empty_and_legacy_has_avatars() {
-        let previous_home = std::env::var_os("HOME");
-        let previous_wenlan = std::env::var_os("WENLAN_DATA_DIR");
-        let previous_origin = std::env::var_os("ORIGIN_DATA_DIR");
+    fn legacy_default_selection_flows_to_avatar_storage() {
         let tmp = tempfile::tempdir().unwrap();
-
-        std::env::set_var("HOME", tmp.path());
-        std::env::remove_var("WENLAN_DATA_DIR");
-        std::env::remove_var("ORIGIN_DATA_DIR");
-
-        let current = dirs::data_local_dir().unwrap().join("wenlan");
-        let legacy = dirs::data_local_dir().unwrap().join("origin");
+        let current = tmp.path().join("wenlan");
+        let legacy = tmp.path().join("origin");
         std::fs::create_dir_all(&current).unwrap();
         std::fs::create_dir_all(legacy.join("avatars")).unwrap();
 
-        assert_eq!(avatar_storage_dir(), legacy.join("avatars"));
-
-        restore_env("HOME", previous_home);
-        restore_env("WENLAN_DATA_DIR", previous_wenlan);
-        restore_env("ORIGIN_DATA_DIR", previous_origin);
+        let selected = crate::identity_paths::app_data_dir_for_base(tmp.path());
+        assert_eq!(selected.join("avatars"), legacy.join("avatars"));
     }
 
     #[test]
