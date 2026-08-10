@@ -10,6 +10,10 @@ import {
   getEntityDetail,
   redistillPage,
   updatePage,
+  getDaemonVersion,
+  getSystemInfo,
+  daemonMeetsFloor,
+  recordPageEditorDiagnostic,
   deletePage,
   clipboardWrite,
   exportPageToObsidian,
@@ -17,13 +21,42 @@ import {
   getPageSources,
   type Entity,
   type Page,
+  type UpdatePageInput,
+  type UpdatePageFailureKind,
 } from "../../lib/tauri";
+// Imported from its own module, not the lib/tauri barrel: tests mock that
+// barrel, and a mocked module would shadow the value this must stay bound to.
+import { PAGE_EDIT_DAEMON_FLOOR } from "../../lib/daemonVersion";
 import ContentRenderer from "./ContentRenderer";
 import RelatedPages from "./page/RelatedPages";
 import PageInfo from "./page/PageInfo";
 import { RailPanelTitle } from "./MemoryDetailPrimitives";
 import { processCitations, stripCitationLinks } from "../../lib/pageCitations";
 import CitationChip from "./page/CitationChip";
+import {
+  prepareMarkdownSource,
+  serializeMarkdownSource,
+  type MarkdownSourceProfile,
+  type PreparedMarkdownSource,
+} from "./editor/markdownSourceContract";
+import {
+  beginPageSave,
+  pageDraftChanged,
+  pageVersionChanged,
+  settlePageSave,
+  type PageEditBaseline,
+  type PageSaveCoordinatorState,
+} from "./editor/pageSaveCoordinator";
+import {
+  MarkdownEditor,
+  type MarkdownEditorHandle,
+  type MarkdownEditorStatus,
+} from "./editor/MarkdownEditor";
+import {
+  MarkdownEditorToolbar,
+  type MarkdownEditorToolbarLabels,
+} from "./editor/MarkdownEditorToolbar";
+import { leadingMarkdownH1MatchesTitle } from "./editor/pageEditorPresentation";
 
 interface PageDetailProps {
   pageId: string;
@@ -33,6 +66,8 @@ interface PageDetailProps {
   onEntityClick?: (entityId: string) => void;
   onDismissAttachedPageNotice?: () => void;
   onPageLoaded?: (page: Pick<Page, "id" | "status" | "title">) => void;
+  onSavePendingChange?: (pending: boolean) => void;
+  onEditDirtyChange?: (dirty: boolean) => void;
   showAttachedPageNotice?: boolean;
 }
 
@@ -75,8 +110,30 @@ function folderName(path: string): string {
   return path.split("/").filter(Boolean).pop() || path;
 }
 
+function createPageOperationId(): string {
+  return globalThis.crypto.randomUUID();
+}
+
+function localShortcutModifier(): "Cmd" | "Ctrl" {
+  if (typeof navigator === "undefined") return "Ctrl";
+  return navigator.platform.toLowerCase().startsWith("mac") ? "Cmd" : "Ctrl";
+}
+
 const PAGE_LINK_ANCHOR_PREFIX = "#concept:";
 type MenuInitialFocus = "first" | "last";
+
+type PageEditGate =
+  | { kind: "closed" }
+  | { kind: "checking" }
+  | { kind: "unsupported"; version: string | null }
+  | { kind: "normalize"; prepared: PreparedMarkdownSource }
+  | { kind: "editor" };
+
+type ConflictLatestSource =
+  | { kind: "idle" }
+  | { kind: "loading"; operationId: string }
+  | { kind: "loaded"; operationId: string; page: Page }
+  | { kind: "error"; operationId: string };
 
 function enabledMenuItems(menu: HTMLDivElement | null): HTMLElement[] {
   if (!menu) return [];
@@ -139,6 +196,8 @@ export default function PageDetail({
   onEntityClick,
   onDismissAttachedPageNotice,
   onPageLoaded,
+  onSavePendingChange,
+  onEditDirtyChange,
   showAttachedPageNotice = false,
 }: PageDetailProps) {
   const { t } = useTranslation();
@@ -148,7 +207,34 @@ export default function PageDetail({
   const [copying, setCopying] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [editing, setEditing] = useState(false);
-  const [editContent, setEditContent] = useState("");
+  const [editInitialDocument, setEditInitialDocument] = useState("");
+  const [editHasMatchingTitle, setEditHasMatchingTitle] = useState(false);
+  const [editGate, setEditGate] = useState<PageEditGate>({ kind: "closed" });
+  const [editBaseline, setEditBaseline] = useState<PageEditBaseline | null>(null);
+  const [sourceProfile, setSourceProfile] =
+    useState<MarkdownSourceProfile | null>(null);
+  const [saveState, setSaveState] = useState<PageSaveCoordinatorState>({
+    phase: "idle",
+  });
+  const [conflictLatest, setConflictLatest] =
+    useState<ConflictLatestSource>({ kind: "idle" });
+  const [editValidation, setEditValidation] = useState<string | null>(null);
+  const [editorFallbackSessionId, setEditorFallbackSessionId] =
+    useState<string | null>(null);
+  const [editorShortcutModifier, setEditorShortcutModifier] =
+    useState<"Cmd" | "Ctrl">(localShortcutModifier);
+  const [editorStatus, setEditorStatus] = useState<MarkdownEditorStatus>({
+    sessionId: "",
+    engine: "loading",
+    ready: false,
+    compositionActive: false,
+    canUndo: false,
+    canRedo: false,
+  });
+  const [editorSessionToken, setEditorSessionToken] = useState<{
+    id: string;
+    epoch: number;
+  } | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [actionMenuOpen, setActionMenuOpen] = useState(false);
@@ -156,7 +242,17 @@ export default function PageDetail({
     kind: "success" | "warning" | "error";
     message: string;
   } | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const editorRef = useRef<MarkdownEditorHandle>(null);
+  const editDocumentRef = useRef("");
+  const editDirtyRef = useRef(false);
+  const editPageTitleRef = useRef("");
+  const beginEditAttemptRef = useRef(0);
+  const editorSessionEpochRef = useRef(0);
+  const activeEditorSessionRef = useRef<{
+    id: string;
+    epoch: number;
+  } | null>(null);
+  const saveStateRef = useRef<PageSaveCoordinatorState>({ phase: "idle" });
   const exportMenuTriggerRef = useRef<HTMLButtonElement>(null);
   const exportMenuRef = useRef<HTMLDivElement>(null);
   const exportMenuInitialFocusRef = useRef<MenuInitialFocus>("first");
@@ -165,8 +261,11 @@ export default function PageDetail({
   const actionMenuListRef = useRef<HTMLDivElement>(null);
   const actionMenuInitialFocusRef = useRef<MenuInitialFocus>("first");
   const activePageIdRef = useRef(pageId);
-  const saveInFlightRef = useRef(false);
   activePageIdRef.current = pageId;
+  const editorSessionId = editBaseline
+    ? `${editBaseline.pageId}:${editBaseline.version}`
+    : null;
+  const editorSessionEpoch = editorSessionToken?.epoch ?? 0;
 
   const {
     data: page,
@@ -256,27 +355,169 @@ export default function PageDetail({
     setCopied(false);
     setExported(false);
     setEditing(false);
-    setEditContent("");
+    setEditGate({ kind: "closed" });
+    setEditBaseline(null);
+    setEditHasMatchingTitle(false);
+    setSourceProfile(null);
+    setEditValidation(null);
+    setEditorFallbackSessionId(null);
+    setEditorSessionToken(null);
+    activeEditorSessionRef.current = null;
+    beginEditAttemptRef.current += 1;
+    editorSessionEpochRef.current += 1;
+    editDocumentRef.current = "";
+    editDirtyRef.current = false;
+    editPageTitleRef.current = "";
+    saveStateRef.current = { phase: "idle" };
+    setSaveState({ phase: "idle" });
   }, [pageId]);
 
+  const updateSaveState = useCallback((next: PageSaveCoordinatorState) => {
+    saveStateRef.current = next;
+    setSaveState(next);
+  }, []);
+
+  useEffect(() => {
+    const blockPendingEscape = (event: KeyboardEvent) => {
+      if (
+        event.key === "Escape" &&
+        saveStateRef.current.phase === "pending"
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    window.addEventListener("keydown", blockPendingEscape, true);
+    return () => window.removeEventListener("keydown", blockPendingEscape, true);
+  }, []);
+
+  useEffect(() => {
+    onSavePendingChange?.(saveState.phase === "pending");
+  }, [onSavePendingChange, saveState.phase]);
+
+  useEffect(
+    () => () => {
+      if (saveStateRef.current.phase !== "pending") {
+        onSavePendingChange?.(false);
+      }
+    },
+    [onSavePendingChange],
+  );
+
+  useEffect(() => {
+    onEditDirtyChange?.(editDirtyRef.current);
+    return () => onEditDirtyChange?.(false);
+  }, [onEditDirtyChange]);
+
+  const updateEditDirty = useCallback(
+    (dirty: boolean) => {
+      if (editDirtyRef.current === dirty) return;
+      editDirtyRef.current = dirty;
+      onEditDirtyChange?.(dirty);
+    },
+    [onEditDirtyChange],
+  );
+
+  const isCurrentSave = useCallback((input: UpdatePageInput) => {
+    const current = saveStateRef.current;
+    return (
+      current.phase === "pending" &&
+      current.pending.operationId === input.operationId &&
+      current.pending.content === input.content &&
+      current.pending.expectedVersion === input.expectedVersion
+    );
+  }, []);
+
+  const fetchConflictLatest = useCallback(
+    async (operationId: string): Promise<Page | null> => {
+      setConflictLatest((currentLatest) =>
+        currentLatest.kind === "loaded" &&
+        currentLatest.operationId === operationId
+          ? currentLatest
+          : { kind: "loading", operationId },
+      );
+      try {
+        const latest = await getPage(pageId);
+        const current = saveStateRef.current;
+        if (
+          current.phase !== "conflict" ||
+          current.pending.operationId !== operationId
+        ) {
+          return null;
+        }
+        if (!latest) {
+          setConflictLatest((currentLatest) =>
+            currentLatest.kind === "loaded" &&
+            currentLatest.operationId === operationId
+              ? currentLatest
+              : { kind: "error", operationId },
+          );
+          return null;
+        }
+        queryClient.setQueryData<Page | null>(["page", pageId], (currentPage) =>
+          currentPage && currentPage.version >= latest.version
+            ? currentPage
+            : latest,
+        );
+        setConflictLatest((currentLatest) =>
+          currentLatest.kind === "loaded" &&
+          currentLatest.operationId === operationId &&
+          currentLatest.page.version >= latest.version
+            ? currentLatest
+            : { kind: "loaded", operationId, page: latest },
+        );
+        return latest;
+      } catch {
+        const current = saveStateRef.current;
+        if (
+          current.phase === "conflict" &&
+          current.pending.operationId === operationId
+        ) {
+          setConflictLatest((currentLatest) =>
+            currentLatest.kind === "loaded" &&
+            currentLatest.operationId === operationId
+              ? currentLatest
+              : { kind: "error", operationId },
+          );
+        }
+        return null;
+      }
+    },
+    [pageId, queryClient],
+  );
+
   const updateMutation = useMutation({
-    mutationFn: ({ id, content }: { id: string; content: string }) =>
-      updatePage(id, content),
-    onSuccess: (_result, { id }) => {
-      queryClient.invalidateQueries({ queryKey: ["page", id] });
-      queryClient.invalidateQueries({ queryKey: ["pages"] });
-      queryClient.invalidateQueries({ queryKey: ["page-links", id] });
-      queryClient.invalidateQueries({ queryKey: ["page-revisions", id] });
-      if (activePageIdRef.current !== id) return;
-      setActionError(null);
-      setEditing(false);
+    mutationFn: (input: UpdatePageInput) => updatePage(input),
+    onSuccess: (outcome, input) => {
+      if (!isCurrentSave(input)) return;
+      const next = settlePageSave(saveStateRef.current, outcome);
+      updateSaveState(next);
+      if (outcome.outcome === "saved") {
+        queryClient.invalidateQueries({ queryKey: ["page", input.id] });
+        queryClient.invalidateQueries({ queryKey: ["pages"] });
+        queryClient.invalidateQueries({ queryKey: ["page-links", input.id] });
+        queryClient.invalidateQueries({ queryKey: ["page-revisions", input.id] });
+        if (activePageIdRef.current !== input.id) return;
+        setActionError(null);
+        setEditing(false);
+        setEditGate({ kind: "closed" });
+        setEditBaseline(null);
+        setSourceProfile(null);
+        setEditValidation(null);
+        setEditorFallbackSessionId(null);
+        setEditorSessionToken(null);
+        activeEditorSessionRef.current = null;
+        editDocumentRef.current = "";
+        updateEditDirty(false);
+      } else if (outcome.outcome === "conflict") {
+        void fetchConflictLatest(input.operationId);
+      }
     },
-    onError: (_error, { id }) => {
-      if (activePageIdRef.current !== id) return;
-      setActionError(t("pageDetail.saveError"));
-    },
-    onSettled: () => {
-      saveInFlightRef.current = false;
+    onError: (_error, input) => {
+      if (!isCurrentSave(input)) return;
+      updateSaveState(
+        settlePageSave(saveStateRef.current, { outcome: "transport" }),
+      );
     },
   });
 
@@ -388,26 +629,431 @@ export default function PageDetail({
     [pageId, t],
   );
 
-  const handleSave = () => {
-    if (saveInFlightRef.current || updateMutation.isPending) return;
-    if (editContent.trim() && editContent !== page?.content) {
-      setActionError(null);
-      saveInFlightRef.current = true;
-      updateMutation.mutate({ id: pageId, content: editContent.trim() });
-    } else {
-      setEditing(false);
-    }
+  const closeEditor = () => {
+    activeEditorSessionRef.current = null;
+    beginEditAttemptRef.current += 1;
+    editorSessionEpochRef.current += 1;
+    editDocumentRef.current = "";
+    editPageTitleRef.current = "";
+    setEditing(false);
+    setEditGate({ kind: "closed" });
+    setEditBaseline(null);
+    setEditHasMatchingTitle(false);
+    setSourceProfile(null);
+    setEditValidation(null);
+    setEditorFallbackSessionId(null);
+    setEditorSessionToken(null);
+    setEditorStatus({
+      sessionId: "",
+      engine: "loading",
+      ready: false,
+      compositionActive: false,
+      canUndo: false,
+      canRedo: false,
+    });
+    setConflictLatest({ kind: "idle" });
+    updateSaveState({ phase: "idle" });
+    updateEditDirty(false);
   };
 
-  const beginEditing = () => {
+  const openPageSourceForEditing = (sourcePage: Page) => {
+    if (activePageIdRef.current !== sourcePage.id) return;
+
+    const prepared = prepareMarkdownSource(sourcePage.content);
+    const sessionId = `${sourcePage.id}:${sourcePage.version}`;
+    editorSessionEpochRef.current += 1;
+    const sessionToken = {
+      id: sessionId,
+      epoch: editorSessionEpochRef.current,
+    };
+    activeEditorSessionRef.current = sessionToken;
+    setEditorSessionToken(sessionToken);
+    setEditorStatus({
+      sessionId,
+      engine: "loading",
+      ready: false,
+      compositionActive: false,
+      canUndo: false,
+      canRedo: false,
+    });
+    editDocumentRef.current = prepared.editorDocument;
+    editPageTitleRef.current = sourcePage.title;
+    updateEditDirty(false);
+    setEditHasMatchingTitle(
+      leadingMarkdownH1MatchesTitle(
+        prepared.editorDocument,
+        sourcePage.title,
+      ),
+    );
+    setEditBaseline({
+      pageId: sourcePage.id,
+      content: sourcePage.content,
+      version: sourcePage.version,
+    });
+    setEditValidation(null);
+    setEditorFallbackSessionId(null);
+    setConflictLatest({ kind: "idle" });
+    updateSaveState({ phase: "idle" });
+    if (!prepared.canEditLosslessly) {
+      setSourceProfile(null);
+      setEditGate({ kind: "normalize", prepared });
+      return;
+    }
+
+    setEditInitialDocument(prepared.editorDocument);
+    setSourceProfile(prepared.profile);
+    setEditGate({ kind: "editor" });
+  };
+
+  const beginEditing = async () => {
+    if (!page) return;
+    const originPageId = page.id;
+    const beginEditAttempt = ++beginEditAttemptRef.current;
+    const isActiveBeginEdit = () =>
+      activePageIdRef.current === originPageId &&
+      beginEditAttemptRef.current === beginEditAttempt;
+
     setActionError(null);
-    setEditContent(page?.content ?? "");
     setEditing(true);
     setActionMenuOpen(false);
+    setEditGate({ kind: "checking" });
+    setEditValidation(null);
+    updateSaveState({ phase: "idle" });
+
+    let version: string;
+    try {
+      const [reportedVersion, systemInfo] = await Promise.all([
+        getDaemonVersion(),
+        getSystemInfo().catch(() => null),
+      ]);
+      if (!isActiveBeginEdit()) return;
+
+      version = reportedVersion;
+      if (systemInfo?.os) {
+        setEditorShortcutModifier(
+          systemInfo.os.toLowerCase() === "macos" ? "Cmd" : "Ctrl",
+        );
+      }
+    } catch {
+      if (!isActiveBeginEdit()) return;
+
+      setEditGate({ kind: "unsupported", version: null });
+      void recordPageEditorDiagnostic({
+        event: "daemon_floor_blocked",
+        reportedVersion: null,
+        requiredFloor: PAGE_EDIT_DAEMON_FLOOR,
+      }).catch(() => undefined);
+      return;
+    }
+    if (!isActiveBeginEdit()) return;
+
+    if (!daemonMeetsFloor(version, PAGE_EDIT_DAEMON_FLOOR)) {
+      setEditGate({ kind: "unsupported", version });
+      void recordPageEditorDiagnostic({
+        event: "daemon_floor_blocked",
+        reportedVersion: version,
+        requiredFloor: PAGE_EDIT_DAEMON_FLOOR,
+      }).catch(() => undefined);
+      return;
+    }
+
+    if (!isActiveBeginEdit()) return;
+    openPageSourceForEditing(page);
+  };
+
+  const handleNormalizeAndEdit = () => {
+    if (editGate.kind !== "normalize") return;
+    const normalizedProfile: MarkdownSourceProfile = {
+      bom: editGate.prepared.profile.bom,
+      lineEndings: { kind: "lf", separator: "\n" },
+    };
+    editDocumentRef.current = editGate.prepared.editorDocument;
+    setEditInitialDocument(editGate.prepared.editorDocument);
+    setSourceProfile(normalizedProfile);
+    setEditGate({ kind: "editor" });
+    updateEditDirty(
+      editBaseline !== null &&
+        serializeMarkdownSource(
+          editGate.prepared.editorDocument,
+          normalizedProfile,
+        ) !== editBaseline.content,
+    );
+  };
+
+  const saveDocument = (document: string) => {
+    if (!editBaseline || !sourceProfile) return;
+
+    editDocumentRef.current = document;
+    const content = serializeMarkdownSource(document, sourceProfile);
+    const attempt = beginPageSave(
+      saveStateRef.current,
+      editBaseline,
+      content,
+      createPageOperationId,
+    );
+
+    if (attempt.kind === "invalid") {
+      setEditValidation(t("pageDetail.editor.empty"));
+      return;
+    }
+    if (attempt.kind === "unchanged") {
+      closeEditor();
+      return;
+    }
+    if (attempt.kind !== "request") {
+      return;
+    }
+
+    setEditValidation(null);
+    updateSaveState(attempt.state);
+    updateMutation.mutate(attempt.input);
+  };
+
+  const handleDocumentChange = (content: string) => {
+    editDocumentRef.current = content;
+    setEditHasMatchingTitle(
+      leadingMarkdownH1MatchesTitle(content, editPageTitleRef.current),
+    );
+    setEditValidation(null);
+    updateSaveState(pageDraftChanged(saveStateRef.current));
+    updateEditDirty(
+      editGate.kind === "editor" &&
+        editBaseline !== null &&
+        (sourceProfile
+          ? serializeMarkdownSource(content, sourceProfile)
+          : content) !== editBaseline.content,
+    );
+  };
+
+  const currentDraftSource = () =>
+    sourceProfile
+      ? serializeMarkdownSource(editDocumentRef.current, sourceProfile)
+      : editDocumentRef.current;
+
+  const editorIsDirty = () =>
+    editGate.kind === "editor" &&
+    editBaseline !== null &&
+    currentDraftSource() !== editBaseline.content;
+
+  const editorToolbarLabels: MarkdownEditorToolbarLabels = {
+    undo: t("pageDetail.editor.toolbar.undo"),
+    redo: t("pageDetail.editor.toolbar.redo"),
+    blockStyle: t("pageDetail.editor.toolbar.blockStyle"),
+    paragraph: t("pageDetail.editor.toolbar.paragraph"),
+    heading1: t("pageDetail.editor.toolbar.heading1"),
+    heading2: t("pageDetail.editor.toolbar.heading2"),
+    heading3: t("pageDetail.editor.toolbar.heading3"),
+    bold: t("pageDetail.editor.toolbar.bold"),
+    italic: t("pageDetail.editor.toolbar.italic"),
+    inlineCode: t("pageDetail.editor.toolbar.inlineCode"),
+    link: t("pageDetail.editor.toolbar.link"),
+    blockquote: t("pageDetail.editor.toolbar.blockquote"),
+    bulletList: t("pageDetail.editor.toolbar.bulletList"),
+    numberedList: t("pageDetail.editor.toolbar.numberedList"),
+    save:
+      saveState.phase === "pending"
+        ? t("pageDetail.editor.saving")
+        : saveState.phase === "retryable"
+          ? t("pageDetail.editor.retry")
+          : t("pageDetail.editor.save"),
+    cancel: t("pageDetail.editor.cancel"),
+  };
+
+  useEffect(() => {
+    if (
+      !editing ||
+      editGate.kind !== "editor" ||
+      !editBaseline ||
+      !page ||
+      page.id !== editBaseline.pageId
+    ) {
+      return;
+    }
+
+    const current = saveStateRef.current;
+    const next = pageVersionChanged(
+      current,
+      editBaseline,
+      currentDraftSource(),
+      page.version,
+      createPageOperationId,
+    );
+    if (next === current) {
+      if (
+        current.phase === "conflict" &&
+        page.version > editBaseline.version
+      ) {
+        setConflictLatest((currentLatest) =>
+          currentLatest.kind === "loaded" &&
+          currentLatest.operationId === current.pending.operationId &&
+          currentLatest.page.version >= page.version
+            ? currentLatest
+            : {
+                kind: "loaded",
+                operationId: current.pending.operationId,
+                page,
+              },
+        );
+      }
+      return;
+    }
+    if (next.phase !== "conflict") return;
+
+    updateSaveState(next);
+    setConflictLatest({
+      kind: "loaded",
+      operationId: next.pending.operationId,
+      page,
+    });
+  }, [
+    editing,
+    editGate.kind,
+    editBaseline,
+    page,
+    saveState,
+    sourceProfile,
+    updateSaveState,
+  ]);
+
+  const requestCloseEditor = () => {
+    if (saveStateRef.current.phase === "pending") return;
+    if (
+      editorIsDirty() &&
+      !confirm(t("pageDetail.editor.discardConfirm"))
+    ) {
+      return;
+    }
+    closeEditor();
+  };
+
+  useEffect(() => {
+    if (!editing) return;
+    const captureUnfocusedEditorEscape = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.isComposing ||
+        event.key !== "Escape"
+      ) {
+        return;
+      }
+      if (
+        event.target instanceof Element &&
+        event.target.closest(
+          'input, textarea, select, [contenteditable]:not([contenteditable="false"])',
+        )
+      ) {
+        return;
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      requestCloseEditor();
+    };
+    window.addEventListener("keydown", captureUnfocusedEditorEscape, true);
+    return () =>
+      window.removeEventListener(
+        "keydown",
+        captureUnfocusedEditorEscape,
+        true,
+      );
+  }, [editing, requestCloseEditor]);
+
+  const requestBack = () => {
+    if (saveStateRef.current.phase === "pending") return;
+    if (
+      editorIsDirty() &&
+      !confirm(t("pageDetail.editor.discardConfirm"))
+    ) {
+      return;
+    }
+    if (editing) closeEditor();
+    onBack();
+  };
+
+  const handleCopyDraft = async () => {
+    await clipboardWrite(currentDraftSource());
+  };
+
+  const handleEditorFallback = (
+    sessionId: string,
+    sessionEpoch: number,
+    reason: "load" | "construction",
+  ) => {
+    const active = activeEditorSessionRef.current;
+    if (
+      !active ||
+      active.id !== sessionId ||
+      active.epoch !== sessionEpoch
+    ) {
+      return;
+    }
+    setEditorFallbackSessionId(sessionId);
+    void recordPageEditorDiagnostic({
+      event: "editor_fallback",
+      reason,
+    }).catch(() => undefined);
+  };
+
+  const handleEditorStatus = (
+    sessionId: string,
+    sessionEpoch: number,
+    status: MarkdownEditorStatus,
+  ) => {
+    const active = activeEditorSessionRef.current;
+    if (
+      !active ||
+      active.id !== sessionId ||
+      active.epoch !== sessionEpoch ||
+      status.sessionId !== sessionId
+    ) {
+      return;
+    }
+    setEditorStatus(status);
+  };
+
+  const handleReloadLatest = async () => {
+    if (saveStateRef.current.phase !== "conflict") return;
+    if (
+      editBaseline &&
+      currentDraftSource() !== editBaseline.content &&
+      !confirm(t("pageDetail.editor.reloadConfirm"))
+    ) {
+      return;
+    }
+    const operationId = saveStateRef.current.pending.operationId;
+    const latest =
+      conflictLatest.kind === "loaded" &&
+      conflictLatest.operationId === operationId
+        ? conflictLatest.page
+        : await fetchConflictLatest(operationId);
+    if (!latest) return;
+    queryClient.setQueryData(["page", pageId], latest);
+    openPageSourceForEditing(latest);
+  };
+
+  const failureMessage = (kind: UpdatePageFailureKind | "transport") => {
+    switch (kind) {
+      case "not_found":
+        return t("pageDetail.editor.failure.notFound");
+      case "auth_required":
+        return t("pageDetail.editor.failure.authRequired");
+      case "payload_too_large":
+        return t("pageDetail.editor.failure.payloadTooLarge");
+      case "validation":
+        return t("pageDetail.editor.failure.validation");
+      case "rate_limited":
+        return t("pageDetail.editor.failure.rateLimited");
+      case "server":
+        return t("pageDetail.editor.failure.server");
+      case "transport":
+        return t("pageDetail.editor.failure.transport");
+      case "other":
+        return t("pageDetail.editor.failure.other");
+    }
   };
 
   const requestDelete = () => {
     setActionMenuOpen(false);
+    if (saveStateRef.current.phase === "pending") return;
     if (confirm(t("pageDetail.deleteConfirm"))) {
       setActionError(null);
       deleteMutation.mutate(pageId);
@@ -436,23 +1082,33 @@ export default function PageDetail({
     openMenu(event.key === "ArrowDown" ? "first" : "last");
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && e.metaKey) {
-      e.preventDefault();
-      handleSave();
+  const handlePageDetailKeyDown = (e: React.KeyboardEvent) => {
+    if (
+      !editing ||
+      e.defaultPrevented ||
+      e.nativeEvent.isComposing ||
+      e.key !== "Escape"
+    ) {
+      return;
     }
-    if (e.key === "Escape") {
-      setEditing(false);
+    if (
+      e.target instanceof Element &&
+      e.target.closest(
+        'input, textarea, select, [contenteditable]:not([contenteditable="false"])',
+      )
+    ) {
+      return;
     }
+    e.preventDefault();
+    e.stopPropagation();
+    requestCloseEditor();
   };
 
-  // Focus textarea on edit
   useEffect(() => {
-    if (editing && textareaRef.current) {
-      textareaRef.current.focus();
-      textareaRef.current.selectionStart = textareaRef.current.value.length;
+    if (editing && editGate.kind === "editor" && editorSessionId) {
+      editorRef.current?.focus();
     }
-  }, [editing]);
+  }, [editing, editGate.kind, editorSessionId]);
 
   useEffect(() => {
     if (!exportMenuOpen) return;
@@ -577,14 +1233,17 @@ export default function PageDetail({
   const pageRevisionEntries = pageRevisions?.entries ?? [];
 
   const hasRail = pageEntities.length > 0 || outboundLinks.length > 0;
+  const hideOuterTitleWhileEditing =
+    editing && editGate.kind === "editor" && editHasMatchingTitle;
 
   return (
-    <div className="page-detail">
+    <div className="page-detail" onKeyDown={handlePageDetailKeyDown}>
       {/* Back + Header */}
       <div>
         <button
           aria-label={t("main.back")}
-          onClick={onBack}
+          onClick={requestBack}
+          disabled={saveState.phase === "pending"}
           className="mem-icon-action -ml-1.5"
           style={{ color: "var(--mem-text-tertiary)", background: "none", border: "none", cursor: "pointer", lineHeight: 0, marginBottom: "12px" }}
           type="button"
@@ -594,7 +1253,11 @@ export default function PageDetail({
 
         <div className="page-detail-heading-row flex items-start justify-between gap-4">
           <div className="flex-1 min-w-0">
-            <h1 className="page-detail-title">
+            <h1
+              className={
+                hideOuterTitleWhileEditing ? "sr-only" : "page-detail-title"
+              }
+            >
               {page.title}
             </h1>
             <div className="page-detail-dateline">
@@ -624,8 +1287,8 @@ export default function PageDetail({
             </div>
           </div>
 
-          <div className="page-detail-header-actions">
-            {!editing ? (
+          {!editing && (
+            <div className="page-detail-header-actions">
               <button
                 type="button"
                 className="page-detail-primary-action"
@@ -633,53 +1296,48 @@ export default function PageDetail({
               >
                 {t("pageDetail.editPage")}
               </button>
-            ) : null}
-            <div className="page-detail-icon-actions">
-            {!editing && (
-              <button
-                aria-label={t("pageDetail.editPage")}
-                onClick={beginEditing}
-                className="mem-icon-action"
-                title={t("pageDetail.editPage")}
-                type="button"
-              >
-                <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" />
-                  <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
-                </svg>
-              </button>
-            )}
-            {!editing && (
-              <button
-                onClick={handleRedistillClick}
-                disabled={redistillMutation.isPending}
-                className="mem-icon-action"
-                aria-label={
-                  redistillMutation.isPending
-                    ? t("pageDetail.redistillingPage")
-                    : t("pageDetail.redistillPage")
-                }
-                title={
-                  redistillMutation.isPending
-                    ? t("pageDetail.redistillingPage")
-                    : t("pageDetail.redistillPage")
-                }
-                type="button"
-              >
-                <svg
-                  aria-hidden="true"
-                  width="14"
-                  height="14"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
+              <div className="page-detail-icon-actions">
+                <button
+                  aria-label={t("pageDetail.editPage")}
+                  onClick={beginEditing}
+                  className="mem-icon-action"
+                  title={t("pageDetail.editPage")}
+                  type="button"
                 >
-                  <path d="M21 12a9 9 0 11-2.64-6.36" />
-                  <path d="M21 3v6h-6" />
-                </svg>
-              </button>
-            )}
+                  <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" />
+                    <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
+                  </svg>
+                </button>
+                <button
+                  onClick={handleRedistillClick}
+                  disabled={redistillMutation.isPending}
+                  className="mem-icon-action"
+                  aria-label={
+                    redistillMutation.isPending
+                      ? t("pageDetail.redistillingPage")
+                      : t("pageDetail.redistillPage")
+                  }
+                  title={
+                    redistillMutation.isPending
+                      ? t("pageDetail.redistillingPage")
+                      : t("pageDetail.redistillPage")
+                  }
+                  type="button"
+                >
+                  <svg
+                    aria-hidden="true"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                  >
+                    <path d="M21 12a9 9 0 11-2.64-6.36" />
+                    <path d="M21 3v6h-6" />
+                  </svg>
+                </button>
             <button
               onClick={copyAsContext}
               disabled={copying}
@@ -878,7 +1536,10 @@ export default function PageDetail({
                   )}
                   <button
                     className="page-detail-menu-danger"
-                    disabled={deleteMutation.isPending}
+                    disabled={
+                      deleteMutation.isPending ||
+                      saveState.phase === "pending"
+                    }
                     onClick={requestDelete}
                     role="menuitem"
                     type="button"
@@ -889,6 +1550,7 @@ export default function PageDetail({
               ) : null}
             </div>
           </div>
+          )}
         </div>
       </div>
 
@@ -946,42 +1608,240 @@ export default function PageDetail({
 
       {/* Content — edit mode or rendered */}
       {editing ? (
-        <div className="flex flex-col gap-2">
-          <textarea
-            ref={textareaRef}
-            disabled={updateMutation.isPending}
-            value={editContent}
-            onChange={(e) => setEditContent(e.target.value)}
-            onKeyDown={handleKeyDown}
-            className="w-full rounded-lg p-4 resize-y outline-none"
-            style={{
-              minHeight: "300px",
-              backgroundColor: "var(--mem-surface)",
-              border: "1px solid var(--mem-border)",
-              color: "var(--mem-text)",
-              fontFamily: "var(--mem-font-mono)",
-              fontSize: "13px",
-              lineHeight: "1.6",
-            }}
-          />
-          <div className="flex items-center gap-2">
+        editGate.kind === "checking" ? (
+          <div role="status" className="page-editor-notice">
+            {t("pageDetail.editor.checking")}
+          </div>
+        ) : editGate.kind === "unsupported" ? (
+          <div className="flex flex-col gap-3">
+            <div role="alert" className="page-editor-notice">
+              {t("pageDetail.editor.upgradeRequired", {
+                floor: PAGE_EDIT_DAEMON_FLOOR,
+                version:
+                  editGate.version ??
+                  t("pageDetail.editor.unavailableVersion"),
+              })}
+            </div>
             <button
-              onClick={handleSave}
-              disabled={updateMutation.isPending}
-              className="text-[11px] font-medium px-3 py-1.5 rounded-md transition-all"
-              style={{ backgroundColor: "rgba(99, 102, 241, 0.15)", color: "var(--mem-accent-page)" }}
+              type="button"
+              className="page-editor-action self-start"
+              onClick={closeEditor}
             >
-              {updateMutation.isPending ? "Saving..." : "Save (Cmd+Enter)"}
-            </button>
-            <button
-              onClick={() => setEditing(false)}
-              className="text-[11px] font-medium px-3 py-1.5 rounded-md transition-all hover:bg-[var(--mem-hover-strong)]"
-              style={{ color: "var(--mem-text-tertiary)" }}
-            >
-              Cancel (Esc)
+              {t("pageDetail.editor.cancel")}
             </button>
           </div>
-        </div>
+        ) : editGate.kind === "normalize" ? (
+          <div className="flex flex-col gap-3">
+            <div role="alert" className="page-editor-notice">
+              <strong>{t("pageDetail.editor.normalizeTitle")}</strong>
+              <div>{t("pageDetail.editor.normalizeDescription")}</div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                className="page-editor-action"
+                onClick={handleNormalizeAndEdit}
+              >
+                {t("pageDetail.editor.normalizeAction")}
+              </button>
+              <button
+                type="button"
+                className="page-editor-action"
+                onClick={closeEditor}
+              >
+                {t("pageDetail.editor.cancel")}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="page-editor-stack flex flex-col gap-2">
+            {saveState.phase === "conflict" && (
+              <div role="alert" className="page-editor-notice">
+                <strong>{t("pageDetail.editor.conflictTitle")}</strong>
+                <div>{t("pageDetail.editor.conflictBody")}</div>
+                {conflictLatest.kind === "loading" && (
+                  <div role="status">
+                    {t("pageDetail.editor.latestLoading")}
+                  </div>
+                )}
+                {conflictLatest.kind === "error" && (
+                  <div>{t("pageDetail.editor.latestLoadFailed")}</div>
+                )}
+                {conflictLatest.kind === "loaded" && (
+                  <details>
+                    <summary>
+                      {t("pageDetail.editor.latestSource", {
+                        version: conflictLatest.page.version,
+                      })}
+                    </summary>
+                    <pre>{conflictLatest.page.content}</pre>
+                  </details>
+                )}
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    className="page-editor-action"
+                    onClick={handleCopyDraft}
+                  >
+                    {t("pageDetail.editor.copyDraft")}
+                  </button>
+                  {conflictLatest.kind === "error" ? (
+                    <button
+                      type="button"
+                      className="page-editor-action"
+                      onClick={() => {
+                        if (saveStateRef.current.phase === "conflict") {
+                          void fetchConflictLatest(
+                            saveStateRef.current.pending.operationId,
+                          );
+                        }
+                      }}
+                    >
+                      {t("pageDetail.editor.retryLatest")}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="page-editor-action"
+                      onClick={handleReloadLatest}
+                      disabled={conflictLatest.kind !== "loaded"}
+                    >
+                      {t("pageDetail.editor.reloadLatest")}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="page-editor-action"
+                    onClick={() => editorRef.current?.focus()}
+                  >
+                    {t("pageDetail.editor.keepEditing")}
+                  </button>
+                </div>
+              </div>
+            )}
+            {saveState.phase === "retryable" && (
+              <div role="alert" className="page-editor-notice">
+                {failureMessage(
+                  saveState.failure.outcome === "transport"
+                    ? "transport"
+                    : saveState.failure.kind,
+                )}
+                {saveState.failure.outcome !== "transport" &&
+                  saveState.failure.message && (
+                    <details>
+                      <summary>
+                        {t("pageDetail.editor.technicalDetails")}
+                      </summary>
+                      {saveState.failure.message}
+                    </details>
+                  )}
+                <button
+                  type="button"
+                  className="page-editor-action"
+                  onClick={handleCopyDraft}
+                >
+                  {t("pageDetail.editor.copyDraft")}
+                </button>
+              </div>
+            )}
+            {saveState.phase === "upgrade_required" && (
+              <div role="alert" className="page-editor-notice">
+                {t("pageDetail.editor.upgradeRequired", {
+                  floor: saveState.requiredFloor,
+                  version: saveState.reportedVersion,
+                })}
+                <button
+                  type="button"
+                  className="page-editor-action"
+                  onClick={handleCopyDraft}
+                >
+                  {t("pageDetail.editor.copyDraft")}
+                </button>
+              </div>
+            )}
+            {saveState.phase === "failed" && (
+              <div role="alert" className="page-editor-notice">
+                {failureMessage(saveState.failure.kind)}
+                {saveState.failure.message && (
+                  <details>
+                    <summary>{t("pageDetail.editor.technicalDetails")}</summary>
+                    {saveState.failure.message}
+                  </details>
+                )}
+                <button
+                  type="button"
+                  className="page-editor-action"
+                  onClick={handleCopyDraft}
+                >
+                  {t("pageDetail.editor.copyDraft")}
+                </button>
+              </div>
+            )}
+            {editValidation && (
+              <div role="alert" className="page-editor-notice">
+                {editValidation}
+              </div>
+            )}
+            {editorSessionId === editorFallbackSessionId && (
+              <div role="alert" className="page-editor-notice">
+                <strong>{t("pageDetail.editor.fallbackTitle")}</strong>
+                <div>{t("pageDetail.editor.fallbackBody")}</div>
+              </div>
+            )}
+            {editorSessionId && (
+              <MarkdownEditorToolbar
+                status={editorStatus}
+                labels={editorToolbarLabels}
+                saveDisabled={
+                  saveState.phase === "pending" ||
+                  saveState.phase === "conflict"
+                }
+                cancelDisabled={saveState.phase === "pending"}
+                onCommand={(command) => editorRef.current?.runCommand(command)}
+                onSave={() => editorRef.current?.requestSave()}
+                onCancel={() => editorRef.current?.requestCancel()}
+              />
+            )}
+            <p
+              id="page-markdown-editor-description"
+              className="sr-only"
+            >
+              {t(
+                editorStatus.engine === "native"
+                  ? "pageDetail.editor.descriptionFallback"
+                  : "pageDetail.editor.description",
+                { modifier: editorShortcutModifier },
+              )}
+            </p>
+            {editorSessionId && (
+              <MarkdownEditor
+                ref={editorRef}
+                initialDocument={editInitialDocument}
+                sessionId={editorSessionId}
+                disabled={saveState.phase === "pending"}
+                ariaLabel={t("pageDetail.editor.label")}
+                describedBy="page-markdown-editor-description"
+                onDocumentChange={handleDocumentChange}
+                onSave={saveDocument}
+                onCancel={requestCloseEditor}
+                onStatusChange={(status) =>
+                  handleEditorStatus(
+                    editorSessionId,
+                    editorSessionEpoch,
+                    status,
+                  )
+                }
+                onFallback={(reason) =>
+                  handleEditorFallback(
+                    editorSessionId,
+                    editorSessionEpoch,
+                    reason,
+                  )
+                }
+              />
+            )}
+          </div>
+        )
       ) : (
         <div className={hasRail ? "page-detail-grid" : undefined}>
           <div className="page-detail-prose" onClickCapture={handleContentClick}>

@@ -6,16 +6,20 @@ import type {
   Page as KnowledgePage,
   RefinementProposalSummary,
   Space,
+  UpdatePageInput,
+  UpdatePageOutcome,
 } from "../../src/lib/tauri";
+import { daemonMeetsFloor } from "../../src/lib/daemonVersion";
 import type { SpacesNavigationFixture } from "../fixtures/spacesNavigation";
 import { baseResponse } from "./baseResponses";
 import { ConfiguredTauriFailureError, TauriMockArgumentError } from "./errors";
-import type { MockCommandCall, MockFailure } from "./types";
+import type { MockCommandCall, MockFailure, TauriMockPageScenario } from "./types";
 
 const CLIENT_PAGE_DRAFT_ID =
   /^page_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SOURCES_BLOCK_START = "<!-- origin:sources:start -->";
 const SOURCES_BLOCK_END = "<!-- origin:sources:end -->";
+const PAGE_EDIT_DAEMON_FLOOR = "0.14.1";
 
 type PageDraftCreateRequest = {
   readonly title: string;
@@ -100,12 +104,18 @@ export class TauriMockRuntime {
   private readonly failures = new Map<string, string[]>();
   private readonly activityRows: readonly Record<string, unknown>[];
   private readonly pageDraftCreateRequests = new Map<string, PageDraftCreateRequest | null>();
+  private readonly updatePageReceipts = new Map<
+    string,
+    { readonly input: UpdatePageInput; readonly outcome: UpdatePageOutcome }
+  >();
+  private firstWriteRemoteMutationPending: boolean;
   private pageSequence: number;
 
   constructor(
     fixture: SpacesNavigationFixture,
     failures: readonly MockFailure[] = [],
     rawActions: readonly string[] = [],
+    private readonly pageScenario: TauriMockPageScenario = {},
   ) {
     this.spaces = fixture.spaces.map((space) => ({ ...space }));
     this.pages = fixture.pages.map((page) => ({ ...page }));
@@ -118,6 +128,8 @@ export class TauriMockRuntime {
     this.memories = fixture.memories.map((memory) => ({ ...memory }));
     this.distillReview = structuredClone(fixture.distillReview);
     this.refinements = structuredClone([...fixture.refinements]);
+    this.firstWriteRemoteMutationPending =
+      pageScenario.firstWriteRemoteMutation !== undefined;
     this.activityRows = rawActions.map((action, index) => ({
       id: index + 1,
       timestamp: 1_783_728_000 - index * 60,
@@ -155,6 +167,17 @@ export class TauriMockRuntime {
       case "confirm_space": return this.confirmSpace(args);
       case "toggle_space_starred": return this.toggleSpace(args);
       case "reorder_space": return this.reorderSpace(args);
+      case "daemon_version": return this.pageScenario.daemonVersion ?? "0.14.1";
+      case "get_system_info": return {
+        total_ram_gb: 32,
+        available_ram_gb: 16,
+        has_metal: true,
+        has_cuda: false,
+        os: "macos",
+        arch: "aarch64",
+        recommended_builtin: "",
+      };
+      case "record_page_editor_diagnostic": return null;
       case "list_pages": return this.listPages(args);
       case "get_page": return this.pages.find((page) => page.id === requiredString(command, args, "id")) ?? null;
       case "create_page": return this.createPage(args);
@@ -320,12 +343,111 @@ export class TauriMockRuntime {
     return null;
   }
 
-  private updatePage(args: unknown): null {
+  private updatePage(args: unknown): UpdatePageOutcome | null {
     const id = requiredString("update_page", args, "id");
     const content = requiredString("update_page", args, "content");
+    if (optionalValue(args, "expectedVersion") === undefined) {
+      const legacyIndex = this.pages.findIndex((page) => page.id === id);
+      const legacyPage = this.pages[legacyIndex];
+      if (legacyIndex < 0 || !legacyPage) {
+        throw new TauriMockArgumentError("update_page", "id");
+      }
+      this.pages[legacyIndex] = {
+        ...legacyPage,
+        content,
+        citations: [],
+        user_edited: true,
+        version: legacyPage.version + 1,
+        last_modified: "2026-07-10T12:32:00Z",
+      };
+      return null;
+    }
+    const expectedVersion = requiredNumber(
+      "update_page",
+      args,
+      "expectedVersion",
+    );
+    const callerId = requiredString("update_page", args, "callerId");
+    const operationId = requiredString("update_page", args, "operationId");
+    if (callerId !== "wenlan-app") {
+      return {
+        outcome: "failure",
+        kind: "auth_required",
+        status: 403,
+        message: "caller is not authorized to update pages",
+      };
+    }
+    const reportedVersion =
+      this.pageScenario.saveDaemonVersion
+      ?? this.pageScenario.daemonVersion
+      ?? PAGE_EDIT_DAEMON_FLOOR;
+    if (!daemonMeetsFloor(reportedVersion, PAGE_EDIT_DAEMON_FLOOR)) {
+      return {
+        outcome: "upgrade_required",
+        reportedVersion,
+        requiredFloor: PAGE_EDIT_DAEMON_FLOOR,
+      };
+    }
+    const input: UpdatePageInput = {
+      id,
+      content,
+      expectedVersion,
+      callerId,
+      operationId,
+    };
+    const receiptKey = `${callerId}\u0000${operationId}`;
+    const receipt = this.updatePageReceipts.get(receiptKey);
+    if (receipt) {
+      const sameRequest =
+        receipt.input.id === input.id
+        && receipt.input.content === input.content
+        && receipt.input.expectedVersion === input.expectedVersion;
+      return sameRequest
+        ? structuredClone(receipt.outcome)
+        : {
+            outcome: "conflict",
+            message:
+              "operation identity was already used for different page content",
+          };
+    }
+
+    if (this.firstWriteRemoteMutationPending) {
+      this.firstWriteRemoteMutationPending = false;
+      const mutation = this.pageScenario.firstWriteRemoteMutation;
+      if (mutation) {
+        const remoteIndex = this.pages.findIndex(
+          (page) => page.id === mutation.pageId,
+        );
+        const remotePage = this.pages[remoteIndex];
+        if (remoteIndex >= 0 && remotePage) {
+          this.pages[remoteIndex] = {
+            ...remotePage,
+            content: mutation.content,
+            user_edited: true,
+            version: remotePage.version + 1,
+            last_modified: "2026-07-10T12:31:00Z",
+          };
+        }
+      }
+    }
+
     const index = this.pages.findIndex((page) => page.id === id);
     const page = this.pages[index];
-    if (index < 0 || !page) throw new TauriMockArgumentError("update_page", "id");
+    if (index < 0 || !page) {
+      return {
+        outcome: "failure",
+        kind: "not_found",
+        status: 404,
+        message: "page not found",
+      };
+    }
+    if (page.version !== expectedVersion) {
+      return {
+        outcome: "conflict",
+        message:
+          `expected version ${expectedVersion}; current version is ${page.version}`,
+      };
+    }
     this.pages[index] = {
       ...page,
       content,
@@ -334,7 +456,12 @@ export class TauriMockRuntime {
       version: page.version + 1,
       last_modified: "2026-07-10T12:32:00Z",
     };
-    return null;
+    const outcome: UpdatePageOutcome = { outcome: "saved" };
+    this.updatePageReceipts.set(receiptKey, {
+      input: structuredClone(input),
+      outcome: structuredClone(outcome),
+    });
+    return outcome;
   }
 
   private redistillPage(args: unknown): { status: "ok"; updated: true } {

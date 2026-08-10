@@ -125,7 +125,9 @@ describe("runtime product identity", () => {
     expect(lib).toContain("code: None");
     expect(lib).toContain("api.prevent_exit()");
     expect(lib).toContain("lifecycle::is_quitting()");
-    expect(lib).toContain("fn cancel_guarded_quit_request()");
+    expect(lib).toContain("fn acknowledge_guarded_quit_request(");
+    expect(lib).toContain("acknowledge_guarded_quit_request,");
+    expect(lib).toContain("fn cancel_guarded_quit_request(");
     expect(lib).toContain("cancel_guarded_quit_request,");
     expect(lib).not.toContain('handle.listen("quit-cancelled"');
     const exitBranch = lib.slice(lib.indexOf("RunEvent::ExitRequested"));

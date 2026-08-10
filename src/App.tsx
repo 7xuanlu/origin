@@ -5,6 +5,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { resizeWindow, resizeWindowCentered } from "./lib/resizeWindow";
 import {
+  acknowledgeGuardedQuitRequest,
   cancelGuardedQuitRequest,
   quitWenlanFull,
   setTrafficLightsVisible,
@@ -58,7 +59,9 @@ export default function App() {
   const [initialView, setInitialView] = useState<"import" | null>(null);
   const [prevPage, setPrevPage] = useState<Page>("spotlight");
   const quitGuardRef = useRef<(() => Promise<boolean>) | null>(null);
-  const quitAttemptRef = useRef<Promise<void> | null>(null);
+  const quitAttemptRef = useRef<{
+    requestId: number;
+  } | null>(null);
 
   const registerQuitGuard = useCallback((guard: (() => Promise<boolean>) | null) => {
     quitGuardRef.current = guard;
@@ -75,9 +78,9 @@ export default function App() {
   // keystroke durable. A failed save aborts quit and reveals the existing retry
   // surface instead of silently dropping text.
   useEffect(() => {
-    const cancelQuitRequest = async () => {
+    const cancelQuitRequest = async (requestId: number, deliveryId: number) => {
       try {
-        await cancelGuardedQuitRequest();
+        await cancelGuardedQuitRequest(requestId, deliveryId);
       } catch {
         // A failed cancellation signal must not hide the editor recovery path.
       }
@@ -93,40 +96,71 @@ export default function App() {
       await Promise.resolve();
       if (focusTarget?.isConnected) focusTarget.focus();
     };
-    const unlisten = listen("quit-requested", () => {
-      if (quitAttemptRef.current) return;
-      const focusTarget = document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
-      const attempt = (async () => {
-        try {
-          await getCurrentWindow().hide();
-        } catch {
-          await cancelQuitRequest();
-          await revealMainWindow(focusTarget);
-          return;
-        }
-        let persisted = false;
-        try {
-          persisted = quitGuardRef.current ? await quitGuardRef.current() : true;
-        } catch {
-          persisted = false;
-        }
-        if (!persisted) {
-          await cancelQuitRequest();
-          await revealMainWindow(focusTarget);
-          return;
-        }
-        await quitWenlanFull();
-      })();
-      quitAttemptRef.current = attempt;
-      void attempt.catch(async () => {
-        await cancelQuitRequest();
-        await revealMainWindow(focusTarget);
-      }).finally(() => {
-        if (quitAttemptRef.current === attempt) quitAttemptRef.current = null;
-      });
-    });
+    const unlisten = listen<{ requestId: number; deliveryId: number }>(
+      "quit-requested",
+      (event) => {
+        const { requestId, deliveryId } = event.payload;
+        void (async () => {
+          let acknowledged = false;
+          try {
+            acknowledged = await acknowledgeGuardedQuitRequest(requestId, deliveryId);
+          } catch {
+            return;
+          }
+          if (!acknowledged) return;
+
+          const activeAttempt = quitAttemptRef.current;
+          if (activeAttempt?.requestId === requestId) return;
+          // Reachable only in a narrow race: an attempt that already cancelled
+          // itself (a rejected hide(), or a failed save) has returned the
+          // coordinator to Idle, but quitAttemptRef is not cleared until the
+          // finally microtask runs. A Cmd-Q landing inside that gap opens a new
+          // request that we acknowledge and then discard here, so the press
+          // appears to do nothing. It is not silent: discarding counts as a
+          // refusal in the Rust coordinator, so a user who keeps pressing hits
+          // the escape hatch and gets out on the third press.
+          if (activeAttempt) {
+            await cancelQuitRequest(requestId, deliveryId);
+            return;
+          }
+
+          const focusTarget = document.activeElement instanceof HTMLElement
+            ? document.activeElement
+            : null;
+          const attempt = (async () => {
+            try {
+              await getCurrentWindow().hide();
+            } catch {
+              await cancelQuitRequest(requestId, deliveryId);
+              await revealMainWindow(focusTarget);
+              return;
+            }
+            let persisted = false;
+            try {
+              persisted = quitGuardRef.current ? await quitGuardRef.current() : true;
+            } catch {
+              persisted = false;
+            }
+            if (!persisted) {
+              await cancelQuitRequest(requestId, deliveryId);
+              await revealMainWindow(focusTarget);
+              return;
+            }
+            await quitWenlanFull();
+          })();
+          const trackedAttempt = { requestId };
+          quitAttemptRef.current = trackedAttempt;
+          void attempt
+            .catch(async () => {
+              await cancelQuitRequest(requestId, deliveryId);
+              await revealMainWindow(focusTarget);
+            })
+            .finally(() => {
+              if (quitAttemptRef.current === trackedAttempt) quitAttemptRef.current = null;
+            });
+        })();
+      },
+    );
     return () => { unlisten.then((f) => f()); };
   }, []);
 
