@@ -2258,12 +2258,9 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_token_generate_args_include_wenlan_output_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let _home = HomeGuard::set(tmp.path());
-        let path = token_file_path().unwrap();
-        let expected_path = tmp.path().join(".config/wenlan-mcp/token");
+        let path = tmp.path().join(".config").join("wenlan-mcp").join("token");
 
         assert_eq!(
             token_generate_args(&path),
@@ -2271,7 +2268,7 @@ mod tests {
                 "token".to_string(),
                 "generate".to_string(),
                 "--output".to_string(),
-                expected_path.to_string_lossy().into_owned()
+                path.to_string_lossy().into_owned()
             ]
         );
     }

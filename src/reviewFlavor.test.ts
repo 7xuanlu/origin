@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { readSourceText } from "./test/sourceText";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function read(path: string): string {
-  return readFileSync(resolve(root, path), "utf8");
+  return readSourceText(resolve(root, path));
 }
 
 describe("fixture-only native Review flavor", () => {

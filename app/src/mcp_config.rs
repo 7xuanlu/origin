@@ -1384,13 +1384,13 @@ mod tests {
     #[test]
     fn test_client_config_path_gemini_cli() {
         let path = client_config_path("gemini_cli").unwrap();
-        assert!(path.to_string_lossy().ends_with(".gemini/settings.json"));
+        assert!(path.ends_with(Path::new(".gemini").join("settings.json")));
     }
 
     #[test]
     fn test_client_config_path_codex_cli() {
         let path = client_config_path("codex_cli").unwrap();
-        assert!(path.to_string_lossy().ends_with(".codex/config.toml"));
+        assert!(path.ends_with(Path::new(".codex").join("config.toml")));
     }
 
     /// `exists` that answers true for exactly one path — so a test failure

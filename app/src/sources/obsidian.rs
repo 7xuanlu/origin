@@ -209,8 +209,8 @@ mod discover_vaults_tests {
                     "id-a": {{"path": "{}", "ts": 1000}},
                     "id-gone": {{"path": "{}", "ts": 2000}}
                 }}}}"#,
-                vault_a.display(),
-                gone_path.display(),
+                vault_a.display().to_string().replace('\\', "\\\\"),
+                gone_path.display().to_string().replace('\\', "\\\\"),
             ),
         );
 
