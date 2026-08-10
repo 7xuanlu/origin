@@ -61,7 +61,7 @@ Wenlan 以单个本地 daemon 运行。桌面 app 内置这个 daemon；无 GUI 
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-Windows 与 Linux 请使用下面的无 GUI runtime。桌面 app 目前仅支持 Apple Silicon。
+目前只发布 macOS Apple Silicon 版本。Windows 与 Linux 请使用下面的无 GUI runtime。
 
 <a id="claude-code-in-30-seconds"></a>
 

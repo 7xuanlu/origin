@@ -59,7 +59,7 @@ This preview is not notarized yet, so macOS blocks the first launch. Allow it on
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-Windows and Linux run the headless runtime below. The desktop app is Apple Silicon only for now.
+Only the macOS Apple Silicon build is published today. On Windows and Linux, use the headless runtime below.
 
 <a id="claude-code-in-30-seconds"></a>
 

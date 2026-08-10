@@ -61,7 +61,7 @@ Esta vista previa aún no está notarizada, así que macOS bloquea el primer arr
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-Windows y Linux usan el entorno de ejecución sin interfaz de abajo. La aplicación de escritorio es solo para Apple Silicon por ahora.
+Hoy solo se publica la versión para macOS Apple Silicon. En Windows y Linux, usa el entorno de ejecución sin interfaz de abajo.
 
 <a id="claude-code-in-30-seconds"></a>
 
