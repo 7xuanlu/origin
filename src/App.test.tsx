@@ -78,7 +78,9 @@ vi.mock("./components/SetupWizard", () => ({
 }));
 
 vi.mock("./components/RuntimeOverlays", () => ({
-  RuntimeOverlays: () => <div data-testid="runtime-overlays">runtime overlays</div>,
+  RuntimeOverlays: ({ variant = "main" }: { variant?: string }) => (
+    <div data-testid="runtime-overlays" data-variant={variant}>runtime overlays</div>
+  ),
 }));
 
 // EntityDetail transitively imports AtlasView → sigma, whose dist touches
@@ -128,6 +130,7 @@ describe("App - first-run wizard gate", () => {
 
     expect(await screen.findByTestId("home-main")).toBeInTheDocument();
     expect(screen.queryByTestId("setup-wizard")).not.toBeInTheDocument();
+    expect(screen.getByTestId("runtime-overlays")).toHaveAttribute("data-variant", "main");
   });
 
   it("renders SetupWizard when shouldShowWizard resolves true", async () => {
@@ -135,7 +138,10 @@ describe("App - first-run wizard gate", () => {
     renderApp();
 
     expect(await screen.findByTestId("setup-wizard")).toBeInTheDocument();
-    expect(screen.getByTestId("runtime-overlays")).toBeInTheDocument();
+    expect(screen.getByTestId("runtime-overlays")).toHaveAttribute(
+      "data-variant",
+      "updater-only",
+    );
     expect(screen.queryByTestId("home-main")).not.toBeInTheDocument();
   });
 

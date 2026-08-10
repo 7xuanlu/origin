@@ -49,7 +49,9 @@ export default function UpdaterDialog() {
       if (p.chunk) setDownloaded((prev) => prev + (p.chunk ?? 0));
       if (p.total !== undefined && p.total !== null) setTotal(p.total);
     });
-    void Promise.all([unlistenAvail, unlistenProg]).then(() => emit("updater://ui-ready"));
+    void Promise.all([unlistenAvail, unlistenProg])
+      .then(() => emit("updater://ui-ready"))
+      .catch(() => {});
     return () => {
       unlistenAvail.then((fn) => fn());
       unlistenProg.then((fn) => fn());

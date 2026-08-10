@@ -481,17 +481,17 @@ fn ensure_server_plist_data_dir_env(launchctl: &dyn LaunchctlExec) -> Result<()>
 }
 
 pub fn prepare_server_plist_for_startup(launchctl: &dyn LaunchctlExec) -> Result<()> {
+    // Isolated launches and non-stable app paths leave the shared LaunchAgent
+    // untouched. In the isolated case, lib.rs then sees that the plist does
+    // not match the selected scratch data dir and starts the sidecar, whose
+    // child inherits the app process environment (including WENLAN_PORT).
     if data_dir_env_overridden() {
-        log::info!(
+        log::warn!(
             "[lifecycle] skipping server plist startup preflight: isolated run (data-dir env override)"
         );
         return Ok(());
     }
 
-    // Isolated launches and non-stable app paths leave the shared LaunchAgent
-    // untouched. In the isolated case, lib.rs then sees that the plist does
-    // not match the selected scratch data dir and starts the sidecar, whose
-    // child inherits the app process environment (including WENLAN_PORT).
     let app_path = match current_app_path() {
         Ok(path) => path,
         Err(error) => {
@@ -551,7 +551,7 @@ pub fn is_run_at_login_enabled(launchctl: &dyn LaunchctlExec) -> bool {
 /// Returns Ok(()) if the install completed or was unnecessary.
 pub fn first_run_install_if_needed(launchctl: &dyn LaunchctlExec) -> Result<()> {
     if data_dir_env_overridden() {
-        log::info!(
+        log::warn!(
             "[lifecycle] skipping first-run LaunchAgent install: isolated run (data-dir env override)"
         );
         return Ok(());
@@ -1549,6 +1549,10 @@ mod tests {
         std::fs::write(&plist, &original).unwrap();
 
         let mock = MockLaunchctl::default();
+        // This assertion pins both gates together: the env override and the
+        // stable-path check. current_exe() cannot be faked to /Applications
+        // from a unit test, so removing only the env gate still leaves this
+        // test protected by the non-stable-path gate.
         prepare_server_plist_for_startup(&mock).unwrap();
 
         assert_eq!(std::fs::read_to_string(&plist).unwrap(), original);
@@ -1587,6 +1591,10 @@ mod tests {
             .collect();
 
         let mock = MockLaunchctl::default();
+        // This assertion pins both gates together: the env override and the
+        // stable-path check. current_exe() cannot be faked to /Applications
+        // from a unit test, so removing only the env gate still leaves this
+        // test protected by the non-stable-path gate.
         first_run_install_if_needed(&mock).unwrap();
 
         for (path, original) in [&app_plist, &server_plist, &legacy_app, &legacy_server]

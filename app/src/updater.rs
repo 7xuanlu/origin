@@ -62,12 +62,13 @@ fn emit_available(app: &AppHandle, version: &str) {
 }
 
 /// Emit `updater://available` to the main webview and wait for the user's
-/// choice via the `updater://action` event. The UI announces
-/// `updater://ui-ready` after mounting, so a prompt emitted before the
-/// webview or a non-main App branch is ready is replayed until answered.
-/// The actual UI is rendered by `UpdaterDialog` inside the main window's
-/// React tree (see `src/components/UpdaterDialog.tsx`), so the dialog stays
-/// attached to the app window and travels with it.
+/// choice via the `updater://action` event. RuntimeOverlays mounts once as a
+/// stable sibling of App's branch body and is reconciled in place, rather than
+/// remounted as App moves between branches. The `updater://ui-ready` handshake
+/// covers webview-load timing: UpdaterDialog emits one ready event after its
+/// listeners register, and the backend re-emits availability if the prompt
+/// predates it. The actual UI is rendered by `UpdaterDialog` inside the main
+/// window's React tree (see `src/components/UpdaterDialog.tsx`).
 async fn prompt_via_overlay(app: &AppHandle, version: &str) -> bool {
     let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
     let tx = Arc::new(Mutex::new(Some(tx)));
@@ -104,6 +105,11 @@ async fn prompt_via_overlay(app: &AppHandle, version: &str) -> bool {
 /// relaunch with progress events. Failures are logged and surfaced in the
 /// overlay, never blocking.
 pub async fn check_and_prompt(app: AppHandle) {
+    if crate::lifecycle::data_dir_env_overridden() {
+        log::warn!("[updater] skipping update check: isolated run (data-dir env override)");
+        return;
+    }
+
     tokio::time::sleep(STARTUP_DELAY).await;
 
     let updater = match app.updater() {

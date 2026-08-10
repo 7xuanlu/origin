@@ -293,7 +293,13 @@ export default function App() {
   return (
     <>
       {body}
-      <RuntimeOverlays />
+      <RuntimeOverlays
+        variant={
+          wizardPending || showWizard || wizardError || migration
+            ? "updater-only"
+            : "main"
+        }
+      />
     </>
   );
 }
