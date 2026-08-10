@@ -55,6 +55,14 @@ export const REVIEW_COMMAND_CAPABILITIES = {
     "publish_page_draft",
     "discard_page_draft",
   ],
+  pageMap: [
+    "get_page_map",
+    "improve_page_map",
+    "create_page_map_node",
+    "patch_page_map_node",
+    "delete_page_map_node",
+    "put_page_map_layout",
+  ],
   refinement: [
     "distill_review",
     "list_refinements",
@@ -95,6 +103,10 @@ export const REVIEW_COMMAND_CAPABILITIES = {
     "confirm_observation_cmd",
     "confirm_entity_cmd",
     "delete_entity_cmd",
+  ],
+  cartography: [
+    "list_communities",
+    "list_community_members",
   ],
   existingUtilityReads: [
     "get_clipboard_enabled",

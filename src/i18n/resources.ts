@@ -929,6 +929,9 @@ const en = {
     regionsToggle: "Regions",
     spaceLabel: "Space",
     spaceAll: "All spaces",
+    cartographyReady: "Durable regions",
+    cartographyFallback: "Estimated regions",
+    cartographyPartialError: "Region sync issue",
     rail: {
       gapTitle: "Gap",
       bridgeTitle: "Bridge",
@@ -2465,6 +2468,9 @@ const zhHans = {
     regionsToggle: "区域",
     spaceLabel: "空间",
     spaceAll: "全部空间",
+    cartographyReady: "稳定区域",
+    cartographyFallback: "估计区域",
+    cartographyPartialError: "区域同步异常",
     rail: {
       gapTitle: "缺口",
       bridgeTitle: "桥接",
@@ -3982,6 +3988,9 @@ const zhHant = {
     regionsToggle: "區域",
     spaceLabel: "空間",
     spaceAll: "全部空間",
+    cartographyReady: "穩定區域",
+    cartographyFallback: "估計區域",
+    cartographyPartialError: "區域同步異常",
     rail: {
       gapTitle: "缺口",
       bridgeTitle: "橋接",

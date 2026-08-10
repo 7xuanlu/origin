@@ -27,10 +27,12 @@ import {
   drawCartography,
   bridgeEdgeTest,
   regionLeader,
+  isUnscopedSpace,
   MIN_REGION_SIZE,
 } from "../../lib/graph/cartography";
 import { useGraphPalette, colorForEntityType, nodeFillFor } from "../../lib/graph/palette";
 import type { GraphPalette } from "../../lib/graph/palette";
+import { fetchCartographyForSpaces, aggregateCartographyStatus } from "../../lib/graph/community";
 
 // Same 5-slot legend as the retired canvas graph (ConstellationMap): place,
 // event, and unknown types fold to neutral and get no swatch; concept is
@@ -134,6 +136,17 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   );
   const [spaceFilter, setSpaceFilter] = useState<string | null>(null);
 
+  // D13/App-PR readiness, one fetch-and-classify per known space (community.ts):
+  // cursor-paginated to exhaustion, generation-checked, never declared ready off
+  // a partial read. Keyed on ALL known spaces regardless of spaceFilter, so
+  // one space's trouble stays visible while another is being viewed; the
+  // unscoped half of the badge is read off the filtered model instead (below).
+  const { data: cartographyBySpace = new Map() } = useQuery({
+    queryKey: ["constellation-cartography", spaces],
+    queryFn: () => fetchCartographyForSpaces(spaces),
+    enabled: spaces.length > 0,
+    refetchInterval: 120_000,
+  });
   // Scoping filters the model INPUTS: the space's own entities plus whatever
   // bridge neighbors their relations synthesize (those carry no space of their
   // own). Regions, counts, and insights all re-derive from the scoped model.
@@ -144,13 +157,42 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       details.filter((d: EntityDetail) => (d.entity.space ?? d.entity.domain) === spaceFilter),
     );
   }, [entities, details, spaceFilter]);
-  const communities = useMemo(() => communitiesFor(model), [model]);
+
+  // Anything in cartography.ts's unscoped bucket is drawn on the fallback
+  // climb, so the badge must never read all-durable while such a node is on
+  // the map. Asked of the RENDERED model — the very nodes communitiesFor
+  // partitions — so the badge and the drawn cartography cannot disagree.
+  // Reading the raw entity list instead misses the case the model CREATES
+  // rather than carries: under a space filter a relation to another space's
+  // entity keeps its endpoint while that entity is filtered away, so
+  // buildGraphModel synthesizes it with no space at all. Going through the
+  // model also covers the two unfiltered ways in — a relation-only neighbor,
+  // and an entity whose own space is null or empty.
+  const hasUnscopedFallback = useMemo(
+    () => model.nodes.some((n: GraphNode) => isUnscopedSpace(n.space)),
+    [model],
+  );
+  const cartographyStatus = useMemo(
+    () => aggregateCartographyStatus(cartographyBySpace, hasUnscopedFallback),
+    [cartographyBySpace, hasUnscopedFallback],
+  );
+  const communities = useMemo(
+    () => communitiesFor(model, cartographyBySpace),
+    [model, cartographyBySpace],
+  );
+  // Mirrors `communities` for the mount effect's afterRender closure (see
+  // the cartography-refresh effect below, by the theme-flip effect) — a
+  // space's durable status arriving or regressing must repaint bridges and
+  // hulls without tearing down the sim/camera, so drawUnderlay reads this
+  // ref at PAINT time instead of closing over the `communities` value that
+  // was current when the sigma renderer was built.
+  const communitiesRef = useRef<Map<string, string>>(communities);
 
   // Region count + names for the toolbar and rail — membership only, so it
   // agrees with the hulls drawCartography actually draws without needing
   // node positions; names share regionLeader with the drawn labels.
   const regionInfo = useMemo(() => {
-    const groups = new Map<number, GraphNode[]>();
+    const groups = new Map<string, GraphNode[]>();
     for (const node of model.nodes) {
       const community = communities.get(node.id);
       if (community === undefined) continue;
@@ -158,7 +200,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       if (list) list.push(node);
       else groups.set(community, [node]);
     }
-    const names = new Map<number, string>();
+    const names = new Map<string, string>();
     for (const [community, members] of groups) {
       if (members.length >= MIN_REGION_SIZE) names.set(community, regionLeader(members).name);
     }
@@ -407,13 +449,16 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       ctx.clearRect(0, 0, width, height);
       drawCartography(
         ctx,
-        cartographyScene(graph, communities),
+        cartographyScene(graph, communitiesRef.current),
         (pos) => renderer.graphToViewport(pos),
         paletteRef.current,
       );
     };
+    // First paint is NOT drawn here. The cartography effect below runs right
+    // after this one on mount (effects fire in declaration order, and both
+    // refs above are already assigned), and its refresh() fires afterRender —
+    // so painting here as well would just compute every hull twice.
     renderer.on("afterRender", drawUnderlay);
-    drawUnderlay();
     // Default zoom: sigma's fit stretches a small cluster edge-to-edge no
     // matter how big the container (7.3 px/graph-unit in preview) — links
     // render ~5x longer than the old graph's ("too wide"). A fixed density
@@ -599,6 +644,27 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     // with the palette paletteRef now carries.
     renderer.refresh();
   }, [palette]);
+
+  // Cartography arriving or regressing (fallback -> ready, or ready -> a
+  // partial-error) must repaint bridges + hulls WITHOUT tearing down the
+  // sim/camera — the mount effect above only rebuilds on `model` changing,
+  // so a `cartographyBySpace` refetch that flips a space's status never
+  // reaches the renderer otherwise. Same "recolor in place" shape as the
+  // theme-flip effect: update edge attributes, point communitiesRef at the
+  // fresh map (drawUnderlay reads it at paint time), then refresh.
+  useEffect(() => {
+    communitiesRef.current = communities;
+    const graph = graphRef.current;
+    const renderer = sigmaRef.current;
+    if (!graph || !renderer) return;
+    const isBridge = bridgeEdgeTest(communities);
+    graph.updateEachEdgeAttributes((edgeKey, attrs) => {
+      const [source, target] = graph.extremities(edgeKey);
+      const bridge = isBridge(source, target);
+      return { ...attrs, bridge, color: bridge ? paletteRef.current.bridge : paletteRef.current.edge };
+    });
+    renderer.refresh();
+  }, [communities]);
 
   useEffect(() => {
     const underlay = underlayRef.current;
@@ -864,6 +930,30 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
               </option>
             ))}
           </select>
+        )}
+        {cartographyStatus && (
+          <span
+            role={cartographyStatus === "partial-error" ? "alert" : undefined}
+            style={{
+              fontSize: 11,
+              fontFamily: "var(--mem-font-mono)",
+              color:
+                cartographyStatus === "partial-error"
+                  ? "var(--mem-danger)"
+                  : "var(--mem-text-tertiary)",
+              border: `1px solid ${cartographyStatus === "partial-error" ? "var(--mem-danger)" : "var(--mem-border)"}`,
+              borderRadius: "var(--mem-radius-full)",
+              padding: "3px 10px",
+            }}
+          >
+            {t(
+              cartographyStatus === "ready"
+                ? "atlas.cartographyReady"
+                : cartographyStatus === "partial-error"
+                  ? "atlas.cartographyPartialError"
+                  : "atlas.cartographyFallback",
+            )}
+          </span>
         )}
         <span
           style={{
