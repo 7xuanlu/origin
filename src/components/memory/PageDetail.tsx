@@ -33,6 +33,7 @@ import PageInfo from "./page/PageInfo";
 import { RailPanelTitle } from "./MemoryDetailPrimitives";
 import { processCitations, stripCitationLinks } from "../../lib/pageCitations";
 import CitationChip from "./page/CitationChip";
+import PageCanvas from "./PageCanvas";
 import {
   prepareMarkdownSource,
   serializeMarkdownSource,
@@ -242,6 +243,13 @@ export default function PageDetail({
     kind: "success" | "warning" | "error";
     message: string;
   } | null>(null);
+  // Reading is what a page is for, so it needs no control of its own — only
+  // leaving for the canvas does. A two-tab row spent a whole band of the page
+  // telling you that you were doing the obvious thing.
+  const [canvasOpen, setCanvasOpen] = useState(false);
+  // Editing happens in the reading column, so edit mode pins the view: nobody
+  // gets to type into a page they cannot see.
+  const showCanvas = canvasOpen && !editing;
   const editorRef = useRef<MarkdownEditorHandle>(null);
   const editDocumentRef = useRef("");
   const editDirtyRef = useRef(false);
@@ -348,6 +356,35 @@ export default function PageDetail({
   const pageEntities = entityQueries
     .map((q) => q.data?.entity)
     .filter((e): e is Entity => !!e);
+
+  // Canvas nodes arrive with label: null for memory/entity/page refs — the
+  // daemon stores the reference, the client renders the backing object. Every
+  // name below comes from a query this component already runs; the canvas
+  // must not fetch anything of its own.
+  const entitySignature = pageEntities
+    .map((e) => `${e.id}\u0000${e.name}`)
+    .join("|");
+  const labelOverrides = useMemo(() => {
+    const overrides = new Map<string, string>();
+    if (page?.title) overrides.set(`page:${pageId}`, page.title);
+    for (const cs of pageSources ?? []) {
+      const memory = cs.memory;
+      if (!memory) continue;
+      const text = (memory.title || memory.summary || memory.content || "").trim();
+      if (!text) continue;
+      overrides.set(
+        `memory:${memory.source_id}`,
+        text.length > 64 ? `${text.slice(0, 64).trimEnd()}\u2026` : text,
+      );
+    }
+    for (const entity of pageEntities) {
+      overrides.set(`entity:${entity.id}`, entity.name);
+    }
+    return overrides;
+    // pageEntities is rebuilt every render by useQueries; entitySignature is
+    // the stable stand-in that actually tracks its content.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pageId, page?.title, pageSources, entitySignature]);
 
   useEffect(() => {
     setRedistillNotice(null);
@@ -1298,6 +1335,30 @@ export default function PageDetail({
               </button>
               <div className="page-detail-icon-actions">
                 <button
+                  aria-label={t("pageCanvas.tabCanvas")}
+                  aria-pressed={showCanvas}
+                  onClick={() => setCanvasOpen((open) => !open)}
+                  className={`mem-icon-action page-detail-canvas-toggle${
+                    showCanvas ? " is-active" : ""
+                  }`}
+                  title={t("pageCanvas.tabCanvas")}
+                  type="button"
+                >
+                  {/* Boxes on a spine. Three dots joined by two diverging lines
+                      is the share glyph — the same drawing Lucide ships as
+                      share-2 — and on a page toolbar next to Copy and Export it
+                      reads as Share, not as a map. Rectangles say "boxes", which
+                      is what the canvas draws, and the sidebar's Graph keeps the
+                      round nodes. */}
+                  <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <rect x="1.5" y="9" width="7" height="6" rx="1.5" />
+                    <rect x="15.5" y="2.5" width="7" height="6" rx="1.5" />
+                    <rect x="15.5" y="15.5" width="7" height="6" rx="1.5" />
+                    <path d="M8.5 12h3.5V5.5h3.5" />
+                    <path d="M12 12v6.5h3.5" />
+                  </svg>
+                </button>
+                <button
                   aria-label={t("pageDetail.editPage")}
                   onClick={beginEditing}
                   className="mem-icon-action"
@@ -1478,6 +1539,25 @@ export default function PageDetail({
                   ref={actionMenuListRef}
                   role="menu"
                 >
+                  {/* Below 600px the icon row is hidden and this menu is the
+                      whole toolbar, so the canvas needs a door here too — it
+                      was reachable by icon only, which is no door at all on a
+                      narrow window. */}
+                  {!editing ? (
+                    <button
+                      className="page-detail-mobile-menu-item"
+                      onClick={() => {
+                        setActionMenuOpen(false);
+                        setCanvasOpen((open) => !open);
+                      }}
+                      role="menuitem"
+                      type="button"
+                    >
+                      {showCanvas
+                        ? t("pageCanvas.closeCanvas")
+                        : t("pageCanvas.tabCanvas")}
+                    </button>
+                  ) : null}
                   {!editing ? (
                     <button
                       className="page-detail-mobile-menu-item"
@@ -1606,8 +1686,18 @@ export default function PageDetail({
         </div>
       )}
 
-      {/* Content — edit mode or rendered */}
-      {editing ? (
+      {showCanvas ? (
+        <div>
+          <PageCanvas
+            pageId={pageId}
+            pageTitle={page.title}
+            labelOverrides={labelOverrides}
+            onMemoryClick={onMemoryClick}
+            onPageClick={onPageClick}
+            onEntityClick={onEntityClick}
+          />
+        </div>
+      ) : editing ? (
         editGate.kind === "checking" ? (
           <div role="status" className="page-editor-notice">
             {t("pageDetail.editor.checking")}
@@ -1894,7 +1984,10 @@ export default function PageDetail({
         </div>
       )}
 
-      {!editing && (
+      {/* The canvas replaces the reading column rather than sitting above
+          its apparatus: sources, citations and revisions are how a page is
+          read, and the map is the other way of reading it. */}
+      {!editing && !showCanvas && (
         <PageInfo
           sourceCount={sourceCount}
           sources={pageSources}

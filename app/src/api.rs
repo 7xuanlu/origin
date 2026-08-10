@@ -725,6 +725,101 @@ impl WenlanClient {
         self.get_json(&path).await
     }
 
+    // ── Page map ─────────────────────────────────────────────────────
+    // `serde_json::Value` carries every body and response. The typed shapes do
+    // exist now that the app is in the workspace — `wenlan_types::page_map`
+    // (crates/wenlan-types/src/page_map.rs) is the daemon's own wire contract,
+    // and the TypeScript interfaces in src/lib/tauri.ts mirror it field for
+    // field. Deserializing into them here would only re-serialize on the way to
+    // the frontend, and would silently drop any field the daemon adds before the
+    // app learns about it. Passing the value through keeps the bridge honest;
+    // typing it belongs on the day the Rust side needs to read a field.
+
+    /// Page-map calls need the HTTP status in the client (409 → refetch+reapply,
+    /// 404/405 → "daemon too old", 422 → invariant violation), which the shared
+    /// helpers flatten into an opaque error string. On non-2xx this returns
+    /// Err(json) where json is `{"status":<u16>,"error":"<body text>"}` so the
+    /// TypeScript layer can branch on the code.
+    async fn page_map_call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let method_str = method.to_string();
+        let mut req = self.client.request(method, self.url(path));
+        if let Some(body) = &body {
+            req = req.json(body);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("HTTP {} {}: {}", method_str, path, e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(
+                serde_json::json!({ "status": status.as_u16(), "error": text }).to_string(),
+            );
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("Parse {}: {}", path, e))
+    }
+
+    pub async fn get_page_map(&self, page_id: &str) -> Result<serde_json::Value, String> {
+        let path = format!("/api/pages/{}/map", page_id);
+        self.page_map_call(reqwest::Method::GET, &path, None).await
+    }
+
+    pub async fn improve_page_map(&self, page_id: &str) -> Result<serde_json::Value, String> {
+        let path = format!("/api/pages/{}/map/improve", page_id);
+        self.page_map_call(reqwest::Method::POST, &path, Some(serde_json::json!({})))
+            .await
+    }
+
+    pub async fn create_page_map_node(
+        &self,
+        page_id: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let path = format!("/api/pages/{}/map/nodes", page_id);
+        self.page_map_call(reqwest::Method::POST, &path, Some(body))
+            .await
+    }
+
+    pub async fn patch_page_map_node(
+        &self,
+        page_id: &str,
+        node_id: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let path = format!("/api/pages/{}/map/nodes/{}", page_id, node_id);
+        self.page_map_call(reqwest::Method::PATCH, &path, Some(body))
+            .await
+    }
+
+    pub async fn delete_page_map_node(
+        &self,
+        page_id: &str,
+        node_id: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let path = format!("/api/pages/{}/map/nodes/{}", page_id, node_id);
+        self.page_map_call(reqwest::Method::DELETE, &path, Some(body))
+            .await
+    }
+
+    pub async fn put_page_map_layout(
+        &self,
+        page_id: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let path = format!("/api/pages/{}/map/layout", page_id);
+        self.page_map_call(reqwest::Method::PUT, &path, Some(body))
+            .await
+    }
+
     pub async fn test_llm(
         &self,
         endpoint: String,
