@@ -20209,6 +20209,59 @@ async fn update_page_content_preserves_delimiter_free_content_exactly() {
 }
 
 #[tokio::test]
+async fn page_write_threads_operation_id_to_new_cites_edges() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_operation_edge",
+        "Operation edge",
+        None,
+        "seed",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let receipt = OperationReceipt {
+        caller_id: "test-caller",
+        operation_id: "page-operation-1",
+        request_digest: "page-digest",
+        response: "{}",
+    };
+    assert!(db
+        .try_update_page_content_with_changelog_at_version(
+            "page_operation_edge",
+            "updated",
+            &["source-operation"],
+            "manual_edit",
+            "[]",
+            None,
+            1,
+            Some(receipt),
+        )
+        .await
+        .unwrap());
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT operation_id FROM edges
+             WHERE edge_type = 'cites' AND src_id = ?1 AND dst_id = ?2",
+            libsql::params!["page_operation_edge", "source-operation"],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("page cites edge");
+    assert_eq!(
+        row.get::<Option<String>>(0).unwrap(),
+        Some("page-operation-1".to_string())
+    );
+}
+
+#[tokio::test]
 async fn insert_page_rejects_reserved_sources_delimiter_without_mutation() {
     use crate::export::provenance::{SOURCES_BLOCK_END, SOURCES_BLOCK_START};
     let (db, _dir) = test_db().await;
@@ -23928,6 +23981,27 @@ async fn accepted_page_merge_advances_survivor_source_revision() {
         .await
         .unwrap()
         .unwrap();
+    let absorbed = db
+        .get_page("page-merge-revision-absorbed")
+        .await
+        .unwrap()
+        .unwrap();
+    let survivor_history = db
+        .list_page_history("page-merge-revision-survivor", 10)
+        .await
+        .unwrap();
+    let absorbed_history = db
+        .list_page_history("page-merge-revision-absorbed", 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        survivor_history.first().map(|entry| entry.version),
+        Some(survivor.version)
+    );
+    assert_eq!(
+        absorbed_history.first().map(|entry| entry.version),
+        Some(absorbed.version)
+    );
     assert_eq!(survivor.stale_reason.as_deref(), Some("source_updated"));
     assert_eq!(
         survivor
@@ -26538,6 +26612,45 @@ async fn test_get_truncated_title_memories() {
         !ids.contains(&"mem_good_title"),
         "should not include good title"
     );
+}
+
+#[tokio::test]
+async fn archive_page_records_history_once_for_status_flip() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page-archive-history",
+        "Archive history",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    db.archive_page("page-archive-history").await.unwrap();
+    let archived = db.get_page("page-archive-history").await.unwrap().unwrap();
+    let history = db
+        .list_page_history("page-archive-history", 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        history.first().map(|entry| entry.version),
+        Some(archived.version)
+    );
+    assert_eq!(history.len(), 2, "archive adds the version history row");
+
+    db.archive_page("page-archive-history").await.unwrap();
+    let archived_again = db.get_page("page-archive-history").await.unwrap().unwrap();
+    let history_again = db
+        .list_page_history("page-archive-history", 10)
+        .await
+        .unwrap();
+    assert_eq!(archived_again.version, archived.version);
+    assert_eq!(history_again, history, "idempotent archive adds no row");
 }
 
 #[tokio::test]
@@ -49775,7 +49888,8 @@ async fn insert_resolved_page_evidence_rejects_autocommit_connection() {
     let conn = db.conn.lock().await;
     insert_raw_page_for_m81_test(&conn, "page_ac", "space_a").await;
     let result =
-        MemoryDB::insert_resolved_page_evidence(&conn, "page_ac", &["mem_ac"], 1, "test").await;
+        MemoryDB::insert_resolved_page_evidence(&conn, "page_ac", &["mem_ac"], 1, "test", None)
+            .await;
     assert!(
         result.is_err(),
         "must reject an autocommit connection (release-enforced, not debug_assert)"

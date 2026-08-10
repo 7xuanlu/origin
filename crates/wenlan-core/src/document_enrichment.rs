@@ -2329,6 +2329,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn exhausted_document_is_not_claimed_while_fresh_pending_claims() {
+        let (db, _dir) = test_db().await;
+        db.enqueue_document("folder", "/poison.md", Some("poison-hash"))
+            .await
+            .unwrap();
+        for _ in 0..MemoryDB::DOC_ENRICHMENT_MAX_ATTEMPTS {
+            db.mark_paused(
+                "folder",
+                "/poison.md",
+                "poison document",
+                Some(chrono::Utc::now().timestamp() - 1),
+            )
+            .await
+            .unwrap();
+        }
+        db.enqueue_document("folder", "/fresh.md", Some("fresh-hash"))
+            .await
+            .unwrap();
+
+        let claimed = db
+            .claim_next_pending()
+            .await
+            .unwrap()
+            .expect("fresh pending document remains claimable");
+        assert_eq!(claimed.file_path, "/fresh.md");
+        assert!(
+            db.claim_next_pending().await.unwrap().is_none(),
+            "the capped poison document is not claimable"
+        );
+
+        let poison = db
+            .get_queue_entry("folder", "/poison.md")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            poison.attempt_count,
+            MemoryDB::DOC_ENRICHMENT_MAX_ATTEMPTS,
+            "poison row reaches the retry cap"
+        );
+        let status = db.document_enrichment_queue_status().await.unwrap();
+        assert_eq!(status.exhausted, 1);
+        assert!(
+            status.paused_reason.is_none(),
+            "exhausted rows are not reported as waiting for another retry"
+        );
+    }
+
     // ── queue observability: status summary reflects pending + paused ─────────
 
     #[tokio::test]
@@ -2340,6 +2389,7 @@ mod tests {
         assert_eq!(empty.pending, 0);
         assert!(empty.paused_reason.is_none());
         assert!(empty.next_retry_at.is_none());
+        assert_eq!(empty.exhausted, 0);
 
         // Two enqueued, one paused with a reason + retry time.
         db.enqueue_document("folder", "/a.md", Some("h"))
@@ -2361,6 +2411,7 @@ mod tests {
         assert_eq!(status.pending, 2, "pending counts all not-done rows");
         assert_eq!(status.paused_reason.as_deref(), Some("analysis LLM failed"));
         assert_eq!(status.next_retry_at, Some(1_712_678_400));
+        assert_eq!(status.exhausted, 0);
 
         // Once done, rows drop out of the pending count and the pause clears.
         db.mark_done("folder", "/a.md").await.unwrap();
@@ -2369,6 +2420,7 @@ mod tests {
         assert_eq!(drained.pending, 0);
         assert!(drained.paused_reason.is_none());
         assert!(drained.next_retry_at.is_none());
+        assert_eq!(drained.exhausted, 0);
     }
 
     // ── restart resume: in_progress rows are requeued (checkpoint preserved) ──
