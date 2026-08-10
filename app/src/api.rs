@@ -316,11 +316,15 @@ pub struct CommunityMembersResponse {
 // the daemon-owned shapes rather than a hand-mirrored copy (unlike the
 // page-map/community types above, which predate the daemon's release).
 //
-// The daemon only ever populates `Page.truth` on an `EntryOnly`-reduced
-// listing entry (`crates/wenlan-core/src/truth_adapter.rs::reduce_to_entry`),
-// which requires the durable cutover generation to be >= 1. `None` otherwise,
-// including on every full-page fetch (`get_page`), so the field is naturally
-// absent everywhere until the daemon's cutover ceremony runs.
+// The daemon populates `Page.truth` in two cases, both gated on the durable
+// cutover generation being >= 1: an `EntryOnly`-reduced listing entry
+// (`crates/wenlan-core/src/truth_adapter.rs::reduce_to_entry`), and a `Full`
+// page whose call named it under a human-intent grant
+// (`truth_adapter.rs::filter_pages`'s `with_truth` branch, reached via
+// `get_page_explicit_browse`'s `x-wenlan-reader-intent` header). A plain
+// `get_page` call carries no marker, so it resolves to `TruthGrant::Automatic`
+// and never reaches either branch. `None` everywhere until the daemon's
+// cutover ceremony runs.
 
 /// Both M5 truth axes for one page.
 pub type PageTruth = wenlan_types::pages::PageTruth;

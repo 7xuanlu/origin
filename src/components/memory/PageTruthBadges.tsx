@@ -41,7 +41,7 @@ export function PageTruthBadges({ cutoverLive, truth, wrapperClassName, wrapperS
       </span>
       <span
         aria-label={`${t("pages.overview.truth.humanReviewAxis")}: ${reviewLabel}`}
-        className={`wiki-page-state wiki-page-state--${truth.human_reviewed ? "reviewed" : "unreviewed"}`}
+        className={`wiki-page-state wiki-page-state--truth-${truth.human_reviewed ? "reviewed" : "unreviewed"}`}
         data-testid="page-truth-review"
       >
         {reviewLabel}

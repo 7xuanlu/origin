@@ -152,6 +152,15 @@ describe("PageDetail", () => {
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
   });
 
+  it("fetches the page with the explicit-browse intent, not the automatic default", async () => {
+    const { getPage } = await import("../../lib/tauri");
+    renderWithQuery(<PageDetail {...defaultProps} />);
+
+    await screen.findByRole("heading", { level: 1, name: "libSQL Architecture" });
+
+    expect(getPage).toHaveBeenCalledWith("concept_abc", "explicit");
+  });
+
   it("names and dismisses the destination Page when authored content attaches to it", async () => {
     const onDismissAttachedPageNotice = vi.fn();
     const { user } = renderWithQuery(

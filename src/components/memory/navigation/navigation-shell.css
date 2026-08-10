@@ -352,11 +352,11 @@
   color: var(--mem-accent-amber);
 }
 
-.wiki-page-state--reviewed {
+.wiki-page-state--truth-reviewed {
   color: var(--mem-accent-sage);
 }
 
-.wiki-page-state--unreviewed {
+.wiki-page-state--truth-unreviewed {
   color: var(--mem-text-meta-aa);
 }
 
