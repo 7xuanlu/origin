@@ -9236,8 +9236,16 @@ fn doc_path_references_resolve() {
         // Skip docs that legitimately reference aspirational / moved / extracted paths:
         // plan & design docs (not-yet-created), and AUDIT.md historical audits (may
         // reference code since extracted to other repos, e.g. the Tauri app -> wenlan-app).
+        // `crates/wenlan-core/contracts/` is skipped for a different reason
+        // than the two gitignored scratch dirs: those files ARE tracked and
+        // load-bearing test fixtures, but their prose cross-references point
+        // into the untracked design history they were promoted out of. Their
+        // real integrity is enforced by the tests that parse them
+        // (`truth_manifest_test`, `m6::catalog_test`,
+        // `scripts/m5-reader-sweep.py --check`), not by this path resolver.
         if f.starts_with("docs/plans/")
             || f.starts_with("docs/superpowers/")
+            || f.starts_with("crates/wenlan-core/contracts/")
             || f.ends_with("AUDIT.md")
         {
             continue;
@@ -9663,8 +9671,16 @@ fn doc_section_references_resolve() {
     let mut dangling = Vec::new();
     for f in git_ls_files(&root, "*.md") {
         // Same aspirational/historical skips as teeth #1.
+        // `crates/wenlan-core/contracts/` is skipped for a different reason
+        // than the two gitignored scratch dirs: those files ARE tracked and
+        // load-bearing test fixtures, but their prose cross-references point
+        // into the untracked design history they were promoted out of. Their
+        // real integrity is enforced by the tests that parse them
+        // (`truth_manifest_test`, `m6::catalog_test`,
+        // `scripts/m5-reader-sweep.py --check`), not by this path resolver.
         if f.starts_with("docs/plans/")
             || f.starts_with("docs/superpowers/")
+            || f.starts_with("crates/wenlan-core/contracts/")
             || f.ends_with("AUDIT.md")
         {
             continue;

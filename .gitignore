@@ -79,7 +79,10 @@ app/eval/data/longmemeval_*.json
 # Eval baselines — competitive intelligence, keep local
 app/eval/baselines/
 
-# Superpowers working docs (specs, plans, research, prototypes)
+# Working design docs — plans, specs, research, prototypes. Local only.
+# A spec that code or CI actually reads is a test fixture: keep it next to the
+# test, e.g. crates/wenlan-core/contracts/, never here.
+docs/plans/
 docs/superpowers/
 .superpowers/
 

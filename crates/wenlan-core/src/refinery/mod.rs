@@ -553,6 +553,24 @@ where
     }
 }
 
+/// [`run_phase`] plus the shared-connection transaction watchdog.
+///
+/// Every phase body swallows its own error by design (see [`run_phase`]), so a
+/// phase that returned early out of a `BEGIN ... COMMIT` without rolling back
+/// would leave `MemoryDB`'s single connection inside an open transaction and
+/// every later daemon write uncommitted — silently. Checking once per phase
+/// turns that into a loud error log plus an automatic recovery.
+async fn run_phase_checked<F, Fut>(db: &MemoryDB, phase: Phase, f: F) -> PhaseResult
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<PhaseOutput, WenlanError>>,
+{
+    let result = run_phase(phase, f).await;
+    db.assert_autocommit_or_recover(&format!("refinery phase '{}'", phase.as_str()))
+        .await;
+    result
+}
+
 // Post-ingest dedup and recap checks moved to post_ingest.rs
 
 /// Periodic steep — called every 30 minutes by the scheduler.
@@ -777,7 +795,7 @@ async fn run_periodic_steep_with_api_scope(
     // Phase 1: Decay pass
     let db_ref = db;
     if runs_phase(Phase::Decay) {
-        let phase = run_phase(Phase::Decay, || async {
+        let phase = run_phase_checked(db_ref, Phase::Decay, || async {
             let decayed = db_ref.decay_update_confidence().await? as usize;
             log::info!("[refinery] decay steep: updated {} memories", decayed);
             let (nudge, headline) = classify_backfill(decayed);
@@ -794,7 +812,7 @@ async fn run_periodic_steep_with_api_scope(
 
     // Phase 1b: Promote uncontradicted memories from 'new' to 'learned'
     if runs_phase(Phase::Promote) {
-        let phase = run_phase(Phase::Promote, || async {
+        let phase = run_phase_checked(db_ref, Phase::Promote, || async {
             let promoted = db_ref.promote_uncontradicted(7).await?;
             if promoted > 0 {
                 log::info!("[refinery] promoted {} memories to 'learned'", promoted);
@@ -814,7 +832,7 @@ async fn run_periodic_steep_with_api_scope(
     // everyday_source pin; otherwise deterministic no-LLM behavior applies).
     let recap_llm = everyday_route_llm;
     if runs_phase(Phase::Recaps) {
-        let phase = run_phase(Phase::Recaps, || async {
+        let phase = run_phase_checked(db_ref, Phase::Recaps, || async {
             let generated =
                 crate::synthesis::recaps::generate_recaps(db_ref, recap_llm, prompts, tuning)
                     .await?;
@@ -848,7 +866,7 @@ async fn run_periodic_steep_with_api_scope(
             }
         }
     {
-        let phase = run_phase(Phase::Reweave, || async {
+        let phase = run_phase_checked(db_ref, Phase::Reweave, || async {
             let count = reweave_entity_links(
                 db_ref,
                 tuning.max_reweave_per_steep,
@@ -881,7 +899,7 @@ async fn run_periodic_steep_with_api_scope(
             }
         }
     {
-        let phase = run_phase(Phase::Reembed, || async {
+        let phase = run_phase_checked(db_ref, Phase::Reembed, || async {
             let count = crate::migrations::reembed::run(db_ref, 5).await?;
             let (nudge, headline) = classify_backfill(count);
             Ok(PhaseOutput {
@@ -911,7 +929,7 @@ async fn run_periodic_steep_with_api_scope(
             }
         }
     {
-        let phase = run_phase(Phase::EntityExtraction, || async {
+        let phase = run_phase_checked(db_ref, Phase::EntityExtraction, || async {
             let count = extract_entities_from_memories(db_ref, extract_llm, prompts, 5).await?;
             let (nudge, headline) = classify_backfill(count);
             Ok(PhaseOutput {
@@ -939,7 +957,7 @@ async fn run_periodic_steep_with_api_scope(
             }
         }
     {
-        let phase = run_phase(Phase::CommunityDetection, || async {
+        let phase = run_phase_checked(db_ref, Phase::CommunityDetection, || async {
             // Keep the legacy label-prop producer live throughout PR-1 so the
             // default-OFF flag and rollback path remain byte-compatible.
             let legacy_count = db_ref.detect_communities().await?;
@@ -978,7 +996,7 @@ async fn run_periodic_steep_with_api_scope(
     // before compile/emergence so cheap attach-to-existing-page opportunities
     // are consumed through PageWrite before any LLM synthesis lane is touched.
     if runs_phase(Phase::Detect) {
-        let phase = run_phase(Phase::Detect, || async {
+        let phase = run_phase_checked(db_ref, Phase::Detect, || async {
             let report = detect_page_candidates(db_ref, distillation).await?;
             if report.candidates_processed > 0
                 || report.attached > 0
@@ -1008,7 +1026,7 @@ async fn run_periodic_steep_with_api_scope(
         resolve_synthesis(synthesis_pin, synthesis_llm, api_llm, external_llm, llm).llm;
     let kp_ref = knowledge_path;
     if runs_phase(Phase::Emergence) {
-        let phase = run_phase(Phase::Emergence, || async {
+        let phase = run_phase_checked(db_ref, Phase::Emergence, || async {
             let run_coherence_gate =
                 compile_llm.is_some_and(|provider| matches!(provider.backend(), LlmBackend::Api));
             let result = distill_pages_scoped_gated(
@@ -1055,7 +1073,7 @@ async fn run_periodic_steep_with_api_scope(
     // community grouping the buckets key on is fresh. Degrades to a
     // deterministic template when no LLM is available (no silent-zero).
     if runs_phase(Phase::SummaryRollup) && crate::db::global_prelude_enabled() {
-        let phase = run_phase(Phase::SummaryRollup, || async {
+        let phase = run_phase_checked(db_ref, Phase::SummaryRollup, || async {
             let count =
                 summary::build_summary_nodes(db_ref, compile_llm.map(|a| a.as_ref())).await?;
             Ok(PhaseOutput {
@@ -1083,7 +1101,7 @@ async fn run_periodic_steep_with_api_scope(
             }
         }
     {
-        let phase = run_phase(Phase::ReDistill, || async {
+        let phase = run_phase_checked(db_ref, Phase::ReDistill, || async {
             let enqueued = enqueue_changed_pages(db_ref).await?;
             if enqueued > 0 {
                 log::info!("[re-distill] queued {enqueued} pages with changed explicit sources");
@@ -1116,7 +1134,7 @@ async fn run_periodic_steep_with_api_scope(
             }
         }
     {
-        let phase = run_phase(Phase::Overview, || async {
+        let phase = run_phase_checked(db_ref, Phase::Overview, || async {
             let count = maybe_refresh_overview_page(db_ref, compile_llm, prompts, kp_ref).await?;
             let (nudge, headline) = classify_redistill(count);
             Ok(PhaseOutput {
@@ -1131,7 +1149,7 @@ async fn run_periodic_steep_with_api_scope(
 
     // Phase 6c: Process refinement queue (contradictions + entity suggestions only)
     if runs_phase(Phase::RefinementQueue) {
-        let phase = run_phase(Phase::RefinementQueue, || async {
+        let phase = run_phase_checked(db_ref, Phase::RefinementQueue, || async {
             let count =
                 process_refinement_queue(db_ref, everyday_route_llm, prompts, tuning).await?;
             let (nudge, headline) = classify_refinement_queue(count);
@@ -1161,7 +1179,7 @@ async fn run_periodic_steep_with_api_scope(
             }
         }
     {
-        let phase = run_phase(Phase::DecisionLogs, || async {
+        let phase = run_phase_checked(db_ref, Phase::DecisionLogs, || async {
             let count = crate::synthesis::decision_logs::generate_decision_logs(
                 db_ref,
                 everyday_route_llm,
@@ -1189,7 +1207,7 @@ async fn run_periodic_steep_with_api_scope(
     // `runs_phase` (not `trigger.runs_phase`): a phase-sliced background turn
     // must not leak page_maps into another phase's slice when auto-suggest is on.
     if page_map_auto_suggest && runs_phase(Phase::PageMaps) {
-        let phase = run_phase(Phase::PageMaps, || async {
+        let phase = run_phase_checked(db_ref, Phase::PageMaps, || async {
             let improved = crate::page_map_improve::run_proactive_page_maps(db_ref, 5).await?;
             let (nudge, headline) = classify_backfill(improved);
             Ok(PhaseOutput {
@@ -1210,7 +1228,7 @@ async fn run_periodic_steep_with_api_scope(
     // gated uniformly by TriggerKind and tracked in result.phases like
     // every other phase.
     if runs_phase(Phase::PruneRejections) {
-        let phase = run_phase(Phase::PruneRejections, || async {
+        let phase = run_phase_checked(db_ref, Phase::PruneRejections, || async {
             let count = db_ref.prune_rejections(30).await?;
             // Clean up concept_sources rows whose source memories were deleted.
             match db_ref.cleanup_orphaned_page_sources().await {
@@ -1241,7 +1259,7 @@ async fn run_periodic_steep_with_api_scope(
     // cycle. Event surfacing flows through PhaseResult nudge/headline; MemoryDB
     // has no emitter.
     if runs_phase(Phase::Evict) && crate::db::eviction_enabled() {
-        let phase = run_phase(Phase::Evict, || async {
+        let phase = run_phase_checked(db_ref, Phase::Evict, || async {
             let report = db_ref
                 .evict_stale(&crate::tuning::EvictionConfig::default())
                 .await?;
@@ -1275,7 +1293,7 @@ async fn run_periodic_steep_with_api_scope(
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         if now.saturating_sub(last_ts) >= interval_secs {
-            let phase = run_phase(Phase::KgRethink, || async {
+            let phase = run_phase_checked(db_ref, Phase::KgRethink, || async {
                 let report = crate::kg_quality::run_rethink(db_ref, llm, tuning).await?;
                 let total = report.merge_candidates
                     + report.relations_healed

@@ -72,9 +72,9 @@ Look for issues labeled [`good first issue`](https://github.com/7xuanlu/wenlan/l
 ## Pull Request Process
 
 1. Fork the repo and create a branch from `main`
-2. Make your changes — keep PRs small and focused (one logical change per PR)
+2. Make your changes, keeping PRs small and focused (one logical change per PR)
 3. Ensure all tests pass and linting is clean
-4. Open a PR using the template — describe what and how to test
+4. Open a PR using the template, describing what changed and how to test it
 
 CI runs `cargo fmt --check --all`, `cargo clippy --workspace --all-targets`, and `cargo test` across all daemon crates.
 
@@ -82,16 +82,17 @@ CI runs `cargo fmt --check --all`, `cargo clippy --workspace --all-targets`, and
 
 These conventions keep the codebase consistent. See `CLAUDE.md` for the full list.
 
-- **SQL safety**: Always use parameterized queries — never interpolate user input into SQL strings
+- **SQL safety**: Always use parameterized queries. Never interpolate user input into SQL strings.
 - **NULL semantics**: Store `Option<T>` as SQL NULL, not empty string
-- **UTF-8 safety**: Never byte-index Rust strings (`&s[..n]`) — use `chars().take(n)` instead
+- **UTF-8 safety**: Never byte-index Rust strings (`&s[..n]`). Use `chars().take(n)` instead.
 - **Batch SQL**: Wrap multi-row insert/delete loops in `BEGIN`/`COMMIT` transactions
 - **License headers**: The workspace is still normalizing SPDX headers after the package split. For new files, use the header that matches the package/file license even if nearby legacy files have not been cleaned up yet.
 
 ## Docs Layout
 
-- In-repo docs live under `docs/` (especially `docs/plans/` for historical implementation context).
-- Some personal/internal notes may exist outside the repository and are not required for contributors.
+- In-repo docs live under `docs/` and are documentation only. Nothing there is read by code or CI.
+- Working design docs (plans, specs, research) are deliberately not tracked. `docs/plans/` and `docs/superpowers/` are gitignored local scratch space, so nothing you need to contribute lives there.
+- `crates/wenlan-core/contracts/` holds two markdown files that are test fixtures rather than documentation: `crates/wenlan-core/src/truth_manifest_test.rs` compiles one in with `include_str!`, and `crates/wenlan-core/src/m6/catalog_test.rs` reads the other at test time. Editing either changes what a test asserts.
 
 ## License
 
@@ -101,6 +102,6 @@ By contributing, you agree that your changes will be licensed under the license 
 
 ## Links
 
-- [wenlan.app](https://wenlan.app) — project home
-- [wenlan.app/docs/get-started](https://wenlan.app/docs/get-started) — install + verify the local memory loop before opening a PR
-- [wenlan.app/docs/daily-workflow](https://wenlan.app/docs/daily-workflow) — the workflow your changes will fit into
+- [wenlan.app](https://wenlan.app): project home
+- [wenlan.app/docs/get-started](https://wenlan.app/docs/get-started): install and verify the local memory loop before opening a PR
+- [wenlan.app/docs/daily-workflow](https://wenlan.app/docs/daily-workflow): the workflow your changes will fit into

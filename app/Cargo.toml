@@ -75,17 +75,22 @@ tempfile = "3"
 
 serde_yaml = "0.9"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-cocoa = "0.26"
-objc = "0.2"
-raw-window-handle = "0.6"
-
 # Workspace crates
 wenlan-types = { workspace = true }
 # Workspace-pinned (=0.38.3): the scheduler tooth requires exactly one sysinfo in Cargo.lock
 sysinfo = { workspace = true }
 pdf-extract = "0.10"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+# Keep this table LAST. A TOML table runs until the next header, so any
+# dependency written below it silently becomes macOS-only. That is how
+# wenlan-types, sysinfo, pdf-extract, and zip stopped existing off macOS and
+# left the app crate uncompilable on Windows (15 unresolved-import errors,
+# unnoticed because app-check only runs on macOS).
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"
+raw-window-handle = "0.6"
 
 [dev-dependencies]
 serial_test = "3"
