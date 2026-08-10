@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { invoke } from "@tauri-apps/api/core";
+export { daemonMeetsFloor } from "./daemonVersion";
 
 export async function setTrafficLightsVisible(visible: boolean): Promise<void> {
   return invoke("set_traffic_lights_visible", { visible });
@@ -179,21 +180,6 @@ export async function syncRegisteredSource(id: string): Promise<SyncStats> {
 /** Read the running daemon's version string from GET /api/health. */
 export async function getDaemonVersion(): Promise<string> {
   return invoke("daemon_version");
-}
-
-/**
- * True when the daemon version is >= floor. Daemon-native file ingest landed
- * in 0.10.0; below that, files register but never index (§0 version gate).
- */
-export function daemonMeetsFloor(version: string, floor = "0.10.0"): boolean {
-  const parse = (v: string) => v.split(".").map((n) => parseInt(n, 10) || 0);
-  const a = parse(version);
-  const b = parse(floor);
-  for (let i = 0; i < 3; i++) {
-    const d = (a[i] ?? 0) - (b[i] ?? 0);
-    if (d !== 0) return d > 0;
-  }
-  return true;
 }
 
 /** Stage a loose file into the managed dir and ensure it is a daemon source. */
@@ -1713,13 +1699,66 @@ export async function getConcept(id: string): Promise<Page | null> {
   return getPage(id);
 }
 
-export async function updatePage(id: string, content: string): Promise<void> {
-  return invoke("update_page", { id, content });
+export interface UpdatePageInput {
+  id: string;
+  content: string;
+  expectedVersion: number;
+  callerId: "wenlan-app";
+  operationId: string;
+}
+
+export type UpdatePageFailureKind =
+  | "not_found"
+  | "auth_required"
+  | "payload_too_large"
+  | "validation"
+  | "rate_limited"
+  | "server"
+  | "other";
+
+export type UpdatePageOutcome =
+  | { outcome: "saved" }
+  | {
+      outcome: "upgrade_required";
+      reportedVersion: string;
+      requiredFloor: string;
+    }
+  | { outcome: "conflict"; message: string }
+  | {
+      outcome: "failure";
+      kind: UpdatePageFailureKind;
+      status: number;
+      message: string;
+    };
+
+export async function updatePage(
+  input: UpdatePageInput,
+): Promise<UpdatePageOutcome> {
+  return invoke("update_page", { ...input });
 }
 
 /** @deprecated Use {@link updatePage} instead. */
-export async function updateConcept(id: string, content: string): Promise<void> {
-  return updatePage(id, content);
+export async function updateConcept(
+  input: UpdatePageInput,
+): Promise<UpdatePageOutcome> {
+  return updatePage(input);
+}
+
+export type PageEditorDiagnosticInput =
+  | {
+      event: "daemon_floor_blocked";
+      reportedVersion: string | null;
+      requiredFloor: string;
+    }
+  | {
+      event: "editor_fallback";
+      reason: "load" | "construction";
+    };
+
+export async function recordPageEditorDiagnostic(
+  input: PageEditorDiagnosticInput,
+): Promise<void> {
+  return invoke("record_page_editor_diagnostic", { ...input });
 }
 
 export async function deletePage(id: string): Promise<void> {
@@ -2414,8 +2453,15 @@ export async function quitWenlanFull(): Promise<void> {
   return invoke("quit_wenlan_full");
 }
 
-export async function cancelGuardedQuitRequest(): Promise<void> {
-  return invoke("cancel_guarded_quit_request");
+export async function acknowledgeGuardedQuitRequest(
+  requestId: number,
+  deliveryId: number,
+): Promise<boolean> {
+  return invoke("acknowledge_guarded_quit_request", { requestId, deliveryId });
+}
+
+export async function cancelGuardedQuitRequest(requestId: number): Promise<boolean> {
+  return invoke("cancel_guarded_quit_request", { requestId });
 }
 
 /** @deprecated Use quitWenlanFull. Kept as a legacy Origin bridge alias. */

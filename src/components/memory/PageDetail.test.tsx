@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import PageDetail from "./PageDetail";
 import { i18n } from "../../i18n";
+import {
+  editorViewFromTextbox,
+  installCodeMirrorDomPolyfills,
+  pressKey,
+  replaceDocument,
+} from "./editor/editorTestUtils";
 
 vi.mock("../../lib/tauri", () => ({
   getPage: vi.fn().mockResolvedValue({
@@ -65,7 +71,11 @@ vi.mock("../../lib/tauri", () => ({
   listOrphanLinks: vi.fn().mockResolvedValue({ min_count: 2, orphan_labels: [] }),
   listPages: vi.fn().mockResolvedValue([]),
   redistillPage: vi.fn().mockResolvedValue({ status: "ok", updated: true }),
-  updatePage: vi.fn().mockResolvedValue(undefined),
+  updatePage: vi.fn().mockResolvedValue({ outcome: "saved" }),
+  getDaemonVersion: vi.fn().mockResolvedValue("0.14.1"),
+  getSystemInfo: vi.fn().mockResolvedValue({ os: "macos" }),
+  daemonMeetsFloor: vi.fn().mockReturnValue(true),
+  recordPageEditorDiagnostic: vi.fn().mockResolvedValue(undefined),
   deletePage: vi.fn().mockResolvedValue(undefined),
   FACET_COLORS: {},
   STABILITY_TIERS: {},
@@ -93,6 +103,10 @@ function deferred<T>() {
   });
   return { promise, reject, resolve };
 }
+
+beforeAll(() => {
+  installCodeMirrorDomPolyfills();
+});
 
 async function makeNextPageResolvable() {
   const { getPage } = await import("../../lib/tauri");
@@ -343,12 +357,20 @@ describe("PageDetail", () => {
 
     await screen.findByRole("heading", { level: 1, name: "libSQL Architecture" });
     await user.click(screen.getByTitle("Edit page"));
-    const editor = screen.getByRole("textbox");
-    await user.clear(editor);
-    await user.type(editor, "Revised Page body");
-    await user.click(screen.getByRole("button", { name: "Save (Cmd+Enter)" }));
+    const editor = await screen.findByRole("textbox", { name: "Page editor" });
+    await waitFor(() => expect(editor).toHaveFocus());
+    act(() => replaceDocument(editorViewFromTextbox(editor), "Revised Page body"));
+    await user.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() =>
-      expect(updatePage).toHaveBeenCalledWith("concept_abc", "Revised Page body"),
+      expect(updatePage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "concept_abc",
+          content: "Revised Page body",
+          expectedVersion: 3,
+          callerId: "wenlan-app",
+          operationId: expect.any(String),
+        }),
+      ),
     );
 
     rerender(
@@ -366,32 +388,134 @@ describe("PageDetail", () => {
     expect(screen.queryByRole("textbox")).toBeNull();
   });
 
-  it("serializes Cmd+Enter saves so an older body cannot finish last", async () => {
+  it("does not open an older Page editor when its readiness check finishes after navigating away and back", async () => {
+    const { daemonMeetsFloor, getDaemonVersion, updatePage } =
+      await import("../../lib/tauri");
+    const pendingVersion = deferred<string>();
+    (getDaemonVersion as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      pendingVersion.promise,
+    );
+    await makeNextPageResolvable();
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { rerender, user } = renderWithQuery(
+      <PageDetail {...defaultProps} />,
+      queryClient,
+    );
+
+    await screen.findByRole("heading", {
+      level: 1,
+      name: "libSQL Architecture",
+    });
+    await user.click(screen.getByTitle("Edit page"));
+
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <PageDetail {...defaultProps} pageId="concept_next" />
+      </QueryClientProvider>,
+    );
+    await screen.findByRole("heading", { level: 1, name: "Next Page" });
+
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <PageDetail {...defaultProps} />
+      </QueryClientProvider>,
+    );
+    await screen.findByRole("heading", {
+      level: 1,
+      name: "libSQL Architecture",
+    });
+
+    await act(async () => {
+      pendingVersion.resolve("0.14.1");
+      await pendingVersion.promise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(daemonMeetsFloor).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("textbox", { name: "Page editor" }),
+    ).toBeNull();
+    expect(screen.getByTitle("Edit page")).toBeVisible();
+    expect(
+      screen.getByRole("heading", {
+        level: 1,
+        name: "libSQL Architecture",
+      }),
+    ).toBeVisible();
+    expect(updatePage).not.toHaveBeenCalled();
+  });
+
+  it("owns body-targeted Escape while editor readiness is still pending", async () => {
+    const { daemonMeetsFloor, getDaemonVersion } =
+      await import("../../lib/tauri");
+    const pendingVersion = deferred<string>();
+    (getDaemonVersion as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      pendingVersion.promise,
+    );
+    const { user } = renderWithQuery(<PageDetail {...defaultProps} />);
+
+    await screen.findByRole("heading", {
+      level: 1,
+      name: "libSQL Architecture",
+    });
+    await user.click(screen.getByTitle("Edit page"));
+    expect(await screen.findByText("Checking editor compatibility…")).toBeVisible();
+
+    fireEvent.keyDown(document.body, { key: "Escape" });
+
+    expect(defaultProps.onBack).not.toHaveBeenCalled();
+    expect(await screen.findByTitle("Edit page")).toBeVisible();
+    expect(
+      screen.queryByText("Checking editor compatibility…"),
+    ).toBeNull();
+
+    await act(async () => {
+      pendingVersion.resolve("0.14.1");
+      await pendingVersion.promise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(daemonMeetsFloor).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("textbox", { name: "Page editor" }),
+    ).toBeNull();
+  });
+
+  it("serializes repeated save shortcuts so an older body cannot finish last", async () => {
     const { updatePage } = await import("../../lib/tauri");
-    const pending = deferred<void>();
+    const pending = deferred<{ outcome: "saved" }>();
     (updatePage as ReturnType<typeof vi.fn>).mockReturnValueOnce(pending.promise);
     const { user } = renderWithQuery(<PageDetail {...defaultProps} />);
 
     await screen.findByRole("heading", { level: 1, name: "libSQL Architecture" });
     await user.click(screen.getByTitle("Edit page"));
-    const editor = screen.getByRole("textbox");
-    await user.clear(editor);
-    await user.type(editor, "One serialized Page body");
+    const editor = await screen.findByRole("textbox", { name: "Page editor" });
+    await waitFor(() => expect(editor).toHaveFocus());
+    act(() => replaceDocument(editorViewFromTextbox(editor), "One serialized Page body"));
 
     try {
-      fireEvent.keyDown(editor, { key: "Enter", metaKey: true });
-      fireEvent.keyDown(editor, { key: "Enter", metaKey: true });
+      act(() => {
+        pressKey(editor, "s", { ctrlKey: true });
+        pressKey(editor, "s", { ctrlKey: true });
+      });
 
       await waitFor(() =>
         expect(updatePage).toHaveBeenCalledWith(
-          "concept_abc",
-          "One serialized Page body",
+          expect.objectContaining({
+            id: "concept_abc",
+            content: "One serialized Page body",
+            expectedVersion: 3,
+            callerId: "wenlan-app",
+            operationId: expect.any(String),
+          }),
         ),
       );
       expect(updatePage).toHaveBeenCalledTimes(1);
-      expect(editor).toBeDisabled();
+      expect(editor).toHaveAttribute("contenteditable", "false");
     } finally {
-      await act(async () => pending.resolve());
+      await act(async () => pending.resolve({ outcome: "saved" }));
     }
   });
 
@@ -467,19 +591,19 @@ describe("PageDetail", () => {
 
     await screen.findByText("libSQL Architecture");
     await user.click(screen.getByTitle("Edit page"));
-    const editor = screen.getByRole("textbox");
-    await user.clear(editor);
-    await user.type(editor, "Revised Page body");
-    await user.click(screen.getByRole("button", { name: "Save (Cmd+Enter)" }));
+    const editor = await screen.findByRole("textbox", { name: "Page editor" });
+    await waitFor(() => expect(editor).toHaveFocus());
+    act(() => replaceDocument(editorViewFromTextbox(editor), "Revised Page body"));
+    await user.click(screen.getByRole("button", { name: "Save" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Could not save this page. Try again.",
+      "Wenlan could not reach the daemon. Check that it is running, then retry.",
     );
     expect(editor).toBeVisible();
 
-    await user.click(screen.getByRole("button", { name: "Save (Cmd+Enter)" }));
+    await user.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(updatePage).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.queryByRole("textbox")).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("textbox", { name: "Page editor" })).toBeNull());
   });
 
   it("surfaces copy failures and lets the user retry", async () => {

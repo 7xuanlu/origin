@@ -178,31 +178,147 @@ fn resolve_tauri_mcp_socket_path(override_path: Option<&std::ffi::OsStr>) -> std
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp/tauri-mcp.sock"))
 }
 
-static QUIT_GUARD_PENDING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuardedQuitAction {
-    RequestFrontendGuard,
-    ForceShutdown,
+    RequestFrontendGuard { request_id: u64, delivery_id: u64 },
+    AwaitFrontendGuard,
 }
 
-fn guarded_quit_action(pending: &std::sync::atomic::AtomicBool) -> GuardedQuitAction {
-    if pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        GuardedQuitAction::ForceShutdown
-    } else {
-        GuardedQuitAction::RequestFrontendGuard
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardedQuitPhase {
+    Idle,
+    AwaitingAcknowledgement {
+        request_id: u64,
+        delivery_id: u64,
+    },
+    Handling {
+        request_id: u64,
+        last_acked_delivery_id: u64,
+    },
+    Forcing,
+}
+
+#[derive(Debug)]
+struct GuardedQuitCoordinator {
+    next_request_id: u64,
+    phase: GuardedQuitPhase,
+}
+
+impl GuardedQuitCoordinator {
+    const fn new() -> Self {
+        Self {
+            next_request_id: 0,
+            phase: GuardedQuitPhase::Idle,
+        }
+    }
+
+    fn request(&mut self) -> GuardedQuitAction {
+        let (request_id, delivery_id) = match self.phase {
+            GuardedQuitPhase::Idle => {
+                self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+                (self.next_request_id, 1)
+            }
+            GuardedQuitPhase::Handling {
+                request_id,
+                last_acked_delivery_id,
+            } => (request_id, last_acked_delivery_id.wrapping_add(1).max(1)),
+            GuardedQuitPhase::AwaitingAcknowledgement { .. } | GuardedQuitPhase::Forcing => {
+                return GuardedQuitAction::AwaitFrontendGuard;
+            }
+        };
+        self.phase = GuardedQuitPhase::AwaitingAcknowledgement {
+            request_id,
+            delivery_id,
+        };
+        GuardedQuitAction::RequestFrontendGuard {
+            request_id,
+            delivery_id,
+        }
+    }
+
+    fn acknowledge(&mut self, request_id: u64, delivery_id: u64) -> bool {
+        if self.phase
+            != (GuardedQuitPhase::AwaitingAcknowledgement {
+                request_id,
+                delivery_id,
+            })
+        {
+            return false;
+        }
+        self.phase = GuardedQuitPhase::Handling {
+            request_id,
+            last_acked_delivery_id: delivery_id,
+        };
+        true
+    }
+
+    fn cancel(&mut self, request_id: u64) -> bool {
+        let is_current = match self.phase {
+            GuardedQuitPhase::AwaitingAcknowledgement {
+                request_id: active_request_id,
+                ..
+            }
+            | GuardedQuitPhase::Handling {
+                request_id: active_request_id,
+                ..
+            } => active_request_id == request_id,
+            GuardedQuitPhase::Idle | GuardedQuitPhase::Forcing => false,
+        };
+        if is_current {
+            self.phase = GuardedQuitPhase::Idle;
+        }
+        is_current
+    }
+
+    fn expire_unacknowledged(&mut self, request_id: u64, delivery_id: u64) -> bool {
+        if self.phase
+            != (GuardedQuitPhase::AwaitingAcknowledgement {
+                request_id,
+                delivery_id,
+            })
+        {
+            return false;
+        }
+        self.phase = GuardedQuitPhase::Forcing;
+        true
+    }
+
+    fn force_if_in_flight(&mut self) -> bool {
+        match self.phase {
+            GuardedQuitPhase::AwaitingAcknowledgement { .. }
+            | GuardedQuitPhase::Handling { .. } => {
+                self.phase = GuardedQuitPhase::Forcing;
+                true
+            }
+            GuardedQuitPhase::Idle | GuardedQuitPhase::Forcing => false,
+        }
     }
 }
 
-fn cancel_guarded_quit(pending: &std::sync::atomic::AtomicBool) {
-    pending.store(false, std::sync::atomic::Ordering::Release);
+static QUIT_GUARD: std::sync::Mutex<GuardedQuitCoordinator> =
+    std::sync::Mutex::new(GuardedQuitCoordinator::new());
+
+fn with_guarded_quit<T>(f: impl FnOnce(&mut GuardedQuitCoordinator) -> T) -> T {
+    let mut guard = QUIT_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(&mut guard)
+}
+
+fn guarded_quit_ack_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(2)
 }
 
 #[cfg(not(feature = "review-fixtures"))]
 #[tauri::command]
-fn cancel_guarded_quit_request() {
-    cancel_guarded_quit(&QUIT_GUARD_PENDING);
+fn acknowledge_guarded_quit_request(request_id: u64, delivery_id: u64) -> bool {
+    with_guarded_quit(|guard| guard.acknowledge(request_id, delivery_id))
+}
+
+#[cfg(not(feature = "review-fixtures"))]
+#[tauri::command]
+fn cancel_guarded_quit_request(request_id: u64) -> bool {
+    with_guarded_quit(|guard| guard.cancel(request_id))
 }
 
 #[cfg(not(feature = "review-fixtures"))]
@@ -218,14 +334,31 @@ fn force_full_quit(app: tauri::AppHandle) {
 #[cfg(not(feature = "review-fixtures"))]
 fn request_full_quit(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
     use tauri::Emitter;
-    match guarded_quit_action(&QUIT_GUARD_PENDING) {
-        GuardedQuitAction::RequestFrontendGuard => {
-            if let Err(error) = app.emit("quit-requested", ()) {
-                cancel_guarded_quit(&QUIT_GUARD_PENDING);
+    match with_guarded_quit(GuardedQuitCoordinator::request) {
+        GuardedQuitAction::RequestFrontendGuard {
+            request_id,
+            delivery_id,
+        } => {
+            let payload = serde_json::json!({
+                "requestId": request_id,
+                "deliveryId": delivery_id,
+            });
+            if let Err(error) = app.emit("quit-requested", payload) {
+                with_guarded_quit(|guard| guard.cancel(request_id));
                 return Err(error);
             }
+            let app_for_timeout = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(guarded_quit_ack_timeout()).await;
+                if with_guarded_quit(|guard| guard.expire_unacknowledged(request_id, delivery_id)) {
+                    log::warn!(
+                        "[app] frontend did not acknowledge guarded quit delivery; forcing shutdown"
+                    );
+                    force_full_quit(app_for_timeout);
+                }
+            });
         }
-        GuardedQuitAction::ForceShutdown => force_full_quit(app.clone()),
+        GuardedQuitAction::AwaitFrontendGuard => {}
     }
     Ok(())
 }
@@ -1093,6 +1226,7 @@ pub fn run() {
             search::get_page_revisions,
             search::list_orphan_links,
             search::update_page,
+            search::record_page_editor_diagnostic,
             search::archive_page,
             search::delete_page,
             search::list_pages,
@@ -1132,6 +1266,7 @@ pub fn run() {
             search::set_run_at_login,
             search::quit_wenlan_full,
             search::quit_origin_full,
+            acknowledge_guarded_quit_request,
             cancel_guarded_quit_request,
             daemon_start::start_daemon_sidecar,
         ])
@@ -1147,6 +1282,17 @@ pub fn run() {
                     Ok(()) => api.prevent_exit(),
                     Err(e) => log::error!("[app] failed to request guarded quit: {e}"),
                 }
+            }
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Destroyed,
+                ..
+            } if label == "main"
+                && !lifecycle::is_quitting()
+                && with_guarded_quit(GuardedQuitCoordinator::force_if_in_flight) =>
+            {
+                log::warn!("[app] main window was destroyed during guarded quit; forcing shutdown");
+                force_full_quit(app.clone());
             }
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen {
@@ -1422,22 +1568,115 @@ mod tests {
     }
 
     #[test]
-    fn repeated_guarded_quit_forces_shutdown_until_the_frontend_cancels() {
-        let pending = std::sync::atomic::AtomicBool::new(false);
+    fn unacknowledged_guarded_quit_expires_to_a_forced_shutdown() {
+        let mut guard = GuardedQuitCoordinator::new();
+
+        let request = guard.request();
+        assert_eq!(
+            request,
+            GuardedQuitAction::RequestFrontendGuard {
+                request_id: 1,
+                delivery_id: 1,
+            }
+        );
+        assert_eq!(guard.request(), GuardedQuitAction::AwaitFrontendGuard);
+        assert!(guard.expire_unacknowledged(1, 1));
+        assert_eq!(guard.request(), GuardedQuitAction::AwaitFrontendGuard);
+    }
+
+    #[test]
+    fn acknowledged_guarded_quit_uses_a_liveness_probe_before_forcing() {
+        let mut guard = GuardedQuitCoordinator::new();
 
         assert_eq!(
-            guarded_quit_action(&pending),
-            GuardedQuitAction::RequestFrontendGuard
+            guard.request(),
+            GuardedQuitAction::RequestFrontendGuard {
+                request_id: 1,
+                delivery_id: 1,
+            }
         );
+        assert!(guard.acknowledge(1, 1));
+        assert!(!guard.expire_unacknowledged(1, 1));
         assert_eq!(
-            guarded_quit_action(&pending),
-            GuardedQuitAction::ForceShutdown
+            guard.request(),
+            GuardedQuitAction::RequestFrontendGuard {
+                request_id: 1,
+                delivery_id: 2,
+            }
+        );
+        assert_eq!(guard.request(), GuardedQuitAction::AwaitFrontendGuard);
+        assert!(guard.acknowledge(1, 2));
+        assert!(!guard.expire_unacknowledged(1, 2));
+
+        assert!(guard.cancel(1));
+        assert_eq!(
+            guard.request(),
+            GuardedQuitAction::RequestFrontendGuard {
+                request_id: 2,
+                delivery_id: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn lost_liveness_probe_expires_an_acknowledged_guarded_quit() {
+        let mut guard = GuardedQuitCoordinator::new();
+
+        assert!(matches!(
+            guard.request(),
+            GuardedQuitAction::RequestFrontendGuard {
+                request_id: 1,
+                delivery_id: 1,
+            }
+        ));
+        assert!(guard.acknowledge(1, 1));
+        assert!(matches!(
+            guard.request(),
+            GuardedQuitAction::RequestFrontendGuard {
+                request_id: 1,
+                delivery_id: 2,
+            }
+        ));
+        assert!(guard.expire_unacknowledged(1, 2));
+    }
+
+    #[test]
+    fn stale_guarded_quit_messages_cannot_mutate_a_later_request() {
+        let mut guard = GuardedQuitCoordinator::new();
+
+        assert_eq!(
+            guard.request(),
+            GuardedQuitAction::RequestFrontendGuard {
+                request_id: 1,
+                delivery_id: 1,
+            }
+        );
+        assert!(guard.acknowledge(1, 1));
+        assert!(guard.cancel(1));
+        assert_eq!(
+            guard.request(),
+            GuardedQuitAction::RequestFrontendGuard {
+                request_id: 2,
+                delivery_id: 1,
+            }
         );
 
-        cancel_guarded_quit(&pending);
-        assert_eq!(
-            guarded_quit_action(&pending),
-            GuardedQuitAction::RequestFrontendGuard
-        );
+        assert!(!guard.acknowledge(1, 1));
+        assert!(!guard.cancel(1));
+        assert!(!guard.expire_unacknowledged(1, 1));
+        assert!(guard.acknowledge(2, 1));
+    }
+
+    #[test]
+    fn destroyed_window_forces_only_an_in_flight_guarded_quit() {
+        let mut guard = GuardedQuitCoordinator::new();
+
+        assert!(!guard.force_if_in_flight());
+        assert!(matches!(
+            guard.request(),
+            GuardedQuitAction::RequestFrontendGuard { .. }
+        ));
+        assert!(guard.force_if_in_flight());
+        assert!(!guard.force_if_in_flight());
     }
 }

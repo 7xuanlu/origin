@@ -25,6 +25,15 @@ import {
 import { liveInvoke } from "./live-invoke";
 
 let graphObsSeq = 0;
+type PreviewPageUpdateRequest = {
+  readonly id: string;
+  readonly content: string;
+  readonly expectedVersion: number;
+};
+const PAGE_UPDATE_RECEIPTS = new Map<
+  string,
+  { readonly input: PreviewPageUpdateRequest; readonly outcome: { outcome: "saved" } }
+>();
 
 export async function invoke(
   cmd: string,
@@ -34,6 +43,10 @@ export async function invoke(
     return liveInvoke(cmd, args);
   }
   switch (cmd) {
+    case "daemon_version":
+      return "0.14.1";
+    case "record_page_editor_diagnostic":
+      return null;
     case "get_page":
       return PAGES[args?.id as string] ?? null;
     case "get_page_sources": {
@@ -64,13 +77,46 @@ export async function invoke(
     case "list_registered_sources":
       return REGISTERED_SOURCES;
     case "update_page": {
-      // Mirror the backend edit contract: content updates, citations reset.
-      const page = PAGES[args?.id as string];
-      if (page) {
-        page.content = args?.content as string;
-        page.citations = [];
+      const input: PreviewPageUpdateRequest = {
+        id: String(args?.id),
+        content: String(args?.content),
+        expectedVersion: Number(args?.expectedVersion),
+      };
+      const receiptKey = `${String(args?.callerId)}\u0000${String(args?.operationId)}`;
+      const receipt = PAGE_UPDATE_RECEIPTS.get(receiptKey);
+      if (receipt) {
+        const sameRequest =
+          receipt.input.id === input.id
+          && receipt.input.content === input.content
+          && receipt.input.expectedVersion === input.expectedVersion;
+        return sameRequest
+          ? structuredClone(receipt.outcome)
+          : {
+              outcome: "conflict",
+              message:
+                "operation identity was already used for different page content",
+            };
       }
-      return null;
+      const page = PAGES[input.id];
+      if (!page || page.version !== input.expectedVersion) {
+        return {
+          outcome: "conflict",
+          message: "This page changed elsewhere.",
+        };
+      }
+      PAGES[page.id] = {
+        ...page,
+        content: input.content,
+        citations: [],
+        version: page.version + 1,
+        last_modified: new Date().toISOString(),
+      };
+      const outcome = { outcome: "saved" } as const;
+      PAGE_UPDATE_RECEIPTS.set(receiptKey, {
+        input: structuredClone(input),
+        outcome: structuredClone(outcome),
+      });
+      return outcome;
     }
     case "redistill_page": {
       const id = args?.pageId as string;

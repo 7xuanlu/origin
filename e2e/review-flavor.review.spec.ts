@@ -83,9 +83,10 @@ test("proves Review identity and exercises Wiki Page mutations", async ({ page }
 
   await openFixtureArchitecture(page);
   await page.locator('.mem-icon-action[aria-label="Edit page"]').click();
-  const editor = page.locator(".page-detail textarea");
+  const editor = page.getByRole("textbox", { name: "Page editor" });
+  await expect(editor).toBeVisible();
   await editor.fill("# Fixture architecture\n\nEdited through the Review-flavor lane.");
-  await page.getByRole("button", { name: "Save (Cmd+Enter)" }).click();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
   await expect(page.getByText("Edited through the Review-flavor lane.")).toBeVisible();
 
   page.once("dialog", (dialog) => dialog.accept());

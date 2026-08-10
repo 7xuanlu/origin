@@ -27,6 +27,17 @@ describe("translation resources", () => {
     expect(resources.en.translation.settings.language.label).toBe("Language");
   });
 
+  it("describes one editing view without exposing Markdown as a peer mode", () => {
+    for (const locale of supportedAppLocales) {
+      const editor = resources[locale].translation.pageDetail.editor;
+      expect(editor.description).toBeTruthy();
+      expect(editor.descriptionFallback).toBeTruthy();
+      expect(editor.toolbar).not.toHaveProperty("modeGroup");
+      expect(editor.toolbar).not.toHaveProperty("writing");
+      expect(editor.toolbar).not.toHaveProperty("markdown");
+    }
+  });
+
   it("keeps the Review fixture boundary explicit in every locale", () => {
     expect([
       resources.en.translation.reviewEnvironment.testData,
