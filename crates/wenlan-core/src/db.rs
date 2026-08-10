@@ -52237,7 +52237,12 @@ impl MemoryDB {
     /// the count of not-`done` rows; the paused fields describe the
     /// soonest-to-retry paused row (a NULL `next_retry_at` — immediately
     /// eligible — sorts first), excluding exhausted rows. `exhausted` counts
-    /// paused rows at or above the retry cap.
+    /// paused rows at or above the retry cap. `paused_reason` also surfaces
+    /// exhaustion: a caller mapping `paused_reason.is_some()` to a stalled
+    /// queue (e.g. the wire `QueueStatus::Paused`) must see an all-exhausted
+    /// queue as stalled too, not silently `Active` forever. `next_retry_at`
+    /// stays `None` when every paused row is exhausted, since there is no
+    /// next retry to report.
     pub async fn document_enrichment_queue_status(
         &self,
     ) -> Result<DocEnrichmentQueueStatus, WenlanError> {
@@ -52285,7 +52290,7 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("queue_status paused: {e}")))?;
-        let (paused_reason, next_retry_at) = match paused_rows
+        let (retryable_paused_reason, next_retry_at) = match paused_rows
             .next()
             .await
             .map_err(|e| WenlanError::VectorDb(format!("queue_status paused row: {e}")))?
@@ -52295,6 +52300,20 @@ impl MemoryDB {
                 row.get::<Option<i64>>(1).unwrap_or(None),
             ),
             None => (None, None),
+        };
+
+        // Fold exhaustion into `paused_reason` so a caller that treats
+        // `paused_reason.is_some()` as "queue is stalled" (the wire mapping
+        // in wenlan-server) still sees a stall when the queue holds only
+        // permanently-exhausted documents, instead of reporting them as
+        // ordinary `pending` work forever.
+        let paused_reason = match (retryable_paused_reason, exhausted) {
+            (reason, 0) => reason,
+            (Some(reason), n) => Some(format!("{reason}; {n} documents exhausted retries")),
+            (None, n) => Some(format!(
+                "{n} documents exhausted enrichment retries (max {} attempts) and will not be retried",
+                Self::DOC_ENRICHMENT_MAX_ATTEMPTS
+            )),
         };
 
         Ok(DocEnrichmentQueueStatus {

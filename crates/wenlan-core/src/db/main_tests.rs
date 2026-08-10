@@ -24002,6 +24002,18 @@ async fn accepted_page_merge_advances_survivor_source_revision() {
         absorbed_history.first().map(|entry| entry.version),
         Some(absorbed.version)
     );
+    assert_eq!(
+        survivor_history
+            .first()
+            .map(|entry| entry.edited_by.as_str()),
+        Some("page_merge")
+    );
+    assert_eq!(
+        absorbed_history
+            .first()
+            .map(|entry| entry.edited_by.as_str()),
+        Some("archive")
+    );
     assert_eq!(survivor.stale_reason.as_deref(), Some("source_updated"));
     assert_eq!(
         survivor
@@ -26642,6 +26654,10 @@ async fn archive_page_records_history_once_for_status_flip() {
         Some(archived.version)
     );
     assert_eq!(history.len(), 2, "archive adds the version history row");
+    assert_eq!(
+        history.first().map(|entry| entry.edited_by.as_str()),
+        Some("archive")
+    );
 
     db.archive_page("page-archive-history").await.unwrap();
     let archived_again = db.get_page("page-archive-history").await.unwrap().unwrap();
