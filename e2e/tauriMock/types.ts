@@ -29,6 +29,12 @@ export type InstallTauriMockOptions = {
   readonly memories?: readonly MemoryItem[];
   readonly fixture?: SpacesNavigationFixture;
   readonly failures?: readonly MockFailure[];
+  /**
+   * Milliseconds to hold a command before answering, keyed by command name.
+   * A real library answers `get_page_map` in one to two seconds, and several
+   * canvas defects only exist inside that window.
+   */
+  readonly delays?: Readonly<Record<string, number>>;
   readonly localStorage?: Readonly<Record<string, string>>;
   readonly pageScenario?: TauriMockPageScenario;
 };

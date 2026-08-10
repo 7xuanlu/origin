@@ -3034,12 +3034,14 @@ pub struct DocEnrichmentQueueEntry {
 /// Aggregate state of the document-enrichment queue, for `/api/status`
 /// observability. `pending` counts rows not yet `done` (pending + in_progress +
 /// paused); `paused_reason` / `next_retry_at` describe the soonest-to-retry
-/// paused row (present only when at least one row is paused).
+/// paused row; `exhausted` counts paused rows that reached the retry cap and are
+/// no longer eligible for a claim.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DocEnrichmentQueueStatus {
     pub pending: u64,
     pub paused_reason: Option<String>,
     pub next_retry_at: Option<i64>,
+    pub exhausted: u64,
 }
 
 /// Durable store-time choices needed by restart-safe fixed-stage enrichment.
@@ -45708,6 +45710,7 @@ impl MemoryDB {
         source_ids: &[&str],
         linked_at: i64,
         link_reason: &str,
+        operation_id: Option<&str>,
     ) -> Result<(), libsql::Error> {
         // Dual-write (M2 PR-1): one SELECT for the page's space, then per
         // source id mirror `backfill_edges_from_page_evidence`'s
@@ -45821,7 +45824,7 @@ impl MemoryDB {
                     lineage,
                     space,
                     cross_space_downgrade,
-                    None,
+                    operation_id,
                     None,
                     None,
                     Some(&semantic_patch),
@@ -46148,9 +46151,15 @@ impl MemoryDB {
         // Dual-write to page_evidence (P2 typed provenance) with each source's
         // resolved source_kind (memory / external_url / external_file /
         // authored). INSERT OR IGNORE keeps this idempotent on re-distill.
-        if let Err(e) =
-            Self::insert_resolved_page_evidence(&conn, id, source_memory_ids, linked_at, "distill")
-                .await
+        if let Err(e) = Self::insert_resolved_page_evidence(
+            &conn,
+            id,
+            source_memory_ids,
+            linked_at,
+            "distill",
+            None,
+        )
+        .await
         {
             let _ = conn.execute("ROLLBACK", ()).await;
             return Err(WenlanError::VectorDb(format!(
@@ -46449,11 +46458,18 @@ impl MemoryDB {
             // frozen (`page_sources` here; `page_evidence` inside
             // `insert_resolved_page_evidence`, called next). It dual-writes
             // the canonical `cites` edge for every kept/new source id.
-            Self::insert_resolved_page_evidence(&conn, id, source_memory_ids, now_ts, link_reason)
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("replace_source_page evidence insert: {e}"))
-                })?;
+            Self::insert_resolved_page_evidence(
+                &conn,
+                id,
+                source_memory_ids,
+                now_ts,
+                link_reason,
+                None,
+            )
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("replace_source_page evidence insert: {e}"))
+            })?;
             // Same transaction as the version bump above: a re-enriched source
             // page is a new version like any other, and leaves the same durable
             // row behind.
@@ -47635,9 +47651,15 @@ impl MemoryDB {
             }
         }
 
-        if let Err(e) =
-            Self::insert_resolved_page_evidence(&conn, id, source_memory_ids, now_ts, link_reason)
-                .await
+        if let Err(e) = Self::insert_resolved_page_evidence(
+            &conn,
+            id,
+            source_memory_ids,
+            now_ts,
+            link_reason,
+            receipt.map(|r| r.operation_id),
+        )
+        .await
         {
             let _ = conn.execute("ROLLBACK", ()).await;
             return Err(WenlanError::VectorDb(format!(
@@ -48017,18 +48039,26 @@ impl MemoryDB {
 
     /// Archive a page (set status to 'archived').
     pub async fn archive_page(&self, id: &str) -> Result<(), WenlanError> {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = chrono::Utc::now();
+        let now_rfc3339 = now.to_rfc3339();
+        let now_ts = now.timestamp();
         let conn = self.conn.lock().await;
         Self::reject_entity_shadow_page_on_conn(&conn, id).await?;
         Self::reject_page_draft_on_conn(&conn, id).await?;
-        conn.execute(
-            "UPDATE pages
+        let affected = conn
+            .execute(
+                "UPDATE pages
              SET status = 'archived', version = version + 1, last_modified = ?1
              WHERE id = ?2 AND status = 'active'",
-            libsql::params![now, id],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("archive_page: {e}")))?;
+                libsql::params![now_rfc3339, id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("archive_page: {e}")))?;
+        if affected == 1 {
+            Self::append_page_history(&conn, id, "archive", now_ts)
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("archive_page history: {e}")))?;
+        }
         Ok(())
     }
 
@@ -48138,6 +48168,11 @@ impl MemoryDB {
                     "page_merge survivor {survivor_id} could not be updated"
                 )));
             }
+            Self::append_page_history(&conn, survivor_id, "page_merge", now_ts)
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("accept_page_merge survivor history: {e}"))
+                })?;
 
             // G6 Stage 2 PR 2b: the `page_sources` INSERT loop and the
             // `page_evidence` INSERT..SELECT copy that used to run here stop
@@ -48252,6 +48287,7 @@ impl MemoryDB {
                 &source_refs,
                 now_ts,
                 "page_merge",
+                None,
             )
             .await
             .map_err(|e| {
@@ -48273,6 +48309,11 @@ impl MemoryDB {
                     "page_merge absorbed page {absorbed_id} could not be archived"
                 )));
             }
+            Self::append_page_history(&conn, absorbed_id, "archive", now_ts)
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("accept_page_merge archive history: {e}"))
+                })?;
 
             let absorbed_title_key = absorbed.title.to_lowercase();
             // Dual-write (G6 Stage 0): the repoint below moves inbound and
@@ -49677,6 +49718,7 @@ impl MemoryDB {
                 &[memory_source_id],
                 now,
                 link_reason,
+                None,
             )
             .await
             {
@@ -49902,6 +49944,7 @@ impl MemoryDB {
                 memory_source_ids,
                 now,
                 link_reason,
+                None,
             )
             .await
             {
@@ -51850,6 +51893,10 @@ impl MemoryDB {
 
     // ===== Document Enrichment Queue Methods =====
 
+    /// Maximum document-enrichment attempts before a paused poison row is
+    /// terminally excluded from future claims.
+    pub(crate) const DOC_ENRICHMENT_MAX_ATTEMPTS: i64 = 5;
+
     /// Enqueue a document for enrichment. Idempotent upsert: re-enqueuing a
     /// live row or a `done` row with the SAME content hash is a no-op — it never
     /// resets an in-progress checkpoint. Any row with a DIFFERENT hash is reset
@@ -51917,10 +51964,11 @@ impl MemoryDB {
                         OR (?2 AND status = 'waiting_for_provider')
                         OR (status = 'paused'
                             AND (next_retry_at IS NULL OR next_retry_at <= ?1)
-                            AND (?2 OR last_completed_chunk = -1))
+                            AND (?2 OR last_completed_chunk = -1)
+                            AND attempt_count < ?3)
                      ORDER BY enqueued_at ASC, rowid ASC
                      LIMIT 1",
-                    libsql::params![now, provider_available],
+                    libsql::params![now, provider_available, Self::DOC_ENRICHMENT_MAX_ATTEMPTS],
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("claim_next_pending select: {}", e)))?;
@@ -52396,7 +52444,13 @@ impl MemoryDB {
     /// Summarize the document-enrichment queue for `/api/status`. `pending` is
     /// the count of not-`done` rows; the paused fields describe the
     /// soonest-to-retry paused row (a NULL `next_retry_at` — immediately
-    /// eligible — sorts first), or are `None` when nothing is paused.
+    /// eligible — sorts first), excluding exhausted rows. `exhausted` counts
+    /// paused rows at or above the retry cap. `paused_reason` also surfaces
+    /// exhaustion: a caller mapping `paused_reason.is_some()` to a stalled
+    /// queue (e.g. the wire `QueueStatus::Paused`) must see an all-exhausted
+    /// queue as stalled too, not silently `Active` forever. `next_retry_at`
+    /// stays `None` when every paused row is exhausted, since there is no
+    /// next retry to report.
     pub async fn document_enrichment_queue_status(
         &self,
     ) -> Result<DocEnrichmentQueueStatus, WenlanError> {
@@ -52417,17 +52471,34 @@ impl MemoryDB {
             .max(0) as u64;
         drop(pending_rows);
 
+        let mut exhausted_rows = conn
+            .query(
+                "SELECT COUNT(*) FROM document_enrichment_queue
+                 WHERE status = 'paused' AND attempt_count >= ?1",
+                libsql::params![Self::DOC_ENRICHMENT_MAX_ATTEMPTS],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("queue_status exhausted: {e}")))?;
+        let exhausted = exhausted_rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("queue_status exhausted row: {e}")))?
+            .and_then(|r| r.get::<i64>(0).ok())
+            .unwrap_or(0)
+            .max(0) as u64;
+        drop(exhausted_rows);
+
         let mut paused_rows = conn
             .query(
                 "SELECT error_detail, next_retry_at FROM document_enrichment_queue
-                 WHERE status = 'paused'
+                 WHERE status = 'paused' AND attempt_count < ?1
                  ORDER BY next_retry_at ASC, rowid ASC
                  LIMIT 1",
-                (),
+                libsql::params![Self::DOC_ENRICHMENT_MAX_ATTEMPTS],
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("queue_status paused: {e}")))?;
-        let (paused_reason, next_retry_at) = match paused_rows
+        let (retryable_paused_reason, next_retry_at) = match paused_rows
             .next()
             .await
             .map_err(|e| WenlanError::VectorDb(format!("queue_status paused row: {e}")))?
@@ -52439,10 +52510,25 @@ impl MemoryDB {
             None => (None, None),
         };
 
+        // Fold exhaustion into `paused_reason` so a caller that treats
+        // `paused_reason.is_some()` as "queue is stalled" (the wire mapping
+        // in wenlan-server) still sees a stall when the queue holds only
+        // permanently-exhausted documents, instead of reporting them as
+        // ordinary `pending` work forever.
+        let paused_reason = match (retryable_paused_reason, exhausted) {
+            (reason, 0) => reason,
+            (Some(reason), n) => Some(format!("{reason}; {n} documents exhausted retries")),
+            (None, n) => Some(format!(
+                "{n} documents exhausted enrichment retries (max {} attempts) and will not be retried",
+                Self::DOC_ENRICHMENT_MAX_ATTEMPTS
+            )),
+        };
+
         Ok(DocEnrichmentQueueStatus {
             pending,
             paused_reason,
             next_retry_at,
+            exhausted,
         })
     }
 

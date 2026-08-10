@@ -38,6 +38,7 @@ export async function installTauriMock(
     options.failures,
     options.rawActions,
     options.pageScenario,
+    options.delays,
   );
   await page.exposeBinding("__wenlanTauriInvoke", (_source, command: string, args?: unknown) => runtime.invoke(command, args));
   await page.addInitScript(({ locale, localeStorageKey, storageEntries }) => {

@@ -3851,6 +3851,66 @@ pub async fn list_orphan_links(
 }
 
 #[tauri::command]
+pub async fn get_page_map(
+    state: tauri::State<'_, State>,
+    page_id: String,
+) -> Result<serde_json::Value, String> {
+    let client = { state.read().await.client.clone() };
+    client.get_page_map(&page_id).await
+}
+
+#[tauri::command]
+pub async fn improve_page_map(
+    state: tauri::State<'_, State>,
+    page_id: String,
+) -> Result<serde_json::Value, String> {
+    let client = { state.read().await.client.clone() };
+    client.improve_page_map(&page_id).await
+}
+
+#[tauri::command]
+pub async fn create_page_map_node(
+    state: tauri::State<'_, State>,
+    page_id: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let client = { state.read().await.client.clone() };
+    client.create_page_map_node(&page_id, body).await
+}
+
+#[tauri::command]
+pub async fn patch_page_map_node(
+    state: tauri::State<'_, State>,
+    page_id: String,
+    node_id: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let client = { state.read().await.client.clone() };
+    client.patch_page_map_node(&page_id, &node_id, body).await
+}
+
+#[tauri::command]
+pub async fn delete_page_map_node(
+    state: tauri::State<'_, State>,
+    page_id: String,
+    node_id: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let client = { state.read().await.client.clone() };
+    client.delete_page_map_node(&page_id, &node_id, body).await
+}
+
+#[tauri::command]
+pub async fn put_page_map_layout(
+    state: tauri::State<'_, State>,
+    page_id: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let client = { state.read().await.client.clone() };
+    client.put_page_map_layout(&page_id, body).await
+}
+
+#[tauri::command]
 pub async fn export_pages_to_obsidian(
     state: tauri::State<'_, State>,
     vault_path: String,

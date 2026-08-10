@@ -2471,3 +2471,145 @@ export async function cancelGuardedQuitRequest(
 export async function quitOriginFull(): Promise<void> {
   return invoke("quit_origin_full");
 }
+
+// ── Page map ─────────────────────────────────────────────────────────
+// Wire shapes hand-mirrored from `crates/wenlan-types/src/page_map.rs`, which
+// is the daemon's own contract and now lives in this workspace. The Rust bridge
+// speaks `serde_json::Value` so it can hand the frontend whatever the daemon
+// sent (see the note in app/src/api.rs), which makes these interfaces the only
+// typing the UI gets — keep them in step with that file field for field.
+
+export type PageMapRefKind = "memory" | "entity" | "page" | "section";
+export type PageMapStatus = "suggested" | "active" | "dismissed";
+
+export interface PageMapNode {
+  id: string;
+  parent_id: string | null; // null only for the root
+  rank: number;
+  ref_kind: PageMapRefKind;
+  ref_id: string;
+  label: string | null; // null = render from the backing object
+  status: PageMapStatus;
+  pinned: boolean;
+  placed: boolean;
+  collapsed: boolean;
+  x: number | null;
+  y: number | null;
+  width: number | null;
+  height: number | null;
+  ref_state: "live" | "dangling";
+}
+
+export interface PageMapEdge {
+  id: string;
+  from_node: string;
+  to_node: string;
+  kind: "link" | "suggested";
+  label: string | null;
+  status: PageMapStatus;
+}
+
+export interface PageMapViewport {
+  x: number;
+  y: number;
+  zoom: number;
+}
+
+export interface PageMap {
+  page_id: string;
+  revision: number;
+  map_schema: number;
+  viewport?: PageMapViewport | null; // omitted by the daemon when unset
+  nodes: PageMapNode[];
+  edges: PageMapEdge[];
+}
+
+export interface PageMapNodeMutation {
+  revision: number;
+  node: PageMapNode;
+}
+
+export interface PageMapLayoutPosition {
+  node_id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  collapsed: boolean;
+}
+
+export interface PageMapApiError {
+  status: number;
+  message: string;
+}
+
+/** Decodes the `{"status":N,"error":"..."}` payload page-map commands reject
+ *  with. Returns null for transport/parse failures, which callers treat as a
+ *  generic error. */
+export function asPageMapApiError(e: unknown): PageMapApiError | null {
+  if (typeof e !== "string") return null;
+  try {
+    const parsed = JSON.parse(e);
+    if (parsed && typeof parsed.status === "number") {
+      return { status: parsed.status, message: String(parsed.error ?? "") };
+    }
+  } catch {
+    // not JSON — transport/parse failure, treat as a generic error
+  }
+  return null;
+}
+
+export async function getPageMap(pageId: string): Promise<PageMap> {
+  return invoke("get_page_map", { pageId });
+}
+
+export async function improvePageMap(pageId: string): Promise<PageMap> {
+  return invoke("improve_page_map", { pageId });
+}
+
+export async function createPageMapNode(
+  pageId: string,
+  body: {
+    base_revision: number;
+    parent_id?: string | null;
+    ref_kind: PageMapRefKind;
+    ref_id: string;
+    label?: string | null;
+  },
+): Promise<PageMapNodeMutation> {
+  return invoke("create_page_map_node", { pageId, body });
+}
+
+export async function patchPageMapNode(
+  pageId: string,
+  nodeId: string,
+  body: {
+    base_revision: number;
+    label?: string | null;
+    pinned?: boolean;
+    status?: PageMapStatus;
+    rank?: number;
+    parent_id?: string;
+  },
+): Promise<PageMapNodeMutation> {
+  return invoke("patch_page_map_node", { pageId, nodeId, body });
+}
+
+export async function deletePageMapNode(
+  pageId: string,
+  nodeId: string,
+  body: { base_revision: number },
+): Promise<PageMapNodeMutation> {
+  return invoke("delete_page_map_node", { pageId, nodeId, body });
+}
+
+export async function putPageMapLayout(
+  pageId: string,
+  body: {
+    base_revision: number;
+    viewport?: PageMapViewport | null;
+    positions: PageMapLayoutPosition[];
+  },
+): Promise<PageMap> {
+  return invoke("put_page_map_layout", { pageId, body });
+}
