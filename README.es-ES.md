@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=ba2dcb4a11b3102e18662b6b14d909829243b03edb0f3bfa457f9a186859a0a6 -->
+<!-- README_SYNC: source=README.md sha256=c076f706a1afb2debab4e24d319143c5d3e40fcee953cc7c44c6f21f08d0d861 -->
 
 <p align="center">
   <picture>
@@ -340,11 +340,11 @@ cargo test
 # aplicación de escritorio (target de Cargo y herramientas frontend en la raíz)
 cargo build -p wenlan-app
 pnpm install
-pnpm tauri dev
+pnpm dev:all
 pnpm build:all
 ```
 
-Usa `pnpm dev:all` en este repositorio cuando quieras iniciar desde cero el daemon y, después, la aplicación. Consulta el [AGENTS.md](AGENTS.md) y [CONTRIBUTING.md](CONTRIBUTING.md) de este repositorio, además del [app/AGENTS.md](app/AGENTS.md) dentro del repositorio, para el flujo de trabajo de desarrollo completo. Reportes de seguridad: [SECURITY.md](SECURITY.md). Por favor, lee también el [Código de Conducta](CODE_OF_CONDUCT.md).
+`pnpm dev:all` es el punto de entrada de desarrollo admitido para la aplicación de escritorio. Mantiene los puertos de desarrollo, los datos, la propiedad de los procesos, la identidad de la aplicación, los sockets MCP y el estado de Remote Access separados del runtime de producción instalado; una compilación de depuración iniciada sin ese aislamiento se niega a ejecutarse. Consulta el [AGENTS.md](AGENTS.md) y [CONTRIBUTING.md](CONTRIBUTING.md) de este repositorio, además del [app/AGENTS.md](app/AGENTS.md) dentro del repositorio, para el flujo de trabajo de desarrollo completo. Reportes de seguridad: [SECURITY.md](SECURITY.md). Por favor, lee también el [Código de Conducta](CODE_OF_CONDUCT.md).
 
 ---
 

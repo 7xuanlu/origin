@@ -62,6 +62,10 @@ impl Default for HealthSignal {
     }
 }
 
+fn health_url_for(client: &crate::api::WenlanClient) -> String {
+    format!("{}/api/health", client.base_url())
+}
+
 /// Pure decision function — given the current state, the latest poll result,
 /// and how long we've been running, return the next state.
 ///
@@ -96,6 +100,7 @@ pub fn spawn_poller_at(start_instant: Instant, app_handle: AppHandle) -> HealthS
     let signal = HealthSignal::new();
     let signal_clone = signal.clone();
     let handle = app_handle.clone();
+    let health_url = health_url_for(&crate::api::WenlanClient::new());
 
     tauri::async_runtime::spawn(async move {
         let client = reqwest::Client::builder()
@@ -108,7 +113,7 @@ pub fn spawn_poller_at(start_instant: Instant, app_handle: AppHandle) -> HealthS
         let mut ever_up = false;
 
         loop {
-            let result = client.get("http://127.0.0.1:7878/api/health").send().await;
+            let result = client.get(&health_url).send().await;
             let poll_ok = matches!(&result, Ok(r) if r.status().is_success());
 
             let new_state = next_state(prev_state, poll_ok, start_instant.elapsed(), ever_up);
@@ -157,6 +162,13 @@ mod tests {
         let s = HealthSignal::new();
         assert_eq!(s.current(), DaemonState::Starting);
         assert_eq!(s.consecutive_down_count(), 0);
+    }
+
+    #[test]
+    fn health_poll_uses_the_selected_daemon_base_url() {
+        let client = crate::api::WenlanClient::with_base_url("http://127.0.0.1:17734".to_string());
+
+        assert_eq!(health_url_for(&client), "http://127.0.0.1:17734/api/health");
     }
 
     #[test]
