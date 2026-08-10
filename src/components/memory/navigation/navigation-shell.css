@@ -341,6 +341,25 @@
   color: var(--mem-accent-warm);
 }
 
+/* M5 truth axes (PageTruthBadges) — independent of the review-status states
+   above: supported/provisional is the support axis, reviewed/unreviewed is
+   the human-review axis. */
+.wiki-page-state--truth-supported {
+  color: var(--mem-accent-sage);
+}
+
+.wiki-page-state--truth-provisional {
+  color: var(--mem-accent-amber);
+}
+
+.wiki-page-state--truth-reviewed {
+  color: var(--mem-accent-sage);
+}
+
+.wiki-page-state--truth-unreviewed {
+  color: var(--mem-text-meta-aa);
+}
+
 .wiki-page-link-title {
   overflow: hidden;
   text-overflow: ellipsis;

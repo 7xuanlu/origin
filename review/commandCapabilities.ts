@@ -33,10 +33,13 @@ export const REVIEW_COMMAND_CAPABILITIES = {
     "acknowledge_onboarding_milestone",
     "get_briefing",
     "get_pending_contradictions",
+    "get_truth_status",
   ],
   wikiAndPages: [
     "list_pages",
     "get_page",
+    "list_pages_explicit_browse",
+    "get_page_explicit_browse",
     "create_page",
     "update_page",
     "delete_page",

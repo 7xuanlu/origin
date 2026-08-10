@@ -1337,6 +1337,10 @@ pub fn run() {
             search::delete_page,
             search::list_pages,
             search::search_pages,
+            // M5 truth axes: explicit-browse variants (human-initiated wiki browse only)
+            search::list_pages_explicit_browse,
+            search::get_page_explicit_browse,
+            search::get_truth_status,
             // Page map commands
             search::get_page_map,
             search::improve_page_map,

@@ -311,6 +311,38 @@ pub struct CommunityMembersResponse {
     pub next_cursor: Option<CommunityMemberCursor>,
 }
 
+// ── M5 truth axes (App PR) ──────────────────────────────────────────────
+// `wenlan-types` is a workspace path dependency here, so these are aliases of
+// the daemon-owned shapes rather than a hand-mirrored copy (unlike the
+// page-map/community types above, which predate the daemon's release).
+//
+// The daemon populates `Page.truth` in two cases, both gated on the durable
+// cutover generation being >= 1: an `EntryOnly`-reduced listing entry
+// (`crates/wenlan-core/src/truth_adapter.rs::reduce_to_entry`), and a `Full`
+// page whose call named it under a human-intent grant
+// (`truth_adapter.rs::filter_pages`'s `with_truth` branch, reached via
+// `get_page_explicit_browse`'s `x-wenlan-reader-intent` header). A plain
+// `get_page` call carries no marker, so it resolves to `TruthGrant::Automatic`
+// and never reaches either branch. `None` everywhere until the daemon's
+// cutover ceremony runs.
+
+/// Both M5 truth axes for one page.
+pub type PageTruth = wenlan_types::pages::PageTruth;
+
+/// Header declaring this client renders both M5 truth axes.
+/// Mirrors `wenlan_core::truth_contract::CONTRACT_HEADER`.
+const TRUTH_CONTRACT_HEADER: &str = "x-wenlan-truth-contract";
+/// Mirrors `wenlan_core::truth_contract::TRUTH_CONTRACT_VERSION`.
+const TRUTH_CONTRACT_VERSION: &str = "1";
+/// Header marking a call as a human-initiated explicit browse rather than an
+/// automatic/background read. Mirrors `wenlan_core::truth_contract::INTENT_HEADER`.
+const TRUTH_INTENT_HEADER: &str = "x-wenlan-reader-intent";
+/// Mirrors `wenlan_core::truth_contract::INTENT_MARKER_VALUE`.
+const TRUTH_INTENT_EXPLICIT: &str = "explicit";
+
+/// Where the daemon stands on the M5 truth cutover.
+pub type TruthStatus = wenlan_types::responses::TruthStatus;
+
 impl Default for WenlanClient {
     fn default() -> Self {
         Self::new()
@@ -404,6 +436,35 @@ impl WenlanClient {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             return Err(format!("HTTP POST {} returned {}: {}", path, status, text));
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("Parse {}: {}", path, e))
+    }
+
+    // ── M5 explicit-browse variants ─────────────────────────────────
+    // Identical to the plain helpers above except they attach the two-header
+    // marker that tells the daemon's truth guard this is a human-initiated
+    // wiki browse (`crates/wenlan-server/src/truth_guard.rs`). Only call
+    // these for a route the manifest marks Collection or NamedPage
+    // (`GET /api/pages`, `POST /api/pages/search`, `GET /api/pages/{id}`);
+    // an automatic/background read must use the plain helpers instead, or
+    // the marker will be recorded against a call that never gestured at it.
+
+    pub async fn get_json_explicit_browse<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T, String> {
+        let resp = self
+            .client
+            .get(self.url(path))
+            .header(TRUTH_CONTRACT_HEADER, TRUTH_CONTRACT_VERSION)
+            .header(TRUTH_INTENT_HEADER, TRUTH_INTENT_EXPLICIT)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP GET {}: {}", path, e))?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP GET {} returned {}", path, resp.status()));
         }
         resp.json()
             .await
@@ -555,6 +616,16 @@ impl WenlanClient {
 
     pub async fn status(&self) -> Result<wenlan_types::responses::StatusResponse, String> {
         self.get_json("/api/status").await
+    }
+
+    /// Where the daemon stands on the M5 truth cutover, or `None` when the
+    /// daemon predates the field or the cutover has not begun
+    /// (`crates/wenlan-server/src/routes.rs::handle_status` only sets it once
+    /// `truth_cutover_generation() > 0`). This is itself an automatic read —
+    /// the cutover state is not page prose, so it carries no explicit-browse
+    /// marker.
+    pub async fn truth_status(&self) -> Result<Option<TruthStatus>, String> {
+        Ok(self.status().await?.truth)
     }
 
     // ── Capture stats ────────────────────────────────────────────────
@@ -1532,6 +1603,69 @@ mod tests {
             value.map(|memory| memory.source_id),
             Some("memory-present".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn get_json_explicit_browse_attaches_the_truth_contract_headers() {
+        let (base_url, request) = serve_json_once(r#"{"pages":[]}"#).await;
+        let client = WenlanClient {
+            client: reqwest::Client::new(),
+            base_url,
+        };
+
+        let _: serde_json::Value = client
+            .get_json_explicit_browse("/api/pages/page-1")
+            .await
+            .unwrap();
+
+        let request = request.await.unwrap();
+        let headers = request.to_ascii_lowercase();
+        assert!(
+            headers.contains("x-wenlan-truth-contract: 1"),
+            "missing contract header: {request}"
+        );
+        assert!(
+            headers.contains("x-wenlan-reader-intent: explicit"),
+            "missing intent header: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truth_status_reads_the_status_response_field() {
+        let (base_url, _request) = serve_json_once(
+            r#"{"is_running":true,"files_indexed":0,"files_total":0,"sources_connected":[],"truth":{"cutover_generation":3,"contract_version":1}}"#,
+        )
+        .await;
+        let client = WenlanClient {
+            client: reqwest::Client::new(),
+            base_url,
+        };
+
+        let truth = client.truth_status().await.unwrap();
+
+        assert_eq!(
+            truth,
+            Some(TruthStatus {
+                cutover_generation: 3,
+                contract_version: 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn truth_status_is_none_before_the_cutover_ships_the_field() {
+        let (base_url, _request) = serve_json_once(
+            r#"{"is_running":true,"files_indexed":0,"files_total":0,"sources_connected":[]}"#,
+        )
+        .await;
+        let client = WenlanClient {
+            client: reqwest::Client::new(),
+            base_url,
+        };
+
+        let truth = client.truth_status().await.unwrap();
+
+        assert_eq!(truth, None);
     }
 
     /// Accepts one connection, reads the request, then never responds.

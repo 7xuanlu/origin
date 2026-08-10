@@ -296,6 +296,14 @@ const en = {
       paginationRange: "{{start}}–{{end}} of {{total}}",
       previous: "Previous",
       next: "Next",
+      truth: {
+        supportAxis: "Support",
+        humanReviewAxis: "Human review",
+        supported: "Supported",
+        provisional: "Provisional",
+        reviewed: "Reviewed",
+        unreviewed: "Unreviewed",
+      },
     },
   },
   spaces: {
@@ -1843,6 +1851,14 @@ const zhHans = {
       paginationRange: "{{start}}–{{end}}，共 {{total}} 个",
       previous: "上一页",
       next: "下一页",
+      truth: {
+        supportAxis: "支持状态",
+        humanReviewAxis: "人工审核",
+        supported: "已支持",
+        provisional: "暂定",
+        reviewed: "已审核",
+        unreviewed: "未审核",
+      },
     },
   },
   spaces: {
@@ -3363,6 +3379,14 @@ const zhHant = {
       paginationRange: "{{start}}–{{end}}，共 {{total}} 個",
       previous: "上一頁",
       next: "下一頁",
+      truth: {
+        supportAxis: "支持狀態",
+        humanReviewAxis: "人工審核",
+        supported: "已支持",
+        provisional: "暫定",
+        reviewed: "已審核",
+        unreviewed: "未審核",
+      },
     },
   },
   spaces: {

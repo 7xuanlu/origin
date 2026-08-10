@@ -17,6 +17,7 @@ const tauriMocks = vi.hoisted(() => ({
   deletePage: vi.fn(),
   clipboardWrite: vi.fn(),
   exportPageToObsidian: vi.fn(),
+  getTruthStatus: vi.fn(),
 }));
 
 vi.mock("../../lib/tauri", () => ({
@@ -108,6 +109,7 @@ beforeEach(() => {
     entries: [],
   });
   tauriMocks.redistillPage.mockResolvedValue({ status: "ok", updated: true });
+  tauriMocks.getTruthStatus.mockResolvedValue(null);
 });
 
 describe("PageDetail citations", () => {
