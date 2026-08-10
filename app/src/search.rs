@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Tauri command surface — thin HTTP client that proxies data operations
-//! to the Wenlan daemon at http://127.0.0.1:7878.
+//! to the selected daemon (`client.base_url()`; an isolated dev app selects a
+//! different port than the installed production runtime).
 //!
 //! UI-only commands (window positioning, permissions, shortcuts) remain local.
 //! Daemon-owned config commands proxy through `state.client`; app-only sensor

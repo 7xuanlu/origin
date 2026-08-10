@@ -47,8 +47,7 @@ app/
   state directory. `scripts/dev-runtime.sh` derives them all from the worktree
   path and `pnpm dev:all` exports them, so start a dev app that way.
   `WENLAN_DEV_PORT` and `WENLAN_DEV_DATA_DIR` override the derived daemon port
-  and data dir; `WENLAN_DEV_PRESERVE_DAEMON_ON_QUIT=1` marks a daemon this
-  session reused rather than started. Release builds read none of these.
+  and data dir. Release builds read none of these.
 - Keep daemon access behind `WenlanClient` in `src/api.rs`; do not scatter raw
   URLs or response-shape parsing through command handlers. Anything that talks
   to "the daemon" must go through `client.base_url()`, never a literal

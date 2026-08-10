@@ -26,6 +26,8 @@ mod search;
 pub mod sources;
 pub mod state;
 pub mod system_info;
+#[cfg(test)]
+mod test_env;
 // Public surface consumed by tray_menu (Task 15); suppress dead_code until then.
 #[allow(dead_code)]
 pub(crate) mod tray_health;
@@ -1169,6 +1171,21 @@ pub fn run() {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+    use crate::test_env::EnvGuard;
+
+    /// Every variable `validate_debug_runtime_isolation` reads, plus the home
+    /// directory the protected production roots hang off.
+    #[cfg(debug_assertions)]
+    const RUNTIME_ENV_KEYS: &[&str] = &[
+        "HOME",
+        "WENLAN_PORT",
+        "WENLAN_DEV_UI_PORT",
+        "WENLAN_DEV_REMOTE_PORT_START",
+        "WENLAN_DEV_APP_ID",
+        "WENLAN_DEV_TAURI_MCP_SOCKET",
+        "WENLAN_DATA_DIR",
+        "WENLAN_DEV_STATE_DIR",
+    ];
 
     #[test]
     fn visible_main_window_uses_regular_activation_policy() {
@@ -1196,30 +1213,22 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn app_log_identity_uses_wenlan() {
-        let previous = std::env::var_os("WENLAN_DEV_STATE_DIR");
+        let _env = EnvGuard::capture(&["WENLAN_DEV_STATE_DIR"]);
         std::env::remove_var("WENLAN_DEV_STATE_DIR");
+
         assert!(app_log_dir().ends_with("Library/Logs/com.wenlan.desktop"));
         assert_eq!(app_log_file_name(), "wenlan.log");
-        match previous {
-            Some(value) => std::env::set_var("WENLAN_DEV_STATE_DIR", value),
-            None => std::env::remove_var("WENLAN_DEV_STATE_DIR"),
-        }
     }
 
     #[test]
     #[cfg(debug_assertions)]
     #[serial_test::serial]
     fn dev_app_log_is_scoped_to_the_worktree_state() {
-        let previous = std::env::var_os("WENLAN_DEV_STATE_DIR");
+        let _env = EnvGuard::capture(&["WENLAN_DEV_STATE_DIR"]);
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("WENLAN_DEV_STATE_DIR", tmp.path());
 
         assert_eq!(app_log_dir(), tmp.path().join("logs"));
-
-        match previous {
-            Some(value) => std::env::set_var("WENLAN_DEV_STATE_DIR", value),
-            None => std::env::remove_var("WENLAN_DEV_STATE_DIR"),
-        }
     }
 
     #[test]
@@ -1241,51 +1250,22 @@ mod tests {
     #[cfg(debug_assertions)]
     #[serial_test::serial]
     fn debug_app_fails_closed_without_an_isolated_runtime_identity() {
-        let keys = [
-            "WENLAN_PORT",
-            "WENLAN_DEV_UI_PORT",
-            "WENLAN_DEV_REMOTE_PORT_START",
-            "WENLAN_DEV_APP_ID",
-            "WENLAN_DEV_TAURI_MCP_SOCKET",
-            "WENLAN_DATA_DIR",
-            "WENLAN_DEV_STATE_DIR",
-        ];
-        let previous: Vec<_> = keys
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect();
-        for key in keys {
+        let _env = EnvGuard::capture(RUNTIME_ENV_KEYS);
+        for key in RUNTIME_ENV_KEYS.iter().filter(|key| **key != "HOME") {
             std::env::remove_var(key);
         }
 
-        let result = validate_debug_runtime_isolation();
-
-        for (key, value) in previous {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-        assert!(result.is_err());
+        assert_eq!(
+            validate_debug_runtime_isolation(),
+            Err("WENLAN_PORT is required".to_string())
+        );
     }
 
     #[test]
     #[cfg(debug_assertions)]
     #[serial_test::serial]
     fn debug_app_accepts_a_complete_worktree_scoped_runtime_identity() {
-        let keys = [
-            "WENLAN_PORT",
-            "WENLAN_DEV_UI_PORT",
-            "WENLAN_DEV_REMOTE_PORT_START",
-            "WENLAN_DEV_APP_ID",
-            "WENLAN_DEV_TAURI_MCP_SOCKET",
-            "WENLAN_DATA_DIR",
-            "WENLAN_DEV_STATE_DIR",
-        ];
-        let previous: Vec<_> = keys
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect();
+        let _env = EnvGuard::capture(RUNTIME_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("state");
         let data = state.join("data");
@@ -1298,76 +1278,130 @@ mod tests {
         std::env::set_var("WENLAN_DATA_DIR", &data);
         std::env::set_var("WENLAN_DEV_STATE_DIR", &state);
 
-        let result = validate_debug_runtime_isolation();
-
-        for (key, value) in previous {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-        assert_eq!(result, Ok(()));
+        assert_eq!(validate_debug_runtime_isolation(), Ok(()));
     }
 
     #[test]
     #[cfg(debug_assertions)]
     #[serial_test::serial]
     fn debug_app_rejects_complete_but_production_touching_runtime_identities() {
-        let keys = [
-            "HOME",
-            "WENLAN_PORT",
-            "WENLAN_DEV_UI_PORT",
-            "WENLAN_DEV_REMOTE_PORT_START",
-            "WENLAN_DEV_APP_ID",
-            "WENLAN_DEV_TAURI_MCP_SOCKET",
-            "WENLAN_DATA_DIR",
-            "WENLAN_DEV_STATE_DIR",
-        ];
-        let previous: Vec<_> = keys
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect();
+        // Each case starts from an identity the guard accepts and changes one
+        // field, so only the rule the case names can reject it, and each
+        // assertion pins that rule's own message. Bare `is_err()` on a
+        // multi-field mutation proves nothing here: the data-dir containment
+        // rule runs ahead of most others and fires first or not depending on
+        // where this machine puts TMPDIR.
+        let _env = EnvGuard::capture(RUNTIME_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         let fake_home = tmp.path().join("home");
-        let production_roots = [
-            fake_home.join("Library/Application Support/wenlan"),
-            fake_home.join("Library/Application Support/origin"),
-            fake_home.join("Library/Logs/com.origin.desktop"),
-            fake_home.join(".config/origin-mcp"),
-            fake_home.join(".origin"),
-        ];
-        for root in &production_roots {
-            std::fs::create_dir_all(root).unwrap();
-        }
+        let state = fake_home.join("state");
+        let data = state.join("data");
+        std::fs::create_dir_all(&data).unwrap();
         std::env::set_var("HOME", &fake_home);
-        std::env::set_var("WENLAN_PORT", "17777");
-        std::env::set_var("WENLAN_DEV_UI_PORT", "18777");
-        std::env::set_var("WENLAN_DEV_REMOTE_PORT_START", "65533");
-        std::env::set_var("WENLAN_DEV_APP_ID", "com.wenlan.desktop.dev.123");
-        std::env::set_var("WENLAN_DEV_STATE_DIR", "/tmp");
-        std::env::set_var("WENLAN_DATA_DIR", tmp.path());
-        std::env::set_var("WENLAN_DEV_TAURI_MCP_SOCKET", "/tmp/dev-tauri-mcp.sock");
-        assert!(validate_debug_runtime_isolation().is_err());
 
-        std::env::set_var("WENLAN_DEV_REMOTE_PORT_START", "22000");
-        std::env::set_var("WENLAN_DEV_TAURI_MCP_SOCKET", "/tmp/tauri-mcp.sock");
-        assert!(validate_debug_runtime_isolation().is_err());
+        let set_valid_identity = || {
+            std::env::set_var("WENLAN_PORT", "17777");
+            std::env::set_var("WENLAN_DEV_UI_PORT", "18777");
+            std::env::set_var("WENLAN_DEV_REMOTE_PORT_START", "22000");
+            std::env::set_var("WENLAN_DEV_APP_ID", "com.wenlan.desktop.dev.123");
+            std::env::set_var("WENLAN_DEV_STATE_DIR", &state);
+            std::env::set_var("WENLAN_DATA_DIR", &data);
+            std::env::set_var("WENLAN_DEV_TAURI_MCP_SOCKET", state.join("tauri-mcp.sock"));
+        };
 
-        std::env::set_var("WENLAN_DEV_STATE_DIR", &fake_home);
-        std::env::set_var(
-            "WENLAN_DEV_TAURI_MCP_SOCKET",
-            fake_home.join("dev-tauri-mcp.sock"),
+        set_valid_identity();
+        assert_eq!(
+            validate_debug_runtime_isolation(),
+            Ok(()),
+            "the baseline identity must pass, or every case below proves nothing"
         );
-        for production_root in production_roots {
-            std::env::set_var("WENLAN_DATA_DIR", production_root);
-            assert!(validate_debug_runtime_isolation().is_err());
+
+        for (key, value, expected) in [
+            (
+                "WENLAN_PORT",
+                "7878",
+                "WENLAN_PORT must not use the production port 7878",
+            ),
+            (
+                "WENLAN_DEV_UI_PORT",
+                "1420",
+                "WENLAN_DEV_UI_PORT must not use the production port 1420",
+            ),
+            (
+                "WENLAN_DEV_REMOTE_PORT_START",
+                "65533",
+                "WENLAN_DEV_REMOTE_PORT_START must leave room for a four-port range",
+            ),
+            (
+                "WENLAN_DEV_REMOTE_PORT_START",
+                "18080",
+                "WENLAN_DEV_REMOTE_PORT_START must not overlap production ports 18080-18083",
+            ),
+            (
+                "WENLAN_DEV_APP_ID",
+                "com.wenlan.desktop",
+                "WENLAN_DEV_APP_ID must use the isolated dev namespace",
+            ),
+        ] {
+            set_valid_identity();
+            std::env::set_var(key, value);
+            assert_eq!(
+                validate_debug_runtime_isolation(),
+                Err(expected.to_string()),
+                "{key}={value} must be rejected by its own rule"
+            );
         }
 
-        for (key, value) in previous {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
+        set_valid_identity();
+        std::env::set_var("WENLAN_DATA_DIR", tmp.path());
+        assert_eq!(
+            validate_debug_runtime_isolation(),
+            Err("WENLAN_DATA_DIR must be contained by WENLAN_DEV_STATE_DIR".to_string())
+        );
+
+        set_valid_identity();
+        std::env::set_var("WENLAN_DEV_TAURI_MCP_SOCKET", fake_home.join("dev.sock"));
+        assert_eq!(
+            validate_debug_runtime_isolation(),
+            Err(
+                "WENLAN_DEV_TAURI_MCP_SOCKET must be contained by WENLAN_DEV_STATE_DIR".to_string()
+            )
+        );
+
+        // The production socket lives directly in /tmp and the socket must sit
+        // inside the state dir, so /tmp is the only anchor from which this rule
+        // is reachable without tripping containment first.
+        set_valid_identity();
+        std::env::set_var("WENLAN_DEV_STATE_DIR", "/tmp");
+        std::env::set_var("WENLAN_DATA_DIR", "/tmp");
+        std::env::set_var("WENLAN_DEV_TAURI_MCP_SOCKET", "/tmp/tauri-mcp.sock");
+        assert_eq!(
+            validate_debug_runtime_isolation(),
+            Err("WENLAN_DEV_TAURI_MCP_SOCKET must not use the production socket".to_string())
+        );
+
+        for production_root in [
+            "Library/Application Support/wenlan",
+            "Library/Application Support/origin",
+            "Library/LaunchAgents",
+            "Library/Logs/com.wenlan.desktop",
+            "Library/Logs/com.origin.desktop",
+            ".config/wenlan-mcp",
+            ".config/origin-mcp",
+            ".wenlan",
+            ".origin",
+        ] {
+            let root = fake_home.join(production_root);
+            std::fs::create_dir_all(&root).unwrap();
+            set_valid_identity();
+            std::env::set_var("WENLAN_DEV_STATE_DIR", &fake_home);
+            std::env::set_var("WENLAN_DATA_DIR", &root);
+            std::env::set_var("WENLAN_DEV_TAURI_MCP_SOCKET", fake_home.join("dev.sock"));
+            assert_eq!(
+                validate_debug_runtime_isolation(),
+                Err("WENLAN_DEV_STATE_DIR must not use a production runtime root".to_string()),
+                "a data dir inside {production_root} must be rejected"
+            );
         }
     }
 

@@ -224,7 +224,6 @@ describe("scoped dev runtime", () => {
     const server = resolve(backend, "target/debug/wenlan-server");
     const stateDir = resolve(tempRoot, "state");
     const fakeBin = resolve(tempRoot, "bin");
-    const pnpmEnvLog = resolve(tempRoot, "pnpm-env.log");
 
     mkdirSync(resolve(backend, "crates/wenlan-server"), { recursive: true });
     mkdirSync(resolve(backend, "crates/wenlan-mcp"), { recursive: true });
@@ -234,10 +233,7 @@ describe("scoped dev runtime", () => {
     mkdirSync(fakeBin, { recursive: true });
     writeFileSync(resolve(backend, "Cargo.toml"), "[workspace]\n");
     symlinkSync("/bin/sleep", server);
-    writeFileSync(
-      resolve(fakeBin, "pnpm"),
-      '#!/usr/bin/env bash\nprintf \'%s\\n\' "${WENLAN_DEV_PRESERVE_DAEMON_ON_QUIT:-unset}" >> "$FAKE_PNPM_ENV_LOG"\nexit 0\n',
-    );
+    writeFileSync(resolve(fakeBin, "pnpm"), "#!/usr/bin/env bash\nexit 0\n");
     writeFileSync(
       resolve(fakeBin, "lsof"),
       '#!/usr/bin/env bash\nprintf \'%s\\n\' "$FAKE_DAEMON_PID"\n',
@@ -267,13 +263,11 @@ describe("scoped dev runtime", () => {
           WENLAN_DEV_PORT: "27991",
           WENLAN_DEV_UI_PORT: "28991",
           FAKE_DAEMON_PID: `${daemon.pid}`,
-          FAKE_PNPM_ENV_LOG: pnpmEnvLog,
         },
       });
 
       expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
       expect(() => process.kill(daemon.pid!, 0)).not.toThrow();
-      expect(readFileSync(pnpmEnvLog, "utf8").trim().split("\n")).toContain("1");
     } finally {
       daemon.kill("SIGKILL");
     }

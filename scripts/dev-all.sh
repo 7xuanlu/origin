@@ -4,7 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DAEMON_STARTED_BY_THIS_RUN=0
-export WENLAN_DEV_PRESERVE_DAEMON_ON_QUIT=0
 
 while IFS='=' read -r key value; do
   case "$key" in
@@ -32,6 +31,8 @@ trap cleanup EXIT HUP INT TERM
 cd "$REPO_ROOT"
 remove_tauri_mcp_socket
 pnpm prepare:sidecars --force-build
+# Status 10 means a healthy worktree daemon was already running, so this run
+# reuses it and the cleanup trap must leave it alone.
 if bash "$SCRIPT_DIR/dev-runtime.sh" start-for-session; then
   DAEMON_STARTED_BY_THIS_RUN=1
 else
@@ -39,6 +40,5 @@ else
   if (( status != 10 )); then
     exit "$status"
   fi
-  export WENLAN_DEV_PRESERVE_DAEMON_ON_QUIT=1
 fi
 pnpm tauri dev --config "{\"identifier\":\"$WENLAN_DEV_APP_ID\",\"build\":{\"devUrl\":\"http://localhost:$WENLAN_DEV_UI_PORT\"}}"

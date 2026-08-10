@@ -761,44 +761,16 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
     use std::sync::Mutex;
 
-    struct EnvGuard {
-        home: Option<std::ffi::OsString>,
-        wenlan: Option<std::ffi::OsString>,
-        origin: Option<std::ffi::OsString>,
-        dev_app_id: Option<std::ffi::OsString>,
-    }
+    use crate::test_env::EnvGuard;
 
-    impl EnvGuard {
-        fn capture() -> Self {
-            Self {
-                home: std::env::var_os("HOME"),
-                wenlan: std::env::var_os("WENLAN_DATA_DIR"),
-                origin: std::env::var_os("ORIGIN_DATA_DIR"),
-                dev_app_id: std::env::var_os("WENLAN_DEV_APP_ID"),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match &self.wenlan {
-                Some(value) => std::env::set_var("WENLAN_DATA_DIR", value),
-                None => std::env::remove_var("WENLAN_DATA_DIR"),
-            }
-            match &self.origin {
-                Some(value) => std::env::set_var("ORIGIN_DATA_DIR", value),
-                None => std::env::remove_var("ORIGIN_DATA_DIR"),
-            }
-            match &self.dev_app_id {
-                Some(value) => std::env::set_var("WENLAN_DEV_APP_ID", value),
-                None => std::env::remove_var("WENLAN_DEV_APP_ID"),
-            }
-        }
-    }
+    /// The environment every lifecycle test mutates: the home directory the
+    /// plist paths hang off, both data-dir overrides, and the dev bundle id.
+    const LIFECYCLE_ENV_KEYS: &[&str] = &[
+        "HOME",
+        "WENLAN_DATA_DIR",
+        "ORIGIN_DATA_DIR",
+        "WENLAN_DEV_APP_ID",
+    ];
 
     #[derive(Default)]
     struct MockLaunchctl {
@@ -880,7 +852,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn opt_out_flag_round_trip() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         // Override HOME so the default app data root resolves under the tempdir.
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
@@ -902,7 +874,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn opt_out_flag_does_not_touch_typed_config_json() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         // The opt-out sentinel must NOT live inside the daemon's typed
         // `config.json` — otherwise unrelated `Config::save` calls overwrite
         // the file and silently drop the user's opt-out preference (C1).
@@ -927,7 +899,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn opt_out_honors_origin_data_dir_env() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         std::env::remove_var("WENLAN_DATA_DIR");
         std::env::set_var("ORIGIN_DATA_DIR", tmp.path());
@@ -941,7 +913,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn opt_out_prefers_wenlan_data_dir() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let current = tempfile::tempdir().unwrap();
         let legacy = tempfile::tempdir().unwrap();
 
@@ -957,7 +929,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn data_dir_env_overridden_reports_either_override_key() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         std::env::remove_var("WENLAN_DATA_DIR");
         std::env::remove_var("ORIGIN_DATA_DIR");
         assert!(!data_dir_env_overridden());
@@ -1064,7 +1036,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn legacy_app_plist_ownership_accepts_owned_origin_app_path() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
         let user_app_path = tmp
@@ -1087,7 +1059,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn legacy_server_plist_ownership_accepts_owned_origin_server_path() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
         let user_server_path = tmp
@@ -1167,7 +1139,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn install_app_plist_writes_wenlan_log_paths() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
@@ -1446,7 +1418,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn first_run_install_cleans_legacy_plists_even_when_user_opted_out() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
         std::env::remove_var("WENLAN_DATA_DIR");
@@ -1488,7 +1460,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn non_stable_first_run_preserves_opted_out_legacy_registrations() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", home.path());
         std::env::remove_var("WENLAN_DATA_DIR");
@@ -1529,7 +1501,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[serial_test::serial]
     fn isolated_dev_app_reports_run_at_login_disabled_without_querying_launchctl() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         std::env::set_var("WENLAN_DEV_APP_ID", "com.wenlan.desktop.dev.123");
         let mock = MockLaunchctl::default();
 
@@ -1550,7 +1522,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn first_run_preserves_legacy_plists_when_current_app_path_is_rejected() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
         std::env::remove_var("WENLAN_DATA_DIR");
@@ -1583,7 +1555,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn set_run_at_login_false_cleans_legacy_app_and_server_plists() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
         std::env::remove_var("WENLAN_DATA_DIR");
@@ -1610,7 +1582,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn prepare_server_plist_skips_isolated_override_without_mutation() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         let selected_data = tempfile::tempdir().unwrap();
         let live_data = tempfile::tempdir().unwrap();
@@ -1653,7 +1625,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn first_run_install_skips_isolated_override_without_touching_plists() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
@@ -1700,7 +1672,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn set_run_at_login_rejects_isolated_override_without_launchctl() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
@@ -1739,7 +1711,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn current_server_plist_counts_as_wenlan_service() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
@@ -1776,7 +1748,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn current_server_plist_with_stale_data_dir_does_not_count_as_wenlan_service() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         let selected_data = tempfile::tempdir().unwrap();
         let stale_data = tempfile::tempdir().unwrap();
@@ -1820,7 +1792,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn server_plist_data_dir_env_is_patched_and_reloaded() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
@@ -1876,7 +1848,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn startup_server_plist_preflight_skips_non_stable_app_path() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         let stale_data = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
@@ -1922,7 +1894,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn server_plist_data_dir_env_rolls_back_file_when_reload_fails() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         let selected_data = tempfile::tempdir().unwrap();
         let stale_data = tempfile::tempdir().unwrap();
