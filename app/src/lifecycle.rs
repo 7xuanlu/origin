@@ -158,6 +158,13 @@ fn current_app_path() -> Result<PathBuf> {
     std::fs::canonicalize(&exe).context("canonicalize current_exe")
 }
 
+/// True when the process was launched with an explicit data-dir override
+/// (WENLAN_DATA_DIR / ORIGIN_DATA_DIR) — an isolated dev/smoke run. Such a
+/// run must never mutate the user's LaunchAgents or the shared daemon.
+pub fn data_dir_env_overridden() -> bool {
+    std::env::var_os("WENLAN_DATA_DIR").is_some() || std::env::var_os("ORIGIN_DATA_DIR").is_some()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StableLaunchAgentTarget {
     Current,
@@ -474,6 +481,34 @@ fn ensure_server_plist_data_dir_env(launchctl: &dyn LaunchctlExec) -> Result<()>
 }
 
 pub fn prepare_server_plist_for_startup(launchctl: &dyn LaunchctlExec) -> Result<()> {
+    // Isolated launches and non-stable app paths leave the shared LaunchAgent
+    // untouched. In the isolated case, lib.rs then sees that the plist does
+    // not match the selected scratch data dir and starts the sidecar, whose
+    // child inherits the app process environment (including WENLAN_PORT).
+    if data_dir_env_overridden() {
+        log::warn!(
+            "[lifecycle] skipping server plist startup preflight: isolated run (data-dir env override)"
+        );
+        return Ok(());
+    }
+
+    let app_path = match current_app_path() {
+        Ok(path) => path,
+        Err(error) => {
+            log::info!(
+                "[lifecycle] skipping server plist startup preflight: non-stable app path ({error})"
+            );
+            return Ok(());
+        }
+    };
+    if !is_stable_launch_agent_target(&app_path) {
+        log::info!(
+            "[lifecycle] skipping server plist startup preflight: non-stable app path ({})",
+            app_path.display()
+        );
+        return Ok(());
+    }
+
     ensure_server_plist_data_dir_env(launchctl)
 }
 
@@ -515,6 +550,13 @@ pub fn is_run_at_login_enabled(launchctl: &dyn LaunchctlExec) -> bool {
 /// and re-installs when the embedded path doesn't match the current binary.
 /// Returns Ok(()) if the install completed or was unnecessary.
 pub fn first_run_install_if_needed(launchctl: &dyn LaunchctlExec) -> Result<()> {
+    if data_dir_env_overridden() {
+        log::warn!(
+            "[lifecycle] skipping first-run LaunchAgent install: isolated run (data-dir env override)"
+        );
+        return Ok(());
+    }
+
     if user_opted_out() {
         if let Err(e) = remove_legacy_app_plist_file_if_owned() {
             log::warn!("[first-run] legacy app plist cleanup failed: {e}");
@@ -601,6 +643,15 @@ pub fn first_run_install_if_needed(launchctl: &dyn LaunchctlExec) -> Result<()> 
 /// line 198).
 pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> Result<()> {
     let _guard = RUN_AT_LOGIN_LOCK.lock().await;
+    if data_dir_env_overridden() {
+        log::info!(
+            "[lifecycle] skipping Run at Login change: isolated run (data-dir env override)"
+        );
+        anyhow::bail!(
+            "refusing to change Run at Login during an isolated run with a data-dir env override"
+        );
+    }
+
     if enabled {
         let exe = current_app_path()?;
         if !is_stable_launch_agent_target(&exe) {
@@ -631,6 +682,13 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
     let Some(attempt) = QuitAttemptGuard::try_begin(&QUITTING) else {
         return Ok(());
     };
+
+    if data_dir_env_overridden() {
+        log::info!("[lifecycle] skipping quit teardown: isolated run (data-dir env override)");
+        app_handle.exit(0);
+        attempt.commit();
+        return Ok(());
+    }
 
     // Spec lifecycle invariant #4: "Quit Wenlan = full off; both plists
     // unloaded, both processes exit, no auto-restart on reboot." (H2)
@@ -871,6 +929,22 @@ mod tests {
 
         assert!(current.path().join("auto_start_disabled.flag").exists());
         assert!(!legacy.path().join("auto_start_disabled.flag").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn data_dir_env_overridden_reports_either_override_key() {
+        let _env = EnvGuard::capture();
+        std::env::remove_var("WENLAN_DATA_DIR");
+        std::env::remove_var("ORIGIN_DATA_DIR");
+        assert!(!data_dir_env_overridden());
+
+        std::env::set_var("WENLAN_DATA_DIR", "/tmp/wenlan-isolated");
+        assert!(data_dir_env_overridden());
+
+        std::env::remove_var("WENLAN_DATA_DIR");
+        std::env::set_var("ORIGIN_DATA_DIR", "/tmp/origin-isolated");
+        assert!(data_dir_env_overridden());
     }
 
     #[test]
@@ -1351,9 +1425,8 @@ mod tests {
     fn first_run_install_cleans_legacy_plists_even_when_user_opted_out() {
         let _env = EnvGuard::capture();
         let tmp = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
-        std::env::set_var("WENLAN_DATA_DIR", data.path());
+        std::env::remove_var("WENLAN_DATA_DIR");
         std::env::remove_var("ORIGIN_DATA_DIR");
 
         let legacy_app = legacy_app_plist_path().unwrap();
@@ -1388,9 +1461,8 @@ mod tests {
     fn first_run_preserves_legacy_plists_when_current_app_path_is_rejected() {
         let _env = EnvGuard::capture();
         let tmp = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
-        std::env::set_var("WENLAN_DATA_DIR", data.path());
+        std::env::remove_var("WENLAN_DATA_DIR");
         std::env::remove_var("ORIGIN_DATA_DIR");
         set_user_opted_out(false).unwrap();
 
@@ -1422,9 +1494,8 @@ mod tests {
     async fn set_run_at_login_false_cleans_legacy_app_and_server_plists() {
         let _env = EnvGuard::capture();
         let tmp = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
-        std::env::set_var("WENLAN_DATA_DIR", data.path());
+        std::env::remove_var("WENLAN_DATA_DIR");
         std::env::remove_var("ORIGIN_DATA_DIR");
 
         let current_app = tmp
@@ -1443,6 +1514,119 @@ mod tests {
         assert!(!current_app.exists(), "current Wenlan app plist removed");
         assert!(!legacy_app.exists(), "owned legacy app plist removed");
         assert!(!legacy_server.exists(), "owned legacy server plist removed");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn prepare_server_plist_skips_isolated_override_without_mutation() {
+        let _env = EnvGuard::capture();
+        let tmp = tempfile::tempdir().unwrap();
+        let selected_data = tempfile::tempdir().unwrap();
+        let live_data = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("WENLAN_DATA_DIR", selected_data.path());
+        std::env::remove_var("ORIGIN_DATA_DIR");
+
+        let plist = server_plist_path().unwrap();
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        let original = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wenlan.server</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>WENLAN_DATA_DIR</key>
+        <string>{}</string>
+    </dict>
+</dict>
+</plist>
+"#,
+            live_data.path().display()
+        );
+        std::fs::write(&plist, &original).unwrap();
+
+        let mock = MockLaunchctl::default();
+        // This assertion pins both gates together: the env override and the
+        // stable-path check. current_exe() cannot be faked to /Applications
+        // from a unit test, so removing only the env gate still leaves this
+        // test protected by the non-stable-path gate.
+        prepare_server_plist_for_startup(&mock).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&plist).unwrap(), original);
+        assert!(mock.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn first_run_install_skips_isolated_override_without_touching_plists() {
+        let _env = EnvGuard::capture();
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("WENLAN_DATA_DIR", data.path());
+        std::env::remove_var("ORIGIN_DATA_DIR");
+
+        let app_plist = app_plist_path().unwrap();
+        let server_plist = server_plist_path().unwrap();
+        let legacy_app = legacy_app_plist_path().unwrap();
+        let legacy_server = legacy_server_plist_path().unwrap();
+        std::fs::create_dir_all(app_plist.parent().unwrap()).unwrap();
+        let legacy_app_content = owned_legacy_app_plist();
+        let legacy_server_content = owned_legacy_server_plist();
+        let originals = [
+            (app_plist.as_path(), b"current app".as_slice()),
+            (server_plist.as_path(), b"current server".as_slice()),
+            (legacy_app.as_path(), legacy_app_content.as_bytes()),
+            (legacy_server.as_path(), legacy_server_content.as_bytes()),
+        ];
+        for (path, content) in originals {
+            std::fs::write(path, content).unwrap();
+        }
+        let original_bytes: Vec<_> = [&app_plist, &server_plist, &legacy_app, &legacy_server]
+            .into_iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+
+        let mock = MockLaunchctl::default();
+        // This assertion pins both gates together: the env override and the
+        // stable-path check. current_exe() cannot be faked to /Applications
+        // from a unit test, so removing only the env gate still leaves this
+        // test protected by the non-stable-path gate.
+        first_run_install_if_needed(&mock).unwrap();
+
+        for (path, original) in [&app_plist, &server_plist, &legacy_app, &legacy_server]
+            .into_iter()
+            .zip(original_bytes)
+        {
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+        assert!(mock.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn set_run_at_login_rejects_isolated_override_without_launchctl() {
+        let _env = EnvGuard::capture();
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("WENLAN_DATA_DIR", data.path());
+        std::env::remove_var("ORIGIN_DATA_DIR");
+        let mock = MockLaunchctl::default();
+
+        let enable_error = set_run_at_login(true, &mock)
+            .await
+            .expect_err("isolated enable must be rejected");
+        let disable_error = set_run_at_login(false, &mock)
+            .await
+            .expect_err("isolated disable must be rejected");
+
+        assert!(enable_error.to_string().contains("isolated run"));
+        assert!(disable_error.to_string().contains("isolated run"));
+        assert!(mock.calls.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1600,13 +1784,12 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn startup_server_plist_preflight_repairs_stale_data_dir_before_selection() {
+    fn startup_server_plist_preflight_skips_non_stable_app_path() {
         let _env = EnvGuard::capture();
         let tmp = tempfile::tempdir().unwrap();
-        let selected_data = tempfile::tempdir().unwrap();
         let stale_data = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
-        std::env::set_var("WENLAN_DATA_DIR", selected_data.path());
+        std::env::remove_var("WENLAN_DATA_DIR");
         std::env::remove_var("ORIGIN_DATA_DIR");
 
         let plist = server_plist_path().unwrap();
@@ -1632,29 +1815,22 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(!current_server_plist_matches_selected_data_dir());
+        let original = std::fs::read(&plist).unwrap();
 
         let mock = MockLaunchctl::default();
         prepare_server_plist_for_startup(&mock).unwrap();
 
-        assert!(
-            current_server_plist_matches_selected_data_dir(),
-            "startup preflight must repair stale launchd data root before daemon selection"
-        );
+        assert_eq!(std::fs::read(&plist).unwrap(), original);
         let calls = mock.calls.lock().unwrap();
         assert!(
-            calls.iter().any(|c| c[0] == "unload"),
-            "stale running daemon should be unloaded before health/config hydration"
-        );
-        assert!(
-            calls.iter().any(|c| c[0] == "load"),
-            "patched daemon should be reloaded before health/config hydration"
+            calls.is_empty(),
+            "non-stable app path must not call launchctl"
         );
     }
 
     #[test]
     #[serial_test::serial]
-    fn startup_server_plist_preflight_rolls_back_file_when_reload_fails() {
+    fn server_plist_data_dir_env_rolls_back_file_when_reload_fails() {
         let _env = EnvGuard::capture();
         let tmp = tempfile::tempdir().unwrap();
         let selected_data = tempfile::tempdir().unwrap();
@@ -1688,8 +1864,8 @@ mod tests {
             load_status: Mutex::new(256),
             ..Default::default()
         };
-        let err = prepare_server_plist_for_startup(&mock)
-            .expect_err("reload failure must make startup preflight fail");
+        let err = ensure_server_plist_data_dir_env(&mock)
+            .expect_err("reload failure must make data-dir patch fail");
         assert!(
             err.to_string().contains("launchctl load failed"),
             "unexpected error: {err}"

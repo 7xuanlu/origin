@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useCallback, useState, useEffect, useRef } from "react";
+import { useCallback, useState, useEffect, useRef, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -231,22 +231,19 @@ export default function App() {
   // isPending, not isLoading: isLoading is (isPending && isFetching), which goes
   // false whenever the query is paused rather than fetching — that would fall
   // through to Home with no answer. isPending is true until we actually have one.
+  let body: ReactNode;
   if (wizardPending) {
-    return <div className="w-screen min-h-screen bg-[var(--bg-secondary)]" />;
-  }
-
-  // ponytail: fail CLOSED. If the daemon is still unreachable after retries,
-  // show the wizard rather than silently falling through to Home — an
-  // existing user whose daemon is dead for 15s+ sees the wizard too, but its
-  // step-5 task thread already surfaces "daemon isn't reachable" + Retry,
-  // which is the intended repair surface for that tradeoff.
-  if (showWizard || wizardError) {
-    return <SetupWizard onComplete={handleWizardComplete} />;
-  }
-
-  if (migration) {
+    body = <div className="w-screen min-h-screen bg-[var(--bg-secondary)]" />;
+  } else if (showWizard || wizardError) {
+    // ponytail: fail CLOSED. If the daemon is still unreachable after retries,
+    // show the wizard rather than silently falling through to Home — an
+    // existing user whose daemon is dead for 15s+ sees the wizard too, but its
+    // step-5 task thread already surfaces "daemon isn't reachable" + Retry,
+    // which is the intended repair surface for that tradeoff.
+    body = <SetupWizard onComplete={handleWizardComplete} />;
+  } else if (migration) {
     const pct = migration.total > 0 ? Math.round((migration.current / migration.total) * 100) : 0;
-    return (
+    body = (
       <div className="flex flex-col items-center justify-center h-screen bg-zinc-950 text-zinc-200">
         <p className="text-lg mb-4">{migration.phase}</p>
         <div className="w-64 h-2 bg-zinc-800 rounded-full overflow-hidden">
@@ -255,42 +252,54 @@ export default function App() {
         <p className="text-sm text-zinc-500 mt-2">{migration.current} / {migration.total}</p>
       </div>
     );
+  } else {
+    body = (
+      <div className="w-screen min-h-screen bg-[var(--bg-secondary)]">
+        {page === "spotlight" && (
+          <Spotlight
+            onOpenMemory={() => { setSelectedPageId(null); setPage("home"); }}
+            onOpenPage={(pageId) => { setSelectedPageId(pageId); setSelectedMemoryId(null); setInitialView(null); setPage("home"); }}
+            onOpenRecap={(snap) => { setSelectedPageId(null); setSelectedSnapshot(snap); setPrevPage("spotlight"); setPage("recap"); }}
+            onEntityClick={(id) => { setSelectedPageId(null); setSelectedEntityId(id); setPrevPage("spotlight"); setPage("entity"); }}
+          />
+        )}
+        {page === "home" && (
+          <Main
+            initialMemoryId={selectedMemoryId}
+            initialPageId={selectedPageId}
+            initialView={initialView}
+            onRegisterQuitGuard={registerQuitGuard}
+            onBackFromDetail={() => { setSelectedMemoryId(null); setSelectedPageId(null); setPage("home"); }}
+          />
+        )}
+        {page === "recap" && selectedSnapshot && (
+          <RecapDetail snapshot={selectedSnapshot} onBack={() => setPage(prevPage)} />
+        )}
+        {page === "entity" && selectedEntityId && (
+          <div className="h-screen overflow-y-auto">
+            <EntityDetail
+              key={selectedEntityId}
+              entityId={selectedEntityId}
+              onBack={() => setPage(prevPage)}
+              onEntityClick={(id) => setSelectedEntityId(id)}
+              onMemoryClick={(sid) => { setSelectedMemoryId(sid); setSelectedPageId(null); setInitialView(null); setPage("home"); }}
+            />
+          </div>
+        )}
+      </div>
+    );
   }
 
   return (
-    <div className="w-screen min-h-screen bg-[var(--bg-secondary)]">
-      {page === "spotlight" && (
-        <Spotlight
-          onOpenMemory={() => { setSelectedPageId(null); setPage("home"); }}
-          onOpenPage={(pageId) => { setSelectedPageId(pageId); setSelectedMemoryId(null); setInitialView(null); setPage("home"); }}
-          onOpenRecap={(snap) => { setSelectedPageId(null); setSelectedSnapshot(snap); setPrevPage("spotlight"); setPage("recap"); }}
-          onEntityClick={(id) => { setSelectedPageId(null); setSelectedEntityId(id); setPrevPage("spotlight"); setPage("entity"); }}
-        />
-      )}
-      {page === "home" && (
-        <Main
-          initialMemoryId={selectedMemoryId}
-          initialPageId={selectedPageId}
-          initialView={initialView}
-          onRegisterQuitGuard={registerQuitGuard}
-          onBackFromDetail={() => { setSelectedMemoryId(null); setSelectedPageId(null); setPage("home"); }}
-        />
-      )}
-      {page === "recap" && selectedSnapshot && (
-        <RecapDetail snapshot={selectedSnapshot} onBack={() => setPage(prevPage)} />
-      )}
-      {page === "entity" && selectedEntityId && (
-        <div className="h-screen overflow-y-auto">
-          <EntityDetail
-            key={selectedEntityId}
-            entityId={selectedEntityId}
-            onBack={() => setPage(prevPage)}
-            onEntityClick={(id) => setSelectedEntityId(id)}
-            onMemoryClick={(sid) => { setSelectedMemoryId(sid); setSelectedPageId(null); setInitialView(null); setPage("home"); }}
-          />
-        </div>
-      )}
-      <RuntimeOverlays />
-    </div>
+    <>
+      {body}
+      <RuntimeOverlays
+        variant={
+          wizardPending || showWizard || wizardError || migration
+            ? "updater-only"
+            : "main"
+        }
+      />
+    </>
   );
 }

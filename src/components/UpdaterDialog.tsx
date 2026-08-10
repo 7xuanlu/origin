@@ -18,6 +18,7 @@ interface ProgressPayload {
  * Driven by Tauri events from `app/src/updater.rs`:
  *   - `updater://available`  payload `{ version }` → show toast
  *   - `updater://progress`   payload `{ chunk, total, error }`
+ *   - `updater://ui-ready`   → ask the backend to replay a pending prompt
  * Sends back:
  *   - `updater://action`     payload `"install"` | `"later"`
  */
@@ -48,6 +49,9 @@ export default function UpdaterDialog() {
       if (p.chunk) setDownloaded((prev) => prev + (p.chunk ?? 0));
       if (p.total !== undefined && p.total !== null) setTotal(p.total);
     });
+    void Promise.all([unlistenAvail, unlistenProg])
+      .then(() => emit("updater://ui-ready"))
+      .catch(() => {});
     return () => {
       unlistenAvail.then((fn) => fn());
       unlistenProg.then((fn) => fn());

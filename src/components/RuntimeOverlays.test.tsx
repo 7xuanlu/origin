@@ -24,4 +24,11 @@ describe("RuntimeOverlays", () => {
     expect(screen.getByText("milestone runtime")).toBeInTheDocument();
     expect(screen.getByText("updater runtime")).toBeInTheDocument();
   });
+
+  it("keeps the milestone toaster off non-main branches", () => {
+    render(<RuntimeOverlays review={false} variant="updater-only" />);
+
+    expect(screen.queryByText("milestone runtime")).not.toBeInTheDocument();
+    expect(screen.getByText("updater runtime")).toBeInTheDocument();
+  });
 });
