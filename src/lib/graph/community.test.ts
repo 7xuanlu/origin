@@ -267,6 +267,33 @@ describe("fetchSpaceCartography", () => {
     expect(result).toEqual({ status: "partial-error", reason: "old-daemon" });
   });
 
+  it("reads a 422 (space name the daemon never registered) as the ordinary fallback", async () => {
+    // The Atlas derives its space list from free-text entity space/domain, so
+    // a name no Space registry knows is routine. The daemon answers 422; that
+    // space simply has no durable community data. Calling it an error would
+    // paint the whole worst-first badge red for an ordinary corpus.
+    mockListCommunities.mockRejectedValue(
+      JSON.stringify({ status: 422, error: "unknown Space: Scratch" }),
+    );
+
+    const result = await fetchSpaceCartography("Scratch");
+
+    expect(result).toEqual({ status: "fallback" });
+  });
+
+  it("reads a 422 on the member read as fallback too", async () => {
+    // The two reads race against Space deletion: the summaries can land just
+    // before the Space goes away, leaving the member read to 422 on its own.
+    mockListCommunities.mockResolvedValue(communitiesPage());
+    mockListCommunityMembers.mockRejectedValue(
+      JSON.stringify({ status: 422, error: "unknown Space: Scratch" }),
+    );
+
+    const result = await fetchSpaceCartography("Scratch");
+
+    expect(result).toEqual({ status: "fallback" });
+  });
+
   it("surfaces a plain transport failure distinctly from an old daemon", async () => {
     mockListCommunities.mockRejectedValue(new Error("connection reset"));
 

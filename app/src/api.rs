@@ -233,14 +233,23 @@ struct OnDeviceModelRequest {
 
 // ── Communities (M6 cartography) ────────────────────────────────────────
 // Wire shapes hand-mirrored from `crates/wenlan-types/src/communities.rs`
-// (`community-read-v1`): the community read routes are merged to the
-// daemon but the pinned wenlan-types 0.14.1 predates the crate module —
-// same situation as the page-map types above. Read-tolerant (no
-// `deny_unknown_fields`): any future additions are ignored rather than
-// rejected. `scope` is carried (not ignored) — these structs are
-// re-serialized verbatim for the frontend by the Tauri commands below, so a
-// field this struct doesn't declare doesn't just go unread here, it's
-// dropped from what the frontend ever sees.
+// (`community-read-v1`). This section deliberately TYPES the response, unlike
+// the page-map section below, which forwards `serde_json::Value` untouched:
+// the community read is classified here in Rust-adjacent code and by
+// src/lib/graph/community.ts, and a field-level mismatch has to fail where a
+// test can see it.
+//
+// The types are hand-mirrored rather than taken from `wenlan_types` (which
+// the app now depends on directly, so the module IS reachable) because
+// `CommunityReadScope` is an internally tagged enum: a `kind` the app has not
+// been taught would fail the WHOLE response to deserialize, and the response
+// is a read the UI must degrade on rather than lose. `kind: String` here
+// accepts a future variant and lets the frontend decide. Everything else is
+// read-tolerant for the same reason: no `deny_unknown_fields`, so additions
+// are ignored rather than rejected. `scope` is carried (not ignored) — these
+// structs are re-serialized verbatim for the frontend by the Tauri commands
+// below, so a field this struct doesn't declare doesn't just go unread here,
+// it's dropped from what the frontend ever sees.
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CommunityScope {

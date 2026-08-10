@@ -51,7 +51,29 @@ function isOldDaemonStatus(status: number): boolean {
   return status === 404 || status === 405;
 }
 
-type PageResult<T> = { rows: T[] } | { reason: PartialErrorReason };
+/**
+ * The daemon only answers a community read for a REGISTERED Space or the
+ * literal "uncategorized"; anything else is a validation error and comes back
+ * 422 (`resolve_read_scope` in crates/wenlan-core/src/read_scope.rs returns
+ * `Unknown`, which crates/wenlan-server/src/read_scope.rs maps to
+ * `ValidationError` → 422).
+ *
+ * That is the ORDINARY case here, not a fault: the Atlas derives its space
+ * list from each entity's own `space`/`domain` text, which is free-form and
+ * routinely names something no Space registry ever knew. A name the daemon
+ * does not recognize genuinely has no durable community data, which is exactly
+ * what "fallback" means — reporting it as a partial error would paint the
+ * whole badge red off one such name, because the aggregate is worst-first.
+ */
+function isUnregisteredSpaceStatus(status: number): boolean {
+  return status === 422;
+}
+
+type PageResult<T> =
+  | { rows: T[] }
+  | { reason: PartialErrorReason }
+  /** The daemon does not know this space name — no durable data, not a fault. */
+  | { unregisteredSpace: true };
 
 async function fetchAllCommunities(space: string): Promise<PageResult<CommunitySummary>> {
   const rows: CommunitySummary[] = [];
@@ -62,15 +84,19 @@ async function fetchAllCommunities(space: string): Promise<PageResult<CommunityS
       response = await listCommunities(space, cursor);
     } catch (e) {
       const apiError = asCommunityApiError(e);
+      if (apiError && isUnregisteredSpaceStatus(apiError.status)) {
+        return { unregisteredSpace: true };
+      }
       return { reason: apiError && isOldDaemonStatus(apiError.status) ? "old-daemon" : "transport" };
     }
     if (response.schema_version !== COMMUNITY_READ_SCHEMA_VERSION) {
       return { reason: "schema-mismatch" };
     }
-    // The daemon's `scope` isn't threaded through the Tauri command today
-    // (see app/src/api.rs's CommunityListResponse) — checking each row's own
-    // `space` field is what actually catches a daemon serving the wrong
-    // scope instead of silently mixing it into this space's read.
+    // The daemon does send its resolved `scope`, and app/src/api.rs types it,
+    // but it is not on the TypeScript response interface, so nothing here can
+    // read it without widening that type. Checking each row's own `space`
+    // field catches the same fault — a daemon serving the wrong scope — from
+    // data the interface already declares, rather than mixing it in silently.
     if (response.communities.some((c) => c.space !== space)) {
       return { reason: "foreign-space" };
     }
@@ -90,6 +116,9 @@ async function fetchAllMembers(space: string): Promise<PageResult<CommunityMembe
       response = await listCommunityMembers(space, cursor);
     } catch (e) {
       const apiError = asCommunityApiError(e);
+      if (apiError && isUnregisteredSpaceStatus(apiError.status)) {
+        return { unregisteredSpace: true };
+      }
       return { reason: apiError && isOldDaemonStatus(apiError.status) ? "old-daemon" : "transport" };
     }
     if (response.schema_version !== COMMUNITY_READ_SCHEMA_VERSION) {
@@ -112,9 +141,11 @@ async function fetchAllMembers(space: string): Promise<PageResult<CommunityMembe
  */
 export async function fetchSpaceCartography(space: string): Promise<SpaceCartography> {
   const communities = await fetchAllCommunities(space);
+  if ("unregisteredSpace" in communities) return { status: "fallback" };
   if ("reason" in communities) return { status: "partial-error", reason: communities.reason };
 
   const members = await fetchAllMembers(space);
+  if ("unregisteredSpace" in members) return { status: "fallback" };
   if ("reason" in members) return { status: "partial-error", reason: members.reason };
 
   if (communities.rows.length === 0 && members.rows.length === 0) {

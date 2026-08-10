@@ -192,6 +192,16 @@ describe("buildGraphModel / buildEgoModel", () => {
     const neither = makeEntity({ id: "G", space: null, domain: null });
     const neitherModel = buildGraphModel([neither], [makeDetail(neither, [])]);
     expect(neitherModel.nodes.find((n) => n.id === "G")!.space).toBeNull();
+
+    // An empty space string is not a space. It has to fall through to the
+    // domain, or the node reads as unscoped and loses its grouping.
+    const emptySpace = makeEntity({ id: "H", space: "", domain: "legacy" });
+    const emptySpaceModel = buildGraphModel([emptySpace], [makeDetail(emptySpace, [])]);
+    expect(emptySpaceModel.nodes.find((n) => n.id === "H")!.space).toBe("legacy");
+
+    const bothEmpty = makeEntity({ id: "I", space: "", domain: "" });
+    const bothEmptyModel = buildGraphModel([bothEmpty], [makeDetail(bothEmpty, [])]);
+    expect(bothEmptyModel.nodes.find((n) => n.id === "I")!.space).toBeNull();
   });
 
   it("leaves a relation-synthesized neighbor's space unknown (null), never guessed from the home entity", () => {

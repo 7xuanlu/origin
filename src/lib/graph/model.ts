@@ -61,6 +61,17 @@ function confidenceOf(rel: RelationWithEntity): number | null {
   return typeof value === "number" ? value : null;
 }
 
+/**
+ * The space an entity is grouped under: its own `space`, else its `domain`.
+ * `||`, not `??` — an entity carrying an empty-string space still has a domain
+ * worth grouping under, and `??` would keep the "" and read as unscoped
+ * downstream (cartography's isUnscopedSpace treats it as falsy). Every place
+ * that derives a space from an entity goes through here so the rules agree.
+ */
+export function entitySpace(entity: Pick<Entity, "space" | "domain">): string | null {
+  return entity.space || entity.domain || null;
+}
+
 function nodeFromEntity(entity: Entity): GraphNode {
   return {
     id: entity.id,
@@ -69,7 +80,7 @@ function nodeFromEntity(entity: Entity): GraphNode {
     entityType: entity.entity_type,
     confirmed: entity.confirmed,
     degree: 0,
-    space: entity.space ?? entity.domain ?? null,
+    space: entitySpace(entity),
     createdAt: entity.created_at,
     updatedAt: entity.updated_at,
   };

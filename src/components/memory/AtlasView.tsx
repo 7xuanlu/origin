@@ -8,7 +8,7 @@ import Sigma from "sigma";
 import type { Simulation } from "d3-force";
 import { listEntities, getEntityDetail } from "../../lib/tauri";
 import type { Entity, EntityDetail } from "../../lib/tauri";
-import { buildGraphModel } from "../../lib/graph/model";
+import { buildGraphModel, entitySpace } from "../../lib/graph/model";
 import type { GraphNode } from "../../lib/graph/model";
 import {
   buildAtlasGraph,
@@ -33,6 +33,13 @@ import {
 import { useGraphPalette, colorForEntityType, nodeFillFor } from "../../lib/graph/palette";
 import type { GraphPalette } from "../../lib/graph/palette";
 import { fetchCartographyForSpaces, aggregateCartographyStatus } from "../../lib/graph/community";
+import type { SpaceCartography } from "../../lib/graph/community";
+
+// One shared empty map for the unresolved query. An inline `new Map()` default
+// mints a fresh identity on every render, and this map feeds the memoized
+// community climb and the canvas underlay — a new identity re-runs the climb
+// and repaints every edge each render until the fetch lands.
+const EMPTY_CARTOGRAPHY: Map<string, SpaceCartography> = new Map();
 
 // Same 5-slot legend as the retired canvas graph (ConstellationMap): place,
 // event, and unknown types fold to neutral and get no swatch; concept is
@@ -126,11 +133,13 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     staleTime: 120_000,
   });
 
-  // Same field precedence as the entity page (EntityDetail's `space ?? domain`).
+  // Same field precedence as the entity page (EntityDetail's space-then-domain
+  // rule), through model.ts's entitySpace so the list, the filter, and the
+  // graph nodes cannot disagree about which space an entity belongs to.
   const spaces = useMemo(
     () =>
       Array.from(
-        new Set(entities.map((e: Entity) => e.space ?? e.domain).filter((s): s is string => !!s)),
+        new Set(entities.map((e: Entity) => entitySpace(e)).filter((s): s is string => !!s)),
       ).sort(),
     [entities],
   );
@@ -141,7 +150,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // a partial read. Keyed on ALL known spaces regardless of spaceFilter, so
   // one space's trouble stays visible while another is being viewed; the
   // unscoped half of the badge is read off the filtered model instead (below).
-  const { data: cartographyBySpace = new Map() } = useQuery({
+  const { data: cartographyBySpace = EMPTY_CARTOGRAPHY } = useQuery({
     queryKey: ["constellation-cartography", spaces],
     queryFn: () => fetchCartographyForSpaces(spaces),
     enabled: spaces.length > 0,
@@ -153,8 +162,8 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   const model = useMemo(() => {
     if (!spaceFilter) return buildGraphModel(entities, details);
     return buildGraphModel(
-      entities.filter((e: Entity) => (e.space ?? e.domain) === spaceFilter),
-      details.filter((d: EntityDetail) => (d.entity.space ?? d.entity.domain) === spaceFilter),
+      entities.filter((e: Entity) => entitySpace(e) === spaceFilter),
+      details.filter((d: EntityDetail) => entitySpace(d.entity) === spaceFilter),
     );
   }, [entities, details, spaceFilter]);
 
