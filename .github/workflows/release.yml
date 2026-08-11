@@ -572,9 +572,234 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
+  # The Windows counterpart of app-bundle. Same shape, same guards; the setup
+  # steps come from ci.yml's app-windows-bundle job, which is where they were
+  # worked out. Unlike that job this one signs with the real updater key,
+  # because what it produces is what users install and what the updater fetches.
+  app-bundle-windows:
+    name: Build Windows desktop app bundle
+    needs: [resolve-promotion, bind-release-tag]
+    runs-on: windows-2022
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      setup_filename: ${{ steps.stage.outputs.setup_filename }}
+      sig_filename: ${{ steps.stage.outputs.sig_filename }}
+      setup_sha256: ${{ steps.stage.outputs.setup_sha256 }}
+      sig_sha256: ${{ steps.stage.outputs.sig_sha256 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Verify release checkout
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          checkout_sha="$(git rev-parse HEAD)"
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$checkout_sha" != "$RELEASE_SHA" || "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: release SHA $RELEASE_SHA, checkout $checkout_sha, and current tag $tag_sha differ."
+            exit 1
+          fi
+
+      - name: Milestone-B 4b app version lockstep guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_VERSION="$(jq -er '.version | strings' app/tauri.conf.json)"
+          if [[ "v$APP_VERSION" != "$RELEASE_TAG" ]]; then
+            echo "ERROR: Milestone-B 4b lockstep guard: app/tauri.conf.json version $APP_VERSION does not match release tag $RELEASE_TAG."
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-pc-windows-msvc
+      - name: Stabilize Windows Rust cache toolchain inputs
+        shell: bash
+        run: bash scripts/stabilize-rust-cache-toolchains.sh
+      - name: Configure rust-lld linker
+        shell: pwsh
+        run: |
+          $sysroot = (rustc --print sysroot).Trim()
+          $lld = Join-Path $sysroot "lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+          if (-not (Test-Path $lld)) {
+            throw "rust-lld.exe missing at $lld"
+          }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+          "RUSTFLAGS=-C linker=$lld -C linker-flavor=lld-link" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+      # Git Bash's msys perl cannot load Locale::Maketext::Simple, so vendored
+      # OpenSSL's ./Configure dies before it starts. Point openssl-src at a
+      # native perl instead.
+      - name: Select native Perl for vendored OpenSSL
+        shell: pwsh
+        run: |
+          $nativePerl = $null
+          foreach ($candidate in Get-Command perl.exe -CommandType Application -All) {
+            if ($candidate.Source -match '[\\/]Git[\\/]') {
+              continue
+            }
+            & $candidate.Source "-MLocale::Maketext::Simple" "-e" "1"
+            if ($LASTEXITCODE -eq 0) {
+              $nativePerl = $candidate.Source
+              break
+            }
+          }
+          if (-not $nativePerl) {
+            throw "No native Perl can load Locale::Maketext::Simple"
+          }
+          "OPENSSL_SRC_PERL=$nativePerl" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "OPENSSL_SRC_PERL=$nativePerl"
+      # libsql does not bundle SQLite on Windows; vcpkg ships it prebuilt.
+      - name: Install sqlite3
+        shell: pwsh
+        run: |
+          vcpkg install sqlite3:x64-windows-static-md
+          "LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib;$env:LIB" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Set up Vulkan SDK
+        shell: pwsh
+        run: |
+          & scripts/setup-vulkan-sdk-windows.ps1
+      - name: Configure MSVC Ninja
+        shell: pwsh
+        run: |
+          & scripts/setup-msvc-ninja-windows.ps1
+      # Into app/binaries beside the sidecars, because that is where
+      # app/tauri.windows.conf.json bundles them from.
+      - name: Stage ONNX Runtime and the Vulkan loader
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dllDir = "app/binaries"
+          & scripts/stage-onnxruntime-windows.ps1 -DestinationDirectory $dllDir
+          & scripts/stage-vulkan-loader-windows.ps1 -DestinationDirectory $dllDir
+          Get-ChildItem $dllDir | Format-Table Name, Length
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # No explicit daemon build step: tauri.conf.json's beforeBuildCommand runs
+      # prepare-sidecars.sh, which compiles the daemon, CLI, and MCP for
+      # TAURI_ENV_TARGET_TRIPLE itself. Adding one here would also trip the
+      # contract test's rule that a tag release never recompiles on its own.
+      - name: Download cloudflared sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared.exe" \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
+          chmod 755 "$RUNNER_TEMP/cloudflared.exe"
+          echo "CLOUDFLARED_BIN=$RUNNER_TEMP/cloudflared.exe" >> "$GITHUB_ENV"
+
+      - name: Build Windows desktop app bundle
+        shell: bash
+        env:
+          CLOUDFLARED_BIN: ${{ env.CLOUDFLARED_BIN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --target x86_64-pc-windows-msvc
+
+      # The same unpack-and-look check ci.yml's app-windows-bundle runs. A
+      # release must never ship an installer that omits what the daemon
+      # dynamically loads, so this gate lives on both paths rather than being
+      # trusted from a CI run against a different commit.
+      - name: Verify the runtime DLLs ship inside the installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $nsisDir = "target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          $required = @("onnxruntime.dll", "vulkan-1.dll", "VulkanRT-License.txt")
+          $failed = $false
+
+          $nsis = Get-ChildItem -Path $nsisDir -Filter *-setup.exe -File |
+            Select-Object -First 1
+          if (-not $nsis) { throw "no NSIS installer found under $nsisDir" }
+          $listing = & 7z l -ba -- $nsis.FullName
+          if ($LASTEXITCODE -ne 0) { throw "7z could not read $($nsis.Name)" }
+          foreach ($name in $required) {
+            $hit = $listing |
+              Where-Object { $_ -match [regex]::Escape($name) } |
+              Select-Object -First 1
+            if ($hit) {
+              Write-Host "PASS $name -> $($hit.Trim())"
+            } else {
+              Write-Host "FAIL $name is not in the installer"
+              $failed = $true
+            }
+          }
+          if ($failed) {
+            throw "the Windows installer is missing runtime files the daemon needs"
+          }
+
+      - name: Stage app bundle assets and checksums
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_VERSION="$(jq -er '.version | strings' app/tauri.conf.json)"
+          nsis_dir="$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          setup="$(find "$nsis_dir" -maxdepth 1 -type f -name '*-setup.exe' -print -quit)"
+          sig="${setup}.sig"
+          [[ -n "$setup" && -f "$setup" ]] || { echo "ERROR: Tauri did not emit a -setup.exe under $nsis_dir."; exit 1; }
+          [[ -f "$sig" ]] || { echo "ERROR: Tauri did not emit $sig."; exit 1; }
+
+          staged="$RUNNER_TEMP/app-bundle-windows-staging"
+          rm -rf "$staged"
+          mkdir -p "$staged"
+          # Version in the name because this is also the human download; the
+          # updater reaches it by the URL latest.json spells out, not by shape.
+          setup_name="Wenlan_${APP_VERSION}_x64-setup.exe"
+          sig_name="${setup_name}.sig"
+          cp "$setup" "$staged/$setup_name"
+          cp "$sig" "$staged/$sig_name"
+
+          setup_sha256="$(sha256sum "$staged/$setup_name" | awk '{print $1}')"
+          sig_sha256="$(sha256sum "$staged/$sig_name" | awk '{print $1}')"
+          echo "Tauri NSIS installer: $setup"
+          echo "Tauri updater signature: $sig"
+          echo "Staged checksums: $setup_sha256 $sig_sha256"
+          {
+            echo "setup_filename=$setup_name"
+            echo "sig_filename=$sig_name"
+            echo "setup_sha256=$setup_sha256"
+            echo "sig_sha256=$sig_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload Windows app bundle artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: app-bundle-windows-${{ github.run_id }}
+          path: ${{ runner.temp }}/app-bundle-windows-staging
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
+
   promote-assets:
     name: Promote exact validated release assets
-    needs: [resolve-promotion, bind-release-tag, prepare-release, app-bundle]
+    needs: [resolve-promotion, bind-release-tag, prepare-release, app-bundle, app-bundle-windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -672,13 +897,18 @@ jobs:
         with:
           name: app-bundle-${{ github.run_id }}
           path: ${{ runner.temp }}/app-bundle
-      - name: Verify macOS app bundle bytes before promotion
+      - name: Download Windows app bundle artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: app-bundle-windows-${{ github.run_id }}
+          path: ${{ runner.temp }}/app-bundle-windows
+      - name: Verify app bundle bytes before promotion
         shell: bash
         run: |
           set -euo pipefail
           verify_sha256() {
-            local name="$1" expected="$2" actual path
-            path="$RUNNER_TEMP/app-bundle/$name"
+            local dir="$1" name="$2" expected="$3" actual path
+            path="$dir/$name"
             [[ -f "$path" ]] || { echo "ERROR: missing app bundle artifact $name."; exit 1; }
             actual="$(sha256sum "$path" | awk '{print $1}')"
             if [[ "$actual" != "$expected" ]]; then
@@ -687,10 +917,14 @@ jobs:
             fi
             echo "$name: $actual"
           }
-          verify_sha256 "${{ needs.app-bundle.outputs.dmg_filename }}" "${{ needs.app-bundle.outputs.dmg_sha256 }}"
-          verify_sha256 "${{ needs.app-bundle.outputs.tarball_filename }}" "${{ needs.app-bundle.outputs.tarball_sha256 }}"
-          verify_sha256 "${{ needs.app-bundle.outputs.sig_filename }}" "${{ needs.app-bundle.outputs.sig_sha256 }}"
-      - name: Upload macOS app assets and updater metadata without clobbering
+          mac="$RUNNER_TEMP/app-bundle"
+          win="$RUNNER_TEMP/app-bundle-windows"
+          verify_sha256 "$mac" "${{ needs.app-bundle.outputs.dmg_filename }}" "${{ needs.app-bundle.outputs.dmg_sha256 }}"
+          verify_sha256 "$mac" "${{ needs.app-bundle.outputs.tarball_filename }}" "${{ needs.app-bundle.outputs.tarball_sha256 }}"
+          verify_sha256 "$mac" "${{ needs.app-bundle.outputs.sig_filename }}" "${{ needs.app-bundle.outputs.sig_sha256 }}"
+          verify_sha256 "$win" "${{ needs.app-bundle-windows.outputs.setup_filename }}" "${{ needs.app-bundle-windows.outputs.setup_sha256 }}"
+          verify_sha256 "$win" "${{ needs.app-bundle-windows.outputs.sig_filename }}" "${{ needs.app-bundle-windows.outputs.sig_sha256 }}"
+      - name: Upload desktop app assets and updater metadata without clobbering
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -727,27 +961,39 @@ jobs:
           upload_without_clobber "$RUNNER_TEMP/app-bundle/${{ needs.app-bundle.outputs.dmg_filename }}"
           upload_without_clobber "$RUNNER_TEMP/app-bundle/${{ needs.app-bundle.outputs.tarball_filename }}"
           upload_without_clobber "$RUNNER_TEMP/app-bundle/${{ needs.app-bundle.outputs.sig_filename }}"
+          upload_without_clobber "$RUNNER_TEMP/app-bundle-windows/${{ needs.app-bundle-windows.outputs.setup_filename }}"
+          upload_without_clobber "$RUNNER_TEMP/app-bundle-windows/${{ needs.app-bundle-windows.outputs.sig_filename }}"
 
           # Installed clients still read the OLD repo endpoint until the phase-5 cutover;
           # this file must exist on the unified release BEFORE that cutover.
+          #
+          # Platform keys are what tauri-plugin-updater asks for: `{os}-{arch}`,
+          # with an installer-suffixed key tried first and this one as the
+          # fallback. On Windows the NSIS setup .exe is itself the update
+          # payload, so the human download and the updater URL are one file.
           version="${RELEASE_TAG#v}"
           notes="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq '.body')"
           pub_date="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_SHA" --jq '.commit.committer.date')"
           signature="$(cat "$RUNNER_TEMP/app-bundle/${{ needs.app-bundle.outputs.sig_filename }}")"
           tarball_name="${{ needs.app-bundle.outputs.tarball_filename }}"
+          win_signature="$(cat "$RUNNER_TEMP/app-bundle-windows/${{ needs.app-bundle-windows.outputs.sig_filename }}")"
+          win_setup_name="${{ needs.app-bundle-windows.outputs.setup_filename }}"
           jq -n \
             --arg version "$version" \
             --arg notes "$notes" \
             --arg pub_date "$pub_date" \
             --arg signature "$signature" \
             --arg url "https://github.com/7xuanlu/wenlan/releases/download/$RELEASE_TAG/$tarball_name" \
+            --arg win_signature "$win_signature" \
+            --arg win_url "https://github.com/7xuanlu/wenlan/releases/download/$RELEASE_TAG/$win_setup_name" \
             '{
               version: $version,
               notes: $notes,
               pub_date: $pub_date,
               platforms: {
                 "darwin-aarch64": {signature: $signature, url: $url},
-                "darwin-aarch64-app": {signature: $signature, url: $url}
+                "darwin-aarch64-app": {signature: $signature, url: $url},
+                "windows-x86_64": {signature: $win_signature, url: $win_url}
               }
             }' > "$RUNNER_TEMP/app-bundle/latest.json"
           upload_without_clobber "$RUNNER_TEMP/app-bundle/latest.json"

@@ -4970,6 +4970,7 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
                 "bind-release-tag",
                 "prepare-release",
                 "app-bundle",
+                "app-bundle-windows",
             ]
     {
         violations.push("tag release artifact-promotion DAG bypasses receipt resolution".into());
@@ -6123,6 +6124,7 @@ fn release_promotion_contract_violations(
                 "bind-release-tag",
                 "prepare-release",
                 "app-bundle",
+                "app-bundle-windows",
             ]
     {
         violations

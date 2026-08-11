@@ -420,6 +420,7 @@ def contract_violations(
         "docker-manifest": 10,
         "finalize-release": 10,
         "app-bundle": 90,
+        "app-bundle-windows": 120,
     }.items():
         if not re.search(
             rf"^    timeout-minutes: {timeout}\s*$",
@@ -434,6 +435,7 @@ def contract_violations(
         "bind-release-tag",
         "prepare-release",
         "app-bundle",
+        "app-bundle-windows",
         "promote-assets",
         "docker",
         "docker-manifest",
@@ -443,7 +445,9 @@ def contract_violations(
             violations.append(f"tag release omits artifact-promotion job {job!r}")
     if "    needs: [resolve-promotion, bind-release-tag]" not in job_body(release, "prepare-release"):
         violations.append("release preparation can start before receipt-derived tag binding")
-    if "    needs: [resolve-promotion, bind-release-tag, prepare-release, app-bundle]" not in job_body(
+    if "    needs: [resolve-promotion, bind-release-tag]" not in job_body(release, "app-bundle-windows"):
+        violations.append("Windows app bundling can start before receipt-derived tag binding")
+    if "    needs: [resolve-promotion, bind-release-tag, prepare-release, app-bundle, app-bundle-windows]" not in job_body(
         release, "promote-assets"
     ):
         violations.append("asset publication bypasses receipt resolution, tag binding, prerelease gate, or app bundling")
@@ -467,6 +471,7 @@ def contract_violations(
         "resolve-promotion",
         "bind-release-tag",
         "app-bundle",
+        "app-bundle-windows",
         "promote-assets",
         "docker",
         "docker-manifest",
@@ -501,26 +506,53 @@ def contract_violations(
             violations.append(f"validated asset promotion omits {marker!r}")
 
     app_bundle = job_body(release, "app-bundle")
+    app_bundle_windows = job_body(release, "app-bundle-windows")
     if "tauri-action" in release:
         violations.append("app bundling must build directly, never via tauri-action")
-    if "contents: read" not in app_bundle:
-        violations.append("app bundle job does not scope permissions to contents: read")
-    if "TAURI_SIGNING_PRIVATE_KEY" not in app_bundle:
-        violations.append("app bundle job omits the Tauri updater signing key")
-    elif release.count("TAURI_SIGNING_PRIVATE_KEY") != app_bundle.count(
+    for job_name, job in [
+        ("app-bundle", app_bundle),
+        ("app-bundle-windows", app_bundle_windows),
+    ]:
+        if "contents: read" not in job:
+            violations.append(
+                f"{job_name} job does not scope permissions to contents: read"
+            )
+        if "TAURI_SIGNING_PRIVATE_KEY" not in job:
+            violations.append(f"{job_name} job omits the Tauri updater signing key")
+    # The signing key belongs to the two jobs that build a signed bundle and
+    # nowhere else. Counting occurrences catches a leak into a job that has no
+    # business holding it, which a containment check on one job would miss.
+    if release.count("TAURI_SIGNING_PRIVATE_KEY") != app_bundle.count(
         "TAURI_SIGNING_PRIVATE_KEY"
-    ):
-        violations.append("Tauri signing key leaks outside the app-bundle job")
-    for marker in ["latest.json", "darwin-aarch64-app"]:
+    ) + app_bundle_windows.count("TAURI_SIGNING_PRIVATE_KEY"):
+        violations.append("Tauri signing key leaks outside the app bundling jobs")
+    # An installer that omits what the daemon dynamically loads installs fine
+    # and then fails on first use, so the release path proves the payload
+    # itself rather than trusting a CI run against a different commit.
+    for marker in [
+        "onnxruntime.dll",
+        "vulkan-1.dll",
+        "the Windows installer is missing runtime files the daemon needs",
+    ]:
+        if marker not in app_bundle_windows:
+            violations.append(
+                f"Windows app bundling does not prove its installer payload: {marker!r}"
+            )
+    for marker in ["latest.json", "darwin-aarch64-app", "windows-x86_64"]:
         if marker not in promote:
             violations.append(f"validated asset promotion omits updater manifest {marker!r}")
-    if "needs.app-bundle.outputs.dmg_sha256" not in promote:
-        violations.append(
-            "app bundle SHA-256 re-verification is not wired to the app-bundle job outputs"
-        )
-    verify_idx = promote.find("Verify macOS app bundle bytes before promotion")
+    for marker in [
+        "needs.app-bundle.outputs.dmg_sha256",
+        "needs.app-bundle-windows.outputs.setup_sha256",
+        "needs.app-bundle-windows.outputs.sig_sha256",
+    ]:
+        if marker not in promote:
+            violations.append(
+                f"app bundle SHA-256 re-verification is not wired to {marker!r}"
+            )
+    verify_idx = promote.find("Verify app bundle bytes before promotion")
     upload_idx = promote.find(
-        "Upload macOS app assets and updater metadata without clobbering"
+        "Upload desktop app assets and updater metadata without clobbering"
     )
     if verify_idx == -1 or upload_idx == -1:
         violations.append(
