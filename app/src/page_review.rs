@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::api::PageReviewOutcome;
+use crate::search::parse_release_version;
 use crate::state::AppState;
 
 type State = Arc<RwLock<AppState>>;
@@ -104,29 +105,6 @@ pub async fn review_page(
 /// containing `1c903bec`, so any daemon reporting 0.15.3 or above necessarily
 /// carries the route.
 const REVIEW_DAEMON_FLOOR: &str = "0.15.3";
-
-/// Parse `major.minor.patch`, rejecting any pre-release: a `-rc` build has not
-/// shipped the contract yet, so it must not unlock page reviews. Build
-/// metadata (`+sha`) does not affect precedence and is ignored.
-///
-/// Mirrors `parse_release_version` in `search.rs`. Hand-rolled rather than
-/// pulled from the `semver` crate for the same reason as that copy: adding a
-/// dependency means editing `app/Cargo.toml`, which the release-please guard
-/// hook blocks.
-fn parse_release_version(version: &str) -> Option<(u64, u64, u64)> {
-    let core = version.split('+').next()?;
-    if core.contains('-') {
-        return None;
-    }
-    let mut parts = core.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((major, minor, patch))
-}
 
 fn daemon_version_supports_review(version: &str) -> bool {
     let Some(candidate) = parse_release_version(version) else {

@@ -3368,13 +3368,17 @@ fn map_page_update_result(
 const PAGE_EDIT_DAEMON_FLOOR: &str = "0.14.1";
 
 /// Parse `major.minor.patch`, rejecting any pre-release: a `-rc` build has not
-/// shipped the contract yet, so it must not unlock page edits. Build metadata
-/// (`+sha`) does not affect precedence and is ignored.
+/// shipped the contract yet, so gating on it must not unlock behavior tied to
+/// that contract. Build metadata (`+sha`) does not affect precedence and is
+/// ignored.
 ///
 /// Hand-rolled rather than pulled from the `semver` crate because adding a
 /// dependency means editing `app/Cargo.toml`, which the release-please guard
-/// hook blocks.
-fn parse_release_version(version: &str) -> Option<(u64, u64, u64)> {
+/// hook blocks. Shared by every daemon-floor gate in this crate — page edits
+/// (`daemon_version_supports_page_edit` below) and page reviews
+/// (`crate::page_review::daemon_version_supports_review`) both parse the
+/// version they read from `/api/health` through this one function.
+pub(crate) fn parse_release_version(version: &str) -> Option<(u64, u64, u64)> {
     let core = version.split('+').next()?;
     if core.contains('-') {
         return None;

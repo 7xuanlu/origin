@@ -1025,11 +1025,6 @@ export const DEFAULTS: Record<string, unknown> = {
   get_skip_title_patterns: [],
   suggest_tags: [],
   record_page_editor_diagnostic: null,
-  // Preview runs in a browser with no Tauri backend, and only that backend
-  // holds the install secret a presence capability is signed with. Nothing
-  // here can mint one — and `unavailable` is exactly the protocol's answer for
-  // "presence cannot be established", so this is the true answer in this
-  // environment rather than a stand-in for one.
   // Both review commands are fixtures rather than daemon reads. Readiness was
   // briefly a live `/api/status` call, which made the Review action's state in
   // preview depend on whether the developer happened to have a current daemon

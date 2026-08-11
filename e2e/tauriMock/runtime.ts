@@ -514,7 +514,7 @@ export class TauriMockRuntime {
    */
   private reviewPage(args: unknown): PageReviewOutcome {
     const id = requiredString("review_page", args, "pageId");
-    const content = requiredString("review_page", args, "content");
+    const content = stringValue("review_page", args, "content");
     const forced = this.pageScenario.pageReview?.outcome;
     if (forced) return forced;
     const page = this.pages.find((candidate) => candidate.id === id);

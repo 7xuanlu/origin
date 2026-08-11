@@ -566,11 +566,8 @@ struct CapabilityWire {
 /// The body of `POST /api/pages/{id}/review`, mirroring
 /// `wenlan_types::requests::ReviewPageRequest`.
 ///
-/// Hand-mirrored rather than imported for the same reason as `PageWithTruth`
-/// in `api.rs`: the type is merged to the daemon but the pinned wenlan-types
-/// 0.14.1 predates it. It would not help to import it anyway — the daemon's
-/// copy is `Deserialize`-only on purpose, and this side is the one that has to
-/// serialize.
+/// Hand-mirrored rather than imported: the daemon's copy is `Deserialize`-only
+/// on purpose, and this side is the one that has to serialize.
 ///
 /// Its field is private, so the only way to obtain one is
 /// [`mint_page_review`]. A body therefore cannot exist without a freshly
