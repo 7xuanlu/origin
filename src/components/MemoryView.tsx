@@ -34,6 +34,7 @@ import SettingsPage from "./memory/SettingsPage";
 import Sidebar, { SidebarHeaderDivider, SidebarToggleButton } from "./memory/Sidebar";
 import AboutWenlanDialog from "./memory/AboutWenlanDialog";
 import { searchResultTarget } from "../lib/searchResultTarget";
+import { topBarLeftInset } from "../lib/windowChrome";
 
 const SOURCE_LABELS: Record<string, string> = {
   local_files: "File",
@@ -892,7 +893,7 @@ export default function MemoryView({ onBack, onSelectFile, onSelectRecap, onSele
         style={{
           height: 52,
           borderBottom: "1px solid var(--mem-border)",
-          paddingLeft: 82,
+          paddingLeft: topBarLeftInset(),
           paddingRight: 20,
         }}
         data-tauri-drag-region

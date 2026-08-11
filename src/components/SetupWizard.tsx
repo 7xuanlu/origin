@@ -22,6 +22,7 @@ import {
   type SyncStats,
   type ResolvedRouting,
 } from "../lib/tauri";
+import { dragStripHeight } from "../lib/windowChrome";
 import { ImportView } from "./memory/ImportView";
 import VaultConnectCard, { type VaultPick } from "./memory/sources/VaultConnectCard";
 import { isPluginClient } from "./connect/pluginClients";
@@ -128,7 +129,7 @@ function StepShell({
       className="flex flex-col"
       style={{ height: "100vh", backgroundColor: "var(--mem-bg)" }}
     >
-      <div data-tauri-drag-region style={{ height: "32px", flexShrink: 0 }} />
+      <div data-tauri-drag-region style={{ height: dragStripHeight(), flexShrink: 0 }} />
 
       <main
         data-testid="wizard-scroll-main"
@@ -447,7 +448,7 @@ function ImportStep({
     // under so its height math keeps working unmodified.
     return (
       <div className="flex flex-col" style={{ height: "100vh", backgroundColor: "var(--mem-bg)" }}>
-        <div data-tauri-drag-region style={{ height: "32px", flexShrink: 0 }} />
+        <div data-tauri-drag-region style={{ height: dragStripHeight(), flexShrink: 0 }} />
         {!hideDots && <StepIndicator currentStep="import" />}
         <div
           className="flex-1"
