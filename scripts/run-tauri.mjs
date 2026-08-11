@@ -12,8 +12,17 @@
 // way everywhere.
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
 
-const cli = createRequire(import.meta.url).resolve("@tauri-apps/cli/tauri.js");
+// Located through the manifest's own bin entry rather than by resolving
+// "@tauri-apps/cli/tauri.js" directly. That deep path works today only because
+// the package declares no `exports` field; the day it adds one, a deep specifier
+// throws ERR_PACKAGE_PATH_NOT_EXPORTED and every build breaks at once. A
+// package.json is always resolvable.
+const require = createRequire(import.meta.url);
+const manifestPath = require.resolve("@tauri-apps/cli/package.json");
+const manifest = require("@tauri-apps/cli/package.json");
+const cli = resolve(dirname(manifestPath), manifest.bin.tauri);
 
 // Spawned through the current Node binary rather than node_modules/.bin/tauri,
 // because that entry is a cmd shim on Windows and would put a shell back in the

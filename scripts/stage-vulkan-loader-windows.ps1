@@ -45,10 +45,13 @@ try {
             "$Version/windows/vulkan-runtime-components.zip"
         )
         Write-Host "Downloading the official LunarG Vulkan runtime components $Version..."
+        # Bounded on purpose: the default is no timeout at all, so a stalled
+        # connection to sdk.lunarg.com would hang the build silently.
         Invoke-WebRequest `
             -UseBasicParsing `
             -Uri $archiveUrl `
-            -OutFile $resolvedArchive
+            -OutFile $resolvedArchive `
+            -TimeoutSec 120
     }
 
     $actualArchiveSha256 = (

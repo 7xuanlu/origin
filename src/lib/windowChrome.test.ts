@@ -17,6 +17,24 @@ const WINDOWS_WEBVIEW2 =
 const LINUX_WEBKITGTK =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
+/** Runs `body` with `globalThis.navigator` replaced, then puts it back. */
+function withNavigator(replacement: { userAgent: string } | undefined, body: () => void): void {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", {
+    value: replacement,
+    configurable: true,
+  });
+  try {
+    body();
+  } finally {
+    if (original) {
+      Object.defineProperty(globalThis, "navigator", original);
+    } else {
+      Reflect.deleteProperty(globalThis, "navigator");
+    }
+  }
+}
+
 describe("window chrome", () => {
   it("recognises the macOS webview and nothing else", () => {
     expect(isMacOS(MACOS_WKWEBVIEW)).toBe(true);
@@ -25,8 +43,30 @@ describe("window chrome", () => {
   });
 
   it("treats a missing user agent as not macOS", () => {
-    expect(isMacOS(undefined)).toBe(false);
     expect(isMacOS("")).toBe(false);
+
+    // The real missing-user-agent path is no navigator at all. Passing
+    // `undefined` explicitly would re-trigger the default parameter and read
+    // jsdom's own user agent instead, so it would pass for the wrong reason.
+    withNavigator(undefined, () => {
+      expect(isMacOS()).toBe(false);
+    });
+  });
+
+  // How the components actually call these: no argument, so the values come
+  // from the webview the app is running in.
+  it("reads the ambient user agent when called with no argument", () => {
+    withNavigator({ userAgent: MACOS_WKWEBVIEW }, () => {
+      expect(isMacOS()).toBe(true);
+      expect(topBarLeftInset()).toBe(MACOS_TRAFFIC_LIGHT_INSET);
+      expect(dragStripHeight()).toBe(32);
+    });
+
+    withNavigator({ userAgent: WINDOWS_WEBVIEW2 }, () => {
+      expect(isMacOS()).toBe(false);
+      expect(topBarLeftInset()).toBe(NATIVE_TITLE_BAR_INSET);
+      expect(dragStripHeight()).toBe(0);
+    });
   });
 
   // "Mac" alone appears in unrelated tokens; only the platform strings count.

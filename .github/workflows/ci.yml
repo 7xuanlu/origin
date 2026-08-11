@@ -2387,10 +2387,9 @@ jobs:
         shell: pwsh
         run: |
           & scripts/setup-msvc-ninja-windows.ps1
-      # The two DLLs the daemon needs at runtime. They ship loose in
-      # wenlan-windows-x64.zip today and are NOT yet in the app bundle; staging
-      # them here is what lets the inspect step below report where an installed
-      # app would have to find them.
+      # The two DLLs the daemon needs at runtime, plus the Vulkan license the
+      # loader is redistributed under. They also ship loose in
+      # wenlan-windows-x64.zip, for the headless install.
       # Straight into app/binaries, beside the sidecars, because that is where
       # app/tauri.windows.conf.json bundles them from. prepare-sidecars.sh would
       # stage them itself if they were missing; doing it here keeps the download
@@ -2478,13 +2477,16 @@ jobs:
           $listing = & 7z l -ba -- $nsis.FullName
           if ($LASTEXITCODE -ne 0) { throw "7z could not read $($nsis.Name)" }
           foreach ($name in $required) {
+            # $PLUGINSDIR is NSIS's scratch directory, deleted when the installer
+            # exits. A name that only appears there is not a file the app ships,
+            # so it must not count as a pass.
             $hit = $listing |
-              Where-Object { $_ -match [regex]::Escape($name) } |
+              Where-Object { $_ -match [regex]::Escape($name) -and $_ -notmatch '\$PLUGINSDIR' } |
               Select-Object -First 1
             if ($hit) {
               Write-Host "PASS nsis $name -> $($hit.Trim())"
             } else {
-              Write-Host "FAIL nsis $name is not in the installer"
+              Write-Host "FAIL nsis $name is not installed by the installer"
               $failed = $true
             }
           }
@@ -2496,6 +2498,11 @@ jobs:
           if (-not $msi) { throw "no MSI found under $bundle/msi" }
           $extract = Join-Path $env:RUNNER_TEMP "wenlan-msi-admin"
           Remove-Item -Recurse -Force $extract -ErrorAction SilentlyContinue
+          # Silently tolerating a failed cleanup would let this half pass on the
+          # previous run's files, so confirm the directory is actually gone.
+          if (Test-Path $extract) {
+            throw "could not clear $extract; a stale tree would make this check meaningless"
+          }
           $admin = Start-Process msiexec -Wait -PassThru -ArgumentList @(
             "/a", "`"$($msi.FullName)`"", "/qn", "TARGETDIR=`"$extract`""
           )
