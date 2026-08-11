@@ -29,6 +29,9 @@ app/gen/
 
 # pnpm
 .pnpm-debug.log
+# pnpm falls back to a project-local content store when it cannot use the one
+# under $HOME. Hundreds of MB of regenerable cache; never commit it.
+.pnpm-store/
 
 # Build artifacts
 tsconfig.tsbuildinfo
