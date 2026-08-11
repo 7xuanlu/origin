@@ -2424,12 +2424,6 @@ jobs:
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
           chmod 755 "$RUNNER_TEMP/cloudflared.exe"
           echo "CLOUDFLARED_BIN=$RUNNER_TEMP/cloudflared.exe" >> "$GITHUB_ENV"
-      # Not `pnpm tauri`: package.json defines that script as
-      # `TAURI_DIR=app tauri`, a POSIX env-var prefix that pnpm hands to
-      # cmd.exe on Windows, which cannot parse it. `pnpm exec` runs the CLI
-      # binary directly, so bash sets TAURI_DIR the way the script intended.
-      # Making package.json itself portable is the real fix and belongs with
-      # whatever change first teaches release.yml to publish a Windows app.
       # tauri.conf.json carries an updater pubkey, so `tauri build` refuses to
       # bundle without the matching private key. This job publishes nothing and
       # no one installs its output, so it mints a throwaway keypair per run
@@ -2448,10 +2442,9 @@ jobs:
         shell: bash
         env:
           CLOUDFLARED_BIN: ${{ env.CLOUDFLARED_BIN }}
-          TAURI_DIR: app
           TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm exec tauri build --target x86_64-pc-windows-msvc
+        run: pnpm tauri build --target x86_64-pc-windows-msvc
       # Diagnostics only. An MSI and an NSIS setup are each a single opaque file,
       # so this listing can say how big they are but never what is inside them.
       # The step below is the one that decides pass or fail.

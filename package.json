@@ -30,7 +30,7 @@
     "clean:release": "rm -f target/release/bundle/macos/rw.*.dmg; rm -rf target/release/bundle/dmg/Wenlan_*.dmg target/release/bundle/dmg/Origin_*.dmg; echo 'Release artifacts cleaned'",
     "clean:all": "pnpm clean:dev && pnpm clean:release && echo 'All cleaned'",
     "preview": "vite preview",
-    "tauri": "TAURI_DIR=app tauri",
+    "tauri": "node scripts/run-tauri.mjs",
     "postinstall": "git config core.hooksPath .githooks 2>/dev/null && chmod +x .githooks/* 2>/dev/null || true",
     "test": "vitest run",
     "test:e2e": "playwright test",
