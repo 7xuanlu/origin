@@ -4,6 +4,27 @@ import { defineConfig, devices } from "@playwright/test";
 const port = Number(process.env.E2E_PORT ?? 14320);
 const baseURL = `http://127.0.0.1:${port}`;
 
+// Playwright's "Desktop Chrome" descriptor carries a Windows user agent whatever
+// host it runs on, so a macOS run reports Windows to the page. The app reads the
+// platform off the user agent to decide whether to leave room for the macOS
+// traffic lights (src/lib/windowChrome.ts), and the approved screenshots are of
+// the macOS app, so the descriptor's default renders a layout no user sees.
+// Patched rather than spelled out so the Chrome version keeps tracking whatever
+// Playwright ships — and asserted, because a silent no-op here would put the
+// wrong layout back without failing anything.
+const WINDOWS_UA_TOKEN = "Windows NT 10.0; Win64; x64";
+const desktopChromeUserAgent = devices["Desktop Chrome"].userAgent;
+if (!desktopChromeUserAgent?.includes(WINDOWS_UA_TOKEN)) {
+  throw new Error(
+    `Desktop Chrome's user agent no longer contains "${WINDOWS_UA_TOKEN}": ${desktopChromeUserAgent}. ` +
+      "Point the chromium project at a macOS user agent some other way before running the suite.",
+  );
+}
+const macOSUserAgent = desktopChromeUserAgent.replace(
+  WINDOWS_UA_TOKEN,
+  "Macintosh; Intel Mac OS X 10_15_7",
+);
+
 export default defineConfig({
   testDir: "./e2e",
   testIgnore: "**/*.review.spec.ts",
@@ -32,6 +53,7 @@ export default defineConfig({
       use: {
         ...devices["Desktop Chrome"],
         timezoneId: "America/Los_Angeles",
+        userAgent: macOSUserAgent,
       },
     },
     // The app ships inside WKWebView, and pointer-driven canvas behaviour is
