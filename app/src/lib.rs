@@ -19,7 +19,14 @@ mod identity_paths;
 mod indexer;
 mod lifecycle;
 pub mod mcp_config;
+mod page_review;
 pub mod plugin_install;
+// M5 presence-capability minting (D7). The page-review half is live through
+// `page_review::review_page`; the claim-attest half has no daemon route yet,
+// so its action variant and the test-only verifier are still unconstructed
+// outside tests. See the module doc comment.
+#[allow(dead_code)]
+mod presence;
 pub mod privacy;
 pub mod remote_access;
 mod search;
@@ -1341,6 +1348,10 @@ pub fn run() {
             search::list_pages_explicit_browse,
             search::get_page_explicit_browse,
             search::get_truth_status,
+            // Page review (M5 D7). Mints and submits in one backend call so no
+            // capability ever crosses into JavaScript.
+            page_review::review_page,
+            page_review::page_review_supported,
             // Page map commands
             search::get_page_map,
             search::improve_page_map,

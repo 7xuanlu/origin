@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { AppLocale } from "../../src/i18n/locales";
-import type { MemoryItem } from "../../src/lib/tauri";
+import type { MemoryItem, PageReviewAvailability, PageReviewOutcome } from "../../src/lib/tauri";
 import type { SpacesNavigationFixture } from "../fixtures/spacesNavigation";
 
 export type MockCommandCall = {
@@ -17,6 +17,17 @@ export type MockFailure = {
 export type TauriMockPageScenario = {
   readonly daemonVersion?: string;
   readonly saveDaemonVersion?: string;
+  /**
+   * Page-review readiness and refusals. `supported` drives the daemon-cutover
+   * gate; `outcome` forces one answer for the refusals a fixture cannot
+   * provoke on its own (a capability that does not verify, a missing install
+   * secret). The stale path needs neither — the runtime reaches it by
+   * comparing content, as the daemon does.
+   */
+  readonly pageReview?: {
+    readonly availability?: PageReviewAvailability;
+    readonly outcome?: PageReviewOutcome;
+  };
   readonly firstWriteRemoteMutation?: {
     readonly pageId: string;
     readonly content: string;

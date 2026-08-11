@@ -1702,6 +1702,65 @@ export async function getTruthStatus(): Promise<TruthStatus | null> {
   return invoke<TruthStatus | null>("get_truth_status");
 }
 
+/**
+ * What the daemon answered when asked to mark a page human-reviewed.
+ *
+ * Every variant but `applied` is a refusal the user is told something
+ * different about, which is why this is a tagged union rather than a boolean
+ * plus an error string. Binding spec:
+ * `docs/plans/2026-07-27-m5-presence-threat-model.md` in the daemon repo.
+ */
+export type PageReviewOutcome =
+  /** The mark landed. A retry of one that already succeeded arrives here too. */
+  | { kind: "applied"; reviewed_page_version: number }
+  /** The page changed after it was read, so the approval is about text nobody
+   *  is looking at any more. Reload and ask again. */
+  | { kind: "stale" }
+  /** The capability's sixty seconds ran out in flight. Clicking again mints a
+   *  fresh one, so this one is worth retrying as-is. */
+  | { kind: "expired" }
+  /** The capability did not verify, or named a page the daemon does not have. */
+  | { kind: "invalid" }
+  /** Its one-shot nonce was already spent. */
+  | { kind: "replayed" }
+  /** The daemon cannot check presence at all — the install secret is missing
+   *  or unreadable. Not a licence to proceed. */
+  | { kind: "unavailable" }
+  /** This daemon has no review route; it predates the endpoint. */
+  | { kind: "unsupported" };
+
+/**
+ * Marks a page human-reviewed.
+ *
+ * `content` is the body the caller actually rendered. It is not decoration:
+ * the Tauri backend hashes it and binds the presence capability to that exact
+ * text, so passing anything other than what the human read either fails as
+ * `stale` or, worse, attributes their approval to content they never saw.
+ *
+ * The capability itself is minted and submitted entirely inside the Rust
+ * backend and never crosses this boundary in either direction (threat model
+ * T1) — which is why this takes a page and its content, and not a token.
+ */
+export async function reviewPage(id: string, content: string): Promise<PageReviewOutcome> {
+  return invoke<PageReviewOutcome>("review_page", { pageId: id, content });
+}
+
+/** Whether a review can succeed, and when it cannot, which fact stops it. */
+export type PageReviewAvailability =
+  /** Both the daemon and this build can carry it through. */
+  | "ready"
+  /** No review route on this daemon — too old, or unreachable. Fixable by
+   *  upgrading, so the copy points there. */
+  | "daemon_unsupported"
+  /** This build cannot mint a capability on any daemon (owner-only secret
+   *  protection is Unix-only today), so upgrading the daemon would not help
+   *  and the copy must not suggest it. */
+  | "platform_unsupported";
+
+export async function pageReviewSupported(): Promise<PageReviewAvailability> {
+  return invoke<PageReviewAvailability>("page_review_supported");
+}
+
 export async function createPage(input: CreatePageInput): Promise<CreatePageResponse> {
   const normalizedSpace = input.space?.trim() || null;
   const result = await invoke<Omit<CreatePageResponse, "warnings"> & { warnings?: string[] }>("create_page", {
