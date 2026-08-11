@@ -61,6 +61,8 @@ anyhow = "1"
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
+hmac = { workspace = true }
+getrandom = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 log = "0.4"
