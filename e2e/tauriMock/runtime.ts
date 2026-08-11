@@ -4,6 +4,7 @@ import type {
   EntityDetail,
   MemoryItem,
   Page as KnowledgePage,
+  PageReviewOutcome,
   RefinementProposalSummary,
   Space,
   UpdatePageInput,
@@ -197,6 +198,8 @@ export class TauriMockRuntime {
       case "update_page": return this.updatePage(args);
       case "delete_page": return this.deletePage(args);
       case "redistill_page": return this.redistillPage(args);
+      case "page_review_supported": return this.pageScenario.pageReview?.availability ?? "ready";
+      case "review_page": return this.reviewPage(args);
       case "get_page_map": return this.pageMaps.get(args);
       case "improve_page_map": return this.pageMaps.improve(args);
       case "create_page_map_node": return this.pageMaps.create(args);
@@ -495,6 +498,29 @@ export class TauriMockRuntime {
       stale_reason: null,
     };
     return { status: "ok", updated: true };
+  }
+
+  /**
+   * Answers `review_page` the way the daemon does, including the one refusal
+   * a fixture can actually provoke.
+   *
+   * The daemon binds a review to a digest of the exact text the reader had on
+   * screen and refuses with `presence_conflict` when the stored page has moved
+   * on since (threat model T6). Comparing content here is the same check, and
+   * it is what lets a spec drive the stale path by editing the page out from
+   * under the reader rather than by asking the mock to lie. Refusals a fixture
+   * cannot reach on its own — an unreadable install secret, a MAC that does
+   * not verify — are set through `pageScenario.pageReview.outcome` instead.
+   */
+  private reviewPage(args: unknown): PageReviewOutcome {
+    const id = requiredString("review_page", args, "pageId");
+    const content = requiredString("review_page", args, "content");
+    const forced = this.pageScenario.pageReview?.outcome;
+    if (forced) return forced;
+    const page = this.pages.find((candidate) => candidate.id === id);
+    if (!page) return { kind: "invalid" };
+    if (page.content !== content) return { kind: "stale" };
+    return { kind: "applied", reviewed_page_version: page.version };
   }
 
   private resolveRefinement(
