@@ -144,6 +144,10 @@ jobs:
               - 'e2e/**'
               - 'preview/**'
               - 'review/**'
+              # Vite serves public/ verbatim, and the app's fonts live there.
+              # Without this a font change matches no filter at all, which is
+              # the silent-green case described above.
+              - 'public/**'
               - 'package.json'
               - 'pnpm-lock.yaml'
               - 'pnpm-workspace.yaml'

@@ -131,7 +131,7 @@ DOCS_JOB_FILES = {
 # The Tauri desktop app crate plus the root-level frontend dirs it shares a
 # release pipeline with. All of it runs under the separate app-check job
 # (macos-14), never the Rust workspace plan.
-APP_JOB_PREFIXES = ("app", "src", "e2e", "preview", "review")
+APP_JOB_PREFIXES = ("app", "src", "e2e", "preview", "review", "public")
 APP_JOB_FILES = {
     "package.json",
     "pnpm-lock.yaml",

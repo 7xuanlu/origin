@@ -2,7 +2,12 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+// Two of these tests start the real Tauri CLI through Node, which is well past
+// vitest's 5s default on a loaded CI runner. Same reasoning as
+// scripts/prepare-sidecars.test.ts: the deadline moves, no assertion does.
+vi.setConfig({ testTimeout: 60_000 });
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const scriptPath = resolve(root, "scripts/run-tauri.mjs");
