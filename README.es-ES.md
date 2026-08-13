@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=c076f706a1afb2debab4e24d319143c5d3e40fcee953cc7c44c6f21f08d0d861 -->
+<!-- README_SYNC: source=README.md sha256=547254c3bc862a3fbbe4daa5b34d23fba1546d8998704166d1a488a903fe7720 -->
 
 <p align="center">
   <picture>
@@ -61,7 +61,7 @@ Esta vista previa aún no está notarizada, así que macOS bloquea el primer arr
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-Hoy solo se publica la versión para macOS Apple Silicon. En Windows y Linux, usa el entorno de ejecución sin interfaz de abajo.
+En Windows x64, ejecuta el `-setup.exe` de la misma página de [Releases](https://github.com/7xuanlu/wenlan/releases/latest). Instala el daemon, la CLI y el conector MCP junto con las bibliotecas que necesitan en tiempo de ejecución, así que no hay nada más que instalar. Linux todavía no tiene versión de escritorio; usa el entorno de ejecución sin interfaz de abajo.
 
 <a id="claude-code-in-30-seconds"></a>
 
