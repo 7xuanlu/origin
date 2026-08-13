@@ -4962,9 +4962,16 @@ fn release_preflight_contract_violations(ci_workflow: &str, release_workflow: &s
         violations
             .push("tag release retains duplicate compilation of PR-validated binaries".into());
     }
+    // The CLI wrappers and the desktop app are promoted by two jobs, and only
+    // the app one waits on the app builds, so a failed Windows bundle stops the
+    // app assets alone instead of the whole release. Both halves are pinned
+    // here: promote-assets must not name an app build at all, and
+    // promote-app-assets must name both.
     if job_needs(&release, "bind-release-tag") != ["resolve-promotion"]
         || job_needs(&release, "prepare-release") != ["resolve-promotion", "bind-release-tag"]
         || job_needs(&release, "promote-assets")
+            != ["resolve-promotion", "bind-release-tag", "prepare-release"]
+        || job_needs(&release, "promote-app-assets")
             != [
                 "resolve-promotion",
                 "bind-release-tag",
@@ -6085,6 +6092,7 @@ fn release_promotion_contract_violations(
         "resolve-promotion",
         "bind-release-tag",
         "promote-assets",
+        "promote-app-assets",
         "docker",
         "docker-manifest",
         "publish-crates",
@@ -6119,6 +6127,8 @@ fn release_promotion_contract_violations(
         || !resolve.contains(".main_sha == $sha and .main_run == null")
         || job_needs(&release, "prepare-release") != ["resolve-promotion", "bind-release-tag"]
         || job_needs(&release, "promote-assets")
+            != ["resolve-promotion", "bind-release-tag", "prepare-release"]
+        || job_needs(&release, "promote-app-assets")
             != [
                 "resolve-promotion",
                 "bind-release-tag",
