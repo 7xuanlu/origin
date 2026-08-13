@@ -437,6 +437,7 @@ def contract_violations(
         "app-bundle",
         "app-bundle-windows",
         "promote-assets",
+        "promote-app-assets",
         "docker",
         "docker-manifest",
         "finalize-release",
@@ -447,10 +448,27 @@ def contract_violations(
         violations.append("release preparation can start before receipt-derived tag binding")
     if "    needs: [resolve-promotion, bind-release-tag]" not in job_body(release, "app-bundle-windows"):
         violations.append("Windows app bundling can start before receipt-derived tag binding")
-    if "    needs: [resolve-promotion, bind-release-tag, prepare-release, app-bundle, app-bundle-windows]" not in job_body(
+    # The CLI wrappers and the desktop app are promoted by two jobs on
+    # purpose. Only the app job waits on the desktop builds, so a failed
+    # Windows bundle no longer skips Docker, npm, crates and Homebrew with it.
+    # The pair of assertions below is what keeps that split honest: the CLI job
+    # must NOT wait on an app build, and the app job must wait on both.
+    if "    needs: [resolve-promotion, bind-release-tag, prepare-release]" not in job_body(
         release, "promote-assets"
     ):
-        violations.append("asset publication bypasses receipt resolution, tag binding, prerelease gate, or app bundling")
+        violations.append("asset publication bypasses receipt resolution, tag binding, or the prerelease gate")
+    if re.search(r"app-bundle", job_body(release, "promote-assets").split("steps:")[0]):
+        violations.append(
+            "CLI asset publication waits on a desktop app build again; a failed "
+            "Windows bundle would take the whole release down with it"
+        )
+    if "    needs: [resolve-promotion, bind-release-tag, prepare-release, app-bundle, app-bundle-windows]" not in job_body(
+        release, "promote-app-assets"
+    ):
+        violations.append(
+            "desktop app promotion bypasses receipt resolution, tag binding, "
+            "the prerelease gate, or one of the two app bundles"
+        )
     resolve = job_body(release, "resolve-promotion")
     for marker in [
         "scripts/release-promotion.py gate-main",
@@ -473,6 +491,7 @@ def contract_violations(
         "app-bundle",
         "app-bundle-windows",
         "promote-assets",
+        "promote-app-assets",
         "docker",
         "docker-manifest",
         "publish-crates",
@@ -538,25 +557,26 @@ def contract_violations(
             violations.append(
                 f"Windows app bundling does not prove its installer payload: {marker!r}"
             )
+    promote_app = job_body(release, "promote-app-assets")
     for marker in ["latest.json", "darwin-aarch64-app", "windows-x86_64"]:
-        if marker not in promote:
-            violations.append(f"validated asset promotion omits updater manifest {marker!r}")
+        if marker not in promote_app:
+            violations.append(f"desktop app promotion omits updater manifest {marker!r}")
     for marker in [
         "needs.app-bundle.outputs.dmg_sha256",
         "needs.app-bundle-windows.outputs.setup_sha256",
         "needs.app-bundle-windows.outputs.sig_sha256",
     ]:
-        if marker not in promote:
+        if marker not in promote_app:
             violations.append(
                 f"app bundle SHA-256 re-verification is not wired to {marker!r}"
             )
-    verify_idx = promote.find("Verify app bundle bytes before promotion")
-    upload_idx = promote.find(
+    verify_idx = promote_app.find("Verify app bundle bytes before promotion")
+    upload_idx = promote_app.find(
         "Upload desktop app assets and updater metadata without clobbering"
     )
     if verify_idx == -1 or upload_idx == -1:
         violations.append(
-            "validated asset promotion omits app bundle SHA-256 re-verification before upload"
+            "desktop app promotion omits app bundle SHA-256 re-verification before upload"
         )
     elif verify_idx > upload_idx:
         violations.append("app bundle assets are uploaded before their SHA-256 re-verification")
@@ -610,8 +630,15 @@ def contract_violations(
     if "    needs: [promote-assets, bind-release-tag]" not in npm or "needs: publish-crates" in npm:
         violations.append("npm publishing is serialized behind crates.io propagation")
     finalize = job_body(release, "finalize-release")
-    if "    needs: [docker-manifest, bind-release-tag]" not in finalize:
-        violations.append("GitHub release finalization bypasses the GHCR promotion barrier")
+    # promote-app-assets is listed here and nowhere downstream. That is the
+    # whole fail-closed half of the promote-assets split: the desktop uploads
+    # no longer block the CLI channels, so this entry is the only thing left
+    # keeping a release whose installers never landed out of releases/latest.
+    if "    needs: [docker-manifest, promote-app-assets, bind-release-tag]" not in finalize:
+        violations.append(
+            "GitHub release finalization bypasses the GHCR promotion barrier or "
+            "would promote a release whose desktop app assets never landed"
+        )
     # The lifecycle step resolves the merged release PR through
     # GET /commits/{sha}/pulls, then POSTs and DELETEs on /issues/{pr}/labels to
     # move it from pending to tagged. The /issues/ path is only the REST
@@ -1246,6 +1273,84 @@ def assert_mutation_detected(
         )
 
 
+# The Windows desktop bundle is built by two hand-copied recipes:
+# ci.yml's `app-windows-bundle`, which anyone can dispatch and which has
+# actually run, and release.yml's `app-bundle-windows`, which nothing exercises
+# until a real release is cut. Whatever the proven one needs to produce a
+# working installer, the unproven one needs too, and a change to either alone
+# is drift nobody would notice until release day.
+#
+# Each marker is asserted present in BOTH files, so editing one side is a
+# failure that names the other. That also keeps this list honest: a marker
+# deleted from CI cannot silently stop being checked.
+WINDOWS_BUILD_RECIPE_MARKERS = [
+    "runs-on: windows-2022",
+    "targets: x86_64-pc-windows-msvc",
+    "bash scripts/stabilize-rust-cache-toolchains.sh",
+    # libsql does not bundle SQLite on Windows.
+    "vcpkg install sqlite3:x64-windows-static-md",
+    "& scripts/setup-vulkan-sdk-windows.ps1",
+    "& scripts/setup-msvc-ninja-windows.ps1",
+    # The two libraries the daemon dynamically loads, staged where
+    # app/tauri.windows.conf.json bundles them from.
+    "& scripts/stage-onnxruntime-windows.ps1 -DestinationDirectory $dllDir",
+    "& scripts/stage-vulkan-loader-windows.ps1 -DestinationDirectory $dllDir",
+    "pnpm tauri build --target x86_64-pc-windows-msvc",
+    # Both jobs unpack the installer they produce and look inside it, and both
+    # refuse a hit in NSIS's scratch directory, which is deleted when the
+    # installer exits and so is not a file the app ships.
+    "onnxruntime.dll",
+    "vulkan-1.dll",
+    "VulkanRT-License.txt",
+    "$PLUGINSDIR",
+]
+
+
+def windows_recipe_drift_violations(ci: str, release: str) -> list[str]:
+    violations: list[str] = []
+    ci_job = job_body(ci, "app-windows-bundle")
+    release_job = job_body(release, "app-bundle-windows")
+    if not ci_job:
+        return ["ci.yml no longer defines app-windows-bundle, the proven Windows recipe"]
+    if not release_job:
+        return ["release.yml no longer defines app-bundle-windows"]
+    for marker in WINDOWS_BUILD_RECIPE_MARKERS:
+        in_ci = marker in ci_job
+        in_release = marker in release_job
+        if in_ci and in_release:
+            continue
+        missing, present = (
+            ("ci.yml app-windows-bundle", "release.yml app-bundle-windows")
+            if not in_ci
+            else ("release.yml app-bundle-windows", "ci.yml app-windows-bundle")
+        )
+        violations.append(
+            f"Windows build recipes have drifted: {marker!r} is in {present} "
+            f"but not in {missing}"
+        )
+    # The one difference that is deliberate. CI publishes nothing and nobody
+    # installs its output, so it mints a throwaway updater keypair per run
+    # instead of borrowing the real release secret; the release job is the only
+    # Windows job that may touch that secret.
+    if "tauri signer generate" not in ci_job:
+        violations.append(
+            "ci.yml app-windows-bundle no longer mints a throwaway updater key"
+        )
+    if "secrets.TAURI_SIGNING_PRIVATE_KEY" in ci_job:
+        violations.append(
+            "ci.yml app-windows-bundle borrows the real updater signing secret"
+        )
+    if "secrets.TAURI_SIGNING_PRIVATE_KEY" not in release_job:
+        violations.append(
+            "release.yml app-bundle-windows no longer signs with the release key"
+        )
+    if "tauri signer generate" in release_job:
+        violations.append(
+            "release.yml app-bundle-windows signs installers with a throwaway key"
+        )
+    return violations
+
+
 def main() -> None:
     publish_helper_tests = subprocess.run(
         [sys.executable, str(PUBLISH_CRATE_TEST_PATH)],
@@ -1273,6 +1378,7 @@ def main() -> None:
         promotion,
         sync_release_pr,
     )
+    violations.extend(windows_recipe_drift_violations(ci, release))
     violations.extend(candidate_observer_contract_violations(ci, observer, validator, archive))
     violations.extend(trusted_candidate_gate_violations(ci, classifier, validator))
     if violations:

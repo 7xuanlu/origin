@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=c076f706a1afb2debab4e24d319143c5d3e40fcee953cc7c44c6f21f08d0d861 -->
+<!-- README_SYNC: source=README.md sha256=547254c3bc862a3fbbe4daa5b34d23fba1546d8998704166d1a488a903fe7720 -->
 
 <p align="center">
   <picture>
@@ -61,7 +61,7 @@ Wenlan 以單一本地 daemon 運行。桌面 app 內建這個 daemon；無 GUI 
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-目前只發布 macOS Apple Silicon 版本。Windows 與 Linux 請使用下面的無 GUI runtime。
+Windows x64 請在同一個 [Releases](https://github.com/7xuanlu/wenlan/releases/latest) 頁面下載 `-setup.exe` 並執行。安裝包內含 daemon、CLI 與 MCP 連接器，以及它們執行時要載入的函式庫，不需要再裝別的東西。Linux 暫時沒有桌面版，請使用下面的無 GUI runtime。
 
 <a id="claude-code-in-30-seconds"></a>
 
