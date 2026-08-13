@@ -47,6 +47,8 @@ export const REVIEW_COMMAND_CAPABILITIES = {
     "daemon_version",
     "get_system_info",
     "record_page_editor_diagnostic",
+    "review_page",
+    "page_review_supported",
     "get_page_links",
     "get_page_revisions",
     "get_page_sources",

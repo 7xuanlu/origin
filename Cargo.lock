@@ -9575,6 +9575,8 @@ dependencies = [
  "dirs 6.0.0",
  "env_logger",
  "futures",
+ "getrandom 0.2.17",
+ "hmac",
  "log",
  "notify",
  "notify-debouncer-full",

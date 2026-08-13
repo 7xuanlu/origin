@@ -343,6 +343,63 @@ const TRUTH_INTENT_EXPLICIT: &str = "explicit";
 /// Where the daemon stands on the M5 truth cutover.
 pub type TruthStatus = wenlan_types::responses::TruthStatus;
 
+/// What a successful page review recorded. An alias of the daemon-owned
+/// shape, same as [`TruthStatus`] above — `wenlan-types` is a workspace path
+/// dependency here, so there is nothing to hand-mirror.
+pub type PageReviewReceipt = wenlan_types::responses::PageReviewReceipt;
+
+/// The daemon's coarse refusal body: one code and nothing else (D7 §7). Not a
+/// daemon-owned wire type — `refusal_response` in
+/// `crates/wenlan-server/src/page_routes.rs` builds this shape ad hoc rather
+/// than through a shared struct, so this side has nothing to alias.
+#[derive(Debug, Clone, Deserialize)]
+struct PresenceRefusalBody {
+    error: String,
+}
+
+/// What `POST /api/pages/{id}/review` answered, in the terms the UI renders.
+///
+/// Serializable because it is what the review command hands back to
+/// JavaScript. Nothing here is capability material — no MAC, no nonce, not
+/// even the nonce digest — so §7 holds by shape rather than by every future
+/// caller remembering it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PageReviewOutcome {
+    /// The mark landed. A retry of a review that had already succeeded arrives
+    /// here too: the daemon replays the stored receipt with the same 200, so
+    /// this side cannot tell the two apart and has no reason to (T7).
+    Applied { reviewed_page_version: i64 },
+    /// The page's content changed after the human read it, so the approval is
+    /// about text nobody is looking at any more (T6). The move is to show what
+    /// is there now and ask again.
+    ///
+    /// `presence_conflict` also covers reusing one operation ID for different
+    /// content (T8), which this client cannot produce — it derives the
+    /// operation ID from the page and the digest, so different content is
+    /// always a different operation. Every conflict reaching this app is the
+    /// stale-content one.
+    Stale,
+    /// The capability's sixty seconds ran out between minting and arrival.
+    /// Retrying mints a fresh one, so this is worth offering again.
+    Expired,
+    /// The capability did not verify, or named a page the daemon does not
+    /// have. Deliberately coarse on the daemon side, so there is nothing more
+    /// specific to report.
+    Invalid,
+    /// The nonce was already spent. Unreachable through the receipt path this
+    /// client uses, and kept because a refusal class the UI cannot name is a
+    /// refusal the UI renders as a lie.
+    Replayed,
+    /// The install secret is missing or unreadable, so the daemon cannot check
+    /// presence at all. Not a caller error, and explicitly not a licence to
+    /// proceed (D7 §5).
+    Unavailable,
+    /// This daemon has no review route — it predates the endpoint. Separate
+    /// from [`Self::Unavailable`] because the fix is an upgrade, not a repair.
+    Unsupported,
+}
+
 impl Default for WenlanClient {
     fn default() -> Self {
         Self::new()
@@ -626,6 +683,67 @@ impl WenlanClient {
     /// marker.
     pub async fn truth_status(&self) -> Result<Option<TruthStatus>, String> {
         Ok(self.status().await?.truth)
+    }
+
+    /// Submits a minted page-review capability to `POST /api/pages/{id}/review`.
+    ///
+    /// Takes an already-built [`crate::presence::ReviewPageBody`] rather than
+    /// the parts to build one, because the capability inside it must have been
+    /// minted for this exact page and this exact content — and the only thing
+    /// that can produce one is `presence::mint_page_review`.
+    ///
+    /// Does not go through [`Self::post_json`], which treats every non-2xx as
+    /// an error string. Here the refusals *are* the answer: four of the five
+    /// tell the UI something different to do, and flattening them into prose
+    /// would throw that away.
+    pub async fn review_page(
+        &self,
+        page_id: &str,
+        body: &crate::presence::ReviewPageBody,
+    ) -> Result<PageReviewOutcome, String> {
+        let path = format!("/api/pages/{}/review", page_id);
+        let resp = self
+            .client
+            .post(self.url(&path))
+            .json(body)
+            .send()
+            .await
+            // The capability is in the request, never in this message: `body`
+            // is not formatted here or anywhere below (§7).
+            .map_err(|e| format!("HTTP POST {}: {}", path, e))?;
+
+        let status = resp.status();
+        if status.is_success() {
+            let receipt: PageReviewReceipt = resp
+                .json()
+                .await
+                .map_err(|e| format!("Parse {}: {}", path, e))?;
+            return Ok(PageReviewOutcome::Applied {
+                reviewed_page_version: receipt.reviewed_page_version,
+            });
+        }
+        // The handler never answers 404 — a page it cannot find is
+        // `presence_invalid`, so that the caller cannot probe the page table.
+        // A 404 therefore means the router has no such route at all, which is
+        // a daemon older than the endpoint.
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(PageReviewOutcome::Unsupported);
+        }
+        let refusal: PresenceRefusalBody = resp
+            .json()
+            .await
+            .map_err(|_| format!("HTTP POST {} returned {}", path, status))?;
+        Ok(match refusal.error.as_str() {
+            "presence_invalid" => PageReviewOutcome::Invalid,
+            "presence_expired" => PageReviewOutcome::Expired,
+            "presence_replayed" => PageReviewOutcome::Replayed,
+            "presence_conflict" => PageReviewOutcome::Stale,
+            "presence_unavailable" => PageReviewOutcome::Unavailable,
+            // A code this build does not know is a newer daemon, not a
+            // refusal to translate into the nearest familiar one — guessing
+            // would show the user a reason that is not the reason.
+            other => return Err(format!("unrecognized review refusal: {}", other)),
+        })
     }
 
     // ── Capture stats ────────────────────────────────────────────────
@@ -2686,5 +2804,146 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&err).expect("status envelope is JSON");
         assert_eq!(parsed["status"], 404);
+    }
+
+    /// A body signed by a secret this test owns. What it signs is irrelevant
+    /// to every test below — none of them run a daemon that could check it.
+    fn review_body(dir: &tempfile::TempDir) -> crate::presence::ReviewPageBody {
+        crate::presence::test_review_body(dir.path(), "p1")
+    }
+
+    async fn review_outcome_for(
+        status: &'static str,
+        body: &'static str,
+    ) -> Result<PageReviewOutcome, String> {
+        let (base_url, _request) = serve_response_once(status, body).await;
+        let client = WenlanClient {
+            client: reqwest::Client::new(),
+            base_url,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        client.review_page("p1", &review_body(&dir)).await
+    }
+
+    #[tokio::test]
+    async fn review_page_posts_the_presence_envelope_to_the_page_review_route() {
+        let (base_url, request) = serve_json_once(
+            r#"{"page_id":"p1","human_reviewed":true,"reviewed_page_version":4,"reviewed_page_digest":"d","protocol_version":1,"nonce_digest":"nd","verified_at":7,"caller_id":"wenlan-app","operation_id":"op-1"}"#,
+        )
+        .await;
+        let client = WenlanClient {
+            client: reqwest::Client::new(),
+            base_url,
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let outcome = client
+            .review_page("p1", &review_body(&dir))
+            .await
+            .expect("review_page succeeds");
+
+        assert_eq!(
+            outcome,
+            PageReviewOutcome::Applied {
+                reviewed_page_version: 4
+            }
+        );
+        let request = request.await.unwrap();
+        assert_eq!(
+            request.lines().next().unwrap_or_default(),
+            "POST /api/pages/p1/review HTTP/1.1"
+        );
+        // The daemon deserializes `ReviewPageRequest { presence }`; a body
+        // that nested it anywhere else would be a 422 nobody could read.
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let sent: serde_json::Value = serde_json::from_str(body).expect("the body is JSON");
+        assert_eq!(sent["presence"]["action"], "review_page");
+        assert_eq!(sent["presence"]["target_ids"], serde_json::json!(["p1"]));
+    }
+
+    #[tokio::test]
+    async fn each_refusal_code_becomes_the_outcome_the_ui_renders() {
+        // The whole point of not using `post_json` here. Four of these tell
+        // the user to do something different; collapsing them into one error
+        // string would make the difference unreachable.
+        for (status, code, expected) in [
+            (
+                "403 Forbidden",
+                r#"{"error":"presence_invalid"}"#,
+                PageReviewOutcome::Invalid,
+            ),
+            (
+                "403 Forbidden",
+                r#"{"error":"presence_expired"}"#,
+                PageReviewOutcome::Expired,
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":"presence_replayed"}"#,
+                PageReviewOutcome::Replayed,
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":"presence_conflict"}"#,
+                PageReviewOutcome::Stale,
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"error":"presence_unavailable"}"#,
+                PageReviewOutcome::Unavailable,
+            ),
+        ] {
+            let outcome = review_outcome_for(status, code)
+                .await
+                .unwrap_or_else(|e| panic!("{code} must be an outcome, not an error: {e}"));
+            assert_eq!(outcome, expected, "for {code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_daemon_without_the_review_route_is_unsupported_not_a_refusal() {
+        // The handler answers `presence_invalid` for a page it cannot find, so
+        // a 404 can only be the router having no such path — an upgrade, not a
+        // repair, and a different thing to tell the user.
+        let outcome = review_outcome_for("404 Not Found", r#"{"error":"not found"}"#)
+            .await
+            .expect("a 404 is an outcome");
+
+        assert_eq!(outcome, PageReviewOutcome::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_refusal_code_is_an_error_rather_than_the_nearest_familiar_one() {
+        let result = review_outcome_for("403 Forbidden", r#"{"error":"presence_future"}"#).await;
+
+        assert!(
+            result.is_err(),
+            "a newer daemon's refusal must not be renamed into a reason that is not the reason",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_review_outcome_never_carries_capability_material() {
+        // D7 §7 facing the UI. The command's answer is the one thing that
+        // crosses into JavaScript, so it is the one place a leak would land.
+        let dir = tempfile::tempdir().unwrap();
+        let body = review_body(&dir);
+        let minted = serde_json::to_value(&body).unwrap();
+        let mac = minted["presence"]["mac"].as_str().unwrap().to_string();
+        let nonce = minted["presence"]["nonce"].as_str().unwrap().to_string();
+
+        let outcome = serde_json::to_string(&PageReviewOutcome::Applied {
+            reviewed_page_version: 4,
+        })
+        .unwrap();
+
+        assert!(
+            !outcome.contains(&mac),
+            "the MAC reached JavaScript; nothing on PageReviewOutcome may carry capability material (D7 §7)",
+        );
+        assert!(
+            !outcome.contains(&nonce),
+            "the nonce reached JavaScript; nothing on PageReviewOutcome may carry capability material (D7 §7)",
+        );
     }
 }

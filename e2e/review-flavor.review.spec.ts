@@ -132,6 +132,31 @@ test("creates and publishes a Page draft through the Review runtime", async ({ p
   expect(browserErrors.consoleErrors).toEqual([]);
 });
 
+test("marks a page reviewed through the backend-minted presence path", async ({ page }) => {
+  // The command contract is the point. `review_page` and
+  // `page_review_supported` were both new, and an unregistered command fails
+  // only at runtime, on this screen — so driving the real gesture through the
+  // Review surface is what proves they were registered and answered.
+  const browserErrors = collectBrowserErrors(page);
+  await installRejectedCommandAudit(page);
+  await page.goto("/");
+  await openFixtureArchitecture(page);
+
+  await page.getByRole("button", { name: "Page actions", exact: true }).click();
+  const review = page.getByRole("menuitem", { name: "Mark page reviewed", exact: true });
+  await expect(review).toBeEnabled();
+  await review.click();
+
+  await expect(page.getByTestId("page-review-notice")).toHaveText("Marked as reviewed.");
+
+  // Nothing was rejected by `review/tauri-core.ts`, which is the assertion the
+  // contract exists to make.
+  await page.waitForTimeout(250);
+  expect(await rejectedCommands(page)).toEqual([]);
+  expect(browserErrors.pageErrors).toEqual([]);
+  expect(browserErrors.consoleErrors).toEqual([]);
+});
+
 test("creates a Space and navigates to its rendered detail", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/");

@@ -19,8 +19,11 @@ import {
   exportPageToObsidian,
   listRegisteredSources,
   getPageSources,
+  reviewPage,
+  pageReviewSupported,
   type Entity,
   type Page,
+  type PageReviewOutcome,
   type UpdatePageInput,
   type UpdatePageFailureKind,
 } from "../../lib/tauri";
@@ -32,6 +35,7 @@ import { PageTruthBadges } from "./PageTruthBadges";
 import ContentRenderer from "./ContentRenderer";
 import RelatedPages from "./page/RelatedPages";
 import PageInfo from "./page/PageInfo";
+import { pageReviewNotice, type PageReviewNotice } from "./page/pageReviewNotice";
 import { RailPanelTitle } from "./MemoryDetailPrimitives";
 import { processCitations, stripCitationLinks } from "../../lib/pageCitations";
 import CitationChip from "./page/CitationChip";
@@ -245,6 +249,7 @@ export default function PageDetail({
     kind: "success" | "warning" | "error";
     message: string;
   } | null>(null);
+  const [reviewNotice, setReviewNotice] = useState<PageReviewNotice | null>(null);
   // Reading is what a page is for, so it needs no control of its own — only
   // leaving for the canvas does. A two-tab row spent a whole band of the page
   // telling you that you were doing the obvious thing.
@@ -289,6 +294,23 @@ export default function PageDetail({
     ...EXPLICIT_BROWSE_QUERY_POLICY,
   });
   const { cutoverLive } = useTruthStatus();
+
+  // Fails closed on purpose, exactly like `useDaemonVersion`: an unreachable
+  // daemon leaves this undefined, and undefined must read as "not available"
+  // rather than "unknown, offer it anyway". The backend answers with WHY it is
+  // unavailable, because the two reasons send you to different places — one is
+  // fixed by upgrading the daemon, the other cannot be fixed here at all.
+  const { data: reviewAvailability } = useQuery({
+    queryKey: ["page-review-supported"],
+    queryFn: pageReviewSupported,
+    staleTime: 60_000,
+    retry: 1,
+  });
+  const reviewSupported = reviewAvailability === "ready";
+  const reviewUnavailableReason =
+    reviewAvailability === "platform_unsupported"
+      ? t("pageDetail.reviewUnsupportedPlatform")
+      : t("pageDetail.reviewUnsupported");
 
   useEffect(() => {
     if (page == null) return;
@@ -606,6 +628,31 @@ export default function PageDetail({
       setRedistillNotice({
         kind: "error",
         message: error instanceof Error ? error.message : "Page re-distill failed.",
+      });
+    },
+  });
+
+  const reviewMutation = useMutation({
+    // The content goes with the request because the mark is bound to the exact
+    // text that was on screen, not to the page as a moving target. The backend
+    // hashes what it is handed here; if the daemon's copy has since changed,
+    // the answer is `stale` and the reader is asked to look again.
+    mutationFn: ({ id, content }: { id: string; content: string }) => reviewPage(id, content),
+    onSuccess: (outcome: PageReviewOutcome, { id }) => {
+      if (outcome.kind === "applied") {
+        queryClient.invalidateQueries({ queryKey: ["page", id] });
+        // The wiki list renders the trust badges, so it is stale now too.
+        queryClient.invalidateQueries({ queryKey: ["pages"] });
+      }
+      if (activePageIdRef.current !== id) return;
+      setReviewNotice(pageReviewNotice(outcome, t));
+    },
+    onError: (_error, { id }) => {
+      if (activePageIdRef.current !== id) return;
+      setReviewNotice({
+        kind: "error",
+        message: t("pageDetail.reviewFailed"),
+        offerReload: false,
       });
     },
   });
@@ -1623,6 +1670,40 @@ export default function PageDetail({
                       </button>
                     ))
                   )}
+                  {/* Lives in the overflow menu at every width, like Delete,
+                      rather than mirroring an icon-row button — this is a
+                      low-frequency action that writes a durable record, and
+                      the icon row is already full of things you reach for
+                      constantly.
+
+                      Visible but disabled before the daemon's truth cutover is
+                      live, following the page editor's daemon-floor gate
+                      rather than the hide-it convention used for provider
+                      presets: this is an editorial action on the page in front
+                      of you, and a control that silently disappears reads as a
+                      feature that was taken away. The title says why.
+
+                      Gone while editing, matching Canvas and Re-distill: the
+                      mark attests the stored text, which is not what an open
+                      editor is showing. (M5 App PR, D2/D7.) */}
+                  {!editing ? (
+                    <button
+                      disabled={!reviewSupported || reviewMutation.isPending}
+                      onClick={() => {
+                        setActionMenuOpen(false);
+                        reviewMutation.mutate({ id: pageId, content: page.content });
+                      }}
+                      role="menuitem"
+                      title={
+                        reviewSupported
+                          ? t("pageDetail.markPageReviewed")
+                          : reviewUnavailableReason
+                      }
+                      type="button"
+                    >
+                      {t("pageDetail.markPageReviewed")}
+                    </button>
+                  ) : null}
                   <button
                     className="page-detail-menu-danger"
                     disabled={
@@ -1682,6 +1763,62 @@ export default function PageDetail({
           }}
         >
           {redistillNotice.message}
+        </div>
+      )}
+
+      {reviewNotice && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="rounded-lg px-3 py-2"
+          data-testid="page-review-notice"
+          style={{
+            backgroundColor:
+              reviewNotice.kind === "error"
+                ? "rgba(239, 68, 68, 0.08)"
+                : reviewNotice.kind === "warning"
+                  ? "rgba(245, 158, 11, 0.08)"
+                  : "rgba(16, 185, 129, 0.08)",
+            border: "1px solid var(--mem-border)",
+            color:
+              reviewNotice.kind === "error"
+                ? "#ef4444"
+                : reviewNotice.kind === "warning"
+                  ? "var(--mem-accent-amber)"
+                  : "var(--mem-text-secondary)",
+            fontFamily: "var(--mem-font-body)",
+            fontSize: "12px",
+            lineHeight: "1.5",
+          }}
+        >
+          {reviewNotice.message}
+          {reviewNotice.offerReload && (
+            <button
+              className="ml-2 underline"
+              onClick={() => {
+                // Clear only once the reload has actually landed. Dropping the
+                // warning first and firing the refetch into the void leaves the
+                // worst state on screen: the same stale text, no warning, and a
+                // Review action that looks ready to approve content the daemon
+                // has already refused once.
+                void (async () => {
+                  const reloaded = await refetchPage();
+                  if (reloaded.isError) {
+                    setReviewNotice({
+                      kind: "error",
+                      message: t("pageDetail.reviewReloadFailed"),
+                      offerReload: true,
+                    });
+                    return;
+                  }
+                  setReviewNotice(null);
+                })();
+              }}
+              type="button"
+            >
+              {t("pageDetail.reviewReload")}
+            </button>
+          )}
         </div>
       )}
 
