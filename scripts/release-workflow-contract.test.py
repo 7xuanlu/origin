@@ -437,6 +437,7 @@ def contract_violations(
         "app-bundle",
         "app-bundle-windows",
         "promote-assets",
+        "promote-app-assets",
         "docker",
         "docker-manifest",
         "finalize-release",
@@ -447,10 +448,27 @@ def contract_violations(
         violations.append("release preparation can start before receipt-derived tag binding")
     if "    needs: [resolve-promotion, bind-release-tag]" not in job_body(release, "app-bundle-windows"):
         violations.append("Windows app bundling can start before receipt-derived tag binding")
-    if "    needs: [resolve-promotion, bind-release-tag, prepare-release, app-bundle, app-bundle-windows]" not in job_body(
+    # The CLI wrappers and the desktop app are promoted by two jobs on
+    # purpose. Only the app job waits on the desktop builds, so a failed
+    # Windows bundle no longer skips Docker, npm, crates and Homebrew with it.
+    # The pair of assertions below is what keeps that split honest: the CLI job
+    # must NOT wait on an app build, and the app job must wait on both.
+    if "    needs: [resolve-promotion, bind-release-tag, prepare-release]" not in job_body(
         release, "promote-assets"
     ):
-        violations.append("asset publication bypasses receipt resolution, tag binding, prerelease gate, or app bundling")
+        violations.append("asset publication bypasses receipt resolution, tag binding, or the prerelease gate")
+    if re.search(r"app-bundle", job_body(release, "promote-assets").split("steps:")[0]):
+        violations.append(
+            "CLI asset publication waits on a desktop app build again; a failed "
+            "Windows bundle would take the whole release down with it"
+        )
+    if "    needs: [resolve-promotion, bind-release-tag, prepare-release, app-bundle, app-bundle-windows]" not in job_body(
+        release, "promote-app-assets"
+    ):
+        violations.append(
+            "desktop app promotion bypasses receipt resolution, tag binding, "
+            "the prerelease gate, or one of the two app bundles"
+        )
     resolve = job_body(release, "resolve-promotion")
     for marker in [
         "scripts/release-promotion.py gate-main",
@@ -473,6 +491,7 @@ def contract_violations(
         "app-bundle",
         "app-bundle-windows",
         "promote-assets",
+        "promote-app-assets",
         "docker",
         "docker-manifest",
         "publish-crates",
@@ -538,25 +557,26 @@ def contract_violations(
             violations.append(
                 f"Windows app bundling does not prove its installer payload: {marker!r}"
             )
+    promote_app = job_body(release, "promote-app-assets")
     for marker in ["latest.json", "darwin-aarch64-app", "windows-x86_64"]:
-        if marker not in promote:
-            violations.append(f"validated asset promotion omits updater manifest {marker!r}")
+        if marker not in promote_app:
+            violations.append(f"desktop app promotion omits updater manifest {marker!r}")
     for marker in [
         "needs.app-bundle.outputs.dmg_sha256",
         "needs.app-bundle-windows.outputs.setup_sha256",
         "needs.app-bundle-windows.outputs.sig_sha256",
     ]:
-        if marker not in promote:
+        if marker not in promote_app:
             violations.append(
                 f"app bundle SHA-256 re-verification is not wired to {marker!r}"
             )
-    verify_idx = promote.find("Verify app bundle bytes before promotion")
-    upload_idx = promote.find(
+    verify_idx = promote_app.find("Verify app bundle bytes before promotion")
+    upload_idx = promote_app.find(
         "Upload desktop app assets and updater metadata without clobbering"
     )
     if verify_idx == -1 or upload_idx == -1:
         violations.append(
-            "validated asset promotion omits app bundle SHA-256 re-verification before upload"
+            "desktop app promotion omits app bundle SHA-256 re-verification before upload"
         )
     elif verify_idx > upload_idx:
         violations.append("app bundle assets are uploaded before their SHA-256 re-verification")
@@ -610,8 +630,15 @@ def contract_violations(
     if "    needs: [promote-assets, bind-release-tag]" not in npm or "needs: publish-crates" in npm:
         violations.append("npm publishing is serialized behind crates.io propagation")
     finalize = job_body(release, "finalize-release")
-    if "    needs: [docker-manifest, bind-release-tag]" not in finalize:
-        violations.append("GitHub release finalization bypasses the GHCR promotion barrier")
+    # promote-app-assets is listed here and nowhere downstream. That is the
+    # whole fail-closed half of the promote-assets split: the desktop uploads
+    # no longer block the CLI channels, so this entry is the only thing left
+    # keeping a release whose installers never landed out of releases/latest.
+    if "    needs: [docker-manifest, promote-app-assets, bind-release-tag]" not in finalize:
+        violations.append(
+            "GitHub release finalization bypasses the GHCR promotion barrier or "
+            "would promote a release whose desktop app assets never landed"
+        )
     # The lifecycle step resolves the merged release PR through
     # GET /commits/{sha}/pulls, then POSTs and DELETEs on /issues/{pr}/labels to
     # move it from pending to tagged. The /issues/ path is only the REST

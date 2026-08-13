@@ -810,7 +810,7 @@ jobs:
 
   promote-assets:
     name: Promote exact validated release assets
-    needs: [resolve-promotion, bind-release-tag, prepare-release, app-bundle, app-bundle-windows]
+    needs: [resolve-promotion, bind-release-tag, prepare-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -903,6 +903,22 @@ jobs:
           # Internal retry locator; Docker revalidates the receipt and archive
           # hashes before it executes the copied server binary.
           overwrite: true
+
+  promote-app-assets:
+    name: Promote the desktop app assets
+    # Split out of promote-assets deliberately. Both jobs upload to the same
+    # release, but only this one waits on the desktop builds, so a failed
+    # Windows bundle no longer skips the CLI tarballs, Docker, npm, crates and
+    # Homebrew along with it. Nothing ships quietly missing a platform:
+    # finalize-release needs this job, so a release whose app assets did not
+    # land stays a prerelease and never becomes `releases/latest`.
+    needs: [resolve-promotion, bind-release-tag, prepare-release, app-bundle, app-bundle-windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    steps:
       - name: Download macOS app bundle artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -1549,8 +1565,12 @@ jobs:
     # release stays a prerelease â€” never a `releases/latest` without artifacts.
     # docker-manifest is itself the fail-closed promotion barrier over every
     # required channel; only after it publishes the aliases may GitHub's
-    # prerelease become the latest stable release.
-    needs: [docker-manifest, bind-release-tag]
+    # prerelease become the latest stable release. promote-app-assets is named
+    # separately because nothing else waits on it any more: the desktop uploads
+    # were split out of promote-assets so a failed app build stops the app
+    # assets alone, and this `needs` entry is what still keeps a release
+    # missing its installers out of `releases/latest`.
+    needs: [docker-manifest, promote-app-assets, bind-release-tag]
     timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
