@@ -20,7 +20,10 @@ New-Item -ItemType Directory -Path $TempRoot | Out-Null
 
 try {
     Write-Host "Downloading $ZipUrl"
-    Invoke-WebRequest -Uri $ZipUrl -OutFile $ZipPath
+    # Invoke-WebRequest waits forever by default, so a stalled connection looks
+    # exactly like a slow build. CI's job timeout would eventually catch it; a
+    # developer's machine never would.
+    Invoke-WebRequest -Uri $ZipUrl -OutFile $ZipPath -TimeoutSec 120
 
     $ActualZipSha256 = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($ActualZipSha256 -ne $ExpectedZipSha256) {

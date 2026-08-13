@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "resources": {
+      "binaries/onnxruntime.dll": "onnxruntime.dll",
+      "binaries/vulkan-1.dll": "vulkan-1.dll",
+      "binaries/VulkanRT-License.txt": "VulkanRT-License.txt"
+    }
+  }
+}

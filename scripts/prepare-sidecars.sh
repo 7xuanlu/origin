@@ -119,4 +119,59 @@ else
   exit 1
 fi
 
+# Windows needs two runtime DLLs beside the sidecars. The daemon loads ONNX
+# Runtime dynamically there (fastembed's ort-load-dynamic feature, selected in
+# crates/wenlan-core/Cargo.toml) and links the Vulkan loader for llama.cpp, and
+# neither ships inside the executables. app/tauri.windows.conf.json bundles them
+# out of this directory, so `tauri build` fails with ResourcePathNotFound if they
+# are absent. Both staging scripts pin a version and verify a SHA-256; the Vulkan
+# one also checks LunarG's Authenticode signature and drops VulkanRT-License.txt
+# next to the loader, which the bundle ships for redistribution.
+#
+# The check below covers every file the bundle names, not just the two DLLs: a
+# tree holding the DLLs but not the license would otherwise take the reuse
+# branch and fail later inside `tauri build` with the same opaque
+# ResourcePathNotFound this block exists to prevent. Reuse trusts whatever is
+# already there, so bumping a pinned version in either staging script means
+# deleting these files by hand on a machine that has already staged them; CI
+# always starts from a clean checkout and is unaffected.
+if [[ "$TRIPLE" == *windows* ]]; then
+  WINDOWS_RUNTIME_FILES=(onnxruntime.dll vulkan-1.dll VulkanRT-License.txt)
+  WINDOWS_RUNTIME_MISSING=false
+  for name in "${WINDOWS_RUNTIME_FILES[@]}"; do
+    if [[ ! -f "$BIN_DIR/$name" ]]; then
+      WINDOWS_RUNTIME_MISSING=true
+      break
+    fi
+  done
+  if [[ "$WINDOWS_RUNTIME_MISSING" == "true" ]]; then
+    if ! command -v powershell.exe >/dev/null 2>&1; then
+      echo "error: the Windows runtime DLLs are missing from $BIN_DIR and powershell.exe is unavailable" >&2
+      echo "       Stage them with scripts/stage-onnxruntime-windows.ps1 and scripts/stage-vulkan-loader-windows.ps1" >&2
+      exit 1
+    fi
+    if command -v cygpath >/dev/null 2>&1; then
+      PS_BIN_DIR="$(cygpath -w "$BIN_DIR")"
+      PS_SCRIPT_DIR="$(cygpath -w "$SCRIPT_DIR")"
+    else
+      PS_BIN_DIR="$BIN_DIR"
+      PS_SCRIPT_DIR="$SCRIPT_DIR"
+    fi
+    powershell.exe -NoProfile -ExecutionPolicy Bypass \
+      -File "$PS_SCRIPT_DIR\\stage-onnxruntime-windows.ps1" \
+      -DestinationDirectory "$PS_BIN_DIR"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass \
+      -File "$PS_SCRIPT_DIR\\stage-vulkan-loader-windows.ps1" \
+      -DestinationDirectory "$PS_BIN_DIR"
+    for name in "${WINDOWS_RUNTIME_FILES[@]}"; do
+      if [[ ! -f "$BIN_DIR/$name" ]]; then
+        echo "error: staging finished but $BIN_DIR/$name is still missing" >&2
+        exit 1
+      fi
+    done
+  else
+    echo "Using existing Windows runtime files in $BIN_DIR"
+  fi
+fi
+
 echo "Prepared sidecars in $BIN_DIR for $TRIPLE"

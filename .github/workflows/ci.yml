@@ -144,6 +144,10 @@ jobs:
               - 'e2e/**'
               - 'preview/**'
               - 'review/**'
+              # Vite serves public/ verbatim, and the app's fonts live there.
+              # Without this a font change matches no filter at all, which is
+              # the silent-green case described above.
+              - 'public/**'
               - 'package.json'
               - 'pnpm-lock.yaml'
               - 'pnpm-workspace.yaml'
@@ -2387,18 +2391,20 @@ jobs:
         shell: pwsh
         run: |
           & scripts/setup-msvc-ninja-windows.ps1
-      # The two DLLs the daemon needs at runtime. They ship loose in
-      # wenlan-windows-x64.zip today and are NOT yet in the app bundle; staging
-      # them here is what lets the inspect step below report where an installed
-      # app would have to find them.
+      # The two DLLs the daemon needs at runtime, plus the Vulkan license the
+      # loader is redistributed under. They also ship loose in
+      # wenlan-windows-x64.zip, for the headless install.
+      # Straight into app/binaries, beside the sidecars, because that is where
+      # app/tauri.windows.conf.json bundles them from. prepare-sidecars.sh would
+      # stage them itself if they were missing; doing it here keeps the download
+      # failure legible as its own step instead of buried inside `tauri build`.
       - name: Stage ONNX Runtime and the Vulkan loader
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $dllDir = Join-Path $env:RUNNER_TEMP "wenlan-app-dlls"
+          $dllDir = "app/binaries"
           & scripts/stage-onnxruntime-windows.ps1 -DestinationDirectory $dllDir
           & scripts/stage-vulkan-loader-windows.ps1 -DestinationDirectory $dllDir
-          "WENLAN_WINDOWS_DLL_DIR=$dllDir" | Out-File -FilePath $env:GITHUB_ENV -Append
           Get-ChildItem $dllDir | Format-Table Name, Length
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -2421,12 +2427,6 @@ jobs:
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
           chmod 755 "$RUNNER_TEMP/cloudflared.exe"
           echo "CLOUDFLARED_BIN=$RUNNER_TEMP/cloudflared.exe" >> "$GITHUB_ENV"
-      # Not `pnpm tauri`: package.json defines that script as
-      # `TAURI_DIR=app tauri`, a POSIX env-var prefix that pnpm hands to
-      # cmd.exe on Windows, which cannot parse it. `pnpm exec` runs the CLI
-      # binary directly, so bash sets TAURI_DIR the way the script intended.
-      # Making package.json itself portable is the real fix and belongs with
-      # whatever change first teaches release.yml to publish a Windows app.
       # tauri.conf.json carries an updater pubkey, so `tauri build` refuses to
       # bundle without the matching private key. This job publishes nothing and
       # no one installs its output, so it mints a throwaway keypair per run
@@ -2445,12 +2445,12 @@ jobs:
         shell: bash
         env:
           CLOUDFLARED_BIN: ${{ env.CLOUDFLARED_BIN }}
-          TAURI_DIR: app
           TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm exec tauri build --target x86_64-pc-windows-msvc
-      # What the bundle actually contains decides where the two DLLs have to go.
-      # Read this listing before wiring bundle.resources in app/tauri.conf.json.
+        run: pnpm tauri build --target x86_64-pc-windows-msvc
+      # Diagnostics only. An MSI and an NSIS setup are each a single opaque file,
+      # so this listing can say how big they are but never what is inside them.
+      # The step below is the one that decides pass or fail.
       - name: Inspect bundle payload
         if: always()
         shell: pwsh
@@ -2463,6 +2463,71 @@ jobs:
           Get-ChildItem -Path $bundle -Recurse -File |
             Select-Object FullName, Length |
             Format-Table -AutoSize
+      # Both installers must carry the runtime files the daemon dynamically
+      # loads on Windows, or the app installs and then fails the first time it
+      # tries to embed anything. Unpack each one and look, rather than trusting
+      # that bundle.resources was wired correctly.
+      - name: Verify the runtime DLLs ship inside both installers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bundle = "target/x86_64-pc-windows-msvc/release/bundle"
+          $required = @("onnxruntime.dll", "vulkan-1.dll", "VulkanRT-License.txt")
+          $failed = $false
+
+          $nsis = Get-ChildItem -Path (Join-Path $bundle "nsis") -Filter *-setup.exe -File |
+            Select-Object -First 1
+          if (-not $nsis) { throw "no NSIS installer found under $bundle/nsis" }
+          $listing = & 7z l -ba -- $nsis.FullName
+          if ($LASTEXITCODE -ne 0) { throw "7z could not read $($nsis.Name)" }
+          foreach ($name in $required) {
+            # $PLUGINSDIR is NSIS's scratch directory, deleted when the installer
+            # exits. A name that only appears there is not a file the app ships,
+            # so it must not count as a pass.
+            $hit = $listing |
+              Where-Object { $_ -match [regex]::Escape($name) -and $_ -notmatch '\$PLUGINSDIR' } |
+              Select-Object -First 1
+            if ($hit) {
+              Write-Host "PASS nsis $name -> $($hit.Trim())"
+            } else {
+              Write-Host "FAIL nsis $name is not installed by the installer"
+              $failed = $true
+            }
+          }
+
+          # An administrative install expands the real file tree. Reading the
+          # MSI File table directly would show WiX's mangled short names.
+          $msi = Get-ChildItem -Path (Join-Path $bundle "msi") -Filter *.msi -File |
+            Select-Object -First 1
+          if (-not $msi) { throw "no MSI found under $bundle/msi" }
+          $extract = Join-Path $env:RUNNER_TEMP "wenlan-msi-admin"
+          Remove-Item -Recurse -Force $extract -ErrorAction SilentlyContinue
+          # Silently tolerating a failed cleanup would let this half pass on the
+          # previous run's files, so confirm the directory is actually gone.
+          if (Test-Path $extract) {
+            throw "could not clear $extract; a stale tree would make this check meaningless"
+          }
+          $admin = Start-Process msiexec -Wait -PassThru -ArgumentList @(
+            "/a", "`"$($msi.FullName)`"", "/qn", "TARGETDIR=`"$extract`""
+          )
+          if ($admin.ExitCode -ne 0) {
+            throw "msiexec administrative install failed with $($admin.ExitCode)"
+          }
+          foreach ($name in $required) {
+            $hit = Get-ChildItem -Path $extract -Recurse -File -Filter $name |
+              Select-Object -First 1
+            if ($hit) {
+              Write-Host "PASS msi $name -> $($hit.FullName)"
+            } else {
+              Write-Host "FAIL msi $name is not in the installer"
+              $failed = $true
+            }
+          }
+
+          if ($failed) {
+            throw "the Windows bundle is missing runtime files the daemon needs"
+          }
+          Write-Host "PASS both installers carry every required runtime file"
       - name: Upload Windows installer
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

@@ -14,6 +14,7 @@ import {
   type SearchResult,
   type Space,
 } from "../../lib/tauri";
+import { topBarLeftInset } from "../../lib/windowChrome";
 import ActivityFeed from "./ActivityFeed";
 import { useSearch } from "../../hooks/useSearch";
 import EntityDetail from "./EntityDetail";
@@ -579,7 +580,7 @@ export default function Main({
         className="relative flex items-center gap-3 shrink-0"
         style={{
           height: 52,
-          paddingLeft: 82,
+          paddingLeft: topBarLeftInset(),
           paddingRight: 20,
           background: responsiveSidebar.presentation === "desktop" && !responsiveSidebar.collapsed
             ? "linear-gradient(to right, var(--mem-sidebar) 240px, transparent 240px)"
