@@ -19,6 +19,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 // the file passed; the deadline moves, no assertion does.
 vi.setConfig({ testTimeout: 60_000 });
 
+// Sidecar prep is a POSIX shell workflow: these cases spawn `bash` (and real
+// login shells) to exercise scripts/*.sh. On Windows `bash` is not even
+// guaranteed to be Git Bash — with WSL installed it resolves to the Linux
+// distro, whose PATH has no Windows rustc or node. The cases that only assert
+// package.json / Tauri config wiring stay platform-neutral and keep running.
+const itPosix = it.skipIf(process.platform === "win32");
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const scriptPath = resolve(root, "scripts/prepare-sidecars.sh");
 const tauriBuildScriptPath = resolve(root, "scripts/prepare-tauri-build-sidecars.sh");
@@ -112,7 +119,7 @@ function restoreEnv(name: string, value: string | undefined): void {
 }
 
 describe("prepare-sidecars backend discovery", () => {
-  it("discovers a sibling wenlan backend from a standalone wenlan-app checkout", () => {
+  itPosix("discovers a sibling wenlan backend from a standalone wenlan-app checkout", () => {
     const base = makeTempRoot();
     const appRoot = resolve(base, "wenlan-app");
     const backendRoot = resolve(base, "wenlan");
@@ -126,7 +133,7 @@ describe("prepare-sidecars backend discovery", () => {
     expect(output).toContain(`cli_src=${backendRoot}/target/debug/wenlan`);
   });
 
-  it("discovers a sibling wenlan backend from a project-local worktree checkout", () => {
+  itPosix("discovers a sibling wenlan backend from a project-local worktree checkout", () => {
     const base = makeTempRoot();
     const appRoot = resolve(base, "wenlan-app/.worktrees/launch-smoke");
     const backendRoot = resolve(base, "wenlan");
@@ -140,7 +147,7 @@ describe("prepare-sidecars backend discovery", () => {
     expect(output).toContain(`cli_src=${backendRoot}/target/debug/wenlan`);
   });
 
-  it("defaults to the monorepo root when no backend override is set", () => {
+  itPosix("defaults to the monorepo root when no backend override is set", () => {
     const base = makeTempRoot();
     // Deliberately not named "wenlan": the old resolver's sibling probe
     // ($REPO_ROOT/../wenlan) would otherwise resolve back to this same
@@ -153,7 +160,7 @@ describe("prepare-sidecars backend discovery", () => {
     expect(resolveBackend(monoRoot)).toBe(monoRoot);
   });
 
-  it("keeps relative WENLAN_BACKEND_DIR overrides relative to the app checkout", () => {
+  itPosix("keeps relative WENLAN_BACKEND_DIR overrides relative to the app checkout", () => {
     const base = makeTempRoot();
     const appRoot = resolve(base, "wenlan-app");
     const backendRoot = resolve(appRoot, "local-backend");
@@ -167,7 +174,7 @@ describe("prepare-sidecars backend discovery", () => {
     expect(output).toContain(`cli_src=${backendRoot}/target/debug/wenlan`);
   });
 
-  it("uses Tauri target triples when Tauri runs sidecar prep for target builds", () => {
+  itPosix("uses Tauri target triples when Tauri runs sidecar prep for target builds", () => {
     const base = makeTempRoot();
     const appRoot = resolve(base, "wenlan-app");
     const backendRoot = resolve(base, "wenlan");
@@ -186,7 +193,7 @@ describe("prepare-sidecars backend discovery", () => {
     expect(output).toContain(`cli_dest=${appRoot}/app/binaries/wenlan-x86_64-apple-darwin`);
   });
 
-  it("uses release sidecars when Tauri runs sidecar prep for release builds", () => {
+  itPosix("uses release sidecars when Tauri runs sidecar prep for release builds", () => {
     const base = makeTempRoot();
     const appRoot = resolve(base, "wenlan-app");
     const backendRoot = resolve(base, "wenlan");
@@ -202,7 +209,7 @@ describe("prepare-sidecars backend discovery", () => {
     expect(output).toContain(`cli_src=${backendRoot}/target/release/wenlan`);
   });
 
-  it("uses release sidecars by default from the Tauri build hook", () => {
+  itPosix("uses release sidecars by default from the Tauri build hook", () => {
     const base = makeTempRoot();
     const appRoot = resolve(base, "wenlan-app");
     const backendRoot = resolve(base, "wenlan");
@@ -216,7 +223,7 @@ describe("prepare-sidecars backend discovery", () => {
     expect(output).toContain(`cli_src=${backendRoot}/target/release/wenlan`);
   });
 
-  it("uses debug sidecars from the Tauri build hook when Tauri is building debug", () => {
+  itPosix("uses debug sidecars from the Tauri build hook when Tauri is building debug", () => {
     const base = makeTempRoot();
     const appRoot = resolve(base, "wenlan-app");
     const backendRoot = resolve(base, "wenlan");
@@ -232,7 +239,7 @@ describe("prepare-sidecars backend discovery", () => {
     expect(output).toContain(`cli_src=${backendRoot}/target/debug/wenlan`);
   });
 
-  it("ignores inherited path overrides while testing default discovery", () => {
+  itPosix("ignores inherited path overrides while testing default discovery", () => {
     const base = makeTempRoot();
     const appRoot = resolve(base, "wenlan-app");
     const backendRoot = resolve(base, "wenlan");
@@ -258,7 +265,7 @@ describe("prepare-sidecars backend discovery", () => {
     }
   });
 
-  it("fails loud for invalid WENLAN_BACKEND_DIR overrides", () => {
+  itPosix("fails loud for invalid WENLAN_BACKEND_DIR overrides", () => {
     const base = makeTempRoot();
     const appRoot = resolve(base, "wenlan-app");
     writeAppScripts(appRoot);
@@ -275,7 +282,7 @@ describe("prepare-sidecars backend discovery", () => {
     expect(stderr).toContain("WENLAN_BACKEND_DIR is not a Wenlan backend checkout");
   });
 
-  it("exposes the same backend resolver for dev scripts", () => {
+  itPosix("exposes the same backend resolver for dev scripts", () => {
     const base = makeTempRoot();
     const appRoot = resolve(base, "wenlan-app");
     const backendRoot = resolve(base, "wenlan");
@@ -306,7 +313,7 @@ describe("prepare-sidecars backend discovery", () => {
     expect(tauri.build.beforeBuildCommand).toContain("pnpm prepare:sidecars:tauri-build");
   });
 
-  it("does not reach cargo when dev:daemon backend resolution fails", () => {
+  itPosix("does not reach cargo when dev:daemon backend resolution fails", () => {
     const packageJson = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
     const devDaemon = String(packageJson.scripts["dev:daemon"]);
     const base = makeTempRoot();
@@ -330,7 +337,7 @@ describe("prepare-sidecars backend discovery", () => {
     expect(result.stderr).not.toContain("cargo should not run");
   });
 
-  it("fails loud when cloudflared is required but missing", () => {
+  itPosix("fails loud when cloudflared is required but missing", () => {
     const base = makeTempRoot();
     const appRoot = resolve(base, "wenlan-app");
     const backendRoot = resolve(base, "wenlan");

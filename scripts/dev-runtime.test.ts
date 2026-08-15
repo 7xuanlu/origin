@@ -16,6 +16,14 @@ import { afterEach, describe, expect, it } from "vitest";
 const root = resolve(import.meta.dirname, "..");
 const tempRoots: string[] = [];
 
+// The dev runtime is a POSIX shell workflow: these cases spawn `bash`, symlink
+// /bin/sleep, chmod a fake `lsof`, and join PATH with ':'. None of that has a
+// Windows meaning — and `bash` there is not even guaranteed to be Git Bash: on a
+// box with WSL installed it resolves to the Linux distro, which has no Windows
+// node or rustc on its PATH. The assertions still guard macOS/Linux; the rest of
+// this file (package.json and script-text contracts) stays platform-neutral.
+const itPosix = it.skipIf(process.platform === "win32");
+
 afterEach(() => {
   for (const path of tempRoots.splice(0)) {
     rmSync(path, { recursive: true, force: true });
@@ -41,7 +49,7 @@ describe("scoped dev runtime", () => {
     expect(lifecycleCommands).not.toContain("kill -9");
   });
 
-  it("defaults to an isolated non-production port and data directory", () => {
+  itPosix("defaults to an isolated non-production port and data directory", () => {
     const tempRoot = mkdtempSync(resolve(tmpdir(), "wenlan-app-dev-test-"));
     tempRoots.push(tempRoot);
 
@@ -74,7 +82,7 @@ describe("scoped dev runtime", () => {
     expect(config.WENLAN_DATA_DIR).toContain("wenlan-app-dev");
   });
 
-  it.each([
+  itPosix.each([
     ["WENLAN_DEV_PORT", "7878"],
     ["WENLAN_DEV_UI_PORT", "1420"],
     ["WENLAN_DEV_APP_ID", "com.wenlan.desktop"],
@@ -94,7 +102,7 @@ describe("scoped dev runtime", () => {
     expect(result.stderr).toContain("refusing production");
   });
 
-  it.each([
+  itPosix.each([
     ["Library/Application Support/wenlan"],
     ["Library/Application Support/origin"],
     [".origin"],
@@ -115,7 +123,7 @@ describe("scoped dev runtime", () => {
     expect(result.stderr).toContain("refusing production");
   });
 
-  it.each([
+  itPosix.each([
     ["Library/LaunchAgents"],
     ["Library/Logs/com.wenlan.desktop"],
     ["Library/Logs/com.origin.desktop"],
@@ -152,7 +160,7 @@ describe("scoped dev runtime", () => {
     expect(script).toContain("wenlan-server.data-dir");
   });
 
-  it("refuses to reuse a worktree daemon opened on a different data directory", () => {
+  itPosix("refuses to reuse a worktree daemon opened on a different data directory", () => {
     const tempRoot = mkdtempSync(resolve(tmpdir(), "wenlan-dev-data-identity-test-"));
     tempRoots.push(tempRoot);
     const backend = resolve(tempRoot, "wenlan");
@@ -217,7 +225,7 @@ describe("scoped dev runtime", () => {
     expect(script).not.toContain("pnpm prepare:sidecars -- --force-build");
   });
 
-  it("dev:all leaves a pre-existing worktree daemon running", () => {
+  itPosix("dev:all leaves a pre-existing worktree daemon running", () => {
     const tempRoot = mkdtempSync(resolve(tmpdir(), "wenlan-dev-owner-test-"));
     tempRoots.push(tempRoot);
     const backend = resolve(tempRoot, "wenlan");
