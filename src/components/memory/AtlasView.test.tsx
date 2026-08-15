@@ -452,6 +452,36 @@ describe("AtlasView", () => {
     expect(refreshSpy).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps a pinned node pinned after its drag, and releases an unpinned one", async () => {
+    // packComponents parks every node outside the biggest component and the
+    // sim pins it there. Clearing that pin on mouseup would hand the node
+    // back to charge + forceCenter, which is what used to fling the packed
+    // islands back out to one ring on the first drag.
+    mockConnectedPair();
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    const instance = capturedSigmaInstances[0];
+    const mouseCaptor = instance.getMouseCaptor();
+    const sim = (window as any).__ATLAS_SIM;
+    const pinned = sim.nodes().find((n: { id: string }) => n.id === "e1");
+    pinned.fx = pinned.x;
+    pinned.fy = pinned.y;
+
+    instance.handlers.get("downNode")?.({ node: "e1" });
+    mouseCaptor.handlers.get("mousemovebody")?.(dragEvent(300, 300));
+    mouseCaptor.handlers.get("mouseup")?.({});
+    expect(pinned.fx).toBe(300);
+    expect(pinned.fy).toBe(300);
+
+    const free = sim.nodes().find((n: { id: string }) => n.id === "e2");
+    instance.handlers.get("downNode")?.({ node: "e2" });
+    mouseCaptor.handlers.get("mousemovebody")?.(dragEvent(120, 120));
+    mouseCaptor.handlers.get("mouseup")?.({});
+    expect(free.fx).toBeNull();
+    expect(free.fy).toBeNull();
+  });
+
   it("locks hover while a drag is live — enter/leave neither repaint nor flip the cursor until release", async () => {
     mockConnectedPair();
 
@@ -1742,6 +1772,34 @@ describe("AtlasView", () => {
     };
     expect(after).not.toEqual(before);
     expect(after).toEqual({ x: 500, y: 500 });
+  });
+
+  it("holds a dragged leaf memory in place while the sim keeps ticking", async () => {
+    // The satellite orbit is rewritten on every writeback, so without telling
+    // the sim which node the pointer holds, a warm tick would snap the leaf
+    // straight back onto its anchor's ring mid-drag.
+    withMemoryLayerOn();
+    mockConnectedPairWithMemory();
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    const instance = capturedSigmaInstances[0];
+    const graph = instance.graph;
+    const mouseCaptor = instance.getMouseCaptor();
+    const sim = (window as any).__ATLAS_SIM;
+
+    instance.handlers.get("downNode")?.({ node: "mem:m1" });
+    mouseCaptor.handlers.get("mousemovebody")?.(dragEvent(500, 500));
+    sim.alpha(0.3);
+    sim.tick(3);
+
+    expect(graph.getNodeAttribute("mem:m1", "x")).toBe(500);
+    expect(graph.getNodeAttribute("mem:m1", "y")).toBe(500);
+
+    // Released, it belongs to its anchor again.
+    mouseCaptor.handlers.get("mouseup")?.({});
+    sim.tick(1);
+    expect(graph.getNodeAttribute("mem:m1", "x")).not.toBe(500);
   });
 
   it("carries a leaf memory along when its anchor entity is dragged", async () => {

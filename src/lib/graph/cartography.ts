@@ -37,6 +37,15 @@ function regionLabelFont(size: number): string {
   return `italic 500 ${size}px Fraunces, Georgia, serif`;
 }
 
+/** The tracking that goes with that font. Wide tracking is part of the
+ *  artifact's `.region` style and it WIDENS the text, so the placement pass
+ *  has to measure with it applied — measuring without it made every accepted
+ *  label box about 14% per character too narrow, which let two names the
+ *  overlap test had cleared still collide on screen. */
+function regionLabelTracking(size: number): string {
+  return `${(size * 0.14).toFixed(1)}px`;
+}
+
 function pushInto<K, V>(map: Map<K, V[]>, key: K, value: V): void {
   const list = map.get(key);
   if (list) list.push(value);
@@ -632,13 +641,15 @@ export function drawCartography(
   // only the ones that survive the placement pass (see placeRegionLabels).
   const measure = (text: string, size: number): number => {
     ctx.font = regionLabelFont(size);
-    return ctx.measureText(text).width;
+    ctx.letterSpacing = regionLabelTracking(size);
+    const width = ctx.measureText(text).width;
+    ctx.letterSpacing = "0px";
+    return width;
   };
   for (const label of placeRegionLabels(scene, project, measure)) {
     ctx.font = regionLabelFont(label.size);
-    // Wide tracking is part of the artifact spec; jsdom's mock ctx simply
-    // ignores the property.
-    ctx.letterSpacing = `${(label.size * 0.14).toFixed(1)}px`;
+    // Same tracking the measurement used; jsdom's mock ctx simply ignores it.
+    ctx.letterSpacing = regionLabelTracking(label.size);
     ctx.fillStyle = palette.labelMuted;
     ctx.textAlign = "center";
     ctx.textBaseline = "bottom";

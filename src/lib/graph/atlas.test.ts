@@ -818,6 +818,88 @@ describe("nonSimulatedIds and satellites", () => {
     const g2 = buildAtlasGraph(leafModel(), PALETTE);
     expect(satellitePlan(g1)).toEqual(satellitePlan(g2));
   });
+
+  /** One entity with `count` leaf memories hanging off it — the real capture's
+   *  worst anchor carries 374. */
+  function haloModel(count: number): GraphModel {
+    const nodes: GraphNode[] = [node({ id: "hub", degree: count })];
+    const edges: GraphEdge[] = [];
+    for (let i = 0; i < count; i += 1) {
+      const id = `leaf${String(i).padStart(3, "0")}`;
+      nodes.push(node({ id, entityType: "memory", confirmed: null, degree: 1 }));
+      edges.push(edge({ id: `m${i}`, source: id, target: "hub", type: "mentions" }));
+    }
+    return makeModel(nodes, edges);
+  }
+
+  function haloGraph(count: number): Graph {
+    const graph = buildAtlasGraph(haloModel(count), PALETTE);
+    graph.setNodeAttribute("hub", "x", 0);
+    graph.setNodeAttribute("hub", "y", 0);
+    return graph;
+  }
+
+  it("fills SHELLS as the leaf count grows instead of crowding one circle", () => {
+    const rings = (count: number) =>
+      new Set(satellitePlan(haloGraph(count)).map((s) => s.radius.toFixed(6))).size;
+    // Two leaves fit on the first ring; forty cannot.
+    expect(rings(2)).toBe(1);
+    expect(rings(40)).toBeGreaterThan(1);
+    expect(rings(120)).toBeGreaterThan(rings(40));
+  });
+
+  it("never lets two satellite discs of one halo touch, at 40 leaves", () => {
+    const graph = haloGraph(40);
+    const plan = satellitePlan(graph);
+    placeSatellites(graph, plan);
+    const leafSize = graph.getNodeAttribute("leaf000", "size") as number;
+    // Two discs plus a unit of sky. On one circle at the anchor's radius the
+    // forty leaves sit ~1.6 units apart — a solid donut.
+    const floor = 2 * leafSize + 1;
+    let closest = Infinity;
+    for (let i = 0; i < plan.length; i += 1) {
+      for (let j = i + 1; j < plan.length; j += 1) {
+        const a = plan[i] as { id: string };
+        const b = plan[j] as { id: string };
+        closest = Math.min(
+          closest,
+          Math.hypot(
+            (graph.getNodeAttribute(a.id, "x") as number) - (graph.getNodeAttribute(b.id, "x") as number),
+            (graph.getNodeAttribute(a.id, "y") as number) - (graph.getNodeAttribute(b.id, "y") as number),
+          ),
+        );
+      }
+    }
+    expect(closest).toBeGreaterThanOrEqual(floor);
+  });
+
+  it("leaves the leaf under the pointer where the drag put it", () => {
+    const graph = buildAtlasGraph(leafModel(), PALETTE);
+    runAtlasLayout(graph);
+    const sim = createAtlasSimulation(graph);
+    // What AtlasView's mousemovebody does for a satellite: write the pointer
+    // position straight onto the graph. It is not a sim node, so there is no
+    // pin to set — the sim is told by id instead.
+    sim.setDraggingId("leaf1");
+    graph.setNodeAttribute("leaf1", "x", 900);
+    graph.setNodeAttribute("leaf1", "y", -900);
+    sim.alpha(0.3);
+    sim.tick(5);
+    expect(graph.getNodeAttribute("leaf1", "x")).toBe(900);
+    expect(graph.getNodeAttribute("leaf1", "y")).toBe(-900);
+    // Its sibling is still riding its orbit, so the writeback did run.
+    expect(graph.getNodeAttribute("leaf2", "x")).not.toBe(900);
+  });
+
+  it("puts a released leaf back on its orbit — the exemption is for the drag only", () => {
+    const graph = buildAtlasGraph(leafModel(), PALETTE);
+    runAtlasLayout(graph);
+    const sim = createAtlasSimulation(graph);
+    graph.setNodeAttribute("leaf1", "x", 900);
+    sim.alpha(0.3);
+    sim.tick(1);
+    expect(graph.getNodeAttribute("leaf1", "x")).not.toBe(900);
+  });
 });
 
 describe("packComponents", () => {
@@ -863,6 +945,69 @@ describe("packComponents", () => {
     });
     return { cx, cy, radius };
   }
+
+  it("holds the packed islands still through a drag reheat", () => {
+    const graph = buildAtlasGraph(islandModel(), PALETTE);
+    runAtlasLayout(graph);
+    const sim = createAtlasSimulation(graph);
+    const before = [measure(graph, ["a1", "a2"]), measure(graph, ["b1", "b2"])];
+    // Exactly AtlasView's downNode: pin the pressed core node, jump alpha to
+    // 0.3 and reheat. Before the islands were pinned this pushed them back
+    // out to the one ring the pack had just broken up.
+    const pressed = sim.nodes().find((n) => n.id === "c1") as { fx?: number | null; fy?: number | null; x?: number; y?: number };
+    pressed.fx = pressed.x;
+    pressed.fy = pressed.y;
+    sim.alpha(0.3).alphaTarget(0.3);
+    sim.tick(60);
+    const after = [measure(graph, ["a1", "a2"]), measure(graph, ["b1", "b2"])];
+    for (let i = 0; i < before.length; i += 1) {
+      expect(after[i].cx).toBeCloseTo(before[i].cx, 6);
+      expect(after[i].cy).toBeCloseTo(before[i].cy, 6);
+    }
+  });
+
+  it("measures a component with its satellite halo, so an island clears the halo", () => {
+    const leaves = 40;
+    const nodes: GraphNode[] = [
+      node({ id: "c1", degree: leaves + 1 }),
+      node({ id: "c2" }),
+      node({ id: "c3" }),
+      node({ id: "c4" }),
+      node({ id: "i1" }),
+      node({ id: "i2" }),
+    ];
+    const edges: GraphEdge[] = [
+      edge({ id: "x1", source: "c1", target: "c2" }),
+      edge({ id: "x2", source: "c2", target: "c3" }),
+      edge({ id: "x3", source: "c3", target: "c4" }),
+      edge({ id: "x4", source: "i1", target: "i2" }),
+    ];
+    for (let i = 0; i < leaves; i += 1) {
+      const id = `leaf${String(i).padStart(3, "0")}`;
+      nodes.push(node({ id, entityType: "memory", confirmed: null, degree: 1 }));
+      edges.push(edge({ id: `m${i}`, source: id, target: "c1", type: "mentions" }));
+    }
+    const graph = buildAtlasGraph(makeModel(nodes, edges), PALETTE);
+    const excluded = new Set(nonSimulatedIds(graph));
+    packComponents(graph, graph.nodes().filter((id) => !excluded.has(id)));
+    const plan = satellitePlan(graph);
+    placeSatellites(graph, plan);
+    const at = (id: string) => ({
+      x: graph.getNodeAttribute(id, "x") as number,
+      y: graph.getNodeAttribute(id, "y") as number,
+    });
+    let closest = Infinity;
+    for (const satellite of plan) {
+      for (const islandId of ["i1", "i2"]) {
+        const a = at(satellite.id);
+        const b = at(islandId);
+        closest = Math.min(closest, Math.hypot(a.x - b.x, a.y - b.y));
+      }
+    }
+    // The island's bounding disc clears the core's by PACK_GAP, and the halo
+    // is inside the core's disc, so every leaf is at least that far off.
+    expect(closest).toBeGreaterThanOrEqual(PACK_GAP);
+  });
 
   it("recentres the largest component on the origin", () => {
     const graph = packed();

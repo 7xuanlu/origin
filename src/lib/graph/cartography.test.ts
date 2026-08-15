@@ -715,6 +715,9 @@ function mockCtx() {
   const strokes: StrokeCall[] = [];
   const fills: string[] = [];
   const texts: { text: string; x: number; y: number; font: string; fillStyle: string }[] = [];
+  /** What the context looked like at each measureText call — the placement
+   *  pass has to measure in the same font AND tracking it later draws with. */
+  const measures: { text: string; font: string; letterSpacing: string }[] = [];
   let dash: number[] = [];
   const ctx = {
     strokeStyle: "",
@@ -748,9 +751,12 @@ function mockCtx() {
     }),
     // The real 2D context measures the label; jsdom's has no text engine, so
     // the mock reports a deterministic 7px per character at the label size.
-    measureText: vi.fn((text: string) => ({ width: text.length * 7 })),
+    measureText: vi.fn((text: string) => {
+      measures.push({ text, font: ctx.font, letterSpacing: ctx.letterSpacing });
+      return { width: text.length * 7 };
+    }),
   };
-  return { ctx: ctx as unknown as CanvasRenderingContext2D, strokes, fills, texts };
+  return { ctx: ctx as unknown as CanvasRenderingContext2D, strokes, fills, texts, measures };
 }
 
 describe("drawCartography", () => {
@@ -962,5 +968,93 @@ describe("placeRegionLabels", () => {
     expect(placed[0].x).toBe(90);
     // Hull top 200, minus HULL_PAD 26 and the 14px blob-bow clearance.
     expect(placed[0].y).toBe(200 - 26 - 14);
+  });
+});
+
+describe("region label measurement includes its tracking", () => {
+  const identity = (pos: { x: number; y: number }) => pos;
+
+  /** Two triangular regions side by side, 220px between their hull centres,
+   *  each named with a 25-character name. At 7px per character the two label
+   *  boxes clear each other by 45px; with the artifact's 0.14em tracking they
+   *  overlap by 9px. So whether the second name is drawn says exactly which
+   *  width the placement pass measured. */
+  function twoWideRegions() {
+    const graph = graphOf(
+      [
+        { id: "a1", x: 0, y: 0, label: "Deterministic Fixture Set" },
+        { id: "a2", x: 120, y: 0, label: "Left Wing" },
+        { id: "a3", x: 60, y: 60, label: "Left Foot" },
+        { id: "b1", x: 220, y: 0, label: "Reproducible Layout Notes" },
+        { id: "b2", x: 340, y: 0, label: "Right Wing" },
+        { id: "b3", x: 280, y: 60, label: "Right Foot" },
+      ],
+      [
+        ["a1", "a2"],
+        ["a1", "a3"],
+        ["b1", "b2"],
+        ["b1", "b3"],
+      ],
+    );
+    const communities = new Map<string, string>([
+      ["a1", "0"],
+      ["a2", "0"],
+      ["a3", "0"],
+      ["b1", "1"],
+      ["b2", "1"],
+      ["b3", "1"],
+    ]);
+    return cartographyScene(graph, communities);
+  }
+
+  /** mockCtx reports a flat 7px per character; a real canvas adds the
+   *  letterSpacing after every character, so the mock has to as well for the
+   *  width to mean anything. */
+  function trackingAwareCtx() {
+    const harness = mockCtx();
+    const ctx = harness.ctx as unknown as {
+      letterSpacing: string;
+      measureText: (text: string) => { width: number };
+    };
+    ctx.measureText = (text: string) => ({
+      width: text.length * (7 + (parseFloat(ctx.letterSpacing) || 0)),
+    });
+    return harness;
+  }
+
+  it("sets the same letter spacing for measuring that it later draws with", () => {
+    const { ctx, texts, measures } = mockCtx();
+    drawCartography(ctx, twoWideRegions(), identity, PALETTE);
+    expect(measures.length).toBeGreaterThan(0);
+    for (const call of measures) {
+      // 16px label -> 2.2px, 13px label -> 1.8px. Never the 0 that measuring
+      // in the bare font would leave behind.
+      const size = Number(/(\d+)px/.exec(call.font)?.[1]);
+      expect(call.letterSpacing).toBe(`${(size * 0.14).toFixed(1)}px`);
+    }
+    // Whatever survived placement is drawn with that same tracking.
+    expect(texts.length).toBeGreaterThan(0);
+  });
+
+  it("drops a second name whose box only fits when the tracking is ignored", () => {
+    const { ctx, texts } = trackingAwareCtx();
+    drawCartography(ctx, twoWideRegions(), identity, PALETTE);
+    expect(texts.map((t) => t.text)).toEqual(["Deterministic Fixture Set"]);
+  });
+
+  it("keeps both names when they are far enough apart for the tracked width", () => {
+    const { ctx, texts } = trackingAwareCtx();
+    const scene = twoWideRegions();
+    // Push the right region 200px further out: now even the tracked boxes
+    // clear, so the thinning is about real width and not a blanket rule.
+    for (const region of scene.regions) {
+      if (region.name !== "Reproducible Layout Notes") continue;
+      region.hull = region.hull.map((p) => ({ x: p.x + 200, y: p.y }));
+    }
+    drawCartography(ctx, scene, identity, PALETTE);
+    expect(texts.map((t) => t.text).sort()).toEqual([
+      "Deterministic Fixture Set",
+      "Reproducible Layout Notes",
+    ]);
   });
 });

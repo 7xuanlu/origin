@@ -5,7 +5,6 @@ import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import Graph from "graphology";
 import Sigma from "sigma";
-import type { Simulation } from "d3-force";
 import { getKnowledgeGraph } from "../../lib/tauri";
 import type { Entity, KnowledgeGraph } from "../../lib/tauri";
 import {
@@ -31,7 +30,7 @@ import {
   drawPageRings,
   drawRadialNodeLabel,
 } from "../../lib/graph/atlas";
-import type { HoverState, AtlasSimNode } from "../../lib/graph/atlas";
+import type { HoverState, AtlasSimulation } from "../../lib/graph/atlas";
 import type { CartographyScene } from "../../lib/graph/cartography";
 import {
   communitiesFor,
@@ -154,7 +153,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   const containerRef = useRef<HTMLDivElement>(null);
   const sigmaRef = useRef<Sigma | null>(null);
   const graphRef = useRef<Graph | null>(null);
-  const simRef = useRef<Simulation<AtlasSimNode, undefined> | null>(null);
+  const simRef = useRef<AtlasSimulation | null>(null);
   // Reducer inputs, read from refs so hover/theme changes repaint without a
   // React re-render or a renderer rebuild (see the mount effect below).
   const hoverStateRef = useRef<HoverState>({ hovered: null, neighbors: new Set() });
@@ -163,6 +162,9 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // pointer actually moved during the current press — the latter gates
   // clickNode so a drag-release doesn't also fire entity navigation.
   const draggedNodeRef = useRef<string | null>(null);
+  /** Was the node under the pointer already pinned before this drag? A packed
+   *  island node is, and must stay pinned when the pointer lets go. */
+  const draggedNodeWasPinnedRef = useRef(false);
   const movedDuringPressRef = useRef(false);
   // Cached cartography (hulls + graticule). Recomputing every hull on every
   // afterRender meant a plain camera pan or a hover re-hulled all 66 regions;
@@ -469,10 +471,10 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // remounting the whole renderer.
   useEffect(() => {
     const container = containerRef.current;
-    // Guarded on the FULL model, not the drawn one: a graph made entirely of
-    // unconnected nodes draws nothing but must still mount, so the map frame
-    // and the "N unconnected hidden" chip explain the emptiness instead of the
-    // view silently showing a blank slot.
+    // Guarded on the FULL model, not the drawn one: a graph whose components
+    // are all smaller than MIN_COMPONENT_SIZE draws nothing but must still
+    // mount, so the map frame and the "N unconnected or paired, hidden" chip
+    // explain the emptiness instead of the view silently showing a blank slot.
     if (!container || model.nodes.length === 0) return;
 
     const graph = buildAtlasGraph(visibleModel, palette, communities);
@@ -527,9 +529,13 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       labelRenderedSizeThreshold: 7,
       // Round 4: with memories on, the size threshold alone still let dozens
       // of labels pile on top of each other. Sigma buckets the viewport into
-      // a grid and draws at most a few labels per cell; a coarse cell (120
-      // screen px) and a low density are what actually thin the soup. Both
-      // are measured in SCREEN px, so zooming in reveals more names.
+      // a grid of labelGridCellSize screen px and keeps
+      // ceil(labelDensity / cameraRatio^2) labels per cell, biggest node
+      // first. At 0.04 that is exactly ONE name per cell for any camera ratio
+      // above 0.2 — i.e. one per 120 px of screen at every zoom the map
+      // normally sits at — and the cell size is what decides how coarse that
+      // thinning is. Zooming in reveals more names because the same graph
+      // area then spans more cells, not because the per-cell count rises.
       labelDensity: 0.04,
       labelGridCellSize: 120,
       // Default camera fit maps the graph bbox edge-to-edge on the tighter
@@ -698,10 +704,19 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       movedDuringPressRef.current = false;
       graph.setNodeAttribute(node, "highlighted", true);
       container.style.cursor = "grabbing";
+      // A leaf memory is not a sim node — the writeback would put it back on
+      // its orbit on the next tick unless the sim knows a hand is on it.
+      sim.setDraggingId(node);
       const simNode = sim.nodes().find((n) => n.id === node);
-      // Isolates aren't sim members (see createAtlasSimulation) — an isolate
-      // drag is pure direct manipulation via mousemovebody's graphology
-      // writes, so there's nothing here to pin or reheat.
+      // Nodes outside the biggest component are parked by packComponents and
+      // pinned there; a drag moves the pin, and release leaves it at the new
+      // spot rather than handing it back to charge + forceCenter, which would
+      // fling it out to the pre-pack ring.
+      draggedNodeWasPinnedRef.current = simNode?.fx != null;
+      // Leaf memories aren't sim members (see nonSimulatedIds) — dragging one
+      // is pure direct manipulation via mousemovebody's graphology writes, so
+      // there's nothing here to pin or reheat; setDraggingId above is what
+      // stops the writeback snapping it back onto its orbit.
       if (simNode) {
         simNode.fx = simNode.x;
         simNode.fy = simNode.y;
@@ -750,12 +765,14 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       if (draggedNode) {
         graph.setNodeAttribute(draggedNode, "highlighted", false);
         const simNode = sim.nodes().find((n) => n.id === draggedNode);
-        if (simNode) {
+        if (simNode && !draggedNodeWasPinnedRef.current) {
           simNode.fx = null;
           simNode.fy = null;
         }
         draggedNodeRef.current = null;
+        draggedNodeWasPinnedRef.current = false;
       }
+      sim.setDraggingId(null);
       container.style.cursor = hoverStateRef.current.hovered ? "pointer" : "default";
       // Natural decay is the inertia tail; reduced motion skips it outright.
       if (prefersReducedMotion()) sim.stop();

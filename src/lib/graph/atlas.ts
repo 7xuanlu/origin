@@ -196,9 +196,13 @@ export function runAtlasLayout(graph: Graph): void {
  * Parks degree-0 isolates on a deterministic ring just outside the connected
  * cluster instead of wherever FA2's gravity-only diffusion (or the d3 sim's
  * settle) left them: quiet periphery, honest bbox. Computed from the graph's
- * CURRENT connected-node bbox at call time — round 5 calls this AFTER the
- * sim settles (see createAtlasSimulation) so the ring tracks the graph's
- * rest-state extent, not FA2's raw seed packing.
+ * CURRENT connected-node bbox at call time.
+ *
+ * TEST-ONLY as of round 3: drawableModel drops every component smaller than
+ * MIN_COMPONENT_SIZE before the layout runs, so a degree-0 isolate never
+ * reaches the map and there is no ring left to park. Nothing in the render
+ * path calls this; it is kept because the ring geometry is still the
+ * documented answer if isolates are ever drawn again.
  */
 export function placeIsolateRing(graph: Graph): void {
   const isolates = isolateIds(graph);
@@ -263,11 +267,30 @@ export interface Satellite {
   radius: number;
 }
 
+/** Smallest arc a satellite may claim on its ring: two disc diameters plus a
+ *  pixel, so consecutive leaves read as separate dots with clear sky between
+ *  them rather than a bead chain. */
+function satelliteMinArc(leafSize: number): number {
+  return 4 * leafSize + 1;
+}
+
+/** Radial step from one shell to the next: a disc diameter plus 3, so a leaf
+ *  on the outer ring cannot touch the one it sits behind. */
+function satelliteRingStep(leafSize: number): number {
+  return 2 * leafSize + 3;
+}
+
 /**
- * Deterministic orbits for the leaf memories: each sits at its anchor's disc
- * radius plus SATELLITE_GAP, spaced evenly by its index among that anchor's
- * own leaves (sorted by id, so the answer never depends on iteration order).
+ * Deterministic orbits for the leaf memories: each hangs off its one
+ * neighbour, sorted by id so the answer never depends on iteration order.
  * Isolates are skipped — they have no anchor to orbit.
+ *
+ * Round 5: leaves fill SHELLS, not a single circle. A ring takes as many
+ * leaves as fit at satelliteMinArc spacing and the rest start a new ring
+ * satelliteRingStep further out. One circle was fine for the handful of
+ * leaves a test fixture has, but the real capture has an entity anchoring
+ * 374 of them — at radius anchorSize + SATELLITE_GAP that is 0.2 graph units
+ * of arc each, drawn as a solid donut of overlapping discs.
  */
 export function satellitePlan(graph: Graph): Satellite[] {
   const leavesByAnchor = new Map<string, string[]>();
@@ -281,20 +304,49 @@ export function satellitePlan(graph: Graph): Satellite[] {
   }
   const plan: Satellite[] = [];
   for (const [anchor, leaves] of leavesByAnchor) {
-    const radius = (graph.getNodeAttribute(anchor, "size") as number) + SATELLITE_GAP;
     const sorted = [...leaves].sort();
-    sorted.forEach((id, i) => {
-      plan.push({ id, anchor, angle: (2 * Math.PI * i) / sorted.length, radius });
-    });
+    // One spacing for the whole halo, taken from the widest leaf in it: a
+    // per-leaf spacing would make ring capacity depend on which leaves
+    // happened to land on that ring.
+    let leafSize = 0;
+    for (const id of sorted) {
+      leafSize = Math.max(leafSize, (graph.getNodeAttribute(id, "size") as number) ?? 0);
+    }
+    const minArc = satelliteMinArc(leafSize);
+    const step = satelliteRingStep(leafSize);
+    let radius = (graph.getNodeAttribute(anchor, "size") as number) + SATELLITE_GAP;
+    let placed = 0;
+    while (placed < sorted.length) {
+      // At least one per ring even when the anchor disc is tiny, or a small
+      // circumference would stall the loop.
+      const capacity = Math.max(1, Math.floor((2 * Math.PI * radius) / minArc));
+      const count = Math.min(capacity, sorted.length - placed);
+      for (let i = 0; i < count; i += 1) {
+        plan.push({
+          id: sorted[placed + i] as string,
+          anchor,
+          angle: (2 * Math.PI * i) / count,
+          radius,
+        });
+      }
+      placed += count;
+      radius += step;
+    }
   }
   return plan;
 }
 
 /** Write a satellite plan onto the graph. Cheap enough (two trig calls per
  *  leaf) to re-run on every tick writeback, which is what makes a dragged
- *  entity carry its memories along. */
-export function placeSatellites(graph: Graph, plan: Satellite[]): void {
+ *  entity carry its memories along.
+ *
+ *  `skipId` is the node the pointer is currently holding. A satellite is not
+ *  a sim node, so a drag moves it by writing the graph directly; without this
+ *  exemption the next writeback would put it straight back on its orbit and
+ *  the leaf would look unmovable while the sim is warm. */
+export function placeSatellites(graph: Graph, plan: Satellite[], skipId?: string | null): void {
   for (const satellite of plan) {
+    if (satellite.id === skipId) continue;
     const ax = graph.getNodeAttribute(satellite.anchor, "x") as number;
     const ay = graph.getNodeAttribute(satellite.anchor, "y") as number;
     graph.setNodeAttribute(satellite.id, "x", ax + satellite.radius * Math.cos(satellite.angle));
@@ -352,7 +404,24 @@ function simulatedComponents(graph: Graph, simulated: Set<string>): string[][] {
   return [...groups.values()];
 }
 
-function measureComponent(graph: Graph, ids: string[]): PackedComponent {
+/** How far each anchor's satellite halo reaches past the anchor's own centre:
+ *  the outermost shell radius plus that leaf's disc. Leaves are not simulated,
+ *  so they are invisible to the component bbox unless it is told about them —
+ *  and a 374-leaf halo reaches ~130 units, far more than PACK_GAP covers. */
+function satelliteReach(plan: Satellite[], sizeOf: (id: string) => number): Map<string, number> {
+  const reach = new Map<string, number>();
+  for (const satellite of plan) {
+    const outer = satellite.radius + sizeOf(satellite.id);
+    reach.set(satellite.anchor, Math.max(reach.get(satellite.anchor) ?? 0, outer));
+  }
+  return reach;
+}
+
+function measureComponent(
+  graph: Graph,
+  ids: string[],
+  reach: Map<string, number>,
+): PackedComponent {
   let minX = Infinity;
   let maxX = -Infinity;
   let minY = Infinity;
@@ -372,7 +441,7 @@ function measureComponent(graph: Graph, ids: string[]): PackedComponent {
     const x = graph.getNodeAttribute(id, "x") as number;
     const y = graph.getNodeAttribute(id, "y") as number;
     const size = (graph.getNodeAttribute(id, "size") as number) ?? 0;
-    radius = Math.max(radius, Math.hypot(x - cx, y - cy) + size);
+    radius = Math.max(radius, Math.hypot(x - cx, y - cy) + Math.max(size, reach.get(id) ?? 0));
   }
   return { ids, cx, cy, radius };
 }
@@ -391,14 +460,24 @@ function measureComponent(graph: Graph, ids: string[]): PackedComponent {
  * placed, so no two overlap. Order is size-descending with an id tie-break,
  * so the same graph always packs the same way.
  *
+ * A component's measured radius covers its satellite halo too (see
+ * satelliteReach): leaves are not simulated, so a bbox over sim nodes alone
+ * would let one component's halo sit inside its neighbour's gap.
+ *
+ * Returns the node ids of each component in placement order — largest first,
+ * so the caller can tell the core from the packed islands.
+ *
  * Pure in the sense that matters here: it reads x/y/size off the graph and
  * writes x/y back, touching nothing else and consulting no clock or random.
  */
-export function packComponents(graph: Graph, simulatedIds: string[]): void {
+export function packComponents(graph: Graph, simulatedIds: string[]): string[][] {
   const simulated = new Set(simulatedIds);
-  if (simulated.size === 0) return;
+  if (simulated.size === 0) return [];
+  const reach = satelliteReach(satellitePlan(graph), (id) =>
+    (graph.getNodeAttribute(id, "size") as number) ?? 0,
+  );
   const components = simulatedComponents(graph, simulated)
-    .map((ids) => measureComponent(graph, ids))
+    .map((ids) => measureComponent(graph, ids, reach))
     .sort((a, b) => b.ids.length - a.ids.length || (a.ids[0] < b.ids[0] ? -1 : 1));
 
   const translate = (component: PackedComponent, tx: number, ty: number) => {
@@ -437,6 +516,14 @@ export function packComponents(graph: Graph, simulatedIds: string[]): void {
     translate(component, x, y);
     placed.push(component);
   }
+  return placed.map((component) => component.ids);
+}
+
+/** The sim plus the one thing the view has to tell it: which node the pointer
+ *  is holding right now. Satellites are not sim nodes, so the writeback needs
+ *  to be told to leave the dragged one alone (see placeSatellites). */
+export interface AtlasSimulation extends Simulation<AtlasSimNode, undefined> {
+  setDraggingId(id: string | null): void;
 }
 
 export interface AtlasSimNode extends SimulationNodeDatum {
@@ -483,9 +570,11 @@ function linkEndId(end: string | AtlasSimNode): string {
 }
 
 /** d3-force simulation over the live graphology graph — the interaction engine.
- *  Sim nodes are the CONNECTED subgraph only (degree > 0) — isolates hold
- *  their round-1 ring position structurally (see placeIsolateRing) and are
- *  never simulated. Matches the retired ConstellationMap feel: charge -40,
+ *  Sim nodes are the drawable graph MINUS the nodes nonSimulatedIds names:
+ *  degree-0 isolates and every degree-1 memory. Neither is simulated —
+ *  isolates are not drawn at all once drawableModel drops components under
+ *  MIN_COMPONENT_SIZE, and a leaf memory rides its anchor as a satellite.
+ *  Matches the retired ConstellationMap feel: charge -40,
  *  forceCenter(0, 0), alphaDecay 0.03, velocityDecay 0.25, d3-default link
  *  force. Parallel edges collapse to one link per undirected pair (d3 sums
  *  pull per link; sigma still RENDERS every parallel edge). Settles
@@ -497,7 +586,7 @@ function linkEndId(end: string | AtlasSimNode): string {
 export function createAtlasSimulation(
   graph: Graph,
   onTick?: () => void,
-): Simulation<AtlasSimNode, undefined> {
+): AtlasSimulation {
   const excluded = new Set(nonSimulatedIds(graph));
   const satellites = satellitePlan(graph);
   const nodes: AtlasSimNode[] = [];
@@ -569,6 +658,7 @@ export function createAtlasSimulation(
   // and sigma's scheduler are separate rAF queues, and a render requested
   // mid-frame only runs on the next one — a constant extra frame of drag
   // latency (the old force-graph loop ticked and painted together).
+  let draggingId: string | null = null;
   const writeBack = () => {
     for (const node of nodes) {
       if (node.fx != null && node.fy != null) continue;
@@ -577,8 +667,9 @@ export function createAtlasSimulation(
     }
     // Leaf memories ride their anchor, so they are re-placed after every
     // position writeback — including mid-drag, which is what carries a
-    // dragged entity's memories along with it.
-    placeSatellites(graph, satellites);
+    // dragged entity's memories along with it. The one exception is a leaf
+    // the pointer is holding: that one is being positioned by hand.
+    placeSatellites(graph, satellites, draggingId);
     onTick?.();
   };
   sim.on("tick", writeBack);
@@ -603,10 +694,21 @@ export function createAtlasSimulation(
   // balance at about the same radius for all of them). Pack them into a
   // spiral instead, then copy the packed positions back INTO the sim so a
   // later drag flexes the packed layout rather than snapping to the ring.
-  packComponents(graph, nodes.map((node) => node.id));
+  const packedComponents = packComponents(graph, nodes.map((node) => node.id));
+  // Everything outside the biggest component is PINNED where the pack put it.
+  // Without this the first drag undoes the packing: downNode reheats the sim
+  // to alpha 0.3 and charge plus forceCenter push the islands straight back
+  // out to the one ring the pack just broke up, and nothing re-packs them.
+  // An island has no edge into the core, so it has nothing to flex toward
+  // anyway — holding it still costs the layout nothing.
+  const core = new Set(packedComponents[0] ?? []);
   for (const node of nodes) {
     node.x = graph.getNodeAttribute(node.id, "x") as number;
     node.y = graph.getNodeAttribute(node.id, "y") as number;
+    if (!core.has(node.id)) {
+      node.fx = node.x;
+      node.fy = node.y;
+    }
   }
   // Same writeback path as a tick, so satellites re-place around their moved
   // anchors and the caller's onTick marks the cartography scene dirty.
@@ -614,7 +716,12 @@ export function createAtlasSimulation(
 
   sim.alpha(0);
   sim.stop();
-  return sim;
+
+  const atlasSim = sim as AtlasSimulation;
+  atlasSim.setDraggingId = (id: string | null) => {
+    draggingId = id;
+  };
+  return atlasSim;
 }
 
 export interface HoverState {
