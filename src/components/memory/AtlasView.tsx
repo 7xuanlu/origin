@@ -14,6 +14,7 @@ import {
   memorySourceId,
   pageIdOf,
   drawableModel,
+  smallGroupNodeCount,
   DEFAULT_LAYERS,
   MEMORY_NODE_TYPE,
   PAGE_NODE_TYPE,
@@ -65,6 +66,21 @@ const EMPTY_GRAPH: KnowledgeGraph = {
 
 /** Where the layer choice survives a reload. */
 const LAYERS_STORAGE_KEY = "atlas.layers";
+
+/** Where the small-groups choice is remembered across reloads. */
+export const SMALL_GROUPS_STORAGE_KEY = "atlas.smallGroups";
+
+/** Read the persisted small-groups choice. Only a stored `true` turns them
+ *  on; anything malformed — bad JSON, a number, a string — leaves them
+ *  hidden, which is the default the map is designed around. */
+export function readStoredSmallGroups(raw: string | null): boolean {
+  if (raw === null) return false;
+  try {
+    return JSON.parse(raw) === true;
+  } catch {
+    return false;
+  }
+}
 
 /** Read the persisted layer choice. Anything malformed — bad JSON, a
  *  non-object, a non-boolean field, or all three off — falls back to the
@@ -222,6 +238,27 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       // Private mode / quota: the choice still applies for this session.
     }
   };
+  // Components of fewer than MIN_COMPONENT_SIZE nodes are off the map until
+  // the reader asks for them; the chip below is the ask. Persisted like the
+  // layer choice, and a malformed stored value falls back to hidden.
+  const [showSmallGroups, setShowSmallGroups] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return readStoredSmallGroups(window.localStorage.getItem(SMALL_GROUPS_STORAGE_KEY));
+    } catch {
+      return false;
+    }
+  });
+  const toggleSmallGroups = () => {
+    const next = !showSmallGroups;
+    setShowSmallGroups(next);
+    try {
+      window.localStorage.setItem(SMALL_GROUPS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Private mode / quota: the choice still applies for this session.
+    }
+  };
+
   const onlyLayerOn = (key: keyof GraphLayers) =>
     layers[key] && Object.values(layers).filter(Boolean).length === 1;
 
@@ -245,13 +282,17 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   );
 
   // What sigma actually draws. Nodes in a connected component smaller than
-  // MIN_COMPONENT_SIZE are left out entirely (model.ts): on real data ~960 of
-  // 1,600 entities have no relation at all, and another ~196 sit in 137
-  // pairs-and-triples that d3's centering force flings into a ring around the
-  // core. Both buried the map. The count of what was left out is shown in the
-  // toolbar instead.
-  const visibleModel = useMemo<GraphModel>(() => drawableModel(model), [model]);
-  const hiddenCount = model.nodes.length - visibleModel.nodes.length;
+  // MIN_COMPONENT_SIZE are left out (model.ts) unless the reader turns them
+  // on: on real data ~960 of 1,600 entities have no relation at all, and
+  // another ~196 sit in small groups of four or fewer. Both buried the map.
+  // The count is shown on the toolbar chip that turns them back on.
+  const visibleModel = useMemo<GraphModel>(
+    () => drawableModel(model, showSmallGroups),
+    [model, showSmallGroups],
+  );
+  // Counted off the FULL model, so the chip keeps its number when the groups
+  // are showing and can offer to hide them again.
+  const smallGroupCount = useMemo(() => smallGroupNodeCount(model), [model]);
 
   // Anything in cartography.ts's unscoped bucket is drawn on the fallback
   // climb, so the badge must never read all-durable while such a node is on
@@ -708,10 +749,10 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       // its orbit on the next tick unless the sim knows a hand is on it.
       sim.setDraggingId(node);
       const simNode = sim.nodes().find((n) => n.id === node);
-      // Nodes outside the biggest component are parked by packComponents and
-      // pinned there; a drag moves the pin, and release leaves it at the new
-      // spot rather than handing it back to charge + forceCenter, which would
-      // fling it out to the pre-pack ring.
+      // Nodes outside the biggest component are parked on the shelf by
+      // shelveComponents and pinned there; a drag moves the pin, and release
+      // leaves it at the new spot rather than handing it back to charge +
+      // forceCenter, which would fling it into the core.
       draggedNodeWasPinnedRef.current = simNode?.fx != null;
       // Leaf memories aren't sim members (see nonSimulatedIds) — dragging one
       // is pure direct manipulation via mousemovebody's graphology writes, so
@@ -1207,18 +1248,26 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
             )}
           </span>
         )}
-        {hiddenCount > 0 && (
-          <span
+        {smallGroupCount > 0 && (
+          <button
+            type="button"
+            onClick={toggleSmallGroups}
+            aria-pressed={showSmallGroups}
+            aria-label={t(showSmallGroups ? "atlas.hideSmallGroups" : "atlas.showSmallGroups")}
             style={{
               font: "400 11px var(--mem-font-mono)",
-              color: "var(--mem-text-tertiary)",
+              color: showSmallGroups ? "var(--mem-text-secondary)" : "var(--mem-text-tertiary)",
+              background: "transparent",
               border: "1px solid var(--mem-border)",
               borderRadius: "var(--mem-radius-full)",
               padding: "3px 10px",
+              cursor: "pointer",
             }}
           >
-            {t("atlas.unconnectedHidden", { count: hiddenCount })}
-          </span>
+            {showSmallGroups
+              ? t("atlas.hideSmallGroups")
+              : t("atlas.smallGroupsHidden", { count: smallGroupCount })}
+          </button>
         )}
         <span
           style={{

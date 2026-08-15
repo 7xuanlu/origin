@@ -21,6 +21,7 @@ import {
   pageNodeId,
   componentSizeByNode,
   drawableModel,
+  smallGroupNodeCount,
   DEFAULT_LAYERS,
   MIN_COMPONENT_SIZE,
   SHARED_SOURCE_MAX_FANOUT,
@@ -655,16 +656,47 @@ describe("componentSizeByNode / drawableModel", () => {
 
   it("drops components below MIN_COMPONENT_SIZE, and their edges with them", () => {
     const drawable = drawableModel(
-      model(["a", "b", "c", "d", "e", "f"], [["a", "b"], ["b", "c"], ["d", "e"]]),
+      model(
+        ["a", "b", "c", "d", "e", "f", "g"],
+        [["a", "b"], ["b", "c"], ["c", "d"], ["d", "e"], ["f", "g"]],
+      ),
     );
-    expect(drawable.nodes.map((n) => n.id)).toEqual(["a", "b", "c"]);
-    // "d"-"e" would otherwise dangle off nodes the graph no longer has.
-    expect(drawable.edges.map((e) => e.id)).toEqual(["e0", "e1"]);
-    expect(MIN_COMPONENT_SIZE).toBe(3);
+    expect(drawable.nodes.map((n) => n.id)).toEqual(["a", "b", "c", "d", "e"]);
+    // "f"-"g" would otherwise dangle off nodes the graph no longer has.
+    expect(drawable.edges.map((e) => e.id)).toEqual(["e0", "e1", "e2", "e3"]);
+    expect(MIN_COMPONENT_SIZE).toBe(5);
+  });
+
+  it("keeps the small groups when the reader asks for them", () => {
+    const full = model(
+      ["a", "b", "c", "d", "e", "f", "g"],
+      [["a", "b"], ["b", "c"], ["c", "d"], ["d", "e"], ["f", "g"]],
+    );
+    expect(drawableModel(full, true)).toBe(full);
+    expect(drawableModel(full, false).nodes).toHaveLength(5);
+  });
+
+  it("counts the nodes in the small groups for the chip", () => {
+    const full = model(
+      ["a", "b", "c", "d", "e", "f", "g", "h"],
+      [["a", "b"], ["b", "c"], ["c", "d"], ["d", "e"], ["f", "g"]],
+    );
+    // Four nodes are small: the f-g pair and the lone "h".
+    expect(smallGroupNodeCount(full)).toBe(3);
+    // The count is about the FULL model, so turning the groups on does not
+    // change what the chip has to offer back.
+    expect(smallGroupNodeCount(drawableModel(full, true))).toBe(3);
+  });
+
+  it("hides nothing when no component clears the bar — there is no core to be small beside", () => {
+    const tiny = model(["a", "b", "c", "d"], [["a", "b"], ["c", "d"]]);
+    expect(drawableModel(tiny)).toBe(tiny);
+    expect(smallGroupNodeCount(tiny)).toBe(0);
   });
 
   it("returns the model untouched when every component is big enough", () => {
-    const full = model(["a", "b", "c"], [["a", "b"], ["b", "c"]]);
+    const full = model(["a", "b", "c", "d", "e"], [["a", "b"], ["b", "c"], ["c", "d"], ["d", "e"]]);
     expect(drawableModel(full)).toBe(full);
+    expect(smallGroupNodeCount(full)).toBe(0);
   });
 });

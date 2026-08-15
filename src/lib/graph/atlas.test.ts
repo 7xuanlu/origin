@@ -13,8 +13,10 @@ import {
   nonSimulatedIds,
   satellitePlan,
   placeSatellites,
-  packComponents,
-  PACK_GAP,
+  shelveComponents,
+  SHELF_GAP,
+  SHELF_TOP_GAP,
+  SHELF_WIDTH_FACTOR,
   hoverStateFor,
   nodeDisplay,
   edgeDisplay,
@@ -902,239 +904,6 @@ describe("nonSimulatedIds and satellites", () => {
   });
 });
 
-describe("packComponents", () => {
-  // Three islands, deliberately laid on top of each other so the packing has
-  // to move them: a 4-node core and two pairs, all built at the origin.
-  function islandModel(): GraphModel {
-    return makeModel(
-      [
-        node({ id: "c1" }),
-        node({ id: "c2" }),
-        node({ id: "c3" }),
-        node({ id: "c4" }),
-        node({ id: "a1" }),
-        node({ id: "a2" }),
-        node({ id: "b1" }),
-        node({ id: "b2" }),
-      ],
-      [
-        edge({ id: "e1", source: "c1", target: "c2" }),
-        edge({ id: "e2", source: "c2", target: "c3" }),
-        edge({ id: "e3", source: "c3", target: "c4" }),
-        edge({ id: "e4", source: "a1", target: "a2" }),
-        edge({ id: "e5", source: "b1", target: "b2" }),
-      ],
-    );
-  }
-
-  function packed(): Graph {
-    const graph = buildAtlasGraph(islandModel(), PALETTE);
-    packComponents(graph, graph.nodes());
-    return graph;
-  }
-
-  function measure(graph: Graph, ids: string[]) {
-    const xs = ids.map((id) => graph.getNodeAttribute(id, "x") as number);
-    const ys = ids.map((id) => graph.getNodeAttribute(id, "y") as number);
-    const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
-    const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
-    let radius = 0;
-    ids.forEach((id, i) => {
-      const size = graph.getNodeAttribute(id, "size") as number;
-      radius = Math.max(radius, Math.hypot(xs[i] - cx, ys[i] - cy) + size);
-    });
-    return { cx, cy, radius };
-  }
-
-  it("holds the packed islands still through a drag reheat", () => {
-    const graph = buildAtlasGraph(islandModel(), PALETTE);
-    runAtlasLayout(graph);
-    const sim = createAtlasSimulation(graph);
-    const before = [measure(graph, ["a1", "a2"]), measure(graph, ["b1", "b2"])];
-    // Exactly AtlasView's downNode: pin the pressed core node, jump alpha to
-    // 0.3 and reheat. Before the islands were pinned this pushed them back
-    // out to the one ring the pack had just broken up.
-    const pressed = sim.nodes().find((n) => n.id === "c1") as { fx?: number | null; fy?: number | null; x?: number; y?: number };
-    pressed.fx = pressed.x;
-    pressed.fy = pressed.y;
-    sim.alpha(0.3).alphaTarget(0.3);
-    sim.tick(60);
-    const after = [measure(graph, ["a1", "a2"]), measure(graph, ["b1", "b2"])];
-    for (let i = 0; i < before.length; i += 1) {
-      expect(after[i].cx).toBeCloseTo(before[i].cx, 6);
-      expect(after[i].cy).toBeCloseTo(before[i].cy, 6);
-    }
-  });
-
-  it("measures a component with its satellite halo, so an island clears the halo", () => {
-    const leaves = 40;
-    const nodes: GraphNode[] = [
-      node({ id: "c1", degree: leaves + 1 }),
-      node({ id: "c2" }),
-      node({ id: "c3" }),
-      node({ id: "c4" }),
-      node({ id: "i1" }),
-      node({ id: "i2" }),
-    ];
-    const edges: GraphEdge[] = [
-      edge({ id: "x1", source: "c1", target: "c2" }),
-      edge({ id: "x2", source: "c2", target: "c3" }),
-      edge({ id: "x3", source: "c3", target: "c4" }),
-      edge({ id: "x4", source: "i1", target: "i2" }),
-    ];
-    for (let i = 0; i < leaves; i += 1) {
-      const id = `leaf${String(i).padStart(3, "0")}`;
-      nodes.push(node({ id, entityType: "memory", confirmed: null, degree: 1 }));
-      edges.push(edge({ id: `m${i}`, source: id, target: "c1", type: "mentions" }));
-    }
-    const graph = buildAtlasGraph(makeModel(nodes, edges), PALETTE);
-    const excluded = new Set(nonSimulatedIds(graph));
-    packComponents(graph, graph.nodes().filter((id) => !excluded.has(id)));
-    const plan = satellitePlan(graph);
-    placeSatellites(graph, plan);
-    const at = (id: string) => ({
-      x: graph.getNodeAttribute(id, "x") as number,
-      y: graph.getNodeAttribute(id, "y") as number,
-    });
-    let closest = Infinity;
-    for (const satellite of plan) {
-      for (const islandId of ["i1", "i2"]) {
-        const a = at(satellite.id);
-        const b = at(islandId);
-        closest = Math.min(closest, Math.hypot(a.x - b.x, a.y - b.y));
-      }
-    }
-    // The island's bounding disc clears the core's by PACK_GAP, and the halo
-    // is inside the core's disc, so every leaf is at least that far off.
-    expect(closest).toBeGreaterThanOrEqual(PACK_GAP);
-  });
-
-  it("recentres the largest component on the origin", () => {
-    const graph = packed();
-    const core = measure(graph, ["c1", "c2", "c3", "c4"]);
-    expect(core.cx).toBeCloseTo(0, 6);
-    expect(core.cy).toBeCloseTo(0, 6);
-  });
-
-  it("leaves every component's internal layout untouched — the move is rigid", () => {
-    const before = buildAtlasGraph(islandModel(), PALETTE);
-    const after = packed();
-    // Same pairwise distance inside a component before and after packing.
-    const span = (graph: Graph, a: string, b: string) =>
-      Math.hypot(
-        (graph.getNodeAttribute(a, "x") as number) - (graph.getNodeAttribute(b, "x") as number),
-        (graph.getNodeAttribute(a, "y") as number) - (graph.getNodeAttribute(b, "y") as number),
-      );
-    expect(span(after, "c1", "c3")).toBeCloseTo(span(before, "c1", "c3"), 6);
-    expect(span(after, "a1", "a2")).toBeCloseTo(span(before, "a1", "a2"), 6);
-  });
-
-  // Enough islands that the phyllotaxis spiral alone is not enough — later
-  // arms come back around near earlier ones, so the greedy step-out is what
-  // actually keeps them apart. Twenty pairs is the same order as the ~23
-  // components the real graph has at default layers. Mutation-proven: with
-  // the step-out disabled, they all land on one circle and this fails.
-  function manyIslandsModel(pairs: number): GraphModel {
-    const nodes: GraphNode[] = [];
-    const edges: GraphEdge[] = [];
-    for (let i = 0; i < pairs; i += 1) {
-      nodes.push(node({ id: `x${i}` }), node({ id: `y${i}` }));
-      edges.push(edge({ id: `k${i}`, source: `x${i}`, target: `y${i}` }));
-    }
-    return makeModel(nodes, edges);
-  }
-
-  it("leaves no two components overlapping, with PACK_GAP to spare", () => {
-    const pairs = 20;
-    const graph = buildAtlasGraph(manyIslandsModel(pairs), PALETTE);
-    packComponents(graph, graph.nodes());
-    const groups = Array.from({ length: pairs }, (_unused, i) => measure(graph, [`x${i}`, `y${i}`]));
-    for (let i = 0; i < groups.length; i += 1) {
-      for (let j = i + 1; j < groups.length; j += 1) {
-        const gap = Math.hypot(groups[i].cx - groups[j].cx, groups[i].cy - groups[j].cy);
-        expect(gap).toBeGreaterThanOrEqual(groups[i].radius + groups[j].radius + PACK_GAP);
-      }
-    }
-  });
-
-  it("pushes an island further out when its first spiral radius is already taken", () => {
-    // The greedy step-out, isolated. With twenty islands the phyllotaxis arms
-    // crowd each other, so at least one cannot sit at the radius that merely
-    // clears the core — it has to walk out in PACK_STEP increments.
-    const pairs = 20;
-    const graph = buildAtlasGraph(manyIslandsModel(pairs), PALETTE);
-    packComponents(graph, graph.nodes());
-    const groups = Array.from({ length: pairs }, (_unused, i) => measure(graph, [`x${i}`, `y${i}`]));
-    const core = groups.reduce((best, g) => (Math.hypot(g.cx, g.cy) < Math.hypot(best.cx, best.cy) ? g : best));
-    const steppedOut = groups.filter((g) => {
-      const firstTry = core.radius + PACK_GAP + g.radius;
-      return Math.hypot(g.cx, g.cy) > firstTry + 1e-6;
-    });
-    expect(steppedOut.length).toBeGreaterThan(0);
-  });
-
-  it("spreads the small components around the core rather than stacking them on one arm", () => {
-    const graph = packed();
-    const a = measure(graph, ["a1", "a2"]);
-    const b = measure(graph, ["b1", "b2"]);
-    const angle = (m: { cx: number; cy: number }) => Math.atan2(m.cy, m.cx);
-    let apart = Math.abs(angle(a) - angle(b));
-    if (apart > Math.PI) apart = 2 * Math.PI - apart;
-    // The phyllotaxis step is 137.5 degrees, so consecutive islands land on
-    // opposite sides — never within a few degrees of each other.
-    expect(apart).toBeGreaterThan(Math.PI / 4);
-  });
-
-  it("is deterministic: the same graph packs to identical positions twice", () => {
-    const first = packed();
-    const second = packed();
-    for (const id of first.nodes()) {
-      expect(second.getNodeAttribute(id, "x")).toBe(first.getNodeAttribute(id, "x"));
-      expect(second.getNodeAttribute(id, "y")).toBe(first.getNodeAttribute(id, "y"));
-    }
-  });
-
-  it("does nothing when there are no simulated nodes", () => {
-    const graph = buildAtlasGraph(islandModel(), PALETTE);
-    const before = graph.nodes().map((id) => graph.getNodeAttribute(id, "x"));
-    packComponents(graph, []);
-    expect(graph.nodes().map((id) => graph.getNodeAttribute(id, "x"))).toEqual(before);
-  });
-
-  it("ignores nodes the caller left out of the simulated set", () => {
-    const graph = buildAtlasGraph(islandModel(), PALETTE);
-    const strayBefore = {
-      x: graph.getNodeAttribute("b1", "x"),
-      y: graph.getNodeAttribute("b1", "y"),
-    };
-    packComponents(
-      graph,
-      graph.nodes().filter((id) => id !== "b1" && id !== "b2"),
-    );
-    expect(graph.getNodeAttribute("b1", "x")).toBe(strayBefore.x);
-    expect(graph.getNodeAttribute("b1", "y")).toBe(strayBefore.y);
-  });
-
-  it("pulls the islands in from the ring the settle leaves them on", () => {
-    // The whole point of section A: after the sim settles, charge plus
-    // forceCenter park the small components far out; packing brings them to
-    // just outside the core.
-    const graph = buildAtlasGraph(islandModel(), PALETTE);
-    runAtlasLayout(graph);
-    const sim = createAtlasSimulation(graph);
-    sim.stop();
-    const core = measure(graph, ["c1", "c2", "c3", "c4"]);
-    for (const ids of [["a1", "a2"], ["b1", "b2"]]) {
-      const island = measure(graph, ids);
-      const distance = Math.hypot(island.cx - core.cx, island.cy - core.cy);
-      // Clear of the core, but not flung to a wide ring: the greedy search
-      // stops at the first radius that fits.
-      expect(distance).toBeGreaterThan(core.radius);
-      expect(distance).toBeLessThan(core.radius + island.radius + PACK_GAP + 3 * 12);
-    }
-  });
-});
-
 describe("simulation forces (round 4)", () => {
   function pagePair(): GraphModel {
     return makeModel(
@@ -1235,5 +1004,280 @@ describe("simulation forces (round 4)", () => {
     // The wikilink is the asserted link, so it sets the spring — not the
     // shared-source edge that happens to run beside it.
     expect(distance(links[0])).toBe(50);
+  });
+});
+
+describe("shelveComponents", () => {
+  /** One chain per requested size, so component sizes are exactly as asked
+   *  and every node is an entity (a leaf MEMORY would be a satellite, which
+   *  the shelf measures through its anchor instead). */
+  function componentsModel(sizes: number[]): GraphModel {
+    const nodes: GraphNode[] = [];
+    const edges: GraphEdge[] = [];
+    sizes.forEach((size, c) => {
+      for (let i = 0; i < size; i += 1) {
+        nodes.push(node({ id: `c${c}n${i}` }));
+        if (i > 0) {
+          edges.push(edge({ id: `c${c}e${i}`, source: `c${c}n${i - 1}`, target: `c${c}n${i}` }));
+        }
+      }
+    });
+    return makeModel(nodes, edges);
+  }
+
+  function shelved(sizes: number[]) {
+    const graph = buildAtlasGraph(componentsModel(sizes), PALETTE);
+    runAtlasLayout(graph);
+    const placement = shelveComponents(graph);
+    return { graph, placement };
+  }
+
+  /** The drawn extent of one component: every node's disc. */
+  function box(graph: Graph, ids: string[]) {
+    const pad = (id: string) => graph.getNodeAttribute(id, "size") as number;
+    const xs = ids.map((id) => graph.getNodeAttribute(id, "x") as number);
+    const ys = ids.map((id) => graph.getNodeAttribute(id, "y") as number);
+    return {
+      minX: Math.min(...ids.map((id, i) => (xs[i] as number) - pad(id))),
+      maxX: Math.max(...ids.map((id, i) => (xs[i] as number) + pad(id))),
+      minY: Math.min(...ids.map((id, i) => (ys[i] as number) - pad(id))),
+      maxY: Math.max(...ids.map((id, i) => (ys[i] as number) + pad(id))),
+    };
+  }
+
+  it("centres the largest component on the origin and returns it first", () => {
+    const { graph, placement } = shelved([9, 6, 5]);
+    expect(placement[0]).toHaveLength(9);
+    const core = box(graph, placement[0] as string[]);
+    expect((core.minX + core.maxX) / 2).toBeCloseTo(0, 6);
+    expect((core.minY + core.maxY) / 2).toBeCloseTo(0, 6);
+  });
+
+  it("puts every other component BELOW the core, never around it", () => {
+    const { graph, placement } = shelved([9, 6, 5, 5]);
+    const core = box(graph, placement[0] as string[]);
+    for (const ids of placement.slice(1)) {
+      const shelf = box(graph, ids);
+      // Graph +y is screen-up, so "below" is smaller y. The whole shelf box
+      // clears the core's bottom edge by at least SHELF_TOP_GAP.
+      expect(shelf.maxY).toBeLessThanOrEqual(core.minY - SHELF_TOP_GAP + 1e-6);
+    }
+    const first = box(graph, placement[1] as string[]);
+    expect(first.maxY).toBeCloseTo(core.minY - SHELF_TOP_GAP, 6);
+  });
+
+  it("orders the shelf largest-first, left to right, one SHELF_GAP apart", () => {
+    const { graph, placement } = shelved([12, 7, 6, 5]);
+    const shelf = placement.slice(1);
+    expect(shelf.map((ids) => ids.length)).toEqual([7, 6, 5]);
+    const boxes = shelf.map((ids) => box(graph, ids));
+    for (let i = 1; i < boxes.length; i += 1) {
+      const left = boxes[i - 1] as { maxX: number };
+      const right = boxes[i] as { minX: number };
+      expect(right.minX - left.maxX).toBeCloseTo(SHELF_GAP, 6);
+    }
+  });
+
+  it("centres each shelf row under the core", () => {
+    const { graph, placement } = shelved([12, 7, 6, 5]);
+    const boxes = placement.slice(1).map((ids) => box(graph, ids));
+    const rowLeft = Math.min(...boxes.map((b) => b.minX));
+    const rowRight = Math.max(...boxes.map((b) => b.maxX));
+    expect((rowLeft + rowRight) / 2).toBeCloseTo(0, 6);
+  });
+
+  it("wraps to another row once a row would run wider than the core allows", () => {
+    // Eight shelf components against a narrow core: one row cannot hold them.
+    const { graph, placement } = shelved([6, 5, 5, 5, 5, 5, 5, 5, 5]);
+    const core = box(graph, placement[0] as string[]);
+    const boxes = placement.slice(1).map((ids) => box(graph, ids));
+    const rows = new Map<string, { minX: number; maxX: number }[]>();
+    for (const b of boxes) {
+      const key = b.maxY.toFixed(6);
+      const list = rows.get(key);
+      if (list) list.push(b);
+      else rows.set(key, [b]);
+    }
+    expect(rows.size).toBeGreaterThan(1);
+    const budget = SHELF_WIDTH_FACTOR * (core.maxX - core.minX);
+    for (const row of rows.values()) {
+      const width = Math.max(...row.map((b) => b.maxX)) - Math.min(...row.map((b) => b.minX));
+      // A row may only exceed the budget when a single component does.
+      const widest = Math.max(...row.map((b) => b.maxX - b.minX));
+      expect(width).toBeLessThanOrEqual(Math.max(budget, widest) + 1e-6);
+    }
+  });
+
+  it("never overlaps two components", () => {
+    const { graph, placement } = shelved([9, 6, 5, 5, 5, 5, 5]);
+    const boxes = placement.map((ids) => box(graph, ids));
+    for (let i = 0; i < boxes.length; i += 1) {
+      for (let j = i + 1; j < boxes.length; j += 1) {
+        const a = boxes[i] as { minX: number; maxX: number; minY: number; maxY: number };
+        const b = boxes[j] as { minX: number; maxX: number; minY: number; maxY: number };
+        const overlaps =
+          a.minX < b.maxX && b.minX < a.maxX && a.minY < b.maxY && b.minY < a.maxY;
+        expect(overlaps).toBe(false);
+      }
+    }
+  });
+
+  it("moves a component rigidly — internal distances survive", () => {
+    const { graph, placement } = shelved([9, 5]);
+    const ids = placement[1] as string[];
+    const graph2 = buildAtlasGraph(componentsModel([9, 5]), PALETTE);
+    runAtlasLayout(graph2);
+    const at = (g: Graph, id: string) => ({
+      x: g.getNodeAttribute(id, "x") as number,
+      y: g.getNodeAttribute(id, "y") as number,
+    });
+    for (let i = 1; i < ids.length; i += 1) {
+      const before = Math.hypot(
+        at(graph2, ids[i] as string).x - at(graph2, ids[0] as string).x,
+        at(graph2, ids[i] as string).y - at(graph2, ids[0] as string).y,
+      );
+      const after = Math.hypot(
+        at(graph, ids[i] as string).x - at(graph, ids[0] as string).x,
+        at(graph, ids[i] as string).y - at(graph, ids[0] as string).y,
+      );
+      expect(after).toBeCloseTo(before, 6);
+    }
+  });
+
+  it("puts lone nodes last, on rows of their own", () => {
+    const { graph, placement } = shelved([9, 5, 1, 1, 3]);
+    // Largest-first among the grouped ones, then the singletons.
+    expect(placement.slice(1).map((ids) => ids.length)).toEqual([5, 3, 1, 1]);
+    const grouped = placement.slice(1, 3).map((ids) => box(graph, ids));
+    const singles = placement.slice(3).map((ids) => box(graph, ids));
+    const groupedBottom = Math.min(...grouped.map((b) => b.minY));
+    for (const single of singles) {
+      expect(single.maxY).toBeLessThanOrEqual(groupedBottom + 1e-6);
+    }
+    // And the two lone nodes share their own row.
+    expect((singles[0] as { maxY: number }).maxY).toBeCloseTo(
+      (singles[1] as { maxY: number }).maxY,
+      6,
+    );
+  });
+
+  it("keeps a shelved component clear of the core's satellite halo", () => {
+    const leaves = 40;
+    const nodes: GraphNode[] = [];
+    const edges: GraphEdge[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      nodes.push(node({ id: `k${i}` }));
+      if (i > 0) edges.push(edge({ id: `ke${i}`, source: `k${i - 1}`, target: `k${i}` }));
+    }
+    for (let i = 0; i < leaves; i += 1) {
+      const id = `leaf${String(i).padStart(3, "0")}`;
+      nodes.push(node({ id, entityType: "memory", confirmed: null, degree: 1 }));
+      edges.push(edge({ id: `m${i}`, source: id, target: "k0", type: "mentions" }));
+    }
+    for (let i = 0; i < 5; i += 1) {
+      nodes.push(node({ id: `s${i}` }));
+      if (i > 0) edges.push(edge({ id: `se${i}`, source: `s${i - 1}`, target: `s${i}` }));
+    }
+    const graph = buildAtlasGraph(makeModel(nodes, edges), PALETTE);
+    // Placed by hand instead of laid out: the whole core sits on one line, so
+    // the ONLY thing that can reach below it is k0's halo.
+    for (let i = 0; i < 6; i += 1) {
+      graph.setNodeAttribute(`k${i}`, "x", i * 40);
+      graph.setNodeAttribute(`k${i}`, "y", 0);
+    }
+    for (let i = 0; i < 5; i += 1) {
+      graph.setNodeAttribute(`s${i}`, "x", i * 40);
+      graph.setNodeAttribute(`s${i}`, "y", 500);
+    }
+    const placement = shelveComponents(graph);
+    placeSatellites(graph, satellitePlan(graph));
+    expect(placement[0]).toContain("k0");
+    const shelf = box(graph, ["s0", "s1", "s2", "s3", "s4"]);
+    const leafSize = graph.getNodeAttribute("leaf000", "size") as number;
+    let lowest = Infinity;
+    for (let i = 0; i < leaves; i += 1) {
+      lowest = Math.min(
+        lowest,
+        (graph.getNodeAttribute(`leaf${String(i).padStart(3, "0")}`, "y") as number) - leafSize,
+      );
+    }
+    // The halo hangs well below the core's own discs, and the shelf still
+    // clears its lowest leaf by the full SHELF_TOP_GAP.
+    expect(lowest).toBeLessThan(-(graph.getNodeAttribute("k0", "size") as number) * 2);
+    expect(shelf.maxY).toBeLessThanOrEqual(lowest - SHELF_TOP_GAP + 1e-6);
+  });
+
+  it("is deterministic: the same graph shelves the same way twice", () => {
+    const first = shelved([9, 6, 5, 1]);
+    const second = shelved([9, 6, 5, 1]);
+    expect(second.placement).toEqual(first.placement);
+    for (const ids of first.placement) {
+      expect(box(second.graph, ids)).toEqual(box(first.graph, ids));
+    }
+  });
+
+  it("does nothing to an empty graph", () => {
+    const graph = buildAtlasGraph(makeModel([]), PALETTE);
+    expect(shelveComponents(graph)).toEqual([]);
+  });
+
+  it("holds the shelved components still through a drag reheat", () => {
+    const graph = buildAtlasGraph(componentsModel([9, 6, 5]), PALETTE);
+    runAtlasLayout(graph);
+    const sim = createAtlasSimulation(graph);
+    const placement = [
+      ["c1n0", "c1n1", "c1n2", "c1n3", "c1n4", "c1n5"],
+      ["c2n0", "c2n1", "c2n2", "c2n3", "c2n4"],
+    ];
+    const before = placement.map((ids) => box(graph, ids));
+    // Exactly AtlasView's downNode: pin the pressed core node, jump alpha to
+    // 0.3 and reheat.
+    const pressed = sim.nodes().find((n) => n.id === "c0n0") as {
+      fx?: number | null;
+      fy?: number | null;
+      x?: number;
+      y?: number;
+    };
+    pressed.fx = pressed.x;
+    pressed.fy = pressed.y;
+    sim.alpha(0.3).alphaTarget(0.3);
+    sim.tick(60);
+    placement.forEach((ids, i) => {
+      expect(box(graph, ids)).toEqual(before[i]);
+    });
+  });
+
+  it("holds the core in place through a reheat instead of chasing the shelf's mass", () => {
+    const graph = buildAtlasGraph(componentsModel([24, 6, 6, 6, 6]), PALETTE);
+    runAtlasLayout(graph);
+    const sim = createAtlasSimulation(graph);
+    const pressed = sim.nodes().find((n) => n.fx == null) as {
+      fx?: number | null;
+      fy?: number | null;
+      x?: number;
+      y?: number;
+    };
+    const rest = sim.nodes().filter((n) => n.fx == null && n !== pressed);
+    const centroid = () => ({
+      x: rest.reduce((sum, n) => sum + (n.x ?? 0), 0) / rest.length,
+      y: rest.reduce((sum, n) => sum + (n.y ?? 0), 0) / rest.length,
+    });
+    const span = Math.max(...rest.map((n) => Math.hypot(n.x ?? 0, n.y ?? 0)));
+    const before = centroid();
+
+    pressed.fx = pressed.x;
+    pressed.fy = pressed.y;
+    sim.alpha(0.3).alphaTarget(0.3);
+    sim.tick(60);
+
+    const after = centroid();
+    // The shelf is pinned BELOW the core, so a centre force that averaged
+    // every node would see a centroid below the origin every tick and walk
+    // the core upward to compensate — the two zones would drift apart.
+    // 18 units on a 430-unit span as written. d3's own forceCenter, which
+    // averages the pinned shelf in too, gives 268; averaging only the free
+    // nodes but pulling them to a centroid of (0,0) rather than to where the
+    // shelf pass left them gives 54.
+    expect(Math.hypot(after.x - before.x, after.y - before.y)).toBeLessThan(span * 0.08);
   });
 });

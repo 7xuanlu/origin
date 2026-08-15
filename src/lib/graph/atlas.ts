@@ -5,7 +5,6 @@ import {
   forceSimulation,
   forceLink,
   forceManyBody,
-  forceCenter,
   forceCollide,
   type Simulation,
   type SimulationNodeDatum,
@@ -18,6 +17,7 @@ import {
   WIKILINK_EDGE_TYPE,
   CITES_EDGE_TYPE,
   MEMORY_EDGE_TYPE,
+  MIN_COMPONENT_SIZE,
 } from "./model";
 import { nodeFillFor, type GraphPalette } from "./palette";
 import { bridgeEdgeTest } from "./cartography";
@@ -354,29 +354,43 @@ export function placeSatellites(graph: Graph, plan: Satellite[], skipId?: string
   }
 }
 
-/** Graph-space clearance between two packed components, and between the core
- *  and the first ring of them. Big enough that the gap reads as a gap at
- *  fit-to-screen zoom, small enough that the cloud still hugs the core. */
-export const PACK_GAP = 24;
-/** How much further out the greedy search pushes a component each time the
- *  current spiral radius still collides with something already placed. */
-export const PACK_STEP = 12;
-/** 137.5 degrees in radians — the phyllotaxis angle. Successive components
- *  land on different sides of the core instead of stacking along one arm. */
-const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+/** Horizontal clearance between two shelved components, and the vertical
+ *  clearance between two shelf rows. */
+export const SHELF_GAP = 24;
+/** Clear air between the core's bottom edge and the top of the shelf. Bigger
+ *  than SHELF_GAP so the shelf reads as a separate zone rather than as more
+ *  of the core. */
+export const SHELF_TOP_GAP = 60;
+/** A component this size or larger earns a place on the shelf by default;
+ *  1-4 node components are "small groups", hidden until the reader asks for
+ *  them and shelved alongside the rest once they do. An ALIAS, not a second
+ *  number: the filtering itself happens in drawableModel, and two constants
+ *  for one threshold could only ever drift apart. */
+export const SHELF_MIN_SIZE = MIN_COMPONENT_SIZE;
+/** A shelf row may run this much wider than the core before it wraps. Wider
+ *  than the core so the shelf can hold a few components per row, but bounded
+ *  so it never stretches the scene sideways and shrinks the core. */
+export const SHELF_WIDTH_FACTOR = 1.6;
 
-interface PackedComponent {
+/** One component's drawn extent, in graph units. */
+interface ComponentBox {
   ids: string[];
-  cx: number;
-  cy: number;
-  /** Distance from the component's bbox centre to its furthest node EDGE. */
-  radius: number;
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
 }
 
-/** Connected components over the simulated nodes only, in graph node order. */
-function simulatedComponents(graph: Graph, simulated: Set<string>): string[][] {
+const boxWidth = (box: ComponentBox): number => box.maxX - box.minX;
+const boxHeight = (box: ComponentBox): number => box.maxY - box.minY;
+
+/** Connected components over the DRAWN graph, in graph node order. Every node
+ *  counts, including the leaf memories the sim never touches — a component's
+ *  size has to mean what the eye sees, and it is the same number
+ *  MIN_COMPONENT_SIZE filters on. */
+function graphComponents(graph: Graph): string[][] {
   const parent = new Map<string, string>();
-  for (const id of simulated) parent.set(id, id);
+  graph.forEachNode((id) => parent.set(id, id));
   const find = (start: string): string => {
     let root = start;
     while (parent.get(root) !== root) root = parent.get(root) as string;
@@ -389,25 +403,24 @@ function simulatedComponents(graph: Graph, simulated: Set<string>): string[][] {
     return root;
   };
   graph.forEachEdge((_key, _attrs, source, target) => {
-    if (!simulated.has(source) || !simulated.has(target)) return;
     const a = find(source);
     const b = find(target);
     if (a !== b) parent.set(a, b);
   });
   const groups = new Map<string, string[]>();
-  for (const id of simulated) {
+  graph.forEachNode((id) => {
     const root = find(id);
     const list = groups.get(root);
     if (list) list.push(id);
     else groups.set(root, [id]);
-  }
+  });
   return [...groups.values()];
 }
 
 /** How far each anchor's satellite halo reaches past the anchor's own centre:
- *  the outermost shell radius plus that leaf's disc. Leaves are not simulated,
- *  so they are invisible to the component bbox unless it is told about them —
- *  and a 374-leaf halo reaches ~130 units, far more than PACK_GAP covers. */
+ *  the outermost shell radius plus that leaf's disc. Measuring the leaves
+ *  where they currently sit would depend on placeSatellites having run; the
+ *  plan gives the same answer from geometry alone. */
 function satelliteReach(plan: Satellite[], sizeOf: (id: string) => number): Map<string, number> {
   const reach = new Map<string, number>();
   for (const satellite of plan) {
@@ -417,106 +430,128 @@ function satelliteReach(plan: Satellite[], sizeOf: (id: string) => number): Map<
   return reach;
 }
 
+/** Bounding box of a component's ink: every node's disc, and every anchor's
+ *  satellite halo. Satellites are skipped as nodes (their own position is
+ *  derived from the anchor) and counted through the anchor's reach instead. */
 function measureComponent(
   graph: Graph,
   ids: string[],
   reach: Map<string, number>,
-): PackedComponent {
+  satellites: Set<string>,
+): ComponentBox {
   let minX = Infinity;
   let maxX = -Infinity;
   let minY = Infinity;
   let maxY = -Infinity;
   for (const id of ids) {
+    if (satellites.has(id)) continue;
     const x = graph.getNodeAttribute(id, "x") as number;
     const y = graph.getNodeAttribute(id, "y") as number;
-    minX = Math.min(minX, x);
-    maxX = Math.max(maxX, x);
-    minY = Math.min(minY, y);
-    maxY = Math.max(maxY, y);
+    const pad = Math.max((graph.getNodeAttribute(id, "size") as number) ?? 0, reach.get(id) ?? 0);
+    minX = Math.min(minX, x - pad);
+    maxX = Math.max(maxX, x + pad);
+    minY = Math.min(minY, y - pad);
+    maxY = Math.max(maxY, y + pad);
   }
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
-  let radius = 0;
-  for (const id of ids) {
-    const x = graph.getNodeAttribute(id, "x") as number;
-    const y = graph.getNodeAttribute(id, "y") as number;
-    const size = (graph.getNodeAttribute(id, "size") as number) ?? 0;
-    radius = Math.max(radius, Math.hypot(x - cx, y - cy) + Math.max(size, reach.get(id) ?? 0));
+  if (minX === Infinity) {
+    // A component of nothing but satellites cannot happen (a satellite's
+    // anchor is in its own component), but a zero box beats a NaN one.
+    return { ids, minX: 0, maxX: 0, minY: 0, maxY: 0 };
   }
-  return { ids, cx, cy, radius };
+  return { ids, minX, maxX, minY, maxY };
+}
+
+/** Greedy row filling: a component joins the current row unless that would
+ *  push the row past `maxWidth`. Every row holds at least one component, so a
+ *  single component wider than the budget gets a row to itself. */
+function shelfRows(boxes: ComponentBox[], maxWidth: number): ComponentBox[][] {
+  const rows: ComponentBox[][] = [];
+  let row: ComponentBox[] = [];
+  let width = 0;
+  for (const box of boxes) {
+    const added = row.length === 0 ? boxWidth(box) : width + SHELF_GAP + boxWidth(box);
+    if (row.length > 0 && added > maxWidth) {
+      rows.push(row);
+      row = [box];
+      width = boxWidth(box);
+      continue;
+    }
+    row.push(box);
+    width = added;
+  }
+  if (row.length > 0) rows.push(row);
+  return rows;
 }
 
 /**
- * Round 4, section A. After the sim settles, charge repulsion plus
- * forceCenter has pushed every small component out to roughly the same
- * distance from the core — twenty-odd islands on one circle, which reads as
- * the round-1 ring of dots at a coarser grain.
+ * Round 5, section A. Two zones, never a ring.
  *
- * This rearranges them: the biggest component is recentred on the origin and
- * keeps the layout the sim gave it, and every other component is translated
- * RIGIDLY (never re-laid-out) onto a phyllotaxis spiral around it. Each one
- * starts at the smallest radius that clears the core and is pushed out in
- * PACK_STEP increments until its bounding disc clears every component already
- * placed, so no two overlap. Order is size-descending with an id tie-break,
- * so the same graph always packs the same way.
+ * The biggest component is the CORE: it keeps the layout the sim gave it and
+ * is recentred so its bbox centre is the origin. Every other component is
+ * translated RIGIDLY onto a SHELF below the core — largest first, left to
+ * right, rows centred under the core, wrapping once a row would run wider
+ * than SHELF_WIDTH_FACTOR times the core. Singleton components go last, on
+ * rows of their own, because a row of lone dots reads as a legend rather than
+ * as structure.
  *
- * A component's measured radius covers its satellite halo too (see
- * satelliteReach): leaves are not simulated, so a bbox over sim nodes alone
- * would let one component's halo sit inside its neighbour's gap.
+ * This replaces round 4's phyllotaxis packing. Arranging the small components
+ * AROUND the core drew an almost complete perimeter, which reads as a false
+ * core-and-periphery hierarchy and shrinks the one thing a viewer has to
+ * grasp first.
  *
- * Returns the node ids of each component in placement order — largest first,
- * so the caller can tell the core from the packed islands.
+ * Returns the node ids of each component in placement order — the core first,
+ * so the caller can tell it from the shelved ones and pin the rest.
  *
  * Pure in the sense that matters here: it reads x/y/size off the graph and
  * writes x/y back, touching nothing else and consulting no clock or random.
  */
-export function packComponents(graph: Graph, simulatedIds: string[]): string[][] {
-  const simulated = new Set(simulatedIds);
-  if (simulated.size === 0) return [];
-  const reach = satelliteReach(satellitePlan(graph), (id) =>
-    (graph.getNodeAttribute(id, "size") as number) ?? 0,
-  );
-  const components = simulatedComponents(graph, simulated)
-    .map((ids) => measureComponent(graph, ids, reach))
-    .sort((a, b) => b.ids.length - a.ids.length || (a.ids[0] < b.ids[0] ? -1 : 1));
+export function shelveComponents(graph: Graph): string[][] {
+  if (graph.order === 0) return [];
+  const plan = satellitePlan(graph);
+  const satellites = new Set(plan.map((satellite) => satellite.id));
+  const reach = satelliteReach(plan, (id) => (graph.getNodeAttribute(id, "size") as number) ?? 0);
+  const boxes = graphComponents(graph)
+    .map((ids) => measureComponent(graph, ids, reach, satellites))
+    .sort((a, b) => b.ids.length - a.ids.length || ((a.ids[0] as string) < (b.ids[0] as string) ? -1 : 1));
 
-  const translate = (component: PackedComponent, tx: number, ty: number) => {
-    const dx = tx - component.cx;
-    const dy = ty - component.cy;
-    for (const id of component.ids) {
+  const translate = (box: ComponentBox, dx: number, dy: number) => {
+    for (const id of box.ids) {
       graph.setNodeAttribute(id, "x", (graph.getNodeAttribute(id, "x") as number) + dx);
       graph.setNodeAttribute(id, "y", (graph.getNodeAttribute(id, "y") as number) + dy);
     }
-    component.cx = tx;
-    component.cy = ty;
+    box.minX += dx;
+    box.maxX += dx;
+    box.minY += dy;
+    box.maxY += dy;
   };
 
-  const core = components[0];
-  translate(core, 0, 0);
-  const placed: PackedComponent[] = [core];
+  const core = boxes[0] as ComponentBox;
+  translate(core, -(core.minX + core.maxX) / 2, -(core.minY + core.maxY) / 2);
 
-  for (let i = 1; i < components.length; i += 1) {
-    const component = components[i];
-    const angle = i * GOLDEN_ANGLE;
-    let r = core.radius + PACK_GAP + component.radius;
-    let x = 0;
-    let y = 0;
-    // Greedy: step outward along this arm until the component's disc clears
-    // every disc already placed. Bounded by the loop over `placed`, which is
-    // at most a couple of dozen components on real data.
-    for (;;) {
-      x = r * Math.cos(angle);
-      y = r * Math.sin(angle);
-      const clash = placed.some(
-        (other) => Math.hypot(x - other.cx, y - other.cy) < other.radius + component.radius + PACK_GAP,
-      );
-      if (!clash) break;
-      r += PACK_STEP;
+  const rest = boxes.slice(1);
+  // Sizes already descend, so splitting on "is it a lone node" keeps both
+  // halves largest-first: 4s, then 3s, then pairs, then the singletons.
+  const grouped = rest.filter((box) => box.ids.length > 1);
+  const singletons = rest.filter((box) => box.ids.length === 1);
+  const maxWidth = SHELF_WIDTH_FACTOR * boxWidth(core);
+  const rows = [...shelfRows(grouped, maxWidth), ...shelfRows(singletons, maxWidth)];
+
+  // Graph +y is screen-up (see drawRadialNodeLabel), so "below the core" is
+  // DECREASING y: each row hangs off the bottom edge of the one above it.
+  let rowTop = core.minY - SHELF_TOP_GAP;
+  for (const row of rows) {
+    const rowWidth = row.reduce((sum, box) => sum + boxWidth(box), 0) + SHELF_GAP * (row.length - 1);
+    let left = -rowWidth / 2;
+    let tallest = 0;
+    for (const box of row) {
+      translate(box, left - box.minX, rowTop - box.maxY);
+      left += boxWidth(box) + SHELF_GAP;
+      tallest = Math.max(tallest, boxHeight(box));
     }
-    translate(component, x, y);
-    placed.push(component);
+    rowTop -= tallest + SHELF_GAP;
   }
-  return placed.map((component) => component.ids);
+
+  return [core.ids, ...rows.flat().map((box) => box.ids)];
 }
 
 /** The sim plus the one thing the view has to tell it: which node the pointer
@@ -569,13 +604,74 @@ function linkEndId(end: string | AtlasSimNode): string {
   return typeof end === "string" ? end : end.id;
 }
 
+/**
+ * `forceCenter(0, 0)`, but blind to pinned nodes — and able to hold a target
+ * other than the origin.
+ *
+ * d3's own centre force averages EVERY node and shifts them all by the
+ * offset. Pinned nodes snap straight back to fx/fy afterwards, so with a
+ * shelf hanging below the core the average sits below the origin every tick
+ * and the whole correction lands on the core: on the real capture a
+ * drag-reheat slid the core 776 units up a 3,939-unit span, pulling the two
+ * zones apart. Averaging the FREE nodes only cuts that to 371.
+ *
+ * `retarget()` removes the rest. shelveComponents centres the core by its
+ * BOUNDING BOX, which is not where its centroid is; asking the force for a
+ * centroid of exactly (0,0) therefore slides the core by the difference on
+ * the first reheat. Retargeting after the shelf is laid out tells the force
+ * to hold the core exactly where the composition put it, which leaves only
+ * the ~154 units the core genuinely relaxes by.
+ */
+function coreCenterForce(): {
+  (alpha: number): void;
+  initialize(nodes: AtlasSimNode[]): void;
+  retarget(): void;
+} {
+  let nodes: AtlasSimNode[] = [];
+  let targetX = 0;
+  let targetY = 0;
+  const centroid = (): { x: number; y: number; free: number } => {
+    let sx = 0;
+    let sy = 0;
+    let free = 0;
+    for (const node of nodes) {
+      if (node.fx != null || node.fy != null) continue;
+      sx += node.x ?? 0;
+      sy += node.y ?? 0;
+      free += 1;
+    }
+    return free === 0 ? { x: 0, y: 0, free } : { x: sx / free, y: sy / free, free };
+  };
+  const force = () => {
+    const { x, y, free } = centroid();
+    if (free === 0) return;
+    const dx = x - targetX;
+    const dy = y - targetY;
+    for (const node of nodes) {
+      if (node.fx != null || node.fy != null) continue;
+      node.x = (node.x ?? 0) - dx;
+      node.y = (node.y ?? 0) - dy;
+    }
+  };
+  force.initialize = (ns: AtlasSimNode[]) => {
+    nodes = ns;
+  };
+  force.retarget = () => {
+    const { x, y, free } = centroid();
+    if (free === 0) return;
+    targetX = x;
+    targetY = y;
+  };
+  return force;
+}
+
 /** d3-force simulation over the live graphology graph — the interaction engine.
  *  Sim nodes are the drawable graph MINUS the nodes nonSimulatedIds names:
  *  degree-0 isolates and every degree-1 memory. Neither is simulated —
  *  isolates are not drawn at all once drawableModel drops components under
  *  MIN_COMPONENT_SIZE, and a leaf memory rides its anchor as a satellite.
  *  Matches the retired ConstellationMap feel: charge -40,
- *  forceCenter(0, 0), alphaDecay 0.03, velocityDecay 0.25, d3-default link
+ *  centre-on-origin (coreCenterForce), alphaDecay 0.03, velocityDecay 0.25, d3-default link
  *  force. Parallel edges collapse to one link per undirected pair (d3 sums
  *  pull per link; sigma still RENDERS every parallel edge). Settles
  *  synchronously to its own equilibrium before returning — a FA2 seed handed
@@ -630,6 +726,7 @@ export function createAtlasSimulation(
     linkDegree.set(link.target, (linkDegree.get(link.target) ?? 0) + 1);
   }
 
+  const center = coreCenterForce();
   const sim = forceSimulation(nodes)
     .force(
       "link",
@@ -645,7 +742,7 @@ export function createAtlasSimulation(
         }),
     )
     .force("charge", forceManyBody<AtlasSimNode>().strength(-40))
-    .force("center", forceCenter(0, 0))
+    .force("center", center)
     // Keeps discs off each other. Strength 0.7 (not 1) so the collision
     // resolves over a few ticks instead of snapping, which reads calmer.
     .force("collide", forceCollide<AtlasSimNode>().radius((d) => d.radius).strength(0.7).iterations(1))
@@ -689,19 +786,19 @@ export function createAtlasSimulation(
   // decay at 0.03 when the budget allows it) — see the doc comment above.
   sim.tick(settleTicks(graph.order));
 
-  // Round 4: the settle leaves every small component on roughly one circle
+  // Round 5: the settle leaves every small component on roughly one circle
   // around the core (charge pushes out, forceCenter pulls in, and they
-  // balance at about the same radius for all of them). Pack them into a
-  // spiral instead, then copy the packed positions back INTO the sim so a
-  // later drag flexes the packed layout rather than snapping to the ring.
-  const packedComponents = packComponents(graph, nodes.map((node) => node.id));
-  // Everything outside the biggest component is PINNED where the pack put it.
-  // Without this the first drag undoes the packing: downNode reheats the sim
-  // to alpha 0.3 and charge plus forceCenter push the islands straight back
-  // out to the one ring the pack just broke up, and nothing re-packs them.
-  // An island has no edge into the core, so it has nothing to flex toward
+  // balance at about the same radius for all of them). Move them onto a shelf
+  // below the core instead, then copy those positions back INTO the sim so a
+  // later drag flexes the real layout rather than snapping to the ring.
+  const placement = shelveComponents(graph);
+  // Everything outside the core is PINNED where the shelf put it. Without
+  // this the first drag undoes the whole arrangement: downNode reheats the
+  // sim to alpha 0.3 and charge plus forceCenter push the shelved components
+  // straight back out into a ring, and nothing re-shelves them. A shelved
+  // component has no edge into the core, so it has nothing to flex toward
   // anyway — holding it still costs the layout nothing.
-  const core = new Set(packedComponents[0] ?? []);
+  const core = new Set(placement[0] ?? []);
   for (const node of nodes) {
     node.x = graph.getNodeAttribute(node.id, "x") as number;
     node.y = graph.getNodeAttribute(node.id, "y") as number;
@@ -710,6 +807,9 @@ export function createAtlasSimulation(
       node.fy = node.y;
     }
   }
+  // The core is now where the composition wants it — hold it THERE on every
+  // later reheat rather than dragging it back to a centroid of (0,0).
+  center.retarget();
   // Same writeback path as a tick, so satellites re-place around their moved
   // anchors and the caller's onTick marks the cartography scene dirty.
   writeBack();

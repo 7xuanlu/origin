@@ -558,13 +558,13 @@ export function buildKnowledgeGraphModel(
 }
 
 /**
- * Smallest connected component the map will draw. Real data has 160 components
- * with the default layers on: one of 288 nodes, then 18, 14, 8 … and 137 of
- * three nodes or fewer. Those crumbs carry no structure, and d3's centering
- * force flings them into a ring around the core — the same halo the round-1
- * isolate rule removed. They go behind the same "hidden" chip instead.
+ * Smallest connected component the map draws by default. Real data has 160
+ * components with the default layers on: one of 288 nodes, then 18, 14, 8 …
+ * and 137 of four nodes or fewer. Those crumbs carry no structure of their
+ * own, and a row of them would be longer than the shelf they sit on. They go
+ * behind the "small groups hidden" chip, which reveals them on demand.
  */
-export const MIN_COMPONENT_SIZE = 3;
+export const MIN_COMPONENT_SIZE = 5;
 
 /**
  * Node id -> how many nodes are in its connected component, by union-find over
@@ -611,19 +611,47 @@ export function componentSizeByNode(model: GraphModel): Map<string, number> {
  * The sub-model the map actually draws: every node whose connected component
  * has at least MIN_COMPONENT_SIZE members, plus the edges between them. Edges
  * are filtered too — a dropped node's edges would otherwise point at nothing.
+ *
+ * `showSmallGroups` is the reader's own call, made through the toolbar chip:
+ * with it on, nothing is dropped and the small components join the shelf.
  */
-export function drawableModel(model: GraphModel): GraphModel {
-  const sizes = componentSizeByNode(model);
-  const kept = new Set<string>();
-  for (const node of model.nodes) {
-    if ((sizes.get(node.id) ?? 0) >= MIN_COMPONENT_SIZE) kept.add(node.id);
-  }
-  if (kept.size === model.nodes.length) return model;
+export function drawableModel(model: GraphModel, showSmallGroups = false): GraphModel {
+  if (showSmallGroups) return model;
+  const kept = drawableByComponentSize(model);
+  if (kept === null || kept.size === model.nodes.length) return model;
   return {
     ...model,
     nodes: model.nodes.filter((node) => kept.has(node.id)),
     edges: model.edges.filter((edge) => kept.has(edge.source) && kept.has(edge.target)),
   };
+}
+
+/**
+ * The nodes big enough to draw by default, or null when NOTHING clears the
+ * bar. A small group is small relative to a core; with no component of
+ * MIN_COMPONENT_SIZE anywhere there is no core, and hiding every node would
+ * leave a young graph of a few pairs staring at a blank map behind a chip.
+ * So in that case nothing is small and nothing is hidden.
+ */
+function drawableByComponentSize(model: GraphModel): Set<string> | null {
+  const sizes = componentSizeByNode(model);
+  const kept = new Set<string>();
+  for (const node of model.nodes) {
+    if ((sizes.get(node.id) ?? 0) >= MIN_COMPONENT_SIZE) kept.add(node.id);
+  }
+  return kept.size === 0 ? null : kept;
+}
+
+/**
+ * How many nodes sit in components too small to draw by default — the number
+ * on the "small groups hidden" chip. Computed from the FULL model, so it does
+ * not change when the reader turns the small groups on; the chip has to keep
+ * saying how many there are in order to offer them back.
+ */
+export function smallGroupNodeCount(model: GraphModel): number {
+  const kept = drawableByComponentSize(model);
+  if (kept === null) return 0;
+  return model.nodes.length - kept.size;
 }
 
 /** 1-hop ego graph: the center entity plus its direct neighbors. */
