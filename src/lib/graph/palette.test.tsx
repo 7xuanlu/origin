@@ -84,6 +84,7 @@ describe("colorForEntityType", () => {
       hullBorder: "#hullBorder",
       graticule: "#graticule",
       bridge: "#bridge",
+      memory: "#memory",
     };
     expect(colorForEntityType("technology", palette)).toBe("#tool");
     expect(colorForEntityType("place", palette)).toBe("#neutral");
@@ -122,6 +123,7 @@ describe("nodeFillFor", () => {
     hullBorder: "rgba(1,2,3,0.16)",
     graticule: "rgba(4,5,6,0.13)",
     bridge: "#bbbbbb",
+    memory: "#cccccc",
   };
 
   it("fills confirmed entities at 0.9 alpha and everything else at 0.5", () => {

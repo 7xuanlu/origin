@@ -647,6 +647,22 @@ describe('entity operations', () => {
     await tauri.confirmEntity('e1', true);
     expect(mockInvoke).toHaveBeenCalledWith('confirm_entity_cmd', { entityId: 'e1', confirmed: true });
   });
+
+  it('getKnowledgeGraph reads the whole graph in one call and back-fills entity domain', async () => {
+    mockInvoke.mockResolvedValue({
+      entities: [{ id: 'e1', name: 'Alice', space: 'Work' }],
+      relations: [{ id: 'r1', from_entity: 'e1', to_entity: 'e2', relation_type: 'knows', source_agent: null, created_at: 1 }],
+      memories: [{ source_id: 'm1', title: 'A memory', memory_type: 'fact', space: null, confirmed: true, last_modified: 2 }],
+      memory_links: [{ memory_id: 'm1', entity_id: 'e1' }],
+    });
+    const graph = await tauri.getKnowledgeGraph();
+    expect(mockInvoke).toHaveBeenCalledWith('get_knowledge_graph_cmd');
+    // Same legacy back-fill listEntities does, so callers can read `domain`.
+    expect(graph.entities[0].domain).toBe('Work');
+    expect(graph.relations).toHaveLength(1);
+    expect(graph.memories[0].source_id).toBe('m1');
+    expect(graph.memory_links).toEqual([{ memory_id: 'm1', entity_id: 'e1' }]);
+  });
 });
 
 describe('listPinnedMemories', () => {

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { Entity, EntityDetail, RelationWithEntity } from "../tauri";
+import type { Entity, EntityDetail, KnowledgeGraph, RelationWithEntity } from "../tauri";
 
 // The renderer-neutral graph every view consumes. Daemon response shapes are
 // translated into this once (here); no view reads raw relation records for
@@ -189,6 +189,149 @@ export function buildGraphModel(entities: Entity[], details: EntityDetail[]): Gr
     nodes: Array.from(nodes.values()),
     edges: Array.from(edges.values()),
     coverage: { relationsFetchedFor: uniqueDetailEntityIds.size, totalEntities: entities.length },
+  };
+}
+
+/**
+ * The `entityType` every memory node carries. Not a daemon vocabulary word —
+ * memories have no entity type — so palette/atlas can key their one muted
+ * swatch and fixed size off it without a `kind` lookup at every call site.
+ */
+export const MEMORY_NODE_TYPE = "memory";
+
+/** Edge verb for a memory -> entity link. Not a daemon relation type. */
+export const MEMORY_EDGE_TYPE = "mentions";
+
+/** Graph-node id for a memory. Prefixed so it can never collide with an
+ *  entity id, and so click routing can tell the two apart. */
+export function memoryNodeId(sourceId: string): string {
+  return `mem:${sourceId}`;
+}
+
+/** The memory `source_id` behind a memory node id, or null for anything else. */
+export function memorySourceId(nodeId: string): string | null {
+  return nodeId.startsWith("mem:") ? nodeId.slice(4) : null;
+}
+
+/**
+ * Narrow a bulk graph read to one space: entities by `entitySpace`, memories
+ * by their own space, and relations/links to whatever survives. A relation
+ * whose other endpoint was filtered out is DROPPED, not synthesized — the
+ * bulk read carries every in-scope entity, so a missing endpoint means out of
+ * scope rather than not-fetched-yet.
+ */
+export function filterKnowledgeGraph(graph: KnowledgeGraph, space: string | null): KnowledgeGraph {
+  if (!space) return graph;
+  const entities = graph.entities.filter((entity) => entitySpace(entity) === space);
+  const kept = new Set(entities.map((entity) => entity.id));
+  const memories = graph.memories.filter((memory) => memory.space === space);
+  const keptMemories = new Set(memories.map((memory) => memory.source_id));
+  return {
+    entities,
+    relations: graph.relations.filter(
+      (relation) => kept.has(relation.from_entity) && kept.has(relation.to_entity),
+    ),
+    memories,
+    memory_links: graph.memory_links.filter(
+      (link) => kept.has(link.entity_id) && keptMemories.has(link.memory_id),
+    ),
+  };
+}
+
+/**
+ * Fold one bulk graph read into a GraphModel: every entity as a node, every
+ * relation as an edge, and every memory that links to a present entity as its
+ * own node joined to those entities by `mentions` edges. Degree counts the
+ * memory edges too, so an entity with only memories attached is not an
+ * isolate. No filtering happens here — that is a per-view decision
+ * (filterKnowledgeGraph above for the space filter, degree-0 hiding in
+ * AtlasView).
+ */
+export function buildKnowledgeGraphModel(graph: KnowledgeGraph): GraphModel {
+  const nodes = new Map<string, GraphNode>();
+  for (const entity of graph.entities) nodes.set(entity.id, nodeFromEntity(entity));
+
+  const edges = new Map<string, GraphEdge>();
+  const seenComposites = new Set<string>();
+  for (const relation of graph.relations) {
+    // Both endpoints must be present. The daemon already guarantees it; a
+    // dangling endpoint here would mean a filter ran, and inventing the
+    // missing entity is exactly the fabrication the old top-20 fan-out was
+    // forced into.
+    if (!nodes.has(relation.from_entity) || !nodes.has(relation.to_entity)) continue;
+    const type = relation.relation_type;
+    const composite = `${relation.from_entity}:${type}:${relation.to_entity}`;
+    const edge: GraphEdge = {
+      id: relation.id || composite,
+      source: relation.from_entity,
+      target: relation.to_entity,
+      type,
+      confidence: null,
+      createdAt: relation.created_at,
+    };
+    if (relation.id) {
+      const key = `id:${relation.id}`;
+      if (!edges.has(key)) edges.set(key, edge);
+      seenComposites.add(composite);
+    } else if (!seenComposites.has(composite)) {
+      seenComposites.add(composite);
+      edges.set(`k:${composite}`, edge);
+    }
+  }
+
+  // Only memories with at least one link to a present entity become nodes —
+  // a memory node with no edge would be an isolate the view hides anyway.
+  const linksByMemory = new Map<string, string[]>();
+  for (const link of graph.memory_links) {
+    if (!nodes.has(link.entity_id)) continue;
+    const list = linksByMemory.get(link.memory_id);
+    if (list) list.push(link.entity_id);
+    else linksByMemory.set(link.memory_id, [link.entity_id]);
+  }
+  for (const memory of graph.memories) {
+    const linked = linksByMemory.get(memory.source_id);
+    if (!linked) continue;
+    const id = memoryNodeId(memory.source_id);
+    if (nodes.has(id)) continue;
+    nodes.set(id, {
+      id,
+      kind: "memory",
+      name: memory.title,
+      entityType: MEMORY_NODE_TYPE,
+      confirmed: memory.confirmed,
+      degree: 0,
+      space: memory.space || null,
+      createdAt: memory.last_modified,
+      updatedAt: memory.last_modified,
+    });
+    for (const entityId of [...new Set(linked)].sort()) {
+      const key = `mem:${memory.source_id}:${entityId}`;
+      edges.set(key, {
+        id: key,
+        source: id,
+        target: entityId,
+        type: MEMORY_EDGE_TYPE,
+        confidence: null,
+        createdAt: memory.last_modified,
+      });
+    }
+  }
+
+  for (const edge of edges.values()) {
+    const source = nodes.get(edge.source);
+    if (source) source.degree += 1;
+    if (edge.target !== edge.source) {
+      const target = nodes.get(edge.target);
+      if (target) target.degree += 1;
+    }
+  }
+
+  return {
+    nodes: Array.from(nodes.values()),
+    edges: Array.from(edges.values()),
+    // One read covers every entity in scope, so coverage is total — the
+    // honesty chip has nothing left to confess.
+    coverage: { relationsFetchedFor: graph.entities.length, totalEntities: graph.entities.length },
   };
 }
 

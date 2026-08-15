@@ -913,6 +913,44 @@ export interface EntitySearchResult {
   distance: number;
 }
 
+/** A relation edge from the bulk graph read: both endpoints by id. */
+export interface GraphRelation {
+  id: string;
+  from_entity: string;
+  to_entity: string;
+  relation_type: string;
+  source_agent: string | null;
+  created_at: number;
+}
+
+/** A memory drawn as a graph node. */
+export interface GraphMemoryNode {
+  source_id: string;
+  title: string;
+  memory_type: string | null;
+  space: string | null;
+  confirmed: boolean;
+  last_modified: number;
+}
+
+/** A memory-to-entity link, drawn as an edge. */
+export interface GraphMemoryLink {
+  memory_id: string;
+  entity_id: string;
+}
+
+/**
+ * The whole knowledge graph for the current space scope in one read. Replaces
+ * the per-entity detail fan-out the Graph view used to do, which could only
+ * afford the first 20 entities.
+ */
+export interface KnowledgeGraph {
+  entities: Entity[];
+  relations: GraphRelation[];
+  memories: GraphMemoryNode[];
+  memory_links: GraphMemoryLink[];
+}
+
 export interface MemoryItem {
   source_id: string;
   title: string;
@@ -1339,6 +1377,11 @@ export async function searchEntities(
     ...result,
     entity: withDomain(result.entity),
   }));
+}
+
+export async function getKnowledgeGraph(): Promise<KnowledgeGraph> {
+  const graph = await invoke<KnowledgeGraph>("get_knowledge_graph_cmd");
+  return { ...graph, entities: withDomainArray(graph.entities) };
 }
 
 export async function getEntityDetail(entityId: string): Promise<EntityDetail> {

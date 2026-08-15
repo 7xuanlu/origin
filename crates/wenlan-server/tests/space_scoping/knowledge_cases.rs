@@ -69,6 +69,13 @@ pub async fn unknown_selectors_are_rejected() {
         ),
         (
             HttpMethod::GET,
+            "/api/memory/graph".to_string(),
+            None,
+            "/api/memory/graph",
+            Method::Get,
+        ),
+        (
+            HttpMethod::GET,
             "/api/memory/entity-suggestions".to_string(),
             None,
             "/api/memory/entity-suggestions",
@@ -275,6 +282,45 @@ pub async fn detail_and_relation_endpoints_are_scoped() {
     )
     .await;
     assert_eq!(global_missing, missing);
+
+    let (status, graph) = json_body(
+        fixture
+            .send(HttpMethod::GET, "/api/memory/graph", None, Some("work"))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{graph}");
+    let graph_entities = entity_ids(&graph, "entities");
+    assert!(graph_entities.contains(&work));
+    assert!(graph_entities.contains(&work_peer));
+    assert!(!graph_entities.contains(&personal));
+    let graph_relations = graph["relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        graph_relations,
+        BTreeSet::from([work_relation.as_str()]),
+        "the cross-space relation must not survive a work-scoped graph read"
+    );
+
+    let (status, global_graph) = json_body(
+        fixture
+            .send(HttpMethod::GET, "/api/memory/graph", None, None)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{global_graph}");
+    let global_graph_relations = global_graph["relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(global_graph_relations.contains(work_relation.as_str()));
+    assert!(global_graph_relations.contains(mixed_relation.as_str()));
 
     let (status, selected) = json_body(
         fixture

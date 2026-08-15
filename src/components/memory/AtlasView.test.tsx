@@ -8,8 +8,7 @@ vi.mock("../../lib/tauri", async () => {
   const actual = await vi.importActual<typeof import("../../lib/tauri")>("../../lib/tauri");
   return {
     ...actual,
-    listEntities: vi.fn(),
-    getEntityDetail: vi.fn(),
+    getKnowledgeGraph: vi.fn(),
     listCommunities: vi.fn(),
     listCommunityMembers: vi.fn(),
   };
@@ -95,13 +94,114 @@ vi.mock("sigma", () => {
   return { default: SigmaMock };
 });
 
-import { listEntities, getEntityDetail, listCommunities, listCommunityMembers } from "../../lib/tauri";
+import { getKnowledgeGraph, listCommunities, listCommunityMembers } from "../../lib/tauri";
+import type {
+  Entity,
+  EntityDetail,
+  GraphMemoryLink,
+  GraphMemoryNode,
+  GraphRelation,
+  KnowledgeGraph,
+} from "../../lib/tauri";
 import AtlasView from "./AtlasView";
 
-const mockListEntities = vi.mocked(listEntities);
-const mockGetEntityDetail = vi.mocked(getEntityDetail);
+const mockGetKnowledgeGraph = vi.mocked(getKnowledgeGraph);
 const mockListCommunities = vi.mocked(listCommunities);
 const mockListCommunityMembers = vi.mocked(listCommunityMembers);
+
+// The view makes ONE bulk read now. These two stand-ins keep the fixtures in
+// the entities-plus-details shape the per-entity routes used to serve, and
+// fold them into that single response — so a test still declares a graph
+// shape rather than a wire payload, and the fold enforces the bulk read's own
+// contract (a relation whose other endpoint is out of scope never ships).
+let entitiesSource: () => Promise<Entity[]>;
+let detailSource: (id: string) => Promise<EntityDetail>;
+let memorySource: { memories: GraphMemoryNode[]; memory_links: GraphMemoryLink[] };
+
+const mockListEntities = {
+  mockResolvedValue(entities: Entity[]) {
+    entitiesSource = async () => entities;
+  },
+  mockReturnValue(promise: Promise<Entity[]>) {
+    entitiesSource = () => promise;
+  },
+  mockResolvedValueOnce(entities: Entity[]) {
+    const previous = entitiesSource;
+    let used = false;
+    entitiesSource = async () => {
+      if (used) return previous();
+      used = true;
+      return entities;
+    };
+  },
+  mockRejectedValueOnce(error: Error) {
+    const previous = entitiesSource;
+    let used = false;
+    entitiesSource = async () => {
+      if (used) return previous();
+      used = true;
+      throw error;
+    };
+  },
+};
+
+const mockGetEntityDetail = {
+  mockResolvedValue(detail: EntityDetail) {
+    detailSource = async () => detail;
+  },
+  mockImplementation(provider: (id: string) => Promise<EntityDetail>) {
+    detailSource = provider;
+  },
+};
+
+/** Memory nodes and their entity links for the next bulk read. */
+function mockMemories(memories: GraphMemoryNode[], links: GraphMemoryLink[]) {
+  memorySource = { memories, memory_links: links };
+}
+
+function makeMemory(overrides: Partial<GraphMemoryNode> = {}): GraphMemoryNode {
+  return {
+    source_id: overrides.source_id ?? "m1",
+    title: overrides.title ?? "Memory",
+    memory_type: overrides.memory_type ?? "fact",
+    space: overrides.space ?? null,
+    confirmed: overrides.confirmed ?? true,
+    last_modified: overrides.last_modified ?? Math.floor(Date.now() / 1000),
+  };
+}
+
+function foldGraph(entities: Entity[], details: EntityDetail[]): KnowledgeGraph {
+  const known = new Set(entities.map((entity) => entity.id));
+  const relations = new Map<string, GraphRelation>();
+  for (const detail of details) {
+    const home = detail.entity.id;
+    if (!known.has(home)) continue;
+    for (const relation of detail.relations) {
+      // Both endpoints in scope or the relation does not exist — the daemon
+      // never ships a dangling one, so neither does this fixture.
+      if (!known.has(relation.entity_id)) continue;
+      const incoming = relation.direction === "incoming";
+      const from = incoming ? relation.entity_id : home;
+      const to = incoming ? home : relation.entity_id;
+      const id = relation.id || `${from}:${relation.relation_type}:${to}`;
+      if (relations.has(id)) continue;
+      relations.set(id, {
+        id,
+        from_entity: from,
+        to_entity: to,
+        relation_type: relation.relation_type,
+        source_agent: relation.source_agent,
+        created_at: relation.created_at,
+      });
+    }
+  }
+  return {
+    entities,
+    relations: Array.from(relations.values()),
+    memories: memorySource.memories,
+    memory_links: memorySource.memory_links,
+  };
+}
 
 function renderWithQuery(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
@@ -129,6 +229,18 @@ describe("AtlasView", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     capturedSigmaInstances.length = 0;
+    entitiesSource = async () => [];
+    detailSource = async (id: string) => ({
+      entity: makeEntity({ id }),
+      observations: [],
+      relations: [],
+    });
+    memorySource = { memories: [], memory_links: [] };
+    mockGetKnowledgeGraph.mockImplementation(async () => {
+      const entities = await entitiesSource();
+      const details = await Promise.all(entities.map((entity) => detailSource(entity.id)));
+      return foldGraph(entities, details);
+    });
     // Ordinary "no durable data published yet" default — most tests carry
     // no space at all (so this never fires), and the ones that do only care
     // about entities/relations, not cartography.
@@ -212,9 +324,9 @@ describe("AtlasView", () => {
   });
 
   it("fires onNodeClick with the sigma node id on clickNode", async () => {
-    const entities = [makeEntity({ id: "e1", name: "Alice" })];
-    mockListEntities.mockResolvedValue(entities);
-    mockGetEntityDetail.mockResolvedValue({ entity: entities[0], observations: [], relations: [] });
+    // A drawn node needs an edge now that degree-0 nodes are hidden, so this
+    // interacts with the connected pair rather than a lone entity.
+    mockConnectedPair();
     const onNodeClick = vi.fn();
 
     renderWithQuery(<AtlasView onNodeClick={onNodeClick} />);
@@ -222,13 +334,13 @@ describe("AtlasView", () => {
 
     capturedSigmaInstances[0].handlers.get("clickNode")?.({ node: "e1" });
 
-    expect(onNodeClick).toHaveBeenCalledWith("e1");
+    expect(onNodeClick).toHaveBeenCalledWith({ kind: "entity", id: "e1" });
   });
 
   it("wires nodeReducer and edgeReducer functions into the sigma constructor settings", async () => {
-    const entities = [makeEntity({ id: "e1", name: "Alice" })];
-    mockListEntities.mockResolvedValue(entities);
-    mockGetEntityDetail.mockResolvedValue({ entity: entities[0], observations: [], relations: [] });
+    // A drawn node needs an edge now that degree-0 nodes are hidden, so this
+    // interacts with the connected pair rather than a lone entity.
+    mockConnectedPair();
 
     renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
@@ -243,9 +355,9 @@ describe("AtlasView", () => {
   });
 
   it("wires the radial label drawer over the live graph and lowers sigma's edge-thickness floor", async () => {
-    const entities = [makeEntity({ id: "e1", name: "Alice" })];
-    mockListEntities.mockResolvedValue(entities);
-    mockGetEntityDetail.mockResolvedValue({ entity: entities[0], observations: [], relations: [] });
+    // A drawn node needs an edge now that degree-0 nodes are hidden, so this
+    // interacts with the connected pair rather than a lone entity.
+    mockConnectedPair();
 
     renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
@@ -292,9 +404,9 @@ describe("AtlasView", () => {
   });
 
   it("refreshes on enterNode and again on leaveNode", async () => {
-    const entities = [makeEntity({ id: "e1", name: "Alice" })];
-    mockListEntities.mockResolvedValue(entities);
-    mockGetEntityDetail.mockResolvedValue({ entity: entities[0], observations: [], relations: [] });
+    // A drawn node needs an edge now that degree-0 nodes are hidden, so this
+    // interacts with the connected pair rather than a lone entity.
+    mockConnectedPair();
 
     renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
@@ -368,9 +480,9 @@ describe("AtlasView", () => {
   });
 
   it("suppresses onNodeClick when clickNode follows a moved drag", async () => {
-    const entities = [makeEntity({ id: "e1", name: "Alice" })];
-    mockListEntities.mockResolvedValue(entities);
-    mockGetEntityDetail.mockResolvedValue({ entity: entities[0], observations: [], relations: [] });
+    // A drawn node needs an edge now that degree-0 nodes are hidden, so this
+    // interacts with the connected pair rather than a lone entity.
+    mockConnectedPair();
     const onNodeClick = vi.fn();
 
     renderWithQuery(<AtlasView onNodeClick={onNodeClick} />);
@@ -392,9 +504,9 @@ describe("AtlasView", () => {
   });
 
   it("still fires onNodeClick for a plain click with no prior drag", async () => {
-    const entities = [makeEntity({ id: "e1", name: "Alice" })];
-    mockListEntities.mockResolvedValue(entities);
-    mockGetEntityDetail.mockResolvedValue({ entity: entities[0], observations: [], relations: [] });
+    // A drawn node needs an edge now that degree-0 nodes are hidden, so this
+    // interacts with the connected pair rather than a lone entity.
+    mockConnectedPair();
     const onNodeClick = vi.fn();
 
     renderWithQuery(<AtlasView onNodeClick={onNodeClick} />);
@@ -402,7 +514,7 @@ describe("AtlasView", () => {
 
     capturedSigmaInstances[0].handlers.get("clickNode")?.({ node: "e1" });
 
-    expect(onNodeClick).toHaveBeenCalledWith("e1");
+    expect(onNodeClick).toHaveBeenCalledWith({ kind: "entity", id: "e1" });
   });
 
   // A hub connected to one neighbor — enough to prove drag-follow moves the
@@ -432,6 +544,17 @@ describe("AtlasView", () => {
       }
       return { entity: entities[1], observations: [], relations: [] };
     });
+    return entities;
+  }
+
+  // The connected pair plus one memory linked to Alice — the memory is a
+  // drawn node in its own right (id "mem:m1") with an edge to the entity.
+  function mockConnectedPairWithMemory() {
+    const entities = mockConnectedPair();
+    mockMemories(
+      [makeMemory({ source_id: "m1", title: "A decision I made", memory_type: "decision" })],
+      [{ memory_id: "m1", entity_id: "e1" }],
+    );
     return entities;
   }
 
@@ -568,27 +691,23 @@ describe("AtlasView", () => {
     }
   });
 
-  it("places the isolate ring from the sim's SETTLED bbox, not a pre-settle one", async () => {
+  it("keeps degree-0 entities out of the drawn graph and reports them in the chip", async () => {
+    // The isolate ring is gone from this view: an unconnected entity is not
+    // drawn at all, it is counted. placeIsolateRing itself still exists and is
+    // still covered by its own tests in src/lib/graph/atlas.test.ts.
     mockConnectedPairWithIsolate();
 
     renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
     const graph = capturedSigmaInstances[0].graph;
 
-    // This fails if placeIsolateRing ran BEFORE createAtlasSimulation's
-    // settle: the isolate would be frozen at a ring radius derived from the
-    // pre-settle bbox, which no longer matches the connected pair's actual
-    // (post-settle) final bbox read here.
-    const xs = ["e1", "e2"].map((id) => graph.getNodeAttribute(id, "x") as number);
-    const ys = ["e1", "e2"].map((id) => graph.getNodeAttribute(id, "y") as number);
-    const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
-    const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
-    const expectedRadius =
-      Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys), 1) * 0.65;
-
-    const dx = (graph.getNodeAttribute("e3", "x") as number) - cx;
-    const dy = (graph.getNodeAttribute("e3", "y") as number) - cy;
-    expect(Math.hypot(dx, dy)).toBeCloseTo(expectedRadius, 6);
+    expect(graph.hasNode("e1")).toBe(true);
+    expect(graph.hasNode("e2")).toBe(true);
+    expect(graph.hasNode("e3")).toBe(false);
+    expect(graph.order).toBe(2);
+    expect(screen.getByText("1 unconnected hidden")).toBeInTheDocument();
+    // The count line still describes the whole graph, not just what is drawn.
+    expect(screen.getByText("3 entities")).toBeInTheDocument();
   });
 
   it("mounts the cartography underlay canvas beneath sigma and removes it on unmount", async () => {
@@ -736,10 +855,11 @@ describe("AtlasView", () => {
     expect(screen.queryByText("Gap")).not.toBeInTheDocument();
   });
 
-  it("renders a Gap card for isolates whose action flies the camera to the isolate", async () => {
+  it("renders a Gap card whose action opens the hidden isolate's page instead of flying to nothing", async () => {
     mockConnectedPairWithIsolate();
+    const onNodeClick = vi.fn();
 
-    renderWithQuery(<AtlasView />);
+    renderWithQuery(<AtlasView onNodeClick={onNodeClick} />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
     const instance = capturedSigmaInstances[0];
 
@@ -751,12 +871,12 @@ describe("AtlasView", () => {
     ).toBeInTheDocument();
 
     // Cards render gap-first, so the first action belongs to the isolate.
+    // The isolate is not drawn any more, so the action navigates to its entity
+    // page; flying the camera would land on empty map.
     const actions = screen.getAllByRole("button", { name: "Show in Atlas →" });
     fireEvent.click(actions[0]);
-    expect(instance.camera.animate).toHaveBeenCalledWith(
-      { x: 0.42, y: 0.24, ratio: 1 },
-      { duration: 450 },
-    );
+    expect(onNodeClick).toHaveBeenCalledWith({ kind: "entity", id: "e3" });
+    expect(instance.camera.animate).not.toHaveBeenCalled();
   });
 
   it("hides the This-week card (and the empty rail) when all relations are older than a week", async () => {
@@ -990,28 +1110,34 @@ describe("AtlasView", () => {
     expect(await screen.findByText("Durable regions")).toBeInTheDocument();
   });
 
-  it("keeps the badge honest when a null-space relation neighbor sits beside an otherwise-ready space", async () => {
-    // "e1" carries a real space and its own community read comes back
-    // ready; "ghost" only ever appears as a relation target (model.ts
-    // synthesizes it with space: null) — the aggregate must never read as
-    // all-durable while that unreported fallback node is on the map.
-    const entity = mockOneSpaceEntity();
-    mockGetEntityDetail.mockResolvedValue({
-      entity,
-      observations: [],
-      relations: [
-        {
-          id: "rel-1",
-          relation_type: "knows",
-          direction: "outgoing" as const,
-          entity_id: "ghost",
-          entity_name: "Ghost",
-          entity_type: "concept",
-          source_agent: null,
-          created_at: Math.floor(Date.now() / 1000),
-        },
-      ],
-    });
+  it("keeps the badge honest when a space-less entity sits beside an otherwise-ready space", async () => {
+    // "e1" carries a real space and its own community read comes back ready;
+    // "ghost" is a real entity with no space at all, drawn on the fallback
+    // climb — the aggregate must never read as all-durable while that
+    // unreported node is on the map.
+    const entity = makeEntity({ id: "e1", domain: "wenlan-dev" });
+    const ghost = makeEntity({ id: "ghost", name: "Ghost" });
+    mockListEntities.mockResolvedValue([entity, ghost]);
+    mockGetEntityDetail.mockImplementation(async (id: string) =>
+      id === "e1"
+        ? {
+            entity,
+            observations: [],
+            relations: [
+              {
+                id: "rel-1",
+                relation_type: "knows",
+                direction: "outgoing" as const,
+                entity_id: "ghost",
+                entity_name: "Ghost",
+                entity_type: "concept",
+                source_agent: null,
+                created_at: Math.floor(Date.now() / 1000),
+              },
+            ],
+          }
+        : { entity: ghost, observations: [], relations: [] },
+    );
     const pages = readyCommunityPages("wenlan-dev");
     mockListCommunities.mockResolvedValue(pages.communities);
     mockListCommunityMembers.mockResolvedValue(pages.members);
@@ -1053,13 +1179,11 @@ describe("AtlasView", () => {
     expect(await screen.findByText("Estimated regions")).toBeInTheDocument();
   });
 
-  // Scoping to a space drops the other space's entities from the model inputs
-  // but keeps the relations pointing at them, so buildGraphModel synthesizes
-  // those endpoints with space: null — real unscoped nodes, drawn on the
-  // fallback climb, that exist ONLY in the filtered model. A badge derived
-  // from the unfiltered entity list cannot see them and keeps claiming
-  // durable while the map shows otherwise.
-  it("badges the toolbar as estimated once a space filter synthesizes an unscoped bridge neighbor", async () => {
+  // Scoping to a space drops the other space's entities AND every relation
+  // that pointed at them. Nothing is synthesized any more: the bulk read
+  // already carries every entity, so a half-visible relation is a filtered-out
+  // edge, not a node the view has to invent.
+  it("drops a cross-space relation under a space filter instead of synthesizing an unscoped neighbor", async () => {
     const entities = [
       makeEntity({ id: "e1", name: "Alice", domain: "Work" }),
       makeEntity({ id: "e2", name: "Bob", domain: "Personal" }),
@@ -1123,14 +1247,22 @@ describe("AtlasView", () => {
 
     // Unfiltered, every rendered node carries a ready space.
     expect(await screen.findByText("Durable regions")).toBeInTheDocument();
+    expect(capturedSigmaInstances[0].graph.hasEdge("e1", "e2")).toBe(true);
 
     fireEvent.change(screen.getByRole("combobox", { name: "Space" }), {
       target: { value: "Work" },
     });
 
-    // Bob is now a synthesized, space-less endpoint on the map.
-    expect(await screen.findByText("Estimated regions")).toBeInTheDocument();
-    expect(screen.queryByText("Durable regions")).not.toBeInTheDocument();
+    // Bob is gone and so is the edge to him, which leaves Alice unconnected
+    // and therefore hidden — but no space-less node was invented, so the badge
+    // stays durable.
+    await waitFor(() => expect(capturedSigmaInstances.length).toBeGreaterThan(1));
+    const scoped = capturedSigmaInstances[capturedSigmaInstances.length - 1].graph;
+    expect(scoped.hasNode("e2")).toBe(false);
+    expect(scoped.order).toBe(0);
+    expect(await screen.findByText("1 unconnected hidden")).toBeInTheDocument();
+    expect(screen.getByText("Durable regions")).toBeInTheDocument();
+    expect(screen.queryByText("Estimated regions")).not.toBeInTheDocument();
   });
 
   it("badges the toolbar with an alerting sync-issue state when a space's community read fails", async () => {
@@ -1431,8 +1563,12 @@ describe("AtlasView", () => {
     expect(onBack).toHaveBeenCalledTimes(1);
   });
 
-  it("drags an isolate by direct manipulation, without restarting the sim", async () => {
-    mockConnectedPairWithIsolate();
+  it("drags a memory node like any other member of the sim", async () => {
+    // Every drawn node has degree > 0 now, so every drawn node is a sim
+    // member — including memories, which used to have no representation here
+    // at all. (The old isolate-drag case is gone with the isolate ring;
+    // placeIsolateRing's own tests still cover the function.)
+    mockConnectedPairWithMemory();
 
     renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
@@ -1442,16 +1578,100 @@ describe("AtlasView", () => {
     const sim = (window as any).__ATLAS_SIM;
     const restartSpy = vi.spyOn(sim, "restart");
 
-    const before = { x: graph.getNodeAttribute("e3", "x"), y: graph.getNodeAttribute("e3", "y") };
+    expect(graph.hasNode("mem:m1")).toBe(true);
+    const before = {
+      x: graph.getNodeAttribute("mem:m1", "x"),
+      y: graph.getNodeAttribute("mem:m1", "y"),
+    };
 
-    // Isolates aren't sim members — downNode's lookup misses, so there's
-    // nothing to pin or reheat.
-    instance.handlers.get("downNode")?.({ node: "e3" });
-    expect(restartSpy).not.toHaveBeenCalled();
+    instance.handlers.get("downNode")?.({ node: "mem:m1" });
+    expect(restartSpy).toHaveBeenCalled();
 
     mouseCaptor.handlers.get("mousemovebody")?.(dragEvent(500, 500));
 
-    const after = { x: graph.getNodeAttribute("e3", "x"), y: graph.getNodeAttribute("e3", "y") };
+    const after = {
+      x: graph.getNodeAttribute("mem:m1", "x"),
+      y: graph.getNodeAttribute("mem:m1", "y"),
+    };
     expect(after).not.toEqual(before);
+    expect(after).toEqual({ x: 500, y: 500 });
+  });
+
+  it("draws memories as nodes linked to their entities, counts them, and legends them", async () => {
+    mockConnectedPairWithMemory();
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    const graph = capturedSigmaInstances[0].graph;
+
+    expect(graph.hasNode("mem:m1")).toBe(true);
+    expect(graph.hasEdge("mem:m1", "e1")).toBe(true);
+    expect(graph.getNodeAttribute("mem:m1", "label")).toBe("A decision I made");
+    // Memories are drawn smaller than the smallest entity.
+    expect(graph.getNodeAttribute("mem:m1", "size")).toBeLessThan(
+      graph.getNodeAttribute("e1", "size") as number,
+    );
+    expect(screen.getByText("2 entities · 1 memory")).toBeInTheDocument();
+    expect(screen.getByText("Memory")).toBeInTheDocument();
+  });
+
+  it("routes a click on a memory node to the memory, not to an entity", async () => {
+    mockConnectedPairWithMemory();
+    const onNodeClick = vi.fn();
+
+    renderWithQuery(<AtlasView onNodeClick={onNodeClick} />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    capturedSigmaInstances[0].handlers.get("clickNode")?.({ node: "mem:m1" });
+
+    // The "mem:" prefix keeps memory ids from colliding with entity ids and
+    // is stripped here, so the caller gets the memory's own source_id.
+    expect(onNodeClick).toHaveBeenCalledWith({ kind: "memory", id: "m1" });
+  });
+
+  it("hides a memory whose only entity is filtered out by the space selector", async () => {
+    const entities = [
+      makeEntity({ id: "e1", name: "Alice", domain: "Work" }),
+      makeEntity({ id: "e2", name: "Bob", domain: "Work" }),
+    ];
+    mockListEntities.mockResolvedValue(entities);
+    mockGetEntityDetail.mockImplementation(async (id: string) => ({
+      entity: entities.find((entity) => entity.id === id)!,
+      observations: [],
+      relations:
+        id === "e1"
+          ? [
+              {
+                id: "rel-1",
+                relation_type: "knows",
+                direction: "outgoing" as const,
+                entity_id: "e2",
+                entity_name: "Bob",
+                entity_type: "person",
+                source_agent: null,
+                created_at: Math.floor(Date.now() / 1000),
+              },
+            ]
+          : [],
+    }));
+    // The memory itself lives in another space, so a Work-scoped map must not
+    // draw it even though the entity it links to is in scope.
+    mockMemories(
+      [makeMemory({ source_id: "m1", title: "Personal note", space: "Personal" })],
+      [{ memory_id: "m1", entity_id: "e1" }],
+    );
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    expect(capturedSigmaInstances[0].graph.hasNode("mem:m1")).toBe(true);
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Space" }), {
+      target: { value: "Work" },
+    });
+
+    await waitFor(() => expect(capturedSigmaInstances.length).toBeGreaterThan(1));
+    const scoped = capturedSigmaInstances[capturedSigmaInstances.length - 1].graph;
+    expect(scoped.hasNode("mem:m1")).toBe(false);
+    expect(scoped.hasEdge("e1", "e2")).toBe(true);
   });
 });

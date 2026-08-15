@@ -6,15 +6,20 @@ import { useTranslation } from "react-i18next";
 import Graph from "graphology";
 import Sigma from "sigma";
 import type { Simulation } from "d3-force";
-import { listEntities, getEntityDetail } from "../../lib/tauri";
-import type { Entity, EntityDetail } from "../../lib/tauri";
-import { buildGraphModel, entitySpace } from "../../lib/graph/model";
-import type { GraphNode } from "../../lib/graph/model";
+import { getKnowledgeGraph } from "../../lib/tauri";
+import type { Entity, KnowledgeGraph } from "../../lib/tauri";
+import {
+  buildKnowledgeGraphModel,
+  entitySpace,
+  filterKnowledgeGraph,
+  memorySourceId,
+  MEMORY_NODE_TYPE,
+} from "../../lib/graph/model";
+import type { GraphModel, GraphNode } from "../../lib/graph/model";
 import {
   buildAtlasGraph,
   runAtlasLayout,
   createAtlasSimulation,
-  placeIsolateRing,
   hoverStateFor,
   nodeDisplay,
   edgeDisplay,
@@ -41,6 +46,15 @@ import type { SpaceCartography } from "../../lib/graph/community";
 // and repaints every edge each render until the fetch lands.
 const EMPTY_CARTOGRAPHY: Map<string, SpaceCartography> = new Map();
 
+// Same reason as EMPTY_CARTOGRAPHY: a stable identity for the unresolved
+// graph query, so the model memo below doesn't rebuild on every render.
+const EMPTY_GRAPH: KnowledgeGraph = {
+  entities: [],
+  relations: [],
+  memories: [],
+  memory_links: [],
+};
+
 // Same 5-slot legend as the retired canvas graph (ConstellationMap): place,
 // event, and unknown types fold to neutral and get no swatch; concept is
 // labeled "Theme" to match the product copy.
@@ -50,10 +64,23 @@ const LEGEND_ITEMS: { label: string; key: string }[] = [
   { label: "Organization", key: "organization" },
   { label: "Person", key: "person" },
   { label: "Theme", key: "concept" },
+  { label: "Memory", key: MEMORY_NODE_TYPE },
 ];
 
+/** What a click on a drawn node resolves to. Memories carry their own
+ *  `source_id`, not the prefixed graph-node id. */
+export type AtlasNodeTarget =
+  | { kind: "entity"; id: string }
+  | { kind: "memory"; id: string };
+
+/** The node id a click landed on, resolved to a navigable target. */
+function targetForNode(nodeId: string): AtlasNodeTarget {
+  const sourceId = memorySourceId(nodeId);
+  return sourceId === null ? { kind: "entity", id: nodeId } : { kind: "memory", id: sourceId };
+}
+
 interface AtlasViewProps {
-  onNodeClick?: (entityId: string) => void;
+  onNodeClick?: (target: AtlasNodeTarget) => void;
   // Initial framing: center this entity with its neighborhood emphasized
   // (EntityDetail's overlay "Atlas" mode). Applied instantly on mount — a
   // starting frame, not a transition — so no camera animation.
@@ -93,45 +120,20 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   const draggedNodeRef = useRef<string | null>(null);
   const movedDuringPressRef = useRef(false);
 
+  // ONE read for the whole graph. This used to be two queries — every entity,
+  // then a detail fetch per entity capped at the first 20 — which drew every
+  // connected entity outside that top 20 as an isolate.
   const {
-    data: entities = [],
-    isLoading: entitiesLoading,
-    isError: entitiesError,
-    refetch: refetchEntities,
+    data: graph = EMPTY_GRAPH,
+    isLoading: graphLoading,
+    isError: graphError,
+    refetch: refetchGraph,
   } = useQuery({
-    queryKey: ["constellation-entities"],
-    queryFn: () => listEntities(),
+    queryKey: ["knowledge-graph"],
+    queryFn: () => getKnowledgeGraph(),
     refetchInterval: 120_000,
   });
-
-  const top20Ids = useMemo(
-    () => entities.slice(0, 20).map((e: Entity) => e.id),
-    [entities],
-  );
-
-  const {
-    data: details = [],
-    isLoading: detailsLoading,
-    isError: detailsError,
-    refetch: refetchDetails,
-  } = useQuery({
-    queryKey: ["constellation-relations", top20Ids],
-    queryFn: async () => {
-      const settled = await Promise.allSettled(top20Ids.map((id) => getEntityDetail(id)));
-      const succeeded = settled
-        .filter((r): r is PromiseFulfilledResult<EntityDetail> => r.status === "fulfilled")
-        .map((r) => r.value);
-      // One flaky detail fetch shouldn't blank the whole graph — only a
-      // total wipeout is a real outage worth the full error screen.
-      if (succeeded.length === 0) {
-        throw new Error("All entity detail fetches failed");
-      }
-      return succeeded;
-    },
-    enabled: top20Ids.length > 0,
-    refetchInterval: 300_000,
-    staleTime: 120_000,
-  });
+  const entities = graph.entities;
 
   // Same field precedence as the entity page (EntityDetail's space-then-domain
   // rule), through model.ts's entitySpace so the list, the filter, and the
@@ -156,16 +158,23 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     enabled: spaces.length > 0,
     refetchInterval: 120_000,
   });
-  // Scoping filters the model INPUTS: the space's own entities plus whatever
-  // bridge neighbors their relations synthesize (those carry no space of their
-  // own). Regions, counts, and insights all re-derive from the scoped model.
-  const model = useMemo(() => {
-    if (!spaceFilter) return buildGraphModel(entities, details);
-    return buildGraphModel(
-      entities.filter((e: Entity) => entitySpace(e) === spaceFilter),
-      details.filter((d: EntityDetail) => entitySpace(d.entity) === spaceFilter),
-    );
-  }, [entities, details, spaceFilter]);
+  // Scoping filters the model INPUTS: the space's own entities and memories,
+  // and only the relations/links whose endpoints both survive. Regions,
+  // counts, and insights all re-derive from the scoped model.
+  const model = useMemo(
+    () => buildKnowledgeGraphModel(filterKnowledgeGraph(graph, spaceFilter)),
+    [graph, spaceFilter],
+  );
+
+  // What sigma actually draws. Degree-0 nodes are left out entirely: on real
+  // data ~960 of 1,600 entities have no relation at all, and drawing them as
+  // a ring around the graph buried the graph. The count of what was left out
+  // is shown in the toolbar instead.
+  const visibleModel = useMemo<GraphModel>(
+    () => ({ ...model, nodes: model.nodes.filter((node) => node.degree > 0) }),
+    [model],
+  );
+  const hiddenCount = model.nodes.length - visibleModel.nodes.length;
 
   // Anything in cartography.ts's unscoped bucket is drawn on the fallback
   // climb, so the badge must never read all-durable while such a node is on
@@ -177,8 +186,14 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // buildGraphModel synthesizes it with no space at all. Going through the
   // model also covers the two unfiltered ways in — a relation-only neighbor,
   // and an entity whose own space is null or empty.
+  // Memory nodes are exempt: they inherit their community from the entity
+  // they hang off (cartography.ts), so a spaceless memory is not a node drawn
+  // on the fallback climb and must not hold the badge back.
   const hasUnscopedFallback = useMemo(
-    () => model.nodes.some((n: GraphNode) => isUnscopedSpace(n.space)),
+    () =>
+      model.nodes.some(
+        (n: GraphNode) => n.kind !== "memory" && isUnscopedSpace(n.space),
+      ),
     [model],
   );
   const cartographyStatus = useMemo(
@@ -332,8 +347,16 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     setActiveIndex(0);
     searchInputRef.current?.blur();
     const renderer = sigmaRef.current;
-    const graph = graphRef.current;
-    if (!renderer || !graph || !graph.hasNode(nodeId)) return;
+    const drawn = graphRef.current;
+    // A degree-0 node is not on the map at all (see visibleModel). The gap
+    // card names exactly those, so "show in atlas" opens the node's own page
+    // rather than flying the camera to nothing.
+    if (!drawn || !drawn.hasNode(nodeId)) {
+      if (model.nodes.some((node) => node.id === nodeId)) onNodeClick?.(targetForNode(nodeId));
+      return;
+    }
+    const graph = drawn;
+    if (!renderer) return;
     // Same emphasis as hovering the node: its neighborhood stays lit, the
     // rest dims. Cleared naturally by the next enter/leaveNode.
     hoverStateRef.current = hoverStateFor(graph, nodeId);
@@ -371,9 +394,13 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // remounting the whole renderer.
   useEffect(() => {
     const container = containerRef.current;
+    // Guarded on the FULL model, not the drawn one: a graph made entirely of
+    // unconnected nodes draws nothing but must still mount, so the map frame
+    // and the "N unconnected hidden" chip explain the emptiness instead of the
+    // view silently showing a blank slot.
     if (!container || model.nodes.length === 0) return;
 
-    const graph = buildAtlasGraph(model, palette, communities);
+    const graph = buildAtlasGraph(visibleModel, palette, communities);
     runAtlasLayout(graph);
     graphRef.current = graph;
 
@@ -386,8 +413,6 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       // Preview/debug handle only — stripped from prod builds.
       (window as unknown as Record<string, unknown>).__ATLAS_SIM = sim;
     }
-    placeIsolateRing(graph);
-
     // Cartography underlay (hulls, region names, graticule) — a plain 2D
     // canvas appended BEFORE sigma mounts so sigma's own canvases stack above
     // it. Redrawn on every afterRender, so hulls flex live with drags and
@@ -503,7 +528,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     renderer.on("clickNode", ({ node }) => {
       // A moved drag must not also navigate on release.
       if (movedDuringPressRef.current) return;
-      onNodeClick?.(node);
+      onNodeClick?.(targetForNode(node));
     });
     // Hover is LOCKED while a drag is live: our drag doesn't capture the
     // pointer (sigma's captor keeps picking), so sweeping the grabbed node
@@ -630,7 +655,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       underlay.remove();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model]);
+  }, [visibleModel]);
 
   // Theme flip: recolor the live graph and repaint — no remount. Also keeps
   // paletteRef current so nodeReducer/edgeReducer (read at paint time) see
@@ -697,7 +722,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   };
 
   // Honest states: a dead daemon must never look like an empty graph.
-  if (entitiesError || detailsError) {
+  if (graphError) {
     return (
       <div data-testid="atlas-view" style={statusStyle}>
         <p className="entity-empty" style={{ color: "var(--mem-status-danger-text)" }}>
@@ -707,8 +732,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
           type="button"
           className="memory-detail-text-button"
           onClick={() => {
-            refetchEntities();
-            refetchDetails();
+            refetchGraph();
           }}
         >
           {t("constellationMap.retry")}
@@ -717,7 +741,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     );
   }
 
-  if (entitiesLoading || detailsLoading) {
+  if (graphLoading) {
     return (
       <div data-testid="atlas-view" style={statusStyle}>
         <span className="entity-empty">{t("constellationMap.loading")}</span>
@@ -733,11 +757,15 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     );
   }
 
-  const entityCount = model.nodes.length;
-  const countLine =
-    regionInfo.count > 0
-      ? `${t("atlas.countEntities", { count: entityCount })} · ${t("atlas.countRegions", { count: regionInfo.count })}`
-      : t("atlas.countEntities", { count: entityCount });
+  // Counts describe what EXISTS in the current scope, not what survived the
+  // degree-0 filter — the hidden ones are reported by their own chip.
+  const memoryCount = model.nodes.filter((node) => node.kind === "memory").length;
+  const entityCount = model.nodes.length - memoryCount;
+  const countLine = [
+    t("atlas.countEntities", { count: entityCount }),
+    ...(memoryCount > 0 ? [t("atlas.countMemories", { count: memoryCount })] : []),
+    ...(regionInfo.count > 0 ? [t("atlas.countRegions", { count: regionInfo.count })] : []),
+  ].join(" · ");
   const dropdownOpen = searchFocused && query.trim().length > 0;
 
   return (
@@ -879,7 +907,10 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
                       height: 8,
                       borderRadius: "50%",
                       flexShrink: 0,
-                      backgroundColor: colorForEntityType(node.entityType, palette),
+                      backgroundColor:
+                        node.entityType === MEMORY_NODE_TYPE
+                          ? palette.memory
+                          : colorForEntityType(node.entityType, palette),
                       opacity: 0.85,
                     }}
                   />
@@ -964,6 +995,19 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
             )}
           </span>
         )}
+        {hiddenCount > 0 && (
+          <span
+            style={{
+              font: "400 11px var(--mem-font-mono)",
+              color: "var(--mem-text-tertiary)",
+              border: "1px solid var(--mem-border)",
+              borderRadius: "var(--mem-radius-full)",
+              padding: "3px 10px",
+            }}
+          >
+            {t("atlas.unconnectedHidden", { count: hiddenCount })}
+          </span>
+        )}
         <span
           style={{
             marginLeft: "auto",
@@ -1015,7 +1059,8 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
                 width: 8,
                 height: 8,
                 borderRadius: "50%",
-                backgroundColor: colorForEntityType(key, palette),
+                backgroundColor:
+                  key === MEMORY_NODE_TYPE ? palette.memory : colorForEntityType(key, palette),
                 opacity: 0.7,
                 flexShrink: 0,
               }}

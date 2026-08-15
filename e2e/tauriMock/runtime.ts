@@ -216,6 +216,7 @@ export class TauriMockRuntime {
       case "reject_refinement": return this.resolveRefinement(args, false);
       case "list_entities_cmd": return this.listEntities(args);
       case "get_entity_detail_cmd": return this.getEntityDetail(args);
+      case "get_knowledge_graph_cmd": return this.getKnowledgeGraph();
       case "add_observation_cmd": return this.addObservation(args);
       case "update_observation_cmd": return this.updateObservation(args);
       case "delete_observation_cmd": return this.deleteObservation(args);
@@ -749,6 +750,43 @@ export class TauriMockRuntime {
   private listEntities(args: unknown) {
     const domain = optionalString(args, "domain");
     return this.entityDetails.map((detail) => detail.entity).filter((entity) => !domain || entity.domain === domain || entity.space === domain);
+  }
+
+  /**
+   * The bulk graph read, derived from the same entity/detail fixtures the
+   * per-entity commands serve. A relation is emitted once, from the endpoint
+   * that declares it outgoing, and only when both endpoints exist. The
+   * navigation fixture links no memory to an entity, so the memory halves are
+   * empty rather than invented.
+   */
+  private getKnowledgeGraph() {
+    const entities = this.entityDetails.map((detail) => detail.entity);
+    const known = new Set(entities.map((entity) => entity.id));
+    const relations: {
+      id: string;
+      from_entity: string;
+      to_entity: string;
+      relation_type: string;
+      source_agent: string | null;
+      created_at: number;
+    }[] = [];
+    const seen = new Set<string>();
+    for (const detail of this.entityDetails) {
+      for (const relation of detail.relations) {
+        if (!known.has(relation.entity_id) || seen.has(relation.id)) continue;
+        seen.add(relation.id);
+        const outgoing = relation.direction !== "incoming";
+        relations.push({
+          id: relation.id,
+          from_entity: outgoing ? detail.entity.id : relation.entity_id,
+          to_entity: outgoing ? relation.entity_id : detail.entity.id,
+          relation_type: relation.relation_type,
+          source_agent: relation.source_agent,
+          created_at: relation.created_at,
+        });
+      }
+    }
+    return { entities, relations, memories: [], memory_links: [] };
   }
 
   private getEntityDetail(args: unknown): EntityDetail {

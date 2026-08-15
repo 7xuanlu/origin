@@ -35,6 +35,7 @@ const PALETTE: GraphPalette = {
   hullBorder: "rgba(1,2,3,0.16)",
   graticule: "rgba(4,5,6,0.13)",
   bridge: "#bbbbbb",
+  memory: "#cccccc",
 };
 
 function node(overrides: Partial<GraphNode> = {}): GraphNode {

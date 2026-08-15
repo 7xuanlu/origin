@@ -1,7 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { describe, it, expect } from "vitest";
-import type { Entity, EntityDetail, RelationWithEntity } from "../tauri";
-import { buildGraphModel, buildEgoModel } from "./model";
+import type {
+  Entity,
+  EntityDetail,
+  GraphMemoryNode,
+  GraphRelation,
+  KnowledgeGraph,
+  RelationWithEntity,
+} from "../tauri";
+import {
+  buildEgoModel,
+  buildGraphModel,
+  buildKnowledgeGraphModel,
+  filterKnowledgeGraph,
+  memorySourceId,
+} from "./model";
 
 function makeEntity(o: Partial<Entity> = {}): Entity {
   return {
@@ -223,5 +236,150 @@ describe("buildGraphModel / buildEgoModel", () => {
     expect(center.entityType).toBe("project");
     expect(center.kind).toBe("entity");
     expect(model.coverage).toEqual({ relationsFetchedFor: 1, totalEntities: 1 });
+  });
+});
+
+function makeGraphRelation(o: Partial<GraphRelation> = {}): GraphRelation {
+  return {
+    id: o.id ?? "r1",
+    from_entity: o.from_entity ?? "A",
+    to_entity: o.to_entity ?? "B",
+    relation_type: o.relation_type ?? "knows",
+    source_agent: o.source_agent ?? null,
+    created_at: o.created_at ?? 150,
+  };
+}
+
+function makeGraphMemory(o: Partial<GraphMemoryNode> = {}): GraphMemoryNode {
+  return {
+    source_id: o.source_id ?? "m1",
+    title: o.title ?? "A memory",
+    memory_type: o.memory_type ?? "fact",
+    space: o.space ?? null,
+    confirmed: o.confirmed ?? true,
+    last_modified: o.last_modified ?? 300,
+  };
+}
+
+function makeGraph(o: Partial<KnowledgeGraph> = {}): KnowledgeGraph {
+  return {
+    entities: o.entities ?? [],
+    relations: o.relations ?? [],
+    memories: o.memories ?? [],
+    memory_links: o.memory_links ?? [],
+  };
+}
+
+describe("buildKnowledgeGraphModel", () => {
+  it("folds entities and relations without inventing endpoints", () => {
+    const model = buildKnowledgeGraphModel(
+      makeGraph({
+        entities: [makeEntity({ id: "A" }), makeEntity({ id: "B" })],
+        relations: [
+          makeGraphRelation({ id: "r1", from_entity: "A", to_entity: "B" }),
+          // Dangling: the daemon never ships this, and a filtered read means
+          // the endpoint is out of scope — synthesizing it would fabricate.
+          makeGraphRelation({ id: "r2", from_entity: "A", to_entity: "GONE" }),
+        ],
+      }),
+    );
+    expect(model.nodes.map((n) => n.id).sort()).toEqual(["A", "B"]);
+    expect(model.edges.map((e) => e.id)).toEqual(["r1"]);
+    expect(model.nodes.find((n) => n.id === "A")!.degree).toBe(1);
+  });
+
+  it("draws a memory as its own node joined to every entity it links to", () => {
+    const model = buildKnowledgeGraphModel(
+      makeGraph({
+        entities: [makeEntity({ id: "A" }), makeEntity({ id: "B" })],
+        memories: [makeGraphMemory({ source_id: "m1", title: "Shared" })],
+        memory_links: [
+          { memory_id: "m1", entity_id: "B" },
+          { memory_id: "m1", entity_id: "A" },
+        ],
+      }),
+    );
+    const memory = model.nodes.find((n) => n.id === "mem:m1")!;
+    expect(memory.kind).toBe("memory");
+    expect(memory.entityType).toBe("memory");
+    expect(memory.name).toBe("Shared");
+    // Two links, so the memory has degree 2 and neither entity is an isolate.
+    expect(memory.degree).toBe(2);
+    expect(model.nodes.find((n) => n.id === "A")!.degree).toBe(1);
+    expect(model.nodes.find((n) => n.id === "B")!.degree).toBe(1);
+    expect(model.edges.every((e) => e.type === "mentions")).toBe(true);
+  });
+
+  it("drops a memory whose links all point outside the entity set", () => {
+    const model = buildKnowledgeGraphModel(
+      makeGraph({
+        entities: [makeEntity({ id: "A" })],
+        memories: [makeGraphMemory({ source_id: "m1" })],
+        memory_links: [{ memory_id: "m1", entity_id: "GONE" }],
+      }),
+    );
+    expect(model.nodes.map((n) => n.id)).toEqual(["A"]);
+    expect(model.edges).toEqual([]);
+  });
+
+  it("prefixes memory ids so a memory can never collide with an entity", () => {
+    const model = buildKnowledgeGraphModel(
+      makeGraph({
+        entities: [makeEntity({ id: "m1", name: "Entity called m1" })],
+        memories: [makeGraphMemory({ source_id: "m1", title: "Memory called m1" })],
+        memory_links: [{ memory_id: "m1", entity_id: "m1" }],
+      }),
+    );
+    expect(model.nodes.find((n) => n.id === "m1")!.name).toBe("Entity called m1");
+    expect(model.nodes.find((n) => n.id === "mem:m1")!.name).toBe("Memory called m1");
+    expect(memorySourceId("mem:m1")).toBe("m1");
+    expect(memorySourceId("m1")).toBeNull();
+  });
+
+  it("reports total coverage — one read, nothing left unfetched", () => {
+    const model = buildKnowledgeGraphModel(
+      makeGraph({ entities: [makeEntity({ id: "A" }), makeEntity({ id: "B" })] }),
+    );
+    expect(model.coverage).toEqual({ relationsFetchedFor: 2, totalEntities: 2 });
+  });
+});
+
+describe("filterKnowledgeGraph", () => {
+  const work = makeEntity({ id: "A", space: "Work" });
+  const personal = makeEntity({ id: "B", space: "Personal" });
+  const graph = makeGraph({
+    entities: [work, personal],
+    relations: [makeGraphRelation({ id: "r1", from_entity: "A", to_entity: "B" })],
+    memories: [
+      makeGraphMemory({ source_id: "m1", space: "Work" }),
+      makeGraphMemory({ source_id: "m2", space: "Personal" }),
+    ],
+    memory_links: [
+      { memory_id: "m1", entity_id: "A" },
+      { memory_id: "m2", entity_id: "A" },
+    ],
+  });
+
+  it("returns the graph untouched when no space is selected", () => {
+    expect(filterKnowledgeGraph(graph, null)).toBe(graph);
+  });
+
+  it("drops a cross-space relation rather than keeping a half-visible edge", () => {
+    const scoped = filterKnowledgeGraph(graph, "Work");
+    expect(scoped.entities.map((e) => e.id)).toEqual(["A"]);
+    expect(scoped.relations).toEqual([]);
+  });
+
+  it("scopes memories by their own space, not by the entity they link to", () => {
+    const scoped = filterKnowledgeGraph(graph, "Work");
+    // m2 is a Personal memory hanging off a Work entity: out of scope.
+    expect(scoped.memories.map((m) => m.source_id)).toEqual(["m1"]);
+    expect(scoped.memory_links).toEqual([{ memory_id: "m1", entity_id: "A" }]);
+  });
+
+  it("falls back to domain when an entity carries no space", () => {
+    const legacy = makeEntity({ id: "C", space: "", domain: "Work" });
+    const scoped = filterKnowledgeGraph(makeGraph({ entities: [legacy] }), "Work");
+    expect(scoped.entities.map((e) => e.id)).toEqual(["C"]);
   });
 });

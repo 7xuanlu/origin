@@ -878,6 +878,196 @@ impl MemoryDB {
         }
         Ok(results)
     }
+
+    /// One bulk read of the whole graph the scope can see: every entity, every
+    /// live entity<->entity relation whose BOTH endpoints are in that entity
+    /// set, and the memories linked to at least one of those entities.
+    ///
+    /// The desktop Graph view used to fan out per-entity detail fetches capped
+    /// at the first 20 entities, which drew every other connected entity as an
+    /// isolate. This is its single replacement request.
+    ///
+    /// Scoping: the entity half reuses `list_entities_scoped`, so relations
+    /// need no scope predicate of their own — an endpoint outside the scope is
+    /// simply not in the id set, and the relation is dropped. Memories carry
+    /// their OWN scope filter (same rule as `list_memories_scoped`), so an
+    /// in-scope entity linked to another space's memory does not leak it.
+    pub async fn get_knowledge_graph_scoped(
+        &self,
+        scope: &ReadScope,
+    ) -> Result<wenlan_types::KnowledgeGraphResponse, WenlanError> {
+        let entities = self.list_entities_scoped(None, scope).await?;
+        if entities.is_empty() {
+            return Ok(wenlan_types::KnowledgeGraphResponse {
+                entities,
+                relations: Vec::new(),
+                memories: Vec::new(),
+                memory_links: Vec::new(),
+            });
+        }
+        let entity_ids: HashSet<&str> = entities.iter().map(|entity| entity.id.as_str()).collect();
+
+        // One held guard for both queries, no `.await` on anything else while
+        // it is held (crate invariant).
+        let conn = self.conn.lock().await;
+
+        // Same live-relation predicate as `get_entity_detail_scoped`:
+        // `edge_type='relates' AND valid_until IS NULL AND semantic_type IS
+        // NOT NULL`. Endpoint membership is checked in Rust against the
+        // already-scoped id set above rather than re-joining
+        // `entity_page_map`/`pages` twice more here.
+        let mut relation_rows = conn
+            .query(
+                "SELECT edge_id, src_id, dst_id, semantic_type, \
+                        json_extract(payload, '$.source_agent'), \
+                        COALESCE(json_extract(payload, '$.asserted_at'), created_at) AS asserted_ts \
+                 FROM edges \
+                 WHERE edge_type = 'relates' AND valid_until IS NULL \
+                   AND semantic_type IS NOT NULL \
+                 ORDER BY asserted_ts DESC, edge_id ASC",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("get_knowledge_graph_scoped relations query: {error}"))
+            })?;
+        let mut relations = Vec::new();
+        while let Some(row) = relation_rows.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!(
+                "get_knowledge_graph_scoped relations next: {error}"
+            ))
+        })? {
+            let from_entity: String = row.get(1).map_err(|error| {
+                WenlanError::VectorDb(format!("get_knowledge_graph_scoped relation src: {error}"))
+            })?;
+            let to_entity: String = row.get(2).map_err(|error| {
+                WenlanError::VectorDb(format!("get_knowledge_graph_scoped relation dst: {error}"))
+            })?;
+            if !entity_ids.contains(from_entity.as_str())
+                || !entity_ids.contains(to_entity.as_str())
+            {
+                continue;
+            }
+            relations.push(wenlan_types::GraphRelation {
+                id: row.get(0).map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "get_knowledge_graph_scoped relation id: {error}"
+                    ))
+                })?,
+                from_entity,
+                to_entity,
+                relation_type: row.get(3).map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "get_knowledge_graph_scoped relation type: {error}"
+                    ))
+                })?,
+                source_agent: row.get::<Option<String>>(4).map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "get_knowledge_graph_scoped relation source_agent: {error}"
+                    ))
+                })?,
+                created_at: row.get(5).map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "get_knowledge_graph_scoped relation created_at: {error}"
+                    ))
+                })?,
+            });
+        }
+        drop(relation_rows);
+
+        // Memory rows resolve the same way `list_memories_scoped` does:
+        // `source = 'memory'`, no pending revision, superseded rows hidden,
+        // fields folded with MAX over the memory's chunks.
+        let hidden_by_superseder = super::superseder_not_exists(
+            scope,
+            "m",
+            "superseder.pending_revision = 0 AND superseder.source = 'memory'",
+        );
+        let (memory_scope_sql, memory_scope_value) = match scope {
+            ReadScope::Global => ("", None),
+            ReadScope::Space(space) => {
+                ("AND m.space = ?1", Some(libsql::Value::Text(space.clone())))
+            }
+            ReadScope::Uncategorized => (
+                "AND (m.space IS NULL OR m.space = '00000000-0000-4000-8000-000000000001')",
+                None,
+            ),
+        };
+        let memory_sql = format!(
+            "SELECT me.entity_id, m.source_id, MAX(m.title), MAX(m.memory_type), \
+                    MAX(m.space), MAX(m.confirmed), MAX(m.last_modified) \
+             FROM memory_entities me \
+             JOIN memories m ON m.source_id = me.memory_id \
+             WHERE m.source = 'memory' AND m.pending_revision = 0 \
+               AND {hidden_by_superseder} {memory_scope_sql} \
+             GROUP BY me.entity_id, m.source_id \
+             ORDER BY m.source_id ASC, me.entity_id ASC"
+        );
+        let memory_params: Vec<libsql::Value> = memory_scope_value.into_iter().collect();
+        let mut memory_rows = conn
+            .query(&memory_sql, libsql::params_from_iter(memory_params))
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "get_knowledge_graph_scoped memories query: {error}"
+                ))
+            })?;
+        let mut memories: HashMap<String, wenlan_types::GraphMemoryNode> = HashMap::new();
+        let mut memory_links = Vec::new();
+        while let Some(row) = memory_rows.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("get_knowledge_graph_scoped memories next: {error}"))
+        })? {
+            let entity_id: String = row.get(0).map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "get_knowledge_graph_scoped link entity_id: {error}"
+                ))
+            })?;
+            if !entity_ids.contains(entity_id.as_str()) {
+                continue;
+            }
+            let source_id: String = row.get(1).map_err(|error| {
+                WenlanError::VectorDb(format!(
+                    "get_knowledge_graph_scoped memory source_id: {error}"
+                ))
+            })?;
+            if !memories.contains_key(&source_id) {
+                memories.insert(
+                    source_id.clone(),
+                    wenlan_types::GraphMemoryNode {
+                        source_id: source_id.clone(),
+                        title: row
+                            .get::<Option<String>>(2)
+                            .unwrap_or(None)
+                            .unwrap_or_default(),
+                        memory_type: row.get::<Option<String>>(3).unwrap_or(None),
+                        // The wire contract keeps `null` for "unfiled", same
+                        // normalization the entity rows get.
+                        space: crate::space_context::normalize_unfiled_space(
+                            row.get::<Option<String>>(4).unwrap_or(None),
+                        ),
+                        confirmed: row.get::<i64>(5).unwrap_or(0) != 0,
+                        last_modified: row.get::<i64>(6).unwrap_or(0),
+                    },
+                );
+            }
+            memory_links.push(wenlan_types::GraphMemoryLink {
+                memory_id: source_id,
+                entity_id,
+            });
+        }
+        drop(memory_rows);
+        drop(conn);
+
+        let mut memories: Vec<wenlan_types::GraphMemoryNode> = memories.into_values().collect();
+        memories.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+
+        Ok(wenlan_types::KnowledgeGraphResponse {
+            entities,
+            relations,
+            memories,
+            memory_links,
+        })
+    }
 }
 
 fn entity_from_row(row: &libsql::Row, context: &str) -> Result<Entity, WenlanError> {

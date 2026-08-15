@@ -972,3 +972,157 @@ async fn search_entities_by_vector_scoped_reads_shadow_page_directly() {
     assert_eq!(results[0].entity.confidence, Some(0.75));
     assert!(results[0].entity.confirmed);
 }
+
+/// The bulk Graph-view read: one request must return the scope's whole graph.
+/// Seeded shape — 3 in-scope entities, 2 in-scope relations plus one whose
+/// far endpoint sits in another space, 2 linked memories (one of them linked
+/// to two entities) plus one in-scope memory with no link at all.
+#[tokio::test]
+async fn get_knowledge_graph_scoped_returns_whole_scope_and_drops_out_of_scope_rows() {
+    let (db, _tmp) = test_db().await;
+    let work_a = db
+        .store_entity("Graph work A", "topic", Some("work"), None, Some(0.9))
+        .await
+        .unwrap();
+    let work_b = db
+        .store_entity("Graph work B", "topic", Some("work"), None, Some(0.9))
+        .await
+        .unwrap();
+    let work_c = db
+        .store_entity("Graph work C", "topic", Some("work"), None, Some(0.9))
+        .await
+        .unwrap();
+    let personal = db
+        .store_entity("Graph personal", "topic", Some("personal"), None, Some(0.9))
+        .await
+        .unwrap();
+
+    db.create_relation(&work_a, &work_b, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+    db.create_relation(&work_b, &work_c, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+    // Far endpoint is in another space: scoping must drop this relation
+    // entirely rather than surfacing a dangling endpoint.
+    db.create_relation(&work_a, &personal, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+
+    db.upsert_documents(vec![
+        memory_doc("graph-memory-linked-two", "work"),
+        memory_doc("graph-memory-linked-one", "work"),
+        memory_doc("graph-memory-unlinked", "work"),
+    ])
+    .await
+    .unwrap();
+    db.link_memory_entities(
+        "graph-memory-linked-two",
+        &[work_a.as_str(), work_b.as_str()],
+    )
+    .await
+    .unwrap();
+    db.link_memory_entities("graph-memory-linked-one", &[work_c.as_str()])
+        .await
+        .unwrap();
+
+    let graph = db
+        .get_knowledge_graph_scoped(&ReadScope::Space("work".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(graph.entities.len(), 3);
+    assert!(!graph.entities.iter().any(|entity| entity.id == personal));
+
+    assert_eq!(graph.relations.len(), 2);
+    assert!(!graph
+        .relations
+        .iter()
+        .any(|relation| relation.from_entity == personal || relation.to_entity == personal));
+
+    let mut memory_ids: Vec<&str> = graph
+        .memories
+        .iter()
+        .map(|memory| memory.source_id.as_str())
+        .collect();
+    memory_ids.sort_unstable();
+    assert_eq!(
+        memory_ids,
+        vec!["graph-memory-linked-one", "graph-memory-linked-two"]
+    );
+    assert_eq!(graph.memory_links.len(), 3);
+    let two_way: Vec<&str> = graph
+        .memory_links
+        .iter()
+        .filter(|link| link.memory_id == "graph-memory-linked-two")
+        .map(|link| link.entity_id.as_str())
+        .collect();
+    assert_eq!(two_way.len(), 2);
+    assert!(two_way.contains(&work_a.as_str()));
+    assert!(two_way.contains(&work_b.as_str()));
+    // Every link's memory and entity are both present in the response.
+    for link in &graph.memory_links {
+        assert!(graph
+            .memories
+            .iter()
+            .any(|memory| memory.source_id == link.memory_id));
+        assert!(graph
+            .entities
+            .iter()
+            .any(|entity| entity.id == link.entity_id));
+    }
+}
+
+/// The same seed read unscoped: the cross-space relation is a real relation
+/// between two visible entities, so Global keeps it (and the other space's
+/// memory too). Pins that the drops above come from scoping, not from the
+/// query silently losing rows.
+#[tokio::test]
+async fn get_knowledge_graph_scoped_global_keeps_cross_space_relation() {
+    let (db, _tmp) = test_db().await;
+    let work = db
+        .store_entity("Global graph work", "topic", Some("work"), None, Some(0.9))
+        .await
+        .unwrap();
+    let personal = db
+        .store_entity(
+            "Global graph personal",
+            "topic",
+            Some("personal"),
+            None,
+            Some(0.9),
+        )
+        .await
+        .unwrap();
+    db.create_relation(&work, &personal, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+    db.upsert_documents(vec![memory_doc("global-graph-memory", "personal")])
+        .await
+        .unwrap();
+    db.link_memory_entities("global-graph-memory", &[personal.as_str()])
+        .await
+        .unwrap();
+
+    let graph = db
+        .get_knowledge_graph_scoped(&ReadScope::Global)
+        .await
+        .unwrap();
+
+    assert_eq!(graph.entities.len(), 2);
+    assert_eq!(graph.relations.len(), 1);
+    assert_eq!(graph.relations[0].from_entity, work);
+    assert_eq!(graph.relations[0].to_entity, personal);
+    assert_eq!(graph.memories.len(), 1);
+    assert_eq!(graph.memories[0].source_id, "global-graph-memory");
+    assert_eq!(graph.memory_links.len(), 1);
+
+    let scoped = db
+        .get_knowledge_graph_scoped(&ReadScope::Space("work".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(scoped.entities.len(), 1);
+    assert!(scoped.relations.is_empty());
+    assert!(scoped.memories.is_empty());
+    assert!(scoped.memory_links.is_empty());
+}

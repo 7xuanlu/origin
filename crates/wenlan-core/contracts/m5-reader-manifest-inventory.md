@@ -522,9 +522,9 @@ A surface that transmits anyway is a failing test on that surface. That gate is
 soft, and saying so plainly is what cooperative-tier means. It is also no longer
 load-bearing: the shape gate holds even when this one is bypassed.
 
-## HTTP — all 167 registered `(method, path, handler)` triples
+## HTTP — all 169 registered `(method, path, handler)` triples
 
-59 page-bearing, 108 not.
+60 page-bearing, 109 not.
 
 | Method | Path | Builder | Page-bearing | Class | Marker-shape | Adapter | Evidence |
 |---|---|---|---|---|---|---|---|
@@ -589,6 +589,7 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `PUT` | `/api/memory/entities/{id}/confirm` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/memory/entities/{id}/delete` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/memory/entity-suggestions` | main | no | not_applicable | `none` | — | no prose fields |
+| `GET` | `/api/memory/graph` | main | yes | automatic | `none` | `handle_get_knowledge_graph` | GraphMemoryNode.title via dismissed card |
 | `POST` | `/api/memory/link-entity` | main | yes | automatic | `none` | `handle_link_entity` | opaque response type — fail-closed |
 | `POST` | `/api/memory/list` | main | yes | automatic | `none` | `handle_list_memories` | IndexedFileInfo.title/content via dismissed card |
 | `GET` | `/api/memory/nurture` | main | yes | automatic | `none` | `handle_get_nurture_cards` | MemoryItem.title/content via staged revision card |

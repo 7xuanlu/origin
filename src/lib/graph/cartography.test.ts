@@ -30,6 +30,7 @@ const PALETTE: GraphPalette = {
   hullBorder: "rgba(1,2,3,0.16)",
   graticule: "rgba(4,5,6,0.13)",
   bridge: "#bbbbbb",
+  memory: "#cccccc",
 };
 
 function node(id: string, overrides: Partial<GraphNode> = {}): GraphNode {
@@ -379,6 +380,90 @@ describe("communitiesFor", () => {
     // One bucket, so two unscoped regions CAN bridge each other.
     expect(communities.get("p1")).not.toBe(communities.get("q1"));
     expect(bridgeEdgeTest(communities)("p1", "q1")).toBe(true);
+  });
+
+  function memoryNode(id: string, space: string | null = null): GraphNode {
+    return { ...node(id), kind: "memory", entityType: "memory", space };
+  }
+
+  function mentions(id: string, memory: string, entity: string): GraphEdge {
+    return { id, source: memory, target: entity, type: "mentions", confidence: null, createdAt: 100 };
+  }
+
+  it("gives a memory the community of the entity it links to", () => {
+    const m = modelOf(
+      [node("a1", { space: "Work" }), node("a2", { space: "Work" }), memoryNode("mem:m1")],
+      [edge("ea1", "a1", "a2"), mentions("lm1", "mem:m1", "a2")],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    expect(communities.get("mem:m1")).toBe(communities.get("a2"));
+  });
+
+  it("breaks a multi-entity tie on the lowest entity id, deterministically", () => {
+    // Two disjoint Work regions; the memory touches one node in each, so the
+    // answer is only stable if the tie-break is by id rather than edge order.
+    const m = modelOf(
+      [
+        node("a1", { space: "Work" }),
+        node("a2", { space: "Work" }),
+        node("b1", { space: "Work" }),
+        node("b2", { space: "Work" }),
+        memoryNode("mem:m1"),
+      ],
+      [
+        edge("ea", "a1", "a2"),
+        edge("eb", "b1", "b2"),
+        mentions("lm1", "mem:m1", "b1"),
+        mentions("lm2", "mem:m1", "a1"),
+      ],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    expect(communities.get("mem:m1")).toBe(communities.get("a1"));
+    expect(communities.get("mem:m1")).not.toBe(communities.get("b1"));
+  });
+
+  it("never drags a scoped entity into the unscoped bucket via a spaceless memory", () => {
+    const m = modelOf(
+      [node("a1", { space: "Work" }), node("a2", { space: "Work" }), memoryNode("mem:m1", null)],
+      [edge("ea1", "a1", "a2"), mentions("lm1", "mem:m1", "a1")],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    // "u" is the unscoped segment (see communitiesFor's spaceSegment).
+    for (const id of ["a1", "a2", "mem:m1"]) {
+      expect(communities.get(id)!.split(":")[1]).not.toBe("u");
+    }
+  });
+
+  it("inherits a DURABLE community too, without ever being a durable member", () => {
+    const cartography = new Map<string, SpaceCartography>([
+      [
+        "Work",
+        {
+          status: "ready",
+          memberCommunityId: new Map([
+            ["a1", "c1"],
+            ["a2", "c1"],
+          ]),
+        } as SpaceCartography,
+      ],
+    ]);
+    const m = modelOf(
+      [node("a1", { space: "Work" }), node("a2", { space: "Work" }), memoryNode("mem:m1", "Work")],
+      [edge("ea1", "a1", "a2"), mentions("lm1", "mem:m1", "a1")],
+    );
+    const communities = communitiesFor(m, cartography);
+    expect(communities.get("a1")).toContain("durable:");
+    expect(communities.get("mem:m1")).toBe(communities.get("a1"));
+  });
+
+  it("leaves a memory out of every region when its entities are not partitioned", () => {
+    const m = modelOf(
+      [memoryNode("mem:m1"), memoryNode("mem:m2")],
+      [mentions("lm1", "mem:m1", "mem:m2")],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    expect(communities.has("mem:m1")).toBe(false);
+    expect(communities.has("mem:m2")).toBe(false);
   });
 });
 

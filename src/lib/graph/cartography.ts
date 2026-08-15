@@ -152,7 +152,16 @@ export function communitiesFor(
   // null keys the one unscoped bucket — an out-of-band key no space string
   // can occupy, so the partition itself is unforgeable, not just the ids.
   const bySpace = new Map<string | null, string[]>();
+  // Memory nodes are never partitioned or climbed: they are not durable
+  // community members, and a spaceless memory hanging off a scoped entity
+  // would otherwise drag that entity's region into the unscoped bucket.
+  // They inherit an entity's community below instead.
+  const memoryNodeIds: string[] = [];
   for (const node of model.nodes) {
+    if (node.kind === "memory") {
+      memoryNodeIds.push(node.id);
+      continue;
+    }
     pushInto(bySpace, isUnscopedSpace(node.space) ? null : node.space, node.id);
   }
 
@@ -175,6 +184,29 @@ export function communitiesFor(
     const local = climbFallback(nodeIds, model.edges);
     for (const [id, localId] of local) {
       result.set(id, `fallback:${segment}:${encodeURIComponent(localId)}`);
+    }
+  }
+
+  // A memory joins the region of the entity it links to. Ties break on the
+  // lowest entity id so the answer is deterministic, and a memory whose
+  // entities all landed outside the partition simply gets no community —
+  // which keeps it out of every region size and every bridge test.
+  if (memoryNodeIds.length > 0) {
+    const memories = new Set(memoryNodeIds);
+    const anchorOf = new Map<string, string>();
+    for (const edge of model.edges) {
+      const [memory, entity] = memories.has(edge.source)
+        ? [edge.source, edge.target]
+        : memories.has(edge.target)
+          ? [edge.target, edge.source]
+          : [null, null];
+      if (memory === null || entity === null || memories.has(entity)) continue;
+      const current = anchorOf.get(memory);
+      if (current === undefined || entity < current) anchorOf.set(memory, entity);
+    }
+    for (const [memory, entity] of anchorOf) {
+      const community = result.get(entity);
+      if (community !== undefined) result.set(memory, community);
     }
   }
   return result;

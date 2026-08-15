@@ -37,6 +37,7 @@ pub(crate) fn register_reads(router: TrackedRouter<SharedState>) -> TrackedRoute
     router
         .route("/api/memory/entities/list", post(handle_list_entities))
         .route("/api/memory/entities/search", post(handle_search_entities))
+        .route("/api/memory/graph", get(handle_get_knowledge_graph))
         .route(
             "/api/memory/entities/{entity_id}",
             get(handle_get_entity_detail),
@@ -224,6 +225,25 @@ pub async fn handle_get_entity_detail(
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
     let detail = db.get_entity_detail_scoped(&entity_id, &scope).await?;
     Ok(Json(detail))
+}
+
+/// GET /api/memory/graph — the whole graph for the requested scope in one
+/// read. Space-scoped exactly like `handle_get_entity_detail`: the
+/// `SpaceHeader` resolves through `effective_read_scope`.
+pub async fn handle_get_knowledge_graph(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+) -> Result<Json<wenlan_types::KnowledgeGraphResponse>, ServerError> {
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
+    let graph = db
+        .get_knowledge_graph_scoped(&scope)
+        .await
+        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+    Ok(Json(graph))
 }
 
 #[derive(Debug, Deserialize)]

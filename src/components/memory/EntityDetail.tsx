@@ -236,6 +236,7 @@ export default function EntityDetail({
           locale={locale}
           onClose={() => setGraphOpen(false)}
           onEntityClick={onEntityClick}
+          onMemoryClick={onMemoryClick}
         />
       ) : null}
     </>
@@ -272,6 +273,7 @@ type EntityGraphOverlayProps = {
   readonly locale: string;
   readonly onClose: () => void;
   readonly onEntityClick: (entityId: string) => void;
+  readonly onMemoryClick?: (sourceId: string) => void;
 };
 
 function EntityGraphOverlay({
@@ -280,6 +282,7 @@ function EntityGraphOverlay({
   locale,
   onClose,
   onEntityClick,
+  onMemoryClick,
 }: EntityGraphOverlayProps) {
   const { t } = useTranslation();
   const [mode, setMode] = useState<"focus" | "map">("focus");
@@ -579,7 +582,17 @@ function EntityGraphOverlay({
           </>
         ) : (
           <Suspense fallback={null}>
-            <AtlasView focusEntityId={entity.id} onNodeClick={openEntity} />
+            <AtlasView
+              focusEntityId={entity.id}
+              onNodeClick={(target) => {
+                if (target.kind === "entity") {
+                  openEntity(target.id);
+                } else if (onMemoryClick) {
+                  onClose();
+                  onMemoryClick(target.id);
+                }
+              }}
+            />
           </Suspense>
         )}
       </div>

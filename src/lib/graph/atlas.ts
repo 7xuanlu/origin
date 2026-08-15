@@ -10,16 +10,22 @@ import {
   type SimulationNodeDatum,
 } from "d3-force";
 import type { GraphModel } from "./model";
+import { MEMORY_NODE_TYPE } from "./model";
 import { nodeFillFor, type GraphPalette } from "./palette";
 import { bridgeEdgeTest } from "./cartography";
 
 const MIN_NODE_SIZE = 3;
 const MAX_NODE_SIZE = 8;
+/** Memory nodes sit below the smallest entity, at every degree — they are
+ *  context around the entities, and a memory linked to six entities must not
+ *  outgrow the entities themselves. */
+const MEMORY_NODE_SIZE = 2;
 
 // The old canvas graph's exact radius scale: a stability base (confirmed 4,
 // everything else 3) plus half a px per connection, capped at 8 — finer than
 // the sqrt scale it replaced, and size itself encodes confirmation.
-function nodeSizeFor(confirmed: boolean | null, degree: number): number {
+function nodeSizeFor(confirmed: boolean | null, degree: number, entityType?: string): number {
+  if (entityType === MEMORY_NODE_TYPE) return MEMORY_NODE_SIZE;
   const base = confirmed === true ? 4 : MIN_NODE_SIZE;
   return Math.min(MAX_NODE_SIZE, base + degree * 0.5);
 }
@@ -46,7 +52,7 @@ export function buildAtlasGraph(
     const angle = (2 * Math.PI * i) / Math.max(n, 1);
     graph.addNode(node.id, {
       label: node.name,
-      size: nodeSizeFor(node.confirmed, node.degree),
+      size: nodeSizeFor(node.confirmed, node.degree, node.entityType),
       color: nodeFillFor(node.entityType, node.confirmed, palette),
       entityType: node.entityType,
       // Kept on the node so the theme-flip recolor (AtlasView) can recompute

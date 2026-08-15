@@ -26,6 +26,7 @@ main|get|/api/lint|wenlan_server::lint_routes::handle_lint
 main|get|/api/memory/by-ids|wenlan_server::memory_detail_routes::handle_get_memories_by_ids
 main|get|/api/memory/entities/{entity_id}|wenlan_server::entity_graph_routes::handle_get_entity_detail
 main|get|/api/memory/entity-suggestions|wenlan_server::entity_graph_routes::handle_get_entity_suggestions
+main|get|/api/memory/graph|wenlan_server::entity_graph_routes::handle_get_knowledge_graph
 main|get|/api/memory/nurture|wenlan_server::memory_routes::handle_get_nurture_cards
 main|get|/api/memory/pending-revision/{source_id}|wenlan_server::memory_revision_routes::handle_get_pending_revision
 main|get|/api/memory/pending-revisions|wenlan_server::memory_revision_routes::handle_list_pending_revisions

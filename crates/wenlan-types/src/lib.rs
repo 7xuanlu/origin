@@ -39,8 +39,9 @@ pub use communities::{
     PageCommunityAssignmentState,
 };
 pub use entities::{
-    Entity, EntityDetail, EntitySearchResult, EntitySuggestion, Observation, RecentRelation,
-    Relation, RelationWithEntity,
+    Entity, EntityDetail, EntitySearchResult, EntitySuggestion, GraphMemoryLink, GraphMemoryNode,
+    GraphRelation, KnowledgeGraphResponse, Observation, RecentRelation, Relation,
+    RelationWithEntity,
 };
 pub use lint::{LintCheckResult, LintQuery, LintReport};
 pub use memory::{
