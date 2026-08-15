@@ -238,6 +238,18 @@ export const CITES_EDGE_TYPE = "cites";
  *  memory node itself is hidden. */
 export const SHARED_SOURCE_EDGE_TYPE = "shared_source";
 
+/** A memory cited by more than this many visible pages is a hub source — a
+ *  session log or a bulk import, not a shared topic. Pairing every page that
+ *  touches it makes a clique (real data: one memory cited by 29 pages, 406
+ *  pairs from that memory alone), so a hub source synthesizes NO pairwise
+ *  edges at all. The memory is still there to see when the memory layer is on. */
+export const SHARED_SOURCE_MAX_FANOUT = 6;
+
+/** How many shared-source edges one page may keep, strongest first. Without
+ *  the cut 33 real pages carried 20+ overlap neighbours (max 45) and the page
+ *  layer collapsed into a single blob. */
+export const SHARED_SOURCE_TOP_K = 4;
+
 /** Graph-node id for a wiki page. Prefixed for the same reason memories are:
  *  no collision with an entity id, and click routing can tell them apart. */
 export function pageNodeId(pageId: string): string {
@@ -473,6 +485,8 @@ export function buildKnowledgeGraphModel(
     const shared = new Map<string, number>();
     for (const pageIds of pagesByMemory.values()) {
       const sorted = [...new Set(pageIds)].sort();
+      // Hub source: too many pages cite it for the overlap to mean anything.
+      if (sorted.length > SHARED_SOURCE_MAX_FANOUT) continue;
       for (let i = 0; i < sorted.length; i++) {
         for (let j = i + 1; j < sorted.length; j++) {
           const key = `${sorted[i]}|${sorted[j]}`;
@@ -480,7 +494,34 @@ export function buildKnowledgeGraphModel(
         }
       }
     }
+
+    // Thin each page down to its strongest overlaps. A pair survives if it is
+    // in EITHER endpoint's top-K (union, not intersection) — a page whose only
+    // partner ranks low on that partner's own list still keeps its one edge,
+    // which is what stops the cut from stranding pages.
+    const incident = new Map<string, { partner: string; weight: number }[]>();
+    const noteIncident = (page: string, partner: string, weight: number) => {
+      const list = incident.get(page);
+      if (list) list.push({ partner, weight });
+      else incident.set(page, [{ partner, weight }]);
+    };
     for (const [pair, weight] of shared) {
+      const [a, b] = pair.split("|");
+      noteIncident(a, b, weight);
+      noteIncident(b, a, weight);
+    }
+    const keptPairs = new Set<string>();
+    for (const [page, partners] of incident) {
+      const ranked = [...partners].sort(
+        (x, y) => y.weight - x.weight || (x.partner < y.partner ? -1 : x.partner > y.partner ? 1 : 0),
+      );
+      for (const { partner } of ranked.slice(0, SHARED_SOURCE_TOP_K)) {
+        keptPairs.add(page < partner ? `${page}|${partner}` : `${partner}|${page}`);
+      }
+    }
+
+    for (const [pair, weight] of shared) {
+      if (!keptPairs.has(pair)) continue;
       const [a, b] = pair.split("|");
       const source = pageNodeId(a);
       const target = pageNodeId(b);
@@ -513,6 +554,75 @@ export function buildKnowledgeGraphModel(
     // One read covers every entity in scope, so coverage is total — the
     // honesty chip has nothing left to confess.
     coverage: { relationsFetchedFor: graph.entities.length, totalEntities: graph.entities.length },
+  };
+}
+
+/**
+ * Smallest connected component the map will draw. Real data has 160 components
+ * with the default layers on: one of 288 nodes, then 18, 14, 8 … and 137 of
+ * three nodes or fewer. Those crumbs carry no structure, and d3's centering
+ * force flings them into a ring around the core — the same halo the round-1
+ * isolate rule removed. They go behind the same "hidden" chip instead.
+ */
+export const MIN_COMPONENT_SIZE = 3;
+
+/**
+ * Node id -> how many nodes are in its connected component, by union-find over
+ * the model's own edges (direction ignored; an edge with a missing endpoint is
+ * not adjacency). A degree-0 node reports 1, so the isolate rule this
+ * generalises falls out of the same number.
+ */
+export function componentSizeByNode(model: GraphModel): Map<string, number> {
+  const parent = new Map<string, string>();
+  for (const node of model.nodes) parent.set(node.id, node.id);
+
+  const find = (id: string): string => {
+    let root = id;
+    while (parent.get(root) !== root) root = parent.get(root)!;
+    // Path compression, iterative — a 3,300-node chain would blow a recursive
+    // stack, and this runs on every layer flip.
+    let walk = id;
+    while (parent.get(walk) !== root) {
+      const next = parent.get(walk)!;
+      parent.set(walk, root);
+      walk = next;
+    }
+    return root;
+  };
+
+  for (const edge of model.edges) {
+    if (!parent.has(edge.source) || !parent.has(edge.target)) continue;
+    const a = find(edge.source);
+    const b = find(edge.target);
+    if (a !== b) parent.set(a, b);
+  }
+
+  const sizes = new Map<string, number>();
+  for (const node of model.nodes) {
+    const root = find(node.id);
+    sizes.set(root, (sizes.get(root) ?? 0) + 1);
+  }
+  const byNode = new Map<string, number>();
+  for (const node of model.nodes) byNode.set(node.id, sizes.get(find(node.id))!);
+  return byNode;
+}
+
+/**
+ * The sub-model the map actually draws: every node whose connected component
+ * has at least MIN_COMPONENT_SIZE members, plus the edges between them. Edges
+ * are filtered too — a dropped node's edges would otherwise point at nothing.
+ */
+export function drawableModel(model: GraphModel): GraphModel {
+  const sizes = componentSizeByNode(model);
+  const kept = new Set<string>();
+  for (const node of model.nodes) {
+    if ((sizes.get(node.id) ?? 0) >= MIN_COMPONENT_SIZE) kept.add(node.id);
+  }
+  if (kept.size === model.nodes.length) return model;
+  return {
+    ...model,
+    nodes: model.nodes.filter((node) => kept.has(node.id)),
+    edges: model.edges.filter((edge) => kept.has(edge.source) && kept.has(edge.target)),
   };
 }
 

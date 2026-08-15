@@ -19,7 +19,12 @@ import {
   memorySourceId,
   pageIdOf,
   pageNodeId,
+  componentSizeByNode,
+  drawableModel,
   DEFAULT_LAYERS,
+  MIN_COMPONENT_SIZE,
+  SHARED_SOURCE_MAX_FANOUT,
+  SHARED_SOURCE_TOP_K,
 } from "./model";
 
 function makeEntity(o: Partial<Entity> = {}): Entity {
@@ -534,5 +539,132 @@ describe("filterKnowledgeGraph — pages", () => {
     expect(filtered.pages.map((p) => p.id)).toEqual(["pa"]);
     expect(filtered.page_links).toHaveLength(1);
     expect(filtered.page_links[0].link_type).toBe("about");
+  });
+});
+
+describe("buildKnowledgeGraphModel — shared-source thinning", () => {
+  const PAGES_OFF_MEMORIES = { entity: false, page: true, memory: false };
+
+  /** `citations` maps a memory id to the page ids that cite it. */
+  function citing(citations: Record<string, string[]>): KnowledgeGraph {
+    const pageIds = [...new Set(Object.values(citations).flat())].sort();
+    return makeGraph({
+      pages: pageIds.map((id) => makePage({ id, title: id })),
+      memories: Object.keys(citations).map((id) => makeGraphMemory({ source_id: id })),
+      page_links: Object.entries(citations).flatMap(([memoryId, pages]) =>
+        pages.map((pageId) => pageLink(["page", pageId], ["memory", memoryId], "cites")),
+      ),
+    });
+  }
+
+  const sharedPairs = (graph: KnowledgeGraph): string[] =>
+    buildKnowledgeGraphModel(graph, { layers: PAGES_OFF_MEMORIES })
+      .edges.filter((e) => e.type === "shared_source")
+      .map((e) => `${e.source}|${e.target}`)
+      .sort();
+
+  it("pairs the pages of a memory cited by exactly the fan-out limit", () => {
+    const pages = Array.from({ length: SHARED_SOURCE_MAX_FANOUT }, (_, i) => `p${i}`);
+    expect(sharedPairs(citing({ m: pages })).length).toBeGreaterThan(0);
+  });
+
+  it("synthesizes nothing for a hub source cited by more pages than the limit", () => {
+    // Session logs and bulk imports are cited by everything; pairing them
+    // turns the page layer into one clique (real data: 29 pages on one memory).
+    const pages = Array.from({ length: SHARED_SOURCE_MAX_FANOUT + 1 }, (_, i) => `p${i}`);
+    expect(sharedPairs(citing({ m: pages }))).toEqual([]);
+  });
+
+  it("keeps a page's single partner even when that partner is already full", () => {
+    // "hub" already has SHARED_SOURCE_TOP_K partners it shares two memories
+    // with, so "solo" (one shared memory) is off the bottom of hub's list —
+    // but solo's own list has room, and either endpoint is enough.
+    const citations: Record<string, string[]> = { weak: ["hub", "solo"] };
+    for (let i = 0; i < SHARED_SOURCE_TOP_K; i++) {
+      citations[`strong${i}a`] = ["hub", `p${i}`];
+      citations[`strong${i}b`] = ["hub", `p${i}`];
+    }
+    expect(sharedPairs(citing(citations))).toContain("page:hub|page:solo");
+  });
+
+  it("drops a pair only when NEITHER endpoint ranks it in its top-K", () => {
+    // Six pages, every pair sharing exactly one memory: each page keeps its
+    // four lowest-id partners, which leaves E and F off each other's list and
+    // off nobody else's — exactly one of the fifteen pairs is cut.
+    const ids = ["a", "b", "c", "d", "e", "f"];
+    const citations: Record<string, string[]> = {};
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) citations[`m${ids[i]}${ids[j]}`] = [ids[i], ids[j]];
+    }
+    const pairs = sharedPairs(citing(citations));
+    expect(pairs).toHaveLength(14);
+    expect(pairs).not.toContain("page:e|page:f");
+  });
+
+  it("ranks by weight first, so a heavy overlap outranks a lexically earlier light one", () => {
+    // "z" shares two memories with "hub"; a0..a3 share one each. Only z and
+    // the three lexically-earliest light partners make hub's top-4, and a3
+    // survives anyway because hub is a3's only partner.
+    const citations: Record<string, string[]> = { z1: ["hub", "z"], z2: ["hub", "z"] };
+    for (let i = 0; i < 4; i++) citations[`light${i}`] = ["hub", `a${i}`];
+    expect(sharedPairs(citing(citations))).toContain("page:hub|page:z");
+  });
+});
+
+describe("componentSizeByNode / drawableModel", () => {
+  const model = (nodeIds: string[], edges: [string, string][]) => ({
+    nodes: nodeIds.map((id) => ({
+      id,
+      kind: "entity" as const,
+      name: id,
+      entityType: "concept",
+      confirmed: null,
+      degree: edges.filter(([s, t]) => s === id || t === id).length,
+      space: null,
+      createdAt: 0,
+      updatedAt: 0,
+    })),
+    edges: edges.map(([source, target], i) => ({
+      id: `e${i}`,
+      source,
+      target,
+      type: "knows",
+      confidence: null,
+      createdAt: 0,
+    })),
+    coverage: { relationsFetchedFor: nodeIds.length, totalEntities: nodeIds.length },
+  });
+
+  it("reports every member of a component with the same size", () => {
+    const sizes = componentSizeByNode(
+      model(["a", "b", "c", "d", "e"], [["a", "b"], ["b", "c"], ["d", "e"]]),
+    );
+    expect([...sizes.values()].sort()).toEqual([2, 2, 3, 3, 3]);
+    expect(sizes.get("a")).toBe(3);
+    expect(sizes.get("d")).toBe(2);
+  });
+
+  it("reports 1 for a node with no edges at all", () => {
+    expect(componentSizeByNode(model(["lonely"], [])).get("lonely")).toBe(1);
+  });
+
+  it("follows edges regardless of direction", () => {
+    const sizes = componentSizeByNode(model(["a", "b", "c"], [["b", "a"], ["c", "b"]]));
+    expect(sizes.get("c")).toBe(3);
+  });
+
+  it("drops components below MIN_COMPONENT_SIZE, and their edges with them", () => {
+    const drawable = drawableModel(
+      model(["a", "b", "c", "d", "e", "f"], [["a", "b"], ["b", "c"], ["d", "e"]]),
+    );
+    expect(drawable.nodes.map((n) => n.id)).toEqual(["a", "b", "c"]);
+    // "d"-"e" would otherwise dangle off nodes the graph no longer has.
+    expect(drawable.edges.map((e) => e.id)).toEqual(["e0", "e1"]);
+    expect(MIN_COMPONENT_SIZE).toBe(3);
+  });
+
+  it("returns the model untouched when every component is big enough", () => {
+    const full = model(["a", "b", "c"], [["a", "b"], ["b", "c"]]);
+    expect(drawableModel(full)).toBe(full);
   });
 });

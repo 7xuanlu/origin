@@ -10,6 +10,9 @@ import {
   createAtlasSimulation,
   placeIsolateRing,
   isolateIds,
+  nonSimulatedIds,
+  satellitePlan,
+  placeSatellites,
   hoverStateFor,
   nodeDisplay,
   edgeDisplay,
@@ -147,7 +150,7 @@ describe("buildAtlasGraph", () => {
     ]);
     const graph = buildAtlasGraph(model, PALETTE);
     const growth = 1.6 * Math.log2(4);
-    expect(graph.getNodeAttribute("page", "size")).toBeCloseTo(3.5 + growth, 10);
+    expect(graph.getNodeAttribute("page", "size")).toBeCloseTo(3 + growth, 10);
     expect(graph.getNodeAttribute("entity", "size")).toBeCloseTo(3 + growth, 10);
     // Memories are context: they start lowest and are capped well under the
     // entity/page ceiling, so a much-cited memory can never dominate.
@@ -190,10 +193,11 @@ describe("buildAtlasGraph", () => {
     } as unknown as CanvasRenderingContext2D;
     drawPageRings(ctx, [{ x: 10, y: 20, size: 5 }], PALETTE);
     expect(ctx.strokeStyle).toBe(PALETTE.page);
-    expect(ctx.lineWidth).toBe(1.5);
-    // Radius is the disc plus a 3px gap, so the ring reads as a separate mark
-    // rather than a slightly fatter dot.
-    expect(calls).toContain("arc:10,20,8");
+    expect(ctx.lineWidth).toBe(1);
+    // Radius is the disc plus a 2px gap, so the ring reads as a separate mark
+    // rather than a slightly fatter dot — round 3 tightened both the gap and
+    // the stroke so dense page clusters stop merging into one teal mass.
+    expect(calls).toContain("arc:10,20,7");
     expect(calls.filter((c) => c === "stroke")).toHaveLength(1);
   });
 
@@ -684,5 +688,130 @@ describe("drawRadialNodeLabel", () => {
     const ctx = mockCtx();
     drawRadialNodeLabel(ctx as any, { ...data, label: "" }, settings, graphWithNodeAt(10, 0));
     expect(ctx.fillText).not.toHaveBeenCalled();
+  });
+});
+
+describe("shared-source edges and node size", () => {
+  it("sizes a page from its asserted links only, ignoring shared-source overlap", () => {
+    // Same drawn degree (3), but two of "overlap"'s edges are inferred
+    // overlap rather than asserted links, so it draws at asserted-degree 1.
+    const model = makeModel(
+      [
+        node({ id: "asserted", entityType: "page", confirmed: null, degree: 3 }),
+        node({ id: "overlap", entityType: "page", confirmed: null, degree: 3 }),
+        node({ id: "x" }),
+        node({ id: "y" }),
+        node({ id: "z" }),
+      ],
+      [
+        edge({ id: "a1", source: "asserted", target: "x", type: "wikilink" }),
+        edge({ id: "a2", source: "asserted", target: "y", type: "wikilink" }),
+        edge({ id: "a3", source: "asserted", target: "z", type: "cites" }),
+        edge({ id: "o1", source: "overlap", target: "x", type: "wikilink" }),
+        edge({ id: "o2", source: "overlap", target: "y", type: "shared_source" }),
+        edge({ id: "o3", source: "overlap", target: "z", type: "shared_source" }),
+      ],
+    );
+    const graph = buildAtlasGraph(model, PALETTE);
+    expect(graph.getNodeAttribute("asserted", "size")).toBeCloseTo(3 + 1.6 * Math.log2(4), 10);
+    expect(graph.getNodeAttribute("overlap", "size")).toBeCloseTo(3 + 1.6 * Math.log2(2), 10);
+  });
+
+  it("never sizes a node below its base, however many shared-source edges touch it", () => {
+    const model = makeModel(
+      [node({ id: "p", entityType: "page", confirmed: null, degree: 1 }), node({ id: "q", entityType: "page", confirmed: null, degree: 1 })],
+      [edge({ id: "s", source: "p", target: "q", type: "shared_source" })],
+    );
+    const graph = buildAtlasGraph(model, PALETTE);
+    expect(graph.getNodeAttribute("p", "size")).toBe(3);
+  });
+});
+
+describe("nonSimulatedIds and satellites", () => {
+  function leafModel(): GraphModel {
+    return makeModel(
+      [
+        node({ id: "hub", degree: 3 }),
+        node({ id: "peer", degree: 1 }),
+        node({ id: "leaf1", entityType: "memory", confirmed: null, degree: 1 }),
+        node({ id: "leaf2", entityType: "memory", confirmed: null, degree: 1 }),
+        node({ id: "busy", entityType: "memory", confirmed: null, degree: 2 }),
+      ],
+      [
+        edge({ id: "e1", source: "hub", target: "peer" }),
+        edge({ id: "e2", source: "leaf1", target: "hub", type: "mentions" }),
+        edge({ id: "e3", source: "leaf2", target: "hub", type: "mentions" }),
+        edge({ id: "e4", source: "busy", target: "hub", type: "mentions" }),
+        edge({ id: "e5", source: "busy", target: "peer", type: "mentions" }),
+      ],
+    );
+  }
+
+  it("excludes degree-1 memories and isolates, but keeps every other node", () => {
+    const graph = buildAtlasGraph(
+      makeModel(
+        [...leafModel().nodes, node({ id: "iso" })],
+        leafModel().edges,
+      ),
+      PALETTE,
+    );
+    expect(nonSimulatedIds(graph).sort()).toEqual(["iso", "leaf1", "leaf2"]);
+  });
+
+  it("does not treat a degree-1 ENTITY as a satellite — only memories orbit", () => {
+    const graph = buildAtlasGraph(leafModel(), PALETTE);
+    expect(nonSimulatedIds(graph)).not.toContain("peer");
+  });
+
+  it("orbits each leaf around its one neighbour at the neighbour's radius plus a gap", () => {
+    const graph = buildAtlasGraph(leafModel(), PALETTE);
+    graph.setNodeAttribute("hub", "x", 40);
+    graph.setNodeAttribute("hub", "y", -15);
+    const plan = satellitePlan(graph);
+    expect(plan.map((s) => s.id).sort()).toEqual(["leaf1", "leaf2"]);
+    placeSatellites(graph, plan);
+    const hubSize = graph.getNodeAttribute("hub", "size") as number;
+    for (const id of ["leaf1", "leaf2"]) {
+      const dx = (graph.getNodeAttribute(id, "x") as number) - 40;
+      const dy = (graph.getNodeAttribute(id, "y") as number) + 15;
+      expect(Math.hypot(dx, dy)).toBeCloseTo(hubSize + 6, 10);
+    }
+    // Two leaves on one anchor sit on opposite sides of it, not on top of
+    // each other.
+    expect(plan[0].angle).not.toBe(plan[1].angle);
+  });
+
+  it("keeps leaf memories out of the simulation and its links", () => {
+    const graph = buildAtlasGraph(leafModel(), PALETTE);
+    const sim = createAtlasSimulation(graph);
+    expect(sim.nodes().map((n) => n.id).sort()).toEqual(["busy", "hub", "peer"]);
+    const linkForce = sim.force<ForceLink<AtlasSimNode, SimulationLinkDatum<AtlasSimNode>>>("link");
+    // hub-peer, busy-hub, busy-peer: the two leaf edges are drawn but never
+    // simulated, so d3 is never asked to resolve an endpoint it does not own.
+    expect(linkForce?.links()).toHaveLength(3);
+  });
+
+  it("carries a dragged anchor's leaves along on every tick writeback", () => {
+    const graph = buildAtlasGraph(leafModel(), PALETTE);
+    runAtlasLayout(graph);
+    const sim = createAtlasSimulation(graph);
+    const before = graph.getNodeAttribute("leaf1", "x") as number;
+    // Exactly what AtlasView's mousemovebody does: write the pointer position
+    // straight onto the graph AND pin the sim node there.
+    const hubX = graph.getNodeAttribute("hub", "x") as number;
+    graph.setNodeAttribute("hub", "x", hubX + 500);
+    const hub = sim.nodes().find((n) => n.id === "hub")!;
+    hub.fx = hubX + 500;
+    hub.fy = hub.y;
+    sim.alpha(0.3);
+    sim.tick(5);
+    const after = graph.getNodeAttribute("leaf1", "x") as number;
+    expect(after - before).toBeCloseTo(500, 6);
+  });
+
+  it("is deterministic: the same graph plans the same orbits twice", () => {
+    const g1 = buildAtlasGraph(leafModel(), PALETTE);
+    const g2 = buildAtlasGraph(leafModel(), PALETTE);
+    expect(satellitePlan(g1)).toEqual(satellitePlan(g2));
   });
 });

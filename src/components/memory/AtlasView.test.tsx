@@ -428,9 +428,9 @@ describe("AtlasView", () => {
     for (const label of ["Project", "Technology", "Organization", "Person", "Theme", "Connection"]) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
-    // Alice + Bob are two singleton communities — no regions, so the toolbar
-    // count line shows entities only (artifact format).
-    expect(screen.getByText("2 entities")).toBeInTheDocument();
+    // Alice, Bob and Carol form one community of three, so the toolbar count
+    // line reports the entities and the single region (artifact format).
+    expect(screen.getByText("3 entities · 1 region")).toBeInTheDocument();
     // Map affordance hint, bottom-left.
     expect(screen.getByText("scroll to zoom · more labels appear as you approach")).toBeInTheDocument();
   });
@@ -549,11 +549,17 @@ describe("AtlasView", () => {
     expect(onNodeClick).toHaveBeenCalledWith({ kind: "entity", id: "e1" });
   });
 
-  // A hub connected to one neighbor — enough to prove drag-follow moves the
+  // A hub connected to two neighbors — enough to prove drag-follow moves a
   // neighbor, without pulling in the whole buildGraphModel relation-shape test
-  // surface (that's model.test.ts's job).
+  // surface (that's model.test.ts's job). Three nodes, not two, because the
+  // map only draws components of at least MIN_COMPONENT_SIZE (model.ts): a
+  // bare pair is a crumb and goes behind the hidden chip.
   function mockConnectedPair() {
-    const entities = [makeEntity({ id: "e1", name: "Alice" }), makeEntity({ id: "e2", name: "Bob" })];
+    const entities = [
+      makeEntity({ id: "e1", name: "Alice" }),
+      makeEntity({ id: "e2", name: "Bob" }),
+      makeEntity({ id: "e3", name: "Carol" }),
+    ];
     mockListEntities.mockResolvedValue(entities);
     mockGetEntityDetail.mockImplementation(async (id: string) => {
       if (id === "e1") {
@@ -571,10 +577,20 @@ describe("AtlasView", () => {
               source_agent: null,
               created_at: Math.floor(Date.now() / 1000),
             },
+            {
+              id: "rel-2",
+              relation_type: "knows",
+              direction: "outgoing" as const,
+              entity_id: "e3",
+              entity_name: "Carol",
+              entity_type: "person",
+              source_agent: null,
+              created_at: Math.floor(Date.now() / 1000),
+            },
           ],
         };
       }
-      return { entity: entities[1], observations: [], relations: [] };
+      return { entity: entities.find((e) => e.id === id)!, observations: [], relations: [] };
     });
     return entities;
   }
@@ -590,14 +606,14 @@ describe("AtlasView", () => {
     return entities;
   }
 
-  // Same connected pair plus a third, unrelated entity — degree 0, so it
-  // never joins the sim (see atlas.ts's createAtlasSimulation) and rides the
-  // round-1 isolate ring instead.
+  // Same connected trio plus a fourth, unrelated entity — degree 0, so it is
+  // never drawn and never joins the sim (see atlas.ts's createAtlasSimulation).
   function mockConnectedPairWithIsolate() {
     const entities = [
       makeEntity({ id: "e1", name: "Alice" }),
       makeEntity({ id: "e2", name: "Bob" }),
-      makeEntity({ id: "e3", name: "Isolate" }),
+      makeEntity({ id: "e3", name: "Carol" }),
+      makeEntity({ id: "e4", name: "Isolate" }),
     ];
     mockListEntities.mockResolvedValue(entities);
     mockGetEntityDetail.mockImplementation(async (id: string) => {
@@ -612,6 +628,16 @@ describe("AtlasView", () => {
               direction: "outgoing" as const,
               entity_id: "e2",
               entity_name: "Bob",
+              entity_type: "person",
+              source_agent: null,
+              created_at: Math.floor(Date.now() / 1000),
+            },
+            {
+              id: "rel-2",
+              relation_type: "knows",
+              direction: "outgoing" as const,
+              entity_id: "e3",
+              entity_name: "Carol",
               entity_type: "person",
               source_agent: null,
               created_at: Math.floor(Date.now() / 1000),
@@ -735,12 +761,62 @@ describe("AtlasView", () => {
 
     expect(graph.hasNode("e1")).toBe(true);
     expect(graph.hasNode("e2")).toBe(true);
-    expect(graph.hasNode("e3")).toBe(false);
-    expect(graph.order).toBe(2);
-    expect(screen.getByText("1 unconnected hidden")).toBeInTheDocument();
-    // The count line describes what is drawn; the third entity is unconnected,
-    // so it is reported by the chip beside it rather than counted here.
-    expect(screen.getByText("2 entities")).toBeInTheDocument();
+    expect(graph.hasNode("e3")).toBe(true);
+    expect(graph.hasNode("e4")).toBe(false);
+    expect(graph.order).toBe(3);
+    expect(screen.getByText("1 unconnected or paired, hidden")).toBeInTheDocument();
+    // The count line describes what is drawn; the fourth entity is
+    // unconnected, so it is reported by the chip beside it rather than
+    // counted here.
+    expect(screen.getByText("3 entities · 1 region")).toBeInTheDocument();
+  });
+
+  it("hides a component smaller than three nodes and folds it into the hidden chip", async () => {
+    // Round 3, section C: a bare pair off on its own is a crumb — it carries
+    // no shape a reader can navigate by, and dozens of them are what made the
+    // map read as confetti. It goes behind the same chip as the isolates.
+    const entities = [
+      makeEntity({ id: "e1", name: "Alice" }),
+      makeEntity({ id: "e2", name: "Bob" }),
+      makeEntity({ id: "e3", name: "Carol" }),
+      makeEntity({ id: "p1", name: "Pat" }),
+      makeEntity({ id: "p2", name: "Quinn" }),
+    ];
+    const relation = (id: string, target: string, name: string) => ({
+      id,
+      relation_type: "knows",
+      direction: "outgoing" as const,
+      entity_id: target,
+      entity_name: name,
+      entity_type: "person",
+      source_agent: null,
+      created_at: Math.floor(Date.now() / 1000),
+    });
+    mockListEntities.mockResolvedValue(entities);
+    mockGetEntityDetail.mockImplementation(async (id: string) => ({
+      entity: entities.find((e) => e.id === id)!,
+      observations: [],
+      relations:
+        id === "e1"
+          ? [relation("rel-1", "e2", "Bob"), relation("rel-2", "e3", "Carol")]
+          : id === "p1"
+            ? [relation("rel-3", "p2", "Quinn")]
+            : [],
+    }));
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    const graph = capturedSigmaInstances[0].graph;
+
+    // The trio is drawn; the pair is not, even though both its nodes have a
+    // connection and neither is an isolate.
+    expect(graph.order).toBe(3);
+    expect(graph.hasNode("e1")).toBe(true);
+    expect(graph.hasNode("p1")).toBe(false);
+    expect(graph.hasNode("p2")).toBe(false);
+    expect(graph.hasEdge("p1", "p2")).toBe(false);
+    expect(screen.getByText("2 unconnected or paired, hidden")).toBeInTheDocument();
+    expect(screen.getByText("3 entities · 1 region")).toBeInTheDocument();
   });
 
   it("mounts the cartography underlay canvas beneath sigma and removes it on unmount", async () => {
@@ -801,6 +877,7 @@ describe("AtlasView", () => {
       stroke: vi.fn(),
       fill: vi.fn(),
       fillText: vi.fn(),
+      measureText: vi.fn((text: string) => ({ width: text.length * 7 })),
     };
     underlay.getContext = vi.fn().mockReturnValue(ctx) as any;
 
@@ -810,11 +887,12 @@ describe("AtlasView", () => {
     expect(underlay.width).toBe(400);
     expect(underlay.height).toBe(600);
     expect(ctx.clearRect).toHaveBeenCalledWith(0, 0, 400, 600);
-    // The settled pair sits off-origin, so the graticule paints: 3 dashed
-    // rings. (Two singleton communities → no hulls, no bridges — MIN_REGION_SIZE.)
+    // The settled trio sits off-origin, so the graticule paints: 3 dashed rings.
     expect(ctx.setLineDash).toHaveBeenCalledWith([1, 7]);
     expect(ctx.arc).toHaveBeenCalledTimes(3);
-    expect(ctx.fillText).not.toHaveBeenCalled();
+    // One community of three, so exactly one region name is painted — the
+    // label placer keeps it because nothing else competes for the space.
+    expect(ctx.fillText).toHaveBeenCalledTimes(1);
   });
 
   // Two 3-cliques joined by one bridge (a1–b1). Peak-climbing puts each
@@ -900,7 +978,7 @@ describe("AtlasView", () => {
     expect(screen.getByText("Isolate has no connections yet.")).toBeInTheDocument();
     expect(screen.queryByText("Bridge")).not.toBeInTheDocument();
     expect(
-      screen.getByText("1 new connection. Alice gained 1 — the fastest-growing node."),
+      screen.getByText("2 new connections. Alice gained 2 — the fastest-growing node."),
     ).toBeInTheDocument();
 
     // Cards render gap-first, so the first action belongs to the isolate.
@@ -908,7 +986,7 @@ describe("AtlasView", () => {
     // page; flying the camera would land on empty map.
     const actions = screen.getAllByRole("button", { name: "Show in Atlas →" });
     fireEvent.click(actions[0]);
-    expect(onNodeClick).toHaveBeenCalledWith({ kind: "entity", id: "e3" });
+    expect(onNodeClick).toHaveBeenCalledWith({ kind: "entity", id: "e4" });
     expect(instance.camera.animate).not.toHaveBeenCalled();
   });
 
@@ -1035,10 +1113,14 @@ describe("AtlasView", () => {
   });
 
   it("Space selector scopes the graph to one space and back", async () => {
+    // Three connected entities in one space, because a component smaller than
+    // MIN_COMPONENT_SIZE (model.ts) is not drawn at all — plus one isolate in
+    // another space, which is what the selector has to scope away.
     const entities = [
       makeEntity({ id: "e1", name: "Alice", domain: "wenlan-dev" }),
       makeEntity({ id: "e2", name: "Bob", domain: "wenlan-dev" }),
-      makeEntity({ id: "e3", name: "Isolate", domain: "personal" }),
+      makeEntity({ id: "e3", name: "Carol", domain: "wenlan-dev" }),
+      makeEntity({ id: "e4", name: "Isolate", domain: "personal" }),
     ];
     mockListEntities.mockResolvedValue(entities);
     mockGetEntityDetail.mockImplementation(async (id: string) => ({
@@ -1057,6 +1139,16 @@ describe("AtlasView", () => {
                 source_agent: null,
                 created_at: Math.floor(Date.now() / 1000),
               },
+              {
+                id: "rel-2",
+                relation_type: "knows",
+                direction: "outgoing" as const,
+                entity_id: "e3",
+                entity_name: "Carol",
+                entity_type: "person",
+                source_agent: null,
+                created_at: Math.floor(Date.now() / 1000),
+              },
             ]
           : [],
     }));
@@ -1068,17 +1160,17 @@ describe("AtlasView", () => {
     expect(
       Array.from((select as HTMLSelectElement).options).map((o) => o.textContent),
     ).toEqual(["All spaces", "personal", "wenlan-dev"]);
-    // Only e1<->e2 are connected, so the count line reads 2 either way; the
-    // scoping is visible in the graph itself and in the unconnected chip.
-    expect(screen.getByText("2 entities")).toBeInTheDocument();
-    expect(screen.getByText("1 unconnected hidden")).toBeInTheDocument();
+    // Only the wenlan-dev trio is connected, so the count line reads 3 either
+    // way; the scoping is visible in the graph itself and in the hidden chip.
+    expect(screen.getByText("3 entities · 1 region")).toBeInTheDocument();
+    expect(screen.getByText("1 unconnected or paired, hidden")).toBeInTheDocument();
 
     fireEvent.change(select, { target: { value: "wenlan-dev" } });
-    expect(await screen.findByText("2 entities")).toBeInTheDocument();
-    expect(screen.queryByText("1 unconnected hidden")).not.toBeInTheDocument();
+    expect(await screen.findByText("3 entities · 1 region")).toBeInTheDocument();
+    expect(screen.queryByText("1 unconnected or paired, hidden")).not.toBeInTheDocument();
 
     fireEvent.change(select, { target: { value: "" } });
-    expect(await screen.findByText("1 unconnected hidden")).toBeInTheDocument();
+    expect(await screen.findByText("1 unconnected or paired, hidden")).toBeInTheDocument();
   });
 
   it("hides the Space selector when no entity carries a space", async () => {
@@ -1221,9 +1313,13 @@ describe("AtlasView", () => {
   // already carries every entity, so a half-visible relation is a filtered-out
   // edge, not a node the view has to invent.
   it("drops a cross-space relation under a space filter instead of synthesizing an unscoped neighbor", async () => {
+    // Alice and Carol sit in Work, Bob in Personal, all three in one component
+    // so the unfiltered graph clears MIN_COMPONENT_SIZE (model.ts) and is
+    // actually drawn.
     const entities = [
       makeEntity({ id: "e1", name: "Alice", domain: "Work" }),
       makeEntity({ id: "e2", name: "Bob", domain: "Personal" }),
+      makeEntity({ id: "e3", name: "Carol", domain: "Work" }),
     ];
     mockListEntities.mockResolvedValue(entities);
     mockGetEntityDetail.mockImplementation(async (id: string) => ({
@@ -1242,13 +1338,23 @@ describe("AtlasView", () => {
                 source_agent: null,
                 created_at: Math.floor(Date.now() / 1000),
               },
+              {
+                id: "rel-2",
+                relation_type: "knows",
+                direction: "outgoing" as const,
+                entity_id: "e3",
+                entity_name: "Carol",
+                entity_type: "person",
+                source_agent: null,
+                created_at: Math.floor(Date.now() / 1000),
+              },
             ]
           : [],
     }));
     // Both spaces publish durable cartography, so nothing about the daemon
     // reads is degraded — only the filtered view is.
     const communityId = (space: string) => (space === "Work" ? "c1" : "c2");
-    const nodeId = (space: string) => (space === "Work" ? "e1" : "e2");
+    const nodeIds = (space: string) => (space === "Work" ? ["e1", "e3"] : ["e2"]);
     mockListCommunities.mockImplementation(async (space: string) => ({
       schema_version: "community-read-v1" as const,
       communities: [
@@ -1256,7 +1362,7 @@ describe("AtlasView", () => {
           community_id: communityId(space),
           space,
           display_name: null,
-          member_count: 1,
+          member_count: nodeIds(space).length,
           published_generation: 1,
           algo_version: "v1",
           projection_version: "v1",
@@ -1266,16 +1372,14 @@ describe("AtlasView", () => {
     }));
     mockListCommunityMembers.mockImplementation(async (space: string) => ({
       schema_version: "community-read-v1" as const,
-      members: [
-        {
-          space,
-          node_id: nodeId(space),
-          node_kind: "entity",
-          community_id: communityId(space),
-          published_generation: 1,
-          attachment: "core",
-        },
-      ],
+      members: nodeIds(space).map((node_id) => ({
+        space,
+        node_id,
+        node_kind: "entity",
+        community_id: communityId(space),
+        published_generation: 1,
+        attachment: "core",
+      })),
       next_cursor: null,
     }));
 
@@ -1290,14 +1394,14 @@ describe("AtlasView", () => {
       target: { value: "Work" },
     });
 
-    // Bob is gone and so is the edge to him, which leaves Alice unconnected
-    // and therefore hidden — but no space-less node was invented, so the badge
-    // stays durable.
+    // Bob is gone and so is the edge to him, which leaves Alice and Carol as a
+    // bare pair — under MIN_COMPONENT_SIZE, so nothing is drawn. No space-less
+    // node was invented, so the badge stays durable.
     await waitFor(() => expect(capturedSigmaInstances.length).toBeGreaterThan(1));
     const scoped = capturedSigmaInstances[capturedSigmaInstances.length - 1].graph;
     expect(scoped.hasNode("e2")).toBe(false);
     expect(scoped.order).toBe(0);
-    expect(await screen.findByText("1 unconnected hidden")).toBeInTheDocument();
+    expect(await screen.findByText("2 unconnected or paired, hidden")).toBeInTheDocument();
     expect(screen.getByText("Durable regions")).toBeInTheDocument();
     expect(screen.queryByText("Estimated regions")).not.toBeInTheDocument();
   });
@@ -1388,6 +1492,9 @@ describe("AtlasView", () => {
       fillText: vi.fn((text: string) => {
         state.regionNames.push(text);
       }),
+      // The region-label placement pass measures every candidate name; jsdom
+      // has no text engine, so report a deterministic 7px per character.
+      measureText: vi.fn((text: string) => ({ width: text.length * 7 })),
     };
     return { ctx, state };
   }
@@ -1600,11 +1707,12 @@ describe("AtlasView", () => {
     expect(onBack).toHaveBeenCalledTimes(1);
   });
 
-  it("drags a memory node like any other member of the sim", async () => {
-    // Every drawn node has degree > 0 now, so every drawn node is a sim
-    // member — including memories, which used to have no representation here
-    // at all. (The old isolate-drag case is gone with the isolate ring;
-    // placeIsolateRing's own tests still cover the function.)
+  it("drags a leaf memory by direct manipulation, without reheating the sim", async () => {
+    // A memory with exactly one link is a satellite, not a sim member (see
+    // nonSimulatedIds in atlas.ts): a single link has one rest position, so
+    // simulating it buys nothing. Dragging one still moves it — the
+    // mousemovebody handler writes straight onto the graph — but there is no
+    // pin to set and nothing to reheat.
     withMemoryLayerOn();
     mockConnectedPairWithMemory();
 
@@ -1617,13 +1725,14 @@ describe("AtlasView", () => {
     const restartSpy = vi.spyOn(sim, "restart");
 
     expect(graph.hasNode("mem:m1")).toBe(true);
+    expect(sim.nodes().some((n: { id: string }) => n.id === "mem:m1")).toBe(false);
     const before = {
       x: graph.getNodeAttribute("mem:m1", "x"),
       y: graph.getNodeAttribute("mem:m1", "y"),
     };
 
     instance.handlers.get("downNode")?.({ node: "mem:m1" });
-    expect(restartSpy).toHaveBeenCalled();
+    expect(restartSpy).not.toHaveBeenCalled();
 
     mouseCaptor.handlers.get("mousemovebody")?.(dragEvent(500, 500));
 
@@ -1633,6 +1742,30 @@ describe("AtlasView", () => {
     };
     expect(after).not.toEqual(before);
     expect(after).toEqual({ x: 500, y: 500 });
+  });
+
+  it("carries a leaf memory along when its anchor entity is dragged", async () => {
+    // The flip side of the satellite rule: the orbit is rewritten on every
+    // tick writeback, so a memory follows the entity it hangs off instead of
+    // being dragged around on its own.
+    withMemoryLayerOn();
+    mockConnectedPairWithMemory();
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    const instance = capturedSigmaInstances[0];
+    const graph = instance.graph;
+    const mouseCaptor = instance.getMouseCaptor();
+    const sim = (window as any).__ATLAS_SIM;
+
+    instance.handlers.get("downNode")?.({ node: "e1" });
+    mouseCaptor.handlers.get("mousemovebody")?.(dragEvent(500, 500));
+    sim.tick(1);
+
+    const anchorRadius = (graph.getNodeAttribute("e1", "size") as number) + 6;
+    const dx = (graph.getNodeAttribute("mem:m1", "x") as number) - 500;
+    const dy = (graph.getNodeAttribute("mem:m1", "y") as number) - 500;
+    expect(Math.hypot(dx, dy)).toBeCloseTo(anchorRadius, 6);
   });
 
   it("draws memories as nodes linked to their entities, counts them, and legends them", async () => {
@@ -1650,7 +1783,7 @@ describe("AtlasView", () => {
     expect(graph.getNodeAttribute("mem:m1", "size")).toBeLessThan(
       graph.getNodeAttribute("e1", "size") as number,
     );
-    expect(screen.getByText("2 entities · 1 memory")).toBeInTheDocument();
+    expect(screen.getByText("3 entities · 1 memory · 1 region")).toBeInTheDocument();
     expect(screen.getByText("Memory")).toBeInTheDocument();
   });
 
@@ -1670,9 +1803,12 @@ describe("AtlasView", () => {
 
   it("hides a memory whose only entity is filtered out by the space selector", async () => {
     withMemoryLayerOn();
+    // Three Work entities, so the scoped map still has a component big enough
+    // to draw (MIN_COMPONENT_SIZE in model.ts) once the memory is filtered out.
     const entities = [
       makeEntity({ id: "e1", name: "Alice", domain: "Work" }),
       makeEntity({ id: "e2", name: "Bob", domain: "Work" }),
+      makeEntity({ id: "e3", name: "Carol", domain: "Work" }),
     ];
     mockListEntities.mockResolvedValue(entities);
     mockGetEntityDetail.mockImplementation(async (id: string) => ({
@@ -1687,6 +1823,16 @@ describe("AtlasView", () => {
                 direction: "outgoing" as const,
                 entity_id: "e2",
                 entity_name: "Bob",
+                entity_type: "person",
+                source_agent: null,
+                created_at: Math.floor(Date.now() / 1000),
+              },
+              {
+                id: "rel-2",
+                relation_type: "knows",
+                direction: "outgoing" as const,
+                entity_id: "e3",
+                entity_name: "Carol",
                 entity_type: "person",
                 source_agent: null,
                 created_at: Math.floor(Date.now() / 1000),
@@ -1749,7 +1895,7 @@ describe("AtlasView", () => {
     // the two pages that cite it are joined directly instead.
     expect(graph.hasNode("mem:m1")).toBe(false);
     expect(graph.hasEdge("page:p1", "page:p2")).toBe(true);
-    expect(screen.getByText("2 pages · 2 entities · 1 region")).toBeInTheDocument();
+    expect(screen.getByText("2 pages · 3 entities · 1 region")).toBeInTheDocument();
     expect(screen.getByText("Wiki page")).toBeInTheDocument();
   });
 
@@ -1771,7 +1917,7 @@ describe("AtlasView", () => {
     const withMemories = capturedSigmaInstances[capturedSigmaInstances.length - 1].graph;
     expect(withMemories.hasNode("mem:m1")).toBe(true);
     expect(memories).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByText("2 pages · 2 entities · 1 memory · 1 region")).toBeInTheDocument();
+    expect(screen.getByText("2 pages · 3 entities · 1 memory · 1 region")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Entities" }));
     await waitFor(() => {

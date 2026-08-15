@@ -14,6 +14,7 @@ import {
   filterKnowledgeGraph,
   memorySourceId,
   pageIdOf,
+  drawableModel,
   DEFAULT_LAYERS,
   MEMORY_NODE_TYPE,
   PAGE_NODE_TYPE,
@@ -31,6 +32,7 @@ import {
   drawRadialNodeLabel,
 } from "../../lib/graph/atlas";
 import type { HoverState, AtlasSimNode } from "../../lib/graph/atlas";
+import type { CartographyScene } from "../../lib/graph/cartography";
 import {
   communitiesFor,
   cartographyScene,
@@ -162,6 +164,12 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // clickNode so a drag-release doesn't also fire entity navigation.
   const draggedNodeRef = useRef<string | null>(null);
   const movedDuringPressRef = useRef(false);
+  // Cached cartography (hulls + graticule). Recomputing every hull on every
+  // afterRender meant a plain camera pan or a hover re-hulled all 66 regions;
+  // the scene only actually changes when node positions or communities do, so
+  // paints mark it dirty and drawUnderlay rebuilds only then.
+  const sceneRef = useRef<CartographyScene | null>(null);
+  const sceneDirtyRef = useRef(true);
 
   // ONE read for the whole graph. This used to be two queries — every entity,
   // then a detail fetch per entity capped at the first 20 — which drew every
@@ -234,14 +242,13 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     [graph, spaceFilter, layers],
   );
 
-  // What sigma actually draws. Degree-0 nodes are left out entirely: on real
-  // data ~960 of 1,600 entities have no relation at all, and drawing them as
-  // a ring around the graph buried the graph. The count of what was left out
-  // is shown in the toolbar instead.
-  const visibleModel = useMemo<GraphModel>(
-    () => ({ ...model, nodes: model.nodes.filter((node) => node.degree > 0) }),
-    [model],
-  );
+  // What sigma actually draws. Nodes in a connected component smaller than
+  // MIN_COMPONENT_SIZE are left out entirely (model.ts): on real data ~960 of
+  // 1,600 entities have no relation at all, and another ~196 sit in 137
+  // pairs-and-triples that d3's centering force flings into a ring around the
+  // core. Both buried the map. The count of what was left out is shown in the
+  // toolbar instead.
+  const visibleModel = useMemo<GraphModel>(() => drawableModel(model), [model]);
   const hiddenCount = model.nodes.length - visibleModel.nodes.length;
 
   // Anything in cartography.ts's unscoped bucket is drawn on the fallback
@@ -471,11 +478,16 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     const graph = buildAtlasGraph(visibleModel, palette, communities);
     runAtlasLayout(graph);
     graphRef.current = graph;
+    sceneRef.current = null;
+    sceneDirtyRef.current = true;
 
     // Same-frame paint per physics step (see createAtlasSimulation's onTick
     // note). sigmaRef is still null during the synchronous settle ticks, so
     // the 220 pre-paint steps don't render.
-    const sim = createAtlasSimulation(graph, () => sigmaRef.current?.refresh());
+    const sim = createAtlasSimulation(graph, () => {
+      sceneDirtyRef.current = true;
+      sigmaRef.current?.refresh();
+    });
     simRef.current = sim;
     if (import.meta.env.DEV) {
       // Preview/debug handle only — stripped from prod builds.
@@ -566,9 +578,13 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, height);
+      if (sceneDirtyRef.current || sceneRef.current === null) {
+        sceneRef.current = cartographyScene(graph, communitiesRef.current);
+        sceneDirtyRef.current = false;
+      }
       drawCartography(
         ctx,
-        cartographyScene(graph, communitiesRef.current),
+        sceneRef.current,
         (pos) => renderer.graphToViewport(pos),
         paletteRef.current,
       );
@@ -703,6 +719,9 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       const pos = renderer.viewportToGraph(e);
       graph.setNodeAttribute(draggedNode, "x", pos.x);
       graph.setNodeAttribute(draggedNode, "y", pos.y);
+      // Written straight onto the graph, outside the sim's writeback, so the
+      // hulls have to be told the positions moved.
+      sceneDirtyRef.current = true;
       // Instant response between ticks — the dragged node's own position
       // isn't waiting on the next sim tick; its neighbors flow toward this
       // pin as the sim (reheated on downNode) keeps ticking.
@@ -802,6 +821,9 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // fresh map (drawUnderlay reads it at paint time), then refresh.
   useEffect(() => {
     communitiesRef.current = communities;
+    // Region membership is derived from the communities map, so a status flip
+    // invalidates the cached hulls even though nothing moved.
+    sceneDirtyRef.current = true;
     const graph = graphRef.current;
     const renderer = sigmaRef.current;
     if (!graph || !renderer) return;

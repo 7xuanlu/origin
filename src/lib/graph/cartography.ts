@@ -17,6 +17,26 @@ export const MIN_REGION_SIZE = 3;
 /** Screen-px padding between a member node and its hull edge. */
 const HULL_PAD = 26;
 
+/** A region whose hull is narrower than this on screen is a speck: its name
+ *  would be noise rather than orientation, so it goes unlabelled until you
+ *  zoom in far enough for the hull to cross the bar. */
+export const MIN_LABELLED_HULL_PX = 90;
+
+/** Hard ceiling on drawn region names per paint, at any zoom. Real data has
+ *  66 regions with memories off and 148 with them on; drawing every name at
+ *  fit-to-screen turned the map into overlapping strips of text. */
+export const MAX_REGION_LABELS = 24;
+
+/** Clear air demanded around a candidate label before it may sit next to an
+ *  already-placed one. */
+const LABEL_BOX_PAD = 4;
+
+/** The one region-label font (the artifact's `.region` style), sized per call
+ *  — shared by the width measurement and the actual draw so the two agree. */
+function regionLabelFont(size: number): string {
+  return `italic 500 ${size}px Fraunces, Georgia, serif`;
+}
+
 function pushInto<K, V>(map: Map<K, V[]>, key: K, value: V): void {
   const list = map.get(key);
   if (list) list.push(value);
@@ -501,6 +521,66 @@ function traceSmoothHull(
   }
 }
 
+/** One region name that earned its place on this paint, in viewport CSS px. */
+export interface PlacedLabel {
+  name: string;
+  /** Horizontal centre of the text (drawn with textAlign "center"). */
+  x: number;
+  /** Text baseline (drawn with textBaseline "bottom"). */
+  y: number;
+  /** Font size in px: 16 for the first label placed, 13 for every other. */
+  size: number;
+}
+
+/**
+ * Which region names actually get drawn, and where. Pure and injectable so it
+ * can be unit-tested without a canvas: `project` maps graph coords to viewport
+ * CSS px and `measure(text, size)` reports the text width the real 2D context
+ * would report.
+ *
+ * Regions arrive largest-first (communityRegions sorts them) and are walked in
+ * that order, so the biggest region always wins a contested spot. A region is
+ * skipped when its hull is a speck on screen (narrower than
+ * MIN_LABELLED_HULL_PX) or when its label box would touch one already placed;
+ * placement stops at MAX_REGION_LABELS. Hulls themselves are always drawn —
+ * only the names are thinned — and because on-screen hull width grows with
+ * zoom, more names appear as you approach.
+ */
+export function placeRegionLabels(
+  scene: CartographyScene,
+  project: (pos: { x: number; y: number }) => { x: number; y: number },
+  measure: (text: string, size: number) => number,
+): PlacedLabel[] {
+  const placed: PlacedLabel[] = [];
+  const boxes: { left: number; right: number; top: number; bottom: number }[] = [];
+  for (const region of scene.regions) {
+    if (placed.length >= MAX_REGION_LABELS) break;
+    const screenHull = region.hull.map(project);
+    if (screenHull.length === 0) continue;
+    const xs = screenHull.map((p) => p.x);
+    if (Math.max(...xs) - Math.min(...xs) < MIN_LABELLED_HULL_PX) continue;
+    const cx = xs.reduce((sum, x) => sum + x, 0) / xs.length;
+    const top = Math.min(...screenHull.map((p) => p.y));
+    const size = placed.length === 0 ? 16 : 13;
+    // The smooth blob can bow a touch past the raw hull top between two
+    // expanded vertices, so the name gets pad + 14 of lift, not pad + 8.
+    const baseline = top - HULL_PAD - 14;
+    const halfWidth = measure(region.name, size) / 2;
+    const box = { left: cx - halfWidth, right: cx + halfWidth, top: baseline - size, bottom: baseline };
+    const overlaps = boxes.some(
+      (other) =>
+        other.left < box.right + LABEL_BOX_PAD &&
+        box.left - LABEL_BOX_PAD < other.right &&
+        other.top < box.bottom + LABEL_BOX_PAD &&
+        box.top - LABEL_BOX_PAD < other.bottom,
+    );
+    if (overlaps) continue;
+    boxes.push(box);
+    placed.push({ name: region.name, x: cx, y: baseline, size });
+  }
+  return placed;
+}
+
 /**
  * Paint the cartography underlay in VIEWPORT space. `project` maps graph
  * coords to viewport CSS px (AtlasView passes sigma's graphToViewport).
@@ -548,25 +628,22 @@ export function drawCartography(
   }
 
   // Region names last, above their hulls: italic serif with wide tracking
-  // (the artifact's .region style), centered above the hull's top edge. The
-  // dominant region gets 16px, the rest 13px (.region.minor).
-  scene.regions.forEach((region, i) => {
-    const screenHull = region.hull.map(project);
-    if (screenHull.length === 0) return;
-    const cx = screenHull.reduce((s, p) => s + p.x, 0) / screenHull.length;
-    const top = Math.min(...screenHull.map((p) => p.y));
-    const size = i === 0 ? 16 : 13;
-    ctx.font = `italic 500 ${size}px Fraunces, Georgia, serif`;
+  // (the artifact's .region style), centered above the hull's top edge — but
+  // only the ones that survive the placement pass (see placeRegionLabels).
+  const measure = (text: string, size: number): number => {
+    ctx.font = regionLabelFont(size);
+    return ctx.measureText(text).width;
+  };
+  for (const label of placeRegionLabels(scene, project, measure)) {
+    ctx.font = regionLabelFont(label.size);
     // Wide tracking is part of the artifact spec; jsdom's mock ctx simply
     // ignores the property.
-    ctx.letterSpacing = `${(size * 0.14).toFixed(1)}px`;
+    ctx.letterSpacing = `${(label.size * 0.14).toFixed(1)}px`;
     ctx.fillStyle = palette.labelMuted;
     ctx.textAlign = "center";
     ctx.textBaseline = "bottom";
-    // The smooth blob can bow a touch past the raw hull top between two
-    // expanded vertices, so the name gets pad + 14 of lift, not pad + 8.
-    ctx.fillText(region.name, cx, top - HULL_PAD - 14);
+    ctx.fillText(label.name, label.x, label.y);
     ctx.letterSpacing = "0px";
-  });
+  }
   ctx.restore();
 }

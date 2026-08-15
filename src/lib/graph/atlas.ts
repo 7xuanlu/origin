@@ -16,9 +16,11 @@ import { bridgeEdgeTest } from "./cartography";
 
 const MIN_NODE_SIZE = 3;
 const MAX_NODE_SIZE = 12;
-/** Wiki pages sit on the same scale as entities, one base step above an
- *  unconfirmed one — pages ARE subjects on this map. */
-const PAGE_NODE_BASE = 3.5;
+/** Wiki pages sit on the same scale as entities. Round 3 pulled the base from
+ *  3.5 down to the unconfirmed-entity 3: with shared-source overlap no longer
+ *  counting toward size (see buildAtlasGraph), a page reads as a subject
+ *  without the whole page layer drawing a size step above the entities. */
+const PAGE_NODE_BASE = 3;
 /** Memory nodes start below the smallest entity and stay there: they are
  *  context around the subjects, and a memory linked to six entities must not
  *  outgrow the entities themselves. */
@@ -30,7 +32,7 @@ const MEMORY_MAX_SIZE = 4;
  *  visibly bigger while leaving the long tail distinguishable. */
 const DEGREE_GAIN = 1.6;
 
-// Base by stability/kind (confirmed 4, unconfirmed 3, page 3.5, memory 2)
+// Base by stability/kind (confirmed 4, unconfirmed 3, page 3, memory 2)
 // plus DEGREE_GAIN per doubling of degree, capped. Size still encodes
 // confirmation at degree 0, as it did before.
 function nodeSizeFor(confirmed: boolean | null, degree: number, entityType?: string): number {
@@ -68,12 +70,28 @@ export function buildAtlasGraph(
   // ponytail: the old graph's confirmed-glow halo (r+3 disc at 0.1 alpha) is
   // skipped — it needs a custom WebGL node program in sigma; the tiered fills
   // and size base carry the confirmed/unconfirmed distinction instead.
+
+  // Shared-source edges stand for an inferred overlap, not an asserted link,
+  // so they must not inflate a page's disc: size is computed from the degree
+  // MINUS however many shared-source edges touch the node. Done here rather
+  // than as a second field on GraphNode — the model type stays untouched, and
+  // the one place that draws discs is the one place that has to know.
+  const sharedSourceIncident = new Map<string, number>();
+  for (const edge of model.edges) {
+    if (edge.type !== SHARED_SOURCE_EDGE_TYPE) continue;
+    sharedSourceIncident.set(edge.source, (sharedSourceIncident.get(edge.source) ?? 0) + 1);
+    if (edge.target !== edge.source) {
+      sharedSourceIncident.set(edge.target, (sharedSourceIncident.get(edge.target) ?? 0) + 1);
+    }
+  }
+
   const n = model.nodes.length;
   model.nodes.forEach((node, i) => {
     const angle = (2 * Math.PI * i) / Math.max(n, 1);
+    const sizingDegree = Math.max(0, node.degree - (sharedSourceIncident.get(node.id) ?? 0));
     graph.addNode(node.id, {
       label: node.name,
-      size: nodeSizeFor(node.confirmed, node.degree, node.entityType),
+      size: nodeSizeFor(node.confirmed, sizingDegree, node.entityType),
       color: nodeFillFor(node.entityType, node.confirmed, palette),
       entityType: node.entityType,
       // Kept on the node so the theme-flip recolor (AtlasView) can recompute
@@ -110,15 +128,60 @@ export function buildAtlasGraph(
   return graph;
 }
 
+/** Iteration budget for FA2: 600 on anything up to 200 nodes (unchanged from
+ *  round 2 at demo scale), decaying to the 60 floor by ~2,000 nodes. The whole
+ *  layout is synchronous on the main thread, so the budget has to shrink as
+ *  the per-iteration cost grows or the memory layer freezes the UI. */
+function layoutIterations(order: number): number {
+  return Math.min(600, Math.max(60, Math.floor(120_000 / Math.max(order, 1))));
+}
+
+/** Same shape for the d3 settle: the full 220 pre-paint ticks up to ~720
+ *  nodes, then down to the 60 floor. */
+function settleTicks(order: number): number {
+  return Math.min(220, Math.max(60, Math.floor(160_000 / Math.max(order, 1))));
+}
+
 /**
- * Force-directed refinement of the seeded circle, synchronous — fine at
- * today's top-20-cap scale.
- * ponytail: sync FA2, move to a graphology worker when the bulk relations
- * endpoint lands and node counts stop being top-20-capped.
+ * Force-directed refinement of the seeded circle, synchronous.
+ *
+ * Non-simulated nodes (leaf memories, isolates — see nonSimulatedIds) are laid
+ * out on a scratch copy that leaves them out entirely, then the positions are
+ * copied back. On real data that is ~1,300 of ~3,300 nodes and their edges
+ * removed from the O(n log n) repulsion, and they get their real positions
+ * from placeSatellites afterwards anyway.
+ *
+ * ponytail: still sync FA2. If this ever blocks past ~3s again, the next step
+ * is graphology-layout-forceatlas2's worker entry plus a "laying out" state.
  */
 export function runAtlasLayout(graph: Graph): void {
-  const iterations = Math.min(600, Math.max(100, graph.order * 6));
-  forceAtlas2.assign(graph, { iterations, settings: forceAtlas2.inferSettings(graph) });
+  const excluded = new Set(nonSimulatedIds(graph));
+  if (excluded.size === 0) {
+    forceAtlas2.assign(graph, {
+      iterations: layoutIterations(graph.order),
+      settings: forceAtlas2.inferSettings(graph),
+    });
+    return;
+  }
+
+  const core = new Graph({ multi: true });
+  graph.forEachNode((id, attrs) => {
+    if (excluded.has(id)) return;
+    core.addNode(id, { x: attrs.x, y: attrs.y, size: attrs.size });
+  });
+  graph.forEachEdge((key, _attrs, source, target) => {
+    if (excluded.has(source) || excluded.has(target)) return;
+    core.addEdgeWithKey(key, source, target, {});
+  });
+  if (core.order === 0) return;
+  forceAtlas2.assign(core, {
+    iterations: layoutIterations(core.order),
+    settings: forceAtlas2.inferSettings(core),
+  });
+  core.forEachNode((id, attrs) => {
+    graph.setNodeAttribute(id, "x", attrs.x);
+    graph.setNodeAttribute(id, "y", attrs.y);
+  });
 }
 
 /**
@@ -165,6 +228,72 @@ export function isolateIds(graph: Graph): string[] {
   return isolates;
 }
 
+/** Graph-space clearance between a leaf memory and the disc it orbits. */
+const SATELLITE_GAP = 6;
+
+/**
+ * Nodes no force layout runs on: degree-0 isolates (round 1's ring) plus every
+ * degree-1 MEMORY, which round 3 hangs off its one neighbour as a satellite
+ * instead. On real data 1,308 of 1,865 memories are such leaves; simulating
+ * them buys nothing — a single link has exactly one rest position — and it
+ * doubles the cost of every layout step.
+ */
+export function nonSimulatedIds(graph: Graph): string[] {
+  const ids: string[] = [];
+  graph.forEachNode((id, attrs) => {
+    const degree = graph.degree(id);
+    if (degree === 0 || (degree === 1 && attrs.entityType === MEMORY_NODE_TYPE)) ids.push(id);
+  });
+  return ids;
+}
+
+/** Where one leaf memory sits relative to the node it hangs off. */
+export interface Satellite {
+  id: string;
+  anchor: string;
+  angle: number;
+  radius: number;
+}
+
+/**
+ * Deterministic orbits for the leaf memories: each sits at its anchor's disc
+ * radius plus SATELLITE_GAP, spaced evenly by its index among that anchor's
+ * own leaves (sorted by id, so the answer never depends on iteration order).
+ * Isolates are skipped — they have no anchor to orbit.
+ */
+export function satellitePlan(graph: Graph): Satellite[] {
+  const leavesByAnchor = new Map<string, string[]>();
+  for (const id of nonSimulatedIds(graph)) {
+    if (graph.degree(id) === 0) continue;
+    const anchor = graph.neighbors(id)[0];
+    if (anchor === undefined) continue;
+    const list = leavesByAnchor.get(anchor);
+    if (list) list.push(id);
+    else leavesByAnchor.set(anchor, [id]);
+  }
+  const plan: Satellite[] = [];
+  for (const [anchor, leaves] of leavesByAnchor) {
+    const radius = (graph.getNodeAttribute(anchor, "size") as number) + SATELLITE_GAP;
+    const sorted = [...leaves].sort();
+    sorted.forEach((id, i) => {
+      plan.push({ id, anchor, angle: (2 * Math.PI * i) / sorted.length, radius });
+    });
+  }
+  return plan;
+}
+
+/** Write a satellite plan onto the graph. Cheap enough (two trig calls per
+ *  leaf) to re-run on every tick writeback, which is what makes a dragged
+ *  entity carry its memories along. */
+export function placeSatellites(graph: Graph, plan: Satellite[]): void {
+  for (const satellite of plan) {
+    const ax = graph.getNodeAttribute(satellite.anchor, "x") as number;
+    const ay = graph.getNodeAttribute(satellite.anchor, "y") as number;
+    graph.setNodeAttribute(satellite.id, "x", ax + satellite.radius * Math.cos(satellite.angle));
+    graph.setNodeAttribute(satellite.id, "y", ay + satellite.radius * Math.sin(satellite.angle));
+  }
+}
+
 export interface AtlasSimNode extends SimulationNodeDatum {
   id: string;
 }
@@ -190,16 +319,20 @@ export function createAtlasSimulation(
   graph: Graph,
   onTick?: () => void,
 ): Simulation<AtlasSimNode, undefined> {
-  const isolates = new Set(isolateIds(graph));
+  const excluded = new Set(nonSimulatedIds(graph));
+  const satellites = satellitePlan(graph);
   const nodes: AtlasSimNode[] = [];
   graph.forEachNode((id, attrs) => {
-    if (isolates.has(id)) return;
+    if (excluded.has(id)) return;
     nodes.push({ id, x: attrs.x as number, y: attrs.y as number });
   });
 
   const seenPairs = new Set<string>();
   const links: AtlasSimLink[] = [];
   graph.forEachEdge((_edge, _attrs, source, target) => {
+    // A link to a node the sim doesn't own would make d3 throw looking the
+    // endpoint up; a leaf memory's one edge is drawn but never simulated.
+    if (excluded.has(source) || excluded.has(target)) return;
     const pairKey = [source, target].sort().join("|");
     if (seenPairs.has(pairKey)) return;
     seenPairs.add(pairKey);
@@ -225,6 +358,10 @@ export function createAtlasSimulation(
       graph.setNodeAttribute(node.id, "x", node.x);
       graph.setNodeAttribute(node.id, "y", node.y);
     }
+    // Leaf memories ride their anchor, so they are re-placed after every
+    // position writeback — including mid-drag, which is what carries a
+    // dragged entity's memories along with it.
+    placeSatellites(graph, satellites);
     onTick?.();
   };
   sim.on("tick", writeBack);
@@ -241,8 +378,8 @@ export function createAtlasSimulation(
   };
 
   // Settle to equilibrium synchronously before first paint (≈ full alpha
-  // decay at 0.03) — see the doc comment above.
-  sim.tick(220);
+  // decay at 0.03 when the budget allows it) — see the doc comment above.
+  sim.tick(settleTicks(graph.order));
   sim.alpha(0);
   sim.stop();
   return sim;
@@ -343,11 +480,13 @@ export function drawRadialNodeLabel(
   context.globalAlpha = 1;
 }
 
-/** Ring stroke width in CSS px. */
-const PAGE_RING_WIDTH = 1.5;
+/** Ring stroke width in CSS px. Thinned from 1.5 in round 3: at real page
+ *  density the fatter ring merged neighbouring pages into one teal mass. */
+const PAGE_RING_WIDTH = 1;
 /** Clear air between the disc and its ring — without the gap the ring reads as
- *  a slightly fatter dot rather than a different kind of thing. */
-const PAGE_RING_GAP = 3;
+ *  a slightly fatter dot rather than a different kind of thing. Tightened from
+ *  3 for the same density reason as the stroke above. */
+const PAGE_RING_GAP = 2;
 
 /**
  * The halo ring that marks a wiki page. Sigma v3.0.3 ships only disc node

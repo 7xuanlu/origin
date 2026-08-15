@@ -952,8 +952,8 @@ const en = {
     countMemories_other: "{{count}} memories",
     countRegions_one: "{{count}} region",
     countRegions_other: "{{count}} regions",
-    unconnectedHidden_one: "{{count}} unconnected hidden",
-    unconnectedHidden_other: "{{count}} unconnected hidden",
+    unconnectedHidden_one: "{{count}} unconnected or paired, hidden",
+    unconnectedHidden_other: "{{count}} unconnected or paired, hidden",
     hint: "scroll to zoom · more labels appear as you approach",
     layer: {
       page: "Wiki pages",
@@ -2522,8 +2522,8 @@ const zhHans = {
     countMemories_other: "{{count}} 条记忆",
     countRegions_one: "{{count}} 个区域",
     countRegions_other: "{{count}} 个区域",
-    unconnectedHidden_one: "已隐藏 {{count}} 个无连接节点",
-    unconnectedHidden_other: "已隐藏 {{count}} 个无连接节点",
+    unconnectedHidden_one: "已隐藏 {{count}} 个无连接或仅成对的节点",
+    unconnectedHidden_other: "已隐藏 {{count}} 个无连接或仅成对的节点",
     hint: "滚动缩放 · 靠近可见更多标签",
     layer: {
       page: "维基页面",
@@ -4073,8 +4073,8 @@ const zhHant = {
     countMemories_other: "{{count}} 條記憶",
     countRegions_one: "{{count}} 個區域",
     countRegions_other: "{{count}} 個區域",
-    unconnectedHidden_one: "已隱藏 {{count}} 個無連接節點",
-    unconnectedHidden_other: "已隱藏 {{count}} 個無連接節點",
+    unconnectedHidden_one: "已隱藏 {{count}} 個無連接或僅成對的節點",
+    unconnectedHidden_other: "已隱藏 {{count}} 個無連接或僅成對的節點",
     hint: "捲動縮放 · 靠近可見更多標籤",
     layer: {
       page: "維基頁面",

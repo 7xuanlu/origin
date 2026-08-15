@@ -12,7 +12,11 @@ import {
   graticuleRadii,
   cartographyScene,
   drawCartography,
+  placeRegionLabels,
+  MAX_REGION_LABELS,
+  MIN_LABELLED_HULL_PX,
 } from "./cartography";
+import type { CartographyScene, Region } from "./cartography";
 
 const PALETTE: GraphPalette = {
   project: "#111111",
@@ -742,6 +746,9 @@ function mockCtx() {
     fillText: vi.fn((text: string, x: number, y: number) => {
       texts.push({ text, x, y, font: ctx.font, fillStyle: ctx.fillStyle });
     }),
+    // The real 2D context measures the label; jsdom's has no text engine, so
+    // the mock reports a deterministic 7px per character at the label size.
+    measureText: vi.fn((text: string) => ({ width: text.length * 7 })),
   };
   return { ctx: ctx as unknown as CanvasRenderingContext2D, strokes, fills, texts };
 }
@@ -829,15 +836,18 @@ describe("drawCartography", () => {
   });
 
   it("drops to 13px for secondary regions", () => {
+    // Both hulls are >= MIN_LABELLED_HULL_PX wide on screen and far enough
+    // apart vertically that neither label box touches the other, so the
+    // placement pass keeps both and only the size differs.
     const graph = graphOf(
       [
         { id: "a1", x: 0, y: 0, label: "Alpha" },
-        { id: "a2", x: 10, y: 0, label: "A2" },
-        { id: "a3", x: 5, y: 10, label: "A3" },
-        { id: "a4", x: 5, y: 5, label: "A4" },
-        { id: "b1", x: 100, y: 100, label: "Beta" },
-        { id: "b2", x: 110, y: 100, label: "B2" },
-        { id: "b3", x: 105, y: 110, label: "B3" },
+        { id: "a2", x: 120, y: 0, label: "A2" },
+        { id: "a3", x: 60, y: 40, label: "A3" },
+        { id: "a4", x: 60, y: 20, label: "A4" },
+        { id: "b1", x: 0, y: 300, label: "Beta" },
+        { id: "b2", x: 120, y: 300, label: "B2" },
+        { id: "b3", x: 60, y: 340, label: "B3" },
       ],
       [
         ["a1", "a2"],
@@ -871,5 +881,86 @@ describe("drawCartography", () => {
     const arc = ctx.arc as ReturnType<typeof vi.fn>;
     // maxNodeRadius 300 → outer ring 315 graph units → 157.5 at half scale.
     expect(arc.mock.calls[2][2]).toBeCloseTo(157.5, 5);
+  });
+});
+
+describe("placeRegionLabels", () => {
+  const identity = (pos: { x: number; y: number }) => pos;
+  // A fixed 7px per character keeps the overlap arithmetic in the tests exact.
+  const measure = (text: string, size: number) => text.length * (size / 2);
+
+  /** A rectangular hull `width` wide and 20 tall, with its top-left at (x, y). */
+  function boxRegion(name: string, x: number, y: number, width: number, members = 3): Region {
+    return {
+      name,
+      memberCount: members,
+      hull: [
+        { x, y },
+        { x: x + width, y },
+        { x: x + width, y: y + 20 },
+        { x, y: y + 20 },
+      ],
+    };
+  }
+
+  const sceneOf = (regions: Region[]): CartographyScene => ({ regions, maxNodeRadius: 100 });
+
+  it("skips a region whose hull is a speck on screen", () => {
+    const wide = boxRegion("Wide", 0, 0, MIN_LABELLED_HULL_PX);
+    const speck = boxRegion("Speck", 0, 500, MIN_LABELLED_HULL_PX - 1);
+    const placed = placeRegionLabels(sceneOf([wide, speck]), identity, measure);
+    expect(placed.map((label) => label.name)).toEqual(["Wide"]);
+  });
+
+  it("keeps the first of two regions whose label boxes would collide", () => {
+    // Same x span, 6px apart vertically: the second box lands inside the
+    // first one's 4px pad, so only the larger region keeps its name.
+    const big = boxRegion("Big", 0, 100, 200, 9);
+    const small = boxRegion("Small", 0, 106, 200, 4);
+    const placed = placeRegionLabels(sceneOf([big, small]), identity, measure);
+    expect(placed.map((label) => label.name)).toEqual(["Big"]);
+  });
+
+  it("draws both when the same two regions are pulled far enough apart", () => {
+    const big = boxRegion("Big", 0, 100, 200, 9);
+    const small = boxRegion("Small", 0, 400, 200, 4);
+    const placed = placeRegionLabels(sceneOf([big, small]), identity, measure);
+    expect(placed.map((label) => label.name)).toEqual(["Big", "Small"]);
+    // First placed is the dominant one; every other label drops to 13px.
+    expect(placed[0].size).toBe(16);
+    expect(placed[1].size).toBe(13);
+  });
+
+  it("walks regions in the order they arrive, so the largest wins a contested spot", () => {
+    // Region order is communityRegions' largest-first order; reversing the
+    // input reverses which of a colliding pair survives.
+    const a = boxRegion("A", 0, 100, 200, 9);
+    const b = boxRegion("B", 0, 106, 200, 4);
+    expect(placeRegionLabels(sceneOf([a, b]), identity, measure).map((l) => l.name)).toEqual(["A"]);
+    expect(placeRegionLabels(sceneOf([b, a]), identity, measure).map((l) => l.name)).toEqual(["B"]);
+  });
+
+  it("never draws more than MAX_REGION_LABELS names, however many fit", () => {
+    const regions = Array.from({ length: MAX_REGION_LABELS + 10 }, (_, i) =>
+      boxRegion(`R${i}`, 0, i * 300, 200),
+    );
+    const placed = placeRegionLabels(sceneOf(regions), identity, measure);
+    expect(placed).toHaveLength(MAX_REGION_LABELS);
+    expect(placed[placed.length - 1].name).toBe(`R${MAX_REGION_LABELS - 1}`);
+  });
+
+  it("reads hull width in SCREEN px, so zooming in reveals more names", () => {
+    // 60 graph units wide: a speck at 1x, comfortably labelled at 2x.
+    const scene = sceneOf([boxRegion("Zoomed", 0, 0, 60)]);
+    const doubled = (pos: { x: number; y: number }) => ({ x: pos.x * 2, y: pos.y * 2 });
+    expect(placeRegionLabels(scene, identity, measure)).toHaveLength(0);
+    expect(placeRegionLabels(scene, doubled, measure)).toHaveLength(1);
+  });
+
+  it("centres the name on the hull's screen centroid, lifted clear of the blob", () => {
+    const placed = placeRegionLabels(sceneOf([boxRegion("Mid", 40, 200, 100)]), identity, measure);
+    expect(placed[0].x).toBe(90);
+    // Hull top 200, minus HULL_PAD 26 and the 14px blob-bow clearance.
+    expect(placed[0].y).toBe(200 - 26 - 14);
   });
 });
