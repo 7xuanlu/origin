@@ -6,11 +6,19 @@ import {
   forceLink,
   forceManyBody,
   forceCenter,
+  forceCollide,
   type Simulation,
   type SimulationNodeDatum,
 } from "d3-force";
 import type { GraphModel } from "./model";
-import { MEMORY_NODE_TYPE, PAGE_NODE_TYPE, SHARED_SOURCE_EDGE_TYPE } from "./model";
+import {
+  MEMORY_NODE_TYPE,
+  PAGE_NODE_TYPE,
+  SHARED_SOURCE_EDGE_TYPE,
+  WIKILINK_EDGE_TYPE,
+  CITES_EDGE_TYPE,
+  MEMORY_EDGE_TYPE,
+} from "./model";
 import { nodeFillFor, type GraphPalette } from "./palette";
 import { bridgeEdgeTest } from "./cartography";
 
@@ -294,13 +302,184 @@ export function placeSatellites(graph: Graph, plan: Satellite[]): void {
   }
 }
 
+/** Graph-space clearance between two packed components, and between the core
+ *  and the first ring of them. Big enough that the gap reads as a gap at
+ *  fit-to-screen zoom, small enough that the cloud still hugs the core. */
+export const PACK_GAP = 24;
+/** How much further out the greedy search pushes a component each time the
+ *  current spiral radius still collides with something already placed. */
+export const PACK_STEP = 12;
+/** 137.5 degrees in radians — the phyllotaxis angle. Successive components
+ *  land on different sides of the core instead of stacking along one arm. */
+const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+
+interface PackedComponent {
+  ids: string[];
+  cx: number;
+  cy: number;
+  /** Distance from the component's bbox centre to its furthest node EDGE. */
+  radius: number;
+}
+
+/** Connected components over the simulated nodes only, in graph node order. */
+function simulatedComponents(graph: Graph, simulated: Set<string>): string[][] {
+  const parent = new Map<string, string>();
+  for (const id of simulated) parent.set(id, id);
+  const find = (start: string): string => {
+    let root = start;
+    while (parent.get(root) !== root) root = parent.get(root) as string;
+    let walk = start;
+    while (parent.get(walk) !== root) {
+      const next = parent.get(walk) as string;
+      parent.set(walk, root);
+      walk = next;
+    }
+    return root;
+  };
+  graph.forEachEdge((_key, _attrs, source, target) => {
+    if (!simulated.has(source) || !simulated.has(target)) return;
+    const a = find(source);
+    const b = find(target);
+    if (a !== b) parent.set(a, b);
+  });
+  const groups = new Map<string, string[]>();
+  for (const id of simulated) {
+    const root = find(id);
+    const list = groups.get(root);
+    if (list) list.push(id);
+    else groups.set(root, [id]);
+  }
+  return [...groups.values()];
+}
+
+function measureComponent(graph: Graph, ids: string[]): PackedComponent {
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const id of ids) {
+    const x = graph.getNodeAttribute(id, "x") as number;
+    const y = graph.getNodeAttribute(id, "y") as number;
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+  }
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  let radius = 0;
+  for (const id of ids) {
+    const x = graph.getNodeAttribute(id, "x") as number;
+    const y = graph.getNodeAttribute(id, "y") as number;
+    const size = (graph.getNodeAttribute(id, "size") as number) ?? 0;
+    radius = Math.max(radius, Math.hypot(x - cx, y - cy) + size);
+  }
+  return { ids, cx, cy, radius };
+}
+
+/**
+ * Round 4, section A. After the sim settles, charge repulsion plus
+ * forceCenter has pushed every small component out to roughly the same
+ * distance from the core — twenty-odd islands on one circle, which reads as
+ * the round-1 ring of dots at a coarser grain.
+ *
+ * This rearranges them: the biggest component is recentred on the origin and
+ * keeps the layout the sim gave it, and every other component is translated
+ * RIGIDLY (never re-laid-out) onto a phyllotaxis spiral around it. Each one
+ * starts at the smallest radius that clears the core and is pushed out in
+ * PACK_STEP increments until its bounding disc clears every component already
+ * placed, so no two overlap. Order is size-descending with an id tie-break,
+ * so the same graph always packs the same way.
+ *
+ * Pure in the sense that matters here: it reads x/y/size off the graph and
+ * writes x/y back, touching nothing else and consulting no clock or random.
+ */
+export function packComponents(graph: Graph, simulatedIds: string[]): void {
+  const simulated = new Set(simulatedIds);
+  if (simulated.size === 0) return;
+  const components = simulatedComponents(graph, simulated)
+    .map((ids) => measureComponent(graph, ids))
+    .sort((a, b) => b.ids.length - a.ids.length || (a.ids[0] < b.ids[0] ? -1 : 1));
+
+  const translate = (component: PackedComponent, tx: number, ty: number) => {
+    const dx = tx - component.cx;
+    const dy = ty - component.cy;
+    for (const id of component.ids) {
+      graph.setNodeAttribute(id, "x", (graph.getNodeAttribute(id, "x") as number) + dx);
+      graph.setNodeAttribute(id, "y", (graph.getNodeAttribute(id, "y") as number) + dy);
+    }
+    component.cx = tx;
+    component.cy = ty;
+  };
+
+  const core = components[0];
+  translate(core, 0, 0);
+  const placed: PackedComponent[] = [core];
+
+  for (let i = 1; i < components.length; i += 1) {
+    const component = components[i];
+    const angle = i * GOLDEN_ANGLE;
+    let r = core.radius + PACK_GAP + component.radius;
+    let x = 0;
+    let y = 0;
+    // Greedy: step outward along this arm until the component's disc clears
+    // every disc already placed. Bounded by the loop over `placed`, which is
+    // at most a couple of dozen components on real data.
+    for (;;) {
+      x = r * Math.cos(angle);
+      y = r * Math.sin(angle);
+      const clash = placed.some(
+        (other) => Math.hypot(x - other.cx, y - other.cy) < other.radius + component.radius + PACK_GAP,
+      );
+      if (!clash) break;
+      r += PACK_STEP;
+    }
+    translate(component, x, y);
+    placed.push(component);
+  }
+}
+
 export interface AtlasSimNode extends SimulationNodeDatum {
   id: string;
+  /** Collision radius: the drawn disc, plus a page's ring, plus COLLIDE_PAD. */
+  radius: number;
 }
 
 interface AtlasSimLink {
   source: string;
   target: string;
+  /** The graph edge's verb, which sets this link's rest length and pull. */
+  type: string;
+}
+
+/** Breathing room between two discs that are not otherwise pushed apart. Two
+ *  px is enough to stop the overlap that made page clusters read as one blob
+ *  without visibly loosening the rest of the map. */
+const COLLIDE_PAD = 2;
+/** Rest length and pull per edge verb; anything not listed keeps d3's own
+ *  defaults (distance 30, strength 1/min(degree)). A shared-source edge is an
+ *  inferred overlap, so it sits long and slack — it should suggest that two
+ *  pages are near each other, not staple them together. A wikilink is an
+ *  asserted link between pages, so it is shorter and firmer, but still longer
+ *  than a relation because page discs carry a ring. */
+const LINK_LAYOUT: Record<string, { distance: number; strength: number }> = {
+  [SHARED_SOURCE_EDGE_TYPE]: { distance: 70, strength: 0.15 },
+  [WIKILINK_EDGE_TYPE]: { distance: 50, strength: 0.5 },
+};
+
+/** Which verb survives when parallel edges between one pair collapse to a
+ *  single spring: the most strongly asserted one wins, so a wikilink is never
+ *  loosened by a shared-source edge that happens to run beside it. */
+function linkPriority(type: string): number {
+  if (type === WIKILINK_EDGE_TYPE) return 3;
+  if (type === CITES_EDGE_TYPE || type === MEMORY_EDGE_TYPE) return 1;
+  if (type === SHARED_SOURCE_EDGE_TYPE) return 0;
+  // Entity relations and page->entity `about` links: asserted, unremarkable.
+  return 2;
+}
+
+function linkEndId(end: string | AtlasSimNode): string {
+  return typeof end === "string" ? end : end.id;
 }
 
 /** d3-force simulation over the live graphology graph — the interaction engine.
@@ -324,25 +503,63 @@ export function createAtlasSimulation(
   const nodes: AtlasSimNode[] = [];
   graph.forEachNode((id, attrs) => {
     if (excluded.has(id)) return;
-    nodes.push({ id, x: attrs.x as number, y: attrs.y as number });
+    // A page is drawn as a disc plus a detached ring, so its footprint is
+    // wider than its `size` — collide against the ring or the rings overlap.
+    const ring =
+      attrs.entityType === PAGE_NODE_TYPE ? PAGE_RING_GAP + PAGE_RING_WIDTH : 0;
+    nodes.push({
+      id,
+      x: attrs.x as number,
+      y: attrs.y as number,
+      radius: (attrs.size as number) + ring + COLLIDE_PAD,
+    });
   });
 
-  const seenPairs = new Set<string>();
-  const links: AtlasSimLink[] = [];
-  graph.forEachEdge((_edge, _attrs, source, target) => {
+  const linkByPair = new Map<string, AtlasSimLink>();
+  graph.forEachEdge((_edge, attrs, source, target) => {
     // A link to a node the sim doesn't own would make d3 throw looking the
     // endpoint up; a leaf memory's one edge is drawn but never simulated.
     if (excluded.has(source) || excluded.has(target)) return;
     const pairKey = [source, target].sort().join("|");
-    if (seenPairs.has(pairKey)) return;
-    seenPairs.add(pairKey);
-    links.push({ source, target });
+    const type = (attrs.edgeType as string) ?? "";
+    const existing = linkByPair.get(pairKey);
+    if (!existing) {
+      linkByPair.set(pairKey, { source, target, type });
+      return;
+    }
+    if (linkPriority(type) > linkPriority(existing.type)) existing.type = type;
   });
+  const links = [...linkByPair.values()];
+
+  // d3's default link strength is 1/min(degree) over the LINK graph, computed
+  // privately inside forceLink — overriding .strength() would throw that away
+  // for every verb, so the same formula is rebuilt here and used for anything
+  // LINK_LAYOUT does not name.
+  const linkDegree = new Map<string, number>();
+  for (const link of links) {
+    linkDegree.set(link.source, (linkDegree.get(link.source) ?? 0) + 1);
+    linkDegree.set(link.target, (linkDegree.get(link.target) ?? 0) + 1);
+  }
 
   const sim = forceSimulation(nodes)
-    .force("link", forceLink<AtlasSimNode, AtlasSimLink>(links).id((d) => d.id))
+    .force(
+      "link",
+      forceLink<AtlasSimNode, AtlasSimLink>(links)
+        .id((d) => d.id)
+        .distance((link) => LINK_LAYOUT[link.type]?.distance ?? 30)
+        .strength((link) => {
+          const named = LINK_LAYOUT[link.type];
+          if (named) return named.strength;
+          const source = linkDegree.get(linkEndId(link.source)) ?? 1;
+          const target = linkDegree.get(linkEndId(link.target)) ?? 1;
+          return 1 / Math.min(source, target);
+        }),
+    )
     .force("charge", forceManyBody<AtlasSimNode>().strength(-40))
     .force("center", forceCenter(0, 0))
+    // Keeps discs off each other. Strength 0.7 (not 1) so the collision
+    // resolves over a few ticks instead of snapping, which reads calmer.
+    .force("collide", forceCollide<AtlasSimNode>().radius((d) => d.radius).strength(0.7).iterations(1))
     .alphaDecay(0.03)
     .velocityDecay(0.25);
 
@@ -380,6 +597,21 @@ export function createAtlasSimulation(
   // Settle to equilibrium synchronously before first paint (≈ full alpha
   // decay at 0.03 when the budget allows it) — see the doc comment above.
   sim.tick(settleTicks(graph.order));
+
+  // Round 4: the settle leaves every small component on roughly one circle
+  // around the core (charge pushes out, forceCenter pulls in, and they
+  // balance at about the same radius for all of them). Pack them into a
+  // spiral instead, then copy the packed positions back INTO the sim so a
+  // later drag flexes the packed layout rather than snapping to the ring.
+  packComponents(graph, nodes.map((node) => node.id));
+  for (const node of nodes) {
+    node.x = graph.getNodeAttribute(node.id, "x") as number;
+    node.y = graph.getNodeAttribute(node.id, "y") as number;
+  }
+  // Same writeback path as a tick, so satellites re-place around their moved
+  // anchors and the caller's onTick marks the cartography scene dirty.
+  writeBack();
+
   sim.alpha(0);
   sim.stop();
   return sim;

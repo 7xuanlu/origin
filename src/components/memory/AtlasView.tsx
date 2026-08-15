@@ -525,6 +525,13 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       // page, so the zoomed-out map shows hub names only; sigma's own label
       // grid reveals the rest as you zoom in.
       labelRenderedSizeThreshold: 7,
+      // Round 4: with memories on, the size threshold alone still let dozens
+      // of labels pile on top of each other. Sigma buckets the viewport into
+      // a grid and draws at most a few labels per cell; a coarse cell (120
+      // screen px) and a low density are what actually thin the soup. Both
+      // are measured in SCREEN px, so zooming in reveals more names.
+      labelDensity: 0.04,
+      labelGridCellSize: 120,
       // Default camera fit maps the graph bbox edge-to-edge on the tighter
       // axis, half-clipping the extreme nodes; give the map a margin.
       stagePadding: 40,

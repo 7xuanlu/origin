@@ -13,6 +13,8 @@ import {
   nonSimulatedIds,
   satellitePlan,
   placeSatellites,
+  packComponents,
+  PACK_GAP,
   hoverStateFor,
   nodeDisplay,
   edgeDisplay,
@@ -467,14 +469,16 @@ describe("createAtlasSimulation", () => {
     expect(after).not.toEqual(before);
   });
 
-  it("invokes onTick after every writeback — once for the settle batch, once per manual tick", () => {
+  it("invokes onTick after every writeback — settle, then the pack pass, then once per manual tick", () => {
     const graph = starGraph();
     const onTick = vi.fn();
     const sim = createAtlasSimulation(graph, onTick);
-    // The settle runs as a single wrapped tick(220) call → one writeback.
-    expect(onTick).toHaveBeenCalledTimes(1);
-    sim.tick(1);
+    // The settle runs as a single wrapped tick(220) call → one writeback;
+    // round 4's component packing runs the same writeback path afterwards so
+    // satellites follow their moved anchors → a second.
     expect(onTick).toHaveBeenCalledTimes(2);
+    sim.tick(1);
+    expect(onTick).toHaveBeenCalledTimes(3);
   });
 });
 
@@ -813,5 +817,278 @@ describe("nonSimulatedIds and satellites", () => {
     const g1 = buildAtlasGraph(leafModel(), PALETTE);
     const g2 = buildAtlasGraph(leafModel(), PALETTE);
     expect(satellitePlan(g1)).toEqual(satellitePlan(g2));
+  });
+});
+
+describe("packComponents", () => {
+  // Three islands, deliberately laid on top of each other so the packing has
+  // to move them: a 4-node core and two pairs, all built at the origin.
+  function islandModel(): GraphModel {
+    return makeModel(
+      [
+        node({ id: "c1" }),
+        node({ id: "c2" }),
+        node({ id: "c3" }),
+        node({ id: "c4" }),
+        node({ id: "a1" }),
+        node({ id: "a2" }),
+        node({ id: "b1" }),
+        node({ id: "b2" }),
+      ],
+      [
+        edge({ id: "e1", source: "c1", target: "c2" }),
+        edge({ id: "e2", source: "c2", target: "c3" }),
+        edge({ id: "e3", source: "c3", target: "c4" }),
+        edge({ id: "e4", source: "a1", target: "a2" }),
+        edge({ id: "e5", source: "b1", target: "b2" }),
+      ],
+    );
+  }
+
+  function packed(): Graph {
+    const graph = buildAtlasGraph(islandModel(), PALETTE);
+    packComponents(graph, graph.nodes());
+    return graph;
+  }
+
+  function measure(graph: Graph, ids: string[]) {
+    const xs = ids.map((id) => graph.getNodeAttribute(id, "x") as number);
+    const ys = ids.map((id) => graph.getNodeAttribute(id, "y") as number);
+    const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+    const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+    let radius = 0;
+    ids.forEach((id, i) => {
+      const size = graph.getNodeAttribute(id, "size") as number;
+      radius = Math.max(radius, Math.hypot(xs[i] - cx, ys[i] - cy) + size);
+    });
+    return { cx, cy, radius };
+  }
+
+  it("recentres the largest component on the origin", () => {
+    const graph = packed();
+    const core = measure(graph, ["c1", "c2", "c3", "c4"]);
+    expect(core.cx).toBeCloseTo(0, 6);
+    expect(core.cy).toBeCloseTo(0, 6);
+  });
+
+  it("leaves every component's internal layout untouched — the move is rigid", () => {
+    const before = buildAtlasGraph(islandModel(), PALETTE);
+    const after = packed();
+    // Same pairwise distance inside a component before and after packing.
+    const span = (graph: Graph, a: string, b: string) =>
+      Math.hypot(
+        (graph.getNodeAttribute(a, "x") as number) - (graph.getNodeAttribute(b, "x") as number),
+        (graph.getNodeAttribute(a, "y") as number) - (graph.getNodeAttribute(b, "y") as number),
+      );
+    expect(span(after, "c1", "c3")).toBeCloseTo(span(before, "c1", "c3"), 6);
+    expect(span(after, "a1", "a2")).toBeCloseTo(span(before, "a1", "a2"), 6);
+  });
+
+  // Enough islands that the phyllotaxis spiral alone is not enough — later
+  // arms come back around near earlier ones, so the greedy step-out is what
+  // actually keeps them apart. Twenty pairs is the same order as the ~23
+  // components the real graph has at default layers. Mutation-proven: with
+  // the step-out disabled, they all land on one circle and this fails.
+  function manyIslandsModel(pairs: number): GraphModel {
+    const nodes: GraphNode[] = [];
+    const edges: GraphEdge[] = [];
+    for (let i = 0; i < pairs; i += 1) {
+      nodes.push(node({ id: `x${i}` }), node({ id: `y${i}` }));
+      edges.push(edge({ id: `k${i}`, source: `x${i}`, target: `y${i}` }));
+    }
+    return makeModel(nodes, edges);
+  }
+
+  it("leaves no two components overlapping, with PACK_GAP to spare", () => {
+    const pairs = 20;
+    const graph = buildAtlasGraph(manyIslandsModel(pairs), PALETTE);
+    packComponents(graph, graph.nodes());
+    const groups = Array.from({ length: pairs }, (_unused, i) => measure(graph, [`x${i}`, `y${i}`]));
+    for (let i = 0; i < groups.length; i += 1) {
+      for (let j = i + 1; j < groups.length; j += 1) {
+        const gap = Math.hypot(groups[i].cx - groups[j].cx, groups[i].cy - groups[j].cy);
+        expect(gap).toBeGreaterThanOrEqual(groups[i].radius + groups[j].radius + PACK_GAP);
+      }
+    }
+  });
+
+  it("pushes an island further out when its first spiral radius is already taken", () => {
+    // The greedy step-out, isolated. With twenty islands the phyllotaxis arms
+    // crowd each other, so at least one cannot sit at the radius that merely
+    // clears the core — it has to walk out in PACK_STEP increments.
+    const pairs = 20;
+    const graph = buildAtlasGraph(manyIslandsModel(pairs), PALETTE);
+    packComponents(graph, graph.nodes());
+    const groups = Array.from({ length: pairs }, (_unused, i) => measure(graph, [`x${i}`, `y${i}`]));
+    const core = groups.reduce((best, g) => (Math.hypot(g.cx, g.cy) < Math.hypot(best.cx, best.cy) ? g : best));
+    const steppedOut = groups.filter((g) => {
+      const firstTry = core.radius + PACK_GAP + g.radius;
+      return Math.hypot(g.cx, g.cy) > firstTry + 1e-6;
+    });
+    expect(steppedOut.length).toBeGreaterThan(0);
+  });
+
+  it("spreads the small components around the core rather than stacking them on one arm", () => {
+    const graph = packed();
+    const a = measure(graph, ["a1", "a2"]);
+    const b = measure(graph, ["b1", "b2"]);
+    const angle = (m: { cx: number; cy: number }) => Math.atan2(m.cy, m.cx);
+    let apart = Math.abs(angle(a) - angle(b));
+    if (apart > Math.PI) apart = 2 * Math.PI - apart;
+    // The phyllotaxis step is 137.5 degrees, so consecutive islands land on
+    // opposite sides — never within a few degrees of each other.
+    expect(apart).toBeGreaterThan(Math.PI / 4);
+  });
+
+  it("is deterministic: the same graph packs to identical positions twice", () => {
+    const first = packed();
+    const second = packed();
+    for (const id of first.nodes()) {
+      expect(second.getNodeAttribute(id, "x")).toBe(first.getNodeAttribute(id, "x"));
+      expect(second.getNodeAttribute(id, "y")).toBe(first.getNodeAttribute(id, "y"));
+    }
+  });
+
+  it("does nothing when there are no simulated nodes", () => {
+    const graph = buildAtlasGraph(islandModel(), PALETTE);
+    const before = graph.nodes().map((id) => graph.getNodeAttribute(id, "x"));
+    packComponents(graph, []);
+    expect(graph.nodes().map((id) => graph.getNodeAttribute(id, "x"))).toEqual(before);
+  });
+
+  it("ignores nodes the caller left out of the simulated set", () => {
+    const graph = buildAtlasGraph(islandModel(), PALETTE);
+    const strayBefore = {
+      x: graph.getNodeAttribute("b1", "x"),
+      y: graph.getNodeAttribute("b1", "y"),
+    };
+    packComponents(
+      graph,
+      graph.nodes().filter((id) => id !== "b1" && id !== "b2"),
+    );
+    expect(graph.getNodeAttribute("b1", "x")).toBe(strayBefore.x);
+    expect(graph.getNodeAttribute("b1", "y")).toBe(strayBefore.y);
+  });
+
+  it("pulls the islands in from the ring the settle leaves them on", () => {
+    // The whole point of section A: after the sim settles, charge plus
+    // forceCenter park the small components far out; packing brings them to
+    // just outside the core.
+    const graph = buildAtlasGraph(islandModel(), PALETTE);
+    runAtlasLayout(graph);
+    const sim = createAtlasSimulation(graph);
+    sim.stop();
+    const core = measure(graph, ["c1", "c2", "c3", "c4"]);
+    for (const ids of [["a1", "a2"], ["b1", "b2"]]) {
+      const island = measure(graph, ids);
+      const distance = Math.hypot(island.cx - core.cx, island.cy - core.cy);
+      // Clear of the core, but not flung to a wide ring: the greedy search
+      // stops at the first radius that fits.
+      expect(distance).toBeGreaterThan(core.radius);
+      expect(distance).toBeLessThan(core.radius + island.radius + PACK_GAP + 3 * 12);
+    }
+  });
+});
+
+describe("simulation forces (round 4)", () => {
+  function pagePair(): GraphModel {
+    return makeModel(
+      [
+        node({ id: "p1", entityType: "page", degree: 2 }),
+        node({ id: "p2", entityType: "page", degree: 2 }),
+        node({ id: "p3", entityType: "page", degree: 2 }),
+      ],
+      [
+        edge({ id: "s1", source: "p1", target: "p2", type: "shared_source" }),
+        edge({ id: "w1", source: "p2", target: "p3", type: "wikilink" }),
+      ],
+    );
+  }
+
+  it("gives each sim node a collision radius wider than its disc, and pages wider still", () => {
+    const model = makeModel(
+      [node({ id: "e", degree: 1 }), node({ id: "p", entityType: "page", degree: 1 })],
+      [edge({ id: "e1", source: "e", target: "p", type: "about" })],
+    );
+    const graph = buildAtlasGraph(model, PALETTE);
+    const sim = createAtlasSimulation(graph);
+    sim.stop();
+    const byId = new Map(sim.nodes().map((n) => [n.id, n]));
+    const entity = byId.get("e")!;
+    const page = byId.get("p")!;
+    expect(entity.radius).toBe((graph.getNodeAttribute("e", "size") as number) + 2);
+    // Page adds its detached ring (gap 2 + width 1) on top of the same pad.
+    expect(page.radius).toBe((graph.getNodeAttribute("p", "size") as number) + 3 + 2);
+  });
+
+  it("registers a collide force, so two discs dropped on the same spot separate", () => {
+    const graph = buildAtlasGraph(pagePair(), PALETTE);
+    // Stack p1 and p2 exactly, which is what the page blob looked like.
+    for (const id of ["p1", "p2"]) {
+      graph.setNodeAttribute(id, "x", 0);
+      graph.setNodeAttribute(id, "y", 0);
+    }
+    const sim = createAtlasSimulation(graph);
+    sim.stop();
+    const byId = new Map(sim.nodes().map((n) => [n.id, n]));
+    const gap = Math.hypot(byId.get("p1")!.x! - byId.get("p2")!.x!, byId.get("p1")!.y! - byId.get("p2")!.y!);
+    expect(sim.force("collide")).toBeDefined();
+    expect(gap).toBeGreaterThan(byId.get("p1")!.radius);
+  });
+
+  it("gives each link the rest length its verb calls for", () => {
+    const graph = buildAtlasGraph(pagePair(), PALETTE);
+    const sim = createAtlasSimulation(graph);
+    sim.stop();
+    const linkForce = sim.force<ForceLink<AtlasSimNode, SimulationLinkDatum<AtlasSimNode>>>("link");
+    const links = linkForce!.links() as unknown as { source: AtlasSimNode; target: AtlasSimNode }[];
+    const distance = linkForce!.distance() as unknown as (link: unknown) => number;
+    const strength = linkForce!.strength() as unknown as (link: unknown) => number;
+    const shared = links.find((l) => l.source.id === "p1" || l.target.id === "p1")!;
+    const wiki = links.find((l) => l.source.id === "p3" || l.target.id === "p3")!;
+    expect(distance(shared)).toBe(70);
+    expect(strength(shared)).toBeCloseTo(0.15, 6);
+    expect(distance(wiki)).toBe(50);
+    expect(strength(wiki)).toBeCloseTo(0.5, 6);
+  });
+
+  it("leaves an unlisted verb on d3's own distance and 1/min-degree strength", () => {
+    const model = makeModel(
+      [node({ id: "a", degree: 2 }), node({ id: "b", degree: 1 }), node({ id: "c", degree: 1 })],
+      [
+        edge({ id: "e1", source: "a", target: "b", type: "knows" }),
+        edge({ id: "e2", source: "a", target: "c", type: "knows" }),
+      ],
+    );
+    const graph = buildAtlasGraph(model, PALETTE);
+    const sim = createAtlasSimulation(graph);
+    sim.stop();
+    const linkForce = sim.force<ForceLink<AtlasSimNode, SimulationLinkDatum<AtlasSimNode>>>("link");
+    const links = linkForce!.links() as unknown as { source: AtlasSimNode; target: AtlasSimNode }[];
+    const distance = linkForce!.distance() as unknown as (link: unknown) => number;
+    const strength = linkForce!.strength() as unknown as (link: unknown) => number;
+    // a has two links, b and c one each → 1/min(2,1) = 1, d3's own answer.
+    expect(distance(links[0])).toBe(30);
+    expect(strength(links[0])).toBeCloseTo(1, 6);
+  });
+
+  it("keeps the strongest verb when parallel edges collapse to one spring", () => {
+    const model = makeModel(
+      [node({ id: "p1", entityType: "page", degree: 2 }), node({ id: "p2", entityType: "page", degree: 2 })],
+      [
+        edge({ id: "s1", source: "p1", target: "p2", type: "shared_source" }),
+        edge({ id: "w1", source: "p1", target: "p2", type: "wikilink" }),
+      ],
+    );
+    const graph = buildAtlasGraph(model, PALETTE);
+    const sim = createAtlasSimulation(graph);
+    sim.stop();
+    const linkForce = sim.force<ForceLink<AtlasSimNode, SimulationLinkDatum<AtlasSimNode>>>("link");
+    const links = linkForce!.links();
+    const distance = linkForce!.distance() as unknown as (link: unknown) => number;
+    expect(links).toHaveLength(1);
+    // The wikilink is the asserted link, so it sets the spring — not the
+    // shared-source edge that happens to run beside it.
+    expect(distance(links[0])).toBe(50);
   });
 });
