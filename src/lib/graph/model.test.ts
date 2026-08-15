@@ -4,6 +4,9 @@ import type {
   Entity,
   EntityDetail,
   GraphMemoryNode,
+  GraphPageLink,
+  GraphPageNode,
+  GraphRef,
   GraphRelation,
   KnowledgeGraph,
   RelationWithEntity,
@@ -14,6 +17,9 @@ import {
   buildKnowledgeGraphModel,
   filterKnowledgeGraph,
   memorySourceId,
+  pageIdOf,
+  pageNodeId,
+  DEFAULT_LAYERS,
 } from "./model";
 
 function makeEntity(o: Partial<Entity> = {}): Entity {
@@ -267,8 +273,31 @@ function makeGraph(o: Partial<KnowledgeGraph> = {}): KnowledgeGraph {
     relations: o.relations ?? [],
     memories: o.memories ?? [],
     memory_links: o.memory_links ?? [],
+    pages: o.pages ?? [],
+    page_links: o.page_links ?? [],
   };
 }
+
+function makePage(o: Partial<GraphPageNode> = {}): GraphPageNode {
+  return {
+    id: o.id ?? "p1",
+    title: o.title ?? "A page",
+    space: o.space ?? null,
+    creation_kind: o.creation_kind ?? "distilled",
+    entity_id: o.entity_id ?? null,
+    last_modified: o.last_modified ?? "2026-08-15T00:00:00Z",
+  };
+}
+
+function pageLink(
+  from: [GraphRef["kind"], string],
+  to: [GraphRef["kind"], string],
+  link_type: GraphPageLink["link_type"],
+): GraphPageLink {
+  return { from: { kind: from[0], id: from[1] }, to: { kind: to[0], id: to[1] }, link_type };
+}
+
+const ALL_LAYERS = { entity: true, page: true, memory: true };
 
 describe("buildKnowledgeGraphModel", () => {
   it("folds entities and relations without inventing endpoints", () => {
@@ -381,5 +410,129 @@ describe("filterKnowledgeGraph", () => {
     const legacy = makeEntity({ id: "C", space: "", domain: "Work" });
     const scoped = filterKnowledgeGraph(makeGraph({ entities: [legacy] }), "Work");
     expect(scoped.entities.map((e) => e.id)).toEqual(["C"]);
+  });
+});
+
+describe("buildKnowledgeGraphModel — wiki pages", () => {
+  const seed = () =>
+    makeGraph({
+      entities: [makeEntity({ id: "E1" }), makeEntity({ id: "E2" })],
+      memories: [makeGraphMemory({ source_id: "m1" }), makeGraphMemory({ source_id: "m2" })],
+      pages: [
+        makePage({ id: "pa", title: "Page A", entity_id: "E1" }),
+        makePage({ id: "pb", title: "Page B" }),
+      ],
+      page_links: [
+        pageLink(["page", "pa"], ["page", "pb"], "wikilink"),
+        pageLink(["page", "pa"], ["entity", "E1"], "about"),
+        pageLink(["page", "pa"], ["entity", "E2"], "wikilink"),
+        pageLink(["page", "pa"], ["memory", "m1"], "cites"),
+        pageLink(["page", "pb"], ["memory", "m1"], "cites"),
+        pageLink(["page", "pb"], ["memory", "m2"], "cites"),
+      ],
+    });
+
+  it("draws pages as prefixed nodes joined by their typed links", () => {
+    const model = buildKnowledgeGraphModel(seed(), { layers: ALL_LAYERS });
+    const page = model.nodes.find((n) => n.id === pageNodeId("pa"))!;
+    expect(page.kind).toBe("page");
+    expect(page.name).toBe("Page A");
+    expect(page.entityType).toBe("page");
+    expect(pageIdOf(page.id)).toBe("pa");
+    // A page id can never collide with an entity id.
+    expect(model.nodes.some((n) => n.id === "pa")).toBe(false);
+
+    const types = model.edges
+      .filter((e) => e.source.startsWith("page:") || e.target.startsWith("page:"))
+      .map((e) => `${e.source}->${e.target}:${e.type}`)
+      .sort();
+    expect(types).toEqual([
+      "page:pa->E1:about",
+      "page:pa->E2:wikilink",
+      "page:pa->mem:m1:cites",
+      "page:pa->page:pb:wikilink",
+      "page:pb->mem:m1:cites",
+      "page:pb->mem:m2:cites",
+    ]);
+    // Degree counts every one of them.
+    expect(page.degree).toBe(4);
+  });
+
+  it("pulls in a memory that only a page cites", () => {
+    // No memory_links at all — round 1 would have dropped both memories.
+    const model = buildKnowledgeGraphModel(seed(), { layers: ALL_LAYERS });
+    expect(model.nodes.filter((n) => n.kind === "memory").map((n) => n.id).sort()).toEqual([
+      "mem:m1",
+      "mem:m2",
+    ]);
+  });
+
+  it("drops a hidden layer's nodes and edges before computing degree", () => {
+    const model = buildKnowledgeGraphModel(seed(), {
+      layers: { entity: false, page: true, memory: false },
+    });
+    expect(model.nodes.map((n) => n.id).sort()).toEqual(["page:pa", "page:pb"]);
+    // Only the wikilink and the synthesized shared-source edge survive: the
+    // about/entity-wikilink edges lost their entity, the cites lost their
+    // memory.
+    const page = model.nodes.find((n) => n.id === "page:pa")!;
+    expect(page.degree).toBe(2);
+  });
+
+  it("synthesizes one weighted shared-source edge per page pair while memories are off", () => {
+    const model = buildKnowledgeGraphModel(seed(), {
+      layers: { entity: true, page: true, memory: false },
+    });
+    const shared = model.edges.filter((e) => e.type === "shared_source");
+    expect(shared).toHaveLength(1);
+    expect(shared[0].source).toBe("page:pa");
+    expect(shared[0].target).toBe("page:pb");
+    // Both pages cite m1; only pb cites m2, so the pair shares exactly one.
+    expect(shared[0].weight).toBe(1);
+    expect(model.nodes.some((n) => n.kind === "memory")).toBe(false);
+  });
+
+  it("synthesizes nothing while memories are on — the memory node shows the path", () => {
+    const model = buildKnowledgeGraphModel(seed(), { layers: ALL_LAYERS });
+    expect(model.edges.some((e) => e.type === "shared_source")).toBe(false);
+  });
+
+  it("weights a shared-source edge by how many memories the pair shares", () => {
+    const graph = seed();
+    graph.page_links.push(pageLink(["page", "pa"], ["memory", "m2"], "cites"));
+    const model = buildKnowledgeGraphModel(graph, {
+      layers: { entity: false, page: true, memory: false },
+    });
+    expect(model.edges.find((e) => e.type === "shared_source")!.weight).toBe(2);
+  });
+
+  it("defaults to pages and entities on, memories off", () => {
+    expect(DEFAULT_LAYERS).toEqual({ entity: true, page: true, memory: false });
+    const model = buildKnowledgeGraphModel(seed(), { layers: DEFAULT_LAYERS });
+    expect(model.nodes.some((n) => n.kind === "memory")).toBe(false);
+    expect(model.nodes.some((n) => n.kind === "page")).toBe(true);
+    expect(model.nodes.some((n) => n.kind === "entity")).toBe(true);
+  });
+});
+
+describe("filterKnowledgeGraph — pages", () => {
+  it("keeps only the space's pages and the links whose endpoints both survive", () => {
+    const filtered = filterKnowledgeGraph(
+      makeGraph({
+        entities: [makeEntity({ id: "E1", space: "work" })],
+        pages: [
+          makePage({ id: "pa", space: "work" }),
+          makePage({ id: "pb", space: "personal" }),
+        ],
+        page_links: [
+          pageLink(["page", "pa"], ["page", "pb"], "wikilink"),
+          pageLink(["page", "pa"], ["entity", "E1"], "about"),
+        ],
+      }),
+      "work",
+    );
+    expect(filtered.pages.map((p) => p.id)).toEqual(["pa"]);
+    expect(filtered.page_links).toHaveLength(1);
+    expect(filtered.page_links[0].link_type).toBe("about");
   });
 });

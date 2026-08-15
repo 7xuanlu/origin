@@ -26,7 +26,9 @@ test("renders Graph as a structured canvas instead of a flat orange field", asyn
 
   const graph = page.getByTestId("atlas-view");
   await expect(graph).toBeVisible();
-  await expect(page.getByText(/^7 entities(?: · \d+ regions?)?$/)).toBeVisible();
+  // Pages lead the line now, and the counts are over what is actually drawn:
+  // seven wiki pages plus the three entities that have a connection.
+  await expect(page.getByText(/^7 pages · 3 entities(?: · \d+ regions?)?$/)).toBeVisible();
 
   const canvas = graph.locator('canvas[data-testid="atlas-cartography"]');
   await expect(canvas).toHaveCount(1);

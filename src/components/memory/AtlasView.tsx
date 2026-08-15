@@ -13,9 +13,12 @@ import {
   entitySpace,
   filterKnowledgeGraph,
   memorySourceId,
+  pageIdOf,
+  DEFAULT_LAYERS,
   MEMORY_NODE_TYPE,
+  PAGE_NODE_TYPE,
 } from "../../lib/graph/model";
-import type { GraphModel, GraphNode } from "../../lib/graph/model";
+import type { GraphLayers, GraphModel, GraphNode } from "../../lib/graph/model";
 import {
   buildAtlasGraph,
   runAtlasLayout,
@@ -23,6 +26,8 @@ import {
   hoverStateFor,
   nodeDisplay,
   edgeDisplay,
+  edgeSizeFor,
+  drawPageRings,
   drawRadialNodeLabel,
 } from "../../lib/graph/atlas";
 import type { HoverState, AtlasSimNode } from "../../lib/graph/atlas";
@@ -53,7 +58,40 @@ const EMPTY_GRAPH: KnowledgeGraph = {
   relations: [],
   memories: [],
   memory_links: [],
+  pages: [],
+  page_links: [],
 };
+
+/** Where the layer choice survives a reload. */
+const LAYERS_STORAGE_KEY = "atlas.layers";
+
+/** Read the persisted layer choice. Anything malformed — bad JSON, a
+ *  non-object, a non-boolean field, or all three off — falls back to the
+ *  default rather than half-applying a broken value. */
+export function readStoredLayers(raw: string | null): GraphLayers {
+  if (raw === null) return DEFAULT_LAYERS;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return DEFAULT_LAYERS;
+    const record = parsed as Record<string, unknown>;
+    const layers: GraphLayers = {
+      entity: record.entity,
+      page: record.page,
+      memory: record.memory,
+    } as GraphLayers;
+    if (
+      typeof layers.entity !== "boolean" ||
+      typeof layers.page !== "boolean" ||
+      typeof layers.memory !== "boolean"
+    ) {
+      return DEFAULT_LAYERS;
+    }
+    if (!layers.entity && !layers.page && !layers.memory) return DEFAULT_LAYERS;
+    return layers;
+  } catch {
+    return DEFAULT_LAYERS;
+  }
+}
 
 // Same 5-slot legend as the retired canvas graph (ConstellationMap): place,
 // event, and unknown types fold to neutral and get no swatch; concept is
@@ -64,6 +102,7 @@ const LEGEND_ITEMS: { label: string; key: string }[] = [
   { label: "Organization", key: "organization" },
   { label: "Person", key: "person" },
   { label: "Theme", key: "concept" },
+  { label: "Wiki page", key: PAGE_NODE_TYPE },
   { label: "Memory", key: MEMORY_NODE_TYPE },
 ];
 
@@ -71,12 +110,16 @@ const LEGEND_ITEMS: { label: string; key: string }[] = [
  *  `source_id`, not the prefixed graph-node id. */
 export type AtlasNodeTarget =
   | { kind: "entity"; id: string }
-  | { kind: "memory"; id: string };
+  | { kind: "memory"; id: string }
+  | { kind: "page"; id: string };
 
 /** The node id a click landed on, resolved to a navigable target. */
 function targetForNode(nodeId: string): AtlasNodeTarget {
   const sourceId = memorySourceId(nodeId);
-  return sourceId === null ? { kind: "entity", id: nodeId } : { kind: "memory", id: sourceId };
+  if (sourceId !== null) return { kind: "memory", id: sourceId };
+  const pageId = pageIdOf(nodeId);
+  if (pageId !== null) return { kind: "page", id: pageId };
+  return { kind: "entity", id: nodeId };
 }
 
 interface AtlasViewProps {
@@ -147,6 +190,31 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   );
   const [spaceFilter, setSpaceFilter] = useState<string | null>(null);
 
+  // Which node kinds are drawn. Wiki pages and entities on, memories off by
+  // default: memories outnumber everything else and bury the map. Persisted
+  // across reloads; a malformed stored value falls back to the default.
+  const [layers, setLayers] = useState<GraphLayers>(() => {
+    if (typeof window === "undefined") return DEFAULT_LAYERS;
+    try {
+      return readStoredLayers(window.localStorage.getItem(LAYERS_STORAGE_KEY));
+    } catch {
+      return DEFAULT_LAYERS;
+    }
+  });
+  const toggleLayer = (key: keyof GraphLayers) => {
+    const next = { ...layers, [key]: !layers[key] };
+    // The last lit chip can't be turned off — an empty map is not a view.
+    if (!next.entity && !next.page && !next.memory) return;
+    setLayers(next);
+    try {
+      window.localStorage.setItem(LAYERS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Private mode / quota: the choice still applies for this session.
+    }
+  };
+  const onlyLayerOn = (key: keyof GraphLayers) =>
+    layers[key] && Object.values(layers).filter(Boolean).length === 1;
+
   // D13/App-PR readiness, one fetch-and-classify per known space (community.ts):
   // cursor-paginated to exhaustion, generation-checked, never declared ready off
   // a partial read. Keyed on ALL known spaces regardless of spaceFilter, so
@@ -162,8 +230,8 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // and only the relations/links whose endpoints both survive. Regions,
   // counts, and insights all re-derive from the scoped model.
   const model = useMemo(
-    () => buildKnowledgeGraphModel(filterKnowledgeGraph(graph, spaceFilter)),
-    [graph, spaceFilter],
+    () => buildKnowledgeGraphModel(filterKnowledgeGraph(graph, spaceFilter), { layers }),
+    [graph, spaceFilter, layers],
   );
 
   // What sigma actually draws. Degree-0 nodes are left out entirely: on real
@@ -186,13 +254,13 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // buildGraphModel synthesizes it with no space at all. Going through the
   // model also covers the two unfiltered ways in — a relation-only neighbor,
   // and an entity whose own space is null or empty.
-  // Memory nodes are exempt: they inherit their community from the entity
-  // they hang off (cartography.ts), so a spaceless memory is not a node drawn
-  // on the fallback climb and must not hold the badge back.
+  // Memory and wiki-page nodes are exempt: both inherit their community from
+  // an entity (cartography.ts), so a spaceless one is not a node drawn on the
+  // fallback climb and must not hold the badge back.
   const hasUnscopedFallback = useMemo(
     () =>
       model.nodes.some(
-        (n: GraphNode) => n.kind !== "memory" && isUnscopedSpace(n.space),
+        (n: GraphNode) => n.kind === "entity" && isUnscopedSpace(n.space),
       ),
     [model],
   );
@@ -427,8 +495,24 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     container.appendChild(underlay);
     underlayRef.current = underlay;
 
+    // Page-ring overlay — appended AFTER sigma mounts (below) so it stacks
+    // ABOVE sigma's canvases, the mirror of the cartography underlay. Sigma
+    // v3 has no bordered or square node program, so the page marker is drawn
+    // here (see atlas.ts's drawPageRings).
+    const overlay = document.createElement("canvas");
+    overlay.dataset.testid = "atlas-page-rings";
+    overlay.style.position = "absolute";
+    overlay.style.inset = "0";
+    overlay.style.width = "100%";
+    overlay.style.height = "100%";
+    overlay.style.pointerEvents = "none";
+
     const renderer = new Sigma(graph, container, {
-      labelRenderedSizeThreshold: 6,
+      // Only nodes at least this big carry a label. With the log2 size scale
+      // (atlas.ts) that is roughly degree >= 5 for an entity and >= 6 for a
+      // page, so the zoomed-out map shows hub names only; sigma's own label
+      // grid reveals the rest as you zoom in.
+      labelRenderedSizeThreshold: 7,
       // Default camera fit maps the graph bbox edge-to-edge on the tighter
       // axis, half-clipping the extreme nodes; give the map a margin.
       stagePadding: 40,
@@ -465,6 +549,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       },
     });
     sigmaRef.current = renderer;
+    container.appendChild(overlay);
     if (import.meta.env.DEV) {
       // Preview/debug handle only — stripped from prod builds.
       (window as unknown as Record<string, unknown>).__ATLAS_SIGMA = renderer;
@@ -488,6 +573,34 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
         paletteRef.current,
       );
     };
+    const drawOverlay = () => {
+      const ctx = overlay.getContext("2d");
+      if (!ctx) return; // jsdom
+      const { width, height } = renderer.getDimensions();
+      const dpr = window.devicePixelRatio || 1;
+      if (overlay.width !== width * dpr || overlay.height !== height * dpr) {
+        overlay.width = width * dpr;
+        overlay.height = height * dpr;
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      const positions: { x: number; y: number; size: number }[] = [];
+      graph.forEachNode((id, attrs) => {
+        if (attrs.entityType !== PAGE_NODE_TYPE) return;
+        const display = renderer.getNodeDisplayData(id);
+        if (!display || display.hidden) return;
+        // getNodeDisplayData reports framed-graph coordinates, not screen px —
+        // the whole map lands in a ~1px box at the origin if they are used
+        // directly. Convert the node's own graph position the same way the
+        // cartography underlay does. Size is already CSS px, because
+        // zoomToSizeRatioFunction is pinned to 1.
+        const at = renderer.graphToViewport({ x: attrs.x as number, y: attrs.y as number });
+        positions.push({ x: at.x, y: at.y, size: display.size });
+      });
+      drawPageRings(ctx, positions, paletteRef.current);
+    };
+    renderer.on("afterRender", drawOverlay);
+
     // First paint is NOT drawn here. The cartography effect below runs right
     // after this one on mount (effects fire in declaration order, and both
     // refs above are already assigned), and its refresh() fires afterRender —
@@ -651,8 +764,9 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       sigmaRef.current = null;
       graphRef.current = null;
       renderer.kill();
-      // Sigma removes its own canvases; the underlay is ours to remove.
+      // Sigma removes its own canvases; these two are ours to remove.
       underlay.remove();
+      overlay.remove();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visibleModel]);
@@ -695,7 +809,12 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     graph.updateEachEdgeAttributes((edgeKey, attrs) => {
       const [source, target] = graph.extremities(edgeKey);
       const bridge = isBridge(source, target);
-      return { ...attrs, bridge, color: bridge ? paletteRef.current.bridge : paletteRef.current.edge };
+      return {
+        ...attrs,
+        bridge,
+        size: edgeSizeFor(attrs.edgeType as string, bridge),
+        color: bridge ? paletteRef.current.bridge : paletteRef.current.edge,
+      };
     });
     renderer.refresh();
   }, [communities]);
@@ -749,7 +868,9 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     );
   }
 
-  if (entities.length === 0) {
+  // Nothing to draw only when the daemon has neither entities NOR wiki pages:
+  // a knowledge base made purely of pages is a real map, not an empty one.
+  if (entities.length === 0 && graph.pages.length === 0) {
     return (
       <div data-testid="atlas-view" style={statusStyle}>
         <span className="entity-empty">{t("constellationMap.empty")}</span>
@@ -757,13 +878,22 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     );
   }
 
-  // Counts describe what EXISTS in the current scope, not what survived the
-  // degree-0 filter — the hidden ones are reported by their own chip.
-  const memoryCount = model.nodes.filter((node) => node.kind === "memory").length;
-  const entityCount = model.nodes.length - memoryCount;
+  // Counts describe what is actually ON THE MAP: layer on, and connected to
+  // something. What the degree-0 filter took out is reported by its own chip,
+  // and a layer that is off contributes nothing rather than a zero.
+  const drawn = visibleModel.nodes;
+  const pageCount = drawn.filter((node) => node.kind === "page").length;
+  const memoryCount = drawn.filter((node) => node.kind === "memory").length;
+  const entityCount = drawn.length - pageCount - memoryCount;
+  // A kind appears when its layer is on and it actually contributed nodes.
+  // Entities are the exception and always report, zero included — the round-1
+  // line did, and "0 entities" is the honest answer to an empty entity layer.
   const countLine = [
-    t("atlas.countEntities", { count: entityCount }),
-    ...(memoryCount > 0 ? [t("atlas.countMemories", { count: memoryCount })] : []),
+    ...(layers.page && pageCount > 0 ? [t("atlas.countPages", { count: pageCount })] : []),
+    ...(layers.entity ? [t("atlas.countEntities", { count: entityCount })] : []),
+    ...(layers.memory && memoryCount > 0
+      ? [t("atlas.countMemories", { count: memoryCount })]
+      : []),
     ...(regionInfo.count > 0 ? [t("atlas.countRegions", { count: regionInfo.count })] : []),
   ].join(" · ");
   const dropdownOpen = searchFocused && query.trim().length > 0;
@@ -910,7 +1040,9 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
                       backgroundColor:
                         node.entityType === MEMORY_NODE_TYPE
                           ? palette.memory
-                          : colorForEntityType(node.entityType, palette),
+                          : node.entityType === PAGE_NODE_TYPE
+                            ? palette.page
+                            : colorForEntityType(node.entityType, palette),
                       opacity: 0.85,
                     }}
                   />
@@ -927,6 +1059,40 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
             </ul>
           )}
         </div>
+        {/* Layer chips — which node kinds the map draws. The last lit chip is
+            disabled: an empty map is not a view. */}
+        {(
+          [
+            { key: "page" as const, label: t("atlas.layer.page") },
+            { key: "entity" as const, label: t("atlas.layer.entity") },
+            { key: "memory" as const, label: t("atlas.layer.memory") },
+          ]
+        ).map(({ key, label }) => {
+          const on = layers[key];
+          const locked = onlyLayerOn(key);
+          return (
+            <button
+              key={key}
+              type="button"
+              aria-pressed={on}
+              disabled={locked}
+              onClick={() => toggleLayer(key)}
+              style={{
+                fontSize: 12,
+                color: on ? "var(--mem-text)" : "var(--mem-text-secondary)",
+                border: `1px solid ${on ? "var(--mem-distilled-border)" : "var(--mem-border)"}`,
+                borderRadius: "var(--mem-radius-full)",
+                padding: "4px 12px",
+                background: on ? "var(--mem-indigo-bg)" : "transparent",
+                cursor: locked ? "default" : "pointer",
+                opacity: locked ? 0.7 : 1,
+                fontFamily: "inherit",
+              }}
+            >
+              {label}
+            </button>
+          );
+        })}
         <button
           type="button"
           aria-pressed={showRegions}
@@ -1060,7 +1226,11 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
                 height: 8,
                 borderRadius: "50%",
                 backgroundColor:
-                  key === MEMORY_NODE_TYPE ? palette.memory : colorForEntityType(key, palette),
+                  key === MEMORY_NODE_TYPE
+                    ? palette.memory
+                    : key === PAGE_NODE_TYPE
+                      ? palette.page
+                      : colorForEntityType(key, palette),
                 opacity: 0.7,
                 flexShrink: 0,
               }}

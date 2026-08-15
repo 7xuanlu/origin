@@ -948,6 +948,7 @@ export default function Main({
               onBack={navigateBack}
               onEntityClick={handleEntityClick}
               onMemoryClick={(sid) => navigateTo({ kind: "memory", sourceId: sid })}
+              onPageClick={(pageId) => navigateTo({ kind: "page", pageId })}
             />
           ) : view.kind === "page-draft" ? (
             <PageDraftEditor
@@ -1021,7 +1022,9 @@ export default function Main({
                 onNodeClick={(target) =>
                   target.kind === "memory"
                     ? navigateTo({ kind: "memory", sourceId: target.id })
-                    : handleEntityClick(target.id)
+                    : target.kind === "page"
+                      ? navigateTo({ kind: "page", pageId: target.id })
+                      : handleEntityClick(target.id)
                 }
                 onBack={navigateBack}
               />

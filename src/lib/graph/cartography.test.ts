@@ -31,6 +31,7 @@ const PALETTE: GraphPalette = {
   graticule: "rgba(4,5,6,0.13)",
   bridge: "#bbbbbb",
   memory: "#cccccc",
+  page: "#cccccc",
 };
 
 function node(id: string, overrides: Partial<GraphNode> = {}): GraphNode {
@@ -389,6 +390,68 @@ describe("communitiesFor", () => {
   function mentions(id: string, memory: string, entity: string): GraphEdge {
     return { id, source: memory, target: entity, type: "mentions", confidence: null, createdAt: 100 };
   }
+
+  function pageNode(id: string, space: string | null = null): GraphNode {
+    return { ...node(id), kind: "page", entityType: "page", space };
+  }
+
+  function about(id: string, page: string, entity: string): GraphEdge {
+    return { id, source: page, target: entity, type: "about", confidence: null, createdAt: 100 };
+  }
+
+  function wikilink(id: string, from: string, to: string): GraphEdge {
+    return { id, source: from, target: to, type: "wikilink", confidence: null, createdAt: 100 };
+  }
+
+  it("gives a wiki page the community of the entity it links to", () => {
+    const m = modelOf(
+      [node("a1", { space: "Work" }), node("a2", { space: "Work" }), pageNode("page:p1", "Work")],
+      [edge("ea1", "a1", "a2"), about("ab1", "page:p1", "a2")],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    expect(communities.get("page:p1")).toBe(communities.get("a2"));
+  });
+
+  it("propagates a community from page to page when a page links no entity", () => {
+    // p1 is anchored to the region through a2; p2 only wikilinks p1.
+    const m = modelOf(
+      [
+        node("a1", { space: "Work" }),
+        node("a2", { space: "Work" }),
+        pageNode("page:p1", "Work"),
+        pageNode("page:p2", "Work"),
+      ],
+      [
+        edge("ea1", "a1", "a2"),
+        about("ab1", "page:p1", "a2"),
+        wikilink("wl1", "page:p2", "page:p1"),
+      ],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    expect(communities.get("page:p2")).toBe(communities.get("a2"));
+  });
+
+  it("leaves a page-only map with no regions rather than inventing them", () => {
+    // Entities toggled off: nothing to inherit from, so no page is assigned
+    // and the region count is honestly zero.
+    const m = modelOf(
+      [pageNode("page:p1", "Work"), pageNode("page:p2", "Work")],
+      [wikilink("wl1", "page:p1", "page:p2")],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    expect(communities.size).toBe(0);
+  });
+
+  it("never drags a scoped entity into the unscoped bucket via a spaceless page", () => {
+    const m = modelOf(
+      [node("a1", { space: "Work" }), node("a2", { space: "Work" }), pageNode("page:p1", null)],
+      [edge("ea1", "a1", "a2"), about("ab1", "page:p1", "a1")],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    for (const id of ["a1", "a2", "page:p1"]) {
+      expect(communities.get(id)!.split(":")[1]).not.toBe("u");
+    }
+  });
 
   it("gives a memory the community of the entity it links to", () => {
     const m = modelOf(

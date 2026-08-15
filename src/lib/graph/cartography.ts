@@ -152,14 +152,15 @@ export function communitiesFor(
   // null keys the one unscoped bucket — an out-of-band key no space string
   // can occupy, so the partition itself is unforgeable, not just the ids.
   const bySpace = new Map<string | null, string[]>();
-  // Memory nodes are never partitioned or climbed: they are not durable
-  // community members, and a spaceless memory hanging off a scoped entity
-  // would otherwise drag that entity's region into the unscoped bucket.
-  // They inherit an entity's community below instead.
-  const memoryNodeIds: string[] = [];
+  // Memory AND wiki-page nodes are never partitioned or climbed: neither is a
+  // durable community member (the daemon assigns communities to entities
+  // only), and a spaceless one hanging off a scoped entity would otherwise
+  // drag that entity's region into the unscoped bucket. Both inherit a
+  // community below instead.
+  const inheritorIds: string[] = [];
   for (const node of model.nodes) {
-    if (node.kind === "memory") {
-      memoryNodeIds.push(node.id);
+    if (node.kind === "memory" || node.kind === "page") {
+      inheritorIds.push(node.id);
       continue;
     }
     pushInto(bySpace, isUnscopedSpace(node.space) ? null : node.space, node.id);
@@ -187,26 +188,57 @@ export function communitiesFor(
     }
   }
 
-  // A memory joins the region of the entity it links to. Ties break on the
-  // lowest entity id so the answer is deterministic, and a memory whose
-  // entities all landed outside the partition simply gets no community —
-  // which keeps it out of every region size and every bridge test.
-  if (memoryNodeIds.length > 0) {
-    const memories = new Set(memoryNodeIds);
+  // A memory or page joins the region of the partitioned node (an entity) it
+  // links to. Ties break on the lowest neighbor id so the answer is
+  // deterministic, and one whose neighbors all landed outside the partition
+  // simply gets no community — which keeps it out of every region size and
+  // every bridge test.
+  //
+  // Pages get a second chance the memories never needed: a page that links no
+  // entity but wikilinks another page inherits from that page, the lowest-id
+  // neighbor that has a community, propagated until nothing new resolves. In
+  // the pages-only view (entities toggled off) nothing is anchored at all and
+  // the map honestly draws no regions rather than inventing them.
+  if (inheritorIds.length > 0) {
+    const inheritors = new Set(inheritorIds);
     const anchorOf = new Map<string, string>();
+    const peers = new Map<string, string[]>();
     for (const edge of model.edges) {
-      const [memory, entity] = memories.has(edge.source)
+      const bothInherit = inheritors.has(edge.source) && inheritors.has(edge.target);
+      if (bothInherit) {
+        pushInto(peers, edge.source, edge.target);
+        pushInto(peers, edge.target, edge.source);
+        continue;
+      }
+      const [inheritor, anchor] = inheritors.has(edge.source)
         ? [edge.source, edge.target]
-        : memories.has(edge.target)
+        : inheritors.has(edge.target)
           ? [edge.target, edge.source]
           : [null, null];
-      if (memory === null || entity === null || memories.has(entity)) continue;
-      const current = anchorOf.get(memory);
-      if (current === undefined || entity < current) anchorOf.set(memory, entity);
+      if (inheritor === null || anchor === null) continue;
+      const current = anchorOf.get(inheritor);
+      if (current === undefined || anchor < current) anchorOf.set(inheritor, anchor);
     }
-    for (const [memory, entity] of anchorOf) {
-      const community = result.get(entity);
-      if (community !== undefined) result.set(memory, community);
+    for (const [inheritor, anchor] of anchorOf) {
+      const community = result.get(anchor);
+      if (community !== undefined) result.set(inheritor, community);
+    }
+    // Propagate between inheritors until nothing changes. Each pass can only
+    // ADD assignments, and there are finitely many nodes, so it terminates.
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const id of inheritorIds) {
+        if (result.has(id)) continue;
+        let best: string | null = null;
+        for (const peer of peers.get(id) ?? []) {
+          if (!result.has(peer)) continue;
+          if (best === null || peer < best) best = peer;
+        }
+        if (best === null) continue;
+        result.set(id, result.get(best)!);
+        changed = true;
+      }
     }
   }
   return result;

@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { Entity, EntityDetail, KnowledgeGraph, RelationWithEntity } from "../tauri";
+import type {
+  Entity,
+  EntityDetail,
+  GraphRef,
+  KnowledgeGraph,
+  RelationWithEntity,
+} from "../tauri";
 
 // The renderer-neutral graph every view consumes. Daemon response shapes are
 // translated into this once (here); no view reads raw relation records for
@@ -44,6 +50,10 @@ export interface GraphEdge {
   /** null until wenlan-types exposes confidence on RelationWithEntity. */
   confidence: number | null;
   createdAt: number;
+  /** How many underlying facts this one drawn edge stands for. Only the
+   *  synthesized shared-source edges set it (the number of memories two pages
+   *  both cite); every other edge is one fact and leaves it undefined. */
+  weight?: number;
 }
 
 export interface GraphModel {
@@ -214,11 +224,48 @@ export function memorySourceId(nodeId: string): string | null {
 }
 
 /**
+ * The `entityType` every wiki-page node carries — same reason as
+ * MEMORY_NODE_TYPE above: one swatch, keyed without a `kind` lookup.
+ */
+export const PAGE_NODE_TYPE = "page";
+
+/** Edge verbs for the three typed page links, plus the synthesized one. Not
+ *  daemon relation types. */
+export const WIKILINK_EDGE_TYPE = "wikilink";
+export const ABOUT_EDGE_TYPE = "about";
+export const CITES_EDGE_TYPE = "cites";
+/** Two pages that cite the same memory, drawn directly page→page because the
+ *  memory node itself is hidden. */
+export const SHARED_SOURCE_EDGE_TYPE = "shared_source";
+
+/** Graph-node id for a wiki page. Prefixed for the same reason memories are:
+ *  no collision with an entity id, and click routing can tell them apart. */
+export function pageNodeId(pageId: string): string {
+  return `page:${pageId}`;
+}
+
+/** The page id behind a page node id, or null for anything else. */
+export function pageIdOf(nodeId: string): string | null {
+  return nodeId.startsWith("page:") ? nodeId.slice(5) : null;
+}
+
+/** Which node kinds the map is currently drawing. Off means the nodes and
+ *  every edge touching them never enter the model at all. */
+export interface GraphLayers {
+  entity: boolean;
+  page: boolean;
+  memory: boolean;
+}
+
+/** Wiki pages and entities on, memories off — the round-2 default view. */
+export const DEFAULT_LAYERS: GraphLayers = { entity: true, page: true, memory: false };
+
+/**
  * Narrow a bulk graph read to one space: entities by `entitySpace`, memories
- * by their own space, and relations/links to whatever survives. A relation
- * whose other endpoint was filtered out is DROPPED, not synthesized — the
- * bulk read carries every in-scope entity, so a missing endpoint means out of
- * scope rather than not-fetched-yet.
+ * and pages by their own space, and relations/links to whatever survives. A
+ * relation whose other endpoint was filtered out is DROPPED, not synthesized
+ * — the bulk read carries every in-scope entity, so a missing endpoint means
+ * out of scope rather than not-fetched-yet.
  */
 export function filterKnowledgeGraph(graph: KnowledgeGraph, space: string | null): KnowledgeGraph {
   if (!space) return graph;
@@ -226,6 +273,14 @@ export function filterKnowledgeGraph(graph: KnowledgeGraph, space: string | null
   const kept = new Set(entities.map((entity) => entity.id));
   const memories = graph.memories.filter((memory) => memory.space === space);
   const keptMemories = new Set(memories.map((memory) => memory.source_id));
+  const pages = graph.pages.filter((page) => page.space === space);
+  const keptPages = new Set(pages.map((page) => page.id));
+  const endpointKept = (ref: GraphRef): boolean =>
+    ref.kind === "page"
+      ? keptPages.has(ref.id)
+      : ref.kind === "entity"
+        ? kept.has(ref.id)
+        : keptMemories.has(ref.id);
   return {
     entities,
     relations: graph.relations.filter(
@@ -235,21 +290,41 @@ export function filterKnowledgeGraph(graph: KnowledgeGraph, space: string | null
     memory_links: graph.memory_links.filter(
       (link) => kept.has(link.entity_id) && keptMemories.has(link.memory_id),
     ),
+    pages,
+    page_links: graph.page_links.filter(
+      (link) => endpointKept(link.from) && endpointKept(link.to),
+    ),
   };
 }
 
 /**
  * Fold one bulk graph read into a GraphModel: every entity as a node, every
- * relation as an edge, and every memory that links to a present entity as its
- * own node joined to those entities by `mentions` edges. Degree counts the
- * memory edges too, so an entity with only memories attached is not an
- * isolate. No filtering happens here — that is a per-view decision
+ * relation as an edge, every wiki page as its own node joined by its typed
+ * links (`wikilink` / `about` / `cites`), and every memory that links to a
+ * present entity or is cited by a present page as its own node. Degree counts
+ * all of them, so an entity with only memories attached is not an isolate.
+ *
+ * `layers` decides which KINDS exist at all. A hidden layer's nodes and every
+ * edge touching them are dropped BEFORE degree is computed, so "unconnected"
+ * means unconnected among the layers actually on screen. With the memory layer
+ * off, two pages citing the same memory are joined directly by one synthesized
+ * `shared_source` edge instead — the llm_wiki look, where shared sources are
+ * the page graph's second edge type. With memories on, the memory node itself
+ * shows that path and nothing is synthesized.
+ *
+ * No other filtering happens here — that is a per-view decision
  * (filterKnowledgeGraph above for the space filter, degree-0 hiding in
  * AtlasView).
  */
-export function buildKnowledgeGraphModel(graph: KnowledgeGraph): GraphModel {
+export function buildKnowledgeGraphModel(
+  graph: KnowledgeGraph,
+  options?: { layers?: GraphLayers },
+): GraphModel {
+  const layers = options?.layers ?? { entity: true, page: true, memory: true };
   const nodes = new Map<string, GraphNode>();
-  for (const entity of graph.entities) nodes.set(entity.id, nodeFromEntity(entity));
+  if (layers.entity) {
+    for (const entity of graph.entities) nodes.set(entity.id, nodeFromEntity(entity));
+  }
 
   const edges = new Map<string, GraphEdge>();
   const seenComposites = new Set<string>();
@@ -279,40 +354,146 @@ export function buildKnowledgeGraphModel(graph: KnowledgeGraph): GraphModel {
     }
   }
 
-  // Only memories with at least one link to a present entity become nodes —
-  // a memory node with no edge would be an isolate the view hides anyway.
-  const linksByMemory = new Map<string, string[]>();
-  for (const link of graph.memory_links) {
-    if (!nodes.has(link.entity_id)) continue;
-    const list = linksByMemory.get(link.memory_id);
-    if (list) list.push(link.entity_id);
-    else linksByMemory.set(link.memory_id, [link.entity_id]);
+  // Pages join the map before memories so a page's citations can pull a
+  // memory in that no entity links to. `last_modified` is RFC 3339 on a page
+  // (Unix seconds on a memory); parse it to the same Unix-seconds unit every
+  // other node carries, and fall back to 0 rather than NaN on a bad string.
+  const pageTimestamp = (value: string): number => {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? Math.round(parsed / 1000) : 0;
+  };
+  const pageNodeIds = new Map<string, string>();
+  if (layers.page) {
+    for (const page of graph.pages) {
+      const id = pageNodeId(page.id);
+      if (nodes.has(id)) continue;
+      pageNodeIds.set(page.id, id);
+      nodes.set(id, {
+        id,
+        kind: "page",
+        name: page.title,
+        entityType: PAGE_NODE_TYPE,
+        // A page carries no confirmed axis of its own on this wire shape.
+        confirmed: null,
+        degree: 0,
+        space: page.space || null,
+        createdAt: pageTimestamp(page.last_modified),
+        updatedAt: pageTimestamp(page.last_modified),
+      });
+    }
   }
-  for (const memory of graph.memories) {
-    const linked = linksByMemory.get(memory.source_id);
-    if (!linked) continue;
-    const id = memoryNodeId(memory.source_id);
-    if (nodes.has(id)) continue;
-    nodes.set(id, {
-      id,
-      kind: "memory",
-      name: memory.title,
-      entityType: MEMORY_NODE_TYPE,
-      confirmed: memory.confirmed,
-      degree: 0,
-      space: memory.space || null,
-      createdAt: memory.last_modified,
-      updatedAt: memory.last_modified,
+
+  // Which memories earn a node: linked to a present entity, or cited by a
+  // present page. Collected first, because a citation alone is enough.
+  const linksByMemory = new Map<string, string[]>();
+  if (layers.memory && layers.entity) {
+    for (const link of graph.memory_links) {
+      if (!nodes.has(link.entity_id)) continue;
+      const list = linksByMemory.get(link.memory_id);
+      if (list) list.push(link.entity_id);
+      else linksByMemory.set(link.memory_id, [link.entity_id]);
+    }
+  }
+  // page id -> the memory ids it cites, for the memory nodes below and for
+  // the shared-source synthesis when the memory layer is off.
+  const citedByPage = new Map<string, string[]>();
+  for (const link of graph.page_links) {
+    if (link.link_type !== CITES_EDGE_TYPE) continue;
+    if (!pageNodeIds.has(link.from.id)) continue;
+    const list = citedByPage.get(link.from.id);
+    if (list) list.push(link.to.id);
+    else citedByPage.set(link.from.id, [link.to.id]);
+  }
+  const citedMemories = new Set<string>();
+  for (const cited of citedByPage.values()) for (const id of cited) citedMemories.add(id);
+
+  if (layers.memory) {
+    for (const memory of graph.memories) {
+      const linked = linksByMemory.get(memory.source_id);
+      if (!linked && !citedMemories.has(memory.source_id)) continue;
+      const id = memoryNodeId(memory.source_id);
+      if (nodes.has(id)) continue;
+      nodes.set(id, {
+        id,
+        kind: "memory",
+        name: memory.title,
+        entityType: MEMORY_NODE_TYPE,
+        confirmed: memory.confirmed,
+        degree: 0,
+        space: memory.space || null,
+        createdAt: memory.last_modified,
+        updatedAt: memory.last_modified,
+      });
+      for (const entityId of [...new Set(linked ?? [])].sort()) {
+        const key = `mem:${memory.source_id}:${entityId}`;
+        edges.set(key, {
+          id: key,
+          source: id,
+          target: entityId,
+          type: MEMORY_EDGE_TYPE,
+          confidence: null,
+          createdAt: memory.last_modified,
+        });
+      }
+    }
+  }
+
+  // The typed page links. An endpoint whose layer is off simply isn't in
+  // `nodes`, which is what drops the edge with it.
+  const graphNodeId = (ref: GraphRef): string =>
+    ref.kind === "page" ? pageNodeId(ref.id) : ref.kind === "memory" ? memoryNodeId(ref.id) : ref.id;
+  for (const link of graph.page_links) {
+    const source = graphNodeId(link.from);
+    const target = graphNodeId(link.to);
+    if (!nodes.has(source) || !nodes.has(target) || source === target) continue;
+    const key = `pl:${link.link_type}:${source}:${target}`;
+    if (edges.has(key)) continue;
+    edges.set(key, {
+      id: key,
+      source,
+      target,
+      type: link.link_type,
+      confidence: null,
+      createdAt: nodes.get(source)!.createdAt,
     });
-    for (const entityId of [...new Set(linked)].sort()) {
-      const key = `mem:${memory.source_id}:${entityId}`;
+  }
+
+  // Shared sources, only while the memory layer is off: one undirected edge
+  // per page pair, weighted by how many memories they both cite. Page-only on
+  // purpose — doing the same for entities would detonate the hubs.
+  if (!layers.memory && layers.page) {
+    const pagesByMemory = new Map<string, string[]>();
+    for (const [pageId, cited] of citedByPage) {
+      for (const memoryId of new Set(cited)) {
+        const list = pagesByMemory.get(memoryId);
+        if (list) list.push(pageId);
+        else pagesByMemory.set(memoryId, [pageId]);
+      }
+    }
+    const shared = new Map<string, number>();
+    for (const pageIds of pagesByMemory.values()) {
+      const sorted = [...new Set(pageIds)].sort();
+      for (let i = 0; i < sorted.length; i++) {
+        for (let j = i + 1; j < sorted.length; j++) {
+          const key = `${sorted[i]}|${sorted[j]}`;
+          shared.set(key, (shared.get(key) ?? 0) + 1);
+        }
+      }
+    }
+    for (const [pair, weight] of shared) {
+      const [a, b] = pair.split("|");
+      const source = pageNodeId(a);
+      const target = pageNodeId(b);
+      const key = `ss:${source}:${target}`;
+      if (edges.has(key)) continue;
       edges.set(key, {
         id: key,
-        source: id,
-        target: entityId,
-        type: MEMORY_EDGE_TYPE,
+        source,
+        target,
+        type: SHARED_SOURCE_EDGE_TYPE,
         confidence: null,
-        createdAt: memory.last_modified,
+        createdAt: nodes.get(source)!.createdAt,
+        weight,
       });
     }
   }

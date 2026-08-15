@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { i18n } from "../../i18n";
 
@@ -100,6 +100,8 @@ import type {
   EntityDetail,
   GraphMemoryLink,
   GraphMemoryNode,
+  GraphPageLink,
+  GraphPageNode,
   GraphRelation,
   KnowledgeGraph,
 } from "../../lib/tauri";
@@ -117,6 +119,7 @@ const mockListCommunityMembers = vi.mocked(listCommunityMembers);
 let entitiesSource: () => Promise<Entity[]>;
 let detailSource: (id: string) => Promise<EntityDetail>;
 let memorySource: { memories: GraphMemoryNode[]; memory_links: GraphMemoryLink[] };
+let pageSource: { pages: GraphPageNode[]; page_links: GraphPageLink[] };
 
 const mockListEntities = {
   mockResolvedValue(entities: Entity[]) {
@@ -157,6 +160,31 @@ const mockGetEntityDetail = {
 /** Memory nodes and their entity links for the next bulk read. */
 function mockMemories(memories: GraphMemoryNode[], links: GraphMemoryLink[]) {
   memorySource = { memories, memory_links: links };
+}
+
+/** Wiki-page nodes and their typed links for the next bulk read. */
+function mockPages(pages: GraphPageNode[], links: GraphPageLink[]) {
+  pageSource = { pages, page_links: links };
+}
+
+function makePage(overrides: Partial<GraphPageNode> = {}): GraphPageNode {
+  return {
+    id: overrides.id ?? "p1",
+    title: overrides.title ?? "Page",
+    space: overrides.space ?? null,
+    creation_kind: overrides.creation_kind ?? "distilled",
+    entity_id: overrides.entity_id ?? null,
+    last_modified: overrides.last_modified ?? "2026-08-15T00:00:00Z",
+  };
+}
+
+/** Turn the memory layer on before the first render. Memories ship OFF by
+ *  default, so a case that is about memory nodes has to ask for them. */
+function withMemoryLayerOn() {
+  window.localStorage.setItem(
+    "atlas.layers",
+    JSON.stringify({ page: true, entity: true, memory: true }),
+  );
 }
 
 function makeMemory(overrides: Partial<GraphMemoryNode> = {}): GraphMemoryNode {
@@ -200,6 +228,8 @@ function foldGraph(entities: Entity[], details: EntityDetail[]): KnowledgeGraph 
     relations: Array.from(relations.values()),
     memories: memorySource.memories,
     memory_links: memorySource.memory_links,
+    pages: pageSource.pages,
+    page_links: pageSource.page_links,
   };
 }
 
@@ -236,6 +266,8 @@ describe("AtlasView", () => {
       relations: [],
     });
     memorySource = { memories: [], memory_links: [] };
+    pageSource = { pages: [], page_links: [] };
+    window.localStorage.removeItem("atlas.layers");
     mockGetKnowledgeGraph.mockImplementation(async () => {
       const entities = await entitiesSource();
       const details = await Promise.all(entities.map((entity) => detailSource(entity.id)));
@@ -706,8 +738,9 @@ describe("AtlasView", () => {
     expect(graph.hasNode("e3")).toBe(false);
     expect(graph.order).toBe(2);
     expect(screen.getByText("1 unconnected hidden")).toBeInTheDocument();
-    // The count line still describes the whole graph, not just what is drawn.
-    expect(screen.getByText("3 entities")).toBeInTheDocument();
+    // The count line describes what is drawn; the third entity is unconnected,
+    // so it is reported by the chip beside it rather than counted here.
+    expect(screen.getByText("2 entities")).toBeInTheDocument();
   });
 
   it("mounts the cartography underlay canvas beneath sigma and removes it on unmount", async () => {
@@ -1035,13 +1068,17 @@ describe("AtlasView", () => {
     expect(
       Array.from((select as HTMLSelectElement).options).map((o) => o.textContent),
     ).toEqual(["All spaces", "personal", "wenlan-dev"]);
-    expect(screen.getByText("3 entities")).toBeInTheDocument();
+    // Only e1<->e2 are connected, so the count line reads 2 either way; the
+    // scoping is visible in the graph itself and in the unconnected chip.
+    expect(screen.getByText("2 entities")).toBeInTheDocument();
+    expect(screen.getByText("1 unconnected hidden")).toBeInTheDocument();
 
     fireEvent.change(select, { target: { value: "wenlan-dev" } });
     expect(await screen.findByText("2 entities")).toBeInTheDocument();
+    expect(screen.queryByText("1 unconnected hidden")).not.toBeInTheDocument();
 
     fireEvent.change(select, { target: { value: "" } });
-    expect(await screen.findByText("3 entities")).toBeInTheDocument();
+    expect(await screen.findByText("1 unconnected hidden")).toBeInTheDocument();
   });
 
   it("hides the Space selector when no entity carries a space", async () => {
@@ -1568,6 +1605,7 @@ describe("AtlasView", () => {
     // member — including memories, which used to have no representation here
     // at all. (The old isolate-drag case is gone with the isolate ring;
     // placeIsolateRing's own tests still cover the function.)
+    withMemoryLayerOn();
     mockConnectedPairWithMemory();
 
     renderWithQuery(<AtlasView />);
@@ -1598,6 +1636,7 @@ describe("AtlasView", () => {
   });
 
   it("draws memories as nodes linked to their entities, counts them, and legends them", async () => {
+    withMemoryLayerOn();
     mockConnectedPairWithMemory();
 
     renderWithQuery(<AtlasView />);
@@ -1630,6 +1669,7 @@ describe("AtlasView", () => {
   });
 
   it("hides a memory whose only entity is filtered out by the space selector", async () => {
+    withMemoryLayerOn();
     const entities = [
       makeEntity({ id: "e1", name: "Alice", domain: "Work" }),
       makeEntity({ id: "e2", name: "Bob", domain: "Work" }),
@@ -1673,5 +1713,127 @@ describe("AtlasView", () => {
     const scoped = capturedSigmaInstances[capturedSigmaInstances.length - 1].graph;
     expect(scoped.hasNode("mem:m1")).toBe(false);
     expect(scoped.hasEdge("e1", "e2")).toBe(true);
+  });
+  // The connected pair plus two wiki pages: Alpha links to Beta, Alpha is
+  // about Alice, and both pages cite the one memory (so the memory-off map
+  // can still join them with a synthetic shared-source edge).
+  function mockPairWithPages() {
+    const entities = mockConnectedPair();
+    mockMemories(
+      [makeMemory({ source_id: "m1", title: "A decision I made", memory_type: "decision" })],
+      [{ memory_id: "m1", entity_id: "e1" }],
+    );
+    mockPages(
+      [makePage({ id: "p1", title: "Alpha" }), makePage({ id: "p2", title: "Beta" })],
+      [
+        { from: { kind: "page", id: "p1" }, to: { kind: "page", id: "p2" }, link_type: "wikilink" },
+        { from: { kind: "page", id: "p1" }, to: { kind: "entity", id: "e1" }, link_type: "about" },
+        { from: { kind: "page", id: "p1" }, to: { kind: "memory", id: "m1" }, link_type: "cites" },
+        { from: { kind: "page", id: "p2" }, to: { kind: "memory", id: "m1" }, link_type: "cites" },
+      ],
+    );
+    return entities;
+  }
+
+  it("draws wiki pages by default and leaves memories out until the chip is lit", async () => {
+    mockPairWithPages();
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    const graph = capturedSigmaInstances[0].graph;
+
+    expect(graph.hasNode("page:p1")).toBe(true);
+    expect(graph.hasNode("page:p2")).toBe(true);
+    expect(graph.getNodeAttribute("page:p1", "label")).toBe("Alpha");
+    // Memories are the off-by-default layer, so the cited memory is absent and
+    // the two pages that cite it are joined directly instead.
+    expect(graph.hasNode("mem:m1")).toBe(false);
+    expect(graph.hasEdge("page:p1", "page:p2")).toBe(true);
+    expect(screen.getByText("2 pages · 2 entities · 1 region")).toBeInTheDocument();
+    expect(screen.getByText("Wiki page")).toBeInTheDocument();
+  });
+
+  it("gives each layer a chip whose pressed state matches what is drawn", async () => {
+    mockPairWithPages();
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    const pages = screen.getByRole("button", { name: "Wiki pages" });
+    const entities = screen.getByRole("button", { name: "Entities" });
+    const memories = screen.getByRole("button", { name: "Memories" });
+    expect(pages).toHaveAttribute("aria-pressed", "true");
+    expect(entities).toHaveAttribute("aria-pressed", "true");
+    expect(memories).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(memories);
+    await waitFor(() => expect(capturedSigmaInstances.length).toBeGreaterThan(1));
+    const withMemories = capturedSigmaInstances[capturedSigmaInstances.length - 1].graph;
+    expect(withMemories.hasNode("mem:m1")).toBe(true);
+    expect(memories).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("2 pages · 2 entities · 1 memory · 1 region")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Entities" }));
+    await waitFor(() => {
+      const graph = capturedSigmaInstances[capturedSigmaInstances.length - 1].graph;
+      expect(graph.hasNode("e1")).toBe(false);
+    });
+    expect(screen.getByText("2 pages · 1 memory")).toBeInTheDocument();
+  });
+
+  it("refuses to turn off the last lit layer", async () => {
+    mockPairWithPages();
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Entities" }));
+    const pages = screen.getByRole("button", { name: "Wiki pages" });
+    // Pages are now the only lit layer: the chip stays pressed and stops
+    // taking clicks, because an empty map is not a view.
+    expect(pages).toHaveAttribute("aria-pressed", "true");
+    expect(pages).toBeDisabled();
+    fireEvent.click(pages);
+    expect(pages).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("persists the layer choice and ignores a malformed stored value", async () => {
+    mockPairWithPages();
+
+    const first = renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    fireEvent.click(screen.getByRole("button", { name: "Memories" }));
+    expect(JSON.parse(window.localStorage.getItem("atlas.layers")!)).toEqual({
+      page: true,
+      entity: true,
+      memory: true,
+    });
+
+    first.unmount();
+    capturedSigmaInstances.length = 0;
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    expect(capturedSigmaInstances[0].graph.hasNode("mem:m1")).toBe(true);
+
+    window.localStorage.setItem("atlas.layers", "{not json");
+    cleanup();
+    capturedSigmaInstances.length = 0;
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    // Back to the default: pages and entities, no memories.
+    expect(capturedSigmaInstances[0].graph.hasNode("mem:m1")).toBe(false);
+    expect(capturedSigmaInstances[0].graph.hasNode("page:p1")).toBe(true);
+  });
+
+  it("routes a click on a page node to the page, not to an entity", async () => {
+    mockPairWithPages();
+    const onNodeClick = vi.fn();
+
+    renderWithQuery(<AtlasView onNodeClick={onNodeClick} />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    capturedSigmaInstances[0].handlers.get("clickNode")?.({ node: "page:p1" });
+
+    expect(onNodeClick).toHaveBeenCalledWith({ kind: "page", id: "p1" });
   });
 });

@@ -13,6 +13,7 @@ import {
   hoverStateFor,
   nodeDisplay,
   edgeDisplay,
+  drawPageRings,
   drawRadialNodeLabel,
 } from "./atlas";
 import type { HoverState, AtlasSimNode } from "./atlas";
@@ -36,6 +37,7 @@ const PALETTE: GraphPalette = {
   graticule: "rgba(4,5,6,0.13)",
   bridge: "#bbbbbb",
   memory: "#cccccc",
+  page: "#dddddd",
 };
 
 function node(overrides: Partial<GraphNode> = {}): GraphNode {
@@ -120,18 +122,86 @@ describe("buildAtlasGraph", () => {
     expect(graph.getNodeAttribute("x", "color")).toBe("#333333");
   });
 
-  it("gives a confirmed node a larger size base than an unconfirmed one at equal degree, capped at 8", () => {
+  it("gives a confirmed node a larger size base than an unconfirmed one at equal degree, capped at 12", () => {
     const model = makeModel([
       node({ id: "conf", confirmed: true, degree: 2 }),
       node({ id: "unconf", confirmed: false, degree: 2 }),
       node({ id: "unknown", confirmed: null, degree: 2 }),
-      node({ id: "hub", confirmed: true, degree: 30 }),
+      node({ id: "hub", confirmed: true, degree: 300 }),
     ]);
     const graph = buildAtlasGraph(model, PALETTE);
-    expect(graph.getNodeAttribute("conf", "size")).toBe(5); // 4 + 2*0.5
-    expect(graph.getNodeAttribute("unconf", "size")).toBe(4); // 3 + 2*0.5
-    expect(graph.getNodeAttribute("unknown", "size")).toBe(4);
-    expect(graph.getNodeAttribute("hub", "size")).toBe(8);
+    // base + 1.6 * log2(1 + degree); log2(3) = 1.585.
+    const growth = 1.6 * Math.log2(3);
+    expect(graph.getNodeAttribute("conf", "size")).toBeCloseTo(4 + growth, 10);
+    expect(graph.getNodeAttribute("unconf", "size")).toBeCloseTo(3 + growth, 10);
+    expect(graph.getNodeAttribute("unknown", "size")).toBeCloseTo(3 + growth, 10);
+    expect(graph.getNodeAttribute("hub", "size")).toBe(12);
+  });
+
+  it("keeps a wiki page on the entity scale and a memory below it, capped", () => {
+    const model = makeModel([
+      node({ id: "page", entityType: "page", confirmed: null, degree: 3 }),
+      node({ id: "entity", entityType: "concept", confirmed: false, degree: 3 }),
+      node({ id: "memory", entityType: "memory", confirmed: true, degree: 3 }),
+      node({ id: "memhub", entityType: "memory", confirmed: true, degree: 300 }),
+    ]);
+    const graph = buildAtlasGraph(model, PALETTE);
+    const growth = 1.6 * Math.log2(4);
+    expect(graph.getNodeAttribute("page", "size")).toBeCloseTo(3.5 + growth, 10);
+    expect(graph.getNodeAttribute("entity", "size")).toBeCloseTo(3 + growth, 10);
+    // Memories are context: they start lowest and are capped well under the
+    // entity/page ceiling, so a much-cited memory can never dominate.
+    expect(graph.getNodeAttribute("memory", "size")).toBe(4);
+    expect(graph.getNodeAttribute("memhub", "size")).toBe(4);
+  });
+
+  it("draws a shared-source edge thinner than a real link and keeps the verb on the edge", () => {
+    const model = makeModel(
+      [node({ id: "a" }), node({ id: "b" })],
+      [
+        { id: "w", source: "a", target: "b", type: "wikilink", confidence: null, createdAt: 1 },
+        {
+          id: "s",
+          source: "a",
+          target: "b",
+          type: "shared_source",
+          confidence: null,
+          createdAt: 1,
+          weight: 2,
+        },
+      ],
+    );
+    const graph = buildAtlasGraph(model, PALETTE);
+    expect(graph.getEdgeAttribute("w", "size")).toBe(1.5);
+    expect(graph.getEdgeAttribute("s", "size")).toBe(0.8);
+    expect(graph.getEdgeAttribute("s", "edgeType")).toBe("shared_source");
+  });
+
+  it("rings every page node just outside its disc, in the page ink", () => {
+    const calls: string[] = [];
+    const ctx = {
+      save: () => calls.push("save"),
+      restore: () => calls.push("restore"),
+      beginPath: () => calls.push("beginPath"),
+      stroke: () => calls.push("stroke"),
+      arc: (x: number, y: number, r: number) => calls.push(`arc:${x},${y},${r}`),
+      strokeStyle: "",
+      lineWidth: 0,
+    } as unknown as CanvasRenderingContext2D;
+    drawPageRings(ctx, [{ x: 10, y: 20, size: 5 }], PALETTE);
+    expect(ctx.strokeStyle).toBe(PALETTE.page);
+    expect(ctx.lineWidth).toBe(1.5);
+    // Radius is the disc plus a 3px gap, so the ring reads as a separate mark
+    // rather than a slightly fatter dot.
+    expect(calls).toContain("arc:10,20,8");
+    expect(calls.filter((c) => c === "stroke")).toHaveLength(1);
+  });
+
+  it("draws nothing when there are no pages on the map", () => {
+    let touched = false;
+    const ctx = { save: () => (touched = true) } as unknown as CanvasRenderingContext2D;
+    drawPageRings(ctx, [], PALETTE);
+    expect(touched).toBe(false);
   });
 
   it("stores confirmed on the node so theme recoloring can recompute the tiered fill", () => {

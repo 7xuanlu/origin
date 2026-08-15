@@ -939,6 +939,33 @@ export interface GraphMemoryLink {
   entity_id: string;
 }
 
+/** A wiki page drawn as a graph node. Entity shadow pages are not wiki pages
+ *  and never appear here — the entity itself is already the node. The daemon
+ *  sends no community for a page (neither store can answer it honestly); the
+ *  map derives one by inheritance, see cartography.ts. */
+export interface GraphPageNode {
+  id: string;
+  title: string;
+  space: string | null;
+  creation_kind: string;
+  entity_id: string | null;
+  /** RFC 3339, as `pages.last_modified` stores it. */
+  last_modified: string;
+}
+
+/** One endpoint of a page link: which collection to look the id up in. */
+export interface GraphRef {
+  kind: "page" | "entity" | "memory";
+  id: string;
+}
+
+/** A typed edge with a page on at least one end. */
+export interface GraphPageLink {
+  from: GraphRef;
+  to: GraphRef;
+  link_type: "wikilink" | "about" | "cites";
+}
+
 /**
  * The whole knowledge graph for the current space scope in one read. Replaces
  * the per-entity detail fan-out the Graph view used to do, which could only
@@ -949,6 +976,8 @@ export interface KnowledgeGraph {
   relations: GraphRelation[];
   memories: GraphMemoryNode[];
   memory_links: GraphMemoryLink[];
+  pages: GraphPageNode[];
+  page_links: GraphPageLink[];
 }
 
 export interface MemoryItem {

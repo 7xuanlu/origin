@@ -786,7 +786,73 @@ export class TauriMockRuntime {
         });
       }
     }
-    return { entities, relations, memories: [], memory_links: [] };
+    // Wiki pages and their typed links. The fixture has no wikilink or
+    // citation records of its own, so the map half is derived
+    // deterministically from the page list: consecutive active pages are
+    // wikilinked in a chain, a page carrying `entity_id` gets its `about`
+    // link, and the first two pages both cite the first memory (which is what
+    // makes the shared-source edge appear while the memory layer is off).
+    const activePages = this.pages.filter((page) => page.status === "active");
+    const graphPages = activePages.map((page) => ({
+      id: page.id,
+      title: page.title,
+      space: page.space ?? null,
+      creation_kind: page.creation_kind ?? "distilled",
+      entity_id: page.entity_id ?? null,
+      last_modified: page.last_modified,
+    }));
+    const pageLinks: {
+      from: { kind: "page" | "entity" | "memory"; id: string };
+      to: { kind: "page" | "entity" | "memory"; id: string };
+      link_type: "wikilink" | "about" | "cites";
+    }[] = [];
+    for (let index = 1; index < activePages.length; index += 1) {
+      pageLinks.push({
+        from: { kind: "page", id: activePages[index - 1].id },
+        to: { kind: "page", id: activePages[index].id },
+        link_type: "wikilink",
+      });
+    }
+    for (const page of activePages) {
+      if (page.entity_id && known.has(page.entity_id)) {
+        pageLinks.push({
+          from: { kind: "page", id: page.id },
+          to: { kind: "entity", id: page.entity_id },
+          link_type: "about",
+        });
+      }
+    }
+    const citedMemory = this.memories[0];
+    const memories = citedMemory
+      ? [
+          {
+            source_id: citedMemory.source_id,
+            title: citedMemory.title,
+            memory_type: citedMemory.memory_type,
+            space: citedMemory.space,
+            confirmed: citedMemory.confirmed,
+            last_modified: citedMemory.last_modified,
+          },
+        ]
+      : [];
+    if (citedMemory) {
+      for (const page of activePages.slice(0, 2)) {
+        pageLinks.push({
+          from: { kind: "page", id: page.id },
+          to: { kind: "memory", id: citedMemory.source_id },
+          link_type: "cites",
+        });
+      }
+    }
+
+    return {
+      entities,
+      relations,
+      memories,
+      memory_links: [],
+      pages: graphPages,
+      page_links: pageLinks,
+    };
   }
 
   private getEntityDetail(args: unknown): EntityDetail {

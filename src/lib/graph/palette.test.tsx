@@ -85,6 +85,7 @@ describe("colorForEntityType", () => {
       graticule: "#graticule",
       bridge: "#bridge",
       memory: "#memory",
+      page: "#page",
     };
     expect(colorForEntityType("technology", palette)).toBe("#tool");
     expect(colorForEntityType("place", palette)).toBe("#neutral");
@@ -124,6 +125,7 @@ describe("nodeFillFor", () => {
     graticule: "rgba(4,5,6,0.13)",
     bridge: "#bbbbbb",
     memory: "#cccccc",
+    page: "#dddddd",
   };
 
   it("fills confirmed entities at 0.9 alpha and everything else at 0.5", () => {
@@ -132,6 +134,14 @@ describe("nodeFillFor", () => {
     // 0x44 * 0.5 = 34 = 0x22 — unconfirmed and unknown (relation-derived) alike.
     expect(nodeFillFor("person", false, palette)).toBe("#222222");
     expect(nodeFillFor("person", null, palette)).toBe("#222222");
+  });
+
+  it("gives a wiki page its own full-presence fill, never an entity slot", () => {
+    // page #dddddd at 0.9 over #000000: 0xdd * 0.9 = 198.9 → 199 = 0xc7.
+    expect(nodeFillFor("page", null, palette)).toBe("#c7c7c7");
+    // The `page` type is not in the 5-slot entity vocabulary, so without the
+    // dedicated branch it would fall through to neutral.
+    expect(nodeFillFor("page", null, palette)).not.toBe(nodeFillFor("place", null, palette));
   });
 
   it("resolves the entity type through its palette slot before compositing", () => {

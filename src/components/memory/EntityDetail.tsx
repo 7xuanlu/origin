@@ -28,6 +28,7 @@ interface EntityDetailProps {
   onBack: () => void;
   onEntityClick: (entityId: string) => void;
   onMemoryClick?: (sourceId: string) => void;
+  onPageClick?: (pageId: string) => void;
 }
 
 export default function EntityDetail({
@@ -35,6 +36,7 @@ export default function EntityDetail({
   onBack,
   onEntityClick,
   onMemoryClick,
+  onPageClick,
 }: EntityDetailProps) {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
@@ -237,6 +239,7 @@ export default function EntityDetail({
           onClose={() => setGraphOpen(false)}
           onEntityClick={onEntityClick}
           onMemoryClick={onMemoryClick}
+          onPageClick={onPageClick}
         />
       ) : null}
     </>
@@ -274,6 +277,7 @@ type EntityGraphOverlayProps = {
   readonly onClose: () => void;
   readonly onEntityClick: (entityId: string) => void;
   readonly onMemoryClick?: (sourceId: string) => void;
+  readonly onPageClick?: (pageId: string) => void;
 };
 
 function EntityGraphOverlay({
@@ -283,6 +287,7 @@ function EntityGraphOverlay({
   onClose,
   onEntityClick,
   onMemoryClick,
+  onPageClick,
 }: EntityGraphOverlayProps) {
   const { t } = useTranslation();
   const [mode, setMode] = useState<"focus" | "map">("focus");
@@ -587,6 +592,13 @@ function EntityGraphOverlay({
               onNodeClick={(target) => {
                 if (target.kind === "entity") {
                   openEntity(target.id);
+                } else if (target.kind === "page") {
+                  // The overlay has no page router of its own; close it and
+                  // let the host navigate, the same shape a memory click uses.
+                  if (onPageClick) {
+                    onClose();
+                    onPageClick(target.id);
+                  }
                 } else if (onMemoryClick) {
                   onClose();
                   onMemoryClick(target.id);

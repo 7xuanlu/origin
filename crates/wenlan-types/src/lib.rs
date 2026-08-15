@@ -40,8 +40,8 @@ pub use communities::{
 };
 pub use entities::{
     Entity, EntityDetail, EntitySearchResult, EntitySuggestion, GraphMemoryLink, GraphMemoryNode,
-    GraphRelation, KnowledgeGraphResponse, Observation, RecentRelation, Relation,
-    RelationWithEntity,
+    GraphPageLink, GraphPageNode, GraphRef, GraphRelation, KnowledgeGraphResponse, Observation,
+    RecentRelation, Relation, RelationWithEntity,
 };
 pub use lint::{LintCheckResult, LintQuery, LintReport};
 pub use memory::{

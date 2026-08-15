@@ -10,24 +10,45 @@ import {
   type SimulationNodeDatum,
 } from "d3-force";
 import type { GraphModel } from "./model";
-import { MEMORY_NODE_TYPE } from "./model";
+import { MEMORY_NODE_TYPE, PAGE_NODE_TYPE, SHARED_SOURCE_EDGE_TYPE } from "./model";
 import { nodeFillFor, type GraphPalette } from "./palette";
 import { bridgeEdgeTest } from "./cartography";
 
 const MIN_NODE_SIZE = 3;
-const MAX_NODE_SIZE = 8;
-/** Memory nodes sit below the smallest entity, at every degree — they are
- *  context around the entities, and a memory linked to six entities must not
+const MAX_NODE_SIZE = 12;
+/** Wiki pages sit on the same scale as entities, one base step above an
+ *  unconfirmed one — pages ARE subjects on this map. */
+const PAGE_NODE_BASE = 3.5;
+/** Memory nodes start below the smallest entity and stay there: they are
+ *  context around the subjects, and a memory linked to six entities must not
  *  outgrow the entities themselves. */
-const MEMORY_NODE_SIZE = 2;
+const MEMORY_NODE_BASE = 2;
+const MEMORY_MAX_SIZE = 4;
+/** Px added per doubling of degree. Linear growth (round 1's degree * 0.5)
+ *  saturated the cap on real data — 1,600 entities where the hubs run to
+ *  hundreds of links drew as one uniform field of 8s. log2 keeps the hubs
+ *  visibly bigger while leaving the long tail distinguishable. */
+const DEGREE_GAIN = 1.6;
 
-// The old canvas graph's exact radius scale: a stability base (confirmed 4,
-// everything else 3) plus half a px per connection, capped at 8 — finer than
-// the sqrt scale it replaced, and size itself encodes confirmation.
+// Base by stability/kind (confirmed 4, unconfirmed 3, page 3.5, memory 2)
+// plus DEGREE_GAIN per doubling of degree, capped. Size still encodes
+// confirmation at degree 0, as it did before.
 function nodeSizeFor(confirmed: boolean | null, degree: number, entityType?: string): number {
-  if (entityType === MEMORY_NODE_TYPE) return MEMORY_NODE_SIZE;
-  const base = confirmed === true ? 4 : MIN_NODE_SIZE;
-  return Math.min(MAX_NODE_SIZE, base + degree * 0.5);
+  const growth = DEGREE_GAIN * Math.log2(1 + degree);
+  if (entityType === MEMORY_NODE_TYPE) {
+    return Math.min(MEMORY_MAX_SIZE, MEMORY_NODE_BASE + growth);
+  }
+  const base =
+    entityType === PAGE_NODE_TYPE ? PAGE_NODE_BASE : confirmed === true ? 4 : MIN_NODE_SIZE;
+  return Math.min(MAX_NODE_SIZE, base + growth);
+}
+
+/** Edge ink and stroke by verb. Shared-source edges are the lightest thing on
+ *  the map (they stand for an inferred overlap, not an asserted link); a
+ *  bridge stays amber and a hair thinner, per the artifact. */
+export function edgeSizeFor(type: string, bridge: boolean): number {
+  if (type === SHARED_SOURCE_EDGE_TYPE) return 0.8;
+  return bridge ? 1.4 : 1.5;
 }
 
 /**
@@ -74,11 +95,14 @@ export function buildAtlasGraph(
     // isn't distinct enough.
     const bridge = isBridge(edge.source, edge.target);
     graph.addEdgeWithKey(edge.id, edge.source, edge.target, {
+      // Kept on the edge so the theme-flip and cartography recolors can
+      // recompute ink and stroke without re-reading the model.
+      edgeType: edge.type,
       // Rendered 1:1 in CSS px (AtlasView pins zoomToSizeRatioFunction to 1),
       // calibrated to the old canvas graph's exact stroke: lineWidth 1 at its
       // fixed k=1.499 zoom ≈ 1.5 CSS px. Needs minEdgeThickness lowered in
       // AtlasView — sigma's default floor (1.7) silently bumps this back up.
-      size: bridge ? 1.4 : 1.5,
+      size: edgeSizeFor(edge.type, bridge),
       color: bridge ? palette.bridge : palette.edge,
       bridge,
     });
@@ -317,4 +341,35 @@ export function drawRadialNodeLabel(
     context.fillText(data.label, data.x, data.y + (isBelow ? pad : -pad));
   }
   context.globalAlpha = 1;
+}
+
+/** Ring stroke width in CSS px — the spec's 2px page border. */
+const PAGE_RING_WIDTH = 1.5;
+/** Clear air between the disc and its ring — without the gap the ring reads as
+ *  a slightly fatter dot rather than a different kind of thing. */
+const PAGE_RING_GAP = 3;
+
+/**
+ * The halo ring that marks a wiki page. Sigma v3.0.3 ships only disc node
+ * programs (`node-circle` / `node-point`, both borderless), and no `@sigma/*`
+ * package is installed, so a square marker would mean either a new dependency
+ * or a hand-written WebGL program — neither was in scope. The ring is drawn on
+ * a plain 2D canvas stacked ABOVE sigma instead, the same technique the
+ * cartography underlay uses below it. `positions` are viewport CSS px.
+ */
+export function drawPageRings(
+  ctx: CanvasRenderingContext2D,
+  positions: { x: number; y: number; size: number }[],
+  palette: GraphPalette,
+): void {
+  if (positions.length === 0) return;
+  ctx.save();
+  ctx.strokeStyle = palette.page;
+  ctx.lineWidth = PAGE_RING_WIDTH;
+  for (const { x, y, size } of positions) {
+    ctx.beginPath();
+    ctx.arc(x, y, size + PAGE_RING_GAP, 0, 2 * Math.PI);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
