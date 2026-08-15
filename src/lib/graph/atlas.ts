@@ -343,7 +343,7 @@ export function drawRadialNodeLabel(
   context.globalAlpha = 1;
 }
 
-/** Ring stroke width in CSS px — the spec's 2px page border. */
+/** Ring stroke width in CSS px. */
 const PAGE_RING_WIDTH = 1.5;
 /** Clear air between the disc and its ring — without the gap the ring reads as
  *  a slightly fatter dot rather than a different kind of thing. */

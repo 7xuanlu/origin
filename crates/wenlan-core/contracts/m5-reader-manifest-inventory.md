@@ -589,7 +589,7 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `PUT` | `/api/memory/entities/{id}/confirm` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/memory/entities/{id}/delete` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/memory/entity-suggestions` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/graph` | main | yes | automatic | `none` | `handle_get_knowledge_graph` | GraphMemoryNode.title via dismissed card |
+| `GET` | `/api/memory/graph` | main | yes | automatic | `none` | `handle_get_knowledge_graph` | GraphPageNode.title, GraphMemoryNode.title via dismissed card |
 | `POST` | `/api/memory/link-entity` | main | yes | automatic | `none` | `handle_link_entity` | opaque response type — fail-closed |
 | `POST` | `/api/memory/list` | main | yes | automatic | `none` | `handle_list_memories` | IndexedFileInfo.title/content via dismissed card |
 | `GET` | `/api/memory/nurture` | main | yes | automatic | `none` | `handle_get_nurture_cards` | MemoryItem.title/content via staged revision card |
