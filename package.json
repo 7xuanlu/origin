@@ -31,7 +31,7 @@
     "clean:all": "pnpm clean:dev && pnpm clean:release && echo 'All cleaned'",
     "preview": "vite preview",
     "tauri": "node scripts/run-tauri.mjs",
-    "postinstall": "git config core.hooksPath .githooks 2>/dev/null && chmod +x .githooks/* 2>/dev/null || true",
+    "postinstall": "node scripts/install-git-hooks.mjs",
     "test": "vitest run",
     "test:e2e": "playwright test",
     "test:e2e:review": "playwright test --config playwright.review.config.ts",
