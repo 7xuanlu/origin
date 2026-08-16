@@ -867,6 +867,7 @@ async fn missing_entity_link_uses_memory_scope_and_exact_pair_rollback() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn imported_document_owner_with_missing_entity_prepares_and_applies_in_scope() {
     let (db, _dir) = test_db().await;
     db.test_primary_session()
@@ -953,6 +954,7 @@ async fn imported_document_owner_with_missing_entity_prepares_and_applies_in_sco
 /// makes the `apply_repair` call below fail with `repair_target_stale`;
 /// restoring the shadow-page clause makes it pass again.
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_guard() {
     let (db, _dir) = test_db().await;
     db.test_primary_session()
@@ -1005,6 +1007,7 @@ async fn raw_seeded_entity_without_shadow_page_deletes_via_applier_shadow_page_g
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn orphan_revision_cas_rejects_scope_state_and_noop_then_changes_only_pending_revision() {
     let (db, _dir) = test_db().await;
     db.test_primary_session()
@@ -1181,6 +1184,7 @@ async fn orphan_revision_cas_rejects_scope_state_and_noop_then_changes_only_pend
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn orphan_link_cas_stales_on_restored_owner_and_deletes_only_the_exact_pair() {
     let (db, _dir) = test_db().await;
     let db = std::sync::Arc::new(db);
@@ -1916,6 +1920,7 @@ async fn stale_page_projection_symlink_target_and_quarantine_ancestor_are_blocke
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_apply_quarantines_exact_bytes_and_verifies() {
     use wenlan_types::repair::VerifyRepairRequest;
 
@@ -2020,6 +2025,7 @@ async fn stale_page_projection_apply_quarantines_exact_bytes_and_verifies() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_manifests_from_one_plan_apply_sequentially() {
     let fixture = stale_projection_plan_fixture(&["page_stale_a", "page_stale_b"]).await;
     for (index, manifest) in fixture.manifests.iter().enumerate() {
@@ -2039,6 +2045,7 @@ async fn stale_page_projection_manifests_from_one_plan_apply_sequentially() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_plan_allows_an_ordered_subset() {
     let fixture = stale_projection_plan_fixture(&[
         "page_stale_subset_a",
@@ -2069,6 +2076,7 @@ async fn stale_page_projection_plan_allows_an_ordered_subset() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_plan_allows_only_the_last_manifest() {
     let fixture =
         stale_projection_plan_fixture(&["page_stale_last_only_a", "page_stale_last_only_b"]).await;
@@ -2086,6 +2094,7 @@ async fn stale_page_projection_plan_allows_only_the_last_manifest() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_recovery_preserves_an_earlier_selected_repair() {
     let fixture =
         stale_projection_plan_fixture(&["page_stale_recovery_a", "page_stale_recovery_b"]).await;
@@ -2152,6 +2161,7 @@ async fn stale_page_projection_recovery_preserves_an_earlier_selected_repair() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_legacy_pending_without_journal_fails_closed() {
     let fixture =
         stale_projection_plan_fixture(&["page_stale_pre_journal_a", "page_stale_pre_journal_b"])
@@ -2203,6 +2213,7 @@ async fn stale_page_projection_legacy_pending_without_journal_fails_closed() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_journal_without_pending_preserves_earlier_repair() {
     let fixture = stale_projection_plan_fixture(&[
         "page_stale_valid_pending_a",
@@ -2252,6 +2263,7 @@ async fn stale_page_projection_journal_without_pending_preserves_earlier_repair(
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_pending_journal_is_promoted_and_recovered() {
     let fixture = stale_projection_plan_fixture(&[
         "page_stale_pending_journal_a",
@@ -2300,6 +2312,7 @@ async fn stale_page_projection_pending_journal_is_promoted_and_recovered() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_after_plan_collision_is_no_clobber_stale() {
     let (db, _dir) = test_db().await;
     let page_root = tempfile::TempDir::new().unwrap();
@@ -2383,6 +2396,7 @@ async fn stale_page_projection_after_plan_collision_is_no_clobber_stale() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_rejects_db_owner_created_after_plan() {
     let (db, _dir) = test_db().await;
     let page_root = tempfile::TempDir::new().unwrap();
@@ -2796,6 +2810,7 @@ async fn stale_page_projection_source_replacement_before_unlink_preserves_replac
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_rollback_failure_retains_marker_for_later_safe_recovery() {
     let fixture = stale_recovery_fixture("page_rollback_failure_recovery", false).await;
     std::fs::write(fixture.pending_path(), b"partial").unwrap();
@@ -2908,6 +2923,7 @@ async fn stale_page_projection_partial_writer_error_retains_marker_and_retry_rec
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_empty_pending_after_link_restores_and_retries() {
     let (db, _dir) = test_db().await;
     let page_root = tempfile::TempDir::new().unwrap();
@@ -3082,6 +3098,7 @@ async fn stale_page_projection_crash_after_source_relink_recovers_idempotently()
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_crash_after_private_quarantine_move_recovers_and_retries() {
     let fixture = stale_recovery_fixture("page_recover_after_quarantine_move", false).await;
     std::fs::write(fixture.pending_path(), b"partial receipt").unwrap();
@@ -3110,6 +3127,7 @@ async fn stale_page_projection_crash_after_private_quarantine_move_recovers_and_
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_crash_after_private_stage_prepare_restores_exact_original() {
     let fixture = stale_recovery_fixture("page_recover_after_stage_prepare", true).await;
     std::fs::write(fixture.pending_path(), b"partial receipt").unwrap();
@@ -3161,6 +3179,7 @@ async fn stale_page_projection_crash_after_private_stage_prepare_restores_exact_
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_preexisting_private_stage_is_zero_mutation_stale() {
     let fixture = stale_recovery_fixture("page_preexisting_private_stage", true).await;
     fixture.ensure_source_stage_dir();
@@ -3186,6 +3205,7 @@ async fn stale_page_projection_preexisting_private_stage_is_zero_mutation_stale(
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_partial_pending_recovers_after_unlink_and_post() {
     for (page_id, stage_post, preexisting_orphan) in [
         ("page_recover_after_unlink", false, false),
@@ -3229,6 +3249,7 @@ async fn stale_page_projection_partial_pending_recovers_after_unlink_and_post() 
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_valid_pending_publishes_post_and_recovers_partial() {
     let post = stale_recovery_fixture("page_valid_pending_post", false).await;
     let receipt = post.apply(1_721_000_201).await.unwrap();
@@ -3266,6 +3287,7 @@ async fn stale_page_projection_valid_pending_publishes_post_and_recovers_partial
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_page_projection_valid_pending_with_wrong_post_digest_stays_pending() {
     use wenlan_types::repair::{RepairApplyReceipt, RepairApplyReceiptDraft, RepairDigest};
 
@@ -3497,6 +3519,7 @@ async fn only_empty_machine_owned_unconfirmed_source_page_is_exact_archive_targe
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn source_page_archive_accepts_rust_whitespace_persisted_below_ingress() {
     let (db, _dir) = test_db().await;
     let now = "2026-07-17T00:00:00Z";
@@ -3571,6 +3594,7 @@ async fn source_page_archive_accepts_rust_whitespace_persisted_below_ingress() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn source_page_archive_cas_changes_only_status_and_clears_lint_findings() {
     let (db, _dir) = test_db().await;
     let now = "2026-07-17T00:00:00Z";

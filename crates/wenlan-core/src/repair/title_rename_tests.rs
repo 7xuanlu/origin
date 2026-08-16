@@ -182,6 +182,7 @@ fn target_filename(root: &Path, page_id: &str) -> String {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn preparation_binds_exact_review_page_scope_row_projection_and_embedding() {
     let fixture = rename_fixture().await;
     let filename = target_filename(fixture.page_root.path(), "page-a");
@@ -297,6 +298,7 @@ async fn capture_rejects_a_duplicate_key_in_non_target_projection_state() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn apply_changes_only_title_version_embedding_and_target_projection() {
     let fixture = rename_fixture().await;
     let filename = target_filename(fixture.page_root.path(), "page-a");
@@ -343,6 +345,7 @@ async fn apply_changes_only_title_version_embedding_and_target_projection() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn apply_then_verification_reuses_the_owned_projection_session() {
     let fixture = rename_fixture().await;
     let manifest = prepare(&fixture).await;
@@ -436,6 +439,7 @@ async fn apply_then_verification_reuses_the_owned_projection_session() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn verification_page_receipts_stay_on_the_pinned_root_after_ancestor_swap() {
     let fixture = rename_fixture().await;
     let manifest = prepare(&fixture).await;
@@ -498,6 +502,7 @@ async fn verification_page_receipts_stay_on_the_pinned_root_after_ancestor_swap(
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowed() {
     for stale_case in [
         "same_scope_collision",
@@ -623,6 +628,7 @@ async fn stale_dimensions_are_zero_mutation_and_cross_scope_same_title_is_allowe
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn pre_commit_failure_restores_raw_projection_and_rolls_back_db() {
     let fixture = rename_fixture().await;
     let manifest = prepare(&fixture).await;
@@ -660,6 +666,7 @@ async fn pre_commit_failure_restores_raw_projection_and_rolls_back_db() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn mid_projection_write_failure_restores_target_state_and_database() {
     let fixture = rename_fixture().await;
     let manifest = prepare(&fixture).await;
@@ -740,6 +747,7 @@ async fn mid_projection_write_failure_restores_target_state_and_database() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn recovery_publishes_only_exact_committed_post_and_restores_known_pre_db_mixed_state() {
     let committed = rename_fixture().await;
     let committed_manifest = prepare(&committed).await;
@@ -857,6 +865,7 @@ async fn recovery_publishes_only_exact_committed_post_and_restores_known_pre_db_
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn recovery_clears_a_valid_pending_receipt_when_target_is_exactly_pre_state() {
     let fixture = rename_fixture().await;
     let manifest = prepare(&fixture).await;

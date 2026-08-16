@@ -6595,6 +6595,12 @@ where
     Ok(())
 }
 
+// Every repair entry point refuses on non-unix, because the artifact store's
+// privacy guarantee is POSIX mode bits and there is no Windows equivalent wired
+// up. That refusal is the product's decision; the consequence for tests is that
+// any case which drives a real repair cannot run on Windows, so those carry
+// `#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]`. Keep the
+// two in step: if this gate ever opens, drop the attributes with it.
 #[cfg(unix)]
 fn ensure_repair_artifacts_supported() -> Result<(), WenlanError> {
     Ok(())
@@ -7077,6 +7083,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn prepare_resolves_one_hashed_memory_without_mutating_store() {
         let (db, _db_dir) = fixture().await;
         let repair_root = tempfile::tempdir().unwrap();
@@ -7114,6 +7121,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn prepare_accepts_complete_classification_with_unrelated_incomplete_deep_check() {
         let (db, _db_dir) = fixture().await;
         let repair_root = tempfile::tempdir().unwrap();
@@ -7187,6 +7195,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn unverified_v1_apply_receipt_cannot_claim_v2_non_target_proof() {
         let repair_root = tempfile::tempdir().unwrap();
         let manifest_id = "repair_550e8400-e29b-41d4-a716-446655440000";
@@ -7259,6 +7268,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn prepare_rejects_reports_from_different_runtime_producers() {
         let (db, _db_dir) = fixture().await;
         let repair_root = tempfile::tempdir().unwrap();
@@ -7284,6 +7294,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn prepare_rejects_reports_from_a_different_page_projection() {
         let (db, _db_dir) = fixture().await;
         let repair_root = tempfile::tempdir().unwrap();
@@ -7307,6 +7318,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn prepare_rejects_registered_label_bound_to_another_opaque_scope() {
         let (db, _db_dir) = fixture().await;
         let repair_root = tempfile::tempdir().unwrap();
@@ -7495,6 +7507,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verify_request_roundtrips_optional_exact_next_apply() {
         let (db, _db_dir, _repair_root, manifest) = prepared_fixture().await;
         let (general, deep) = verification_reports(&db).await;
@@ -7543,6 +7556,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn wrong_approval_or_stale_target_performs_zero_writes() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -7588,6 +7602,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn successful_apply_changes_only_declared_owner_closure() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -7618,6 +7633,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn reclassification_rollback_uncertainty_retains_pending_receipt() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -7649,6 +7665,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn apply_recovers_committed_receipt_after_unrelated_background_write() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -7680,6 +7697,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn apply_refuses_while_manifest_operation_lock_is_held() {
         use fs2::FileExt as _;
 
@@ -7708,6 +7726,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn apply_discards_precommit_partial_receipt_and_retries() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -7724,6 +7743,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn effect_escape_rolls_back_target_and_trigger_side_effect() {
         let (db, _db_dir) = fixture().await;
         db.test_primary_session()
@@ -7776,6 +7796,7 @@ mod tests {
     /// escaped write. Here the escape both mutates a second `memories` row and
     /// inflates the counter, so the arithmetic alone would net to zero.
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn effect_escape_cannot_hide_behind_an_inflated_parity_generation() {
         let (db, _db_dir) = fixture().await;
         db.test_primary_session()
@@ -7823,6 +7844,7 @@ mod tests {
     /// unit-bump guard closes for UPDATE, so the guard has to cover the insert
     /// path too. DELETE+INSERT is the same bypass by a longer route.
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn effect_escape_cannot_hide_behind_a_replaced_parity_row() {
         let (db, _db_dir) = fixture().await;
         db.test_primary_session()
@@ -7867,6 +7889,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_records_receipt_only_after_post_lint_and_effect_proof() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -7894,6 +7917,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_control_observes_nonprojection_commit_and_cleanup_boundaries() {
         use fs2::FileExt as _;
         use std::sync::{Arc, Mutex};
@@ -7982,6 +8006,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_real_receipt_conflict_rolls_back_and_retains_pending() {
         use std::sync::{
             atomic::{AtomicBool, Ordering},
@@ -8041,6 +8066,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_commit_failure_keeps_terminal_receipt_for_retry_cleanup() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -8083,6 +8109,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn post_repair_general_and_deep_must_share_one_producer() {
         let (db, _db_dir, _repair_root, manifest) = prepared_fixture().await;
         let (general, deep) = verification_reports(&db).await;
@@ -8121,6 +8148,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn pending_verification_manifest_ids_tracks_apply_until_verify() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -8192,6 +8220,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_clears_crash_window_pending_apply_link() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -8236,6 +8265,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_retry_returns_the_existing_receipt() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -8256,6 +8286,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn failed_post_apply_verification_can_resume_with_fresh_valid_reports() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -8299,6 +8330,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_refuses_while_manifest_operation_lock_is_held() {
         use fs2::FileExt as _;
 
@@ -8340,6 +8372,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_rejects_target_evidence_that_survives_post_lint() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -8400,6 +8433,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_accepts_unrelated_write_after_apply_when_reports_are_fresh() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -8433,6 +8467,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_accepts_in_place_metadata_update_when_reports_are_fresh() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -8464,6 +8499,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_rejects_target_owner_change_after_apply_even_with_fresh_reports() {
         use std::sync::{
             atomic::{AtomicBool, Ordering},
@@ -8521,6 +8557,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_rejects_reports_that_are_no_longer_current() {
         use std::sync::{
             atomic::{AtomicBool, Ordering},
@@ -8575,6 +8612,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_rejects_reports_after_page_projection_changes() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -8601,6 +8639,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_rejects_new_actionable_check() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
@@ -8660,6 +8699,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_accepts_unchanged_unrelated_deep_incomplete_baseline() {
         let (db, _db_dir) = fixture().await;
         let repair_root = tempfile::tempdir().unwrap();
@@ -8688,6 +8728,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
     async fn verification_rejects_new_unrelated_deep_incomplete_check() {
         let (db, _db_dir, repair_root, manifest) = prepared_fixture().await;
         let store = RepairArtifactStore::new(repair_root.path().to_path_buf());
