@@ -146,6 +146,13 @@ APP_JOB_FILES = {
     "playwright.review.config.ts",
     "scripts/prepare-sidecars.sh",
     "scripts/prepare-tauri-build-sidecars.sh",
+    # app-check is the only job that installs the package, so it is the only
+    # one that runs the postinstall hook installer and the Vitest suites that
+    # assert on the dev entry points and their Node launchers.
+    "scripts/dev-all.sh",
+    "scripts/dev-runtime.sh",
+    "scripts/install-git-hooks.mjs",
+    "scripts/run-bash.mjs",
     "scripts/open-review-app.mjs",
     "scripts/open-review-app.test.ts",
     "scripts/prepare-sidecars.test.ts",
