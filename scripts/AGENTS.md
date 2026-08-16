@@ -11,7 +11,7 @@ part of packaging behavior, not generic local helpers.
 | --- | --- | --- |
 | Stage sidecars | `prepare-sidecars.sh` | tree-build only; compiles from the checked-out backend |
 | Tauri build hook | `prepare-tauri-build-sidecars.sh` | picks debug vs release based on `TAURI_ENV_DEBUG` |
-| Resolve backend checkout | `resolve-backend-dir.sh` | validates sibling or `WENLAN_BACKEND_DIR` shape |
+| Resolve backend checkout | `resolve-backend-dir.sh` | validates the current checkout, or `WENLAN_BACKEND_DIR`; a sibling checkout is only a legacy fallback |
 | Isolated dev runtime | `dev-runtime.sh`, `dev-all.sh` | worktree-owned daemon/UI ports, data dir, debug MCP socket, PID, and teardown |
 | Version lockstep | `release-version-sync.test.ts` | app, Cargo, Tauri versions must match |
 | Sidecar tests | `prepare-sidecars.test.ts` | locks path and cloudflared behavior |
@@ -19,11 +19,10 @@ part of packaging behavior, not generic local helpers.
 
 ## CONVENTIONS
 
-- Sidecars always come from a backend checkout in the same tree, found by
-  `resolve-backend-dir.sh` (sibling checkout or `WENLAN_BACKEND_DIR`). The old
-  pinned-download mode (`.wenlan-backend-version`, `prepare-sidecars.sh
-  --download`) was deleted once the unified release (v0.15.7) proved the
-  in-tree build.
+- Sidecars always come from a backend checkout, found by
+  `resolve-backend-dir.sh` (the current checkout by default, or
+  `WENLAN_BACKEND_DIR`; a sibling checkout is only a legacy fallback). See
+  `HISTORY.md` for the retired pinned-download mode.
 - `prepare-tauri-build-sidecars.sh` is the Tauri hook; keep it aligned with
   `app/tauri.conf.json` `beforeBuildCommand`.
 - `cloudflared` is required for a full Tauri bundle:

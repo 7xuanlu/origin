@@ -32,11 +32,20 @@ vi.mock("./FocusGraph", () => ({
 vi.mock("./AtlasView", () => ({
   default: (props: {
     focusEntityId?: string;
-    onNodeClick?: (id: string) => void;
+    onNodeClick?: (target: { kind: "entity" | "memory"; id: string }) => void;
   }) => (
     <div data-focus-entity-id={props.focusEntityId ?? ""} data-testid="atlas-view">
-      <button type="button" onClick={() => props.onNodeClick?.("entity-hopper")}>
+      <button
+        type="button"
+        onClick={() => props.onNodeClick?.({ kind: "entity", id: "entity-hopper" })}
+      >
         Atlas node
+      </button>
+      <button
+        type="button"
+        onClick={() => props.onNodeClick?.({ kind: "memory", id: "memory-ada" })}
+      >
+        Atlas memory node
       </button>
     </div>
   ),
@@ -269,6 +278,21 @@ describe("EntityDetail characterization", () => {
 
     await user.click(within(dialog).getByRole("button", { name: "Atlas node" }));
     expect(defaultProps.onEntityClick).toHaveBeenCalledWith("entity-hopper");
+    expect(screen.queryByRole("dialog", { name: "Full screen" })).not.toBeInTheDocument();
+  });
+
+  it("routes a memory node in the Atlas overlay to the memory, closing the overlay", async () => {
+    const { user } = renderEntity();
+    await screen.findByRole("heading", { name: "Ada Lovelace" });
+    await user.click(screen.getByRole("button", { name: "Full screen" }));
+    const dialog = screen.getByRole("dialog", { name: "Full screen" });
+    await user.click(within(dialog).getByRole("button", { name: "Atlas" }));
+    await screen.findByTestId("atlas-view");
+
+    await user.click(within(dialog).getByRole("button", { name: "Atlas memory node" }));
+
+    expect(defaultProps.onMemoryClick).toHaveBeenCalledWith("memory-ada");
+    expect(defaultProps.onEntityClick).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog", { name: "Full screen" })).not.toBeInTheDocument();
   });
 

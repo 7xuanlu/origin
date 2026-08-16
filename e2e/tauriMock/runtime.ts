@@ -216,6 +216,7 @@ export class TauriMockRuntime {
       case "reject_refinement": return this.resolveRefinement(args, false);
       case "list_entities_cmd": return this.listEntities(args);
       case "get_entity_detail_cmd": return this.getEntityDetail(args);
+      case "get_knowledge_graph_cmd": return this.getKnowledgeGraph();
       case "add_observation_cmd": return this.addObservation(args);
       case "update_observation_cmd": return this.updateObservation(args);
       case "delete_observation_cmd": return this.deleteObservation(args);
@@ -749,6 +750,109 @@ export class TauriMockRuntime {
   private listEntities(args: unknown) {
     const domain = optionalString(args, "domain");
     return this.entityDetails.map((detail) => detail.entity).filter((entity) => !domain || entity.domain === domain || entity.space === domain);
+  }
+
+  /**
+   * The bulk graph read, derived from the same entity/detail fixtures the
+   * per-entity commands serve. A relation is emitted once, from the endpoint
+   * that declares it outgoing, and only when both endpoints exist. The
+   * navigation fixture links no memory to an entity, so the memory halves are
+   * empty rather than invented.
+   */
+  private getKnowledgeGraph() {
+    const entities = this.entityDetails.map((detail) => detail.entity);
+    const known = new Set(entities.map((entity) => entity.id));
+    const relations: {
+      id: string;
+      from_entity: string;
+      to_entity: string;
+      relation_type: string;
+      source_agent: string | null;
+      created_at: number;
+    }[] = [];
+    const seen = new Set<string>();
+    for (const detail of this.entityDetails) {
+      for (const relation of detail.relations) {
+        if (!known.has(relation.entity_id) || seen.has(relation.id)) continue;
+        seen.add(relation.id);
+        const outgoing = relation.direction !== "incoming";
+        relations.push({
+          id: relation.id,
+          from_entity: outgoing ? detail.entity.id : relation.entity_id,
+          to_entity: outgoing ? relation.entity_id : detail.entity.id,
+          relation_type: relation.relation_type,
+          source_agent: relation.source_agent,
+          created_at: relation.created_at,
+        });
+      }
+    }
+    // Wiki pages and their typed links. The fixture has no wikilink or
+    // citation records of its own, so the map half is derived
+    // deterministically from the page list: consecutive active pages are
+    // wikilinked in a chain, a page carrying `entity_id` gets its `about`
+    // link, and the first two pages both cite the first memory (which is what
+    // makes the shared-source edge appear while the memory layer is off).
+    const activePages = this.pages.filter((page) => page.status === "active");
+    const graphPages = activePages.map((page) => ({
+      id: page.id,
+      title: page.title,
+      space: page.space ?? null,
+      creation_kind: page.creation_kind ?? "distilled",
+      entity_id: page.entity_id ?? null,
+      last_modified: page.last_modified,
+    }));
+    const pageLinks: {
+      from: { kind: "page" | "entity" | "memory"; id: string };
+      to: { kind: "page" | "entity" | "memory"; id: string };
+      link_type: "wikilink" | "about" | "cites";
+    }[] = [];
+    for (let index = 1; index < activePages.length; index += 1) {
+      pageLinks.push({
+        from: { kind: "page", id: activePages[index - 1].id },
+        to: { kind: "page", id: activePages[index].id },
+        link_type: "wikilink",
+      });
+    }
+    for (const page of activePages) {
+      if (page.entity_id && known.has(page.entity_id)) {
+        pageLinks.push({
+          from: { kind: "page", id: page.id },
+          to: { kind: "entity", id: page.entity_id },
+          link_type: "about",
+        });
+      }
+    }
+    const citedMemory = this.memories[0];
+    const memories = citedMemory
+      ? [
+          {
+            source_id: citedMemory.source_id,
+            title: citedMemory.title,
+            memory_type: citedMemory.memory_type,
+            space: citedMemory.space,
+            confirmed: citedMemory.confirmed,
+            last_modified: citedMemory.last_modified,
+          },
+        ]
+      : [];
+    if (citedMemory) {
+      for (const page of activePages.slice(0, 2)) {
+        pageLinks.push({
+          from: { kind: "page", id: page.id },
+          to: { kind: "memory", id: citedMemory.source_id },
+          link_type: "cites",
+        });
+      }
+    }
+
+    return {
+      entities,
+      relations,
+      memories,
+      memory_links: [],
+      pages: graphPages,
+      page_links: pageLinks,
+    };
   }
 
   private getEntityDetail(args: unknown): EntityDetail {

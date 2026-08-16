@@ -1677,6 +1677,20 @@ pub async fn get_entity_detail_cmd(
         .await
 }
 
+/// One bulk read of the whole knowledge graph for the current space scope.
+///
+/// The Graph view used to fan out one `get_entity_detail_cmd` per entity and
+/// could only afford the first 20, which drew every other connected entity as
+/// an isolate. This returns entities, relations, memory nodes and memory links
+/// in a single typed response.
+#[tauri::command]
+pub async fn get_knowledge_graph_cmd(
+    state: tauri::State<'_, State>,
+) -> Result<KnowledgeGraphResponse, String> {
+    let s = state.read().await;
+    s.client.get_json("/api/memory/graph").await
+}
+
 #[tauri::command]
 pub async fn update_observation_cmd(
     state: tauri::State<'_, State>,

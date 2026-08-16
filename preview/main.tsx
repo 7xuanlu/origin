@@ -311,9 +311,13 @@ function Harness() {
         <div style={{ height: `calc(100vh - ${BAR_H}px)` }}>
           <Suspense fallback={<div style={{ padding: 16 }}>Loading atlas…</div>}>
             <AtlasView
-              onNodeClick={(id: string) => {
-                setEntityId(id);
-                setMode("entity");
+              onNodeClick={(target) => {
+                if (target.kind === "entity") {
+                  setEntityId(target.id);
+                  setMode("entity");
+                } else {
+                  console.log(`[preview] onNodeClick (${target.kind})`, target.id);
+                }
               }}
               // Main.tsx passes navigateBack here; a logging stub keeps the
               // previewed toolbar at Main parity.

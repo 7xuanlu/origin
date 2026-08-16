@@ -51,12 +51,14 @@ crates/*/.fastembed_cache
 .claude/*
 !.claude/settings.json
 !.claude/hooks/
+!.claude/agents/
 # Skills are tracked selectively: verification skills ship with the repo,
 # personal/local skills stay local.
 !.claude/skills/
 .claude/skills/*
 !.claude/skills/prove/
 !.claude/skills/run-wenlan/
+!.claude/skills/run-wenlan-app/
 !.claude/skills/verify/
 .mcp.json
 
@@ -68,7 +70,7 @@ app/binaries/
 
 # Git worktrees
 .worktrees/
-# Top-level sibling clone of origin-mcp (legacy; crates/origin-mcp/ is the in-repo crate)
+# Top-level sibling clone of wenlan-mcp (legacy; crates/wenlan-mcp/ is the in-repo crate)
 /origin-mcp/
 .autopilot-task.md
 

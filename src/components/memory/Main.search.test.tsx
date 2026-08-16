@@ -65,13 +65,22 @@ vi.mock("./HomePage", () => ({
   ),
 }));
 vi.mock("./AtlasView", () => ({
-  default: (props: { onBack?: () => void; onNodeClick?: (id: string) => void }) => (
+  default: (props: {
+    onBack?: () => void;
+    onNodeClick?: (target: { kind: "entity" | "memory"; id: string }) => void;
+  }) => (
     <div data-testid="atlas-view">
       <button type="button" onClick={() => props.onBack?.()}>
         Atlas back
       </button>
-      <button type="button" onClick={() => props.onNodeClick?.("ent-1")}>
+      <button type="button" onClick={() => props.onNodeClick?.({ kind: "entity", id: "ent-1" })}>
         Atlas node
+      </button>
+      <button
+        type="button"
+        onClick={() => props.onNodeClick?.({ kind: "memory", id: "memory-1" })}
+      >
+        Atlas memory node
       </button>
     </div>
   ),
@@ -1077,6 +1086,17 @@ describe("Main search", () => {
     await user.click(screen.getByRole("button", { name: "Open graph view" }));
     await user.click(screen.getByRole("button", { name: "Atlas node" }));
     expect(screen.getByTestId("entity-detail")).toBeInTheDocument();
+  });
+
+  it("opens the memory, not an entity, when a memory node is clicked in the Graph view", async () => {
+    const user = userEvent.setup();
+    renderMain();
+
+    await user.click(screen.getByRole("button", { name: "Open graph view" }));
+    await user.click(screen.getByRole("button", { name: "Atlas memory node" }));
+
+    expect(await screen.findByTestId("memory-detail")).toBeInTheDocument();
+    expect(screen.queryByTestId("entity-detail")).not.toBeInTheDocument();
   });
 
   it("opens memory detail when initialMemoryId arrives after mount", async () => {
