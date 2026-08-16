@@ -70,11 +70,17 @@ a third of the wall-clock. A `#[cfg(windows)]` unit test therefore has no
 required-CI execution on any platform; `projection_state_mode_tracks_windows_readonly_attribute`
 is one such test.
 
-That gap is older than this change and is not closed by it. Pre-push never
-covered it either: the only machine that could run those tests is a Windows
-one, and until this branch a Windows checkout could not complete a push at all.
-Windows behaviour is covered at a coarser grain by the Windows CLI/server
-integration step and the schtasks install round-trip in the same job. Closing
-it at unit level means paying the ~25 minute Windows lib run on every PR, which
-is a separate decision from this one.
+Trimming the widened pre-push plan removed the one lane that did run them.
+Before that change a widened plan scheduled `cargo test --workspace --exclude
+wenlan-app --lib` and the `wenlan-server` binary tests, so a Windows developer
+pushing a broad change executed every `#[cfg(windows)]` unit test on the only
+platform that compiles them. Nothing runs them now — not a required check, not
+a local hook, on any platform.
+
+That is the cost of the trade the section above describes, taken knowingly: the
+same run took over an hour on Windows and blocked every broad change on a
+failure unrelated to it. Windows behaviour is still covered at a coarser grain
+by the Windows CLI/server integration step and the schtasks install round-trip
+in the same job. Closing the unit-level gap means paying the ~25 minute Windows
+lib run on every PR, which is a separate decision from this one.
 
