@@ -311,7 +311,7 @@ async fn add_observation_short_content_returns_422() {
         &app,
         "/api/memory/entities",
         Some("test"),
-        serde_json::json!({"name": "S", "entity_type": "person"}),
+        serde_json::json!({"name": "Subject Two", "entity_type": "person"}),
     )
     .await;
     let entity_id = e["id"].as_str().expect("entity missing id");

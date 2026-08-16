@@ -350,10 +350,14 @@ pub async fn heal_entity_vocabulary(db: &MemoryDB) -> Result<VocabHealCounts, We
             );
             continue;
         }
-        // Band A2: deterministic safe transform toward an existing canonical.
-        if let Some(canonical) =
-            crate::vocab::safe_transform::safe_transform(entity_type, &canonicals)
-        {
+        // Band A2: the write-time canonicalizer -- the reviewed alias table
+        // plus the deterministic safe transform. Sharing it with
+        // `resolve_or_create_entity` is what lets this heal the rows that
+        // predate the gate: without it the alias table would only apply to new
+        // writes and the historical off-vocabulary rows would sit here forever.
+        let normalized = crate::vocab::entity_type::normalize(entity_type, &canonicals);
+        if !normalized.unrecognized {
+            let canonical = normalized.canonical;
             let folded = db.fold_entity_type(entity_type, &canonical).await?;
             counts.healed += folded;
             log::info!(
@@ -1583,9 +1587,12 @@ mod tests {
         db.store_entity("X", "concepts", None, Some("t"), None)
             .await
             .unwrap(); // safe: concepts->concept
-        db.store_entity("Y", "interest", None, Some("t"), None)
+        db.store_entity("Y", "widget", None, Some("t"), None)
             .await
-            .unwrap(); // semantic: queue
+            .unwrap(); // semantic, no alias: queue
+        db.store_entity("Z", "platform", None, Some("t"), None)
+            .await
+            .unwrap(); // reviewed alias: platform->technology
         let counts = super::heal_entity_vocabulary(&db).await.unwrap();
         assert!(counts.healed >= 1);
         assert!(counts.queued >= 1);
@@ -1609,7 +1616,12 @@ mod tests {
         }
         assert!(types.contains(&"concept".to_string()));
         assert!(!types.contains(&"concepts".to_string()));
-        assert!(types.contains(&"interest".to_string())); // unchanged, awaiting human
+        // The reviewed alias table now folds here too, so a historical
+        // off-vocabulary value lands on the canonical the write path would
+        // have chosen -- not on a blanket default.
+        assert!(types.contains(&"technology".to_string()));
+        assert!(!types.contains(&"platform".to_string()));
+        assert!(types.contains(&"widget".to_string())); // unchanged, awaiting human
     }
 
     #[tokio::test]

@@ -908,7 +908,7 @@ carrying the authority of agreement.
 | `core/db.rs::get_stale_page_after` | `pub` | no | no | — | — |
 | `core/db.rs::insert_page_with_kind_inner` | `private` | no | no | — | — |
 | `core/db.rs::list_active_page_titles_scoped` | `pub` | no | no | — | — |
-| `core/db.rs::list_entities` | `pub` | no | no | — | — |
+| `core/db.rs::list_entities` | `pub` | no | **yes** | `server/cmd_prune_junk_entities.rs::collect_candidates` | — |
 | `core/db.rs::list_pages_by_space` | `pub` | no | no | — | — |
 | `core/db.rs::list_pages_inner` | `private` | no | no | — | — |
 | `core/db.rs::list_pages_stale` | `pub` | no | no | — | — |
@@ -986,6 +986,7 @@ carrying the authority of agreement.
 | Reader | Visibility | Ambiguous | Exposure | External callers | Reaches prose via |
 |---|---|---|---|---|---|
 | `core/db.rs::accept_page_merge` | `pub` | no | no | — | `core/db.rs::append_page_history`, `core/db.rs::page_merge_row` |
+| `core/db.rs::archive_entity` | `pub` | no | **yes** | `server/cmd_prune_junk_entities.rs::run` | `core/db.rs::append_page_history` |
 | `core/db.rs::archive_page` | `pub` | no | **yes** | `server/page_routes.rs::handle_archive_page` | `core/db.rs::append_page_history` |
 | `core/db.rs::augment_with_graph_gated` | `private` | no | no | — | `core/db/scoped_entities.rs::get_observations_for_entities_scoped`, `core/db/scoped_entities.rs::search_entities_by_vector_scoped` |
 | `core/db.rs::augment_with_graph_seeded_scoped` | `private` | no | no | — | `core/db/scoped_entities.rs::get_observations_for_entities_scoped` |
@@ -1066,6 +1067,7 @@ carrying the authority of agreement.
 | `core/synthesis/wikilinks.rs::resolve_against_pages` | `pub` | no | no | — | `core/db.rs::find_unique_active_page_id_by_title_scoped` |
 | `core/truth_adapter.rs::verdicts` | `private` | no | no | — | `core/db/truth_exposure.rs::page_truth_states` |
 | `server/cmd_backfill.rs::run` | `pub` | yes | no | — | `core/db.rs::find_stale_archived_pages` |
+| `server/cmd_prune_junk_entities.rs::collect_candidates` | `private` | no | no | `server/cmd_prune_junk_entities.rs::run` | `core/db.rs::list_entities` |
 | `server/entity_graph_routes.rs::handle_create_entity` | `pub` | no | no | — | `core/db.rs::get_entity_detail` |
 | `server/entity_graph_routes.rs::handle_get_entity_detail` | `pub` | no | no | — | `core/db/scoped_entities.rs::get_entity_detail_scoped` |
 | `server/entity_graph_routes.rs::handle_list_entities` | `pub` | no | no | — | `core/db/scoped_entities.rs::list_entities_scoped` |
@@ -1208,6 +1210,7 @@ carrying the authority of agreement.
 | `core/truth_adapter.rs::page_write_permit` | `pub` | no | **yes** | `server/page_routes.rs::handle_export_page`, `server/page_routes.rs::handle_export_pages` | `core/db/truth_exposure.rs::page_visibility` |
 | `server/brief_routes.rs::handle_read_brief` | `pub` | no | **yes** | `server/routes.rs::handle_context` | `core/db.rs::search_memory` |
 | `server/cmd_cutover.rs::run` | `pub` | yes | no | — | `core/export/knowledge.rs::plan_truth_cutover` |
+| `server/cmd_prune_junk_entities.rs::run` | `pub` | yes | no | — | `core/db.rs::archive_entity`, `server/cmd_prune_junk_entities.rs::collect_candidates` |
 | `server/main/runtime.rs::register_optional_runtime_workers` | `pub(super)` | no | no | `server/main.rs::run_daemon` | `core/db/claim_derivation.rs::reconcile_supported_pages` |
 | `server/main/startup.rs::prepare_startup_state` | `pub(super)` | no | no | `server/main.rs::run_daemon` | `core/db.rs::list_pages` |
 | `server/memory_routes.rs::handle_search_memory` | `pub` | no | no | — | `core/db.rs::search_memory` |

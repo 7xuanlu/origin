@@ -10,7 +10,19 @@ pub(crate) const REVIEW_ID: &str = "pages.review_status_inventory";
 pub(crate) const SOURCE_INTEGRITY_ID: &str = "pages.source_page_integrity";
 
 const STATUSES: [&str; 2] = ["active", "archived"];
-const CREATION_KINDS: [&str; 5] = ["authored", "distilled", "imported", "research", "source"];
+// Must match `pages.creation_kind`'s CHECK constraint, which the G6 shadow-page
+// migration widened to admit 'entity' (see `db.rs`, "widen `pages.creation_kind`'s
+// CHECK to admit 'entity'"). While 'entity' was missing here, every entity shadow
+// page counted as an unknown storage value and `pages.db.partitions` and
+// `pages.review_status_inventory` reported the whole graph as errors.
+const CREATION_KINDS: [&str; 6] = [
+    "authored",
+    "distilled",
+    "entity",
+    "imported",
+    "research",
+    "source",
+];
 const REVIEW_STATUSES: [&str; 2] = ["confirmed", "unconfirmed"];
 
 #[derive(Debug, Clone)]
