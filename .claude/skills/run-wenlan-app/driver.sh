@@ -4,11 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)" # unit root (repo or worktree)
-# Reuse the main checkout's warm cargo cache and sibling backend even from
-# a linked worktree (resolve-backend-dir.sh fallbacks don't reach
-# .claude/worktrees/<name>, which is 3 levels deep).
 MAIN="$(cd "$(git -C "$ROOT" rev-parse --git-common-dir)/.." && pwd)"
-export WENLAN_BACKEND_DIR="${WENLAN_BACKEND_DIR:-$MAIN/../wenlan}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$MAIN/target}"
 BIN="$CARGO_TARGET_DIR/debug/wenlan-app"
 LOG="${TMPDIR:-/tmp}"

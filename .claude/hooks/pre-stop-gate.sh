@@ -11,11 +11,11 @@ cd "$REPO"
 
 [ -f "$REPO/Cargo.toml" ] || exit 0
 
-# Collect changed source files (staged + unstaged + untracked, .rs only)
+# Collect changed source files (staged + unstaged + untracked, Rust and TypeScript)
 FILES_LIST=$({
-  git diff --name-only --diff-filter=ACMR -- '*.rs' 2>/dev/null
-  git diff --name-only --cached --diff-filter=ACMR -- '*.rs' 2>/dev/null
-  git ls-files --others --exclude-standard -- '*.rs' 2>/dev/null
+  git diff --name-only --diff-filter=ACMR -- '*.rs' '*.ts' '*.tsx' 2>/dev/null
+  git diff --name-only --cached --diff-filter=ACMR -- '*.rs' '*.ts' '*.tsx' 2>/dev/null
+  git ls-files --others --exclude-standard -- '*.rs' '*.ts' '*.tsx' 2>/dev/null
 } | sort -u)
 
 PROBLEMS=()
@@ -37,6 +37,10 @@ if [ "${#FILES[@]}" -gt 0 ]; then
     'todo!\s*\('
     'unimplemented!\s*\('
     '^\s*//.*FIXME'
+    'assert[[:space:]]*\([[:space:]]*true[[:space:]]*\)'
+    'expect[[:space:]]*\([[:space:]]*true[[:space:]]*\)[[:space:]]*\.toBe[[:space:]]*\([[:space:]]*true[[:space:]]*\)'
+    '(^|[^[:alnum:]_])(it|test)\.skip[[:space:]]*\('
+    '(^|[^[:alnum:]_])xit[[:space:]]*\('
   )
 
   # Added lines from both unstaged and staged changes. Untracked files are counted
@@ -45,7 +49,7 @@ if [ "${#FILES[@]}" -gt 0 ]; then
     git diff --unified=0 -- "${FILES[@]}" 2>/dev/null
     git diff --cached --unified=0 -- "${FILES[@]}" 2>/dev/null
   } | grep -E '^\+[^+]' || true)"
-  # For untracked .rs files, include all lines
+  # For untracked source files, include all lines
   for f in "${FILES[@]}"; do
     if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then continue; fi
     [ -f "$f" ] && ADDED_LINES+=$'\n'"$(sed 's/^/+ /' "$f")"
@@ -88,7 +92,7 @@ STAGED="$(git diff --cached --shortstat 2>/dev/null | sed 's/^ *//')"
   echo "[$TS] branch=$BRANCH head=$HEAD_SHA"
   [ -n "$CHANGED" ] && echo "  unstaged: $CHANGED"
   [ -n "$STAGED" ]  && echo "  staged:   $STAGED"
-  echo "  files: ${#FILES[@]} .rs touched, pattern scan clear"
+  echo "  files: ${#FILES[@]} source files touched, pattern scan clear"
 } >> "$PROGRESS"
 
 exit 0
