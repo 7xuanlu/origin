@@ -772,7 +772,11 @@ jobs:
     needs: [detect-changes]
     if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # The release branch is pushed seconds after the main merge, so this proof
+    # starts while the base's own push CI is still running. Recent main push CI
+    # runs take 18-27 minutes, so the wait window must outlast a slow main run;
+    # a shorter one fails the release PR on a pure start-order race.
+    timeout-minutes: 45
     permissions:
       actions: read
       contents: read
@@ -791,7 +795,7 @@ jobs:
           python3 trusted-main-ci-proof/scripts/release-promotion.py verify-main-ci
           --repository "$GITHUB_REPOSITORY"
           --sha "${{ github.event.pull_request.base.sha }}"
-          --wait-seconds 1080
+          --wait-seconds 2400
 
   # On PRs and main pushes, Rust fmt + lint run only when their exact source
   # classes changed. Non-Rust changes still get the required aggregate
