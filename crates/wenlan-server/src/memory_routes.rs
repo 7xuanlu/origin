@@ -188,7 +188,7 @@ async fn record_near_duplicate_flag(
         detail
     );
     let warning = format!(
-        "near_duplicate: {similarity:.2} similar to {source_id}; stored anyway. If it repeats that memory, store again with supersedes={source_id} or delete one."
+        "near_duplicate: {similarity:.2} similar to {source_id}; stored anyway. If it repeats that memory, store again with supersedes={source_id}, or delete one."
     );
     Some((
         NearDuplicate {

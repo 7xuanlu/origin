@@ -546,7 +546,7 @@ impl LongMemEvalReport {
             total_negatives: 0,
             negative_leakage: 0,
             gate_content_filtered: 0,
-            gate_novelty_filtered: 0,
+            gate_novelty_flagged: 0,
             empty_set_count: 0,
             empty_set_false_confidence: None,
             score_gap: None,

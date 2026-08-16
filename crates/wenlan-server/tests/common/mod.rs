@@ -93,9 +93,10 @@ pub async fn test_app() -> (AppRouter, tempfile::TempDir, Arc<MemoryDB>) {
 /// Build a test app with the quality gate disabled.
 ///
 /// Use this when the test needs to store memories through the HTTP API
-/// (exercising the full store handler) but the novelty filter would
-/// otherwise reject content that is intentionally similar to an existing
-/// memory — e.g., when testing the topic-match-protected path.
+/// (exercising the full store handler) but wants no gate noise at all —
+/// e.g. no `near_duplicate` flag/warning on content that is intentionally
+/// similar to an existing memory, such as when testing the
+/// topic-match-protected path.
 #[allow(dead_code)]
 pub async fn test_app_no_gate() -> (AppRouter, tempfile::TempDir, Arc<MemoryDB>) {
     let dir = tempfile::tempdir().unwrap();

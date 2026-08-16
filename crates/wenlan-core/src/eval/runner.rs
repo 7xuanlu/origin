@@ -112,7 +112,7 @@ pub async fn run_eval(
     let mut total_neg_above = 0usize;
     let mut total_negatives = 0usize;
     let mut total_gate_content_filtered = 0usize;
-    let mut total_gate_novelty_filtered = 0usize;
+    let mut total_gate_novelty_flagged = 0usize;
     let mut empty_set_cosines: Vec<f64> = Vec::new();
     let mut normal_top1_cosines: Vec<f64> = Vec::new();
     let mut empty_set_count = 0usize;
@@ -160,12 +160,18 @@ pub async fn run_eval(
                     continue;
                 }
 
-                // Novelty check (async, needs DB) — only for Full mode
+                // Novelty check (async, needs DB) — only for Full mode. A
+                // near-duplicate no longer drops the doc (production stores
+                // it too); count it as flagged and keep it. Only a genuine
+                // gate failure (e.g. fail-closed on embedding unavailable)
+                // still drops it here.
                 if gate_mode == GateMode::Full {
                     let (novelty_result, _similar_id) = g.evaluate(&neg.content, None, &db).await?;
                     if !novelty_result.admitted {
-                        total_gate_novelty_filtered += 1;
                         continue;
+                    }
+                    if novelty_result.near_duplicate.is_some() {
+                        total_gate_novelty_flagged += 1;
                     }
                 }
             }
@@ -389,7 +395,7 @@ pub async fn run_eval(
         neg_above_relevant: total_neg_above,
         total_negatives,
         gate_content_filtered: total_gate_content_filtered,
-        gate_novelty_filtered: total_gate_novelty_filtered,
+        gate_novelty_flagged: total_gate_novelty_flagged,
         empty_set_count,
         empty_set_false_confidence,
         score_gap,

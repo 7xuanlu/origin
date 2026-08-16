@@ -148,7 +148,7 @@ pub struct EvalReport {
     #[serde(default)]
     pub gate_content_filtered: usize,
     #[serde(default)]
-    pub gate_novelty_filtered: usize,
+    pub gate_novelty_flagged: usize,
     // Empty-set precision
     #[serde(default)]
     pub empty_set_count: usize,
@@ -354,14 +354,14 @@ impl EvalReport {
             "  Neg>relevant:  {}/{}\n",
             self.neg_above_relevant, self.total_negatives
         ));
-        if self.gate_content_filtered > 0 || self.gate_novelty_filtered > 0 {
+        if self.gate_content_filtered > 0 || self.gate_novelty_flagged > 0 {
             out.push_str(&format!(
-                "  Gate (content): {}\n",
+                "  Gate (content filtered): {}\n",
                 self.gate_content_filtered
             ));
             out.push_str(&format!(
-                "  Gate (novelty): {}\n",
-                self.gate_novelty_filtered
+                "  Gate (novelty flagged):  {}\n",
+                self.gate_novelty_flagged
             ));
         }
 
@@ -751,7 +751,7 @@ mod tests {
             total_negatives: 20,
             negative_leakage: 15,
             gate_content_filtered: 0,
-            gate_novelty_filtered: 0,
+            gate_novelty_flagged: 0,
             empty_set_count: 0,
             empty_set_false_confidence: None,
             score_gap: None,
