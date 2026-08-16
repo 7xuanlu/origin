@@ -35,9 +35,12 @@ describe("scoped dev runtime", () => {
     const packageJson = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
     const scripts = packageJson.scripts as Record<string, string>;
 
-    expect(scripts["dev:daemon"]).toBe("bash scripts/dev-runtime.sh start");
-    expect(scripts["clean:dev"]).toBe("bash scripts/dev-runtime.sh stop");
-    expect(scripts["dev:all"]).toBe("bash scripts/dev-all.sh");
+    // `node scripts/run-bash.mjs`, never a bare `bash`: on a Windows machine
+    // with WSL installed the first `bash` on PATH is the Linux distro, which
+    // cannot see the Windows toolchain these scripts need.
+    expect(scripts["dev:daemon"]).toBe("node scripts/run-bash.mjs scripts/dev-runtime.sh start");
+    expect(scripts["clean:dev"]).toBe("node scripts/run-bash.mjs scripts/dev-runtime.sh stop");
+    expect(scripts["dev:all"]).toBe("node scripts/run-bash.mjs scripts/dev-all.sh");
 
     const lifecycleCommands = [
       scripts["dev:daemon"],

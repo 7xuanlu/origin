@@ -31,6 +31,7 @@ const scriptPath = resolve(root, "scripts/prepare-sidecars.sh");
 const tauriBuildScriptPath = resolve(root, "scripts/prepare-tauri-build-sidecars.sh");
 const resolverScriptPath = resolve(root, "scripts/resolve-backend-dir.sh");
 const devRuntimeScriptPath = resolve(root, "scripts/dev-runtime.sh");
+const runBashScriptPath = resolve(root, "scripts/run-bash.mjs");
 const tempRoots: string[] = [];
 const pathOverrideEnvKeys = new Set([
   "WENLAN_BACKEND_DIR",
@@ -69,6 +70,9 @@ function writeAppScripts(appRoot: string): void {
   copyFileSync(tauriBuildScriptPath, resolve(appRoot, "scripts/prepare-tauri-build-sidecars.sh"));
   copyFileSync(resolverScriptPath, resolve(appRoot, "scripts/resolve-backend-dir.sh"));
   copyFileSync(devRuntimeScriptPath, resolve(appRoot, "scripts/dev-runtime.sh"));
+  // The package.json scripts invoke the shell scripts through this launcher, so
+  // a fixture root that omits it cannot run them at all.
+  copyFileSync(runBashScriptPath, resolve(appRoot, "scripts/run-bash.mjs"));
 }
 
 function childEnv(overrides: Record<string, string> = {}): Record<string, string> {
@@ -297,7 +301,7 @@ describe("prepare-sidecars backend discovery", () => {
     const devDaemon = String(packageJson.scripts["dev:daemon"]);
     const devRuntime = readFileSync(devRuntimeScriptPath, "utf8");
 
-    expect(devDaemon).toBe("bash scripts/dev-runtime.sh start");
+    expect(devDaemon).toBe("node scripts/run-bash.mjs scripts/dev-runtime.sh start");
     expect(devRuntime).toContain('resolve-backend-dir.sh" "$REPO_ROOT"');
     expect(devRuntime).not.toContain("${WENLAN_BACKEND_DIR:-../..}");
   });
@@ -307,7 +311,7 @@ describe("prepare-sidecars backend discovery", () => {
     const tauri = JSON.parse(readFileSync(resolve(root, "app/tauri.conf.json"), "utf8"));
 
     expect(packageJson.scripts["prepare:sidecars:tauri-build"]).toBe(
-      "bash scripts/prepare-tauri-build-sidecars.sh",
+      "node scripts/run-bash.mjs scripts/prepare-tauri-build-sidecars.sh",
     );
     expect(tauri.build.beforeDevCommand).toContain("pnpm prepare:sidecars");
     expect(tauri.build.beforeBuildCommand).toContain("pnpm prepare:sidecars:tauri-build");
