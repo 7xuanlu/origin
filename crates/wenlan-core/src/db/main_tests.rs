@@ -19877,7 +19877,10 @@ async fn test_prune_old_rejections() {
 #[tokio::test]
 async fn test_check_novelty_empty_db() {
     let (db, _dir) = test_db().await;
-    let result = db.check_novelty("User prefers dark mode").await.unwrap();
+    let result = db
+        .check_novelty("User prefers dark mode", None)
+        .await
+        .unwrap();
     assert!(result.is_none());
 }
 
@@ -19895,7 +19898,7 @@ async fn test_check_novelty_finds_similar() {
     db.upsert_documents(vec![doc]).await.unwrap();
 
     let result = db
-        .check_novelty("User prefers dark mode for all code editors")
+        .check_novelty("User prefers dark mode for all code editors", None)
         .await
         .unwrap();
     assert!(result.is_some(), "Should find similar memory");
@@ -19921,7 +19924,10 @@ async fn test_check_novelty_different_content() {
     db.upsert_documents(vec![doc]).await.unwrap();
 
     let result = db
-        .check_novelty("The database uses libSQL with vector indexing for semantic search")
+        .check_novelty(
+            "The database uses libSQL with vector indexing for semantic search",
+            None,
+        )
         .await
         .unwrap();
     match result {
@@ -19931,6 +19937,63 @@ async fn test_check_novelty_different_content() {
             "Unrelated content should have low similarity, got {sim}"
         ),
     }
+}
+
+#[tokio::test]
+async fn test_check_novelty_excludes_supersedes_target() {
+    let (db, _dir) = test_db().await;
+    let doc = RawDocument {
+        content: "User prefers dark mode for all IDEs".to_string(),
+        source_id: "mem_existing".to_string(),
+        source: "memory".to_string(),
+        title: "Dark mode pref".to_string(),
+        last_modified: chrono::Utc::now().timestamp(),
+        ..Default::default()
+    };
+    db.upsert_documents(vec![doc]).await.unwrap();
+
+    let result = db
+        .check_novelty("User prefers dark mode for all IDEs", Some("mem_existing"))
+        .await
+        .unwrap();
+    assert_ne!(
+        result.map(|(source_id, _)| source_id),
+        Some("mem_existing".into())
+    );
+}
+
+#[tokio::test]
+async fn test_check_novelty_skips_superseded_rows() {
+    let (db, _dir) = test_db().await;
+    let original = RawDocument {
+        content: "User prefers dark mode for all IDEs".to_string(),
+        source_id: "mem_original".to_string(),
+        source: "memory".to_string(),
+        title: "Original dark mode pref".to_string(),
+        last_modified: chrono::Utc::now().timestamp(),
+        ..Default::default()
+    };
+    let correction = RawDocument {
+        content: "User prefers dark mode for all code editors".to_string(),
+        source_id: "mem_correction".to_string(),
+        source: "memory".to_string(),
+        title: "Corrected dark mode pref".to_string(),
+        supersedes: Some("mem_original".to_string()),
+        last_modified: chrono::Utc::now().timestamp(),
+        ..Default::default()
+    };
+    db.upsert_documents(vec![original, correction])
+        .await
+        .unwrap();
+
+    let result = db
+        .check_novelty("User prefers dark mode for all IDEs", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.map(|(source_id, _)| source_id),
+        Some("mem_correction".into())
+    );
 }
 
 #[tokio::test]

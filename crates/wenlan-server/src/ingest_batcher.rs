@@ -23,9 +23,9 @@
 //!
 //! ### Why outcomes flow per-request (not batch-wide)
 //!
-//! Quality gate can reject individual docs — e.g., one is a duplicate of
-//! something already in the store, another is fine. The coalescer has to
-//! be able to send each caller its own accept/reject verdict. That's why
+//! Quality gate can reject individual docs — e.g., one is noise while another
+//! is fine. The coalescer has to be able to send each caller its own
+//! accept/reject verdict. That's why
 //! `StoreOutcome` is a three-arm enum and the processor closure returns a
 //! `Vec` parallel to its input.
 
@@ -44,7 +44,10 @@ pub enum StoreOutcome {
     /// caller-supplied pre-computed chunk count (the batch upsert
     /// returns a sum across all docs, so per-doc counts have to be
     /// tracked at submission time).
-    Stored { chunks_created: usize },
+    Stored {
+        chunks_created: usize,
+        near_duplicate: Option<(String, f64)>,
+    },
     /// Quality gate rejected the document. Fields mirror the shape the
     /// HTTP handler turns into `ServerError::QualityGateRejected` so
     /// the daemon emits the same 422 shape callers already see today.
@@ -275,6 +278,7 @@ mod tests {
                         .into_iter()
                         .map(|(_, chunks, _)| StoreOutcome::Stored {
                             chunks_created: chunks,
+                            near_duplicate: None,
                         })
                         .collect()
                 })
@@ -301,7 +305,13 @@ mod tests {
         let results: Vec<_> = futures::future::join_all(handles).await;
         for r in results {
             match r.unwrap().unwrap() {
-                StoreOutcome::Stored { chunks_created } => assert_eq!(chunks_created, 1),
+                StoreOutcome::Stored {
+                    chunks_created,
+                    near_duplicate,
+                } => {
+                    assert_eq!(chunks_created, 1);
+                    assert!(near_duplicate.is_none());
+                }
                 other => panic!("expected Stored, got {other:?}"),
             }
         }
@@ -329,11 +339,12 @@ mod tests {
                             if i % 2 == 0 {
                                 StoreOutcome::Stored {
                                     chunks_created: chunks,
+                                    near_duplicate: None,
                                 }
                             } else {
                                 StoreOutcome::GateRejected {
-                                    reason: "not_novel".into(),
-                                    detail: "too similar to existing".into(),
+                                    reason: "noise_pattern".into(),
+                                    detail: "matched noise pattern".into(),
                                     similar_to: Some(format!("mem_existing_{i}")),
                                 }
                             }
@@ -394,6 +405,7 @@ mod tests {
                         .into_iter()
                         .map(|(_, chunks, _)| StoreOutcome::Stored {
                             chunks_created: chunks,
+                            near_duplicate: None,
                         })
                         .collect()
                 })
@@ -415,7 +427,13 @@ mod tests {
             .unwrap();
         let elapsed = start.elapsed();
 
-        assert!(matches!(result, StoreOutcome::Stored { chunks_created: 1 }));
+        assert!(matches!(
+            result,
+            StoreOutcome::Stored {
+                chunks_created: 1,
+                near_duplicate: None
+            }
+        ));
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert!(
             elapsed < Duration::from_millis(500),
@@ -438,6 +456,7 @@ mod tests {
                         .into_iter()
                         .map(|(_, chunks, _)| StoreOutcome::Stored {
                             chunks_created: chunks,
+                            near_duplicate: None,
                         })
                         .collect()
                 })

@@ -22,6 +22,8 @@ pub struct GateResult {
     pub admitted: bool,
     pub reason: Option<RejectionReason>,
     pub scores: GateScores,
+    /// `(source_id, similarity)` for an admitted memory near an existing one.
+    pub near_duplicate: Option<(String, f64)>,
 }
 
 /// Why a piece of content was rejected.
@@ -29,7 +31,6 @@ pub struct GateResult {
 pub enum RejectionReason {
     NoisePattern(String),
     TooShort(usize),
-    NotNovel(f64),
     CredentialLeak(String),
     EmbeddingUnavailable(String),
 }
@@ -40,7 +41,6 @@ impl RejectionReason {
         match self {
             Self::NoisePattern(_) => "noise_pattern",
             Self::TooShort(_) => "too_short",
-            Self::NotNovel(_) => "not_novel",
             Self::CredentialLeak(_) => "credential_leak",
             Self::EmbeddingUnavailable(_) => "embedding_unavailable",
         }
@@ -51,9 +51,6 @@ impl RejectionReason {
         match self {
             Self::NoisePattern(p) => format!("Matched noise pattern: {p}"),
             Self::TooShort(n) => format!("Only {n} meaningful words (below minimum)"),
-            Self::NotNovel(score) => {
-                format!("Similarity {score:.2} above threshold — too similar to existing memory")
-            }
             Self::CredentialLeak(kind) => format!("Contains credential: {kind}"),
             Self::EmbeddingUnavailable(reason) => {
                 format!("Embedding service unavailable (fail closed): {reason}")
@@ -285,6 +282,7 @@ impl QualityGate {
                     pattern_matched: None,
                     latency_ms: start.elapsed().as_millis() as u64,
                 },
+                near_duplicate: None,
             };
         }
 
@@ -300,6 +298,7 @@ impl QualityGate {
                     pattern_matched: None,
                     latency_ms: start.elapsed().as_millis() as u64,
                 },
+                near_duplicate: None,
             };
         }
 
@@ -316,6 +315,7 @@ impl QualityGate {
                         pattern_matched: Some(kind),
                         latency_ms: start.elapsed().as_millis() as u64,
                     },
+                    near_duplicate: None,
                 };
             }
         }
@@ -343,6 +343,7 @@ impl QualityGate {
                             pattern_matched: Some(name.to_string()),
                             latency_ms: start.elapsed().as_millis() as u64,
                         },
+                        near_duplicate: None,
                     };
                 }
             }
@@ -359,11 +360,12 @@ impl QualityGate {
                         pattern_matched: Some("timestamp_only".to_string()),
                         latency_ms: start.elapsed().as_millis() as u64,
                     },
+                    near_duplicate: None,
                 };
             }
         }
 
-        // Novelty check (NotNovel) requires DB access — handled by evaluate() in a later step.
+        // Novelty check requires DB access — handled by evaluate() in a later step.
         // check_content() is pure/sync; evaluate() is async and adds the novelty gate.
 
         // All checks passed — admit
@@ -377,6 +379,7 @@ impl QualityGate {
                 pattern_matched: None,
                 latency_ms: start.elapsed().as_millis() as u64,
             },
+            near_duplicate: None,
         }
     }
 
@@ -391,15 +394,16 @@ impl QualityGate {
     /// (~50–100 ms for one embedding) becomes the per-BATCH cost.
     ///
     /// Returns a parallel `Vec<(GateResult, Option<String>)>` in the same
-    /// order as `contents`.
+    /// order as `docs`. The second tuple element is the legacy similar-source
+    /// value; `GateResult::near_duplicate` is the soft-flag source of truth.
     pub async fn evaluate_batch(
         &self,
-        contents: &[&str],
+        docs: &[(&str, Option<&str>)],
         db: &crate::db::MemoryDB,
     ) -> Result<Vec<(GateResult, Option<String>)>, crate::error::WenlanError> {
         // Fast path: gate disabled. Admit every doc.
         if !self.config.enabled {
-            return Ok(contents
+            return Ok(docs
                 .iter()
                 .map(|c| {
                     (
@@ -409,10 +413,11 @@ impl QualityGate {
                             scores: GateScores {
                                 content_type_pass: true,
                                 novelty_score: None,
-                                word_count: c.split_whitespace().count(),
+                                word_count: c.0.split_whitespace().count(),
                                 pattern_matched: None,
                                 latency_ms: 0,
                             },
+                            near_duplicate: None,
                         },
                         None,
                     )
@@ -421,19 +426,21 @@ impl QualityGate {
         }
 
         // Step 1: content checks for every doc.
-        let mut per_doc: Vec<(GateResult, Option<String>)> = contents
+        let mut per_doc: Vec<(GateResult, Option<String>)> = docs
             .iter()
-            .map(|c| (self.check_content(c), None))
+            .map(|(content, _)| (self.check_content(content), None))
             .collect();
 
         // Step 2: gather indices still eligible for novelty, batch-embed
         // + novelty-query them together.
         let mut survivor_indices: Vec<usize> = Vec::new();
         let mut survivor_contents: Vec<String> = Vec::new();
+        let mut survivor_exclude_source_ids: Vec<Option<String>> = Vec::new();
         for (i, (r, _)) in per_doc.iter().enumerate() {
             if r.admitted {
                 survivor_indices.push(i);
-                survivor_contents.push(contents[i].to_string());
+                survivor_contents.push(docs[i].0.to_string());
+                survivor_exclude_source_ids.push(docs[i].1.map(str::to_string));
             }
         }
 
@@ -442,7 +449,9 @@ impl QualityGate {
         }
 
         let started = std::time::Instant::now();
-        let novelty_results = db.check_novelty_batch(&survivor_contents).await?;
+        let novelty_results = db
+            .check_novelty_batch(&survivor_contents, &survivor_exclude_source_ids)
+            .await?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
         // Amortize the batch latency across survivors so each
@@ -459,8 +468,7 @@ impl QualityGate {
             if let Some((source_id, similarity)) = novelty {
                 result.scores.novelty_score = Some(similarity);
                 if similarity >= self.config.novelty_threshold {
-                    result.admitted = false;
-                    result.reason = Some(RejectionReason::NotNovel(similarity));
+                    result.near_duplicate = Some((source_id.clone(), similarity));
                 }
                 *similar = Some(source_id);
             }
@@ -471,6 +479,7 @@ impl QualityGate {
     pub async fn evaluate(
         &self,
         content: &str,
+        supersedes: Option<&str>,
         db: &crate::db::MemoryDB,
     ) -> Result<(GateResult, Option<String>), crate::error::WenlanError> {
         // Early exit if gate is disabled
@@ -486,6 +495,7 @@ impl QualityGate {
                         pattern_matched: None,
                         latency_ms: 0,
                     },
+                    near_duplicate: None,
                 },
                 None,
             ));
@@ -499,12 +509,11 @@ impl QualityGate {
 
         // Novelty check (requires DB)
         let start = std::time::Instant::now();
-        let similar_source_id = match db.check_novelty(content).await? {
+        let similar_source_id = match db.check_novelty(content, supersedes).await? {
             Some((source_id, similarity)) => {
                 result.scores.novelty_score = Some(similarity);
                 if similarity >= self.config.novelty_threshold {
-                    result.admitted = false;
-                    result.reason = Some(RejectionReason::NotNovel(similarity));
+                    result.near_duplicate = Some((source_id.clone(), similarity));
                 }
                 Some(source_id)
             }
@@ -804,14 +813,15 @@ mod integration_tests {
         let (db, _dir) = crate::db::tests::test_db().await;
         let g = QualityGate::new(GateConfig::default());
         let (r, _similar): (GateResult, Option<String>) = g
-            .evaluate("User prefers Rust for all backend services", &db)
+            .evaluate("User prefers Rust for all backend services", None, &db)
             .await
             .unwrap();
         assert!(r.admitted, "Novel content in empty DB should be admitted");
+        assert!(r.near_duplicate.is_none());
     }
 
     #[tokio::test]
-    async fn test_evaluate_rejects_duplicate() {
+    async fn test_evaluate_soft_flags_near_duplicate() {
         let (db, _dir) = crate::db::tests::test_db().await;
         let g = QualityGate::new(GateConfig::default());
 
@@ -826,14 +836,43 @@ mod integration_tests {
         };
         db.upsert_documents(vec![doc]).await.unwrap();
 
-        // Exact duplicate should be rejected
+        // Exact duplicate is admitted but flagged for the caller.
         let (r, similar): (GateResult, Option<String>) = g
-            .evaluate("User prefers dark mode for all IDEs", &db)
+            .evaluate("User prefers dark mode for all IDEs", None, &db)
             .await
             .unwrap();
-        assert!(!r.admitted, "Exact duplicate should be rejected");
-        assert!(matches!(r.reason, Some(RejectionReason::NotNovel(_))));
+        assert!(r.admitted, "Exact duplicate should be stored");
+        assert!(r.reason.is_none());
         assert!(similar.is_some());
+        assert_eq!(r.near_duplicate.as_ref().unwrap().0, "mem_existing");
+        assert!(r.near_duplicate.as_ref().unwrap().1 >= 0.75);
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_below_threshold_has_no_near_duplicate_flag() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let g = QualityGate::new(GateConfig::default());
+        let doc = crate::sources::RawDocument {
+            content: "User prefers dark mode for all IDEs".to_string(),
+            source_id: "mem_existing".to_string(),
+            source: "memory".to_string(),
+            title: "Dark mode".to_string(),
+            last_modified: chrono::Utc::now().timestamp(),
+            ..Default::default()
+        };
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        let (r, _similar) = g
+            .evaluate(
+                "The database uses libSQL with vector indexing for semantic search",
+                None,
+                &db,
+            )
+            .await
+            .unwrap();
+        assert!(r.admitted);
+        assert!(r.near_duplicate.is_none());
+        assert!(r.scores.novelty_score.is_none_or(|score| score < 0.75));
     }
 
     #[tokio::test]
@@ -841,9 +880,9 @@ mod integration_tests {
         let (db, _dir) = crate::db::tests::test_db().await;
         let g = QualityGate::new(GateConfig::default());
         // Short/noise content should be caught by content check before novelty
-        let (r, _similar): (GateResult, Option<String>) = g.evaluate("You are a helpful AI assistant. Always respond politely and accurately to all queries.", &db).await.unwrap();
+        let (r, _similar): (GateResult, Option<String>) = g.evaluate("You are a helpful AI assistant. Always respond politely and accurately to all queries.", None, &db).await.unwrap();
         assert!(!r.admitted);
-        // Should be noise pattern, NOT NotNovel
+        // Should be noise pattern, not a novelty flag.
         assert!(matches!(
             r.reason,
             Some(RejectionReason::NoisePattern(_)) | Some(RejectionReason::TooShort(_))
@@ -866,6 +905,7 @@ mod integration_tests {
         let start = std::time::Instant::now();
         let (r, _similar): (GateResult, Option<String>) = g.evaluate(
             "A legitimate memory about project architecture decisions that should pass all checks",
+            None,
             &db,
         ).await.unwrap();
         let elapsed = start.elapsed();
@@ -884,7 +924,7 @@ mod integration_tests {
         let g = QualityGate::new(GateConfig::default());
 
         // Evaluate something that should be rejected by content check
-        let (r, _) = g.evaluate("You are a helpful AI assistant. Your role is to answer all questions helpfully and accurately.", &db).await.unwrap();
+        let (r, _) = g.evaluate("You are a helpful AI assistant. Your role is to answer all questions helpfully and accurately.", None, &db).await.unwrap();
         assert!(!r.admitted);
 
         // Log the rejection (simulating what handle_store_memory does)
@@ -1416,7 +1456,7 @@ mod integration_tests {
 
         // Evaluate duplicates
         for (content, kind, _seed) in duplicates {
-            let (r, _similar) = g.evaluate(content, &db).await.unwrap();
+            let (r, _similar) = g.evaluate(content, None, &db).await.unwrap();
             let sim = r.scores.novelty_score.unwrap_or(0.0);
             let label = if *kind == "near-exact" {
                 "exact"
@@ -1433,7 +1473,7 @@ mod integration_tests {
 
         // Evaluate different
         for (content, _desc) in different {
-            let (r, _similar) = g.evaluate(content, &db).await.unwrap();
+            let (r, _similar) = g.evaluate(content, None, &db).await.unwrap();
             let sim = r.scores.novelty_score.unwrap_or(0.0);
             all_results.push(Sample {
                 content,

@@ -162,7 +162,7 @@ pub async fn run_eval(
 
                 // Novelty check (async, needs DB) — only for Full mode
                 if gate_mode == GateMode::Full {
-                    let (novelty_result, _similar_id) = g.evaluate(&neg.content, &db).await?;
+                    let (novelty_result, _similar_id) = g.evaluate(&neg.content, None, &db).await?;
                     if !novelty_result.admitted {
                         total_gate_novelty_filtered += 1;
                         continue;

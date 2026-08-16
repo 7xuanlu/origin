@@ -23757,6 +23757,7 @@ impl MemoryDB {
     pub async fn check_novelty_batch(
         &self,
         contents: &[String],
+        exclude_source_ids: &[Option<String>],
     ) -> Result<Vec<Option<(String, f64)>>, WenlanError> {
         if contents.is_empty() {
             return Ok(vec![]);
@@ -23770,15 +23771,24 @@ impl MemoryDB {
         })?;
         let conn = self.conn.lock().await;
         let mut results = Vec::with_capacity(contents.len());
-        for embedding in embeddings {
+        for (index, embedding) in embeddings.into_iter().enumerate() {
             let vec_str = Self::vec_to_sql(&embedding);
             let mut rows = conn
                 .query(
                     "SELECT c.source_id, vector_distance_cos(c.embedding, vector32(?1))
-                     FROM vector_top_k('memories_vec_idx', vector32(?1), 5) AS vt
+                     FROM vector_top_k('memories_vec_idx', vector32(?1), 8) AS vt
                      JOIN memories c ON c.rowid = vt.id
-                     WHERE c.source = 'memory' AND c.pending_revision = 0",
-                    libsql::params![vec_str],
+                     WHERE c.source = 'memory' AND c.pending_revision = 0
+                       AND (?2 IS NULL OR c.source_id != ?2)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM memories superseder
+                           WHERE superseder.supersedes = c.source_id
+                             AND superseder.pending_revision = 0
+                       )",
+                    libsql::params![
+                        vec_str,
+                        exclude_source_ids.get(index).and_then(|id| id.as_deref())
+                    ],
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("check_novelty_batch: {e}")))?;
@@ -23800,7 +23810,11 @@ impl MemoryDB {
         Ok(results)
     }
 
-    pub async fn check_novelty(&self, content: &str) -> Result<Option<(String, f64)>, WenlanError> {
+    pub async fn check_novelty(
+        &self,
+        content: &str,
+        exclude_source_id: Option<&str>,
+    ) -> Result<Option<(String, f64)>, WenlanError> {
         let embedding = self.get_or_compute_embedding(content).map_err(|e| {
             log::error!("[quality_gate] embedding failed (fail closed): {e}");
             e
@@ -23811,10 +23825,16 @@ impl MemoryDB {
         let mut rows = conn
             .query(
                 "SELECT c.source_id, vector_distance_cos(c.embedding, vector32(?1))
-             FROM vector_top_k('memories_vec_idx', vector32(?1), 5) AS vt
+             FROM vector_top_k('memories_vec_idx', vector32(?1), 8) AS vt
              JOIN memories c ON c.rowid = vt.id
-             WHERE c.source = 'memory' AND c.pending_revision = 0",
-                libsql::params![vec_str],
+             WHERE c.source = 'memory' AND c.pending_revision = 0
+               AND (?2 IS NULL OR c.source_id != ?2)
+               AND NOT EXISTS (
+                   SELECT 1 FROM memories superseder
+                   WHERE superseder.supersedes = c.source_id
+                     AND superseder.pending_revision = 0
+               )",
+                libsql::params![vec_str, exclude_source_id],
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("check_novelty: {e}")))?;

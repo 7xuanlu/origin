@@ -2651,7 +2651,7 @@ pub async fn run_longmemeval_eval_with_gate(
                 let gate = gate.as_ref().unwrap();
                 let mut admitted_docs = Vec::new();
                 for doc in &noise {
-                    let (result, _similar_id) = gate.evaluate(&doc.content, &db).await?;
+                    let (result, _similar_id) = gate.evaluate(&doc.content, None, &db).await?;
                     if result.admitted {
                         admitted_docs.push(doc.clone());
                     }

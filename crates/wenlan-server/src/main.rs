@@ -801,21 +801,28 @@ async fn ingest_batch_process(
     use ingest_batcher::StoreOutcome;
     use wenlan_core::quality_gate::{GateResult, GateScores};
 
+    type Survivor = (
+        usize,
+        wenlan_core::sources::RawDocument,
+        usize,
+        Option<wenlan_core::space_context::ResolvedWriteSpace>,
+        Option<(String, f64)>,
+    );
+
     if items.is_empty() {
         return vec![];
     }
 
     // Batch gate evaluate. One FastEmbed call, N vector queries, one pass.
-    let contents: Vec<&str> = items
+    let docs: Vec<(&str, Option<&str>)> = items
         .iter()
-        .map(|(document, _, _)| document.content.as_str())
+        .map(|(document, _, _)| (document.content.as_str(), document.supersedes.as_deref()))
         .collect();
-    let gate_results = match gate.evaluate_batch(&contents, &db).await {
+    let gate_results = match gate.evaluate_batch(&docs, &db).await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("[ingest_batch_process] gate batch evaluate failed (fail closed), rejecting all: {e}");
-            contents
-                .iter()
+            docs.iter()
                 .map(|c| {
                     (
                         GateResult {
@@ -828,10 +835,11 @@ async fn ingest_batch_process(
                             scores: GateScores {
                                 content_type_pass: true,
                                 novelty_score: None,
-                                word_count: c.split_whitespace().count(),
+                                word_count: c.0.split_whitespace().count(),
                                 pattern_matched: Some("embedding_unavailable".to_string()),
                                 latency_ms: 0,
                             },
+                            near_duplicate: None,
                         },
                         None,
                     )
@@ -843,18 +851,13 @@ async fn ingest_batch_process(
     let n = items.len();
     let mut outcomes: Vec<Option<StoreOutcome>> = (0..n).map(|_| None).collect();
     // (original_position, doc, chunks_predicted) for every admitted doc.
-    let mut survivors: Vec<(
-        usize,
-        wenlan_core::sources::RawDocument,
-        usize,
-        Option<wenlan_core::space_context::ResolvedWriteSpace>,
-    )> = Vec::new();
+    let mut survivors: Vec<Survivor> = Vec::new();
 
     for (i, ((doc, chunks, write_space), (gate_result, similar_id))) in
         items.into_iter().zip(gate_results).enumerate()
     {
         if gate_result.admitted {
-            survivors.push((i, doc, chunks, write_space));
+            survivors.push((i, doc, chunks, write_space, gate_result.near_duplicate));
         } else {
             let (reason_str, detail_str) = gate_result
                 .reason
@@ -872,20 +875,21 @@ async fn ingest_batch_process(
     if !survivors.is_empty() {
         let docs = survivors
             .iter()
-            .map(|(_, document, _, write_space)| (document.clone(), write_space.clone()))
+            .map(|(_, document, _, write_space, _)| (document.clone(), write_space.clone()))
             .collect();
         match db.upsert_documents_with_write_spaces(docs).await {
             Ok(_total) => {
-                for (pos, _, chunks, _) in &survivors {
+                for (pos, _, chunks, _, near_duplicate) in &survivors {
                     outcomes[*pos] = Some(StoreOutcome::Stored {
                         chunks_created: *chunks,
+                        near_duplicate: near_duplicate.clone(),
                     });
                 }
             }
             Err(e) => {
                 let validation = matches!(e, wenlan_core::WenlanError::Validation(_));
                 let message = e.to_string();
-                for (pos, _, _, _) in &survivors {
+                for (pos, _, _, _, _) in &survivors {
                     outcomes[*pos] = Some(if validation {
                         StoreOutcome::WriteSpaceInvalid(message.clone())
                     } else {

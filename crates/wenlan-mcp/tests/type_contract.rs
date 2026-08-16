@@ -145,6 +145,7 @@ async fn t1_remember_roundtrip() {
         entity_id: None,
         quality: None,
         warnings: vec![],
+        near_duplicate: None,
         extraction_method: "none".into(),
 
         enrichment: String::new(),
@@ -293,6 +294,7 @@ async fn t2_remember_surfaces_warnings_when_present() {
         entity_id: None,
         quality: None,
         warnings: vec!["decision memory missing required 'claim' field".into()],
+        near_duplicate: None,
         extraction_method: "agent".into(),
 
         enrichment: String::new(),
@@ -350,6 +352,7 @@ async fn t3_structured_fields_schema_is_object() {
         entity_id: None,
         quality: None,
         warnings: vec![],
+        near_duplicate: None,
         extraction_method: "agent".into(),
 
         enrichment: String::new(),
@@ -477,6 +480,7 @@ async fn t5_memory_type_hint_preserved_without_forcing_domain() {
         entity_id: None,
         quality: Some("medium".into()),
         warnings: vec![],
+        near_duplicate: None,
         extraction_method: "llm".into(),
 
         enrichment: String::new(),
@@ -704,6 +708,7 @@ async fn t10_remember_request_does_not_contain_user_id() {
         entity_id: None,
         quality: None,
         warnings: vec![],
+        near_duplicate: None,
         extraction_method: "none".into(),
 
         enrichment: String::new(),
@@ -756,6 +761,7 @@ async fn t11_extraction_method_none_not_in_text() {
         entity_id: None,
         quality: None,
         warnings: vec![],
+        near_duplicate: None,
         extraction_method: "none".into(),
 
         enrichment: String::new(),
@@ -911,6 +917,7 @@ async fn origin_client_sends_x_agent_name_header() {
         entity_id: None,
         quality: None,
         warnings: vec![],
+        near_duplicate: None,
         extraction_method: "none".into(),
         enrichment: String::new(),
         hint: String::new(),
@@ -966,6 +973,7 @@ async fn origin_client_omits_x_agent_name_when_unset() {
         entity_id: None,
         quality: None,
         warnings: vec![],
+        near_duplicate: None,
         extraction_method: "none".into(),
         enrichment: String::new(),
         hint: String::new(),
