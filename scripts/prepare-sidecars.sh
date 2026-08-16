@@ -79,6 +79,16 @@ elif [[ "$PRINT_PATHS" != "true" ]]; then
   exit 1
 fi
 
+# Checked before the backend build, not after the install step. cloudflared is a
+# hard Tauri externalBin requirement with no fallback, and finding it missing at
+# install time means having waited out a full backend build first.
+if [[ -z "$CLOUDFLARED_SRC" && "$PRINT_PATHS" != "true" ]]; then
+  echo "error: cloudflared not found in PATH; install cloudflared or set CLOUDFLARED_BIN" >&2
+  echo "       Required by Tauri externalBin: binaries/cloudflared-$TRIPLE" >&2
+  echo "       Install: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/" >&2
+  exit 1
+fi
+
 if [[ "$PRINT_PATHS" == "true" ]]; then
   printf 'server_src=%s\n' "$SERVER_SRC"
   printf 'mcp_src=%s\n' "$MCP_SRC"
@@ -111,13 +121,7 @@ install -m 755 "$SERVER_SRC" "$SERVER_DEST"
 install -m 755 "$MCP_SRC" "$MCP_DEST"
 install -m 755 "$CLI_SRC" "$CLI_DEST"
 
-if [[ -n "$CLOUDFLARED_SRC" ]]; then
-  install -m 755 "$CLOUDFLARED_SRC" "$CLOUDFLARED_DEST"
-else
-  echo "error: cloudflared not found in PATH; install cloudflared or set CLOUDFLARED_BIN" >&2
-  echo "       Required by Tauri externalBin: binaries/cloudflared-$TRIPLE" >&2
-  exit 1
-fi
+install -m 755 "$CLOUDFLARED_SRC" "$CLOUDFLARED_DEST"
 
 # Windows needs two runtime DLLs beside the sidecars. The daemon loads ONNX
 # Runtime dynamically there (fastembed's ort-load-dynamic feature, selected in
