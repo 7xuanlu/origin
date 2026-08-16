@@ -48,7 +48,9 @@ test("keeps every enabled primary destination inside the Review command contract
 
   await navigation.getByRole("button", { name: "Graph", exact: true }).click();
   await expect(page.getByTestId("atlas-view")).toBeVisible();
-  await expect(page.getByText(/^7 entities(?: · \d+ regions?)?$/)).toBeVisible();
+  // Same fixture and same count line as graph-rendering.visual.spec: pages
+  // lead, and the entity count is over what is drawn (the three connected ones).
+  await expect(page.getByText(/^7 pages · 3 entities(?: · \d+ regions?)?$/)).toBeVisible();
 
   await navigation.getByRole("button", { name: "Memories", exact: true }).click();
   await expect(page.getByRole("region", { name: "Memory list" })).toBeVisible();
