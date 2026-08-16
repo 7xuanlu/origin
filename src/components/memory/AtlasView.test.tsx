@@ -947,6 +947,106 @@ describe("AtlasView", () => {
     expect(y("p2")).toBeLessThan(coreBottom);
   });
 
+  /** A five-node star (the core) plus a four-node star that MIN_COMPONENT_SIZE
+   *  keeps off the map by default. Unlike the pair above, the small star is
+   *  big enough to earn a region of its own once it is drawn (MIN_REGION_SIZE
+   *  is 3), and its hub outranks its leaves so the fallback climb gathers all
+   *  four under one community instead of splitting them into singletons. */
+  function mockStarWithSmallStar() {
+    const entities = [
+      makeEntity({ id: "e1", name: "Alice" }),
+      makeEntity({ id: "e2", name: "Bob" }),
+      makeEntity({ id: "e3", name: "Carol" }),
+      makeEntity({ id: "e4", name: "Dan" }),
+      makeEntity({ id: "e5", name: "Elle" }),
+      makeEntity({ id: "s1", name: "Shelf Hub" }),
+      makeEntity({ id: "s2", name: "Shelf Two" }),
+      makeEntity({ id: "s3", name: "Shelf Three" }),
+      makeEntity({ id: "s4", name: "Shelf Four" }),
+    ];
+    const relation = (id: string, target: string, name: string) => ({
+      id,
+      relation_type: "knows",
+      direction: "outgoing" as const,
+      entity_id: target,
+      entity_name: name,
+      entity_type: "person",
+      source_agent: null,
+      created_at: Math.floor(Date.now() / 1000),
+    });
+    mockListEntities.mockResolvedValue(entities);
+    mockGetEntityDetail.mockImplementation(async (id: string) => ({
+      entity: entities.find((e) => e.id === id)!,
+      observations: [],
+      relations:
+        id === "e1"
+          ? [
+              relation("rel-1", "e2", "Bob"),
+              relation("rel-2", "e3", "Carol"),
+              relation("rel-3", "e4", "Dan"),
+              relation("rel-4", "e5", "Elle"),
+            ]
+          : id === "s1"
+            ? [
+                relation("rel-5", "s2", "Shelf Two"),
+                relation("rel-6", "s3", "Shelf Three"),
+                relation("rel-7", "s4", "Shelf Four"),
+              ]
+            : [],
+    }));
+    return entities;
+  }
+
+  it("paints the rebuilt renderer's underlay when the small-groups chip flips", async () => {
+    mockStarWithSmallStar();
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    // Stub the prototype, not one canvas: the chip rebuilds the renderer, and
+    // the underlay this has to watch does not exist until that happens.
+    const painter = recordingUnderlayCtx();
+    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(painter.ctx) as any;
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "Show small groups" }));
+      await waitFor(() => expect(capturedSigmaInstances).toHaveLength(2));
+
+      // Nothing fires afterRender by hand here, and nothing else can: the chip
+      // changes only the DRAWN model, while `communities` and the palette are
+      // derived from the full model and the theme, so neither of the two
+      // repaint effects re-runs. The rebuilt renderer has to paint its own
+      // first frame or the map loses every hull, name, and ring.
+      expect(painter.state.paints).toBeGreaterThan(0);
+      expect(painter.state.regionNames.length).toBeGreaterThan(0);
+    } finally {
+      HTMLCanvasElement.prototype.getContext = originalGetContext;
+    }
+  });
+
+  it("hulls and names a shelved small group that is big enough to be a region", async () => {
+    mockStarWithSmallStar();
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    const painter = recordingUnderlayCtx();
+    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(painter.ctx) as any;
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "Show small groups" }));
+      await waitFor(() => expect(capturedSigmaInstances).toHaveLength(2));
+
+      // The small star sits on the shelf, below the core — being off in that
+      // zone must not cost it its region. Its leader is its degree-3 hub.
+      expect(painter.state.regionNames).toContain("Shelf Hub");
+      // ...and the core keeps its own.
+      expect(painter.state.regionNames).toContain("Alice");
+    } finally {
+      HTMLCanvasElement.prototype.getContext = originalGetContext;
+    }
+  });
+
   it("starts hidden when the stored small-groups choice is malformed", async () => {
     window.localStorage.setItem("atlas.smallGroups", "{oops");
     mockStarWithSmallPair();

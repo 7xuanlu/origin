@@ -671,10 +671,6 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     };
     renderer.on("afterRender", drawOverlay);
 
-    // First paint is NOT drawn here. The cartography effect below runs right
-    // after this one on mount (effects fire in declaration order, and both
-    // refs above are already assigned), and its refresh() fires afterRender —
-    // so painting here as well would just compute every hull twice.
     renderer.on("afterRender", drawUnderlay);
     // Default zoom: sigma's fit stretches a small cluster edge-to-edge no
     // matter how big the container (7.3 px/graph-unit in preview) — links
@@ -706,8 +702,19 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
         const camera = renderer.getCamera();
         camera.setState({ x: display.x, y: display.y, ratio: Math.min(camera.ratio, 1) });
       }
-      renderer.refresh();
     }
+    // First paint of THIS renderer, and the only thing that draws the two
+    // canvases above at all. Sigma's constructor render already happened
+    // before the afterRender listeners existed, and the simulation rests at
+    // alpha 0 straight out of createAtlasSimulation (atlas.ts settles it
+    // synchronously, then stops), so no tick will schedule one either. This
+    // used to be left to the cartography effect below — which only runs when
+    // `communities` changes, and `communities` is derived from the FULL
+    // model. Toggling the small-groups chip rebuilds the renderer off
+    // `visibleModel` WITHOUT changing `communities`, so nothing ever painted:
+    // the fresh underlay stayed at its untouched 300x150 default and every
+    // hull, region name, graticule ring, and page ring vanished from the map.
+    renderer.refresh();
     renderer.on("clickNode", ({ node }) => {
       // A moved drag must not also navigate on release.
       if (movedDuringPressRef.current) return;
@@ -879,12 +886,17 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
 
   // Cartography arriving or regressing (fallback -> ready, or ready -> a
   // partial-error) must repaint bridges + hulls WITHOUT tearing down the
-  // sim/camera — the mount effect above only rebuilds on `model` changing,
-  // so a `cartographyBySpace` refetch that flips a space's status never
-  // reaches the renderer otherwise. Same "recolor in place" shape as the
-  // theme-flip effect: update edge attributes, point communitiesRef at the
-  // fresh map (drawUnderlay reads it at paint time), then refresh.
+  // sim/camera — the mount effect above only rebuilds on `visibleModel`
+  // changing, so a `cartographyBySpace` refetch that flips a space's status
+  // never reaches the renderer otherwise. Same "recolor in place" shape as
+  // the theme-flip effect: update edge attributes, point communitiesRef at
+  // the fresh map (drawUnderlay reads it at paint time), then refresh.
   useEffect(() => {
+    // On the mount pass communitiesRef already holds this very map (it is
+    // seeded with it), and the mount effect has just painted with it — so
+    // there is nothing to repaint and every hull would be computed twice.
+    // Only an actual change to the map is work.
+    if (communitiesRef.current === communities) return;
     communitiesRef.current = communities;
     // Region membership is derived from the communities map, so a status flip
     // invalidates the cached hulls even though nothing moved.
