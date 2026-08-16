@@ -88,9 +88,17 @@ process_image_path() {
 # there is no graceful stop to try first; `taskkill /F` is the only stop that
 # works. The daemon's durability is SQLite WAL, which is crash-safe, and the
 # POSIX path already force-kills anything that ignores SIGTERM for 5s.
+#
+# Both take the recorded server path as a second argument, and on Windows the
+# kill carries an image-name filter as well as the pid. The ownership check and
+# the kill are two separate calls, so Windows is free to recycle the pid in
+# between; taskkill applies both filters against the live table, so a pid that
+# now belongs to something else no longer matches and is left alone. A stranger
+# that happens to be running the same image out of the same worktree-private
+# staging directory is the daemon by every definition this script has.
 terminate_process() {
   if (( HOST_IS_WINDOWS == 1 )); then
-    taskkill //F //PID "$1" >/dev/null 2>&1 || true
+    taskkill //F //FI "PID eq $1" //FI "IMAGENAME eq $(basename "$2")" >/dev/null 2>&1 || true
   else
     kill "$1"
   fi
@@ -98,7 +106,7 @@ terminate_process() {
 
 force_terminate_process() {
   if (( HOST_IS_WINDOWS == 1 )); then
-    taskkill //F //T //PID "$1" >/dev/null 2>&1 || true
+    taskkill //F //T //FI "PID eq $1" //FI "IMAGENAME eq $(basename "$2")" >/dev/null 2>&1 || true
   else
     kill -KILL "$1"
   fi
@@ -333,7 +341,7 @@ stop_runtime() {
     return 1
   fi
 
-  terminate_process "$OWNED_PID"
+  terminate_process "$OWNED_PID" "$OWNED_SERVER"
   for _ in $(seq 1 50); do
     if ! process_is_alive "$OWNED_PID"; then
       rm -f "$PID_FILE" "$SERVER_PATH_FILE" "$PORT_FILE" "$DATA_DIR_FILE"
@@ -344,7 +352,7 @@ stop_runtime() {
   done
 
   if has_owned_command_identity; then
-    force_terminate_process "$OWNED_PID"
+    force_terminate_process "$OWNED_PID" "$OWNED_SERVER"
   fi
   for _ in $(seq 1 50); do
     if ! process_is_alive "$OWNED_PID"; then
@@ -359,7 +367,7 @@ stop_runtime() {
 }
 
 start_runtime() {
-  local backend build_dir server pid job_pid listener_pid
+  local backend build_dir server pid job_pid listener_pid stray_pid stray_image
   STARTED_RUNTIME=0
   DEV_DATA_DIR="$(canonicalize_path "$DEV_DATA_DIR")"
   backend="$(bash "$SCRIPT_DIR/resolve-backend-dir.sh" "$REPO_ROOT")"
@@ -409,9 +417,19 @@ start_runtime() {
     # Windows one, so that is the identity worth recording and comparing.
     if ! pid="$(windows_pid_for_job "$job_pid" "$server")"; then
       # Nothing downstream can identify this daemon, so it cannot be left
-      # holding the port. The MSYS pid is the only handle still known to be
-      # its own, and MSYS can signal the native process it spawned.
-      kill -KILL "$job_pid" 2>/dev/null || true
+      # holding the port. The MSYS pid is not the handle to reach for: the
+      # resolution above waits up to ten seconds, MSYS recycles pids, and by
+      # this branch the job may already be gone, so signalling it can land on
+      # an unrelated process. Reap by identity instead. The port is the one
+      # thing this daemon was told to take, and whatever listens on it is
+      # stopped only if the image behind it is the server just launched.
+      stray_pid="$(listener_pid_for_port "$DEV_PORT")"
+      if [[ "$stray_pid" =~ ^[0-9]+$ ]]; then
+        stray_image="$(normalize_program_path "$(process_image_path "$stray_pid")")"
+        if [[ "$stray_image" == "$(normalize_program_path "$server")" ]]; then
+          force_terminate_process "$stray_pid" "$server"
+        fi
+      fi
       echo "error: could not resolve the Windows pid of the dev daemon" >&2
       tail -n 40 "$SERVER_LOG" >&2 || true
       return 1
