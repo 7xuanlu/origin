@@ -16,9 +16,10 @@
 //!   commit sha or UUID, a filesystem path, a bare source filename, or an exact
 //!   test-fixture string. These are safe to archive in bulk.
 //! * **Review** is for names that merely *look* suspicious: bare version
-//!   strings, one- and two-character Latin names, URLs, and slash-bearing names
-//!   with no strong path marker. The write path declines to create them and
-//!   logs, but a bulk cleanup must not archive them without a human looking.
+//!   strings, one- and two-character Latin names, URLs, slash-bearing names
+//!   with no strong path marker, and bare Markdown filenames. The write path
+//!   declines to create them and logs, but a bulk cleanup must not archive
+//!   them without a human looking.
 //!
 //! A name is **never** rejected merely for being short, containing digits,
 //! containing punctuation, or containing a dot or a slash. Those signals feed
@@ -98,6 +99,10 @@ pub enum Reason {
     /// Slashes and dots but no strong path marker ("app/eval/fixtures",
     /// "7xuanlu/origin.git"). Could be a repo slug; could be a path fragment.
     AmbiguousSlashes,
+    /// A bare Markdown filename with no slash ("AGENTS.md", "identity.md",
+    /// "README.md"). Documents are often referred to by their filename, so a
+    /// human decides; these must never be bulk-archived.
+    DocumentFilename,
 }
 
 impl Reason {
@@ -114,6 +119,7 @@ impl Reason {
             Reason::BareVersion => "bare_version",
             Reason::VeryShortName => "very_short_name",
             Reason::AmbiguousSlashes => "ambiguous_slashes",
+            Reason::DocumentFilename => "document_filename",
         }
     }
 
@@ -130,7 +136,8 @@ impl Reason {
             Reason::Url
             | Reason::BareVersion
             | Reason::VeryShortName
-            | Reason::AmbiguousSlashes => Tier::Review,
+            | Reason::AmbiguousSlashes
+            | Reason::DocumentFilename => Tier::Review,
         }
     }
 }
@@ -368,13 +375,36 @@ fn last_segment(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
-/// A bare filename: no slash, a dot, and a known source or asset extension.
-fn is_source_filename(name: &str) -> bool {
+/// No slash, a dot, and a known source or asset extension. Shared by
+/// [`is_source_filename`] (reject tier) and [`is_filesystem_path`]'s
+/// "directory plus a filename" branch, which must still catch `docs/AGENTS.md`
+/// even though a bare `AGENTS.md` is review tier, not reject tier.
+fn has_file_ext(name: &str) -> bool {
     if name.contains(char::is_whitespace) || name.contains('/') {
         return false;
     }
     match name.rsplit_once('.') {
         Some((_, ext)) => FILE_EXT.contains(&ext.to_lowercase().as_str()),
+        None => false,
+    }
+}
+
+/// A bare filename: no slash, a dot, and a known source or asset extension.
+/// Excludes bare Markdown filenames, which are review tier via
+/// [`is_document_filename`] instead of reject tier.
+fn is_source_filename(name: &str) -> bool {
+    has_file_ext(name) && !is_document_filename(name)
+}
+
+/// A bare Markdown filename: no whitespace, no slash, extension `.md`
+/// (case-insensitive). Documents are often referred to by their filename, so
+/// a human decides; these must never be bulk-archived.
+fn is_document_filename(name: &str) -> bool {
+    if name.contains(char::is_whitespace) || name.contains('/') {
+        return false;
+    }
+    match name.rsplit_once('.') {
+        Some((_, ext)) => ext.eq_ignore_ascii_case("md"),
         None => false,
     }
 }
@@ -413,8 +443,11 @@ fn is_filesystem_path(name: &str) -> bool {
     if CACHE_SEGMENTS.iter().any(|seg| lower.contains(seg)) {
         return true;
     }
-    // A directory plus a source filename: "src/index.ts", "scripts/dev-sync.sh".
-    name.contains('/') && is_source_filename(last_segment(name))
+    // A directory plus a filename: "src/index.ts", "scripts/dev-sync.sh",
+    // "docs/AGENTS.md". Uses `has_file_ext`, not `is_source_filename`, so a
+    // Markdown extension still counts here even though a bare Markdown
+    // filename is review tier on its own.
+    name.contains('/') && has_file_ext(last_segment(name))
 }
 
 /// Slashes or dots with no strong marker. Could be a repo slug, could be a path
@@ -463,7 +496,12 @@ fn is_test_fixture(name: &str) -> bool {
 ///
 /// Order matters. URLs are checked before the path rules so a URL is reviewed
 /// rather than rejected, and the reject-tier rules run before the review-tier
-/// ones so the reported reason is the strongest one that applies.
+/// ones so the reported reason is the strongest one that applies. A bare
+/// Markdown filename never reaches `is_source_filename`'s reject-tier check:
+/// that function excludes them itself, so a directory-qualified path
+/// (`docs/AGENTS.md`) still rejects as [`Reason::FilesystemPath`] via
+/// `is_filesystem_path`, while the bare name reviews as
+/// [`Reason::DocumentFilename`].
 pub fn assess(name: &str) -> Verdict {
     let name = name.trim();
     if name.is_empty() || !name.chars().any(char::is_alphanumeric) {
@@ -492,6 +530,9 @@ pub fn assess(name: &str) -> Verdict {
     }
     if is_bare_version(name) {
         return Verdict::Review(Reason::BareVersion);
+    }
+    if is_document_filename(name) {
+        return Verdict::Review(Reason::DocumentFilename);
     }
     if is_very_short(name) {
         return Verdict::Review(Reason::VeryShortName);
@@ -560,6 +601,7 @@ mod tests {
                 Reason::FilesystemPath,
             ),
             ("skills/claude-profile/SKILL.md", Reason::FilesystemPath),
+            ("docs/AGENTS.md", Reason::FilesystemPath),
             (".mcp.json", Reason::SourceFilename),
             (".yml", Reason::SourceFilename),
             ("config.json", Reason::SourceFilename),
@@ -567,7 +609,6 @@ mod tests {
             ("db.rs", Reason::SourceFilename),
             ("App.tsx", Reason::SourceFilename),
             ("release.yml", Reason::SourceFilename),
-            ("AGENTS.md", Reason::SourceFilename),
             ("tauri.conf.json", Reason::SourceFilename),
             ("entity-1280x900.png", Reason::SourceFilename),
             ("live-smoke-*.sh", Reason::SourceFilename),
@@ -605,6 +646,9 @@ mod tests {
             ("pr", Reason::VeryShortName),
             ("app/eval/fixtures", Reason::AmbiguousSlashes),
             ("7xuanlu/origin.git", Reason::AmbiguousSlashes),
+            ("AGENTS.md", Reason::DocumentFilename),
+            ("identity.md", Reason::DocumentFilename),
+            ("README.md", Reason::DocumentFilename),
         ];
         for (name, expected) in cases {
             assert_eq!(
