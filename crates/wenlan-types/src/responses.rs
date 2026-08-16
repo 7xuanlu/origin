@@ -1427,6 +1427,10 @@ mod tests {
             !json.contains("\"hint\""),
             "empty hint must be skipped on the wire, got: {json}"
         );
+        assert!(
+            !json.contains("\"near_duplicate\""),
+            "near_duplicate: None must be skipped on the wire, got: {json}"
+        );
         let parsed: StoreMemoryResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.enrichment, "not_needed");
         assert_eq!(parsed.hint, "");

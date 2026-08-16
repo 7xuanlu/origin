@@ -371,6 +371,11 @@ pub struct LongMemEvalReport {
     pub aggregate_hit_rate_at_1: f64,
     pub total_questions: usize,
     pub total_memories: usize,
+    /// Gated-mode only: noise docs the quality gate admitted with a
+    /// near-duplicate flag (stored anyway, per the soft-flag change) rather
+    /// than dropped. 0 for modes that never call the gate.
+    #[serde(default)]
+    pub gate_novelty_flagged: usize,
     pub per_category: Vec<LongMemEvalCategoryResult>,
     /// Baseline comparison from a previous run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -546,7 +551,7 @@ impl LongMemEvalReport {
             total_negatives: 0,
             negative_leakage: 0,
             gate_content_filtered: 0,
-            gate_novelty_flagged: 0,
+            gate_novelty_flagged: self.gate_novelty_flagged,
             empty_set_count: 0,
             empty_set_false_confidence: None,
             score_gap: None,
@@ -781,6 +786,7 @@ async fn run_longmemeval_eval_core(
         aggregate_hit_rate_at_1: avg_field(&all_scores, |s| s.5),
         total_questions: all_scores.len(),
         total_memories,
+        gate_novelty_flagged: 0,
         per_category,
         baseline: None,
         env: None,
@@ -1010,6 +1016,7 @@ pub async fn run_longmemeval_eval_cross_rerank_from_db(
         aggregate_hit_rate_at_1: avg_field(&all_scores, |s| s.5),
         total_questions: all_scores.len(),
         total_memories,
+        gate_novelty_flagged: 0,
         per_category,
         baseline: None,
         env: None,
@@ -1130,6 +1137,7 @@ pub async fn run_longmemeval_eval_from_db(
         aggregate_hit_rate_at_1: avg_field(&all_scores, |s| s.5),
         total_questions: all_scores.len(),
         total_memories,
+        gate_novelty_flagged: 0,
         per_category,
         baseline: None,
         env: None,
@@ -2235,6 +2243,7 @@ pub async fn run_longmemeval_eval_temporal(path: &Path) -> Result<LongMemEvalRep
         aggregate_hit_rate_at_1: avg_field(&all_scores, |s| s.5),
         total_questions: all_scores.len(),
         total_memories,
+        gate_novelty_flagged: 0,
         per_category,
         baseline: None,
         env: None,
@@ -2599,6 +2608,7 @@ pub async fn run_longmemeval_eval_with_gate(
     let mut all_scores: Vec<(String, f64, f64, f64, f64, f64)> = Vec::new();
     let mut per_case: Vec<crate::eval::report::CaseResult> = Vec::new();
     let mut total_memories_inserted: usize = 0;
+    let mut total_novelty_flagged: usize = 0;
 
     let gate = match mode {
         LongMemEvalGateMode::Gated => Some(QualityGate::new(GateConfig::default())),
@@ -2653,6 +2663,9 @@ pub async fn run_longmemeval_eval_with_gate(
                 for doc in &noise {
                     let (result, _similar_id) = gate.evaluate(&doc.content, None, &db).await?;
                     if result.admitted {
+                        if result.near_duplicate.is_some() {
+                            total_novelty_flagged += 1;
+                        }
                         admitted_docs.push(doc.clone());
                     }
                 }
@@ -2745,6 +2758,7 @@ pub async fn run_longmemeval_eval_with_gate(
         aggregate_hit_rate_at_1: avg_field(&all_scores, |s| s.5),
         total_questions: all_scores.len(),
         total_memories: total_memories_inserted,
+        gate_novelty_flagged: total_novelty_flagged,
         per_category,
         baseline: None,
         env: None,
@@ -3146,6 +3160,7 @@ mod tests {
             aggregate_hit_rate_at_1: 0.35,
             total_questions: 10,
             total_memories: 100,
+            gate_novelty_flagged: 0,
             per_category: vec![LongMemEvalCategoryResult {
                 question_type: "single-session-user".to_string(),
                 code: "SSU".to_string(),
@@ -3180,6 +3195,7 @@ mod tests {
             aggregate_hit_rate_at_1: 0.350,
             total_questions: 10,
             total_memories: 100,
+            gate_novelty_flagged: 0,
             per_category: vec![
                 LongMemEvalCategoryResult {
                     question_type: "single-session-user".to_string(),
@@ -3233,6 +3249,7 @@ mod tests {
             aggregate_hit_rate_at_1: 0.400,
             total_questions: 10,
             total_memories: 100,
+            gate_novelty_flagged: 0,
             per_category: vec![LongMemEvalCategoryResult {
                 question_type: "single-session-user".to_string(),
                 code: "SSU".to_string(),

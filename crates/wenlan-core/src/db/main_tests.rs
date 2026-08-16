@@ -19996,6 +19996,51 @@ async fn test_check_novelty_skips_superseded_rows() {
     );
 }
 
+/// Archive-mode supersedes (the correction's own `supersede_mode = "archive"`,
+/// as the classifier sets for `memory_type = "decision"`) must NOT hide the
+/// superseded target from novelty candidates — search keeps archive-mode
+/// targets visible (see `superseder_not_exists` at the `search` call site), so
+/// check_novelty must mirror that or it would treat a still-visible memory as
+/// gone and let a duplicate back in unflagged.
+#[tokio::test]
+async fn test_check_novelty_keeps_archive_mode_superseded_rows() {
+    let (db, _dir) = test_db().await;
+    let original = RawDocument {
+        content: "We decided to use libSQL over sqlite3 for vector search".to_string(),
+        source_id: "mem_decision_original".to_string(),
+        source: "memory".to_string(),
+        title: "Original decision".to_string(),
+        memory_type: Some("decision".to_string()),
+        last_modified: chrono::Utc::now().timestamp(),
+        ..Default::default()
+    };
+    let revision = RawDocument {
+        content: "We revised the decision: still using libSQL over sqlite3".to_string(),
+        source_id: "mem_decision_revision".to_string(),
+        source: "memory".to_string(),
+        title: "Revised decision".to_string(),
+        memory_type: Some("decision".to_string()),
+        supersedes: Some("mem_decision_original".to_string()),
+        supersede_mode: "archive".to_string(),
+        last_modified: chrono::Utc::now().timestamp(),
+        ..Default::default()
+    };
+    db.upsert_documents(vec![original, revision]).await.unwrap();
+
+    let result = db
+        .check_novelty(
+            "We decided to use libSQL over sqlite3 for vector search",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.map(|(source_id, _)| source_id),
+        Some("mem_decision_original".into()),
+        "archive-mode superseded row must stay a novelty candidate"
+    );
+}
+
 #[tokio::test]
 async fn test_concepts_table_exists() {
     let (db, _dir) = test_db().await;

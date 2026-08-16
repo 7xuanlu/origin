@@ -2507,6 +2507,90 @@ mod novelty_store_tests {
             .iter()
             .all(|warning| !warning.contains("near_duplicate:")));
     }
+
+    /// Both prior tests use `ServerState::default()`, which leaves
+    /// `ingest_batcher: None` — they only exercise `handle_store_memory`'s
+    /// synchronous fallback branch. Production traffic goes through the
+    /// coalesced `IngestBatcher` path instead (see `main.rs`'s
+    /// `ingest_batch_process`, spawned at startup). This test wires a real
+    /// `IngestBatcher` with a stub `BatchProcessFn` that returns
+    /// `StoreOutcome::Stored { near_duplicate: Some(..), .. }` — mirroring
+    /// what the real gate-backed process fn returns for a flagged doc — to
+    /// prove `handle_store_memory`'s batcher branch (the `StoreOutcome::Stored`
+    /// arm around memory_routes.rs:618) and `record_near_duplicate_flag` carry
+    /// the flag and warning into the HTTP response exactly like the fallback
+    /// branch already does.
+    #[tokio::test]
+    async fn near_duplicate_survives_the_batcher_round_trip() {
+        use crate::ingest_batcher::{BatcherConfig, IngestBatcher, StoreOutcome};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            wenlan_core::db::MemoryDB::new(tmp.path(), Arc::new(wenlan_core::events::NoopEmitter))
+                .await
+                .unwrap(),
+        );
+        db.upsert_documents(vec![wenlan_core::sources::RawDocument {
+            content: "User prefers dark mode for all IDEs".to_string(),
+            source_id: "mem_existing".to_string(),
+            source: "memory".to_string(),
+            title: "Existing memory".to_string(),
+            last_modified: chrono::Utc::now().timestamp(),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+
+        let process: crate::ingest_batcher::BatchProcessFn = Arc::new(|items| {
+            Box::pin(async move {
+                items
+                    .into_iter()
+                    .map(|_| StoreOutcome::Stored {
+                        chunks_created: 1,
+                        near_duplicate: Some(("mem_existing".to_string(), 0.95)),
+                    })
+                    .collect::<Vec<_>>()
+            })
+        });
+        let batcher = IngestBatcher::spawn(process, BatcherConfig::default());
+
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db.clone()),
+            ingest_batcher: Some(batcher),
+            ..ServerState::default()
+        }));
+
+        let response = handle_store_memory(
+            State(state),
+            HeaderMap::new(),
+            crate::space_header::SpaceHeader(None),
+            Json(store_request(
+                "Every month, on the third Tuesday, dark mode is the IDE preference.",
+                None,
+            )),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let near_duplicate = response
+            .near_duplicate
+            .expect("batcher path must carry the soft flag through");
+        assert_eq!(near_duplicate.source_id, "mem_existing");
+        assert_eq!(near_duplicate.similarity, 0.95);
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("near_duplicate:")));
+
+        let rejections = db.get_rejections(10, Some("near_duplicate")).await.unwrap();
+        assert_eq!(
+            rejections.len(),
+            1,
+            "record_near_duplicate_flag must log the flag from the batcher branch too"
+        );
+        assert_eq!(rejections[0].rejection_reason, "near_duplicate");
+    }
 }
 
 #[cfg(test)]
