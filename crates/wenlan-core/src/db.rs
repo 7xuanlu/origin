@@ -39757,6 +39757,25 @@ impl MemoryDB {
         Ok(out)
     }
 
+    /// Scoped twin of `list_pending_revisions`.
+    ///
+    /// A staged revision has one of TWO target kinds, and both must be listed
+    /// or the Review lane silently drops half its queue:
+    ///
+    /// - a MEMORY target — `supersedes` names a `memories.source_id`
+    ///   (L3 doc-grounded revisions, `reconcile::write_revision`);
+    /// - a PAGE target — `supersedes` names a `pages.id`
+    ///   (`post_write::page_update::stage_page_revision_card`, staged when a
+    ///   machine write lands on a human-owned page).
+    ///
+    /// The target-existence check is what keeps a DANGLING revision — one whose
+    /// target no longer exists — off the queue, so it is applied per target kind
+    /// rather than dropped. Each kind is scoped by ITS OWN scope column: a
+    /// memory by `memories.space`, a page by `pages.workspace`, the column every
+    /// scoped page read gates on (`get_page_scoped`, `list_pages_scoped`). The
+    /// card's own `space` is deliberately NOT the page arm's gate — it is a copy
+    /// taken at staging time, while the page's `workspace` is the live authority
+    /// on who may see the page the card would rewrite.
     pub async fn list_pending_revisions_scoped(
         &self,
         limit: usize,
@@ -39764,22 +39783,37 @@ impl MemoryDB {
     ) -> Result<Vec<wenlan_types::responses::PendingRevisionItem>, WenlanError> {
         let (scope_sql, values) = match scope {
             ReadScope::Global => (
-                "AND EXISTS (
-                     SELECT 1 FROM memories target
-                     WHERE target.source_id = revision.supersedes
-                       AND target.source = 'memory'
-                       AND target.chunk_index = 0
+                "AND (
+                     EXISTS (
+                         SELECT 1 FROM memories target
+                         WHERE target.source_id = revision.supersedes
+                           AND target.source = 'memory'
+                           AND target.chunk_index = 0
+                     )
+                     OR EXISTS (
+                         SELECT 1 FROM pages page
+                         WHERE page.id = revision.supersedes
+                     )
                  )",
                 vec![libsql::Value::Integer(limit as i64)],
             ),
             ReadScope::Space(space) => (
-                "AND revision.space = ?1
-                 AND EXISTS (
-                     SELECT 1 FROM memories target
-                     WHERE target.source_id = revision.supersedes
-                       AND target.source = 'memory'
-                       AND target.chunk_index = 0
-                       AND target.space = ?2
+                "AND (
+                     (
+                         revision.space = ?1
+                         AND EXISTS (
+                             SELECT 1 FROM memories target
+                             WHERE target.source_id = revision.supersedes
+                               AND target.source = 'memory'
+                               AND target.chunk_index = 0
+                               AND target.space = ?2
+                         )
+                     )
+                     OR EXISTS (
+                         SELECT 1 FROM pages page
+                         WHERE page.id = revision.supersedes
+                           AND page.workspace = ?2
+                     )
                  )",
                 vec![
                     libsql::Value::Text(space.clone()),
@@ -39788,13 +39822,22 @@ impl MemoryDB {
                 ],
             ),
             ReadScope::Uncategorized => (
-                "AND (revision.space IS NULL OR revision.space = '00000000-0000-4000-8000-000000000001')
-                 AND EXISTS (
-                     SELECT 1 FROM memories target
-                     WHERE target.source_id = revision.supersedes
-                       AND target.source = 'memory'
-                       AND target.chunk_index = 0
-                       AND (target.space IS NULL OR target.space = '00000000-0000-4000-8000-000000000001')
+                "AND (
+                     (
+                         (revision.space IS NULL OR revision.space = '00000000-0000-4000-8000-000000000001')
+                         AND EXISTS (
+                             SELECT 1 FROM memories target
+                             WHERE target.source_id = revision.supersedes
+                               AND target.source = 'memory'
+                               AND target.chunk_index = 0
+                               AND (target.space IS NULL OR target.space = '00000000-0000-4000-8000-000000000001')
+                         )
+                     )
+                     OR EXISTS (
+                         SELECT 1 FROM pages page
+                         WHERE page.id = revision.supersedes
+                           AND (page.workspace IS NULL OR page.workspace = '00000000-0000-4000-8000-000000000001')
+                     )
                  )",
                 vec![libsql::Value::Integer(limit as i64)],
             ),

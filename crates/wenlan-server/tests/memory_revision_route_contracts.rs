@@ -10,7 +10,9 @@ use tokio::sync::RwLock;
 use tower::ServiceExt;
 use wenlan_core::truth_contract::{CONTRACT_HEADER, INTENT_HEADER};
 use wenlan_server::{router::build_router, state::ServerState};
-use wenlan_types::responses::{ListMemoryRevisionsResponse, PendingRevision, PendingRevisionItem};
+use wenlan_types::responses::{
+    ListMemoryRevisionsResponse, PageWriteResponse, PendingRevision, PendingRevisionItem,
+};
 
 #[derive(Debug, Deserialize)]
 struct ErrorEnvelope {
@@ -243,5 +245,95 @@ async fn moved_memory_revision_handlers_preserve_typed_contracts() {
         let (status, error): (StatusCode, ErrorEnvelope) = request_typed(&no_db, uri, None).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(error.error, "Database not initialized");
+    }
+}
+
+/// The Review lane's own reader, at the surface where the bug was seen.
+///
+/// `PUT /api/pages/{id}` on a human-owned page is gated: the daemon stages a
+/// revision card and leaves the prose alone. `GET /api/memory/pending-revisions`
+/// then returned `[]`, because its target-existence check only knew how to
+/// resolve a target that lives in `memories` — and a page does not. The staged
+/// card existed and nothing ever showed it.
+///
+/// Accept is proven at the core layer instead (`post_write::tests`): the accept
+/// handler re-projects markdown through the process-wide configured knowledge
+/// path, which a router test cannot isolate.
+#[tokio::test]
+async fn pending_revisions_lists_a_gated_page_write_card() {
+    let (router, _tmp, db) = common::test_app_no_gate().await;
+    db.create_space("work", None, false).await.unwrap();
+    seed_memory(
+        &db,
+        "work-page-source",
+        "Ferns reproduce by spores.",
+        None,
+        false,
+        100,
+        "work",
+    )
+    .await;
+    let page_id = common::create_page_fixture(
+        &db,
+        "Ferns",
+        "Ferns reproduce by spores.",
+        Some("work"),
+        &[],
+        "authored",
+    )
+    .await;
+
+    let proposed = "Ferns reproduce by spores rather than by seeds.";
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/pages/{page_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "content": proposed,
+                        "source_memory_ids": ["work-page-source"],
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    let gated: PageWriteResponse = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        gated.gated,
+        "a human-owned page must gate a machine refresh"
+    );
+    let card_id = gated
+        .revision_card_id
+        .expect("a gated refresh must stage a revision card");
+    assert_eq!(
+        db.get_page(&page_id).await.unwrap().unwrap().content,
+        "Ferns reproduce by spores.",
+        "precondition: the gated refresh left the page prose alone"
+    );
+
+    for space in [Some("work"), None] {
+        let (status, items): (StatusCode, Vec<PendingRevisionItem>) =
+            request_typed(&router, "/api/memory/pending-revisions?limit=10", space).await;
+        assert_eq!(status, StatusCode::OK);
+        let card = items
+            .iter()
+            .find(|item| item.revision_source_id == card_id)
+            .unwrap_or_else(|| {
+                panic!("staged page card missing from pending-revisions for space {space:?}")
+            });
+        assert_eq!(
+            card.target_source_id, page_id,
+            "the Review lane sends this id back to accept/dismiss"
+        );
+        assert_eq!(card.revision_content, proposed);
     }
 }
