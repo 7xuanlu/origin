@@ -29,11 +29,23 @@ if echo "$STAGED_FILES" | grep -Eq '^crates/(wenlan-core|wenlan-server)/|^script
         exit 1
     fi
 
-    echo "  Checking M5 reader inventory..."
-    "$PYTHON_BIN" scripts/m5-reader-sweep.py --check || {
-        echo "FAIL: the M5 reader inventory is stale. Run python3 scripts/m5-reader-sweep.py --update-inventory, review the diff, and stage crates/wenlan-core/contracts/m5-reader-manifest-inventory.md."
+    echo "  Refreshing M5 reader inventory..."
+    INVENTORY=crates/wenlan-core/contracts/m5-reader-manifest-inventory.md
+    "$PYTHON_BIN" scripts/m5-reader-sweep.py --update-inventory >/dev/null || {
+        echo "FAIL: scripts/m5-reader-sweep.py --update-inventory failed; fix the sweep error above before committing."
         exit 1
     }
+
+    if ! git diff --quiet -- "$INVENTORY" || ! git diff --cached --quiet -- "$INVENTORY"; then
+        git add "$INVENTORY"
+        echo "  M5 reader inventory refreshed and staged; review it in the diff."
+    else
+        echo "  M5 reader inventory up to date."
+    fi
+
+    if [ -n "$(git diff --name-only -- crates/wenlan-core crates/wenlan-server)" ]; then
+        echo "  warning: unstaged Rust changes present; the inventory was generated from the working tree."
+    fi
 fi
 
 if [ "$HAS_RUST_INPUT" = "yes" ]; then

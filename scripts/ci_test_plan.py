@@ -146,6 +146,13 @@ APP_JOB_FILES = {
     "playwright.review.config.ts",
     "scripts/prepare-sidecars.sh",
     "scripts/prepare-tauri-build-sidecars.sh",
+    # app-check is the only job that installs the package, so it is the only
+    # one that runs the postinstall hook installer and the Vitest suites that
+    # assert on the dev entry points and their Node launchers.
+    "scripts/dev-all.sh",
+    "scripts/dev-runtime.sh",
+    "scripts/install-git-hooks.mjs",
+    "scripts/run-bash.mjs",
     "scripts/open-review-app.mjs",
     "scripts/open-review-app.test.ts",
     "scripts/prepare-sidecars.test.ts",
@@ -966,6 +973,11 @@ def clippy_command_for(plan: object, cargo_metadata: object) -> list[str]:
     ]
 
 
+def _workspace_suite_mode(plan: object) -> object:
+    workspace = plan.get("workspace_lib") if isinstance(plan, dict) else None
+    return workspace.get("mode") if isinstance(workspace, dict) else None
+
+
 def local_test_commands_for(plan: object, cargo_metadata: object) -> list[list[str]]:
     """Return bounded pre-push tests: affected libs plus directly changed targets."""
 
@@ -976,13 +988,16 @@ def local_test_commands_for(plan: object, cargo_metadata: object) -> list[list[s
         raise PlanError("test plan has no suite 'workspace_lib'")
     workspace_mode = workspace.get("mode")
     if workspace_mode == "full":
-        commands.append(
-            ["cargo", "test", "--workspace", "--exclude", "wenlan-app", "--lib"]
-        )
-        commands.append(
-            ["cargo", "test", "-p", "wenlan-server", "--bin", "wenlan-server"]
-        )
-    elif workspace_mode == "packages":
+        # Every fail-closed widening lands here: a workflow file, an unowned
+        # path, a shared build input. Those are the changes least likely to
+        # break a specific package and the most expensive to prove locally --
+        # the whole workspace lib suite, which is over an hour on Windows. CI
+        # owns that run through `workspace-lib-required`, so pre-push stops at
+        # Clippy rather than making every broad change unpushable. Narrow plans
+        # below still run their own tests, which is where the local signal is
+        # actually worth its cost.
+        return []
+    if workspace_mode == "packages":
         names = _validated_package_names(workspace.get("packages"), packages)
         commands.append(["cargo", "test", *_package_args(names), "--lib"])
         if "wenlan-server" in names:
@@ -1691,6 +1706,12 @@ def _main(argv: list[str]) -> int:
         plan = build_plan(changed_paths, metadata, event_name="pull_request")
         commands = [clippy_command_for(plan, metadata)]
         if arguments.level == "push":
+            if _workspace_suite_mode(plan) == "full":
+                print(
+                    "local checks: plan widened to the full workspace; "
+                    "CI owns that suite",
+                    flush=True,
+                )
             commands.extend(local_test_commands_for(plan, metadata))
         commands = [command for command in commands if command]
         if not commands:

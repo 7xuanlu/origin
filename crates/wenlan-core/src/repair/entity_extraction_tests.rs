@@ -186,6 +186,7 @@ async fn entity_state(db: &MemoryDB) -> (Vec<String>, (String, Option<String>, i
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn preparation_binds_review_owner_failed_step_links_and_selected_entities() {
     let fixture = entity_extraction_fixture().await;
     let manifest = prepare(&fixture).await;
@@ -234,6 +235,7 @@ async fn preparation_binds_review_owner_failed_step_links_and_selected_entities(
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn apply_preserves_existing_link_adds_approved_link_and_completes_only_selected_step() {
     let fixture = entity_extraction_fixture().await;
     let manifest = prepare(&fixture).await;
@@ -302,6 +304,7 @@ async fn apply_preserves_existing_link_adds_approved_link_and_completes_only_sel
 /// repair with `repair_target_write_unproven`. Registered-space coverage cannot
 /// see this -- the two predicates agree whenever a real space id is involved.
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn uncategorized_target_completes_entity_extraction() {
     let fixture = entity_extraction_fixture_in_space(None).await;
     let manifest = prepare(&fixture).await;
@@ -331,6 +334,7 @@ async fn uncategorized_target_completes_entity_extraction() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn entity_rollback_uncertainty_retains_pending_receipt() {
     let fixture = entity_extraction_fixture().await;
     let manifest = prepare(&fixture).await;
@@ -376,6 +380,7 @@ async fn entity_rollback_uncertainty_retains_pending_receipt() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn apply_recovers_empty_original_and_valid_committed_pending_receipts() {
     let empty_fixture = entity_extraction_fixture().await;
     let empty_manifest = prepare(&empty_fixture).await;
@@ -475,6 +480,7 @@ async fn apply_recovers_empty_original_and_valid_committed_pending_receipts() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn oversized_typed_rollback_is_rejected_before_json_parse() {
     let fixture = entity_extraction_fixture().await;
     let manifest = prepare(&fixture).await;
@@ -502,6 +508,7 @@ async fn oversized_typed_rollback_is_rejected_before_json_parse() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn aggregate_cas_rejects_every_stale_dimension_without_database_mutation() {
     for stale_case in [
         "link_set",
@@ -622,6 +629,7 @@ async fn aggregate_cas_rejects_every_stale_dimension_without_database_mutation()
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn insert_update_and_receipt_failures_roll_back_links_and_step_together() {
     for failure in ["insert", "update", "receipt"] {
         let fixture = entity_extraction_fixture().await;
@@ -735,6 +743,7 @@ async fn generic_review_item_cannot_prepare_or_mutate_entity_extraction() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn complete_entity_extraction_verifies_end_to_end_with_unrelated_failure_remaining() {
     let mut fixture = entity_extraction_fixture().await;
     fixture
@@ -811,6 +820,7 @@ async fn complete_entity_extraction_verifies_end_to_end_with_unrelated_failure_r
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn entity_extraction_actionability_is_exact_and_mismatched_targets_fail_closed() {
     let fixture = entity_extraction_fixture().await;
     let manifest = prepare(&fixture).await;
@@ -865,6 +875,7 @@ async fn entity_extraction_actionability_is_exact_and_mismatched_targets_fail_cl
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn suppressed_approved_link_insert_rolls_back_step_completion() {
     let fixture = entity_extraction_fixture().await;
     let manifest = prepare(&fixture).await;
@@ -901,6 +912,7 @@ async fn suppressed_approved_link_insert_rolls_back_step_completion() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn aggregate_memory_receipt_distinguishes_null_blob_and_embedded_nul_text() {
     let mut fixture = entity_extraction_fixture().await;
     let vector = serde_json::to_string(&vec![0.25_f32; 768]).unwrap();
@@ -961,6 +973,7 @@ async fn aggregate_memory_receipt_distinguishes_null_blob_and_embedded_nul_text(
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn prepare_rejects_oversized_memory_receipt_without_persisting_manifest() {
     let fixture = entity_extraction_fixture().await;
     fixture
@@ -997,6 +1010,7 @@ async fn prepare_rejects_oversized_memory_receipt_without_persisting_manifest() 
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn prepare_rejects_oversized_link_receipt_without_persisting_manifest() {
     let fixture = entity_extraction_fixture().await;
     let raw_bytes = (REPAIR_ROLLBACK_ARTIFACT_MAX_BYTES / 2) + 1;
@@ -1112,6 +1126,7 @@ async fn link_preflight_counts_multibyte_and_embedded_nul_id_bytes() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn prepare_rejects_oversized_multibyte_and_nul_text_without_manifest() {
     for value_sql in [
         format!(
@@ -1161,6 +1176,7 @@ async fn prepare_rejects_oversized_multibyte_and_nul_text_without_manifest() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn prepare_rejects_oversized_step_error_before_materializing_it() {
     let fixture = entity_extraction_fixture().await;
     fixture

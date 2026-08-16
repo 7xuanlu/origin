@@ -619,7 +619,7 @@ function ConnectStep({
 
       {isLoading && (
         <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-          <SectionHeader label={t("setup.connect.detectedOnMac")} />
+          <SectionHeader label={t("setup.connect.detectedOnMachine")} />
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
             {[0, 1].map((i) => (
               <div
@@ -666,7 +666,7 @@ function ConnectStep({
 
       {!isLoading && detectedClients.length > 0 && (
         <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-          <SectionHeader label={t("setup.connect.detectedOnMac")} />
+          <SectionHeader label={t("setup.connect.detectedOnMachine")} />
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
             {detectedClients.map((client) => {
               const isSelected = !!selectedClients[client.client_type];

@@ -367,12 +367,12 @@ describe("SetupWizard", () => {
 
     renderWizard({ initialStep: "connect" });
 
-    // "Found on this Mac" renders identically in both the loading skeleton
+    // "Found on this machine" renders identically in both the loading skeleton
     // and the loaded-data branch, so it can't signal load completion by
     // itself — wait on "Cursor", which only exists once data has loaded.
     await screen.findByText("Cursor");
 
-    expect(screen.getByText("Found on this Mac")).toBeInTheDocument();
+    expect(screen.getByText("Found on this machine")).toBeInTheDocument();
     expect(screen.queryByText("Claude Code")).not.toBeInTheDocument();
     expect(screen.getAllByRole("checkbox")).toHaveLength(1);
     // The old per-row "Detected"/"Install first" pill duplicated the section
@@ -395,9 +395,9 @@ describe("SetupWizard", () => {
     renderWizard({ initialStep: "connect" });
 
     await waitFor(() => {
-      expect(screen.getByText("No AI tools found on this Mac.")).toBeInTheDocument();
+      expect(screen.getByText("No AI tools found on this machine.")).toBeInTheDocument();
     });
-    expect(screen.queryByText("Found on this Mac")).not.toBeInTheDocument();
+    expect(screen.queryByText("Found on this machine")).not.toBeInTheDocument();
   });
 
   // ── Dot 4 asks, dot 5 acts ────────────────────────────────────────────
