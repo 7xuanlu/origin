@@ -62,3 +62,19 @@ owns that suite` and stops at Clippy. Narrow plans still run their own lib and
 integration tests locally, which is where the fast local signal is worth paying
 for.
 
+**What CI does not own: Windows-gated unit tests.** `workspace-lib-required`
+runs on Linux and macOS. The Windows job deliberately skips the workspace lib
+suite — see the "Workspace lib tests skipped on Windows" step comment in
+`ci.yml` — because Linux and macOS catch the same cross-platform unit logic in
+a third of the wall-clock. A `#[cfg(windows)]` unit test therefore has no
+required-CI execution on any platform; `projection_state_mode_tracks_windows_readonly_attribute`
+is one such test.
+
+That gap is older than this change and is not closed by it. Pre-push never
+covered it either: the only machine that could run those tests is a Windows
+one, and until this branch a Windows checkout could not complete a push at all.
+Windows behaviour is covered at a coarser grain by the Windows CLI/server
+integration step and the schtasks install round-trip in the same job. Closing
+it at unit level means paying the ~25 minute Windows lib run on every PR, which
+is a separate decision from this one.
+
