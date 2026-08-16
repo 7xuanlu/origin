@@ -11,3 +11,10 @@ split was documented in `docs/superpowers/decision_extract_tauri_to_origin_app_r
 `app` workspace crate (this repo). The 2026-05-07 split above is history.
 
 License: AGPL-3.0-only (vs Apache-2.0 for the daemon and shared types).
+
+## scripts/ — pinned-download sidecar mode retired
+
+Sidecars used to support a pinned-download mode (`.wenlan-backend-version`,
+`prepare-sidecars.sh --download`). It was deleted once the unified release
+(v0.15.7) proved the in-tree build; `resolve-backend-dir.sh` now always
+resolves a backend checkout instead.

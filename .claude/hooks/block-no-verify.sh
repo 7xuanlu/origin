@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PreToolUse hook on Bash: block git commands using --no-verify or --no-gpg-sign.
-# Enforces CLAUDE.md rule: "Never skip hooks (--no-verify) or bypass signing".
+# This hook is the policy: hooks must run and signing must not be bypassed.
 set -euo pipefail
 
 INPUT="$(cat)"
