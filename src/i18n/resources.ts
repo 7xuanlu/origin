@@ -23,7 +23,7 @@ const en = {
       localOption: "Your own local server",
       recommended: "Recommended",
       deviceNote:
-        "Local models keep inference on your Mac. If you skip this now, Wenlan can still store memories and you can download a model later from Settings.",
+        "Local models keep inference on your machine. If you skip this now, Wenlan can still store memories and you can download a model later from Settings.",
       cloudNote:
         "Your cloud provider API key powers page synthesis. Nothing else leaves your machine unless you also connect a local server.",
       localNote:
@@ -41,12 +41,12 @@ const en = {
     connect: {
       title: "Connect your AI tools",
       description: "Pick the tools Wenlan should set itself up in. Nothing is written yet.",
-      detectedOnMac: "Found on this Mac",
+      detectedOnMachine: "Found on this machine",
       configured: "Configured",
       alreadySetUp: "Already set up. Uncheck to leave it as it is.",
       settingsPointer:
         "Claude.ai, ChatGPT, and more tools can be connected any time in Settings → Agents.",
-      emptyTitle: "No AI tools found on this Mac.",
+      emptyTitle: "No AI tools found on this machine.",
       detectionFailed:
         "Couldn't scan for AI tools. You can connect them any time in Settings → Agents.",
     },
@@ -1573,8 +1573,8 @@ const en = {
     statusConnected: "Connected",
     statusConnectedLatency: "Connected ({{ms}} ms)",
     tunnelChangesNote:
-      "This tunnel URL changes when your Mac sleeps or restarts. Enable a stable relay in Settings → Agents to avoid reconnecting.",
-    stableNote: "This URL is stable — it won't change when your Mac sleeps or restarts.",
+      "This tunnel URL changes when your machine sleeps or restarts. Enable a stable relay in Settings → Agents to avoid reconnecting.",
+    stableNote: "This URL is stable — it won't change when your machine sleeps or restarts.",
   },
   addMemory: {
     placeholder: "What do you want to remember?",
@@ -1607,7 +1607,7 @@ const zhHans = {
       localOption: "你自己的本地服务器",
       recommended: "推荐",
       deviceNote:
-        "本地模型会在你的 Mac 上完成推理。现在跳过也没关系，文澜仍可存储记忆，稍后可在设置中下载模型。",
+        "本地模型会在你的设备上完成推理。现在跳过也没关系，文澜仍可存储记忆，稍后可在设置中下载模型。",
       cloudNote:
         "你的云服务商 API key 用于页面综合。除非你还连接了本地服务器，否则不会有其他内容离开你的设备。",
       localNote:
@@ -1625,11 +1625,11 @@ const zhHans = {
     connect: {
       title: "连接你的 AI 工具",
       description: "选择你希望文澜自行接入的工具。现在还不会写入任何内容。",
-      detectedOnMac: "在此 Mac 上找到",
+      detectedOnMachine: "在此设备上找到",
       configured: "已配置",
       alreadySetUp: "已经设置好。取消勾选可保持原样。",
       settingsPointer: "Claude.ai、ChatGPT 及更多工具可随时在设置 → 代理中连接。",
-      emptyTitle: "在此 Mac 上未找到 AI 工具。",
+      emptyTitle: "在此设备上未找到 AI 工具。",
       detectionFailed: "无法扫描 AI 工具。你可以随时在设置 → 代理中连接它们。",
     },
     settingUp: {
@@ -3113,8 +3113,8 @@ const zhHans = {
     statusConnected: "已连接",
     statusConnectedLatency: "已连接（{{ms}} 毫秒）",
     tunnelChangesNote:
-      "此隧道地址会在 Mac 休眠或重启后变化。可在“设置 → Agents”中启用稳定中继,免去重新连接。",
-    stableNote: "此地址是稳定的——不会在 Mac 休眠或重启后变化。",
+      "此隧道地址会在设备休眠或重启后变化。可在“设置 → Agents”中启用稳定中继,免去重新连接。",
+    stableNote: "此地址是稳定的——不会在设备休眠或重启后变化。",
   },
   addMemory: {
     placeholder: "你想记住什么?",
@@ -3147,7 +3147,7 @@ const zhHant = {
       localOption: "你自己的本機伺服器",
       recommended: "推薦",
       deviceNote:
-        "本機模型會在你的 Mac 上完成推理。現在略過也沒關係，文瀾仍可儲存記憶，稍後可在設定中下載模型。",
+        "本機模型會在你的裝置上完成推理。現在略過也沒關係，文瀾仍可儲存記憶，稍後可在設定中下載模型。",
       cloudNote:
         "你的雲端服務商 API key 用於頁面綜合。除非你還連接了本機伺服器，否則不會有其他內容離開你的裝置。",
       localNote:
@@ -3165,11 +3165,11 @@ const zhHant = {
     connect: {
       title: "連接你的 AI 工具",
       description: "選擇你希望文瀾自行接入的工具。現在還不會寫入任何內容。",
-      detectedOnMac: "在此 Mac 上找到",
+      detectedOnMachine: "在此裝置上找到",
       configured: "已設定",
       alreadySetUp: "已經設定好。取消勾選可維持原樣。",
       settingsPointer: "Claude.ai、ChatGPT 及更多工具可隨時在設定 → 代理中連接。",
-      emptyTitle: "在此 Mac 上未找到 AI 工具。",
+      emptyTitle: "在此裝置上未找到 AI 工具。",
       detectionFailed: "無法掃描 AI 工具。你可以隨時在設定 → 代理中連接它們。",
     },
     settingUp: {
@@ -4653,8 +4653,8 @@ const zhHant = {
     statusConnected: "已連線",
     statusConnectedLatency: "已連線（{{ms}} 毫秒）",
     tunnelChangesNote:
-      "此隧道位址會在 Mac 休眠或重啟後變化。可在「設定 → Agents」中啟用穩定中繼,免去重新連線。",
-    stableNote: "此位址是穩定的——不會在 Mac 休眠或重啟後變化。",
+      "此隧道位址會在裝置休眠或重啟後變化。可在「設定 → Agents」中啟用穩定中繼,免去重新連線。",
+    stableNote: "此位址是穩定的——不會在裝置休眠或重啟後變化。",
   },
   addMemory: {
     placeholder: "你想記住什麼?",
