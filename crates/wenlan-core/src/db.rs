@@ -222,6 +222,57 @@ fn superseder_not_exists(
     )
 }
 
+/// `supersede_mode` is superseder BEHAVIOUR, not row state: it says how a row
+/// treats the rows *it* supersedes -- `'hide'` removes the predecessor from
+/// retrieval, `'archive'` keeps the predecessor visible but muted. The store
+/// path stamps every `memory_type='decision'` row with `'archive'` for that
+/// reason alone (`wenlan-server/src/memory_routes.rs` at store time, and
+/// `ingest::run_classification_enrichment` when the classifier refines the
+/// type), so `'archive'` on a decision says nothing at all about the decision
+/// itself. `search_memory_cross_rerank` reads the field correctly: it collects
+/// `supersedes` from rows whose own mode is `'archive'` and mutes those
+/// *targets*, and only self-excludes `'evicted'`.
+///
+/// Two values are written back onto a row to describe that row's own state:
+///
+///   * `'evicted'` -- refinery soft-eviction (`evict_stale`). Always self-state.
+///   * `'archive'` -- `apply_merge` marks the originals it folded into a
+///     `merged_*` row. Because the store path never writes `'archive'` for a
+///     non-decision, `'archive'` on a non-decision row is unambiguously this
+///     marker.
+///
+/// Returns the predicate that is TRUE while a row is still live content, i.e.
+/// not self-excluded by either marker. A decision that `apply_merge` folded
+/// away is not separable from a freshly stored decision on this column alone,
+/// so it stays included here; the merge links the first original through
+/// `supersedes`, which the callers' superseder test already excludes.
+pub(crate) fn not_self_archived(alias: &str) -> String {
+    format!(
+        "COALESCE({alias}.supersede_mode, '') <> 'evicted' \
+         AND NOT (COALESCE({alias}.supersede_mode, '') = 'archive' \
+                  AND COALESCE({alias}.memory_type, '') <> 'decision')"
+    )
+}
+
+/// The distillation staging pool's "not genuinely superseded" test, shared by
+/// `query_distillation_staging_pool`, `query_distillation_seed_slice`, and
+/// `query_distillation_ann_neighbors` so the three cannot drift.
+///
+/// Mirrors the rule `search_memory_cross_rerank` applies: a row is superseded
+/// only when a non-pending memory supersedes it *and* that superseder's mode is
+/// `'hide'`. An `'archive'`-mode superseder leaves its predecessor visible, so
+/// the predecessor stays in the pool exactly as it stays in search. `Global`
+/// scope matches search's unscoped read; the pool applies its own space filter
+/// separately.
+fn distillation_not_superseded(alias: &str) -> String {
+    superseder_not_exists(
+        &ReadScope::Global,
+        alias,
+        "superseder.pending_revision = 0 AND superseder.source = 'memory' \
+         AND superseder.supersede_mode = 'hide'",
+    )
+}
+
 fn capture_memory_source(source: &str) -> &str {
     match source {
         "focus" => "focus_capture",
@@ -28890,6 +28941,7 @@ impl MemoryDB {
                 "p.community_id",
             )
         };
+        let live = not_self_archived("m");
         let sql = format!(
             "SELECT m.source_id, m.title, m.content, {community_expr}
                FROM memories m
@@ -28903,7 +28955,7 @@ impl MemoryDB {
                        AND superseder.source = 'memory'
                 )
                 AND m.is_recap = 0
-                AND m.supersede_mode <> 'archive'
+                AND {live}
                 AND m.source_id NOT LIKE 'merged_%'
                 AND m.source_id NOT LIKE 'recap_%'
                 AND m.embedding IS NOT NULL
@@ -41793,14 +41845,17 @@ impl MemoryDB {
         // G6 Stage 1.5a: `e.name` hydration moved onto the `kind='entity'`
         // shadow page (via `entity_page_map`) -- name-only projection, no
         // space touch, LEFT JOIN semantics preserved.
-        let mut sql = String::from(
+        let live = not_self_archived("m");
+        let not_superseded = distillation_not_superseded("m");
+        let mut sql = format!(
             "SELECT m.source_id, m.content, m.entity_id, m.space, m.embedding, p.title, m.source_agent, m.content_hash \
              FROM memories m \
              LEFT JOIN entity_page_map epm ON epm.entity_id = m.entity_id \
              LEFT JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity' AND p.status = 'active' \
              WHERE m.source = 'memory' AND m.chunk_index = 0 \
                AND (m.pinned = 0 OR m.pinned IS NULL) \
-               AND m.supersede_mode NOT IN ('archive', 'evicted') \
+               AND {live} \
+               AND {not_superseded} \
                AND m.source_id NOT LIKE 'merged_%' \
                AND m.source_id NOT LIKE 'recap_%' \
                AND m.is_recap = 0 \
@@ -42078,12 +42133,15 @@ impl MemoryDB {
         // G6 Stage 1.5a: `e.name` hydration moved onto the `kind='entity'`
         // shadow page (via `entity_page_map`) -- same pattern as
         // `query_distillation_staging_pool` above.
-        let mut sql = String::from(
+        let live = not_self_archived("m");
+        let not_superseded = distillation_not_superseded("m");
+        let mut sql = format!(
             "SELECT m.id, m.source_id, m.content, m.entity_id, m.space, m.embedding, \
                     p.title, m.source_agent, m.content_hash, \
                     CASE WHEN m.source = 'memory' AND m.chunk_index = 0 \
                            AND (m.pinned = 0 OR m.pinned IS NULL) \
-                           AND m.supersede_mode NOT IN ('archive', 'evicted') \
+                           AND {live} \
+                           AND {not_superseded} \
                            AND m.source_id NOT LIKE 'merged_%' \
                            AND m.source_id NOT LIKE 'recap_%' \
                            AND m.is_recap = 0 \
@@ -42148,13 +42206,17 @@ impl MemoryDB {
         // G6 Stage 1.5a: `e.name` hydration moved onto the `kind='entity'`
         // shadow page (via `entity_page_map`) -- same pattern as the two
         // sibling distillation queries above.
+        let live = not_self_archived("m");
+        let not_superseded = distillation_not_superseded("m");
         let mut rows = conn
             .query(
+                &format!(
                 "SELECT m.source_id, m.content, m.entity_id, m.space, m.embedding, \
                         p.title, m.source_agent, m.content_hash, \
                         CASE WHEN m.source = 'memory' AND m.chunk_index = 0 \
                                AND (m.pinned = 0 OR m.pinned IS NULL) \
-                               AND m.supersede_mode NOT IN ('archive', 'evicted') \
+                               AND {live} \
+                               AND {not_superseded} \
                                AND m.source_id NOT LIKE 'merged_%' \
                                AND m.source_id NOT LIKE 'recap_%' \
                                AND m.is_recap = 0 \
@@ -42172,7 +42234,8 @@ impl MemoryDB {
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt \
                  JOIN memories m ON m.rowid = vt.id \
                  LEFT JOIN entity_page_map epm ON epm.entity_id = m.entity_id \
-                 LEFT JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity' AND p.status = 'active'",
+                 LEFT JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity' AND p.status = 'active'"
+                ),
                 libsql::params![vec_str, limit as i64],
             )
             .await

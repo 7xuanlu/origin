@@ -14597,6 +14597,124 @@ async fn find_distillation_clusters_reads_space_scoped_staging_pool() {
     );
 }
 
+/// Regression: the store path stamps `supersede_mode='archive'` on every
+/// `memory_type='decision'` row to say "archive what I supersede", not "I am
+/// archived". The staging pool used to test that value as row state
+/// (`supersede_mode NOT IN ('archive','evicted')`), so no decision ever reached
+/// a cluster and none was ever cited on a page.
+///
+/// The pool must now admit decisions while still excluding the rows that really
+/// are gone: `'evicted'`, an `apply_merge` original (archive on a NON-decision),
+/// and a memory a `'hide'`-mode replacement superseded.
+#[tokio::test]
+async fn find_distillation_clusters_includes_decisions_but_not_superseded_rows() {
+    let (db, _dir) = test_db().await;
+
+    let now = chrono::Utc::now().timestamp();
+    let mut docs = Vec::new();
+    // Three plain captures clear the >= 3 non-document capture seed floor.
+    for (sid, memory_type) in [
+        ("pool_fact_a", "fact"),
+        ("pool_fact_b", "fact"),
+        ("pool_fact_c", "fact"),
+        // The regression subject. `make_memory_doc` derives supersede_mode from
+        // memory_type exactly as the store path does, so this row lands with
+        // supersede_mode='archive' without the test asserting it by hand.
+        ("pool_decision", "decision"),
+        // Excluded below by a direct UPDATE, mirroring the two writers that put
+        // self-state onto the column.
+        ("pool_evicted", "fact"),
+        ("pool_merged_away", "fact"),
+        // Superseded by `pool_replacement` with the default 'hide' mode.
+        ("pool_hidden", "fact"),
+        ("pool_replacement", "fact"),
+    ] {
+        let mut doc = make_memory_doc(
+            sid,
+            &format!("Shared distillation pool memory content for {sid}"),
+            memory_type,
+            "alpha",
+            "test-agent",
+        );
+        doc.entity_id = Some("pool_entity".to_string());
+        doc.last_modified = now;
+        if sid == "pool_replacement" {
+            doc.supersedes = Some("pool_hidden".to_string());
+        }
+        docs.push(doc);
+    }
+    db.upsert_documents(docs).await.unwrap();
+
+    // `upsert_documents` overwrites supersede_mode unconditionally, so the
+    // self-state markers have to be applied after the insert.
+    {
+        let conn = db.conn.lock().await;
+        // `evict_stale` writes this.
+        conn.execute(
+            "UPDATE memories SET supersede_mode = 'evicted' \
+             WHERE source_id = 'pool_evicted' AND source = 'memory'",
+            (),
+        )
+        .await
+        .unwrap();
+        // `apply_merge` writes this onto each original it folded away. On a
+        // non-decision the value cannot have come from the store path, so it is
+        // unambiguously the merge marker.
+        conn.execute(
+            "UPDATE memories SET supersede_mode = 'archive' \
+             WHERE source_id = 'pool_merged_away' AND source = 'memory'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Guard the premise: the decision really does carry the archive stamp, so a
+    // green assertion below cannot come from the stamp having quietly changed.
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT supersede_mode FROM memories \
+                 WHERE source_id = 'pool_decision' AND source = 'memory' AND chunk_index = 0",
+                (),
+            )
+            .await
+            .unwrap();
+        let mode: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            mode, "archive",
+            "premise: the store path stamps decisions with supersede_mode='archive'"
+        );
+    }
+
+    let clusters = db
+        .find_distillation_clusters_scoped(0.0, 1, 10, 3500, 50, 50, None, Some("alpha"))
+        .await
+        .unwrap();
+    let actual: std::collections::BTreeSet<String> = clusters
+        .iter()
+        .flat_map(|cluster| cluster.source_ids.iter().cloned())
+        .collect();
+
+    assert!(
+        actual.contains("pool_decision"),
+        "a decision must reach the distillation pool; got {actual:?}"
+    );
+    assert!(
+        !actual.contains("pool_evicted"),
+        "an evicted row must stay out of the pool; got {actual:?}"
+    );
+    assert!(
+        !actual.contains("pool_merged_away"),
+        "an apply_merge original must stay out of the pool; got {actual:?}"
+    );
+    assert!(
+        !actual.contains("pool_hidden"),
+        "a hide-superseded row must stay out of the pool; got {actual:?}"
+    );
+}
+
 #[tokio::test]
 async fn find_distillation_clusters_requires_three_non_document_captures_to_seed() {
     // Seeding rule (spec §4.2/§4.3): a cluster needs >= 3 staging CAPTURE
@@ -16556,6 +16674,65 @@ async fn load_summary_buckets_excludes_pending_and_hide_superseded_memories() {
         .flat_map(|(_, members)| members.into_iter().map(|member| member.source_id))
         .collect();
     assert_eq!(source_ids, vec!["summary_active".to_string()]);
+}
+
+/// Companion to the pool regression above: summary buckets read the same
+/// `supersede_mode` column and dropped every decision for the same reason.
+#[tokio::test]
+async fn load_summary_buckets_includes_decisions_but_not_merged_originals() {
+    let (db, _dir) = test_db().await;
+    let entity_id = db
+        .store_entity("Scheduler", "concept", None, None, None)
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET community_id = 7 \
+             WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![entity_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut decision = make_memory_doc(
+        "summary_decision",
+        "We chose libSQL over sqlite for the graph store.",
+        "decision",
+        "work",
+        "agent",
+    );
+    decision.entity_id = Some(entity_id.clone());
+    let mut merged_away = make_memory_doc(
+        "summary_merged_away",
+        "An original that apply_merge folded into a merged_ row.",
+        "fact",
+        "work",
+        "agent",
+    );
+    merged_away.entity_id = Some(entity_id);
+    db.upsert_documents(vec![decision, merged_away])
+        .await
+        .unwrap();
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET supersede_mode = 'archive' \
+             WHERE source_id = 'summary_merged_away' AND source = 'memory'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let buckets = db.load_summary_buckets().await.unwrap();
+    let source_ids: Vec<String> = buckets
+        .into_iter()
+        .flat_map(|(_, members)| members.into_iter().map(|member| member.source_id))
+        .collect();
+    assert_eq!(source_ids, vec!["summary_decision".to_string()]);
 }
 
 // ==================== Space CRUD ====================
