@@ -1178,7 +1178,7 @@ def trusted_candidate_gate_violations(
     for marker in [
         "needs: [detect-changes]",
         "trusted-release-candidate == 'true'",
-        "timeout-minutes: 20",
+        "timeout-minutes: 45",
         "actions: read",
         "contents: read",
     ]:
@@ -1198,7 +1198,7 @@ def trusted_candidate_gate_violations(
         "trusted-main-ci-proof/scripts/release-promotion.py verify-main-ci",
         '--repository "$GITHUB_REPOSITORY"',
         '--sha "${{ github.event.pull_request.base.sha }}"',
-        "--wait-seconds 1080",
+        "--wait-seconds 2400",
     ]:
         if marker not in proof_run:
             violations.append(f"trusted candidate base CI proof omits {marker!r}")
