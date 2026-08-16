@@ -20041,6 +20041,45 @@ async fn test_check_novelty_keeps_archive_mode_superseded_rows() {
     );
 }
 
+/// check_novelty_batch must apply each row's own exclude_source_ids entry to
+/// that same row's query, not some other row's — a misaligned zip would let
+/// one exclude leak onto a different index's result.
+#[tokio::test]
+async fn test_check_novelty_batch_applies_per_row_exclude() {
+    let (db, _dir) = test_db().await;
+    let doc = RawDocument {
+        content: "User prefers dark mode for all IDEs".to_string(),
+        source_id: "mem_existing".to_string(),
+        source: "memory".to_string(),
+        title: "Dark mode pref".to_string(),
+        last_modified: chrono::Utc::now().timestamp(),
+        ..Default::default()
+    };
+    db.upsert_documents(vec![doc]).await.unwrap();
+
+    let contents = vec![
+        "User prefers dark mode for all code editors".to_string(),
+        "User prefers dark mode for all code editors".to_string(),
+    ];
+    let exclude_source_ids = vec![None, Some("mem_existing".to_string())];
+    let results = db
+        .check_novelty_batch(&contents, &exclude_source_ids)
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].as_ref().map(|(source_id, _)| source_id.as_str()),
+        Some("mem_existing"),
+        "row with exclude=None should still find mem_existing"
+    );
+    assert_ne!(
+        results[1].as_ref().map(|(source_id, _)| source_id.as_str()),
+        Some("mem_existing"),
+        "row with exclude=Some(mem_existing) must not return the excluded source"
+    );
+}
+
 #[tokio::test]
 async fn test_concepts_table_exists() {
     let (db, _dir) = test_db().await;

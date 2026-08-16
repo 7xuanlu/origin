@@ -23790,7 +23790,8 @@ impl MemoryDB {
              JOIN memories c ON c.rowid = vt.id
              WHERE c.source = 'memory' AND c.pending_revision = 0
                AND (?2 IS NULL OR c.source_id != ?2)
-               AND {hidden_by_superseder}"
+               AND {hidden_by_superseder}
+             ORDER BY 2 ASC LIMIT 1"
         );
         let conn = self.conn.lock().await;
         let mut results = Vec::with_capacity(contents.len());
@@ -23850,7 +23851,8 @@ impl MemoryDB {
              JOIN memories c ON c.rowid = vt.id
              WHERE c.source = 'memory' AND c.pending_revision = 0
                AND (?2 IS NULL OR c.source_id != ?2)
-               AND {hidden_by_superseder}"
+               AND {hidden_by_superseder}
+             ORDER BY 2 ASC LIMIT 1"
         );
 
         let conn = self.conn.lock().await;
