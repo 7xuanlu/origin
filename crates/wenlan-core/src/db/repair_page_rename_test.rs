@@ -351,6 +351,7 @@ fn assert_projection_and_db_still_locked(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn projection_session_precedes_db_mutex_for_apply_and_pending_recovery() {
     let fixture = rename_fixture().await;
     let invalid_root = tempfile::NamedTempFile::new().unwrap();
@@ -393,6 +394,7 @@ async fn projection_session_precedes_db_mutex_for_apply_and_pending_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn apply_keeps_the_same_db_contender_pending_across_projection_write() {
     let fixture = rename_fixture().await;
     let contender = DbContender::prestarted(Arc::clone(&fixture.db));
@@ -432,6 +434,7 @@ async fn apply_keeps_the_same_db_contender_pending_across_projection_write() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn apply_compensation_holds_db_mutex_from_restore_entry_through_midpoint() {
     let fixture = rename_fixture().await;
     let contender = DbContender::prestarted(Arc::clone(&fixture.db));
@@ -476,6 +479,7 @@ async fn apply_compensation_holds_db_mutex_from_restore_entry_through_midpoint()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn recovery_restore_holds_db_mutex_from_entry_through_midpoint() {
     let fixture = rename_fixture().await;
     let filename = target_filename(fixture.page_root.path(), "page-a");
@@ -514,6 +518,7 @@ async fn recovery_restore_holds_db_mutex_from_entry_through_midpoint() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn recovery_publish_runs_after_commit_while_db_and_projection_stay_locked() {
     let fixture = rename_fixture().await;
     let (pending, final_path) = artifact_paths(&fixture);
@@ -560,6 +565,7 @@ async fn recovery_publish_runs_after_commit_while_db_and_projection_stay_locked(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn recovery_clear_runs_after_commit_while_db_and_projection_stay_locked() {
     let fixture = rename_fixture().await;
     let (pending, final_path) = artifact_paths(&fixture);
@@ -592,6 +598,7 @@ async fn recovery_clear_runs_after_commit_while_db_and_projection_stay_locked() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn split_projection_states_fail_closed_and_retain_pending() {
     for target_post in [true, false] {
         let fixture = rename_fixture().await;
