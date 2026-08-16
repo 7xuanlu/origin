@@ -1,5 +1,6 @@
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -26,6 +27,13 @@ const itPosix = it.skipIf(process.platform === "win32");
 // The mirror of the above: cases whose subject is Windows path resolution, run
 // through `run-bash.mjs` for the same reason package.json does.
 const itWindows = it.skipIf(process.platform !== "win32");
+// 8.3 alias generation is off by default on modern volumes, so a machine may
+// have no alias to test with. `C:\PROGRA~1` predates that default on most
+// installs; where it is absent the alias case has nothing to assert against.
+const dosAliasRoot = "C:\\PROGRA~1";
+const itWindowsAlias = it.skipIf(
+  process.platform !== "win32" || !existsSync(dosAliasRoot),
+);
 
 afterEach(() => {
   for (const path of tempRoots.splice(0)) {
@@ -178,6 +186,45 @@ describe("scoped dev runtime", () => {
     // seconds is normal on Windows; the 5s default is not enough.
     30_000,
   );
+
+  itWindowsAlias(
+    "rejects a production root reached through a DOS 8.3 alias",
+    () => {
+      // An alias and its long form are two names for one directory, and
+      // `realpath` keeps whichever one it was handed. LOCALAPPDATA is
+      // overridden here because that is what the guard builds its Windows
+      // roots from, and this machine's real one has no alias to exercise.
+      const result = spawnSync(
+        process.execPath,
+        ["scripts/run-bash.mjs", "scripts/dev-runtime.sh", "print-config"],
+        {
+          cwd: root,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            LOCALAPPDATA: "C:\\Program Files",
+            WENLAN_DEV_DATA_DIR: `${dosAliasRoot}\\wenlan`,
+          },
+        },
+      );
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("refusing production");
+    },
+    30_000,
+  );
+
+  it("expands DOS 8.3 aliases while canonicalizing on Windows only", () => {
+    const script = readFileSync(resolve(root, "scripts/dev-runtime.sh"), "utf8");
+    const start = script.indexOf("canonicalize_path() {");
+    expect(start).toBeGreaterThan(-1);
+    const body = script.slice(start, script.indexOf("\n}\n", start));
+
+    // Without this, C:/PROGRA~1 and C:/Program Files canonicalize to two
+    // different strings and every comparison below them fails open.
+    expect(body).toContain("HOST_IS_WINDOWS == 1");
+    expect(body).toContain("cygpath -m -l");
+  });
 
   it("compares production roots case-insensitively on Windows only", () => {
     const script = readFileSync(resolve(root, "scripts/dev-runtime.sh"), "utf8");

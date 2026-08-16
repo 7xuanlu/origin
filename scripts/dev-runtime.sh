@@ -237,7 +237,18 @@ canonicalize_path() {
     suffix="/$(basename "$path")$suffix"
     path="$(dirname "$path")"
   done
-  printf '%s%s\n' "$(realpath "$path")" "$suffix"
+  path="$(realpath "$path")"
+  if (( HOST_IS_WINDOWS == 1 )); then
+    # A DOS 8.3 alias is a second name for one directory, and `realpath` keeps
+    # whichever one it was handed: C:/PROGRA~1 and C:/Program Files come out as
+    # two different strings. Every comparison built on this then fails open,
+    # including the production-root guard below. Expand the alias so the
+    # canonical form is actually canonical. Only the existing prefix can carry
+    # one -- an alias names something that is on disk -- so the suffix is left
+    # alone, and a path with no alias comes back unchanged.
+    path="$(cygpath -m -l "$path" 2>/dev/null || printf '%s' "$path")"
+  fi
+  printf '%s%s\n' "$path" "$suffix"
 }
 
 # Windows resolves paths case-insensitively, and `realpath` hands back whatever
