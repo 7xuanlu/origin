@@ -57,7 +57,15 @@ const memoryItem: ReviewItem = {
   timestampMs: 1_760_000_000_000,
 };
 
-function ReviewHarness({ item }: { readonly item: ReviewItem }) {
+function ReviewHarness({
+  item,
+  onOpenPage,
+  onOpenMemory,
+}: {
+  readonly item: ReviewItem;
+  readonly onOpenPage?: (pageId: string) => void;
+  readonly onOpenMemory?: (sourceId: string) => void;
+}) {
   const [openId, setOpenId] = useState<string | null>(null);
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -73,14 +81,22 @@ function ReviewHarness({ item }: { readonly item: ReviewItem }) {
         onOpenChange={setOpenId}
         onResolve={vi.fn().mockResolvedValue(undefined)}
         isResolving={false}
+        onOpenPage={onOpenPage}
+        onOpenMemory={onOpenMemory}
       />
     </QueryClientProvider>
   );
 }
 
-async function openDialog(item: ReviewItem): Promise<HTMLElement> {
+async function openDialog(
+  item: ReviewItem,
+  handlers: {
+    onOpenPage?: (pageId: string) => void;
+    onOpenMemory?: (sourceId: string) => void;
+  } = {},
+): Promise<HTMLElement> {
   const user = userEvent.setup();
-  render(<ReviewHarness item={item} />);
+  render(<ReviewHarness item={item} {...handlers} />);
   await user.click(screen.getByRole("button", { name: "Open review" }));
   return await screen.findByRole("dialog");
 }
@@ -175,6 +191,21 @@ describe("ReviewDialog page-target revision card", () => {
     await within(dialog).findByRole("heading", { name: PAGE_TITLE });
     await waitFor(() => expect(getPageRevisions).toHaveBeenCalled());
     expect(within(dialog).queryByText(/History ·/)).toBeNull();
+  });
+
+  it("offers Open page (not Open memory) and opens the page itself", async () => {
+    const onOpenPage = vi.fn();
+    const onOpenMemory = vi.fn();
+    const dialog = await openDialog(pageItem, { onOpenPage, onOpenMemory });
+    await within(dialog).findByRole("heading", { name: PAGE_TITLE });
+
+    expect(
+      within(dialog).queryByRole("button", { name: "Open memory" }),
+    ).toBeNull();
+    const user = userEvent.setup();
+    await user.click(within(dialog).getByRole("button", { name: "Open page" }));
+    expect(onOpenPage).toHaveBeenCalledWith(PAGE_ID);
+    expect(onOpenMemory).not.toHaveBeenCalled();
   });
 
   it("still reads a memory-target card through the memory routes", async () => {

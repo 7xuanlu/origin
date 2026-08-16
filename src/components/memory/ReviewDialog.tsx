@@ -1529,7 +1529,19 @@ export default function ReviewDialog({
                   {t("review.openPage")}
                 </button>
               )}
-              {(item.kind === "revision" || item.kind === "capture") &&
+              {item.kind === "revision" &&
+                item.targetKind === "page" &&
+                onOpenPage && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenPage(item.targetSourceId)}
+                    style={actionButtonStyle}
+                  >
+                    {t("review.openPage")}
+                  </button>
+                )}
+              {((item.kind === "revision" && item.targetKind !== "page") ||
+                item.kind === "capture") &&
                 onOpenMemory && (
                   <button
                     type="button"
