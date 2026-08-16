@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useEffect, useState } from "react";
+import { MEMORY_NODE_TYPE, PAGE_NODE_TYPE } from "./model";
 
 export type GraphSlot =
   | "project"
@@ -53,6 +54,13 @@ export interface GraphPalette {
   graticule: string;
   /** Cross-community edge ink — opaque (sigma-consumed). */
   bridge: string;
+  /** The one muted fill every memory node wears — memories carry no entity
+   *  type, so they get a slot-free colour rather than a sixth category. */
+  memory: string;
+  /** The one fill every wiki-page node wears — same slot-free reasoning as
+   *  `memory`, but at full presence: pages are subjects on this map, not
+   *  context. */
+  page: string;
 }
 
 // Read the resolved --kg-* custom properties off <html>. getComputedStyle
@@ -77,6 +85,8 @@ function readPalette(): GraphPalette {
     hullBorder: read("--kg-hull-border"),
     graticule: read("--kg-graticule"),
     bridge: read("--kg-bridge"),
+    memory: read("--kg-memory"),
+    page: read("--kg-page"),
   };
 }
 
@@ -138,6 +148,16 @@ export function nodeFillFor(
   confirmed: boolean | null,
   palette: GraphPalette,
 ): string {
+  // Memory nodes are context, not categories: one muted fill at a fixed
+  // alpha, so a wall of them never competes with the entities they hang off.
+  if (entityType === MEMORY_NODE_TYPE) {
+    return compositeOver(palette.memory, palette.surface, 0.6);
+  }
+  // Wiki pages are subjects, not context: full-presence fill, like a
+  // confirmed entity, so the page graph reads as the map's other half.
+  if (entityType === PAGE_NODE_TYPE) {
+    return compositeOver(palette.page, palette.surface, 0.9);
+  }
   const alpha = confirmed === true ? 0.9 : 0.5;
   return compositeOver(colorForEntityType(entityType, palette), palette.surface, alpha);
 }

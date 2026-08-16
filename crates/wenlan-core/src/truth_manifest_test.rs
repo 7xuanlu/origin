@@ -199,7 +199,7 @@ fn manifest_counts_match_the_spec() {
     // `/api/brief`. The router coverage assertion caught both drifts.
     assert_eq!(
         HTTP_READERS.len(),
-        168,
+        169,
         "registered (method, path, handler) triples"
     );
     assert_eq!(MCP_READERS.len(), 29, "#[tool( declarations");
@@ -208,7 +208,7 @@ fn manifest_counts_match_the_spec() {
     let entries: Vec<_> = runtime_entries().collect();
     assert_eq!(
         entries.len(),
-        172,
+        173,
         "(builder, method, path) runtime entries"
     );
     assert_eq!(
@@ -216,7 +216,7 @@ fn manifest_counts_match_the_spec() {
             .iter()
             .filter(|(b, _, _)| *b == Builder::Main)
             .count(),
-        166,
+        167,
         "main builder entries"
     );
     assert_eq!(
@@ -232,7 +232,7 @@ fn manifest_counts_match_the_spec() {
         .iter()
         .filter(|r| r.page_bearing == PageBearing::Yes)
         .count();
-    assert_eq!(bearing, 59, "page-bearing HTTP routes");
+    assert_eq!(bearing, 60, "page-bearing HTTP routes");
 }
 
 #[test]
@@ -392,7 +392,7 @@ fn marker_shape_allowlist_is_fail_closed() {
             .iter()
             .filter(|r| r.marker_shape == MarkerShape::None)
             .count(),
-        162
+        163
     );
 }
 

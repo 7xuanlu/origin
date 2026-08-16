@@ -522,9 +522,9 @@ A surface that transmits anyway is a failing test on that surface. That gate is
 soft, and saying so plainly is what cooperative-tier means. It is also no longer
 load-bearing: the shape gate holds even when this one is bypassed.
 
-## HTTP — all 167 registered `(method, path, handler)` triples
+## HTTP — all 169 registered `(method, path, handler)` triples
 
-59 page-bearing, 108 not.
+60 page-bearing, 109 not.
 
 | Method | Path | Builder | Page-bearing | Class | Marker-shape | Adapter | Evidence |
 |---|---|---|---|---|---|---|---|
@@ -589,6 +589,7 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `PUT` | `/api/memory/entities/{id}/confirm` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/memory/entities/{id}/delete` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/memory/entity-suggestions` | main | no | not_applicable | `none` | — | no prose fields |
+| `GET` | `/api/memory/graph` | main | yes | automatic | `none` | `handle_get_knowledge_graph` | GraphPageNode.title, GraphMemoryNode.title via dismissed card |
 | `POST` | `/api/memory/link-entity` | main | yes | automatic | `none` | `handle_link_entity` | opaque response type — fail-closed |
 | `POST` | `/api/memory/list` | main | yes | automatic | `none` | `handle_list_memories` | IndexedFileInfo.title/content via dismissed card |
 | `GET` | `/api/memory/nurture` | main | yes | automatic | `none` | `handle_get_nurture_cards` | MemoryItem.title/content via staged revision card |
@@ -949,6 +950,7 @@ carrying the authority of agreement.
 | `core/db/repair_page_rename.rs::page_on_connection` | `private` | no | no | — | — |
 | `core/db/repair_page_rename.rs::rename_page_title_cas_inner` | `pub(crate)` | no | no | — | — |
 | `core/db/scoped_entities.rs::get_entity_detail_scoped` | `pub` | no | **yes** | `server/entity_graph_routes.rs::handle_get_entity_detail` | — |
+| `core/db/scoped_entities.rs::get_knowledge_graph_scoped` | `pub` | no | **yes** | `server/entity_graph_routes.rs::handle_get_knowledge_graph` | — |
 | `core/db/scoped_entities.rs::get_observations_for_entities_scoped` | `pub(super)` | no | no | — | — |
 | `core/db/scoped_entities.rs::list_entities_scoped` | `pub` | no | **yes** | `server/entity_graph_routes.rs::handle_list_entities` | — |
 | `core/db/scoped_entities.rs::list_recent_relations_scoped` | `pub` | no | **yes** | `server/knowledge_routes.rs::handle_list_recent_relations` | — |
@@ -1068,6 +1070,7 @@ carrying the authority of agreement.
 | `server/cmd_backfill.rs::run` | `pub` | yes | no | — | `core/db.rs::find_stale_archived_pages` |
 | `server/entity_graph_routes.rs::handle_create_entity` | `pub` | no | no | — | `core/db.rs::get_entity_detail` |
 | `server/entity_graph_routes.rs::handle_get_entity_detail` | `pub` | no | no | — | `core/db/scoped_entities.rs::get_entity_detail_scoped` |
+| `server/entity_graph_routes.rs::handle_get_knowledge_graph` | `pub` | no | no | — | `core/db/scoped_entities.rs::get_knowledge_graph_scoped` |
 | `server/entity_graph_routes.rs::handle_list_entities` | `pub` | no | no | — | `core/db/scoped_entities.rs::list_entities_scoped` |
 | `server/entity_graph_routes.rs::handle_search_entities` | `pub` | no | no | — | `core/db/scoped_entities.rs::search_entities_by_vector_scoped` |
 | `server/knowledge_routes.rs::handle_list_recent_relations` | `pub` | no | no | — | `core/db/scoped_entities.rs::list_recent_relations_scoped` |
@@ -1203,7 +1206,7 @@ carrying the authority of agreement.
 | `core/synthesis/overview.rs::refresh_overview_page` | `pub` | no | no | — | `core/synthesis/overview.rs::ensure_overview_page` |
 | `core/synthesis/overview.rs::top_page_source_ids` | `private` | no | no | — | `core/db.rs::list_pages` |
 | `core/synthesis/refinement_queue.rs::apply_refinement` | `pub` | no | no | — | `core/synthesis/refinement_queue.rs::apply_refinement_with_decision` |
-| `core/truth_adapter.rs::filter_page_refs` | `pub` | no | **yes** | `server/brief_routes.rs::handle_read_brief`, `server/memory_routes.rs::handle_search_memory`, `server/page_routes.rs::handle_get_page_links`, `server/page_routes.rs::handle_get_page_revisions`, `server/page_routes.rs::handle_get_page_sources`, `server/page_routes.rs::handle_list_orphan_links`, `server/routes.rs::handle_distill`, `server/routes.rs::handle_recent_page_changes`, `server/routes.rs::handle_recent_pages`, `server/routes.rs::handle_recent_retrievals`, `server/routes.rs::handle_search` | `core/db/truth_exposure.rs::page_visibility` |
+| `core/truth_adapter.rs::filter_page_refs` | `pub` | no | **yes** | `server/brief_routes.rs::handle_read_brief`, `server/entity_graph_routes.rs::handle_get_knowledge_graph`, `server/memory_routes.rs::handle_search_memory`, `server/page_routes.rs::handle_get_page_links`, `server/page_routes.rs::handle_get_page_revisions`, `server/page_routes.rs::handle_get_page_sources`, `server/page_routes.rs::handle_list_orphan_links`, `server/routes.rs::handle_distill`, `server/routes.rs::handle_recent_page_changes`, `server/routes.rs::handle_recent_pages`, `server/routes.rs::handle_recent_retrievals`, `server/routes.rs::handle_search` | `core/db/truth_exposure.rs::page_visibility` |
 | `core/truth_adapter.rs::filter_pages` | `pub` | no | **yes** | `server/page_routes.rs::handle_list_pages`, `server/page_routes.rs::handle_search_pages`, `server/routes.rs::handle_distill` | `core/truth_adapter.rs::verdicts` |
 | `core/truth_adapter.rs::page_write_permit` | `pub` | no | **yes** | `server/page_routes.rs::handle_export_page`, `server/page_routes.rs::handle_export_pages` | `core/db/truth_exposure.rs::page_visibility` |
 | `server/brief_routes.rs::handle_read_brief` | `pub` | no | **yes** | `server/routes.rs::handle_context` | `core/db.rs::search_memory` |
