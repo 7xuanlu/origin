@@ -4,13 +4,15 @@ import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import {
   getMemoryRevisions,
+  getPageRevisions,
   listRecentChanges,
   type MemoryRevisionEntry,
   type PageChange,
   type PageChangeKind,
+  type PageChangelogEntry,
 } from "../../lib/tauri";
 import { truncateReviewText } from "./ReviewDialog";
-import { relativeMs } from "./page/format";
+import { prettyAgent, relativeMs } from "./page/format";
 
 const secondaryTextStyle: React.CSSProperties = {
   fontFamily: "var(--mem-font-body)",
@@ -297,6 +299,115 @@ function MemoryRevisionRow({
         </span>
       )}
     </button>
+  );
+}
+
+/** One prior version of the page a revision card proposes to rewrite. */
+function PageRevisionRow({ entry }: { entry: PageChangelogEntry }) {
+  return (
+    <div
+      style={{
+        ...itemSurfaceStyle,
+        display: "grid",
+        gap: 4,
+        width: "100%",
+        padding: "8px 12px",
+        fontFamily: "var(--mem-font-body)",
+      }}
+    >
+      <span style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+        <span
+          style={{
+            fontFamily: "var(--mem-font-mono)",
+            fontSize: 11,
+            fontWeight: 600,
+            color: "var(--mem-accent-page)",
+          }}
+        >
+          {`v${entry.version}`}
+        </span>
+        <span
+          style={{
+            flex: 1,
+            minWidth: 0,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            fontSize: 12.5,
+            color: "var(--mem-text-secondary)",
+          }}
+        >
+          {prettyAgent(entry.edited_by)}
+        </span>
+        <span
+          style={{
+            fontFamily: "var(--mem-font-mono)",
+            fontSize: 10.5,
+            color: "var(--mem-text-tertiary)",
+          }}
+        >
+          {relativeMs(entry.at * 1000)}
+        </span>
+      </span>
+      {entry.delta_summary && (
+        <span
+          style={{
+            fontSize: 12,
+            lineHeight: 1.4,
+            color: "var(--mem-text-tertiary)",
+          }}
+        >
+          {truncateReviewText(entry.delta_summary, 80)}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** The page twin of {@link MemoryRevisionChain}.
+ *
+ * A page card's target is a page, so the memory revision chain has nothing to
+ * walk for it — asking `/api/memory/{id}/revisions` about a page id is a
+ * guaranteed 404. This reads the page's own changelog instead, and follows the
+ * same garnish rule: nothing on error, nothing on an empty changelog. Rows are
+ * not clickable because a page version is not a separate row to open; the
+ * version the human is deciding about is the diff above. */
+export function PageRevisionChain({ pageId }: { pageId: string | null }) {
+  const { t } = useTranslation();
+  const query = useQuery({
+    queryKey: ["page-revisions", pageId],
+    queryFn: () => getPageRevisions(pageId as string),
+    enabled: pageId != null,
+    staleTime: 60_000,
+  });
+
+  if (pageId == null) return null;
+  if (query.isError) return null;
+
+  if (query.isLoading) {
+    return (
+      <div style={{ marginTop: 18 }}>
+        <ShimmerRow height={34} />
+      </div>
+    );
+  }
+
+  const entries = [...(query.data?.entries ?? [])].sort(
+    (a, b) => b.version - a.version,
+  );
+  if (entries.length === 0) return null;
+
+  return (
+    <div style={{ marginTop: 18 }}>
+      <p style={{ ...paneLabelStyle, fontVariantNumeric: "tabular-nums" }}>
+        {t("review.historyLabel", { count: entries.length })}
+      </p>
+      <div className="grid gap-1.5">
+        {entries.map((entry) => (
+          <PageRevisionRow key={`${entry.version}-${entry.at}`} entry={entry} />
+        ))}
+      </div>
+    </div>
   );
 }
 

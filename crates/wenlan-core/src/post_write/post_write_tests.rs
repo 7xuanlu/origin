@@ -4319,6 +4319,18 @@ async fn pending_revision_queue_lists_a_gated_page_card_and_accept_applies_it() 
     );
     assert_eq!(card.revision_content, proposed_content);
     assert_eq!(card.source_agent.as_deref(), Some("page_write"));
+    assert_eq!(
+        card.target_kind,
+        wenlan_types::responses::RevisionTargetKind::Page,
+        "the reader must label a page card so its client knows to fetch a page"
+    );
+    assert!(
+        listed
+            .iter()
+            .filter(|item| item.revision_source_id != card_id)
+            .all(|item| item.target_kind == wenlan_types::responses::RevisionTargetKind::Memory),
+        "only a page-target card may be labelled Page"
+    );
     assert!(
         !listed
             .iter()

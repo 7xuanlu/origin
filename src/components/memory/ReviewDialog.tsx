@@ -13,10 +13,15 @@ import { diffWords, diffWordCounts, type DiffSegment } from "../../lib/wordDiff"
 import { isExampleReviewItem } from "./reviewExamples";
 import { reviewItemId, type ReviewItem } from "./useReviewQueue";
 import { PageMergeStripOff } from "./ReviewPageMerge";
-import { MemoryRevisionChain } from "./ReviewHistory";
+import { MemoryRevisionChain, PageRevisionChain } from "./ReviewHistory";
 
 export function reviewKindLabel(t: TFunction, item: ReviewItem): string {
-  if (item.kind === "revision") return t("review.kindRevision");
+  if (item.kind === "revision")
+    return t(
+      item.targetKind === "page"
+        ? "review.kindPageRevision"
+        : "review.kindRevision",
+    );
   if (item.kind === "capture") return t("review.kindCapture");
   if (item.kind === "stale_page") return t("review.kindPageRefresh");
   if (item.kind === "page_candidate") return t("review.kindPageCandidate");
@@ -156,7 +161,13 @@ function reviewLookupRefs(item: ReviewItem | null): {
   bId: string | null;
 } {
   if (item?.kind === "revision") {
-    return { lookup: "memory", aId: item.targetSourceId, bId: null };
+    // `targetKind` comes from the daemon; a page card's target is a page id and
+    // resolves through `getPage`, not `getMemoryDetail`.
+    return {
+      lookup: item.targetKind === "page" ? "page" : "memory",
+      aId: item.targetSourceId,
+      bId: null,
+    };
   }
   if (item?.kind !== "refinement") return { lookup: null, aId: null, bId: null };
   switch (item.action) {
@@ -200,7 +211,7 @@ async function fetchReviewName(
 ): Promise<{ name: string | null; text: string | null }> {
   if (lookup === "page") {
     const page = await getPage(id);
-    return { name: page?.title ?? null, text: null };
+    return { name: page?.title ?? null, text: page?.content ?? null };
   }
   if (lookup === "entity") {
     const detail = await getEntityDetail(id);
@@ -538,8 +549,12 @@ export default function ReviewDialog({
   const resolving = isResolving || resolvingLocally;
   const summary = useReviewItemSummary(item);
 
+  // The diff's "before" side. Both revision kinds resolve through the same two
+  // accept/dismiss verbs, but a memory revision reads its target from the
+  // memory detail and a page revision reads the page itself — two caches, two
+  // shapes, so they stay two queries and are folded together below.
   const detailSourceId =
-    item?.kind === "revision"
+    item?.kind === "revision" && item.targetKind === "memory"
       ? item.targetSourceId
       : item?.kind === "capture"
         ? item.id
@@ -548,6 +563,15 @@ export default function ReviewDialog({
     queryKey: ["memory-detail", detailSourceId],
     queryFn: () => getMemoryDetail(detailSourceId as string),
     enabled: detailSourceId != null,
+  });
+  const targetPageId =
+    item?.kind === "revision" && item.targetKind === "page"
+      ? item.targetSourceId
+      : null;
+  const targetPage = useQuery({
+    queryKey: ["page", targetPageId],
+    queryFn: () => getPage(targetPageId as string),
+    enabled: targetPageId != null,
   });
 
   // Actions whose source_ids are memory ids; the rest point at entities,
@@ -594,13 +618,16 @@ export default function ReviewDialog({
     enabled: mergePayload != null,
   });
 
-  const beforeContent = target.data?.content ?? "";
+  const beforeTitle = target.data?.title ?? targetPage.data?.title ?? null;
+  const beforeContent = target.data?.content ?? targetPage.data?.content ?? "";
+  const beforeLoading = target.isLoading || targetPage.isLoading;
+  const beforeLoaded = target.data != null || targetPage.data != null;
   const segments = useMemo(
     () =>
-      item?.kind === "revision" && target.data
+      item?.kind === "revision" && beforeLoaded
         ? diffWords(beforeContent, item.content)
         : [],
-    [item, target.data, beforeContent],
+    [item, beforeLoaded, beforeContent],
   );
   const wordCounts = useMemo(() => diffWordCounts(segments), [segments]);
 
@@ -778,8 +805,7 @@ export default function ReviewDialog({
   const heading = done
     ? t("review.allCaughtUp")
     : item?.kind === "revision"
-      ? (target.data?.title?.trim() ||
-        truncateReviewText(item.content, 72))
+      ? (beforeTitle?.trim() || truncateReviewText(item.content, 72))
       : item?.kind === "capture"
         ? truncateReviewText(item.title, 72)
         : item?.kind === "page_candidate" || item?.kind === "stale_page"
@@ -1080,7 +1106,7 @@ export default function ReviewDialog({
                     ))}
                   </div>
 
-                  {target.isLoading ? (
+                  {beforeLoading ? (
                     <div style={paneStyle}>{t("review.loadingCurrent")}</div>
                   ) : sideBySide ? (
                     <div
@@ -1118,7 +1144,7 @@ export default function ReviewDialog({
                     </div>
                   )}
 
-                  {!target.isLoading && (
+                  {!beforeLoading && (
                     <p
                       style={{
                         fontFamily: "var(--mem-font-body)",
@@ -1138,10 +1164,14 @@ export default function ReviewDialog({
                     </p>
                   )}
 
-                  <MemoryRevisionChain
-                    sourceId={item.targetSourceId}
-                    onOpenMemory={(id) => onOpenMemory?.(id)}
-                  />
+                  {item.targetKind === "page" ? (
+                    <PageRevisionChain pageId={item.targetSourceId} />
+                  ) : (
+                    <MemoryRevisionChain
+                      sourceId={item.targetSourceId}
+                      onOpenMemory={(id) => onOpenMemory?.(id)}
+                    />
+                  )}
                 </>
               )}
 

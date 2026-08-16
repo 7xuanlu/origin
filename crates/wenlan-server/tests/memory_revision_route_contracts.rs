@@ -12,6 +12,7 @@ use wenlan_core::truth_contract::{CONTRACT_HEADER, INTENT_HEADER};
 use wenlan_server::{router::build_router, state::ServerState};
 use wenlan_types::responses::{
     ListMemoryRevisionsResponse, PageWriteResponse, PendingRevision, PendingRevisionItem,
+    RevisionTargetKind,
 };
 
 #[derive(Debug, Deserialize)]
@@ -196,6 +197,11 @@ async fn moved_memory_revision_handlers_preserve_typed_contracts() {
     assert_eq!(items[0].target_source_id, "work-pending-target");
     assert_eq!(items[0].revision_source_id, "work-pending-revision");
     assert_eq!(items[0].revision_content, "Work staged revision.");
+    assert_eq!(
+        items[0].target_kind,
+        RevisionTargetKind::Memory,
+        "a revision of a memory must say so, so a reader knows what to fetch for the before side"
+    );
 
     let (status, revision): (StatusCode, Option<PendingRevision>) = request_typed(
         &router,
@@ -335,5 +341,29 @@ async fn pending_revisions_lists_a_gated_page_write_card() {
             "the Review lane sends this id back to accept/dismiss"
         );
         assert_eq!(card.revision_content, proposed);
+        assert_eq!(
+            card.target_kind,
+            RevisionTargetKind::Page,
+            "the card must name its target kind so the Review lane fetches a page, not a memory"
+        );
     }
+
+    // Freeze the wire spelling, not just the Rust enum: the desktop app and
+    // every MCP client read this field off the JSON.
+    let (_, bytes) = request_bytes(
+        &router,
+        "/api/memory/pending-revisions?limit=10",
+        false,
+        Some("work"),
+    )
+    .await;
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let entry = raw
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|value| value["revision_source_id"] == card_id.as_str())
+        .expect("staged page card must be present in the raw payload");
+    assert_eq!(entry["target_kind"], "page");
+    assert_eq!(entry["target_source_id"], page_id.as_str());
 }

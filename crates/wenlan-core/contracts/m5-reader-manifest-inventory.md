@@ -912,6 +912,8 @@ carrying the authority of agreement.
 | `core/db.rs::list_pages_by_space` | `pub` | no | no | — | — |
 | `core/db.rs::list_pages_inner` | `private` | no | no | — | — |
 | `core/db.rs::list_pages_stale` | `pub` | no | no | — | — |
+| `core/db.rs::list_pending_revisions` | `pub` | yes | no | — | — |
+| `core/db.rs::list_pending_revisions_scoped` | `pub` | no | **yes** | `server/memory_revision_routes.rs::handle_list_pending_revisions` | — |
 | `core/db.rs::list_recent_changes` | `pub` | no | no | — | — |
 | `core/db.rs::list_recent_pages_with_badges` | `pub` | no | no | — | — |
 | `core/db.rs::list_recent_relations` | `pub` | no | no | — | — |
@@ -1071,6 +1073,7 @@ carrying the authority of agreement.
 | `server/entity_graph_routes.rs::handle_list_entities` | `pub` | no | no | — | `core/db/scoped_entities.rs::list_entities_scoped` |
 | `server/entity_graph_routes.rs::handle_search_entities` | `pub` | no | no | — | `core/db/scoped_entities.rs::search_entities_by_vector_scoped` |
 | `server/knowledge_routes.rs::handle_list_recent_relations` | `pub` | no | no | — | `core/db/scoped_entities.rs::list_recent_relations_scoped` |
+| `server/memory_revision_routes.rs::handle_list_pending_revisions` | `pub` | no | no | — | `core/db.rs::list_pending_revisions_scoped` |
 | `server/memory_routes.rs::handle_store_memory` | `pub` | no | no | — | `core/db.rs::resolve_entity_by_name` |
 | `server/page_map_routes.rs::compute_ref_state` | `private` | no | no | `server/page_map_routes.rs::wire_node` | `core/db.rs::get_entity_name_type` |
 | `server/routes.rs::handle_distill` | `pub` | no | no | — | `core/db.rs::list_stale_pages_scoped`, `core/db.rs::load_page_source_index` |

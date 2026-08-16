@@ -1213,10 +1213,28 @@ pub struct OrphanLinksResponse {
     pub orphan_labels: Vec<OrphanLink>,
 }
 
+/// What kind of thing a staged revision proposes to rewrite.
+///
+/// A reader needs this to render the revision at all: the "before" side of a
+/// memory revision is a memory, and of a page revision is a page, and the two
+/// live in different tables behind different reads. Without it a client is
+/// left sniffing id prefixes, which is not a contract.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RevisionTargetKind {
+    /// `target_source_id` names a `memories.source_id`.
+    #[default]
+    Memory,
+    /// `target_source_id` names a `pages.id`.
+    Page,
+}
+
 /// One pending revision awaiting human accept/dismiss.
 ///
-/// `target_source_id` is the memory being revised; pass it to
-/// `accept_pending_revision` or `dismiss_pending_revision`.
+/// `target_source_id` is the thing being revised; pass it to
+/// `accept_pending_revision` or `dismiss_pending_revision`. It is a memory or
+/// a page according to `target_kind` -- both resolve through the same two
+/// verbs, but a reader must know which one to fetch for the "before" side.
 /// `revision_source_id` is the staged revision row itself, exposed
 /// for diagnostics and round-tripping (not for the action call).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1226,6 +1244,11 @@ pub struct PendingRevisionItem {
     pub revision_content: String,
     pub source_agent: Option<String>,
     pub last_modified: i64,
+    /// Which table `target_source_id` points into. Defaults to `memory` so a
+    /// response from a daemon that predates the field still deserializes --
+    /// every producer before it staged memory targets only.
+    #[serde(default)]
+    pub target_kind: RevisionTargetKind,
     /// Doc file source_id that grounds a doc-grounded revision (L3); None for
     /// other revision producers. Read from structured_fields.grounded_in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1518,14 +1541,46 @@ mod tests {
             revision_content: "new body".into(),
             source_agent: Some("claude-code".into()),
             last_modified: 1_715_000_000,
+            target_kind: RevisionTargetKind::Memory,
             grounded_in: None,
         };
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["target_source_id"], "mem_target");
         assert_eq!(json["revision_source_id"], "mem_rev");
         assert_eq!(json["revision_content"], "new body");
+        assert_eq!(json["target_kind"], "memory");
         let decoded: PendingRevisionItem = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, item);
+    }
+
+    /// A page card must say so on the wire, and a payload from a daemon that
+    /// predates the field must still read as a memory revision rather than
+    /// failing to deserialize.
+    #[test]
+    fn pending_revision_item_carries_the_target_kind() {
+        let page_item = PendingRevisionItem {
+            target_source_id: "page_abc".into(),
+            revision_source_id: "mem_rev".into(),
+            revision_content: "new page body".into(),
+            source_agent: Some("page_write".into()),
+            last_modified: 1_715_000_000,
+            target_kind: RevisionTargetKind::Page,
+            grounded_in: None,
+        };
+        let json = serde_json::to_value(&page_item).unwrap();
+        assert_eq!(json["target_kind"], "page");
+        let decoded: PendingRevisionItem = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, page_item);
+
+        let legacy = serde_json::json!({
+            "target_source_id": "mem_target",
+            "revision_source_id": "mem_rev",
+            "revision_content": "new body",
+            "source_agent": null,
+            "last_modified": 1_715_000_000i64,
+        });
+        let decoded: PendingRevisionItem = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.target_kind, RevisionTargetKind::Memory);
     }
 }
 

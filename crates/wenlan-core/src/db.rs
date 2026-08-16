@@ -194,6 +194,23 @@ fn push_read_scope_filter_folded(
     }
 }
 
+/// Read a pending revision's target kind off the `EXISTS (... FROM pages ...)`
+/// column the two pending-revision readers select.
+///
+/// A page card's `supersedes` names a `pages.id` and a memory revision's names
+/// a `memories.source_id`; only the row itself can say which, so both readers
+/// resolve it in SQL and hand the answer to clients rather than leaving them to
+/// guess from an id prefix. Non-1 reads as `Memory`, which is the safe
+/// direction: a card mislabelled `Page` would send a reader to fetch a page
+/// that is not there.
+fn revision_target_kind(target_is_page: i64) -> wenlan_types::responses::RevisionTargetKind {
+    if target_is_page == 1 {
+        wenlan_types::responses::RevisionTargetKind::Page
+    } else {
+        wenlan_types::responses::RevisionTargetKind::Memory
+    }
+}
+
 fn legacy_read_scope(space: Option<&str>) -> ReadScope {
     match space {
         None => ReadScope::Global,
@@ -39710,7 +39727,8 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT supersedes, source_id, content, source_agent, last_modified, structured_fields \
+                "SELECT supersedes, source_id, content, source_agent, last_modified, structured_fields, \
+                        EXISTS (SELECT 1 FROM pages page WHERE page.id = memories.supersedes) \
                  FROM memories \
                  WHERE pending_revision = 1 \
                    AND supersedes IS NOT NULL \
@@ -39751,6 +39769,7 @@ impl MemoryDB {
                 last_modified: row
                     .get::<i64>(4)
                     .map_err(|e| WenlanError::VectorDb(format!("col 4: {e}")))?,
+                target_kind: revision_target_kind(row.get::<i64>(6).unwrap_or(0)),
                 grounded_in,
             });
         }
@@ -39845,7 +39864,8 @@ impl MemoryDB {
         let limit_param = values.len();
         let sql = format!(
             "SELECT revision.supersedes, revision.source_id, revision.content,
-                    revision.source_agent, revision.last_modified, revision.structured_fields
+                    revision.source_agent, revision.last_modified, revision.structured_fields,
+                    EXISTS (SELECT 1 FROM pages page WHERE page.id = revision.supersedes)
              FROM memories revision
              WHERE revision.pending_revision = 1
                AND revision.supersedes IS NOT NULL
@@ -39890,6 +39910,7 @@ impl MemoryDB {
                 last_modified: row
                     .get::<i64>(4)
                     .map_err(|e| WenlanError::VectorDb(format!("col 4: {e}")))?,
+                target_kind: revision_target_kind(row.get::<i64>(6).unwrap_or(0)),
                 grounded_in,
             });
         }

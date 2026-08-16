@@ -482,6 +482,7 @@ const reviewRevisions = (): PendingRevisionItem[] => [
       "Lucian prefers pnpm for JavaScript package management across projects, keeping npm only for one-off npx invocations.",
     source_agent: "claude-code",
     last_modified: 1_752_000_000,
+    target_kind: "memory" as const,
   },
   {
     target_source_id: "mem-daemon-port",
@@ -490,6 +491,7 @@ const reviewRevisions = (): PendingRevisionItem[] => [
       "The wenlan daemon listens on port 7878 and the dev server runs on 1420. The preview harness uses 1421.",
     source_agent: "codex",
     last_modified: 1_752_000_100,
+    target_kind: "memory" as const,
   },
   {
     target_source_id: "mem-review-flow",
@@ -498,6 +500,7 @@ const reviewRevisions = (): PendingRevisionItem[] => [
       "Review happens in the desktop app: a queue page with a before/after diff dialog, approve or dismiss per item.",
     source_agent: "claude-code",
     last_modified: 1_752_000_200,
+    target_kind: "memory" as const,
   },
 ];
 
