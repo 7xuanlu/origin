@@ -138,8 +138,9 @@ fn route_catalog_freezes_exact_global_and_scoped_keys() {
         .map(|row| (row.method, row.path))
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(rows.len(), 64);
-    assert_eq!(keys.len(), 64, "duplicate sensitive route key");
+    // The GLOBAL/SCOPED set-equality asserts below already pin the exact
+    // catalog; a literal row count here only added a second place to edit.
+    assert_eq!(keys.len(), rows.len(), "duplicate sensitive route key");
     assert_eq!(global, GLOBAL.iter().copied().collect());
     assert_eq!(scoped, SCOPED.iter().copied().collect());
 }

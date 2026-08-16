@@ -340,6 +340,12 @@ fn spawn_shutdown_stub_response(
     (base, received)
 }
 
+// Every caller is a launchd/unix background-lifecycle test, so on Windows this
+// is dead code and `-D warnings` fails the whole `cli_integration` target. CI's
+// lint job runs on Linux, so nothing caught it: `cargo clippy --workspace
+// --all-targets -- -D warnings` -- what the pre-push hook runs -- could not pass
+// on Windows at all.
+#[cfg(unix)]
 fn bind_addr_from_stub_host(host: &str) -> &str {
     host.strip_prefix("http://")
         .expect("shutdown stub host must use http")

@@ -20,6 +20,18 @@ The modules whose job is not evident from the name:
 | `ingest_batcher.rs` | Request-level coalescer for concurrent `/api/memory/store` — folds QualityGate in-line, async classify/extract, passes enrichment + hint through in the response |
 | `scheduler.rs` | Background periodic tasks (distill cycles, distillation, the reconcile/backfill sweeps gated by the `WENLAN_ENABLE_*` flags) |
 
+## Adding or rescoping a route
+
+- If the route reads user data, register it in `crates/wenlan-core/src/lint/serving/routes.rs`.
+- Add it to `SCOPED` or `GLOBAL` in
+  `crates/wenlan-core/src/lint/serving_review_test.rs`.
+- The reader inventory is regenerated and staged by the pre-commit hook;
+  review it in your diff. If hooks are not installed, run
+  `python3 scripts/m5-reader-sweep.py --update-inventory` yourself.
+
+Pre-commit and pre-push run these two checks first, so a missed step fails in
+seconds, not after the full suite.
+
 ## Manual RB-01 profiling flags
 
 These flags control ignored, target-Mac profiling tests; they are not daemon runtime settings and must not be set in normal service configuration.

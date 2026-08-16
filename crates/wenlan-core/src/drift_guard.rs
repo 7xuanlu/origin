@@ -2188,7 +2188,7 @@ fn ci_routing_contract_violations(
             != Some(
                 "needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.trusted-release-candidate == 'true'",
             )
-        || base_proof["timeout-minutes"].as_u64() != Some(20)
+        || base_proof["timeout-minutes"].as_u64() != Some(45)
         || base_proof["permissions"]["actions"].as_str() != Some("read")
         || base_proof["permissions"]["contents"].as_str() != Some("read")
         || base_proof_checkout.and_then(|step| step["uses"].as_str())
@@ -2207,7 +2207,7 @@ fn ci_routing_contract_violations(
             .contains("trusted-main-ci-proof/scripts/release-promotion.py verify-main-ci")
         || !base_proof_command.contains("--repository \"$GITHUB_REPOSITORY\"")
         || !base_proof_command.contains("--sha \"${{ github.event.pull_request.base.sha }}\"")
-        || !base_proof_command.contains("--wait-seconds 1080")
+        || !base_proof_command.contains("--wait-seconds 2400")
     {
         violations.push(
             "trusted release candidate skip is not backed by exact successful base main CI"
