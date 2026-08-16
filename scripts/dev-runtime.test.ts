@@ -23,6 +23,9 @@ const tempRoots: string[] = [];
 // node or rustc on its PATH. The assertions still guard macOS/Linux; the rest of
 // this file (package.json and script-text contracts) stays platform-neutral.
 const itPosix = it.skipIf(process.platform === "win32");
+// The mirror of the above: cases whose subject is Windows path resolution, run
+// through `run-bash.mjs` for the same reason package.json does.
+const itWindows = it.skipIf(process.platform !== "win32");
 
 afterEach(() => {
   for (const path of tempRoots.splice(0)) {
@@ -144,6 +147,51 @@ describe("scoped dev runtime", () => {
 
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("refusing production");
+  });
+
+  itWindows.each([
+    ["WENLAN_DEV_DATA_DIR", "WENLAN"],
+    ["WENLAN_DEV_DATA_DIR", "OrIgIn"],
+    ["WENLAN_DEV_STATE_DIR", "WENLAN"],
+  ])(
+    "rejects %s pointed at a differently-cased LOCALAPPDATA production root %s",
+    (key, name) => {
+      const localAppData = process.env.LOCALAPPDATA;
+      expect(localAppData).toBeTruthy();
+      const result = spawnSync(
+        process.execPath,
+        ["scripts/run-bash.mjs", "scripts/dev-runtime.sh", "print-config"],
+        {
+          cwd: root,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            [key]: `${localAppData}\\${name}`,
+          },
+        },
+      );
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("refusing production");
+    },
+    // Node, then Git Bash, then a `node -e` per path this canonicalizes. Six
+    // seconds is normal on Windows; the 5s default is not enough.
+    30_000,
+  );
+
+  it("compares production roots case-insensitively on Windows only", () => {
+    const script = readFileSync(resolve(root, "scripts/dev-runtime.sh"), "utf8");
+    const start = script.indexOf("path_is_within() {");
+    expect(start).toBeGreaterThan(-1);
+    const guard = script.slice(start, script.indexOf("\n}\n", start));
+
+    // Windows resolves %LOCALAPPDATA%\WENLAN and %LOCALAPPDATA%\wenlan to one
+    // directory, so an unfolded comparison lets the second spelling walk past
+    // the guard and point the dev daemon at production. app-check runs on
+    // macOS, so this text contract is what keeps the Windows-only branch under
+    // a required lane; the case above proves the behaviour on Windows itself.
+    expect(guard).toContain("HOST_IS_WINDOWS == 1");
+    expect(guard).toContain("tr '[:upper:]' '[:lower:]'");
   });
 
   it("detaches the daemon from the lifecycle command", () => {

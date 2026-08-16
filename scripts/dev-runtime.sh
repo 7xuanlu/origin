@@ -240,8 +240,20 @@ canonicalize_path() {
   printf '%s%s\n' "$(realpath "$path")" "$suffix"
 }
 
+# Windows resolves paths case-insensitively, and `realpath` hands back whatever
+# casing the caller wrote, so %LOCALAPPDATA%\WENLAN and %LOCALAPPDATA%\wenlan
+# reach here as two different strings naming one directory. Comparing them
+# literally lets the second spelling walk past the production-root guard and
+# point the dev daemon at the real data directory. Fold case there, and only
+# there: on Linux those are genuinely two directories, and folding would refuse
+# a path that is not production at all.
 path_is_within() {
-  [[ "$1" == "$2" || "$1" == "$2/"* ]]
+  local child="$1" parent="$2"
+  if (( HOST_IS_WINDOWS == 1 )); then
+    child="$(printf '%s' "$child" | tr '[:upper:]' '[:lower:]')"
+    parent="$(printf '%s' "$parent" | tr '[:upper:]' '[:lower:]')"
+  fi
+  [[ "$child" == "$parent" || "$child" == "$parent/"* ]]
 }
 
 refuse_production_path() {
