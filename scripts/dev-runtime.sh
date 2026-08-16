@@ -243,14 +243,19 @@ canonicalize_path() {
     const fs = require("node:fs");
     const path = require("node:path");
     let resolved = path.resolve(process.argv[1]);
-    if (process.platform === "win32") {
-      // Win32 drops trailing dots and spaces from every component, so
-      // `...\wenlan.` opens `...\wenlan`. Node resolves through the extended
-      // `\\?\` form, where they are literal instead, so it would call that a
-      // different and missing directory and hand the guard a path that never
-      // matches -- while the daemon, going through Win32, writes to the real
-      // one. Drop them here so both see the same directory. The drive is left
-      // alone, and `.` and `..` are already gone by now.
+    // Win32 drops trailing dots and spaces from every component, so
+    // `...\wenlan.` opens `...\wenlan`. Node resolves through the extended
+    // `\\?\` form, where they are literal instead, so it would call that a
+    // different and missing directory and hand the guard a path that never
+    // matches -- while the daemon, going through Win32, writes to the real one.
+    // Drop them here so both see the same directory. The drive is left alone,
+    // and `.` and `..` are already gone by now.
+    //
+    // A path the caller already wrote in verbatim form is exempt: `\\?\` and
+    // `\\.\` mean "do not normalize this", the trailing characters really are
+    // part of the name, and rewriting one would silently redirect it to a
+    // different directory than the daemon would open.
+    if (process.platform === "win32" && !/^\\\\[?.]\\/.test(resolved)) {
       resolved = resolved
         .split(path.sep)
         .map((part, index) => (index === 0 ? part : part.replace(/[. ]+$/, "")))

@@ -215,6 +215,58 @@ describe("scoped dev runtime", () => {
     30_000,
   );
 
+  itWindows(
+    "keeps a verbatim path's components exactly as written",
+    () => {
+      const tempRoot = mkdtempSync(resolve(tmpdir(), "wenlan-verbatim-test-"));
+      tempRoots.push(tempRoot);
+      // `\\?\` means "do not normalize this", so the trailing dot is part of
+      // the name rather than something Win32 strips. Rewriting it would point
+      // the daemon at a different directory than the one it was handed.
+      const result = spawnSync(
+        process.execPath,
+        ["scripts/run-bash.mjs", "scripts/dev-runtime.sh", "print-config"],
+        {
+          cwd: root,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            WENLAN_DEV_DATA_DIR: `\\\\?\\${tempRoot}\\dev.\\data`,
+          },
+        },
+      );
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("/dev./data");
+    },
+    30_000,
+  );
+
+  itWindows(
+    "allows a literal trailing-dot sibling of a production root",
+    () => {
+      const localAppData = process.env.LOCALAPPDATA;
+      expect(localAppData).toBeTruthy();
+      // Verbatim, so `wenlan.` is its own directory and not the production
+      // `wenlan`. Refusing it would be a false positive.
+      const result = spawnSync(
+        process.execPath,
+        ["scripts/run-bash.mjs", "scripts/dev-runtime.sh", "print-config"],
+        {
+          cwd: root,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            WENLAN_DEV_DATA_DIR: `\\\\?\\${localAppData}\\wenlan.\\dev`,
+          },
+        },
+      );
+
+      expect(result.status, result.stderr).toBe(0);
+    },
+    30_000,
+  );
+
   itWindowsAlias(
     "rejects a production root reached through a DOS 8.3 alias",
     () => {
