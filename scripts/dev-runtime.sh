@@ -84,21 +84,45 @@ process_image_path() {
   fi
 }
 
+# Kill a Windows process only if it is still the recorded executable.
+#
+# `taskkill` can filter on a pid and on an image *name*, and a production
+# install and every other worktree's dev daemon are all called
+# wenlan-server.exe, so that filter cannot tell them apart from this one.
+# Checking the full path in a separate call would leave the reuse window open:
+# the daemon can exit and Windows can hand its pid to one of those neighbours
+# before the kill lands.
+#
+# Opening the process first closes that window. Windows keeps a pid reserved for
+# as long as any handle to it is open, so once `$p.Handle` materializes, the
+# path this reads and the process this kills are the same one. `MainModule` and
+# the kill both address it by pid, which is now pinned. A path that cannot be
+# read is not a match, so an identity this cannot prove kills nothing; the
+# caller sees the process fail to exit rather than a stranger disappear.
+kill_by_image_path() {
+  MSYS2_ARG_CONV_EXCL='*' WENLAN_KILL_PID="$1" WENLAN_KILL_PATH="$2" \
+    powershell.exe -NoProfile -NonInteractive -Command '
+      $want = ($env:WENLAN_KILL_PATH -replace "/", "\")
+      try { $p = [System.Diagnostics.Process]::GetProcessById([int]$env:WENLAN_KILL_PID) }
+      catch { exit 0 }
+      try { $null = $p.Handle } catch { exit 0 }
+      try { $got = $p.MainModule.FileName } catch { exit 0 }
+      if ($got -ieq $want) { $p.Kill() }
+    ' >/dev/null 2>&1 || true
+}
+
 # Windows cannot deliver SIGTERM to a console process that owns no console, so
-# there is no graceful stop to try first; `taskkill /F` is the only stop that
+# there is no graceful stop to try first; a forced kill is the only stop that
 # works. The daemon's durability is SQLite WAL, which is crash-safe, and the
 # POSIX path already force-kills anything that ignores SIGTERM for 5s.
 #
-# Both take the recorded server path as a second argument, and on Windows the
-# kill carries an image-name filter as well as the pid. The ownership check and
-# the kill are two separate calls, so Windows is free to recycle the pid in
-# between; taskkill applies both filters against the live table, so a pid that
-# now belongs to something else no longer matches and is left alone. A stranger
-# that happens to be running the same image out of the same worktree-private
-# staging directory is the daemon by every definition this script has.
+# Both take the recorded server path as a second argument. Neither kills a
+# process tree: `kill -KILL` does not on POSIX, so the Windows side does not
+# either, and a tree kill is exactly what should not follow an identity check
+# that only covers the root.
 terminate_process() {
   if (( HOST_IS_WINDOWS == 1 )); then
-    taskkill //F //FI "PID eq $1" //FI "IMAGENAME eq $(basename "$2")" >/dev/null 2>&1 || true
+    kill_by_image_path "$1" "$2"
   else
     kill "$1"
   fi
@@ -106,7 +130,7 @@ terminate_process() {
 
 force_terminate_process() {
   if (( HOST_IS_WINDOWS == 1 )); then
-    taskkill //F //T //FI "PID eq $1" //FI "IMAGENAME eq $(basename "$2")" >/dev/null 2>&1 || true
+    kill_by_image_path "$1" "$2"
   else
     kill -KILL "$1"
   fi
@@ -142,6 +166,42 @@ windows_pid_for_job() {
       return 0
     fi
     sleep 0.1
+  done
+  return 1
+}
+
+# Stop a daemon that was launched but never resolved to a pid.
+#
+# `windows_pid_for_job` gives up after ten seconds, and a daemon that is merely
+# slow is still alive when it does. Nothing recorded it, and `dev-all.sh` only
+# registers the runtime once `start` succeeds, so no later `stop` will find it
+# either -- it goes on to bind the dev port and stays there unmanaged.
+#
+# Looking for the port is not enough: the process may not have bound it yet at
+# the moment the snapshot is taken. The staging directory is private to this
+# worktree, so the executable itself is the identity. Anything running that
+# exact image is this runtime's own daemon, bound or not, and this keeps looking
+# for as long as the health probe downstream would have waited. The `ps` scan is
+# prefiltered by name so only the handful of candidate rows are canonicalized.
+reap_staged_daemon() {
+  local server="$1" want winpid image
+  want="$(normalize_program_path "$server")"
+  for _ in $(seq 1 50); do
+    while read -r winpid image; do
+      [[ "$winpid" =~ ^[0-9]+$ ]] || continue
+      [[ "$(normalize_program_path "$image")" == "$want" ]] || continue
+      force_terminate_process "$winpid" "$server"
+      for _ in $(seq 1 50); do
+        process_is_alive "$winpid" || return 0
+        sleep 0.1
+      done
+      return 1
+    done < <(ps -W | awk 'tolower($0) ~ /wenlan-server/ {
+      printf "%s", $4
+      for (i = 8; i <= NF; i++) printf " %s", $i
+      print ""
+    }')
+    sleep 0.2
   done
   return 1
 }
@@ -367,7 +427,7 @@ stop_runtime() {
 }
 
 start_runtime() {
-  local backend build_dir server pid job_pid listener_pid stray_pid stray_image
+  local backend build_dir server pid job_pid listener_pid
   STARTED_RUNTIME=0
   DEV_DATA_DIR="$(canonicalize_path "$DEV_DATA_DIR")"
   backend="$(bash "$SCRIPT_DIR/resolve-backend-dir.sh" "$REPO_ROOT")"
@@ -417,18 +477,16 @@ start_runtime() {
     # Windows one, so that is the identity worth recording and comparing.
     if ! pid="$(windows_pid_for_job "$job_pid" "$server")"; then
       # Nothing downstream can identify this daemon, so it cannot be left
-      # holding the port. The MSYS pid is not the handle to reach for: the
-      # resolution above waits up to ten seconds, MSYS recycles pids, and by
-      # this branch the job may already be gone, so signalling it can land on
-      # an unrelated process. Reap by identity instead. The port is the one
-      # thing this daemon was told to take, and whatever listens on it is
-      # stopped only if the image behind it is the server just launched.
-      stray_pid="$(listener_pid_for_port "$DEV_PORT")"
-      if [[ "$stray_pid" =~ ^[0-9]+$ ]]; then
-        stray_image="$(normalize_program_path "$(process_image_path "$stray_pid")")"
-        if [[ "$stray_image" == "$(normalize_program_path "$server")" ]]; then
-          force_terminate_process "$stray_pid" "$server"
-        fi
+      # running. The MSYS pid is not the handle to reach for: the resolution
+      # above waits up to ten seconds, MSYS recycles pids, and by this branch
+      # the job may already be gone, so signalling it can land on an unrelated
+      # process. Reap by image identity instead, which needs neither the pid nor
+      # the port to have settled.
+      if ! reap_staged_daemon "$server"; then
+        # Nothing was recorded, so `stop` has no pid to read and cannot clean
+        # this up. Name the executable so the port can be freed by hand.
+        echo "warning: a daemon may still be starting from $server" >&2
+        echo "         nothing recorded it; end that process before retrying" >&2
       fi
       echo "error: could not resolve the Windows pid of the dev daemon" >&2
       tail -n 40 "$SERVER_LOG" >&2 || true
