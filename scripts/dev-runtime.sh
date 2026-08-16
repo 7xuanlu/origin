@@ -20,6 +20,147 @@ SERVER_LOG="$STATE_DIR/wenlan-server.log"
 LOCK_DIR="$STATE_DIR/runtime.lock"
 LOCK_OWNER_FILE="$LOCK_DIR/pid"
 STARTED_RUNTIME=0
+DAEMON_STAGE_DIR="$STATE_DIR/daemon"
+
+# --- Host process primitives -------------------------------------------------
+# Everything below keeps its original POSIX implementation and gains a Git Bash
+# branch. Windows needed one because none of the POSIX pieces exist there: no
+# `lsof`, and an MSYS `ps` with neither `-p` nor `-o`. A process launched from
+# bash also carries two identities, the MSYS pid that `$!` yields and the
+# Windows pid that every Windows tool reports, so the runtime records the
+# Windows pid and compares like with like.
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) HOST_IS_WINDOWS=1 ;;
+  *) HOST_IS_WINDOWS=0 ;;
+esac
+
+# Values printed for a consumer outside this shell. The desktop app calls
+# `std::fs::canonicalize` on the directories it is handed, and a Windows build
+# cannot resolve an MSYS path like /tmp/wenlan-app-dev/<id>. Only the boundary
+# converts; the script keeps working in the shell's own form.
+native_path() {
+  if (( HOST_IS_WINDOWS == 1 )); then
+    cygpath -m "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# `ps -W` reports the MSYS spelling for a process it launched and the Windows
+# spelling for anything else, drops the .exe from the first, and does not
+# promise a case. The recorded server path is whatever the caller wrote. Both
+# sides go through this so the identity check compares one spelling.
+normalize_program_path() {
+  local path="${1%.[eE][xX][eE]}"
+  if (( HOST_IS_WINDOWS == 1 )); then
+    path="$(cygpath -m "$path" 2>/dev/null || printf '%s' "$path")"
+    printf '%s' "$path" | tr '[:upper:]' '[:lower:]'
+  else
+    printf '%s' "$path"
+  fi
+}
+
+process_is_alive() {
+  if (( HOST_IS_WINDOWS == 1 )); then
+    tasklist //FI "PID eq $1" //NH //FO CSV 2>/dev/null | grep -q '^"'
+  else
+    kill -0 "$1" 2>/dev/null
+  fi
+}
+
+process_image_path() {
+  if (( HOST_IS_WINDOWS == 1 )); then
+    # Column 4 is WINPID and column 8 onward is the image path, which can
+    # contain spaces.
+    ps -W | awk -v want="$1" '
+      $4 == want {
+        for (i = 8; i <= NF; i++) printf "%s%s", (i > 8 ? " " : ""), $i
+        print ""
+        exit
+      }
+    '
+  else
+    ps -p "$1" -o command= 2>/dev/null || true
+  fi
+}
+
+# Windows cannot deliver SIGTERM to a console process that owns no console, so
+# there is no graceful stop to try first; `taskkill /F` is the only stop that
+# works. The daemon's durability is SQLite WAL, which is crash-safe, and the
+# POSIX path already force-kills anything that ignores SIGTERM for 5s.
+terminate_process() {
+  if (( HOST_IS_WINDOWS == 1 )); then
+    taskkill //F //PID "$1" >/dev/null 2>&1 || true
+  else
+    kill "$1"
+  fi
+}
+
+force_terminate_process() {
+  if (( HOST_IS_WINDOWS == 1 )); then
+    taskkill //F //T //PID "$1" >/dev/null 2>&1 || true
+  else
+    kill -KILL "$1"
+  fi
+}
+
+# The Windows pid of a job just backgrounded from this shell.
+#
+# `nohup env ... server &` is a chain of MSYS processes that ends in an exec of
+# a native binary, and MSYS spawns a fresh Windows process for that last step.
+# Until it does, the MSYS pid still maps to the WINPID of `env`, which then
+# exits. Taking the first WINPID that appears therefore records a pid that is
+# dead moments later, so this waits for the row to name the program that was
+# actually launched.
+windows_pid_for_job() {
+  local job_pid="$1" program="$2" want row winpid command
+  want="$(normalize_program_path "$program")"
+  for _ in $(seq 1 100); do
+    # One snapshot yields both fields, so the pid and the image it names cannot
+    # come from either side of an exec.
+    row="$(ps -W | awk -v p="$job_pid" '
+      $1 == p {
+        printf "%s", $4
+        for (i = 8; i <= NF; i++) printf " %s", $i
+        print ""
+        exit
+      }
+    ')"
+    winpid="${row%% *}"
+    command="${row#* }"
+    if [[ "$winpid" =~ ^[0-9]+$ ]] && (( winpid > 0 )) &&
+      [[ "$(normalize_program_path "$command")" == "$want" ]]; then
+      printf '%s\n' "$winpid"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# Tauri's build script copies the staged sidecars and their runtime DLLs into
+# the cargo target directory. A daemon running out of that directory holds
+# onnxruntime.dll open, and Windows fails the copy with os error 32, so
+# `pnpm dev:all` would deadlock against its own daemon. Running from a private
+# copy under the dev state directory keeps the two out of each other's way, and
+# incidentally makes the recorded server path unique to this worktree.
+stage_windows_daemon() {
+  local source="$1" source_dir dll
+  source_dir="$(dirname "$source")"
+  mkdir -p "$DAEMON_STAGE_DIR"
+  if ! cp -u "$source" "$DAEMON_STAGE_DIR/wenlan-server.exe"; then
+    echo "error: could not stage the dev daemon in $DAEMON_STAGE_DIR" >&2
+    echo "       a daemon may still be running from it; try dev-runtime.sh stop" >&2
+    return 1
+  fi
+  # The loader resolves these from the executable's own directory, so they have
+  # to travel with it. app/binaries is the staging area prepare-sidecars.sh
+  # fills, and is the only source on a checkout that has not built the app yet.
+  for dll in "$REPO_ROOT/app/binaries"/*.dll "$source_dir"/*.dll; do
+    [[ -f "$dll" ]] || continue
+    cp -u "$dll" "$DAEMON_STAGE_DIR/" || true
+  done
+}
 
 canonicalize_path() {
   local path suffix=""
@@ -37,17 +178,26 @@ path_is_within() {
 
 refuse_production_path() {
   local label="$1" value="$2" canonical root
+  local -a roots=(
+    "$HOME/Library/Application Support/wenlan"
+    "$HOME/Library/Application Support/origin"
+    "$HOME/Library/LaunchAgents"
+    "$HOME/Library/Logs/com.wenlan.desktop"
+    "$HOME/Library/Logs/com.origin.desktop"
+    "$HOME/.config/wenlan-mcp"
+    "$HOME/.config/origin-mcp"
+    "$HOME/.wenlan"
+    "$HOME/.origin"
+  )
+  # The Windows half of the same list the app enforces in
+  # `production_runtime_roots`. Only appended when the variable is actually set:
+  # an empty root would canonicalize to the working directory and refuse the
+  # whole checkout.
+  if [[ -n "${LOCALAPPDATA:-}" ]]; then
+    roots+=("$LOCALAPPDATA/wenlan" "$LOCALAPPDATA/origin")
+  fi
   canonical="$(canonicalize_path "$value")"
-  for root in \
-    "$HOME/Library/Application Support/wenlan" \
-    "$HOME/Library/Application Support/origin" \
-    "$HOME/Library/LaunchAgents" \
-    "$HOME/Library/Logs/com.wenlan.desktop" \
-    "$HOME/Library/Logs/com.origin.desktop" \
-    "$HOME/.config/wenlan-mcp" \
-    "$HOME/.config/origin-mcp" \
-    "$HOME/.wenlan" \
-    "$HOME/.origin"; do
+  for root in "${roots[@]}"; do
     root="$(canonicalize_path "$root")"
     if path_is_within "$canonical" "$root"; then
       echo "error: refusing production path for $label: $value" >&2
@@ -98,9 +248,9 @@ print_config() {
   printf 'WENLAN_DEV_UI_PORT=%s\n' "$DEV_UI_PORT"
   printf 'WENLAN_DEV_REMOTE_PORT_START=%s\n' "$DEV_REMOTE_PORT_START"
   printf 'WENLAN_DEV_APP_ID=%s\n' "$DEV_APP_ID"
-  printf 'WENLAN_DEV_TAURI_MCP_SOCKET=%s\n' "$DEV_TAURI_MCP_SOCKET"
-  printf 'WENLAN_DATA_DIR=%s\n' "$DEV_DATA_DIR"
-  printf 'WENLAN_DEV_STATE_DIR=%s\n' "$STATE_DIR"
+  printf 'WENLAN_DEV_TAURI_MCP_SOCKET=%s\n' "$(native_path "$DEV_TAURI_MCP_SOCKET")"
+  printf 'WENLAN_DATA_DIR=%s\n' "$(native_path "$DEV_DATA_DIR")"
+  printf 'WENLAN_DEV_STATE_DIR=%s\n' "$(native_path "$STATE_DIR")"
 }
 
 read_owned_pid() {
@@ -114,14 +264,26 @@ read_owned_pid() {
 }
 
 listener_pid_for_port() {
-  lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | sed -n '1p'
+  if (( HOST_IS_WINDOWS == 1 )); then
+    # netstat is the only listener table Windows offers here. Anchoring the
+    # port keeps :17895 from matching :178950 or a foreign address.
+    netstat -ano | awk -v port=":$1\$" '
+      $1 == "TCP" && $2 ~ port && $4 == "LISTENING" { print $5; exit }
+    '
+  else
+    lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | sed -n '1p'
+  fi
 }
 
 has_owned_command_identity() {
   local command
-  kill -0 "$OWNED_PID" 2>/dev/null || return 1
-  command="$(ps -p "$OWNED_PID" -o command= 2>/dev/null || true)"
-  [[ "$command" == "$OWNED_SERVER" || "$command" == "$OWNED_SERVER "* ]]
+  process_is_alive "$OWNED_PID" || return 1
+  command="$(process_image_path "$OWNED_PID")"
+  if (( HOST_IS_WINDOWS == 1 )); then
+    [[ "$(normalize_program_path "$command")" == "$(normalize_program_path "$OWNED_SERVER")" ]]
+  else
+    [[ "$command" == "$OWNED_SERVER" || "$command" == "$OWNED_SERVER "* ]]
+  fi
 }
 
 is_owned_process() {
@@ -161,7 +323,7 @@ stop_runtime() {
     echo "No worktree-owned Wenlan dev daemon is recorded."
     return 0
   fi
-  if ! kill -0 "$OWNED_PID" 2>/dev/null; then
+  if ! process_is_alive "$OWNED_PID"; then
     rm -f "$PID_FILE" "$SERVER_PATH_FILE" "$PORT_FILE" "$DATA_DIR_FILE"
     echo "Removed stale Wenlan dev daemon state."
     return 0
@@ -171,9 +333,9 @@ stop_runtime() {
     return 1
   fi
 
-  kill "$OWNED_PID"
+  terminate_process "$OWNED_PID"
   for _ in $(seq 1 50); do
-    if ! kill -0 "$OWNED_PID" 2>/dev/null; then
+    if ! process_is_alive "$OWNED_PID"; then
       rm -f "$PID_FILE" "$SERVER_PATH_FILE" "$PORT_FILE" "$DATA_DIR_FILE"
       echo "Stopped worktree-owned Wenlan dev daemon (PID $OWNED_PID)."
       return 0
@@ -182,10 +344,10 @@ stop_runtime() {
   done
 
   if has_owned_command_identity; then
-    kill -KILL "$OWNED_PID"
+    force_terminate_process "$OWNED_PID"
   fi
   for _ in $(seq 1 50); do
-    if ! kill -0 "$OWNED_PID" 2>/dev/null; then
+    if ! process_is_alive "$OWNED_PID"; then
       rm -f "$PID_FILE" "$SERVER_PATH_FILE" "$PORT_FILE" "$DATA_DIR_FILE"
       echo "Force-stopped unresponsive worktree-owned Wenlan dev daemon (PID $OWNED_PID)."
       return 0
@@ -197,11 +359,21 @@ stop_runtime() {
 }
 
 start_runtime() {
-  local backend server pid listener_pid
+  local backend build_dir server pid job_pid listener_pid
   STARTED_RUNTIME=0
   DEV_DATA_DIR="$(canonicalize_path "$DEV_DATA_DIR")"
   backend="$(bash "$SCRIPT_DIR/resolve-backend-dir.sh" "$REPO_ROOT")"
-  server="$backend/target/debug/wenlan-server"
+  # The same target-root resolution prepare-sidecars.sh uses. A short
+  # CARGO_TARGET_DIR is how a Windows checkout stays under MAX_PATH, and reading
+  # the built binary from the wrong root either fails to launch or, worse,
+  # launches a stale one.
+  build_dir="${CARGO_TARGET_DIR:-$backend/target}/debug"
+  server="$build_dir/wenlan-server"
+  if (( HOST_IS_WINDOWS == 1 )); then
+    # Spelled natively so the recorded identity is one string no matter whether
+    # this run inherited WENLAN_DEV_STATE_DIR from `print-config` or derived it.
+    server="$(native_path "$DAEMON_STAGE_DIR")/wenlan-server.exe"
+  fi
 
   if read_owned_pid && is_owned_process; then
     if [[ "$OWNED_SERVER" != "$server" || "$OWNED_PORT" != "$DEV_PORT" ||
@@ -219,15 +391,32 @@ start_runtime() {
   mkdir -p "$STATE_DIR" "$DEV_DATA_DIR"
   rm -f "$PID_FILE" "$SERVER_PATH_FILE" "$PORT_FILE" "$DATA_DIR_FILE"
 
-  if lsof -nP -iTCP:"$DEV_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  if [[ -n "$(listener_pid_for_port "$DEV_PORT")" ]]; then
     echo "error: isolated dev port $DEV_PORT is already in use; set WENLAN_DEV_PORT" >&2
     return 1
   fi
 
   cargo build --manifest-path "$backend/Cargo.toml" -p wenlan-server
+  if (( HOST_IS_WINDOWS == 1 )); then
+    stage_windows_daemon "$build_dir/wenlan-server.exe" || return 1
+  fi
   nohup env WENLAN_PORT="$DEV_PORT" WENLAN_DATA_DIR="$DEV_DATA_DIR" \
     "$server" </dev/null >"$SERVER_LOG" 2>&1 &
   pid=$!
+  job_pid=$pid
+  if (( HOST_IS_WINDOWS == 1 )); then
+    # `$!` is the MSYS pid. Every Windows listener and process table reports the
+    # Windows one, so that is the identity worth recording and comparing.
+    if ! pid="$(windows_pid_for_job "$job_pid" "$server")"; then
+      # Nothing downstream can identify this daemon, so it cannot be left
+      # holding the port. The MSYS pid is the only handle still known to be
+      # its own, and MSYS can signal the native process it spawned.
+      kill -KILL "$job_pid" 2>/dev/null || true
+      echo "error: could not resolve the Windows pid of the dev daemon" >&2
+      tail -n 40 "$SERVER_LOG" >&2 || true
+      return 1
+    fi
+  fi
   printf '%s\n' "$pid" >"$PID_FILE"
   printf '%s\n' "$server" >"$SERVER_PATH_FILE"
   printf '%s\n' "$DEV_PORT" >"$PORT_FILE"
@@ -237,7 +426,7 @@ start_runtime() {
     if curl --fail --silent --max-time 1 \
       "http://127.0.0.1:$DEV_PORT/api/health" >/dev/null 2>&1; then
       listener_pid="$(listener_pid_for_port "$DEV_PORT")"
-      if kill -0 "$pid" 2>/dev/null && [[ "$listener_pid" == "$pid" ]]; then
+      if process_is_alive "$pid" && [[ "$listener_pid" == "$pid" ]]; then
         print_config
         echo "Started worktree-owned Wenlan dev daemon (PID $pid)."
         STARTED_RUNTIME=1
@@ -245,7 +434,7 @@ start_runtime() {
       fi
       break
     fi
-    if ! kill -0 "$pid" 2>/dev/null; then
+    if ! process_is_alive "$pid"; then
       break
     fi
     sleep 0.2
