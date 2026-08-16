@@ -13,8 +13,20 @@ while IFS='=' read -r key value; do
   esac
 done < <(bash "$SCRIPT_DIR/dev-runtime.sh" print-config)
 
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) HOST_IS_WINDOWS=1 ;;
+  *) HOST_IS_WINDOWS=0 ;;
+esac
+
+# `-S` is what keeps a mis-set WENLAN_DEV_TAURI_MCP_SOCKET from turning this
+# into an arbitrary `rm`. Git Bash has no socket file type, so that test is
+# never true on Windows and a stale entry at this path would survive forever;
+# there the regular-file test stands in. Either way the path lives inside the
+# dev state directory, which dev-runtime.sh already refuses to aim at a
+# production root.
 remove_tauri_mcp_socket() {
-  if [[ -S "$WENLAN_DEV_TAURI_MCP_SOCKET" ]]; then
+  if [[ -S "$WENLAN_DEV_TAURI_MCP_SOCKET" ]] ||
+    { (( HOST_IS_WINDOWS == 1 )) && [[ -f "$WENLAN_DEV_TAURI_MCP_SOCKET" ]]; }; then
     rm -f "$WENLAN_DEV_TAURI_MCP_SOCKET"
   fi
 }
