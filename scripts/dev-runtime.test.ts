@@ -158,11 +158,15 @@ describe("scoped dev runtime", () => {
   });
 
   itWindows.each([
+    // Case, a trailing dot, and the \\?\ prefix are all the same directory to
+    // Win32 and three different strings to a plain comparison.
     ["WENLAN_DEV_DATA_DIR", "WENLAN"],
     ["WENLAN_DEV_DATA_DIR", "OrIgIn"],
+    ["WENLAN_DEV_DATA_DIR", "wenlan."],
+    ["WENLAN_DEV_DATA_DIR", "wenlan\\sub\\.."],
     ["WENLAN_DEV_STATE_DIR", "WENLAN"],
   ])(
-    "rejects %s pointed at a differently-cased LOCALAPPDATA production root %s",
+    "rejects %s pointed at another spelling of a LOCALAPPDATA production root %s",
     (key, name) => {
       const localAppData = process.env.LOCALAPPDATA;
       expect(localAppData).toBeTruthy();
@@ -184,6 +188,30 @@ describe("scoped dev runtime", () => {
     },
     // Node, then Git Bash, then a `node -e` per path this canonicalizes. Six
     // seconds is normal on Windows; the 5s default is not enough.
+    30_000,
+  );
+
+  itWindows(
+    "rejects a production root reached through the extended-length prefix",
+    () => {
+      const localAppData = process.env.LOCALAPPDATA;
+      expect(localAppData).toBeTruthy();
+      const result = spawnSync(
+        process.execPath,
+        ["scripts/run-bash.mjs", "scripts/dev-runtime.sh", "print-config"],
+        {
+          cwd: root,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            WENLAN_DEV_DATA_DIR: `\\\\?\\${localAppData}\\wenlan`,
+          },
+        },
+      );
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("refusing production");
+    },
     30_000,
   );
 
@@ -214,16 +242,17 @@ describe("scoped dev runtime", () => {
     30_000,
   );
 
-  it("expands DOS 8.3 aliases while canonicalizing on Windows only", () => {
+  it("canonicalizes by asking the OS for the real on-disk path", () => {
     const script = readFileSync(resolve(root, "scripts/dev-runtime.sh"), "utf8");
     const start = script.indexOf("canonicalize_path() {");
     expect(start).toBeGreaterThan(-1);
     const body = script.slice(start, script.indexOf("\n}\n", start));
 
-    // Without this, C:/PROGRA~1 and C:/Program Files canonicalize to two
-    // different strings and every comparison below them fails open.
-    expect(body).toContain("HOST_IS_WINDOWS == 1");
-    expect(body).toContain("cygpath -m -l");
+    // Windows spells one directory many ways - a different case, a DOS 8.3
+    // alias, a \\?\ prefix, a trailing dot, a junction - and the production
+    // guard compares strings. String normalization cannot reduce all of them,
+    // so this has to stay a GetFinalPathNameByHandle call.
+    expect(body).toContain("realpathSync.native");
   });
 
   it("compares production roots case-insensitively on Windows only", () => {

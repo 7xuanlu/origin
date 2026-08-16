@@ -230,25 +230,46 @@ stage_windows_daemon() {
   done
 }
 
+# One directory has many spellings on Windows -- a different case, a DOS 8.3
+# alias, a `\\?\` prefix, a trailing dot, a junction -- and the production-root
+# guard below compares these as strings, so every spelling it cannot reduce is a
+# way past it. Normalizing them by hand is a losing game, so this asks the OS
+# instead: `fs.realpathSync.native` goes through GetFinalPathNameByHandle on
+# Windows and answers with the real on-disk path, and is realpath(3) on POSIX,
+# which is what this always used. Only something that exists can be resolved, so
+# the non-existent tail is peeled off first and re-attached afterwards.
 canonicalize_path() {
-  local path suffix=""
-  path="$(node -e 'process.stdout.write(require("node:path").resolve(process.argv[1]))' "$1")"
-  while [[ ! -e "$path" && "$path" != "/" ]]; do
-    suffix="/$(basename "$path")$suffix"
-    path="$(dirname "$path")"
-  done
-  path="$(realpath "$path")"
-  if (( HOST_IS_WINDOWS == 1 )); then
-    # A DOS 8.3 alias is a second name for one directory, and `realpath` keeps
-    # whichever one it was handed: C:/PROGRA~1 and C:/Program Files come out as
-    # two different strings. Every comparison built on this then fails open,
-    # including the production-root guard below. Expand the alias so the
-    # canonical form is actually canonical. Only the existing prefix can carry
-    # one -- an alias names something that is on disk -- so the suffix is left
-    # alone, and a path with no alias comes back unchanged.
-    path="$(cygpath -m -l "$path" 2>/dev/null || printf '%s' "$path")"
-  fi
-  printf '%s%s\n' "$path" "$suffix"
+  node -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    let resolved = path.resolve(process.argv[1]);
+    if (process.platform === "win32") {
+      // Win32 drops trailing dots and spaces from every component, so
+      // `...\wenlan.` opens `...\wenlan`. Node resolves through the extended
+      // `\\?\` form, where they are literal instead, so it would call that a
+      // different and missing directory and hand the guard a path that never
+      // matches -- while the daemon, going through Win32, writes to the real
+      // one. Drop them here so both see the same directory. The drive is left
+      // alone, and `.` and `..` are already gone by now.
+      resolved = resolved
+        .split(path.sep)
+        .map((part, index) => (index === 0 ? part : part.replace(/[. ]+$/, "")))
+        .join(path.sep);
+    }
+    let suffix = "";
+    for (;;) {
+      try {
+        resolved = fs.realpathSync.native(resolved);
+        break;
+      } catch {
+        const parent = path.dirname(resolved);
+        if (parent === resolved) break;
+        suffix = "/" + path.basename(resolved) + suffix;
+        resolved = parent;
+      }
+    }
+    process.stdout.write(resolved.split(path.sep).join("/") + suffix);
+  ' "$1"
 }
 
 # Windows resolves paths case-insensitively, and `realpath` hands back whatever
