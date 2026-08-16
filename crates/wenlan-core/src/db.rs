@@ -3624,6 +3624,31 @@ async fn legacy_table_present(conn: &libsql::Connection, name: &str) -> Result<b
         .is_some())
 }
 
+/// What an entity is currently carrying. Returned by
+/// [`MemoryDB::entity_link_summary`]; a cleanup prints it per candidate so the
+/// operator can see what archiving would hide.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EntityLinkSummary {
+    /// Rows in `memory_entities`.
+    pub memory_links: i64,
+    /// Rows in `observations`.
+    pub observations: i64,
+    /// Live relation edges in either direction (`valid_until IS NULL`).
+    pub active_edges: i64,
+    /// Entries in the shadow page's `aliases` JSON array.
+    pub aliases: i64,
+    /// Memories whose `entity_id` points here (the primary-entity pointer,
+    /// separate from the `memory_entities` link table).
+    pub primary_memories: i64,
+}
+
+impl EntityLinkSummary {
+    /// True when nothing in the graph refers to this entity.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// G6 Stage 3 test fixture: describes an entity for
 /// `MemoryDB::test_seed_entity_shadow_page`. Before Stage 3 a fixture
 /// raw-INSERTed an `entities` row and the helper re-read it; migration 123
@@ -33095,6 +33120,12 @@ impl MemoryDB {
     /// in-batch cache, `create_entity` layers input validation, its richer
     /// `WriteResult` wrapping, and post-write enrichment (verify, refinery
     /// enqueue, activity log) gated on `was_newly_created`.
+    ///
+    /// It is one of the two lanes that call `kg::entity_admission::admit`: a
+    /// junk-shape name is refused with a `Validation` error, which every
+    /// production caller drops and logs, and the type is canonicalized against
+    /// `entity_type_vocabulary` before anything is stored. The other lane is
+    /// `commit_entity_enrichment_at_version`, the ambient backfill writer.
     pub async fn resolve_or_create_entity(
         &self,
         name: &str,
@@ -33103,6 +33134,29 @@ impl MemoryDB {
         source_agent: Option<&str>,
         confidence: Option<f32>,
     ) -> Result<(String, bool), WenlanError> {
+        // Admission. Refusing before resolution also stops a junk name being
+        // registered as an alias of a real entity, which is how "17%" would
+        // otherwise attach itself to whatever it embedded near.
+        let canonicals = self.entity_canonicals().await?;
+        let admitted = match crate::kg::entity_admission::admit(name, entity_type, &canonicals) {
+            crate::kg::entity_admission::Admission::Admit(a) => a,
+            crate::kg::entity_admission::Admission::Refuse(r) => {
+                return Err(WenlanError::Validation(format!("{r}: {name:?}")));
+            }
+        };
+        // An unresolvable type still stores the entity; its raw form goes to
+        // the existing vocabulary review lane rather than vanishing.
+        if let Some(raw) = admitted.unrecognized_type.as_deref() {
+            if let Err(e) = self
+                .insert_vocab_promote_proposal("entity", raw, None)
+                .await
+            {
+                log::warn!("[resolve_or_create_entity] vocab promote enqueue failed: {e}");
+            }
+        }
+        let name = admitted.name.as_str();
+        let entity_type = admitted.entity_type.as_str();
+
         let _resolution_guard = self.entity_resolution_lock.lock().await;
         let name_lower = name.to_lowercase();
 
@@ -35016,6 +35070,87 @@ impl MemoryDB {
         Ok(())
     }
 
+    /// Archive an entity by archiving its `kind='entity'` shadow page.
+    ///
+    /// The reversible counterpart to [`Self::delete_entity`], and the entity
+    /// API's own archive lane — `archive_page` deliberately refuses shadow
+    /// pages, because a shadow page must only be touched through here. Since
+    /// G6 every entity reader joins `pages ... AND p.status='active'`, so an
+    /// archived entity disappears from search, listing, and the graph while
+    /// its row, its `entity_page_map` link, its observations, and its memory
+    /// links all stay put and can be restored by flipping `status` back.
+    ///
+    /// Returns true when a page moved from active to archived, false when the
+    /// entity has no shadow page or was already archived.
+    pub async fn archive_entity(&self, entity_id: &str) -> Result<bool, WenlanError> {
+        let now = chrono::Utc::now();
+        let now_rfc3339 = now.to_rfc3339();
+        let now_ts = now.timestamp();
+        let conn = self.conn.lock().await;
+        let Some(page_id) = entity_page_adapter::page_id_for_entity(&conn, entity_id).await? else {
+            return Ok(false);
+        };
+        let affected = conn
+            .execute(
+                "UPDATE pages
+                 SET status = 'archived', version = version + 1, last_modified = ?1
+                 WHERE id = ?2 AND kind = 'entity' AND status = 'active'",
+                libsql::params![now_rfc3339, page_id.clone()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("archive_entity: {e}")))?;
+        if affected == 1 {
+            Self::append_page_history(&conn, &page_id, "archive", now_ts)
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("archive_entity history: {e}")))?;
+        }
+        Ok(affected == 1)
+    }
+
+    /// What an entity is currently carrying: linked memories, observations,
+    /// aliases, and live relation edges.
+    ///
+    /// The blast radius a cleanup has to show before it archives anything. The
+    /// edge count matches `get_entity_detail`'s relations query (`valid_until
+    /// IS NULL`, either direction), and aliases come from the shadow page's
+    /// `aliases` JSON array, which since G6 is the sole alias store. Reports
+    /// zeros for an entity with no active shadow page rather than erroring.
+    pub async fn entity_link_summary(
+        &self,
+        entity_id: &str,
+    ) -> Result<EntityLinkSummary, WenlanError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT
+                   (SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?1),
+                   (SELECT COUNT(*) FROM observations WHERE entity_id = ?1),
+                   (SELECT COUNT(*) FROM edges
+                     WHERE valid_until IS NULL AND (src_id = ?1 OR dst_id = ?1)),
+                   (SELECT COUNT(*) FROM entity_page_map epm
+                      JOIN pages p ON p.id = epm.page_id
+                      JOIN json_each(p.aliases)
+                     WHERE epm.entity_id = ?1
+                       AND p.kind = 'entity' AND p.status = 'active'),
+                   (SELECT COUNT(*) FROM memories WHERE entity_id = ?1)",
+                libsql::params![entity_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("entity_link_summary: {e}")))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("entity_link_summary row: {e}")))?
+            .ok_or_else(|| WenlanError::VectorDb("entity_link_summary: no row".to_string()))?;
+        Ok(EntityLinkSummary {
+            memory_links: row.get::<i64>(0).unwrap_or(0),
+            observations: row.get::<i64>(1).unwrap_or(0),
+            active_edges: row.get::<i64>(2).unwrap_or(0),
+            aliases: row.get::<i64>(3).unwrap_or(0),
+            primary_memories: row.get::<i64>(4).unwrap_or(0),
+        })
+    }
+
     pub async fn delete_entity(&self, entity_id: &str) -> Result<(), WenlanError> {
         let conn = self.conn.lock().await;
         conn.execute("BEGIN", ())
@@ -35432,17 +35567,48 @@ impl MemoryDB {
             }
         }
 
+        // Admission: the same seam `resolve_or_create_entity` uses. This lane
+        // inserts shadow pages directly further down, so without this call the
+        // ambient backfill -- the lane that actually produced the junk pages --
+        // would be ungated. It runs before embedding, so a refused name costs
+        // no model time either.
+        let canonicals = self.entity_canonicals().await?;
         let mut seen_names = HashSet::new();
         let mut entities = Vec::new();
+        let mut unrecognized_types: Vec<String> = Vec::new();
         for kg in kg_results {
             for entity in &kg.entities {
                 let name = entity.name.trim();
                 let entity_type = entity.entity_type.trim();
-                let lower = name.to_lowercase();
-                if name.is_empty() || entity_type.is_empty() || !seen_names.insert(lower.clone()) {
+                if name.is_empty() || entity_type.is_empty() {
                     continue;
                 }
-                entities.push((lower, name.to_string(), entity_type.to_string()));
+                let admitted =
+                    match crate::kg::entity_admission::admit(name, entity_type, &canonicals) {
+                        crate::kg::entity_admission::Admission::Admit(a) => a,
+                        crate::kg::entity_admission::Admission::Refuse(_) => continue,
+                    };
+                let lower = admitted.name.to_lowercase();
+                if !seen_names.insert(lower.clone()) {
+                    continue;
+                }
+                if let Some(raw) = admitted.unrecognized_type {
+                    if !unrecognized_types.contains(&raw) {
+                        unrecognized_types.push(raw);
+                    }
+                }
+                entities.push((lower, admitted.name, admitted.entity_type));
+            }
+        }
+        // Outside the connection lock by construction: the preflight guard's
+        // `conn` guard went out of scope above and the transaction below has
+        // not started.
+        for raw in unrecognized_types {
+            if let Err(e) = self
+                .insert_vocab_promote_proposal("entity", &raw, None)
+                .await
+            {
+                log::warn!("[entity enrichment] vocab promote enqueue failed: {e}");
             }
         }
 

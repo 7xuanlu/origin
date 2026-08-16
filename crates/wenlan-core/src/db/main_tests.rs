@@ -9829,6 +9829,119 @@ async fn resolve_or_create_entity_creates_new_when_no_match() {
     assert_eq!(detail.entity.name, "Rust");
 }
 
+/// The admission seam sits on the cascade itself, so the bulk-import producer
+/// (`importer::resolve_entity_bulk`, which calls this directly and never sees
+/// `post_write::create_entity`'s validation) is covered too. Both tiers refuse
+/// the write; only the cleanup treats them differently.
+#[tokio::test]
+async fn resolve_or_create_entity_refuses_junk_names_and_writes_nothing() {
+    let (db, _dir) = test_db().await;
+    for junk in [
+        "30 minutes",
+        "17%",
+        "~/.claude/CLAUDE.md",
+        "types.rs",
+        "bd691cc",
+        "v1",
+        "burst test",
+    ] {
+        let err = db
+            .resolve_or_create_entity(junk, "concept", None, Some("test"), None)
+            .await
+            .expect_err("junk name must be refused");
+        assert!(
+            matches!(err, WenlanError::Validation(_)),
+            "{junk:?} should fail validation, got {err:?}"
+        );
+    }
+    assert!(
+        db.list_entities(None, None).await.unwrap().is_empty(),
+        "a refused name must leave no entity and no shadow page behind"
+    );
+}
+
+/// A real entity that merely looks junk-shaped must survive the same cascade.
+/// This is the false-rejection guard: every name here exists in the production
+/// corpus or was named as a must-keep by review.
+#[tokio::test]
+async fn resolve_or_create_entity_keeps_real_names_that_look_junk_shaped() {
+    let (db, _dir) = test_db().await;
+    let keep = [
+        "Go",
+        "C#",
+        ".NET",
+        "3M",
+        "GPT-4o",
+        "Python 3.12",
+        "Node.js",
+        "llama.cpp",
+        "7xuanlu/wenlan",
+        "@huggingface/transformers",
+        "Redis Pub/Sub",
+        "TestFlight",
+        "建築/房地產公司",
+    ];
+    for name in keep {
+        db.resolve_or_create_entity(name, "technology", None, Some("test"), None)
+            .await
+            .unwrap_or_else(|e| panic!("{name:?} must be admitted, got {e:?}"));
+    }
+    assert_eq!(
+        db.list_entities(None, None).await.unwrap().len(),
+        keep.len(),
+        "every must-keep name should have produced an entity"
+    );
+}
+
+/// The type canonicalizer is on the same cascade, so the bulk path cannot
+/// store an off-vocabulary type either. An alias resolves to its own reviewed
+/// target rather than collapsing into `concept`, and a genuinely new value
+/// keeps the entity while queuing a vocabulary proposal.
+#[tokio::test]
+async fn resolve_or_create_entity_canonicalizes_entity_type() {
+    let (db, _dir) = test_db().await;
+
+    for (raw, expected) in [
+        ("concepts", "concept"),
+        ("platform", "technology"),
+        ("language", "technology"),
+        ("technique", "concept"),
+    ] {
+        let (id, _) = db
+            .resolve_or_create_entity(&format!("Canary {raw}"), raw, None, Some("test"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_entity_detail(&id).await.unwrap().entity.entity_type,
+            expected,
+            "{raw:?} must canonicalize to {expected:?}"
+        );
+    }
+
+    // A value no band resolves: the entity is still stored, and the raw value
+    // reaches the existing vocabulary review lane instead of vanishing.
+    let (unknown_id, _) = db
+        .resolve_or_create_entity("Unknown Type Canary", "widget", None, Some("test"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_entity_detail(&unknown_id)
+            .await
+            .unwrap()
+            .entity
+            .entity_type,
+        "concept"
+    );
+    let proposal_id = MemoryDB::vocab_proposal_fingerprint("entity", "widget");
+    assert!(
+        db.get_refinement_proposal(&proposal_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "an unresolvable type must be queued as a vocab_promote proposal"
+    );
+}
+
 #[tokio::test]
 async fn resolve_or_create_entity_resolves_existing_by_exact_name() {
     let (db, _dir) = test_db().await;
@@ -30872,6 +30985,78 @@ fn extracted_entity_with_observation(
     }]
 }
 
+/// The ambient backfill lane inserts shadow pages directly and never touches
+/// `resolve_or_create_entity`, so the seam needs its own proof here. This is
+/// the lane that actually minted the junk pages: a gate on the ingest cascade
+/// alone would not have stopped any of them.
+#[tokio::test]
+async fn ambient_enrichment_commit_refuses_junk_names_and_canonicalizes_types() {
+    let (db, _dir) = test_db().await;
+    let content = "The backfill re-extracted this memory after 30 minutes.";
+    db.upsert_documents(vec![make_memory_doc(
+        "mem_gate_cas",
+        content,
+        "knowledge",
+        "work",
+        "agent",
+    )])
+    .await
+    .unwrap();
+
+    let kg = vec![crate::extract::KgExtractionResult {
+        index: 0,
+        entities: vec![
+            crate::extract::ExtractedEntity {
+                name: "30 minutes".to_string(),
+                entity_type: "concept".to_string(),
+            },
+            crate::extract::ExtractedEntity {
+                name: "types.rs".to_string(),
+                entity_type: "file".to_string(),
+            },
+            crate::extract::ExtractedEntity {
+                name: "17%".to_string(),
+                entity_type: "concept".to_string(),
+            },
+            crate::extract::ExtractedEntity {
+                name: "Rust".to_string(),
+                entity_type: "language".to_string(),
+            },
+        ],
+        observations: vec![crate::extract::ExtractedObservation {
+            entity: "30 minutes".to_string(),
+            content: "the backfill took half an hour".to_string(),
+        }],
+        relations: Vec::new(),
+    }];
+
+    assert!(db
+        .commit_entity_enrichment_at_version("mem_gate_cas", 1, &kg, content)
+        .await
+        .unwrap());
+
+    let stored = db.list_entities(None, None).await.unwrap();
+    let names: Vec<&str> = stored.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Rust"],
+        "only the real entity may reach the shadow-page table"
+    );
+    assert_eq!(
+        stored[0].entity_type, "technology",
+        "the type alias must be canonicalized in this lane too"
+    );
+    // An observation hanging off a refused entity has nothing to attach to.
+    let observations = db
+        .get_observations_for_entities(&[stored[0].id.clone()], 50)
+        .await
+        .unwrap();
+    assert!(
+        observations.is_empty(),
+        "a refused entity must not drag its observations into the graph"
+    );
+}
+
 fn extracted_graph(
     from: &str,
     to: &str,
@@ -34575,7 +34760,7 @@ async fn test_enrichment_sweep_processes_null_entity_id_memories() {
 
     // Insert a stub entity that the sweep will "extract".
     db.test_seed_entity_shadow_page(
-        TestEntity::new("ent_universal", "U", "Topic").timestamps(0, 0),
+        TestEntity::new("ent_universal", "Universal Topic", "Topic").timestamps(0, 0),
     )
     .await
     .unwrap();
@@ -34600,7 +34785,7 @@ async fn test_enrichment_sweep_processes_null_entity_id_memories() {
     for _ in 0..3 {
         let processed = db
             .run_entity_enrichment_slice(|_content: String| async move {
-                Ok(extracted_entity("U", "Topic"))
+                Ok(extracted_entity("Universal Topic", "Topic"))
             })
             .await
             .expect("slice should succeed");
@@ -34608,7 +34793,7 @@ async fn test_enrichment_sweep_processes_null_entity_id_memories() {
     }
     let empty = db
         .run_entity_enrichment_slice(|_content: String| async move {
-            Ok(extracted_entity("U", "Topic"))
+            Ok(extracted_entity("Universal Topic", "Topic"))
         })
         .await
         .expect("drained slice should succeed");
@@ -34711,9 +34896,11 @@ async fn test_enrichment_sweep_empty_returns_zero() {
 #[tokio::test]
 async fn test_entity_enrichment_slice_attempts_exactly_one_row() {
     let (db, _dir) = test_db().await;
-    db.test_seed_entity_shadow_page(TestEntity::new("ent_u", "U", "Topic").timestamps(0, 0))
-        .await
-        .unwrap();
+    db.test_seed_entity_shadow_page(
+        TestEntity::new("ent_u", "Unit Topic", "Topic").timestamps(0, 0),
+    )
+    .await
+    .unwrap();
     {
         let conn = db.conn.lock().await;
         for i in 0..5usize {
@@ -34730,7 +34917,7 @@ async fn test_entity_enrichment_slice_attempts_exactly_one_row() {
         }
     }
     let processed = db
-        .run_entity_enrichment_slice(|_| async move { Ok(extracted_entity("U", "Topic")) })
+        .run_entity_enrichment_slice(|_| async move { Ok(extracted_entity("Unit Topic", "Topic")) })
         .await
         .expect("slice");
     assert_eq!(processed, 1, "one invocation must attempt one row");

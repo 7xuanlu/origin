@@ -192,6 +192,13 @@ pub async fn commit_kg(
                         first_entity_id = Some(result.id);
                     }
                 }
+                // A name the admission gate refused is expected traffic, not a
+                // failure: the extractor returns quantities and paths on most
+                // memories, and warning on each would drown the daemon log
+                // during a backfill.
+                Err(WenlanError::Validation(reason)) => {
+                    log::debug!("[post_ingest] entity not admitted: {reason}")
+                }
                 Err(e) => log::warn!("[post_ingest] entity create failed: {e}"),
             }
         }
@@ -409,6 +416,124 @@ mod tests {
             Some("work"),
             "new derived entities must inherit the persisted source-memory Space"
         );
+    }
+
+    /// The regression this whole gate exists for: the extractor returns
+    /// quantities, paths, filenames, shas, and test strings alongside the real
+    /// entity, and every one of them used to become a `kind='entity'` row in
+    /// `pages`. After the gate only the real entity may reach `pages`; the rest
+    /// are dropped and logged, and the commit still succeeds.
+    #[tokio::test]
+    async fn commit_kg_never_writes_a_junk_name_into_pages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::MemoryDB::new(dir.path(), Arc::new(crate::events::NoopEmitter))
+            .await
+            .expect("MemoryDB::new failed");
+        let content = "Adaptive gap detection computes the median interval between writes; \
+                       Alice Chen tuned it to 30 minutes in ~/.claude/CLAUDE.md at bd691cc.";
+        let doc = RawDocument {
+            source: "memory".to_string(),
+            source_id: "m_junk".to_string(),
+            title: "junk canary".to_string(),
+            content: content.to_string(),
+            ..Default::default()
+        };
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        let junk = [
+            "30 minutes",
+            "17%",
+            "~/.claude/CLAUDE.md",
+            "config.json",
+            "bd691cc",
+            "v1",
+            "burst test",
+            ".",
+        ];
+        let mut entities = vec![crate::extract::ExtractedEntity {
+            name: "Alice Chen".to_string(),
+            entity_type: "person".to_string(),
+        }];
+        entities.extend(junk.iter().map(|n| crate::extract::ExtractedEntity {
+            name: (*n).to_string(),
+            entity_type: "concept".to_string(),
+        }));
+        let kg = vec![crate::extract::KgExtractionResult {
+            index: 0,
+            entities,
+            observations: vec![],
+            relations: vec![],
+        }];
+
+        let primary = commit_kg(&db, "m_junk", &kg, content, None)
+            .await
+            .expect("commit_kg must survive rejected names");
+        assert!(
+            primary.is_some(),
+            "the one real entity should still be committed"
+        );
+
+        for name in junk {
+            let hits = db.search_entities_by_name(name).await.unwrap();
+            assert!(
+                hits.is_empty(),
+                "junk name {name:?} reached pages as {hits:?}"
+            );
+        }
+        let all = db.list_entities(None, None).await.unwrap();
+        assert_eq!(
+            all.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["Alice Chen"],
+            "only the real entity may exist"
+        );
+    }
+
+    /// The type the extractor supplies is normalized at the same choke point,
+    /// so an off-vocabulary value can never be stored.
+    #[tokio::test]
+    async fn commit_kg_normalizes_entity_type_to_the_vocabulary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::MemoryDB::new(dir.path(), Arc::new(crate::events::NoopEmitter))
+            .await
+            .expect("MemoryDB::new failed");
+        let content = "Plural Canary and Platform Canary both appeared.";
+        let doc = RawDocument {
+            source: "memory".to_string(),
+            source_id: "m_vocab".to_string(),
+            title: "vocab canary".to_string(),
+            content: content.to_string(),
+            ..Default::default()
+        };
+        db.upsert_documents(vec![doc]).await.unwrap();
+
+        let kg = vec![crate::extract::KgExtractionResult {
+            index: 0,
+            entities: vec![
+                crate::extract::ExtractedEntity {
+                    name: "Plural Canary".to_string(),
+                    // Deterministically singularizes.
+                    entity_type: "concepts".to_string(),
+                },
+                crate::extract::ExtractedEntity {
+                    name: "Platform Canary".to_string(),
+                    // Off-vocabulary, with a reviewed alias: -> technology.
+                    entity_type: "platform".to_string(),
+                },
+            ],
+            observations: vec![],
+            relations: vec![],
+        }];
+        commit_kg(&db, "m_vocab", &kg, content, None).await.unwrap();
+
+        let canonicals = db.entity_canonicals().await.unwrap();
+        for entity in db.list_entities(None, None).await.unwrap() {
+            assert!(
+                canonicals.contains(&entity.entity_type),
+                "{} stored off-vocabulary type {:?}",
+                entity.name,
+                entity.entity_type
+            );
+        }
     }
 
     /// Minor-1 (M3g stage-a review): the entity-sweep path used to write
