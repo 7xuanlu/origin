@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { resolve, win32 } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -196,22 +196,25 @@ describe("scoped dev runtime", () => {
   // the daemon both go through Win32. So the guard would compare a path whose
   // trailing dots have stopped being literal, and `\\?\%LOCALAPPDATA%\wenlan.`
   // would read as a sibling of production and then be opened as production.
-  // The forward-slash spellings are here because `path.resolve` turns them into
-  // the backslash ones. All four are refused rather than rewritten.
-  itWindows.each([
-    ["\\\\?\\", "wenlan.\\dev", "a trailing-dot sibling of a production root"],
-    ["\\\\.\\", "wenlan.\\dev", "a trailing-dot sibling of a production root"],
-    ["//?/", "wenlan./dev", "a trailing-dot sibling of a production root"],
-    ["//./", "wenlan./dev", "a trailing-dot sibling of a production root"],
-    ["\\\\?\\", "wenlan", "a production root"],
-  ])(
-    "refuses the %s prefix on %s (%s)",
-    (prefix, tail) => {
+  //
+  // Win32 accepts either separator in all three positions and `path.resolve`
+  // folds every combination into the same two prefixes, so all sixteen are
+  // enumerated here rather than the tidy two. A `wenlan.` tail is used because
+  // that is the spelling the guard is standing in front of: dropped by Win32,
+  // literal under the prefix, and a sibling of production either way.
+  itWindows.each(
+    ["\\", "/"].flatMap((a) =>
+      ["\\", "/"].flatMap((b) =>
+        ["?", "."].flatMap((mark) =>
+          ["\\", "/"].map((c) => [`${a}${b}${mark}${c}`] as [string]),
+        ),
+      ),
+    ),
+  )(
+    "refuses the %s device prefix",
+    (prefix) => {
       const localAppData = process.env.LOCALAPPDATA;
       expect(localAppData).toBeTruthy();
-      const base = prefix.startsWith("/")
-        ? localAppData!.split("\\").join("/") + "/"
-        : `${localAppData}\\`;
       const result = spawnSync(
         process.execPath,
         ["scripts/run-bash.mjs", "scripts/dev-runtime.sh", "print-config"],
@@ -220,7 +223,7 @@ describe("scoped dev runtime", () => {
           encoding: "utf8",
           env: {
             ...process.env,
-            WENLAN_DEV_DATA_DIR: `${prefix}${base}${tail}`,
+            WENLAN_DEV_DATA_DIR: `${prefix}${localAppData}\\wenlan.\\dev`,
           },
         },
       );
@@ -230,6 +233,7 @@ describe("scoped dev runtime", () => {
     },
     30_000,
   );
+
 
   itWindows(
     "refuses a verbatim path that has nothing to do with production",
@@ -341,15 +345,14 @@ describe("scoped dev runtime", () => {
     expect(start).toBeGreaterThan(-1);
     const guard = script.slice(start, script.indexOf("\n}\n", start));
 
-    // Both spellings of the prefix, and the forward-slash forms path.resolve
-    // folds into them. Every one of the three dev inputs goes through it, and
+    // Matched by shape, not by spelling: either separator in all three
+    // positions, because path.resolve folds all sixteen combinations into the
+    // same two prefixes. Every one of the three dev inputs goes through it, and
     // it is Windows-only because a leading \\ is an ordinary relative filename
     // on POSIX. app-check runs on macOS, so this text contract is what keeps
     // the branch under a required lane; the cases above prove the behaviour.
     expect(guard).toContain("HOST_IS_WINDOWS == 1");
-    for (const prefix of ["'\\\\?\\'*", "'\\\\.\\'*", "'//?/'*", "'//./'*"]) {
-      expect(guard).toContain(prefix);
-    }
+    expect(guard).toContain("'^[\\\\/][\\\\/][?.][\\\\/]'");
     for (const label of [
       "WENLAN_DEV_STATE_DIR",
       "WENLAN_DEV_DATA_DIR",
@@ -357,6 +360,48 @@ describe("scoped dev runtime", () => {
     ]) {
       expect(script).toContain(`reject_verbatim_path "${label}"`);
     }
+  });
+
+  it("refuses exactly the paths win32 resolves to a device prefix", () => {
+    const script = readFileSync(resolve(root, "scripts/dev-runtime.sh"), "utf8");
+    const match = script.match(/^\s*local verbatim='(.+)'$/m);
+    expect(match).toBeTruthy();
+    // The script writes the class as `[\\/]`, which is the same set in a POSIX
+    // bracket expression and in a JS regex, so the text can be handed straight
+    // to RegExp. Reading it out of the script rather than restating it is what
+    // makes this a test of the guard.
+    const guard = new RegExp(match![1]);
+
+    // What win32 treats as a device path, taken from path.win32.resolve rather
+    // than asserted by hand, so a Node change shows up here instead of in the
+    // production guard. Runs on every platform: path.win32 does not need to be
+    // on win32, which is the point - app-check is macOS.
+    const isDevice = (input: string) =>
+      /^\\\\[?.]\\/.test(win32.resolve("C:\\anchor", input));
+
+    const separators = ["\\", "/"];
+    const inputs: string[] = [];
+    for (const a of separators)
+      for (const b of separators)
+        for (const mark of ["?", "."])
+          for (const c of separators)
+            inputs.push(`${a}${b}${mark}${c}C:/scratch/dev./data`);
+    inputs.push(
+      "\\\\server\\share\\dev.\\data",
+      "//server/share/dev./data",
+      "C:\\scratch\\dev.\\data",
+      "\\\\?x\\C:\\dev",
+      "\\\\.x\\C:\\dev",
+      "\\?\\C:\\dev",
+      "/tmp/wenlan-dev",
+    );
+
+    for (const input of inputs) {
+      expect(guard.test(input), input).toBe(isDevice(input));
+    }
+    // Sanity: the sixteen device spellings are actually device spellings, so a
+    // guard that matched nothing could not pass the loop above.
+    expect(inputs.filter(isDevice)).toHaveLength(16);
   });
 
   it("detaches the daemon from the lifecycle command", () => {

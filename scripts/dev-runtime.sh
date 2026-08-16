@@ -308,16 +308,24 @@ path_is_within() {
 # error: it would send a genuine `\\?\C:\scratch\dev.\data` to `...\dev\data`.
 # Neither is acceptable silently, so this says no and names the fix. Windows
 # only: on POSIX a leading `\\` is an ordinary relative filename.
+#
+# The prefix is matched by shape rather than by spelling. Win32 reads either
+# separator in any of the three positions, and `path.resolve` folds all sixteen
+# combinations -- `\\?/`, `//?\`, `/\./` and the rest -- into the same two
+# canonical prefixes, so listing the tidy ones would leave fourteen ways in.
+# `\\server\share` is not one of them: the third character has to be `?` or `.`.
 reject_verbatim_path() {
   local label="$1" value="$2"
+  # Written `[\\/]` rather than `[\/]` so the same text is a valid ERE here and
+  # a valid regex in the test that reads it back out: inside a POSIX bracket
+  # expression a backslash is literal, so the doubled one is the same set.
+  local verbatim='^[\\/][\\/][?.][\\/]'
   (( HOST_IS_WINDOWS == 1 )) || return 0
-  case "$value" in
-    '\\?\'* | '\\.\'* | '//?/'* | '//./'*)
-      echo "error: refusing extended-length or device path for $label: $value" >&2
-      echo "       write it without the \\\\?\\ or \\\\.\\ prefix" >&2
-      exit 2
-      ;;
-  esac
+  if [[ "$value" =~ $verbatim ]]; then
+    echo "error: refusing extended-length or device path for $label: $value" >&2
+    echo "       write it without the \\\\?\\ or \\\\.\\ prefix" >&2
+    exit 2
+  fi
 }
 
 refuse_production_path() {
