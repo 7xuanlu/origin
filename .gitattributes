@@ -2,3 +2,13 @@ crates/wenlan-types/testdata/repair/v1/*.json text eol=lf
 crates/wenlan-core/tests/fixtures/m5_page_size_dist.json text eol=lf
 crates/wenlan-core/tests/fixtures/m5_judge_accuracy.jsonl text eol=lf
 crates/wenlan-core/tests/fixtures/m5_bench_corpus.sha256 text eol=lf
+
+# POSIX scripts must be checked in with LF. A Windows editor that writes CRLF
+# turns `set -euo pipefail` into `pipefail\r`, and bash then fails on the
+# carriage return. These files are all executed by bash on macOS and Linux -- the
+# git hooks and agent hooks fail closed, so a CRLF one blocks every commit,
+# push, or tool call on those platforms.
+*.sh text eol=lf
+*.bash text eol=lf
+.githooks/* text eol=lf
+.claude/hooks/* text eol=lf
