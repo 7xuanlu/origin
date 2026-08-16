@@ -1076,6 +1076,7 @@ async fn deep_only_deterministic_finding_is_visible_but_not_general_only_ready()
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn approved_general_only_deterministic_manifest_applies_and_verifies_exact_field() {
     use crate::lint::{
         context::{CancellationToken, LintClock},
@@ -1416,6 +1417,7 @@ async fn incomplete_tag_source_check_cannot_be_replaced_by_a_ready_manifest() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn tag_manifests_from_global_plan_verify_sequentially_across_ordinal_shifts() {
     use crate::db::repair_verification::{
         with_repair_verification_test_control, RepairVerificationTestControl,
@@ -1767,6 +1769,7 @@ async fn verify_large_tag_window_repair(
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn tag_repair_inside_capped_evidence_window_allows_natural_window_shift() {
     verify_large_tag_window_repair("missing-000", TagDriftAfterPrepare::None)
         .await
@@ -1774,6 +1777,7 @@ async fn tag_repair_inside_capped_evidence_window_allows_natural_window_shift() 
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn tag_repair_outside_capped_evidence_window_is_still_proven_resolved() {
     verify_large_tag_window_repair("missing-101", TagDriftAfterPrepare::None)
         .await
@@ -1781,6 +1785,7 @@ async fn tag_repair_outside_capped_evidence_window_is_still_proven_resolved() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn same_check_finding_added_after_prepare_is_rejected() {
     let error = verify_large_tag_window_repair("missing-101", TagDriftAfterPrepare::Add)
         .await
@@ -1793,6 +1798,7 @@ async fn same_check_finding_added_after_prepare_is_rejected() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn count_neutral_same_check_replacement_after_prepare_is_rejected() {
     let error = verify_large_tag_window_repair("missing-101", TagDriftAfterPrepare::Replace)
         .await
@@ -1939,6 +1945,7 @@ async fn semantic_finding_becomes_one_stable_review_item() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn review_item_contract_reclassification_prepare_requires_plan_item() {
     use crate::{
         lint::{
@@ -2186,6 +2193,7 @@ async fn deterministic_review_payload_binds_the_canonical_owner_set() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn review_item_contract_duplicate_title_plan_can_prepare_manifest() {
     use crate::{
         export::knowledge::KnowledgeProjectionWrite,
@@ -2285,6 +2293,7 @@ async fn review_item_contract_duplicate_title_plan_can_prepare_manifest() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn review_item_contract_failed_entity_plan_can_prepare_manifest() {
     use crate::{
         lint::{
@@ -2395,6 +2404,7 @@ async fn review_item_contract_failed_entity_plan_can_prepare_manifest() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn deterministic_db_writers_apply_exactly_and_orphan_binding_fails_when_ambiguous() {
     use crate::lint::{
         context::{CancellationToken, LintClock},
@@ -2632,6 +2642,7 @@ async fn deterministic_db_writers_apply_exactly_and_orphan_binding_fails_when_am
 /// a successful bind must mint the now-implied canonical `links` edge, or the
 /// row is permanent "missing" parity drift (G6 Stage 0).
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn bind_page_link_repair_mints_the_links_edge() {
     use crate::lint::{
         context::{CancellationToken, LintClock},
@@ -2775,6 +2786,7 @@ async fn bind_page_link_repair_mints_the_links_edge() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn page_projection_manifest_repairs_only_the_named_page_projection() {
     use crate::db::repair_verification::{
         assert_repair_verification_transaction_reusable, with_repair_verification_test_control,
@@ -2996,6 +3008,7 @@ async fn page_projection_manifest_repairs_only_the_named_page_projection() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn page_projection_manifests_from_one_plan_apply_sequentially() {
     use crate::db::repair_verification::{
         with_repair_verification_test_control, RepairVerificationDbContender,
@@ -3197,6 +3210,7 @@ async fn page_projection_manifests_from_one_plan_apply_sequentially() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn page_projection_apply_preserves_non_target_shared_state_on_effect_escape() {
     use crate::lint::{
         context::{CancellationToken, LintClock},
@@ -3330,6 +3344,7 @@ async fn page_projection_apply_preserves_non_target_shared_state_on_effect_escap
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn page_projection_invalid_pending_with_changed_target_fails_closed() {
     use crate::lint::{
         context::{CancellationToken, LintClock},

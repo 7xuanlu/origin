@@ -605,6 +605,7 @@ async fn owner_appearance_blocks_apply_and_recovery_without_projection_mutation(
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn journal_failure_and_after_publish_crash_have_distinct_artifact_states() {
     let _serial = STALE_PROJECTION_TEST_MUTEX.lock().await;
     let before = stale_projection_fixture("stale-journal-before").await;
@@ -673,6 +674,7 @@ async fn journal_failure_and_after_publish_crash_have_distinct_artifact_states()
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn two_manifest_dynamic_journal_recovery_preserves_first_repair() {
     let _serial = STALE_PROJECTION_TEST_MUTEX.lock().await;
     let fixture = two_manifest_fixture().await;
@@ -876,6 +878,7 @@ async fn mutation_split_restore_and_restore_failure_mapping_are_exact() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn recovery_original_post_mismatch_unknown_and_restore_post_are_closed() {
     let _serial = STALE_PROJECTION_TEST_MUTEX.lock().await;
 

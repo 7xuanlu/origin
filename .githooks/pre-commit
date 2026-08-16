@@ -19,6 +19,35 @@ if [ "$HAS_RUST" = "yes" ]; then
 
 fi
 
+if echo "$STAGED_FILES" | grep -Eq '^crates/(wenlan-core|wenlan-server)/|^scripts/m5-reader-sweep\.py$'; then
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN=python3
+    elif command -v python >/dev/null 2>&1; then
+        PYTHON_BIN=python
+    else
+        echo "FAIL: Python is required for the M5 reader inventory check." >&2
+        exit 1
+    fi
+
+    echo "  Refreshing M5 reader inventory..."
+    INVENTORY=crates/wenlan-core/contracts/m5-reader-manifest-inventory.md
+    "$PYTHON_BIN" scripts/m5-reader-sweep.py --update-inventory >/dev/null || {
+        echo "FAIL: scripts/m5-reader-sweep.py --update-inventory failed; fix the sweep error above before committing."
+        exit 1
+    }
+
+    if ! git diff --quiet -- "$INVENTORY" || ! git diff --cached --quiet -- "$INVENTORY"; then
+        git add "$INVENTORY"
+        echo "  M5 reader inventory refreshed and staged; review it in the diff."
+    else
+        echo "  M5 reader inventory up to date."
+    fi
+
+    if [ -n "$(git diff --name-only -- crates/wenlan-core crates/wenlan-server)" ]; then
+        echo "  warning: unstaged Rust changes present; the inventory was generated from the working tree."
+    fi
+fi
+
 if [ "$HAS_RUST_INPUT" = "yes" ]; then
     # Detect direct owners only; the pre-push hook expands the reverse closure.
     TOUCHED_CRATES=""

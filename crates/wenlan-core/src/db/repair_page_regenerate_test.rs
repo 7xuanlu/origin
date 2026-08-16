@@ -528,6 +528,7 @@ async fn completion_branch_restores_exact_bytes_and_maps_restore_failure_exactly
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn apply_level_projection_failure_aborts_the_pending_receipt() {
     let _serial = REGENERATE_TEST_MUTEX.lock().await;
     let fixture = regenerate_fixture().await;

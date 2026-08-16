@@ -43,6 +43,28 @@ else
     exit 1
 fi
 
+if printf '%s' "$all_changed" | grep -Eq '^crates/(wenlan-core|wenlan-server)/|^scripts/m5-reader-sweep\.py$'; then
+    "$PYTHON_BIN" scripts/m5-reader-sweep.py --check || {
+        echo "FAIL: the M5 reader inventory is stale. Run python3 scripts/m5-reader-sweep.py --update-inventory, review the diff, and stage crates/wenlan-core/contracts/m5-reader-manifest-inventory.md."
+        exit 1
+    }
+
+    route_catalog_test='lint::serving::tests::review_tests::route_catalog_freezes_exact_global_and_scoped_keys'
+    route_catalog_out=$(cargo test -p wenlan-core --lib -- "$route_catalog_test" 2>&1) && route_catalog_rc=0 || route_catalog_rc=$?
+    echo "$route_catalog_out"
+    if [ "$route_catalog_rc" -eq 0 ] && printf '%s' "$route_catalog_out" | grep -Fq 'test result: ok. 1 passed'; then
+        :
+    elif printf '%s' "$route_catalog_out" | grep -Fq 'running 0 tests'; then
+        echo "FAIL: the route-catalog gate matched no test; the test was renamed or moved. Update the filter in .githooks/pre-push and scripts/git-hooks.test.sh."
+        exit 1
+    else
+        echo "FAIL: the sensitive-read route catalog changed. Add or move the route in SCOPED/GLOBAL in crates/wenlan-core/src/lint/serving_review_test.rs (see crates/wenlan-server/AGENTS.md, \"Adding or rescoping a route\")."
+        exit 1
+    fi
+
+    echo "Pre-push: fast drift gates passed."
+fi
+
 changed_json=$(printf '%s\n' "$all_changed" | "$PYTHON_BIN" -c \
     'import json, sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))')
 

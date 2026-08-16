@@ -17,7 +17,7 @@ Wenlan runs across several layers. The split is driven by three questions: **(1)
 |---|---|---|---|---|---|
 | **L1 dev loop** | rust-analyzer / IDE | Local | Every save | <1s | No |
 | **L2 pre-commit** | `cargo fmt --all -- --check`; Clippy on directly changed crates only | Local | `git commit` | ~5s | Yes |
-| **L3 pre-push** | Planner-selected Clippy + lib tests over the affected reverse-dependency closure; directly edited integration targets and isolated unit-test owners run alone | Local | `git push` | change-dependent | Yes |
+| **L3 pre-push** | Planner-selected Clippy + lib tests over the affected reverse-dependency closure; directly edited integration targets and isolated unit-test owners run alone. When the plan widens to the whole workspace, Clippy still runs and the lib suite is left to L4 | Local | `git push` | change-dependent | Yes |
 | **L4 CI on PR/main** | Fail-closed differential plan: affected lib, integration, contract, platform, and HTTP smoke owners only; aggregate `conclusion` verifies every expected job. Pushes to `main` reuse the same source-owned routing; release-sensitive pushes retain the Windows release-profile cache warmer, while CI-only pushes skip it. Manual dispatch is the full backstop. An exact same-repository Release PR whose current-main diff passes the semantic validator omits duplicate base-tree Rust/platform lanes only after independently proving that base's main CI succeeded; release-managed plugin/npm/docs checks and all four shipped-target preflights remain. | GitHub (`ci.yml`) | Every PR/main push | target ≤20min | Yes (required) |
 | **L5 coverage** | `cargo llvm-cov` on wenlan-core + wenlan-server only | GitHub (`coverage.yml`) | Relevant source-owner push to `main`, or manual dispatch | ~30min | **No (informational)** |
 | **L6 main canary** | Exact retrieval-quality + ranking-drift pair (`test_run_quality_cost_eval_basic`, `ranking_drift_vs_golden`) | GitHub (`main-canary.yml`) | Relevant core/eval-owner push to `main`, or manual dispatch | <20min | No (post-merge) |
@@ -42,4 +42,45 @@ Tried 90% `cargo llvm-cov` gate in pre-push, removed because:
 - **Percentage gates rot:** new untestable surface forces busywork.
 
 Pre-push now runs planner-selected Clippy + non-instrumented tests only. Coverage = L5 (main/manual, informational) or L7 (manual HTML).
+
+### Why pre-push doesn't run the full workspace lib suite
+
+The planner is fail-closed, so a workflow file, an unowned path, or any shared
+build input widens the plan to the whole workspace. Running that locally cost
+more than it caught:
+
+- **Slow, and worst exactly where it is least informative:** over an hour on
+  Windows for changes — a YAML edit, a new script — that are the least likely to
+  break a specific package.
+- **Already owned by CI:** `workspace-lib-required` runs the same suite on every
+  PR and main push, so the local run was duplicate work, not extra coverage.
+- **It made whole platforms unpushable:** any Windows-only test failure turned
+  every broad change into a hard block, regardless of what the change touched.
+
+A widened plan now prints `local checks: plan widened to the full workspace; CI
+owns that suite` and stops at Clippy. Narrow plans still run their own lib and
+integration tests locally, which is where the fast local signal is worth paying
+for.
+
+**What CI does not own: Windows-gated unit tests.** `workspace-lib-required`
+runs on Linux and macOS. The Windows job deliberately skips the workspace lib
+suite — see the "Workspace lib tests skipped on Windows" step comment in
+`ci.yml` — because Linux and macOS catch the same cross-platform unit logic in
+a third of the wall-clock. A `#[cfg(windows)]` unit test therefore has no
+required-CI execution on any platform; `projection_state_mode_tracks_windows_readonly_attribute`
+is one such test.
+
+Trimming the widened pre-push plan removed the one lane that did run them.
+Before that change a widened plan scheduled `cargo test --workspace --exclude
+wenlan-app --lib` and the `wenlan-server` binary tests, so a Windows developer
+pushing a broad change executed every `#[cfg(windows)]` unit test on the only
+platform that compiles them. Nothing runs them now — not a required check, not
+a local hook, on any platform.
+
+That is the cost of the trade the section above describes, taken knowingly: the
+same run took over an hour on Windows and blocked every broad change on a
+failure unrelated to it. Windows behaviour is still covered at a coarser grain
+by the Windows CLI/server integration step and the schtasks install round-trip
+in the same job. Closing the unit-level gap means paying the ~25 minute Windows
+lib run on every PR, which is a separate decision from this one.
 
