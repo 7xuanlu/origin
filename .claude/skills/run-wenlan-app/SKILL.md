@@ -19,10 +19,12 @@ daemon this worktree recorded.
 ## Prerequisites
 
 - `pnpm install` done in the unit root (worktrees start without `node_modules`).
-- Sibling backend checkout at `../wenlan` of the **main** checkout, or
-  `WENLAN_BACKEND_DIR` set. The driver defaults both this and
-  `CARGO_TARGET_DIR` to the main checkout (warm ~14G cargo cache) via
-  `git rev-parse --git-common-dir`, so worktrees work out of the box.
+- No sibling checkout needed: the monorepo checkout is the backend, and
+  `scripts/resolve-backend-dir.sh` probes the repo root first (an explicit
+  `WENLAN_BACKEND_DIR` overrides it; a sibling checkout is only a legacy
+  fallback). The driver defaults `CARGO_TARGET_DIR` to the main checkout (a
+  warm cargo cache) via `git rev-parse --git-common-dir`, so worktrees work
+  out of the box.
 - Terminal needs macOS Screen Recording permission (for `shot`).
 
 ## Run (agent path)
@@ -78,9 +80,6 @@ Ctrl-C to stop.
   `driver.sh vite` pins vite to :1420 even though the isolated runtime config
   also carries a worktree-scoped `WENLAN_DEV_UI_PORT` (which `pnpm dev:all`
   does use, since the tauri CLI can rewrite `devUrl` via `--config`).
-- `scripts/resolve-backend-dir.sh` fallbacks don't reach worktrees under
-  `.claude/worktrees/<name>` (3 levels deep) — the driver exports
-  `WENLAN_BACKEND_DIR` explicitly.
 - The dev updater toast covers the lower-left sidebar and its Install button
   is live. Never click it. Suppress during verification with a TEMP
   `if (import.meta.env.DEV) return null;` at the top of
