@@ -251,11 +251,11 @@ canonicalize_path() {
     // Drop them here so both see the same directory. The drive is left alone,
     // and `.` and `..` are already gone by now.
     //
-    // A path the caller already wrote in verbatim form is exempt: `\\?\` and
-    // `\\.\` mean "do not normalize this", the trailing characters really are
-    // part of the name, and rewriting one would silently redirect it to a
-    // different directory than the daemon would open.
-    if (process.platform === "win32" && !/^\\\\[?.]\\/.test(resolved)) {
+    // Only ordinary Win32 paths reach this: a caller that writes `\\?\` or
+    // `\\.\` is refused upstream, because nothing here can carry that prefix
+    // through -- `realpathSync.native` answers without it -- so the literal
+    // trailing characters it promises would stop being literal right here.
+    if (process.platform === "win32") {
       resolved = resolved
         .split(path.sep)
         .map((part, index) => (index === 0 ? part : part.replace(/[. ]+$/, "")))
@@ -291,6 +291,33 @@ path_is_within() {
     parent="$(printf '%s' "$parent" | tr '[:upper:]' '[:lower:]')"
   fi
   [[ "$child" == "$parent" || "$child" == "$parent/"* ]]
+}
+
+# Refuse an extended-length or device path instead of quietly rewriting it.
+#
+# `\\?\` and `\\.\` mean "pass this to the filesystem unchanged": trailing dots
+# and spaces are part of the name rather than something Win32 discards. Nothing
+# downstream can honour that. `realpathSync.native` answers without the prefix,
+# MSYS `mkdir` and `realpath` go through Win32, and so does the daemon -- so a
+# verbatim path arrives at the guard as an ordinary one whose components no
+# longer mean what the caller wrote. `\\?\%LOCALAPPDATA%\wenlan.\dev` would pass
+# the production check as a sibling directory and then be opened as
+# `...\wenlan\dev`, inside production.
+#
+# Stripping the components instead redirects the path, which is the opposite
+# error: it would send a genuine `\\?\C:\scratch\dev.\data` to `...\dev\data`.
+# Neither is acceptable silently, so this says no and names the fix. Windows
+# only: on POSIX a leading `\\` is an ordinary relative filename.
+reject_verbatim_path() {
+  local label="$1" value="$2"
+  (( HOST_IS_WINDOWS == 1 )) || return 0
+  case "$value" in
+    '\\?\'* | '\\.\'* | '//?/'* | '//./'*)
+      echo "error: refusing extended-length or device path for $label: $value" >&2
+      echo "       write it without the \\\\?\\ or \\\\.\\ prefix" >&2
+      exit 2
+      ;;
+  esac
 }
 
 refuse_production_path() {
@@ -352,6 +379,9 @@ if [[ "$DEV_APP_ID" == "com.wenlan.desktop" || "$DEV_APP_ID" == "com.origin.desk
   echo "error: refusing production app identifier: $DEV_APP_ID" >&2
   exit 2
 fi
+reject_verbatim_path "WENLAN_DEV_STATE_DIR" "$STATE_DIR"
+reject_verbatim_path "WENLAN_DEV_DATA_DIR" "$DEV_DATA_DIR"
+reject_verbatim_path "WENLAN_DEV_TAURI_MCP_SOCKET" "$DEV_TAURI_MCP_SOCKET"
 if [[ "$(canonicalize_path "$DEV_TAURI_MCP_SOCKET")" == "$(canonicalize_path "/tmp/tauri-mcp.sock")" ]]; then
   echo "error: refusing production Tauri MCP socket: $DEV_TAURI_MCP_SOCKET" >&2
   exit 2

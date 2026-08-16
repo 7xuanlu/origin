@@ -191,11 +191,27 @@ describe("scoped dev runtime", () => {
     30_000,
   );
 
-  itWindows(
-    "rejects a production root reached through the extended-length prefix",
-    () => {
+  // `\\?\` and `\\.\` mean "pass this through unchanged", and nothing below can
+  // honour that: `realpathSync.native` answers without the prefix, and MSYS and
+  // the daemon both go through Win32. So the guard would compare a path whose
+  // trailing dots have stopped being literal, and `\\?\%LOCALAPPDATA%\wenlan.`
+  // would read as a sibling of production and then be opened as production.
+  // The forward-slash spellings are here because `path.resolve` turns them into
+  // the backslash ones. All four are refused rather than rewritten.
+  itWindows.each([
+    ["\\\\?\\", "wenlan.\\dev", "a trailing-dot sibling of a production root"],
+    ["\\\\.\\", "wenlan.\\dev", "a trailing-dot sibling of a production root"],
+    ["//?/", "wenlan./dev", "a trailing-dot sibling of a production root"],
+    ["//./", "wenlan./dev", "a trailing-dot sibling of a production root"],
+    ["\\\\?\\", "wenlan", "a production root"],
+  ])(
+    "refuses the %s prefix on %s (%s)",
+    (prefix, tail) => {
       const localAppData = process.env.LOCALAPPDATA;
       expect(localAppData).toBeTruthy();
+      const base = prefix.startsWith("/")
+        ? localAppData!.split("\\").join("/") + "/"
+        : `${localAppData}\\`;
       const result = spawnSync(
         process.execPath,
         ["scripts/run-bash.mjs", "scripts/dev-runtime.sh", "print-config"],
@@ -204,25 +220,24 @@ describe("scoped dev runtime", () => {
           encoding: "utf8",
           env: {
             ...process.env,
-            WENLAN_DEV_DATA_DIR: `\\\\?\\${localAppData}\\wenlan`,
+            WENLAN_DEV_DATA_DIR: `${prefix}${base}${tail}`,
           },
         },
       );
 
       expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain("refusing production");
+      expect(result.stderr).toContain("extended-length or device path");
     },
     30_000,
   );
 
   itWindows(
-    "keeps a verbatim path's components exactly as written",
+    "refuses a verbatim path that has nothing to do with production",
     () => {
       const tempRoot = mkdtempSync(resolve(tmpdir(), "wenlan-verbatim-test-"));
       tempRoots.push(tempRoot);
-      // `\\?\` means "do not normalize this", so the trailing dot is part of
-      // the name rather than something Win32 strips. Rewriting it would point
-      // the daemon at a different directory than the one it was handed.
+      // Rewriting this one would silently send the daemon to `dev\data`
+      // instead; refusing is the other half of the same contract.
       const result = spawnSync(
         process.execPath,
         ["scripts/run-bash.mjs", "scripts/dev-runtime.sh", "print-config"],
@@ -236,19 +251,17 @@ describe("scoped dev runtime", () => {
         },
       );
 
-      expect(result.status, result.stderr).toBe(0);
-      expect(result.stdout).toContain("/dev./data");
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("extended-length or device path");
     },
     30_000,
   );
 
   itWindows(
-    "allows a literal trailing-dot sibling of a production root",
+    "allows the same directory written in ordinary form",
     () => {
-      const localAppData = process.env.LOCALAPPDATA;
-      expect(localAppData).toBeTruthy();
-      // Verbatim, so `wenlan.` is its own directory and not the production
-      // `wenlan`. Refusing it would be a false positive.
+      const tempRoot = mkdtempSync(resolve(tmpdir(), "wenlan-ordinary-test-"));
+      tempRoots.push(tempRoot);
       const result = spawnSync(
         process.execPath,
         ["scripts/run-bash.mjs", "scripts/dev-runtime.sh", "print-config"],
@@ -257,7 +270,7 @@ describe("scoped dev runtime", () => {
           encoding: "utf8",
           env: {
             ...process.env,
-            WENLAN_DEV_DATA_DIR: `\\\\?\\${localAppData}\\wenlan.\\dev`,
+            WENLAN_DEV_DATA_DIR: `${tempRoot}\\dev\\data`,
           },
         },
       );
@@ -320,6 +333,30 @@ describe("scoped dev runtime", () => {
     // a required lane; the case above proves the behaviour on Windows itself.
     expect(guard).toContain("HOST_IS_WINDOWS == 1");
     expect(guard).toContain("tr '[:upper:]' '[:lower:]'");
+  });
+
+  it("refuses extended-length and device paths instead of rewriting them", () => {
+    const script = readFileSync(resolve(root, "scripts/dev-runtime.sh"), "utf8");
+    const start = script.indexOf("reject_verbatim_path() {");
+    expect(start).toBeGreaterThan(-1);
+    const guard = script.slice(start, script.indexOf("\n}\n", start));
+
+    // Both spellings of the prefix, and the forward-slash forms path.resolve
+    // folds into them. Every one of the three dev inputs goes through it, and
+    // it is Windows-only because a leading \\ is an ordinary relative filename
+    // on POSIX. app-check runs on macOS, so this text contract is what keeps
+    // the branch under a required lane; the cases above prove the behaviour.
+    expect(guard).toContain("HOST_IS_WINDOWS == 1");
+    for (const prefix of ["'\\\\?\\'*", "'\\\\.\\'*", "'//?/'*", "'//./'*"]) {
+      expect(guard).toContain(prefix);
+    }
+    for (const label of [
+      "WENLAN_DEV_STATE_DIR",
+      "WENLAN_DEV_DATA_DIR",
+      "WENLAN_DEV_TAURI_MCP_SOCKET",
+    ]) {
+      expect(script).toContain(`reject_verbatim_path "${label}"`);
+    }
   });
 
   it("detaches the daemon from the lifecycle command", () => {
