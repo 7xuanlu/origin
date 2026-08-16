@@ -17,7 +17,7 @@ Wenlan runs across several layers. The split is driven by three questions: **(1)
 |---|---|---|---|---|---|
 | **L1 dev loop** | rust-analyzer / IDE | Local | Every save | <1s | No |
 | **L2 pre-commit** | `cargo fmt --all -- --check`; Clippy on directly changed crates only | Local | `git commit` | ~5s | Yes |
-| **L3 pre-push** | Planner-selected Clippy + lib tests over the affected reverse-dependency closure; directly edited integration targets and isolated unit-test owners run alone | Local | `git push` | change-dependent | Yes |
+| **L3 pre-push** | Planner-selected Clippy + lib tests over the affected reverse-dependency closure; directly edited integration targets and isolated unit-test owners run alone. When the plan widens to the whole workspace, Clippy still runs and the lib suite is left to L4 | Local | `git push` | change-dependent | Yes |
 | **L4 CI on PR/main** | Fail-closed differential plan: affected lib, integration, contract, platform, and HTTP smoke owners only; aggregate `conclusion` verifies every expected job. Pushes to `main` reuse the same source-owned routing; release-sensitive pushes retain the Windows release-profile cache warmer, while CI-only pushes skip it. Manual dispatch is the full backstop. An exact same-repository Release PR whose current-main diff passes the semantic validator omits duplicate base-tree Rust/platform lanes only after independently proving that base's main CI succeeded; release-managed plugin/npm/docs checks and all four shipped-target preflights remain. | GitHub (`ci.yml`) | Every PR/main push | target ≤20min | Yes (required) |
 | **L5 coverage** | `cargo llvm-cov` on wenlan-core + wenlan-server only | GitHub (`coverage.yml`) | Relevant source-owner push to `main`, or manual dispatch | ~30min | **No (informational)** |
 | **L6 main canary** | Exact retrieval-quality + ranking-drift pair (`test_run_quality_cost_eval_basic`, `ranking_drift_vs_golden`) | GitHub (`main-canary.yml`) | Relevant core/eval-owner push to `main`, or manual dispatch | <20min | No (post-merge) |
@@ -42,4 +42,23 @@ Tried 90% `cargo llvm-cov` gate in pre-push, removed because:
 - **Percentage gates rot:** new untestable surface forces busywork.
 
 Pre-push now runs planner-selected Clippy + non-instrumented tests only. Coverage = L5 (main/manual, informational) or L7 (manual HTML).
+
+### Why pre-push doesn't run the full workspace lib suite
+
+The planner is fail-closed, so a workflow file, an unowned path, or any shared
+build input widens the plan to the whole workspace. Running that locally cost
+more than it caught:
+
+- **Slow, and worst exactly where it is least informative:** over an hour on
+  Windows for changes — a YAML edit, a new script — that are the least likely to
+  break a specific package.
+- **Already owned by CI:** `workspace-lib-required` runs the same suite on every
+  PR and main push, so the local run was duplicate work, not extra coverage.
+- **It made whole platforms unpushable:** any Windows-only test failure turned
+  every broad change into a hard block, regardless of what the change touched.
+
+A widened plan now prints `local checks: plan widened to the full workspace; CI
+owns that suite` and stops at Clippy. Narrow plans still run their own lib and
+integration tests locally, which is where the fast local signal is worth paying
+for.
 
