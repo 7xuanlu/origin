@@ -23,10 +23,11 @@ The modules whose job is not evident from the name:
 ## Adding or rescoping a route
 
 - If the route reads user data, register it in `crates/wenlan-core/src/lint/serving/routes.rs`.
-- Add it to `SCOPED` or `GLOBAL` and update the count in
+- Add it to `SCOPED` or `GLOBAL` in
   `crates/wenlan-core/src/lint/serving_review_test.rs`.
-- Run `python3 scripts/m5-reader-sweep.py --update-inventory` and stage the
-  regenerated inventory.
+- The reader inventory is regenerated and staged by the pre-commit hook;
+  review it in your diff. If hooks are not installed, run
+  `python3 scripts/m5-reader-sweep.py --update-inventory` yourself.
 
 Pre-commit and pre-push run these two checks first, so a missed step fails in
 seconds, not after the full suite.

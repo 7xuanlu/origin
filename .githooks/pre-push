@@ -58,7 +58,7 @@ if printf '%s' "$all_changed" | grep -Eq '^crates/(wenlan-core|wenlan-server)/|^
         echo "FAIL: the route-catalog gate matched no test; the test was renamed or moved. Update the filter in .githooks/pre-push and scripts/git-hooks.test.sh."
         exit 1
     else
-        echo "FAIL: the sensitive-read route catalog changed. Add or move the route in SCOPED/GLOBAL and update the count in crates/wenlan-core/src/lint/serving_review_test.rs (see crates/wenlan-server/AGENTS.md, \"Adding or rescoping a route\")."
+        echo "FAIL: the sensitive-read route catalog changed. Add or move the route in SCOPED/GLOBAL in crates/wenlan-core/src/lint/serving_review_test.rs (see crates/wenlan-server/AGENTS.md, \"Adding or rescoping a route\")."
         exit 1
     fi
 

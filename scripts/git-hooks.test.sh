@@ -11,7 +11,8 @@ if grep -Fq 'cargo check --workspace' .githooks/pre-commit; then
   exit 1
 fi
 
-grep -Fq 'scripts/m5-reader-sweep.py --check' .githooks/pre-commit
+grep -Fq 'scripts/m5-reader-sweep.py --update-inventory' .githooks/pre-commit
+grep -Fq 'git add "$INVENTORY"' .githooks/pre-commit
 grep -Fq 'scripts/m5-reader-sweep.py --check' .githooks/pre-push
 grep -Fq 'lint::serving::tests::review_tests::route_catalog_freezes_exact_global_and_scoped_keys' .githooks/pre-push
 grep -Fq '1 passed' .githooks/pre-push
