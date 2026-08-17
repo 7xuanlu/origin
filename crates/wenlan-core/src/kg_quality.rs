@@ -199,6 +199,12 @@ async fn surface_minhash_merge_candidates(db: &MemoryDB) -> Result<usize, Wenlan
             }
         })
         .collect();
+    // Canonical pair orientation: the proposal id (`minhash_{i}_{j}`) and the
+    // survivor (`existing_id = id_i`) derive from index order, and the reader
+    // has no ORDER BY, so sort by id here or a plan change would mint a new id
+    // for a pair a human already dismissed.
+    let mut entities = entities;
+    entities.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Bucket entity indices by band key.
     let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
