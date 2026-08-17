@@ -1,4 +1,4 @@
-use super::{scope_clause, scope_clause_folded};
+use super::scope_clause;
 use crate::lint::context::LintContext;
 use wenlan_types::lint::{LintMetric, LintMetricCode, LintMetricValue};
 
@@ -42,7 +42,7 @@ impl AggregateCounts {
 pub(super) async fn entity_partitions(
     context: &LintContext<'_, '_>,
 ) -> Result<Vec<LintMetric>, ()> {
-    let (clause, params) = scope_clause_folded(context.scope().filter(), "e", false);
+    let (clause, params) = scope_clause(context.scope().filter(), "e", false);
     let values = scalar_row(
         context,
         &format!(

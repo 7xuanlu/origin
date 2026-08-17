@@ -234,24 +234,34 @@ async fn surface_minhash_merge_candidates(db: &MemoryDB) -> Result<usize, Wenlan
                 let i_len = id_i.len().min(8);
                 let j_len = id_j.len().min(8);
                 let proposal_id = format!("minhash_{}_{}", &id_i[..i_len], &id_j[..j_len]);
+                // `similarity` is the key `RefinementPayload::EntityMerge`
+                // decodes on the wire; `jaccard` stays as the provenance-
+                // specific extra. `source_ids` follows the accept path's
+                // `[new, existing]` convention (`apply_refinement` folds
+                // `source_ids[0]` into `source_ids[1]`), so `existing_id`
+                // (id_i) is the survivor it declares.
                 let payload = serde_json::json!({
                     "existing_id": id_i,
                     "new_id": id_j,
+                    "similarity": jac,
                     "jaccard": jac,
                     "same_type": same_type,
                     "provenance": "minhash_jaccard",
                 })
                 .to_string();
+                // If-absent insert: the id is deterministic per pair, so a
+                // dismissed proposal must stay dismissed across rethink
+                // passes; only a genuinely new row counts as enqueued.
                 if db
-                    .insert_refinement_proposal(
+                    .insert_refinement_proposal_if_absent(
                         &proposal_id,
                         "entity_merge",
-                        &[id_i.clone(), id_j.clone()],
+                        &[id_j.clone(), id_i.clone()],
                         Some(&payload),
                         jac,
                     )
                     .await
-                    .is_ok()
+                    .unwrap_or(false)
                 {
                     enqueued += 1;
                 }
@@ -910,7 +920,7 @@ mod tests {
         db.create_relation(&e1, &e2, "works_on", Some("test"), Some(0.9), None, None)
             .await
             .unwrap();
-        // Loser: leads, confidence 0.5, has an explanation.
+        // Loser: leads, confidence 0.5, has an explanation and a source memory.
         db.create_relation(
             &e1,
             &e2,
@@ -918,7 +928,7 @@ mod tests {
             Some("test"),
             Some(0.5),
             Some("employed since 2020"),
-            None,
+            Some("mem_fold_loser"),
         )
         .await
         .unwrap();
@@ -932,7 +942,8 @@ mod tests {
         // (survivor had none).
         let mut rows = conn
             .query(
-                "SELECT COUNT(*), MAX(json_extract(payload,'$.confidence')) FROM edges \
+                "SELECT COUNT(*), MAX(json_extract(payload,'$.confidence')), \
+                        MAX(json_extract(payload,'$.source_memory_id')) FROM edges \
                  WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2 AND valid_until IS NULL",
                 libsql::params![e1.clone(), e2.clone()],
             )
@@ -941,10 +952,19 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let cnt: i64 = row.get(0).unwrap();
         let conf: f64 = row.get(1).unwrap();
+        let smid: Option<String> = row.get(2).unwrap();
         assert_eq!(cnt, 1, "collision must not leave two rows");
         assert!(
             (conf - 0.9).abs() < 1e-6,
             "survivor keeps the higher confidence"
+        );
+        // Review finding #11: the loser's `source_memory_id` is COALESCE-merged
+        // into the survivor (fill-if-absent), so memory-delete invalidation and
+        // the grounding scan still see this relation after the fold.
+        assert_eq!(
+            smid.as_deref(),
+            Some("mem_fold_loser"),
+            "survivor must inherit the loser's source_memory_id"
         );
         drop(rows);
         // The absorbed edge's pre-image is in the ledger (undo is possible),
@@ -1288,6 +1308,84 @@ mod tests {
             assert!(
                 payload.contains("minhash_jaccard"),
                 "proposal must carry minhash_jaccard provenance, got: {payload}"
+            );
+            // Review finding #13: the payload must decode as the wire type
+            // (the server tags the raw map with `action` before decoding,
+            // mirrored here) and `source_ids` must follow the accept path's
+            // `[new, existing]` order so `existing_id` really is the survivor.
+            let mut tagged: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(payload).expect("payload is a JSON object");
+            tagged.insert("action".into(), serde_json::json!("entity_merge"));
+            let decoded: wenlan_types::RefinementPayload =
+                serde_json::from_value(serde_json::Value::Object(tagged))
+                    .expect("minhash payload must decode as RefinementPayload::EntityMerge");
+            match decoded {
+                wenlan_types::RefinementPayload::EntityMerge {
+                    existing_id,
+                    new_id,
+                    similarity,
+                } => {
+                    assert_eq!(proposal.source_ids.len(), 2);
+                    assert_eq!(
+                        proposal.source_ids[1], existing_id,
+                        "source_ids[1] is the survivor apply_refinement keeps"
+                    );
+                    assert_eq!(proposal.source_ids[0], new_id);
+                    assert!((similarity - jac).abs() < 1e-9);
+                }
+                other => panic!("expected EntityMerge, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    // Review finding #14: the proposal id is deterministic per pair, so a
+    // second rethink pass must not resurrect a dismissed proposal (nor count
+    // it as enqueued again).
+    #[tokio::test]
+    async fn find_merge_candidates_keeps_dismissed_minhash_proposals_dismissed() {
+        temp_env::async_with_vars([("WENLAN_ENABLE_ENTITY_MINHASH", Some("1"))], async {
+            let (db, _dir) = test_db().await;
+            db.store_entity("Glorptech", "project", None, Some("t"), None)
+                .await
+                .unwrap();
+            db.store_entity("Glorptechs", "project", None, Some("t"), None)
+                .await
+                .unwrap();
+
+            let first = find_merge_candidates(&db).await.unwrap();
+            assert_eq!(first, 1, "first pass enqueues the pair once");
+            let pending = db.get_pending_refinements().await.unwrap();
+            let proposal = pending
+                .iter()
+                .find(|p| p.action == "entity_merge" && p.id.starts_with("minhash_"))
+                .expect("a minhash entity_merge proposal must be queued");
+            let id = proposal.id.clone();
+            assert_eq!(
+                db.resolve_refinement_if_open(&id, "dismissed")
+                    .await
+                    .unwrap(),
+                1
+            );
+
+            let second = find_merge_candidates(&db).await.unwrap();
+            assert_eq!(
+                second, 0,
+                "second pass must not re-enqueue a dismissed pair"
+            );
+            let row = db
+                .get_refinement_proposal(&id)
+                .await
+                .unwrap()
+                .expect("dismissed row still exists");
+            assert_eq!(row.status, "dismissed", "dismissal must stay permanent");
+            assert!(
+                !db.get_pending_refinements()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|p| p.id == id),
+                "dismissed proposal must not reappear in the pending queue"
             );
         })
         .await;

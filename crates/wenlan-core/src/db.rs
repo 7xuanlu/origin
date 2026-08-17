@@ -529,7 +529,8 @@ impl MemoryDB {
                     "SELECT edge_id, src_id, dst_id, json_extract(payload,'$.confidence'), \
                             json_extract(payload,'$.explanation'), \
                             json_extract(payload,'$.source_memory_id'), \
-                            json_extract(payload,'$.source_agent'), created_at \
+                            json_extract(payload,'$.source_agent'), created_at, \
+                            payload, grounded \
                      FROM edges \
                      WHERE edge_type = 'relates' AND src_kind = 'entity' AND dst_kind = 'entity' \
                        AND valid_until IS NULL AND semantic_type = ?1",
@@ -548,6 +549,7 @@ impl MemoryDB {
                 Option<String>,
                 Option<String>,
                 Option<i64>,
+                Option<String>,
             )> = Vec::new();
             while let Some(r) = rows
                 .next()
@@ -562,22 +564,30 @@ impl MemoryDB {
                 let smid: Option<String> = r.get(5).ok();
                 let sagent: Option<String> = r.get(6).ok();
                 let created: Option<i64> = r.get(7).ok();
+                let payload: Option<String> = r.get(8).ok();
+                let grounded: i64 = r.get(9).unwrap_or(0);
                 pre_image.push(serde_json::json!({
                     "edge_id": id, "from_entity": from, "to_entity": to, "relation_type": old_type,
                     "confidence": conf, "explanation": expl, "source_memory_id": smid,
-                    "source_agent": sagent, "created_at": created,
+                    "source_agent": sagent, "created_at": created, "grounded": grounded,
                 }));
                 // G6 Stage 2 PR 2b: sagent/created ride along too now — the
                 // relations-side fold write stops below, so the edge's
                 // semantic patch is built from this pre-image instead of a
-                // post-write re-read.
-                ids.push((id, from, to, conf, expl, smid, sagent, created));
+                // post-write re-read. The full `payload` rides along so the
+                // canonical-type edge minted below keeps the loser's
+                // `source_memory_id`/`span`/`model_version`/`prompt_version`
+                // (memory-delete invalidation and the M3g grounding scan key
+                // on `payload.source_memory_id`). Grounding itself resets on
+                // the new edge by design: the M3g candidate scan re-promotes
+                // it because `source_memory_id` survives.
+                ids.push((id, from, to, conf, expl, smid, sagent, created, payload));
             }
             drop(rows);
 
             let mut folded = 0usize;
             let mut graph_changes: Vec<CommunityGraphChange> = Vec::new();
-            for (_id, from, to, conf, expl, _smid, sagent, created) in &ids {
+            for (_id, from, to, conf, expl, _smid, sagent, created, payload) in &ids {
                 // Set in each branch below; feeds the edge's semantic patch
                 // once the relations-side fold write stops (G6 Stage 2 PR 2b).
                 let fold_semantic_patch: Option<String>;
@@ -706,7 +716,7 @@ impl MemoryDB {
                     &space,
                     cross_space_downgrade,
                     None,
-                    None,
+                    payload.as_deref(),
                     Some(canonical),
                     fold_semantic_patch.as_deref(),
                 )
@@ -874,6 +884,99 @@ impl MemoryDB {
                 conn.execute("COMMIT", ())
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("fold_entity commit: {e}")))?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Re-type the entities that were stored under the default type
+    /// (`concept`) only because their extracted type was not yet in the
+    /// vocabulary, once that type has been accepted as a canonical. Called by
+    /// the `vocab_promote` accept path with the proposal's `source_ids` (the
+    /// affected entity ids recorded by [`Self::append_vocab_promote_affected`])
+    /// and the freshly promoted canonical. Only shadow pages still typed
+    /// `concept` move -- an entity a human already re-typed is left alone.
+    /// Ledgered exactly like [`Self::fold_entity_type`] so it is reversible.
+    /// Returns the number of entities re-typed.
+    pub async fn retype_entities_after_promote(
+        &self,
+        entity_ids: &[String],
+        canonical: &str,
+    ) -> Result<usize, WenlanError> {
+        let default_type = crate::vocab::entity_type::DEFAULT_ENTITY_TYPE;
+        if entity_ids.is_empty() || canonical == default_type {
+            return Ok(0);
+        }
+        let ids_json = serde_json::to_string(entity_ids)
+            .map_err(|e| WenlanError::VectorDb(format!("retype ids: {e}")))?;
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("retype begin: {e}")))?;
+
+        let result: Result<usize, WenlanError> = async {
+            let mut rows = conn
+                .query(
+                    "SELECT epm.entity_id FROM entity_page_map epm \
+                     JOIN pages p ON p.id = epm.page_id \
+                     WHERE p.kind = 'entity' AND p.status = 'active' \
+                       AND p.entity_type = ?1 \
+                       AND epm.entity_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))",
+                    libsql::params![default_type, ids_json.clone()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+            let mut ids = Vec::new();
+            while let Some(r) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?
+            {
+                ids.push(r.get::<String>(0).unwrap_or_default());
+            }
+            drop(rows);
+            if ids.is_empty() {
+                return Ok(0);
+            }
+            let pre: Vec<serde_json::Value> = ids
+                .iter()
+                .map(|id| serde_json::json!({"id": id, "entity_type": default_type}))
+                .collect();
+            let pre_json = serde_json::to_string(&pre).unwrap_or_else(|_| "[]".into());
+
+            let now_iso = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE pages SET entity_type = ?1, last_modified = ?2 \
+                 WHERE kind = 'entity' AND status = 'active' AND entity_type = ?3 \
+                   AND id IN (SELECT page_id FROM entity_page_map \
+                              WHERE entity_id IN (SELECT CAST(value AS TEXT) FROM json_each(?4)))",
+                libsql::params![canonical.to_string(), now_iso, default_type, ids_json],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("retype_entities shadow: {e}")))?;
+
+            let ledger_id = format!("vheal-{}", uuid::Uuid::new_v4());
+            let now = chrono::Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO vocab_heal_ledger (id, kind, old_value, new_value, pre_image, created_at) VALUES (?1, 'entity', ?2, ?3, ?4, ?5)",
+                libsql::params![ledger_id, default_type, canonical, pre_json, now],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("insert_vocab_ledger: {e}")))?;
+
+            Ok(ids.len())
+        }
+        .await;
+
+        match result {
+            Ok(n) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("retype commit: {e}")))?;
                 Ok(n)
             }
             Err(e) => {
@@ -33737,6 +33840,13 @@ impl MemoryDB {
                 log::warn!("[resolve_or_create_entity] minhash band index failed for {id}: {e}");
             }
         }
+        // A freshly created entity stored under the default type is recorded
+        // on its vocab proposal so accepting the type can re-type it.
+        if let Some(raw) = admitted.unrecognized_type.as_deref() {
+            if let Err(e) = self.append_vocab_promote_affected("entity", raw, &id).await {
+                log::warn!("[resolve_or_create_entity] vocab promote affected append failed: {e}");
+            }
+        }
         Ok((id, true))
     }
 
@@ -36297,12 +36407,19 @@ impl MemoryDB {
                 if !seen_names.insert(lower.clone()) {
                     continue;
                 }
-                if let Some(raw) = admitted.unrecognized_type {
-                    if !unrecognized_types.contains(&raw) {
-                        unrecognized_types.push(raw);
+                if let Some(raw) = admitted.unrecognized_type.as_deref() {
+                    if !unrecognized_types.iter().any(|t| t == raw) {
+                        unrecognized_types.push(raw.to_string());
                     }
                 }
-                entities.push((lower, admitted.name, admitted.entity_type));
+                // The raw type rides along so a created entity can be
+                // recorded on its vocab proposal after COMMIT.
+                entities.push((
+                    lower,
+                    admitted.name,
+                    admitted.entity_type,
+                    admitted.unrecognized_type,
+                ));
             }
         }
         // Outside the connection lock by construction: the preflight guard's
@@ -36319,7 +36436,10 @@ impl MemoryDB {
 
         // Embedding is CPU work and must not hold the SQLite connection lock.
         // Batch it once for the selected memory instead of once per entity.
-        let entity_names: Vec<String> = entities.iter().map(|(_, name, _)| name.clone()).collect();
+        let entity_names: Vec<String> = entities
+            .iter()
+            .map(|(_, name, _, _)| name.clone())
+            .collect();
         let embeddings = if entity_names.is_empty() {
             Vec::new()
         } else {
@@ -36341,7 +36461,9 @@ impl MemoryDB {
         let _resolution_guard = self.entity_resolution_lock.lock().await;
         let minhash_enabled = entity_minhash_enabled();
         let mut prepared_entities = Vec::with_capacity(entities.len());
-        for ((lower, name, entity_type), embedding) in entities.into_iter().zip(embeddings) {
+        for ((lower, name, entity_type, raw_type), embedding) in
+            entities.into_iter().zip(embeddings)
+        {
             let minhash_candidate = if minhash_enabled {
                 self.minhash_resolve_candidate(&name, &entity_type).await?
             } else {
@@ -36353,6 +36475,7 @@ impl MemoryDB {
                 entity_type,
                 Self::vec_to_sql(&embedding),
                 minhash_candidate,
+                raw_type,
             ));
         }
 
@@ -36363,7 +36486,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("entity enrichment begin: {e}")))?;
 
-        let mut created_entities: Vec<(String, String)> = Vec::new();
+        let mut created_entities: Vec<(String, String, Option<String>)> = Vec::new();
         let mut generation_updates: Vec<CommunityGenerationUpdate> = Vec::new();
         let result: Result<bool, WenlanError> = async {
             let mut current_rows = conn
@@ -36439,7 +36562,9 @@ impl MemoryDB {
 
             let mut entity_ids: HashMap<String, String> = HashMap::new();
             let mut first_entity_id: Option<String> = None;
-            for (lower, name, entity_type, embedding, minhash_candidate) in &prepared_entities {
+            for (lower, name, entity_type, embedding, minhash_candidate, raw_type) in
+                &prepared_entities
+            {
                 let mut resolved: Option<String> = None;
 
                 // G6 Stage 2 PR 2c sub-step 3 item 4: page-payload lookup,
@@ -36611,7 +36736,7 @@ impl MemoryDB {
                             now,
                         )
                         .await?;
-                        created_entities.push((id.clone(), name.clone()));
+                        created_entities.push((id.clone(), name.clone(), raw_type.clone()));
                         id
                     }
                 };
@@ -37067,14 +37192,27 @@ impl MemoryDB {
                     .map_err(|e| WenlanError::VectorDb(format!("entity enrichment commit: {e}")))?;
                 self.record_community_dirty_nodes(generation_updates);
                 drop(conn);
-                if minhash_enabled {
-                    for (entity_id, name) in created_entities {
+                for (entity_id, name, raw_type) in created_entities {
+                    if minhash_enabled {
                         if let Err(error) = self
                             .index_entity_minhash_if_eligible(&entity_id, &name)
                             .await
                         {
                             log::warn!(
                                 "[entity_enrichment_slice] minhash index failed for {entity_id}: {error}"
+                            );
+                        }
+                    }
+                    // Same rule as `resolve_or_create_entity`: a created
+                    // entity stored under the default type is recorded on
+                    // its vocab proposal so accepting the type re-types it.
+                    if let Some(raw) = raw_type.as_deref() {
+                        if let Err(error) = self
+                            .append_vocab_promote_affected("entity", raw, &entity_id)
+                            .await
+                        {
+                            log::warn!(
+                                "[entity_enrichment_slice] vocab promote affected append failed for {entity_id}: {error}"
                             );
                         }
                     }
@@ -42263,6 +42401,40 @@ impl MemoryDB {
         Ok(())
     }
 
+    /// Insert a refinement proposal only when no row with `id` exists yet.
+    /// Returns true iff a new row was created. Unlike
+    /// [`Self::insert_refinement_proposal`] (`INSERT OR REPLACE`), the
+    /// `ON CONFLICT(id) DO NOTHING` guard keeps an existing
+    /// dismissed/resolved row intact, so a producer that recomputes the same
+    /// deterministic id every pass (the MinHash merge sweep) cannot resurrect
+    /// a human dismissal -- same contract as `insert_vocab_promote_proposal`.
+    pub async fn insert_refinement_proposal_if_absent(
+        &self,
+        id: &str,
+        action: &str,
+        source_ids: &[String],
+        payload: Option<&str>,
+        confidence: f64,
+    ) -> Result<bool, WenlanError> {
+        if action == "lint_repair_review" {
+            return Err(WenlanError::Validation(
+                "lint repair reviews require the canonical insert_lint_review_if_absent writer"
+                    .to_string(),
+            ));
+        }
+        let conn = self.conn.lock().await;
+        let source_ids_json = serde_json::to_string(source_ids).unwrap_or_default();
+        let affected = conn
+            .execute(
+                "INSERT INTO refinement_queue (id, action, source_ids, payload, confidence) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO NOTHING",
+                libsql::params![id, action, source_ids_json, payload, confidence],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("insert_refinement_if_absent: {e}")))?;
+        Ok(affected > 0)
+    }
+
     /// Persist one stable lint Review Item without overwriting an existing
     /// open or terminal decision. The deterministic id is the dedupe key;
     /// `INSERT OR IGNORE` deliberately never resurrects a dismissed item.
@@ -42380,6 +42552,35 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("insert_vocab_promote: {e}")))?;
+        Ok(affected > 0)
+    }
+
+    /// Record `entity_id` on the open `vocab_promote` proposal for
+    /// `(kind, old_value)` so that accepting the proposal can re-type the
+    /// entities that were stored under the default type because of it (see
+    /// [`Self::retype_entities_after_promote`]). Appends to `source_ids` only
+    /// while the proposal is still open and only if the id is not already
+    /// listed; a missing, dismissed or resolved proposal is left untouched.
+    /// Returns true iff a row was updated.
+    pub async fn append_vocab_promote_affected(
+        &self,
+        kind: &str,
+        old_value: &str,
+        entity_id: &str,
+    ) -> Result<bool, WenlanError> {
+        let id = Self::vocab_proposal_fingerprint(kind, old_value);
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "UPDATE refinement_queue \
+                 SET source_ids = json_insert(COALESCE(source_ids, '[]'), '$[#]', ?2) \
+                 WHERE id = ?1 AND status IN ('pending', 'awaiting_review') \
+                   AND NOT EXISTS (SELECT 1 FROM json_each(COALESCE(source_ids, '[]')) \
+                                    WHERE value = ?2)",
+                libsql::params![id, entity_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("append_vocab_promote_affected: {e}")))?;
         Ok(affected > 0)
     }
 

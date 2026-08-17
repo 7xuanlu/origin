@@ -877,9 +877,9 @@ async fn load_memory_entity_links(
 // repairs for relations that already existed. Ported to the same canonical
 // projected subquery `entity_scope_clause` above already uses for its
 // `source`-aliased edges joins; `source.space` still resolves the same way,
-// so `scope_clause_folded` needs no change.
+// so `scope_clause` needs no change.
 async fn load_relations(context: &LintContext<'_, '_>) -> Result<Vec<Relation>, ()> {
-    let (scope, params) = scope_clause_folded(context.scope().filter(), "source.space");
+    let (scope, params) = scope_clause(context.scope().filter(), "source.space");
     let mut rows = context
         .snapshot()
         .query(
@@ -956,25 +956,11 @@ async fn load_page_evidence(context: &LintContext<'_, '_>) -> Result<Vec<PageEvi
     Ok(output)
 }
 
+/// Scope predicate for a space column folded by the 1.5b space-sentinel
+/// migration (`memories.space`, `entities.space`, `pages.workspace`): an
+/// unfiled row stores `UNFILED_SPACE_ID`, not SQL NULL, so `Uncategorized`
+/// must match either. Mirrors `push_read_scope_filter_folded` (db.rs).
 fn scope_clause(scope: &ScopeFilter, column: &str) -> (String, libsql::params::Params) {
-    match scope {
-        ScopeFilter::Global => (String::new(), libsql::params::Params::None),
-        ScopeFilter::Registered(value) => (
-            format!(" AND {column}=?1"),
-            libsql::params::Params::Positional(vec![libsql::Value::Text(value.clone())]),
-        ),
-        ScopeFilter::Uncategorized => (
-            format!(" AND {column} IS NULL"),
-            libsql::params::Params::None,
-        ),
-    }
-}
-
-/// Same as `scope_clause`, but for an `entities.space` column folded by the
-/// 1.5b space-sentinel migration: an unfiled row stores `UNFILED_SPACE_ID`,
-/// not SQL NULL, so `Uncategorized` must match either. Mirrors
-/// `push_read_scope_filter_folded` (db.rs).
-fn scope_clause_folded(scope: &ScopeFilter, column: &str) -> (String, libsql::params::Params) {
     match scope {
         ScopeFilter::Global => (String::new(), libsql::params::Params::None),
         ScopeFilter::Registered(value) => (

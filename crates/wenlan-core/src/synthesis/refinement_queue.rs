@@ -236,6 +236,14 @@ pub async fn apply_refinement_with_decision(
             let category = v["category"].as_str();
             db.promote_vocabulary_canonical(kind, old_value, category)
                 .await?;
+            // The entities that proposed this type were stored under the
+            // default `concept` (their ids are the proposal's `source_ids`);
+            // now that the type is canonical, move them onto it.
+            if kind == "entity" {
+                let canonical = old_value.to_lowercase();
+                db.retype_entities_after_promote(&prop.source_ids, &canonical)
+                    .await?;
+            }
         }
         other => {
             return Err(WenlanError::Validation(format!("unknown action: {other}")));
@@ -860,6 +868,56 @@ mod tests {
                 .unwrap(),
             Some("design_inspiration".into())
         );
+    }
+
+    // Appendix E miss: an entity whose extracted type was unknown is stored
+    // as `concept` and its id recorded on the vocab proposal; accepting the
+    // proposal must re-type that entity onto the new canonical.
+    #[tokio::test]
+    async fn apply_refinement_vocab_promote_retypes_proposing_entities() {
+        let (db, _tmp) = test_db().await;
+        // "widget" is not a canonical, alias, or safe transform of one.
+        let (id, created) = db
+            .resolve_or_create_entity("Sprocket Widget", "widget", None, Some("test"), None)
+            .await
+            .unwrap();
+        assert!(created);
+        let stored = db.get_entity_name_type(&id).await.unwrap().unwrap();
+        assert_eq!(stored.1, "concept", "unknown type is stored as the default");
+
+        let proposal_id = crate::db::MemoryDB::vocab_proposal_fingerprint("entity", "widget");
+        let prop = db
+            .get_refinement_proposal(&proposal_id)
+            .await
+            .unwrap()
+            .expect("vocab_promote proposal was queued");
+        assert_eq!(
+            prop.source_ids,
+            vec![id.clone()],
+            "the created entity is recorded on the proposal"
+        );
+
+        apply_refinement(&db, &proposal_id, "test").await.unwrap();
+        assert_eq!(
+            db.resolve_entity_type("widget").await.unwrap(),
+            Some("widget".into())
+        );
+        let retyped = db.get_entity_name_type(&id).await.unwrap().unwrap();
+        assert_eq!(
+            retyped.1, "widget",
+            "accepting the vocabulary re-types the entity that proposed it"
+        );
+        // Ledgered like fold_entity_type so the re-type is reversible.
+        let conn = db.test_primary_session().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM vocab_heal_ledger WHERE kind='entity' AND old_value='concept' AND new_value='widget'",
+                (),
+            )
+            .await
+            .unwrap();
+        let n: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(n, 1);
     }
 
     #[tokio::test]

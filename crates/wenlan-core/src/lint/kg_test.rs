@@ -100,6 +100,25 @@ async fn scoped_rows_follow_memory_or_entity_ownership_but_aggregates_stay_globa
     assert_eq!(metric(aggregates, LintMetricCode::KgMemoryEntityLinks), 3);
 }
 
+// Review finding #12: `memories.space` stores the `UNFILED_SPACE_ID` sentinel
+// (never NULL) since migration 91, so the memory-side scope clause must be
+// sentinel-aware or the Uncategorized scope silently sees zero rows.
+#[tokio::test]
+async fn uncategorized_scope_sees_sentinel_space_memory_rows() {
+    let (db, _tmp) = test_db().await;
+    seed_valid_scoped_graph(&db).await;
+
+    let report = run(&db, Some("uncategorized"), test_config(true)).await;
+
+    // mem-none -> ent-a is the one link owned by an unfiled memory.
+    assert_eq!(check(&report, LINKS).coverage().denominator(), 1);
+    // mem-none is the one unfiled memory eligible for serving.
+    assert_eq!(
+        metric(check(&report, LIVENESS), LintMetricCode::EligibleRecords),
+        1
+    );
+}
+
 #[tokio::test]
 async fn configured_off_is_expected_empty_and_enabled_empty_substrate_is_actionable() {
     let (db, _tmp) = test_db().await;
