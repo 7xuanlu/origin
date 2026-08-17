@@ -5,5 +5,6 @@
 
 pub mod client;
 pub mod commands;
+pub mod outbox;
 pub mod output;
 pub mod space_context;

@@ -4,10 +4,13 @@
 use anyhow::{Context, Result};
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
+use wenlan_types::{OutboxEnvelope, OutboxPayload, OUTBOX_SCHEMA};
 
 use crate::client::WenlanClient;
+use crate::outbox;
 use crate::output::{print_json, OutputFormat};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: &WenlanClient,
     format: OutputFormat,
@@ -15,6 +18,8 @@ pub async fn run(
     text: Option<String>,
     file: Option<PathBuf>,
     memory_type: Option<String>,
+    effective_space: Option<String>,
+    agent_name: Option<&str>,
 ) -> Result<()> {
     let content = match (text, file) {
         (Some(t), None) => t,
@@ -41,7 +46,39 @@ pub async fn run(
     if content.is_empty() {
         anyhow::bail!("Empty content. Provide text, --file, or pipe content via stdin.");
     }
-    let resp = client.store(content, memory_type).await?;
+    let request = WenlanClient::store_request(content.clone(), memory_type.clone());
+    let resp = match client.store(content, memory_type).await {
+        Ok(response) => response,
+        Err(error) if outbox::is_daemon_unreachable(&error) => {
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let envelope = OutboxEnvelope {
+                schema: OUTBOX_SCHEMA,
+                created_at: outbox::now_rfc3339(),
+                caller_id: "wenlan-cli".into(),
+                operation_id: operation_id.clone(),
+                space: effective_space,
+                agent_name: agent_name.map(str::to_owned),
+                reconcile_summary_version: false,
+                payload: OutboxPayload::MemoryStore(request),
+            };
+            let path = outbox::enqueue(&envelope)?;
+            if !quiet {
+                match format {
+                    OutputFormat::Json => print_json(&serde_json::json!({
+                        "status": "queued",
+                        "path": path.display().to_string(),
+                        "operation_id": operation_id,
+                    }))?,
+                    OutputFormat::Table => println!("queued: {}", path.display()),
+                    OutputFormat::Auto => {
+                        unreachable!("Auto resolved by main before dispatch")
+                    }
+                }
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     if quiet {
         return Ok(());
     }

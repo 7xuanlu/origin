@@ -135,13 +135,7 @@ const BOOTSTRAP_LOG_MAX_BYTES: usize = 256 * 1024;
 const BOOTSTRAP_LOG_BACKUPS: usize = 1;
 
 fn resolve_wenlan_root() -> std::path::PathBuf {
-    wenlan_core::env_compat::var_compat("WENLAN_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("wenlan")
-        })
+    wenlan_core::config::data_root()
 }
 
 fn resolve_brief_status_root(wenlan_root: &std::path::Path) -> std::path::PathBuf {
@@ -733,7 +727,7 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
     let _data_root_lock = DaemonDataLock::acquire(&wenlan_root, startup_repair_claimed)?;
 
     let startup::PreparedStartupState {
-        server_state,
+        mut server_state,
         db_arc,
         repair_recovery_pending,
         config,
@@ -747,6 +741,8 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
         startup_repair_claimed,
     )
     .await?;
+
+    server_state.bound_port = listener.local_addr()?.port();
 
     server_state.maintenance_coordinator.finish_recovery();
 

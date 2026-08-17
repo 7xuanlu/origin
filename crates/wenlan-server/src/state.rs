@@ -75,6 +75,8 @@ impl LintServerConfig {
 pub struct ServerState {
     /// Sticky daemon-lifecycle signal shared by HTTP and background workers.
     pub shutdown: ShutdownHandle,
+    /// Port of this daemon's bound listener for loopback durable workers.
+    pub bound_port: u16,
     pub db: Option<Arc<MemoryDB>>,
     /// One-way, human-readable projection of the daemon-owned Space Brief.
     /// `None` disables projection without affecting the authoritative DB state.
@@ -82,6 +84,8 @@ pub struct ServerState {
     // Serializes the read-and-replace receipt projection so a stale handler
     // cannot overwrite a newer committed Brief projection.
     pub brief_projection_lock: Arc<Mutex<()>>,
+    /// Prevent concurrent manual and scheduled outbox drains.
+    pub outbox_drain_lock: Arc<Mutex<()>>,
     /// On-device LLM provider (Qwen via llama-cpp).
     pub llm: Option<Arc<dyn LlmProvider>>,
     /// Registry id of the currently-loaded on-device model (e.g. "qwen3-4b").
@@ -162,9 +166,11 @@ impl Default for ServerState {
     fn default() -> Self {
         Self {
             shutdown: ShutdownHandle::default(),
+            bound_port: 0,
             db: None,
             brief_status_root: None,
             brief_projection_lock: Arc::new(Mutex::new(())),
+            outbox_drain_lock: Arc::new(Mutex::new(())),
             llm: None,
             loaded_on_device_model: None,
             startup_model_load_reserved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -211,6 +217,11 @@ impl ServerState {
     /// Override the human-readable Brief receipt root for an isolated server.
     pub fn with_brief_status_root(mut self, root: PathBuf) -> Self {
         self.brief_status_root = Some(root);
+        self
+    }
+
+    pub fn with_bound_port(mut self, port: u16) -> Self {
+        self.bound_port = port;
         self
     }
 }

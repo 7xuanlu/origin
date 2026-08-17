@@ -169,6 +169,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: commands::space::SpaceCmd,
     },
+    /// Inspect or drain writes queued while the daemon was unreachable.
+    Outbox {
+        #[command(subcommand)]
+        command: commands::outbox::OutboxCommand,
+    },
 }
 
 #[tokio::main]
@@ -189,23 +194,49 @@ async fn main() -> anyhow::Result<ExitCode> {
         &cli.command,
         Commands::Brief(args) if args.command.is_some()
     );
+    let is_outbox = matches!(&cli.command, Commands::Outbox { .. });
     let operation = match &cli.command {
         Commands::Search { .. }
         | Commands::Recall { .. }
         | Commands::Brief(commands::brief::BriefArgs { command: None, .. })
-        | Commands::Memories { .. } => Some(CliSpaceOperation::Read),
+        | Commands::Memories { .. }
+        | Commands::Outbox { .. } => Some(CliSpaceOperation::Read),
         Commands::Capture { .. } => Some(CliSpaceOperation::Write),
         _ => None,
     };
     let is_lint = matches!(&cli.command, Commands::Lint { .. });
     let mut effective_cli_space = cli.space.clone();
-    let client = if let Some(operation) = operation {
-        let registered = base_client
-            .list_spaces()
-            .await?
-            .into_iter()
-            .map(|space| space.name)
-            .collect();
+    let client = if is_outbox {
+        if cli.space.is_some() || cli.all_spaces {
+            anyhow::bail!("--space/--all-spaces are not supported by outbox commands");
+        }
+        effective_cli_space = None;
+        base_client
+    } else if let Some(operation) = operation {
+        let registered = match base_client.list_spaces().await {
+            Ok(spaces) => spaces.into_iter().map(|space| space.name).collect(),
+            Err(error)
+                if matches!(&cli.command, Commands::Capture { .. })
+                    && wenlan_cli::outbox::is_daemon_unreachable(&error) =>
+            {
+                if cli.all_spaces {
+                    anyhow::bail!("--all-spaces is valid only for read commands");
+                }
+                let fallback = resolve_native_read_space(
+                    std::env::var("WENLAN_SPACE").ok().as_deref(),
+                    cli.space.as_deref(),
+                    false,
+                )?
+                .or_else(|| {
+                    std::env::var("WENLAN_DEFAULT_SPACE")
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                });
+                fallback.into_iter().collect()
+            }
+            Err(error) => return Err(error),
+        };
         let context = resolve_cli_space(
             cli.space.clone(),
             cli.all_spaces,
@@ -292,7 +323,15 @@ async fn main() -> anyhow::Result<ExitCode> {
             commands::recall::run(&client, format, cli.quiet, query).await?
         }
         Commands::Brief(args) => {
-            commands::brief::run(&client, format, cli.quiet, args, effective_cli_space).await?
+            commands::brief::run(
+                &client,
+                format,
+                cli.quiet,
+                args,
+                effective_cli_space,
+                agent_name.as_deref(),
+            )
+            .await?
         }
         Commands::Pages {
             query,
@@ -306,7 +345,19 @@ async fn main() -> anyhow::Result<ExitCode> {
             text,
             file,
             memory_type,
-        } => commands::store::run(&client, format, cli.quiet, text, file, memory_type).await?,
+        } => {
+            commands::store::run(
+                &client,
+                format,
+                cli.quiet,
+                text,
+                file,
+                memory_type,
+                effective_cli_space,
+                agent_name.as_deref(),
+            )
+            .await?
+        }
         Commands::Memories {
             limit,
             memory_type,
@@ -317,6 +368,9 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Commands::Agents { cmd } => commands::agents::run(&client, format, cli.quiet, cmd).await?,
         Commands::Spaces { cmd } => commands::space::run(&client, format, cli.quiet, cmd).await?,
+        Commands::Outbox { command } => {
+            commands::outbox::run(&client, format, cli.quiet, command).await?
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

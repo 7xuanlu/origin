@@ -478,6 +478,7 @@ fn each_subcommand_has_help() {
         "keys",
         "connect",
         "sources",
+        "outbox",
     ] {
         cli().args([sub, "--help"]).assert().success();
     }
@@ -746,6 +747,90 @@ fn capture_text_and_file_conflict_bails_before_daemon_access() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn unreachable_capture_and_brief_update_are_queued_and_status_is_offline() {
+    let runtime = IsolatedRuntime::new();
+    let capture = cli_with_isolated_runtime(&runtime)
+        .args(["capture", "hello outbox integration", "--format", "json"])
+        .output()
+        .expect("run capture");
+    assert!(
+        capture.status.success(),
+        "capture stderr: {:?}",
+        capture.stderr
+    );
+    let capture_json: serde_json::Value = serde_json::from_slice(&capture.stdout).unwrap();
+    assert_eq!(capture_json["status"], "queued");
+    assert_eq!(capture_json["operation_id"].as_str().unwrap().len(), 36);
+
+    let update_path = runtime.root.path().join("brief-update.json");
+    fs::write(
+        &update_path,
+        serde_json::json!({
+            "space": "demo",
+            "caller_id": "wenlan-cli",
+            "operation_id": "brief-integration",
+            "summary": {"text": "queued handoff summary", "expected_version": 0},
+            "mutations": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let update = cli_with_isolated_runtime(&runtime)
+        .args([
+            "--space",
+            "demo",
+            "brief",
+            "update",
+            "--file",
+            update_path.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run brief update");
+    assert!(update.status.success(), "brief stderr: {:?}", update.stderr);
+    let update_json: serde_json::Value = serde_json::from_slice(&update.stdout).unwrap();
+    assert_eq!(update_json["status"], "queued");
+    assert_eq!(update_json["operation_id"], "brief-integration");
+
+    let status = cli_with_isolated_runtime(&runtime)
+        .args(["outbox", "status", "--format", "json"])
+        .output()
+        .expect("run outbox status");
+    assert!(
+        status.status.success(),
+        "status stderr: {:?}",
+        status.stderr
+    );
+    let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status_json["queued"], 2);
+    assert_eq!(status_json["failed"], 0);
+
+    let files = fs::read_dir(runtime.data.path().join("outbox"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().all(|path| !path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with(".tmp-")));
+    let memory_file = files
+        .iter()
+        .find(|path| path.to_string_lossy().contains("memory_store"))
+        .unwrap();
+    println!(
+        "queued envelope:\n{}",
+        fs::read_to_string(memory_file).unwrap()
+    );
 }
 
 #[test]

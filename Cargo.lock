@@ -9548,6 +9548,7 @@ version = "0.15.8"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "chrono",
  "clap",
  "dirs 6.0.0",
  "predicates",
@@ -9558,6 +9559,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "tokio",
+ "uuid",
  "wenlan-core",
  "wenlan-types",
  "which",

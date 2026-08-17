@@ -271,6 +271,10 @@ The loop has four steps:
 3. **Close the loop.** `/handoff` records what changed and applies typed item-level updates to the current Space Brief.
 4. **Keep the wiki current.** `/distill` deliberately creates or refreshes pages. Between sessions, optional model-backed passes can enrich captures, connect related entities, and refresh eligible pages. `/lint` checks knowledge health; `/curate` brings proposed revisions and any conflict-review items created by the optional reconcile pass to you.
 
+### Offline queue (outbox)
+
+If the local daemon is unreachable, `wenlan capture` and `wenlan brief update` write their requests to a durable local outbox and exit successfully. When the daemon returns, it drains those writes through the normal HTTP routes; inspect the queue with `wenlan outbox status` or request an immediate replay with `wenlan outbox drain`.
+
 ### Models and privacy
 
 - **Local base retrieval:** The [BGE embedding model](https://huggingface.co/Qdrant/bge-base-en-v1.5-onnx-Q) runs through FastEmbed on your machine for hybrid search and needs no API key.

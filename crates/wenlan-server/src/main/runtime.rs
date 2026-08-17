@@ -10,6 +10,30 @@ pub(super) async fn register_optional_runtime_workers(
     config: wenlan_core::config::Config,
     db_arc: Arc<wenlan_core::db::MemoryDB>,
 ) {
+    if optional_runtime_workers_allowed(repair_recovery_pending) {
+        let shared_for_outbox = shared.clone();
+        let mut outbox_shutdown = { shared.read().await.shutdown.subscribe() };
+        tokio::spawn(async move {
+            wenlan_server::outbox::drain_once(shared_for_outbox.clone()).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            // Consume interval's immediate first tick; the startup drain above
+            // is the one initial pass.
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        wenlan_server::outbox::drain_once(shared_for_outbox.clone()).await;
+                    }
+                    changed = outbox_shutdown.changed() => {
+                        if changed.is_err() || *outbox_shutdown.borrow() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // full mode: load the heavy deep bge-base in the background so startup never
     // blocks on the ~1.1GB download (council fix #3). rerank=true uses plain hybrid
     // until this completes; deep status flips to Active/Failed when the load resolves.

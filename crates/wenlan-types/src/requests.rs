@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 // ===== Memory CRUD =====
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoreMemoryRequest {
     pub content: String,
     #[serde(default)]

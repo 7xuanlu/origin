@@ -23,7 +23,7 @@ use wenlan_types::{
         SearchMemoryResponse, SearchResponse, StoreMemoryResponse,
     },
     sources::Source,
-    BriefReadRequest, BriefReadResponse, BriefUpdateReceipt, BriefUpdateRequest,
+    BriefReadRequest, BriefReadResponse, BriefUpdateReceipt, BriefUpdateRequest, OutboxDrainReport,
 };
 
 mod lint;
@@ -220,19 +220,7 @@ impl WenlanClient {
         memory_type: Option<String>,
     ) -> Result<StoreMemoryResponse> {
         let url = format!("{}/api/memory/store", self.base_url);
-        let req = StoreMemoryRequest {
-            content,
-            memory_type,
-            space: (None).into(),
-            source_agent: None,
-            title: None,
-            confidence: None,
-            supersedes: None,
-            entity: None,
-            entity_id: None,
-            structured_fields: None,
-            retrieval_cue: None,
-        };
+        let req = Self::store_request(content, memory_type);
         let resp = self
             .send(
                 self.http.post(&url).json(&req),
@@ -245,6 +233,36 @@ impl WenlanClient {
         resp.json()
             .await
             .context("parsing /api/memory/store response")
+    }
+
+    pub fn store_request(content: String, memory_type: Option<String>) -> StoreMemoryRequest {
+        StoreMemoryRequest {
+            content,
+            memory_type,
+            space: (None).into(),
+            source_agent: None,
+            title: None,
+            confidence: None,
+            supersedes: None,
+            entity: None,
+            entity_id: None,
+            structured_fields: None,
+            retrieval_cue: None,
+        }
+    }
+
+    /// POST /api/outbox/drain — ask the daemon to replay queued envelopes.
+    pub async fn drain_outbox(&self) -> Result<OutboxDrainReport> {
+        let url = format!("{}/api/outbox/drain", self.base_url);
+        let response = self
+            .send(self.http.post(&url), &format!("POST {url} failed"))
+            .await?
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {url}"))?;
+        response
+            .json()
+            .await
+            .context("parsing /api/outbox/drain response")
     }
 
     /// GET /api/sources — list registered sources.
