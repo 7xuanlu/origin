@@ -18,6 +18,7 @@ import {
   type RecentActivityItem,
   type RefinementPayload,
   type RefinementProposalSummary,
+  type RevisionTargetKind,
 } from "../../lib/tauri";
 
 export type ReviewItem =
@@ -25,6 +26,9 @@ export type ReviewItem =
       kind: "revision";
       id: string;
       targetSourceId: string;
+      /** Whether `targetSourceId` names a memory or a page. Straight from the
+       * daemon — the two need different reads for the diff's "before" side. */
+      targetKind: RevisionTargetKind;
       revisionSourceId: string;
       content: string;
       agent: string | null;
@@ -166,6 +170,7 @@ export function useReviewQueue(enabled: boolean = true) {
           kind: "revision",
           id: item.target_source_id,
           targetSourceId: item.target_source_id,
+          targetKind: item.target_kind,
           revisionSourceId: item.revision_source_id,
           content: item.revision_content,
           agent: item.source_agent,

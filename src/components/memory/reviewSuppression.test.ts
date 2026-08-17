@@ -30,6 +30,7 @@ function revisionItem(id: string): ReviewItem {
     kind: "revision",
     id,
     targetSourceId: "t1",
+    targetKind: "memory",
     revisionSourceId: "rs1",
     content: "content",
     agent: null,

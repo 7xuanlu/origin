@@ -798,12 +798,24 @@ export interface PendingRevision {
   source_agent: string | null;
 }
 
+/**
+ * What a staged revision proposes to rewrite. The daemon resolves this; never
+ * infer it from an id prefix or from `source_agent`.
+ *
+ * `target_source_id` is a `memories.source_id` for `"memory"` and a `pages.id`
+ * for `"page"`. Both are accepted and dismissed through the same two verbs, but
+ * the "before" side of the diff comes from a different read
+ * (`getMemoryDetail` vs `getPage`).
+ */
+export type RevisionTargetKind = "memory" | "page";
+
 export interface PendingRevisionItem {
   target_source_id: string;
   revision_source_id: string;
   revision_content: string;
   source_agent: string | null;
   last_modified: number;
+  target_kind: RevisionTargetKind;
 }
 
 export interface RevisionAcceptResponse {
