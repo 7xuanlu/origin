@@ -994,6 +994,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mixed_lineage_promotion_batch_advances_graph_generation_once() {
+        // KG review #9: `promote_edges_grounded` compensates the m4 grouping
+        // trigger with `graph_generation = MAX(graph_generation - N + 1, 1)`,
+        // where N must count only the promoted rows that actually FIRED the
+        // trigger (entity-entity `lineage='assertion'` relates). A cross-space
+        // legacy edge promoted in the same batch fires no trigger; counting it
+        // used to cancel the batch's real +1 advance.
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let content = "Alice works on ProjectX. Bob works on ProjectY. Carol works on ProjectZ.";
+        seed_folder_memory(&db, "doc_mixed", content, "space_a").await;
+        // A first grounded assertion edge so `space_a` has a graph-state row;
+        // at a fresh row the `MAX(.., 1)` floor would mask the miscount.
+        let baseline_edge = seed_edge(
+            &db,
+            "Alice",
+            "ProjectX",
+            "works_on",
+            "space_a",
+            "doc_mixed",
+            Some("Alice works on ProjectX"),
+            content,
+        )
+        .await;
+        let assertion_edge = seed_edge(
+            &db,
+            "Bob",
+            "ProjectY",
+            "works_on",
+            "space_a",
+            "doc_mixed",
+            Some("Bob works on ProjectY"),
+            content,
+        )
+        .await;
+        // Cross-space endpoints stamp `lineage='legacy'` in the source
+        // entity's space (`space_a`), so both batch rows share one graph state.
+        let carol = db
+            .create_entity("Carol", "concept", Some("space_a"))
+            .await
+            .unwrap();
+        let project_z = db
+            .create_entity("ProjectZ", "concept", Some("space_b"))
+            .await
+            .unwrap();
+        db.create_relation_with_span(
+            &carol,
+            &project_z,
+            "works_on",
+            Some("post_ingest"),
+            None,
+            None,
+            Some("doc_mixed"),
+            Some("Carol works on ProjectZ"),
+            Some(content),
+            Some("extract-model"),
+            Some("extract-prompt-v1"),
+        )
+        .await
+        .unwrap();
+        let canonical = db
+            .resolve_relation_type("works_on")
+            .await
+            .unwrap()
+            .unwrap_or_else(|| "related_to".to_string());
+        let legacy_edge = crate::provenance::compute_edge_id(
+            "relates", "entity", &carol, "entity", &project_z, &canonical,
+        );
+        let legacy = db.edge_snapshot_for_test(&legacy_edge).await.unwrap();
+        assert_eq!(legacy["lineage"], "legacy");
+        assert_eq!(legacy["space"], "space_a");
+
+        let root_id = db
+            .acquire_provenance_root(
+                "document_ingest",
+                content,
+                &IndependenceSignals {
+                    source_identity: Some("file:///doc_mixed"),
+                    agent_turn: None,
+                    import_batch: None,
+                },
+            )
+            .await
+            .unwrap();
+        let promotion = |edge_id: &str| EdgePromotion {
+            edge_id: edge_id.to_string(),
+            root_id: root_id.clone(),
+            payload: build_grounding_payload("span+entailment", 0.95, "test-model", 1),
+            source_memory_id: "doc_mixed".to_string(),
+            judged_content: content.to_string(),
+        };
+
+        assert_eq!(
+            db.promote_edges_grounded(&[promotion(&baseline_edge)])
+                .await
+                .unwrap(),
+            1
+        );
+        let before = db
+            .space_graph_generation_for_test("space_a")
+            .await
+            .expect("a grounded assertion edge creates the graph-state row");
+
+        assert_eq!(
+            db.promote_edges_grounded(&[promotion(&assertion_edge), promotion(&legacy_edge)])
+                .await
+                .unwrap(),
+            2,
+            "both the assertion and the legacy edge flip"
+        );
+        let after = db.space_graph_generation_for_test("space_a").await.unwrap();
+        assert_eq!(
+            after,
+            before + 1,
+            "one batch with one trigger-firing change advances graph_generation by exactly \
+             one; the legacy promotion fired no trigger and must not be compensated"
+        );
+        assert_eq!(
+            db.edge_snapshot_for_test(&legacy_edge).await.unwrap()["grounded"],
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn canonical_only_edge_with_no_relations_row_is_scanned_and_promoted() {
         // G6 Stage 2 PR 2b regression. The M3g candidate scan used to select
         // from `relations`, documented there as "the sole producer of every

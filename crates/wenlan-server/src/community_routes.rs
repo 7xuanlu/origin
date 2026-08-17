@@ -137,4 +137,51 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn communities_routes_reject_unknown_space_and_half_cursors_with_422() {
+        // KG review #26: the query -> scope -> ServerError -> 422 translation
+        // is what the app keys its unregistered-space fallback on, and the
+        // members cursor must be all-or-nothing.
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            wenlan_core::db::MemoryDB::new(root.path(), Arc::new(wenlan_core::events::NoopEmitter))
+                .await
+                .unwrap(),
+        );
+        let state = crate::state::ServerState {
+            db: Some(db),
+            ..Default::default()
+        };
+        let router = crate::router::build_router(Arc::new(RwLock::new(state)));
+        for (uri, expected) in [
+            (
+                "/api/communities?space=missing",
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "/api/communities/members?space=missing",
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "/api/communities/members?cursor_node_id=node-1",
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "/api/communities/members?cursor_space=space-a",
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "/api/communities/members?cursor_space=space-a&cursor_node_id=node-1",
+                axum::http::StatusCode::OK,
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{uri}");
+        }
+    }
 }
