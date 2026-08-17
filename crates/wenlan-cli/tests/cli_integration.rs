@@ -776,7 +776,9 @@ fn memories_reports_existing_connection_error_without_autostart() {
         .args(["memories"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("(is the daemon running?)"))
+        .stderr(predicate::str::contains(
+            "GET http://127.0.0.1:9/api/spaces failed",
+        ))
         .stderr(predicate::str::contains("starting com.wenlan.server").not());
 }
 

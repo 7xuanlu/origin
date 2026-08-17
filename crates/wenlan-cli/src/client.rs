@@ -125,7 +125,10 @@ impl WenlanClient {
     pub async fn health(&self) -> Result<HealthResponse> {
         let url = format!("{}/api/health", self.base_url);
         let resp = self
-            .send(self.http.get(&url), &format!("GET {} failed", url))
+            .send(
+                self.http.get(&url),
+                &format!("GET {} failed (is the daemon running?)", url),
+            )
             .await?;
         let resp = resp
             .error_for_status()
@@ -381,10 +384,7 @@ impl WenlanClient {
     pub async fn list_spaces(&self) -> Result<Vec<wenlan_types::Space>> {
         let url = format!("{}/api/spaces", self.base_url);
         let resp = self
-            .send(
-                self.http.get(&url),
-                &format!("GET {} failed (is the daemon running?)", url),
-            )
+            .send(self.http.get(&url), &format!("GET {} failed", url))
             .await?;
         let resp = resp
             .error_for_status()
