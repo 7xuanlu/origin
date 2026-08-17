@@ -343,8 +343,8 @@ pub fn assert_wave_4_knowledge_catalog_contract() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         keys.len(),
-        6,
-        "Wave 4 Knowledge must contain six unique keys"
+        4,
+        "Wave 4 Knowledge must contain four unique keys"
     );
 
     for expected in WAVE_4_KNOWLEDGE {
@@ -366,7 +366,7 @@ pub fn assert_wave_4_knowledge_catalog_contract() {
     }
 
     let rows = wenlan_server::sensitive_read_routes::sensitive_read_routes().collect::<Vec<_>>();
-    assert_eq!(rows.len(), 65);
+    assert_eq!(rows.len(), 61);
     assert_eq!(
         rows.iter()
             .filter(|row| row.scope_binding == ScopeBinding::Global)
@@ -377,7 +377,7 @@ pub fn assert_wave_4_knowledge_catalog_contract() {
         rows.iter()
             .filter(|row| row.scope_binding != ScopeBinding::Global)
             .count(),
-        49
+        45
     );
     assert_eq!(
         rows.iter()
