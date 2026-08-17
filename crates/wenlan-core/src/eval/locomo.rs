@@ -362,6 +362,11 @@ pub struct LocomoReport {
     pub aggregate_hit_rate_at_1: f64,
     pub total_questions: usize,
     pub total_memories: usize,
+    /// Gated-mode only: noise docs the quality gate admitted with a
+    /// near-duplicate flag (stored anyway, per the soft-flag change) rather
+    /// than dropped. 0 for Clean/Noisy modes, which never call the gate.
+    #[serde(default)]
+    pub gate_novelty_flagged: usize,
     pub per_category_aggregate: Vec<LocomoCategoryResult>,
     /// Placeholder for future LLM-as-judge QA accuracy (J-score).
     /// Currently None — requires an LLM to generate answers from retrieved context.
@@ -554,7 +559,7 @@ impl LocomoReport {
             total_negatives: 0,
             negative_leakage: 0,
             gate_content_filtered: 0,
-            gate_novelty_filtered: 0,
+            gate_novelty_flagged: self.gate_novelty_flagged,
             empty_set_count: 0,
             empty_set_false_confidence: None,
             score_gap: None,
@@ -799,6 +804,7 @@ async fn run_locomo_eval_core(
         aggregate_hit_rate_at_1: avg_field(&all_scores, |s| s.5),
         total_questions: all_scores.len(),
         total_memories: samples.iter().map(|s| extract_observations(s).len()).sum(),
+        gate_novelty_flagged: 0,
         per_category_aggregate: per_cat_agg,
         qa_accuracy: None,
         baseline: None,
@@ -1043,6 +1049,7 @@ pub async fn run_locomo_eval_cross_rerank_from_db(
         aggregate_hit_rate_at_1: avg_field(&all_scores, |s| s.5),
         total_questions: all_scores.len(),
         total_memories: samples.iter().map(|s| extract_observations(s).len()).sum(),
+        gate_novelty_flagged: 0,
         per_category_aggregate: per_cat_agg,
         qa_accuracy: None,
         baseline: None,
@@ -1629,6 +1636,7 @@ pub async fn run_locomo_eval_from_db(
         aggregate_hit_rate_at_1: avg_field(&all_scores, |s| s.5),
         total_questions: all_scores.len(),
         total_memories: samples.iter().map(|s| extract_observations(s).len()).sum(),
+        gate_novelty_flagged: 0,
         per_category_aggregate: per_cat_agg,
         qa_accuracy: None,
         baseline: None,
@@ -2123,6 +2131,7 @@ pub async fn run_locomo_eval_with_gate(
     let mut all_scores: Vec<(u8, f64, f64, f64, f64, f64)> = Vec::new();
     let mut per_case: Vec<crate::eval::report::CaseResult> = Vec::new();
     let mut total_memories_inserted: usize = 0;
+    let mut total_novelty_flagged: usize = 0;
 
     let gate = match mode {
         LocomoGateMode::Gated => Some(QualityGate::new(GateConfig::default())),
@@ -2169,8 +2178,11 @@ pub async fn run_locomo_eval_with_gate(
                 let gate = gate.as_ref().unwrap();
                 let mut admitted_docs = Vec::new();
                 for doc in &noise {
-                    let (result, _similar_id) = gate.evaluate(&doc.content, &db).await?;
+                    let (result, _similar_id) = gate.evaluate(&doc.content, None, &db).await?;
                     if result.admitted {
+                        if result.near_duplicate.is_some() {
+                            total_novelty_flagged += 1;
+                        }
                         admitted_docs.push(doc.clone());
                     }
                 }
@@ -2285,6 +2297,7 @@ pub async fn run_locomo_eval_with_gate(
         aggregate_hit_rate_at_1: avg_field(&all_scores, |s| s.5),
         total_questions: all_scores.len(),
         total_memories: total_memories_inserted,
+        gate_novelty_flagged: total_novelty_flagged,
         per_category_aggregate: per_cat_agg,
         qa_accuracy: None,
         baseline: None,
@@ -2570,6 +2583,7 @@ mod tests {
             aggregate_hit_rate_at_1: 0.450,
             total_questions: 100,
             total_memories: 500,
+            gate_novelty_flagged: 0,
             per_category_aggregate: vec![
                 LocomoCategoryResult {
                     category: 1,
@@ -2625,6 +2639,7 @@ mod tests {
             aggregate_hit_rate_at_1: 0.0,
             total_questions: 0,
             total_memories: 0,
+            gate_novelty_flagged: 0,
             per_category_aggregate: vec![],
             qa_accuracy: None,
             baseline: None,
@@ -2661,6 +2676,7 @@ mod tests {
             aggregate_hit_rate_at_1: 0.470,
             total_questions: 100,
             total_memories: 500,
+            gate_novelty_flagged: 0,
             per_category_aggregate: vec![LocomoCategoryResult {
                 category: 3,
                 name: "open-domain".to_string(),
@@ -2771,6 +2787,7 @@ mod tests {
             aggregate_hit_rate_at_1: 0.0,
             total_questions: 0,
             total_memories: 0,
+            gate_novelty_flagged: 0,
             per_category_aggregate: vec![],
             qa_accuracy: None,
             baseline: None,

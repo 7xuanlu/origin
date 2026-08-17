@@ -20167,7 +20167,10 @@ async fn test_prune_old_rejections() {
 #[tokio::test]
 async fn test_check_novelty_empty_db() {
     let (db, _dir) = test_db().await;
-    let result = db.check_novelty("User prefers dark mode").await.unwrap();
+    let result = db
+        .check_novelty("User prefers dark mode", None)
+        .await
+        .unwrap();
     assert!(result.is_none());
 }
 
@@ -20185,7 +20188,7 @@ async fn test_check_novelty_finds_similar() {
     db.upsert_documents(vec![doc]).await.unwrap();
 
     let result = db
-        .check_novelty("User prefers dark mode for all code editors")
+        .check_novelty("User prefers dark mode for all code editors", None)
         .await
         .unwrap();
     assert!(result.is_some(), "Should find similar memory");
@@ -20211,7 +20214,10 @@ async fn test_check_novelty_different_content() {
     db.upsert_documents(vec![doc]).await.unwrap();
 
     let result = db
-        .check_novelty("The database uses libSQL with vector indexing for semantic search")
+        .check_novelty(
+            "The database uses libSQL with vector indexing for semantic search",
+            None,
+        )
         .await
         .unwrap();
     match result {
@@ -20221,6 +20227,147 @@ async fn test_check_novelty_different_content() {
             "Unrelated content should have low similarity, got {sim}"
         ),
     }
+}
+
+#[tokio::test]
+async fn test_check_novelty_excludes_supersedes_target() {
+    let (db, _dir) = test_db().await;
+    let doc = RawDocument {
+        content: "User prefers dark mode for all IDEs".to_string(),
+        source_id: "mem_existing".to_string(),
+        source: "memory".to_string(),
+        title: "Dark mode pref".to_string(),
+        last_modified: chrono::Utc::now().timestamp(),
+        ..Default::default()
+    };
+    db.upsert_documents(vec![doc]).await.unwrap();
+
+    let result = db
+        .check_novelty("User prefers dark mode for all IDEs", Some("mem_existing"))
+        .await
+        .unwrap();
+    assert_ne!(
+        result.map(|(source_id, _)| source_id),
+        Some("mem_existing".into())
+    );
+}
+
+#[tokio::test]
+async fn test_check_novelty_skips_superseded_rows() {
+    let (db, _dir) = test_db().await;
+    let original = RawDocument {
+        content: "User prefers dark mode for all IDEs".to_string(),
+        source_id: "mem_original".to_string(),
+        source: "memory".to_string(),
+        title: "Original dark mode pref".to_string(),
+        last_modified: chrono::Utc::now().timestamp(),
+        ..Default::default()
+    };
+    let correction = RawDocument {
+        content: "User prefers dark mode for all code editors".to_string(),
+        source_id: "mem_correction".to_string(),
+        source: "memory".to_string(),
+        title: "Corrected dark mode pref".to_string(),
+        supersedes: Some("mem_original".to_string()),
+        last_modified: chrono::Utc::now().timestamp(),
+        ..Default::default()
+    };
+    db.upsert_documents(vec![original, correction])
+        .await
+        .unwrap();
+
+    let result = db
+        .check_novelty("User prefers dark mode for all IDEs", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.map(|(source_id, _)| source_id),
+        Some("mem_correction".into())
+    );
+}
+
+/// Archive-mode supersedes (the correction's own `supersede_mode = "archive"`,
+/// as the classifier sets for `memory_type = "decision"`) must NOT hide the
+/// superseded target from novelty candidates — search keeps archive-mode
+/// targets visible (see `superseder_not_exists` at the `search` call site), so
+/// check_novelty must mirror that or it would treat a still-visible memory as
+/// gone and let a duplicate back in unflagged.
+#[tokio::test]
+async fn test_check_novelty_keeps_archive_mode_superseded_rows() {
+    let (db, _dir) = test_db().await;
+    let original = RawDocument {
+        content: "We decided to use libSQL over sqlite3 for vector search".to_string(),
+        source_id: "mem_decision_original".to_string(),
+        source: "memory".to_string(),
+        title: "Original decision".to_string(),
+        memory_type: Some("decision".to_string()),
+        last_modified: chrono::Utc::now().timestamp(),
+        ..Default::default()
+    };
+    let revision = RawDocument {
+        content: "We revised the decision: still using libSQL over sqlite3".to_string(),
+        source_id: "mem_decision_revision".to_string(),
+        source: "memory".to_string(),
+        title: "Revised decision".to_string(),
+        memory_type: Some("decision".to_string()),
+        supersedes: Some("mem_decision_original".to_string()),
+        supersede_mode: "archive".to_string(),
+        last_modified: chrono::Utc::now().timestamp(),
+        ..Default::default()
+    };
+    db.upsert_documents(vec![original, revision]).await.unwrap();
+
+    let result = db
+        .check_novelty(
+            "We decided to use libSQL over sqlite3 for vector search",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.map(|(source_id, _)| source_id),
+        Some("mem_decision_original".into()),
+        "archive-mode superseded row must stay a novelty candidate"
+    );
+}
+
+/// check_novelty_batch must apply each row's own exclude_source_ids entry to
+/// that same row's query, not some other row's — a misaligned zip would let
+/// one exclude leak onto a different index's result.
+#[tokio::test]
+async fn test_check_novelty_batch_applies_per_row_exclude() {
+    let (db, _dir) = test_db().await;
+    let doc = RawDocument {
+        content: "User prefers dark mode for all IDEs".to_string(),
+        source_id: "mem_existing".to_string(),
+        source: "memory".to_string(),
+        title: "Dark mode pref".to_string(),
+        last_modified: chrono::Utc::now().timestamp(),
+        ..Default::default()
+    };
+    db.upsert_documents(vec![doc]).await.unwrap();
+
+    let contents = vec![
+        "User prefers dark mode for all code editors".to_string(),
+        "User prefers dark mode for all code editors".to_string(),
+    ];
+    let exclude_source_ids = vec![None, Some("mem_existing".to_string())];
+    let results = db
+        .check_novelty_batch(&contents, &exclude_source_ids)
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].as_ref().map(|(source_id, _)| source_id.as_str()),
+        Some("mem_existing"),
+        "row with exclude=None should still find mem_existing"
+    );
+    assert_ne!(
+        results[1].as_ref().map(|(source_id, _)| source_id.as_str()),
+        Some("mem_existing"),
+        "row with exclude=Some(mem_existing) must not return the excluded source"
+    );
 }
 
 #[tokio::test]

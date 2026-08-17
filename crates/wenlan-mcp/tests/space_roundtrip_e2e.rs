@@ -88,6 +88,7 @@ fn store_response(source_id: &str) -> StoreMemoryResponse {
         entity_id: None,
         quality: None,
         warnings: vec![],
+        near_duplicate: None,
         extraction_method: "none".into(),
         enrichment: String::new(),
         hint: String::new(),

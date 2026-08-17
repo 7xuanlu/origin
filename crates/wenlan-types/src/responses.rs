@@ -11,6 +11,12 @@ use std::collections::HashMap;
 
 // ===== Memory CRUD =====
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NearDuplicate {
+    pub source_id: String,
+    pub similarity: f64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StoreMemoryResponse {
     pub source_id: String,
@@ -26,6 +32,8 @@ pub struct StoreMemoryResponse {
     /// Schema-validation issues — actionable by the agent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub near_duplicate: Option<NearDuplicate>,
     /// How structured fields were populated. "agent" | "llm" | "none" | "unknown" (forward-compat default).
     #[serde(default = "default_extraction_method")]
     pub extraction_method: String,
@@ -1428,6 +1436,7 @@ mod tests {
             entity_id: None,
             quality: None,
             warnings: vec![],
+            near_duplicate: None,
             extraction_method: "none".into(),
             enrichment: "not_needed".into(),
             hint: String::new(),
@@ -1440,6 +1449,10 @@ mod tests {
         assert!(
             !json.contains("\"hint\""),
             "empty hint must be skipped on the wire, got: {json}"
+        );
+        assert!(
+            !json.contains("\"near_duplicate\""),
+            "near_duplicate: None must be skipped on the wire, got: {json}"
         );
         let parsed: StoreMemoryResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.enrichment, "not_needed");
@@ -1455,6 +1468,7 @@ mod tests {
             entity_id: None,
             quality: None,
             warnings: vec![],
+            near_duplicate: None,
             extraction_method: "none".into(),
             enrichment: "paused".into(),
             hint: "Stored; choose a model source to enable enrichment.".into(),

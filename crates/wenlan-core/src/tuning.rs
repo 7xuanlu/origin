@@ -344,6 +344,7 @@ pub struct GateConfig {
     pub enabled: bool,
     #[serde(default = "d_5_usize")]
     pub min_word_count: usize,
+    /// Flag threshold: similarity at or above this value stores the memory and flags it as a near duplicate.
     #[serde(default = "d_070_f64")]
     pub novelty_threshold: f64,
     #[serde(default = "d_true")]

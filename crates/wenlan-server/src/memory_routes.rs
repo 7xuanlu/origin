@@ -17,7 +17,7 @@ use wenlan_types::requests::{
     ConfirmRequest, ListMemoriesRequest, SearchMemoryRequest, StoreMemoryRequest,
 };
 use wenlan_types::responses::{
-    ConfirmResponse, DeleteResponse, ListMemoriesResponse, SearchMemoryResponse,
+    ConfirmResponse, DeleteResponse, ListMemoriesResponse, NearDuplicate, SearchMemoryResponse,
     StoreMemoryResponse,
 };
 use wenlan_types::sources::{stability_tier, MemoryType, RawDocument, StabilityTier};
@@ -143,6 +143,60 @@ fn compute_warnings_and_extraction(
         }
         (None, None) => (Vec::new(), "none".to_string()),
     }
+}
+
+/// Record and render the soft near-duplicate flag for an admitted memory.
+/// The batcher and fallback store paths both call this after persistence so
+/// their response and rejection-log behavior cannot drift.
+async fn record_near_duplicate_flag(
+    db: &wenlan_core::db::MemoryDB,
+    log_rejections: bool,
+    content: &str,
+    source_agent: Option<&str>,
+    near_duplicate: Option<(String, f64)>,
+) -> Option<(NearDuplicate, String)> {
+    let (source_id, similarity) = near_duplicate?;
+    let detail = format!("stored with soft flag; similarity {similarity:.2} to {source_id}");
+    if log_rejections {
+        let rejection_id = format!(
+            "rej_{}",
+            uuid::Uuid::new_v4()
+                .to_string()
+                .replace('-', "")
+                .chars()
+                .take(12)
+                .collect::<String>()
+        );
+        if let Err(error) = db
+            .log_rejection(
+                &rejection_id,
+                content,
+                source_agent,
+                "near_duplicate",
+                Some(&detail),
+                Some(similarity),
+                Some(&source_id),
+            )
+            .await
+        {
+            tracing::warn!("[quality_gate] failed to log near-duplicate flag: {error}");
+        }
+    }
+    tracing::info!(
+        "[quality_gate] stored near-duplicate memory from {:?}: {}",
+        source_agent.unwrap_or("unknown"),
+        detail
+    );
+    let warning = format!(
+        "near_duplicate: {similarity:.2} similar to {source_id}; stored anyway. If it repeats that memory, store again with supersedes={source_id}, or delete one."
+    );
+    Some((
+        NearDuplicate {
+            source_id,
+            similarity,
+        },
+        warning,
+    ))
 }
 
 fn fixed_enrichment_origin(
@@ -365,7 +419,7 @@ pub async fn handle_store_memory(
     );
 
     // Phase 2b-validate: split into warnings (schema-validation only) and extraction_method (status label).
-    let (warnings, extraction_method) = compute_warnings_and_extraction(
+    let (mut warnings, extraction_method) = compute_warnings_and_extraction(
         extracted_fields.as_deref(),
         req.structured_fields.as_ref(),
         &memory_type_str,
@@ -545,7 +599,7 @@ pub async fn handle_store_memory(
         .await
         .map_err(|e| ServerError::IngestFailed(e.to_string()))?;
 
-    let chunks_created = if let Some(batcher) = ingest_batcher {
+    let (chunks_created, near_duplicate) = if let Some(batcher) = ingest_batcher {
         // Coalesced path: concurrent callers share one FastEmbed call +
         // one libSQL transaction. Gate runs inside the coalescer flush.
         // See `ingest_batcher.rs` for details.
@@ -561,7 +615,10 @@ pub async fn handle_store_memory(
             }
         };
         match outcome {
-            StoreOutcome::Stored { chunks_created } => chunks_created,
+            StoreOutcome::Stored {
+                chunks_created,
+                near_duplicate,
+            } => (chunks_created, near_duplicate),
             StoreOutcome::GateRejected {
                 reason,
                 detail,
@@ -623,7 +680,7 @@ pub async fn handle_store_memory(
         // Gate runs synchronously here, pre-upsert.
         let db = db_fallback.clone().ok_or(ServerError::DbNotInitialized)?;
         let (gate_result, similar_source_id) = quality_gate
-            .evaluate(&doc.content, &db)
+            .evaluate(&doc.content, doc.supersedes.as_deref(), &db)
             .await
             .unwrap_or_else(|e| {
                 tracing::error!("[quality_gate] evaluate failed (fail closed): {e}");
@@ -642,6 +699,7 @@ pub async fn handle_store_memory(
                             pattern_matched: Some("embedding_unavailable".to_string()),
                             latency_ms: 0,
                         },
+                        near_duplicate: None,
                     },
                     None,
                 )
@@ -690,11 +748,12 @@ pub async fn handle_store_memory(
                 similar_to: similar_source_id,
             });
         }
+        let near_duplicate = gate_result.near_duplicate.clone();
         match db
             .upsert_documents_with_write_spaces(vec![(doc, Some(resolved_write_space.clone()))])
             .await
         {
-            Ok(chunks) => chunks,
+            Ok(chunks) => (chunks, near_duplicate),
             Err(wenlan_core::WenlanError::Validation(message)) => {
                 let _ = origin_db.delete_enrichment_origin(&source_id).await;
                 return Err(ServerError::ValidationError(message));
@@ -711,6 +770,18 @@ pub async fn handle_store_memory(
         return Err(ServerError::ValidationError(
             "Memory produced no indexable content after processing".into(),
         ));
+    }
+
+    let near_duplicate_response = record_near_duplicate_flag(
+        &origin_db,
+        tuning.gate.log_rejections,
+        &doc_content_for_log,
+        doc_agent_for_log.as_deref(),
+        near_duplicate,
+    )
+    .await;
+    if let Some((_, warning)) = &near_duplicate_response {
+        warnings.push(warning.clone());
     }
 
     let persisted_space = origin_db
@@ -848,6 +919,7 @@ pub async fn handle_store_memory(
         space: persisted_space,
         space_source: Some(persisted_space_source),
         write_outcome: Some(WriteOutcome::Created),
+        near_duplicate: near_duplicate_response.map(|(near_duplicate, _)| near_duplicate),
     }))
 }
 
@@ -2315,6 +2387,209 @@ mod split_tests {
             /* memory_type_str */ "fact",
         );
         assert_eq!(extraction_method, "llm");
+    }
+}
+
+#[cfg(test)]
+mod novelty_store_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    async fn state_with_seed(
+        seed_content: &str,
+    ) -> (
+        Arc<RwLock<ServerState>>,
+        Arc<wenlan_core::db::MemoryDB>,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            wenlan_core::db::MemoryDB::new(tmp.path(), Arc::new(wenlan_core::events::NoopEmitter))
+                .await
+                .unwrap(),
+        );
+        db.upsert_documents(vec![wenlan_core::sources::RawDocument {
+            content: seed_content.to_string(),
+            source_id: "mem_existing".to_string(),
+            source: "memory".to_string(),
+            title: "Existing memory".to_string(),
+            last_modified: chrono::Utc::now().timestamp(),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db.clone()),
+            ..ServerState::default()
+        }));
+        (state, db, tmp)
+    }
+
+    fn store_request(content: &str, supersedes: Option<&str>) -> StoreMemoryRequest {
+        StoreMemoryRequest {
+            content: content.to_string(),
+            memory_type: None,
+            space: (None).into(),
+            source_agent: Some("soft-flag-test".to_string()),
+            title: None,
+            confidence: None,
+            supersedes: supersedes.map(str::to_string),
+            entity: None,
+            entity_id: None,
+            structured_fields: None,
+            retrieval_cue: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn near_duplicate_is_stored_with_flag_warning_and_rejection_log() {
+        let (state, db, _tmp) = state_with_seed("User prefers dark mode for all IDEs").await;
+        let response = handle_store_memory(
+            State(state),
+            HeaderMap::new(),
+            crate::space_header::SpaceHeader(None),
+            Json(store_request("User prefers dark mode for all IDEs.", None)),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let near_duplicate = response.near_duplicate.expect("soft flag is returned");
+        assert_eq!(near_duplicate.source_id, "mem_existing");
+        assert!(near_duplicate.similarity >= 0.75);
+        assert_eq!(response.write_outcome, Some(WriteOutcome::Created));
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("near_duplicate:")));
+
+        let rejections = db.get_rejections(10, Some("near_duplicate")).await.unwrap();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].rejection_reason, "near_duplicate");
+        let expected_detail = format!(
+            "stored with soft flag; similarity {:.2} to mem_existing",
+            near_duplicate.similarity
+        );
+        assert_eq!(
+            rejections[0].rejection_detail.as_deref(),
+            Some(expected_detail.as_str())
+        );
+        assert_eq!(
+            rejections[0].similar_to_source_id.as_deref(),
+            Some("mem_existing")
+        );
+        assert_eq!(
+            rejections[0].similarity_score,
+            Some(near_duplicate.similarity)
+        );
+    }
+
+    #[tokio::test]
+    async fn supersedes_target_is_excluded_from_soft_flag() {
+        let (state, _db, _tmp) = state_with_seed("User prefers dark mode for all IDEs").await;
+        let response = handle_store_memory(
+            State(state),
+            HeaderMap::new(),
+            crate::space_header::SpaceHeader(None),
+            Json(store_request(
+                "User prefers dark mode for all IDEs.",
+                Some("mem_existing"),
+            )),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(response.near_duplicate.is_none());
+        assert!(response
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("near_duplicate:")));
+    }
+
+    /// Both prior tests use `ServerState::default()`, which leaves
+    /// `ingest_batcher: None` — they only exercise `handle_store_memory`'s
+    /// synchronous fallback branch. Production traffic goes through the
+    /// coalesced `IngestBatcher` path instead (see `main.rs`'s
+    /// `ingest_batch_process`, spawned at startup). This test wires a real
+    /// `IngestBatcher` with a stub `BatchProcessFn` that returns
+    /// `StoreOutcome::Stored { near_duplicate: Some(..), .. }` — mirroring
+    /// what the real gate-backed process fn returns for a flagged doc — to
+    /// prove `handle_store_memory`'s batcher branch (the `StoreOutcome::Stored`
+    /// arm around memory_routes.rs:618) and `record_near_duplicate_flag` carry
+    /// the flag and warning into the HTTP response exactly like the fallback
+    /// branch already does.
+    #[tokio::test]
+    async fn near_duplicate_survives_the_batcher_round_trip() {
+        use crate::ingest_batcher::{BatcherConfig, IngestBatcher, StoreOutcome};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            wenlan_core::db::MemoryDB::new(tmp.path(), Arc::new(wenlan_core::events::NoopEmitter))
+                .await
+                .unwrap(),
+        );
+        db.upsert_documents(vec![wenlan_core::sources::RawDocument {
+            content: "User prefers dark mode for all IDEs".to_string(),
+            source_id: "mem_existing".to_string(),
+            source: "memory".to_string(),
+            title: "Existing memory".to_string(),
+            last_modified: chrono::Utc::now().timestamp(),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+
+        let process: crate::ingest_batcher::BatchProcessFn = Arc::new(|items| {
+            Box::pin(async move {
+                items
+                    .into_iter()
+                    .map(|_| StoreOutcome::Stored {
+                        chunks_created: 1,
+                        near_duplicate: Some(("mem_existing".to_string(), 0.95)),
+                    })
+                    .collect::<Vec<_>>()
+            })
+        });
+        let batcher = IngestBatcher::spawn(process, BatcherConfig::default());
+
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db.clone()),
+            ingest_batcher: Some(batcher),
+            ..ServerState::default()
+        }));
+
+        let response = handle_store_memory(
+            State(state),
+            HeaderMap::new(),
+            crate::space_header::SpaceHeader(None),
+            Json(store_request(
+                "Every month, on the third Tuesday, dark mode is the IDE preference.",
+                None,
+            )),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let near_duplicate = response
+            .near_duplicate
+            .expect("batcher path must carry the soft flag through");
+        assert_eq!(near_duplicate.source_id, "mem_existing");
+        assert_eq!(near_duplicate.similarity, 0.95);
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("near_duplicate:")));
+
+        let rejections = db.get_rejections(10, Some("near_duplicate")).await.unwrap();
+        assert_eq!(
+            rejections.len(),
+            1,
+            "record_near_duplicate_flag must log the flag from the batcher branch too"
+        );
+        assert_eq!(rejections[0].rejection_reason, "near_duplicate");
     }
 }
 

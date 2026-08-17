@@ -967,6 +967,12 @@ fn format_capture_success(resp: &StoreMemoryResponse) -> String {
         resp.space_source,
         resp.write_outcome,
     );
+    if let Some(near_duplicate) = &resp.near_duplicate {
+        msg.push_str(&format!(
+            "\nnear_duplicate: {} ({:.2})",
+            near_duplicate.source_id, near_duplicate.similarity
+        ));
+    }
     if !resp.warnings.is_empty() {
         msg.push_str("\nWarnings:");
         for warning in &resp.warnings {
@@ -2645,7 +2651,7 @@ impl WenlanMcpServer {
     }
 
     #[tool(
-        description = "List quality-gate rejections: memories the daemon discarded before storing due to duplication, low quality, or another filter. Use only to diagnose a missing capture or when the user asks what Wenlan rejected. Returns reason codes, detail, and similarity info; optional limit and reason filters narrow the audit.",
+        description = "List quality-gate flags and rejections: memories the daemon discarded before storing (low quality or another filter), plus near-duplicate memories that were stored anyway but logged for review (reason \"near_duplicate\"). Use only to diagnose a missing capture, a flagged near duplicate, or when the user asks what Wenlan rejected. Returns reason codes, detail, and similarity info; optional limit and reason filters narrow the audit.",
         annotations(
             title = "List rejections",
             read_only_hint = true,
@@ -3954,6 +3960,7 @@ mod tests {
             entity_id: Some("ent_xyz".into()),
             quality: Some("high".into()),
             warnings: vec![],
+            near_duplicate: None,
             extraction_method: "llm".into(),
             enrichment: String::new(),
             hint: String::new(),
@@ -3980,6 +3987,7 @@ mod tests {
             entity_id: None,
             quality: None,
             warnings: vec!["decision memory missing required 'claim' field".into()],
+            near_duplicate: None,
             extraction_method: "agent".into(),
             enrichment: String::new(),
             hint: String::new(),
@@ -4002,6 +4010,7 @@ mod tests {
             entity_id: None,
             quality: None,
             warnings: vec![],
+            near_duplicate: None,
             extraction_method: "agent".into(),
             enrichment: String::new(),
             hint: String::new(),
