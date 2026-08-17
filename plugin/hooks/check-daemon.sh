@@ -6,8 +6,27 @@
 # Hook never blocks (always exit 0) and never prints command soup.
 set -u
 
-URL="http://127.0.0.1:7878/api/health"
+URL="${WENLAN_HEALTH_URL:-http://127.0.0.1:7878/api/health}"
+W="${WENLAN_CLI:-$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")}"
 PLUGIN_JSON="${CLAUDE_PLUGIN_ROOT:-}/.claude-plugin/plugin.json"
+
+# Print a one-line outbox report when queued or failed writes exist. Silent
+# on any error (old CLI without the subcommand, no python3, bad JSON).
+report_outbox() {
+  [ -x "$W" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  status=$("$W" --format json outbox status 2>/dev/null) || return 0
+  printf '%s' "$status" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    q, f = d.get("queued", 0), d.get("failed", 0)
+    if q > 0 or f > 0:
+        print(f"[wenlan] outbox: {q} queued handoff write(s), {f} failed — run \`wenlan outbox status\`.")
+except Exception:
+    pass
+' 2>/dev/null
+}
 
 RESP=""
 for i in 1 2 3; do
@@ -17,10 +36,13 @@ done
 
 if [ -z "$RESP" ]; then
   cat <<MSG
-[wenlan] local runtime not running. Run /wenlan:setup to set up.
+[wenlan] local runtime not running. Handoff writes will queue in the outbox; run /wenlan:setup or \`wenlan background on\`.
 MSG
+  report_outbox
   exit 0
 fi
+
+report_outbox
 
 # Compare daemon version vs plugin manifest version. Silent unless mismatch.
 [ -r "$PLUGIN_JSON" ] || exit 0
