@@ -249,7 +249,7 @@ describe("FocusGraph", () => {
     const { container } = render(
       <FocusGraph detail={detail} onEntityClick={vi.fn()} fill memoriesCount={3} />,
     );
-    expect(screen.getByText("memories (3)")).toBeInTheDocument();
+    expect(screen.getByText("related memories (3)")).toBeInTheDocument();
     // The cluster hangs off the center on its own thin line: neighbor edge +
     // cluster line.
     expect(container.querySelectorAll("line")).toHaveLength(2);
@@ -258,7 +258,7 @@ describe("FocusGraph", () => {
 
     // Inline card (no fill): no cluster even with memories.
     render(<FocusGraph detail={detail} onEntityClick={vi.fn()} memoriesCount={3} />);
-    expect(screen.queryByText("memories (3)")).not.toBeInTheDocument();
+    expect(screen.queryByText("related memories (3)")).not.toBeInTheDocument();
 
     cleanup();
 

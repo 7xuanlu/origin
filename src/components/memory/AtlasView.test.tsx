@@ -782,9 +782,8 @@ describe("AtlasView", () => {
   });
 
   it("keeps degree-0 entities out of the drawn graph and reports them in the chip", async () => {
-    // The isolate ring is gone from this view: an unconnected entity is not
-    // drawn at all, it is counted. placeIsolateRing itself still exists and is
-    // still covered by its own tests in src/lib/graph/atlas.test.ts.
+    // The isolate ring is gone: an unconnected entity is not drawn at all,
+    // it is counted.
     mockConnectedPairWithIsolate();
 
     renderWithQuery(<AtlasView />);
@@ -1047,6 +1046,21 @@ describe("AtlasView", () => {
     }
   });
 
+  it("counts only regions whose hulls are drawn: a hidden small group adds none until it is shown", async () => {
+    mockStarWithSmallStar();
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    // The small star is its own community in the full model, but while its
+    // nodes are hidden nothing draws its hull — so it must not be counted.
+    expect(screen.getByText("5 entities · 1 region")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show small groups" }));
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(2));
+    expect(screen.getByText("9 entities · 2 regions")).toBeInTheDocument();
+  });
+
   it("starts hidden when the stored small-groups choice is malformed", async () => {
     window.localStorage.setItem("atlas.smallGroups", "{oops");
     mockStarWithSmallPair();
@@ -1273,6 +1287,54 @@ describe("AtlasView", () => {
     expect(screen.queryByText("This week")).not.toBeInTheDocument();
     // No gaps, no bridges, no recent relations — the rail column is gone.
     expect(screen.queryByRole("button", { name: "Show in Atlas →" })).not.toBeInTheDocument();
+  });
+
+  it("does not count a freshly saved page's old links as this week's new connections", async () => {
+    const entities = [makeEntity({ id: "e1", name: "Alice" }), makeEntity({ id: "e2", name: "Bob" })];
+    mockListEntities.mockResolvedValue(entities);
+    mockGetEntityDetail.mockImplementation(async (id: string) => {
+      if (id === "e1") {
+        return {
+          entity: entities[0],
+          observations: [],
+          relations: [
+            {
+              id: "rel-old",
+              relation_type: "knows",
+              direction: "outgoing" as const,
+              entity_id: "e2",
+              entity_name: "Bob",
+              entity_type: "person",
+              source_agent: null,
+              created_at: Math.floor(Date.now() / 1000) - 8 * 24 * 60 * 60,
+            },
+          ],
+        };
+      }
+      return { entity: entities[1], observations: [], relations: [] };
+    });
+    // Page-link edges borrow the page's last_modified (model.ts): a page saved
+    // today carries links that may be arbitrarily old, so they never count.
+    const today = new Date().toISOString();
+    mockPages(
+      [
+        makePage({ id: "p1", title: "Alpha", last_modified: today }),
+        makePage({ id: "p2", title: "Beta", last_modified: today }),
+      ],
+      [
+        { from: { kind: "page", id: "p1" }, to: { kind: "entity", id: "e1" }, link_type: "about" },
+        { from: { kind: "page", id: "p1" }, to: { kind: "page", id: "p2" }, link_type: "wikilink" },
+      ],
+    );
+
+    renderWithQuery(<AtlasView />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+
+    // The links are on the map — only the week card ignores them.
+    const graph = capturedSigmaInstances[0].graph;
+    expect(graph.hasEdge("page:p1", "e1")).toBe(true);
+    expect(graph.hasEdge("page:p1", "page:p2")).toBe(true);
+    expect(screen.queryByText("This week")).not.toBeInTheDocument();
   });
 
   it("focuses the search input on ⌘K", async () => {
@@ -1924,6 +1986,24 @@ describe("AtlasView", () => {
 
     // e3 is outside e1's neighborhood — the mounted reducer already dims it.
     expect(instance.settings.nodeReducer("e3", attrs)).not.toEqual(plain);
+  });
+
+  it("draws the small groups when focusEntityId sits in one, so the focus lands instead of silently vanishing", async () => {
+    mockStarWithSmallPair();
+
+    // A core entity as focus: the small pair stays hidden as usual.
+    const { unmount } = renderWithQuery(<AtlasView focusEntityId="e1" />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    expect(latestGraph().hasNode("p1")).toBe(false);
+    unmount();
+    capturedSigmaInstances.length = 0;
+
+    renderWithQuery(<AtlasView focusEntityId="p1" />);
+    await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
+    const instance = capturedSigmaInstances[0];
+    expect(instance.graph.hasNode("p1")).toBe(true);
+    expect(instance.graph.hasNode("p2")).toBe(true);
+    expect(instance.camera.setState).toHaveBeenCalledWith({ x: 0.42, y: 0.24, ratio: 1 });
   });
 
   it("renders a Back toolbar button only when onBack is passed, and clicking it fires the callback", async () => {

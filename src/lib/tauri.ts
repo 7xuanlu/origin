@@ -2802,8 +2802,17 @@ export interface CommunitySummary {
   projection_version: string;
 }
 
+/** The daemon's resolved read scope, mirrored from app/src/api.rs
+ *  `CommunityScope`: `{kind:"space", name}` for a registered Space, or
+ *  `{kind:"global"|"uncategorized"}` with no name at all. */
+export interface CommunityScope {
+  kind: string;
+  name?: string | null;
+}
+
 export interface CommunityListResponse {
   schema_version: string;
+  scope?: CommunityScope | null;
   communities: CommunitySummary[];
   next_cursor: string | null;
 }
@@ -2824,6 +2833,7 @@ export interface CommunityMemberCursor {
 
 export interface CommunityMembersResponse {
   schema_version: string;
+  scope?: CommunityScope | null;
   members: CommunityMember[];
   next_cursor: CommunityMemberCursor | null;
 }

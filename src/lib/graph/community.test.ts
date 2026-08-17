@@ -353,6 +353,45 @@ describe("fetchSpaceCartography", () => {
 
     expect(result).toEqual({ status: "partial-error", reason: "foreign-space" });
   });
+
+  // The daemon answers the literal "uncategorized" from its Uncategorized
+  // read scope, and every row then carries the unfiled-space sentinel UUID
+  // rather than the literal — the resolved scope, not the rows, vouches for it.
+  const UNFILED_SPACE_ID = "00000000-0000-4000-8000-000000000001";
+
+  it("accepts an uncategorized read whose rows carry the unfiled sentinel when the daemon resolved that scope", async () => {
+    mockListCommunities.mockResolvedValue(
+      communitiesPage({
+        scope: { kind: "uncategorized" },
+        communities: [summary({ space: UNFILED_SPACE_ID })],
+      }),
+    );
+    mockListCommunityMembers.mockResolvedValue(
+      membersPage({
+        scope: { kind: "uncategorized" },
+        members: [member({ node_id: "e1", space: UNFILED_SPACE_ID })],
+      }),
+    );
+
+    const result = await fetchSpaceCartography("uncategorized");
+
+    expect(result.status).toBe("ready");
+    expect(result.memberCommunityId?.get("e1")).toBe("c1");
+  });
+
+  it("still flags an uncategorized read the daemon resolved to some other scope as foreign-space", async () => {
+    mockListCommunities.mockResolvedValue(
+      communitiesPage({
+        scope: { kind: "space", name: "Work" },
+        communities: [summary({ space: "Work" })],
+      }),
+    );
+    mockListCommunityMembers.mockResolvedValue(membersPage());
+
+    const result = await fetchSpaceCartography("uncategorized");
+
+    expect(result).toEqual({ status: "partial-error", reason: "foreign-space" });
+  });
 });
 
 describe("fetchCartographyForSpaces / aggregateCartographyStatus", () => {

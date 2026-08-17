@@ -5,7 +5,12 @@ import {
   asCommunityApiError,
   COMMUNITY_READ_SCHEMA_VERSION,
 } from "../tauri";
-import type { CommunityMember, CommunityMemberCursor, CommunitySummary } from "../tauri";
+import type {
+  CommunityMember,
+  CommunityMemberCursor,
+  CommunityScope,
+  CommunitySummary,
+} from "../tauri";
 
 // D13/App-PR readiness contract: a space's durable community assignment is
 // authoritative only once BOTH cursor-paginated reads (communities, then
@@ -75,6 +80,23 @@ type PageResult<T> =
   /** The daemon does not know this space name — no durable data, not a fault. */
   | { unregisteredSpace: true };
 
+/**
+ * A daemon serving the wrong scope is the fault to catch. Ordinarily each
+ * row's own `space` must equal the requested name. The literal
+ * "uncategorized" is the exception: the daemon resolves it to its
+ * Uncategorized read scope and every row then carries the unfiled-space
+ * sentinel UUID, not the literal — so for that name only the resolved
+ * `scope.kind` can vouch for the page, and the per-row check is skipped.
+ */
+function isForeignSpace(
+  space: string,
+  scope: CommunityScope | null | undefined,
+  rows: { space: string }[],
+): boolean {
+  if (space === "uncategorized") return scope?.kind !== "uncategorized";
+  return rows.some((r) => r.space !== space);
+}
+
 async function fetchAllCommunities(space: string): Promise<PageResult<CommunitySummary>> {
   const rows: CommunitySummary[] = [];
   let cursor: string | null = null;
@@ -92,12 +114,7 @@ async function fetchAllCommunities(space: string): Promise<PageResult<CommunityS
     if (response.schema_version !== COMMUNITY_READ_SCHEMA_VERSION) {
       return { reason: "schema-mismatch" };
     }
-    // The daemon does send its resolved `scope`, and app/src/api.rs types it,
-    // but it is not on the TypeScript response interface, so nothing here can
-    // read it without widening that type. Checking each row's own `space`
-    // field catches the same fault — a daemon serving the wrong scope — from
-    // data the interface already declares, rather than mixing it in silently.
-    if (response.communities.some((c) => c.space !== space)) {
+    if (isForeignSpace(space, response.scope, response.communities)) {
       return { reason: "foreign-space" };
     }
     rows.push(...response.communities);
@@ -124,7 +141,7 @@ async function fetchAllMembers(space: string): Promise<PageResult<CommunityMembe
     if (response.schema_version !== COMMUNITY_READ_SCHEMA_VERSION) {
       return { reason: "schema-mismatch" };
     }
-    if (response.members.some((m) => m.space !== space)) {
+    if (isForeignSpace(space, response.scope, response.members)) {
       return { reason: "foreign-space" };
     }
     rows.push(...response.members);

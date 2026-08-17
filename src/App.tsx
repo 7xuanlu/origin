@@ -317,6 +317,7 @@ export default function App() {
               onBack={() => setPage(prevPage)}
               onEntityClick={(id) => setSelectedEntityId(id)}
               onMemoryClick={(sid) => { setSelectedMemoryId(sid); setSelectedPageId(null); setInitialView(null); setPage("home"); }}
+              onPageClick={(pageId) => { setSelectedPageId(pageId); setSelectedMemoryId(null); setInitialView(null); setPage("home"); }}
             />
           </div>
         )}
