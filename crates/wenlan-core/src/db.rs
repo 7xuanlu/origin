@@ -23415,6 +23415,10 @@ impl MemoryDB {
                 .map_err(|e| {
                     WenlanError::VectorDb(format!("delete_space move pages scope: {}", e))
                 })?;
+                // Fold the community/genesis substrate into the target too, so
+                // the moved entities keep their `relates` edges for grouping and
+                // no control row keeps naming the space deleted below.
+                space_rename::cascade_space_merge(&tx, name, target).await?;
                 #[cfg(test)]
                 page_drafts_test::transaction_test_hooks::after_space_cascade(&format!(
                     "delete_space:{name}"
@@ -23539,6 +23543,10 @@ impl MemoryDB {
         )
         .await
         .map_err(|e| WenlanError::VectorDb(format!("reassign pages scope: {}", e)))?;
+        // Fold the community/genesis substrate into the target too, so the
+        // moved entities keep their `relates` edges for grouping and the
+        // source's community rows do not outlive its content.
+        space_rename::cascade_space_merge(&tx, from, to).await?;
         #[cfg(test)]
         page_drafts_test::transaction_test_hooks::after_space_cascade(&format!(
             "reassign_memories_space:{from}"

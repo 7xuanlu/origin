@@ -4,7 +4,7 @@
 //! and genesis substrate, then check that identity is unchanged, that the new
 //! name resolves, and that no row still names the old space.
 
-use super::space_rename::{closed_tables, permanent_tables};
+use super::space_rename::{closed_tables, permanent_tables, space_id_bound_tables};
 use crate::db::tests::test_db;
 use crate::db::MemoryDB;
 
@@ -800,6 +800,151 @@ async fn every_space_keyed_table_is_accounted_for() {
         assert!(
             space_keyed.iter().any(|t| t == table),
             "{table} is in the closure but carries no `space` column"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Merge cascade (`reassign_memories_space`, `delete_space(_, "move:…")`).
+//
+// The same seeded substrate, folded into a LIVE second space rather than
+// renamed: edges follow the moved entities, the source's communities retire,
+// its re-derivable control rows go, and the target's grouping input sees the
+// moved edge.
+// ---------------------------------------------------------------------------
+
+async fn seeded_db_with_live_target() -> (MemoryDB, tempfile::TempDir) {
+    let (db, dir) = seeded_db().await;
+    db.create_space(NEW, None, false).await.unwrap();
+    (db, dir)
+}
+
+async fn assert_substrate_merged_into_target(db: &MemoryDB) {
+    let conn = db.conn.lock().await;
+    assert_eq!(
+        rows_naming(&conn, "edges", OLD).await,
+        0,
+        "an edge still names the source space after the merge"
+    );
+    assert_eq!(rows_naming(&conn, "edges", NEW).await, 1);
+
+    let mut rows = conn
+        .query(
+            "SELECT space, retired_at FROM communities WHERE community_id = 'com-1'",
+            (),
+        )
+        .await
+        .unwrap();
+    let community = rows.next().await.unwrap().unwrap();
+    assert_eq!(community.get::<String>(0).unwrap(), OLD);
+    assert!(
+        community.get::<Option<i64>>(1).unwrap().is_some(),
+        "the source community must be retired, not left live under the old name"
+    );
+    drop(rows);
+
+    for table in closed_tables() {
+        if table == "communities" || table == "edges" {
+            continue;
+        }
+        let expected = if space_id_bound_tables().contains(&table) {
+            1
+        } else {
+            0
+        };
+        assert_eq!(
+            rows_naming(&conn, table, OLD).await,
+            expected,
+            "{table} rows naming the source space after the merge"
+        );
+    }
+    for table in permanent_tables() {
+        if space_id_bound_tables().contains(&table) {
+            continue;
+        }
+        assert_eq!(
+            rows_naming(&conn, table, NEW).await,
+            1,
+            "permanent {table} row did not follow the merge"
+        );
+    }
+
+    let mut rows = conn
+        .query(
+            "SELECT dirty FROM space_graph_state WHERE space = ?1",
+            libsql::params![NEW],
+        )
+        .await
+        .unwrap();
+    let dirty: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(
+        dirty, 1,
+        "the target must be re-grouped over the merged input"
+    );
+    drop(rows);
+    drop(conn);
+
+    let (edges, _) = db.load_community_ungrounded_edges_paged(NEW).await.unwrap();
+    let ids: Vec<&str> = edges.iter().map(|e| e.edge_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["edge-1"],
+        "the target's grouping input must see the moved edge"
+    );
+}
+
+#[tokio::test]
+async fn reassigning_memories_merges_the_substrate_into_the_target() {
+    let (db, _dir) = seeded_db_with_live_target().await;
+    db.reassign_memories_space(OLD, NEW).await.unwrap();
+    assert!(db.get_space(OLD).await.unwrap().is_some());
+    assert_substrate_merged_into_target(&db).await;
+}
+
+#[tokio::test]
+async fn deleting_a_space_with_move_merges_the_substrate_into_the_target() {
+    let (db, _dir) = seeded_db_with_live_target().await;
+    db.delete_space(OLD, &format!("move:{NEW}")).await.unwrap();
+    assert!(db.get_space(OLD).await.unwrap().is_none());
+    assert_substrate_merged_into_target(&db).await;
+}
+
+#[tokio::test]
+async fn permanent_genesis_rows_on_both_sides_refuse_the_merge_without_mutating_either() {
+    let (db, _dir) = seeded_db_with_live_target().await;
+    {
+        let conn = db.conn.lock().await;
+        seed_destination_genesis(&conn).await;
+    }
+
+    let error = db
+        .reassign_memories_space(OLD, NEW)
+        .await
+        .expect_err("two genesis histories must not be spliced");
+    assert!(
+        error.to_string().contains("permanent genesis rows"),
+        "merge was refused for the wrong reason: {error}"
+    );
+
+    let conn = db.conn.lock().await;
+    for table in closed_tables() {
+        assert_eq!(
+            rows_naming(&conn, table, OLD).await,
+            1,
+            "source row in {table} was not rolled back"
+        );
+    }
+    assert_eq!(rows_naming(&conn, "pages", OLD).await, 2);
+    for table in [
+        "genesis_candidates",
+        "genesis_coverage_state",
+        "genesis_group_coverage",
+        "genesis_frontier",
+    ] {
+        assert_eq!(
+            rows_naming(&conn, table, NEW).await,
+            1,
+            "destination row in {table} changed during the refused merge"
         );
     }
 }

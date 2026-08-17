@@ -123,6 +123,16 @@ const PERMANENT_GENESIS_TABLES: &[&str] = &[
 /// space rename creates that name.
 const DESTINATION_ORPHANS_TO_RETIRE: &[&str] = &["genesis_refresh_jobs"];
 
+/// Permanent M6 rows whose identity is `spaces.id`, not the name. Migration
+/// 109's identity triggers (`m6/remaining_substrate.rs`) refuse an `UPDATE …
+/// SET space` to a name whose `spaces.id` differs from the row's `space_id`,
+/// and refuse every `DELETE`, so a merge into a live space can neither move
+/// nor retire them. A rename keeps the id and passes; a merge leaves them
+/// under the source name — the retained-proof posture `delete_space(_,
+/// "keep")` already has, locked by
+/// `delete_keep_cannot_authorize_proof_parking_and_zero_reset`.
+const SPACE_ID_BOUND_TABLES: &[&str] = &["genesis_coverage_state", "m6_counters"];
+
 /// Rewrite every space-keyed row from `old_name` to `new_name` inside the
 /// caller's transaction. The caller must already have renamed the `spaces` row
 /// and cascaded `memories`, `entities`, and `pages` (see the `edges` fence
@@ -197,6 +207,118 @@ pub(super) async fn cascade_space_rename(
     Ok(())
 }
 
+/// Fold every space-keyed row from `old_name` into the LIVE space
+/// `target_name` inside the caller's transaction, after the memories/pages
+/// cascade (see the `edges` fence above). This is a merge, not a rename: the
+/// destination has rows of its own that must survive, so nothing under
+/// `target_name` is retired. Over the same `CLOSURE`, per table: `edges` are
+/// re-keyed to the target; `communities` are retired the way
+/// `finalize_community_grouping` retires a superseded generation; re-derivable
+/// community/genesis control rows are dropped; permanent genesis rows move
+/// only when the target holds none (a merge must not splice two spaces'
+/// histories, so both sides carrying rows refuses the whole operation before
+/// anything is written); `SPACE_ID_BOUND_TABLES` stay put. Finally the target
+/// is marked dirty so grouping re-runs over the merged input.
+pub(super) async fn cascade_space_merge(
+    tx: &libsql::Transaction,
+    old_name: &str,
+    target_name: &str,
+) -> Result<(), WenlanError> {
+    for table in PERMANENT_GENESIS_TABLES {
+        if SPACE_ID_BOUND_TABLES.contains(table) {
+            continue;
+        }
+        if has_rows_naming(tx, table, old_name).await?
+            && has_rows_naming(tx, table, target_name).await?
+        {
+            return Err(WenlanError::Validation(format!(
+                "both {old_name:?} and {target_name:?} carry permanent genesis rows in {table}; \
+                 refusing to merge their histories"
+            )));
+        }
+    }
+
+    // `edges` goes first, out of CLOSURE order: `m4_grouping_edge_update`
+    // (db.rs `m4_grouping_edge_update`) re-materialises the `space_graph_state`
+    // row of OLD.space when a grounded edge changes space, so that row can only
+    // be retired once the edge rewrite is done.
+    tx.execute(
+        "UPDATE edges SET space = ?1 WHERE space = ?2",
+        libsql::params![target_name, old_name],
+    )
+    .await
+    .map_err(|e| WenlanError::VectorDb(format!("space merge cascade edges: {e}")))?;
+
+    let now = chrono::Utc::now().timestamp();
+    for (table, _) in CLOSURE {
+        match *table {
+            "edges" => {}
+            "communities" => {
+                tx.execute(
+                    "UPDATE communities SET retired_at = ?2, updated_at = ?2 \
+                     WHERE space = ?1 AND retired_at IS NULL",
+                    libsql::params![old_name, now],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("space merge retire communities: {e}"))
+                })?;
+            }
+            table if SPACE_ID_BOUND_TABLES.contains(&table) => {}
+            table if PERMANENT_GENESIS_TABLES.contains(&table) => {
+                tx.execute(
+                    &format!("UPDATE {table} SET space = ?1 WHERE space = ?2"),
+                    libsql::params![target_name, old_name],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("space merge cascade {table}: {e}")))?;
+            }
+            table => {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE space = ?1"),
+                    libsql::params![old_name],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("space merge retire {table}: {e}")))?;
+            }
+        }
+    }
+
+    // Same shape as `m4_grouping_entity_update`'s destination upsert, so a
+    // merge that moved no entity page still invalidates the target's grouping.
+    tx.execute(
+        "INSERT INTO space_graph_state
+             (space, graph_generation, grouping_generation, published_generation, dirty)
+         VALUES (?1, 0, 1, NULL, 1)
+         ON CONFLICT(space) DO UPDATE SET
+             grouping_generation = grouping_generation + 1,
+             dirty = 1",
+        libsql::params![target_name],
+    )
+    .await
+    .map_err(|e| WenlanError::VectorDb(format!("space merge dirty target: {e}")))?;
+    Ok(())
+}
+
+async fn has_rows_naming(
+    tx: &libsql::Transaction,
+    table: &str,
+    space: &str,
+) -> Result<bool, WenlanError> {
+    let mut rows = tx
+        .query(
+            &format!("SELECT 1 FROM {table} WHERE space = ?1 LIMIT 1"),
+            libsql::params![space],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("space merge inspect {table}: {e}")))?;
+    Ok(rows
+        .next()
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("space merge inspect {table}: {e}")))?
+        .is_some())
+}
+
 /// Every table the closure covers, for the teeth.
 #[cfg(test)]
 pub(super) fn closed_tables() -> Vec<&'static str> {
@@ -208,4 +330,10 @@ pub(super) fn closed_tables() -> Vec<&'static str> {
 #[cfg(test)]
 pub(super) fn permanent_tables() -> Vec<&'static str> {
     PERMANENT_GENESIS_TABLES.to_vec()
+}
+
+/// Permanent M6 rows a merge leaves under the source name.
+#[cfg(test)]
+pub(super) fn space_id_bound_tables() -> Vec<&'static str> {
+    SPACE_ID_BOUND_TABLES.to_vec()
 }
