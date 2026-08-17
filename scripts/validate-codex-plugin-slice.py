@@ -60,7 +60,7 @@ REQUIRED_SKILL_INTERFACE = {
         "short_description": "Set up and verify the local Wenlan runtime and MCP bridge",
     },
 }
-SKILLS_WITHOUT_MCP_REFERENCE = {"help", "pages"}
+SKILLS_WITHOUT_MCP_REFERENCE = {"handoff", "help", "pages"}
 SKILLS_USING_RESOLVER = {"brief", "capture", "distill", "handoff", "lint", "recall"}
 REQUIRED_GUARDRAILS = {
     "forget": [

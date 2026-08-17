@@ -4,7 +4,7 @@ description: >
   End a work session. Stores durable captures, writes a narrative session log,
   and automatically applies typed item-level deltas to the current Space Brief.
   Invoked as `/handoff`.
-allowed-tools: ["Bash", "mcp__plugin_wenlan_wenlan__capture", "mcp__plugin_wenlan_wenlan__list_pending"]
+allowed-tools: ["Bash"]
 ---
 
 # /handoff
@@ -32,7 +32,8 @@ if [ -n "$repo" ]; then
 else
   project=""
 fi
-resolved="$("$CLAUDE_PLUGIN_ROOT/bin/resolve-space.sh" --cwd "$PWD" 2>/dev/null)"
+handoff_arg="<the Space name passed to /handoff, empty when none>"
+resolved="$("$CLAUDE_PLUGIN_ROOT/bin/resolve-space.sh" --cwd "$PWD" --arg "$handoff_arg" 2>/dev/null)"
 space="$(printf '%s\n' "$resolved" | cut -f1)"
 source_layer="$(printf '%s\n' "$resolved" | cut -f2)"
 if [ -z "$space" ] && [ -n "$project" ]; then
@@ -40,6 +41,9 @@ if [ -z "$space" ] && [ -n "$project" ]; then
   source_layer="cwd-repo-new"
 fi
 ```
+
+If the user passed a Space name (`/wenlan:handoff <space>`), pass it as
+`--arg <space>` to resolve-space.sh.
 
 Print `space` and `source_layer`. Explicit pins, defaults, and mappings still
 win. `cwd-repo-new` is the approved first-handoff fallback: use the canonical
@@ -49,7 +53,9 @@ Do not invent any other Space name.
 Outside a Git repository, do not derive a new Space from the directory
 basename. If resolution still leaves `space` empty, skip the Brief read and
 typed update, do not issue Space-scoped captures, and continue with the
-unscoped session log and any unscoped durable captures.
+unscoped session log and any unscoped durable captures. Outside a Git
+repository, a pin, explicit argument, default, or mapping still resolves a
+Space, and the Brief update and captures still run.
 
 ## 2. Read the Brief before composing deltas
 
@@ -57,6 +63,7 @@ unscoped session log and any unscoped durable captures.
 W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
 brief_before=""
 brief_absent=0
+daemon_down=0
 if [ -n "$space" ]; then
   if [ "$source_layer" = "cwd-repo-new" ]; then
     space_probe_status=0
@@ -66,12 +73,27 @@ if [ -n "$space" ]; then
       source_layer="cwd-repo"
     elif [ "$space_probe" = "Error: space '$space' not found" ]; then
       brief_absent=1
+    elif printf '%s' "$space_probe" | grep -qE 'tcp connect error|daemon not reachable'; then
+      daemon_down=1
+      brief_before=""
+      echo "wenlan daemon unreachable — this handoff will queue its writes"
     else
       printf "%s\n" "$space_probe" >&2
       exit "$space_probe_status"
     fi
   else
-    brief_before="$("$W" --format json --space "$space" brief)"
+    brief_status=0
+    brief_output="$("$W" --format json --space "$space" brief 2>&1)" || brief_status=$?
+    if [ "$brief_status" -eq 0 ]; then
+      brief_before="$brief_output"
+    elif printf '%s' "$brief_output" | grep -qE 'tcp connect error|daemon not reachable'; then
+      daemon_down=1
+      brief_before=""
+      echo "wenlan daemon unreachable — this handoff will queue its writes"
+    else
+      printf "%s\n" "$brief_output" >&2
+      exit "$brief_status"
+    fi
   fi
 fi
 ```
@@ -91,16 +113,32 @@ typed update may then create the Space and Brief.
 
 ## 3. Preview pending captures and gather evidence
 
-Call `mcp__plugin_wenlan_wenlan__list_pending(limit=50)`. Filter by
-`created_at >= last_handoff_at`, or 12 hours ago when absent. Show at most three
-when any match, then continue automatically; `/curate captures` remains opt-in.
+Best-effort; skip silently when `daemon_down=1` or the command fails:
+
+```bash
+"$W" --format json --space "$space" memories --pending -l 50
+```
+
+Filter by `created_at >= last_handoff_at`, or 12 hours ago when absent. Show
+at most three when any match, then continue automatically; `/curate captures`
+remains opt-in.
 
 For a repository, inspect a bounded recent log, short status, diff stat, and
 worktree list. Combine that evidence with the conversation. Draft atomic
 captures only for durable decisions, lessons, gotchas, corrections,
 preferences, and facts. Skip transient or git-recoverable state.
 
-## 4. Build and apply one typed Brief update
+## 4. Write the session log
+
+Write `~/.wenlan/sessions/<YYYY-MM-DD-HHmm>-<slug>.md` with Accomplished,
+Decisions, Lessons & Gotchas, Open Threads, Captures stored, and Git summary.
+This is narrative history, not current-work authority. It is a plain file and
+must never depend on the daemon, so write it before the Brief update.
+
+Best-effort commit the logical `~/.wenlan/` file batch; do not fail if no
+repository is configured or a commit races.
+
+## 5. Build and apply one typed Brief update
 
 Compare the session outcome with `brief_before` and write one
 `BriefUpdateRequest` JSON file:
@@ -118,7 +156,11 @@ Compare the session outcome with `brief_before` and write one
 }
 ```
 
-Use the existing Brief version instead of `0` when present.
+Use the existing Brief version instead of `0` when present. When
+`daemon_down=1`, use `expected_version: 0` — the daemon reconciles the
+summary version when it replays the queued file — and author only `add`
+mutations; do not author `edit`, `move`, `set_gate`, or `complete` without a
+Brief snapshot.
 If `space` is empty, skip this typed update entirely.
 
 - `add`: genuinely new open work, in `active` or `backlog`, with an optional
@@ -138,38 +180,34 @@ Apply exactly once:
 ```
 
 Do not ask approval for this normal handoff update. Interpret `applied`,
-`conflicts`, `projection_path`, and `warnings` independently. Non-overlapping
-changes may commit while a stale same-item delta conflicts. Re-read before any
-safe mechanical reconciliation; never guess.
+`conflicts`, `projection_path`, and `warnings` independently. A `"status":
+"queued"` result is success-queued: record the outbox path and report it as
+queued, not applied. Non-overlapping changes may commit while a stale
+same-item delta conflicts. Re-read before any safe mechanical reconciliation;
+never guess.
 
 Apply the Brief update before Space-scoped captures when this fallback is new.
 That creates the basename Space through the typed handoff path without making a
 read or a capture create state. If this first update fails, stop Space-scoped
-captures and report the exact failure.
+captures and report the exact failure. A queued result is not a failure.
 
-## 5. Store durable captures
+## 6. Store durable captures
 
-For each drafted durable item, call:
+For each drafted durable item, run one command:
 
-```text
-mcp__plugin_wenlan_wenlan__capture(
-  content="<self-contained statement with why>",
-  memory_type="<decision|lesson|gotcha|preference|fact>",
-  space="<resolved Space>"
-)
+```bash
+"$W" --format json --space "$space" capture -t <type> "<content>"
 ```
 
-Use one atomic item per call. Do not ask about ordinary captures. Pause only
-for a contradiction, critical incident, irreversible production action, or
-genuine durability ambiguity.
+Use one atomic item per call. A `"status": "queued"` result counts as
+queued, not failed — record the path. Do not ask about ordinary captures.
+Pause only for a contradiction, critical incident, irreversible production
+action, or genuine durability ambiguity.
 
-## 6. Write the session log and report
+## 7. Report
 
-Write `~/.wenlan/sessions/<YYYY-MM-DD-HHmm>-<slug>.md` with Accomplished,
-Decisions, Lessons & Gotchas, Open Threads, Captures stored, and Git summary.
-This is narrative history, not current-work authority.
-
-Best-effort commit the logical `~/.wenlan/` file batch; do not fail if no
-repository is configured or a commit races. Report capture counts, session-log
-path, applied/conflicted Brief deltas, Brief version, and projection path or
-warning.
+Report capture counts (stored vs queued), session-log path,
+applied/conflicted/queued Brief deltas, Brief version or outbox path, and
+projection path or warning. When anything queued, add: `N handoff write(s)
+queued in the outbox — they apply when the daemon is back (`wenlan outbox
+status`).`

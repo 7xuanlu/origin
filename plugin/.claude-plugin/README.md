@@ -60,7 +60,7 @@ Reload the plugin (`/reload-plugins`) and the wrapper picks the local binary on 
 /handoff    end-of-session debrief
 ```
 
-A `SessionStart` hook (`hooks/check-daemon.sh`) probes the local runtime at `127.0.0.1:7878`. If down, it prints a single line: `local runtime not running. Run /wenlan:setup to set up.` The skill owns the install logic — the hook is just a nudge. Hook never blocks the session.
+A `SessionStart` hook (`hooks/check-daemon.sh`) probes the local runtime at `127.0.0.1:7878`. If down, it prints a single line: `local runtime not running. Handoff writes will queue in the outbox; run /wenlan:setup or \`wenlan background on\`.` The skill owns the install logic — the hook is just a nudge. Hook never blocks the session.
 
 ## Where your data lives
 
