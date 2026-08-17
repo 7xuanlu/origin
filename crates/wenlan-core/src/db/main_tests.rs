@@ -46685,6 +46685,60 @@ async fn archive_entity_retracts_its_edges_so_rename_and_rebind_succeed_and_rest
     );
 }
 
+/// Restore is order-independent when both endpoints were archived. The
+/// stamp names the entity whose archive retired the edge (A); B's archive
+/// finds the edge already retired and stamps nothing. Restoring A first must
+/// leave the edge retired (B is still archived, the fence says no) but keep
+/// the stamp; restoring B then brings it back. Restoring in the other order
+/// works the same way.
+#[tokio::test]
+async fn restore_entity_reactivates_shared_edge_regardless_of_restore_order() {
+    let (db, _dir) = test_db().await;
+    let edge_id = seed_linked_entity_pair(&db, "ord", "work").await;
+
+    assert!(db.archive_entity("ord-a").await.unwrap());
+    assert!(db.archive_entity("ord-b").await.unwrap());
+    let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
+    assert!(valid_until.is_some());
+    assert_eq!(
+        tag.as_deref(),
+        Some("ord-a"),
+        "first archive stamps the edge"
+    );
+
+    // A first: the other endpoint is still archived, so the fence refuses the
+    // re-activation and the row stays retired *and stamped*.
+    assert!(db.restore_entity("ord-a").await.unwrap());
+    let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
+    assert!(
+        valid_until.is_some(),
+        "an edge whose other endpoint is still archived must stay retired"
+    );
+    assert_eq!(
+        tag.as_deref(),
+        Some("ord-a"),
+        "the stamp survives a refused restore"
+    );
+
+    // B second: the edge is incident to B, so B's restore picks it up even
+    // though the stamp names A.
+    assert!(db.restore_entity("ord-b").await.unwrap());
+    let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
+    assert!(
+        valid_until.is_none(),
+        "restoring the second endpoint re-activates the shared edge"
+    );
+    assert!(tag.is_none());
+    assert_eq!(
+        db.entity_link_summary("ord-a").await.unwrap().active_edges,
+        1
+    );
+    assert_eq!(
+        db.entity_link_summary("ord-b").await.unwrap().active_edges,
+        1
+    );
+}
+
 /// KG review 2026-08-16 #2, the permanent half: delete retracts the edges too
 /// (untagged -- there is nothing to restore), and a rename still succeeds.
 #[tokio::test]

@@ -624,6 +624,8 @@ enum Command {
     /// Internal maintenance: archive entity pages whose names the admission
     /// gate refuses (quantities, paths, filenames, shas, test residue).
     /// Daemon must be stopped first. Dry run unless `--apply`.
+    /// `--restore <ENTITY_ID>` un-archives one entity (repeatable) and
+    /// re-activates the edges the archive retracted.
     #[command(name = "prune-junk-entities", hide = true)]
     PruneJunkEntities {
         /// Archive the listed pages. Without it this only prints them.
@@ -633,6 +635,10 @@ enum Command {
         /// names, URLs). Off by default: those are ambiguous, not junk.
         #[arg(long)]
         include_review: bool,
+        /// Un-archive this entity id (repeatable) instead of scanning; the
+        /// edges its archive retracted come back with it.
+        #[arg(long, value_name = "ENTITY_ID", conflicts_with_all = ["apply", "include_review"])]
+        restore: Vec<String>,
     },
 }
 
@@ -956,7 +962,14 @@ async fn main() -> anyhow::Result<()> {
             Some(Command::PruneJunkEntities {
                 apply,
                 include_review,
-            }) => cmd_prune_junk_entities::run(apply, include_review).await,
+                restore,
+            }) => {
+                if restore.is_empty() {
+                    cmd_prune_junk_entities::run(apply, include_review).await
+                } else {
+                    cmd_prune_junk_entities::restore(&restore).await
+                }
+            }
             None => run_daemon(startup_repair_claim).await,
         }
     }

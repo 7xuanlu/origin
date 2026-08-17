@@ -15988,7 +15988,12 @@ impl MemoryDB {
         let result: Result<(u64, u64, u64, Vec<CommunityGenerationUpdate>), WenlanError> = async {
             // (a) Orphan entity edges. The stamp resolves to the archived
             // endpoint's entity id (source side first), NULL when the
-            // orphaned endpoint has no shadow page at all.
+            // orphaned endpoint has no shadow page at all. Legacy-lineage
+            // rows are skipped on purpose: the fence never fires on them
+            // (its WHEN excludes `lineage='legacy'`) and typed readers do
+            // not load them, so they cannot cause the aborts this step
+            // repairs. The live archive path retracts every lineage; that
+            // is a stricter policy for new archives, not a repair target.
             let mut rows = conn
                 .query(
                     "SELECT e.edge_id, \
@@ -35646,13 +35651,15 @@ impl MemoryDB {
     }
 
     /// Un-archive an entity: flip its `kind='entity'` shadow page back to
-    /// `active` and re-activate the edges [`Self::archive_entity`] retired
-    /// for it (the rows stamped `payload.$.retired_by_archive = <entity
-    /// id>`). Reversibility is the archive lane's contract, so this is the
-    /// other half of the same operation. An edge whose OTHER endpoint has
-    /// since moved to another space (or gone) would trip the space fence on
-    /// re-activation; that row is logged and left retired rather than
-    /// failing the restore -- the fence is right that it must not come back.
+    /// `active` and re-activate the archive-retired edges incident to it
+    /// (rows stamped `payload.$.retired_by_archive`, whichever endpoint's
+    /// archive stamped them). Reversibility is the archive lane's contract,
+    /// so this is the other half of the same operation. An edge whose OTHER
+    /// endpoint is still archived, has moved to another space, or is gone
+    /// trips the space fence on re-activation; that row is logged and left
+    /// retired (still stamped) rather than failing the restore -- the fence
+    /// is right that it must not come back yet, and restoring the other
+    /// endpoint later picks it up. Any other per-row error propagates.
     ///
     /// Returns true when a page moved from archived to active, false when the
     /// entity has no shadow page or was not archived.
@@ -35688,7 +35695,9 @@ impl MemoryDB {
                 .query(
                     "SELECT edge_id FROM edges \
                      WHERE valid_until IS NOT NULL AND superseded_by IS NULL \
-                       AND json_extract(payload, '$.retired_by_archive') = ?1 \
+                       AND json_extract(payload, '$.retired_by_archive') IS NOT NULL \
+                       AND ((src_kind = 'entity' AND src_id = ?1) \
+                            OR (dst_kind = 'entity' AND dst_id = ?1)) \
                      ORDER BY edge_id",
                     libsql::params![entity_id],
                 )
@@ -35720,12 +35729,17 @@ impl MemoryDB {
                     .await
                 {
                     Ok(_) => {}
-                    Err(e) => {
+                    Err(e) if e.to_string().contains("edges_space_fence") => {
                         log::warn!(
                             "[restore_entity] edge {edge_id} left retired: re-activation refused \
                              ({e})"
                         );
                         continue;
+                    }
+                    Err(e) => {
+                        return Err(WenlanError::VectorDb(format!(
+                            "restore_entity edge {edge_id}: {e}"
+                        )));
                     }
                 }
                 let mut rows = conn

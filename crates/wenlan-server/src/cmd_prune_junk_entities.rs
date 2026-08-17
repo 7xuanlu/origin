@@ -17,7 +17,10 @@
 //! Dry run is the default, and `--apply` archives rather than deletes: the
 //! shadow page flips to `status='archived'`, which hides the entity from every
 //! reader while leaving the row, its observations, its aliases, and its memory
-//! links in place and restorable.
+//! links in place; its live edges are retracted alongside it, stamped so they
+//! come back. `--restore <ENTITY_ID>` is the way back: it un-archives the
+//! entity and re-activates those edges (a bare `UPDATE pages SET status`
+//! would bring the entity back with none of its relations).
 //!
 //! Like the other one-off commands here, it refuses to run while the daemon is
 //! up, so it never writes to a live WAL.
@@ -40,7 +43,9 @@ struct Candidate {
     links: EntityLinkSummary,
 }
 
-pub async fn run(apply: bool, include_review: bool) -> Result<()> {
+/// Open the store the way every one-off command here does: daemon down,
+/// data-root lock held for the life of the returned guard.
+async fn open_store() -> Result<(MemoryDB, super::DaemonDataLock)> {
     super::cmd_backfill::check_service_unloaded()?;
     super::cmd_backfill::check_daemon_not_running().await?;
 
@@ -52,11 +57,52 @@ pub async fn run(apply: bool, include_review: bool) -> Result<()> {
                 .join("wenlan")
         });
     let data_dir = wenlan_root.join("memorydb");
-    let _data_root_lock = super::DaemonDataLock::acquire(&wenlan_root, true)?;
+    let data_root_lock = super::DaemonDataLock::acquire(&wenlan_root, true)?;
 
     let db = MemoryDB::new(&data_dir, Arc::new(NoopEmitter))
         .await
         .with_context(|| format!("opening MemoryDB at {}", data_dir.display()))?;
+    Ok((db, data_root_lock))
+}
+
+/// `--restore <ENTITY_ID>`: un-archive each entity and re-activate the edges
+/// its archive retracted. Reports per id; an id that is not archived (or does
+/// not exist) is a no-op, not an error.
+pub async fn restore(entity_ids: &[String]) -> Result<()> {
+    let (db, _data_root_lock) = open_store().await?;
+    let mut restored = 0usize;
+    for id in entity_ids {
+        let before = db
+            .entity_link_summary(id)
+            .await
+            .with_context(|| format!("link summary for {id}"))?;
+        if db
+            .restore_entity(id)
+            .await
+            .with_context(|| format!("restoring entity {id}"))?
+        {
+            let after = db
+                .entity_link_summary(id)
+                .await
+                .with_context(|| format!("link summary for {id}"))?;
+            println!(
+                "restored {id}: active edges {} -> {}",
+                before.active_edges, after.active_edges
+            );
+            restored += 1;
+        } else {
+            println!("skipped {id}: no archived entity page with that id");
+        }
+    }
+    println!(
+        "Restored {restored} of {} entity page(s).",
+        entity_ids.len()
+    );
+    Ok(())
+}
+
+pub async fn run(apply: bool, include_review: bool) -> Result<()> {
+    let (db, _data_root_lock) = open_store().await?;
 
     let candidates = collect_candidates(&db).await?;
     if candidates.is_empty() {
@@ -120,7 +166,8 @@ pub async fn run(apply: bool, include_review: bool) -> Result<()> {
 
     print!(
         "Archive {} entity page(s)? Observations, aliases, and memory links are kept; live \
-         edges are retracted and come back on restore. (y/N): ",
+         edges are retracted and come back with `prune-junk-entities --restore <ENTITY_ID>`. \
+         (y/N): ",
         targets.len()
     );
     io::stdout().flush().ok();
@@ -145,7 +192,8 @@ pub async fn run(apply: bool, include_review: bool) -> Result<()> {
     }
     println!(
         "Archived {archived} entity page(s). Nothing was deleted; each entity's live edges were \
-         retracted alongside it, and restoring the entity re-activates them."
+         retracted alongside it. To bring one back with its edges: \
+         `prune-junk-entities --restore <ENTITY_ID>`."
     );
     Ok(())
 }
