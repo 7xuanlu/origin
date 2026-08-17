@@ -3229,7 +3229,7 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        1015,
+        1020,
         "PR-D integration must expose the frozen 967 support calls, the 6 PR-D test identities, \
          the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, \
          the 7 G6 BindPageLink repair-test calls (G6 Stage 2 PR 2b, item 3: \
@@ -3310,7 +3310,14 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
          carries the behavior on its own; +4 calls added for the new \
          alias_collision lint check's own fixtures, lint/deep_test.rs's \
          alias_collision_inventory_flags_the_same_alias_on_two_active_pages and \
-         alias_collision_inventory_is_silent_on_a_clean_store"
+         alias_collision_inventory_is_silent_on_a_clean_store; plus the net +5 KG-review \
+         2026-08-16 PR D calls: kg_quality.rs's \
+         fold_relation_type_merges_provenance_and_ledgers_the_loser gains one TestDbRow::get \
+         (finding #11: it now reads json_extract(payload,'$.source_memory_id') off the canonical \
+         edge to prove provenance survives the fold), and the new vocab re-type acceptance test \
+         synthesis/refinement_queue.rs::apply_refinement_vocab_promote_retypes_proposing_entities \
+         contributes a test_primary_session / TestDbSession::query / TestDbRows::next / \
+         TestDbRow::get chain reading the shadow page's entity_type after the promote"
     );
 }
 
