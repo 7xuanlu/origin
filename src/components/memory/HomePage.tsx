@@ -4,7 +4,6 @@ import { useQuery } from "@tanstack/react-query";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import {
-  getEntitySuggestions,
   getMemoryStats,
   listEntities,
   listRecentChanges,
@@ -643,12 +642,6 @@ function HomeContextRail({
     queryFn: () => listEntities(),
     staleTime: 60_000,
   });
-  // Same cache key/shape as EntitySuggestions' fetch — shared cache.
-  const suggestionsQuery = useQuery({
-    queryKey: ["entity-suggestions"],
-    queryFn: getEntitySuggestions,
-    staleTime: 60_000,
-  });
   const pagesUpdatedToday = updatedTodayCount(pages);
 
   return (
@@ -701,17 +694,7 @@ function HomeContextRail({
             testId="entities"
             label={t("home.entities")}
             total={entitiesQuery.data ? String(entitiesQuery.data.length) : "—"}
-            deltas={
-              (suggestionsQuery.data?.length ?? 0) > 0
-                ? [
-                    {
-                      text: t("home.deltaSuggested", { value: String(suggestionsQuery.data!.length) }),
-                      tone: "sage",
-                      testId: "wiki-context-entities-delta",
-                    },
-                  ]
-                : []
-            }
+            deltas={[]}
           />
         </div>
       </section>

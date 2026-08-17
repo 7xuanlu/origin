@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 use tower::ServiceExt;
 use wenlan_core::truth_contract::{CONTRACT_HEADER, INTENT_HEADER};
 use wenlan_server::{router::build_router, state::ServerState};
-use wenlan_types::entities::{EntityDetail, EntitySuggestion};
+use wenlan_types::entities::EntityDetail;
 use wenlan_types::requests::{
     AddEntityObservationRequest, AddObservationRequest, ConfirmEntityRequest,
     ConfirmObservationRequest, CreateEntityRequest, CreateRelationRequest, LinkEntityRequest,
@@ -207,6 +207,20 @@ async fn moved_entity_graph_handlers_preserve_typed_contracts() {
     assert_eq!(status, StatusCode::OK);
     assert!(linked.linked);
 
+    // Unknown ids must not report a link that touched zero rows.
+    let (status, error): (StatusCode, ErrorEnvelope) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/link-entity",
+        json_body(&LinkEntityRequest {
+            source_id: "no-such-memory".to_string(),
+            entity_id: "no-such-entity".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(error.error.contains("no-such-memory"), "{}", error.error);
+
     let list_request = ListEntitiesRequest {
         entity_type: None,
         space: None,
@@ -246,16 +260,6 @@ async fn moved_entity_graph_handlers_preserve_typed_contracts() {
         .iter()
         .any(|result| result.entity.id == alpha.id));
 
-    let (status, suggestions): (StatusCode, Vec<EntitySuggestion>) = request_typed(
-        &router,
-        Method::GET,
-        "/api/memory/entity-suggestions",
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(suggestions.is_empty());
-
     let confirm_entity_uri = format!("/api/memory/entities/{}/confirm", alpha.id);
     let (status, confirmed): (StatusCode, SuccessResponse) = request_typed(
         &router,
@@ -281,6 +285,50 @@ async fn moved_entity_graph_handlers_preserve_typed_contracts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+
+    // The entity-scoped route shares `POST /api/memory/observations`'s
+    // validity contract: unknown entity, short content and out-of-range
+    // confidence are all 422, never a 200 with an orphan row.
+    let invalid_observation_cases = [
+        (
+            "/api/memory/entities/missing/observations".to_string(),
+            AddEntityObservationRequest {
+                content: "Observation for an entity that does not exist.".to_string(),
+                source_agent: None,
+                confidence: Some(0.5),
+            },
+            "does not exist",
+        ),
+        (
+            add_observation_uri.clone(),
+            AddEntityObservationRequest {
+                content: "x".to_string(),
+                source_agent: None,
+                confidence: Some(0.5),
+            },
+            "at least 5 characters",
+        ),
+        (
+            add_observation_uri.clone(),
+            AddEntityObservationRequest {
+                content: "Confidence far out of range.".to_string(),
+                source_agent: None,
+                confidence: Some(9.0),
+            },
+            "out of range",
+        ),
+    ];
+    for (uri, request, expected) in invalid_observation_cases {
+        let (status, error): (StatusCode, ErrorEnvelope) =
+            request_typed(&router, Method::POST, &uri, json_body(&request)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{uri}: {}",
+            error.error
+        );
+        assert!(error.error.contains(expected), "{uri}: {}", error.error);
+    }
 
     let observation_uri = format!("/api/memory/observations/{}", added.id);
     let (status, updated): (StatusCode, SuccessResponse) = request_typed(
@@ -350,7 +398,6 @@ async fn moved_entity_graph_handlers_preserve_typed_contracts() {
             serde_json::to_vec(&search_request).unwrap(),
         ),
         (Method::GET, "/api/memory/entities/missing", Vec::new()),
-        (Method::GET, "/api/memory/entity-suggestions", Vec::new()),
         (
             Method::PUT,
             "/api/memory/entities/missing/confirm",

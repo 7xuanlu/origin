@@ -197,10 +197,12 @@ fn manifest_counts_match_the_spec() {
     // 167, not the 162 the Stage 0 document was generated with: PR #399 added
     // the three `/api/spaces/default` routes and PR #407 added POST/PATCH
     // `/api/brief`. The outbox PR added GET `/api/outbox/status` and POST
-    // `/api/outbox/drain`. The router coverage assertion caught every drift.
+    // `/api/outbox/drain`. The router coverage assertion caught every drift. Then
+    // 165 after the dead recent-relations, entity-suggestions and community
+    // proposal/page-assignment routes were deleted (KG review 2026-08-16).
     assert_eq!(
         HTTP_READERS.len(),
-        171,
+        165,
         "registered (method, path, handler) triples"
     );
     assert_eq!(MCP_READERS.len(), 29, "#[tool( declarations");
@@ -209,7 +211,7 @@ fn manifest_counts_match_the_spec() {
     let entries: Vec<_> = runtime_entries().collect();
     assert_eq!(
         entries.len(),
-        175,
+        169,
         "(builder, method, path) runtime entries"
     );
     assert_eq!(
@@ -217,7 +219,7 @@ fn manifest_counts_match_the_spec() {
             .iter()
             .filter(|(b, _, _)| *b == Builder::Main)
             .count(),
-        169,
+        163,
         "main builder entries"
     );
     assert_eq!(
@@ -393,7 +395,7 @@ fn marker_shape_allowlist_is_fail_closed() {
             .iter()
             .filter(|r| r.marker_shape == MarkerShape::None)
             .count(),
-        165
+        159
     );
 }
 

@@ -6,7 +6,6 @@ import { getMemoryStats, listSpaces, type Page, type Space } from "../../lib/tau
 import { rankRecentPages, readRecentPageHistory } from "../../lib/recentPages";
 import { rankRecentSpaces, readRecentSpaceHistory } from "../../lib/recentSpaces";
 import IdentityCard from "./IdentityCard";
-import EntitySuggestions from "./EntitySuggestions";
 import { RecentPages } from "./RecentPages";
 import { RecentSpaces } from "./RecentSpaces";
 import { PrimaryNavigation } from "./navigation/PrimaryNavigation";
@@ -158,10 +157,6 @@ export default function Sidebar({
           pointerEvents: open ? "auto" : "none",
         }}
       >
-        <div className="flex flex-col gap-6 px-4 pt-2 pb-2">
-          <EntitySuggestions />
-        </div>
-
         <div className="flex-1 overflow-y-auto min-h-0 px-4 pb-4" style={{ overflowX: "hidden" }}>
           <PrimaryNavigation
             active={activeNavigation}

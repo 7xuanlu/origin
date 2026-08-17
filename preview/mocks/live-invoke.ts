@@ -749,11 +749,6 @@ export const HANDLERS: Record<string, (a: any) => Promise<unknown>> = {
     post("/api/memory/entities/search", { query: a.query }).then((r) => r.entities ?? r),
   get_entity_detail_cmd: (a) => get(`/api/memory/entities/${enc(a.entityId)}`),
   get_knowledge_graph_cmd: () => get("/api/memory/graph"),
-  get_entity_suggestions_cmd: () => get("/api/memory/entity-suggestions"),
-  list_recent_relations: (a) =>
-    get(`/api/knowledge/recent-relations${qs({ limit: a?.limit ?? 50 })}`).then(
-      (r) => r.relations ?? r,
-    ),
   count_knowledge_files: () => get("/api/knowledge/count").then((r) => r.total ?? r.count ?? 0),
 
   // --- home / profile / spaces / misc ---

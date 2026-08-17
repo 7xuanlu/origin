@@ -947,21 +947,6 @@ impl WenlanClient {
         self.get_json(&path).await
     }
 
-    pub async fn list_recent_relations(
-        &self,
-        limit: Option<usize>,
-        since_ms: Option<i64>,
-    ) -> Result<Vec<wenlan_types::RecentRelation>, String> {
-        let mut path = format!(
-            "/api/knowledge/recent-relations?limit={}",
-            limit.unwrap_or(10)
-        );
-        if let Some(ms) = since_ms {
-            path.push_str(&format!("&since_ms={}", ms));
-        }
-        self.get_json(&path).await
-    }
-
     pub async fn get_page_sources(
         &self,
         page_id: &str,

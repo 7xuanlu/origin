@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    Entity, EntityDetail, EntitySearchResult, MemoryDB, Observation, RefinementProposal,
-    RelationWithEntity, SearchResult,
+    Entity, EntityDetail, EntitySearchResult, MemoryDB, Observation, RelationWithEntity,
+    SearchResult,
 };
 use crate::read_scope::ReadScope;
 use crate::WenlanError;
@@ -75,9 +75,8 @@ impl MemoryDB {
         // Stage 2 PR 2c sub-step 3 item 5) the relations query's endpoint
         // hydration below -- `store_entity` no longer writes `entities`, so
         // the old `entities` JOIN silently excluded any shadow-only
-        // endpoint. Ported onto `entity_page_map`/`pages`, same shape as
-        // `list_recent_relations_scoped` below. The observations query
-        // never touched `entities`, so it's unchanged. Spec item 9
+        // endpoint. Ported onto `entity_page_map`/`pages`. The observations
+        // query never touched `entities`, so it's unchanged. Spec item 9
         // collapses this reader's `reader_uses_entity_pages` gate (same
         // program contract as 1.5a and `list_entities_scoped` above).
         let mut conditions = vec!["epm.entity_id = ?".to_string()];
@@ -265,218 +264,6 @@ impl MemoryDB {
             observations,
             relations,
         })
-    }
-
-    pub async fn list_recent_relations_scoped(
-        &self,
-        limit: usize,
-        since_ms: Option<i64>,
-        scope: &ReadScope,
-    ) -> Result<Vec<wenlan_types::RecentRelation>, WenlanError> {
-        if matches!(scope, ReadScope::Global) {
-            return self.list_recent_relations(limit, since_ms).await;
-        }
-
-        let conn = self.conn.lock().await;
-        // G6 Stage 1.5b Part 3: unconditional hard cutover onto the
-        // `kind='entity'` shadow page (spec item 9 collapses this reader's
-        // `reader_uses_entity_pages` gate -- the last of the four
-        // `scoped_entities.rs` call sites). Item 7's structural rework: the
-        // join itself now runs on `entity_page_map`/`pages` for both row set
-        // and scope filter, replacing the former tie-safe-flip design (base
-        // query always legacy `entities`, gated hydration query overlaying
-        // just the display title).
-        let (scope_filter, scope_value) = match scope {
-            ReadScope::Space(space) => (
-                "AND p1.space = ?3 AND p2.space = ?3",
-                Some(libsql::Value::Text(space.clone())),
-            ),
-            ReadScope::Uncategorized => (
-                "AND (p1.space IS NULL OR p1.space = '00000000-0000-4000-8000-000000000001') \
-                 AND (p2.space IS NULL OR p2.space = '00000000-0000-4000-8000-000000000001')",
-                None,
-            ),
-            ReadScope::Global => unreachable!(),
-        };
-        let sql = format!(
-            "SELECT r.edge_id, r.src_id, r.semantic_type, r.dst_id, \
-                    p1.title, p2.title, \
-                    COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at) AS asserted_ts \
-             FROM edges r \
-             JOIN entity_page_map epm1 ON r.src_id = epm1.entity_id \
-             JOIN pages p1 ON p1.id = epm1.page_id AND p1.kind = 'entity' AND p1.status = 'active' \
-             JOIN entity_page_map epm2 ON r.dst_id = epm2.entity_id \
-             JOIN pages p2 ON p2.id = epm2.page_id AND p2.kind = 'entity' AND p2.status = 'active' \
-             WHERE r.edge_type = 'relates' AND r.valid_until IS NULL \
-               AND r.semantic_type IS NOT NULL \
-               AND (?1 IS NULL OR COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at) >= ?1) \
-               AND p1.title IS NOT NULL AND p1.title != '' \
-               AND p2.title IS NOT NULL AND p2.title != '' \
-               {scope_filter} \
-             ORDER BY asserted_ts DESC, r.edge_id DESC LIMIT ?2"
-        );
-        let mut values = vec![
-            since_ms
-                .map(libsql::Value::Integer)
-                .unwrap_or(libsql::Value::Null),
-            libsql::Value::Integer(limit as i64),
-        ];
-        if let Some(value) = scope_value {
-            values.push(value);
-        }
-        let mut rows = conn
-            .query(&sql, libsql::params_from_iter(values))
-            .await
-            .map_err(|error| {
-                WenlanError::VectorDb(format!("list_recent_relations_scoped query: {error}"))
-            })?;
-        let mut relations = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|error| {
-            WenlanError::VectorDb(format!("list_recent_relations_scoped next: {error}"))
-        })? {
-            relations.push(wenlan_types::RecentRelation {
-                id: row.get(0).map_err(|error| {
-                    WenlanError::VectorDb(format!("list_recent_relations_scoped id: {error}"))
-                })?,
-                from_entity_id: row.get(1).map_err(|error| {
-                    WenlanError::VectorDb(format!(
-                        "list_recent_relations_scoped from_entity: {error}"
-                    ))
-                })?,
-                relation_type: row.get(2).map_err(|error| {
-                    WenlanError::VectorDb(format!(
-                        "list_recent_relations_scoped relation_type: {error}"
-                    ))
-                })?,
-                to_entity_id: row.get(3).map_err(|error| {
-                    WenlanError::VectorDb(format!(
-                        "list_recent_relations_scoped to_entity: {error}"
-                    ))
-                })?,
-                from_entity_name: row.get(4).map_err(|error| {
-                    WenlanError::VectorDb(format!(
-                        "list_recent_relations_scoped from_name: {error}"
-                    ))
-                })?,
-                to_entity_name: row.get(5).map_err(|error| {
-                    WenlanError::VectorDb(format!("list_recent_relations_scoped to_name: {error}"))
-                })?,
-                created_at_ms: row.get(6).map_err(|error| {
-                    WenlanError::VectorDb(format!(
-                        "list_recent_relations_scoped created_at: {error}"
-                    ))
-                })?,
-            });
-        }
-
-        Ok(relations)
-    }
-
-    pub async fn list_entity_suggestions_scoped(
-        &self,
-        scope: &ReadScope,
-    ) -> Result<Vec<RefinementProposal>, WenlanError> {
-        if matches!(scope, ReadScope::Global) {
-            return self.get_pending_refinements().await;
-        }
-
-        let conn = self.conn.lock().await;
-        // M3 PR-2 stage c: NOT a cutover consumer. A suggestion proposes an
-        // entity that does not exist yet, so this query sources nothing
-        // from `entities`/`pages` (it reads `refinement_queue` + `memories`
-        // only) -- it stays on its own substrate until the retirement rung
-        // widens the mirror.
-        let safe_sources = "CASE WHEN json_valid(rq.source_ids) \
-                            THEN rq.source_ids ELSE '[]' END";
-        let (matching_owner, mismatching_owner, values) = match scope {
-            ReadScope::Space(space) => (
-                "m.space = ?1",
-                "(m.space IS NULL OR m.space != ?1)",
-                vec![libsql::Value::Text(space.clone())],
-            ),
-            ReadScope::Uncategorized => (
-                "(m.space IS NULL OR m.space = '00000000-0000-4000-8000-000000000001')",
-                "(m.space IS NOT NULL AND m.space != '00000000-0000-4000-8000-000000000001')",
-                Vec::new(),
-            ),
-            ReadScope::Global => unreachable!(),
-        };
-        let sql = format!(
-            "SELECT rq.id, rq.action, rq.source_ids, rq.payload, rq.confidence, \
-                    rq.status, rq.created_at \
-             FROM refinement_queue rq \
-             WHERE rq.action = 'suggest_entity' \
-               AND rq.status IN ('pending', 'awaiting_review') \
-               AND json_valid(rq.source_ids) \
-               AND json_type({safe_sources}) = 'array' \
-               AND json_array_length({safe_sources}) > 0 \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM json_each({safe_sources}) sid \
-                   WHERE sid.type != 'text' \
-                      OR NOT EXISTS ( \
-                          SELECT 1 FROM memories m \
-                          WHERE m.source = 'memory' AND m.pending_revision = 0 \
-                            AND m.source_id = sid.value AND {matching_owner} \
-                      ) \
-                      OR EXISTS ( \
-                          SELECT 1 FROM memories m \
-                          WHERE m.source = 'memory' AND m.pending_revision = 0 \
-                            AND m.source_id = sid.value AND {mismatching_owner} \
-                      ) \
-               ) \
-             ORDER BY rq.created_at, rq.id"
-        );
-        let mut rows = conn
-            .query(&sql, libsql::params_from_iter(values))
-            .await
-            .map_err(|error| {
-                WenlanError::VectorDb(format!("list_entity_suggestions_scoped query: {error}"))
-            })?;
-        let mut proposals = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|error| {
-            WenlanError::VectorDb(format!("list_entity_suggestions_scoped next: {error}"))
-        })? {
-            let source_ids_json: String = row.get(2).map_err(|error| {
-                WenlanError::VectorDb(format!(
-                    "list_entity_suggestions_scoped source_ids: {error}"
-                ))
-            })?;
-            proposals.push(RefinementProposal {
-                id: row.get(0).map_err(|error| {
-                    WenlanError::VectorDb(format!("list_entity_suggestions_scoped id: {error}"))
-                })?,
-                action: row.get(1).map_err(|error| {
-                    WenlanError::VectorDb(format!("list_entity_suggestions_scoped action: {error}"))
-                })?,
-                source_ids: serde_json::from_str(&source_ids_json).map_err(|error| {
-                    WenlanError::VectorDb(format!(
-                        "list_entity_suggestions_scoped source_ids JSON: {error}"
-                    ))
-                })?,
-                payload: row.get::<Option<String>>(3).map_err(|error| {
-                    WenlanError::VectorDb(format!(
-                        "list_entity_suggestions_scoped payload: {error}"
-                    ))
-                })?,
-                confidence: row
-                    .get::<Option<f64>>(4)
-                    .map_err(|error| {
-                        WenlanError::VectorDb(format!(
-                            "list_entity_suggestions_scoped confidence: {error}"
-                        ))
-                    })?
-                    .unwrap_or(0.0),
-                status: row.get(5).map_err(|error| {
-                    WenlanError::VectorDb(format!("list_entity_suggestions_scoped status: {error}"))
-                })?,
-                created_at: row.get(6).map_err(|error| {
-                    WenlanError::VectorDb(format!(
-                        "list_entity_suggestions_scoped created_at: {error}"
-                    ))
-                })?,
-            });
-        }
-        Ok(proposals)
     }
 
     /// G6 Stage 1.5a: scope-filters via the `kind='entity'` shadow page's
@@ -757,7 +544,11 @@ impl MemoryDB {
                     c.version, c.pending_revision,
                     0.0, c.importance, c.event_date, c.content_hash, me.entity_id
              FROM memories c
-             JOIN memory_entities me ON me.memory_id = c.source_id
+             JOIN (SELECT memory_id, entity_id FROM memory_entities
+                   UNION
+                   SELECT source_id, entity_id FROM memories
+                    WHERE entity_id IS NOT NULL AND source = 'memory' AND chunk_index = 0) me
+               ON me.memory_id = c.source_id
              WHERE me.entity_id IN ({placeholders})
                AND c.source = 'memory' AND c.chunk_index = 0 {scope_sql}"
         );
@@ -1007,7 +798,10 @@ impl MemoryDB {
         let memory_sql = format!(
             "SELECT me.entity_id, m.source_id, MAX(m.title), MAX(m.memory_type), \
                     MAX(m.space), MAX(m.confirmed), MAX(m.last_modified) \
-             FROM memory_entities me \
+             FROM (SELECT memory_id, entity_id FROM memory_entities \
+                   UNION \
+                   SELECT source_id, entity_id FROM memories \
+                    WHERE entity_id IS NOT NULL AND source = 'memory' AND chunk_index = 0) me \
              JOIN memories m ON m.source_id = me.memory_id \
              WHERE m.source = 'memory' AND m.pending_revision = 0 \
                AND {hidden_by_superseder} {memory_scope_sql} \

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The error-seam invariant from `docs/plans/2026-07-27-m5-reader-manifest-inventory.md`
+//! The error-seam invariant from `crates/wenlan-core/contracts/m5-reader-manifest-inventory.md`
 //! (teeth check 14): an error response body must never contain a page's title
 //! or prose, at any cutover generation. Error bodies routinely embed the
 //! thing that failed ("page 'X' not found", a serde error quoting the

@@ -7,8 +7,6 @@ main|get|/api/capture-stats|wenlan_server::memory_detail_routes::handle_capture_
 main|get|/api/chunks/{source_id}|wenlan_server::indexed_files_routes::handle_get_chunks
 main|get|/api/communities|wenlan_server::community_routes::handle_list_communities
 main|get|/api/communities/members|wenlan_server::community_routes::handle_list_community_members
-main|get|/api/communities/page-assignments|wenlan_server::community_routes::handle_list_community_page_assignments
-main|get|/api/communities/proposals|wenlan_server::community_routes::handle_list_community_proposals
 main|get|/api/config|wenlan_server::config_routes::handle_get_config
 main|get|/api/config/routing|wenlan_server::config_routes::handle_get_resolved_routing
 main|get|/api/config/skip-apps|wenlan_server::config_routes::handle_get_skip_apps
@@ -21,11 +19,9 @@ main|get|/api/import/state|wenlan_server::import_routes::handle_list_pending_imp
 main|get|/api/indexed-files|wenlan_server::indexed_files_routes::handle_list_indexed_files
 main|get|/api/knowledge/count|wenlan_server::knowledge_routes::handle_get_knowledge_count
 main|get|/api/knowledge/path|wenlan_server::knowledge_routes::handle_get_knowledge_path
-main|get|/api/knowledge/recent-relations|wenlan_server::knowledge_routes::handle_list_recent_relations
 main|get|/api/lint|wenlan_server::lint_routes::handle_lint
 main|get|/api/memory/by-ids|wenlan_server::memory_detail_routes::handle_get_memories_by_ids
 main|get|/api/memory/entities/{entity_id}|wenlan_server::entity_graph_routes::handle_get_entity_detail
-main|get|/api/memory/entity-suggestions|wenlan_server::entity_graph_routes::handle_get_entity_suggestions
 main|get|/api/memory/graph|wenlan_server::entity_graph_routes::handle_get_knowledge_graph
 main|get|/api/memory/nurture|wenlan_server::memory_routes::handle_get_nurture_cards
 main|get|/api/memory/pending-revision/{source_id}|wenlan_server::memory_revision_routes::handle_get_pending_revision
@@ -68,8 +64,6 @@ main|get|/api/tags|wenlan_server::activity_tag_routes::handle_list_tags
 main|get|/ws/updates|wenlan_server::websocket::handle_ws_upgrade
 main|post|/api/brief|wenlan_server::brief_routes::handle_read_brief
 main|post|/api/chunks/delete-bulk|wenlan_server::indexed_files_routes::handle_delete_bulk
-main|post|/api/communities/proposals/{id}/accept|wenlan_server::community_routes::handle_accept_community_proposal
-main|post|/api/communities/proposals/{id}/reject|wenlan_server::community_routes::handle_reject_community_proposal
 main|post|/api/context|wenlan_server::routes::handle_context
 main|post|/api/distill|wenlan_server::routes::handle_distill
 main|post|/api/distill/{page_id}|wenlan_server::routes::handle_redistill

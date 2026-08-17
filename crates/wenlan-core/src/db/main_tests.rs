@@ -33553,8 +33553,8 @@ async fn migration_120_fresh_db_has_no_retired_tables() {
 /// fell back to `relations` would report a different number, not the same
 /// one by coincidence). Covers readers #1 (`expand_anchor_entities_khop`),
 /// #2 (`expand_entities_khop_scoped`), #3 (`aggregate_counts`), #5
-/// (`get_entity_detail`), #7 (`list_recent_relations`), #9
-/// (`relation_vocabulary`), and #11 (`relation_integrity`) — each must see
+/// (`get_entity_detail`), #9 (`relation_vocabulary`), and #11
+/// (`relation_integrity`) — each must see
 /// the edge-only fact and stay blind to the relations-only orphans. Readers
 /// #4 (`entity_scope_clause`) and #13 (`load_relations`, both in
 /// `lint/semantic_candidates.rs`) are NOT exercised by this test.
@@ -33618,21 +33618,6 @@ async fn migrated_readers_diverge_from_relations_and_follow_edges() {
     let rel_detail = db.get_entity_detail(&rel_src).await.unwrap();
     assert!(
         rel_detail.relations.is_empty(),
-        "must not see the relations-only orphans"
-    );
-
-    // Reader #7: list_recent_relations.
-    let recent = db.list_recent_relations(50, None).await.unwrap();
-    assert!(
-        recent
-            .iter()
-            .any(|r| r.from_entity_id == edge_src && r.to_entity_id == edge_dst),
-        "must see the edge-only relation"
-    );
-    assert!(
-        !recent
-            .iter()
-            .any(|r| r.from_entity_id == rel_src && r.to_entity_id == rel_dst),
         "must not see the relations-only orphans"
     );
 
@@ -33729,110 +33714,6 @@ async fn migrated_readers_diverge_from_relations_and_follow_edges() {
     assert_eq!(
         kg_relations_count, 1,
         "aggregate_counts must count edges (1), not relations (2)"
-    );
-}
-
-/// G6 Stage 1.2 Trap 1 (recency scramble): `edges.created_at` is
-/// migration-day for m81-backfilled edges, not a substitute for
-/// `relations.created_at`. `list_recent_relations` must order and filter
-/// on `asserted_at` (COALESCE'd to `edges.created_at` only when absent),
-/// never on the edge's own dual-write timestamp.
-#[tokio::test]
-async fn list_recent_relations_orders_by_asserted_at_not_edge_created_at() {
-    let (db, _dir) = test_db().await;
-    let hub = db
-        .create_entity("G6 Recency Hub", "person", Some("space_a"))
-        .await
-        .unwrap();
-    let e_a = db
-        .create_entity("G6 Recency A", "project", Some("space_a"))
-        .await
-        .unwrap();
-    let e_b = db
-        .create_entity("G6 Recency B", "project", Some("space_a"))
-        .await
-        .unwrap();
-    let e_c = db
-        .create_entity("G6 Recency C", "project", Some("space_a"))
-        .await
-        .unwrap();
-    let e_d = db
-        .create_entity("G6 Recency D", "project", Some("space_a"))
-        .await
-        .unwrap();
-
-    // "type_a".."type_d" all fold to the same normalized relation_type
-    // (create_relation resolves unknown types against the shared
-    // vocabulary), so ordering is asserted on the target entity name
-    // instead -- the (from, to) pair is already unique per target below.
-    db.create_relation(&hub, &e_a, "type_a", None, None, None, None)
-        .await
-        .unwrap();
-    db.create_relation(&hub, &e_b, "type_b", None, None, None, None)
-        .await
-        .unwrap();
-    db.create_relation(&hub, &e_c, "type_c", None, None, None, None)
-        .await
-        .unwrap();
-    db.create_relation(&hub, &e_d, "type_d", None, None, None, None)
-        .await
-        .unwrap();
-
-    // Force distinct relations.created_at (the truth) mirrored onto
-    // edges.payload.asserted_at. e_d additionally gets a much newer
-    // edges.created_at (an m81-style backfill mismatch) to prove ordering
-    // and since_ms filtering key off asserted_at, not edges.created_at.
-    {
-        let conn = db.conn.lock().await;
-        for (target, created_at) in [
-            (&e_a, 1_000i64),
-            (&e_b, 2_000i64),
-            (&e_c, 3_000i64),
-            (&e_d, 500i64),
-        ] {
-            conn.execute(
-                "UPDATE relations SET created_at = ?1 \
-                 WHERE from_entity = ?2 AND to_entity = ?3",
-                libsql::params![created_at, hub.as_str(), target.as_str()],
-            )
-            .await
-            .unwrap();
-            conn.execute(
-                "UPDATE edges SET payload = json_set(COALESCE(payload, '{}'), '$.asserted_at', ?1) \
-                 WHERE edge_type = 'relates' AND src_id = ?2 AND dst_id = ?3",
-                libsql::params![created_at, hub.as_str(), target.as_str()],
-            )
-            .await
-            .unwrap();
-        }
-        conn.execute(
-            "UPDATE edges SET created_at = 9999999 \
-             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?2",
-            libsql::params![hub.as_str(), e_d.as_str()],
-        )
-        .await
-        .unwrap();
-    }
-
-    let all = db.list_recent_relations(10, None).await.unwrap();
-    let names: Vec<&str> = all.iter().map(|r| r.to_entity_name.as_str()).collect();
-    assert_eq!(
-        names,
-        vec![
-            "G6 Recency C",
-            "G6 Recency B",
-            "G6 Recency A",
-            "G6 Recency D"
-        ],
-        "order must follow asserted_at DESC, not edges.created_at"
-    );
-
-    let since = db.list_recent_relations(10, Some(1_500)).await.unwrap();
-    let since_names: Vec<&str> = since.iter().map(|r| r.to_entity_name.as_str()).collect();
-    assert_eq!(
-        since_names,
-        vec!["G6 Recency C", "G6 Recency B"],
-        "since_ms must filter on asserted_at, not edges.created_at"
     );
 }
 

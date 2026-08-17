@@ -197,11 +197,6 @@ pub struct CommunityProposalAcceptResponse {
     pub display_name_updated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommunityProposalRejectResponse {
-    pub id: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

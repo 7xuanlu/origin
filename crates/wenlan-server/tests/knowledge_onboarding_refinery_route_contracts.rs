@@ -15,7 +15,6 @@ use wenlan_types::responses::{
     AcceptRefinementResponse, KnowledgeCountResponse, KnowledgePathResponse,
     ListRefinementsResponse, RejectRefinementResponse,
 };
-use wenlan_types::RecentRelation;
 
 #[derive(Debug, Deserialize)]
 struct ErrorEnvelope {
@@ -144,16 +143,6 @@ async fn moved_knowledge_onboarding_and_refinery_routes_preserve_typed_contracts
     assert!(!error.error.is_empty());
     wenlan_core::config::save_config(&config).unwrap();
 
-    let (status, relations): (StatusCode, Vec<RecentRelation>) = request_typed(
-        &router,
-        Method::GET,
-        "/api/knowledge/recent-relations?limit=5",
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(relations.is_empty());
-
     db.record_milestone(MilestoneId::FirstMemory, None)
         .await
         .unwrap();
@@ -250,7 +239,6 @@ async fn moved_knowledge_onboarding_and_refinery_routes_preserve_typed_contracts
     let no_db_router =
         wenlan_server::router::build_router(Arc::new(RwLock::new(ServerState::default())));
     for (method, uri) in [
-        (Method::GET, "/api/knowledge/recent-relations"),
         (Method::GET, "/api/onboarding/milestones"),
         (
             Method::POST,

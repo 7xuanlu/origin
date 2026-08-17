@@ -28442,7 +28442,11 @@ impl MemoryDB {
                     c.version, c.pending_revision,
                     0.0, c.importance, c.event_date, c.content_hash, me.entity_id
              FROM memories c
-             JOIN memory_entities me ON me.memory_id = c.source_id
+             JOIN (SELECT memory_id, entity_id FROM memory_entities
+                   UNION
+                   SELECT source_id, entity_id FROM memories
+                    WHERE entity_id IS NOT NULL AND source = 'memory' AND chunk_index = 0) me
+               ON me.memory_id = c.source_id
              WHERE me.entity_id IN ({ph})
                AND c.source = 'memory' AND c.chunk_index = 0",
             ph = placeholders.join(",")
@@ -36033,19 +36037,21 @@ impl MemoryDB {
     }
 
     /// Update a memory's entity_id (for post-ingest entity linking).
+    /// Returns the number of memory rows updated (0 = unknown `source_id`).
     pub async fn update_memory_entity_id(
         &self,
         source_id: &str,
         entity_id: &str,
-    ) -> Result<(), WenlanError> {
+    ) -> Result<u64, WenlanError> {
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE memories SET entity_id = ?1 WHERE source_id = ?2",
-            libsql::params![entity_id, source_id],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("update_memory_entity_id: {}", e)))?;
-        Ok(())
+        let updated = conn
+            .execute(
+                "UPDATE memories SET entity_id = ?1 WHERE source_id = ?2",
+                libsql::params![entity_id, source_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("update_memory_entity_id: {}", e)))?;
+        Ok(updated)
     }
 
     /// Write a row to `memory_entities` for each entity in `entity_ids`.
@@ -39810,73 +39816,6 @@ impl MemoryDB {
             .ok_or_else(|| WenlanError::Generic("count_relations: no rows".into()))?;
         row.get::<i64>(0)
             .map_err(|e| WenlanError::VectorDb(format!("count_relations get: {}", e)))
-    }
-
-    /// Return the most recent knowledge-graph relations with entity names resolved.
-    ///
-    /// `since_ms` filters by `created_at` (unix seconds). Rows where either
-    /// entity name is missing are excluded so the UI always shows readable text.
-    /// G6 Stage 1.5b Part 3: joins the `kind='entity'` shadow page via
-    /// `entity_page_map` for each endpoint's display name, unconditional
-    /// hard cutover (same program contract as `list_entities`). Structural
-    /// rework, not a hydration overlay -- unlike `list_recent_relations_scoped`
-    /// pre-migration, this fn never had a GATED legacy base query to preserve,
-    /// only the one unconditional shape.
-    pub async fn list_recent_relations(
-        &self,
-        limit: usize,
-        since_ms: Option<i64>,
-    ) -> Result<Vec<wenlan_types::RecentRelation>, WenlanError> {
-        let conn = self.conn.lock().await;
-        let sql = "SELECT r.edge_id, r.src_id, r.semantic_type, r.dst_id, \
-                   p1.title AS from_entity_name, p2.title AS to_entity_name, \
-                   COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at) AS asserted_ts \
-                   FROM edges r \
-                   JOIN entity_page_map epm1 ON r.src_id = epm1.entity_id \
-                   JOIN pages p1 ON p1.id = epm1.page_id AND p1.kind = 'entity' AND p1.status = 'active' \
-                   JOIN entity_page_map epm2 ON r.dst_id = epm2.entity_id \
-                   JOIN pages p2 ON p2.id = epm2.page_id AND p2.kind = 'entity' AND p2.status = 'active' \
-                   WHERE r.edge_type = 'relates' AND r.valid_until IS NULL \
-                   AND r.semantic_type IS NOT NULL \
-                   AND (?1 IS NULL OR COALESCE(json_extract(r.payload, '$.asserted_at'), r.created_at) >= ?1) \
-                   AND p1.title IS NOT NULL AND p1.title != '' \
-                   AND p2.title IS NOT NULL AND p2.title != '' \
-                   ORDER BY asserted_ts DESC, r.edge_id DESC LIMIT ?2";
-        let mut rows = conn
-            .query(sql, libsql::params![since_ms, limit as i64])
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("list_recent_relations query: {}", e)))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("list_recent_relations next: {}", e)))?
-        {
-            out.push(wenlan_types::RecentRelation {
-                id: row.get::<String>(0).map_err(|e| {
-                    WenlanError::VectorDb(format!("list_recent_relations col 0: {}", e))
-                })?,
-                from_entity_id: row.get::<String>(1).map_err(|e| {
-                    WenlanError::VectorDb(format!("list_recent_relations col 1: {}", e))
-                })?,
-                relation_type: row.get::<String>(2).map_err(|e| {
-                    WenlanError::VectorDb(format!("list_recent_relations col 2: {}", e))
-                })?,
-                to_entity_id: row.get::<String>(3).map_err(|e| {
-                    WenlanError::VectorDb(format!("list_recent_relations col 3: {}", e))
-                })?,
-                from_entity_name: row.get::<String>(4).map_err(|e| {
-                    WenlanError::VectorDb(format!("list_recent_relations col 4: {}", e))
-                })?,
-                to_entity_name: row.get::<String>(5).map_err(|e| {
-                    WenlanError::VectorDb(format!("list_recent_relations col 5: {}", e))
-                })?,
-                created_at_ms: row.get::<i64>(6).map_err(|e| {
-                    WenlanError::VectorDb(format!("list_recent_relations col 6: {}", e))
-                })?,
-            });
-        }
-        Ok(out)
     }
 
     /// Count agent connections that have recorded at least one memory write.

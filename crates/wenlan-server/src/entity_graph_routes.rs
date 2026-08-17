@@ -44,15 +44,6 @@ pub(crate) fn register_reads(router: TrackedRouter<SharedState>) -> TrackedRoute
         )
 }
 
-pub(crate) fn register_suggestions(
-    router: TrackedRouter<SharedState>,
-) -> TrackedRouter<SharedState> {
-    router.route(
-        "/api/memory/entity-suggestions",
-        get(handle_get_entity_suggestions),
-    )
-}
-
 pub(crate) fn register_crud(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
     router
         .route(
@@ -171,11 +162,22 @@ pub async fn handle_link_entity(
     State(state): State<Arc<RwLock<ServerState>>>,
     Json(req): Json<LinkEntityRequest>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-    db.update_memory_entity_id(&req.source_id, &req.entity_id)
+    let db = {
+        let s = state.read().await;
+        s.db.as_ref()
+            .cloned()
+            .ok_or(ServerError::DbNotInitialized)?
+    };
+    let updated = db
+        .update_memory_entity_id(&req.source_id, &req.entity_id)
         .await
         .map_err(|e| ServerError::IngestFailed(e.to_string()))?;
+    if updated == 0 {
+        return Err(ServerError::NotFound(format!(
+            "memory '{}' does not exist",
+            req.source_id
+        )));
+    }
     Ok(Json(serde_json::json!({"linked": true})))
 }
 
@@ -322,48 +324,6 @@ pub async fn handle_search_entities(
     Ok(Json(SearchEntitiesResponse { results }))
 }
 
-// ===== Entity Suggestions =====
-
-#[derive(Debug, Serialize)]
-pub struct EntitySuggestion {
-    pub id: String,
-    pub entity_name: Option<String>,
-    pub source_ids: Vec<String>,
-    pub confidence: f64,
-    pub created_at: String,
-}
-
-pub async fn handle_get_entity_suggestions(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
-) -> Result<Json<Vec<EntitySuggestion>>, ServerError> {
-    let db = {
-        let s = state.read().await;
-        s.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
-    let pending = db
-        .list_entity_suggestions_scoped(&scope)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
-
-    let suggestions: Vec<EntitySuggestion> = pending
-        .iter()
-        .filter(|p| {
-            p.action == "suggest_entity" && (p.status == "pending" || p.status == "awaiting_review")
-        })
-        .map(|p| EntitySuggestion {
-            id: p.id.clone(),
-            entity_name: p.payload.clone(),
-            source_ids: p.source_ids.clone(),
-            confidence: p.confidence,
-            created_at: p.created_at.clone(),
-        })
-        .collect();
-
-    Ok(Json(suggestions))
-}
-
 // =====================================================================
 // Batch 3 — Entity / Observation CRUD
 // =====================================================================
@@ -403,24 +363,26 @@ pub async fn handle_delete_entity(
 pub async fn handle_add_entity_observation(
     State(state): State<Arc<RwLock<ServerState>>>,
     Path(entity_id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<wenlan_types::requests::AddEntityObservationRequest>,
 ) -> Result<Json<wenlan_types::responses::AddObservationResponse>, ServerError> {
+    let agent = extract_agent_name(&headers, req.source_agent.as_deref());
     let db = {
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
-    let id = db
-        .add_observation(
-            &entity_id,
-            &req.content,
-            req.source_agent.as_deref(),
-            req.confidence,
-        )
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+    // Same validity contract as `POST /api/memory/observations`: entity must
+    // exist, content >= 5 chars, confidence in [0, 1].
+    let req = AddObservationRequest {
+        entity_id,
+        content: req.content,
+        source_agent: req.source_agent,
+        confidence: req.confidence,
+    };
+    let result = wenlan_core::post_write::add_observation(&db, req, &agent).await?;
     Ok(Json(wenlan_types::responses::AddObservationResponse {
-        id,
-        warnings: vec![],
+        id: result.id,
+        warnings: result.warnings,
     }))
 }
 

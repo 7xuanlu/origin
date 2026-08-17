@@ -114,13 +114,9 @@ fn route_catalog_freezes_exact_global_and_scoped_keys() {
         (Method::Post, "/api/memory/entities/list"),
         (Method::Post, "/api/memory/entities/search"),
         (Method::Get, "/api/memory/entities/{entity_id}"),
-        (Method::Get, "/api/memory/entity-suggestions"),
         (Method::Get, "/api/memory/graph"),
-        (Method::Get, "/api/knowledge/recent-relations"),
         (Method::Get, "/api/communities"),
         (Method::Get, "/api/communities/members"),
-        (Method::Get, "/api/communities/page-assignments"),
-        (Method::Get, "/api/communities/proposals"),
     ];
 
     let rows = sensitive_read_routes().collect::<Vec<_>>();

@@ -1314,10 +1314,6 @@ pub fn run() {
             search::get_wenlan_mcp_entry,
             search::install_client_plugin,
             search::wire_state,
-            // Entity suggestion commands
-            search::get_entity_suggestions_cmd,
-            search::approve_entity_suggestion_cmd,
-            search::dismiss_entity_suggestion_cmd,
             // Remote access commands
             search::toggle_remote_access,
             search::get_remote_access_status,
@@ -1369,7 +1365,6 @@ pub fn run() {
             search::list_recent_memories,
             search::list_unconfirmed_memories,
             search::list_recent_pages,
-            search::list_recent_relations,
             search::export_pages_to_obsidian,
             search::export_page_to_obsidian,
             search::get_knowledge_path,

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Typed, versioned M4 community reads and dedicated identity-review routes.
+//! Typed, versioned M4 community reads.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Query, State},
     Json,
 };
 use serde::Deserialize;
 
 use crate::{
     error::ServerError,
-    route_registry::{get, post, TrackedRouter},
+    route_registry::{get, TrackedRouter},
     space_header::SpaceHeader,
     state::SharedState,
 };
@@ -20,22 +20,6 @@ pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<Shar
         .route(
             "/api/communities/members",
             get(handle_list_community_members),
-        )
-        .route(
-            "/api/communities/page-assignments",
-            get(handle_list_community_page_assignments),
-        )
-        .route(
-            "/api/communities/proposals",
-            get(handle_list_community_proposals),
-        )
-        .route(
-            "/api/communities/proposals/{id}/accept",
-            post(handle_accept_community_proposal),
-        )
-        .route(
-            "/api/communities/proposals/{id}/reject",
-            post(handle_reject_community_proposal),
         )
 }
 
@@ -112,96 +96,6 @@ pub async fn handle_list_community_members(
     Ok(Json(response))
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub struct ListCommunityPageAssignmentsQuery {
-    pub space: Option<String>,
-    pub cursor: Option<String>,
-    pub limit: Option<usize>,
-}
-
-pub async fn handle_list_community_page_assignments(
-    State(state): State<SharedState>,
-    SpaceHeader(header_space): SpaceHeader,
-    Query(query): Query<ListCommunityPageAssignmentsQuery>,
-) -> Result<Json<wenlan_types::CommunityPageAssignmentsResponse>, ServerError> {
-    let db = {
-        let state = state.read().await;
-        state.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(
-        &db,
-        query.space.as_deref(),
-        header_space.as_deref(),
-    )
-    .await?;
-    let response = db
-        .list_community_page_assignments(
-            &scope,
-            query.cursor.as_deref(),
-            query.limit.unwrap_or(100),
-        )
-        .await
-        .map_err(ServerError::from)?;
-    Ok(Json(response))
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct ListCommunityProposalsQuery {
-    pub space: Option<String>,
-    pub limit: Option<usize>,
-}
-
-pub async fn handle_list_community_proposals(
-    State(state): State<SharedState>,
-    SpaceHeader(header_space): SpaceHeader,
-    Query(query): Query<ListCommunityProposalsQuery>,
-) -> Result<Json<wenlan_types::ListCommunityProposalsResponse>, ServerError> {
-    let db = {
-        let state = state.read().await;
-        state.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let scope = crate::read_scope::effective_read_scope(
-        &db,
-        query.space.as_deref(),
-        header_space.as_deref(),
-    )
-    .await?;
-    let response = db
-        .list_community_proposals(&scope, query.limit.unwrap_or(100))
-        .await
-        .map_err(ServerError::from)?;
-    Ok(Json(response))
-}
-
-pub async fn handle_accept_community_proposal(
-    State(state): State<SharedState>,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::CommunityProposalAcceptResponse>, ServerError> {
-    let db = {
-        let state = state.read().await;
-        state.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    let response = db
-        .accept_community_proposal(&id)
-        .await
-        .map_err(ServerError::from)?;
-    Ok(Json(response))
-}
-
-pub async fn handle_reject_community_proposal(
-    State(state): State<SharedState>,
-    Path(id): Path<String>,
-) -> Result<Json<wenlan_types::CommunityProposalRejectResponse>, ServerError> {
-    let db = {
-        let state = state.read().await;
-        state.db.clone().ok_or(ServerError::DbNotInitialized)?
-    };
-    db.reject_community_proposal(&id)
-        .await
-        .map_err(ServerError::from)?;
-    Ok(Json(wenlan_types::CommunityProposalRejectResponse { id }))
-}
-
 #[cfg(test)]
 mod tests {
     use axum::{body::Body, http::Request};
@@ -225,7 +119,6 @@ mod tests {
         for uri in [
             "/api/communities?limit=10",
             "/api/communities/members?limit=10",
-            "/api/communities/page-assignments?limit=10",
         ] {
             let response = router
                 .clone()

@@ -57,7 +57,6 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
     let router = entity_graph_routes::register_writes(router);
     let router = profile_agents_routes::register(router);
     let router = entity_graph_routes::register_reads(router);
-    let router = entity_graph_routes::register_suggestions(router);
     let router = spaces_routes::register_core(router);
     let router = page_routes::register(router);
 

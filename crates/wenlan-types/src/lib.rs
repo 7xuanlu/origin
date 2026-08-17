@@ -35,14 +35,14 @@ pub use briefing::{BriefingResponse, ContradictionItem};
 pub use communities::{
     CommunityListResponse, CommunityMember, CommunityMemberCursor, CommunityMembersResponse,
     CommunityPageAssignment, CommunityPageAssignmentsResponse, CommunityProposalAcceptResponse,
-    CommunityProposalAction, CommunityProposalPayload, CommunityProposalRejectResponse,
-    CommunityProposalSummary, CommunityReadScope, CommunitySummary, ListCommunityProposalsResponse,
+    CommunityProposalAction, CommunityProposalPayload, CommunityProposalSummary,
+    CommunityReadScope, CommunitySummary, ListCommunityProposalsResponse,
     PageCommunityAssignmentState,
 };
 pub use entities::{
-    Entity, EntityDetail, EntitySearchResult, EntitySuggestion, GraphMemoryLink, GraphMemoryNode,
-    GraphPageLink, GraphPageNode, GraphRef, GraphRelation, KnowledgeGraphResponse, Observation,
-    RecentRelation, Relation, RelationWithEntity,
+    Entity, EntityDetail, EntitySearchResult, GraphMemoryLink, GraphMemoryNode, GraphPageLink,
+    GraphPageNode, GraphRef, GraphRelation, KnowledgeGraphResponse, Observation, Relation,
+    RelationWithEntity,
 };
 pub use lint::{LintCheckResult, LintQuery, LintReport};
 pub use memory::{

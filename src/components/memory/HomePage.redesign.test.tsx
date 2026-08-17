@@ -25,9 +25,7 @@ vi.mock("../../lib/tauri", async () => {
     listPages: vi.fn(),
     listConcepts: vi.fn(),
     listRecentChanges: vi.fn(),
-    listRecentRelations: vi.fn(),
     listEntities: vi.fn(),
-    getEntitySuggestions: vi.fn(),
     getMemoryStats: vi.fn(),
     getProfile: vi.fn(),
     getPendingContradictions: vi.fn(),
@@ -107,9 +105,7 @@ beforeEach(async () => {
     chain_depth: 1,
     entries: [],
   } as any);
-  vi.mocked(tauri.listRecentRelations).mockResolvedValue([]);
   vi.mocked(tauri.listEntities).mockResolvedValue([]);
-  vi.mocked(tauri.getEntitySuggestions).mockResolvedValue([]);
   vi.mocked(tauri.getMemoryStats).mockResolvedValue({
     total: 0,
     new_today: 0,
@@ -948,15 +944,6 @@ describe("HomePage redesign", () => {
         updated_at: 0,
       })) as any,
     );
-    vi.mocked(tauri.getEntitySuggestions).mockResolvedValue(
-      Array.from({ length: 4 }, (_, i) => ({
-        id: `sugg-${i}`,
-        entity_name: `Entity ${i}`,
-        source_ids: [],
-        confidence: 0.8,
-        created_at: nowIso,
-      })) as any,
-    );
 
     renderHome();
 
@@ -965,7 +952,6 @@ describe("HomePage redesign", () => {
     expect(screen.getByTestId("wiki-context-memories")).toHaveTextContent("1204");
     expect(await screen.findByTestId("wiki-context-memories-delta")).toHaveTextContent("+18 today");
     expect(await screen.findByTestId("wiki-context-entities")).toHaveTextContent("87");
-    expect(await screen.findByTestId("wiki-context-entities-delta")).toHaveTextContent("4 suggested");
   });
 
   it("shows a before/after relation pair for relation conflicts and approves", async () => {

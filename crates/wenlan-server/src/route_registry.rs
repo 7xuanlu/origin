@@ -241,8 +241,9 @@ where
             assert!(
                 truth_manifest::http_reader(self.builder, method, path).is_some(),
                 "unclassified reader path: {method:?} {path} in {:?}. Add a row to \
-                 wenlan_core::truth_manifest and to \
-                 docs/plans/2026-07-27-m5-reader-manifest-inventory.md; a new route is \
+                 wenlan_core::truth_manifest and regenerate \
+                 crates/wenlan-core/contracts/m5-reader-manifest-inventory.md with \
+                 scripts/m5-reader-sweep.py --update-inventory; a new route is \
                  page_bearing until its response type says otherwise.",
                 self.builder
             );
@@ -393,7 +394,6 @@ const NON_SENSITIVE_PATHS: &[&str] = &[
     "/api/pages/{id}/map/layout", "/api/pages/{id}/map/nodes", "/api/pages/{id}/map/edges",
     "/api/pages/{id}/map/nodes/{node_id}", "/api/pages/{id}/map/edges/{edge_id}",
     "/api/pages/{id}/map/improve",
-    "/api/communities/proposals/{id}/accept", "/api/communities/proposals/{id}/reject",
 ];
 
 const NON_SENSITIVE_MIXED_ROUTES: &[(RegisteredMethod, &str)] = &[
