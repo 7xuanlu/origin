@@ -167,6 +167,9 @@ export function buildGraphModel(entities: Entity[], details: EntityDetail[]): Gr
         // endpoints' details, each carrying its real id).
         const key = `id:${rel.id}`;
         if (!edges.has(key)) edges.set(key, edge);
+        // An idless mirror folded EARLIER sits under the composite key; the
+        // id-bearing copy wins regardless of detail order.
+        edges.delete(`k:${composite}`);
         seenComposites.add(composite);
       } else if (!seenComposites.has(composite)) {
         // No id (daemon gap): fall back to the endpoints+verb composite.
@@ -229,10 +232,9 @@ export function memorySourceId(nodeId: string): string | null {
  */
 export const PAGE_NODE_TYPE = "page";
 
-/** Edge verbs for the three typed page links, plus the synthesized one. Not
+/** Edge verbs for the typed page links, plus the synthesized one. Not
  *  daemon relation types. */
 export const WIKILINK_EDGE_TYPE = "wikilink";
-export const ABOUT_EDGE_TYPE = "about";
 export const CITES_EDGE_TYPE = "cites";
 /** Two pages that cite the same memory, drawn directly page→page because the
  *  memory node itself is hidden. */

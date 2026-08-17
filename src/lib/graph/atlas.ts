@@ -17,7 +17,6 @@ import {
   WIKILINK_EDGE_TYPE,
   CITES_EDGE_TYPE,
   MEMORY_EDGE_TYPE,
-  MIN_COMPONENT_SIZE,
 } from "./model";
 import { nodeFillFor, type GraphPalette } from "./palette";
 import { bridgeEdgeTest } from "./cartography";
@@ -192,54 +191,6 @@ export function runAtlasLayout(graph: Graph): void {
   });
 }
 
-/**
- * Parks degree-0 isolates on a deterministic ring just outside the connected
- * cluster instead of wherever FA2's gravity-only diffusion (or the d3 sim's
- * settle) left them: quiet periphery, honest bbox. Computed from the graph's
- * CURRENT connected-node bbox at call time.
- *
- * TEST-ONLY as of round 3: drawableModel drops every component smaller than
- * MIN_COMPONENT_SIZE before the layout runs, so a degree-0 isolate never
- * reaches the map and there is no ring left to park. Nothing in the render
- * path calls this; it is kept because the ring geometry is still the
- * documented answer if isolates are ever drawn again.
- */
-export function placeIsolateRing(graph: Graph): void {
-  const isolates = isolateIds(graph);
-  const isolateSet = new Set(isolates);
-  let minX = Infinity;
-  let maxX = -Infinity;
-  let minY = Infinity;
-  let maxY = -Infinity;
-  graph.forEachNode((id, attrs) => {
-    if (isolateSet.has(id)) return;
-    minX = Math.min(minX, attrs.x as number);
-    maxX = Math.max(maxX, attrs.x as number);
-    minY = Math.min(minY, attrs.y as number);
-    maxY = Math.max(maxY, attrs.y as number);
-  });
-  // No isolates, or nothing BUT isolates (the seed circle is already fine).
-  if (isolates.length === 0 || minX === Infinity) return;
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
-  const radius = Math.max(maxX - minX, maxY - minY, 1) * 0.65;
-  isolates.forEach((id, i) => {
-    const angle = (2 * Math.PI * i) / isolates.length;
-    graph.setNodeAttribute(id, "x", cx + radius * Math.cos(angle));
-    graph.setNodeAttribute(id, "y", cy + radius * Math.sin(angle));
-  });
-}
-
-/** Degree-0 node ids — the round-1 isolate ring that gravity would otherwise
- *  pull inward during a live layout step. */
-export function isolateIds(graph: Graph): string[] {
-  const isolates: string[] = [];
-  graph.forEachNode((id) => {
-    if (graph.degree(id) === 0) isolates.push(id);
-  });
-  return isolates;
-}
-
 /** Graph-space clearance between a leaf memory and the disc it orbits. */
 const SATELLITE_GAP = 6;
 
@@ -361,12 +312,6 @@ export const SHELF_GAP = 24;
  *  than SHELF_GAP so the shelf reads as a separate zone rather than as more
  *  of the core. */
 export const SHELF_TOP_GAP = 60;
-/** A component this size or larger earns a place on the shelf by default;
- *  1-4 node components are "small groups", hidden until the reader asks for
- *  them and shelved alongside the rest once they do. An ALIAS, not a second
- *  number: the filtering itself happens in drawableModel, and two constants
- *  for one threshold could only ever drift apart. */
-export const SHELF_MIN_SIZE = MIN_COMPONENT_SIZE;
 /** A shelf row may run this much wider than the core before it wraps. Wider
  *  than the core so the shelf can hold a few components per row, but bounded
  *  so it never stretches the scene sideways and shrinks the core. */

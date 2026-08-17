@@ -130,10 +130,17 @@ describe("buildGraphModel / buildEgoModel", () => {
     const detailB = makeDetail(b, [
       makeRel({ id: "", direction: "incoming", entity_id: "A", entity_name: "A", relation_type: "uses" }),
     ]);
-    const model = buildGraphModel([a, b], [detailA, detailB]);
-    expect(model.edges).toHaveLength(1);
-    expect(model.nodes.find((n) => n.id === "A")!.degree).toBe(1);
-    expect(model.nodes.find((n) => n.id === "B")!.degree).toBe(1);
+    for (const details of [
+      [detailA, detailB],
+      // Idless mirror first: the id-bearing copy must still replace it.
+      [detailB, detailA],
+    ]) {
+      const model = buildGraphModel([a, b], details);
+      expect(model.edges).toHaveLength(1);
+      expect(model.edges[0].id).toBe("r1");
+      expect(model.nodes.find((n) => n.id === "A")!.degree).toBe(1);
+      expect(model.nodes.find((n) => n.id === "B")!.degree).toBe(1);
+    }
   });
 
   it("counts unique detail entities for coverage, not raw detail-array length", () => {

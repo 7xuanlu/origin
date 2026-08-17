@@ -286,10 +286,20 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // on: on real data ~960 of 1,600 entities have no relation at all, and
   // another ~196 sit in small groups of four or fewer. Both buried the map.
   // The count is shown on the toolbar chip that turns them back on.
-  const visibleModel = useMemo<GraphModel>(
-    () => drawableModel(model, showSmallGroups),
-    [model, showSmallGroups],
-  );
+  // Overlay entry point: a focused entity that sits in a small group would
+  // otherwise vanish with it and the mount focus below would silently not
+  // fire, so the small groups are drawn for that mount whatever the chip says.
+  const visibleModel = useMemo<GraphModel>(() => {
+    const drawable = drawableModel(model, showSmallGroups);
+    if (
+      focusEntityId &&
+      !drawable.nodes.some((n) => n.id === focusEntityId) &&
+      model.nodes.some((n) => n.id === focusEntityId)
+    ) {
+      return drawableModel(model, true);
+    }
+    return drawable;
+  }, [model, showSmallGroups, focusEntityId]);
   // Counted off the FULL model, so the chip keeps its number when the groups
   // are showing and can offer to hide them again.
   const smallGroupCount = useMemo(() => smallGroupNodeCount(model), [model]);
@@ -332,10 +342,12 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
 
   // Region count + names for the toolbar and rail — membership only, so it
   // agrees with the hulls drawCartography actually draws without needing
-  // node positions; names share regionLeader with the drawn labels.
+  // node positions; names share regionLeader with the drawn labels. Counted
+  // over the DRAWN nodes for the same reason: communities come from the full
+  // model, but a hidden small group's community has no hull on the map.
   const regionInfo = useMemo(() => {
     const groups = new Map<string, GraphNode[]>();
-    for (const node of model.nodes) {
+    for (const node of visibleModel.nodes) {
       const community = communities.get(node.id);
       if (community === undefined) continue;
       const list = groups.get(community);
@@ -347,7 +359,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       if (members.length >= MIN_REGION_SIZE) names.set(community, regionLeader(members).name);
     }
     return { count: names.size, names };
-  }, [model, communities]);
+  }, [visibleModel, communities]);
 
   // Insight rail (artifact screen 01) — only cards whose data is real today:
   // isolates as the gap signal, cross-region bridges, this week's relations.
@@ -396,8 +408,17 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     }
 
     // createdAt is Unix seconds (daemon convention — see EntityDetail's * 1000)
+    // Only an entity relation carries its own creation time; page-link,
+    // shared-source, and memory edges borrow their page's or memory's
+    // last_modified (model.ts), so a re-saved page would report every one of
+    // its old links as new. Count relations only: both endpoints entities.
     const weekAgo = Date.now() / 1000 - 7 * 24 * 60 * 60;
-    const recent = model.edges.filter((e) => e.createdAt >= weekAgo);
+    const entityIds = new Set(
+      model.nodes.filter((n) => n.kind === "entity").map((n) => n.id),
+    );
+    const recent = model.edges.filter(
+      (e) => entityIds.has(e.source) && entityIds.has(e.target) && e.createdAt >= weekAgo,
+    );
     if (recent.length > 0) {
       const gained = new Map<string, number>();
       for (const e of recent) {

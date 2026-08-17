@@ -8,8 +8,6 @@ import {
   buildAtlasGraph,
   runAtlasLayout,
   createAtlasSimulation,
-  placeIsolateRing,
-  isolateIds,
   nonSimulatedIds,
   satellitePlan,
   placeSatellites,
@@ -327,41 +325,6 @@ describe("runAtlasLayout", () => {
   });
 });
 
-describe("placeIsolateRing", () => {
-  it("parks degree-0 isolates on a ring outside the connected cluster's CURRENT bbox", () => {
-    const model = makeModel(
-      [node({ id: "a", degree: 1 }), node({ id: "b", degree: 1 }), node({ id: "iso1" }), node({ id: "iso2" })],
-      [edge({ id: "e1", source: "a", target: "b" })],
-    );
-    const graph = buildAtlasGraph(model, PALETTE);
-    // Move the connected pair AFTER building — proves the ring is computed
-    // from the bbox at CALL time, not wherever buildAtlasGraph originally
-    // seeded them (round 5: this runs after the sim settles, so the
-    // connected cluster has moved by the time this is called).
-    graph.setNodeAttribute("a", "x", 5);
-    graph.setNodeAttribute("a", "y", 0);
-    graph.setNodeAttribute("b", "x", -5);
-    graph.setNodeAttribute("b", "y", 0);
-
-    placeIsolateRing(graph);
-
-    const xs = ["a", "b"].map((id) => graph.getNodeAttribute(id, "x") as number);
-    const ys = ["a", "b"].map((id) => graph.getNodeAttribute(id, "y") as number);
-    const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
-    const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
-    // The contract: isolates sit exactly on the deterministic ring at
-    // 0.65 x the cluster's larger bbox dimension (> the 0.5 x half-extent,
-    // so always outside the cluster) — not wherever FA2's gravity left them.
-    const expectedRadius =
-      Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys), 1) * 0.65;
-    for (const id of ["iso1", "iso2"]) {
-      const dx = (graph.getNodeAttribute(id, "x") as number) - cx;
-      const dy = (graph.getNodeAttribute(id, "y") as number) - cy;
-      expect(Math.hypot(dx, dy)).toBeCloseTo(expectedRadius, 6);
-    }
-  });
-});
-
 describe("createAtlasSimulation", () => {
   function starGraph(): Graph {
     // Hub "h" with four spokes, laid out once so the spokes start near the hub.
@@ -481,41 +444,6 @@ describe("createAtlasSimulation", () => {
     expect(onTick).toHaveBeenCalledTimes(2);
     sim.tick(1);
     expect(onTick).toHaveBeenCalledTimes(3);
-  });
-});
-
-describe("full atlas pipeline", () => {
-  it("is deterministic end to end: FA2 seed, sim settle, and ring placement land on identical positions", () => {
-    const model = makeModel(
-      [node({ id: "a" }), node({ id: "b" }), node({ id: "c" }), node({ id: "iso" })],
-      [edge({ id: "e1", source: "a", target: "b" }), edge({ id: "e2", source: "b", target: "c" })],
-    );
-
-    function run(): Graph {
-      const graph = buildAtlasGraph(model, PALETTE);
-      runAtlasLayout(graph);
-      createAtlasSimulation(graph);
-      placeIsolateRing(graph);
-      return graph;
-    }
-
-    const g1 = run();
-    const g2 = run();
-    for (const id of ["a", "b", "c", "iso"]) {
-      expect(g1.getNodeAttribute(id, "x")).toBeCloseTo(g2.getNodeAttribute(id, "x") as number, 6);
-      expect(g1.getNodeAttribute(id, "y")).toBeCloseTo(g2.getNodeAttribute(id, "y") as number, 6);
-    }
-  });
-});
-
-describe("isolateIds", () => {
-  it("returns exactly the degree-0 node ids", () => {
-    const model = makeModel(
-      [node({ id: "a" }), node({ id: "b" }), node({ id: "iso1" }), node({ id: "iso2" })],
-      [edge({ id: "e1", source: "a", target: "b" })],
-    );
-    const graph = buildAtlasGraph(model, PALETTE);
-    expect(new Set(isolateIds(graph))).toEqual(new Set(["iso1", "iso2"]));
   });
 });
 
