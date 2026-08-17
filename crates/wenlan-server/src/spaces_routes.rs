@@ -175,10 +175,8 @@ pub async fn handle_move_space(
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
-    let affected = db
-        .reassign_memories_space(&from, &to)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+    // `From<WenlanError>` keeps `Validation` (a refused merge) a 400, not a 500.
+    let affected = db.reassign_memories_space(&from, &to).await?;
     Ok(Json(serde_json::json!({"affected": affected})))
 }
 
