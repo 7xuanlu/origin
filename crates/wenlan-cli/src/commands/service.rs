@@ -162,22 +162,8 @@ fn current_server_path() -> Result<PathBuf> {
     Ok(server)
 }
 
-/// Resolves the data root the daemon will use at runtime. Mirrors
-/// `crates/wenlan-server/src/main.rs` so launchd log paths line up with the
-/// on-disk layout the daemon owns.
-// TODO(PR 3): replace this local mirror with wenlan_core::config::data_root().
-fn data_root() -> PathBuf {
-    wenlan_core::env_compat::var_compat("WENLAN_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("wenlan")
-        })
-}
-
 fn autostart_off_marker_path() -> PathBuf {
-    data_root().join(AUTOSTART_OFF_MARKER)
+    wenlan_core::config::data_root().join(AUTOSTART_OFF_MARKER)
 }
 
 pub(crate) fn autostart_off_marker_exists() -> bool {
@@ -208,7 +194,7 @@ fn remove_autostart_off_marker() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn origin_data_root() -> PathBuf {
-    data_root()
+    wenlan_core::config::data_root()
 }
 
 /// Builds a launchd plist that mirrors `service-manager`'s default output for

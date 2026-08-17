@@ -6,10 +6,11 @@ use clap::{Args, Subcommand};
 use std::path::{Path, PathBuf};
 use wenlan_types::{
     Brief, BriefItem, BriefReadRequest, BriefReadResponse, BriefReadState, BriefUpdateReceipt,
-    BriefUpdateRequest,
+    BriefUpdateRequest, OutboxEnvelope, OutboxPayload, OUTBOX_SCHEMA,
 };
 
 use crate::client::WenlanClient;
+use crate::outbox;
 use crate::output::{print_json, OutputFormat};
 
 #[derive(Debug, Args)]
@@ -38,6 +39,7 @@ pub async fn run(
     quiet: bool,
     args: BriefArgs,
     effective_space: Option<String>,
+    agent_name: Option<&str>,
 ) -> Result<()> {
     match args.command {
         Some(BriefCommand::Update { file }) => {
@@ -51,7 +53,27 @@ pub async fn run(
                     );
                 }
             }
-            let receipt = client.update_brief(&request).await?;
+            let receipt = match client.update_brief(&request).await {
+                Ok(receipt) => receipt,
+                Err(error) if client.is_local() && outbox::is_daemon_unreachable(&error) => {
+                    let envelope = OutboxEnvelope {
+                        schema: OUTBOX_SCHEMA,
+                        created_at: outbox::now_rfc3339(),
+                        caller_id: request.caller_id.clone(),
+                        operation_id: request.operation_id.clone(),
+                        space: Some(request.space.clone()),
+                        agent_name: agent_name.map(str::to_owned),
+                        reconcile_summary_version: true,
+                        payload: OutboxPayload::BriefUpdate(request),
+                    };
+                    let path = outbox::enqueue(&envelope)?;
+                    if !quiet {
+                        print_queued(format, &path, &envelope.operation_id)?;
+                    }
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
             if !quiet {
                 match format {
                     OutputFormat::Json => print_json(&receipt)?,
@@ -82,6 +104,28 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct QueuedOutput<'a> {
+    status: &'static str,
+    path: String,
+    operation_id: &'a str,
+}
+
+fn print_queued(format: OutputFormat, path: &Path, operation_id: &str) -> Result<()> {
+    match format {
+        OutputFormat::Json => print_json(&QueuedOutput {
+            status: "queued",
+            path: path.display().to_string(),
+            operation_id,
+        }),
+        OutputFormat::Table => {
+            println!("queued: {}", path.display());
+            Ok(())
+        }
+        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
+    }
 }
 
 pub fn load_update(path: &Path) -> Result<BriefUpdateRequest> {

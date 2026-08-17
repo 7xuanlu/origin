@@ -8,6 +8,7 @@ pub mod ingest;
 pub mod lint;
 pub mod list;
 pub mod mcp;
+pub mod outbox;
 pub mod pages;
 pub mod recall;
 pub mod search;

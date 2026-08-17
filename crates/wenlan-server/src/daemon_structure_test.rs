@@ -1535,10 +1535,14 @@ fn structure_violations_with_children(
             };
             violations.extend(unique_order_violations(&body, order, function));
             if function == "register_optional_runtime_workers" {
+                // Four snapshots: the outbox drain worker's shutdown receiver,
+                // the model-load reservation, the load shutdown receiver, and
+                // the reconcile truth provider. Each takes the guard inside a
+                // block and drops it before awaiting.
                 violations.extend(exact_token_count_violations(
                     &body,
                     "shared.read().await",
-                    3,
+                    4,
                     "register_optional_runtime_workers",
                 ));
                 violations.extend(unique_order_violations(

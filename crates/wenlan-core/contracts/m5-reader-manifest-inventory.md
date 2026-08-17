@@ -522,9 +522,9 @@ A surface that transmits anyway is a failing test on that surface. That gate is
 soft, and saying so plainly is what cooperative-tier means. It is also no longer
 load-bearing: the shape gate holds even when this one is bypassed.
 
-## HTTP — all 169 registered `(method, path, handler)` triples
+## HTTP — all 171 registered `(method, path, handler)` triples
 
-60 page-bearing, 109 not.
+60 page-bearing, 111 not.
 
 | Method | Path | Builder | Page-bearing | Class | Marker-shape | Adapter | Evidence |
 |---|---|---|---|---|---|---|---|
@@ -625,6 +625,8 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `GET` | `/api/onboarding/milestones` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/onboarding/milestones/{id}/acknowledge` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/onboarding/reset` | main | no | not_applicable | `none` | — | no prose fields |
+| `POST` | `/api/outbox/drain` | main | no | not_applicable | `none` | — | drain report only |
+| `GET` | `/api/outbox/status` | main | no | not_applicable | `none` | — | outbox counts only |
 | `GET` | `/api/pages` | main | yes | automatic | **`collection`** | `handle_list_pages` | opaque response type — fail-closed |
 | `POST` | `/api/pages` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/pages/export` | main | yes | automatic | `none` | `handle_export_pages` | EFFECT: writes page prose to the requested vault |

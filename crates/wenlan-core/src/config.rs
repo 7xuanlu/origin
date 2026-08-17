@@ -218,6 +218,23 @@ fn config_path() -> PathBuf {
     root.join("config.json")
 }
 
+/// Resolve the shared Wenlan data root used by the daemon and CLI durable
+/// workflow artifacts.
+pub fn data_root() -> PathBuf {
+    crate::env_compat::var_compat("WENLAN_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("wenlan")
+        })
+}
+
+/// Directory containing durable CLI writes waiting for daemon replay.
+pub fn outbox_dir() -> PathBuf {
+    data_root().join("outbox")
+}
+
 pub fn load_config() -> Config {
     let path = config_path();
     let mut config = match std::fs::read_to_string(&path) {

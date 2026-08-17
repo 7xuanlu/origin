@@ -101,6 +101,7 @@ main|post|/api/memory/{id}/pin|wenlan_server::pinned_memory_routes::handle_pin_m
 main|post|/api/memory/{id}/unpin|wenlan_server::pinned_memory_routes::handle_unpin_memory
 main|post|/api/memory/{id}/update-page|wenlan_server::page_routes::handle_update_page
 main|post|/api/on-device-model/download|wenlan_server::config_routes::handle_download_on_device_model
+main|post|/api/outbox/drain|wenlan_server::outbox_routes::handle_drain
 main|post|/api/onboarding/milestones/{id}/acknowledge|wenlan_server::onboarding_routes::handle_acknowledge_milestone
 main|post|/api/onboarding/reset|wenlan_server::onboarding_routes::handle_reset_milestones
 main|post|/api/pages|wenlan_server::page_routes::handle_create_page
@@ -164,6 +165,7 @@ main|delete|/api/spaces/default|wenlan_server::spaces_routes::handle_clear_defau
 main|delete|/api/spaces/{name}|wenlan_server::spaces_routes::handle_delete_space
 main|delete|/api/tags/{name}|wenlan_server::activity_tag_routes::handle_delete_tag
 main|patch|/api/brief|wenlan_server::brief_routes::handle_update_brief
+main|get|/api/outbox/status|wenlan_server::outbox_routes::handle_status
 main|patch|/api/pages/{id}/map/edges/{edge_id}|wenlan_server::page_map_routes::handle_patch_map_edge
 main|patch|/api/pages/{id}/map/nodes/{node_id}|wenlan_server::page_map_routes::handle_patch_map_node
 repair|get|/api/health|wenlan_server::routes::handle_health

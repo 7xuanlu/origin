@@ -17,6 +17,7 @@ pub mod memory;
 pub mod memory_type;
 pub mod narrative;
 pub mod onboarding;
+pub mod outbox;
 pub mod page_map;
 pub mod pages;
 pub mod repair;
@@ -53,6 +54,9 @@ pub use memory::{
 };
 pub use memory_type::{MEMORY_TYPE_CAPTURE_DESCRIPTION, MEMORY_TYPE_FILTER_DESCRIPTION};
 pub use narrative::NarrativeResponse;
+pub use outbox::{
+    OutboxDrainDetail, OutboxDrainReport, OutboxEnvelope, OutboxPayload, OUTBOX_SCHEMA,
+};
 pub use pages::{Page, PageEvidence};
 pub use repair::*;
 pub use repair_plan::*;
