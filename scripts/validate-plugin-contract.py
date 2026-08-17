@@ -18,7 +18,7 @@ from typing import Any
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[1]
 ALLOWED_SKILL_STATUSES = {"shared_now", "claude_only_until_ported"}
-CODEX_SKILLS_WITHOUT_MCP_REFERENCE = {"help", "pages"}
+CODEX_SKILLS_WITHOUT_MCP_REFERENCE = {"handoff", "help", "pages"}
 CODEX_SKILLS_USING_RESOLVER = {
     "brief",
     "capture",
