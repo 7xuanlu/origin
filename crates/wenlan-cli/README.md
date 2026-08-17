@@ -51,9 +51,11 @@ Set `WENLAN_HOST` to point at a remote daemon:
 export WENLAN_HOST=http://127.0.0.1:7878  # default
 ```
 
-When a request cannot connect, the CLI automatically starts the registered
-background service (`com.wenlan.server`) and waits for its health endpoint. Set
-`WENLAN_NO_AUTOSTART=1` to opt out and report the connection failure directly.
+When a request to a loopback daemon cannot connect, the CLI automatically starts
+the registered background service (`com.wenlan.server`) and waits for its health
+endpoint. Remote or invalid `WENLAN_HOST` values keep the original connection
+error. `status`, `background`, and `restart` skip autostart; set
+`WENLAN_NO_AUTOSTART=1` to opt out for other commands.
 
 ## Subcommands
 
@@ -79,7 +81,7 @@ wenlan setup --anthropic-api-key-env ANTHROPIC_API_KEY
 
 ### `wenlan background <on|off>`
 
-Start or stop the per-user background runtime. `wenlan background off` stops the current daemon while preserving its login registration; run `wenlan background on` to start it again. Most users run `wenlan background on` once after setup and `wenlan restart` after upgrades installed outside `wenlan setup`.
+Start or stop the per-user background runtime. `wenlan background off` stops the current daemon while preserving its login registration and writes `<data root>/autostart.off`, so recovery will not start it again. Run `wenlan background on` to remove the marker and start it again. Most users run `wenlan background on` once after setup and `wenlan restart` after upgrades installed outside `wenlan setup`.
 
 ```bash
 wenlan background on

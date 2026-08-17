@@ -3,7 +3,9 @@ use assert_cmd::Command;
 use serde_json::json;
 
 fn cli() -> Command {
-    Command::cargo_bin("wenlan").expect("wenlan binary built")
+    let mut command = Command::cargo_bin("wenlan").expect("wenlan binary built");
+    command.env("WENLAN_NO_AUTOSTART", "1");
+    command
 }
 
 #[test]

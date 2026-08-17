@@ -97,7 +97,9 @@ impl WenlanClient {
     }
 
     async fn send(&self, req: reqwest::RequestBuilder, what: &str) -> Result<reqwest::Response> {
-        let retry = if recovery::autostart_allowed_from_env(self.recovery_enabled) {
+        let retry = if recovery::autostart_allowed_from_env(self.recovery_enabled)
+            && recovery::is_local_daemon_url(&self.base_url)
+        {
             req.try_clone()
         } else {
             None
@@ -111,7 +113,7 @@ impl WenlanClient {
                 };
                 let original = anyhow::Error::new(error).context(what.to_owned());
                 if let Err(recovery_error) = recovery::recover(&self.base_url).await {
-                    return Err(original.context(recovery_error.to_string()));
+                    return Err(original.context(format!("{recovery_error:#}")));
                 }
                 retry.send().await.with_context(|| what.to_owned())
             }
@@ -123,10 +125,7 @@ impl WenlanClient {
     pub async fn health(&self) -> Result<HealthResponse> {
         let url = format!("{}/api/health", self.base_url);
         let resp = self
-            .send(
-                self.http.get(&url),
-                &format!("GET {} failed (is the daemon running?)", url),
-            )
+            .send(self.http.get(&url), &format!("GET {} failed", url))
             .await?;
         let resp = resp
             .error_for_status()
