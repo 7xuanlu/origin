@@ -509,6 +509,71 @@ pub async fn test_db() -> (MemoryDB, tempfile::TempDir) {
     (memory_db, dir)
 }
 
+/// [`test_db`] stopped at a historical schema state: the migration chain
+/// runs only up to `ceiling` (see `run_migrations_up_to` for the exact
+/// checkpoints), so a test gets the GENUINE `pages`/`edges` shape of that
+/// version instead of a fully migrated schema with columns dropped by
+/// hand. Everything else -- embedder, chunker, caches -- is `test_db`'s.
+pub async fn test_db_at(ceiling: i64) -> (MemoryDB, tempfile::TempDir) {
+    let dir = tempdir().expect("failed to create temp dir");
+    let db_path = dir.path();
+    std::fs::create_dir_all(db_path).unwrap();
+    let db_file = db_path.join("origin_memory.db");
+
+    let db = libsql::Builder::new_local(db_file.to_str().unwrap())
+        .build()
+        .await
+        .expect("libsql open");
+    let conn = db.connect().expect("libsql connect");
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        .await
+        .unwrap();
+    conn.execute_batch(SCHEMA).await.unwrap();
+    let _ = conn.execute_batch(FTS_SCHEMA).await;
+    let _ = conn.execute_batch(FTS_TRIGGERS).await;
+    let _ = conn
+        .execute(
+            "CREATE INDEX IF NOT EXISTS memories_vec_idx ON memories (
+                libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32')
+            )",
+            (),
+        )
+        .await;
+    let _ = conn
+        .execute(
+            "CREATE INDEX IF NOT EXISTS child_vectors_vec_idx ON child_vectors (
+                libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32')
+            )",
+            (),
+        )
+        .await;
+
+    let lint_freshness = Arc::new(
+        crate::lint::snapshot::LintFreshnessClock::new(&db).expect("lint freshness observer"),
+    );
+    let memory_db = MemoryDB {
+        _db: db,
+        conn: Arc::new(tokio::sync::Mutex::new(conn)),
+        entity_resolution_lock: tokio::sync::Mutex::new(()),
+        space_write_lock: tokio::sync::Mutex::new(()),
+        lint_freshness,
+        page_projection_tracker: crate::page_projection_tracker::PageProjectionTracker::new(),
+        derived_artifact_state: crate::derived_artifact_state::DerivedArtifactState::new(),
+        embedder: Some(shared_embedder()),
+        chunker: build_chunker(std::path::Path::new(".nonexistent")),
+        embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(200)),
+        community_dirty_nodes: std::sync::Mutex::new(BTreeMap::new()),
+        community_grouping_runtime: std::sync::Mutex::new(
+            crate::community_grouping::CommunityGroupingRuntime::default(),
+        ),
+    };
+    memory_db
+        .run_migrations_up_to(&crate::events::NoopEmitter, ceiling)
+        .await
+        .unwrap();
+    (memory_db, dir)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_m4_finalize_rolls_back_and_restores_lease_connection_and_runtime() {
     const SPACE: &str = "m4-cancel-space";
@@ -31688,6 +31753,268 @@ async fn ambient_entity_sweep_dual_writes_shadow_pages() {
     }
 }
 
+async fn user_version(db: &MemoryDB) -> i64 {
+    let conn = db.conn.lock().await;
+    let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+    rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+}
+
+async fn pages_has_column(db: &MemoryDB, column: &str) -> bool {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM pragma_table_info('pages') WHERE name = ?1",
+            libsql::params![column],
+        )
+        .await
+        .unwrap();
+    rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap() > 0
+}
+
+/// KG review 2026-08-16 #1: the frozen bodies of migrations 113 and 114
+/// UPDATEd five `pages` columns that only migration 117 adds, so a real
+/// database at user_version <= 112 holding any entity could not open on the
+/// current build. The fixture is a GENUINE schema-112 store (the chain
+/// stopped before 113 -- no hand-dropped columns), with one unmapped entity
+/// for 113's repair loop and one mapped entity for 114's resync loop.
+#[tokio::test]
+async fn migration_113_and_114_replay_against_a_genuine_schema_112_pages_shape() {
+    let (db, _dir) = test_db_at(112).await;
+    assert_eq!(user_version(&db).await, 112);
+    // Tripwire: the fixture really is pre-117.
+    assert!(
+        !pages_has_column(&db, "source_agent").await,
+        "a schema-112 pages table must not carry migration 117's columns"
+    );
+
+    let mapped_page = crate::pages::new_page_id();
+    {
+        let conn = db.conn.lock().await;
+        // A: unmapped -- migration 113 backfills its shadow, then resyncs it.
+        conn.execute(
+            "INSERT INTO entities \
+                 (id, name, entity_type, space, source_agent, confidence, confirmed, \
+                  created_at, updated_at, community_id, embedding_updated_at) \
+             VALUES ('m112-unmapped', 'Unmapped', 'concept', 'work', 'claude', NULL, 0, \
+                     11, 12, NULL, NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+        // B: mapped -- migration 114 resyncs every mapped shadow.
+        conn.execute(
+            "INSERT INTO entities \
+                 (id, name, entity_type, space, source_agent, confidence, confirmed, \
+                  created_at, updated_at, community_id, embedding_updated_at) \
+             VALUES ('m112-mapped', 'Mapped', 'concept', 'work', 'codex', NULL, 0, \
+                     21, 22, NULL, NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+        // Same column list migration 113 uses for a shadow at this version.
+        conn.execute(
+            "INSERT INTO pages (
+                id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
+                embedding, space, workspace, source_memory_ids, version, status,
+                created_at, last_compiled, last_modified, creation_kind, review_status
+             ) VALUES (?1, 'Mapped', NULL, '', 'entity', 'concept', NULL, 0,
+                       NULL, 'work', 'work', '[]', 1, 'active',
+                       '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z',
+                       'entity', 'unconfirmed')",
+            libsql::params![mapped_page.as_str()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_page_map (entity_id, page_id, created_at) \
+             VALUES ('m112-mapped', ?1, '2026-08-01T00:00:00Z')",
+            libsql::params![mapped_page.as_str()],
+        )
+        .await
+        .unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("a schema-112 database with entities must open on the current build");
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+    assert_eq!(user_version(&db).await, 124);
+
+    let conn = db.conn.lock().await;
+    for (entity_id, source_agent, created_at) in [
+        ("m112-unmapped", "claude", 11i64),
+        ("m112-mapped", "codex", 21i64),
+    ] {
+        let mut rows = conn
+            .query(
+                "SELECT p.source_agent, p.entity_created_at, p.status \
+                 FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id \
+                 WHERE epm.entity_id = ?1 AND p.kind = 'entity'",
+                libsql::params![entity_id],
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{entity_id} must have a shadow page after the chain"));
+        assert_eq!(
+            row.get::<Option<String>>(0).unwrap().as_deref(),
+            Some(source_agent),
+            "{entity_id}: migration 117's backfill must populate source_agent"
+        );
+        assert_eq!(
+            row.get::<Option<i64>>(1).unwrap(),
+            Some(created_at),
+            "{entity_id}: migration 117's backfill must populate entity_created_at"
+        );
+        assert_eq!(row.get::<String>(2).unwrap(), "active");
+    }
+}
+
+/// Seed a page P and a memory M in one space with an active `cites` edge
+/// between them (the id migration 115/119 derive from `page_evidence`), on a
+/// database whose chain stopped before 115. Returns the edge id.
+async fn seed_cites_edge_at_114(
+    db: &MemoryDB,
+    page_id: &str,
+    source_id: &str,
+    space: &str,
+    valid_until: Option<i64>,
+) -> String {
+    let edge_id = crate::provenance::compute_edge_id(
+        "cites", "page", page_id, "memory", source_id, source_id,
+    );
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO pages (id, title, content, space, workspace, version, status, \
+                            created_at, last_compiled, last_modified) \
+         VALUES (?1, ?1, 'body', ?2, ?2, 1, 'active', \
+                 '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z')",
+        libsql::params![page_id, space],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO memories \
+             (id, content, source, source_id, title, chunk_index, last_modified, \
+              chunk_type, source_agent, space, pending_revision, version) \
+         VALUES (?1, 'evidence body', 'memory', ?2, ?2, 0, 0, 'text', 'folder', ?3, 0, 1)",
+        libsql::params![format!("row_{source_id}"), source_id, space],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO page_evidence (page_id, source_kind, locator, title, linked_at, link_reason) \
+         VALUES (?1, 'memory', ?2, 'Evidence', 5, 'test')",
+        libsql::params![page_id, source_id],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO edges \
+             (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, lineage, \
+              grounded, root_id, space, created_at, superseded_by, valid_until) \
+         VALUES (?1, ?2, 'page', ?3, 'memory', 'cites', 'evidence', \
+                 0, NULL, ?4, 0, NULL, ?5)",
+        libsql::params![edge_id.as_str(), page_id, source_id, space, valid_until],
+    )
+    .await
+    .unwrap();
+    edge_id
+}
+
+async fn edge_state(db: &MemoryDB, edge_id: &str) -> (String, Option<i64>, Option<String>) {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT lineage, valid_until, json_extract(payload, '$.source_kind') \
+             FROM edges WHERE edge_id = ?1",
+            libsql::params![edge_id],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("edge row");
+    (
+        row.get::<String>(0).unwrap(),
+        row.get::<Option<i64>>(1).unwrap(),
+        row.get::<Option<String>>(2).unwrap(),
+    )
+}
+
+/// KG review 2026-08-16 #5: an active `cites` edge whose memory endpoint
+/// moved to another space made migration 115's payload UPDATE trip the space
+/// fence and roll the whole migration back. The pre-pass downgrades it to
+/// legacy first, so the chain completes and the payload still gets patched.
+#[tokio::test]
+async fn migration_115_downgrades_a_moved_endpoint_cites_edge_before_patching() {
+    let (db, _dir) = test_db_at(114).await;
+    assert_eq!(user_version(&db).await, 114);
+    let edge_id = seed_cites_edge_at_114(&db, "m114-page", "m114-mem", "space-a", None).await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET space = 'space-b' WHERE source_id = 'm114-mem'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("a moved-endpoint cites edge must not abort migrations 115/116/119");
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+
+    let (lineage, valid_until, source_kind) = edge_state(&db, &edge_id).await;
+    assert_eq!(
+        lineage, "legacy",
+        "the cross-space row is downgraded, not left typed"
+    );
+    assert!(valid_until.is_none(), "downgrade keeps the row active");
+    assert_eq!(
+        source_kind.as_deref(),
+        Some("memory"),
+        "migration 115 still patches the downgraded row's payload"
+    );
+}
+
+/// KG review 2026-08-16 #5, migration 119's half: a RETIRED cites edge is
+/// not downgraded (it cannot trip the fence while retired), so 119's
+/// reactivation must skip it when its memory endpoint has moved -- bringing
+/// it back would either abort under the fence or resurrect a cross-space
+/// typed row.
+#[tokio::test]
+async fn migration_119_leaves_a_retired_cites_edge_with_a_moved_memory_retired() {
+    let (db, _dir) = test_db_at(114).await;
+    let edge_id =
+        seed_cites_edge_at_114(&db, "m119-page", "m119-mem", "space-a", Some(1_700_000_000)).await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET space = 'space-b' WHERE source_id = 'm119-mem'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("chain must complete");
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+
+    let (lineage, valid_until, _) = edge_state(&db, &edge_id).await;
+    assert_eq!(
+        valid_until,
+        Some(1_700_000_000),
+        "migration 119 must not reactivate a cites edge whose memory moved"
+    );
+    assert_eq!(lineage, "evidence", "a retired row is not downgraded");
+}
+
 /// KG close plan G5: migration 113 repairs the entities #473's sweep already
 /// wrote without shadow pages. Simulate the damage (a mapped-page-less
 /// entity, the live drift shape), run the migration, and the parity sweep
@@ -46241,6 +46568,201 @@ async fn delete_entity_deletes_shadow_page() {
     );
 }
 
+/// Two same-space entities joined by an active `relates` edge, plus the memory
+/// the edge cites (so `rebind_source_id` has a live source to rename).
+async fn seed_linked_entity_pair(db: &MemoryDB, prefix: &str, space: &str) -> String {
+    db.create_space(space, None, false).await.unwrap();
+    db.upsert_documents(vec![make_memory_doc(
+        &format!("{prefix}-src"),
+        "The two entities relate.",
+        "fact",
+        space,
+        "folder",
+    )])
+    .await
+    .unwrap();
+    db.test_seed_entity_shadow_page(
+        TestEntity::new(&format!("{prefix}-a"), "Left", "concept").space(space),
+    )
+    .await
+    .unwrap();
+    db.test_seed_entity_shadow_page(
+        TestEntity::new(&format!("{prefix}-b"), "Right", "concept").space(space),
+    )
+    .await
+    .unwrap();
+    db.create_relation(
+        &format!("{prefix}-a"),
+        &format!("{prefix}-b"),
+        "related_to",
+        None,
+        None,
+        None,
+        Some(&format!("{prefix}-src")),
+    )
+    .await
+    .unwrap()
+}
+
+async fn relates_edge_state(
+    db: &MemoryDB,
+    edge_id: &str,
+) -> (Option<i64>, String, Option<String>, Option<String>) {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT valid_until, space, json_extract(payload, '$.retired_by_archive'), \
+                    json_extract(payload, '$.source_memory_id') \
+             FROM edges WHERE edge_id = ?1",
+            libsql::params![edge_id],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("edge row");
+    (
+        row.get::<Option<i64>>(0).unwrap(),
+        row.get::<String>(1).unwrap(),
+        row.get::<Option<String>>(2).unwrap(),
+        row.get::<Option<String>>(3).unwrap(),
+    )
+}
+
+/// KG review 2026-08-16 #2: archiving an entity used to leave its active
+/// edges alive with an endpoint the space fence can no longer resolve, so the
+/// next space rename or source rebind aborted. Archive retracts them (tagged),
+/// both writers succeed, and restore brings the entity and its edges back.
+#[tokio::test]
+async fn archive_entity_retracts_its_edges_so_rename_and_rebind_succeed_and_restore_reverts() {
+    let (db, _dir) = test_db().await;
+    let edge_id = seed_linked_entity_pair(&db, "arch", "work").await;
+    assert_eq!(
+        db.entity_link_summary("arch-a").await.unwrap().active_edges,
+        1
+    );
+
+    assert!(db.archive_entity("arch-a").await.unwrap());
+    assert_eq!(
+        db.entity_link_summary("arch-a").await.unwrap().active_edges,
+        0,
+        "archive must retract the entity's active edges"
+    );
+    let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
+    assert!(
+        valid_until.is_some(),
+        "the edge is soft-retired, not deleted"
+    );
+    assert_eq!(
+        tag.as_deref(),
+        Some("arch-a"),
+        "an archive-retired edge is stamped with the archiving entity"
+    );
+
+    // Both in-place edge writers the fence used to abort on.
+    db.update_space("work", "career", None)
+        .await
+        .expect("a space rename must survive an archived entity's edges");
+    db.rebind_source_id("memory", "arch-src", "arch-src-renamed")
+        .await
+        .expect("a source rebind must survive an archived entity's edges");
+    let (_, space, _, source_memory_id) = relates_edge_state(&db, &edge_id).await;
+    assert_eq!(space, "career");
+    assert_eq!(source_memory_id.as_deref(), Some("arch-src-renamed"));
+
+    assert!(db.restore_entity("arch-a").await.unwrap());
+    let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
+    assert!(
+        valid_until.is_none(),
+        "restore re-activates the archive-retired edge"
+    );
+    assert!(tag.is_none(), "restore removes the archive stamp");
+    assert_eq!(
+        db.entity_link_summary("arch-a").await.unwrap().active_edges,
+        1
+    );
+    assert!(
+        !db.restore_entity("arch-a").await.unwrap(),
+        "restoring an active entity is a no-op"
+    );
+}
+
+/// Restore is order-independent when both endpoints were archived. The
+/// stamp names the entity whose archive retired the edge (A); B's archive
+/// finds the edge already retired and stamps nothing. Restoring A first must
+/// leave the edge retired (B is still archived, the fence says no) but keep
+/// the stamp; restoring B then brings it back. Restoring in the other order
+/// works the same way.
+#[tokio::test]
+async fn restore_entity_reactivates_shared_edge_regardless_of_restore_order() {
+    let (db, _dir) = test_db().await;
+    let edge_id = seed_linked_entity_pair(&db, "ord", "work").await;
+
+    assert!(db.archive_entity("ord-a").await.unwrap());
+    assert!(db.archive_entity("ord-b").await.unwrap());
+    let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
+    assert!(valid_until.is_some());
+    assert_eq!(
+        tag.as_deref(),
+        Some("ord-a"),
+        "first archive stamps the edge"
+    );
+
+    // A first: the other endpoint is still archived, so the fence refuses the
+    // re-activation and the row stays retired *and stamped*.
+    assert!(db.restore_entity("ord-a").await.unwrap());
+    let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
+    assert!(
+        valid_until.is_some(),
+        "an edge whose other endpoint is still archived must stay retired"
+    );
+    assert_eq!(
+        tag.as_deref(),
+        Some("ord-a"),
+        "the stamp survives a refused restore"
+    );
+
+    // B second: the edge is incident to B, so B's restore picks it up even
+    // though the stamp names A.
+    assert!(db.restore_entity("ord-b").await.unwrap());
+    let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
+    assert!(
+        valid_until.is_none(),
+        "restoring the second endpoint re-activates the shared edge"
+    );
+    assert!(tag.is_none());
+    assert_eq!(
+        db.entity_link_summary("ord-a").await.unwrap().active_edges,
+        1
+    );
+    assert_eq!(
+        db.entity_link_summary("ord-b").await.unwrap().active_edges,
+        1
+    );
+}
+
+/// KG review 2026-08-16 #2, the permanent half: delete retracts the edges too
+/// (untagged -- there is nothing to restore), and a rename still succeeds.
+#[tokio::test]
+async fn delete_entity_retracts_its_edges_so_rename_succeeds() {
+    let (db, _dir) = test_db().await;
+    let edge_id = seed_linked_entity_pair(&db, "del", "work").await;
+
+    db.delete_entity("del-a").await.unwrap();
+    let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
+    assert!(
+        valid_until.is_some(),
+        "delete must retract the entity's active edges"
+    );
+    assert!(tag.is_none(), "a permanent delete leaves no restore stamp");
+    assert_eq!(
+        db.entity_link_summary("del-b").await.unwrap().active_edges,
+        0
+    );
+
+    db.update_space("work", "career", None)
+        .await
+        .expect("a space rename must survive a deleted entity's edges");
+}
+
 #[tokio::test]
 async fn merge_entities_deletes_loser_shadow_and_resyncs_canonical() {
     let (db, _dir) = test_db().await;
@@ -52694,6 +53216,114 @@ async fn migration_123_shadow_page_write_bumps_each_generation_exactly_once() {
 /// retirement had left any of the three reading a table that no longer exists,
 /// or writing one nothing reads, this fails rather than silently producing an
 /// empty community set.
+/// KG review 2026-08-16, migration 124: the repair for databases already past
+/// the frozen-replay fixes. (a) An active edge stranded on an archived shadow
+/// page (archived by a raw status flip, i.e. before `archive_entity` learned
+/// to retract) is retired and stamped; (b) a job parked by either now-fixed
+/// conflict is requeued; (c) an active cites edge whose memory moved is
+/// downgraded to legacy under the pages-reading fence.
+#[tokio::test]
+async fn migration_124_retires_orphan_edges_requeues_parked_jobs_and_downgrades_moved_edges() {
+    let (db, _dir) = test_db().await;
+    let orphan_edge = seed_linked_entity_pair(&db, "m124", "work").await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "m124-page",
+        "M124 page",
+        None,
+        "cites a memory",
+        None,
+        Some("work"),
+        &["m124-src"],
+        &now,
+    )
+    .await
+    .unwrap();
+    let cites_edge = crate::provenance::compute_edge_id(
+        "cites",
+        "page",
+        "m124-page",
+        "memory",
+        "m124-src",
+        "m124-src",
+    );
+    {
+        let conn = db.conn.lock().await;
+        // (a) the pre-fix archive shape: status flipped, edges untouched.
+        conn.execute(
+            "UPDATE pages SET status = 'archived' \
+             WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = 'm124-a')",
+            (),
+        )
+        .await
+        .unwrap();
+        // (b) a job parked by the version-only conflict.
+        conn.execute(
+            "INSERT INTO claim_derivation_jobs \
+                 (job_id, page_id, page_version, status, attempts, last_error, \
+                  created_at, updated_at) \
+             VALUES ('m124-page:1', 'm124-page', 1, 'parked', 5, \
+                     'Conflict: support_verdict_supersedes_existing: cr already has a support \
+                      edge for this span naming a different verdict', 1, 1) \
+             ON CONFLICT(job_id) DO UPDATE SET status = 'parked', attempts = 5, \
+                 last_error = excluded.last_error",
+            (),
+        )
+        .await
+        .unwrap();
+        // (c) `insert_page` dual-wrote the same-space cites edge; now the
+        // memory moves (the live move path leaves cites edges active).
+        conn.execute(
+            "UPDATE memories SET space = 'elsewhere' WHERE source_id = 'm124-src'",
+            (),
+        )
+        .await
+        .unwrap();
+        // Rewind to the pre-repair boundary.
+        conn.execute("PRAGMA user_version = 123", ()).await.unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("migration 124 must apply");
+    assert_eq!(user_version(&db).await, 124);
+
+    let (valid_until, _, tag, _) = relates_edge_state(&db, &orphan_edge).await;
+    assert!(valid_until.is_some(), "the orphan edge is retired");
+    assert_eq!(
+        tag.as_deref(),
+        Some("m124-a"),
+        "an edge orphaned by an ARCHIVED shadow is stamped for restore"
+    );
+    let (lineage, cites_valid_until, _) = edge_state(&db, &cites_edge).await;
+    assert_eq!(
+        lineage, "legacy",
+        "the moved-endpoint cites edge is downgraded"
+    );
+    assert!(cites_valid_until.is_none());
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT status, attempts, last_error FROM claim_derivation_jobs \
+                 WHERE job_id = 'm124-page:1'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "pending");
+        assert_eq!(row.get::<i64>(1).unwrap(), 0);
+        assert!(row.get::<Option<String>>(2).unwrap().is_none());
+    }
+
+    // The restore lane picks the stamped edge back up.
+    assert!(db.restore_entity("m124-a").await.unwrap());
+    let (valid_until, _, tag, _) = relates_edge_state(&db, &orphan_edge).await;
+    assert!(valid_until.is_none());
+    assert!(tag.is_none());
+}
+
 #[tokio::test]
 async fn community_pipeline_survives_entity_retirement_end_to_end() {
     const SPACE: &str = "g6s3-community-space";

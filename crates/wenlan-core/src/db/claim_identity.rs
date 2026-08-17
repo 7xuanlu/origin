@@ -1279,9 +1279,26 @@ impl MemoryDB {
         // genuinely distinct citations in chunks 0 and 1 would otherwise collide
         // on one edge id and the second would be refused as a superseding
         // re-judgment of the first.
+        //
+        // The source version is in the locator too (KG review 2026-08-16 #3).
+        // It was only in the payload, and every version bump that leaves the
+        // text alone -- a space rename or move bumps `memories.version` and
+        // the space-move trigger retracts the edge -- made the re-run's write
+        // land on the same edge id with a payload differing only in
+        // `source_version`: neither the byte-equal reactivation nor a
+        // legitimate supersede, so a hard `support_verdict_supersedes_existing`
+        // conflict that parked the page's derivation job for good. With the
+        // version in the id a re-judgment of the same place at a newer version
+        // is a NEW edge; the supersede UPDATE below still retires an active
+        // same-span row (any version), the retracted old row keeps its id and
+        // its audit record, and no payload is ever rewritten in place.
         let span_locator = format!(
-            "{}:{}:{}:{}",
-            verdict.chunk_index, verdict.span_start, verdict.span_end, verdict.span_digest
+            "{}:{}:{}:{}:{}",
+            verdict.chunk_index,
+            verdict.source_version,
+            verdict.span_start,
+            verdict.span_end,
+            verdict.span_digest
         );
         let judgment_locator = serde_json::json!([
             span_locator,

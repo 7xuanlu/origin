@@ -5832,3 +5832,166 @@ async fn producer_rolling_judge_upgrade_replaces_edge_without_losing_supported_s
     );
     assert!(rows.next().await.unwrap().is_none());
 }
+
+/// Every `supports` edge into `source_id`, oldest first: (active, source_version).
+async fn support_edges_into(db: &MemoryDB, source_id: &str) -> Vec<(bool, i64)> {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT valid_until IS NULL, json_extract(payload, '$.source_version')
+               FROM edges
+              WHERE edge_type = 'supports' AND dst_id = ?1
+              ORDER BY json_extract(payload, '$.source_version'), created_at, edge_id",
+            libsql::params![source_id],
+        )
+        .await
+        .unwrap();
+    let mut edges = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        edges.push((row.get::<i64>(0).unwrap() == 1, row.get::<i64>(1).unwrap()));
+    }
+    edges
+}
+
+/// KG review 2026-08-16 #3 / #28: the demote -> re-derive -> re-support loop
+/// after a version bump that leaves the text alone. A space rename bumps
+/// `memories.version`, the move trigger retracts the support edge and demotes
+/// the page; the re-run used to collide on the same edge id with a payload
+/// differing only in `source_version` and park the job forever. With the
+/// version in the locator the re-judgment is a new edge, the old one stays
+/// retracted, and the page is supported again.
+#[tokio::test]
+async fn producer_re_supports_after_a_space_rename_bumps_the_source_version() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    db.create_space("space-a", None, false).await.unwrap();
+    let evidence = "Alpha launched successfully.";
+    add_producer_memory(&db, "rename-source", evidence, "space-a", "folder").await;
+    add_producer_page(&db, "rename-page", evidence, "space-a").await;
+    link_page_evidence(&db, "rename-page", "rename-source").await;
+    let judge = ProducerJudge::pinned(&db);
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { .. }
+    ));
+    assert_eq!(truth_row(&db, "rename-page").await.unwrap().0, "supported");
+    assert_eq!(
+        support_edges_into(&db, "rename-source").await,
+        vec![(true, 1)]
+    );
+
+    db.update_space("space-a", "space-b", None).await.unwrap();
+    assert_eq!(
+        truth_row(&db, "rename-page").await.unwrap().0,
+        "provisional"
+    );
+    assert_eq!(
+        job_for(&db, "rename-page")
+            .await
+            .map(|(_, status, _)| status),
+        Some("pending".to_string()),
+        "the move trigger demotes and requeues"
+    );
+    assert_eq!(
+        support_edges_into(&db, "rename-source").await,
+        vec![(false, 1)],
+        "the move trigger retracts the old edge"
+    );
+
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { .. }
+    ));
+    assert_eq!(truth_row(&db, "rename-page").await.unwrap().0, "supported");
+    assert_eq!(
+        support_edges_into(&db, "rename-source").await,
+        vec![(false, 1), (true, 2)],
+        "the re-run mints a new edge at the live version and leaves the old one retracted"
+    );
+    assert_eq!(
+        job_for(&db, "rename-page")
+            .await
+            .map(|(_, status, _)| status),
+        Some("done".to_string())
+    );
+}
+
+/// KG review 2026-08-16 #4 / #28: the loop after a content edit. Rewriting the
+/// cited chunk demotes and requeues the page but leaves the old support edge
+/// active; the re-run ranks the NEW chunk's spans, so the old locator is not
+/// in its inventory and evaluation used to refuse to publish (`unregistered`)
+/// until the job parked. The run now retires the edges outside its sealed
+/// inventory, so the page is supported again and nothing parks.
+#[tokio::test]
+async fn producer_retires_stale_support_edges_after_the_cited_chunk_is_rewritten() {
+    let (db, _temp) = db_with_queue().await;
+    authorize_producer_judge(&db).await;
+    add_producer_memory(
+        &db,
+        "edit-source",
+        "Alpha launched successfully.",
+        "space-a",
+        "folder",
+    )
+    .await;
+    add_producer_page(&db, "edit-page", "Alpha launched successfully.", "space-a").await;
+    link_page_evidence(&db, "edit-page", "edit-source").await;
+    let judge = ProducerJudge::pinned(&db);
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { .. }
+    ));
+    assert_eq!(truth_row(&db, "edit-page").await.unwrap().0, "supported");
+    assert_eq!(
+        support_edges_into(&db, "edit-source").await,
+        vec![(true, 1)]
+    );
+
+    // A typo fix ahead of the cited sentence shifts every offset in chunk 0.
+    db.update_memory(
+        "edit-source",
+        "Preface added by an edit. Alpha launched successfully.",
+    )
+    .await
+    .unwrap();
+    assert_eq!(truth_row(&db, "edit-page").await.unwrap().0, "provisional");
+    assert_eq!(
+        job_for(&db, "edit-page").await.map(|(_, status, _)| status),
+        Some("pending".to_string()),
+        "the chunk-edit trigger demotes and requeues"
+    );
+    assert_eq!(
+        support_edges_into(&db, "edit-source").await,
+        vec![(true, 1)],
+        "the chunk-edit trigger does not retract the old edge"
+    );
+
+    assert!(matches!(
+        db.run_page_linked_truth_promotion_turn(&judge, "producer-worker")
+            .await
+            .unwrap(),
+        PromotionTurn::Completed { .. }
+    ));
+    assert_eq!(truth_row(&db, "edit-page").await.unwrap().0, "supported");
+    // The edited memory has two sentences and the pinned judge scores every
+    // span, so the re-run may publish more than one edge; what matters is
+    // that the pre-edit edge is the only retired one and every live edge
+    // names the live version.
+    let edges = support_edges_into(&db, "edit-source").await;
+    assert_eq!(edges[0], (false, 1), "the stale edge is retired by the run");
+    assert!(
+        edges.len() >= 2 && edges[1..].iter().all(|(active, v)| *active && *v > 1),
+        "the re-run's edges are active at the live version: {edges:?}"
+    );
+    assert_eq!(
+        job_for(&db, "edit-page").await.map(|(_, status, _)| status),
+        Some("done".to_string()),
+        "nothing parks"
+    );
+}

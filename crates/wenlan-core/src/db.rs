@@ -923,7 +923,7 @@ pub const EMBEDDING_DIM: usize = 768;
 /// `entities` table, skip every `version < N` branch, and quietly operate
 /// against a schema it cannot see. Refusing to open is recoverable; writing is
 /// not.
-pub const SCHEMA_VERSION: u32 = 123;
+pub const SCHEMA_VERSION: u32 = 124;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -4360,6 +4360,26 @@ impl MemoryDB {
     /// Apply incremental migrations based on PRAGMA user_version.
     /// Idempotent: checks column existence before ALTER TABLE.
     pub async fn run_migrations(&self, emitter: &dyn EventEmitter) -> Result<(), WenlanError> {
+        self.run_migrations_up_to(emitter, i64::MAX).await
+    }
+
+    /// [`Self::run_migrations`] with a stopping point: the chain runs in
+    /// order and returns as soon as the next migration would exceed
+    /// `ceiling`, leaving `user_version` at the highest applied number.
+    /// This is how a test gets a database at a GENUINE historical schema
+    /// state -- the pages shape at 112, say -- instead of hand-dropping the
+    /// columns later migrations add, which is exactly the fixture gap that
+    /// let migrations 113/114 ship UPDATEs against columns 117 creates.
+    /// Only the checkpoints a test needs exist: a ceiling below 113 stops
+    /// before migration 113, a ceiling of 113 or 114 stops before 115, and
+    /// anything higher runs the whole chain. The post-chain repairs
+    /// (community substrate/cutover, embedding recovery) are skipped on an
+    /// early return -- they belong to a fully migrated database.
+    pub(crate) async fn run_migrations_up_to(
+        &self,
+        emitter: &dyn EventEmitter,
+        ceiling: i64,
+    ) -> Result<(), WenlanError> {
         let conn = self.conn.lock().await;
 
         // Read current user_version
@@ -9068,6 +9088,9 @@ impl MemoryDB {
             // fixed the edge half of this path but missed the entity half).
             // Backfills a shadow page + `entity_page_map` row for every entity
             // that has none. See migrate_113_entity_shadow_page_repair.
+            if ceiling < 113 {
+                return Ok(());
+            }
             if version < 113 {
                 self.migrate_113_entity_shadow_page_repair(version).await?;
             }
@@ -9087,6 +9110,9 @@ impl MemoryDB {
             // confidence, explanation, source_agent) from the live legacy
             // rows, so the blocked readers can migrate onto the edge. See
             // migrate_115_edge_semantic_payload.
+            if ceiling < 115 {
+                return Ok(());
+            }
             if version < 115 {
                 self.migrate_115_edge_semantic_payload(version).await?;
             }
@@ -9183,6 +9209,18 @@ impl MemoryDB {
             if version < 123 {
                 self.migrate_123_retire_legacy_entity_tables(version)
                     .await?;
+            }
+
+            // Migration 124 (KG review 2026-08-16, PR A1): repair the data
+            // the frozen-replay fixes in this same PR cannot reach on an
+            // already-migrated database -- retire active edges stranded on
+            // archived/deleted entity endpoints, requeue derivation jobs
+            // parked by the two now-fixed conflicts, and downgrade
+            // moved-endpoint active edges to legacy so live in-place edge
+            // UPDATEs stop tripping the space fence. See
+            // migrate_124_kg_integrity_repair.
+            if version < 124 {
+                self.migrate_124_kg_integrity_repair(version).await?;
             }
         }
 
@@ -13970,6 +14008,15 @@ impl MemoryDB {
     // A repaired entity is byte-identical in shape to a correctly created
     // one, aliases folded in. Idempotent: scoped to entities with no
     // `entity_page_map` row at all.
+    //
+    // Frozen-replay fix (KG review 2026-08-16 #1): the resync UPDATE once
+    // also SET `source_agent`/`entity_created_at`/`entity_updated_at`/
+    // `community_id`/`embedding_updated_at` -- five `pages` columns that
+    // migration 117 ADDs later in the chain, so on any real database
+    // upgrading from <=112 with an unmapped entity the statement failed at
+    // prepare with `no such column: source_agent` and the daemon could not
+    // open the store. They are gone from this body: 117's own backfill
+    // populates them for every mapped entity once the columns exist.
     async fn migrate_113_entity_shadow_page_repair(
         &self,
         prior_version: i64,
@@ -14040,11 +14087,6 @@ impl MemoryDB {
                         aliases = (SELECT json_group_array(alias_name)
                                    FROM (SELECT alias_name FROM entity_aliases
                                          WHERE canonical_entity_id = ?1 ORDER BY alias_name)),
-                        source_agent = (SELECT source_agent FROM entities WHERE id = ?1),
-                        entity_created_at = (SELECT created_at FROM entities WHERE id = ?1),
-                        entity_updated_at = (SELECT updated_at FROM entities WHERE id = ?1),
-                        community_id = (SELECT community_id FROM entities WHERE id = ?1),
-                        embedding_updated_at = (SELECT embedding_updated_at FROM entities WHERE id = ?1),
                         last_modified = ?3
                      WHERE kind = 'entity'
                        AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
@@ -14092,6 +14134,11 @@ impl MemoryDB {
     // `entities` IS authoritative, so re-deriving the shadow from it here
     // remains correct forever, unlike a live writer), is idempotent and
     // repairs every stale mirrored column.
+    //
+    // Frozen-replay fix (KG review 2026-08-16 #1): same as migration 113 --
+    // the five columns migration 117 adds to `pages` are no longer SET
+    // here, because at user_version 113 they do not exist yet and every
+    // mapped entity made the UPDATE fail at prepare.
     async fn migrate_114_entity_shadow_resync(
         &self,
         prior_version: i64,
@@ -14132,11 +14179,6 @@ impl MemoryDB {
                         aliases = (SELECT json_group_array(alias_name)
                                    FROM (SELECT alias_name FROM entity_aliases
                                          WHERE canonical_entity_id = ?1 ORDER BY alias_name)),
-                        source_agent = (SELECT source_agent FROM entities WHERE id = ?1),
-                        entity_created_at = (SELECT created_at FROM entities WHERE id = ?1),
-                        entity_updated_at = (SELECT updated_at FROM entities WHERE id = ?1),
-                        community_id = (SELECT community_id FROM entities WHERE id = ?1),
-                        embedding_updated_at = (SELECT embedding_updated_at FROM entities WHERE id = ?1),
                         last_modified = ?3
                      WHERE kind = 'entity'
                        AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
@@ -14167,6 +14209,83 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("m114 bump: {e}")))?;
         log::info!("[migration] Migration 114 applied: {resynced} entity shadow pages re-synced");
         Ok(())
+    }
+
+    /// Downgrade every ACTIVE, non-legacy edge whose endpoint has drifted out
+    /// of the edge's space to `lineage='legacy'`, so a later in-place UPDATE
+    /// of that row cannot trip `edges_space_fence_update` (KG review
+    /// 2026-08-16 #5). The fence's UPDATE twin fires on any column update of
+    /// an active typed edge and RAISE(ABORT)s when either endpoint's resolved
+    /// space `IS NOT` the edge's space -- and a live memory/entity move only
+    /// retracts `supports` edges, so a `cites`/`relates` row can sit active
+    /// with a moved endpoint indefinitely. Migrations 115/116/119 bulk-UPDATE
+    /// active edges inside one transaction with `?` propagation, so one such
+    /// row rolled the whole migration back and the daemon could not open the
+    /// store. `lineage='legacy'` is the same reconciliation
+    /// `dual_write_edge`'s ON CONFLICT applies to a cross-space re-write, and
+    /// it makes the fence's `WHEN NEW.lineage != 'legacy'` false, so this
+    /// pre-pass is itself fence-safe.
+    ///
+    /// The endpoint predicate is the fence body of the migration this runs
+    /// under, arm for arm (including the `attests`-from-root and
+    /// `cites`-to-external exemptions), so exactly the rows the fence would
+    /// abort on are downgraded and no others. `arm` selects where an
+    /// `entity` endpoint's space is read: the historical `entities` table
+    /// (migrations 81/98's fence, live during 115/116/119) or the
+    /// `kind='entity'` shadow page (migration 121's fence, live from 121
+    /// on). Migrations 115/116/119 call it first thing with
+    /// [`EntityArm::installed`] (frozen-replay fix, no new number: on a chain
+    /// replay `entities` is stood up and the 81/98 fence is live; a direct
+    /// re-run on a post-123 store has neither, so the shadow-page arm mirrors
+    /// the fence that is actually installed), and migration 124 calls it with
+    /// `ShadowPages` for live databases already past them.
+    async fn downgrade_cross_space_active_edges(
+        conn: &libsql::Connection,
+        arm: EntityArm,
+    ) -> Result<u64, WenlanError> {
+        let entity_space = |endpoint: &str| match arm {
+            EntityArm::Entities => {
+                format!("(SELECT space FROM entities WHERE id = {endpoint})")
+            }
+            EntityArm::ShadowPages => format!(
+                "(SELECT p.space FROM entity_page_map epm \
+                   JOIN pages p ON p.id = epm.page_id \
+                  WHERE epm.entity_id = {endpoint} \
+                    AND p.kind = 'entity' AND p.status = 'active')"
+            ),
+        };
+        let endpoint_space = |kind: &str, endpoint: &str| {
+            format!(
+                "CASE {kind} \
+                    WHEN 'page' THEN (SELECT space FROM pages WHERE id = {endpoint}) \
+                    WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = {endpoint}) \
+                    WHEN 'entity' THEN {entity} \
+                    WHEN 'claim_revision' THEN ( \
+                        SELECT p.space FROM claim_revisions cr \
+                          JOIN claims c ON c.claim_id = cr.claim_id \
+                          JOIN pages p ON p.id = c.page_id \
+                         WHERE cr.claim_revision_id = {endpoint}) \
+                    ELSE NULL \
+                 END",
+                entity = entity_space(endpoint)
+            )
+        };
+        let sql = format!(
+            "UPDATE edges SET lineage = 'legacy' \
+             WHERE valid_until IS NULL AND lineage != 'legacy' \
+               AND ( \
+                 (NOT (edge_type = 'attests' AND src_kind = 'root') \
+                  AND ({src}) IS NOT space) \
+                 OR \
+                 (NOT (edge_type = 'cites' AND dst_kind = 'external') \
+                  AND ({dst}) IS NOT space) \
+               )",
+            src = endpoint_space("src_kind", "src_id"),
+            dst = endpoint_space("dst_kind", "dst_id"),
+        );
+        conn.execute(&sql, ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("cross-space edge downgrade: {e}")))
     }
 
     // Migration 115 (KG close plan G6, Stage 1 "one source of truth" — spec
@@ -14201,6 +14320,19 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("m115 begin: {e}")))?;
 
         let result: Result<(u64, u64, u64), WenlanError> = async {
+            // Frozen-replay fix (KG review 2026-08-16 #5): every pass below
+            // UPDATEs active edges in place, and a moved-endpoint row would
+            // make `edges_space_fence_update` abort the whole migration.
+            // Downgrade those rows first; see the helper.
+            let downgraded =
+                Self::downgrade_cross_space_active_edges(&conn, EntityArm::installed(&conn).await?)
+                    .await?;
+            if downgraded > 0 {
+                log::info!(
+                    "[migration] m115: {downgraded} cross-space active edge(s) downgraded to legacy"
+                );
+            }
+
             // Each pass collects (edge_id, patch) pairs first, then updates —
             // the single connection cannot interleave an UPDATE with a
             // streaming SELECT.
@@ -14494,6 +14626,17 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("m116 begin: {e}")))?;
 
         let result: Result<u64, WenlanError> = async {
+            // Frozen-replay fix (KG review 2026-08-16 #5): same fence
+            // hazard as migration 115 -- see
+            // `downgrade_cross_space_active_edges`.
+            let downgraded =
+                Self::downgrade_cross_space_active_edges(&conn, EntityArm::installed(&conn).await?)
+                    .await?;
+            if downgraded > 0 {
+                log::info!(
+                    "[migration] m116: {downgraded} cross-space active edge(s) downgraded to legacy"
+                );
+            }
             #[allow(clippy::type_complexity)]
             let mut pending: Vec<(String, i64, Option<String>)> = Vec::new();
             let mut rows = conn
@@ -14940,6 +15083,20 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("m119 begin: {e}")))?;
 
         let result: Result<u64, WenlanError> = async {
+            // Frozen-replay fix (KG review 2026-08-16 #5): same fence
+            // hazard as migration 115 for the active rows -- see
+            // `downgrade_cross_space_active_edges`. Retired rows are not
+            // downgraded (they cannot trip the fence while retired), so the
+            // reactivation UPDATE below additionally guards that both
+            // endpoints still resolve to the edge's space.
+            let downgraded =
+                Self::downgrade_cross_space_active_edges(&conn, EntityArm::installed(&conn).await?)
+                    .await?;
+            if downgraded > 0 {
+                log::info!(
+                    "[migration] m119: {downgraded} cross-space active edge(s) downgraded to legacy"
+                );
+            }
             let mut rows = conn
                 .query(
                     "SELECT page_id, source_kind, locator FROM page_evidence \
@@ -14972,12 +15129,22 @@ impl MemoryDB {
                 let edge_id = crate::provenance::compute_edge_id(
                     "cites", "page", &page_id, dst_kind, &locator, &locator,
                 );
+                // Reactivating a row makes it active-and-typed again, so the
+                // fence's UPDATE twin re-checks its endpoints: a page or
+                // memory endpoint that has since moved to another space (or
+                // been deleted) would RAISE(ABORT) and roll the migration
+                // back -- and a cross-space or endpoint-less reactivation is
+                // wrong anyway. Only rows whose endpoints still resolve to
+                // the edge's space come back.
                 let affected = conn
                     .execute(
                         "UPDATE edges SET valid_until = NULL \
                          WHERE edge_id = ?1 AND valid_until IS NOT NULL \
-                           AND superseded_by IS NULL",
-                        libsql::params![edge_id],
+                           AND superseded_by IS NULL \
+                           AND space IS (SELECT space FROM pages WHERE id = ?2) \
+                           AND (?3 = 'external' \
+                                OR (SELECT space FROM memories WHERE source_id = ?4) IS space)",
+                        libsql::params![edge_id, page_id.as_str(), dst_kind, locator.as_str()],
                     )
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m119 reactivate: {e}")))?;
@@ -15778,6 +15945,152 @@ impl MemoryDB {
         Ok(())
     }
 
+    /// Migration 124 (KG review 2026-08-16, PR A1 data repair). Three
+    /// repairs for state the forward fixes in this PR only prevent going
+    /// forward:
+    ///
+    /// (a) **Orphan entity edges.** `archive_entity`/`delete_entity` used to
+    ///     leave the entity's ACTIVE edges alive; migration 121's fence
+    ///     resolves an `entity` endpoint only through an ACTIVE shadow page,
+    ///     so every later in-place UPDATE of those rows (space rename, source
+    ///     rebind) aborted. Same pattern as migration 111's orphan pass:
+    ///     active, non-legacy edges with an entity endpoint that has no
+    ///     active shadow page are soft-retired (`dual_write_invalidate_edge`)
+    ///     and the community graph generations bumped. A row whose orphaned
+    ///     endpoint is an ARCHIVED shadow page is stamped
+    ///     `payload.$.retired_by_archive = <entity id>` so
+    ///     `restore_entity` can bring it back, exactly as a live archive now
+    ///     stamps it; a deleted endpoint gets no stamp.
+    /// (b) **Parked derivation jobs.** `write_support_edge` refused a
+    ///     version-only re-judgment (`support_verdict_supersedes_existing`)
+    ///     and `evaluate_support_on` refused to publish over a stale edge
+    ///     from a prior run (`M5 finalization refused ...`); both burned the
+    ///     job's attempts and parked it with no self-heal. Both are fixed
+    ///     forward in this PR, so jobs parked with either error are requeued
+    ///     once (the same reset the judge-activation requeue applies).
+    /// (c) **Moved-endpoint active edges** are downgraded to
+    ///     `lineage='legacy'` under the pages-reading fence
+    ///     (`downgrade_cross_space_active_edges(ShadowPages)`), so live
+    ///     renames stop aborting on a `cites`/`relates` row whose memory or
+    ///     entity moved after the edge was minted. Runs AFTER (a): an orphan
+    ///     edge is retired, not downgraded.
+    ///
+    /// Data repair that retracts rows: takes the restore point first.
+    /// Idempotent -- a second run finds no orphan, no matching parked job,
+    /// and no cross-space active row.
+    async fn migrate_124_kg_integrity_repair(&self, prior_version: i64) -> Result<(), WenlanError> {
+        self.backup_before_migration(124, prior_version).await?;
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m124 begin: {e}")))?;
+
+        let result: Result<(u64, u64, u64, Vec<CommunityGenerationUpdate>), WenlanError> = async {
+            // (a) Orphan entity edges. The stamp resolves to the archived
+            // endpoint's entity id (source side first), NULL when the
+            // orphaned endpoint has no shadow page at all. Legacy-lineage
+            // rows are skipped on purpose: the fence never fires on them
+            // (its WHEN excludes `lineage='legacy'`) and typed readers do
+            // not load them, so they cannot cause the aborts this step
+            // repairs. The live archive path retracts every lineage; that
+            // is a stricter policy for new archives, not a repair target.
+            let mut rows = conn
+                .query(
+                    "SELECT e.edge_id, \
+                                COALESCE( \
+                                  (SELECT epm.entity_id FROM entity_page_map epm \
+                                     JOIN pages p ON p.id = epm.page_id \
+                                    WHERE e.src_kind = 'entity' AND epm.entity_id = e.src_id \
+                                      AND p.kind = 'entity' AND p.status = 'archived'), \
+                                  (SELECT epm.entity_id FROM entity_page_map epm \
+                                     JOIN pages p ON p.id = epm.page_id \
+                                    WHERE e.dst_kind = 'entity' AND epm.entity_id = e.dst_id \
+                                      AND p.kind = 'entity' AND p.status = 'archived')) \
+                         FROM edges e \
+                         WHERE e.valid_until IS NULL AND e.lineage != 'legacy' \
+                           AND ((e.src_kind = 'entity' AND NOT EXISTS ( \
+                                    SELECT 1 FROM entity_page_map epm \
+                                      JOIN pages p ON p.id = epm.page_id \
+                                     WHERE epm.entity_id = e.src_id \
+                                       AND p.kind = 'entity' AND p.status = 'active')) \
+                             OR (e.dst_kind = 'entity' AND NOT EXISTS ( \
+                                    SELECT 1 FROM entity_page_map epm \
+                                      JOIN pages p ON p.id = epm.page_id \
+                                     WHERE epm.entity_id = e.dst_id \
+                                       AND p.kind = 'entity' AND p.status = 'active'))) \
+                         ORDER BY e.edge_id",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m124 orphan scan: {e}")))?;
+            let mut orphans: Vec<(String, Option<String>)> = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m124 orphan row: {e}")))?
+            {
+                orphans.push((
+                    row.get::<String>(0).unwrap_or_default(),
+                    row.get::<Option<String>>(1).unwrap_or(None),
+                ));
+            }
+            drop(rows);
+            let retired = orphans.len() as u64;
+            let graph_changes = Self::retire_edges_tagged(&conn, orphans)
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m124 retire orphan: {e}")))?;
+            let generation_updates = Self::bump_community_graph_generations(&conn, graph_changes)
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m124 generation: {e}")))?;
+
+            // (b) Parked derivation jobs.
+            let now = chrono::Utc::now().timestamp();
+            let requeued = conn
+                .execute(
+                    "UPDATE claim_derivation_jobs \
+                            SET status = 'pending', attempts = 0, last_error = NULL, \
+                                lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1 \
+                          WHERE status = 'parked' \
+                            AND (last_error LIKE '%support_verdict_supersedes_existing%' \
+                                 OR last_error LIKE '%M5 finalization refused%')",
+                    libsql::params![now],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m124 requeue parked: {e}")))?;
+
+            // (c) Moved-endpoint active edges, pages-reading fence.
+            let downgraded =
+                Self::downgrade_cross_space_active_edges(&conn, EntityArm::ShadowPages).await?;
+
+            Ok((retired, requeued, downgraded, generation_updates))
+        }
+        .await;
+
+        let (retired, requeued, downgraded, generation_updates) = match result {
+            Ok(value) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m124 commit: {e}")))?;
+                value
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+        self.record_community_dirty_nodes(generation_updates);
+
+        conn.execute("PRAGMA user_version = 124", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m124 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 124 applied: {retired} orphan entity edge(s) retired, \
+             {requeued} parked derivation job(s) requeued, \
+             {downgraded} cross-space active edge(s) downgraded to legacy"
+        );
+        Ok(())
+    }
+
     async fn repair_community_cutover(&self) -> Result<(), WenlanError> {
         let conn = self.conn.lock().await;
         let tx = conn
@@ -16412,6 +16725,29 @@ struct CommunityGraphChange {
     dst_id: String,
 }
 
+/// Where an `entity` edge endpoint's space is read from, for
+/// [`MemoryDB::downgrade_cross_space_active_edges`]: the legacy `entities`
+/// table (the fence body migrations 81/98 install) or the `kind='entity'`
+/// shadow page (the fence body migration 121 installs).
+#[derive(Debug, Clone, Copy)]
+enum EntityArm {
+    Entities,
+    ShadowPages,
+}
+
+impl EntityArm {
+    /// The arm matching the fence body installed on `conn`: `entities` while
+    /// the legacy table exists (chain replay through migrations 81..122),
+    /// shadow pages once migration 123 has dropped it.
+    async fn installed(conn: &libsql::Connection) -> Result<Self, WenlanError> {
+        Ok(if legacy_table_present(conn, "entities").await? {
+            EntityArm::Entities
+        } else {
+            EntityArm::ShadowPages
+        })
+    }
+}
+
 #[derive(Debug)]
 struct EntityMergeEdgePlan {
     old_edge_id: String,
@@ -16956,6 +17292,35 @@ impl MemoryDB {
         )
         .await?;
         Ok((affected > 0).then_some(graph_change).flatten())
+    }
+
+    /// Soft-retire a batch of edges, optionally stamping each with the
+    /// entity whose archive retired it (`payload.$.retired_by_archive`), so
+    /// [`Self::restore_entity`] can find and re-activate exactly those rows.
+    /// The stamp lands after the retraction, on a row that is no longer
+    /// active, so `edges_space_fence_update` (which only re-fences rows that
+    /// stay active and typed) never fires for it. Returns the community
+    /// graph changes the retractions imply, for the caller's generation bump.
+    async fn retire_edges_tagged(
+        conn: &libsql::Connection,
+        edges: Vec<(String, Option<String>)>,
+    ) -> Result<Vec<CommunityGraphChange>, libsql::Error> {
+        let mut graph_changes = Vec::new();
+        for (edge_id, archived_entity) in edges {
+            if let Some(change) = Self::dual_write_invalidate_edge(conn, &edge_id, None).await? {
+                graph_changes.push(change);
+            }
+            if let Some(entity_id) = archived_entity {
+                conn.execute(
+                    "UPDATE edges \
+                     SET payload = json_set(COALESCE(payload, '{}'), '$.retired_by_archive', ?1) \
+                     WHERE edge_id = ?2 AND valid_until IS NOT NULL",
+                    libsql::params![entity_id, edge_id],
+                )
+                .await?;
+            }
+        }
+        Ok(graph_changes)
     }
 
     /// Re-address every canonical edge touching a renamed identity (G6
@@ -31454,6 +31819,46 @@ impl MemoryDB {
         Ok(())
     }
 
+    /// Retract every ACTIVE edge incident on an entity, in the caller's
+    /// transaction (KG review 2026-08-16 #2). `archive_entity` and
+    /// `delete_entity` used to leave the entity's `relates` edges alive;
+    /// migration 121's fence resolves an `entity` endpoint only through an
+    /// ACTIVE shadow page, so any later in-place UPDATE of those rows -- a
+    /// space rename's `UPDATE edges SET space`, `rebind_source_id`'s payload
+    /// rewrite -- RAISE(ABORT)ed with an opaque cross-space error, and the
+    /// community loaders kept feeding the orphan edges into grouping. Same
+    /// soft retraction `supersede_relation` and migration 111 apply; `tag`
+    /// (the archiving entity's id) marks the rows an un-archive may bring
+    /// back, see [`Self::retire_edges_tagged`] / [`Self::restore_entity`].
+    async fn retract_entity_incident_edges_in_transaction(
+        &self,
+        conn: &libsql::Connection,
+        entity_id: &str,
+        tag: Option<&str>,
+    ) -> Result<u64, libsql::Error> {
+        let mut rows = conn
+            .query(
+                "SELECT edge_id FROM edges \
+                 WHERE valid_until IS NULL \
+                   AND ((src_kind = 'entity' AND src_id = ?1) \
+                     OR (dst_kind = 'entity' AND dst_id = ?1)) \
+                 ORDER BY edge_id",
+                libsql::params![entity_id],
+            )
+            .await?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next().await? {
+            edges.push((row.get::<String>(0)?, tag.map(str::to_string)));
+        }
+        drop(rows);
+        let retired = edges.len() as u64;
+        let graph_changes = Self::retire_edges_tagged(conn, edges).await?;
+        let generation_updates =
+            Self::bump_community_graph_generations(conn, graph_changes).await?;
+        self.record_community_dirty_nodes(generation_updates);
+        Ok(retired)
+    }
+
     async fn invalidate_memory_entity_projection_in_transaction(
         &self,
         conn: &libsql::Connection,
@@ -35189,7 +35594,12 @@ impl MemoryDB {
     /// G6 every entity reader joins `pages ... AND p.status='active'`, so an
     /// archived entity disappears from search, listing, and the graph while
     /// its row, its `entity_page_map` link, its observations, and its memory
-    /// links all stay put and can be restored by flipping `status` back.
+    /// links all stay put. Its ACTIVE edges are soft-retired in the same
+    /// transaction and stamped `payload.$.retired_by_archive = <entity id>`
+    /// (KG review 2026-08-16 #2: an archived endpoint no longer resolves to
+    /// the space fence, so a live orphan edge would abort every later space
+    /// rename / source rebind); [`Self::restore_entity`] brings the page and
+    /// those edges back.
     ///
     /// Returns true when a page moved from active to archived, false when the
     /// entity has no shadow page or was already archived.
@@ -35201,21 +35611,177 @@ impl MemoryDB {
         let Some(page_id) = entity_page_adapter::page_id_for_entity(&conn, entity_id).await? else {
             return Ok(false);
         };
-        let affected = conn
-            .execute(
-                "UPDATE pages
-                 SET status = 'archived', version = version + 1, last_modified = ?1
-                 WHERE id = ?2 AND kind = 'entity' AND status = 'active'",
-                libsql::params![now_rfc3339, page_id.clone()],
-            )
+        conn.execute("BEGIN", ())
             .await
-            .map_err(|e| WenlanError::VectorDb(format!("archive_entity: {e}")))?;
-        if affected == 1 {
+            .map_err(|e| WenlanError::VectorDb(format!("archive_entity begin: {e}")))?;
+        let result: Result<bool, WenlanError> = async {
+            let affected = conn
+                .execute(
+                    "UPDATE pages
+                     SET status = 'archived', version = version + 1, last_modified = ?1
+                     WHERE id = ?2 AND kind = 'entity' AND status = 'active'",
+                    libsql::params![now_rfc3339, page_id.clone()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("archive_entity: {e}")))?;
+            if affected != 1 {
+                return Ok(false);
+            }
             Self::append_page_history(&conn, &page_id, "archive", now_ts)
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("archive_entity history: {e}")))?;
+            self.retract_entity_incident_edges_in_transaction(&conn, entity_id, Some(entity_id))
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("archive_entity edges: {e}")))?;
+            Ok(true)
         }
-        Ok(affected == 1)
+        .await;
+        match result {
+            Ok(archived) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("archive_entity commit: {e}")))?;
+                Ok(archived)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Un-archive an entity: flip its `kind='entity'` shadow page back to
+    /// `active` and re-activate the archive-retired edges incident to it
+    /// (rows stamped `payload.$.retired_by_archive`, whichever endpoint's
+    /// archive stamped them). Reversibility is the archive lane's contract,
+    /// so this is the other half of the same operation. An edge whose OTHER
+    /// endpoint is still archived, has moved to another space, or is gone
+    /// trips the space fence on re-activation; that row is logged and left
+    /// retired (still stamped) rather than failing the restore -- the fence
+    /// is right that it must not come back yet, and restoring the other
+    /// endpoint later picks it up. Any other per-row error propagates.
+    ///
+    /// Returns true when a page moved from archived to active, false when the
+    /// entity has no shadow page or was not archived.
+    pub async fn restore_entity(&self, entity_id: &str) -> Result<bool, WenlanError> {
+        let now = chrono::Utc::now();
+        let now_rfc3339 = now.to_rfc3339();
+        let now_ts = now.timestamp();
+        let conn = self.conn.lock().await;
+        let Some(page_id) = entity_page_adapter::page_id_for_entity(&conn, entity_id).await? else {
+            return Ok(false);
+        };
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("restore_entity begin: {e}")))?;
+        let result: Result<bool, WenlanError> = async {
+            let affected = conn
+                .execute(
+                    "UPDATE pages
+                     SET status = 'active', version = version + 1, last_modified = ?1
+                     WHERE id = ?2 AND kind = 'entity' AND status = 'archived'",
+                    libsql::params![now_rfc3339, page_id.clone()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("restore_entity: {e}")))?;
+            if affected != 1 {
+                return Ok(false);
+            }
+            Self::append_page_history(&conn, &page_id, "restore", now_ts)
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("restore_entity history: {e}")))?;
+
+            let mut rows = conn
+                .query(
+                    "SELECT edge_id FROM edges \
+                     WHERE valid_until IS NOT NULL AND superseded_by IS NULL \
+                       AND json_extract(payload, '$.retired_by_archive') IS NOT NULL \
+                       AND ((src_kind = 'entity' AND src_id = ?1) \
+                            OR (dst_kind = 'entity' AND dst_id = ?1)) \
+                     ORDER BY edge_id",
+                    libsql::params![entity_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("restore_entity edge scan: {e}")))?;
+            let mut edge_ids = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("restore_entity edge row: {e}")))?
+            {
+                edge_ids.push(row.get::<String>(0).unwrap_or_default());
+            }
+            drop(rows);
+
+            let mut graph_changes = Vec::new();
+            for edge_id in edge_ids {
+                // Re-activating makes the row active-and-typed again, so the
+                // fence's UPDATE twin re-checks both endpoints; a RAISE(ABORT)
+                // here rolls back this one statement only.
+                match conn
+                    .execute(
+                        "UPDATE edges \
+                         SET valid_until = NULL, \
+                             payload = json_remove(payload, '$.retired_by_archive') \
+                         WHERE edge_id = ?1 AND valid_until IS NOT NULL",
+                        libsql::params![edge_id.clone()],
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("edges_space_fence") => {
+                        log::warn!(
+                            "[restore_entity] edge {edge_id} left retired: re-activation refused \
+                             ({e})"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(WenlanError::VectorDb(format!(
+                            "restore_entity edge {edge_id}: {e}"
+                        )));
+                    }
+                }
+                let mut rows = conn
+                    .query(
+                        "SELECT space, src_id, dst_id FROM edges \
+                         WHERE edge_id = ?1 AND edge_type = 'relates' \
+                           AND grounded = 1 AND lineage = 'assertion'",
+                        libsql::params![edge_id.clone()],
+                    )
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("restore_entity edge reread: {e}"))
+                    })?;
+                if let Some(row) = rows.next().await.map_err(|e| {
+                    WenlanError::VectorDb(format!("restore_entity edge reread row: {e}"))
+                })? {
+                    graph_changes.push(CommunityGraphChange {
+                        space: row.get::<String>(0).unwrap_or_default(),
+                        src_id: row.get::<String>(1).unwrap_or_default(),
+                        dst_id: row.get::<String>(2).unwrap_or_default(),
+                    });
+                }
+            }
+            let generation_updates = Self::bump_community_graph_generations(&conn, graph_changes)
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("restore_entity generation: {e}")))?;
+            self.record_community_dirty_nodes(generation_updates);
+            Ok(true)
+        }
+        .await;
+        match result {
+            Ok(restored) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("restore_entity commit: {e}")))?;
+                Ok(restored)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// What an entity is currently carrying: linked memories, observations,
@@ -35317,6 +35883,15 @@ impl MemoryDB {
             .map_err(|e| {
                 WenlanError::VectorDb(format!("delete_entity entity_minhash_bands: {e}"))
             })?;
+
+            // KG review 2026-08-16 #2: retract the entity's active edges in
+            // this same transaction. Once the shadow page is gone the fence
+            // cannot resolve the endpoint, and any later in-place UPDATE of
+            // a still-active row (space rename, source rebind) would abort.
+            // Permanent delete, so no restore tag.
+            self.retract_entity_incident_edges_in_transaction(&conn, entity_id, None)
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("delete_entity edges: {e}")))?;
 
             // Delete the entity's shadow page (M3 PR-1 item C) -- since G6
             // Stage 3 this IS the entity delete, not a mirror of one. The
@@ -35738,6 +36313,13 @@ impl MemoryDB {
                 embeddings.len()
             )));
         }
+        // KG review 2026-08-16 #7: this lane resolves-or-creates entities
+        // too, so it takes the same in-process lock the agent/import lane
+        // (`resolve_or_create_entity`) holds across its lookup->insert
+        // sequence -- and in the same order, resolution lock then `conn` --
+        // otherwise the two creators can each miss the other's insert and
+        // leave two active shadow pages with one lowercase title.
+        let _resolution_guard = self.entity_resolution_lock.lock().await;
         let minhash_enabled = entity_minhash_enabled();
         let mut prepared_entities = Vec::with_capacity(entities.len());
         for ((lower, name, entity_type), embedding) in entities.into_iter().zip(embeddings) {
