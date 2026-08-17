@@ -4,7 +4,7 @@
 //! and genesis substrate, then check that identity is unchanged, that the new
 //! name resolves, and that no row still names the old space.
 
-use super::space_rename::{closed_tables, permanent_tables, space_id_bound_tables};
+use super::space_rename::{closed_tables, merge_retained_tables, permanent_tables};
 use crate::db::tests::test_db;
 use crate::db::MemoryDB;
 
@@ -847,7 +847,7 @@ async fn assert_substrate_merged_into_target(db: &MemoryDB) {
         if table == "communities" || table == "edges" {
             continue;
         }
-        let expected = if space_id_bound_tables().contains(&table) {
+        let expected = if merge_retained_tables().contains(&table) {
             1
         } else {
             0
@@ -859,7 +859,7 @@ async fn assert_substrate_merged_into_target(db: &MemoryDB) {
         );
     }
     for table in permanent_tables() {
-        if space_id_bound_tables().contains(&table) {
+        if merge_retained_tables().contains(&table) {
             continue;
         }
         assert_eq!(
