@@ -37,6 +37,7 @@ pub(crate) fn register_reads(router: TrackedRouter<SharedState>) -> TrackedRoute
     router
         .route("/api/memory/entities/list", post(handle_list_entities))
         .route("/api/memory/entities/search", post(handle_search_entities))
+        .route("/api/memory/graph", get(handle_get_knowledge_graph))
         .route(
             "/api/memory/entities/{entity_id}",
             get(handle_get_entity_detail),
@@ -224,6 +225,64 @@ pub async fn handle_get_entity_detail(
     let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
     let detail = db.get_entity_detail_scoped(&entity_id, &scope).await?;
     Ok(Json(detail))
+}
+
+/// GET /api/memory/graph — the whole graph for the requested scope in one
+/// read. Space-scoped exactly like `handle_get_entity_detail`: the
+/// `SpaceHeader` resolves through `effective_read_scope`.
+///
+/// # Why `filter_page_refs` and not `filter_pages`
+///
+/// A `GraphPageNode` is not a `Page`: it carries the page's id and title and
+/// nothing else, and it has no field for the two truth axes. `filter_pages`
+/// serves an `EntryOnly` page as a reduced entry — id, title, and BOTH axes —
+/// and `truth_adapter` is explicit that an entry without its axes is exactly
+/// the unearned trust the carve-out exists to prevent. This wire type cannot
+/// carry them, so the carve-out is not available to it.
+///
+/// `filter_page_refs` is the operation for that shape and says so in its own
+/// doc: things that hang off a page rather than being one, **map nodes**
+/// included. `Full` or gone. At generation 0 every page is `Full`, so this is
+/// the identity today, same as every other adapter.
+///
+/// A dropped page takes its links with it. Removing the node and keeping the
+/// edge would either orphan the edge or silently rewire the graph — the exact
+/// hazard the reader manifest names in its `/api/pages/{id}/map` demotion note.
+pub async fn handle_get_knowledge_graph(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
+) -> Result<Json<wenlan_types::KnowledgeGraphResponse>, ServerError> {
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
+    let mut graph = db
+        .get_knowledge_graph_scoped(&scope)
+        .await
+        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+
+    graph.pages = wenlan_core::truth_adapter::filter_page_refs(
+        &db,
+        &view.grant,
+        std::mem::take(&mut graph.pages),
+        |page| page.id.as_str(),
+    )
+    .await
+    .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+    let visible: std::collections::HashSet<&str> =
+        graph.pages.iter().map(|page| page.id.as_str()).collect();
+    // Only the `page` endpoints are re-checked: an `entity` or `memory`
+    // endpoint is an id into a collection this route already scoped, and
+    // neither is a page.
+    graph.page_links.retain(|link| {
+        let endpoint_visible = |endpoint: &wenlan_types::GraphRef| {
+            endpoint.kind != "page" || visible.contains(endpoint.id.as_str())
+        };
+        endpoint_visible(&link.from) && endpoint_visible(&link.to)
+    });
+    Ok(Json(graph))
 }
 
 #[derive(Debug, Deserialize)]

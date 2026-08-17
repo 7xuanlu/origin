@@ -18,6 +18,7 @@ pub(super) const ROUTES: &[SensitiveReadRoute] = &[
     row!(Post,"/api/memory/entities/list","entity_list",BodyThenHeader,UnauthenticatedLocal,EntitySpace,NoGate,Rejected,Forbidden),
     row!(Post,"/api/memory/entities/search","entity_search",BodyThenHeader,UnauthenticatedLocal,EntitySpace,NoGate,Rejected,Forbidden),
     row!(Get,"/api/memory/entities/{entity_id}","entity_detail",HeaderOnly,UnauthenticatedLocal,EntitySpace,SingleId404,Rejected,Forbidden),
+    row!(Get,"/api/memory/graph","knowledge_graph",HeaderOnly,UnauthenticatedLocal,EntitySpace,NoGate,Rejected,Forbidden),
     row!(Get,"/api/memory/stats","memory_stats",NoSelector,UnauthenticatedLocal,Global,NoGate,NotApplicable,AggregateOnly),
     row!(Get,"/api/home-stats","home_stats_with_memory_rows",HeaderOnly,UnauthenticatedLocal,MemorySpace,NoGate,Rejected,Forbidden),
     row!(Get,"/api/memory/entity-suggestions","entity_suggestions",HeaderOnly,UnauthenticatedLocal,MemorySpace,NoGate,Rejected,Forbidden),

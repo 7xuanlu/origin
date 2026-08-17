@@ -6,16 +6,6 @@ Browser-only harness for inspecting app UI with Tauri APIs shimmed. The root
 path can proxy live daemon calls; `/preview/` uses fixtures for page-detail
 citation states.
 
-## STRUCTURE
-
-```text
-preview/
-|-- index.html           # fixture harness entry with __PREVIEW_FIXTURES__
-|-- main.tsx             # PageDetail preview controls and theme toggle
-|-- fixtures.ts          # citation/page/source/link/revision fixture data
-`-- mocks/               # Vite aliases for Tauri APIs and live invoke bridge
-```
-
 ## WHERE TO LOOK
 
 | Task | Location | Notes |

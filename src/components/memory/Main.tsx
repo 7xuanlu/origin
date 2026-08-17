@@ -948,6 +948,7 @@ export default function Main({
               onBack={navigateBack}
               onEntityClick={handleEntityClick}
               onMemoryClick={(sid) => navigateTo({ kind: "memory", sourceId: sid })}
+              onPageClick={(pageId) => navigateTo({ kind: "page", pageId })}
             />
           ) : view.kind === "page-draft" ? (
             <PageDraftEditor
@@ -1017,7 +1018,16 @@ export default function Main({
             />
           ) : view.kind === "graph" ? (
             <div style={{ position: "relative", width: "100%", height: "100%" }}>
-              <AtlasView onNodeClick={handleEntityClick} onBack={navigateBack} />
+              <AtlasView
+                onNodeClick={(target) =>
+                  target.kind === "memory"
+                    ? navigateTo({ kind: "memory", sourceId: target.id })
+                    : target.kind === "page"
+                      ? navigateTo({ kind: "page", pageId: target.id })
+                      : handleEntityClick(target.id)
+                }
+                onBack={navigateBack}
+              />
             </div>
           ) : (
             <>

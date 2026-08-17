@@ -6,23 +6,6 @@ React 19 frontend for the Tauri app. This tree owns UI state, routing inside
 the desktop windows, i18n, browser-side preview compatibility, and the typed
 frontend side of the Tauri command contract.
 
-## STRUCTURE
-
-```text
-src/
-|-- main.tsx             # window hash bootstrap: app, toast, quick capture
-|-- App.tsx              # top-level window/event shell
-|-- components/
-|   |-- memory/          # main product UI; has its own AGENTS.md
-|   |-- ChatImport/      # chat import flow and ZIP/drop handling
-|   |-- onboarding/      # first-page modal, milestone toasts/hooks
-|   `-- intelligence/    # local/external model setup surface
-|-- hooks/               # small shared hooks
-|-- i18n/                # locale resolution and canonical resources
-|-- lib/                 # Tauri wrappers, storage, classifiers, stores
-`-- test/                # Vitest setup and Tauri mocks
-```
-
 ## WHERE TO LOOK
 
 | Task | Location | Notes |
@@ -37,6 +20,8 @@ src/
 
 ## CONVENTIONS
 
+- TypeScript is strict and no-emit; `pnpm build` is `tsc -b && vite build`.
+  Plain `pnpm dev` runs Vite on `:1420` with `strictPort` set.
 - `src/lib/tauri.ts` is the frontend-to-Rust boundary. Add or update wrappers
   there before wiring components directly to a command.
 - Translation resources are the canonical fixed-copy inventory. New visible

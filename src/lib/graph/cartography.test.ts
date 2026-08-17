@@ -12,7 +12,11 @@ import {
   graticuleRadii,
   cartographyScene,
   drawCartography,
+  placeRegionLabels,
+  MAX_REGION_LABELS,
+  MIN_LABELLED_HULL_PX,
 } from "./cartography";
+import type { CartographyScene, Region } from "./cartography";
 
 const PALETTE: GraphPalette = {
   project: "#111111",
@@ -30,6 +34,8 @@ const PALETTE: GraphPalette = {
   hullBorder: "rgba(1,2,3,0.16)",
   graticule: "rgba(4,5,6,0.13)",
   bridge: "#bbbbbb",
+  memory: "#cccccc",
+  page: "#cccccc",
 };
 
 function node(id: string, overrides: Partial<GraphNode> = {}): GraphNode {
@@ -380,6 +386,152 @@ describe("communitiesFor", () => {
     expect(communities.get("p1")).not.toBe(communities.get("q1"));
     expect(bridgeEdgeTest(communities)("p1", "q1")).toBe(true);
   });
+
+  function memoryNode(id: string, space: string | null = null): GraphNode {
+    return { ...node(id), kind: "memory", entityType: "memory", space };
+  }
+
+  function mentions(id: string, memory: string, entity: string): GraphEdge {
+    return { id, source: memory, target: entity, type: "mentions", confidence: null, createdAt: 100 };
+  }
+
+  function pageNode(id: string, space: string | null = null): GraphNode {
+    return { ...node(id), kind: "page", entityType: "page", space };
+  }
+
+  function about(id: string, page: string, entity: string): GraphEdge {
+    return { id, source: page, target: entity, type: "about", confidence: null, createdAt: 100 };
+  }
+
+  function wikilink(id: string, from: string, to: string): GraphEdge {
+    return { id, source: from, target: to, type: "wikilink", confidence: null, createdAt: 100 };
+  }
+
+  it("gives a wiki page the community of the entity it links to", () => {
+    const m = modelOf(
+      [node("a1", { space: "Work" }), node("a2", { space: "Work" }), pageNode("page:p1", "Work")],
+      [edge("ea1", "a1", "a2"), about("ab1", "page:p1", "a2")],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    expect(communities.get("page:p1")).toBe(communities.get("a2"));
+  });
+
+  it("propagates a community from page to page when a page links no entity", () => {
+    // p1 is anchored to the region through a2; p2 only wikilinks p1.
+    const m = modelOf(
+      [
+        node("a1", { space: "Work" }),
+        node("a2", { space: "Work" }),
+        pageNode("page:p1", "Work"),
+        pageNode("page:p2", "Work"),
+      ],
+      [
+        edge("ea1", "a1", "a2"),
+        about("ab1", "page:p1", "a2"),
+        wikilink("wl1", "page:p2", "page:p1"),
+      ],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    expect(communities.get("page:p2")).toBe(communities.get("a2"));
+  });
+
+  it("leaves a page-only map with no regions rather than inventing them", () => {
+    // Entities toggled off: nothing to inherit from, so no page is assigned
+    // and the region count is honestly zero.
+    const m = modelOf(
+      [pageNode("page:p1", "Work"), pageNode("page:p2", "Work")],
+      [wikilink("wl1", "page:p1", "page:p2")],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    expect(communities.size).toBe(0);
+  });
+
+  it("never drags a scoped entity into the unscoped bucket via a spaceless page", () => {
+    const m = modelOf(
+      [node("a1", { space: "Work" }), node("a2", { space: "Work" }), pageNode("page:p1", null)],
+      [edge("ea1", "a1", "a2"), about("ab1", "page:p1", "a1")],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    for (const id of ["a1", "a2", "page:p1"]) {
+      expect(communities.get(id)!.split(":")[1]).not.toBe("u");
+    }
+  });
+
+  it("gives a memory the community of the entity it links to", () => {
+    const m = modelOf(
+      [node("a1", { space: "Work" }), node("a2", { space: "Work" }), memoryNode("mem:m1")],
+      [edge("ea1", "a1", "a2"), mentions("lm1", "mem:m1", "a2")],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    expect(communities.get("mem:m1")).toBe(communities.get("a2"));
+  });
+
+  it("breaks a multi-entity tie on the lowest entity id, deterministically", () => {
+    // Two disjoint Work regions; the memory touches one node in each, so the
+    // answer is only stable if the tie-break is by id rather than edge order.
+    const m = modelOf(
+      [
+        node("a1", { space: "Work" }),
+        node("a2", { space: "Work" }),
+        node("b1", { space: "Work" }),
+        node("b2", { space: "Work" }),
+        memoryNode("mem:m1"),
+      ],
+      [
+        edge("ea", "a1", "a2"),
+        edge("eb", "b1", "b2"),
+        mentions("lm1", "mem:m1", "b1"),
+        mentions("lm2", "mem:m1", "a1"),
+      ],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    expect(communities.get("mem:m1")).toBe(communities.get("a1"));
+    expect(communities.get("mem:m1")).not.toBe(communities.get("b1"));
+  });
+
+  it("never drags a scoped entity into the unscoped bucket via a spaceless memory", () => {
+    const m = modelOf(
+      [node("a1", { space: "Work" }), node("a2", { space: "Work" }), memoryNode("mem:m1", null)],
+      [edge("ea1", "a1", "a2"), mentions("lm1", "mem:m1", "a1")],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    // "u" is the unscoped segment (see communitiesFor's spaceSegment).
+    for (const id of ["a1", "a2", "mem:m1"]) {
+      expect(communities.get(id)!.split(":")[1]).not.toBe("u");
+    }
+  });
+
+  it("inherits a DURABLE community too, without ever being a durable member", () => {
+    const cartography = new Map<string, SpaceCartography>([
+      [
+        "Work",
+        {
+          status: "ready",
+          memberCommunityId: new Map([
+            ["a1", "c1"],
+            ["a2", "c1"],
+          ]),
+        } as SpaceCartography,
+      ],
+    ]);
+    const m = modelOf(
+      [node("a1", { space: "Work" }), node("a2", { space: "Work" }), memoryNode("mem:m1", "Work")],
+      [edge("ea1", "a1", "a2"), mentions("lm1", "mem:m1", "a1")],
+    );
+    const communities = communitiesFor(m, cartography);
+    expect(communities.get("a1")).toContain("durable:");
+    expect(communities.get("mem:m1")).toBe(communities.get("a1"));
+  });
+
+  it("leaves a memory out of every region when its entities are not partitioned", () => {
+    const m = modelOf(
+      [memoryNode("mem:m1"), memoryNode("mem:m2")],
+      [mentions("lm1", "mem:m1", "mem:m2")],
+    );
+    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
+    expect(communities.has("mem:m1")).toBe(false);
+    expect(communities.has("mem:m2")).toBe(false);
+  });
 });
 
 describe("bridgeEdgeTest", () => {
@@ -563,6 +715,9 @@ function mockCtx() {
   const strokes: StrokeCall[] = [];
   const fills: string[] = [];
   const texts: { text: string; x: number; y: number; font: string; fillStyle: string }[] = [];
+  /** What the context looked like at each measureText call — the placement
+   *  pass has to measure in the same font AND tracking it later draws with. */
+  const measures: { text: string; font: string; letterSpacing: string }[] = [];
   let dash: number[] = [];
   const ctx = {
     strokeStyle: "",
@@ -594,8 +749,14 @@ function mockCtx() {
     fillText: vi.fn((text: string, x: number, y: number) => {
       texts.push({ text, x, y, font: ctx.font, fillStyle: ctx.fillStyle });
     }),
+    // The real 2D context measures the label; jsdom's has no text engine, so
+    // the mock reports a deterministic 7px per character at the label size.
+    measureText: vi.fn((text: string) => {
+      measures.push({ text, font: ctx.font, letterSpacing: ctx.letterSpacing });
+      return { width: text.length * 7 };
+    }),
   };
-  return { ctx: ctx as unknown as CanvasRenderingContext2D, strokes, fills, texts };
+  return { ctx: ctx as unknown as CanvasRenderingContext2D, strokes, fills, texts, measures };
 }
 
 describe("drawCartography", () => {
@@ -681,15 +842,18 @@ describe("drawCartography", () => {
   });
 
   it("drops to 13px for secondary regions", () => {
+    // Both hulls are >= MIN_LABELLED_HULL_PX wide on screen and far enough
+    // apart vertically that neither label box touches the other, so the
+    // placement pass keeps both and only the size differs.
     const graph = graphOf(
       [
         { id: "a1", x: 0, y: 0, label: "Alpha" },
-        { id: "a2", x: 10, y: 0, label: "A2" },
-        { id: "a3", x: 5, y: 10, label: "A3" },
-        { id: "a4", x: 5, y: 5, label: "A4" },
-        { id: "b1", x: 100, y: 100, label: "Beta" },
-        { id: "b2", x: 110, y: 100, label: "B2" },
-        { id: "b3", x: 105, y: 110, label: "B3" },
+        { id: "a2", x: 120, y: 0, label: "A2" },
+        { id: "a3", x: 60, y: 40, label: "A3" },
+        { id: "a4", x: 60, y: 20, label: "A4" },
+        { id: "b1", x: 0, y: 300, label: "Beta" },
+        { id: "b2", x: 120, y: 300, label: "B2" },
+        { id: "b3", x: 60, y: 340, label: "B3" },
       ],
       [
         ["a1", "a2"],
@@ -723,5 +887,174 @@ describe("drawCartography", () => {
     const arc = ctx.arc as ReturnType<typeof vi.fn>;
     // maxNodeRadius 300 → outer ring 315 graph units → 157.5 at half scale.
     expect(arc.mock.calls[2][2]).toBeCloseTo(157.5, 5);
+  });
+});
+
+describe("placeRegionLabels", () => {
+  const identity = (pos: { x: number; y: number }) => pos;
+  // A fixed 7px per character keeps the overlap arithmetic in the tests exact.
+  const measure = (text: string, size: number) => text.length * (size / 2);
+
+  /** A rectangular hull `width` wide and 20 tall, with its top-left at (x, y). */
+  function boxRegion(name: string, x: number, y: number, width: number, members = 3): Region {
+    return {
+      name,
+      memberCount: members,
+      hull: [
+        { x, y },
+        { x: x + width, y },
+        { x: x + width, y: y + 20 },
+        { x, y: y + 20 },
+      ],
+    };
+  }
+
+  const sceneOf = (regions: Region[]): CartographyScene => ({ regions, maxNodeRadius: 100 });
+
+  it("skips a region whose hull is a speck on screen", () => {
+    const wide = boxRegion("Wide", 0, 0, MIN_LABELLED_HULL_PX);
+    const speck = boxRegion("Speck", 0, 500, MIN_LABELLED_HULL_PX - 1);
+    const placed = placeRegionLabels(sceneOf([wide, speck]), identity, measure);
+    expect(placed.map((label) => label.name)).toEqual(["Wide"]);
+  });
+
+  it("keeps the first of two regions whose label boxes would collide", () => {
+    // Same x span, 6px apart vertically: the second box lands inside the
+    // first one's 4px pad, so only the larger region keeps its name.
+    const big = boxRegion("Big", 0, 100, 200, 9);
+    const small = boxRegion("Small", 0, 106, 200, 4);
+    const placed = placeRegionLabels(sceneOf([big, small]), identity, measure);
+    expect(placed.map((label) => label.name)).toEqual(["Big"]);
+  });
+
+  it("draws both when the same two regions are pulled far enough apart", () => {
+    const big = boxRegion("Big", 0, 100, 200, 9);
+    const small = boxRegion("Small", 0, 400, 200, 4);
+    const placed = placeRegionLabels(sceneOf([big, small]), identity, measure);
+    expect(placed.map((label) => label.name)).toEqual(["Big", "Small"]);
+    // First placed is the dominant one; every other label drops to 13px.
+    expect(placed[0].size).toBe(16);
+    expect(placed[1].size).toBe(13);
+  });
+
+  it("walks regions in the order they arrive, so the largest wins a contested spot", () => {
+    // Region order is communityRegions' largest-first order; reversing the
+    // input reverses which of a colliding pair survives.
+    const a = boxRegion("A", 0, 100, 200, 9);
+    const b = boxRegion("B", 0, 106, 200, 4);
+    expect(placeRegionLabels(sceneOf([a, b]), identity, measure).map((l) => l.name)).toEqual(["A"]);
+    expect(placeRegionLabels(sceneOf([b, a]), identity, measure).map((l) => l.name)).toEqual(["B"]);
+  });
+
+  it("never draws more than MAX_REGION_LABELS names, however many fit", () => {
+    const regions = Array.from({ length: MAX_REGION_LABELS + 10 }, (_, i) =>
+      boxRegion(`R${i}`, 0, i * 300, 200),
+    );
+    const placed = placeRegionLabels(sceneOf(regions), identity, measure);
+    expect(placed).toHaveLength(MAX_REGION_LABELS);
+    expect(placed[placed.length - 1].name).toBe(`R${MAX_REGION_LABELS - 1}`);
+  });
+
+  it("reads hull width in SCREEN px, so zooming in reveals more names", () => {
+    // 60 graph units wide: a speck at 1x, comfortably labelled at 2x.
+    const scene = sceneOf([boxRegion("Zoomed", 0, 0, 60)]);
+    const doubled = (pos: { x: number; y: number }) => ({ x: pos.x * 2, y: pos.y * 2 });
+    expect(placeRegionLabels(scene, identity, measure)).toHaveLength(0);
+    expect(placeRegionLabels(scene, doubled, measure)).toHaveLength(1);
+  });
+
+  it("centres the name on the hull's screen centroid, lifted clear of the blob", () => {
+    const placed = placeRegionLabels(sceneOf([boxRegion("Mid", 40, 200, 100)]), identity, measure);
+    expect(placed[0].x).toBe(90);
+    // Hull top 200, minus HULL_PAD 26 and the 14px blob-bow clearance.
+    expect(placed[0].y).toBe(200 - 26 - 14);
+  });
+});
+
+describe("region label measurement includes its tracking", () => {
+  const identity = (pos: { x: number; y: number }) => pos;
+
+  /** Two triangular regions side by side, 220px between their hull centres,
+   *  each named with a 25-character name. At 7px per character the two label
+   *  boxes clear each other by 45px; with the artifact's 0.14em tracking they
+   *  overlap by 9px. So whether the second name is drawn says exactly which
+   *  width the placement pass measured. */
+  function twoWideRegions() {
+    const graph = graphOf(
+      [
+        { id: "a1", x: 0, y: 0, label: "Deterministic Fixture Set" },
+        { id: "a2", x: 120, y: 0, label: "Left Wing" },
+        { id: "a3", x: 60, y: 60, label: "Left Foot" },
+        { id: "b1", x: 220, y: 0, label: "Reproducible Layout Notes" },
+        { id: "b2", x: 340, y: 0, label: "Right Wing" },
+        { id: "b3", x: 280, y: 60, label: "Right Foot" },
+      ],
+      [
+        ["a1", "a2"],
+        ["a1", "a3"],
+        ["b1", "b2"],
+        ["b1", "b3"],
+      ],
+    );
+    const communities = new Map<string, string>([
+      ["a1", "0"],
+      ["a2", "0"],
+      ["a3", "0"],
+      ["b1", "1"],
+      ["b2", "1"],
+      ["b3", "1"],
+    ]);
+    return cartographyScene(graph, communities);
+  }
+
+  /** mockCtx reports a flat 7px per character; a real canvas adds the
+   *  letterSpacing after every character, so the mock has to as well for the
+   *  width to mean anything. */
+  function trackingAwareCtx() {
+    const harness = mockCtx();
+    const ctx = harness.ctx as unknown as {
+      letterSpacing: string;
+      measureText: (text: string) => { width: number };
+    };
+    ctx.measureText = (text: string) => ({
+      width: text.length * (7 + (parseFloat(ctx.letterSpacing) || 0)),
+    });
+    return harness;
+  }
+
+  it("sets the same letter spacing for measuring that it later draws with", () => {
+    const { ctx, texts, measures } = mockCtx();
+    drawCartography(ctx, twoWideRegions(), identity, PALETTE);
+    expect(measures.length).toBeGreaterThan(0);
+    for (const call of measures) {
+      // 16px label -> 2.2px, 13px label -> 1.8px. Never the 0 that measuring
+      // in the bare font would leave behind.
+      const size = Number(/(\d+)px/.exec(call.font)?.[1]);
+      expect(call.letterSpacing).toBe(`${(size * 0.14).toFixed(1)}px`);
+    }
+    // Whatever survived placement is drawn with that same tracking.
+    expect(texts.length).toBeGreaterThan(0);
+  });
+
+  it("drops a second name whose box only fits when the tracking is ignored", () => {
+    const { ctx, texts } = trackingAwareCtx();
+    drawCartography(ctx, twoWideRegions(), identity, PALETTE);
+    expect(texts.map((t) => t.text)).toEqual(["Deterministic Fixture Set"]);
+  });
+
+  it("keeps both names when they are far enough apart for the tracked width", () => {
+    const { ctx, texts } = trackingAwareCtx();
+    const scene = twoWideRegions();
+    // Push the right region 200px further out: now even the tracked boxes
+    // clear, so the thinning is about real width and not a blanket rule.
+    for (const region of scene.regions) {
+      if (region.name !== "Reproducible Layout Notes") continue;
+      region.hull = region.hull.map((p) => ({ x: p.x + 200, y: p.y }));
+    }
+    drawCartography(ctx, scene, identity, PALETTE);
+    expect(texts.map((t) => t.text).sort()).toEqual([
+      "Deterministic Fixture Set",
+      "Reproducible Layout Notes",
+    ]);
   });
 });

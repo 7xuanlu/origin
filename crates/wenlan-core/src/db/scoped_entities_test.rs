@@ -972,3 +972,392 @@ async fn search_entities_by_vector_scoped_reads_shadow_page_directly() {
     assert_eq!(results[0].entity.confidence, Some(0.75));
     assert!(results[0].entity.confirmed);
 }
+
+/// The bulk Graph-view read: one request must return the scope's whole graph.
+/// Seeded shape — 3 in-scope entities, 2 in-scope relations plus one whose
+/// far endpoint sits in another space, 2 linked memories (one of them linked
+/// to two entities) plus one in-scope memory with no link at all.
+#[tokio::test]
+async fn get_knowledge_graph_scoped_returns_whole_scope_and_drops_out_of_scope_rows() {
+    let (db, _tmp) = test_db().await;
+    let work_a = db
+        .store_entity("Graph work A", "topic", Some("work"), None, Some(0.9))
+        .await
+        .unwrap();
+    let work_b = db
+        .store_entity("Graph work B", "topic", Some("work"), None, Some(0.9))
+        .await
+        .unwrap();
+    let work_c = db
+        .store_entity("Graph work C", "topic", Some("work"), None, Some(0.9))
+        .await
+        .unwrap();
+    let personal = db
+        .store_entity("Graph personal", "topic", Some("personal"), None, Some(0.9))
+        .await
+        .unwrap();
+
+    db.create_relation(&work_a, &work_b, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+    db.create_relation(&work_b, &work_c, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+    // Far endpoint is in another space: scoping must drop this relation
+    // entirely rather than surfacing a dangling endpoint.
+    db.create_relation(&work_a, &personal, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+
+    db.upsert_documents(vec![
+        memory_doc("graph-memory-linked-two", "work"),
+        memory_doc("graph-memory-linked-one", "work"),
+        memory_doc("graph-memory-unlinked", "work"),
+    ])
+    .await
+    .unwrap();
+    db.link_memory_entities(
+        "graph-memory-linked-two",
+        &[work_a.as_str(), work_b.as_str()],
+    )
+    .await
+    .unwrap();
+    db.link_memory_entities("graph-memory-linked-one", &[work_c.as_str()])
+        .await
+        .unwrap();
+
+    let graph = db
+        .get_knowledge_graph_scoped(&ReadScope::Space("work".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(graph.entities.len(), 3);
+    assert!(!graph.entities.iter().any(|entity| entity.id == personal));
+
+    assert_eq!(graph.relations.len(), 2);
+    assert!(!graph
+        .relations
+        .iter()
+        .any(|relation| relation.from_entity == personal || relation.to_entity == personal));
+
+    let mut memory_ids: Vec<&str> = graph
+        .memories
+        .iter()
+        .map(|memory| memory.source_id.as_str())
+        .collect();
+    memory_ids.sort_unstable();
+    assert_eq!(
+        memory_ids,
+        vec!["graph-memory-linked-one", "graph-memory-linked-two"]
+    );
+    assert_eq!(graph.memory_links.len(), 3);
+    let two_way: Vec<&str> = graph
+        .memory_links
+        .iter()
+        .filter(|link| link.memory_id == "graph-memory-linked-two")
+        .map(|link| link.entity_id.as_str())
+        .collect();
+    assert_eq!(two_way.len(), 2);
+    assert!(two_way.contains(&work_a.as_str()));
+    assert!(two_way.contains(&work_b.as_str()));
+    // Every link's memory and entity are both present in the response.
+    for link in &graph.memory_links {
+        assert!(graph
+            .memories
+            .iter()
+            .any(|memory| memory.source_id == link.memory_id));
+        assert!(graph
+            .entities
+            .iter()
+            .any(|entity| entity.id == link.entity_id));
+    }
+}
+
+/// The same seed read unscoped: the cross-space relation is a real relation
+/// between two visible entities, so Global keeps it (and the other space's
+/// memory too). Pins that the drops above come from scoping, not from the
+/// query silently losing rows.
+#[tokio::test]
+async fn get_knowledge_graph_scoped_global_keeps_cross_space_relation() {
+    let (db, _tmp) = test_db().await;
+    let work = db
+        .store_entity("Global graph work", "topic", Some("work"), None, Some(0.9))
+        .await
+        .unwrap();
+    let personal = db
+        .store_entity(
+            "Global graph personal",
+            "topic",
+            Some("personal"),
+            None,
+            Some(0.9),
+        )
+        .await
+        .unwrap();
+    db.create_relation(&work, &personal, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+    db.upsert_documents(vec![memory_doc("global-graph-memory", "personal")])
+        .await
+        .unwrap();
+    db.link_memory_entities("global-graph-memory", &[personal.as_str()])
+        .await
+        .unwrap();
+
+    let graph = db
+        .get_knowledge_graph_scoped(&ReadScope::Global)
+        .await
+        .unwrap();
+
+    assert_eq!(graph.entities.len(), 2);
+    assert_eq!(graph.relations.len(), 1);
+    assert_eq!(graph.relations[0].from_entity, work);
+    assert_eq!(graph.relations[0].to_entity, personal);
+    assert_eq!(graph.memories.len(), 1);
+    assert_eq!(graph.memories[0].source_id, "global-graph-memory");
+    assert_eq!(graph.memory_links.len(), 1);
+
+    let scoped = db
+        .get_knowledge_graph_scoped(&ReadScope::Space("work".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(scoped.entities.len(), 1);
+    assert!(scoped.relations.is_empty());
+    assert!(scoped.memories.is_empty());
+    assert!(scoped.memory_links.is_empty());
+}
+
+/// The page half of the bulk Graph-view read. Seeded shape -- 2 wiki pages
+/// (A links to B, A is *about* entity E1, A also carries a legacy wikilink to
+/// E2's shadow page and one dangling `[[link]]`), A cites M1, B cites M1 and
+/// M2, plus an archived page that links to B. Expected: the two wiki pages
+/// (never an entity shadow), six typed links, both cited memories, and no
+/// trace of the archived page or the dangling link.
+#[tokio::test]
+async fn get_knowledge_graph_scoped_returns_wiki_pages_and_typed_page_links() {
+    let (db, _tmp) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    let entity_one = db
+        .store_entity("Graph page entity one", "topic", Some("work"), None, None)
+        .await
+        .unwrap();
+    let entity_two = db
+        .store_entity("Graph page entity two", "topic", Some("work"), None, None)
+        .await
+        .unwrap();
+    let shadow_two: String = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT page_id FROM entity_page_map WHERE entity_id = ?1",
+                libsql::params![entity_two.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get::<String>(0).unwrap()
+    };
+
+    db.upsert_documents(vec![
+        memory_doc("graph-page-cited-one", "work"),
+        memory_doc("graph-page-cited-two", "work"),
+    ])
+    .await
+    .unwrap();
+
+    db.insert_page_with_kind(
+        "graph-page-a",
+        "Graph page A",
+        None,
+        "body a",
+        Some(entity_one.as_str()),
+        Some("work"),
+        &["graph-page-cited-one"],
+        &now,
+        "authored",
+        "confirmed",
+        Some("work"),
+        None,
+    )
+    .await
+    .unwrap();
+    db.insert_page_with_kind(
+        "graph-page-b",
+        "Graph page B",
+        None,
+        "body b",
+        None,
+        Some("work"),
+        &["graph-page-cited-one", "graph-page-cited-two"],
+        &now,
+        "distilled",
+        "confirmed",
+        Some("work"),
+        None,
+    )
+    .await
+    .unwrap();
+    db.insert_page_with_kind(
+        "graph-page-archived",
+        "Graph page archived",
+        None,
+        "body archived",
+        None,
+        Some("work"),
+        &[],
+        &now,
+        "authored",
+        "confirmed",
+        Some("work"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Resolved wikilinks are `edges` rows (page_links keeps orphans only).
+    let seed_link = |src: &'static str, dst: String, label: &'static str| {
+        let db = &db;
+        async move {
+            let edge_id =
+                crate::provenance::compute_edge_id("links", "page", src, "page", &dst, label);
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO edges (
+                     edge_id, src_id, src_kind, dst_id, dst_kind, edge_type,
+                     lineage, grounded, space, payload, created_at
+                 ) VALUES (?1, ?2, 'page', ?3, 'page', 'links',
+                           'synthesis', 0, 'work', ?4, 0)",
+                libsql::params![edge_id, src, dst, format!(r#"{{"label":"{label}"}}"#)],
+            )
+            .await
+            .unwrap();
+        }
+    };
+    seed_link("graph-page-a", "graph-page-b".to_string(), "graph page b").await;
+    seed_link("graph-page-a", shadow_two.clone(), "graph page entity two").await;
+    seed_link(
+        "graph-page-archived",
+        "graph-page-b".to_string(),
+        "graph page b",
+    )
+    .await;
+
+    {
+        let conn = db.conn.lock().await;
+        // A dangling `[[link]]`: an orphan row, no edge, reaches nothing.
+        conn.execute(
+            "INSERT INTO page_links (source_page_id, target_page_id, label_key, label) \
+             VALUES ('graph-page-a', NULL, 'nowhere', 'Nowhere')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE pages SET status = 'archived' WHERE id = 'graph-page-archived'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let graph = db
+        .get_knowledge_graph_scoped(&ReadScope::Space("work".to_string()))
+        .await
+        .unwrap();
+
+    let mut page_ids: Vec<&str> = graph.pages.iter().map(|page| page.id.as_str()).collect();
+    page_ids.sort_unstable();
+    assert_eq!(
+        page_ids,
+        vec!["graph-page-a", "graph-page-b"],
+        "wiki pages only: no entity shadow page, no archived page"
+    );
+    let page_a = graph
+        .pages
+        .iter()
+        .find(|page| page.id == "graph-page-a")
+        .unwrap();
+    assert_eq!(page_a.title, "Graph page A");
+    assert_eq!(page_a.creation_kind, "authored");
+    assert_eq!(page_a.entity_id.as_deref(), Some(entity_one.as_str()));
+    assert_eq!(page_a.space.as_deref(), Some("work"));
+
+    let mut links: Vec<(String, String, String)> = graph
+        .page_links
+        .iter()
+        .map(|link| {
+            (
+                format!("{}:{}", link.from.kind, link.from.id),
+                format!("{}:{}", link.to.kind, link.to.id),
+                link.link_type.clone(),
+            )
+        })
+        .collect();
+    links.sort();
+    let mut expected: Vec<(String, String, String)> = vec![
+        (
+            "page:graph-page-a".to_string(),
+            "page:graph-page-b".to_string(),
+            "wikilink".to_string(),
+        ),
+        (
+            "page:graph-page-a".to_string(),
+            format!("entity:{entity_one}"),
+            "about".to_string(),
+        ),
+        (
+            "page:graph-page-a".to_string(),
+            format!("entity:{entity_two}"),
+            "wikilink".to_string(),
+        ),
+        (
+            "page:graph-page-a".to_string(),
+            "memory:graph-page-cited-one".to_string(),
+            "cites".to_string(),
+        ),
+        (
+            "page:graph-page-b".to_string(),
+            "memory:graph-page-cited-one".to_string(),
+            "cites".to_string(),
+        ),
+        (
+            "page:graph-page-b".to_string(),
+            "memory:graph-page-cited-two".to_string(),
+            "cites".to_string(),
+        ),
+    ];
+    expected.sort();
+    assert_eq!(links, expected);
+
+    let mut memory_ids: Vec<&str> = graph
+        .memories
+        .iter()
+        .map(|memory| memory.source_id.as_str())
+        .collect();
+    memory_ids.sort_unstable();
+    assert_eq!(
+        memory_ids,
+        vec!["graph-page-cited-one", "graph-page-cited-two"],
+        "a cited memory joins the map even with no entity link"
+    );
+
+    // Every endpoint resolves inside the collection its kind names.
+    for link in &graph.page_links {
+        for endpoint in [&link.from, &link.to] {
+            let present = match endpoint.kind.as_str() {
+                "page" => graph.pages.iter().any(|page| page.id == endpoint.id),
+                "entity" => graph.entities.iter().any(|entity| entity.id == endpoint.id),
+                "memory" => graph
+                    .memories
+                    .iter()
+                    .any(|memory| memory.source_id == endpoint.id),
+                other => panic!("unknown endpoint kind {other}"),
+            };
+            assert!(
+                present,
+                "dangling endpoint {}:{}",
+                endpoint.kind, endpoint.id
+            );
+        }
+    }
+}

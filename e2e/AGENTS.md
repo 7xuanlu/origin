@@ -2,9 +2,15 @@
 
 ## OVERVIEW
 
-Playwright browser tests for user-visible flows that need a real rendered app.
-The current suite covers Chinese interface localization through a Tauri runtime
-mock installed before page load.
+Playwright browser tests for user-visible flows that need a real rendered app,
+run through a Tauri runtime mock installed before page load. The suite groups
+into: i18n (`i18n.spec.ts`, `spaces-zh-hans-visual.spec.ts`), page canvas
+(`page-canvas-*.spec.ts`, `page-editor.spec.ts`, `page-draft.visual.spec.ts`),
+spaces (`spaces-*.spec.ts`, `space-mark.visual.spec.ts`), wiki
+(`wiki-*.spec.ts`), graph (`graph-rendering.visual.spec.ts`), plus a handful of
+standalone suites (`memory-list.spec.ts`, `review-flavor.review.spec.ts`,
+`no-third-party-requests.spec.ts`, `tauriMock.self-test.spec.ts`). `*.visual.spec.ts`
+files are screenshot-diff tests.
 
 ## WHERE TO LOOK
 

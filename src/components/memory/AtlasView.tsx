@@ -5,22 +5,34 @@ import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import Graph from "graphology";
 import Sigma from "sigma";
-import type { Simulation } from "d3-force";
-import { listEntities, getEntityDetail } from "../../lib/tauri";
-import type { Entity, EntityDetail } from "../../lib/tauri";
-import { buildGraphModel, entitySpace } from "../../lib/graph/model";
-import type { GraphNode } from "../../lib/graph/model";
+import { getKnowledgeGraph } from "../../lib/tauri";
+import type { Entity, KnowledgeGraph } from "../../lib/tauri";
+import {
+  buildKnowledgeGraphModel,
+  entitySpace,
+  filterKnowledgeGraph,
+  memorySourceId,
+  pageIdOf,
+  drawableModel,
+  smallGroupNodeCount,
+  DEFAULT_LAYERS,
+  MEMORY_NODE_TYPE,
+  PAGE_NODE_TYPE,
+} from "../../lib/graph/model";
+import type { GraphLayers, GraphModel, GraphNode } from "../../lib/graph/model";
 import {
   buildAtlasGraph,
   runAtlasLayout,
   createAtlasSimulation,
-  placeIsolateRing,
   hoverStateFor,
   nodeDisplay,
   edgeDisplay,
+  edgeSizeFor,
+  drawPageRings,
   drawRadialNodeLabel,
 } from "../../lib/graph/atlas";
-import type { HoverState, AtlasSimNode } from "../../lib/graph/atlas";
+import type { HoverState, AtlasSimulation } from "../../lib/graph/atlas";
+import type { CartographyScene } from "../../lib/graph/cartography";
 import {
   communitiesFor,
   cartographyScene,
@@ -41,6 +53,63 @@ import type { SpaceCartography } from "../../lib/graph/community";
 // and repaints every edge each render until the fetch lands.
 const EMPTY_CARTOGRAPHY: Map<string, SpaceCartography> = new Map();
 
+// Same reason as EMPTY_CARTOGRAPHY: a stable identity for the unresolved
+// graph query, so the model memo below doesn't rebuild on every render.
+const EMPTY_GRAPH: KnowledgeGraph = {
+  entities: [],
+  relations: [],
+  memories: [],
+  memory_links: [],
+  pages: [],
+  page_links: [],
+};
+
+/** Where the layer choice survives a reload. */
+const LAYERS_STORAGE_KEY = "atlas.layers";
+
+/** Where the small-groups choice is remembered across reloads. */
+export const SMALL_GROUPS_STORAGE_KEY = "atlas.smallGroups";
+
+/** Read the persisted small-groups choice. Only a stored `true` turns them
+ *  on; anything malformed — bad JSON, a number, a string — leaves them
+ *  hidden, which is the default the map is designed around. */
+export function readStoredSmallGroups(raw: string | null): boolean {
+  if (raw === null) return false;
+  try {
+    return JSON.parse(raw) === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Read the persisted layer choice. Anything malformed — bad JSON, a
+ *  non-object, a non-boolean field, or all three off — falls back to the
+ *  default rather than half-applying a broken value. */
+export function readStoredLayers(raw: string | null): GraphLayers {
+  if (raw === null) return DEFAULT_LAYERS;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return DEFAULT_LAYERS;
+    const record = parsed as Record<string, unknown>;
+    const layers: GraphLayers = {
+      entity: record.entity,
+      page: record.page,
+      memory: record.memory,
+    } as GraphLayers;
+    if (
+      typeof layers.entity !== "boolean" ||
+      typeof layers.page !== "boolean" ||
+      typeof layers.memory !== "boolean"
+    ) {
+      return DEFAULT_LAYERS;
+    }
+    if (!layers.entity && !layers.page && !layers.memory) return DEFAULT_LAYERS;
+    return layers;
+  } catch {
+    return DEFAULT_LAYERS;
+  }
+}
+
 // Same 5-slot legend as the retired canvas graph (ConstellationMap): place,
 // event, and unknown types fold to neutral and get no swatch; concept is
 // labeled "Theme" to match the product copy.
@@ -50,10 +119,28 @@ const LEGEND_ITEMS: { label: string; key: string }[] = [
   { label: "Organization", key: "organization" },
   { label: "Person", key: "person" },
   { label: "Theme", key: "concept" },
+  { label: "Wiki page", key: PAGE_NODE_TYPE },
+  { label: "Memory", key: MEMORY_NODE_TYPE },
 ];
 
+/** What a click on a drawn node resolves to. Memories carry their own
+ *  `source_id`, not the prefixed graph-node id. */
+export type AtlasNodeTarget =
+  | { kind: "entity"; id: string }
+  | { kind: "memory"; id: string }
+  | { kind: "page"; id: string };
+
+/** The node id a click landed on, resolved to a navigable target. */
+function targetForNode(nodeId: string): AtlasNodeTarget {
+  const sourceId = memorySourceId(nodeId);
+  if (sourceId !== null) return { kind: "memory", id: sourceId };
+  const pageId = pageIdOf(nodeId);
+  if (pageId !== null) return { kind: "page", id: pageId };
+  return { kind: "entity", id: nodeId };
+}
+
 interface AtlasViewProps {
-  onNodeClick?: (entityId: string) => void;
+  onNodeClick?: (target: AtlasNodeTarget) => void;
   // Initial framing: center this entity with its neighborhood emphasized
   // (EntityDetail's overlay "Atlas" mode). Applied instantly on mount — a
   // starting frame, not a transition — so no camera animation.
@@ -82,7 +169,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   const containerRef = useRef<HTMLDivElement>(null);
   const sigmaRef = useRef<Sigma | null>(null);
   const graphRef = useRef<Graph | null>(null);
-  const simRef = useRef<Simulation<AtlasSimNode, undefined> | null>(null);
+  const simRef = useRef<AtlasSimulation | null>(null);
   // Reducer inputs, read from refs so hover/theme changes repaint without a
   // React re-render or a renderer rebuild (see the mount effect below).
   const hoverStateRef = useRef<HoverState>({ hovered: null, neighbors: new Set() });
@@ -91,47 +178,31 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // pointer actually moved during the current press — the latter gates
   // clickNode so a drag-release doesn't also fire entity navigation.
   const draggedNodeRef = useRef<string | null>(null);
+  /** Was the node under the pointer already pinned before this drag? A packed
+   *  island node is, and must stay pinned when the pointer lets go. */
+  const draggedNodeWasPinnedRef = useRef(false);
   const movedDuringPressRef = useRef(false);
+  // Cached cartography (hulls + graticule). Recomputing every hull on every
+  // afterRender meant a plain camera pan or a hover re-hulled all 66 regions;
+  // the scene only actually changes when node positions or communities do, so
+  // paints mark it dirty and drawUnderlay rebuilds only then.
+  const sceneRef = useRef<CartographyScene | null>(null);
+  const sceneDirtyRef = useRef(true);
 
+  // ONE read for the whole graph. This used to be two queries — every entity,
+  // then a detail fetch per entity capped at the first 20 — which drew every
+  // connected entity outside that top 20 as an isolate.
   const {
-    data: entities = [],
-    isLoading: entitiesLoading,
-    isError: entitiesError,
-    refetch: refetchEntities,
+    data: graph = EMPTY_GRAPH,
+    isLoading: graphLoading,
+    isError: graphError,
+    refetch: refetchGraph,
   } = useQuery({
-    queryKey: ["constellation-entities"],
-    queryFn: () => listEntities(),
+    queryKey: ["knowledge-graph"],
+    queryFn: () => getKnowledgeGraph(),
     refetchInterval: 120_000,
   });
-
-  const top20Ids = useMemo(
-    () => entities.slice(0, 20).map((e: Entity) => e.id),
-    [entities],
-  );
-
-  const {
-    data: details = [],
-    isLoading: detailsLoading,
-    isError: detailsError,
-    refetch: refetchDetails,
-  } = useQuery({
-    queryKey: ["constellation-relations", top20Ids],
-    queryFn: async () => {
-      const settled = await Promise.allSettled(top20Ids.map((id) => getEntityDetail(id)));
-      const succeeded = settled
-        .filter((r): r is PromiseFulfilledResult<EntityDetail> => r.status === "fulfilled")
-        .map((r) => r.value);
-      // One flaky detail fetch shouldn't blank the whole graph — only a
-      // total wipeout is a real outage worth the full error screen.
-      if (succeeded.length === 0) {
-        throw new Error("All entity detail fetches failed");
-      }
-      return succeeded;
-    },
-    enabled: top20Ids.length > 0,
-    refetchInterval: 300_000,
-    staleTime: 120_000,
-  });
+  const entities = graph.entities;
 
   // Same field precedence as the entity page (EntityDetail's space-then-domain
   // rule), through model.ts's entitySpace so the list, the filter, and the
@@ -145,6 +216,52 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   );
   const [spaceFilter, setSpaceFilter] = useState<string | null>(null);
 
+  // Which node kinds are drawn. Wiki pages and entities on, memories off by
+  // default: memories outnumber everything else and bury the map. Persisted
+  // across reloads; a malformed stored value falls back to the default.
+  const [layers, setLayers] = useState<GraphLayers>(() => {
+    if (typeof window === "undefined") return DEFAULT_LAYERS;
+    try {
+      return readStoredLayers(window.localStorage.getItem(LAYERS_STORAGE_KEY));
+    } catch {
+      return DEFAULT_LAYERS;
+    }
+  });
+  const toggleLayer = (key: keyof GraphLayers) => {
+    const next = { ...layers, [key]: !layers[key] };
+    // The last lit chip can't be turned off — an empty map is not a view.
+    if (!next.entity && !next.page && !next.memory) return;
+    setLayers(next);
+    try {
+      window.localStorage.setItem(LAYERS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Private mode / quota: the choice still applies for this session.
+    }
+  };
+  // Components of fewer than MIN_COMPONENT_SIZE nodes are off the map until
+  // the reader asks for them; the chip below is the ask. Persisted like the
+  // layer choice, and a malformed stored value falls back to hidden.
+  const [showSmallGroups, setShowSmallGroups] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return readStoredSmallGroups(window.localStorage.getItem(SMALL_GROUPS_STORAGE_KEY));
+    } catch {
+      return false;
+    }
+  });
+  const toggleSmallGroups = () => {
+    const next = !showSmallGroups;
+    setShowSmallGroups(next);
+    try {
+      window.localStorage.setItem(SMALL_GROUPS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Private mode / quota: the choice still applies for this session.
+    }
+  };
+
+  const onlyLayerOn = (key: keyof GraphLayers) =>
+    layers[key] && Object.values(layers).filter(Boolean).length === 1;
+
   // D13/App-PR readiness, one fetch-and-classify per known space (community.ts):
   // cursor-paginated to exhaustion, generation-checked, never declared ready off
   // a partial read. Keyed on ALL known spaces regardless of spaceFilter, so
@@ -156,16 +273,26 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     enabled: spaces.length > 0,
     refetchInterval: 120_000,
   });
-  // Scoping filters the model INPUTS: the space's own entities plus whatever
-  // bridge neighbors their relations synthesize (those carry no space of their
-  // own). Regions, counts, and insights all re-derive from the scoped model.
-  const model = useMemo(() => {
-    if (!spaceFilter) return buildGraphModel(entities, details);
-    return buildGraphModel(
-      entities.filter((e: Entity) => entitySpace(e) === spaceFilter),
-      details.filter((d: EntityDetail) => entitySpace(d.entity) === spaceFilter),
-    );
-  }, [entities, details, spaceFilter]);
+  // Scoping filters the model INPUTS: the space's own entities and memories,
+  // and only the relations/links whose endpoints both survive. Regions,
+  // counts, and insights all re-derive from the scoped model.
+  const model = useMemo(
+    () => buildKnowledgeGraphModel(filterKnowledgeGraph(graph, spaceFilter), { layers }),
+    [graph, spaceFilter, layers],
+  );
+
+  // What sigma actually draws. Nodes in a connected component smaller than
+  // MIN_COMPONENT_SIZE are left out (model.ts) unless the reader turns them
+  // on: on real data ~960 of 1,600 entities have no relation at all, and
+  // another ~196 sit in small groups of four or fewer. Both buried the map.
+  // The count is shown on the toolbar chip that turns them back on.
+  const visibleModel = useMemo<GraphModel>(
+    () => drawableModel(model, showSmallGroups),
+    [model, showSmallGroups],
+  );
+  // Counted off the FULL model, so the chip keeps its number when the groups
+  // are showing and can offer to hide them again.
+  const smallGroupCount = useMemo(() => smallGroupNodeCount(model), [model]);
 
   // Anything in cartography.ts's unscoped bucket is drawn on the fallback
   // climb, so the badge must never read all-durable while such a node is on
@@ -177,8 +304,14 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // buildGraphModel synthesizes it with no space at all. Going through the
   // model also covers the two unfiltered ways in — a relation-only neighbor,
   // and an entity whose own space is null or empty.
+  // Memory and wiki-page nodes are exempt: both inherit their community from
+  // an entity (cartography.ts), so a spaceless one is not a node drawn on the
+  // fallback climb and must not hold the badge back.
   const hasUnscopedFallback = useMemo(
-    () => model.nodes.some((n: GraphNode) => isUnscopedSpace(n.space)),
+    () =>
+      model.nodes.some(
+        (n: GraphNode) => n.kind === "entity" && isUnscopedSpace(n.space),
+      ),
     [model],
   );
   const cartographyStatus = useMemo(
@@ -332,8 +465,16 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     setActiveIndex(0);
     searchInputRef.current?.blur();
     const renderer = sigmaRef.current;
-    const graph = graphRef.current;
-    if (!renderer || !graph || !graph.hasNode(nodeId)) return;
+    const drawn = graphRef.current;
+    // A degree-0 node is not on the map at all (see visibleModel). The gap
+    // card names exactly those, so "show in atlas" opens the node's own page
+    // rather than flying the camera to nothing.
+    if (!drawn || !drawn.hasNode(nodeId)) {
+      if (model.nodes.some((node) => node.id === nodeId)) onNodeClick?.(targetForNode(nodeId));
+      return;
+    }
+    const graph = drawn;
+    if (!renderer) return;
     // Same emphasis as hovering the node: its neighborhood stays lit, the
     // rest dims. Cleared naturally by the next enter/leaveNode.
     hoverStateRef.current = hoverStateFor(graph, nodeId);
@@ -371,23 +512,30 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // remounting the whole renderer.
   useEffect(() => {
     const container = containerRef.current;
+    // Guarded on the FULL model, not the drawn one: a graph whose components
+    // are all smaller than MIN_COMPONENT_SIZE draws nothing but must still
+    // mount, so the map frame and the "N unconnected or paired, hidden" chip
+    // explain the emptiness instead of the view silently showing a blank slot.
     if (!container || model.nodes.length === 0) return;
 
-    const graph = buildAtlasGraph(model, palette, communities);
+    const graph = buildAtlasGraph(visibleModel, palette, communities);
     runAtlasLayout(graph);
     graphRef.current = graph;
+    sceneRef.current = null;
+    sceneDirtyRef.current = true;
 
     // Same-frame paint per physics step (see createAtlasSimulation's onTick
     // note). sigmaRef is still null during the synchronous settle ticks, so
     // the 220 pre-paint steps don't render.
-    const sim = createAtlasSimulation(graph, () => sigmaRef.current?.refresh());
+    const sim = createAtlasSimulation(graph, () => {
+      sceneDirtyRef.current = true;
+      sigmaRef.current?.refresh();
+    });
     simRef.current = sim;
     if (import.meta.env.DEV) {
       // Preview/debug handle only — stripped from prod builds.
       (window as unknown as Record<string, unknown>).__ATLAS_SIM = sim;
     }
-    placeIsolateRing(graph);
-
     // Cartography underlay (hulls, region names, graticule) — a plain 2D
     // canvas appended BEFORE sigma mounts so sigma's own canvases stack above
     // it. Redrawn on every afterRender, so hulls flex live with drags and
@@ -402,8 +550,35 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     container.appendChild(underlay);
     underlayRef.current = underlay;
 
+    // Page-ring overlay — appended AFTER sigma mounts (below) so it stacks
+    // ABOVE sigma's canvases, the mirror of the cartography underlay. Sigma
+    // v3 has no bordered or square node program, so the page marker is drawn
+    // here (see atlas.ts's drawPageRings).
+    const overlay = document.createElement("canvas");
+    overlay.dataset.testid = "atlas-page-rings";
+    overlay.style.position = "absolute";
+    overlay.style.inset = "0";
+    overlay.style.width = "100%";
+    overlay.style.height = "100%";
+    overlay.style.pointerEvents = "none";
+
     const renderer = new Sigma(graph, container, {
-      labelRenderedSizeThreshold: 6,
+      // Only nodes at least this big carry a label. With the log2 size scale
+      // (atlas.ts) that is roughly degree >= 5 for an entity and >= 6 for a
+      // page, so the zoomed-out map shows hub names only; sigma's own label
+      // grid reveals the rest as you zoom in.
+      labelRenderedSizeThreshold: 7,
+      // Round 4: with memories on, the size threshold alone still let dozens
+      // of labels pile on top of each other. Sigma buckets the viewport into
+      // a grid of labelGridCellSize screen px and keeps
+      // ceil(labelDensity / cameraRatio^2) labels per cell, biggest node
+      // first. At 0.04 that is exactly ONE name per cell for any camera ratio
+      // above 0.2 — i.e. one per 120 px of screen at every zoom the map
+      // normally sits at — and the cell size is what decides how coarse that
+      // thinning is. Zooming in reveals more names because the same graph
+      // area then spans more cells, not because the per-cell count rises.
+      labelDensity: 0.04,
+      labelGridCellSize: 120,
       // Default camera fit maps the graph bbox edge-to-edge on the tighter
       // axis, half-clipping the extreme nodes; give the map a margin.
       stagePadding: 40,
@@ -440,6 +615,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       },
     });
     sigmaRef.current = renderer;
+    container.appendChild(overlay);
     if (import.meta.env.DEV) {
       // Preview/debug handle only — stripped from prod builds.
       (window as unknown as Record<string, unknown>).__ATLAS_SIGMA = renderer;
@@ -456,17 +632,45 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, height);
+      if (sceneDirtyRef.current || sceneRef.current === null) {
+        sceneRef.current = cartographyScene(graph, communitiesRef.current);
+        sceneDirtyRef.current = false;
+      }
       drawCartography(
         ctx,
-        cartographyScene(graph, communitiesRef.current),
+        sceneRef.current,
         (pos) => renderer.graphToViewport(pos),
         paletteRef.current,
       );
     };
-    // First paint is NOT drawn here. The cartography effect below runs right
-    // after this one on mount (effects fire in declaration order, and both
-    // refs above are already assigned), and its refresh() fires afterRender —
-    // so painting here as well would just compute every hull twice.
+    const drawOverlay = () => {
+      const ctx = overlay.getContext("2d");
+      if (!ctx) return; // jsdom
+      const { width, height } = renderer.getDimensions();
+      const dpr = window.devicePixelRatio || 1;
+      if (overlay.width !== width * dpr || overlay.height !== height * dpr) {
+        overlay.width = width * dpr;
+        overlay.height = height * dpr;
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      const positions: { x: number; y: number; size: number }[] = [];
+      graph.forEachNode((id, attrs) => {
+        if (attrs.entityType !== PAGE_NODE_TYPE) return;
+        const display = renderer.getNodeDisplayData(id);
+        if (!display || display.hidden) return;
+        // getNodeDisplayData reports framed-graph coordinates, not screen px —
+        // the whole map lands in a ~1px box at the origin if they are used
+        // directly. Convert the node's own graph position the same way the
+        // cartography underlay does. Size is already CSS px, because
+        // zoomToSizeRatioFunction is pinned to 1.
+        const at = renderer.graphToViewport({ x: attrs.x as number, y: attrs.y as number });
+        positions.push({ x: at.x, y: at.y, size: display.size });
+      });
+      drawPageRings(ctx, positions, paletteRef.current);
+    };
+    renderer.on("afterRender", drawOverlay);
+
     renderer.on("afterRender", drawUnderlay);
     // Default zoom: sigma's fit stretches a small cluster edge-to-edge no
     // matter how big the container (7.3 px/graph-unit in preview) — links
@@ -498,12 +702,23 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
         const camera = renderer.getCamera();
         camera.setState({ x: display.x, y: display.y, ratio: Math.min(camera.ratio, 1) });
       }
-      renderer.refresh();
     }
+    // First paint of THIS renderer, and the only thing that draws the two
+    // canvases above at all. Sigma's constructor render already happened
+    // before the afterRender listeners existed, and the simulation rests at
+    // alpha 0 straight out of createAtlasSimulation (atlas.ts settles it
+    // synchronously, then stops), so no tick will schedule one either. This
+    // used to be left to the cartography effect below — which only runs when
+    // `communities` changes, and `communities` is derived from the FULL
+    // model. Toggling the small-groups chip rebuilds the renderer off
+    // `visibleModel` WITHOUT changing `communities`, so nothing ever painted:
+    // the fresh underlay stayed at its untouched 300x150 default and every
+    // hull, region name, graticule ring, and page ring vanished from the map.
+    renderer.refresh();
     renderer.on("clickNode", ({ node }) => {
       // A moved drag must not also navigate on release.
       if (movedDuringPressRef.current) return;
-      onNodeClick?.(node);
+      onNodeClick?.(targetForNode(node));
     });
     // Hover is LOCKED while a drag is live: our drag doesn't capture the
     // pointer (sigma's captor keeps picking), so sweeping the grabbed node
@@ -537,10 +752,19 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       movedDuringPressRef.current = false;
       graph.setNodeAttribute(node, "highlighted", true);
       container.style.cursor = "grabbing";
+      // A leaf memory is not a sim node — the writeback would put it back on
+      // its orbit on the next tick unless the sim knows a hand is on it.
+      sim.setDraggingId(node);
       const simNode = sim.nodes().find((n) => n.id === node);
-      // Isolates aren't sim members (see createAtlasSimulation) — an isolate
-      // drag is pure direct manipulation via mousemovebody's graphology
-      // writes, so there's nothing here to pin or reheat.
+      // Nodes outside the biggest component are parked on the shelf by
+      // shelveComponents and pinned there; a drag moves the pin, and release
+      // leaves it at the new spot rather than handing it back to charge +
+      // forceCenter, which would fling it into the core.
+      draggedNodeWasPinnedRef.current = simNode?.fx != null;
+      // Leaf memories aren't sim members (see nonSimulatedIds) — dragging one
+      // is pure direct manipulation via mousemovebody's graphology writes, so
+      // there's nothing here to pin or reheat; setDraggingId above is what
+      // stops the writeback snapping it back onto its orbit.
       if (simNode) {
         simNode.fx = simNode.x;
         simNode.fy = simNode.y;
@@ -565,6 +789,9 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       const pos = renderer.viewportToGraph(e);
       graph.setNodeAttribute(draggedNode, "x", pos.x);
       graph.setNodeAttribute(draggedNode, "y", pos.y);
+      // Written straight onto the graph, outside the sim's writeback, so the
+      // hulls have to be told the positions moved.
+      sceneDirtyRef.current = true;
       // Instant response between ticks — the dragged node's own position
       // isn't waiting on the next sim tick; its neighbors flow toward this
       // pin as the sim (reheated on downNode) keeps ticking.
@@ -586,12 +813,14 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       if (draggedNode) {
         graph.setNodeAttribute(draggedNode, "highlighted", false);
         const simNode = sim.nodes().find((n) => n.id === draggedNode);
-        if (simNode) {
+        if (simNode && !draggedNodeWasPinnedRef.current) {
           simNode.fx = null;
           simNode.fy = null;
         }
         draggedNodeRef.current = null;
+        draggedNodeWasPinnedRef.current = false;
       }
+      sim.setDraggingId(null);
       container.style.cursor = hoverStateRef.current.hovered ? "pointer" : "default";
       // Natural decay is the inertia tail; reduced motion skips it outright.
       if (prefersReducedMotion()) sim.stop();
@@ -626,11 +855,12 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       sigmaRef.current = null;
       graphRef.current = null;
       renderer.kill();
-      // Sigma removes its own canvases; the underlay is ours to remove.
+      // Sigma removes its own canvases; these two are ours to remove.
       underlay.remove();
+      overlay.remove();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model]);
+  }, [visibleModel]);
 
   // Theme flip: recolor the live graph and repaint — no remount. Also keeps
   // paletteRef current so nodeReducer/edgeReducer (read at paint time) see
@@ -656,13 +886,21 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
 
   // Cartography arriving or regressing (fallback -> ready, or ready -> a
   // partial-error) must repaint bridges + hulls WITHOUT tearing down the
-  // sim/camera — the mount effect above only rebuilds on `model` changing,
-  // so a `cartographyBySpace` refetch that flips a space's status never
-  // reaches the renderer otherwise. Same "recolor in place" shape as the
-  // theme-flip effect: update edge attributes, point communitiesRef at the
-  // fresh map (drawUnderlay reads it at paint time), then refresh.
+  // sim/camera — the mount effect above only rebuilds on `visibleModel`
+  // changing, so a `cartographyBySpace` refetch that flips a space's status
+  // never reaches the renderer otherwise. Same "recolor in place" shape as
+  // the theme-flip effect: update edge attributes, point communitiesRef at
+  // the fresh map (drawUnderlay reads it at paint time), then refresh.
   useEffect(() => {
+    // On the mount pass communitiesRef already holds this very map (it is
+    // seeded with it), and the mount effect has just painted with it — so
+    // there is nothing to repaint and every hull would be computed twice.
+    // Only an actual change to the map is work.
+    if (communitiesRef.current === communities) return;
     communitiesRef.current = communities;
+    // Region membership is derived from the communities map, so a status flip
+    // invalidates the cached hulls even though nothing moved.
+    sceneDirtyRef.current = true;
     const graph = graphRef.current;
     const renderer = sigmaRef.current;
     if (!graph || !renderer) return;
@@ -670,7 +908,12 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     graph.updateEachEdgeAttributes((edgeKey, attrs) => {
       const [source, target] = graph.extremities(edgeKey);
       const bridge = isBridge(source, target);
-      return { ...attrs, bridge, color: bridge ? paletteRef.current.bridge : paletteRef.current.edge };
+      return {
+        ...attrs,
+        bridge,
+        size: edgeSizeFor(attrs.edgeType as string, bridge),
+        color: bridge ? paletteRef.current.bridge : paletteRef.current.edge,
+      };
     });
     renderer.refresh();
   }, [communities]);
@@ -697,7 +940,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   };
 
   // Honest states: a dead daemon must never look like an empty graph.
-  if (entitiesError || detailsError) {
+  if (graphError) {
     return (
       <div data-testid="atlas-view" style={statusStyle}>
         <p className="entity-empty" style={{ color: "var(--mem-status-danger-text)" }}>
@@ -707,8 +950,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
           type="button"
           className="memory-detail-text-button"
           onClick={() => {
-            refetchEntities();
-            refetchDetails();
+            refetchGraph();
           }}
         >
           {t("constellationMap.retry")}
@@ -717,7 +959,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     );
   }
 
-  if (entitiesLoading || detailsLoading) {
+  if (graphLoading) {
     return (
       <div data-testid="atlas-view" style={statusStyle}>
         <span className="entity-empty">{t("constellationMap.loading")}</span>
@@ -725,7 +967,9 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     );
   }
 
-  if (entities.length === 0) {
+  // Nothing to draw only when the daemon has neither entities NOR wiki pages:
+  // a knowledge base made purely of pages is a real map, not an empty one.
+  if (entities.length === 0 && graph.pages.length === 0) {
     return (
       <div data-testid="atlas-view" style={statusStyle}>
         <span className="entity-empty">{t("constellationMap.empty")}</span>
@@ -733,11 +977,24 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     );
   }
 
-  const entityCount = model.nodes.length;
-  const countLine =
-    regionInfo.count > 0
-      ? `${t("atlas.countEntities", { count: entityCount })} · ${t("atlas.countRegions", { count: regionInfo.count })}`
-      : t("atlas.countEntities", { count: entityCount });
+  // Counts describe what is actually ON THE MAP: layer on, and connected to
+  // something. What the degree-0 filter took out is reported by its own chip,
+  // and a layer that is off contributes nothing rather than a zero.
+  const drawn = visibleModel.nodes;
+  const pageCount = drawn.filter((node) => node.kind === "page").length;
+  const memoryCount = drawn.filter((node) => node.kind === "memory").length;
+  const entityCount = drawn.length - pageCount - memoryCount;
+  // A kind appears when its layer is on and it actually contributed nodes.
+  // Entities are the exception and always report, zero included — the round-1
+  // line did, and "0 entities" is the honest answer to an empty entity layer.
+  const countLine = [
+    ...(layers.page && pageCount > 0 ? [t("atlas.countPages", { count: pageCount })] : []),
+    ...(layers.entity ? [t("atlas.countEntities", { count: entityCount })] : []),
+    ...(layers.memory && memoryCount > 0
+      ? [t("atlas.countMemories", { count: memoryCount })]
+      : []),
+    ...(regionInfo.count > 0 ? [t("atlas.countRegions", { count: regionInfo.count })] : []),
+  ].join(" · ");
   const dropdownOpen = searchFocused && query.trim().length > 0;
 
   return (
@@ -879,7 +1136,12 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
                       height: 8,
                       borderRadius: "50%",
                       flexShrink: 0,
-                      backgroundColor: colorForEntityType(node.entityType, palette),
+                      backgroundColor:
+                        node.entityType === MEMORY_NODE_TYPE
+                          ? palette.memory
+                          : node.entityType === PAGE_NODE_TYPE
+                            ? palette.page
+                            : colorForEntityType(node.entityType, palette),
                       opacity: 0.85,
                     }}
                   />
@@ -896,6 +1158,40 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
             </ul>
           )}
         </div>
+        {/* Layer chips — which node kinds the map draws. The last lit chip is
+            disabled: an empty map is not a view. */}
+        {(
+          [
+            { key: "page" as const, label: t("atlas.layer.page") },
+            { key: "entity" as const, label: t("atlas.layer.entity") },
+            { key: "memory" as const, label: t("atlas.layer.memory") },
+          ]
+        ).map(({ key, label }) => {
+          const on = layers[key];
+          const locked = onlyLayerOn(key);
+          return (
+            <button
+              key={key}
+              type="button"
+              aria-pressed={on}
+              disabled={locked}
+              onClick={() => toggleLayer(key)}
+              style={{
+                fontSize: 12,
+                color: on ? "var(--mem-text)" : "var(--mem-text-secondary)",
+                border: `1px solid ${on ? "var(--mem-distilled-border)" : "var(--mem-border)"}`,
+                borderRadius: "var(--mem-radius-full)",
+                padding: "4px 12px",
+                background: on ? "var(--mem-indigo-bg)" : "transparent",
+                cursor: locked ? "default" : "pointer",
+                opacity: locked ? 0.7 : 1,
+                fontFamily: "inherit",
+              }}
+            >
+              {label}
+            </button>
+          );
+        })}
         <button
           type="button"
           aria-pressed={showRegions}
@@ -964,6 +1260,27 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
             )}
           </span>
         )}
+        {smallGroupCount > 0 && (
+          <button
+            type="button"
+            onClick={toggleSmallGroups}
+            aria-pressed={showSmallGroups}
+            aria-label={t(showSmallGroups ? "atlas.hideSmallGroups" : "atlas.showSmallGroups")}
+            style={{
+              font: "400 11px var(--mem-font-mono)",
+              color: showSmallGroups ? "var(--mem-text-secondary)" : "var(--mem-text-tertiary)",
+              background: "transparent",
+              border: "1px solid var(--mem-border)",
+              borderRadius: "var(--mem-radius-full)",
+              padding: "3px 10px",
+              cursor: "pointer",
+            }}
+          >
+            {showSmallGroups
+              ? t("atlas.hideSmallGroups")
+              : t("atlas.smallGroupsHidden", { count: smallGroupCount })}
+          </button>
+        )}
         <span
           style={{
             marginLeft: "auto",
@@ -1015,7 +1332,12 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
                 width: 8,
                 height: 8,
                 borderRadius: "50%",
-                backgroundColor: colorForEntityType(key, palette),
+                backgroundColor:
+                  key === MEMORY_NODE_TYPE
+                    ? palette.memory
+                    : key === PAGE_NODE_TYPE
+                      ? palette.page
+                      : colorForEntityType(key, palette),
                 opacity: 0.7,
                 flexShrink: 0,
               }}

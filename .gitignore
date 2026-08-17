@@ -51,12 +51,14 @@ crates/*/.fastembed_cache
 .claude/*
 !.claude/settings.json
 !.claude/hooks/
+!.claude/agents/
 # Skills are tracked selectively: verification skills ship with the repo,
 # personal/local skills stay local.
 !.claude/skills/
 .claude/skills/*
 !.claude/skills/prove/
 !.claude/skills/run-wenlan/
+!.claude/skills/run-wenlan-app/
 !.claude/skills/verify/
 .mcp.json
 
@@ -68,7 +70,7 @@ app/binaries/
 
 # Git worktrees
 .worktrees/
-# Top-level sibling clone of origin-mcp (legacy; crates/origin-mcp/ is the in-repo crate)
+# Top-level sibling clone of wenlan-mcp (legacy; crates/wenlan-mcp/ is the in-repo crate)
 /origin-mcp/
 .autopilot-task.md
 
@@ -82,9 +84,12 @@ app/eval/data/longmemeval_*.json
 # Eval baselines — competitive intelligence, keep local
 app/eval/baselines/
 
-# Working design docs — plans, specs, research, prototypes. Local only.
-# A spec that code or CI actually reads is a test fixture: keep it next to the
-# test, e.g. crates/wenlan-core/contracts/, never here.
+# Working design docs — plans, specs, research, prototypes — do not live in this
+# public repo. Their home is a private notes repo outside every worktree
+# (maintainer setup: ~/.wenlan/specs/<repo>/); nothing should be written to the
+# paths below any more. The ignores stay as a tripwire so a stray write cannot
+# reach a commit. A spec that code or CI actually reads is a test fixture: keep
+# it next to the test, e.g. crates/wenlan-core/contracts/, never here.
 docs/plans/
 docs/superpowers/
 .superpowers/
