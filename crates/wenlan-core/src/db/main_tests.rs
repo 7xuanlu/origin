@@ -51309,10 +51309,19 @@ async fn fold_relation_type_dual_writes_edges() {
         .await
         .unwrap();
 
-    // Simple rename: a->c carries only the old type (both are vocabulary canonicals).
-    db.create_relation(&a, &c, "works_on", Some("test"), None, None, None)
-        .await
-        .unwrap();
+    // Simple rename: a->c carries only the old type (both are vocabulary
+    // canonicals) and a source memory whose id must survive the fold.
+    db.create_relation(
+        &a,
+        &c,
+        "works_on",
+        Some("test"),
+        None,
+        None,
+        Some("mem_fold_ac"),
+    )
+    .await
+    .unwrap();
     // Collision merge: a->b carries BOTH the old and the canonical type.
     db.create_relation(&a, &b, "works_on", Some("test"), None, None, None)
         .await
@@ -51350,6 +51359,27 @@ async fn fold_relation_type_dual_writes_edges() {
             "old-type edge points at its canonical successor"
         );
     }
+    // Review finding #11: the simple-rename branch mints the canonical-type
+    // edge WITH the retired edge's payload, so `source_memory_id` survives.
+    let new_ac = crate::provenance::compute_edge_id("relates", "entity", &a, "entity", &c, "leads");
+    let mut rows = conn
+        .query(
+            "SELECT json_extract(payload,'$.source_memory_id') FROM edges \
+             WHERE edge_id = ?1 AND valid_until IS NULL",
+            libsql::params![new_ac.as_str()],
+        )
+        .await
+        .unwrap();
+    let row = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("canonical a->c edge exists");
+    assert_eq!(
+        row.get::<Option<String>>(0).unwrap().as_deref(),
+        Some("mem_fold_ac"),
+        "folded edge keeps the retired edge's source_memory_id"
+    );
 }
 
 /// `replace_page_sources` prunes `page_sources` + memory-kind `page_evidence`

@@ -46,7 +46,7 @@ pub(super) async fn load(context: &LintContext<'_, '_>, hub_cap: u64) -> Result<
 }
 
 // G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
-// space-sentinel fold: the scope clause now uses `scope_clause_folded`, and
+// space-sentinel fold: the scope clause now uses `scope_clause`, and
 // the integrity predicate excludes the `UNFILED_SPACE_ID` sentinel itself
 // (never a registered `spaces.name`) so a folded unfiled entity no longer
 // vacuously flags as an integrity violation. G6 Stage 3 retirement lint
@@ -60,7 +60,7 @@ pub(super) async fn load(context: &LintContext<'_, '_>, hub_cap: u64) -> Result<
 // `e.name`/`e.entity_type`/`e.confirmed`/`e.confidence`/`e.space`/`e.id`
 // reference is unchanged.
 async fn entity_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
-    let (clause, params) = scope_clause_folded(context.scope().filter(), "e", false);
+    let (clause, params) = scope_clause(context.scope().filter(), "e", false);
     row_check(
         context,
         &format!(
@@ -83,7 +83,7 @@ async fn entity_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()>
 }
 
 // G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
-// space-sentinel fold: `e.space`/`e.id` now uses `scope_clause_folded`,
+// space-sentinel fold: `e.space`/`e.id` now uses `scope_clause`,
 // sentinel-aware (entity-existence side only -- observation content itself
 // is out of scope for this stage regardless, see the spec's 1.5b
 // observations ruling). G6 Stage 3 retirement lint track: the prior
@@ -96,7 +96,7 @@ async fn entity_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()>
 // `link_integrity` above: a canonical-only entity's observations no longer
 // read as orphaned just because it never got an `entities` row.
 async fn observation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
-    let (clause, params) = scope_clause_folded(context.scope().filter(), "e", true);
+    let (clause, params) = scope_clause(context.scope().filter(), "e", true);
     row_check(
         context,
         &format!(
@@ -118,7 +118,7 @@ async fn observation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck
 
 // G6 Stage 1.5a carryover (2026-08-05), resolved by the 1.5b Part 2
 // space-sentinel fold: `f.space`/`f.id` (the src-entity alias) now uses
-// `scope_clause_folded`, sentinel-aware. G6 Stage 3 retirement lint track:
+// `scope_clause`, sentinel-aware. G6 Stage 3 retirement lint track:
 // the prior disposition here ("audits the legacy entities store's own data
 // quality") was only half right -- `TRIM(r.semantic_type)=''` has nothing to
 // do with `entities`, and `f.id`/`t.id IS NULL` are real orphan-relation
@@ -127,7 +127,7 @@ async fn observation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck
 // projected subquery, same pattern as `link_integrity` above; two separate
 // subquery instances since `f` and `t` each need their own derived table.
 async fn relation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
-    let (clause, params) = scope_clause_folded(context.scope().filter(), "f", true);
+    let (clause, params) = scope_clause(context.scope().filter(), "f", true);
     row_check(
         context,
         &format!(
@@ -203,35 +203,11 @@ async fn row_check(
     })
 }
 
+/// Scope predicate for a space column folded by the 1.5b space-sentinel
+/// migration (`memories.space`, `entities.space`, `pages.workspace`): an
+/// unfiled row stores `UNFILED_SPACE_ID`, not SQL NULL, so `Uncategorized`
+/// must match either. Mirrors `push_read_scope_filter_folded` (db.rs).
 pub(super) fn scope_clause(
-    scope: &ScopeFilter,
-    alias: &str,
-    exclude_missing_owner: bool,
-) -> (String, libsql::params::Params) {
-    match scope {
-        ScopeFilter::Global => (String::new(), libsql::params::Params::None),
-        ScopeFilter::Registered(space) => (
-            format!(" WHERE {alias}.space=?1"),
-            libsql::params::Params::Positional(vec![libsql::Value::Text(space.clone())]),
-        ),
-        ScopeFilter::Uncategorized => (
-            format!(
-                " WHERE {alias}.space IS NULL{}",
-                if exclude_missing_owner {
-                    format!(" AND {alias}.id IS NOT NULL")
-                } else {
-                    String::new()
-                }
-            ),
-            libsql::params::Params::None,
-        ),
-    }
-}
-
-/// Same as `scope_clause`, but for an `entities.space` alias folded by the
-/// 1.5b space-sentinel migration: an unfiled row stores `UNFILED_SPACE_ID`,
-/// not SQL NULL, so `Uncategorized` must match either.
-pub(super) fn scope_clause_folded(
     scope: &ScopeFilter,
     alias: &str,
     exclude_missing_owner: bool,
