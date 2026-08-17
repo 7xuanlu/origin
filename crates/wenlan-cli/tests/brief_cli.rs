@@ -17,7 +17,9 @@ struct Recorded {
 }
 
 fn cli() -> Command {
-    Command::cargo_bin("wenlan").unwrap()
+    let mut command = Command::cargo_bin("wenlan").unwrap();
+    command.env("WENLAN_NO_AUTOSTART", "1");
+    command
 }
 
 fn response(body: &str) -> String {

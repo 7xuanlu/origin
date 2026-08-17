@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 fn cli() -> Command {
-    Command::cargo_bin("wenlan").expect("origin binary built")
+    let mut command = Command::cargo_bin("wenlan").expect("origin binary built");
+    command.env("WENLAN_NO_AUTOSTART", "1");
+    command
 }
 
 fn cli_with_isolated_runtime(runtime: &IsolatedRuntime) -> Command {
@@ -23,6 +25,7 @@ fn cli_with_isolated_runtime(runtime: &IsolatedRuntime) -> Command {
         .env("USERPROFILE", runtime.home.path())
         .env("WENLAN_DATA_DIR", runtime.data.path())
         .env("WENLAN_HOST", "http://127.0.0.1:9")
+        .env("WENLAN_NO_AUTOSTART", "1")
         .env("WENLAN_BIND_ADDR", "127.0.0.1:9")
         .env("PATH", &joined);
     cmd
@@ -481,6 +484,15 @@ fn each_subcommand_has_help() {
 }
 
 #[test]
+fn memories_help_shows_pending_filter() {
+    cli()
+        .args(["memories", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--pending"));
+}
+
+#[test]
 fn removed_top_level_commands_are_not_advertised() {
     let output = cli()
         .arg("--help")
@@ -749,10 +761,88 @@ fn agents_edit_no_flags_bails() {
 fn status_json_succeeds_when_daemon_is_unreachable() {
     cli()
         .env("WENLAN_HOST", "http://127.0.0.1:9")
+        .env("WENLAN_NO_AUTOSTART", "1")
         .args(["status", "--format", "json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"status\": \"unreachable\""));
+}
+
+#[test]
+fn memories_reports_existing_connection_error_without_autostart() {
+    cli()
+        .env("WENLAN_HOST", "http://127.0.0.1:9")
+        .env("WENLAN_NO_AUTOSTART", "1")
+        .args(["memories"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "GET http://127.0.0.1:9/api/spaces failed",
+        ))
+        .stderr(predicate::str::contains("starting com.wenlan.server").not());
+}
+
+#[cfg(unix)]
+#[test]
+fn autostart_reports_missing_service_without_starting_it() {
+    let home = tempfile::tempdir().expect("temp home");
+    let data = tempfile::tempdir().expect("temp data");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
+    let host = format!(
+        "http://{}",
+        listener.local_addr().expect("loopback address")
+    );
+    drop(listener);
+
+    let started = std::time::Instant::now();
+    cli()
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("WENLAN_DATA_DIR", data.path())
+        .env("WENLAN_HOST", &host)
+        .env_remove("WENLAN_NO_AUTOSTART")
+        .arg("memories")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no background service is registered",
+        ))
+        .stderr(predicate::str::contains("starting com.wenlan.server").not());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "missing-service recovery stalled: {:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn autostart_honours_background_off_marker_without_starting_it() {
+    let home = tempfile::tempdir().expect("temp home");
+    let data = tempfile::tempdir().expect("temp data");
+    fs::write(data.path().join("autostart.off"), b"").expect("write autostart marker");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
+    let host = format!(
+        "http://{}",
+        listener.local_addr().expect("loopback address")
+    );
+    drop(listener);
+
+    cli()
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("WENLAN_DATA_DIR", data.path())
+        .env("WENLAN_HOST", &host)
+        .env_remove("WENLAN_NO_AUTOSTART")
+        .arg("memories")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "daemon stopped by `wenlan background off` — run `wenlan background on` to enable it again",
+        ))
+        .stderr(predicate::str::contains("starting com.wenlan.server").not());
 }
 
 #[test]
@@ -914,6 +1004,7 @@ fn setup_background_status_roundtrip_isolated() {
         .stdout(predicate::str::contains(
             "Installed and started com.wenlan.server",
         ));
+    assert!(!runtime.data.path().join("autostart.off").exists());
 
     let plist = fs::read_to_string(runtime.service_unit_path()).expect("plist written");
     assert!(plist.contains("<string>com.wenlan.server</string>"));
@@ -972,8 +1063,10 @@ fn setup_background_status_roundtrip_isolated() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Stopped com.wenlan.server"))
+        .stdout(predicate::str::contains("autostart.off"))
         .stdout(predicate::str::contains("Uninstalled").not());
 
+    assert!(runtime.data.path().join("autostart.off").is_file());
     assert!(
         runtime.service_unit_path().exists(),
         "background off preserves the launchd plist"

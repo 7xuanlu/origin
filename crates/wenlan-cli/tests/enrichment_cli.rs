@@ -10,6 +10,7 @@ use std::thread;
 
 fn cli(base: &str) -> Command {
     let mut cmd = Command::cargo_bin("wenlan").expect("wenlan binary built");
+    cmd.env("WENLAN_NO_AUTOSTART", "1");
     cmd.env("WENLAN_HOST", base);
     cmd
 }

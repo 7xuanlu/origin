@@ -150,6 +150,9 @@ enum Commands {
         /// Filter by memory type.
         #[arg(short = 't', long = "type")]
         memory_type: Option<String>,
+        /// Only unconfirmed memories (what the MCP list_pending tool returns).
+        #[arg(long)]
+        pending: bool,
     },
     /// Walk pending revisions (conflicts / merges) awaiting your accept or dismiss.
     Curate {
@@ -176,7 +179,12 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
     let environment_agent = std::env::var("WENLAN_AGENT_NAME").ok();
     let agent_name = resolve_agent_name(cli.agent_name.as_deref(), environment_agent.as_deref());
-    let base_client = client::WenlanClient::from_env_with_context(agent_name.as_deref(), None)?;
+    let recovery_enabled = !matches!(
+        &cli.command,
+        Commands::Status | Commands::Background { .. } | Commands::Restart
+    );
+    let base_client = client::WenlanClient::from_env_with_context(agent_name.as_deref(), None)?
+        .with_recovery(recovery_enabled);
     let is_brief_update = matches!(
         &cli.command,
         Commands::Brief(args) if args.command.is_some()
@@ -210,6 +218,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             agent_name.as_deref(),
             context.space.as_deref(),
         )?
+        .with_recovery(recovery_enabled)
     } else if is_brief_update {
         let strict_space = std::env::var("WENLAN_SPACE").ok();
         effective_cli_space =
@@ -218,6 +227,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             agent_name.as_deref(),
             effective_cli_space.as_deref(),
         )?
+        .with_recovery(recovery_enabled)
     } else if is_lint {
         let strict_space = std::env::var("WENLAN_SPACE").ok();
         effective_cli_space = resolve_native_read_space(
@@ -297,9 +307,11 @@ async fn main() -> anyhow::Result<ExitCode> {
             file,
             memory_type,
         } => commands::store::run(&client, format, cli.quiet, text, file, memory_type).await?,
-        Commands::Memories { limit, memory_type } => {
-            commands::list::run(&client, format, cli.quiet, limit, memory_type).await?
-        }
+        Commands::Memories {
+            limit,
+            memory_type,
+            pending,
+        } => commands::list::run(&client, format, cli.quiet, limit, memory_type, pending).await?,
         Commands::Curate { action } => {
             commands::curate::run(&client, format, cli.quiet, action).await?
         }

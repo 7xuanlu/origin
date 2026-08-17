@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `wenlan memories [--limit N] [--type X]` — POST /api/memory/list.
+//! `wenlan memories [--limit N] [--type X] [--pending]` — POST /api/memory/list.
 
 use anyhow::Result;
 use wenlan_types::responses::ListMemoriesResponse;
@@ -13,8 +13,11 @@ pub async fn run(
     quiet: bool,
     limit: usize,
     memory_type: Option<String>,
+    pending: bool,
 ) -> Result<()> {
-    let resp = client.list(Some(limit), memory_type).await?;
+    let resp = client
+        .list(Some(limit), memory_type, pending.then_some(false))
+        .await?;
     if quiet {
         return Ok(());
     }

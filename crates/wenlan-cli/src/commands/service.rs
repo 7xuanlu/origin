@@ -23,6 +23,7 @@ const SHUTDOWN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_mi
 const SHUTDOWN_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 const SHUTDOWN_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const DAEMON_PROCESS_ID_HEADER: &str = "x-wenlan-process-id";
+const AUTOSTART_OFF_MARKER: &str = "autostart.off";
 
 #[derive(Clone, Copy, Debug)]
 struct DaemonProcessIdentity {
@@ -163,17 +164,51 @@ fn current_server_path() -> Result<PathBuf> {
 
 /// Resolves the data root the daemon will use at runtime. Mirrors
 /// `crates/wenlan-server/src/main.rs` so launchd log paths line up with the
-/// on-disk layout the daemon owns. macOS-only because launchd is the only
-/// service backend that consumes pre-rendered log paths today.
-#[cfg(target_os = "macos")]
-fn origin_data_root() -> PathBuf {
-    std::env::var_os("WENLAN_DATA_DIR")
+/// on-disk layout the daemon owns.
+// TODO(PR 3): replace this local mirror with wenlan_core::config::data_root().
+fn data_root() -> PathBuf {
+    wenlan_core::env_compat::var_compat("WENLAN_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("wenlan")
         })
+}
+
+fn autostart_off_marker_path() -> PathBuf {
+    data_root().join(AUTOSTART_OFF_MARKER)
+}
+
+pub(crate) fn autostart_off_marker_exists() -> bool {
+    autostart_off_marker_path().is_file()
+}
+
+fn write_autostart_off_marker() -> Result<PathBuf> {
+    let path = autostart_off_marker_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create Wenlan data root for {}", parent.display()))?;
+    }
+    std::fs::write(&path, b"")
+        .with_context(|| format!("write autostart marker {}", path.display()))?;
+    Ok(path)
+}
+
+fn remove_autostart_off_marker() -> Result<()> {
+    let path = autostart_off_marker_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove autostart marker {}", path.display()))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn origin_data_root() -> PathBuf {
+    data_root()
 }
 
 /// Builds a launchd plist that mirrors `service-manager`'s default output for
@@ -273,6 +308,7 @@ pub fn install() -> Result<()> {
             "create scheduled task",
         )?;
         run_schtasks(&["/run", "/tn", WINDOWS_TASK_NAME], "run scheduled task")?;
+        remove_autostart_off_marker()?;
         println!(
             "Installed and started Windows scheduled task '{}' (wenlan-server).",
             WINDOWS_TASK_NAME
@@ -340,6 +376,7 @@ pub fn install() -> Result<()> {
 
     m.start(ServiceStartCtx { label: label_value })
         .context("start service")?;
+    remove_autostart_off_marker()?;
     println!("Installed and started {}.", SERVICE_LABEL);
     Ok(())
 }
@@ -635,15 +672,24 @@ async fn stop() -> Result<()> {
         }
         Err(error) => return Err(error),
     };
+    let marker = write_autostart_off_marker()?;
     if registration_present {
-        println!("Stopped {}. Background registration kept.", SERVICE_LABEL);
+        println!(
+            "Stopped {}. Background registration kept. Autostart disabled via {}.",
+            SERVICE_LABEL,
+            marker.display()
+        );
     } else if shutdown_requested {
         println!(
-            "Stopped {}. No background registration found.",
-            SERVICE_LABEL
+            "Stopped {}. No background registration found. Autostart disabled via {}.",
+            SERVICE_LABEL,
+            marker.display()
         );
     } else {
-        println!("Wenlan background process is already stopped; no registration found.");
+        println!(
+            "Wenlan background process is already stopped; no registration found. Autostart disabled via {}.",
+            marker.display()
+        );
     }
     Ok(())
 }
@@ -665,6 +711,7 @@ pub fn restart() -> Result<()> {
             .args(["/end", "/tn", WINDOWS_TASK_NAME])
             .output();
         run_schtasks(&["/run", "/tn", WINDOWS_TASK_NAME], "run scheduled task")?;
+        remove_autostart_off_marker()?;
         println!("Restarted Windows scheduled task '{}'.", WINDOWS_TASK_NAME);
         return Ok(());
     }
@@ -678,7 +725,35 @@ pub fn restart() -> Result<()> {
     });
     m.start(ServiceStartCtx { label: label_value })
         .context("start service")?;
+    remove_autostart_off_marker()?;
     println!("Restarted {}.", SERVICE_LABEL);
+    Ok(())
+}
+
+/// Start the already-registered Wenlan service without stopping or replacing it.
+pub fn start_registered(explicit_user_command: bool) -> Result<()> {
+    if !is_installed() {
+        anyhow::bail!("Wenlan background process is not set up. Run `wenlan background on` first.");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        run_schtasks(&["/run", "/tn", WINDOWS_TASK_NAME], "run scheduled task")?;
+        if explicit_user_command {
+            remove_autostart_off_marker()?;
+        }
+        return Ok(());
+    }
+
+    #[cfg_attr(target_os = "windows", allow(unreachable_code))]
+    let label_value = label()?;
+    let m = manager()?;
+    // The service manager may unload/load when the plist carries Disabled: true.
+    m.start(ServiceStartCtx { label: label_value })
+        .context("start service")?;
+    if explicit_user_command {
+        remove_autostart_off_marker()?;
+    }
     Ok(())
 }
 
