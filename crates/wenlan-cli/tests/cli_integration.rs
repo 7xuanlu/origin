@@ -823,14 +823,9 @@ fn unreachable_capture_and_brief_update_are_queued_and_status_is_offline() {
         .unwrap()
         .to_string_lossy()
         .starts_with(".tmp-")));
-    let memory_file = files
+    assert!(files
         .iter()
-        .find(|path| path.to_string_lossy().contains("memory_store"))
-        .unwrap();
-    println!(
-        "queued envelope:\n{}",
-        fs::read_to_string(memory_file).unwrap()
-    );
+        .any(|path| path.to_string_lossy().contains("memory_store")));
 }
 
 #[test]

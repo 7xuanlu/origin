@@ -6,7 +6,7 @@ use chrono::{SecondsFormat, Utc};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use wenlan_types::{OutboxEnvelope, OutboxPayload};
+use wenlan_types::OutboxEnvelope;
 
 #[derive(Debug, Clone)]
 pub struct OutboxStatus {
@@ -61,6 +61,9 @@ fn json_files(directory: &std::path::Path) -> Result<Vec<PathBuf>> {
                 && !path
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().ends_with(".receipt.json"))
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".tmp-"))
         })
         .collect::<Vec<_>>();
     files.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
@@ -73,10 +76,6 @@ pub fn is_daemon_unreachable(error: &anyhow::Error) -> bool {
             .downcast_ref::<reqwest::Error>()
             .is_some_and(reqwest::Error::is_connect)
     })
-}
-
-pub fn payload_kind(payload: &OutboxPayload) -> &'static str {
-    payload.kind()
 }
 
 #[cfg(test)]
@@ -128,6 +127,18 @@ mod tests {
             Some(value) => std::env::set_var("WENLAN_DATA_DIR", value),
             None => std::env::remove_var("WENLAN_DATA_DIR"),
         }
+    }
+
+    #[test]
+    fn json_files_skips_tmp_and_receipt_files() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("x.json"), b"{}").unwrap();
+        std::fs::write(temp.path().join(".tmp-x.json"), b"{}").unwrap();
+        std::fs::write(temp.path().join("x.json.receipt.json"), b"{}").unwrap();
+
+        let files = json_files(temp.path()).unwrap();
+
+        assert_eq!(files, vec![temp.path().join("x.json")]);
     }
 
     #[tokio::test]

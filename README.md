@@ -273,7 +273,7 @@ The loop has four steps:
 
 ### Offline queue (outbox)
 
-If the local daemon is unreachable, `wenlan capture` and `wenlan brief update` write their requests to a durable local outbox and exit successfully. When the daemon returns, it drains those writes through the normal HTTP routes; inspect the queue with `wenlan outbox status` or request an immediate replay with `wenlan outbox drain`.
+If the local daemon is unreachable, `wenlan capture` and `wenlan brief update` write their requests to a durable local outbox and exit successfully. When the daemon returns, it drains those writes through the normal HTTP routes; inspect the queue with `wenlan outbox status` or request an immediate replay with `wenlan outbox drain`. A write the daemon rejects outright (a 4xx, such as failing the content quality gate) moves to `outbox/failed/` with a receipt instead of retrying forever; a transport failure or server error (5xx) leaves it queued for the next drain, which runs automatically every 60 seconds.
 
 ### Models and privacy
 

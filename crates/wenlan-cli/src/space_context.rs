@@ -69,10 +69,35 @@ pub fn resolve_cli_space(
     )
 }
 
+/// Same resolution ladder as `resolve_cli_space`, for use when the daemon
+/// (and with it the Space registry) is unreachable. Every registry check is
+/// skipped, so the result is authoritative for queueing a write but is not
+/// validated against the daemon's registered Spaces.
+pub fn resolve_cli_space_offline(
+    explicit_space: Option<String>,
+    all_spaces: bool,
+    cwd: Option<PathBuf>,
+    operation: CliSpaceOperation,
+) -> Result<CliSpaceContext> {
+    resolve_cli_space_core(
+        &CliSpaceInputs::from_process(explicit_space, all_spaces, cwd),
+        operation,
+        None,
+    )
+}
+
 pub fn resolve_cli_space_with(
     inputs: &CliSpaceInputs,
     operation: CliSpaceOperation,
     registered_spaces: &HashSet<String>,
+) -> Result<CliSpaceContext> {
+    resolve_cli_space_core(inputs, operation, Some(registered_spaces))
+}
+
+fn resolve_cli_space_core(
+    inputs: &CliSpaceInputs,
+    operation: CliSpaceOperation,
+    registered_spaces: Option<&HashSet<String>>,
 ) -> Result<CliSpaceContext> {
     let strict = nonempty(inputs.strict_space.as_deref());
     let explicit = nonempty(inputs.explicit_space.as_deref());
@@ -95,7 +120,9 @@ pub fn resolve_cli_space_with(
                 strict
             );
         }
-        validate_registered(&strict, registered_spaces, "WENLAN_SPACE")?;
+        if let Some(registered_spaces) = registered_spaces {
+            validate_registered(&strict, registered_spaces, "WENLAN_SPACE")?;
+        }
         return Ok(CliSpaceContext {
             space: Some(strict),
             source: CliSpaceSource::StrictEnv,
@@ -110,7 +137,9 @@ pub fn resolve_cli_space_with(
     }
 
     if let Some(explicit) = explicit {
-        validate_registered(&explicit, registered_spaces, "--space")?;
+        if let Some(registered_spaces) = registered_spaces {
+            validate_registered(&explicit, registered_spaces, "--space")?;
+        }
         return Ok(CliSpaceContext {
             space: Some(explicit),
             source: CliSpaceSource::Explicit,
@@ -118,7 +147,9 @@ pub fn resolve_cli_space_with(
     }
 
     if let Some(fallback) = fallback {
-        validate_registered(&fallback, registered_spaces, "WENLAN_DEFAULT_SPACE")?;
+        if let Some(registered_spaces) = registered_spaces {
+            validate_registered(&fallback, registered_spaces, "WENLAN_DEFAULT_SPACE")?;
+        }
         return Ok(CliSpaceContext {
             space: Some(fallback),
             source: CliSpaceSource::DefaultEnv,
@@ -127,7 +158,9 @@ pub fn resolve_cli_space_with(
 
     if let (Some(cwd), Some(config)) = (&inputs.cwd, &inputs.spaces_file) {
         if let Some(mapped) = longest_mapping(cwd, config) {
-            validate_registered(&mapped, registered_spaces, "cwd mapping")?;
+            if let Some(registered_spaces) = registered_spaces {
+                validate_registered(&mapped, registered_spaces, "cwd mapping")?;
+            }
             return Ok(CliSpaceContext {
                 space: Some(mapped),
                 source: CliSpaceSource::CwdConfig,
@@ -137,11 +170,21 @@ pub fn resolve_cli_space_with(
 
     if let Some(cwd) = &inputs.cwd {
         if let Some(repo) = repository_basename(cwd) {
-            if registered_spaces.contains(&repo) {
-                return Ok(CliSpaceContext {
-                    space: Some(repo),
-                    source: CliSpaceSource::CwdRepo,
-                });
+            match registered_spaces {
+                Some(registered_spaces) => {
+                    if registered_spaces.contains(&repo) {
+                        return Ok(CliSpaceContext {
+                            space: Some(repo),
+                            source: CliSpaceSource::CwdRepo,
+                        });
+                    }
+                }
+                None => {
+                    return Ok(CliSpaceContext {
+                        space: Some(repo),
+                        source: CliSpaceSource::CwdRepo,
+                    });
+                }
             }
         }
     }
@@ -407,6 +450,46 @@ mod tests {
             Some("future-space".into())
         );
         assert_eq!(resolve_native_read_space(None, None, true).unwrap(), None);
+    }
+
+    #[test]
+    fn offline_resolver_resolves_cwd_mapping_without_a_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("spaces.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[[mapping]]\nprefix = \"{}\"\nspace = \"mapped\"\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let inputs = CliSpaceInputs {
+            strict_space: None,
+            default_space: None,
+            explicit_space: None,
+            all_spaces: false,
+            cwd: Some(tmp.path().to_path_buf()),
+            spaces_file: Some(config),
+        };
+        let resolved = resolve_cli_space_core(&inputs, CliSpaceOperation::Write, None).unwrap();
+        assert_eq!(resolved.space.as_deref(), Some("mapped"));
+        assert_eq!(resolved.source, CliSpaceSource::CwdConfig);
+    }
+
+    #[test]
+    fn online_resolver_still_bails_against_an_empty_registry() {
+        let inputs = CliSpaceInputs {
+            strict_space: None,
+            default_space: None,
+            explicit_space: Some("explicit".into()),
+            all_spaces: false,
+            cwd: None,
+            spaces_file: None,
+        };
+        let error = resolve_cli_space_with(&inputs, CliSpaceOperation::Write, &registered(&[]))
+            .unwrap_err();
+        assert!(error.to_string().contains("unregistered Space"));
     }
 
     #[test]

@@ -4,7 +4,8 @@ use output::OutputFormat;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use wenlan_cli::space_context::{
-    resolve_agent_name, resolve_cli_space, resolve_native_read_space, CliSpaceOperation,
+    resolve_agent_name, resolve_cli_space, resolve_cli_space_offline, resolve_native_read_space,
+    CliSpaceOperation,
 };
 use wenlan_cli::{client, commands, output};
 use wenlan_types::lint::LintProfile;
@@ -199,8 +200,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         Commands::Search { .. }
         | Commands::Recall { .. }
         | Commands::Brief(commands::brief::BriefArgs { command: None, .. })
-        | Commands::Memories { .. }
-        | Commands::Outbox { .. } => Some(CliSpaceOperation::Read),
+        | Commands::Memories { .. } => Some(CliSpaceOperation::Read),
         Commands::Capture { .. } => Some(CliSpaceOperation::Write),
         _ => None,
     };
@@ -213,37 +213,37 @@ async fn main() -> anyhow::Result<ExitCode> {
         effective_cli_space = None;
         base_client
     } else if let Some(operation) = operation {
-        let registered = match base_client.list_spaces().await {
-            Ok(spaces) => spaces.into_iter().map(|space| space.name).collect(),
+        let context = match base_client.list_spaces().await {
+            Ok(spaces) => resolve_cli_space(
+                cli.space.clone(),
+                cli.all_spaces,
+                std::env::current_dir().ok(),
+                operation,
+                &spaces.into_iter().map(|space| space.name).collect(),
+            )?,
             Err(error)
                 if matches!(&cli.command, Commands::Capture { .. })
+                    && base_client.is_local()
                     && wenlan_cli::outbox::is_daemon_unreachable(&error) =>
             {
                 if cli.all_spaces {
                     anyhow::bail!("--all-spaces is valid only for read commands");
                 }
-                let fallback = resolve_native_read_space(
-                    std::env::var("WENLAN_SPACE").ok().as_deref(),
-                    cli.space.as_deref(),
-                    false,
-                )?
-                .or_else(|| {
-                    std::env::var("WENLAN_DEFAULT_SPACE")
-                        .ok()
-                        .map(|value| value.trim().to_string())
-                        .filter(|value| !value.is_empty())
-                });
-                fallback.into_iter().collect()
+                let context = resolve_cli_space_offline(
+                    cli.space.clone(),
+                    cli.all_spaces,
+                    std::env::current_dir().ok(),
+                    operation,
+                )?;
+                if let Some(space) = context.space.as_deref() {
+                    eprintln!(
+                        "wenlan: daemon unreachable — queued for Space '{space}' (not validated against the registry)"
+                    );
+                }
+                context
             }
             Err(error) => return Err(error),
         };
-        let context = resolve_cli_space(
-            cli.space.clone(),
-            cli.all_spaces,
-            std::env::current_dir().ok(),
-            operation,
-            &registered,
-        )?;
         effective_cli_space = context.space.clone();
         client::WenlanClient::from_env_with_context(
             agent_name.as_deref(),

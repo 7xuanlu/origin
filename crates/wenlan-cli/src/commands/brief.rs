@@ -55,7 +55,7 @@ pub async fn run(
             }
             let receipt = match client.update_brief(&request).await {
                 Ok(receipt) => receipt,
-                Err(error) if outbox::is_daemon_unreachable(&error) => {
+                Err(error) if client.is_local() && outbox::is_daemon_unreachable(&error) => {
                     let envelope = OutboxEnvelope {
                         schema: OUTBOX_SCHEMA,
                         created_at: outbox::now_rfc3339(),

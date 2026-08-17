@@ -96,6 +96,14 @@ impl WenlanClient {
         self
     }
 
+    /// True when this client's base URL is a loopback daemon. Callers must
+    /// gate offline fallbacks (outbox queueing, offline Space resolution) on
+    /// this — a connect failure against a remote host is a real error, never
+    /// grounds to queue locally or guess a Space.
+    pub fn is_local(&self) -> bool {
+        recovery::is_local_daemon_url(&self.base_url)
+    }
+
     async fn send(&self, req: reqwest::RequestBuilder, what: &str) -> Result<reqwest::Response> {
         let retry = if recovery::autostart_allowed_from_env(self.recovery_enabled)
             && recovery::is_local_daemon_url(&self.base_url)
@@ -553,7 +561,7 @@ fn build_list_request(
 
 #[cfg(test)]
 mod tests {
-    use super::build_list_request;
+    use super::{build_list_request, WenlanClient};
 
     #[test]
     fn list_request_can_filter_unconfirmed_memories() {
@@ -567,5 +575,33 @@ mod tests {
         let request = build_list_request(Some(20), None, None);
         let json = serde_json::to_value(request).expect("serialize list request");
         assert!(json.get("confirmed").is_none());
+    }
+
+    fn client_for(base_url: &str) -> WenlanClient {
+        WenlanClient {
+            base_url: base_url.to_string(),
+            http: reqwest::Client::new(),
+            recovery_enabled: true,
+        }
+    }
+
+    // F1 regression: a client pointed at a remote host must never be treated
+    // as merely offline. The integration-level version of this ("capture
+    // against an unreachable *remote* WENLAN_HOST must never queue") is not
+    // exercised end-to-end here because the sandboxed test environment
+    // denies egress to arbitrary hosts (including a nonexistent
+    // `*.invalid` one), so a live connection attempt cannot be made to fail
+    // fast and deterministically the way `reqwest::Error::is_connect()`
+    // would need. `is_local()` is exactly the gate `store`/`brief`/`main`
+    // check before queueing, so pinning its behavior on both loopback and
+    // remote URLs covers the same guarantee without depending on sandbox or
+    // real-world DNS timing.
+    #[test]
+    fn is_local_accepts_only_loopback_hosts() {
+        assert!(client_for("http://127.0.0.1:7878").is_local());
+        assert!(client_for("http://localhost:7878").is_local());
+        assert!(client_for("http://[::1]:7878").is_local());
+        assert!(!client_for("http://wenlan-outbox-nonlocal.invalid:7878").is_local());
+        assert!(!client_for("http://example.com:7878").is_local());
     }
 }

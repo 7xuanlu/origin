@@ -213,6 +213,82 @@ async fn drain_replays_both_kinds_and_handles_duplicates_and_malformed_files() {
 }
 
 #[tokio::test]
+async fn drain_moves_a_terminal_4xx_rejection_to_failed_with_a_receipt() {
+    let _env_lock = data_dir_lock().lock().await;
+    let _data = DataDirGuard::new();
+    let db_path = wenlan_core::config::data_root().join("memorydb");
+    let db = Arc::new(
+        MemoryDB::new(&db_path, Arc::new(NoopEmitter))
+            .await
+            .unwrap(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let state = Arc::new(RwLock::new(
+        ServerState {
+            db: Some(Arc::clone(&db)),
+            ..ServerState::default()
+        }
+        .with_bound_port(port),
+    ));
+    let app = build_router(state);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let rejected = OutboxEnvelope {
+        schema: OUTBOX_SCHEMA,
+        created_at: "2026-08-16T12:00:02.000Z".into(),
+        caller_id: "test".into(),
+        operation_id: "quality-gate-reject".into(),
+        space: Some("demo".into()),
+        agent_name: None,
+        reconcile_summary_version: false,
+        payload: OutboxPayload::MemoryStore(StoreMemoryRequest {
+            content: "too short".into(),
+            memory_type: None,
+            space: WriteSpaceTarget::Named("demo".into()),
+            source_agent: None,
+            title: None,
+            confidence: None,
+            supersedes: None,
+            entity: None,
+            entity_id: None,
+            structured_fields: None,
+            retrieval_cue: None,
+        }),
+    };
+    let name = rejected.file_name(1);
+    envelope_file(&rejected, 1);
+
+    let client = reqwest::Client::new();
+    let report: OutboxDrainReport = client
+        .post(format!("http://127.0.0.1:{port}/api/outbox/drain"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(report.applied, 0, "{report:?}");
+    assert_eq!(report.failed, 1, "{report:?}");
+    assert_eq!(report.remaining, 0, "{report:?}");
+
+    let failed_dir = wenlan_core::config::outbox_dir().join("failed");
+    assert!(failed_dir.join(&name).is_file());
+    let receipt: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(failed_dir.join(format!("{name}.receipt.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["http_status"], 422);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn outbox_status_counts_envelopes_without_counting_receipts() {
     let _env_lock = data_dir_lock().lock().await;
     let _data = DataDirGuard::new();

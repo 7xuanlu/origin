@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use wenlan_core::db::MemoryDB;
 use wenlan_types::{
     BriefUpdateReceipt, OutboxDrainDetail, OutboxDrainReport, OutboxEnvelope, OutboxPayload,
@@ -25,6 +26,7 @@ pub async fn drain_once(state: SharedState) -> OutboxDrainReport {
     let Some(_drain_guard) = lock.try_lock().ok() else {
         let remaining = queued_files().map(|files| files.len() as u32).unwrap_or(0);
         return OutboxDrainReport {
+            failed: 1,
             remaining,
             details: vec![OutboxDrainDetail {
                 file: String::new(),
@@ -55,7 +57,10 @@ pub async fn drain_once(state: SharedState) -> OutboxDrainReport {
         return OutboxDrainReport::default();
     }
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let mut report = OutboxDrainReport::default();
     for path in files {
         let file = path.display().to_string();
@@ -128,6 +133,28 @@ pub async fn drain_once(state: SharedState) -> OutboxDrainReport {
                     report.details.push(detail(&file, &kind, "duplicate", None));
                 }
             }
+            Ok(ReplayOutcome::Rejected { status, body }) => {
+                let error = format!("loopback replay returned {status}: {body}");
+                let parsed_body: Value =
+                    serde_json::from_str(&body).unwrap_or_else(|_| Value::String(body.clone()));
+                let receipt = serde_json::json!({
+                    "status": "failed",
+                    "file": name,
+                    "http_status": status,
+                    "body": parsed_body,
+                });
+                let move_error = move_to_failed(&path, &name, &receipt).err();
+                report.failed += 1;
+                report.details.push(detail(
+                    &file,
+                    &kind,
+                    "failed",
+                    Some(match move_error {
+                        Some(move_error) => format!("{error}; move to failed: {move_error}"),
+                        None => error,
+                    }),
+                ));
+            }
             Err(error) => {
                 report.failed += 1;
                 report
@@ -170,6 +197,9 @@ fn json_files(directory: &Path) -> Result<Vec<PathBuf>> {
                 && !path
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().ends_with(".receipt.json"))
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".tmp-"))
         })
         .collect::<Vec<_>>();
     files.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
@@ -179,6 +209,7 @@ fn json_files(directory: &Path) -> Result<Vec<PathBuf>> {
 enum ReplayOutcome {
     Applied { receipt: Option<BriefUpdateReceipt> },
     Duplicate,
+    Rejected { status: u16, body: String },
 }
 
 async fn replay(
@@ -233,14 +264,22 @@ async fn replay(
     }
     if status.as_u16() == 422 && matches!(&envelope.payload, OutboxPayload::MemoryStore(_)) {
         let body_json: Value = serde_json::from_str(&body).unwrap_or_default();
-        let reason = body_json.get("reason").and_then(Value::as_str);
+        // String-matches the "Duplicate:" prefix `handle_store_memory` in
+        // memory_routes.rs emits for its dedup check — that string and this
+        // check must move together.
         let exact_duplicate = body_json
             .get("error")
             .and_then(Value::as_str)
             .is_some_and(|error| error.starts_with("Duplicate:"));
-        if reason == Some("not_novel") || exact_duplicate {
+        if exact_duplicate {
             return Ok(ReplayOutcome::Duplicate);
         }
+    }
+    if status.is_client_error() {
+        return Ok(ReplayOutcome::Rejected {
+            status: status.as_u16(),
+            body,
+        });
     }
     anyhow::bail!("loopback replay returned {status}: {body}")
 }

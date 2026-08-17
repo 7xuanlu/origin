@@ -49,7 +49,7 @@ pub async fn run(
     let request = WenlanClient::store_request(content.clone(), memory_type.clone());
     let resp = match client.store(content, memory_type).await {
         Ok(response) => response,
-        Err(error) if outbox::is_daemon_unreachable(&error) => {
+        Err(error) if client.is_local() && outbox::is_daemon_unreachable(&error) => {
             let operation_id = uuid::Uuid::new_v4().to_string();
             let envelope = OutboxEnvelope {
                 schema: OUTBOX_SCHEMA,
