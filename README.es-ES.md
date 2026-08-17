@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=547254c3bc862a3fbbe4daa5b34d23fba1546d8998704166d1a488a903fe7720 -->
+<!-- README_SYNC: source=README.md sha256=ec9a46d70592bfcd1816a33c3331c9a40006d3d3feabb933948fb7820193dec8 -->
 
 <p align="center">
   <picture>
@@ -272,6 +272,10 @@ El bucle tiene cuatro pasos:
 2. **Capturar y encontrar conocimiento mientras trabajas.** `/capture <cosa>` guarda una decisión, lección, advertencia o hecho con su fuente. `/recall <consulta>` recupera solo lo que es relevante en lugar de cargar todo tu historial.
 3. **Cerrar el bucle.** `/handoff` registra qué cambió y aplica actualizaciones tipadas a cada elemento del Brief del Espacio actual.
 4. **Mantener la wiki actualizada.** `/distill` crea o actualiza páginas deliberadamente. Entre sesiones, pasos opcionales basados en modelos pueden enriquecer capturas, conectar entidades relacionadas y actualizar páginas elegibles. `/lint` verifica la salud del conocimiento; `/curate` te presenta las revisiones propuestas y cualquier elemento de revisión de conflictos creado por el paso de reconciliación opcional.
+
+### Cola offline (outbox)
+
+Si el daemon local no está accesible, `wenlan capture` y `wenlan brief update` escriben sus solicitudes en una cola local duradera (outbox) y terminan correctamente. Cuando el daemon vuelve, drena esas escrituras por las rutas HTTP normales; revisa la cola con `wenlan outbox status` o pide una reproducción inmediata con `wenlan outbox drain`. Una escritura que el daemon rechaza de plano (un 4xx, por ejemplo al no pasar el control de calidad del contenido) se mueve a `outbox/failed/` con un recibo en lugar de reintentarse para siempre; un fallo de transporte o un error del servidor (5xx) la deja en la cola para el siguiente drenaje, que se ejecuta automáticamente cada 60 segundos.
 
 ### Modelos y privacidad
 

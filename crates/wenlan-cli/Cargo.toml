@@ -28,6 +28,8 @@ service-manager = { workspace = true }
 sysinfo = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"
+chrono = { workspace = true }
+uuid = { workspace = true }
 # `which` for PATHEXT-aware binary resolution on Windows. std::process::Command
 # only auto-appends `.exe`; .cmd / .bat live behind explicit-extension paths.
 which = "4"

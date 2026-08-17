@@ -196,10 +196,11 @@ fn cli_table_equals_inventory_document() {
 fn manifest_counts_match_the_spec() {
     // 167, not the 162 the Stage 0 document was generated with: PR #399 added
     // the three `/api/spaces/default` routes and PR #407 added POST/PATCH
-    // `/api/brief`. The router coverage assertion caught both drifts.
+    // `/api/brief`. The outbox PR added GET `/api/outbox/status` and POST
+    // `/api/outbox/drain`. The router coverage assertion caught every drift.
     assert_eq!(
         HTTP_READERS.len(),
-        169,
+        171,
         "registered (method, path, handler) triples"
     );
     assert_eq!(MCP_READERS.len(), 29, "#[tool( declarations");
@@ -208,7 +209,7 @@ fn manifest_counts_match_the_spec() {
     let entries: Vec<_> = runtime_entries().collect();
     assert_eq!(
         entries.len(),
-        173,
+        175,
         "(builder, method, path) runtime entries"
     );
     assert_eq!(
@@ -216,7 +217,7 @@ fn manifest_counts_match_the_spec() {
             .iter()
             .filter(|(b, _, _)| *b == Builder::Main)
             .count(),
-        167,
+        169,
         "main builder entries"
     );
     assert_eq!(
@@ -392,7 +393,7 @@ fn marker_shape_allowlist_is_fail_closed() {
             .iter()
             .filter(|r| r.marker_shape == MarkerShape::None)
             .count(),
-        163
+        165
     );
 }
 

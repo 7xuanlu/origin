@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=547254c3bc862a3fbbe4daa5b34d23fba1546d8998704166d1a488a903fe7720 -->
+<!-- README_SYNC: source=README.md sha256=ec9a46d70592bfcd1816a33c3331c9a40006d3d3feabb933948fb7820193dec8 -->
 
 <p align="center">
   <picture>
@@ -272,6 +272,10 @@ a1b2c3d distill: 4 pages
 2. **工作时随手保存与查找。** `/capture <thing>` 保存决策、经验、踩坑或事实，并记录来源。`/recall <query>` 只取回相关内容，不加载全部历史。
 3. **闭合循环。** `/handoff` 记录本次改动，并把类型化的逐项更新应用到当前 Space Brief。
 4. **让 wiki 保持最新。** `/distill` 主动建立或刷新页面。可选的模型流程会在两次工作之间补充已保存内容、连接相关知识，并刷新符合条件的页面。`/lint` 检查知识库健康状态；`/curate` 让你审核页面更新提案，以及可选 Reconcile 流程产生的冲突项目。
+
+### 离线队列（outbox）
+
+如果本地守护进程无法访问，`wenlan capture` 和 `wenlan brief update` 会把请求写入本地持久化队列（outbox）并正常退出。守护进程恢复后，它会通过常规 HTTP 路由排空这些写入；用 `wenlan outbox status` 查看队列，或用 `wenlan outbox drain` 立即重放。被守护进程直接拒绝的写入（4xx，例如未通过内容质量检查）会带着回执移动到 `outbox/failed/`，而不是无限重试；传输失败或服务器错误（5xx）则留在队列中等待下一次排空，排空每 60 秒自动运行一次。
 
 ### 模型与隐私
 
