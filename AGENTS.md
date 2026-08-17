@@ -63,6 +63,11 @@ active without checking the current worktree.
 - Request defaults: `WENLAN_AGENT_NAME` supplies the CLI identity when no explicit
   agent name is given; `WENLAN_DEFAULT_SPACE` is an overridable CLI/MCP fallback, while
   the strict `WENLAN_SPACE` lock wins over both explicit and default values.
+- Daemon recovery: on a connect failure to a loopback host the CLI starts the registered
+  background service once and re-polls health before failing. `WENLAN_NO_AUTOSTART=1`
+  turns that off — every test harness and CI job must set it so a run can never start the
+  developer's daemon. The `autostart.off` marker file in the data root is the persistent
+  equivalent (`wenlan background off` writes it).
 - Preserve cross-platform behavior on macOS arm64, Linux x86_64/aarch64, and Windows
   x86_64. Read `docs/cross-platform.md` before changing platform conditionals or release
   matrices.
