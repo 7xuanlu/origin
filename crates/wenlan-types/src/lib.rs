@@ -35,8 +35,8 @@ pub use briefing::{BriefingResponse, ContradictionItem};
 pub use communities::{
     CommunityListResponse, CommunityMember, CommunityMemberCursor, CommunityMembersResponse,
     CommunityPageAssignment, CommunityPageAssignmentsResponse, CommunityProposalAcceptResponse,
-    CommunityProposalAction, CommunityProposalPayload, CommunityProposalRejectResponse,
-    CommunityProposalSummary, CommunityReadScope, CommunitySummary, ListCommunityProposalsResponse,
+    CommunityProposalAction, CommunityProposalPayload, CommunityProposalSummary,
+    CommunityReadScope, CommunitySummary, ListCommunityProposalsResponse,
     PageCommunityAssignmentState,
 };
 pub use entities::{
