@@ -945,7 +945,11 @@ impl MemoryDB {
             let to_entity: String = row.get(2).map_err(|error| {
                 WenlanError::VectorDb(format!("get_knowledge_graph_scoped relation dst: {error}"))
             })?;
-            if !entity_ids.contains(from_entity.as_str())
+            // A self-loop is not a relationship between two things (mirrors
+            // the page->page self-link drop below); older rows written before
+            // the writers refused them must not draw a loop on the map.
+            if from_entity == to_entity
+                || !entity_ids.contains(from_entity.as_str())
                 || !entity_ids.contains(to_entity.as_str())
             {
                 continue;

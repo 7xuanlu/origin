@@ -224,7 +224,7 @@ Cache directories accumulate fast (1GB+ per full LoCoMo+LME run) and snapshots s
 
 > Moved from root `AGENTS.md` (index-and-pointer refactor); co-located with its `kg_fixtures/` fixtures.
 
-`app/eval/kg_fixtures/*.toml` hold hand-curated entity + relation ground-truth per source_text case. The `eval::kg_faithfulness` module's smoke test (`#[ignore]`d, runs in L6 main canary) extracts KG from each case and scores entity + relation precision/recall/F1 against the expected ground truth. No LLM judge in this bench — string-match faithfulness only. LLM-judge variant is a follow-up plan.
+`app/eval/kg_fixtures/*.toml` hold hand-curated entity + relation ground-truth per source_text case. `eval::kg_faithfulness::run_kg_faithfulness_eval` scores entity + relation precision/recall/F1 against that ground truth (string-match only, no LLM judge). Its smoke test in `crates/wenlan-core/tests/eval_harness.rs` (`run_kg_faithfulness_smoke`, `#[ignore]`d) is currently a stub: it locates the fixture dir and prints SKIP without constructing an extractor, so nothing scores these fixtures yet. CI only checks that the `eval_harness` target compiles (`cargo check -p wenlan-core --features eval-harness --test eval_harness`). Wiring the extractor and the LLM-judge variant are follow-up work.
 
 ---
 
