@@ -119,7 +119,8 @@ pub async fn run(apply: bool, include_review: bool) -> Result<()> {
     }
 
     print!(
-        "Archive {} entity page(s)? Observations, aliases, edges, and memory links are kept. (y/N): ",
+        "Archive {} entity page(s)? Observations, aliases, and memory links are kept; live \
+         edges are retracted and come back on restore. (y/N): ",
         targets.len()
     );
     io::stdout().flush().ok();
@@ -143,8 +144,8 @@ pub async fn run(apply: bool, include_review: bool) -> Result<()> {
         }
     }
     println!(
-        "Archived {archived} entity page(s). Nothing was deleted; flip `pages.status` back to \
-         'active' on a page to restore it with all of its links intact."
+        "Archived {archived} entity page(s). Nothing was deleted; each entity's live edges were \
+         retracted alongside it, and restoring the entity re-activates them."
     );
     Ok(())
 }

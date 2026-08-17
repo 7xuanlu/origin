@@ -2346,6 +2346,62 @@ impl MemoryDB {
                 .await
                 .map_err(|error| WenlanError::VectorDb(format!("M5 attempt write: {error}")))?;
             }
+
+            // Retire the evidence this run no longer weighs (KG review
+            // 2026-08-16 #4). `evaluate_support_on` reads EVERY active support
+            // edge on the page's claim revisions and refuses to publish when
+            // one of them has no attempt row in this run -- but a run's
+            // attempts cover only the locators ranked from the CURRENT linked
+            // chunks, so an edge from a memory that was since edited (offsets
+            // shifted), unlinked, or ranked out of the top-N stayed active
+            // forever and forced NoPublish on every re-run until the job
+            // parked. Inside this lease-checked transaction, soft-retire every
+            // active support edge on this page/version's claim revisions whose
+            // (source, chunk, span, digest) is outside the sealed inventory of
+            // THIS run generation. Same-locator rows are left for
+            // `write_support_edge`'s explicit supersede.
+            let retired = tx
+                .execute(
+                    "UPDATE edges
+                        SET valid_until = ?4, superseded_by = NULL
+                      WHERE edge_type = 'supports' AND src_kind = 'claim_revision'
+                        AND valid_until IS NULL
+                        AND src_id IN (SELECT claim_revision_id FROM page_version_claims
+                                        WHERE page_id = ?1 AND page_version = ?2)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM claim_run_candidates c
+                             WHERE c.page_id = ?1 AND c.page_version = ?2
+                               AND c.run_generation = ?3
+                               AND c.claim_revision_id = edges.src_id
+                               AND c.candidate_source_id = edges.dst_id
+                               AND c.candidate_chunk_index
+                                   = json_extract(edges.payload, '$.chunk_index')
+                               AND c.candidate_span_start
+                                   = json_extract(edges.payload, '$.span_start')
+                               AND c.candidate_span_end
+                                   = json_extract(edges.payload, '$.span_end')
+                               AND c.candidate_digest
+                                   = json_extract(edges.payload, '$.span_digest'))",
+                    libsql::params![
+                        job.page_id.as_str(),
+                        job.page_version,
+                        job.run_generation,
+                        now
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!("M5 stale support retire: {error}"))
+                })?;
+            if retired > 0 {
+                log::info!(
+                    "[claim_derivation] {}:{} run {} retired {retired} support edge(s) outside \
+                     the sealed inventory",
+                    job.page_id,
+                    job.page_version,
+                    job.run_generation
+                );
+            }
             Ok(true)
         }
         .await;
