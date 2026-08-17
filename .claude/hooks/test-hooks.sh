@@ -65,6 +65,72 @@ stop_t() { # desc fixture want-exit
 stop_t "pre-stop: block staged todo!" rust-todo 2
 stop_t "pre-stop: block staged TS skip" ts-skip 2
 stop_t "pre-stop: allow clean tree" clean 0
+
+# ---- wrapper-level cases: exercise the REAL settings.json command strings, not
+# just the inner scripts above. These cover the cwd-resolution fallback chain
+# (CLAUDE_PROJECT_DIR env -> git toplevel of the event .cwd -> fail closed inside
+# a repo / allow outside any repo) that the inner-script tests never touch.
+ROOT="$(cd ../.. && pwd)"
+SETTINGS="$ROOT/.claude/settings.json"
+W_BASH="$(jq -r '.hooks.PreToolUse[] | select(.matcher=="Bash") | .hooks[0].command' "$SETTINGS")"
+W_WRITE="$(jq -r '.hooks.PreToolUse[] | select(.matcher=="Edit|Write|MultiEdit") | .hooks[0].command' "$SETTINGS")"
+W_STOP="$(jq -r '.hooks.Stop[0].hooks[0].command' "$SETTINGS")"
+
+wt() { # desc wrapper-cmd stdin-json CLAUDE_PROJECT_DIR-or-UNSET want-exit [want-stderr-substr]
+  local desc="$1" cmd="$2" json="$3" pd="$4" want="$5" substr="${6:-}"
+  local got err
+  if [ "$pd" = "UNSET" ]; then
+    err="$(printf '%s' "$json" | env -u CLAUDE_PROJECT_DIR bash -c "$cmd" 2>&1 >/dev/null)"
+  else
+    err="$(printf '%s' "$json" | env CLAUDE_PROJECT_DIR="$pd" bash -c "$cmd" 2>&1 >/dev/null)"
+  fi
+  got=$?
+  if [ "$got" -ne "$want" ]; then
+    echo "FAIL  $desc (want exit $want, got $got)"
+    fails=$((fails + 1))
+  elif [ -n "$substr" ] && [[ "$err" != *"$substr"* ]]; then
+    echo "FAIL  $desc (exit $got ok, but stderr missing '$substr': $err)"
+    fails=$((fails + 1))
+  else
+    echo "PASS  $desc"
+  fi
+}
+
+D="$(mktemp -d "${TMPDIR:-/tmp}/wenlan-wrap.XXXXXX")"
+J="$(jq -n --arg cwd "$D" '{cwd:$cwd, tool_input:{command:"git commit --no-verify -m x"}}')"
+wt "wrapper bash: CLAUDE_PROJECT_DIR resolves, inner blocks --no-verify" "$W_BASH" "$J" "$ROOT" 2
+rm -rf "$D"
+
+J="$(jq -n --arg cwd "$ROOT" '{cwd:$cwd, tool_input:{command:"echo hi"}}')"
+wt "wrapper bash: env unset, resolves via git toplevel of cwd" "$W_BASH" "$J" "UNSET" 0
+
+# Outside any repo: nothing to guard, so allow even a command the inner script
+# would otherwise block (--no-verify). This is the intended new behavior.
+D="$(mktemp -d "${TMPDIR:-/tmp}/wenlan-wrap.XXXXXX")"
+J="$(jq -n --arg cwd "$D" '{cwd:$cwd, tool_input:{command:"git commit --no-verify -m x"}}')"
+wt "wrapper bash: cwd outside any git repo -> allow" "$W_BASH" "$J" "/nonexistent/path" 0 "nothing to guard"
+rm -rf "$D"
+
+# Inside a repo that's just missing the script: still fail closed.
+D="$(mktemp -d "${TMPDIR:-/tmp}/wenlan-wrap.XXXXXX")"
+git init -q "$D"
+J="$(jq -n --arg cwd "$D" '{cwd:$cwd, tool_input:{command:"git commit --no-verify -m x"}}')"
+wt "wrapper bash: cwd inside a repo missing the script -> fail closed" "$W_BASH" "$J" "/nonexistent/path" 2 "inside a repo"
+rm -rf "$D"
+
+D="$(mktemp -d "${TMPDIR:-/tmp}/wenlan-wrap.XXXXXX")"
+J="$(jq -n --arg cwd "$D" '{cwd:$cwd, tool_input:{file_path:"CHANGELOG.md"}}')"
+wt "wrapper write: cwd outside any git repo -> allow" "$W_WRITE" "$J" "/nonexistent" 0
+rm -rf "$D"
+
+J="$(jq -n --arg cwd "$ROOT" --arg fp "$ROOT/CHANGELOG.md" '{cwd:$cwd, tool_input:{file_path:$fp}}')"
+wt "wrapper write: CLAUDE_PROJECT_DIR resolves, inner blocks CHANGELOG.md" "$W_WRITE" "$J" "$ROOT" 2
+
+D="$(mktemp -d "${TMPDIR:-/tmp}/wenlan-wrap.XXXXXX")"
+J="$(jq -n --arg cwd "$D" '{cwd:$cwd}')"
+wt "wrapper stop: cwd outside any git repo -> allow" "$W_STOP" "$J" "/nonexistent" 0
+rm -rf "$D"
+
 echo "----"
 if [ "$fails" -eq 0 ]; then
   echo "hook canary: ALL PASS"

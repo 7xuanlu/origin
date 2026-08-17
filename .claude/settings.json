@@ -14,7 +14,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'IN=$(cat); H=.claude/hooks/block-no-verify.sh; R=\"${CLAUDE_PROJECT_DIR:-}\"; [ -f \"$R/$H\" ] || R=$(git -C \"$(printf %s \"$IN\" | jq -r .cwd)\" rev-parse --show-toplevel 2>/dev/null); [ -f \"$R/$H\" ] || { echo \"block-no-verify: hook script unresolvable — failing closed\" >&2; exit 2; }; printf %s \"$IN\" | CLAUDE_PROJECT_DIR=\"$R\" bash \"$R/$H\"'"
+            "command": "bash -c 'IN=$(cat); H=.claude/hooks/block-no-verify.sh; C=$(printf %s \"$IN\" | jq -r \".cwd // empty\"); R=\"${CLAUDE_PROJECT_DIR:-}\"; [ -f \"$R/$H\" ] || R=$(git -C \"$C\" rev-parse --show-toplevel 2>/dev/null); if [ -f \"$R/$H\" ]; then printf %s \"$IN\" | CLAUDE_PROJECT_DIR=\"$R\" bash \"$R/$H\"; elif [ -n \"$C\" ] && git -C \"$C\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo \"block-no-verify: hook script unresolvable inside a repo — failing closed\" >&2; exit 2; else echo \"block-no-verify: cwd outside any git repo — nothing to guard\" >&2; exit 0; fi'"
           }
         ]
       },
@@ -23,7 +23,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'IN=$(cat); H=.claude/hooks/block-release-please-files.sh; R=\"${CLAUDE_PROJECT_DIR:-}\"; [ -f \"$R/$H\" ] || R=$(git -C \"$(printf %s \"$IN\" | jq -r .cwd)\" rev-parse --show-toplevel 2>/dev/null); [ -f \"$R/$H\" ] || { echo \"block-release-please-files: hook script unresolvable — failing closed\" >&2; exit 2; }; printf %s \"$IN\" | CLAUDE_PROJECT_DIR=\"$R\" bash \"$R/$H\"'"
+            "command": "bash -c 'IN=$(cat); H=.claude/hooks/block-release-please-files.sh; C=$(printf %s \"$IN\" | jq -r \".cwd // empty\"); R=\"${CLAUDE_PROJECT_DIR:-}\"; [ -f \"$R/$H\" ] || R=$(git -C \"$C\" rev-parse --show-toplevel 2>/dev/null); if [ -f \"$R/$H\" ]; then printf %s \"$IN\" | CLAUDE_PROJECT_DIR=\"$R\" bash \"$R/$H\"; elif [ -n \"$C\" ] && git -C \"$C\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo \"block-release-please-files: hook script unresolvable inside a repo — failing closed\" >&2; exit 2; else echo \"block-release-please-files: cwd outside any git repo — nothing to guard\" >&2; exit 0; fi'"
           }
         ]
       }
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'IN=$(cat); H=.claude/hooks/pre-stop-gate.sh; R=\"${CLAUDE_PROJECT_DIR:-}\"; [ -f \"$R/$H\" ] || R=$(git -C \"$(printf %s \"$IN\" | jq -r .cwd)\" rev-parse --show-toplevel 2>/dev/null); [ -f \"$R/$H\" ] || { echo \"pre-stop-gate: hook script unresolvable — gate did not run\" >&2; exit 1; }; printf %s \"$IN\" | CLAUDE_PROJECT_DIR=\"$R\" bash \"$R/$H\"'"
+            "command": "bash -c 'IN=$(cat); H=.claude/hooks/pre-stop-gate.sh; C=$(printf %s \"$IN\" | jq -r \".cwd // empty\"); R=\"${CLAUDE_PROJECT_DIR:-}\"; [ -f \"$R/$H\" ] || R=$(git -C \"$C\" rev-parse --show-toplevel 2>/dev/null); if [ -f \"$R/$H\" ]; then printf %s \"$IN\" | CLAUDE_PROJECT_DIR=\"$R\" bash \"$R/$H\"; elif [ -n \"$C\" ] && git -C \"$C\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo \"pre-stop-gate: hook script unresolvable inside a repo — gate did not run\" >&2; exit 1; else echo \"pre-stop-gate: cwd outside any git repo — nothing to guard\" >&2; exit 0; fi'"
           }
         ]
       }
