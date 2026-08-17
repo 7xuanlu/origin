@@ -2,12 +2,10 @@
 
 Applies under `app/eval/` in addition to the root instructions.
 
-- Missing fixtures must fail or report `unchecked`; never silently convert a skipped
-  dataset into a passing eval.
 - Treat cached scenario databases and model-backed baselines as external, reproducible
-  artifacts. Do not keep their only valuable copy inside a disposable worktree.
+  artifacts.
 - Use smoke limits for wiring checks and the smallest representative subset for method
-  checks. Run a full eval only when the decision or publication claim requires it.
+  checks.
 - Do not cite a score without the producing commit, environment/schema stamp, sample
   size, per-run receipt, and the correct pipeline layer.
 - Never compare arms produced from different substrates or silently migrate/wipe a

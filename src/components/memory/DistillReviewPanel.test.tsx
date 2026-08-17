@@ -103,6 +103,7 @@ function revision(
     revision_source_id: `${overrides.target_source_id}_rev`,
     source_agent: "claude-code",
     last_modified: 1_760_000_000,
+    target_kind: "memory",
     ...overrides,
   };
 }
@@ -822,6 +823,7 @@ describe("reviewExamples", () => {
         kind: "revision",
         id: "mem_target",
         targetSourceId: "mem_target",
+        targetKind: "memory",
         revisionSourceId: "mem_target_rev",
         content: "content",
         agent: null,

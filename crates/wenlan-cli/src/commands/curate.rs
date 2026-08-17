@@ -253,6 +253,7 @@ mod tests {
             revision_content: content.to_string(),
             source_agent: None,
             last_modified: 0,
+            target_kind: wenlan_types::responses::RevisionTargetKind::Memory,
             grounded_in: None,
         }
     }

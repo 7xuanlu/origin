@@ -377,6 +377,7 @@ async fn reclassification_forced_rollback_failure_is_exact_recovery_required() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn entity_extraction_stale_target_rolls_back_without_mutation() {
     let (db, _db_dir, manifest, rollback) = entity_fixture().await;
     db.conn
@@ -404,6 +405,7 @@ async fn entity_extraction_stale_target_rolls_back_without_mutation() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn entity_extraction_success_commits_proof_while_mutex_blocks_a_writer() {
     let (db, _db_dir, manifest, rollback) = entity_fixture().await;
     let proof = db
@@ -436,6 +438,7 @@ async fn entity_extraction_success_commits_proof_while_mutex_blocks_a_writer() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn entity_extraction_hook_failure_rolls_back_the_mutation() {
     let (db, _db_dir, manifest, rollback) = entity_fixture().await;
     let before = entity_state(&db).await;
@@ -456,6 +459,7 @@ async fn entity_extraction_hook_failure_rolls_back_the_mutation() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn entity_extraction_sql_failure_rolls_back_the_transaction() {
     let (db, _db_dir, manifest, rollback) = entity_fixture().await;
     let before = entity_state(&db).await;
@@ -486,6 +490,7 @@ async fn entity_extraction_sql_failure_rolls_back_the_transaction() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "repair artifacts are unix-only")]
 async fn entity_extraction_forced_rollback_failure_is_exact_recovery_required() {
     let (db, _db_dir, manifest, rollback) = entity_fixture().await;
     let before = entity_state(&db).await;

@@ -31,16 +31,17 @@ fn cartesian_partitions_and_all_unconfirmed_kinds_are_exact_inventory() {
             }
         }
     }
+    let expected = (STATUSES.len() * CREATION_KINDS.len() * REVIEW_STATUSES.len()) as u64;
     let partitions = Partitions::from_rows(&rows);
-    assert!(partitions.is_exact(20));
-    assert!(!partitions.is_exact(19));
+    assert!(partitions.is_exact(expected));
+    assert!(!partitions.is_exact(expected - 1));
     let partition_result = assess_partitions(&rows).result(PARTITIONS_ID, 0).unwrap();
     assert_eq!(partition_result.outcome(), LintOutcome::Pass);
-    assert_eq!(partition_result.coverage().denominator(), 20);
+    assert_eq!(partition_result.coverage().denominator(), expected);
     let review_result = assess_review(&rows).result(REVIEW_ID, 0).unwrap();
     assert_eq!(review_result.outcome(), LintOutcome::Pass);
     assert_eq!(review_result.applicability(), LintApplicability::Inventory);
-    assert_eq!(review_result.coverage().denominator(), 20);
+    assert_eq!(review_result.coverage().denominator(), expected);
     for creation in CREATION_KINDS {
         let one = [page("private", "active", creation, "unconfirmed")];
         assert_eq!(
@@ -48,6 +49,23 @@ fn cartesian_partitions_and_all_unconfirmed_kinds_are_exact_inventory() {
             LintOutcome::Pass
         );
     }
+}
+
+#[test]
+fn an_entity_shadow_page_is_not_an_unknown_storage_value() {
+    // Every entity in the graph is a `kind='entity'` page whose creation_kind is
+    // 'entity' and whose review_status is 'unconfirmed'. The production corpus
+    // has 1,625 of them; while 'entity' was missing from CREATION_KINDS both
+    // checks reported all of them as errors.
+    let row = page("Rust", "active", "entity", "unconfirmed");
+    let partition = assess_partitions(std::slice::from_ref(&row))
+        .result(PARTITIONS_ID, 0)
+        .unwrap();
+    assert_eq!(partition.outcome(), LintOutcome::Pass);
+    let review = assess_review(std::slice::from_ref(&row))
+        .result(REVIEW_ID, 0)
+        .unwrap();
+    assert_eq!(review.outcome(), LintOutcome::Pass);
 }
 
 #[test]

@@ -169,6 +169,17 @@ jobs:
               - 'scripts/refactor/api-route-diff.mjs'
               - 'scripts/resolve-backend-dir.sh'
               - 'scripts/verify-review-bundle.mjs'
+              # The dev entry points and the Node launchers every package
+              # script goes through. `scripts/**` already schedules Rust CI,
+              # but app-check is the only job that installs the package -- so
+              # it is the only one that runs the postinstall hook installer,
+              # and the only one that runs the Vitest suites asserting on
+              # these files. Without a route here, breaking Git Bash discovery
+              # or hook installation reports green.
+              - 'scripts/dev-all.sh'
+              - 'scripts/dev-runtime.sh'
+              - 'scripts/install-git-hooks.mjs'
+              - 'scripts/run-bash.mjs'
               - '.github/workflows/ci.yml'
               # The app compiles wenlan-types by path and shares the workspace
               # lockfile, so a types change or a shared-dep bump can break the
@@ -293,6 +304,15 @@ jobs:
               - 'crates/wenlan-core/src/repair.rs'
               - 'crates/wenlan-core/src/repair/**'
               - 'crates/wenlan-core/src/repair_plan/**'
+              # The repair cases that drive a real repair are gated
+              # `cfg_attr(not(unix), ignore)` to match the entry point's own
+              # refusal, so they now carry a platform route and must schedule
+              # the lanes that prove the gate on both sides.
+              - 'crates/wenlan-core/src/repair_plan_tests.rs'
+              - 'crates/wenlan-core/src/db/repair_memory_cas_test.rs'
+              - 'crates/wenlan-core/src/db/repair_page_regenerate_test.rs'
+              - 'crates/wenlan-core/src/db/repair_page_rename_test.rs'
+              - 'crates/wenlan-core/src/db/repair_stale_projection_test.rs'
               - 'crates/wenlan-core/src/sources/directory.rs'
               - 'crates/wenlan-core/tests/m4_community_gates.rs'
               - 'crates/wenlan-core/tests/m5_bench.rs'
@@ -358,6 +378,15 @@ jobs:
               - 'crates/wenlan-core/src/repair.rs'
               - 'crates/wenlan-core/src/repair/**'
               - 'crates/wenlan-core/src/repair_plan/**'
+              # The repair cases that drive a real repair are gated
+              # `cfg_attr(not(unix), ignore)` to match the entry point's own
+              # refusal, so they now carry a platform route and must schedule
+              # the lanes that prove the gate on both sides.
+              - 'crates/wenlan-core/src/repair_plan_tests.rs'
+              - 'crates/wenlan-core/src/db/repair_memory_cas_test.rs'
+              - 'crates/wenlan-core/src/db/repair_page_regenerate_test.rs'
+              - 'crates/wenlan-core/src/db/repair_page_rename_test.rs'
+              - 'crates/wenlan-core/src/db/repair_stale_projection_test.rs'
               - 'crates/wenlan-core/src/sources/directory.rs'
               - 'crates/wenlan-core/tests/m5_bench.rs'
               - 'crates/wenlan-core/src/bin/m5_export_page_size_dist.rs'

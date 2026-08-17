@@ -4217,6 +4217,293 @@ async fn accept_pending_revision_page_write_card_updates_page_content() {
     );
 }
 
+/// The desktop Review lane reads `/api/memory/pending-revisions`, which is
+/// `list_pending_revisions_scoped`. A gated page write stages its card against
+/// a `pages.id`, but that reader only accepted a target that exists in
+/// `memories`, so every page card was filtered out: the daemon gated the write
+/// and staged the card, and then nothing ever asked the human about it.
+///
+/// The dangling card in this test is the other half of the contract: a
+/// revision whose target exists in neither table must still stay off the queue,
+/// so widening the check must not become "no check".
+#[tokio::test]
+async fn pending_revision_queue_lists_a_gated_page_card_and_accept_applies_it() {
+    let (db, _dir) = test_db().await;
+    let knowledge_dir = tempfile::tempdir().unwrap();
+    let mem_id = "mem_page_queue_original";
+    let original_content = "Rust ownership keeps memory safety rules explicit";
+    let human_content = "Rust ownership keeps memory safety rules explicit, with human notes";
+    let proposed_content = "Rust ownership lets the compiler enforce memory safety at compile time";
+
+    seed_memory(&db, mem_id, original_content).await;
+    let page_id = seed_page(&db, mem_id, original_content).await;
+    update_page(
+        &db,
+        &page_id,
+        UpdatePageRequest {
+            content: human_content.to_string(),
+            source_memory_ids: vec![mem_id.to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        "fs_edit",
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        db.get_page(&page_id).await.unwrap().unwrap().user_edited,
+        "precondition: the page is human-owned"
+    );
+
+    // A machine write to a human-owned page is gated into a card rather than
+    // overwriting the prose -- this is the live receipt's `gated: true`.
+    let gated = update_page(
+        &db,
+        &page_id,
+        UpdatePageRequest {
+            content: proposed_content.to_string(),
+            source_memory_ids: vec![mem_id.to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        "page_growth",
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(gated.gated, "machine write to a human page must be gated");
+    assert!(!gated.wrote, "gated write must leave the page prose alone");
+    let card_id = gated
+        .revision_card_id
+        .clone()
+        .expect("a gated page write must stage a revision card");
+    assert_eq!(
+        db.get_page(&page_id).await.unwrap().unwrap().content,
+        human_content,
+        "precondition: the gated write did not touch the page"
+    );
+
+    // A card whose target exists in neither `memories` nor `pages`.
+    db.upsert_documents(vec![crate::sources::RawDocument {
+        source: "memory".to_string(),
+        source_id: "mem_page_queue_dangling".to_string(),
+        title: "dangling".to_string(),
+        content: "revision of a target that does not exist".to_string(),
+        last_modified: chrono::Utc::now().timestamp(),
+        memory_type: Some("fact".to_string()),
+        supersedes: Some("page_does_not_exist".to_string()),
+        pending_revision: true,
+        ..Default::default()
+    }])
+    .await
+    .unwrap();
+
+    let listed = db
+        .list_pending_revisions_scoped(10, &crate::read_scope::ReadScope::Global)
+        .await
+        .unwrap();
+    let card = listed
+        .iter()
+        .find(|item| item.revision_source_id == card_id)
+        .expect("a staged page revision card must reach the pending-revisions queue");
+    assert_eq!(
+        card.target_source_id, page_id,
+        "the queue must name the page as the card's target, so accept/dismiss resolve it"
+    );
+    assert_eq!(card.revision_content, proposed_content);
+    assert_eq!(card.source_agent.as_deref(), Some("page_write"));
+    assert_eq!(
+        card.target_kind,
+        wenlan_types::responses::RevisionTargetKind::Page,
+        "the reader must label a page card so its client knows to fetch a page"
+    );
+    assert!(
+        listed
+            .iter()
+            .filter(|item| item.revision_source_id != card_id)
+            .all(|item| item.target_kind == wenlan_types::responses::RevisionTargetKind::Memory),
+        "only a page-target card may be labelled Page"
+    );
+    assert!(
+        !listed
+            .iter()
+            .any(|item| item.revision_source_id == "mem_page_queue_dangling"),
+        "a revision whose target exists in neither table must stay off the queue"
+    );
+
+    // An unfiled page is visible to the uncategorized scope and to no named one.
+    assert!(
+        db.list_pending_revisions_scoped(10, &crate::read_scope::ReadScope::Uncategorized)
+            .await
+            .unwrap()
+            .iter()
+            .any(|item| item.revision_source_id == card_id),
+        "a card for a page with no workspace belongs to the uncategorized scope"
+    );
+    assert!(
+        db.list_pending_revisions_scoped(
+            10,
+            &crate::read_scope::ReadScope::Space("work".to_string())
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "a card for a page with no workspace must not leak into a named Space"
+    );
+
+    // The app sends the queue's `target_source_id` to accept -- here, the page.
+    let accepted = accept_pending_revision_with_knowledge_path(
+        &db,
+        &card.target_source_id,
+        "test-agent",
+        Some(knowledge_dir.path()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(accepted.target_source_id, page_id);
+    assert_eq!(accepted.revision_source_id, card_id);
+    assert!(accepted.wrote);
+    assert_eq!(
+        db.get_page(&page_id).await.unwrap().unwrap().content,
+        proposed_content,
+        "accepting from the queue must apply the proposed prose to the page"
+    );
+    assert!(
+        !db.list_pending_revisions_scoped(10, &crate::read_scope::ReadScope::Global)
+            .await
+            .unwrap()
+            .iter()
+            .any(|item| item.revision_source_id == card_id),
+        "an accepted card must leave the queue"
+    );
+}
+
+/// A page card is scoped by the page's own `workspace`, the column every other
+/// scoped page read gates on. The card's copied `space` is not the authority:
+/// `stage_page_revision_card` fills it from `pages.space`, which is the page's
+/// category column on distilled pages, not its scope.
+#[tokio::test]
+async fn pending_revision_queue_scopes_a_page_card_by_the_page_workspace() {
+    let (db, _dir) = test_db().await;
+    let mem_id = "mem_page_scope_original";
+    let original_content = "Postgres row locks serialize concurrent updates";
+    let human_content = "Postgres row locks serialize concurrent updates, with human notes";
+    let proposed_content = "Postgres takes a row lock so concurrent updates cannot interleave";
+
+    seed_memory(&db, mem_id, original_content).await;
+    let page_id = create_page(
+        &db,
+        CreateConceptRequest {
+            title: "Postgres row locks".to_string(),
+            content: original_content.to_string(),
+            summary: None,
+            entity_id: None,
+            space: (None).into(),
+            source_memory_ids: vec![mem_id.to_string()],
+            creation_kind: Some("research".to_string()),
+            workspace: Some("work".to_string()),
+        },
+        "test",
+        None,
+    )
+    .await
+    .unwrap()
+    .id;
+    update_page(
+        &db,
+        &page_id,
+        UpdatePageRequest {
+            content: human_content.to_string(),
+            source_memory_ids: vec![mem_id.to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        "fs_edit",
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let page = db.get_page(&page_id).await.unwrap().unwrap();
+    assert_eq!(page.workspace.as_deref(), Some("work"));
+    let card_id = stage_page_revision_card(
+        &db,
+        &page,
+        proposed_content,
+        &[mem_id.to_string()],
+        "page_growth",
+        None,
+    )
+    .await
+    .unwrap()
+    .revision_card_id
+    .expect("staged page card must return an id");
+
+    async fn lists_card(db: &MemoryDB, scope: crate::read_scope::ReadScope, card_id: &str) -> bool {
+        db.list_pending_revisions_scoped(10, &scope)
+            .await
+            .unwrap()
+            .iter()
+            .any(|item| item.revision_source_id == card_id)
+    }
+    assert!(
+        lists_card(
+            &db,
+            crate::read_scope::ReadScope::Space("work".to_string()),
+            &card_id
+        )
+        .await,
+        "the card must be listed in the page's own Space"
+    );
+    assert!(
+        !lists_card(
+            &db,
+            crate::read_scope::ReadScope::Space("personal".to_string()),
+            &card_id
+        )
+        .await,
+        "the card must not be listed in another Space"
+    );
+    assert!(
+        !lists_card(&db, crate::read_scope::ReadScope::Uncategorized, &card_id).await,
+        "a workspace-bound page's card is not uncategorized"
+    );
+    assert!(
+        lists_card(&db, crate::read_scope::ReadScope::Global, &card_id).await,
+        "the card must be listed globally"
+    );
+
+    // Dismiss resolves the same `target_source_id` the queue hands the app.
+    let dismissed = dismiss_pending_revision(&db, &page_id, "test-agent")
+        .await
+        .unwrap();
+    assert_eq!(dismissed.target_source_id, page_id);
+    assert!(
+        !lists_card(
+            &db,
+            crate::read_scope::ReadScope::Space("work".to_string()),
+            &card_id
+        )
+        .await,
+        "a dismissed card must leave the queue"
+    );
+    assert_eq!(
+        db.get_page(&page_id).await.unwrap().unwrap().content,
+        human_content,
+        "dismissing must leave the human's prose untouched"
+    );
+}
+
 #[tokio::test]
 async fn accept_page_revision_consume_failure_keeps_page_retryable() {
     let (db, _dir) = test_db().await;

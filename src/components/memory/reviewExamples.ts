@@ -41,6 +41,7 @@ export const EXAMPLE_REVIEW_ITEMS: ReviewItem[] = [
     kind: "revision",
     id: COFFEE_ID, // revision items key on target_source_id
     targetSourceId: COFFEE_ID,
+    targetKind: "memory",
     revisionSourceId: "example:memory-coffee-rev1",
     content: COFFEE_REVISED,
     agent: "claude-desktop",

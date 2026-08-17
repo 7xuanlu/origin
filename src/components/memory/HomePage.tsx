@@ -434,6 +434,7 @@ function WikiHome({
         onResolve={resolve}
         isResolving={isResolving}
         onOpenMemory={onOpenMemory}
+        onOpenPage={onSelectPage}
       />
     </div>
   );

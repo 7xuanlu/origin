@@ -160,8 +160,13 @@ describe("SpacesOverview management", () => {
     await waitFor(() => expect(api.updateSpace).toHaveBeenCalledWith("Work", "Studio", "Projects and planning"));
 
     // When Delete is selected, the API waits for explicit confirmation
-    const actionsAfterRename = screen.getByRole("button", { name: labels.actionsFor("Work") });
-    fireEvent.click(actionsAfterRename);
+    // updateSpace having been *called* is not the row being back: the editor stays
+    // mounted and disabled until the mutation settles, so querying the trigger
+    // straight after the waitFor above raced the pending state.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: labels.actionsFor("Work") })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: labels.actionsFor("Work") }));
     fireEvent.click(screen.getByRole("menuitem", { name: labels.delete }));
     expect(api.deleteSpace).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: labels.confirmDelete }));
@@ -203,8 +208,13 @@ describe("SpacesOverview management", () => {
 
     // Then the same API path receives the target order, while group boundary moves stay disabled
     await waitFor(() => expect(api.reorderSpace).toHaveBeenLastCalledWith("Work", 1));
+    // Same race as above: the reorder call lands before the row leaves its
+    // pending state, and a click on a disabled trigger opens no menu.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: labels.actionsFor("Work") })).toBeEnabled(),
+    );
     fireEvent.click(screen.getByRole("button", { name: labels.actionsFor("Work") }));
-    expect(screen.getByRole("menuitem", { name: labels.moveUp })).toBeDisabled();
+    expect(await screen.findByRole("menuitem", { name: labels.moveUp })).toBeDisabled();
   });
 
   it("isolates pending and error state to the affected row and invalidates dependent data", async () => {

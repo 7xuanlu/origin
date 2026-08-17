@@ -1367,14 +1367,26 @@ class CommandGenerationTests(unittest.TestCase):
             ],
         )
 
-    def test_main_plan_local_tests_exclude_wenlan_app(self) -> None:
+    def test_local_push_defers_the_full_workspace_suite_to_ci(self) -> None:
+        # A shared build input widens the plan to the whole workspace. CI still
+        # runs that suite through `workspace-lib-required`; pre-push stops at
+        # Clippy so a broad change stays pushable from every platform.
         plan = plan_for("Cargo.lock")
 
+        self.assertEqual(plan["workspace_lib"]["mode"], "full")
+        self.assertEqual(local_test_commands_for(plan, cargo_metadata()), [])
         self.assertEqual(
-            local_test_commands_for(plan, cargo_metadata()),
+            clippy_command_for(plan, cargo_metadata()),
             [
-                ["cargo", "test", "--workspace", "--exclude", "wenlan-app", "--lib"],
-                ["cargo", "test", "-p", "wenlan-server", "--bin", "wenlan-server"],
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--exclude",
+                "wenlan-app",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
             ],
         )
 

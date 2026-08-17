@@ -115,6 +115,7 @@ fn route_catalog_freezes_exact_global_and_scoped_keys() {
         (Method::Post, "/api/memory/entities/search"),
         (Method::Get, "/api/memory/entities/{entity_id}"),
         (Method::Get, "/api/memory/entity-suggestions"),
+        (Method::Get, "/api/memory/graph"),
         (Method::Get, "/api/knowledge/recent-relations"),
         (Method::Get, "/api/communities"),
         (Method::Get, "/api/communities/members"),
@@ -138,8 +139,9 @@ fn route_catalog_freezes_exact_global_and_scoped_keys() {
         .map(|row| (row.method, row.path))
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(rows.len(), 64);
-    assert_eq!(keys.len(), 64, "duplicate sensitive route key");
+    // The GLOBAL/SCOPED set-equality asserts below already pin the exact
+    // catalog; a literal row count here only added a second place to edit.
+    assert_eq!(keys.len(), rows.len(), "duplicate sensitive route key");
     assert_eq!(global, GLOBAL.iter().copied().collect());
     assert_eq!(scoped, SCOPED.iter().copied().collect());
 }

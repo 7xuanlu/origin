@@ -3,6 +3,7 @@
 
 mod cmd_backfill;
 mod cmd_cutover;
+mod cmd_prune_junk_entities;
 #[path = "main/runtime.rs"]
 mod runtime;
 #[path = "main/startup.rs"]
@@ -626,6 +627,19 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Internal maintenance: archive entity pages whose names the admission
+    /// gate refuses (quantities, paths, filenames, shas, test residue).
+    /// Daemon must be stopped first. Dry run unless `--apply`.
+    #[command(name = "prune-junk-entities", hide = true)]
+    PruneJunkEntities {
+        /// Archive the listed pages. Without it this only prints them.
+        #[arg(long)]
+        apply: bool,
+        /// Also archive review-tier candidates (bare versions, very short
+        /// names, URLs). Off by default: those are ambiguous, not junk.
+        #[arg(long)]
+        include_review: bool,
+    },
 }
 
 async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow::Result<()> {
@@ -943,6 +957,10 @@ async fn main() -> anyhow::Result<()> {
             Some(Command::TruthCutover { generation, apply }) => {
                 cmd_cutover::run(generation, apply).await
             }
+            Some(Command::PruneJunkEntities {
+                apply,
+                include_review,
+            }) => cmd_prune_junk_entities::run(apply, include_review).await,
             None => run_daemon(startup_repair_claim).await,
         }
     }

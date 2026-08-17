@@ -8,6 +8,8 @@ This repo holds the daemon (`wenlan-server`), the CLI (`wenlan`), the MCP server
 
 **Requirements:** macOS arm64, Linux (x86_64 + arm64; glibc), or Windows x86_64; platform build tools ([Xcode Command Line Tools](https://developer.apple.com/xcode/resources/) on macOS, MSVC Build Tools on Windows, gcc + make on Linux); [Rust](https://rustup.rs/) (stable).
 
+Building the **desktop app** additionally needs [Node.js](https://nodejs.org/) with [pnpm](https://pnpm.io/), and [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) on `PATH` (or `CLOUDFLARED_BIN` pointing at it). Wenlan ships `cloudflared` as a Tauri `externalBin` for Remote Access, so `pnpm dev:all`, `pnpm build:all`, and `pnpm tauri build` all fail without it. The daemon, CLI, and MCP crates build without either.
+
 macOS Intel is not currently a supported stock build target because the pinned ONNX Runtime dependency has no prebuilt x86_64 macOS binary. See the [platform note](crates/wenlan-cli/README.md#macos-intel).
 
 ```bash

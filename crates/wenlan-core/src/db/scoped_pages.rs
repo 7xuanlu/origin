@@ -26,7 +26,10 @@ fn numbered_conditions(conditions: &[String], start: usize) -> String {
         .join(" AND ")
 }
 
-fn page_scope_clause(
+/// The one page-scoping predicate. `pub(super)` so the bulk graph read in
+/// `scoped_entities` scopes its page half by the same rule rather than
+/// spelling a second copy of it.
+pub(super) fn page_scope_clause(
     scope: &ReadScope,
     column: &str,
     parameter: usize,

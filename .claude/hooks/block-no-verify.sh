@@ -1,13 +1,27 @@
 #!/usr/bin/env bash
 # PreToolUse hook on Bash: block git commands using --no-verify or --no-gpg-sign.
-# Enforces CLAUDE.md rule: "Never skip hooks (--no-verify) or bypass signing".
+# This hook is the policy: hooks must run and signing must not be bypassed.
 set -euo pipefail
 
 INPUT="$(cat)"
-# Fail CLOSED: if extraction fails (python3 missing, malformed JSON) we cannot
-# prove the command is safe — block instead of silently allowing. The old
+
+# Resolve the interpreter from PATH. Git Bash on Windows has no
+# /usr/bin/python3, so the hardcoded absolute path made this hook fail closed on
+# *every* Bash call there — no agent could run a shell command in this repo on
+# Windows. Same python3-then-python probe .githooks/pre-push already uses.
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN=python3
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN=python
+else
+  echo "🛑 block-no-verify hook: no Python interpreter on PATH — failing closed." >&2
+  exit 2
+fi
+
+# Fail CLOSED: if extraction fails (malformed JSON, broken interpreter) we
+# cannot prove the command is safe — block instead of silently allowing. The old
 # `|| true` swallowed the error and let `git commit --no-verify` through.
-CMD="$(printf '%s' "$INPUT" | /usr/bin/python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("tool_input",{}).get("command",""))' 2>/dev/null)" || {
+CMD="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c 'import sys,json; d=json.load(sys.stdin); print(d.get("tool_input",{}).get("command",""))' 2>/dev/null)" || {
   echo "🛑 block-no-verify hook: could not parse tool input — failing closed." >&2
   exit 2
 }

@@ -402,6 +402,7 @@ describe("HomePage redesign", () => {
         revision_content: "First proposed wording",
         source_agent: "claude-code",
         last_modified: 1_782_365_076,
+        target_kind: "memory" as const,
       },
       {
         target_source_id: "mem-b",
@@ -409,6 +410,7 @@ describe("HomePage redesign", () => {
         revision_content: "Second proposed wording",
         source_agent: "claude-code",
         last_modified: 1_782_365_077,
+        target_kind: "memory" as const,
       },
       {
         target_source_id: "mem-c",
@@ -416,6 +418,7 @@ describe("HomePage redesign", () => {
         revision_content: "Third proposed wording",
         source_agent: "claude-code",
         last_modified: 1_782_365_078,
+        target_kind: "memory" as const,
       },
     ]);
     vi.mocked(tauri.listRefinements).mockResolvedValue({
@@ -498,6 +501,7 @@ describe("HomePage redesign", () => {
         revision_content: "The durable updated wording from the daemon.",
         source_agent: "claude-code",
         last_modified: 1_782_365_076,
+        target_kind: "memory" as const,
       },
     ]);
 
@@ -640,6 +644,7 @@ describe("HomePage redesign", () => {
           revision_content: "The durable updated wording from the daemon.",
           source_agent: "claude-code",
           last_modified: 1_782_365_076,
+          target_kind: "memory" as const,
         },
       ])
       .mockResolvedValue([]);
@@ -1154,6 +1159,7 @@ describe("HomePage redesign", () => {
         revision_content: "The durable updated wording from the daemon.",
         source_agent: "claude-code",
         last_modified: 1_782_365_076,
+        target_kind: "memory" as const,
       },
     ]);
     vi.mocked(tauri.listPages).mockResolvedValue([
@@ -1271,6 +1277,7 @@ describe("HomePage redesign", () => {
         revision_content: "The durable updated wording from the daemon.",
         source_agent: "claude-code",
         last_modified: 1_782_365_076,
+        target_kind: "memory" as const,
       },
     ]);
     vi.mocked(tauri.listPages).mockResolvedValue([

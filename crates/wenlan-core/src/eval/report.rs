@@ -820,10 +820,18 @@ mod tests {
     #[test]
     fn encode_baseline_path_layout() {
         let env = sample_env(EvalLayer::L1Db, "base");
-        let path = encode_baseline_path(std::path::Path::new("/tmp/baselines"), &env);
+        let root = std::path::Path::new("/tmp/baselines");
+        let path = encode_baseline_path(root, &env);
         let comparable = comparable_env_hash(&env);
-        let expected = format!("/tmp/baselines/l1_db/locomo/base__{}.json", comparable);
-        assert_eq!(path.to_string_lossy(), expected);
+        // Build the expectation with `join` rather than a literal '/' string:
+        // `encode_baseline_path` joins, so on Windows it produces backslashes and
+        // the old string comparison failed there. The layout is what this asserts,
+        // not the separator.
+        let expected = root
+            .join("l1_db")
+            .join("locomo")
+            .join(format!("base__{comparable}.json"));
+        assert_eq!(path, expected);
     }
 
     #[test]

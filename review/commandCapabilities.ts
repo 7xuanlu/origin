@@ -25,6 +25,7 @@ export const REVIEW_COMMAND_CAPABILITIES = {
     "list_recent_pages",
     "list_recent_relations",
     "list_entities_cmd",
+    "get_knowledge_graph_cmd",
     "get_entity_suggestions_cmd",
     "get_profile",
     "list_agents",
