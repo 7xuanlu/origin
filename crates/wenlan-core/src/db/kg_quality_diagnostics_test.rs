@@ -31,12 +31,16 @@ async fn insert_relation(
     to_entity: &str,
     source_memory_id: Option<&str>,
 ) {
+    // Live `relates` edge; `source_memory_id` lives in the payload JSON.
+    let payload = match source_memory_id {
+        Some(source) => serde_json::json!({ "source_memory_id": source }).to_string(),
+        None => "{}".to_string(),
+    };
     let conn = db.conn.lock().await;
     conn.execute(
-        "INSERT INTO relations (
-             id, from_entity, to_entity, relation_type, source_memory_id, created_at
-         ) VALUES (?1, ?2, ?3, 'related_to', ?4, 1)",
-        libsql::params![id, from_entity, to_entity, source_memory_id],
+        "INSERT INTO edges (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,payload,created_at,semantic_type)
+         VALUES (?1,?2,'entity',?3,'entity','relates','legacy',0,'00000000-0000-4000-8000-000000000001',?4,1,'related_to')",
+        libsql::params![id, from_entity, to_entity, payload],
     )
     .await
     .unwrap();

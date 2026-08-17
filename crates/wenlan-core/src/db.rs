@@ -39187,11 +39187,19 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("count_entities get: {}", e)))
     }
 
-    /// Count rows in the `relations` table (knowledge-graph edges).
+    /// Count live knowledge-graph relations. Reads the active
+    /// entity->entity `relates` edges (the same predicate as
+    /// `list_relations_between`), not the frozen legacy `relations` table,
+    /// which has had no writer since G6 Stage 2 PR 2b.
     pub async fn count_relations(&self) -> Result<i64, WenlanError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
-            .query("SELECT COUNT(*) FROM relations", ())
+            .query(
+                "SELECT COUNT(*) FROM edges \
+                 WHERE edge_type = 'relates' AND src_kind = 'entity' AND dst_kind = 'entity' \
+                   AND valid_until IS NULL",
+                (),
+            )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("count_relations query: {}", e)))?;
         let row = rows

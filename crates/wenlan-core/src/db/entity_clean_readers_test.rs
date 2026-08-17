@@ -173,3 +173,45 @@ async fn shadow_page_title_type_and_confidence_track_store_entity_updates() {
         "confidence must still track the entities row after the re-sync"
     );
 }
+
+/// `count_relations` reads live `relates` edges, not the frozen legacy
+/// `relations` table (which `create_relation` stopped writing at G6 Stage 2
+/// PR 2b). Five entities plus one live relation is exactly the shape the
+/// GraphAlive onboarding gate (`onboarding.rs`) needs to fire.
+#[tokio::test]
+async fn count_relations_counts_live_relates_edges() {
+    let (db, _tmp) = crate::db::tests::test_db().await;
+
+    let mut ids = Vec::new();
+    for name in ["Ent One", "Ent Two", "Ent Three", "Ent Four", "Ent Five"] {
+        ids.push(
+            db.store_entity(name, "concept", None, None, Some(0.5))
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(db.count_entities().await.unwrap(), 5);
+    assert_eq!(
+        db.count_relations().await.unwrap(),
+        0,
+        "entities alone must count as zero relations"
+    );
+
+    db.create_relation(
+        &ids[0],
+        &ids[1],
+        "related_to",
+        Some("test"),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        db.count_relations().await.unwrap(),
+        1,
+        "one live relation created through the writer must be counted"
+    );
+}

@@ -10,21 +10,18 @@ pub(crate) struct ContradictionObservationCount {
 }
 
 impl MemoryDB {
-    // G6 Stage 2 PR 2b sweep classification (2026-08-06): Tripwire, not a
-    // live bug -- `detect_stale_relations` (kg_quality.rs), the only caller,
-    // is pure `log::warn!` for visibility with no behavioral effect (its own
-    // doc comment: "actual pruning is deferred"). Left on `relations` on
-    // purpose, same disposition as the Q3-ruled entity-store lint audits
-    // (frozen-store tripwire; a CONSTANT post-cutover count is itself the
-    // signal that no writer regressed back onto `relations`). Retires with
-    // the store in Stage 3, not migrated onto `edges` in Stage 2.
+    /// Count live `relates` edges whose payload `source_memory_id` no longer
+    /// resolves to a memory row. Reads `edges` (the sole live producer of
+    /// relations since G6 Stage 2 PR 2b), not the frozen legacy `relations`
+    /// table.
     pub(crate) async fn count_stale_relation_sources(&self) -> Result<usize, WenlanError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT COUNT(*) FROM relations
-                 WHERE source_memory_id IS NOT NULL
-                 AND source_memory_id NOT IN (SELECT DISTINCT source_id FROM memories WHERE source_id IS NOT NULL)",
+                "SELECT COUNT(*) FROM edges
+                 WHERE edge_type = 'relates' AND valid_until IS NULL
+                 AND json_extract(payload, '$.source_memory_id') IS NOT NULL
+                 AND json_extract(payload, '$.source_memory_id') NOT IN (SELECT DISTINCT source_id FROM memories WHERE source_id IS NOT NULL)",
                 (),
             )
             .await

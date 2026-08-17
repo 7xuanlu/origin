@@ -734,23 +734,28 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify normalization happened at insert time
+        // Verify normalization happened at insert time. `relations` is
+        // frozen; the live relation is the `relates` edge's `semantic_type`.
         {
             let conn = db.test_primary_session().await;
             let mut rows = conn
                 .query(
-                    "SELECT relation_type FROM relations WHERE from_entity = ?1",
+                    "SELECT semantic_type FROM edges \
+                     WHERE edge_type = 'relates' AND src_id = ?1 AND valid_until IS NULL",
                     libsql::params![id1.clone()],
                 )
                 .await
                 .unwrap();
+            let mut seen = 0;
             while let Some(row) = rows.next().await.unwrap() {
                 let rt: String = row.get::<String>(0).unwrap();
                 assert_eq!(
                     rt, "works_on",
                     "expected all relations normalized to 'works_on'"
                 );
+                seen += 1;
             }
+            assert_eq!(seen, 2, "both live relates edges must be visible");
         }
 
         // 5. Entity self-retrieval passes
