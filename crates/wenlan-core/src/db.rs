@@ -9971,18 +9971,15 @@ impl MemoryDB {
     /// §6.9 pre-migration backup: take an online snapshot + integrity receipt
     /// BEFORE a migration's DDL so a botched migration has a restore point, and
     /// record the receipt in `app_metadata` (key `backup_before_migration_<n>`)
-    /// so an operator can find it. Skips a fresh DB (`prior_version == 0`:
-    /// nothing to protect -- the first-ever open runs every migration from
-    /// scratch). The snapshot lands beside the live db as
-    /// `pre_migration_<n>_backup.db`.
+    /// so an operator can find it. Runs on every open that reaches the
+    /// migration, including a fresh DB (`prior_version` is the `user_version`
+    /// the dispatch re-read after the early migrations, never 0 here). The
+    /// snapshot lands beside the live db as `pre_migration_<n>_backup.db`.
     async fn backup_before_migration(
         &self,
         migration: i64,
         prior_version: i64,
     ) -> Result<(), WenlanError> {
-        if prior_version == 0 {
-            return Ok(());
-        }
         let source_path = {
             let conn = self.conn.lock().await;
             Self::main_db_path(&conn).await?
@@ -10019,7 +10016,8 @@ impl MemoryDB {
         )
         .await?;
         log::info!(
-            "[migration] pre-migration {migration} backup: {} ({} pages, integrity ok)",
+            "[migration] pre-migration {migration} backup (from user_version {prior_version}): {} \
+             ({} pages, integrity ok)",
             receipt.dest,
             receipt.backup_pages
         );
@@ -10074,7 +10072,7 @@ impl MemoryDB {
         // §6.9: pre-migration online backup + integrity receipt BEFORE any DDL,
         // so a botched cutover migration has a restore point. Taken here (not
         // inside the BEGIN) because `online_backup` checkpoints + copies under
-        // its own conn lock; skips a fresh DB (prior_version == 0).
+        // its own conn lock.
         self.backup_before_migration(82, prior_version).await?;
 
         let conn = self.conn.lock().await;
@@ -35058,6 +35056,13 @@ impl MemoryDB {
         model_version: Option<&str>,
         prompt_version: Option<&str>,
     ) -> Result<String, WenlanError> {
+        // A self-loop carries no information and would only draw a loop on
+        // the map; refuse it before any vocabulary side effect.
+        if from_entity == to_entity {
+            return Err(WenlanError::Validation(
+                "from_entity and to_entity must differ".to_string(),
+            ));
+        }
         // Normalize relation type against vocabulary.
         // NOTE: resolve_relation_type acquires the conn lock, so we must not hold it here.
         let canonical = match self.resolve_relation_type(relation_type).await? {
@@ -36708,6 +36713,12 @@ impl MemoryDB {
                     let Some(to_id) = entity_ids.get(&relation.to.to_lowercase()) else {
                         continue;
                     };
+                    // Resolution can collapse two extractor names onto one
+                    // entity ("Rust" / "Rust lang"); a self-loop is not a
+                    // relation.
+                    if from_id == to_id {
+                        continue;
+                    }
 
                     let mut canonical = None;
                     let mut canonical_rows = conn

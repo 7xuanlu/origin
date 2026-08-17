@@ -5,6 +5,7 @@
 //! Tests needing external data (locomo10.json, longmemeval) or real GPU LLM stay `#[ignore]`.
 
 use wenlan_core::eval::runner::{run_eval, GateMode};
+use wenlan_core::read_scope::ReadScope;
 
 /// Stderr logger so distill's per-cluster `log::warn!`/`log::info!` skip reasons
 /// (thin cluster / LLM error / hallucination sim / garbage title) are visible in
@@ -2281,7 +2282,6 @@ async fn seed_scenario_dbs_complete() {
     use wenlan_core::eval::seed_contract::{assert_seed_contract, SeedExpectations};
     use wenlan_core::eval::shared::run_classification_for_eval_concurrent;
     use wenlan_core::prompts::PromptRegistry;
-    use wenlan_core::read_scope::ReadScope;
     use wenlan_core::tuning::DistillationConfig;
 
     // Route distill's per-cluster log::warn!/info! skip reasons to stderr so the
@@ -7903,6 +7903,7 @@ async fn kg_faithfulness_llm_judge_smoke() {
             relation_type: "is_a".into(),
             confidence: None,
             explanation: None,
+            span: None,
         }],
     };
     let judged = judge_kg_case_with_llm(&case, &extracted, "claude-haiku-4-5-20251001")
@@ -9736,6 +9737,7 @@ async fn enrichment_parity_contract() {
             structured_fields: None,
             retrieval_cue: None,
             source_text: None,
+            content_hash: None,
         }
     }
 

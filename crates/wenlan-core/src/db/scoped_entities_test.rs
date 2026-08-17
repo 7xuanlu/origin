@@ -1073,6 +1073,43 @@ async fn get_knowledge_graph_scoped_returns_whole_scope_and_drops_out_of_scope_r
     }
 }
 
+/// A self-loop `relates` row stored before the writers refused them must not
+/// be drawn (mirrors the page->page self-link drop).
+#[tokio::test]
+async fn get_knowledge_graph_scoped_drops_stored_self_loop_relations() {
+    let (db, _tmp) = test_db().await;
+    let a = db
+        .store_entity("Self loop A", "topic", Some("work"), None, Some(0.9))
+        .await
+        .unwrap();
+    let b = db
+        .store_entity("Self loop B", "topic", Some("work"), None, Some(0.9))
+        .await
+        .unwrap();
+    db.create_relation(&a, &b, "related_to", None, None, None, None)
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO edges (edge_id,src_id,src_kind,dst_id,dst_kind,edge_type,lineage,grounded,space,created_at,semantic_type)
+             VALUES ('self-loop-edge',?1,'entity',?1,'entity','relates','assertion',0,'work',1,'related_to')",
+            libsql::params![a.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let graph = db
+        .get_knowledge_graph_scoped(&ReadScope::Space("work".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(graph.entities.len(), 2);
+    assert_eq!(graph.relations.len(), 1);
+    assert_eq!(graph.relations[0].from_entity, a);
+    assert_eq!(graph.relations[0].to_entity, b);
+}
+
 /// The same seed read unscoped: the cross-space relation is a real relation
 /// between two visible entities, so Global keeps it (and the other space's
 /// memory too). Pins that the drops above come from scoping, not from the

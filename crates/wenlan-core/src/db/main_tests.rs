@@ -24088,6 +24088,107 @@ async fn create_relation_captures_coerced_type_as_promote_candidate() {
 }
 
 #[tokio::test]
+async fn create_relation_rejects_self_loop_before_vocabulary_side_effects() {
+    let (db, _tmp) = test_db().await;
+    let e1 = db.create_entity("Rust", "concept", None).await.unwrap();
+
+    // An unknown type would normally queue a promote proposal; the self-loop
+    // must be refused before that side effect fires.
+    let err = db
+        .create_relation(&e1, &e1, "is_same_as", None, Some(0.9), None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, WenlanError::Validation(ref msg) if msg == "from_entity and to_entity must differ"),
+        "expected Validation error, got {err:?}"
+    );
+
+    let pending = db.get_pending_refinements().await.unwrap();
+    assert!(
+        !pending.iter().any(|p| p.action == "vocab_promote"
+            && p.payload.as_deref().unwrap_or("").contains("is_same_as")),
+        "a refused self-loop must not queue a promote candidate"
+    );
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM edges \
+             WHERE edge_type = 'relates' AND src_id = ?1 AND dst_id = ?1",
+            libsql::params![e1.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0,
+        "no self-loop edge may be written"
+    );
+}
+
+#[tokio::test]
+async fn ambient_enrichment_skips_self_loop_relation_after_resolution() {
+    let (db, _dir) = test_db().await;
+    // "Rust" and "Rust Lang" both resolve to the same entity (exact title +
+    // alias), so the extractor's triple collapses onto a self-loop.
+    let rust = db
+        .store_entity("Rust", "concept", Some("work"), Some("test"), Some(1.0))
+        .await
+        .unwrap();
+    db.add_entity_alias("rust lang", &rust, "test")
+        .await
+        .unwrap();
+    db.upsert_documents(vec![make_memory_doc(
+        "mem_self_loop_relation",
+        "Rust is also called Rust Lang.",
+        "fact",
+        "work",
+        "agent",
+    )])
+    .await
+    .unwrap();
+
+    let mut extracted = extracted_graph("Rust", "Rust Lang", "Rust is a language");
+    extracted[0].relations[0].relation_type = "also_known_as".to_string();
+    assert!(db
+        .commit_entity_enrichment_at_version(
+            "mem_self_loop_relation",
+            1,
+            &extracted,
+            "Rust is also called Rust Lang.",
+        )
+        .await
+        .unwrap());
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM edges \
+             WHERE edge_type = 'relates' AND src_id = dst_id AND src_id = ?1",
+            libsql::params![rust.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0,
+        "the ambient lane must skip a relation whose endpoints collapse to one entity"
+    );
+    drop(rows);
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM memory_entities WHERE memory_id = 'mem_self_loop_relation' AND entity_id = ?1",
+            libsql::params![rust.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        1,
+        "skipping the self-loop must not drop the entity link itself"
+    );
+}
+
+#[tokio::test]
 async fn entity_type_vocabulary_seeded_and_resolves() {
     let (db, _tmp) = test_db().await;
     // Canonical resolves to itself.

@@ -1546,6 +1546,11 @@ jobs:
         env:
           CI_TEST_PLAN: ${{ needs.detect-changes.outputs.test-plan }}
         run: python3 scripts/ci_test_plan.py run --suite core-integration --plan-json "$CI_TEST_PLAN"
+      - name: Check eval_harness compiles (Linux)
+        if: needs.detect-changes.outputs.core-integration-required == 'true'
+        # Check-only: the target is manual-only to run, but it must keep
+        # building or the eval scripts that invoke it rot silently.
+        run: cargo check -p wenlan-core --features eval-harness --test eval_harness
       - name: E2E wenlan background on/off (Linux user-systemd)
         if: needs.detect-changes.outputs.canonical-smokes-required == 'true'
         run: |

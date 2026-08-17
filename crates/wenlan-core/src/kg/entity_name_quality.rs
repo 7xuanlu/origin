@@ -348,16 +348,46 @@ fn is_quantity(name: &str) -> bool {
     suffix == "%" || digit_count >= 2
 }
 
+/// Real names spelled only with hex letters and digits, in the single-case
+/// short-sha shape. `feb`/`dec` followed by digits (month + year) are handled
+/// as a pattern in `is_hex_word`.
+const HEX_WORDS: &[&str] = &["ed25519"];
+
+fn is_hex_word(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    HEX_WORDS.contains(&lower.as_str())
+        || ["feb", "dec"].iter().any(|month| {
+            lower
+                .strip_prefix(month)
+                .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        })
+}
+
 fn is_hex_or_uuid(name: &str) -> bool {
     let hex_run = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit());
     // Short git sha: 7-40 hex characters carrying at least one digit and one
-    // letter, which keeps real words like "decade" and "facade" out.
+    // letter, which keeps real words like "decade" and "facade" out. Words
+    // spelled only with a-f and digits ("Ed25519", "Face2Face", "Feb2024") also
+    // fit that shape, so a short candidate counts as a sha only when it looks
+    // like one: single-case letters, no alphabetic run of four or more, and not
+    // a known hex-spelled word. At 12+ characters the odds of a real word
+    // vanish and the shape alone decides.
     if (7..=40).contains(&name.len())
         && hex_run(name)
         && name.chars().any(|c| c.is_ascii_digit())
         && name.chars().any(|c| c.is_ascii_alphabetic())
     {
-        return true;
+        if name.len() >= 12 {
+            return true;
+        }
+        let single_case = !(name.chars().any(|c| c.is_ascii_lowercase())
+            && name.chars().any(|c| c.is_ascii_uppercase()));
+        let longest_alpha_run = name
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        return single_case && longest_alpha_run < 4 && !is_hex_word(name);
     }
     let groups: Vec<&str> = name.split('-').collect();
     groups.len() == 5
@@ -573,6 +603,11 @@ mod tests {
             ("bd691cc", Reason::HexOrUuid),
             ("9f97751", Reason::HexOrUuid),
             ("a310415", Reason::HexOrUuid),
+            ("7a8287fe", Reason::HexOrUuid),
+            ("231794f4", Reason::HexOrUuid),
+            ("ba894341", Reason::HexOrUuid),
+            ("deadbeefcafe0123", Reason::HexOrUuid),
+            ("ABCDEF1234567", Reason::HexOrUuid),
             ("3f444117-ef36-4205-b00b-2c0dc830683e", Reason::HexOrUuid),
             ("~/.claude/CLAUDE.md", Reason::FilesystemPath),
             ("~/.claude/skills", Reason::FilesystemPath),
@@ -731,6 +766,12 @@ mod tests {
             // words that brush the hex rule
             "decade",
             "facade",
+            "Ed25519",
+            "ED25519",
+            "Face2Face",
+            "Feb2024",
+            "Cafe2024",
+            "Deadbeef1",
             // names containing "test" that are real
             "Convergence Test Entity",
             "A/B test memory pool",
