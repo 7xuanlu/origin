@@ -69,19 +69,6 @@ pub struct RelationWithEntity {
     pub created_at: i64,
 }
 
-/// A relation with both entity names resolved, for the home page connections feed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecentRelation {
-    pub id: String,
-    pub from_entity_id: String,
-    pub relation_type: String,
-    pub to_entity_id: String,
-    pub from_entity_name: String,
-    pub to_entity_name: String,
-    /// Unix seconds (same unit as the `created_at` column in the `relations` table).
-    pub created_at_ms: i64,
-}
-
 /// One bulk read of the whole knowledge graph for a read scope: every entity
 /// the scope can see, every live relation whose BOTH endpoints are in that
 /// entity set, and the memories linked to at least one of those entities.
@@ -185,14 +172,4 @@ pub struct GraphPageLink {
     pub from: GraphRef,
     pub to: GraphRef,
     pub link_type: String,
-}
-
-/// A pending entity suggestion from the refinement queue.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EntitySuggestion {
-    pub id: String,
-    pub entity_name: Option<String>,
-    pub source_ids: Vec<String>,
-    pub confidence: f64,
-    pub created_at: String,
 }

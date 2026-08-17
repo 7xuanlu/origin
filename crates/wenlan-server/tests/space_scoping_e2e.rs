@@ -143,11 +143,6 @@ async fn wave_4_knowledge_gates_detail_and_relation_endpoints() {
     space_scoping::knowledge_cases::detail_and_relation_endpoints_are_scoped().await;
 }
 
-#[tokio::test]
-async fn wave_4_knowledge_filters_suggestions_conservatively() {
-    space_scoping::knowledge_cases::suggestions_require_all_sources_in_scope().await;
-}
-
 #[test]
 fn wave_4_knowledge_registry_closes_all_scope_contracts() {
     space_scoping::knowledge_cases::registry_matches_completed_contracts();

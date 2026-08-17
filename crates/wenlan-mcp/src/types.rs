@@ -5,7 +5,6 @@
 //! cross-repo refactor; later PRs may remove the module entirely and import
 //! `wenlan_types::*` at call sites directly.
 
-pub use wenlan_types::entities::EntitySuggestion;
 pub use wenlan_types::memory::{RecentActivityItem, RejectionRecord, SearchResult, Space};
 pub use wenlan_types::requests::{
     ChatContextRequest, CreateConceptRequest, CreateEntityRequest, CreateRelationRequest,

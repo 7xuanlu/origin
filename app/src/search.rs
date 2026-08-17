@@ -2260,77 +2260,6 @@ pub async fn list_agent_activity(
     Ok(resp.activities)
 }
 
-// ── Entity suggestions ────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct EntitySuggestion {
-    pub id: String,
-    pub entity_name: Option<String>,
-    pub source_ids: Vec<String>,
-    pub confidence: f64,
-    pub created_at: String,
-}
-
-#[tauri::command]
-pub async fn get_entity_suggestions_cmd(
-    state: tauri::State<'_, State>,
-) -> Result<Vec<EntitySuggestion>, String> {
-    let s = state.read().await;
-    let suggestions: Vec<wenlan_types::EntitySuggestion> =
-        s.client.get_json("/api/memory/entity-suggestions").await?;
-    Ok(suggestions
-        .into_iter()
-        .map(|s| EntitySuggestion {
-            id: s.id,
-            entity_name: s.entity_name,
-            source_ids: s.source_ids,
-            confidence: s.confidence,
-            created_at: s.created_at,
-        })
-        .collect())
-}
-
-#[tauri::command]
-pub async fn approve_entity_suggestion_cmd(
-    _state: tauri::State<'_, State>,
-    _id: String,
-) -> Result<(), String> {
-    Err("Entity suggestion accept is not supported by this daemon contract".to_string())
-}
-
-#[tauri::command]
-pub async fn dismiss_entity_suggestion_cmd(
-    state: tauri::State<'_, State>,
-    id: String,
-) -> Result<responses::RejectRefinementResponse, String> {
-    let client = {
-        let s = state.read().await;
-        s.client.clone()
-    };
-    client.reject_refinement(&id).await
-}
-
-#[cfg(test)]
-mod entity_suggestion_command_type_tests {
-    use super::*;
-
-    #[allow(dead_code)]
-    async fn approve_entity_suggestion_accept_is_unsupported(state: tauri::State<'_, State>) {
-        let _: Result<(), String> = approve_entity_suggestion_cmd(state, String::new()).await;
-    }
-
-    #[allow(dead_code)]
-    async fn dismiss_entity_suggestion_uses_refinery_reject_response(
-        state: tauri::State<'_, State>,
-    ) {
-        let _: Result<responses::RejectRefinementResponse, String> =
-            dismiss_entity_suggestion_cmd(state, String::new()).await;
-    }
-
-    #[test]
-    fn entity_suggestion_command_response_types_are_checked() {}
-}
-
 // ── Spaces ────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -4823,19 +4752,6 @@ pub async fn list_recent_pages(
     client
         .list_recent_pages(limit.unwrap_or(10), since_ms)
         .await
-}
-
-#[tauri::command]
-pub async fn list_recent_relations(
-    state: tauri::State<'_, State>,
-    limit: Option<usize>,
-    since_ms: Option<i64>,
-) -> Result<Vec<wenlan_types::RecentRelation>, String> {
-    let client = {
-        let s = state.read().await;
-        s.client.clone()
-    };
-    client.list_recent_relations(limit, since_ms).await
 }
 
 // ── Lifecycle commands ─────────────────────────────────────────────────────

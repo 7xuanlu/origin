@@ -107,8 +107,6 @@ pub const WAVE_4_KNOWLEDGE: &[ExpectedContract] = &[
         SelectionGate::SingleId404,
     ),
     entity_header(Method::Get, "/api/memory/graph"),
-    memory_header(Method::Get, "/api/memory/entity-suggestions"),
-    entity_header(Method::Get, "/api/knowledge/recent-relations"),
 ];
 
 const fn body(method: Method, path: &'static str) -> ExpectedContract {
@@ -209,10 +207,6 @@ const fn entity_expected(
         binding: ScopeBinding::EntitySpace,
         gate: SelectionGate::NotApplicable,
     }
-}
-
-const fn memory_header(method: Method, path: &'static str) -> ExpectedContract {
-    expected(method, path, SelectorPrecedence::HeaderOnly)
 }
 
 pub fn assert_wave_1_catalog_contract() {

@@ -1329,7 +1329,6 @@ const en = {
     entities: "Entities",
     deltaToday: "+{{value}} today",
     deltaUpdated: "{{value}} updated today",
-    deltaSuggested: "{{value}} suggested",
     reasons: {
       sourceConflict: "Source conflict",
       sourceUpdated: "New sources waiting",
@@ -2885,7 +2884,6 @@ const zhHans = {
     entities: "实体",
     deltaToday: "今日 +{{value}}",
     deltaUpdated: "今日更新 {{value}} 条",
-    deltaSuggested: "{{value}} 个建议",
     reasons: {
       sourceConflict: "来源冲突",
       sourceUpdated: "有新来源待处理",
@@ -4439,7 +4437,6 @@ const zhHant = {
     entities: "實體",
     deltaToday: "今日 +{{value}}",
     deltaUpdated: "今日更新 {{value}} 條",
-    deltaSuggested: "{{value}} 個建議",
     reasons: {
       sourceConflict: "來源衝突",
       sourceUpdated: "有新來源待處理",

@@ -1047,14 +1047,6 @@ export interface MemoryStats {
   enrichment_pending?: number;
 }
 
-export interface EntitySuggestion {
-  id: string;
-  entity_name: string | null;
-  source_ids: string[];
-  confidence: number;
-  created_at: string;
-}
-
 // ── Pages ───────────────────────────────────────────────────────────
 
 export interface PageCitation {
@@ -1737,20 +1729,6 @@ export async function rejectRefinement(id: string): Promise<RejectRefinementResp
   return invoke("reject_refinement", { id });
 }
 
-// ===== Entity Suggestions =====
-
-export async function getEntitySuggestions(): Promise<EntitySuggestion[]> {
-  return invoke("get_entity_suggestions_cmd");
-}
-
-export async function approveEntitySuggestion(_id: string): Promise<never> {
-  throw new Error("Entity suggestion accept is not supported by this daemon contract");
-}
-
-export async function dismissEntitySuggestion(id: string): Promise<RejectRefinementResponse> {
-  return rejectRefinement(id);
-}
-
 // ===== Pages =====
 
 /**
@@ -2114,26 +2092,6 @@ export async function listRecentConcepts(
   sinceMs?: number,
 ): Promise<RecentActivityItem[]> {
   return listRecentPages(limit, sinceMs);
-}
-
-export interface RecentRelation {
-  id: string;
-  from_entity_id: string;
-  relation_type: string;
-  to_entity_id: string;
-  from_entity_name: string;
-  to_entity_name: string;
-  created_at_ms: number;
-}
-
-export async function listRecentRelations(
-  limit?: number,
-  sinceMs?: number,
-): Promise<RecentRelation[]> {
-  return invoke<RecentRelation[]>("list_recent_relations", {
-    limit: limit ?? 10,
-    sinceMs: sinceMs ?? null,
-  });
 }
 
 export interface ExportStats {

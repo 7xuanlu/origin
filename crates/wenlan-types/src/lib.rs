@@ -40,9 +40,9 @@ pub use communities::{
     PageCommunityAssignmentState,
 };
 pub use entities::{
-    Entity, EntityDetail, EntitySearchResult, EntitySuggestion, GraphMemoryLink, GraphMemoryNode,
-    GraphPageLink, GraphPageNode, GraphRef, GraphRelation, KnowledgeGraphResponse, Observation,
-    RecentRelation, Relation, RelationWithEntity,
+    Entity, EntityDetail, EntitySearchResult, GraphMemoryLink, GraphMemoryNode, GraphPageLink,
+    GraphPageNode, GraphRef, GraphRelation, KnowledgeGraphResponse, Observation, Relation,
+    RelationWithEntity,
 };
 pub use lint::{LintCheckResult, LintQuery, LintReport};
 pub use memory::{

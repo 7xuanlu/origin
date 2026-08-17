@@ -522,9 +522,9 @@ A surface that transmits anyway is a failing test on that surface. That gate is
 soft, and saying so plainly is what cooperative-tier means. It is also no longer
 load-bearing: the shape gate holds even when this one is bypassed.
 
-## HTTP — all 171 registered `(method, path, handler)` triples
+## HTTP — all 163 registered `(method, path, handler)` triples
 
-60 page-bearing, 111 not.
+60 page-bearing, 109 not.
 
 | Method | Path | Builder | Page-bearing | Class | Marker-shape | Adapter | Evidence |
 |---|---|---|---|---|---|---|---|
@@ -543,10 +543,6 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `GET` | `/api/chunks/{source_id}` | main | yes | automatic | `none` | `handle_get_chunks` | MemoryDetail.title/content via revision card |
 | `GET` | `/api/communities` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/communities/members` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/communities/page-assignments` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/communities/proposals` | main | no | not_applicable | `none` | — | no prose fields |
-| `POST` | `/api/communities/proposals/{id}/accept` | main | no | not_applicable | `none` | — | no prose fields |
-| `POST` | `/api/communities/proposals/{id}/reject` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/config` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `PUT` | `/api/config` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `GET` | `/api/config/routing` | main | no | not_applicable | `none` | — | no prose fields |
@@ -573,7 +569,6 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `POST` | `/api/ingest/webpage` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/knowledge/count` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/knowledge/path` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/knowledge/recent-relations` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/lint` | main + repair | yes | automatic | `none` | `handle_lint` | LintAgentRecord.excerpt, LintAgentRecord.source_excerpt, LintCheck |
 | `POST` | `/api/lint` | main + repair | yes | automatic | `none` | `handle_lint_submission` | LintAgentRecord.excerpt, LintAgentRecord.source_excerpt, LintCheck |
 | `POST` | `/api/llm/test` | main | no | not_applicable | `none` | — | no prose fields |
@@ -588,7 +583,6 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `POST` | `/api/memory/entities/{entity_id}/observations` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/memory/entities/{id}/confirm` | main | no | not_applicable | `none` | — | no prose fields |
 | `DELETE` | `/api/memory/entities/{id}/delete` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/memory/entity-suggestions` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/memory/graph` | main | yes | automatic | `none` | `handle_get_knowledge_graph` | GraphPageNode.title, GraphMemoryNode.title via dismissed card |
 | `POST` | `/api/memory/link-entity` | main | yes | automatic | `none` | `handle_link_entity` | opaque response type — fail-closed |
 | `POST` | `/api/memory/list` | main | yes | automatic | `none` | `handle_list_memories` | IndexedFileInfo.title/content via dismissed card |
@@ -625,8 +619,6 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `GET` | `/api/onboarding/milestones` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/onboarding/milestones/{id}/acknowledge` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/onboarding/reset` | main | no | not_applicable | `none` | — | no prose fields |
-| `POST` | `/api/outbox/drain` | main | no | not_applicable | `none` | — | drain report only |
-| `GET` | `/api/outbox/status` | main | no | not_applicable | `none` | — | outbox counts only |
 | `GET` | `/api/pages` | main | yes | automatic | **`collection`** | `handle_list_pages` | opaque response type — fail-closed |
 | `POST` | `/api/pages` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/pages/export` | main | yes | automatic | `none` | `handle_export_pages` | EFFECT: writes page prose to the requested vault |
@@ -919,7 +911,6 @@ carrying the authority of agreement.
 | `core/db.rs::list_pending_revisions_scoped` | `pub` | no | **yes** | `server/memory_revision_routes.rs::handle_list_pending_revisions` | — |
 | `core/db.rs::list_recent_changes` | `pub` | no | no | — | — |
 | `core/db.rs::list_recent_pages_with_badges` | `pub` | no | no | — | — |
-| `core/db.rs::list_recent_relations` | `pub` | no | no | — | — |
 | `core/db.rs::list_recent_retrievals` | `pub` | no | no | — | — |
 | `core/db.rs::list_recent_retrievals_scoped` | `pub` | no | **yes** | `server/routes.rs::handle_recent_retrievals` | — |
 | `core/db.rs::list_relevant_active_page_titles` | `pub` | no | no | — | — |
@@ -957,7 +948,6 @@ carrying the authority of agreement.
 | `core/db/scoped_entities.rs::get_knowledge_graph_scoped` | `pub` | no | **yes** | `server/entity_graph_routes.rs::handle_get_knowledge_graph` | — |
 | `core/db/scoped_entities.rs::get_observations_for_entities_scoped` | `pub(super)` | no | no | — | — |
 | `core/db/scoped_entities.rs::list_entities_scoped` | `pub` | no | **yes** | `server/entity_graph_routes.rs::handle_list_entities` | — |
-| `core/db/scoped_entities.rs::list_recent_relations_scoped` | `pub` | no | **yes** | `server/knowledge_routes.rs::handle_list_recent_relations` | — |
 | `core/db/scoped_entities.rs::search_entities_by_vector_scoped` | `pub` | no | **yes** | `server/entity_graph_routes.rs::handle_search_entities` | — |
 | `core/db/scoped_pages.rs::list_recent_changes_scoped` | `pub` | no | **yes** | `server/routes.rs::handle_recent_page_changes` | — |
 | `core/db/truth_exposure.rs::page_truth_states` | `pub` | no | no | — | — |
@@ -1079,7 +1069,6 @@ carrying the authority of agreement.
 | `server/entity_graph_routes.rs::handle_get_knowledge_graph` | `pub` | no | no | — | `core/db/scoped_entities.rs::get_knowledge_graph_scoped` |
 | `server/entity_graph_routes.rs::handle_list_entities` | `pub` | no | no | — | `core/db/scoped_entities.rs::list_entities_scoped` |
 | `server/entity_graph_routes.rs::handle_search_entities` | `pub` | no | no | — | `core/db/scoped_entities.rs::search_entities_by_vector_scoped` |
-| `server/knowledge_routes.rs::handle_list_recent_relations` | `pub` | no | no | — | `core/db/scoped_entities.rs::list_recent_relations_scoped` |
 | `server/memory_revision_routes.rs::handle_list_pending_revisions` | `pub` | no | no | — | `core/db.rs::list_pending_revisions_scoped` |
 | `server/memory_routes.rs::handle_store_memory` | `pub` | no | no | — | `core/db.rs::resolve_entity_by_name` |
 | `server/page_map_routes.rs::compute_ref_state` | `private` | no | no | `server/page_map_routes.rs::wire_node` | `core/db.rs::get_entity_name_type` |

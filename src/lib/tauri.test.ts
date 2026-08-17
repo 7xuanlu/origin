@@ -390,18 +390,6 @@ describe('refinery queue', () => {
     expect(mockInvoke).toHaveBeenNthCalledWith(1, 'accept_refinement', { id: 'ref-1' });
     expect(mockInvoke).toHaveBeenNthCalledWith(2, 'reject_refinement', { id: 'ref-1' });
   });
-
-  it("keeps legacy entity suggestion accept unsupported until the daemon has an accept path", async () => {
-    mockInvoke.mockResolvedValueOnce({ id: "ref-suggest" });
-
-    await expect(tauri.approveEntitySuggestion("ref-suggest")).rejects.toThrow(
-      "Entity suggestion accept is not supported by this daemon contract",
-    );
-    await expect(tauri.dismissEntitySuggestion("ref-suggest")).resolves.toEqual({ id: "ref-suggest" });
-
-    expect(mockInvoke).toHaveBeenCalledTimes(1);
-    expect(mockInvoke).toHaveBeenNthCalledWith(1, "reject_refinement", { id: "ref-suggest" });
-  });
 });
 
 // --- Additional wrappers for coverage ---

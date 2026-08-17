@@ -28,8 +28,7 @@
 //! just the struct literal's default.
 
 use crate::entities::{
-    Entity, EntityDetail, EntitySearchResult, EntitySuggestion, Observation, RecentRelation,
-    Relation, RelationWithEntity,
+    Entity, EntityDetail, EntitySearchResult, Observation, Relation, RelationWithEntity,
 };
 use crate::memory::{MemoryItem, SearchResult, Space};
 use crate::pages::Page;
@@ -206,67 +205,6 @@ fn relation_family_freeze() {
         serde_json::to_value(&back).unwrap(),
         relation_with_entity_json()
     );
-
-    let recent = RecentRelation {
-        id: "rel_1".into(),
-        from_entity_id: "entity_1".into(),
-        relation_type: "knows".into(),
-        to_entity_id: "entity_2".into(),
-        from_entity_name: "Alice".into(),
-        to_entity_name: "Bob".into(),
-        created_at_ms: 1_700_000_000_000,
-    };
-    let recent_json = json!({
-        "id": "rel_1",
-        "from_entity_id": "entity_1",
-        "relation_type": "knows",
-        "to_entity_id": "entity_2",
-        "from_entity_name": "Alice",
-        "to_entity_name": "Bob",
-        "created_at_ms": 1_700_000_000_000i64,
-    });
-    assert_eq!(serde_json::to_value(&recent).unwrap(), recent_json);
-    let back: RecentRelation = serde_json::from_value(recent_json.clone()).unwrap();
-    assert_eq!(serde_json::to_value(&back).unwrap(), recent_json);
-}
-
-#[test]
-fn entity_suggestion_freeze() {
-    let some = EntitySuggestion {
-        id: "sugg_1".into(),
-        entity_name: Some("Alice".into()),
-        source_ids: vec!["mem_1".into()],
-        confidence: 0.6,
-        created_at: "2026-01-01T00:00:00Z".into(),
-    };
-    let some_json = json!({
-        "id": "sugg_1",
-        "entity_name": "Alice",
-        "source_ids": ["mem_1"],
-        "confidence": 0.6,
-        "created_at": "2026-01-01T00:00:00Z",
-    });
-    assert_eq!(serde_json::to_value(&some).unwrap(), some_json);
-    let back: EntitySuggestion = serde_json::from_value(some_json.clone()).unwrap();
-    assert_eq!(serde_json::to_value(&back).unwrap(), some_json);
-
-    // entity_name has no skip_serializing_if: None still serializes as a null
-    // key (freezing today's shape, not the omission pattern used elsewhere).
-    let none = EntitySuggestion {
-        id: "sugg_2".into(),
-        entity_name: None,
-        source_ids: vec![],
-        confidence: 0.0,
-        created_at: "2026-01-01T00:00:00Z".into(),
-    };
-    let none_json = json!({
-        "id": "sugg_2",
-        "entity_name": null,
-        "source_ids": [],
-        "confidence": 0.0,
-        "created_at": "2026-01-01T00:00:00Z",
-    });
-    assert_eq!(serde_json::to_value(&none).unwrap(), none_json);
 }
 
 // ===== responses.rs:284/317/322,697-745 =====

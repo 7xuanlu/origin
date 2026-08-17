@@ -31,15 +31,6 @@ fn canonical_matrix_is_unique_and_matches_observed_handler_contracts() {
     assert_eq!(page_search.unknown_scope, UnknownScopePolicy::Rejected);
     assert!(!page_search.scope_contract_violation());
 
-    let assignments = route(Method::Get, "/api/communities/page-assignments")
-        .expect("community page assignments");
-    assert_eq!(assignments.scope_binding, ScopeBinding::PageWorkspace);
-    assert_eq!(
-        assignments.selector_precedence,
-        SelectorPrecedence::QueryThenHeader
-    );
-    assert!(!assignments.scope_contract_violation());
-
     for path in [
         "/api/home-stats",
         "/api/retrievals/recent",
@@ -141,12 +132,8 @@ fn canonical_matrix_freezes_exact_global_and_scoped_keys() {
         (Method::Post, "/api/memory/entities/search"),
         (Method::Get, "/api/memory/entities/{entity_id}"),
         (Method::Get, "/api/memory/graph"),
-        (Method::Get, "/api/memory/entity-suggestions"),
-        (Method::Get, "/api/knowledge/recent-relations"),
         (Method::Get, "/api/communities"),
         (Method::Get, "/api/communities/members"),
-        (Method::Get, "/api/communities/page-assignments"),
-        (Method::Get, "/api/communities/proposals"),
     ];
 
     let rows = sensitive_read_routes().collect::<Vec<_>>();
@@ -165,8 +152,8 @@ fn canonical_matrix_freezes_exact_global_and_scoped_keys() {
         .map(|row| (row.method, row.path))
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(rows.len(), 65);
-    assert_eq!(keys.len(), 65, "duplicate sensitive route key");
+    assert_eq!(rows.len(), 61);
+    assert_eq!(keys.len(), 61, "duplicate sensitive route key");
     assert_eq!(global, GLOBAL.iter().copied().collect());
     assert_eq!(scoped, SCOPED.iter().copied().collect());
     assert_eq!(

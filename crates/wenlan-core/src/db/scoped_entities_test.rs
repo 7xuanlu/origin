@@ -116,6 +116,72 @@ async fn graph_memory_fetch_excludes_cross_scope_rows() {
     assert_eq!(results[0].source_id, "work-memory");
 }
 
+/// The vector auto-linker, batch linker, reweave and `link-entity` write only
+/// `memories.entity_id` (never a `memory_entities` row); the graph readers
+/// must still surface such a link (read-side union over both stores).
+#[tokio::test]
+async fn graph_readers_include_memories_linked_only_via_entity_id() {
+    let (db, _tmp) = test_db().await;
+    let entity_id = db
+        .create_entity("Auto linked topic", "topic", Some("work"))
+        .await
+        .unwrap();
+    db.upsert_documents(vec![memory_doc("auto-linked-memory", "work")])
+        .await
+        .unwrap();
+    let updated = db
+        .update_memory_entity_id("auto-linked-memory", &entity_id)
+        .await
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    for scope in [ReadScope::Space("work".to_string()), ReadScope::Global] {
+        let graph = db.get_knowledge_graph_scoped(&scope).await.unwrap();
+        assert!(
+            graph
+                .memory_links
+                .iter()
+                .any(|link| link.memory_id == "auto-linked-memory" && link.entity_id == entity_id),
+            "{scope:?}: memory link written only via memories.entity_id must be visible"
+        );
+        assert!(graph
+            .memories
+            .iter()
+            .any(|memory| memory.source_id == "auto-linked-memory"));
+
+        let results = db
+            .get_memories_for_entities_scoped(std::slice::from_ref(&entity_id), 10, &scope)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "{scope:?}");
+        assert_eq!(results[0].source_id, "auto-linked-memory");
+    }
+
+    // A memory linked in both stores is still reported once.
+    db.link_memory_entities("auto-linked-memory", &[entity_id.as_str()])
+        .await
+        .unwrap();
+    let graph = db
+        .get_knowledge_graph_scoped(&ReadScope::Space("work".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        graph
+            .memory_links
+            .iter()
+            .filter(|link| link.memory_id == "auto-linked-memory")
+            .count(),
+        1
+    );
+
+    // Unknown memory: no row updated.
+    let missing = db
+        .update_memory_entity_id("no-such-memory", &entity_id)
+        .await
+        .unwrap();
+    assert_eq!(missing, 0);
+}
+
 #[tokio::test]
 async fn selected_khop_keeps_in_scope_neighbor_and_drops_cross_scope_endpoint() {
     let (db, _tmp) = test_db().await;
@@ -423,133 +489,6 @@ async fn get_entity_detail_scoped_requires_matching_relation_endpoints() {
     ));
 }
 
-#[tokio::test]
-async fn list_recent_relations_scoped_requires_both_endpoints() {
-    let (db, _tmp) = test_db().await;
-    let work = db
-        .store_entity("Relation work", "topic", Some("work"), None, Some(0.9))
-        .await
-        .unwrap();
-    let work_peer = db
-        .store_entity("Relation work peer", "topic", Some("work"), None, Some(0.9))
-        .await
-        .unwrap();
-    let personal = db
-        .store_entity(
-            "Relation personal",
-            "topic",
-            Some("personal"),
-            None,
-            Some(0.9),
-        )
-        .await
-        .unwrap();
-    db.create_relation(&work, &work_peer, "related_to", None, None, None, None)
-        .await
-        .unwrap();
-    db.create_relation(&work, &personal, "related_to", None, None, None, None)
-        .await
-        .unwrap();
-    // G6 Stage 1.2 Trap 2: the reader's relation `id` is now the active
-    // edge's edge_id, not create_relation's relations-row uuid return value.
-    let visible = crate::provenance::compute_edge_id(
-        "relates",
-        "entity",
-        &work,
-        "entity",
-        &work_peer,
-        "related_to",
-    );
-    let hidden = crate::provenance::compute_edge_id(
-        "relates",
-        "entity",
-        &work,
-        "entity",
-        &personal,
-        "related_to",
-    );
-
-    let selected = db
-        .list_recent_relations_scoped(20, None, &ReadScope::Space("work".to_string()))
-        .await
-        .unwrap();
-    assert_eq!(
-        selected
-            .iter()
-            .map(|relation| relation.id.as_str())
-            .collect::<Vec<_>>(),
-        vec![visible.as_str()]
-    );
-    let global = db
-        .list_recent_relations_scoped(20, None, &ReadScope::Global)
-        .await
-        .unwrap();
-    assert!(global.iter().any(|relation| relation.id == hidden));
-}
-
-#[tokio::test]
-async fn list_entity_suggestions_scoped_excludes_invalid_and_mixed_owner_sets() {
-    let (db, _tmp) = test_db().await;
-    db.upsert_documents(vec![
-        memory_doc("suggest-work", "work"),
-        memory_doc("suggest-personal", "personal"),
-    ])
-    .await
-    .unwrap();
-    for (id, sources) in [
-        ("suggest-work-only", vec!["suggest-work".to_string()]),
-        (
-            "suggest-mixed",
-            vec!["suggest-work".to_string(), "suggest-personal".to_string()],
-        ),
-        ("suggest-missing", vec!["suggest-absent".to_string()]),
-        ("suggest-empty", Vec::new()),
-    ] {
-        db.insert_refinement_proposal(id, "suggest_entity", &sources, Some(id), 0.9)
-            .await
-            .unwrap();
-    }
-    let conn = db.conn.lock().await;
-    conn.execute(
-        "INSERT INTO refinement_queue (id, action, source_ids, payload, confidence) \
-         VALUES ('suggest-malformed', 'suggest_entity', 'not-json', 'malformed', 0.9)",
-        (),
-    )
-    .await
-    .unwrap();
-    drop(conn);
-
-    let selected = db
-        .list_entity_suggestions_scoped(&ReadScope::Space("work".to_string()))
-        .await
-        .unwrap();
-    assert_eq!(
-        selected
-            .iter()
-            .map(|proposal| proposal.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["suggest-work-only"]
-    );
-
-    let global = db
-        .list_entity_suggestions_scoped(&ReadScope::Global)
-        .await
-        .unwrap();
-    let global_ids = global
-        .iter()
-        .map(|proposal| proposal.id.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    for id in [
-        "suggest-work-only",
-        "suggest-mixed",
-        "suggest-missing",
-        "suggest-empty",
-        "suggest-malformed",
-    ] {
-        assert!(global_ids.contains(id));
-    }
-}
-
 // ===== M3 PR-2 stage c: `scoped_entities` vanguard flip =====
 //
 // Differential-oracle coverage for the six scoped fns' per-call gate: seed
@@ -557,7 +496,7 @@ async fn list_entity_suggestions_scoped_excludes_invalid_and_mixed_owner_sets() 
 // `entities`), flip it ON under a clean, current parity watermark
 // (`reconcile_entity_page_parity`), run again, and assert the two outputs
 // are byte-identical. None of `Entity`/`EntityDetail`/`RelationWithEntity`/
-// `RecentRelation`/`RefinementProposal`/`SearchResult` derive `PartialEq`
+// `SearchResult` derive `PartialEq`
 // (they are `wenlan-types` wire types stage c must not touch), so `Debug`
 // string equality stands in for full struct equality -- it is exact and
 // order-sensitive the same way `assert_eq!` would be. One shared
@@ -628,24 +567,12 @@ async fn stage_c_seed_entities(db: &super::MemoryDB) -> (String, String, String)
 // `list_entities_scoped_reads_shadow_page_directly` and
 // `get_entity_detail_scoped_reads_shadow_page_directly` below.
 
-// G6 Stage 1.5b Part 3: `list_recent_relations_scoped` collapsed onto an
-// unconditional hard cutover (spec item 9) and its join was structurally
-// rebuilt on shadow pages (spec item 7), so there is no more legacy/hybrid
-// branch for it to differ across -- the former `*_hybrid_matches_legacy` A/B
-// test (which called the fn once before and once after flipping the
-// now-deleted gate check) retired as vacuous: both calls run the identical
-// code path. Coverage that this reader produces correct results lives on in
-// `get_entity_detail_scoped_and_list_recent_relations_scoped_read_edges`
-// below; coverage that it reads the shadow page rather than legacy
-// `entities` lives on in `list_recent_relations_scoped_reads_shadow_page_directly`.
-
 /// G6 Stage 1.2 (relations-readers migration,
 /// docs/plans/2026-08-05-g6-stage12-relations-readers-spec.md): the scoped
-/// variants must read the same `relates` edge fields as their unscoped
-/// counterparts -- edge_id as `id`, entity names via the join -- and the
-/// scope filter must still exclude a relation from a different space.
+/// variant must read the same `relates` edge fields as its unscoped
+/// counterpart -- edge_id as `id`, entity names via the join.
 #[tokio::test]
-async fn get_entity_detail_scoped_and_list_recent_relations_scoped_read_edges() {
+async fn get_entity_detail_scoped_reads_edges() {
     let (db, _tmp) = test_db().await;
     let scope = ReadScope::Space("g6_scoped_space_a".to_string());
     let alice = db
@@ -679,37 +606,6 @@ async fn get_entity_detail_scoped_and_list_recent_relations_scoped_read_edges() 
         "scoped detail relation id must be the active edge's edge_id"
     );
     assert_eq!(detail.relations[0].entity_name, "G6 Scoped Wenlan");
-
-    let recent = db
-        .list_recent_relations_scoped(10, None, &scope)
-        .await
-        .unwrap();
-    assert_eq!(recent.len(), 1);
-    assert_eq!(recent[0].id, expected_edge_id);
-    assert_eq!(recent[0].from_entity_name, "G6 Scoped Alice");
-    assert_eq!(recent[0].to_entity_name, "G6 Scoped Wenlan");
-
-    // A relation in a different space must not leak into this scope.
-    let outside_a = db
-        .create_entity("G6 Scoped Outside A", "person", Some("g6_scoped_space_b"))
-        .await
-        .unwrap();
-    let outside_b = db
-        .create_entity("G6 Scoped Outside B", "project", Some("g6_scoped_space_b"))
-        .await
-        .unwrap();
-    db.create_relation(&outside_a, &outside_b, "knows", None, None, None, None)
-        .await
-        .unwrap();
-    let recent_after = db
-        .list_recent_relations_scoped(10, None, &scope)
-        .await
-        .unwrap();
-    assert_eq!(
-        recent_after.len(),
-        1,
-        "a relation in a different space must not leak into this scope"
-    );
 }
 
 // G6 Stage 1.5b Part 3: `search_entities_by_vector_scoped`'s hydration
@@ -784,16 +680,16 @@ async fn list_entities_scoped_flipped_query_uses_index_not_pages_scan() {
 
 // ===== M3 PR-2 stage f: tie-safe flipped reads (Sol review fix 3+4) =====
 //
-// G6 Stage 1.5b Part 3: both `list_recent_relations_scoped` and
-// `search_entities_by_vector_scoped` collapsed onto an unconditional hard
-// cutover (spec item 9), so the `*_tie_heavy_selection_matches_legacy` A/B
-// tests that used to live here (proving the tied LIMIT boundary lands the
-// same row set/order OFF vs ON) retired as vacuous for the same reason as
-// the `*_hybrid_matches_legacy` tests above: there is only one code path
-// left to run, twice, against itself. Neither fn's `ORDER BY` clause
-// changed in this migration (still an untiebroken `DESC LIMIT`), so no
-// stability coverage was lost -- SQLite's own tie-break determinism for a
-// fixed query plan is not a G6 concern.
+// G6 Stage 1.5b Part 3: `search_entities_by_vector_scoped` collapsed onto
+// an unconditional hard cutover (spec item 9), so the
+// `*_tie_heavy_selection_matches_legacy` A/B tests that used to live here
+// (proving the tied LIMIT boundary lands the same row set/order OFF vs ON)
+// retired as vacuous for the same reason as the `*_hybrid_matches_legacy`
+// tests above: there is only one code path left to run, twice, against
+// itself. The fn's `ORDER BY` clause did not change in this migration
+// (still an untiebroken `DESC LIMIT`), so no stability coverage was lost --
+// SQLite's own tie-break determinism for a fixed query plan is not a G6
+// concern.
 
 /// Positive control (G6 Stage 1.5b Part 3): mutating a shadow page's title
 /// directly (without touching `entities`) must be visible through
@@ -870,65 +766,6 @@ async fn get_entity_detail_scoped_reads_shadow_page_directly() {
         detail.entity.name, "Mutated Detail Title",
         "get_entity_detail_scoped must read the shadow page's title, not legacy entities.name"
     );
-}
-
-/// Positive control (G6 Stage 1.5b Part 3): mutating a shadow page's title
-/// directly (without touching `entities`) must be visible through
-/// `list_recent_relations_scoped`, proving the rebuilt join (spec item 7)
-/// reads the mirror -- not legacy `entities.name` -- since there is no flip
-/// left to stamp a watermark under. The former second half of this test
-/// (re-reconcile, then assert a dirty watermark falls back to the legacy
-/// name) no longer holds: the join has no legacy branch left to fall back
-/// to, so that assertion would now be simply wrong, not merely untested.
-#[tokio::test]
-async fn list_recent_relations_scoped_reads_shadow_page_directly() {
-    let (db, _tmp) = test_db().await;
-    let from = db
-        .store_entity(
-            "Stage F Relation From",
-            "person",
-            Some("stage_f_relation_live"),
-            None,
-            Some(0.5),
-        )
-        .await
-        .unwrap();
-    let to = db
-        .store_entity(
-            "Stage F Relation To",
-            "person",
-            Some("stage_f_relation_live"),
-            None,
-            Some(0.5),
-        )
-        .await
-        .unwrap();
-    db.create_relation(&from, &to, "related_to", None, None, None, None)
-        .await
-        .unwrap();
-    let scope = ReadScope::Space("stage_f_relation_live".to_string());
-
-    {
-        let conn = db.conn.lock().await;
-        conn.execute(
-            "UPDATE pages SET title = 'Mutated From Title' \
-             WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
-            libsql::params![from.clone()],
-        )
-        .await
-        .unwrap();
-    }
-
-    let live = db
-        .list_recent_relations_scoped(20, None, &scope)
-        .await
-        .unwrap();
-    assert_eq!(live.len(), 1);
-    assert_eq!(
-        live[0].from_entity_name, "Mutated From Title",
-        "list_recent_relations_scoped must read the shadow page's title, not legacy entities.name"
-    );
-    assert_eq!(live[0].to_entity_name, "Stage F Relation To");
 }
 
 /// Positive control: proves the hydration overlay reads live shadow state
