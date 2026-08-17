@@ -682,6 +682,26 @@ pub fn restart() -> Result<()> {
     Ok(())
 }
 
+/// Start the already-registered Wenlan service without stopping or replacing it.
+pub fn start_registered() -> Result<()> {
+    if !is_installed() {
+        anyhow::bail!("Wenlan background process is not set up. Run `wenlan background on` first.");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        run_schtasks(&["/run", "/tn", WINDOWS_TASK_NAME], "run scheduled task")?;
+        return Ok(());
+    }
+
+    #[cfg_attr(target_os = "windows", allow(unreachable_code))]
+    let label_value = label()?;
+    let m = manager()?;
+    m.start(ServiceStartCtx { label: label_value })
+        .context("start service")?;
+    Ok(())
+}
+
 pub fn is_installed() -> bool {
     #[cfg(target_os = "windows")]
     {

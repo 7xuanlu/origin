@@ -51,6 +51,10 @@ Set `WENLAN_HOST` to point at a remote daemon:
 export WENLAN_HOST=http://127.0.0.1:7878  # default
 ```
 
+When a request cannot connect, the CLI automatically starts the registered
+background service (`com.wenlan.server`) and waits for its health endpoint. Set
+`WENLAN_NO_AUTOSTART=1` to opt out and report the connection failure directly.
+
 ## Subcommands
 
 ### `wenlan status`
@@ -178,7 +182,7 @@ wenlan capture --file notes.md --type page
 echo "stdin pipe content" | wenlan capture --type quick_thought
 ```
 
-### `wenlan memories [--limit N] [--type X]`
+### `wenlan memories [--limit N] [--type X] [--pending]`
 
 List recent memories.
 
@@ -186,6 +190,7 @@ List recent memories.
 wenlan memories
 wenlan memories --limit 5
 wenlan memories --type fact --format json
+wenlan memories --pending
 ```
 
 ### `wenlan agents list/show/edit`

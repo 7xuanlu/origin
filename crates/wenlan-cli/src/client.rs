@@ -27,6 +27,7 @@ use wenlan_types::{
 };
 
 mod lint;
+mod recovery;
 pub use lint::origin_host_from_env;
 
 const DEFAULT_HOST: &str = "http://127.0.0.1:7878";
@@ -50,6 +51,7 @@ pub struct SyncStats {
 pub struct WenlanClient {
     base_url: String,
     http: reqwest::Client,
+    recovery_enabled: bool,
 }
 
 impl WenlanClient {
@@ -82,18 +84,50 @@ impl WenlanClient {
                 .default_headers(headers)
                 .build()
                 .context("building Wenlan HTTP client")?,
+            recovery_enabled: true,
         })
+    }
+
+    /// Enable or disable recovery by starting the registered daemon service
+    /// after a connection failure. Environment opt-out still applies when
+    /// recovery is enabled here.
+    pub fn with_recovery(mut self, enabled: bool) -> Self {
+        self.recovery_enabled = enabled;
+        self
+    }
+
+    async fn send(&self, req: reqwest::RequestBuilder, what: &str) -> Result<reqwest::Response> {
+        let retry = if recovery::autostart_allowed_from_env(self.recovery_enabled) {
+            req.try_clone()
+        } else {
+            None
+        };
+        let response = req.send().await;
+        match response {
+            Ok(response) => Ok(response),
+            Err(error) if error.is_connect() => {
+                let Some(retry) = retry else {
+                    return Err(error).with_context(|| what.to_owned());
+                };
+                let original = anyhow::Error::new(error).context(what.to_owned());
+                if let Err(recovery_error) = recovery::recover(&self.base_url).await {
+                    return Err(original.context(recovery_error.to_string()));
+                }
+                retry.send().await.with_context(|| what.to_owned())
+            }
+            Err(error) => Err(error).with_context(|| what.to_owned()),
+        }
     }
 
     /// GET /api/health — daemon liveness + version.
     pub async fn health(&self) -> Result<HealthResponse> {
         let url = format!("{}/api/health", self.base_url);
         let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {} failed (is the daemon running?)", url))?;
+            .send(
+                self.http.get(&url),
+                &format!("GET {} failed (is the daemon running?)", url),
+            )
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -110,12 +144,11 @@ impl WenlanClient {
             space: None,
         };
         let resp = self
-            .http
-            .post(&url)
-            .json(&req)
-            .send()
-            .await
-            .with_context(|| format!("POST {} failed", url))?;
+            .send(
+                self.http.post(&url).json(&req),
+                &format!("POST {} failed", url),
+            )
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -134,12 +167,11 @@ impl WenlanClient {
             rerank: false,
         };
         let response = self
-            .http
-            .post(&url)
-            .json(&request)
-            .send()
-            .await
-            .with_context(|| format!("POST {url} failed"))?
+            .send(
+                self.http.post(&url).json(&request),
+                &format!("POST {url} failed"),
+            )
+            .await?
             .error_for_status()
             .with_context(|| format!("daemon returned error for {url}"))?;
         response
@@ -152,12 +184,11 @@ impl WenlanClient {
     pub async fn brief(&self, request: &BriefReadRequest) -> Result<BriefReadResponse> {
         let url = format!("{}/api/brief", self.base_url);
         let response = self
-            .http
-            .post(&url)
-            .json(request)
-            .send()
-            .await
-            .with_context(|| format!("POST {url} failed"))?
+            .send(
+                self.http.post(&url).json(request),
+                &format!("POST {url} failed"),
+            )
+            .await?
             .error_for_status()
             .with_context(|| format!("daemon returned error for {url}"))?;
         response.json().await.context("parsing /api/brief response")
@@ -167,12 +198,11 @@ impl WenlanClient {
     pub async fn update_brief(&self, request: &BriefUpdateRequest) -> Result<BriefUpdateReceipt> {
         let url = format!("{}/api/brief", self.base_url);
         let response = self
-            .http
-            .patch(&url)
-            .json(request)
-            .send()
-            .await
-            .with_context(|| format!("PATCH {url} failed"))?
+            .send(
+                self.http.patch(&url).json(request),
+                &format!("PATCH {url} failed"),
+            )
+            .await?
             .error_for_status()
             .with_context(|| format!("daemon returned error for {url}"))?;
         response
@@ -202,12 +232,11 @@ impl WenlanClient {
             retrieval_cue: None,
         };
         let resp = self
-            .http
-            .post(&url)
-            .json(&req)
-            .send()
-            .await
-            .with_context(|| format!("POST {} failed", url))?;
+            .send(
+                self.http.post(&url).json(&req),
+                &format!("POST {} failed", url),
+            )
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -220,11 +249,11 @@ impl WenlanClient {
     pub async fn list_sources(&self) -> Result<Vec<Source>> {
         let url = format!("{}/api/sources", self.base_url);
         let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {} failed (is the daemon running?)", url))?;
+            .send(
+                self.http.get(&url),
+                &format!("GET {} failed (is the daemon running?)", url),
+            )
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -236,12 +265,11 @@ impl WenlanClient {
         let url = format!("{}/api/sources", self.base_url);
         let req = serde_json::json!({ "source_type": source_type, "path": path });
         let resp = self
-            .http
-            .post(&url)
-            .json(&req)
-            .send()
-            .await
-            .with_context(|| format!("POST {} failed", url))?;
+            .send(
+                self.http.post(&url).json(&req),
+                &format!("POST {} failed", url),
+            )
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -254,11 +282,8 @@ impl WenlanClient {
     pub async fn sync_source(&self, id: &str) -> Result<SyncStats> {
         let url = format!("{}/api/sources/{}/sync", self.base_url, id);
         let resp = self
-            .http
-            .post(&url)
-            .send()
-            .await
-            .with_context(|| format!("POST {} failed", url))?;
+            .send(self.http.post(&url), &format!("POST {} failed", url))
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -272,21 +297,16 @@ impl WenlanClient {
         &self,
         limit: Option<usize>,
         memory_type: Option<String>,
+        confirmed: Option<bool>,
     ) -> Result<ListMemoriesResponse> {
         let url = format!("{}/api/memory/list", self.base_url);
-        let req = ListMemoriesRequest {
-            memory_type,
-            space: None,
-            limit: limit.unwrap_or(100),
-            confirmed: None,
-        };
+        let req = build_list_request(limit, memory_type, confirmed);
         let resp = self
-            .http
-            .post(&url)
-            .json(&req)
-            .send()
-            .await
-            .with_context(|| format!("POST {} failed", url))?;
+            .send(
+                self.http.post(&url).json(&req),
+                &format!("POST {} failed", url),
+            )
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -299,11 +319,8 @@ impl WenlanClient {
     pub async fn list_agents(&self) -> Result<Vec<AgentResponse>> {
         let url = format!("{}/api/agents", self.base_url);
         let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {} failed", url))?;
+            .send(self.http.get(&url), &format!("GET {} failed", url))
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -314,11 +331,8 @@ impl WenlanClient {
     pub async fn get_agent(&self, name: &str) -> Result<AgentResponse> {
         let url = format!("{}/api/agents/{}", self.base_url, name);
         let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {} failed", url))?;
+            .send(self.http.get(&url), &format!("GET {} failed", url))
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -330,14 +344,15 @@ impl WenlanClient {
     /// POST /api/spaces — register a new space.
     pub async fn create_space(&self, name: &str) -> Result<()> {
         let url = format!("{}/api/spaces", self.base_url);
-        self.http
-            .post(&url)
-            .json(&serde_json::json!({"name": name}))
-            .send()
-            .await
-            .with_context(|| format!("POST {} failed", url))?
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
+        self.send(
+            self.http
+                .post(&url)
+                .json(&serde_json::json!({"name": name})),
+            &format!("POST {} failed", url),
+        )
+        .await?
+        .error_for_status()
+        .with_context(|| format!("daemon returned error for {}", url))?;
         Ok(())
     }
 
@@ -345,11 +360,8 @@ impl WenlanClient {
     pub async fn move_space(&self, from: &str, to: &str) -> Result<usize> {
         let url = format!("{}/api/spaces/{}/move-to/{}", self.base_url, from, to);
         let resp = self
-            .http
-            .post(&url)
-            .send()
-            .await
-            .with_context(|| format!("POST {} failed", url))?;
+            .send(self.http.post(&url), &format!("POST {} failed", url))
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -370,11 +382,11 @@ impl WenlanClient {
     pub async fn list_spaces(&self) -> Result<Vec<wenlan_types::Space>> {
         let url = format!("{}/api/spaces", self.base_url);
         let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {} failed", url))?;
+            .send(
+                self.http.get(&url),
+                &format!("GET {} failed (is the daemon running?)", url),
+            )
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -385,11 +397,8 @@ impl WenlanClient {
     pub async fn get_default_space(&self) -> Result<DefaultSpaceResponse> {
         let url = format!("{}/api/spaces/default", self.base_url);
         let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {} failed", url))?
+            .send(self.http.get(&url), &format!("GET {} failed", url))
+            .await?
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
         resp.json()
@@ -401,12 +410,13 @@ impl WenlanClient {
     pub async fn set_default_space(&self, space_id: String) -> Result<DefaultSpaceResponse> {
         let url = format!("{}/api/spaces/default", self.base_url);
         let resp = self
-            .http
-            .put(&url)
-            .json(&SetDefaultSpaceRequest { space_id })
-            .send()
-            .await
-            .with_context(|| format!("PUT {} failed", url))?
+            .send(
+                self.http
+                    .put(&url)
+                    .json(&SetDefaultSpaceRequest { space_id }),
+                &format!("PUT {} failed", url),
+            )
+            .await?
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
         resp.json()
@@ -417,11 +427,8 @@ impl WenlanClient {
     /// DELETE /api/spaces/default — clear the daemon-owned default save Space.
     pub async fn clear_default_space(&self) -> Result<()> {
         let url = format!("{}/api/spaces/default", self.base_url);
-        self.http
-            .delete(&url)
-            .send()
-            .await
-            .with_context(|| format!("DELETE {} failed", url))?
+        self.send(self.http.delete(&url), &format!("DELETE {} failed", url))
+            .await?
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
         Ok(())
@@ -431,12 +438,11 @@ impl WenlanClient {
     pub async fn update_agent(&self, name: &str, req: UpdateAgentRequest) -> Result<AgentResponse> {
         let url = format!("{}/api/agents/{}", self.base_url, name);
         let resp = self
-            .http
-            .put(&url)
-            .json(&req)
-            .send()
-            .await
-            .with_context(|| format!("PUT {} failed", url))?;
+            .send(
+                self.http.put(&url).json(&req),
+                &format!("PUT {} failed", url),
+            )
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -452,11 +458,11 @@ impl WenlanClient {
             self.base_url, limit
         );
         let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {} failed (is the daemon running?)", url))?;
+            .send(
+                self.http.get(&url),
+                &format!("GET {} failed (is the daemon running?)", url),
+            )
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -470,11 +476,8 @@ impl WenlanClient {
     pub async fn accept_revision(&self, id: &str) -> Result<RevisionAcceptResponse> {
         let url = format!("{}/api/memory/revision/{}/accept", self.base_url, id);
         let resp = self
-            .http
-            .post(&url)
-            .send()
-            .await
-            .with_context(|| format!("POST {} failed", url))?;
+            .send(self.http.post(&url), &format!("POST {} failed", url))
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -488,11 +491,8 @@ impl WenlanClient {
     pub async fn dismiss_revision(&self, id: &str) -> Result<RevisionDismissResponse> {
         let url = format!("{}/api/memory/revision/{}/dismiss", self.base_url, id);
         let resp = self
-            .http
-            .post(&url)
-            .send()
-            .await
-            .with_context(|| format!("POST {} failed", url))?;
+            .send(self.http.post(&url), &format!("POST {} failed", url))
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
@@ -507,16 +507,48 @@ impl WenlanClient {
     pub async fn get_memory_detail(&self, source_id: &str) -> Result<MemoryDetailResponse> {
         let url = format!("{}/api/memory/{}/detail", self.base_url, source_id);
         let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {} failed (is the daemon running?)", url))?;
+            .send(
+                self.http.get(&url),
+                &format!("GET {} failed (is the daemon running?)", url),
+            )
+            .await?;
         let resp = resp
             .error_for_status()
             .with_context(|| format!("daemon returned error for {}", url))?;
         resp.json()
             .await
             .context("parsing /api/memory/{id}/detail response")
+    }
+}
+
+fn build_list_request(
+    limit: Option<usize>,
+    memory_type: Option<String>,
+    confirmed: Option<bool>,
+) -> ListMemoriesRequest {
+    ListMemoriesRequest {
+        memory_type,
+        space: None,
+        limit: limit.unwrap_or(100),
+        confirmed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_list_request;
+
+    #[test]
+    fn list_request_can_filter_unconfirmed_memories() {
+        let request = build_list_request(Some(20), None, Some(false));
+        let json = serde_json::to_value(request).expect("serialize list request");
+        assert_eq!(json["confirmed"], false);
+    }
+
+    #[test]
+    fn list_request_omits_confirmation_filter_by_default() {
+        let request = build_list_request(Some(20), None, None);
+        let json = serde_json::to_value(request).expect("serialize list request");
+        assert!(json.get("confirmed").is_none());
     }
 }

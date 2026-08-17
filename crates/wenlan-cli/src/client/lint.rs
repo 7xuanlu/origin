@@ -33,12 +33,15 @@ impl WenlanClient {
             Some(submission) => self.http.post(&url).query(&query).json(submission),
             None => self.http.get(&url).query(&query),
         };
-        let response = request.send().await.with_context(|| {
-            format!(
-                "{} {url} failed",
-                if submission.is_some() { "POST" } else { "GET" }
+        let response = self
+            .send(
+                request,
+                &format!(
+                    "{} {url} failed",
+                    if submission.is_some() { "POST" } else { "GET" }
+                ),
             )
-        })?;
+            .await?;
         let status = response.status();
         let body = read_lint_body(response, &url).await?;
         if !status.is_success() {

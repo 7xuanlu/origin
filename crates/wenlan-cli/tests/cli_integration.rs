@@ -23,6 +23,7 @@ fn cli_with_isolated_runtime(runtime: &IsolatedRuntime) -> Command {
         .env("USERPROFILE", runtime.home.path())
         .env("WENLAN_DATA_DIR", runtime.data.path())
         .env("WENLAN_HOST", "http://127.0.0.1:9")
+        .env("WENLAN_NO_AUTOSTART", "1")
         .env("WENLAN_BIND_ADDR", "127.0.0.1:9")
         .env("PATH", &joined);
     cmd
@@ -481,6 +482,15 @@ fn each_subcommand_has_help() {
 }
 
 #[test]
+fn memories_help_shows_pending_filter() {
+    cli()
+        .args(["memories", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--pending"));
+}
+
+#[test]
 fn removed_top_level_commands_are_not_advertised() {
     let output = cli()
         .arg("--help")
@@ -749,10 +759,23 @@ fn agents_edit_no_flags_bails() {
 fn status_json_succeeds_when_daemon_is_unreachable() {
     cli()
         .env("WENLAN_HOST", "http://127.0.0.1:9")
+        .env("WENLAN_NO_AUTOSTART", "1")
         .args(["status", "--format", "json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"status\": \"unreachable\""));
+}
+
+#[test]
+fn memories_reports_existing_connection_error_without_autostart() {
+    cli()
+        .env("WENLAN_HOST", "http://127.0.0.1:9")
+        .env("WENLAN_NO_AUTOSTART", "1")
+        .args(["memories"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("(is the daemon running?)"))
+        .stderr(predicate::str::contains("starting com.wenlan.server").not());
 }
 
 #[test]
