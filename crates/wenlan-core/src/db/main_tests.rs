@@ -5155,6 +5155,151 @@ async fn finalizing_a_split_queues_review_without_overwriting_curated_names() {
 }
 
 #[tokio::test]
+async fn community_republish_supersedes_open_proposals_from_earlier_generations() {
+    // KG review #10: accept/reject CAS on the proposal's `source_generation`
+    // against the live published generation, so a proposal left open across a
+    // republish can never be actioned again -- yet it stayed `awaiting_review`
+    // and crowded the review list. Finalize now marks such rows `superseded`.
+    use crate::community_grouping::{
+        CommunityGroupingComputeMode, CommunityGroupingComputed, CommunityGroupingFullReason,
+        CommunityGroupingOutcome, ComputedCommunityMember,
+    };
+    use wenlan_types::{CommunityProposalAction, CommunityProposalPayload};
+
+    const SPACE: &str = "m96-republish-space";
+    const OLD_COMMUNITY: &str = "m96-republish-old";
+    const NEW_COMMUNITY: &str = "m96-republish-new";
+    let (db, _dir) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO communities
+                (community_id, space, display_name, algo_version, projection_version,
+                 created_at, updated_at, retired_at)
+             VALUES (?1, ?2, NULL, 'leiden-m4-v1', 'grounded-relates-v1', 1, 1, NULL)",
+            libsql::params![OLD_COMMUNITY, SPACE],
+        )
+        .await
+        .unwrap();
+        for node_id in ["m96-republish-node-a", "m96-republish-node-b"] {
+            conn.execute(
+                "INSERT INTO community_members
+                    (space, node_id, node_kind, community_id,
+                     published_generation, attachment)
+                 VALUES (?1, ?2, 'entity', ?3, 1, 'core')",
+                libsql::params![SPACE, node_id, OLD_COMMUNITY],
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO space_graph_state
+                (space, graph_generation, grouping_generation, published_generation, dirty)
+             VALUES (?1, 2, 2, 1, 1)",
+            libsql::params![SPACE],
+        )
+        .await
+        .unwrap();
+    }
+    let computed = |members: Vec<(&str, &str)>| CommunityGroupingComputed {
+        members: members
+            .into_iter()
+            .map(|(node_id, community_id)| ComputedCommunityMember {
+                node_id: node_id.to_string(),
+                community_id: community_id.to_string(),
+                attachment: "core",
+            })
+            .collect(),
+        held_below_floor: false,
+        projected_edge_count: 0,
+        compute_mode: CommunityGroupingComputeMode::Full {
+            reason: CommunityGroupingFullReason::RuntimeStateMissing,
+        },
+    };
+
+    // Generation 2: node-b leaves OLD -> one split proposal.
+    let attempt = db.prepare_community_grouping(SPACE).await.unwrap();
+    let outcome = db
+        .finalize_community_grouping(
+            attempt,
+            computed(vec![
+                ("m96-republish-node-a", OLD_COMMUNITY),
+                ("m96-republish-node-b", NEW_COMMUNITY),
+            ]),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, CommunityGroupingOutcome::Published(_)));
+    let proposals = db
+        .list_community_proposals(&crate::read_scope::ReadScope::Global, 10)
+        .await
+        .unwrap();
+    assert_eq!(proposals.proposals.len(), 1);
+    let split_id = proposals.proposals[0].id.clone();
+    assert_eq!(
+        proposals.proposals[0].action,
+        CommunityProposalAction::CommunitySplit
+    );
+
+    // Generation 3 (left unreviewed): node-b comes back -> one merge proposal.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE space_graph_state
+                SET graph_generation=3, grouping_generation=3, dirty=1
+              WHERE space=?1",
+            libsql::params![SPACE],
+        )
+        .await
+        .unwrap();
+    }
+    let attempt = db.prepare_community_grouping(SPACE).await.unwrap();
+    let outcome = db
+        .finalize_community_grouping(
+            attempt,
+            computed(vec![
+                ("m96-republish-node-a", OLD_COMMUNITY),
+                ("m96-republish-node-b", OLD_COMMUNITY),
+            ]),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, CommunityGroupingOutcome::Published(_)));
+
+    let proposals = db
+        .list_community_proposals(&crate::read_scope::ReadScope::Global, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        proposals.proposals.len(),
+        1,
+        "the generation-2 split must leave the review list after generation 3 publishes"
+    );
+    assert_eq!(
+        proposals.proposals[0].action,
+        CommunityProposalAction::CommunityMerge
+    );
+    match &proposals.proposals[0].payload {
+        CommunityProposalPayload::CommunityMerge {
+            source_generation, ..
+        } => assert_eq!(*source_generation, 3),
+        other => panic!("expected merge payload, got {other:?}"),
+    }
+
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT status, resolved_at IS NOT NULL FROM refinement_queue WHERE id=?1",
+            libsql::params![split_id],
+        )
+        .await
+        .unwrap();
+    let stale = rows.next().await.unwrap().unwrap();
+    assert_eq!(stale.get::<String>(0).unwrap(), "superseded");
+    assert_eq!(stale.get::<i64>(1).unwrap(), 1);
+}
+
+#[tokio::test]
 async fn community_consistency_detects_a_missing_connected_participant() {
     use crate::community_grouping::{
         run_community_grouping_cycle, CommunityGroupingOutcome, CommunityGroupingRuntime,

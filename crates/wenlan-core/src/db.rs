@@ -17978,10 +17978,18 @@ impl MemoryDB {
                     })?;
                 flipped += affected as usize;
                 if affected > 0 {
+                    // Only rows the m4_grouping_edge_update trigger fires for
+                    // (entity-entity assertion relates) count toward the
+                    // trigger compensation below; a legacy-lineage promotion
+                    // fires no trigger and must contribute nothing here, or
+                    // the batch's real advance cancels out. Mirrors
+                    // `dual_write_invalidate_edge`.
                     let mut rows = conn
                         .query(
                             "SELECT space, src_id, dst_id FROM edges \
-                             WHERE edge_id = ?1 AND edge_type = 'relates'",
+                             WHERE edge_id = ?1 AND edge_type = 'relates' \
+                               AND src_kind = 'entity' AND dst_kind = 'entity' \
+                               AND lineage = 'assertion'",
                             libsql::params![promotion.edge_id.clone()],
                         )
                         .await
@@ -18814,6 +18822,25 @@ impl MemoryDB {
                         "finalize publication receipt: {error}"
                     ))
                 })?;
+                // Open identity proposals from earlier generations can no
+                // longer pass accept/reject's generation CAS once this
+                // generation publishes; mark them superseded so they leave
+                // the review list instead of crowding it forever.
+                tx.execute(
+                    "UPDATE refinement_queue
+                        SET status='superseded', resolved_at=datetime('now')
+                      WHERE action IN ('community_split','community_merge','community_rename')
+                        AND status IN ('pending','awaiting_review')
+                        AND json_extract(payload,'$.space')=?1
+                        AND json_extract(payload,'$.source_generation')<?2",
+                    libsql::params![attempt.space.clone(), attempt.input_generation],
+                )
+                .await
+                .map_err(|error| {
+                    CommunityGroupingError::Database(format!(
+                        "finalize supersede stale community proposals: {error}"
+                    ))
+                })?;
                 for event in &identity_events {
                     let mut source_ids = event.old_community_ids.clone();
                     source_ids.extend(event.new_community_ids.iter().cloned());
@@ -18966,6 +18993,23 @@ impl MemoryDB {
             "space": row.get::<String>(9).ok(),
             "payload": row.get::<Option<String>>(10).ok().flatten(),
         }))
+    }
+
+    /// Test-only: read a space's `space_graph_state.graph_generation`, so the
+    /// `edge_grounding` tests (which cannot reach the private `conn`) can pin
+    /// the promotion batch's trigger compensation. `None` when the space has
+    /// no graph-state row yet.
+    #[cfg(test)]
+    pub(crate) async fn space_graph_generation_for_test(&self, space: &str) -> Option<i64> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT graph_generation FROM space_graph_state WHERE space = ?1",
+                libsql::params![space],
+            )
+            .await
+            .ok()?;
+        rows.next().await.ok()??.get::<i64>(0).ok()
     }
 
     /// Test-only: count rows in the now-frozen `relations` table. Lets the M3g
