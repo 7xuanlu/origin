@@ -21,7 +21,7 @@ Sandboxed local runs need `TMPDIR=/tmp/claude` prefixed (macOS mktemp gotcha).
 
 No argument → pick the surfaces the current diff touches (server/core → daemon;
 cli crate → cli; mcp crate → mcp; new/changed tests → behaviors + suite).
-App/UI surface (wenlan-app repo, or anything rendered): rendered evidence
+App/UI surface (`app/`, `src/`, or anything rendered): rendered evidence
 required — drive the running app and look at the screen; unit/build green is
 not proof of visible correctness.
 

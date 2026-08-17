@@ -7,6 +7,13 @@ pub(crate) fn summary_eligible_predicate(alias: &str) -> String {
     let durable_gate = crate::db::community_reader_durable_gate_sql(
         crate::db::COMMUNITY_SUMMARY_ELIGIBILITY_CONSUMER,
     );
+    // `supersede_mode='archive'` is superseder behaviour, and the store path
+    // stamps it on every decision -- see `crate::db::not_self_archived`. Testing
+    // it as row state kept every decision out of summary eligibility while
+    // `load_summary_buckets` (which this predicate must agree with) counted the
+    // same rows.
+    let live = crate::db::not_self_archived(alias);
+    let peer_live = crate::db::not_self_archived("peer");
     // G6 Stage 1.5b Part 3: reads `community_id` off the entity's `kind='entity'`
     // shadow page via `entity_page_map`/`pages` rather than `entities` directly
     // (unconditional hard cutover, same program contract as `load_summary_buckets`
@@ -27,7 +34,7 @@ pub(crate) fn summary_eligible_predicate(alias: &str) -> String {
                      ON peer_p.id=peer_epm.page_id
                     AND peer_p.kind='entity' AND peer_p.status='active'
                   WHERE peer.source='memory' AND peer.chunk_index=0
-                    AND peer.is_recap=0 AND peer.supersede_mode<>'archive'
+                    AND peer.is_recap=0 AND {peer_live}
                     AND peer.source_id NOT LIKE 'merged_%'
                     AND peer.source_id NOT LIKE 'recap_%'
                     AND peer.embedding IS NOT NULL
@@ -57,7 +64,7 @@ pub(crate) fn summary_eligible_predicate(alias: &str) -> String {
                     AND peer_community.space=peer_member.space
                     AND peer_community.retired_at IS NULL
                   WHERE peer.source='memory' AND peer.chunk_index=0
-                    AND peer.is_recap=0 AND peer.supersede_mode<>'archive'
+                    AND peer.is_recap=0 AND {peer_live}
                     AND peer.source_id NOT LIKE 'merged_%'
                     AND peer.source_id NOT LIKE 'recap_%'
                     AND peer.embedding IS NOT NULL
@@ -70,7 +77,7 @@ pub(crate) fn summary_eligible_predicate(alias: &str) -> String {
     );
     format!(
         "{alias}.is_recap=0
-         AND {alias}.supersede_mode<>'archive'
+         AND {live}
          AND {alias}.source_id NOT LIKE 'merged_%'
          AND {alias}.source_id NOT LIKE 'recap_%'
          AND {alias}.embedding IS NOT NULL

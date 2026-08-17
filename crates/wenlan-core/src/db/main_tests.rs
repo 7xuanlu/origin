@@ -9829,6 +9829,119 @@ async fn resolve_or_create_entity_creates_new_when_no_match() {
     assert_eq!(detail.entity.name, "Rust");
 }
 
+/// The admission seam sits on the cascade itself, so the bulk-import producer
+/// (`importer::resolve_entity_bulk`, which calls this directly and never sees
+/// `post_write::create_entity`'s validation) is covered too. Both tiers refuse
+/// the write; only the cleanup treats them differently.
+#[tokio::test]
+async fn resolve_or_create_entity_refuses_junk_names_and_writes_nothing() {
+    let (db, _dir) = test_db().await;
+    for junk in [
+        "30 minutes",
+        "17%",
+        "~/.claude/CLAUDE.md",
+        "types.rs",
+        "bd691cc",
+        "v1",
+        "burst test",
+    ] {
+        let err = db
+            .resolve_or_create_entity(junk, "concept", None, Some("test"), None)
+            .await
+            .expect_err("junk name must be refused");
+        assert!(
+            matches!(err, WenlanError::Validation(_)),
+            "{junk:?} should fail validation, got {err:?}"
+        );
+    }
+    assert!(
+        db.list_entities(None, None).await.unwrap().is_empty(),
+        "a refused name must leave no entity and no shadow page behind"
+    );
+}
+
+/// A real entity that merely looks junk-shaped must survive the same cascade.
+/// This is the false-rejection guard: every name here exists in the production
+/// corpus or was named as a must-keep by review.
+#[tokio::test]
+async fn resolve_or_create_entity_keeps_real_names_that_look_junk_shaped() {
+    let (db, _dir) = test_db().await;
+    let keep = [
+        "Go",
+        "C#",
+        ".NET",
+        "3M",
+        "GPT-4o",
+        "Python 3.12",
+        "Node.js",
+        "llama.cpp",
+        "7xuanlu/wenlan",
+        "@huggingface/transformers",
+        "Redis Pub/Sub",
+        "TestFlight",
+        "建築/房地產公司",
+    ];
+    for name in keep {
+        db.resolve_or_create_entity(name, "technology", None, Some("test"), None)
+            .await
+            .unwrap_or_else(|e| panic!("{name:?} must be admitted, got {e:?}"));
+    }
+    assert_eq!(
+        db.list_entities(None, None).await.unwrap().len(),
+        keep.len(),
+        "every must-keep name should have produced an entity"
+    );
+}
+
+/// The type canonicalizer is on the same cascade, so the bulk path cannot
+/// store an off-vocabulary type either. An alias resolves to its own reviewed
+/// target rather than collapsing into `concept`, and a genuinely new value
+/// keeps the entity while queuing a vocabulary proposal.
+#[tokio::test]
+async fn resolve_or_create_entity_canonicalizes_entity_type() {
+    let (db, _dir) = test_db().await;
+
+    for (raw, expected) in [
+        ("concepts", "concept"),
+        ("platform", "technology"),
+        ("language", "technology"),
+        ("technique", "concept"),
+    ] {
+        let (id, _) = db
+            .resolve_or_create_entity(&format!("Canary {raw}"), raw, None, Some("test"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_entity_detail(&id).await.unwrap().entity.entity_type,
+            expected,
+            "{raw:?} must canonicalize to {expected:?}"
+        );
+    }
+
+    // A value no band resolves: the entity is still stored, and the raw value
+    // reaches the existing vocabulary review lane instead of vanishing.
+    let (unknown_id, _) = db
+        .resolve_or_create_entity("Unknown Type Canary", "widget", None, Some("test"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_entity_detail(&unknown_id)
+            .await
+            .unwrap()
+            .entity
+            .entity_type,
+        "concept"
+    );
+    let proposal_id = MemoryDB::vocab_proposal_fingerprint("entity", "widget");
+    assert!(
+        db.get_refinement_proposal(&proposal_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "an unresolvable type must be queued as a vocab_promote proposal"
+    );
+}
+
 #[tokio::test]
 async fn resolve_or_create_entity_resolves_existing_by_exact_name() {
     let (db, _dir) = test_db().await;
@@ -14597,6 +14710,124 @@ async fn find_distillation_clusters_reads_space_scoped_staging_pool() {
     );
 }
 
+/// Regression: the store path stamps `supersede_mode='archive'` on every
+/// `memory_type='decision'` row to say "archive what I supersede", not "I am
+/// archived". The staging pool used to test that value as row state
+/// (`supersede_mode NOT IN ('archive','evicted')`), so no decision ever reached
+/// a cluster and none was ever cited on a page.
+///
+/// The pool must now admit decisions while still excluding the rows that really
+/// are gone: `'evicted'`, an `apply_merge` original (archive on a NON-decision),
+/// and a memory a `'hide'`-mode replacement superseded.
+#[tokio::test]
+async fn find_distillation_clusters_includes_decisions_but_not_superseded_rows() {
+    let (db, _dir) = test_db().await;
+
+    let now = chrono::Utc::now().timestamp();
+    let mut docs = Vec::new();
+    // Three plain captures clear the >= 3 non-document capture seed floor.
+    for (sid, memory_type) in [
+        ("pool_fact_a", "fact"),
+        ("pool_fact_b", "fact"),
+        ("pool_fact_c", "fact"),
+        // The regression subject. `make_memory_doc` derives supersede_mode from
+        // memory_type exactly as the store path does, so this row lands with
+        // supersede_mode='archive' without the test asserting it by hand.
+        ("pool_decision", "decision"),
+        // Excluded below by a direct UPDATE, mirroring the two writers that put
+        // self-state onto the column.
+        ("pool_evicted", "fact"),
+        ("pool_merged_away", "fact"),
+        // Superseded by `pool_replacement` with the default 'hide' mode.
+        ("pool_hidden", "fact"),
+        ("pool_replacement", "fact"),
+    ] {
+        let mut doc = make_memory_doc(
+            sid,
+            &format!("Shared distillation pool memory content for {sid}"),
+            memory_type,
+            "alpha",
+            "test-agent",
+        );
+        doc.entity_id = Some("pool_entity".to_string());
+        doc.last_modified = now;
+        if sid == "pool_replacement" {
+            doc.supersedes = Some("pool_hidden".to_string());
+        }
+        docs.push(doc);
+    }
+    db.upsert_documents(docs).await.unwrap();
+
+    // `upsert_documents` overwrites supersede_mode unconditionally, so the
+    // self-state markers have to be applied after the insert.
+    {
+        let conn = db.conn.lock().await;
+        // `evict_stale` writes this.
+        conn.execute(
+            "UPDATE memories SET supersede_mode = 'evicted' \
+             WHERE source_id = 'pool_evicted' AND source = 'memory'",
+            (),
+        )
+        .await
+        .unwrap();
+        // `apply_merge` writes this onto each original it folded away. On a
+        // non-decision the value cannot have come from the store path, so it is
+        // unambiguously the merge marker.
+        conn.execute(
+            "UPDATE memories SET supersede_mode = 'archive' \
+             WHERE source_id = 'pool_merged_away' AND source = 'memory'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Guard the premise: the decision really does carry the archive stamp, so a
+    // green assertion below cannot come from the stamp having quietly changed.
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT supersede_mode FROM memories \
+                 WHERE source_id = 'pool_decision' AND source = 'memory' AND chunk_index = 0",
+                (),
+            )
+            .await
+            .unwrap();
+        let mode: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            mode, "archive",
+            "premise: the store path stamps decisions with supersede_mode='archive'"
+        );
+    }
+
+    let clusters = db
+        .find_distillation_clusters_scoped(0.0, 1, 10, 3500, 50, 50, None, Some("alpha"))
+        .await
+        .unwrap();
+    let actual: std::collections::BTreeSet<String> = clusters
+        .iter()
+        .flat_map(|cluster| cluster.source_ids.iter().cloned())
+        .collect();
+
+    assert!(
+        actual.contains("pool_decision"),
+        "a decision must reach the distillation pool; got {actual:?}"
+    );
+    assert!(
+        !actual.contains("pool_evicted"),
+        "an evicted row must stay out of the pool; got {actual:?}"
+    );
+    assert!(
+        !actual.contains("pool_merged_away"),
+        "an apply_merge original must stay out of the pool; got {actual:?}"
+    );
+    assert!(
+        !actual.contains("pool_hidden"),
+        "a hide-superseded row must stay out of the pool; got {actual:?}"
+    );
+}
+
 #[tokio::test]
 async fn find_distillation_clusters_requires_three_non_document_captures_to_seed() {
     // Seeding rule (spec §4.2/§4.3): a cluster needs >= 3 staging CAPTURE
@@ -16556,6 +16787,65 @@ async fn load_summary_buckets_excludes_pending_and_hide_superseded_memories() {
         .flat_map(|(_, members)| members.into_iter().map(|member| member.source_id))
         .collect();
     assert_eq!(source_ids, vec!["summary_active".to_string()]);
+}
+
+/// Companion to the pool regression above: summary buckets read the same
+/// `supersede_mode` column and dropped every decision for the same reason.
+#[tokio::test]
+async fn load_summary_buckets_includes_decisions_but_not_merged_originals() {
+    let (db, _dir) = test_db().await;
+    let entity_id = db
+        .store_entity("Scheduler", "concept", None, None, None)
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET community_id = 7 \
+             WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![entity_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut decision = make_memory_doc(
+        "summary_decision",
+        "We chose libSQL over sqlite for the graph store.",
+        "decision",
+        "work",
+        "agent",
+    );
+    decision.entity_id = Some(entity_id.clone());
+    let mut merged_away = make_memory_doc(
+        "summary_merged_away",
+        "An original that apply_merge folded into a merged_ row.",
+        "fact",
+        "work",
+        "agent",
+    );
+    merged_away.entity_id = Some(entity_id);
+    db.upsert_documents(vec![decision, merged_away])
+        .await
+        .unwrap();
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET supersede_mode = 'archive' \
+             WHERE source_id = 'summary_merged_away' AND source = 'memory'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let buckets = db.load_summary_buckets().await.unwrap();
+    let source_ids: Vec<String> = buckets
+        .into_iter()
+        .flat_map(|(_, members)| members.into_iter().map(|member| member.source_id))
+        .collect();
+    assert_eq!(source_ids, vec!["summary_decision".to_string()]);
 }
 
 // ==================== Space CRUD ====================
@@ -30872,6 +31162,78 @@ fn extracted_entity_with_observation(
     }]
 }
 
+/// The ambient backfill lane inserts shadow pages directly and never touches
+/// `resolve_or_create_entity`, so the seam needs its own proof here. This is
+/// the lane that actually minted the junk pages: a gate on the ingest cascade
+/// alone would not have stopped any of them.
+#[tokio::test]
+async fn ambient_enrichment_commit_refuses_junk_names_and_canonicalizes_types() {
+    let (db, _dir) = test_db().await;
+    let content = "The backfill re-extracted this memory after 30 minutes.";
+    db.upsert_documents(vec![make_memory_doc(
+        "mem_gate_cas",
+        content,
+        "knowledge",
+        "work",
+        "agent",
+    )])
+    .await
+    .unwrap();
+
+    let kg = vec![crate::extract::KgExtractionResult {
+        index: 0,
+        entities: vec![
+            crate::extract::ExtractedEntity {
+                name: "30 minutes".to_string(),
+                entity_type: "concept".to_string(),
+            },
+            crate::extract::ExtractedEntity {
+                name: "types.rs".to_string(),
+                entity_type: "file".to_string(),
+            },
+            crate::extract::ExtractedEntity {
+                name: "17%".to_string(),
+                entity_type: "concept".to_string(),
+            },
+            crate::extract::ExtractedEntity {
+                name: "Rust".to_string(),
+                entity_type: "language".to_string(),
+            },
+        ],
+        observations: vec![crate::extract::ExtractedObservation {
+            entity: "30 minutes".to_string(),
+            content: "the backfill took half an hour".to_string(),
+        }],
+        relations: Vec::new(),
+    }];
+
+    assert!(db
+        .commit_entity_enrichment_at_version("mem_gate_cas", 1, &kg, content)
+        .await
+        .unwrap());
+
+    let stored = db.list_entities(None, None).await.unwrap();
+    let names: Vec<&str> = stored.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Rust"],
+        "only the real entity may reach the shadow-page table"
+    );
+    assert_eq!(
+        stored[0].entity_type, "technology",
+        "the type alias must be canonicalized in this lane too"
+    );
+    // An observation hanging off a refused entity has nothing to attach to.
+    let observations = db
+        .get_observations_for_entities(&[stored[0].id.clone()], 50)
+        .await
+        .unwrap();
+    assert!(
+        observations.is_empty(),
+        "a refused entity must not drag its observations into the graph"
+    );
+}
+
 fn extracted_graph(
     from: &str,
     to: &str,
@@ -34575,7 +34937,7 @@ async fn test_enrichment_sweep_processes_null_entity_id_memories() {
 
     // Insert a stub entity that the sweep will "extract".
     db.test_seed_entity_shadow_page(
-        TestEntity::new("ent_universal", "U", "Topic").timestamps(0, 0),
+        TestEntity::new("ent_universal", "Universal Topic", "Topic").timestamps(0, 0),
     )
     .await
     .unwrap();
@@ -34600,7 +34962,7 @@ async fn test_enrichment_sweep_processes_null_entity_id_memories() {
     for _ in 0..3 {
         let processed = db
             .run_entity_enrichment_slice(|_content: String| async move {
-                Ok(extracted_entity("U", "Topic"))
+                Ok(extracted_entity("Universal Topic", "Topic"))
             })
             .await
             .expect("slice should succeed");
@@ -34608,7 +34970,7 @@ async fn test_enrichment_sweep_processes_null_entity_id_memories() {
     }
     let empty = db
         .run_entity_enrichment_slice(|_content: String| async move {
-            Ok(extracted_entity("U", "Topic"))
+            Ok(extracted_entity("Universal Topic", "Topic"))
         })
         .await
         .expect("drained slice should succeed");
@@ -34711,9 +35073,11 @@ async fn test_enrichment_sweep_empty_returns_zero() {
 #[tokio::test]
 async fn test_entity_enrichment_slice_attempts_exactly_one_row() {
     let (db, _dir) = test_db().await;
-    db.test_seed_entity_shadow_page(TestEntity::new("ent_u", "U", "Topic").timestamps(0, 0))
-        .await
-        .unwrap();
+    db.test_seed_entity_shadow_page(
+        TestEntity::new("ent_u", "Unit Topic", "Topic").timestamps(0, 0),
+    )
+    .await
+    .unwrap();
     {
         let conn = db.conn.lock().await;
         for i in 0..5usize {
@@ -34730,7 +35094,7 @@ async fn test_entity_enrichment_slice_attempts_exactly_one_row() {
         }
     }
     let processed = db
-        .run_entity_enrichment_slice(|_| async move { Ok(extracted_entity("U", "Topic")) })
+        .run_entity_enrichment_slice(|_| async move { Ok(extracted_entity("Unit Topic", "Topic")) })
         .await
         .expect("slice");
     assert_eq!(processed, 1, "one invocation must attempt one row");

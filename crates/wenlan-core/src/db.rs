@@ -239,6 +239,57 @@ fn superseder_not_exists(
     )
 }
 
+/// `supersede_mode` is superseder BEHAVIOUR, not row state: it says how a row
+/// treats the rows *it* supersedes -- `'hide'` removes the predecessor from
+/// retrieval, `'archive'` keeps the predecessor visible but muted. The store
+/// path stamps every `memory_type='decision'` row with `'archive'` for that
+/// reason alone (`wenlan-server/src/memory_routes.rs` at store time, and
+/// `ingest::run_classification_enrichment` when the classifier refines the
+/// type), so `'archive'` on a decision says nothing at all about the decision
+/// itself. `search_memory_cross_rerank` reads the field correctly: it collects
+/// `supersedes` from rows whose own mode is `'archive'` and mutes those
+/// *targets*, and only self-excludes `'evicted'`.
+///
+/// Two values are written back onto a row to describe that row's own state:
+///
+///   * `'evicted'` -- refinery soft-eviction (`evict_stale`). Always self-state.
+///   * `'archive'` -- `apply_merge` marks the originals it folded into a
+///     `merged_*` row. Because the store path never writes `'archive'` for a
+///     non-decision, `'archive'` on a non-decision row is unambiguously this
+///     marker.
+///
+/// Returns the predicate that is TRUE while a row is still live content, i.e.
+/// not self-excluded by either marker. A decision that `apply_merge` folded
+/// away is not separable from a freshly stored decision on this column alone,
+/// so it stays included here; the merge links the first original through
+/// `supersedes`, which the callers' superseder test already excludes.
+pub(crate) fn not_self_archived(alias: &str) -> String {
+    format!(
+        "COALESCE({alias}.supersede_mode, '') <> 'evicted' \
+         AND NOT (COALESCE({alias}.supersede_mode, '') = 'archive' \
+                  AND COALESCE({alias}.memory_type, '') <> 'decision')"
+    )
+}
+
+/// The distillation staging pool's "not genuinely superseded" test, shared by
+/// `query_distillation_staging_pool`, `query_distillation_seed_slice`, and
+/// `query_distillation_ann_neighbors` so the three cannot drift.
+///
+/// Mirrors the rule `search_memory_cross_rerank` applies: a row is superseded
+/// only when a non-pending memory supersedes it *and* that superseder's mode is
+/// `'hide'`. An `'archive'`-mode superseder leaves its predecessor visible, so
+/// the predecessor stays in the pool exactly as it stays in search. `Global`
+/// scope matches search's unscoped read; the pool applies its own space filter
+/// separately.
+fn distillation_not_superseded(alias: &str) -> String {
+    superseder_not_exists(
+        &ReadScope::Global,
+        alias,
+        "superseder.pending_revision = 0 AND superseder.source = 'memory' \
+         AND superseder.supersede_mode = 'hide'",
+    )
+}
+
 fn capture_memory_source(source: &str) -> &str {
     match source {
         "focus" => "focus_capture",
@@ -3639,6 +3690,31 @@ async fn legacy_table_present(conn: &libsql::Connection, name: &str) -> Result<b
         .await
         .map_err(|e| WenlanError::VectorDb(format!("legacy {name} gate probe row: {e}")))?
         .is_some())
+}
+
+/// What an entity is currently carrying. Returned by
+/// [`MemoryDB::entity_link_summary`]; a cleanup prints it per candidate so the
+/// operator can see what archiving would hide.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EntityLinkSummary {
+    /// Rows in `memory_entities`.
+    pub memory_links: i64,
+    /// Rows in `observations`.
+    pub observations: i64,
+    /// Live relation edges in either direction (`valid_until IS NULL`).
+    pub active_edges: i64,
+    /// Entries in the shadow page's `aliases` JSON array.
+    pub aliases: i64,
+    /// Memories whose `entity_id` points here (the primary-entity pointer,
+    /// separate from the `memory_entities` link table).
+    pub primary_memories: i64,
+}
+
+impl EntityLinkSummary {
+    /// True when nothing in the graph refers to this entity.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// G6 Stage 3 test fixture: describes an entity for
@@ -28907,6 +28983,7 @@ impl MemoryDB {
                 "p.community_id",
             )
         };
+        let live = not_self_archived("m");
         let sql = format!(
             "SELECT m.source_id, m.title, m.content, {community_expr}
                FROM memories m
@@ -28920,7 +28997,7 @@ impl MemoryDB {
                        AND superseder.source = 'memory'
                 )
                 AND m.is_recap = 0
-                AND m.supersede_mode <> 'archive'
+                AND {live}
                 AND m.source_id NOT LIKE 'merged_%'
                 AND m.source_id NOT LIKE 'recap_%'
                 AND m.embedding IS NOT NULL
@@ -33112,6 +33189,12 @@ impl MemoryDB {
     /// in-batch cache, `create_entity` layers input validation, its richer
     /// `WriteResult` wrapping, and post-write enrichment (verify, refinery
     /// enqueue, activity log) gated on `was_newly_created`.
+    ///
+    /// It is one of the two lanes that call `kg::entity_admission::admit`: a
+    /// junk-shape name is refused with a `Validation` error, which every
+    /// production caller drops and logs, and the type is canonicalized against
+    /// `entity_type_vocabulary` before anything is stored. The other lane is
+    /// `commit_entity_enrichment_at_version`, the ambient backfill writer.
     pub async fn resolve_or_create_entity(
         &self,
         name: &str,
@@ -33120,6 +33203,29 @@ impl MemoryDB {
         source_agent: Option<&str>,
         confidence: Option<f32>,
     ) -> Result<(String, bool), WenlanError> {
+        // Admission. Refusing before resolution also stops a junk name being
+        // registered as an alias of a real entity, which is how "17%" would
+        // otherwise attach itself to whatever it embedded near.
+        let canonicals = self.entity_canonicals().await?;
+        let admitted = match crate::kg::entity_admission::admit(name, entity_type, &canonicals) {
+            crate::kg::entity_admission::Admission::Admit(a) => a,
+            crate::kg::entity_admission::Admission::Refuse(r) => {
+                return Err(WenlanError::Validation(format!("{r}: {name:?}")));
+            }
+        };
+        // An unresolvable type still stores the entity; its raw form goes to
+        // the existing vocabulary review lane rather than vanishing.
+        if let Some(raw) = admitted.unrecognized_type.as_deref() {
+            if let Err(e) = self
+                .insert_vocab_promote_proposal("entity", raw, None)
+                .await
+            {
+                log::warn!("[resolve_or_create_entity] vocab promote enqueue failed: {e}");
+            }
+        }
+        let name = admitted.name.as_str();
+        let entity_type = admitted.entity_type.as_str();
+
         let _resolution_guard = self.entity_resolution_lock.lock().await;
         let name_lower = name.to_lowercase();
 
@@ -35033,6 +35139,87 @@ impl MemoryDB {
         Ok(())
     }
 
+    /// Archive an entity by archiving its `kind='entity'` shadow page.
+    ///
+    /// The reversible counterpart to [`Self::delete_entity`], and the entity
+    /// API's own archive lane — `archive_page` deliberately refuses shadow
+    /// pages, because a shadow page must only be touched through here. Since
+    /// G6 every entity reader joins `pages ... AND p.status='active'`, so an
+    /// archived entity disappears from search, listing, and the graph while
+    /// its row, its `entity_page_map` link, its observations, and its memory
+    /// links all stay put and can be restored by flipping `status` back.
+    ///
+    /// Returns true when a page moved from active to archived, false when the
+    /// entity has no shadow page or was already archived.
+    pub async fn archive_entity(&self, entity_id: &str) -> Result<bool, WenlanError> {
+        let now = chrono::Utc::now();
+        let now_rfc3339 = now.to_rfc3339();
+        let now_ts = now.timestamp();
+        let conn = self.conn.lock().await;
+        let Some(page_id) = entity_page_adapter::page_id_for_entity(&conn, entity_id).await? else {
+            return Ok(false);
+        };
+        let affected = conn
+            .execute(
+                "UPDATE pages
+                 SET status = 'archived', version = version + 1, last_modified = ?1
+                 WHERE id = ?2 AND kind = 'entity' AND status = 'active'",
+                libsql::params![now_rfc3339, page_id.clone()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("archive_entity: {e}")))?;
+        if affected == 1 {
+            Self::append_page_history(&conn, &page_id, "archive", now_ts)
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("archive_entity history: {e}")))?;
+        }
+        Ok(affected == 1)
+    }
+
+    /// What an entity is currently carrying: linked memories, observations,
+    /// aliases, and live relation edges.
+    ///
+    /// The blast radius a cleanup has to show before it archives anything. The
+    /// edge count matches `get_entity_detail`'s relations query (`valid_until
+    /// IS NULL`, either direction), and aliases come from the shadow page's
+    /// `aliases` JSON array, which since G6 is the sole alias store. Reports
+    /// zeros for an entity with no active shadow page rather than erroring.
+    pub async fn entity_link_summary(
+        &self,
+        entity_id: &str,
+    ) -> Result<EntityLinkSummary, WenlanError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT
+                   (SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?1),
+                   (SELECT COUNT(*) FROM observations WHERE entity_id = ?1),
+                   (SELECT COUNT(*) FROM edges
+                     WHERE valid_until IS NULL AND (src_id = ?1 OR dst_id = ?1)),
+                   (SELECT COUNT(*) FROM entity_page_map epm
+                      JOIN pages p ON p.id = epm.page_id
+                      JOIN json_each(p.aliases)
+                     WHERE epm.entity_id = ?1
+                       AND p.kind = 'entity' AND p.status = 'active'),
+                   (SELECT COUNT(*) FROM memories WHERE entity_id = ?1)",
+                libsql::params![entity_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("entity_link_summary: {e}")))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("entity_link_summary row: {e}")))?
+            .ok_or_else(|| WenlanError::VectorDb("entity_link_summary: no row".to_string()))?;
+        Ok(EntityLinkSummary {
+            memory_links: row.get::<i64>(0).unwrap_or(0),
+            observations: row.get::<i64>(1).unwrap_or(0),
+            active_edges: row.get::<i64>(2).unwrap_or(0),
+            aliases: row.get::<i64>(3).unwrap_or(0),
+            primary_memories: row.get::<i64>(4).unwrap_or(0),
+        })
+    }
+
     pub async fn delete_entity(&self, entity_id: &str) -> Result<(), WenlanError> {
         let conn = self.conn.lock().await;
         conn.execute("BEGIN", ())
@@ -35449,17 +35636,48 @@ impl MemoryDB {
             }
         }
 
+        // Admission: the same seam `resolve_or_create_entity` uses. This lane
+        // inserts shadow pages directly further down, so without this call the
+        // ambient backfill -- the lane that actually produced the junk pages --
+        // would be ungated. It runs before embedding, so a refused name costs
+        // no model time either.
+        let canonicals = self.entity_canonicals().await?;
         let mut seen_names = HashSet::new();
         let mut entities = Vec::new();
+        let mut unrecognized_types: Vec<String> = Vec::new();
         for kg in kg_results {
             for entity in &kg.entities {
                 let name = entity.name.trim();
                 let entity_type = entity.entity_type.trim();
-                let lower = name.to_lowercase();
-                if name.is_empty() || entity_type.is_empty() || !seen_names.insert(lower.clone()) {
+                if name.is_empty() || entity_type.is_empty() {
                     continue;
                 }
-                entities.push((lower, name.to_string(), entity_type.to_string()));
+                let admitted =
+                    match crate::kg::entity_admission::admit(name, entity_type, &canonicals) {
+                        crate::kg::entity_admission::Admission::Admit(a) => a,
+                        crate::kg::entity_admission::Admission::Refuse(_) => continue,
+                    };
+                let lower = admitted.name.to_lowercase();
+                if !seen_names.insert(lower.clone()) {
+                    continue;
+                }
+                if let Some(raw) = admitted.unrecognized_type {
+                    if !unrecognized_types.contains(&raw) {
+                        unrecognized_types.push(raw);
+                    }
+                }
+                entities.push((lower, admitted.name, admitted.entity_type));
+            }
+        }
+        // Outside the connection lock by construction: the preflight guard's
+        // `conn` guard went out of scope above and the transaction below has
+        // not started.
+        for raw in unrecognized_types {
+            if let Err(e) = self
+                .insert_vocab_promote_proposal("entity", &raw, None)
+                .await
+            {
+                log::warn!("[entity enrichment] vocab promote enqueue failed: {e}");
             }
         }
 
@@ -41857,14 +42075,17 @@ impl MemoryDB {
         // G6 Stage 1.5a: `e.name` hydration moved onto the `kind='entity'`
         // shadow page (via `entity_page_map`) -- name-only projection, no
         // space touch, LEFT JOIN semantics preserved.
-        let mut sql = String::from(
+        let live = not_self_archived("m");
+        let not_superseded = distillation_not_superseded("m");
+        let mut sql = format!(
             "SELECT m.source_id, m.content, m.entity_id, m.space, m.embedding, p.title, m.source_agent, m.content_hash \
              FROM memories m \
              LEFT JOIN entity_page_map epm ON epm.entity_id = m.entity_id \
              LEFT JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity' AND p.status = 'active' \
              WHERE m.source = 'memory' AND m.chunk_index = 0 \
                AND (m.pinned = 0 OR m.pinned IS NULL) \
-               AND m.supersede_mode NOT IN ('archive', 'evicted') \
+               AND {live} \
+               AND {not_superseded} \
                AND m.source_id NOT LIKE 'merged_%' \
                AND m.source_id NOT LIKE 'recap_%' \
                AND m.is_recap = 0 \
@@ -42142,12 +42363,15 @@ impl MemoryDB {
         // G6 Stage 1.5a: `e.name` hydration moved onto the `kind='entity'`
         // shadow page (via `entity_page_map`) -- same pattern as
         // `query_distillation_staging_pool` above.
-        let mut sql = String::from(
+        let live = not_self_archived("m");
+        let not_superseded = distillation_not_superseded("m");
+        let mut sql = format!(
             "SELECT m.id, m.source_id, m.content, m.entity_id, m.space, m.embedding, \
                     p.title, m.source_agent, m.content_hash, \
                     CASE WHEN m.source = 'memory' AND m.chunk_index = 0 \
                            AND (m.pinned = 0 OR m.pinned IS NULL) \
-                           AND m.supersede_mode NOT IN ('archive', 'evicted') \
+                           AND {live} \
+                           AND {not_superseded} \
                            AND m.source_id NOT LIKE 'merged_%' \
                            AND m.source_id NOT LIKE 'recap_%' \
                            AND m.is_recap = 0 \
@@ -42212,13 +42436,17 @@ impl MemoryDB {
         // G6 Stage 1.5a: `e.name` hydration moved onto the `kind='entity'`
         // shadow page (via `entity_page_map`) -- same pattern as the two
         // sibling distillation queries above.
+        let live = not_self_archived("m");
+        let not_superseded = distillation_not_superseded("m");
         let mut rows = conn
             .query(
+                &format!(
                 "SELECT m.source_id, m.content, m.entity_id, m.space, m.embedding, \
                         p.title, m.source_agent, m.content_hash, \
                         CASE WHEN m.source = 'memory' AND m.chunk_index = 0 \
                                AND (m.pinned = 0 OR m.pinned IS NULL) \
-                               AND m.supersede_mode NOT IN ('archive', 'evicted') \
+                               AND {live} \
+                               AND {not_superseded} \
                                AND m.source_id NOT LIKE 'merged_%' \
                                AND m.source_id NOT LIKE 'recap_%' \
                                AND m.is_recap = 0 \
@@ -42236,7 +42464,8 @@ impl MemoryDB {
                  FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) AS vt \
                  JOIN memories m ON m.rowid = vt.id \
                  LEFT JOIN entity_page_map epm ON epm.entity_id = m.entity_id \
-                 LEFT JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity' AND p.status = 'active'",
+                 LEFT JOIN pages p ON p.id = epm.page_id AND p.kind = 'entity' AND p.status = 'active'"
+                ),
                 libsql::params![vec_str, limit as i64],
             )
             .await

@@ -68,7 +68,10 @@ pub struct ExtractedRelation {
 /// prompt's extraction semantics change (fields requested, span
 /// instructions, etc.) so a later audit can tell which prompt version
 /// produced a given span.
-pub const EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION: &str = "v1";
+// v2 (entity admission): the prompt now defines "stable named referent" and
+// lists the shapes that are never entities. `kg::entity_admission` is the
+// enforcement; the prompt change only stops the model spending turns on them.
+pub const EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION: &str = "v2";
 
 /// Locate `quote` as an exact CHAR-wise substring of `content`, returning
 /// `(char_start, char_end)` -- **character** offsets, never byte offsets

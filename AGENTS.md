@@ -14,6 +14,10 @@ are read only when the task needs them.
 | Business logic, storage, retrieval, enrichment | `crates/wenlan-core/AGENTS.md` |
 | HTTP daemon and runtime workers | `crates/wenlan-server/AGENTS.md` |
 | Desktop app and frontend | `app/AGENTS.md` or the closest nested `AGENTS.md` |
+| React frontend (Tauri UI) | `src/AGENTS.md` |
+| Browser e2e tests | `e2e/AGENTS.md` |
+| Browser-only preview harness | `preview/AGENTS.md` |
+| Release, sidecar, and repo-inventory scripts | `scripts/AGENTS.md` |
 | Eval fixtures and artifacts | `app/eval/AGENTS.md` |
 | Rust eval runners and experiment design | `crates/wenlan-core/src/eval/AGENTS.md` |
 | Test routing and CI layers | `docs/test-layers.md` |
@@ -50,9 +54,8 @@ active without checking the current worktree.
   `serde_json::Value` envelopes through the boundary.
 - Never hold a `tokio::sync::RwLock` guard across `.await`; snapshot state and drop the
   guard first.
-- All post-store enrichment goes through
-  `wenlan_core::ingest::run_canonical_enrichment`; do not create a parallel consumer
-  implementation.
+- Canonical write-time enrichment routing: see `crates/wenlan-core/AGENTS.md` ("Core
+  invariants").
 - Dev and production use the same daemon port and data roots by default. Isolated tests
   that can create pages must isolate the daemon port, `WENLAN_DATA_DIR`, and the
   configured knowledge/page path, then verify the live daemon reports those scratch

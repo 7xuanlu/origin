@@ -1252,6 +1252,7 @@ pub fn run() {
             search::list_entities_cmd,
             search::search_entities_cmd,
             search::get_entity_detail_cmd,
+            search::get_knowledge_graph_cmd,
             search::update_observation_cmd,
             search::delete_observation_cmd,
             search::delete_entity_cmd,

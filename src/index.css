@@ -422,6 +422,16 @@ html[data-theme="dark"] {
   --kg-hull-border: rgba(169, 174, 242, 0.16);
   --kg-graticule: rgba(150, 155, 173, 0.13);
   --kg-bridge: #C7AA5C;
+  /* Memory nodes — one muted fill, no slot. Opaque for the sigma reason
+     above; dimmer than --kg-neutral so memories read as context hanging off
+     the entities rather than as a sixth category. */
+  --kg-memory: #707A8E;
+  /* Wiki-page nodes — one swatch, no slot, opaque for the sigma reason above.
+     A cool slate-teal: distinct from every entity slot AND from --kg-memory's
+     grey, so a page never reads as an entity category or as a memory. Pages
+     also carry a 2px ring (AtlasView's overlay canvas) — sigma v3 ships only
+     disc node programs, so shape can't carry the distinction. */
+  --kg-page: #3E8F8A;
 }
 
 /* Light (cool paper workspace with restrained brand warmth) */
@@ -508,6 +518,10 @@ html[data-theme="light"] {
   --kg-hull-border: rgba(94, 88, 200, 0.15);
   --kg-graticule: rgba(139, 147, 163, 0.18);
   --kg-bridge: #B5842E;
+  /* Memory nodes — see the dark block. */
+  --kg-memory: #9BA3B2;
+  /* Wiki-page nodes — see the dark block. */
+  --kg-page: #2F7C77;
 }
 
 .wiki-home {

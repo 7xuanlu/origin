@@ -925,6 +925,73 @@ export interface EntitySearchResult {
   distance: number;
 }
 
+/** A relation edge from the bulk graph read: both endpoints by id. */
+export interface GraphRelation {
+  id: string;
+  from_entity: string;
+  to_entity: string;
+  relation_type: string;
+  source_agent: string | null;
+  created_at: number;
+}
+
+/** A memory drawn as a graph node. */
+export interface GraphMemoryNode {
+  source_id: string;
+  title: string;
+  memory_type: string | null;
+  space: string | null;
+  confirmed: boolean;
+  last_modified: number;
+}
+
+/** A memory-to-entity link, drawn as an edge. */
+export interface GraphMemoryLink {
+  memory_id: string;
+  entity_id: string;
+}
+
+/** A wiki page drawn as a graph node. Entity shadow pages are not wiki pages
+ *  and never appear here — the entity itself is already the node. The daemon
+ *  sends no community for a page (neither store can answer it honestly); the
+ *  map derives one by inheritance, see cartography.ts. */
+export interface GraphPageNode {
+  id: string;
+  title: string;
+  space: string | null;
+  creation_kind: string;
+  entity_id: string | null;
+  /** RFC 3339, as `pages.last_modified` stores it. */
+  last_modified: string;
+}
+
+/** One endpoint of a page link: which collection to look the id up in. */
+export interface GraphRef {
+  kind: "page" | "entity" | "memory";
+  id: string;
+}
+
+/** A typed edge with a page on at least one end. */
+export interface GraphPageLink {
+  from: GraphRef;
+  to: GraphRef;
+  link_type: "wikilink" | "about" | "cites";
+}
+
+/**
+ * The whole knowledge graph for the current space scope in one read. Replaces
+ * the per-entity detail fan-out the Graph view used to do, which could only
+ * afford the first 20 entities.
+ */
+export interface KnowledgeGraph {
+  entities: Entity[];
+  relations: GraphRelation[];
+  memories: GraphMemoryNode[];
+  memory_links: GraphMemoryLink[];
+  pages: GraphPageNode[];
+  page_links: GraphPageLink[];
+}
+
 export interface MemoryItem {
   source_id: string;
   title: string;
@@ -1351,6 +1418,11 @@ export async function searchEntities(
     ...result,
     entity: withDomain(result.entity),
   }));
+}
+
+export async function getKnowledgeGraph(): Promise<KnowledgeGraph> {
+  const graph = await invoke<KnowledgeGraph>("get_knowledge_graph_cmd");
+  return { ...graph, entities: withDomainArray(graph.entities) };
 }
 
 export async function getEntityDetail(entityId: string): Promise<EntityDetail> {

@@ -179,6 +179,8 @@ pub(crate) const EXTRACT_KNOWLEDGE_GRAPH: &str = "\
 Extract entities and relations from these memories.\n\
 \n\
 Entity types: person, project, technology, organization, place, concept\n\
+An entity is a stable named referent: a thing you could write a wiki page about, whose identity holds across memories. Extract the thing, never a measurement, path, or identifier of it.\n\
+Never extract as an entity: quantities and durations (\"30 minutes\", \"256 tokens\", \"1,200 users\"), bare numbers and percentages (\"17\", \"15%\", \"$24M\"), file paths and directories (\"~/.claude/CLAUDE.md\", \"node_modules/.vite\", \"./target/debug/origin\"), bare filenames (\"db.rs\", \"config.json\", \"release.yml\"), commit hashes and UUIDs (\"bd691cc\"), URLs, bare version strings (\"v1.2.3\" on its own -- \"Python 3.12\" is a fine entity), and test or placeholder text (\"manual test memory number 3\", \"test\", \"TBD\").\n\
 Relation types (pick from this list ONLY): works_on, uses, prefers, decided, leads, knows, created, part_of, contradicts, replaced_by, learned_from, blocked_by, depends_on, related_to, discussed_in, authored, located_in, member_of\n\
 If none fit, use `related_to`. Do not invent new types — they are coerced to `related_to` at write.\n\
 \n\

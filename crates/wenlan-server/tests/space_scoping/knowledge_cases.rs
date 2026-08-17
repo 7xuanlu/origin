@@ -42,6 +42,66 @@ fn entity_ids(body: &Value, key: &str) -> BTreeSet<String> {
         .collect()
 }
 
+async fn seed_page(
+    fixture: &ScopeFixture,
+    title: &str,
+    content: &str,
+    space: Option<&str>,
+) -> String {
+    let request = wenlan_types::requests::CreateConceptRequest {
+        title: title.to_string(),
+        content: content.to_string(),
+        summary: None,
+        entity_id: None,
+        space: (space.map(str::to_string)).into(),
+        source_memory_ids: Vec::new(),
+        creation_kind: Some("authored".to_string()),
+        workspace: space.map(str::to_string),
+    };
+    let created = wenlan_core::post_write::create_page(&fixture.db, request, "scope-test", None)
+        .await
+        .expect("page fixture must be created through PageWrite");
+    fixture
+        .db
+        .set_page_review_status(&created.id, "confirmed")
+        .await
+        .unwrap();
+    created.id
+}
+
+fn string_set(body: &Value, key: &str, field: &str) -> BTreeSet<String> {
+    body[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("{key} must be an array: {body}"))
+        .iter()
+        .filter_map(|row| row[field].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+fn page_link_triples(body: &Value) -> BTreeSet<(String, String, String)> {
+    body["page_links"]
+        .as_array()
+        .unwrap_or_else(|| panic!("page_links must be an array: {body}"))
+        .iter()
+        .map(|row| {
+            (
+                format!(
+                    "{}:{}",
+                    row["from"]["kind"].as_str().unwrap(),
+                    row["from"]["id"].as_str().unwrap()
+                ),
+                format!(
+                    "{}:{}",
+                    row["to"]["kind"].as_str().unwrap(),
+                    row["to"]["id"].as_str().unwrap()
+                ),
+                row["link_type"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
 pub async fn unknown_selectors_are_rejected() {
     let fixture = ScopeFixture::new().await;
     let entity = seed_entity(&fixture, "Unknown selector entity", Some("work")).await;
@@ -65,6 +125,13 @@ pub async fn unknown_selectors_are_rejected() {
             format!("/api/memory/entities/{entity}"),
             None,
             "/api/memory/entities/{entity_id}",
+            Method::Get,
+        ),
+        (
+            HttpMethod::GET,
+            "/api/memory/graph".to_string(),
+            None,
+            "/api/memory/graph",
             Method::Get,
         ),
         (
@@ -275,6 +342,81 @@ pub async fn detail_and_relation_endpoints_are_scoped() {
     )
     .await;
     assert_eq!(global_missing, missing);
+
+    // Wiki pages ride the same scoped graph read: a work page linking to
+    // another work page, and a personal page that must not cross over.
+    let work_target = seed_page(&fixture, "Scoped graph target", "target body", Some("work")).await;
+    let work_source = seed_page(
+        &fixture,
+        "Scoped graph source",
+        "links to [[Scoped graph target]]",
+        Some("work"),
+    )
+    .await;
+    let personal_page = seed_page(
+        &fixture,
+        "Scoped graph personal",
+        "personal body",
+        Some("personal"),
+    )
+    .await;
+
+    let (status, graph) = json_body(
+        fixture
+            .send(HttpMethod::GET, "/api/memory/graph", None, Some("work"))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{graph}");
+    let graph_entities = entity_ids(&graph, "entities");
+    assert!(graph_entities.contains(&work));
+    assert!(graph_entities.contains(&work_peer));
+    assert!(!graph_entities.contains(&personal));
+    let graph_relations = graph["relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        graph_relations,
+        BTreeSet::from([work_relation.as_str()]),
+        "the cross-space relation must not survive a work-scoped graph read"
+    );
+    let graph_pages = string_set(&graph, "pages", "id");
+    assert_eq!(
+        graph_pages,
+        BTreeSet::from([work_target.clone(), work_source.clone()]),
+        "a work-scoped graph read carries the work wiki pages and nothing else"
+    );
+    assert_eq!(
+        page_link_triples(&graph),
+        BTreeSet::from([(
+            format!("page:{work_source}"),
+            format!("page:{work_target}"),
+            "wikilink".to_string()
+        )]),
+        "the resolved wikilink between two in-scope pages is on the map"
+    );
+
+    let (status, global_graph) = json_body(
+        fixture
+            .send(HttpMethod::GET, "/api/memory/graph", None, None)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{global_graph}");
+    let global_graph_relations = global_graph["relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(global_graph_relations.contains(work_relation.as_str()));
+    assert!(global_graph_relations.contains(mixed_relation.as_str()));
+    let global_graph_pages = string_set(&global_graph, "pages", "id");
+    assert!(global_graph_pages.contains(&personal_page));
+    assert!(global_graph_pages.contains(&work_source));
 
     let (status, selected) = json_body(
         fixture
