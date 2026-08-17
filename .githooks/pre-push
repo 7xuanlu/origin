@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Push-time checks reuse CI's fail-closed package planner. Ordinary source
-# changes run Clippy + lib tests for the owning crate's reverse dependency
-# closure; direct integration-test edits and isolated unit-test owners run only
-# their exact target/module. Shared build inputs intentionally fall back to the
-# full workspace. CI remains the owner of broad integration, HTTP smoke,
-# platform, and release-profile proofs.
+# Fast, non-compiling by default: pre-push only runs the M5 reader-inventory
+# freshness check (pure Python, no compile). Set WENLAN_PUSH_FULL=1 to also
+# run the local affected-closure run (route-catalog test + the fail-closed
+# ci_test_plan.py planner). CI owns clippy, tests, the route-catalog check,
+# and platform proofs on every push regardless of this setting.
 
 ZERO_SHA="0000000000000000000000000000000000000000"
 all_changed=""
@@ -14,6 +13,7 @@ all_changed=""
 while read -r local_ref local_sha remote_ref remote_sha; do
     [ -z "${local_ref:-}" ] && continue
     [ "$local_sha" = "$ZERO_SHA" ] && continue
+    [ "$local_ref" = "(delete)" ] && continue
     case "$local_ref" in
         refs/tags/*) continue ;;
     esac
@@ -22,7 +22,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         base=$(git merge-base "$local_sha" origin/main 2>/dev/null \
             || git rev-list --max-parents=0 "$local_sha" | head -n 1)
     else
-        base="$remote_sha"
+        base=$(git merge-base "$local_sha" origin/main 2>/dev/null || echo "$remote_sha")
     fi
     changed=$(git diff --name-only --diff-filter=ACMRD "$base" "$local_sha")
     [ -n "$changed" ] && all_changed=$(printf '%s\n%s' "$all_changed" "$changed")
@@ -49,6 +49,15 @@ if printf '%s' "$all_changed" | grep -Eq '^crates/(wenlan-core|wenlan-server)/|^
         exit 1
     }
 
+    echo "Pre-push: fast drift gates passed."
+fi
+
+if [ "${WENLAN_PUSH_FULL:-}" != "1" ]; then
+    echo "Pre-push: fast checks only (set WENLAN_PUSH_FULL=1 for the local affected-closure run); CI owns clippy, tests, and the route catalog."
+    exit 0
+fi
+
+if printf '%s' "$all_changed" | grep -Eq '^crates/(wenlan-core|wenlan-server)/|^scripts/m5-reader-sweep\.py$'; then
     route_catalog_test='lint::serving::tests::review_tests::route_catalog_freezes_exact_global_and_scoped_keys'
     route_catalog_out=$(cargo test -p wenlan-core --lib -- "$route_catalog_test" 2>&1) && route_catalog_rc=0 || route_catalog_rc=$?
     echo "$route_catalog_out"
@@ -61,8 +70,6 @@ if printf '%s' "$all_changed" | grep -Eq '^crates/(wenlan-core|wenlan-server)/|^
         echo "FAIL: the sensitive-read route catalog changed. Add or move the route in SCOPED/GLOBAL in crates/wenlan-core/src/lint/serving_review_test.rs (see crates/wenlan-server/AGENTS.md, \"Adding or rescoping a route\")."
         exit 1
     fi
-
-    echo "Pre-push: fast drift gates passed."
 fi
 
 changed_json=$(printf '%s\n' "$all_changed" | "$PYTHON_BIN" -c \

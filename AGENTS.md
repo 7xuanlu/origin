@@ -31,7 +31,8 @@ selected explicitly with `-p wenlan-app`.
 
 - During implementation, run the smallest test that exercises the changed behavior.
 - Before publishing a stable head, run the affected-package and reverse-dependency
-  closure selected by the existing CI planner or pre-push hook.
+  closure selected by the existing CI planner, or locally via `WENLAN_PUSH_FULL=1
+  git push` (pre-push is fast/non-compiling by default; CI is the required gate).
 - The full workspace suite is the CI/main backstop, not a per-worker or per-review-pass
   default. Do not rerun an unchanged, trustworthy receipt without a concrete reason.
 - Eval quality runs, live GPU smokes, and deployed checks are measurement lanes. Run

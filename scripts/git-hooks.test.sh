@@ -30,4 +30,27 @@ if grep -Eq 'cargo (check|clippy|test) --workspace' .githooks/pre-push; then
   exit 1
 fi
 
+# WENLAN_PUSH_FULL must guard both compiling steps: the route-catalog cargo
+# test and the ci_test_plan.py planner. Everything before the guard line must
+# stay non-compiling.
+guard_line=$(grep -n '"\${WENLAN_PUSH_FULL:-}"' .githooks/pre-push | head -n 1 | cut -d: -f1)
+[ -n "$guard_line" ] || { echo 'pre-push must gate the heavy section behind WENLAN_PUSH_FULL' >&2; exit 1; }
+cargo_line=$(grep -n 'cargo ' .githooks/pre-push | head -n 1 | cut -d: -f1)
+if [ -n "$cargo_line" ] && [ "$guard_line" -ge "$cargo_line" ]; then
+  echo 'pre-push must gate every cargo invocation behind WENLAN_PUSH_FULL' >&2
+  exit 1
+fi
+if [ "$guard_line" -ge "$planner_line" ]; then
+  echo 'pre-push must gate the ci_test_plan.py planner behind WENLAN_PUSH_FULL' >&2
+  exit 1
+fi
+
+# Rebase-safe base: the merge-base fix must be present and the old bare
+# assignment to the remote's stale tip must not have regressed back in.
+grep -Fq 'merge-base' .githooks/pre-push
+if grep -Fq 'base="$remote_sha"' .githooks/pre-push; then
+  echo 'pre-push must not fall back to a bare base="$remote_sha" assignment' >&2
+  exit 1
+fi
+
 echo 'git hook routing contracts: PASS'
