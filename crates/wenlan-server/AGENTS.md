@@ -16,5 +16,7 @@ when a task needs the module list or those flags.
   review it in your diff. If hooks are not installed, run
   `python3 scripts/m5-reader-sweep.py --update-inventory` yourself.
 
-Pre-commit and pre-push run these two checks first, so a missed step fails in
-seconds, not after the full suite.
+Pre-commit and pre-push run the reader-inventory check first, so a missed step
+fails in seconds. The SCOPED/GLOBAL route-catalog test is a `wenlan-core` lib
+test: CI always runs it, and pre-push runs it locally only under
+`WENLAN_PUSH_FULL=1`.

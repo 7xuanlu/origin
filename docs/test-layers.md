@@ -17,7 +17,7 @@ Wenlan runs across several layers. The split is driven by three questions: **(1)
 |---|---|---|---|---|---|
 | **L1 dev loop** | rust-analyzer / IDE | Local | Every save | <1s | No |
 | **L2 pre-commit** | `cargo fmt --all -- --check`; Clippy on directly changed crates only | Local | `git commit` | ~5s | Yes |
-| **L3 pre-push** | Planner-selected Clippy + lib tests over the affected reverse-dependency closure; directly edited integration targets and isolated unit-test owners run alone. When the plan widens to the whole workspace, Clippy still runs and the lib suite is left to L4 | Local | `git push` | change-dependent | Yes |
+| **L3 pre-push** | Reader-inventory freshness check (Python, no compile); `WENLAN_PUSH_FULL=1` opts into the planner-selected Clippy + lib-test closure | Local | `git push` | ~4s when core/server changed, ~0.1s otherwise (opt-in run: change-dependent) | Yes (fast checks only) |
 | **L4 CI on PR/main** | Fail-closed differential plan: affected lib, integration, contract, platform, and HTTP smoke owners only; aggregate `conclusion` verifies every expected job. Pushes to `main` reuse the same source-owned routing; release-sensitive pushes retain the Windows release-profile cache warmer, while CI-only pushes skip it. Manual dispatch is the full backstop. An exact same-repository Release PR whose current-main diff passes the semantic validator omits duplicate base-tree Rust/platform lanes only after independently proving that base's main CI succeeded; release-managed plugin/npm/docs checks and all four shipped-target preflights remain. | GitHub (`ci.yml`) | Every PR/main push | target ≤20min | Yes (required) |
 | **L5 coverage** | `cargo llvm-cov` on wenlan-core + wenlan-server only | GitHub (`coverage.yml`) | Relevant source-owner push to `main`, or manual dispatch | ~30min | **No (informational)** |
 | **L6 main canary** | Exact retrieval-quality + ranking-drift pair (`test_run_quality_cost_eval_basic`, `ranking_drift_vs_golden`) | GitHub (`main-canary.yml`) | Relevant core/eval-owner push to `main`, or manual dispatch | <20min | No (post-merge) |
@@ -83,4 +83,18 @@ failure unrelated to it. Windows behaviour is still covered at a coarser grain
 by the Windows CLI/server integration step and the schtasks install round-trip
 in the same job. Closing the unit-level gap means paying the ~25 minute Windows
 lib run on every PR, which is a separate decision from this one.
+
+### Why pre-push no longer compiles
+
+The route-catalog `cargo test` and the `ci_test_plan.py` planner call each
+compiled `wenlan-core` from scratch: ~5 min warm, 19–45 min cold, and both
+contended with rust-analyzer for the `target/` directory lock. Change
+detection was also wrong — it diffed against the stdin `remote_sha`, the *old*
+remote tip, so a rebase onto a newer `main` plus a force-push made every
+upstream commit look like a local change, pulling the Rust closure into a
+docs- or plugin-only push. CI already owns clippy, the lib suites, and the
+route-catalog test (it's a `wenlan-core` lib test, so the nextest slices run
+it). Community consensus puts a local hook's ceiling at 30 s–2 min; past that,
+routine `--no-verify` is a hook defect, not developer misconduct. The heavy
+affected-closure run stays available on demand via `WENLAN_PUSH_FULL=1`.
 

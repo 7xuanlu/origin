@@ -30,4 +30,34 @@ if grep -Eq 'cargo (check|clippy|test) --workspace' .githooks/pre-push; then
   exit 1
 fi
 
+# WENLAN_PUSH_FULL must guard both compiling steps: the route-catalog cargo
+# test and the ci_test_plan.py planner. Everything before the guard line must
+# stay non-compiling.
+guard_line=$(grep -n '"\${WENLAN_PUSH_FULL:-}"' .githooks/pre-push | head -n 1 | cut -d: -f1)
+[ -n "$guard_line" ] || { echo 'pre-push must gate the heavy section behind WENLAN_PUSH_FULL' >&2; exit 1; }
+cargo_line=$(grep -n 'cargo ' .githooks/pre-push | head -n 1 | cut -d: -f1)
+if [ -n "$cargo_line" ] && [ "$guard_line" -ge "$cargo_line" ]; then
+  echo 'pre-push must gate every cargo invocation behind WENLAN_PUSH_FULL' >&2
+  exit 1
+fi
+if [ "$guard_line" -ge "$planner_line" ]; then
+  echo 'pre-push must gate the ci_test_plan.py planner behind WENLAN_PUSH_FULL' >&2
+  exit 1
+fi
+
+# Rebase-safe base: every assignment to `base` must go through git merge-base,
+# so a stale remote tip (the sha git passes on stdin) can never become the diff
+# base again in any spelling (base="$remote_sha", base=$remote_sha, ...).
+if grep -E '^[[:space:]]*base=' .githooks/pre-push | grep -qv 'merge-base'; then
+  echo 'pre-push must derive the changed-files base from git merge-base' >&2
+  exit 1
+fi
+
+# The reader-inventory check is the one gate that must still run by default,
+# so it has to sit above the WENLAN_PUSH_FULL guard.
+if [ "$fast_gate_line" -ge "$guard_line" ]; then
+  echo 'pre-push must run the reader-inventory check before the WENLAN_PUSH_FULL guard' >&2
+  exit 1
+fi
+
 echo 'git hook routing contracts: PASS'
