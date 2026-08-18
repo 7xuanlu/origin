@@ -45,11 +45,18 @@ if [ "$guard_line" -ge "$planner_line" ]; then
   exit 1
 fi
 
-# Rebase-safe base: the merge-base fix must be present and the old bare
-# assignment to the remote's stale tip must not have regressed back in.
-grep -Fq 'merge-base' .githooks/pre-push
-if grep -Fq 'base="$remote_sha"' .githooks/pre-push; then
-  echo 'pre-push must not fall back to a bare base="$remote_sha" assignment' >&2
+# Rebase-safe base: every assignment to `base` must go through git merge-base,
+# so a stale remote tip (the sha git passes on stdin) can never become the diff
+# base again in any spelling (base="$remote_sha", base=$remote_sha, ...).
+if grep -E '^[[:space:]]*base=' .githooks/pre-push | grep -qv 'merge-base'; then
+  echo 'pre-push must derive the changed-files base from git merge-base' >&2
+  exit 1
+fi
+
+# The reader-inventory check is the one gate that must still run by default,
+# so it has to sit above the WENLAN_PUSH_FULL guard.
+if [ "$fast_gate_line" -ge "$guard_line" ]; then
+  echo 'pre-push must run the reader-inventory check before the WENLAN_PUSH_FULL guard' >&2
   exit 1
 fi
 
