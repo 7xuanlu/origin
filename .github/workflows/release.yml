@@ -583,6 +583,12 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read
+    env:
+      # Git Bash on Windows rewrites arguments that look like absolute POSIX
+      # paths ("/repos/...") into filesystem paths, which broke the `gh api`
+      # tag check in the v0.16.0 release run. Disable that conversion for
+      # every bash step in this job.
+      MSYS_NO_PATHCONV: "1"
     outputs:
       setup_filename: ${{ steps.stage.outputs.setup_filename }}
       sig_filename: ${{ steps.stage.outputs.sig_filename }}
