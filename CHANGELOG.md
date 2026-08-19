@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.16.0](https://github.com/7xuanlu/wenlan/compare/v0.15.8...v0.16.0) (2026-08-19)
+
+
+### Features
+
+* **app:** expose M5 truth axes as read-only badges on Pages and Page detail ([#526](https://github.com/7xuanlu/wenlan/issues/526)) ([cc25e35](https://github.com/7xuanlu/wenlan/commit/cc25e354947aef257dcb49b09dc1977f9345bb50))
+* **app:** load the whole knowledge graph and lay it out in two zones with page, entity and memory layers ([#532](https://github.com/7xuanlu/wenlan/issues/532)) ([d28bd28](https://github.com/7xuanlu/wenlan/commit/d28bd283b50d075d8ee8d4327c0a3359bdc61bee))
+* **app:** make the desktop app's runtime paths and tests platform-portable ([#525](https://github.com/7xuanlu/wenlan/issues/525)) ([39c3649](https://github.com/7xuanlu/wenlan/commit/39c36497d843a323c7f5c0796d9f232e2de81cf6))
+* **app:** make the Windows desktop build installable and publishable ([#528](https://github.com/7xuanlu/wenlan/issues/528)) ([4b1c724](https://github.com/7xuanlu/wenlan/commit/4b1c724c427107f47f188c0fbb4d6ec2753ce19c))
+* **app:** mark pages human-reviewed through a backend-minted presence capability ([#529](https://github.com/7xuanlu/wenlan/issues/529)) ([9bf51ee](https://github.com/7xuanlu/wenlan/commit/9bf51ee316f7fb1c21383ee605eddbe821f16191))
+* **app:** restore dev-runtime isolation lost in the monorepo migration ([#519](https://github.com/7xuanlu/wenlan/issues/519)) ([bc9885f](https://github.com/7xuanlu/wenlan/commit/bc9885f107188db5414c452bfd064b00d6332e3a))
+* **app:** restore the community-map overlay lost in the monorepo migration ([#524](https://github.com/7xuanlu/wenlan/issues/524)) ([03919ba](https://github.com/7xuanlu/wenlan/commit/03919ba843982169b7b534814a2817f8bcc168b8))
+* **app:** restore the native CodeMirror page editor lost in the monorepo migration ([#521](https://github.com/7xuanlu/wenlan/issues/521)) ([687ca4c](https://github.com/7xuanlu/wenlan/commit/687ca4c46a714296ac997dbc40dd32b414084867))
+* **app:** restore the Page Map canvas tab lost in the monorepo migration ([#522](https://github.com/7xuanlu/wenlan/issues/522)) ([de21f91](https://github.com/7xuanlu/wenlan/commit/de21f9134ad5f7a4c540a79a4803fdf1c0b33c2f))
+* **cli:** auto-start the registered daemon service on connect failure; add memories --pending ([#544](https://github.com/7xuanlu/wenlan/issues/544)) ([7194a20](https://github.com/7xuanlu/wenlan/commit/7194a203e8affccd8c08868dfa5a138f36c27819))
+* **outbox:** queue Brief updates and captures when the daemon is unreachable; daemon drains them over loopback ([#546](https://github.com/7xuanlu/wenlan/issues/546)) ([43be4c2](https://github.com/7xuanlu/wenlan/commit/43be4c246c64c19294c1cb5b378753c56360fb2d))
+* **plugin:** handoff skill runs CLI-only, survives a down daemon; SessionStart hook reports outbox counts ([#545](https://github.com/7xuanlu/wenlan/issues/545)) ([c52888d](https://github.com/7xuanlu/wenlan/commit/c52888d3b66776eee8f7ffaf8637edfb8ae59248))
+
+
+### Bug Fixes
+
+* **app:** graph region count and week card over visible nodes, uncategorized community scope, order-independent edge dedupe, focus entity always drawn, page click on overlay, drop dead atlas exports ([#553](https://github.com/7xuanlu/wenlan/issues/553)) ([9ecad93](https://github.com/7xuanlu/wenlan/commit/9ecad930323152ec2135b7af8e50ebf95e395105))
+* **communities:** count generation bumps only for assertion relates edges, supersede stale community proposals on republish, cover 422 paths in community routes ([#552](https://github.com/7xuanlu/wenlan/issues/552)) ([8f381c5](https://github.com/7xuanlu/wenlan/commit/8f381c5aed62af5fe258ef9f280079423841b6c5))
+* **core:** close the page-history bypasses and cap poison-document retries ([#523](https://github.com/7xuanlu/wenlan/issues/523)) ([5156d27](https://github.com/7xuanlu/wenlan/commit/5156d2732783a8996d89881273c892439b7694be))
+* **core:** let decisions into the distill pool and summary buckets ([#539](https://github.com/7xuanlu/wenlan/issues/539)) ([63a7bf0](https://github.com/7xuanlu/wenlan/commit/63a7bf0c3467919b315d6e113a68e5cf764f9289))
+* **core:** reject junk entity names at the write seam and normalise entity_type ([#537](https://github.com/7xuanlu/wenlan/issues/537)) ([231794f](https://github.com/7xuanlu/wenlan/commit/231794f4e9cab8375f5152c7f2a2858249e6a711))
+* **db:** roll back leaked transactions and detect them at phase boundaries ([#520](https://github.com/7xuanlu/wenlan/issues/520)) ([2548e1e](https://github.com/7xuanlu/wenlan/commit/2548e1ebfb87b065045e9bfa1ecc7d272e026621))
+* **gate:** pre-push stays fast and non-compiling; heavy closure opt-in via WENLAN_PUSH_FULL; rebase-safe change detection ([#556](https://github.com/7xuanlu/wenlan/issues/556)) ([7f49bf9](https://github.com/7xuanlu/wenlan/commit/7f49bf973c3ebe21039d414b03d1a525f2e69d7d))
+* **gate:** store near-duplicate memories with a soft flag and skip superseded rows in the novelty check ([82f02c9](https://github.com/7xuanlu/wenlan/commit/82f02c9874a6d9ba714d8e7c666d46ed49adc442))
+* **harness:** hook wrappers allow outside any git repo, keep failing closed inside one ([#543](https://github.com/7xuanlu/wenlan/issues/543)) ([e2919fd](https://github.com/7xuanlu/wenlan/commit/e2919fd54ec57684b5488ad896eec9bce2306b37))
+* keep isolated app launches off the shared daemon; deliver update prompts during setup ([#517](https://github.com/7xuanlu/wenlan/issues/517)) ([dac69e3](https://github.com/7xuanlu/wenlan/commit/dac69e376d5bc451e8a74333659802e5c3634941))
+* **kg:** cascade the community/genesis substrate on space move and merge ([#555](https://github.com/7xuanlu/wenlan/issues/555)) ([246ec7e](https://github.com/7xuanlu/wenlan/commit/246ec7e52b4030c88b8aa9a121353d75c9d956fa))
+* **kg:** core data-integrity repairs and migration 124 (m113/m114 columns, cross-space edge fence, orphan edges on archive/delete, claim locator and inventory retirement) ([#547](https://github.com/7xuanlu/wenlan/issues/547)) ([f4900ac](https://github.com/7xuanlu/wenlan/commit/f4900ac84b4359037f1d04971f6636b8b473ad1c))
+* **kg:** keep provenance on folded edges, sentinel-aware uncategorized lint scope, decodable minhash merge proposals that stay dismissed, re-type entities when their vocabulary is accepted ([#551](https://github.com/7xuanlu/wenlan/issues/551)) ([4d610f6](https://github.com/7xuanlu/wenlan/commit/4d610f6598edeef37ee0a7f98d56a0639d63ddea))
+* **kg:** principled short-sha name rule, reject self-loop relations, drop dead fresh-DB backup guard, make the eval harness compile in CI ([#549](https://github.com/7xuanlu/wenlan/issues/549)) ([dc7da9b](https://github.com/7xuanlu/wenlan/commit/dc7da9b0e9e6ae6032dfbac657dab2965f3a2f95))
+* **kg:** read live edges instead of the frozen relations table in count_relations, stale-source diagnostics, and the quality pipeline test ([#548](https://github.com/7xuanlu/wenlan/issues/548)) ([0ea8270](https://github.com/7xuanlu/wenlan/commit/0ea8270394d5f3ec5f632d7a2af2424c31311530))
+* list staged page revision cards and review them from the page itself ([#538](https://github.com/7xuanlu/wenlan/issues/538)) ([c164aec](https://github.com/7xuanlu/wenlan/commit/c164aecefaecf9b9926ce8ddd925d0f14612a4ef))
+* make the repository buildable, testable, and pushable on Windows ([#534](https://github.com/7xuanlu/wenlan/issues/534)) ([6b3f664](https://github.com/7xuanlu/wenlan/commit/6b3f6640bd4326cc37eea2dc11159d02ab072e80))
+* **server:** entity observation validation, memory-link union on graph readers, link-entity 404, delete dead KG surfaces ([#554](https://github.com/7xuanlu/wenlan/issues/554)) ([44b1284](https://github.com/7xuanlu/wenlan/commit/44b12845b0d4abde9f578db1bce6c09707f82aa5))
+
 ## [0.15.8](https://github.com/7xuanlu/wenlan/compare/v0.15.7...v0.15.8) (2026-08-09)
 
 
