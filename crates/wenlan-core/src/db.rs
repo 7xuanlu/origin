@@ -219,19 +219,27 @@ fn legacy_read_scope(space: Option<&str>) -> ReadScope {
     }
 }
 
-fn superseder_not_exists(
-    scope: &ReadScope,
-    target_alias: &str,
-    superseder_conditions: &str,
-) -> String {
-    let scope_guard = if matches!(scope, ReadScope::Global) {
+/// The scope half of a superseder correlated subquery, shared by the negative
+/// (`superseder_not_exists`) and positive (`superseder_archives`) forms so a
+/// reader cannot answer "is this row hidden?" and "is this row archived?" over
+/// two different universes of superseders.
+fn superseder_scope_guard(scope: &ReadScope, target_alias: &str) -> String {
+    if matches!(scope, ReadScope::Global) {
         String::new()
     } else {
         format!(
             " AND ((superseder.space = {target_alias}.space) OR \
              (superseder.space IS NULL AND {target_alias}.space IS NULL))"
         )
-    };
+    }
+}
+
+fn superseder_not_exists(
+    scope: &ReadScope,
+    target_alias: &str,
+    superseder_conditions: &str,
+) -> String {
+    let scope_guard = superseder_scope_guard(scope, target_alias);
     format!(
         "NOT EXISTS (SELECT 1 FROM memories superseder \
          WHERE superseder.supersedes = {target_alias}.source_id \
@@ -271,23 +279,57 @@ pub(crate) fn not_self_archived(alias: &str) -> String {
     )
 }
 
-/// The distillation staging pool's "not genuinely superseded" test, shared by
-/// `query_distillation_staging_pool`, `query_distillation_seed_slice`, and
-/// `query_distillation_ann_neighbors` so the three cannot drift.
-///
-/// Mirrors the rule `search_memory_cross_rerank` applies: a row is superseded
+/// The one "genuinely superseded" test every reader shares: a row is hidden
 /// only when a non-pending memory supersedes it *and* that superseder's mode is
-/// `'hide'`. An `'archive'`-mode superseder leaves its predecessor visible, so
-/// the predecessor stays in the pool exactly as it stays in search. `Global`
-/// scope matches search's unscoped read; the pool applies its own space filter
-/// separately.
-fn distillation_not_superseded(alias: &str) -> String {
+/// `'hide'`. An `'archive'`-mode superseder leaves its predecessor VISIBLE BUT
+/// MUTED (see `not_self_archived` above), so the predecessor stays in the result
+/// and carries the `superseder_archives` flag instead of vanishing.
+///
+/// This exists as one shared definition because the alternative was measured:
+/// five list readers each hand-rolled a mode-blind `NOT EXISTS`, and every one
+/// of them silently dropped every memory a *decision* had replaced -- while
+/// search, reading the same rule correctly, still returned them. The store path
+/// stamps `'archive'` on every decision automatically, so the user never chose
+/// that outcome and could not see why a memory had become unreachable.
+///
+/// Callers pass their own scope. Readers that deliberately read unscoped (the
+/// distillation pool, which applies its own space filter afterwards) pass
+/// `Global` explicitly rather than getting it by default.
+pub(crate) fn not_hidden_by_superseder(scope: &ReadScope, alias: &str) -> String {
     superseder_not_exists(
-        &ReadScope::Global,
+        scope,
         alias,
         "superseder.pending_revision = 0 AND superseder.source = 'memory' \
          AND superseder.supersede_mode = 'hide'",
     )
+}
+
+/// The positive counterpart of `not_hidden_by_superseder`: TRUE when an
+/// `'archive'`-mode superseder replaced `alias`. Selected as `AS is_archived`
+/// so a list reader gets the muting flag in the same round trip as the row.
+///
+/// Deliberately a correlated `EXISTS` rather than search's second pass
+/// (`search_memory_with_cue` scans every archive-superseder in scope into a
+/// `HashSet` behind its own inlined `match scope` block). Five list sites
+/// copying that would mean five more hand-rolled scope blocks, which is the
+/// exact mechanism the doc comment above describes.
+pub(crate) fn superseder_archives(scope: &ReadScope, alias: &str) -> String {
+    let scope_guard = superseder_scope_guard(scope, alias);
+    format!(
+        "EXISTS (SELECT 1 FROM memories superseder \
+         WHERE superseder.supersedes = {alias}.source_id \
+         AND superseder.pending_revision = 0 AND superseder.source = 'memory' \
+         AND superseder.supersede_mode = 'archive'{scope_guard})"
+    )
+}
+
+/// The distillation staging pool's "not genuinely superseded" test, shared by
+/// `query_distillation_staging_pool`, `query_distillation_seed_slice`, and
+/// `query_distillation_ann_neighbors` so the three cannot drift. `Global` scope
+/// matches search's unscoped read; the pool applies its own space filter
+/// separately.
+fn distillation_not_superseded(alias: &str) -> String {
+    not_hidden_by_superseder(&ReadScope::Global, alias)
 }
 
 fn capture_memory_source(source: &str) -> &str {
@@ -31273,6 +31315,9 @@ impl MemoryDB {
                 pinned: row.get::<i64>(12).unwrap_or(0) != 0,
                 created_at: 0, // not fetched in list_indexed_files aggregate query
                 content: String::new(), // not fetched in list_indexed_files aggregate query
+                // This reader is a raw file inventory with no superseder test at
+                // all, so it has no archive state to report.
+                is_archived: false,
             });
         }
         Ok(files)
@@ -32797,11 +32842,8 @@ impl MemoryDB {
     ) -> Result<Vec<MemoryItem>, WenlanError> {
         let conn = self.conn.lock().await;
 
-        let hidden_by_superseder = superseder_not_exists(
-            scope,
-            "memories",
-            "superseder.pending_revision = 0 AND superseder.source = 'memory'",
-        );
+        let hidden_by_superseder = not_hidden_by_superseder(scope, "memories");
+        let is_archived = superseder_archives(scope, "memories");
         let mut sql = format!(
             "SELECT source_id, title,
                     GROUP_CONCAT(content, '\n') as content,
@@ -32831,7 +32873,8 @@ impl MemoryDB {
                     SUM(access_count) as access_count,
                     MAX(source_text) as source_text,
                     MAX(version) as version,
-                    MAX(changelog) as changelog
+                    MAX(changelog) as changelog,
+                    {is_archived} AS is_archived
              FROM memories
              WHERE source = 'memory'
                AND pending_revision = 0
@@ -32902,6 +32945,7 @@ impl MemoryDB {
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
                 version: row.get::<i64>(23).unwrap_or(1),
                 changelog: row.get::<Option<String>>(24).unwrap_or(None),
+                is_archived: row.get::<i64>(25).unwrap_or(0) != 0,
                 pending_revision: false,
                 merged_from: None,
             });
@@ -32915,7 +32959,11 @@ impl MemoryDB {
         source_id: &str,
     ) -> Result<Option<MemoryItem>, WenlanError> {
         let conn = self.conn.lock().await;
-        let sql = "SELECT source_id, title,
+        // Detail is reached by id from any surface, so it reads unscoped; the
+        // flag has to agree with whichever list the click came from.
+        let is_archived = superseder_archives(&ReadScope::Global, "memories");
+        let sql = format!(
+            "SELECT source_id, title,
                     GROUP_CONCAT(content, '\n') as content,
                     MAX(summary) as summary,
                     MAX(memory_type) as memory_type,
@@ -32943,15 +32991,17 @@ impl MemoryDB {
                     SUM(access_count) as access_count,
                     MAX(source_text) as source_text,
                     MAX(version) as version,
-                    MAX(changelog) as changelog
+                    MAX(changelog) as changelog,
+                    {is_archived} AS is_archived
              FROM memories
              WHERE pending_revision = 0
                AND source != 'episode'
                AND source_id = ?1
-             GROUP BY source_id";
+             GROUP BY source_id"
+        );
 
         let mut rows = conn
-            .query(sql, libsql::params![source_id])
+            .query(&sql, libsql::params![source_id])
             .await
             .map_err(|e| WenlanError::VectorDb(format!("get_memory_detail: {}", e)))?;
 
@@ -32986,6 +33036,7 @@ impl MemoryDB {
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
                 version: row.get::<i64>(23).unwrap_or(1),
                 changelog: row.get::<Option<String>>(24).unwrap_or(None),
+                is_archived: row.get::<i64>(25).unwrap_or(0) != 0,
                 pending_revision: false,
                 merged_from: None,
             }))
@@ -33010,6 +33061,9 @@ impl MemoryDB {
             .map(|(i, _)| format!("?{}", i + 1))
             .collect::<Vec<_>>()
             .join(",");
+        // Fetched by id from any surface, so unscoped -- same reasoning as
+        // `get_memory_detail`.
+        let is_archived = superseder_archives(&ReadScope::Global, "memories");
         let sql = format!(
             "SELECT source_id, title,
                 GROUP_CONCAT(content, '\n') as content,
@@ -33039,7 +33093,8 @@ impl MemoryDB {
                 SUM(access_count) as access_count,
                 MAX(source_text) as source_text,
                 MAX(version) as version,
-                MAX(changelog) as changelog
+                MAX(changelog) as changelog,
+                {is_archived} AS is_archived
              FROM memories
              WHERE pending_revision = 0
                AND source != 'episode'
@@ -33090,6 +33145,7 @@ impl MemoryDB {
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
                 version: row.get::<i64>(23).unwrap_or(1),
                 changelog: row.get::<Option<String>>(24).unwrap_or(None),
+                is_archived: row.get::<i64>(25).unwrap_or(0) != 0,
                 pending_revision: false,
                 merged_from: None,
             };
@@ -33133,6 +33189,7 @@ impl MemoryDB {
             .map(libsql::Value::Text)
             .collect::<Vec<_>>();
         push_read_scope_filter_folded(scope, "space", &mut conditions, &mut values);
+        let is_archived = superseder_archives(scope, "memories");
         let sql = format!(
             "SELECT source_id, title,
                 GROUP_CONCAT(content, '\n') as content,
@@ -33162,7 +33219,8 @@ impl MemoryDB {
                 SUM(access_count) as access_count,
                 MAX(source_text) as source_text,
                 MAX(version) as version,
-                MAX(changelog) as changelog
+                MAX(changelog) as changelog,
+                {is_archived} AS is_archived
              FROM memories
              WHERE {}
              GROUP BY source_id",
@@ -33206,6 +33264,7 @@ impl MemoryDB {
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
                 version: row.get::<i64>(23).unwrap_or(1),
                 changelog: row.get::<Option<String>>(24).unwrap_or(None),
+                is_archived: row.get::<i64>(25).unwrap_or(0) != 0,
                 pending_revision: false,
                 merged_from: None,
             };
@@ -33238,11 +33297,8 @@ impl MemoryDB {
         scope: &ReadScope,
     ) -> Result<Vec<MemoryItem>, WenlanError> {
         let conn = self.conn.lock().await;
-        let hidden_by_superseder = superseder_not_exists(
-            scope,
-            "memories",
-            "superseder.pending_revision = 0 AND superseder.source = 'memory'",
-        );
+        let hidden_by_superseder = not_hidden_by_superseder(scope, "memories");
+        let is_archived = superseder_archives(scope, "memories");
         let supersedes_exclusion = format!("AND pending_revision = 0 AND {hidden_by_superseder}");
 
         let space_clause = match scope {
@@ -33282,7 +33338,8 @@ impl MemoryDB {
                     SUM(access_count) as access_count,
                     MAX(source_text) as source_text,
                     MAX(version) as version,
-                    MAX(changelog) as changelog
+                    MAX(changelog) as changelog,
+                    {is_archived} AS is_archived
              FROM memories
              WHERE source = 'memory' AND memory_type = ?1 AND confirmed != 0
              {} {}
@@ -33339,109 +33396,7 @@ impl MemoryDB {
                 source_text: row.get::<Option<String>>(22).unwrap_or(None),
                 version: row.get::<i64>(23).unwrap_or(1),
                 changelog: row.get::<Option<String>>(24).unwrap_or(None),
-                pending_revision: false,
-                merged_from: None,
-            });
-        }
-        Ok(items)
-    }
-
-    /// Load decision memories for the timeline view.
-    /// Filters to `source = 'memory' AND memory_type = 'decision' AND chunk_index = 0`.
-    /// Returns full `MemoryItem` rows with `structured_fields` for expanded view.
-    pub async fn load_decisions(
-        &self,
-        space: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<MemoryItem>, WenlanError> {
-        let conn = self.conn.lock().await;
-        let supersedes_exclusion = "AND pending_revision = 0 AND source_id NOT IN (SELECT supersedes FROM memories WHERE supersedes IS NOT NULL AND pending_revision = 0 AND source = 'memory' GROUP BY supersedes)";
-
-        let space_clause = if space.is_some() {
-            "AND space = ?2"
-        } else {
-            ""
-        };
-
-        let sql = format!(
-            "SELECT source_id, MAX(title) as title,
-                    GROUP_CONCAT(content, '\n') as content,
-                    MAX(summary) as summary,
-                    MAX(memory_type) as memory_type,
-                    MAX(space) as space,
-                    MAX(source_agent) as source_agent,
-                    MAX(confidence) as confidence,
-                    MAX(confirmed) as confirmed,
-                    MAX(stability) as stability,
-                    MAX(pinned) as pinned,
-                    MAX(supersedes) as supersedes,
-                    MAX(last_modified) as last_modified,
-                    COUNT(*) as chunk_count,
-                    MAX(entity_id) as entity_id,
-                    MAX(quality) as quality,
-                    MAX(is_recap) as is_recap,
-                    (SELECT CASE
-                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
-                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
-                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
-                        ELSE 'enrichment_partial'
-                    END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
-                    MAX(supersede_mode) as supersede_mode,
-                    MAX(structured_fields) as structured_fields,
-                    MAX(retrieval_cue) as retrieval_cue,
-                    SUM(access_count) as access_count,
-                    MAX(source_text) as source_text,
-                    MAX(version) as version,
-                    MAX(changelog) as changelog
-             FROM memories
-             WHERE source = 'memory' AND memory_type = 'decision' AND chunk_index = 0 AND confirmed != 0
-             {} {}
-             GROUP BY source_id
-             ORDER BY last_modified DESC
-             LIMIT ?1",
-            supersedes_exclusion, space_clause
-        );
-
-        let mut rows = if let Some(d) = space {
-            conn.query(&sql, libsql::params![limit as i64, d.to_string()])
-                .await
-        } else {
-            conn.query(&sql, libsql::params![limit as i64]).await
-        }
-        .map_err(|e| WenlanError::VectorDb(format!("load_decisions: {}", e)))?;
-
-        let mut items = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-        {
-            items.push(MemoryItem {
-                source_id: row.get::<String>(0).unwrap_or_default(),
-                title: row.get::<String>(1).unwrap_or_default(),
-                content: row.get::<String>(2).unwrap_or_default(),
-                summary: row.get::<Option<String>>(3).unwrap_or(None),
-                memory_type: row.get::<Option<String>>(4).unwrap_or(None),
-                space: row.get::<Option<String>>(5).unwrap_or(None),
-                source_agent: row.get::<Option<String>>(6).unwrap_or(None),
-                confidence: row.get::<Option<f64>>(7).unwrap_or(None).map(|v| v as f32),
-                confirmed: row.get::<i64>(8).unwrap_or(0) != 0,
-                stability: row.get::<Option<String>>(9).unwrap_or(None),
-                pinned: row.get::<i64>(10).unwrap_or(0) != 0,
-                supersedes: row.get::<Option<String>>(11).unwrap_or(None),
-                last_modified: row.get::<i64>(12).unwrap_or(0),
-                chunk_count: row.get::<u64>(13).unwrap_or(0),
-                entity_id: row.get::<Option<String>>(14).unwrap_or(None),
-                quality: row.get::<Option<String>>(15).unwrap_or(None),
-                is_recap: row.get::<i64>(16).unwrap_or(0) != 0,
-                enrichment_status: row.get::<String>(17).unwrap_or_else(|_| "raw".to_string()),
-                supersede_mode: row.get::<String>(18).unwrap_or_else(|_| "hide".to_string()),
-                structured_fields: row.get::<Option<String>>(19).unwrap_or(None),
-                retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
-                access_count: row.get::<u64>(21).unwrap_or(0),
-                source_text: row.get::<Option<String>>(22).unwrap_or(None),
-                version: row.get::<i64>(23).unwrap_or(1),
-                changelog: row.get::<Option<String>>(24).unwrap_or(None),
+                is_archived: row.get::<i64>(25).unwrap_or(0) != 0,
                 pending_revision: false,
                 merged_from: None,
             });
@@ -33550,9 +33505,19 @@ impl MemoryDB {
                 params.push(1i64.into());
                 idx += 1;
             } else {
-                // NULL means "not yet confirmed" — include both explicit 0 and NULL.
-                // Also exclude archived supersedes and recap rows to match the
-                // same set returned by list_unconfirmed_memories.
+                // NULL means "not yet confirmed" — include both explicit 0 and
+                // NULL. The next two conditions are copied from
+                // `list_unconfirmed_memories_scoped`'s WHERE so the two
+                // unconfirmed-review surfaces agree on self-state exclusions:
+                // an `'archive'`/`'evicted'` row is merge or eviction residue,
+                // and a recap is not a capture to review.
+                //
+                // The two readers are NOT the same set, and never were: this
+                // one additionally drops pending revisions, episode rows, and
+                // hide-superseded rows, none of which
+                // `list_unconfirmed_memories_scoped` filters on at all — it
+                // carries no superseder test whatsoever. Do not restore the
+                // "same set" claim that used to sit here.
                 conditions.push("(confirmed = 0 OR confirmed IS NULL)".to_string());
                 conditions.push(
                     "(supersede_mode IS NULL OR supersede_mode NOT IN ('archive', 'evicted'))"
@@ -33562,15 +33527,14 @@ impl MemoryDB {
             }
         }
 
-        // Exclude superseded memories and pending revisions
+        // Exclude hide-superseded memories and pending revisions. An
+        // `'archive'`-mode superseder does NOT remove its predecessor here --
+        // it stays listed and carries `is_archived` for the UI to mute.
         conditions.push("pending_revision = 0".to_string());
         // T2: never list verbatim episode rows in the filtered file view.
         conditions.push("source != 'episode'".to_string());
-        conditions.push(superseder_not_exists(
-            scope,
-            "memories",
-            "superseder.pending_revision = 0 AND superseder.source = 'memory'",
-        ));
+        conditions.push(not_hidden_by_superseder(scope, "memories"));
+        let is_archived = superseder_archives(scope, "memories");
 
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -33588,7 +33552,8 @@ impl MemoryDB {
                     MAX(memory_type), MAX(space), MAX(source_agent),
                     MAX(CAST(confidence AS REAL)), MAX(confirmed), MAX(pinned),
                     MAX(created_at) as created_at,
-                    MAX(content) as content
+                    MAX(content) as content,
+                    {is_archived} AS is_archived
              FROM memories
              {}
              GROUP BY source_id
@@ -33625,6 +33590,7 @@ impl MemoryDB {
                     .get::<Option<String>>(14)
                     .unwrap_or(None)
                     .unwrap_or_default(),
+                is_archived: row.get::<i64>(15).unwrap_or(0) != 0,
             });
         }
 
@@ -40249,6 +40215,13 @@ impl MemoryDB {
                 "AND (c.space IS NULL OR c.space = '00000000-0000-4000-8000-000000000001')"
             }
         };
+        // Deliberately NOT `not_hidden_by_superseder`. This reader is Tier A in
+        // `contracts/m5-reader-manifest-inventory.md` and is certified in
+        // `truth_manifest.rs`; its superseder clause omits
+        // `superseder.pending_revision = 0` as part of that contract. Adopting the
+        // shared helper would change a review-queue contract as a side effect of a
+        // change about lists, so it stays on the mode-blind predicate until a PR
+        // that argues for it and updates the inventory doc in the same commit.
         let hidden_by_superseder =
             superseder_not_exists(scope, "c", "superseder.source = 'memory'");
         let sql = format!(
@@ -40327,6 +40300,10 @@ impl MemoryDB {
                 source_text: row.get::<Option<String>>(21).unwrap_or(None),
                 version: row.get::<i64>(22).unwrap_or(1),
                 changelog: row.get::<Option<String>>(23).unwrap_or(None),
+                // Always false, and correct rather than merely unfilled: the
+                // predicate above drops every row that has any memory superseder,
+                // archive-mode included, so no row reaching here can be archived.
+                is_archived: false,
                 pending_revision: false,
                 merged_from: None,
             });

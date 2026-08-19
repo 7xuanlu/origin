@@ -7123,6 +7123,152 @@ async fn test_superseded_decision_archive_visible() {
         old_result.is_archived,
         "old decision should be marked archived"
     );
+
+    // ...and the list surfaces must agree with search: `'archive'` keeps the
+    // predecessor VISIBLE BUT MUTED, so it stays in the list flagged rather
+    // than being dropped (`db::not_hidden_by_superseder` / `is_archived`).
+    let listed = db
+        .list_filtered_confirmed_scoped(Some("memory"), None, &ReadScope::Global, None, 50)
+        .await
+        .unwrap();
+    let listed_ids: Vec<&str> = listed.iter().map(|f| f.source_id.as_str()).collect();
+    assert!(
+        listed_ids.contains(&"mem_old"),
+        "archive-superseded decision must stay in the list; got {:?}",
+        listed_ids
+    );
+
+    // Present is only half of it. Present-but-unmarked trades an invisible
+    // memory for an indistinguishable one, so the list has to carry the same
+    // flag search does.
+    let listed_old = listed
+        .iter()
+        .find(|f| f.source_id == "mem_old")
+        .expect("mem_old asserted present above");
+    assert!(
+        listed_old.is_archived,
+        "listed archive-superseded decision must be flagged is_archived"
+    );
+    let listed_new = listed
+        .iter()
+        .find(|f| f.source_id == "mem_new")
+        .expect("superseding decision should be listed");
+    assert!(
+        !listed_new.is_archived,
+        "the superseder itself is not archived -- `supersede_mode` on mem_new \
+         describes how it treats mem_old, not its own state"
+    );
+}
+
+/// The other side of the contract: `'hide'` really does hide, so admitting
+/// archive-superseded rows to the lists has not turned the superseder test off.
+#[tokio::test]
+async fn test_superseded_decision_hide_mode_absent_from_list() {
+    let (db, _dir) = test_db().await;
+
+    // Facts get supersede_mode='hide' rather than 'archive'.
+    let old_doc = make_memory_doc(
+        "hidelist_old",
+        "Deploys run from the laptop by hand",
+        "fact",
+        "engineering",
+        "claude",
+    );
+    db.upsert_documents(vec![old_doc]).await.unwrap();
+
+    let mut new_doc = make_memory_doc(
+        "hidelist_new",
+        "Deploys run from CI on every merge",
+        "fact",
+        "engineering",
+        "claude",
+    );
+    new_doc.supersedes = Some("hidelist_old".to_string());
+    db.upsert_documents(vec![new_doc]).await.unwrap();
+
+    let listed = db
+        .list_filtered_confirmed_scoped(Some("memory"), None, &ReadScope::Global, None, 50)
+        .await
+        .unwrap();
+    let listed_ids: Vec<&str> = listed.iter().map(|f| f.source_id.as_str()).collect();
+    assert!(
+        listed_ids.contains(&"hidelist_new"),
+        "superseding fact should be listed; got {:?}",
+        listed_ids
+    );
+    assert!(
+        !listed_ids.contains(&"hidelist_old"),
+        "hide-superseded fact must stay out of the list; got {:?}",
+        listed_ids
+    );
+
+    // And the same rule holds for the MemoryItem list readers, which is where
+    // five hand-rolled copies of this predicate used to live.
+    let items = db
+        .list_memories_scoped(&ReadScope::Global, None, None, None, 50)
+        .await
+        .unwrap();
+    let item_ids: Vec<&str> = items.iter().map(|m| m.source_id.as_str()).collect();
+    assert!(
+        !item_ids.contains(&"hidelist_old"),
+        "hide-superseded fact must stay out of list_memories_scoped; got {:?}",
+        item_ids
+    );
+}
+
+/// `list_memories_scoped` is the Decisions-page reader and one of the five
+/// sites that used to drop the row. It must agree with the file list.
+#[tokio::test]
+async fn test_superseded_decision_archive_flagged_in_memory_items() {
+    let (db, _dir) = test_db().await;
+
+    let old_doc = make_memory_doc(
+        "itemarch_old",
+        "We chose MongoDB for the database system",
+        "decision",
+        "engineering",
+        "claude",
+    );
+    db.upsert_documents(vec![old_doc]).await.unwrap();
+
+    let mut new_doc = make_memory_doc(
+        "itemarch_new",
+        "We chose PostgreSQL for the database system instead",
+        "decision",
+        "engineering",
+        "claude",
+    );
+    new_doc.supersedes = Some("itemarch_old".to_string());
+    db.upsert_documents(vec![new_doc]).await.unwrap();
+
+    let items = db
+        .list_memories_scoped(&ReadScope::Global, None, None, None, 50)
+        .await
+        .unwrap();
+    let old = items
+        .iter()
+        .find(|m| m.source_id == "itemarch_old")
+        .unwrap_or_else(|| {
+            panic!(
+                "archive-superseded decision must stay in list_memories_scoped; got {:?}",
+                items.iter().map(|m| &m.source_id).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        old.is_archived,
+        "list_memories_scoped must flag the archive-superseded decision"
+    );
+
+    // Detail is reached by clicking that row; it must not contradict the list.
+    let detail = db
+        .get_memory_detail("itemarch_old")
+        .await
+        .unwrap()
+        .expect("detail for a listed memory");
+    assert!(
+        detail.is_archived,
+        "get_memory_detail must agree with the list it was reached from"
+    );
 }
 
 #[tokio::test]

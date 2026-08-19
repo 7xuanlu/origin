@@ -1193,6 +1193,7 @@ pub async fn list_memories_cmd(
             chunk_count: info.chunk_count,
             entity_id: None,
             quality: None,
+            is_archived: info.is_archived,
             is_recap: info.source_id.starts_with("recap_"),
             enrichment_status: String::from("raw"),
             supersede_mode: String::from("hide"),

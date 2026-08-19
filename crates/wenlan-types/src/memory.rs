@@ -102,6 +102,13 @@ pub struct MemoryItem {
     pub entity_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quality: Option<String>,
+    /// True when an `'archive'`-mode superseder replaced this row. Such a row
+    /// stays listed — `'archive'` keeps the predecessor visible but muted — and
+    /// the UI fades and labels it. Distinct from `supersede_mode`, which is this
+    /// row's behaviour toward the rows *it* supersedes. Parity with
+    /// `SearchResult::is_archived`.
+    #[serde(default)]
+    pub is_archived: bool,
     #[serde(default)]
     pub is_recap: bool,
     pub enrichment_status: String,
@@ -218,6 +225,12 @@ pub struct IndexedFileInfo {
     /// include it (e.g. aggregate file-list queries).
     #[serde(default)]
     pub content: String,
+    /// True when an `'archive'`-mode superseder replaced this row. Same meaning
+    /// as `MemoryItem::is_archived`, which `POST /api/memory/list` responses are
+    /// converted into for the UI. `false` from producers that do not compute it
+    /// (e.g. `list_indexed_files`, a raw file inventory with no superseder test).
+    #[serde(default)]
+    pub is_archived: bool,
 }
 
 /// Home dashboard statistics.
@@ -473,6 +486,7 @@ mod indexed_file_info_created_at_test {
             pinned: false,
             created_at,
             content: String::new(),
+            is_archived: false,
         }
     }
 
