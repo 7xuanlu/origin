@@ -99,7 +99,7 @@ export default function MemoryListRow({
       className="memory-list-row"
       onKeyDown={handleKeyDown}
       tabIndex={0}
-      style={style}
+      style={memory.is_archived ? { opacity: 0.55, ...style } : style}
     >
       <div className="memory-list-row-body">
         <div className="memory-list-row-copy">
@@ -111,6 +111,11 @@ export default function MemoryListRow({
           >
             {rowTitle}
           </button>
+          {/* Archive-superseded: kept visible but muted, so say why. Opacity
+              alone is overloaded here, so the row needs words too. */}
+          {memory.is_archived && (
+            <span className="memory-list-row-archived">{t("entityDetail.archived")}</span>
+          )}
           {displayText && displayText !== rowTitle && (
             <p className="memory-list-row-preview">
               <ContentRenderer

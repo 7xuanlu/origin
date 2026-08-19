@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useState, useEffect } from "react";
+import { useTranslation } from "react-i18next";
 import { FACET_COLORS, STABILITY_TIERS, agentDisplayName, type MemoryItem, type MemoryVersionItem, type PendingRevision, getPendingRevision, acceptPendingRevision, dismissPendingRevision } from "../../lib/tauri";
 import ContentRenderer from "./ContentRenderer";
 import MemoryListRow from "./MemoryListRow";
@@ -52,6 +53,7 @@ export default function MemoryCard({
   const [showChangelog, setShowChangelog] = useState(false);
 
   const facetType = memory.memory_type ?? "fact";
+  const { t } = useTranslation();
   const isRecap = memory.is_recap === true;
   const tier = STABILITY_TIERS[facetType] ?? "ephemeral";
   const confidence = memory.confidence ?? 0;
@@ -237,7 +239,7 @@ export default function MemoryCard({
       className="group relative h-full flex flex-col"
       style={{
         borderLeft: `3px solid ${borderColor}`,
-        opacity: isSuperseded
+        opacity: isSuperseded || memory.is_archived
           ? 0.55
           : stability === "confirmed" || maturity === "distilled"
             ? 1
@@ -383,6 +385,10 @@ export default function MemoryCard({
                     {facetType}
                   </span>
                 )}
+                {/* Archive-superseded: kept visible but muted, so say why. No
+                    middle-dot separator — matches EntityContextRail, and the
+                    hardcoded-copy guard ratchets that entity's per-file count. */}
+                {memory.is_archived && <span>{t("entityDetail.archived")}</span>}
                 {/* Pin indicator */}
                 {memory.pinned && (
                   <>

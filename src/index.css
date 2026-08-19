@@ -1709,6 +1709,12 @@ html[data-theme="light"] {
   color: var(--mem-accent-page);
 }
 
+.memory-list-row-archived {
+  color: var(--mem-text-tertiary);
+  font-family: var(--mem-font-mono);
+  font-size: 10px;
+}
+
 .memory-list-row-preview {
   display: -webkit-box;
   max-width: 76ch;

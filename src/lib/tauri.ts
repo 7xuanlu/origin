@@ -1014,6 +1014,15 @@ export interface MemoryItem {
   is_recap?: boolean;
   enrichment_status?: string;
   supersede_mode?: string;
+  /**
+   * True when an `'archive'`-mode superseder replaced this memory. The row stays
+   * listed — `'archive'` keeps the predecessor visible but muted — and the UI
+   * fades and labels it. Distinct from `supersede_mode`, which is this row's
+   * behaviour toward the rows *it* supersedes.
+   */
+  is_archived?: boolean;
+  pending_revision?: boolean;
+  merged_from?: string[] | null;
   structured_fields?: string | null;  // JSON string from Rust
   retrieval_cue?: string | null;
   access_count?: number;
