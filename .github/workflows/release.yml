@@ -463,12 +463,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          # Git Bash on Windows rewrites arguments that look like absolute POSIX
-          # paths ("/repos/...") into filesystem paths, which broke this `gh api`
-          # tag check in the v0.16.0 release run. Scoped to this step only:
-          # job-wide it also breaks the pnpm shim, which relies on that
-          # conversion to find its own install path.
-          MSYS_NO_PATHCONV: "1"
         run: |
           set -euo pipefail
           checkout_sha="$(git rev-parse HEAD)"
@@ -607,6 +601,12 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          # Git Bash on Windows rewrites arguments that look like absolute POSIX
+          # paths ("/repos/...") into filesystem paths, which broke this `gh api`
+          # tag check in the v0.16.0 release run. Scoped to this step only:
+          # job-wide it also breaks the pnpm shim, which relies on that
+          # conversion to find its own install path.
+          MSYS_NO_PATHCONV: "1"
         run: |
           set -euo pipefail
           checkout_sha="$(git rev-parse HEAD)"
