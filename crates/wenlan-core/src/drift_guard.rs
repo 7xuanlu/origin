@@ -6084,8 +6084,37 @@ fn release_promotion_contract_violations(
     {
         violations.push("receipt-derived tag binding lacks isolated write authority".into());
     }
-    if release_workflow.matches("secrets.RELEASE_TOKEN").count() != 1 {
-        violations.push("release recovery token is not confined to the exact tag bind".into());
+    // The PAT is confined to two REST-only sites: the tag bind above and the
+    // release-as cleanup PR in finalize-release (a GITHUB_TOKEN-created branch
+    // would not trigger the cleanup PR's required CI). A third occurrence is
+    // drift.
+    if release_workflow.matches("secrets.RELEASE_TOKEN").count() != 2 {
+        violations.push(
+            "release token is not confined to the exact tag bind and the release-as cleanup step"
+                .into(),
+        );
+    }
+    let cleanup_step = job_step(
+        &release,
+        "finalize-release",
+        "Open the release-as override cleanup PR",
+    );
+    let cleanup_run = cleanup_step
+        .and_then(|step| step["run"].as_str())
+        .unwrap_or_default();
+    let finalize_text =
+        serde_yaml::to_string(&release["jobs"]["finalize-release"]).unwrap_or_default();
+    if cleanup_step.and_then(|step| step["env"]["GH_TOKEN"].as_str())
+        != Some("${{ secrets.RELEASE_TOKEN }}")
+        || finalize_text.contains("actions/checkout@")
+        || !cleanup_run.contains(r#"if [[ "$RELEASE_TAG" == *-* ]]"#)
+        || !cleanup_run.contains("contents/release-please-config.json?ref=main")
+        || !cleanup_run.contains("/git/ref/heads/$branch")
+    {
+        violations.push(
+            "release-as cleanup step is missing, checks out code, or lost its prerelease/idempotency guards"
+                .into(),
+        );
     }
     for job_name in [
         "prepare-release",
