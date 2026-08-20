@@ -1501,6 +1501,16 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
         VALIDATOR._release_version_policy(json.dumps(base), "0.15.3", "1.0.0")
         with self.assertRaisesRegex(VALIDATOR.CandidateError, "exactly match release-as"):
             VALIDATOR._release_version_policy(json.dumps(base), "0.15.3", "0.15.4")
+        # A leftover override (its version already released) must fail loudly
+        # instead of re-proposing the same release: release-please never
+        # removes a consumed release-as on its own.
+        for stale in ["0.15.3", "0.15.2"]:
+            with self.subTest(stale_release_as=stale), self.assertRaisesRegex(
+                VALIDATOR.CandidateError, "release-as override .* is stale"
+            ):
+                hostile = json.loads(json.dumps(base))
+                hostile["packages"]["."]["release-as"] = stale
+                VALIDATOR._release_version_policy(json.dumps(hostile), "0.15.3", stale)
 
     def test_release_version_policy_accepts_the_real_repo_config(self) -> None:
         # Regression: round 1 of the version-lockstep work added an

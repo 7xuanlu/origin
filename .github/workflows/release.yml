@@ -1717,3 +1717,79 @@ jobs:
             <<<"$labels" >/dev/null
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Open the release-as override cleanup PR
+        # A deliberate minor/major is steered by a one-shot `release-as`
+        # override in release-please-config.json (RELEASING.md,
+        # version-steering policy), but release-please never consumes it: its
+        # docs warn that later runs "will continue to use this version". Once
+        # the overridden version is released, open the removal PR here so
+        # nobody has to remember it; the candidate validator independently
+        # rejects a stale override, so a forgotten merge fails the next
+        # release candidate instead of re-tagging. Everything runs through the
+        # REST API against fresh `main` content — no checkout, and the commit
+        # is pushed with RELEASE_TOKEN because a GITHUB_TOKEN-created branch
+        # would not trigger the PR's required CI. Merging stays manual.
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            echo "$RELEASE_TAG is a prerelease tag; leaving any override in place."
+            exit 0
+          fi
+          config_response="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/contents/release-please-config.json?ref=main")"
+          jq -r '.content' <<<"$config_response" | base64 -d > "$RUNNER_TEMP/rp-config.json"
+          release_as="$(jq -r '.packages["."]["release-as"] // empty' "$RUNNER_TEMP/rp-config.json")"
+          if [[ -z "$release_as" ]]; then
+            echo "No release-as override on main; nothing to clean up."
+            exit 0
+          fi
+          if [[ "$release_as" != "$version" ]]; then
+            echo "Override on main is $release_as, not the just-released $version; leaving it for a human."
+            exit 0
+          fi
+          branch="release-as-cleanup-$version"
+          if gh api "/repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" >/dev/null 2>&1; then
+            echo "Cleanup branch $branch already exists; assuming an earlier attempt opened the PR."
+            exit 0
+          fi
+          python3 - "$RUNNER_TEMP/rp-config.json" <<'PY'
+          import json, sys
+          path = sys.argv[1]
+          with open(path) as f:
+              config = json.load(f)
+          config["packages"]["."].pop("release-as", None)
+          with open(path, "w") as f:
+              json.dump(config, f, indent=2)
+              f.write("\n")
+          PY
+          main_sha="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          gh api --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/heads/$branch" -f sha="$main_sha" >/dev/null
+          gh api --method PUT \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/contents/release-please-config.json" \
+            -f message="chore: drop the release-as override now that $version is cut" \
+            -f content="$(base64 < "$RUNNER_TEMP/rp-config.json" | tr -d '\n')" \
+            -f sha="$(jq -r '.sha' <<<"$config_response")" \
+            -f branch="$branch" >/dev/null
+          jq -n \
+            --arg title "chore: drop the release-as override now that $version is cut" \
+            --arg head "$branch" \
+            --arg body "Automated follow-up from the v$version release: the one-shot release-as override has been consumed, and release-please would otherwise keep proposing $version (see RELEASING.md, version-steering policy). The candidate validator rejects a stale override, so merging this unblocks the next release." \
+            '{title: $title, head: $head, base: "main", body: $body}' \
+          | gh api --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/pulls" --input - --jq '.html_url'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
