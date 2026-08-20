@@ -324,10 +324,10 @@ pub(crate) fn superseder_archives(scope: &ReadScope, alias: &str) -> String {
 }
 
 /// The distillation staging pool's "not genuinely superseded" test, shared by
-/// `query_distillation_staging_pool`, `query_distillation_seed_slice`, and
-/// `query_distillation_ann_neighbors` so the three cannot drift. `Global` scope
-/// matches search's unscoped read; the pool applies its own space filter
-/// separately.
+/// `query_distillation_staging_pool`, `query_distillation_seed_slice`,
+/// `query_distillation_ann_neighbors`, and `load_summary_buckets` so the four
+/// cannot drift. `Global` scope matches search's unscoped read; the pool applies
+/// its own space filter separately.
 fn distillation_not_superseded(alias: &str) -> String {
     not_hidden_by_superseder(&ReadScope::Global, alias)
 }
