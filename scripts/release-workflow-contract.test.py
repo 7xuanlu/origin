@@ -379,8 +379,30 @@ def contract_violations(
         or 'index("autorelease: tagged") == null' not in bind
     ):
         violations.append("receipt-derived tag binding lacks isolated write authority")
-    if release.count("secrets.RELEASE_TOKEN") != 1:
-        violations.append("release recovery token is not confined to the exact tag bind")
+    # The PAT is deliberately confined to two REST-only sites: the tag bind
+    # above, and the release-as cleanup PR in finalize-release (a
+    # GITHUB_TOKEN-created branch would not trigger the cleanup PR's required
+    # CI). Any third occurrence is drift.
+    if release.count("secrets.RELEASE_TOKEN") != 2:
+        violations.append(
+            "release token is not confined to the exact tag bind and the"
+            " release-as cleanup step"
+        )
+    cleanup = named_step_body(
+        job_body(release, "finalize-release"),
+        "Open the release-as override cleanup PR",
+    )
+    if (
+        cleanup.count("secrets.RELEASE_TOKEN") != 1
+        or "actions/checkout@" in cleanup
+        or 'if [[ "$RELEASE_TAG" == *-* ]]' not in cleanup
+        or "contents/release-please-config.json?ref=main" not in cleanup
+        or "/git/ref/heads/$branch" not in cleanup
+    ):
+        violations.append(
+            "release-as cleanup step is missing, checks out code, or lost its"
+            " prerelease/idempotency guards"
+        )
     if any(
         marker not in resolver_checkout
         for marker in ["actions: read", "contents: read", "pull-requests: read"]
