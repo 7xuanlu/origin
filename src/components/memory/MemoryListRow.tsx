@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
 import {
   FACET_COLORS,
@@ -93,13 +93,25 @@ export default function MemoryListRow({
 
   if (deleting) return null;
 
+  // Caller's style spreads first so the archived values always win.
+  // `--mem-enter-opacity` carries the muted value into the `mem-fade-up` end
+  // keyframe; without it that animation's retained fill resets the row to full
+  // opacity and the fade never shows, however the inline style is written.
   return (
     <article
       aria-label={rowTitle}
       className="memory-list-row"
       onKeyDown={handleKeyDown}
       tabIndex={0}
-      style={memory.is_archived ? { opacity: 0.55, ...style } : style}
+      style={
+        memory.is_archived
+          ? ({
+              ...style,
+              opacity: 0.55,
+              "--mem-enter-opacity": 0.55,
+            } as CSSProperties)
+          : style
+      }
     >
       <div className="memory-list-row-body">
         <div className="memory-list-row-copy">

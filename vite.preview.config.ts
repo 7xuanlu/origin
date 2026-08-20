@@ -11,9 +11,21 @@ import { fileURLToPath } from "node:url";
 const mock = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const stubs = mock("./preview/mocks/tauri-stubs.ts");
 
+// Verification must never run against the shared prod daemon on :7878 (dev and
+// prod share the platform data dir). Point this at an isolated instance with
+// `WENLAN_PREVIEW_DAEMON=http://127.0.0.1:17878`.
+const daemonTarget =
+  process.env.WENLAN_PREVIEW_DAEMON ?? "http://127.0.0.1:7878";
+
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   clearScreen: false,
+  // `RuntimeOverlays` reads this at module scope, so without it the whole app
+  // throws on first render and the preview shows a blank page. Matches
+  // `vite.config.ts`; the review harness is the only config that sets it true.
+  define: {
+    __WENLAN_REVIEW__: "false",
+  },
   resolve: {
     alias: {
       "@tauri-apps/api/core": mock("./preview/mocks/core.ts"),
@@ -33,7 +45,7 @@ export default defineConfig({
     open: false,
     proxy: {
       "/daemon": {
-        target: "http://127.0.0.1:7878",
+        target: daemonTarget,
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/daemon/, ""),
       },
