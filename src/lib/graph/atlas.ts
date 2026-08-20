@@ -445,7 +445,8 @@ function shelfRows(boxes: ComponentBox[], maxWidth: number): ComponentBox[][] {
  * grasp first.
  *
  * Returns the node ids of each component in placement order — the core first,
- * so the caller can tell it from the shelved ones and pin the rest.
+ * so the caller can tell it from the shelved ones and hold each kind the way
+ * it needs (rigid centroid for the core, springs for the shelf).
  *
  * Pure in the sense that matters here: it reads x/y/size off the graph and
  * writes x/y back, touching nothing else and consulting no clock or random.
@@ -504,6 +505,10 @@ export function shelveComponents(graph: Graph): string[][] {
  *  to be told to leave the dragged one alone (see placeSatellites). */
 export interface AtlasSimulation extends Simulation<AtlasSimNode, undefined> {
   setDraggingId(id: string | null): void;
+  /** Put every unheld shelf component back on its slot right now, instead of
+   *  over the cooling tail. The release path uses it when there will be no
+   *  cooling tail (see shelfAnchorForce's `settle`). */
+  settleShelf(): void;
 }
 
 export interface AtlasSimNode extends SimulationNodeDatum {
@@ -693,6 +698,18 @@ function groupCenterForce(): {
  *  instead of snapping. */
 const SHELF_ANCHOR_STRENGTH = 0.1;
 
+/** What fraction of a component's remaining centroid offset is closed per
+ *  tick while no hand is on it. Deliberately NOT scaled by alpha, unlike every
+ *  other force here: alpha is a finite budget (it decays 3%/tick toward
+ *  alphaMin, so the whole cooling tail after a release sums to about 10), and
+ *  an alpha-scaled return of this shape completes only ~53% of the journey
+ *  before the simulation goes to sleep — measured as a 77.5-unit residual
+ *  offset, enough for a released pair to sit inside the core's box. Unscaled,
+ *  0.1 closes the offset geometrically (0.925 per tick after velocity decay)
+ *  and is done long before alphaMin. It is the same rate as the springs, so a
+ *  release reads as one motion rather than two. */
+const SHELF_RETURN_RATE = 0.1;
+
 /** One shelved node's slot, and which component it belongs to. */
 interface ShelfAnchor {
   x: number;
@@ -714,34 +731,55 @@ interface ShelfAnchor {
  *   even see it — on the 24/6/5 fixture a five-node chain raised its top edge
  *   9.1 units toward the core over 120 ticks under a centroid-only hold, and
  *   0.75 with these springs. Soft, so a drag still wins locally.
- * - Removal of each component's BULK velocity, for components with no hand on
- *   them. A spring this soft cannot balance the core's charge on its own: at
+ * - Control of each component's BULK velocity, for components with no hand on
+ *   them: whatever link and charge just handed the component as a whole is
+ *   replaced by exactly the velocity that carries its centroid back to the
+ *   slot, `offset * SHELF_RETURN_RATE`. Only the uniform part is touched — the
+ *   part that translates a component without changing its shape — so every
+ *   relative motion (a drag pulling a neighbor, collide opening a knot) is
+ *   left alone. This is what a spring this soft cannot do on its own: at
  *   capture scale the core's mass accelerates a distant component by roughly
  *   11 units per tick, which a 0.1 spring only cancels hundreds of units away
- *   from the slot. Subtracting the group's mean velocity — computed AFTER
- *   link and charge, before the spring — cancels exactly the uniform part of
- *   that field, the part that translates a component without changing its
- *   shape, and leaves every relative motion (a drag pulling a neighbor,
- *   collide opening a knot) untouched. Measured together at capture scale:
- *   28.5 units of drift under the centroid hold, 0.65 under these two.
+ *   from the slot. Measured together at capture scale: 28.5 units of drift
+ *   under the centroid hold, 0.65 under these two.
  *
- * A component the pointer is holding keeps its velocity: with one node pinned,
- * "the group's mean velocity" is mostly the drag response itself, and removing
- * it would clamp the very neighbors that are supposed to follow. The hand is
- * the constraint while it is down; the springs take over on release.
+ *   Steering home rather than simply zeroing the bulk velocity is what makes a
+ *   RELEASE land. Zeroing removes the spring's own return velocity again on
+ *   the following tick, leaving only one alpha-scaled impulse per tick to do
+ *   the whole journey — and alpha runs out first: a 200-unit drag on a shelved
+ *   pair used to settle 77.5 units from its slot, overlapping the core's box
+ *   by 13. With the bulk velocity steered home it lands within a unit.
+ *
+ * A component the pointer is holding is left entirely alone: with one node
+ * pinned, "the group's bulk velocity" is mostly the drag response itself, and
+ * overriding it would clamp the very neighbors that are supposed to follow.
+ * The hand is the constraint while it is down; this force takes over on
+ * release. When the release skips the cooling tail altogether (reduced
+ * motion), `settle` does the same correction in one step.
  */
 function shelfAnchorForce(): {
   (alpha: number): void;
   initialize(nodes: AtlasSimNode[]): void;
   setPlacement(shelf: string[][]): void;
+  settle(): void;
 } {
   let nodes: AtlasSimNode[] = [];
   let anchorOf = new Map<string, ShelfAnchor>();
   let groupCount = 0;
 
-  const force = (alpha: number) => {
-    if (anchorOf.size === 0) return;
-    const drift = Array.from({ length: groupCount }, () => ({ vx: 0, vy: 0, free: 0 }));
+  interface Bulk {
+    /** Summed velocity and summed offset-to-anchor over the group's free members. */
+    vx: number;
+    vy: number;
+    dx: number;
+    dy: number;
+    free: number;
+  }
+
+  /** Per group: how its free members are moving, how far they are from their
+   *  slots, and whether the pointer is holding one of them. */
+  const measure = (): { bulk: Bulk[]; handOn: boolean[] } => {
+    const bulk = Array.from({ length: groupCount }, () => ({ vx: 0, vy: 0, dx: 0, dy: 0, free: 0 }));
     const handOn = new Array<boolean>(groupCount).fill(false);
     for (const node of nodes) {
       const anchor = anchorOf.get(node.id);
@@ -750,19 +788,29 @@ function shelfAnchorForce(): {
         handOn[anchor.group] = true;
         continue;
       }
-      const entry = drift[anchor.group] as { vx: number; vy: number; free: number };
+      const entry = bulk[anchor.group] as Bulk;
       entry.vx += node.vx ?? 0;
       entry.vy += node.vy ?? 0;
+      entry.dx += anchor.x - (node.x ?? 0);
+      entry.dy += anchor.y - (node.y ?? 0);
       entry.free += 1;
     }
+    return { bulk, handOn };
+  };
+
+  const force = (alpha: number) => {
+    if (anchorOf.size === 0) return;
+    const { bulk, handOn } = measure();
     for (const node of nodes) {
       const anchor = anchorOf.get(node.id);
       if (!anchor) continue;
       if (node.fx != null || node.fy != null) continue;
-      const entry = drift[anchor.group] as { vx: number; vy: number; free: number };
+      const entry = bulk[anchor.group] as Bulk;
       if (!handOn[anchor.group] && entry.free > 0) {
-        node.vx = (node.vx ?? 0) - entry.vx / entry.free;
-        node.vy = (node.vy ?? 0) - entry.vy / entry.free;
+        // Shift every member by (wanted bulk velocity - current bulk velocity),
+        // both means over the group's free set.
+        node.vx = (node.vx ?? 0) + (entry.dx * SHELF_RETURN_RATE - entry.vx) / entry.free;
+        node.vy = (node.vy ?? 0) + (entry.dy * SHELF_RETURN_RATE - entry.vy) / entry.free;
       }
       node.vx = (node.vx ?? 0) + (anchor.x - (node.x ?? 0)) * SHELF_ANCHOR_STRENGTH * alpha;
       node.vy = (node.vy ?? 0) + (anchor.y - (node.y ?? 0)) * SHELF_ANCHOR_STRENGTH * alpha;
@@ -784,6 +832,28 @@ function shelfAnchorForce(): {
         anchorOf.set(id, { x: node.x ?? 0, y: node.y ?? 0, group });
       }
     });
+  };
+  /** The cooling tail's whole job, done in one step: rigidly translate every
+   *  unheld component back onto its slot and stop it dead. For the release
+   *  path under reduced motion, where there IS no cooling tail — the
+   *  simulation is stopped on mouseup, so a component would otherwise keep
+   *  whatever displacement the drag gave it, up to and including sitting on
+   *  top of the core. Rigid, so the shape the drag produced survives; only the
+   *  offset that breaks the two zones apart is undone. */
+  force.settle = () => {
+    if (anchorOf.size === 0) return;
+    const { bulk, handOn } = measure();
+    for (const node of nodes) {
+      const anchor = anchorOf.get(node.id);
+      if (!anchor) continue;
+      if (node.fx != null || node.fy != null) continue;
+      const entry = bulk[anchor.group] as Bulk;
+      if (handOn[anchor.group] || entry.free === 0) continue;
+      node.x = (node.x ?? 0) + entry.dx / entry.free;
+      node.y = (node.y ?? 0) + entry.dy / entry.free;
+      node.vx = 0;
+      node.vy = 0;
+    }
   };
   return force;
 }
@@ -1043,6 +1113,10 @@ export function createAtlasSimulation(
   const atlasSim = sim as AtlasSimulation;
   atlasSim.setDraggingId = (id: string | null) => {
     draggingId = id;
+  };
+  atlasSim.settleShelf = () => {
+    shelfAnchor.settle();
+    writeBack();
   };
   return atlasSim;
 }

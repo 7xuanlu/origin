@@ -838,8 +838,13 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       sim.setDraggingId(null);
       container.style.cursor = hoverStateRef.current.hovered ? "pointer" : "default";
       // Natural decay is the inertia tail; reduced motion skips it outright.
-      if (prefersReducedMotion()) sim.stop();
-      else sim.alphaTarget(0);
+      // That tail is also what walks a released shelf component back onto its
+      // slot, so skipping it needs the same correction applied in one step —
+      // otherwise a component dragged toward the core just stays there.
+      if (prefersReducedMotion()) {
+        sim.settleShelf();
+        sim.stop();
+      } else sim.alphaTarget(0);
     });
 
     // Direct wheel zoom. Sigma's default quantizes the gesture into 1.7x

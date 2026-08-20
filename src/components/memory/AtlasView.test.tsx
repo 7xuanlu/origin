@@ -761,6 +761,7 @@ describe("AtlasView", () => {
       const mouseCaptor = instance.getMouseCaptor();
       const sim = (window as any).__ATLAS_SIM;
       const stopSpy = vi.spyOn(sim, "stop");
+      const settleSpy = vi.spyOn(sim, "settleShelf");
 
       const before = { x: graph.getNodeAttribute("e1", "x"), y: graph.getNodeAttribute("e1", "y") };
 
@@ -776,6 +777,10 @@ describe("AtlasView", () => {
 
       expect(matchMediaMock).toHaveBeenCalledWith("(prefers-reduced-motion: reduce)");
       expect(stopSpy).toHaveBeenCalledTimes(1);
+      // Stopping outright skips the tail that walks a released shelf component
+      // back onto its slot, so the same correction has to be applied in one
+      // step here or the component stays where the drag left it.
+      expect(settleSpy).toHaveBeenCalledTimes(1);
     } finally {
       vi.unstubAllGlobals();
     }

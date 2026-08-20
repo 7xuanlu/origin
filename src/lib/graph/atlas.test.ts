@@ -441,8 +441,8 @@ describe("createAtlasSimulation", () => {
     const sim = createAtlasSimulation(graph, onTick);
     // The settle runs as a single wrapped tick(settleTicks) call → one
     // writeback; the final pack-and-anchor pass writes back explicitly so
-    // satellites follow their moved anchors → a second. The knot relax in
-    // between is exactly TWO, not three: it runs on relaxShelf's scratch
+    // satellites follow their moved anchors → a second. TWO in total, not
+    // three: the knot relax in between runs on relaxShelf's scratch
     // simulation, which never touches this graph or this callback.
     expect(onTick).toHaveBeenCalledTimes(2);
     sim.tick(1);
@@ -1254,10 +1254,11 @@ describe("shelveComponents", () => {
     const graph = buildAtlasGraph(componentsModel([24, 6, 6, 6, 6]), PALETTE);
     runAtlasLayout(graph);
     const sim = createAtlasSimulation(graph);
-    // Every component is live now (see groupCenterForce), so fx == null no
-    // longer picks out the core — every node's fx is null right after
-    // creation. c0 is the core by construction (24 of 48 nodes, by far the
-    // largest), so select it by id instead.
+    // Every component is live now — the core under groupCenterForce, the
+    // shelved ones under shelfAnchorForce — so fx == null no longer picks out
+    // the core; every node's fx is null right after creation. c0 is the core
+    // by construction (24 of 48 nodes, by far the largest), so select it by
+    // id instead.
     const core = sim.nodes().filter((n) => n.id.startsWith("c0n"));
     const pressed = core[0] as {
       fx?: number | null;
@@ -1383,6 +1384,82 @@ describe("shelveComponents", () => {
     expect(travel).toBeGreaterThan(100);
     // And it went WITH the drag, not to the group's own centre.
     expect((neighbor.x ?? 0) - from.x).toBeGreaterThan(100);
+  });
+
+  /** The real mouseup path: pin a shelved node, haul the component `distance`
+   *  units toward the core (the shelf is below it, so +y), then let go the way
+   *  AtlasView does — clear fx/fy, alphaTarget(0), and let the simulation cool
+   *  to alphaMin. Returns where the component ended up relative to its slot. */
+  function dragAndRelease(distance: number, reducedMotion = false) {
+    const graph = buildAtlasGraph(componentsModel([9, 2]), PALETTE);
+    runAtlasLayout(graph);
+    const sim = createAtlasSimulation(graph);
+    const core = Array.from({ length: 9 }, (_, i) => `c0n${i}`);
+    const shelf = ["c1n0", "c1n1"];
+    const centroidOf = (group: string[]) => ({
+      x: group.reduce((sum, id) => sum + (graph.getNodeAttribute(id, "x") as number), 0) / group.length,
+      y: group.reduce((sum, id) => sum + (graph.getNodeAttribute(id, "y") as number), 0) / group.length,
+    });
+    const slot = centroidOf(shelf);
+
+    const dragged = sim.nodes().find((n) => n.id === "c1n0") as {
+      fx?: number | null;
+      fy?: number | null;
+      x?: number;
+      y?: number;
+    };
+    dragged.fx = dragged.x;
+    dragged.fy = (dragged.y ?? 0) + distance;
+    sim.alpha(0.3).alphaTarget(0.3);
+    sim.tick(60);
+
+    dragged.fx = null;
+    dragged.fy = null;
+    if (reducedMotion) {
+      sim.settleShelf();
+      sim.stop();
+    } else {
+      sim.alphaTarget(0);
+      // alphaDecay 0.03 from 0.3 reaches alphaMin in ~190; the cap only keeps
+      // a regression here from hanging the suite.
+      for (let i = 0; i < 400 && sim.alpha() >= sim.alphaMin(); i += 1) sim.tick(1);
+      sim.stop();
+    }
+
+    const after = centroidOf(shelf);
+    const c = box(graph, core);
+    const s = box(graph, shelf);
+    return {
+      offset: Math.hypot(after.x - slot.x, after.y - slot.y),
+      overlapsCore: s.minX < c.maxX && c.minX < s.maxX && s.minY < c.maxY && c.minY < s.maxY,
+    };
+  }
+
+  it("walks a RELEASED component all the way back to its slot, not part of the way", () => {
+    // The failure this catches: hold a component's bulk velocity at zero and
+    // the spring's own return velocity is cancelled again every tick, leaving
+    // one alpha-scaled impulse per tick to do the whole journey — and alpha is
+    // a finite budget. Measured that way, this 200-unit drag settled 77.5
+    // units from its slot with its box 13 units inside the core's; the
+    // 100-unit drag settled 33.4 out, past the 24-unit SHELF_GAP that is
+    // supposed to separate the zones. Steering the bulk velocity home instead
+    // (SHELF_RETURN_RATE) is not alpha-scaled, so the return completes.
+    const far = dragAndRelease(200);
+    expect(far.offset).toBeLessThan(2);
+    expect(far.overlapsCore).toBe(false);
+    const near = dragAndRelease(100);
+    expect(near.offset).toBeLessThan(2);
+    expect(near.overlapsCore).toBe(false);
+  });
+
+  it("puts a released component back on its slot in ONE step when reduced motion skips the cooling tail", () => {
+    // AtlasView's mouseup stops the simulation outright under reduced motion,
+    // so there is no tail to walk the component home — without settleShelf it
+    // simply stays where the drag left it, 61 units off slot and overlapping
+    // the core.
+    const settled = dragAndRelease(200, true);
+    expect(settled.offset).toBeLessThan(0.5);
+    expect(settled.overlapsCore).toBe(false);
   });
 
   it("keeps a long shelf component from swinging its far end up into the core over a long reheat", () => {
