@@ -17204,6 +17204,78 @@ async fn load_summary_buckets_includes_decisions_but_not_merged_originals() {
     assert_eq!(source_ids, vec!["summary_decision".to_string()]);
 }
 
+/// The half neither companion above covers. Those two exercise a memory's *own*
+/// `supersede_mode`; this one exercises the mode of the memory that supersedes
+/// it, which is what `distillation_not_superseded` reads.
+///
+/// `load_summary_buckets` used to hand-roll a mode-blind superseder test, so any
+/// non-pending superseder removed its predecessor. `'archive'` is supposed to
+/// leave the predecessor visible — that is how search and the distillation pool
+/// already behave — and every decision is auto-stamped `'archive'` at store
+/// time, so the mode-blind test silently dropped a memory from summaries the
+/// moment a decision referenced it.
+#[tokio::test]
+async fn load_summary_buckets_keeps_memories_an_archive_superseder_replaced() {
+    let (db, _dir) = test_db().await;
+    let entity_id = db
+        .store_entity("Scheduler", "concept", None, None, None)
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET community_id = 7 \
+             WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![entity_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut kept = make_memory_doc(
+        "summary_kept",
+        "An archive-mode superseder leaves this memory visible.",
+        "fact",
+        "work",
+        "agent",
+    );
+    kept.entity_id = Some(entity_id.clone());
+    let mut archiver = make_memory_doc(
+        "summary_archiver",
+        "We chose libSQL over sqlite for the graph store.",
+        "decision",
+        "work",
+        "agent",
+    );
+    archiver.entity_id = Some(entity_id);
+    archiver.supersedes = Some("summary_kept".to_string());
+    archiver.pending_revision = false;
+    db.upsert_documents(vec![kept, archiver]).await.unwrap();
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE memories SET supersede_mode = 'archive' \
+             WHERE source_id = 'summary_archiver' AND source = 'memory'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let buckets = db.load_summary_buckets().await.unwrap();
+    let mut source_ids: Vec<String> = buckets
+        .into_iter()
+        .flat_map(|(_, members)| members.into_iter().map(|member| member.source_id))
+        .collect();
+    source_ids.sort();
+    assert_eq!(
+        source_ids,
+        vec!["summary_archiver".to_string(), "summary_kept".to_string()],
+        "an 'archive'-mode superseder must leave its predecessor in summary buckets"
+    );
+}
+
 // ==================== Space CRUD ====================
 
 #[tokio::test]
