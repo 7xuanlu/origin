@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
 import {
   listDecisions,
@@ -130,6 +131,7 @@ function DecisionEntryRow({
   onSelectMemory: (sourceId: string) => void;
   isLast: boolean;
 }) {
+  const { t } = useTranslation();
   const { context, alternatives, reversible } = parseStructured(memory);
 
   // Use title if it looks reasonable, otherwise fall back to truncated content.
@@ -184,6 +186,7 @@ function DecisionEntryRow({
         data-testid="decision-entry"
         onClick={onToggle}
         className="pb-4 cursor-pointer group"
+        style={memory.is_archived ? { opacity: 0.55 } : undefined}
       >
         <div
           className="rounded-lg p-3 transition-colors duration-150"
@@ -208,6 +211,20 @@ function DecisionEntryRow({
           >
             {headline}
           </div>
+
+          {/* Archive-superseded: kept visible but muted, so say why */}
+          {memory.is_archived && (
+            <div
+              style={{
+                fontFamily: "var(--mem-font-mono)",
+                fontSize: "10px",
+                color: "var(--mem-text-tertiary)",
+                marginBottom: "4px",
+              }}
+            >
+              {t("entityDetail.archived")}
+            </div>
+          )}
 
         {/* Description preview (2 lines) — structured context if available, otherwise content */}
         {(() => {

@@ -121,6 +121,7 @@ fn sample_memory(source_id: &str) -> MemoryItem {
         chunk_count: 1,
         entity_id: None,
         quality: None,
+        is_archived: false,
         is_recap: false,
         enrichment_status: String::new(),
         supersede_mode: String::new(),
@@ -1644,6 +1645,7 @@ async fn t_list_pending_uses_post_with_confirmed_false() {
             pinned: false,
             created_at: 1_000_000,
             content: String::new(),
+            is_archived: false,
         }],
     };
 
