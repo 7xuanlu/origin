@@ -197,7 +197,13 @@ body {
    UpdaterDialog.tsx:88, but never defined until now. */
 @keyframes mem-fade-up {
   from { opacity: 0; transform: translateY(6px); }
-  to   { opacity: 1; transform: translateY(0); }
+  /* Ends at the element's own target opacity, not a hard 1. This animation runs
+     with `both` fill, so its final keyframe keeps applying forever after the
+     animation finishes -- and an animation outranks an inline style. A hard 1
+     here silently defeated the archived row's inline `opacity: 0.55`: the row
+     carried the inline value, and the browser computed 1 anyway. Callers that
+     need a muted resting state set `--mem-enter-opacity` alongside `opacity`. */
+  to   { opacity: var(--mem-enter-opacity, 1); transform: translateY(0); }
 }
 .mem-fade-up {
   animation: mem-fade-up var(--mem-dur-enter) var(--mem-ease-out) both;
