@@ -549,9 +549,16 @@ function linkEndId(end: string | AtlasSimNode): string {
   return typeof end === "string" ? end : end.id;
 }
 
+/** One shelf group's rigid centroid anchor: every free (non-fx/fy) member is
+ *  shifted uniformly so the group's own centroid sits at `targetX/targetY`. */
+interface CenterGroup {
+  targetX: number;
+  targetY: number;
+}
+
 /**
- * `forceCenter(0, 0)`, but blind to pinned nodes — and able to hold a target
- * other than the origin.
+ * `forceCenter(0, 0)`, but blind to pinned nodes, PER GROUP, and able to hold
+ * a target other than the origin.
  *
  * d3's own centre force averages EVERY node and shifts them all by the
  * offset. Pinned nodes snap straight back to fx/fy afterwards, so with a
@@ -560,52 +567,83 @@ function linkEndId(end: string | AtlasSimNode): string {
  * drag-reheat slid the core 776 units up a 3,939-unit span, pulling the two
  * zones apart. Averaging the FREE nodes only cuts that to 371.
  *
- * `retarget()` removes the rest. shelveComponents centres the core by its
- * BOUNDING BOX, which is not where its centroid is; asking the force for a
- * centroid of exactly (0,0) therefore slides the core by the difference on
- * the first reheat. Retargeting after the shelf is laid out tells the force
- * to hold the core exactly where the composition put it, which leaves only
- * the ~154 units the core genuinely relaxes by.
+ * `retarget()` removes the rest. shelveComponents centres each component by
+ * its BOUNDING BOX, which is not where its centroid is; asking the force for
+ * a centroid of exactly (0,0) therefore slides a component by the difference
+ * on the first reheat. Retargeting after the shelf is laid out tells the
+ * force to hold each component exactly where the composition put it, which
+ * leaves only the small amount a component genuinely relaxes by.
+ *
+ * Round 5's live shelf generalizes this from one group (the core) to one per
+ * shelved component (see `setGroups`): every component gets its own rigid
+ * hold at its shelf slot instead of the old fx/fy freeze, so charge/collide/
+ * link can still act on it — a knot has room to open, and a drag on a
+ * shelved node pulls its neighbors along. Before `setGroups` is ever called
+ * (the pre-shelf settle), every node falls into one implicit group targeting
+ * the origin — exactly today's single-group behavior.
  */
-function coreCenterForce(): {
+function groupCenterForce(): {
   (alpha: number): void;
   initialize(nodes: AtlasSimNode[]): void;
+  setGroups(placement: string[][]): void;
   retarget(): void;
 } {
   let nodes: AtlasSimNode[] = [];
-  let targetX = 0;
-  let targetY = 0;
-  const centroid = (): { x: number; y: number; free: number } => {
-    let sx = 0;
-    let sy = 0;
-    let free = 0;
+  // Populated by setGroups; a node absent from this map (the pre-shelf state,
+  // or an id setGroups never named) falls back to defaultGroup.
+  let groupOf = new Map<string, CenterGroup>();
+  const defaultGroup: CenterGroup = { targetX: 0, targetY: 0 };
+  const groupFor = (id: string): CenterGroup => groupOf.get(id) ?? defaultGroup;
+
+  // One pass over all nodes, bucketed by group — O(nodes) regardless of how
+  // many components are on the shelf, rather than O(nodes * groups).
+  const centroids = (): Map<CenterGroup, { x: number; y: number; free: number }> => {
+    const sums = new Map<CenterGroup, { x: number; y: number; free: number }>();
     for (const node of nodes) {
       if (node.fx != null || node.fy != null) continue;
-      sx += node.x ?? 0;
-      sy += node.y ?? 0;
-      free += 1;
+      const group = groupFor(node.id);
+      const entry = sums.get(group) ?? { x: 0, y: 0, free: 0 };
+      entry.x += node.x ?? 0;
+      entry.y += node.y ?? 0;
+      entry.free += 1;
+      sums.set(group, entry);
     }
-    return free === 0 ? { x: 0, y: 0, free } : { x: sx / free, y: sy / free, free };
+    for (const entry of sums.values()) {
+      entry.x /= entry.free;
+      entry.y /= entry.free;
+    }
+    return sums;
   };
+
   const force = () => {
-    const { x, y, free } = centroid();
-    if (free === 0) return;
-    const dx = x - targetX;
-    const dy = y - targetY;
+    const sums = centroids();
     for (const node of nodes) {
       if (node.fx != null || node.fy != null) continue;
-      node.x = (node.x ?? 0) - dx;
-      node.y = (node.y ?? 0) - dy;
+      const group = groupFor(node.id);
+      const centroid = sums.get(group);
+      if (!centroid) continue;
+      node.x = (node.x ?? 0) - (centroid.x - group.targetX);
+      node.y = (node.y ?? 0) - (centroid.y - group.targetY);
     }
   };
   force.initialize = (ns: AtlasSimNode[]) => {
     nodes = ns;
   };
+  // Installs one group per placement entry (shelveComponents' return, core
+  // first) — an id shelveComponents didn't mention (there is none) would just
+  // fall back to defaultGroup.
+  force.setGroups = (placement: string[][]) => {
+    groupOf = new Map();
+    for (const ids of placement) {
+      const group: CenterGroup = { targetX: 0, targetY: 0 };
+      for (const id of ids) groupOf.set(id, group);
+    }
+  };
   force.retarget = () => {
-    const { x, y, free } = centroid();
-    if (free === 0) return;
-    targetX = x;
-    targetY = y;
+    for (const [group, centroid] of centroids()) {
+      group.targetX = centroid.x;
+      group.targetY = centroid.y;
+    }
   };
   return force;
 }
@@ -616,7 +654,7 @@ function coreCenterForce(): {
  *  isolates are not drawn at all once drawableModel drops components under
  *  MIN_COMPONENT_SIZE, and a leaf memory rides its anchor as a satellite.
  *  Matches the retired ConstellationMap feel: charge -40,
- *  centre-on-origin (coreCenterForce), alphaDecay 0.03, velocityDecay 0.25, d3-default link
+ *  centre-on-origin (groupCenterForce), alphaDecay 0.03, velocityDecay 0.25, d3-default link
  *  force. Parallel edges collapse to one link per undirected pair (d3 sums
  *  pull per link; sigma still RENDERS every parallel edge). Settles
  *  synchronously to its own equilibrium before returning — a FA2 seed handed
@@ -671,7 +709,7 @@ export function createAtlasSimulation(
     linkDegree.set(link.target, (linkDegree.get(link.target) ?? 0) + 1);
   }
 
-  const center = coreCenterForce();
+  const center = groupCenterForce();
   const sim = forceSimulation(nodes)
     .force(
       "link",
@@ -736,25 +774,41 @@ export function createAtlasSimulation(
   // balance at about the same radius for all of them). Move them onto a shelf
   // below the core instead, then copy those positions back INTO the sim so a
   // later drag flexes the real layout rather than snapping to the ring.
-  const placement = shelveComponents(graph);
-  // Everything outside the core is PINNED where the shelf put it. Without
-  // this the first drag undoes the whole arrangement: downNode reheats the
-  // sim to alpha 0.3 and charge plus forceCenter push the shelved components
-  // straight back out into a ring, and nothing re-shelves them. A shelved
-  // component has no edge into the core, so it has nothing to flex toward
-  // anyway — holding it still costs the layout nothing.
-  const core = new Set(placement[0] ?? []);
+  let placement = shelveComponents(graph);
   for (const node of nodes) {
     node.x = graph.getNodeAttribute(node.id, "x") as number;
     node.y = graph.getNodeAttribute(node.id, "y") as number;
-    if (!core.has(node.id)) {
-      node.fx = node.x;
-      node.fy = node.y;
-    }
   }
-  // The core is now where the composition wants it — hold it THERE on every
-  // later reheat rather than dragging it back to a centroid of (0,0).
+  // Every component — not just the core — gets its own rigid centroid anchor
+  // at the shelf slot shelveComponents just gave it, and holds THERE on every
+  // later reheat rather than being pulled toward a centroid of (0,0).
+  center.setGroups(placement);
   center.retarget();
+
+  // Live shelf: relax the WHOLE simulation against those anchors instead of
+  // freezing every component with fx/fy. A component with no edge into the
+  // core has nothing to flex toward the rest of the graph, but charge and
+  // collide still act inside it — this is what opens a component that
+  // settled into a tangled knot before the shelf pass, and what makes a drag
+  // on a shelved node pull its neighbors along afterward. Each anchor's rigid
+  // hold keeps this from just re-exploding the shelf back into a ring.
+  const relaxTicks = settleTicks(graph.order);
+  sim.alpha(0.3);
+  sim.tick(relaxTicks);
+
+  // Relaxing changes every component's bbox (that is the point — a knot
+  // spreading out grows its own box), so the row packing above is stale.
+  // Re-shelve: rigid translation preserves the shape the relax pass just
+  // found, it only restores which row and how much space each component
+  // gets. Anchors move to the fresh slots the same way as above.
+  placement = shelveComponents(graph);
+  for (const node of nodes) {
+    node.x = graph.getNodeAttribute(node.id, "x") as number;
+    node.y = graph.getNodeAttribute(node.id, "y") as number;
+  }
+  center.setGroups(placement);
+  center.retarget();
+
   // Same writeback path as a tick, so satellites re-place around their moved
   // anchors and the caller's onTick marks the cartography scene dirty.
   writeBack();

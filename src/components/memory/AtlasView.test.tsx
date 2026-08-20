@@ -453,11 +453,11 @@ describe("AtlasView", () => {
     expect(refreshSpy).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps a pinned node pinned after its drag, and releases an unpinned one", async () => {
-    // shelveComponents parks every node outside the biggest component on the
-    // shelf and the sim pins it there. Clearing that pin on mouseup would hand
-    // the node back to charge + forceCenter, which would drag the shelf up
-    // into the core on the first drag.
+  it("releases fx/fy for every node on mouseup, pinned or not", async () => {
+    // Every component is live now (see atlas.ts's groupCenterForce): its own
+    // anchor holds it at its shelf slot, so mouseup no longer has to leave a
+    // shelved node pinned to keep the shelf out of the core — it always
+    // clears fx/fy, the same as a core drag always did.
     mockConnectedPair();
 
     renderWithQuery(<AtlasView />);
@@ -472,8 +472,8 @@ describe("AtlasView", () => {
     instance.handlers.get("downNode")?.({ node: "e1" });
     mouseCaptor.handlers.get("mousemovebody")?.(dragEvent(300, 300));
     mouseCaptor.handlers.get("mouseup")?.({});
-    expect(pinned.fx).toBe(300);
-    expect(pinned.fy).toBe(300);
+    expect(pinned.fx).toBeNull();
+    expect(pinned.fy).toBeNull();
 
     const free = sim.nodes().find((n: { id: string }) => n.id === "e2");
     instance.handlers.get("downNode")?.({ node: "e2" });
