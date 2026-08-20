@@ -563,7 +563,17 @@ def _release_version_policy(config_text: str, old_version: str, new_version: str
     if release_as is not None:
         if not isinstance(release_as, str):
             raise CandidateError("release-as is not a semantic version string")
-        _version(release_as, "release-as")
+        # A release-as override is one-shot by intent but release-please never
+        # consumes it: once its version has been released, later runs keep
+        # proposing that same version. Rejecting a non-advancing override here
+        # surfaces the forgotten cleanup PR at candidate validation, with a
+        # clear message, instead of at tag creation.
+        if _version(release_as, "release-as") <= old_parts:
+            raise CandidateError(
+                f"release-as override {release_as!r} is stale: it does not advance"
+                f" past the released base version {old_version!r}; remove it from"
+                " release-please-config.json (RELEASING.md, version-steering policy)"
+            )
         if new_version != release_as:
             raise CandidateError("candidate version does not exactly match release-as")
     elif new_parts != (old_parts[0], old_parts[1], old_parts[2] + 1):
