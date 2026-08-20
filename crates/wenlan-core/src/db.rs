@@ -19453,15 +19453,15 @@ impl MemoryDB {
                 })?;
             drop(generation_rows);
 
-            let mut candidate_rows = snapshot_conn
-                .query(
-                    // G6 Stage 3: the "legacy" side of this comparator used to
-                    // read `entities.community_id` directly. `detect_communities`
-                    // dual-wrote that column and the entity's shadow page; the
-                    // retirement migration leaves only the shadow, which is the
-                    // same value by the same writer, read through the same join
-                    // shape `search_summary_buckets` already uses.
-                    "SELECT m.source_id, m.space, CAST(p.community_id AS TEXT),
+            let live = not_self_archived("m");
+            let candidate_sql = format!(
+                // G6 Stage 3: the "legacy" side of this comparator used to
+                // read `entities.community_id` directly. `detect_communities`
+                // dual-wrote that column and the entity's shadow page; the
+                // retirement migration leaves only the shadow, which is the
+                // same value by the same writer, read through the same join
+                // shape `search_summary_buckets` already uses.
+                "SELECT m.source_id, m.space, CAST(p.community_id AS TEXT),
                                 raw_member.community_id,
                                 CASE WHEN current_community.community_id IS NOT NULL
                                      THEN raw_member.community_id END
@@ -19496,13 +19496,14 @@ impl MemoryDB {
                                 )
                             )
                             AND m.is_recap=0
-                            AND m.supersede_mode<>'archive'
+                            AND {live}
                             AND m.source_id NOT LIKE 'merged_%'
                             AND m.source_id NOT LIKE 'recap_%'
                             AND m.embedding IS NOT NULL
-                          ORDER BY m.source_id",
-                    libsql::params![consumer],
-                )
+                          ORDER BY m.source_id"
+            );
+            let mut candidate_rows = snapshot_conn
+                .query(&candidate_sql, libsql::params![consumer])
                 .await
                 .map_err(|error| {
                     WenlanError::VectorDb(format!("community parity candidates: {error}"))
@@ -29548,18 +29549,14 @@ impl MemoryDB {
             )
         };
         let live = not_self_archived("m");
+        let superseded = distillation_not_superseded("m");
         let sql = format!(
             "SELECT m.source_id, m.title, m.content, {community_expr}
                FROM memories m
                {community_join}
               WHERE m.source = 'memory' AND m.chunk_index = 0
                 AND COALESCE(m.pending_revision, 0) = 0
-                AND NOT EXISTS (
-                    SELECT 1 FROM memories superseder
-                     WHERE superseder.supersedes = m.source_id
-                       AND COALESCE(superseder.pending_revision, 0) = 0
-                       AND superseder.source = 'memory'
-                )
+                AND {superseded}
                 AND m.is_recap = 0
                 AND {live}
                 AND m.source_id NOT LIKE 'merged_%'
