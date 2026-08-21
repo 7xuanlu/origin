@@ -37,6 +37,21 @@ async function listAllPagesWithStatus(
   }
 }
 
+/**
+ * True for a page a person wrote, distilled, imported, or researched; false
+ * for an entity "shadow" page (the auto-made page behind every entity).
+ *
+ * `pages.kind` never serializes, but every shadow page carries
+ * `creation_kind = "entity"` — the same invariant the daemon's knowledge-graph
+ * query relies on (`crates/wenlan-core/src/db/scoped_entities.rs`,
+ * `get_knowledge_graph_scoped`). A missing `creation_kind` (older daemons)
+ * counts as a knowledge page. Browse lists still include shadow pages by
+ * contract; this is for counts that should not double-count entities.
+ */
+export function isKnowledgePage(page: Page): boolean {
+  return page.creation_kind !== "entity";
+}
+
 export function listAllActivePages(): Promise<Page[]> {
   return listAllPagesWithStatus("active", listPages);
 }

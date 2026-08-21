@@ -52,7 +52,9 @@ pub struct Page {
     #[serde(default)]
     pub workspace: Option<String>,
     /// Routing metadata: which mechanism created this page.
-    /// One of: "distilled" | "authored" | "research" | "imported".
+    /// One of: "distilled" | "authored" | "research" | "imported" | "source"
+    /// | "entity" (the dual-write shadow page behind an entity; `kind` never
+    /// serializes, so this is the wire-visible shadow marker).
     /// NOT a trust signal (see `review_status` for that).
     #[serde(default = "default_creation_kind")]
     pub creation_kind: String,

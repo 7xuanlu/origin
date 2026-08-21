@@ -11,7 +11,7 @@ import {
   type MemoryStats,
   type Page,
 } from "../../lib/tauri";
-import { listAllActivePages } from "./pages/listAllPages";
+import { isKnowledgePage, listAllActivePages } from "./pages/listAllPages";
 import { Greeting } from "./Greeting";
 import { useReviewQueue, reviewItemId, type ReviewItem } from "./useReviewQueue";
 import ReviewDialog, {
@@ -642,7 +642,11 @@ function HomeContextRail({
     queryFn: () => listEntities(),
     staleTime: 60_000,
   });
-  const pagesUpdatedToday = updatedTodayCount(pages);
+  // The browse list includes entity shadow pages by daemon contract; entities
+  // already have their own metric below, so the Pages number and its
+  // updated-today chip count knowledge pages only.
+  const knowledgePages = useMemo(() => pages.filter(isKnowledgePage), [pages]);
+  const pagesUpdatedToday = updatedTodayCount(knowledgePages);
 
   return (
     <div
@@ -661,7 +665,7 @@ function HomeContextRail({
           <ContextMetric
             testId="pages"
             label={t("home.pages")}
-            total={String(pages.length)}
+            total={String(knowledgePages.length)}
             deltas={
               pagesUpdatedToday > 0
                 ? [

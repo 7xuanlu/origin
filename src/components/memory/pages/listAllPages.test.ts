@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { listPages, listPagesExplicitBrowse, type Page } from "../../../lib/tauri";
 import {
+  isKnowledgePage,
   listAllActivePages,
   listAllActivePagesExplicitBrowse,
   listAllDraftPages,
@@ -109,5 +110,16 @@ describe("listAllDraftPages", () => {
 
     expect(result).toHaveLength(500);
     expect(listPages).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("isKnowledgePage", () => {
+  it("excludes entity shadow pages and keeps every other creation kind", () => {
+    expect(isKnowledgePage({ ...page("shadow"), creation_kind: "entity" })).toBe(false);
+    for (const kind of ["distilled", "authored", "research", "imported", "source"]) {
+      expect(isKnowledgePage({ ...page(kind), creation_kind: kind })).toBe(true);
+    }
+    expect(isKnowledgePage(page("no-kind"))).toBe(true);
+    expect(isKnowledgePage({ ...page("null-kind"), creation_kind: null })).toBe(true);
   });
 });

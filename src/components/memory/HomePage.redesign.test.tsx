@@ -257,6 +257,26 @@ describe("HomePage redesign", () => {
     expect(screen.queryByTestId("what-happens-next")).toBeNull();
   });
 
+  it("counts only knowledge pages in the pages metric, never entity shadow pages", async () => {
+    // Given two knowledge pages (one updated today) and one entity shadow page
+    // updated today — the daemon's browse list returns all three by contract
+    const lastWeek = new Date(Date.now() - 7 * 86_400_000).toISOString();
+    vi.mocked(tauri.listPages).mockResolvedValue([
+      page({ id: "page-architecture", title: "Wenlan app architecture", creation_kind: "distilled" }),
+      page({ id: "page-policy", title: "Codex workflow policy", last_modified: lastWeek }),
+      page({ id: "shadow-lucian", title: "Lucian", creation_kind: "entity", entity_id: "ent-1" }),
+    ]);
+
+    // When Home renders its overview metrics
+    renderHome();
+    await screen.findByTestId("wiki-context-rail");
+
+    // Then the pages total and its updated-today chip exclude the shadow page
+    expect(screen.getByTestId("wiki-context-pages")).toHaveTextContent("2");
+    expect(screen.getByTestId("wiki-context-pages")).not.toHaveTextContent("3");
+    expect(screen.getByTestId("wiki-context-updated-today")).toHaveTextContent(/^1 updated today$/);
+  });
+
   it("keeps today, index, articles, and review items in the expected reading order", async () => {
     const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
       bottom: 0,
