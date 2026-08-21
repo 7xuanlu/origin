@@ -436,12 +436,11 @@ html[data-theme="dark"] {
      the entities rather than as a sixth category. */
   --kg-memory: #707A8E;
   /* Wiki-page nodes — one swatch, no slot, opaque for the sigma reason above.
-     Pages are the distilled knowledge, so they are the highest-contrast points
-     on the map: paper on the dark ground here, ink on the light one. Distinct
-     from every entity slot (all chromatic) and from --kg-memory's mid grey by
-     value rather than hue, so a page never reads as a category or a memory.
-     Solid disc, no ring — sigma v3 ships only disc node programs. */
-  --kg-page: #E3DDCD;
+     A cool slate-teal: distinct from every entity slot AND from --kg-memory's
+     grey, and it sits inside the palette's contrast range — a max-contrast
+     page ink (paper on dark, ink on light) was tried and read as a scatter of
+     loose beads over the map. Solid disc, no ring. */
+  --kg-page: #3E8F8A;
 }
 
 /* Light (cool paper workspace with restrained brand warmth) */
@@ -524,13 +523,13 @@ html[data-theme="light"] {
   --canvas-edge: #B9BDC5;
   --canvas-edge-strong: #878D9B;
   /* Cartography layer — light variants (see the dark block's note). */
-  --kg-terrain: rgba(94, 88, 200, 0.04);
+  --kg-terrain: rgba(94, 88, 200, 0.028);
   --kg-bridge: #B5842E;
   --kg-graticule: rgba(139, 147, 163, 0.18);
   /* Memory nodes — see the dark block. */
   --kg-memory: #9BA3B2;
-  /* Wiki-page nodes — see the dark block: ink on paper. */
-  --kg-page: #3A3F4C;
+  /* Wiki-page nodes — see the dark block. */
+  --kg-page: #2F7C77;
 }
 
 .wiki-home {
