@@ -365,8 +365,8 @@ export function convexHull(points: { x: number; y: number }[]): { x: number; y: 
  * the dominant region the bigger type.
  */
 /** The member a region is named after: highest degree, ties broken by
- *  smaller name then smaller id — one rule shared by the drawn region labels
- *  and the insight rail so the two can never disagree. */
+ *  smaller name then smaller id — deterministic, so the drawn region labels
+ *  never flicker between members. */
 export function regionLeader<T extends { id: string; name: string; degree: number }>(
   members: T[],
 ): T {

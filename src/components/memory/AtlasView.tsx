@@ -38,7 +38,6 @@ import {
   cartographyScene,
   drawCartography,
   bridgeEdgeTest,
-  regionLeader,
   isUnscopedSpace,
   MIN_REGION_SIZE,
 } from "../../lib/graph/cartography";
@@ -337,12 +336,12 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // was current when the sigma renderer was built.
   const communitiesRef = useRef<Map<string, string>>(communities);
 
-  // Region count + names for the toolbar and rail — membership only, so it
+  // Region count for the toolbar count line — membership only, so it
   // agrees with the hulls drawCartography actually draws without needing
-  // node positions; names share regionLeader with the drawn labels. Counted
+  // node positions. Counted
   // over the DRAWN nodes for the same reason: communities come from the full
   // model, but a hidden small group's community has no hull on the map.
-  const regionInfo = useMemo(() => {
+  const regionCount = useMemo(() => {
     const groups = new Map<string, GraphNode[]>();
     for (const node of visibleModel.nodes) {
       const community = communities.get(node.id);
@@ -351,100 +350,12 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       if (list) list.push(node);
       else groups.set(community, [node]);
     }
-    const names = new Map<string, string>();
-    for (const [community, members] of groups) {
-      if (members.length >= MIN_REGION_SIZE) names.set(community, regionLeader(members).name);
+    let count = 0;
+    for (const members of groups.values()) {
+      if (members.length >= MIN_REGION_SIZE) count += 1;
     }
-    return { count: names.size, names };
+    return count;
   }, [visibleModel, communities]);
-
-  // Insight rail (artifact screen 01) — only cards whose data is real today:
-  // isolates as the gap signal, cross-region bridges, this week's relations.
-  // Every action is a live focusEntity fly, no dead links.
-  const insights = useMemo(() => {
-    const cards: { key: string; title: string; body: string; focusId: string }[] = [];
-    const nodeName = new Map(model.nodes.map((n) => [n.id, n.name]));
-
-    const isolates = model.nodes.filter((n) => n.degree === 0);
-    if (isolates.length > 0) {
-      const first = isolates[0];
-      cards.push({
-        key: "gap",
-        title: t("atlas.rail.gapTitle"),
-        body:
-          isolates.length === 1
-            ? t("atlas.rail.gapOne", { name: first.name })
-            : t("atlas.rail.gapMore", { name: first.name, count: isolates.length - 1 }),
-        focusId: first.id,
-      });
-    }
-
-    const isBridge = bridgeEdgeTest(communities);
-    const bridge = model.edges.find((e) => isBridge(e.source, e.target));
-    if (bridge) {
-      const pairKey = (s: string, t2: string) => {
-        const a = communities.get(s)!;
-        const b = communities.get(t2)!;
-        return a < b ? `${a}:${b}` : `${b}:${a}`;
-      };
-      const pair = pairKey(bridge.source, bridge.target);
-      const pairCount = model.edges.filter(
-        (e) => isBridge(e.source, e.target) && pairKey(e.source, e.target) === pair,
-      ).length;
-      cards.push({
-        key: "bridge",
-        title: t("atlas.rail.bridgeTitle"),
-        body: t("atlas.rail.bridgeBody", {
-          count: pairCount,
-          a: regionInfo.names.get(communities.get(bridge.source)!),
-          b: regionInfo.names.get(communities.get(bridge.target)!),
-          link: `${nodeName.get(bridge.source)} → ${nodeName.get(bridge.target)}`,
-        }),
-        focusId: bridge.source,
-      });
-    }
-
-    // createdAt is Unix seconds (daemon convention — see EntityDetail's * 1000)
-    // Only an entity relation carries its own creation time; page-link,
-    // shared-source, and memory edges borrow their page's or memory's
-    // last_modified (model.ts), so a re-saved page would report every one of
-    // its old links as new. Count relations only: both endpoints entities.
-    const weekAgo = Date.now() / 1000 - 7 * 24 * 60 * 60;
-    const entityIds = new Set(
-      model.nodes.filter((n) => n.kind === "entity").map((n) => n.id),
-    );
-    const recent = model.edges.filter(
-      (e) => entityIds.has(e.source) && entityIds.has(e.target) && e.createdAt >= weekAgo,
-    );
-    if (recent.length > 0) {
-      const gained = new Map<string, number>();
-      for (const e of recent) {
-        gained.set(e.source, (gained.get(e.source) ?? 0) + 1);
-        if (e.target !== e.source) gained.set(e.target, (gained.get(e.target) ?? 0) + 1);
-      }
-      let topId = "";
-      let topN = 0;
-      for (const [id, n] of gained) {
-        const name = nodeName.get(id) ?? "";
-        const topName = nodeName.get(topId) ?? "";
-        if (n > topN || (n === topN && name < topName)) {
-          topId = id;
-          topN = n;
-        }
-      }
-      cards.push({
-        key: "week",
-        title: t("atlas.rail.weekTitle"),
-        body: t("atlas.rail.weekBody", {
-          count: recent.length,
-          name: nodeName.get(topId),
-          gained: topN,
-        }),
-        focusId: topId,
-      });
-    }
-    return cards;
-  }, [model, communities, regionInfo, t]);
 
   // Toolbar search (artifact screen 01): type → listbox of entity names,
   // Enter/click → camera fly + the same emphasis hover applies.
@@ -453,7 +364,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   const [activeIndex, setActiveIndex] = useState(0);
   const [searchFocused, setSearchFocused] = useState(false);
   // Regions on/off governs only the cartography underlay (hulls + names +
-  // graticule); the count line and rail keep reporting regions either way.
+  // graticule); the count line keeps reporting regions either way.
   // Ref mirror so the sigma mount effect (which recreates the underlay per
   // model) can apply the current choice without re-running on toggle.
   const [showRegions, setShowRegions] = useState(true);
@@ -484,9 +395,9 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     searchInputRef.current?.blur();
     const renderer = sigmaRef.current;
     const drawn = graphRef.current;
-    // A degree-0 node is not on the map at all (see visibleModel). The gap
-    // card names exactly those, so "show in atlas" opens the node's own page
-    // rather than flying the camera to nothing.
+    // A degree-0 node is not on the map at all (see visibleModel), but search
+    // can still name it, so focusing opens the node's own page rather than
+    // flying the camera to nothing.
     if (!drawn || !drawn.hasNode(nodeId)) {
       if (model.nodes.some((node) => node.id === nodeId)) onNodeClick?.(targetForNode(nodeId));
       return;
@@ -1013,7 +924,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     ...(layers.memory && memoryCount > 0
       ? [t("atlas.countMemories", { count: memoryCount })]
       : []),
-    ...(regionInfo.count > 0 ? [t("atlas.countRegions", { count: regionInfo.count })] : []),
+    ...(regionCount > 0 ? [t("atlas.countRegions", { count: regionCount })] : []),
   ].join(" · ");
   const dropdownOpen = searchFocused && query.trim().length > 0;
 
@@ -1312,15 +1223,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
         </span>
       </div>
 
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: insights.length > 0 ? "minmax(0, 1fr) 292px" : "minmax(0, 1fr)",
-          flex: 1,
-          minHeight: 0,
-        }}
-      >
-      <div style={{ position: "relative", minWidth: 0 }}>
+      <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
       <div ref={containerRef} data-testid="atlas-view" style={{ height: "100%", width: "100%" }} />
 
       {/* Legend — top-right, same furniture as the old canvas graph (minus
@@ -1398,74 +1301,6 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       >
         {t("atlas.hint")}
       </span>
-      </div>
-
-      {/* Insight rail — artifact screen 01's 292px column. Renders only
-          cards with live data behind them; every action is a real fly. */}
-      {insights.length > 0 && (
-        <aside
-          style={{
-            borderLeft: "1px solid var(--mem-border)",
-            background: "var(--mem-surface)",
-            padding: "16px 16px 20px",
-            display: "flex",
-            flexDirection: "column",
-            gap: 14,
-            overflowY: "auto",
-            fontFamily: "var(--mem-font-body)",
-          }}
-        >
-          {insights.map((card) => (
-            <div
-              key={card.key}
-              style={{
-                background: "var(--mem-detail-surface-raised)",
-                border: "1px solid var(--mem-border)",
-                borderRadius: "var(--mem-radius-md)",
-                padding: "12px 14px",
-              }}
-            >
-              <div
-                style={{
-                  font: "500 10px var(--mem-font-mono)",
-                  letterSpacing: ".14em",
-                  textTransform: "uppercase",
-                  color: "var(--mem-accent-warm)",
-                }}
-              >
-                {card.title}
-              </div>
-              <p
-                style={{
-                  margin: "6px 0 0",
-                  fontSize: 12.5,
-                  lineHeight: 1.5,
-                  color: "var(--mem-text-secondary)",
-                }}
-              >
-                {card.body}
-              </p>
-              <button
-                type="button"
-                onClick={() => focusEntity(card.focusId)}
-                style={{
-                  display: "inline-block",
-                  background: "none",
-                  border: "none",
-                  padding: 0,
-                  marginTop: 8,
-                  fontSize: 11.5,
-                  color: "var(--mem-accent-indigo)",
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                }}
-              >
-                {t("atlas.rail.showInAtlas")}
-              </button>
-            </div>
-          ))}
-        </aside>
-      )}
       </div>
     </div>
   );
