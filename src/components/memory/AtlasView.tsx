@@ -36,7 +36,7 @@ import {
   cartographyScene,
   drawCartography,
   drawRegionNames,
-  terrainSprite,
+  terrainField,
   isUnscopedSpace,
   MIN_REGION_SIZE,
 } from "../../lib/graph/cartography";
@@ -497,7 +497,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       // (atlas.ts) that is roughly degree >= 5 for an entity and >= 6 for a
       // page, so the zoomed-out map shows hub names only; sigma's own label
       // grid reveals the rest as you zoom in.
-      labelRenderedSizeThreshold: 7,
+      labelRenderedSizeThreshold: 8,
       // Round 4: with memories on, the size threshold alone still let dozens
       // of labels pile on top of each other. Sigma buckets the viewport into
       // a grid of labelGridCellSize screen px and keeps
@@ -507,9 +507,10 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       // normally sits at — and the cell size is what decides how coarse that
       // thinning is. Zooming in reveals more names because the same graph
       // area then spans more cells, not because the per-cell count rises.
-      // 160 px cells: a handful of names at fit zoom, read as landmarks.
+      // 200 px cells: a handful of names at fit zoom, read as landmarks,
+      // with room for a radial label to extend without touching the next.
       labelDensity: 0.04,
-      labelGridCellSize: 160,
+      labelGridCellSize: 200,
       // Default camera fit maps the graph bbox edge-to-edge on the tighter
       // axis, half-clipping the extreme nodes; give the map a margin.
       stagePadding: 40,
@@ -553,6 +554,10 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       (window as unknown as Record<string, unknown>).__ATLAS_SIGMA = renderer;
     }
 
+    // The coarse density field the terrain is summed into, kept for the life
+    // of the mount (it resizes itself to the viewport on each paint). Null in
+    // jsdom, where drawCartography falls back to flat discs.
+    const field = terrainField();
     const drawUnderlay = (scene: CartographyScene) => {
       const ctx = underlay.getContext("2d");
       if (!ctx) return; // jsdom
@@ -570,7 +575,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
         (pos) => renderer.graphToViewport(pos),
         paletteRef.current,
         { width, height },
-        terrainSprite(paletteRef.current.terrain, dpr),
+        field,
       );
     };
     const drawOverlay = (scene: CartographyScene) => {

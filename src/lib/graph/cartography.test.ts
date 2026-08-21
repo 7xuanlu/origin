@@ -13,6 +13,14 @@ import {
   placeRegionLabels,
   MAX_REGION_LABELS,
   MIN_LABELLED_SPAN_PX,
+  REGION_NAME_LIFT_MIN_PX,
+  TERRAIN_CELL_PX,
+  KERNEL_PEAK,
+  LAND_MIN,
+  LAND_FULL,
+  landCover,
+  shadeField,
+  parseInk,
   TERRAIN_RADIUS_PX,
 } from "./cartography";
 import type { CartographyScene, Region } from "./cartography";
@@ -535,11 +543,13 @@ describe("communitiesFor", () => {
 });
 
 function graphOf(
-  nodes: { id: string; x: number; y: number; label: string }[],
+  nodes: { id: string; x: number; y: number; label: string; entityType?: string }[],
   edges: [string, string][] = [],
 ): Graph {
   const graph = new Graph({ multi: true });
-  for (const n of nodes) graph.addNode(n.id, { x: n.x, y: n.y, label: n.label });
+  for (const n of nodes) {
+    graph.addNode(n.id, { x: n.x, y: n.y, label: n.label, ...(n.entityType ? { entityType: n.entityType } : {}) });
+  }
   edges.forEach(([source, target], i) => graph.addEdgeWithKey(`e${i}`, source, target));
   return graph;
 }
@@ -601,10 +611,11 @@ describe("communityRegions", () => {
 });
 
 describe("cartographyScene", () => {
-  it("collects one point per node, in graph coords", () => {
+  it("collects one point per knowledge node, in graph coords, and leaves memories out of the terrain", () => {
     const graph = graphOf([
       { id: "a", x: 3, y: 4, label: "A" },
       { id: "b", x: -1, y: 0, label: "B" },
+      { id: "m", x: 7, y: 7, label: "M", entityType: "memory" },
     ]);
     const scene = cartographyScene(graph, new Map([["a", "0"], ["b", "1"]]));
     expect(scene.points).toEqual(
@@ -613,6 +624,8 @@ describe("cartographyScene", () => {
         { x: -1, y: 0 },
       ]),
     );
+    // The memory is context around a subject, not land of its own: ~2,000 of
+    // them on the real map saturated the field into one blot.
     expect(scene.points).toHaveLength(2);
     expect(scene.regions).toHaveLength(0);
   });
@@ -674,7 +687,7 @@ describe("drawCartography", () => {
     return { regions: [], points };
   }
 
-  it("paints one arc per point, radius TERRAIN_RADIUS_PX, filled with palette.terrain, when no sprite is given", () => {
+  it("paints one arc per point, radius TERRAIN_RADIUS_PX, filled with palette.terrain, when there is no field (jsdom)", () => {
     const { ctx, fills } = mockCtx();
     const scene = sceneOfPoints([
       { x: 100, y: 100 },
@@ -704,21 +717,97 @@ describe("drawCartography", () => {
     expect(arc.mock.calls[0][0]).toBe(100);
   });
 
-  it("draws the sprite instead of an arc when one is given", () => {
+  /** A fake density field: records the kernel stamps, hands back a buffer
+   *  whose alpha channel the test seeds, and records what was put back. */
+  function fakeField(alpha: number[]) {
+    const cols = Math.ceil(viewport.width / TERRAIN_CELL_PX);
+    const rows = Math.ceil(viewport.height / TERRAIN_CELL_PX);
+    const data = new Uint8ClampedArray(cols * rows * 4);
+    alpha.forEach((a, i) => {
+      data[i * 4 + 3] = a;
+    });
+    const image = { data, width: cols, height: rows };
+    const fctx = {
+      globalCompositeOperation: "source-over",
+      clearRect: vi.fn(),
+      drawImage: vi.fn(),
+      getImageData: vi.fn(() => image),
+      putImageData: vi.fn(),
+    };
+    const kernel = { width: 16, height: 16 } as HTMLCanvasElement;
+    const canvas = { width: 0, height: 0 } as HTMLCanvasElement;
+    return { field: { canvas, ctx: fctx as unknown as CanvasRenderingContext2D, kernel }, fctx, image, cols, rows };
+  }
+
+  it("stamps one kernel per point into the coarse field, shades it, and draws the field scaled up — no arcs", () => {
     const { ctx } = mockCtx();
-    const sprite = {} as CanvasImageSource;
+    const { field, fctx, cols, rows } = fakeField([]);
     const scene = sceneOfPoints([
       { x: 100, y: 100 },
       { x: 200, y: 150 },
+      { x: 900, y: 300 }, // culled: past viewport.width + TERRAIN_RADIUS_PX
     ]);
-    drawCartography(ctx, scene, identity, PALETTE, viewport, sprite);
+    drawCartography(ctx, scene, identity, PALETTE, viewport, field);
+    // Field sized to the viewport in cells, cleared, kernels summed with `lighter`.
+    expect(field.canvas.width).toBe(cols);
+    expect(field.canvas.height).toBe(rows);
+    expect(fctx.clearRect).toHaveBeenCalledWith(0, 0, cols, rows);
+    const kr = 8;
+    expect(fctx.drawImage.mock.calls).toEqual([
+      [field.kernel, 100 / TERRAIN_CELL_PX - kr, 100 / TERRAIN_CELL_PX - kr],
+      [field.kernel, 200 / TERRAIN_CELL_PX - kr, 150 / TERRAIN_CELL_PX - kr],
+    ]);
+    expect(fctx.getImageData).toHaveBeenCalledWith(0, 0, cols, rows);
+    expect(fctx.putImageData).toHaveBeenCalledTimes(1);
+    // The shaded field lands on the underlay scaled back up to CSS px.
     const drawImage = ctx.drawImage as ReturnType<typeof vi.fn>;
-    const r = TERRAIN_RADIUS_PX;
     expect(drawImage.mock.calls).toEqual([
-      [sprite, 100 - r, 100 - r, r * 2, r * 2],
-      [sprite, 200 - r, 150 - r, r * 2, r * 2],
+      [field.canvas, 0, 0, cols, rows, 0, 0, cols * TERRAIN_CELL_PX, rows * TERRAIN_CELL_PX],
     ]);
     expect(ctx.arc).not.toHaveBeenCalled();
+  });
+
+  it("draws nothing at all when every point is off screen", () => {
+    const { ctx } = mockCtx();
+    const { field, fctx } = fakeField([]);
+    drawCartography(ctx, sceneOfPoints([{ x: 5000, y: 5000 }]), identity, PALETTE, viewport, field);
+    expect(fctx.getImageData).not.toHaveBeenCalled();
+    expect(ctx.drawImage).not.toHaveBeenCalled();
+  });
+
+  it("shades the field as terrain ink at the ink's alpha times the land cover: one node is sea, a crowd is land", () => {
+    const data = new Uint8ClampedArray(4 * 4);
+    const one = Math.round(255 * KERNEL_PEAK); // exactly one kernel deep: a lone node
+    const crowd = Math.round(255 * KERNEL_PEAK * LAND_FULL); // LAND_FULL nodes deep
+    const half = Math.round(255 * KERNEL_PEAK * (LAND_MIN + LAND_FULL) / 2);
+    data[3] = 0;
+    data[7] = one;
+    data[11] = half;
+    data[15] = crowd;
+    shadeField(data, { r: 10, g: 20, b: 30, a: 0.5 });
+    // Every pixel takes the ink's colour…
+    for (let i = 0; i < 16; i += 4) expect([data[i], data[i + 1], data[i + 2]]).toEqual([10, 20, 30]);
+    // …and the alpha is the coastline: nothing below LAND_MIN (a lone node's
+    // peak of 1 included), the full ink at LAND_FULL, the ramp between.
+    expect(data[3]).toBe(0);
+    expect(data[7]).toBe(0);
+    expect(data[11]).toBe(Math.round(255 * 0.5 * landCover((LAND_MIN + LAND_FULL) / 2)));
+    expect(data[15]).toBe(Math.round(255 * 0.5));
+  });
+
+  it("landCover is a smooth 0..1 ramp from LAND_MIN to LAND_FULL", () => {
+    expect(LAND_MIN).toBeGreaterThan(1); // a single node can never be land
+    expect(landCover(0)).toBe(0);
+    expect(landCover(LAND_MIN)).toBe(0);
+    expect(landCover((LAND_MIN + LAND_FULL) / 2)).toBeCloseTo(0.5, 6);
+    expect(landCover(LAND_FULL)).toBe(1);
+    expect(landCover(LAND_FULL + 5)).toBe(1);
+  });
+
+  it("parses rgb/rgba inks and shades anything else as opaque black, loudly", () => {
+    expect(parseInk("rgba(169, 174, 242, 0.16)")).toEqual({ r: 169, g: 174, b: 242, a: 0.16 });
+    expect(parseInk("rgb(1,2,3)")).toEqual({ r: 1, g: 2, b: 3, a: 1 });
+    expect(parseInk("")).toEqual({ r: 0, g: 0, b: 0, a: 1 });
   });
 
   it("draws no region names — that's drawRegionNames' job now", () => {
@@ -756,7 +845,7 @@ describe("drawRegionNames", () => {
     };
   }
 
-  it("draws the dominant region at 15px and the next at 12px, centred on the projected centroid", () => {
+  it("draws the dominant region at 15px and the next at 12px, lifted above the projected centroid", () => {
     const { ctx, texts } = mockCtx();
     const scene: CartographyScene = {
       regions: [region("Wenlan", 100, 100), region("Tauri", 600, 300)],
@@ -767,10 +856,11 @@ describe("drawRegionNames", () => {
     expect(texts[0].font).toBe("italic 500 15px Fraunces, Georgia, serif");
     expect(texts[1].font).toBe("italic 500 12px Fraunces, Georgia, serif");
     expect(texts[0].fillStyle).toBe(PALETTE.labelMuted);
+    // The fixtures are 20px tall, so the lift clamps to its minimum.
     expect(texts[0].x).toBe(100);
-    expect(texts[0].y).toBe(100);
+    expect(texts[0].y).toBe(100 - REGION_NAME_LIFT_MIN_PX);
     expect(texts[1].x).toBe(600);
-    expect(texts[1].y).toBe(300);
+    expect(texts[1].y).toBe(300 - REGION_NAME_LIFT_MIN_PX);
     expect(texts[0].textBaseline).toBe("middle");
   });
 
@@ -782,8 +872,8 @@ describe("drawRegionNames", () => {
     };
     drawRegionNames(ctx, scene, identity, PALETTE);
     expect(haloTexts).toEqual([
-      { text: "Wenlan", x: 100, y: 100, strokeStyle: PALETTE.surface, lineWidth: 3, lineJoin: "round" },
-      { text: "Tauri", x: 600, y: 300, strokeStyle: PALETTE.surface, lineWidth: 3, lineJoin: "round" },
+      { text: "Wenlan", x: 100, y: 100 - REGION_NAME_LIFT_MIN_PX, strokeStyle: PALETTE.surface, lineWidth: 3, lineJoin: "round" },
+      { text: "Tauri", x: 600, y: 300 - REGION_NAME_LIFT_MIN_PX, strokeStyle: PALETTE.surface, lineWidth: 3, lineJoin: "round" },
     ]);
     expect(drawOrder).toEqual(["stroke:Wenlan", "fill:Wenlan", "stroke:Tauri", "fill:Tauri"]);
   });
@@ -859,10 +949,20 @@ describe("placeRegionLabels", () => {
     expect(placeRegionLabels(scene, doubled, measure)).toHaveLength(1);
   });
 
-  it("centres the name on the region's projected centroid, with no lift", () => {
+  it("sets the name above the region's projected centroid, clear of the hub and its own label", () => {
+    // 20px tall: the lift clamps to REGION_NAME_LIFT_MIN_PX.
     const placed = placeRegionLabels(sceneOf([boxRegion("Mid", 40, 200, 140)]), identity, measure);
     expect(placed[0].x).toBe(110);
-    expect(placed[0].y).toBe(210);
+    expect(placed[0].y).toBe(210 - REGION_NAME_LIFT_MIN_PX);
+    // A tall region lifts by a share of its on-screen height instead.
+    const tall: Region = {
+      name: "Tall",
+      memberCount: 5,
+      centroid: { x: 100, y: 200 },
+      bounds: { minX: 0, maxX: 200, minY: 100, maxY: 300 },
+    };
+    const [label] = placeRegionLabels(sceneOf([tall]), identity, measure);
+    expect(label.y).toBe(200 - 0.3 * 200);
   });
 });
 

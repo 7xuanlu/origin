@@ -156,8 +156,8 @@ describe("buildAtlasGraph", () => {
     expect(graph.getNodeAttribute("entity", "size")).toBeCloseTo(3 + growth, 10);
     // Memories are context: they start lowest and are capped well under the
     // entity/page ceiling, so a much-cited memory can never dominate.
-    expect(graph.getNodeAttribute("memory", "size")).toBe(4);
-    expect(graph.getNodeAttribute("memhub", "size")).toBe(4);
+    expect(graph.getNodeAttribute("memory", "size")).toBe(3);
+    expect(graph.getNodeAttribute("memhub", "size")).toBe(3);
   });
 
   it("draws a shared-source edge thinner than a real link and keeps the verb on the edge", () => {
@@ -716,7 +716,7 @@ describe("nonSimulatedIds and satellites", () => {
     for (const id of ["leaf1", "leaf2"]) {
       const dx = (graph.getNodeAttribute(id, "x") as number) - 40;
       const dy = (graph.getNodeAttribute(id, "y") as number) + 15;
-      expect(Math.hypot(dx, dy)).toBeCloseTo(hubSize + 6, 10);
+      expect(Math.hypot(dx, dy)).toBeCloseTo(hubSize + 10, 10);
     }
     // Two leaves on one anchor sit on opposite sides of it, not on top of
     // each other.
@@ -989,54 +989,70 @@ describe("shelveComponents", () => {
     expect((core.minY + core.maxY) / 2).toBeCloseTo(0, 6);
   });
 
-  it("puts every other component BELOW the core, never around it", () => {
-    const { graph, placement } = shelved([9, 6, 5, 5]);
+  it("puts the two largest shelf components one on each side of the core, each column centred on the core's own centre", () => {
+    const { graph, placement } = shelved([9, 6, 5]);
     const core = box(graph, placement[0] as string[]);
-    for (const ids of placement.slice(1)) {
-      const shelf = box(graph, ids);
-      // Graph +y is screen-up, so "below" is smaller y. The whole shelf box
-      // clears the core's bottom edge by at least SHELF_TOP_GAP.
-      expect(shelf.maxY).toBeLessThanOrEqual(core.minY - SHELF_TOP_GAP + 1e-6);
+    // Grouped components are assigned largest-first to whichever wing column
+    // is currently shorter, tie -> right: with only two, the first (6) goes
+    // right, the second (5) goes left.
+    const right = box(graph, placement[1] as string[]);
+    const left = box(graph, placement[2] as string[]);
+    // A single-component column IS the column, so its own midpoint sits at
+    // the core's vertical centre — the origin, after recentring.
+    expect((right.minY + right.maxY) / 2).toBeCloseTo(0, 6);
+    expect((left.minY + left.maxY) / 2).toBeCloseTo(0, 6);
+    expect(right.minX - core.maxX).toBeCloseTo(SHELF_TOP_GAP, 6);
+    expect(core.minX - left.maxX).toBeCloseTo(SHELF_TOP_GAP, 6);
+  });
+
+  it("stacks a wing downward SHELF_GAP apart, and keeps its height within the core's unless it holds only one component", () => {
+    const { graph, placement } = shelved([14, 5, 5, 5, 5, 5, 5]);
+    const core = box(graph, placement[0] as string[]);
+    const shelf = placement.slice(1).map((ids) => box(graph, ids));
+    // A wing member's bottom never drops below the core's own bottom edge;
+    // an overflow row, by contrast, sits well clear of it (SHELF_TOP_GAP
+    // below), so this line cleanly separates the two kinds.
+    const wingBoxes = shelf.filter((b) => b.minY >= core.minY - 1e-6);
+    const right = wingBoxes.filter((b) => b.minX >= core.maxX + SHELF_TOP_GAP - 1e-6);
+    const left = wingBoxes.filter((b) => b.maxX <= core.minX - SHELF_TOP_GAP + 1e-6);
+    expect(right.length + left.length).toBe(wingBoxes.length);
+    const coreHeight = core.maxY - core.minY;
+    for (const column of [right, left]) {
+      expect(column.length).toBeGreaterThan(1);
+      const sorted = [...column].sort((a, b) => b.maxY - a.maxY);
+      for (let i = 1; i < sorted.length; i += 1) {
+        const prev = sorted[i - 1] as { minY: number };
+        const next = sorted[i] as { maxY: number };
+        expect(prev.minY - next.maxY).toBeCloseTo(SHELF_GAP, 6);
+      }
+      const stackHeight =
+        (sorted[0] as { maxY: number }).maxY - (sorted[sorted.length - 1] as { minY: number }).minY;
+      expect(stackHeight).toBeLessThanOrEqual(coreHeight + 1e-6);
+      // The column is slid so its own midpoint sits on the core's vertical
+      // centre (0, after recentring), not pinned to the core's top edge.
+      const top = (sorted[0] as { maxY: number }).maxY;
+      const bottom = (sorted[sorted.length - 1] as { minY: number }).minY;
+      expect((top + bottom) / 2).toBeCloseTo(0, 6);
     }
-    const first = box(graph, placement[1] as string[]);
-    expect(first.maxY).toBeCloseTo(core.minY - SHELF_TOP_GAP, 6);
   });
 
-  it("orders the shelf largest-first, left to right, one SHELF_GAP apart", () => {
-    const { graph, placement } = shelved([12, 7, 6, 5]);
-    const shelf = placement.slice(1);
-    expect(shelf.map((ids) => ids.length)).toEqual([7, 6, 5]);
-    const boxes = shelf.map((ids) => box(graph, ids));
-    for (let i = 1; i < boxes.length; i += 1) {
-      const left = boxes[i - 1] as { maxX: number };
-      const right = boxes[i] as { minX: number };
-      expect(right.minX - left.maxX).toBeCloseTo(SHELF_GAP, 6);
-    }
-  });
-
-  it("centres each shelf row under the core", () => {
-    const { graph, placement } = shelved([12, 7, 6, 5]);
-    const boxes = placement.slice(1).map((ids) => box(graph, ids));
-    const rowLeft = Math.min(...boxes.map((b) => b.minX));
-    const rowRight = Math.max(...boxes.map((b) => b.maxX));
-    expect((rowLeft + rowRight) / 2).toBeCloseTo(0, 6);
-  });
-
-  it("wraps to another row once a row would run wider than the core allows", () => {
-    // Eight shelf components against a narrow core: one row cannot hold them.
+  it("sends whatever overflows the wings to rows below the core, width-budgeted like before", () => {
+    // A narrow core against eight same-size components: the wings fill up
+    // fast and the rest has to fall through to rows.
     const { graph, placement } = shelved([6, 5, 5, 5, 5, 5, 5, 5, 5]);
     const core = box(graph, placement[0] as string[]);
-    const boxes = placement.slice(1).map((ids) => box(graph, ids));
-    const rows = new Map<string, { minX: number; maxX: number }[]>();
-    for (const b of boxes) {
-      const key = b.maxY.toFixed(6);
-      const list = rows.get(key);
-      if (list) list.push(b);
-      else rows.set(key, [b]);
-    }
-    expect(rows.size).toBeGreaterThan(1);
+    const shelf = placement.slice(1).map((ids) => box(graph, ids));
+    const rows = shelf.filter((b) => b.maxY <= core.minY - SHELF_TOP_GAP + 1e-6);
+    expect(rows.length).toBeGreaterThan(0);
     const budget = SHELF_WIDTH_FACTOR * (core.maxX - core.minX);
-    for (const row of rows.values()) {
+    const byRow = new Map<string, typeof rows>();
+    for (const b of rows) {
+      const key = b.maxY.toFixed(6);
+      const list = byRow.get(key);
+      if (list) list.push(b);
+      else byRow.set(key, [b]);
+    }
+    for (const row of byRow.values()) {
       const width = Math.max(...row.map((b) => b.maxX)) - Math.min(...row.map((b) => b.minX));
       // A row may only exceed the budget when a single component does.
       const widest = Math.max(...row.map((b) => b.maxX - b.minX));
@@ -1128,19 +1144,22 @@ describe("shelveComponents", () => {
     const placement = shelveComponents(graph);
     placeSatellites(graph, satellitePlan(graph));
     expect(placement[0]).toContain("k0");
+    // s (5 nodes) is a WING now, not a row below the core, so what it has to
+    // clear is the core's bbox INCLUDING the halo, on whichever side it
+    // landed — not just k0's own bottom edge.
     const shelf = box(graph, ["s0", "s1", "s2", "s3", "s4"]);
+    const leafIds = Array.from({ length: leaves }, (_, i) => `leaf${String(i).padStart(3, "0")}`);
+    const coreWithHalo = box(graph, ["k0", "k1", "k2", "k3", "k4", "k5", ...leafIds]);
     const leafSize = graph.getNodeAttribute("leaf000", "size") as number;
     let lowest = Infinity;
-    for (let i = 0; i < leaves; i += 1) {
-      lowest = Math.min(
-        lowest,
-        (graph.getNodeAttribute(`leaf${String(i).padStart(3, "0")}`, "y") as number) - leafSize,
-      );
+    for (const id of leafIds) {
+      lowest = Math.min(lowest, (graph.getNodeAttribute(id, "y") as number) - leafSize);
     }
-    // The halo hangs well below the core's own discs, and the shelf still
-    // clears its lowest leaf by the full SHELF_TOP_GAP.
+    // The halo hangs well below the core's own discs.
     expect(lowest).toBeLessThan(-(graph.getNodeAttribute("k0", "size") as number) * 2);
-    expect(shelf.maxY).toBeLessThanOrEqual(lowest - SHELF_TOP_GAP + 1e-6);
+    const clearsRight = shelf.minX >= coreWithHalo.maxX + SHELF_TOP_GAP - 1e-6;
+    const clearsLeft = shelf.maxX <= coreWithHalo.minX - SHELF_TOP_GAP + 1e-6;
+    expect(clearsRight || clearsLeft).toBe(true);
   });
 
   it("is deterministic: the same graph shelves the same way twice", () => {
@@ -1242,11 +1261,12 @@ describe("shelveComponents", () => {
     sim.tick(60);
 
     const after = centroid();
-    // The shelf sits BELOW the core, so a centre force that averaged every
-    // node would see a centroid below the origin every tick and walk the
-    // core upward to compensate — the two zones would drift apart. Each
-    // component holding its OWN centroid (not a shared one across the whole
-    // graph) is what keeps the core from chasing the shelf's mass.
+    // The shelf sits off-centre from the core (in the wings, or below it on
+    // overflow rows), so a centre force that averaged every node would see a
+    // lopsided centroid every tick and walk the core to compensate — the
+    // zones would drift apart. Each component holding its OWN centroid (not
+    // a shared one across the whole graph) is what keeps the core from
+    // chasing the shelf's mass.
     expect(Math.hypot(after.x - before.x, after.y - before.y)).toBeLessThan(span * 0.08);
   });
 
@@ -1428,10 +1448,12 @@ describe("shelveComponents", () => {
     // Chains this long are the case a centroid hold cannot catch: holding the
     // CENTRE says nothing about which way a body points, and an elongated
     // component in the core's repulsion field pivots to point at the core —
-    // its top edge rises even though its centroid has barely moved. Under the
-    // centroid-only hold this fixture's five-node chain rose 9.1 units toward
-    // the core in 120 ticks and its centroid drifted 1.8; both are near zero
-    // once each node is sprung to its own slot.
+    // its near edge closes in even though its centroid has barely moved
+    // (measured on this fixture: the five-node left-wing chain's centroid
+    // drifted under 1e-13 over 120 ticks while its clearance from the core
+    // fell by ~21 of the 60-unit gap the packing left. Nowhere near an
+    // overlap, and the per-node springs are what stop it going further —
+    // a centroid-only hold has nothing to say about rotation at all).
     const graph = buildAtlasGraph(componentsModel([24, 6, 5]), PALETTE);
     runAtlasLayout(graph);
     const sim = createAtlasSimulation(graph);
@@ -1456,15 +1478,24 @@ describe("shelveComponents", () => {
     sim.tick(120);
 
     const core = box(graph, ids[0] as string[]);
+    const coreBefore = boxBefore[0] as { minX: number; maxX: number };
     for (let i = 1; i < ids.length; i += 1) {
       const shelf = box(graph, ids[i] as string[]);
       const overlaps =
         shelf.minX < core.maxX && core.minX < shelf.maxX && shelf.minY < core.maxY && core.minY < shelf.maxY;
       expect(overlaps).toBe(false);
-      // The shelf is BELOW the core, so "rising toward the core" is maxY
-      // climbing. Bounded well inside the SHELF_GAP the packing left.
-      const rise = shelf.maxY - (boxBefore[i] as { maxY: number }).maxY;
-      expect(rise).toBeLessThan(5);
+      // Both of this fixture's shelf components sit in a wing beside the
+      // core (two grouped components, each an empty column's guaranteed
+      // fit), so "swinging toward the core" now shows up as its NEAR
+      // horizontal edge closing the gap, not a climbing top edge. Read the
+      // side off which half of the core this component landed on.
+      const shelfBefore = boxBefore[i] as { minX: number; maxX: number };
+      const isRight = shelf.minX > core.minX;
+      const clearanceBefore = isRight ? shelfBefore.minX - coreBefore.maxX : coreBefore.minX - shelfBefore.maxX;
+      const clearanceAfter = isRight ? shelf.minX - core.maxX : core.minX - shelf.maxX;
+      // Well short of the SHELF_TOP_GAP clearance the packing left, so the
+      // wing never gets close to overlapping the core.
+      expect(clearanceBefore - clearanceAfter).toBeLessThan(SHELF_TOP_GAP / 2);
       const after = centroidOf(ids[i] as string[]);
       const b = before[i] as { x: number; y: number };
       expect(Math.hypot(after.x - b.x, after.y - b.y)).toBeLessThan(0.5);

@@ -1,30 +1,59 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type Graph from "graphology";
-import type { GraphModel } from "./model";
+import { MEMORY_NODE_TYPE, type GraphModel } from "./model";
 import type { GraphPalette } from "./palette";
 import type { SpaceCartography } from "./community";
 
-// The Atlas cartography layer — a relief map, not a diagram: every drawn
-// node deposits one soft wash of terrain ink on the underlay, so density
-// stacks into landmasses with no outline, and named community regions sit on
-// that terrain as place names drawn above the nodes. Everything here is pure
-// math / pure canvas drawing; AtlasView owns the two helper canvases and the
-// sigma afterRender wiring.
+// The Atlas cartography layer — a relief map, not a diagram: the knowledge
+// nodes (pages and entities) are summed into a density field, and only where
+// that field is dense enough does terrain ink appear — land under the
+// crowds, open sea around a lone point — with no outline anywhere. Named
+// community regions sit on that terrain as place names drawn above the
+// nodes. Everything here is pure math / pure canvas drawing; AtlasView owns
+// the two helper canvases and the sigma afterRender wiring.
 
 /** Minimum members before a community earns a name — a 1-2 node "region" is
  *  noise, not geography. */
 export const MIN_REGION_SIZE = 3;
 
-/** Radius of one node's terrain wash in screen px. Screen-constant on
- *  purpose: zoomed out, neighbouring washes merge into one landmass; zoomed
- *  in, they separate into a halo per node — the map gains detail as you
- *  approach instead of blurring. */
+/** Radius of one node's density kernel in screen px. Screen-constant on
+ *  purpose: zoomed out, neighbouring kernels sum into one landmass; zoomed
+ *  in, the crowd spreads out, the sum falls under the land threshold and the
+ *  map resolves into bare points — detail instead of blur. */
 export const TERRAIN_RADIUS_PX = 34;
+
+/** The density field is sampled at one cell per this many CSS px, then
+ *  upscaled with bilinear smoothing onto the underlay. Coarse is the point:
+ *  a 1440x900 viewport is a 360x225 field, cheap to read back and shade on
+ *  every sigma frame, and the smoothing is what gives the coast a soft edge. */
+export const TERRAIN_CELL_PX = 4;
+
+/** One kernel's peak value in the field's alpha channel (0-1). Kernels are
+ *  summed with the `lighter` blend, so a pixel's alpha is KERNEL_PEAK times
+ *  the local node density until it saturates at 1 — four nodes deep. */
+export const KERNEL_PEAK = 0.25;
+
+/** Density (in nodes, KERNEL_PEAK units) where land starts and where it
+ *  reaches full ink. LAND_MIN is above 1 on purpose: a lone node's kernel
+ *  peaks at exactly 1, so it never shows — no halo, no drop shadow, no aura
+ *  around a single point. Two nodes close together just break the surface;
+ *  three or more within a kernel radius are solid land. */
+export const LAND_MIN = 1.1;
+export const LAND_FULL = 2.6;
 
 /** A region whose members span less than this on screen is a speck: its name
  *  would be noise rather than orientation, so it goes unnamed until you zoom
  *  in far enough for the span to cross the bar. */
-export const MIN_LABELLED_SPAN_PX = 140;
+export const MIN_LABELLED_SPAN_PX = 90;
+
+/** A place name sits ABOVE its region's centroid, not on it: the centroid is
+ *  where the hub node and its own label are, and a name on top of a name was
+ *  the first thing the eye caught. The lift is a share of the region's
+ *  on-screen height, clamped so a flat region still clears its hub and a
+ *  tall one does not float off into the sea. */
+export const REGION_NAME_LIFT_FRACTION = 0.3;
+export const REGION_NAME_LIFT_MIN_PX = 18;
+export const REGION_NAME_LIFT_MAX_PX = 60;
 
 /** Hard ceiling on drawn region names per paint, at any zoom. Real data has
  *  66 regions with memories off and 148 with them on; at fit-to-screen a map
@@ -349,7 +378,11 @@ export function communityRegions(graph: Graph, communities: Map<string, string>)
 
 export interface CartographyScene {
   regions: Region[];
-  /** GRAPH positions of every drawn node — each one deposits a terrain wash. */
+  /** GRAPH positions of every drawn KNOWLEDGE node — pages and entities. Each
+   *  one adds a kernel to the density field. Memories are left out: they are
+   *  context hung around the subjects, and with ~2,000 of them on the map
+   *  every crowd of memories around a page turned the field solid, so the
+   *  whole core became one saturated blot instead of landmasses. */
   points: { x: number; y: number }[];
 }
 
@@ -358,55 +391,93 @@ export interface CartographyScene {
 export function cartographyScene(graph: Graph, communities: Map<string, string>): CartographyScene {
   const points: { x: number; y: number }[] = [];
   graph.forEachNode((_id, attrs) => {
+    if (attrs.entityType === MEMORY_NODE_TYPE) return;
     points.push({ x: attrs.x as number, y: attrs.y as number });
   });
   return { regions: communityRegions(graph, communities), points };
 }
 
 /**
- * One node's wash, pre-rendered once per (ink, devicePixelRatio): a radial
- * gradient from the terrain ink at the centre to transparent at
- * TERRAIN_RADIUS_PX. Drawing ~1,500 of these per frame as drawImage calls is
- * cheap; building a gradient per node per frame is not. Returns null where
- * there is no 2D canvas to render into (jsdom) — drawCartography then falls
- * back to flat discs, the same picture at test granularity.
+ * The offscreen density field plus the one kernel stamped into it. Built
+ * once per AtlasView mount (AtlasView keeps it across frames); null where
+ * there is no 2D canvas to draw into (jsdom) — drawCartography then falls
+ * back to a flat disc per point, the same picture at test granularity.
  */
-const spriteCache = new Map<string, HTMLCanvasElement>();
-export function terrainSprite(ink: string, dpr: number): HTMLCanvasElement | null {
-  if (typeof document === "undefined") return null;
-  const key = `${ink}@${dpr}`;
-  const cached = spriteCache.get(key);
-  if (cached) return cached;
-  const canvas = document.createElement("canvas");
-  const side = Math.ceil(TERRAIN_RADIUS_PX * 2 * dpr);
-  canvas.width = side;
-  canvas.height = side;
-  const ctx = canvas.getContext("2d");
-  if (!ctx || typeof ctx.createRadialGradient !== "function") return null;
-  const c = side / 2;
-  const gradient = ctx.createRadialGradient(c, c, 0, c, c, c);
-  gradient.addColorStop(0, ink);
-  gradient.addColorStop(1, transparentLike(ink));
-  ctx.fillStyle = gradient;
-  ctx.fillRect(0, 0, side, side);
-  spriteCache.set(key, canvas);
-  return canvas;
+export interface TerrainField {
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+  /** One node's kernel: white, alpha KERNEL_PEAK at the centre falling to 0
+   *  at TERRAIN_RADIUS_PX, in FIELD cells. Stamped with the `lighter` blend
+   *  so overlapping kernels sum in the alpha channel. */
+  kernel: HTMLCanvasElement;
 }
 
-/** The same colour at alpha 0, so the gradient fades in place instead of
- *  toward black (CSS `transparent` is rgba(0,0,0,0)). Non-rgba inks (jsdom's
- *  empty computed styles) get plain transparent. */
-function transparentLike(ink: string): string {
-  const m = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/.exec(ink);
-  return m ? `rgba(${m[1]}, ${m[2]}, ${m[3]}, 0)` : "rgba(0, 0, 0, 0)";
+export function terrainField(): TerrainField | null {
+  if (typeof document === "undefined") return null;
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx || typeof ctx.createRadialGradient !== "function") return null;
+  const kernel = document.createElement("canvas");
+  const radius = TERRAIN_RADIUS_PX / TERRAIN_CELL_PX;
+  const side = Math.ceil(radius * 2);
+  kernel.width = side;
+  kernel.height = side;
+  const kctx = kernel.getContext("2d");
+  if (!kctx) return null;
+  const c = side / 2;
+  // Roughly (1 - d/R)^2: the gradient is linear between stops, so a middle
+  // stop at a quarter of the peak bends it toward the bell the sum wants.
+  const gradient = kctx.createRadialGradient(c, c, 0, c, c, radius);
+  gradient.addColorStop(0, `rgba(255, 255, 255, ${KERNEL_PEAK})`);
+  gradient.addColorStop(0.5, `rgba(255, 255, 255, ${KERNEL_PEAK * 0.25})`);
+  gradient.addColorStop(1, "rgba(255, 255, 255, 0)");
+  kctx.fillStyle = gradient;
+  kctx.fillRect(0, 0, side, side);
+  return { canvas, ctx, kernel };
+}
+
+/** Parse a CSS `rgb()`/`rgba()` ink into channels; anything else (jsdom's
+ *  empty computed styles, a hex swatch in a test) shades as opaque black so
+ *  the failure is visible rather than silent. */
+export function parseInk(ink: string): { r: number; g: number; b: number; a: number } {
+  const m = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)/.exec(ink);
+  if (!m) return { r: 0, g: 0, b: 0, a: 1 };
+  return { r: Number(m[1]), g: Number(m[2]), b: Number(m[3]), a: m[4] === undefined ? 1 : Number(m[4]) };
+}
+
+/** Smooth ramp from 0 at LAND_MIN to 1 at LAND_FULL over the summed density
+ *  (in nodes). Pure, exported for the tests: this IS the coastline. */
+export function landCover(density: number): number {
+  const t = Math.min(1, Math.max(0, (density - LAND_MIN) / (LAND_FULL - LAND_MIN)));
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Turn the summed field (alpha = KERNEL_PEAK x density, white) into terrain
+ * ink in place: every pixel becomes the ink's colour at the ink's alpha
+ * times its land cover. Operates on the raw RGBA buffer so it can run on a
+ * plain array in tests and on getImageData's buffer in the browser.
+ */
+export function shadeField(data: Uint8ClampedArray, ink: { r: number; g: number; b: number; a: number }): void {
+  for (let i = 0; i < data.length; i += 4) {
+    const density = data[i + 3]! / 255 / KERNEL_PEAK;
+    const cover = density <= LAND_MIN ? 0 : landCover(density);
+    data[i] = ink.r;
+    data[i + 1] = ink.g;
+    data[i + 2] = ink.b;
+    data[i + 3] = Math.round(255 * ink.a * cover);
+  }
 }
 
 /**
  * Paint the terrain underlay in VIEWPORT space. `project` maps graph coords
  * to viewport CSS px (AtlasView passes sigma's graphToViewport); `viewport`
- * is the canvas size in CSS px, for culling. One wash per drawn node,
- * source-over, so overlaps stack: a lone node is a faint halo, a crowd is a
- * landmass. Nothing is outlined — the map's shapes come from density alone.
+ * is the canvas size in CSS px. Every knowledge node stamps one kernel into
+ * the coarse density field; the field is then read back, shaded through
+ * landCover (below LAND_MIN nothing, LAND_FULL and up the full terrain ink)
+ * and drawn onto the underlay scaled up with smoothing. Land only where
+ * nodes crowd; a single point casts no halo. Nothing is outlined — the map's
+ * shapes come from density alone.
  */
 export function drawCartography(
   ctx: CanvasRenderingContext2D,
@@ -414,22 +485,50 @@ export function drawCartography(
   project: (pos: { x: number; y: number }) => { x: number; y: number },
   palette: GraphPalette,
   viewport: { width: number; height: number },
-  sprite: CanvasImageSource | null = terrainSprite(palette.terrain, 1),
+  field: TerrainField | null,
 ): void {
   const r = TERRAIN_RADIUS_PX;
-  ctx.save();
-  ctx.fillStyle = palette.terrain;
-  for (const point of scene.points) {
-    const at = project(point);
-    if (at.x < -r || at.y < -r || at.x > viewport.width + r || at.y > viewport.height + r) continue;
-    if (sprite) {
-      ctx.drawImage(sprite, at.x - r, at.y - r, r * 2, r * 2);
-    } else {
+  if (!field) {
+    // No 2D canvas (jsdom): one flat disc per point stands in for the field.
+    ctx.save();
+    ctx.fillStyle = palette.terrain;
+    for (const point of scene.points) {
+      const at = project(point);
+      if (at.x < -r || at.y < -r || at.x > viewport.width + r || at.y > viewport.height + r) continue;
       ctx.beginPath();
       ctx.arc(at.x, at.y, r, 0, 2 * Math.PI);
       ctx.fill();
     }
+    ctx.restore();
+    return;
   }
+  const cols = Math.max(1, Math.ceil(viewport.width / TERRAIN_CELL_PX));
+  const rows = Math.max(1, Math.ceil(viewport.height / TERRAIN_CELL_PX));
+  if (field.canvas.width !== cols || field.canvas.height !== rows) {
+    field.canvas.width = cols;
+    field.canvas.height = rows;
+  }
+  const fctx = field.ctx;
+  fctx.globalCompositeOperation = "source-over";
+  fctx.clearRect(0, 0, cols, rows);
+  fctx.globalCompositeOperation = "lighter";
+  const kr = field.kernel.width / 2;
+  let stamped = 0;
+  for (const point of scene.points) {
+    const at = project(point);
+    if (at.x < -r || at.y < -r || at.x > viewport.width + r || at.y > viewport.height + r) continue;
+    fctx.drawImage(field.kernel, at.x / TERRAIN_CELL_PX - kr, at.y / TERRAIN_CELL_PX - kr);
+    stamped += 1;
+  }
+  fctx.globalCompositeOperation = "source-over";
+  if (stamped === 0) return;
+  const image = fctx.getImageData(0, 0, cols, rows);
+  shadeField(image.data, parseInk(palette.terrain));
+  fctx.putImageData(image, 0, 0);
+  ctx.save();
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(field.canvas, 0, 0, cols, rows, 0, 0, cols * TERRAIN_CELL_PX, rows * TERRAIN_CELL_PX);
   ctx.restore();
 }
 
@@ -452,11 +551,12 @@ export interface PlacedLabel {
  *
  * Regions arrive largest-first (communityRegions sorts them) and are walked in
  * that order, so the biggest region always wins a contested spot. A name sits
- * on its region's centroid, like a place name on a map. A region is skipped
- * when its members span a speck on screen (narrower than
- * MIN_LABELLED_SPAN_PX) or when its label box would touch one already placed;
- * placement stops at MAX_REGION_LABELS. Because on-screen span grows with
- * zoom, more names appear as you approach.
+ * above its region's centroid (see REGION_NAME_LIFT_*), like a place name
+ * set on the land rather than on the town. A region is skipped when its
+ * members span a speck on screen (narrower than MIN_LABELLED_SPAN_PX) or when
+ * its label box would touch one already placed; placement stops at
+ * MAX_REGION_LABELS. Because on-screen span grows with zoom, more names
+ * appear as you approach.
  */
 export function placeRegionLabels(
   scene: CartographyScene,
@@ -477,8 +577,15 @@ export function placeRegionLabels(
       project({ x: bounds.maxX, y: bounds.maxY }),
     ];
     const xs = corners.map((p) => p.x);
+    const ys = corners.map((p) => p.y);
     if (Math.max(...xs) - Math.min(...xs) < MIN_LABELLED_SPAN_PX) continue;
-    const at = project(region.centroid);
+    const centroid = project(region.centroid);
+    const lift = Math.min(
+      REGION_NAME_LIFT_MAX_PX,
+      Math.max(REGION_NAME_LIFT_MIN_PX, REGION_NAME_LIFT_FRACTION * (Math.max(...ys) - Math.min(...ys))),
+    );
+    // Viewport y grows downward, so "above" is smaller y.
+    const at = { x: centroid.x, y: centroid.y - lift };
     const size = placed.length === 0 ? 15 : 12;
     const halfWidth = measure(region.name, size) / 2;
     const box = {

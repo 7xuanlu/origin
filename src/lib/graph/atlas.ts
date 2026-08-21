@@ -30,8 +30,8 @@ const PAGE_NODE_BASE = 3;
 /** Memory nodes start below the smallest entity and stay there: they are
  *  context around the subjects, and a memory linked to six entities must not
  *  outgrow the entities themselves. */
-const MEMORY_NODE_BASE = 2;
-const MEMORY_MAX_SIZE = 4;
+const MEMORY_NODE_BASE = 1.5;
+const MEMORY_MAX_SIZE = 3;
 /** Px added per doubling of degree. Linear growth (round 1's degree * 0.5)
  *  saturated the cap on real data — 1,600 entities where the hubs run to
  *  hundreds of links drew as one uniform field of 8s. log2 keeps the hubs
@@ -40,7 +40,7 @@ const MEMORY_MAX_SIZE = 4;
  *  the relief map, not just a slightly larger dot. */
 const DEGREE_GAIN = 1.9;
 
-// Base by stability/kind (confirmed 4, unconfirmed 3, page 3, memory 2)
+// Base by stability/kind (confirmed 4, unconfirmed 3, page 3, memory 1.5)
 // plus DEGREE_GAIN per doubling of degree, capped. Size still encodes
 // confirmation at degree 0, as it did before.
 function nodeSizeFor(confirmed: boolean | null, degree: number, entityType?: string): number {
@@ -179,8 +179,11 @@ export function runAtlasLayout(graph: Graph): void {
   });
 }
 
-/** Graph-space clearance between a leaf memory and the disc it orbits. */
-const SATELLITE_GAP = 6;
+/** Graph-space clearance between a leaf memory and the disc it orbits. Went
+ *  6 -> 10 with the memory discs shrinking (1.5-3 px): at 6 the first ring
+ *  of grey discs touched the page disc and read as a grey ring round a teal
+ *  one, a donut, on the real map with memories on. */
+const SATELLITE_GAP = 10;
 
 /**
  * Nodes no force layout runs on: degree-0 isolates (round 1's ring) plus every
@@ -293,12 +296,13 @@ export function placeSatellites(graph: Graph, plan: Satellite[], skipId?: string
   }
 }
 
-/** Horizontal clearance between two shelved components, and the vertical
- *  clearance between two shelf rows. */
+/** Horizontal clearance between two shelved components in a row, and the
+ *  vertical clearance between two shelf rows or between two components
+ *  stacked in the same wing. */
 export const SHELF_GAP = 24;
-/** Clear air between the core's bottom edge and the top of the shelf. Bigger
- *  than SHELF_GAP so the shelf reads as a separate zone rather than as more
- *  of the core. */
+/** Clearance between the core's own edge and any shelved zone — a wing
+ *  column to either side, or the row strip underneath. Bigger than SHELF_GAP
+ *  so the shelf reads as a separate zone rather than as more of the core. */
 export const SHELF_TOP_GAP = 60;
 /** A shelf row may run this much wider than the core before it wraps. Wider
  *  than the core so the shelf can hold a few components per row, but bounded
@@ -416,21 +420,73 @@ function shelfRows(boxes: ComponentBox[], maxWidth: number): ComponentBox[][] {
   return rows;
 }
 
+/** One wing column's running state while components are being stacked into
+ *  it: the components placed so far, in placement order, and the combined
+ *  height of that stack (top of the first to bottom of the last, including
+ *  the SHELF_GAPs between them). */
+interface Wing {
+  items: ComponentBox[];
+  height: number;
+}
+
+/** Stack `items` top-down against one side of the core, then slide the whole
+ *  column so its own vertical midpoint lands on the core's centre (y = 0,
+ *  since the core is recentred there first) rather than pinning the top
+ *  component to the core's top edge — a top-aligned column puts the biggest
+ *  wing member in one corner of the viewport and leaves the opposite corner
+ *  empty. Every component in the column is aligned to the same vertical line
+ *  — its left edge for the right wing, its right edge for the left wing —
+ *  SHELF_TOP_GAP off the core's edge on that side. */
+function placeWing(
+  items: ComponentBox[],
+  side: "left" | "right",
+  core: ComponentBox,
+  translate: (box: ComponentBox, dx: number, dy: number) => void,
+): void {
+  if (items.length === 0) return;
+  // Stack from an arbitrary reference (0) first, purely to learn the
+  // column's own vertical extent — recentred below once the full stack is
+  // known.
+  let top = 0;
+  for (const box of items) {
+    const dx = side === "right" ? core.maxX + SHELF_TOP_GAP - box.minX : core.minX - SHELF_TOP_GAP - box.maxX;
+    translate(box, dx, top - box.maxY);
+    top = box.minY - SHELF_GAP;
+  }
+  const first = items[0] as ComponentBox;
+  const last = items[items.length - 1] as ComponentBox;
+  const midpoint = (first.maxY + last.minY) / 2;
+  for (const box of items) translate(box, 0, -midpoint);
+}
+
 /**
- * Round 5, section A. Two zones, never a ring.
+ * Round 6. Wings, not a strip.
  *
  * The biggest component is the CORE: it keeps the layout the sim gave it and
- * is recentred so its bbox centre is the origin. Every other component is
- * translated RIGIDLY onto a SHELF below the core — largest first, left to
- * right, rows centred under the core, wrapping once a row would run wider
- * than SHELF_WIDTH_FACTOR times the core. Singleton components go last, on
- * rows of their own, because a row of lone dots reads as a legend rather than
- * as structure.
+ * is recentred so its bbox centre is the origin. The rest split three ways.
  *
- * This replaces round 4's phyllotaxis packing. Arranging the small components
- * AROUND the core drew an almost complete perimeter, which reads as a false
- * core-and-periphery hierarchy and shrinks the one thing a viewer has to
- * grasp first.
+ * Grouped components (more than one node), largest first, fill two WINGS — a
+ * column left of the core and a column right of it, each clearing the core's
+ * edge by SHELF_TOP_GAP. Each next component goes to whichever column is
+ * currently shorter (a tie goes right), stacking top-down SHELF_GAP apart
+ * until that column's stacked height would pass the core's own height; a
+ * column that is still empty always takes one component, however tall it is
+ * on its own. Each finished column is then slid so its own vertical midpoint
+ * sits on the core's centre, rather than pinning its top component to the
+ * core's top edge — that would put the biggest wing member in one corner of
+ * the viewport and leave the opposite corner empty. Anything that does not
+ * fit in either wing, plus every singleton component (a lone node), falls
+ * through to rows below the core exactly as before: largest-first, centred
+ * under the core, wrapping once a row would run wider than
+ * SHELF_WIDTH_FACTOR times the core, with the singletons on rows of their
+ * own, last.
+ *
+ * Two earlier shapes were tried and rejected. A full ring around the core
+ * (round 4, phyllotaxis packing) drew an almost complete perimeter, which
+ * reads as a false core-and-periphery hierarchy and shrinks the one thing a
+ * viewer has to grasp first. A single strip below the core (round 5) wasted
+ * the left and right thirds of a landscape viewport and squeezed every
+ * shelved component, however small, into one growing band underneath.
  *
  * Returns the node ids of each component in placement order — the core first,
  * so the caller can tell it from the shelved ones and hold each kind the way
@@ -467,25 +523,49 @@ export function shelveComponents(graph: Graph): string[][] {
   // halves largest-first: 4s, then 3s, then pairs, then the singletons.
   const grouped = rest.filter((box) => box.ids.length > 1);
   const singletons = rest.filter((box) => box.ids.length === 1);
+  const coreHeight = boxHeight(core);
+
+  // Wings: each next grouped component goes to the shorter column (ties go
+  // right). A column with more room can only be found by testing the shorter
+  // one first — the taller column never has more headroom left — so a
+  // rejection here never needs a second look at the other column.
+  const left: Wing = { items: [], height: 0 };
+  const right: Wing = { items: [], height: 0 };
+  const wingOrder: ComponentBox[] = [];
+  const overflow: ComponentBox[] = [];
+  for (const box of grouped) {
+    const wing = right.height <= left.height ? right : left;
+    const candidateHeight = wing.items.length === 0 ? boxHeight(box) : wing.height + SHELF_GAP + boxHeight(box);
+    if (wing.items.length > 0 && candidateHeight > coreHeight) {
+      overflow.push(box);
+      continue;
+    }
+    wing.items.push(box);
+    wing.height = candidateHeight;
+    wingOrder.push(box);
+  }
+  placeWing(left.items, "left", core, translate);
+  placeWing(right.items, "right", core, translate);
+
   const maxWidth = SHELF_WIDTH_FACTOR * boxWidth(core);
-  const rows = [...shelfRows(grouped, maxWidth), ...shelfRows(singletons, maxWidth)];
+  const rows = [...shelfRows(overflow, maxWidth), ...shelfRows(singletons, maxWidth)];
 
   // Graph +y is screen-up (see drawRadialNodeLabel), so "below the core" is
   // DECREASING y: each row hangs off the bottom edge of the one above it.
   let rowTop = core.minY - SHELF_TOP_GAP;
   for (const row of rows) {
     const rowWidth = row.reduce((sum, box) => sum + boxWidth(box), 0) + SHELF_GAP * (row.length - 1);
-    let left = -rowWidth / 2;
+    let rowLeft = -rowWidth / 2;
     let tallest = 0;
     for (const box of row) {
-      translate(box, left - box.minX, rowTop - box.maxY);
-      left += boxWidth(box) + SHELF_GAP;
+      translate(box, rowLeft - box.minX, rowTop - box.maxY);
+      rowLeft += boxWidth(box) + SHELF_GAP;
       tallest = Math.max(tallest, boxHeight(box));
     }
     rowTop -= tallest + SHELF_GAP;
   }
 
-  return [core.ids, ...rows.flat().map((box) => box.ids)];
+  return [core.ids, ...wingOrder.map((box) => box.ids), ...rows.flat().map((box) => box.ids)];
 }
 
 /** The sim plus the one thing the view has to tell it: which node the pointer

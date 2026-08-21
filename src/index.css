@@ -426,7 +426,7 @@ html[data-theme="dark"] {
      washes stack into a landmass, so density reads as relief with no outline.
      Bridge is the shared amber accent the PageCanvas spokes still wear; it is
      a sigma edge color there, hence opaque. */
-  --kg-terrain: rgba(169, 174, 242, 0.045);
+  --kg-terrain: rgba(169, 174, 242, 0.16);
   --kg-bridge: #C7AA5C;
   /* Dot grid behind the PageCanvas (React Flow background) — not drawn on
      the Atlas any more. */
@@ -523,7 +523,7 @@ html[data-theme="light"] {
   --canvas-edge: #B9BDC5;
   --canvas-edge-strong: #878D9B;
   /* Cartography layer — light variants (see the dark block's note). */
-  --kg-terrain: rgba(94, 88, 200, 0.028);
+  --kg-terrain: rgba(94, 88, 200, 0.09);
   --kg-bridge: #B5842E;
   --kg-graticule: rgba(139, 147, 163, 0.18);
   /* Memory nodes — see the dark block. */

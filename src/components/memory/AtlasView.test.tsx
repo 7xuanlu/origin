@@ -950,7 +950,7 @@ describe("AtlasView", () => {
     expect(window.localStorage.getItem("atlas.smallGroups")).toBe("false");
   });
 
-  it("puts the revealed small groups on the shelf below the core, never around it", async () => {
+  it("puts the revealed small group on a wing beside the core, clear of its bounds", async () => {
     window.localStorage.setItem("atlas.smallGroups", "true");
     mockStarWithSmallPair();
 
@@ -959,12 +959,17 @@ describe("AtlasView", () => {
     const graph = latestGraph();
     expect(graph.hasNode("p1")).toBe(true);
 
-    const y = (id: string) => graph.getNodeAttribute(id, "y") as number;
-    const coreBottom = Math.min(...["e1", "e2", "e3", "e4", "e5"].map(y));
-    // Graph +y is screen-up: the pair hangs below the whole core, rather than
-    // being tucked into a gap around it.
-    expect(y("p1")).toBeLessThan(coreBottom);
-    expect(y("p2")).toBeLessThan(coreBottom);
+    const x = (id: string) => graph.getNodeAttribute(id, "x") as number;
+    const size = (id: string) => graph.getNodeAttribute(id, "size") as number;
+    const core = ["e1", "e2", "e3", "e4", "e5"];
+    const coreLeft = Math.min(...core.map((id) => x(id) - size(id)));
+    const coreRight = Math.max(...core.map((id) => x(id) + size(id)));
+    // The pair is the largest shelf component, so it takes the first wing:
+    // wholly to one side of the core, never tucked into a gap inside it.
+    const pair = ["p1", "p2"];
+    const pairLeft = Math.min(...pair.map((id) => x(id) - size(id)));
+    const pairRight = Math.max(...pair.map((id) => x(id) + size(id)));
+    expect(pairLeft > coreRight || pairRight < coreLeft).toBe(true);
   });
 
   /** A five-node star (the core) plus a four-node star that MIN_COMPONENT_SIZE
@@ -2058,7 +2063,7 @@ describe("AtlasView", () => {
     mouseCaptor.handlers.get("mousemovebody")?.(dragEvent(500, 500));
     sim.tick(1);
 
-    const anchorRadius = (graph.getNodeAttribute("e1", "size") as number) + 6;
+    const anchorRadius = (graph.getNodeAttribute("e1", "size") as number) + 10;
     const dx = (graph.getNodeAttribute("mem:m1", "x") as number) - 500;
     const dy = (graph.getNodeAttribute("mem:m1", "y") as number) - 500;
     expect(Math.hypot(dx, dy)).toBeCloseTo(anchorRadius, 6);
