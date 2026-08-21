@@ -4,28 +4,32 @@ import type { GraphModel } from "./model";
 import type { GraphPalette } from "./palette";
 import type { SpaceCartography } from "./community";
 
-// The Atlas cartography layer (design-mockup artifact, screen 01 —
-// "Cartography, not physics"): named community regions wrapped in translucent
-// hulls, dashed orientation rings, and amber bridge edges between regions.
-// Everything here is pure math / pure canvas drawing; AtlasView owns the
-// underlay canvas and the sigma afterRender wiring.
+// The Atlas cartography layer — a relief map, not a diagram: every drawn
+// node deposits one soft wash of terrain ink on the underlay, so density
+// stacks into landmasses with no outline, and named community regions sit on
+// that terrain as place names drawn above the nodes. Everything here is pure
+// math / pure canvas drawing; AtlasView owns the two helper canvases and the
+// sigma afterRender wiring.
 
-/** Minimum members before a community earns a hull + name — a 1-2 node
- *  "region" is noise, not geography. */
+/** Minimum members before a community earns a name — a 1-2 node "region" is
+ *  noise, not geography. */
 export const MIN_REGION_SIZE = 3;
 
-/** Screen-px padding between a member node and its hull edge. */
-const HULL_PAD = 26;
+/** Radius of one node's terrain wash in screen px. Screen-constant on
+ *  purpose: zoomed out, neighbouring washes merge into one landmass; zoomed
+ *  in, they separate into a halo per node — the map gains detail as you
+ *  approach instead of blurring. */
+export const TERRAIN_RADIUS_PX = 34;
 
-/** A region whose hull is narrower than this on screen is a speck: its name
- *  would be noise rather than orientation, so it goes unlabelled until you
- *  zoom in far enough for the hull to cross the bar. */
-export const MIN_LABELLED_HULL_PX = 90;
+/** A region whose members span less than this on screen is a speck: its name
+ *  would be noise rather than orientation, so it goes unnamed until you zoom
+ *  in far enough for the span to cross the bar. */
+export const MIN_LABELLED_SPAN_PX = 140;
 
 /** Hard ceiling on drawn region names per paint, at any zoom. Real data has
- *  66 regions with memories off and 148 with them on; drawing every name at
- *  fit-to-screen turned the map into overlapping strips of text. */
-export const MAX_REGION_LABELS = 24;
+ *  66 regions with memories off and 148 with them on; at fit-to-screen a map
+ *  needs a handful of place names, not a gazetteer. */
+export const MAX_REGION_LABELS = 12;
 
 /** Clear air demanded around a candidate label before it may sit next to an
  *  already-placed one. */
@@ -168,11 +172,8 @@ function climbFallback(nodeIds: string[], edges: { source: string; target: strin
  *      contain an unescaped ":", no daemon-controlled string can forge a
  *      different family's prefix.
  * Together, two different spaces' — or families' — community/local ids can
- * never compare equal, so bridgeEdgeTest and communityRegions can't
- * accidentally group members across a space boundary purely from id
- * collision (bridgeEdgeTest also checks the space explicitly — see below —
- * since namespacing alone only prevents accidental MERGING, not a
- * cross-space pair from being flagged a bridge).
+ * never compare equal, so communityRegions can't accidentally group members
+ * across a space boundary purely from id collision.
  */
 export function communitiesFor(
   model: GraphModel,
@@ -220,8 +221,7 @@ export function communitiesFor(
   // A memory or page joins the region of the partitioned node (an entity) it
   // links to. Ties break on the lowest neighbor id so the answer is
   // deterministic, and one whose neighbors all landed outside the partition
-  // simply gets no community — which keeps it out of every region size and
-  // every bridge test.
+  // simply gets no community — which keeps it out of every region size.
   //
   // Pages get a second chance the memories never needed: a page that links no
   // entity but wikilinks another page inherits from that page, the lowest-id
@@ -273,97 +273,6 @@ export function communitiesFor(
   return result;
 }
 
-/** Extract the tagged space segment from a namespaced community id
- *  (`durable:<segment>:…` / `fallback:<segment>:…` / `unassigned:<segment>:…`)
- *  — every family shares this exact 3-segment shape (see communitiesFor), so
- *  a single split index reads the space regardless of prefix. Compared as the
- *  tagged segment itself: `s<enc>` is injective in the space and `u` is
- *  unreachable from any real name, so two ids carry the same space iff their
- *  segments are equal, and unscoped only ever matches unscoped. */
-function communitySpace(id: string): string {
-  return id.split(":")[1] ?? "";
-}
-
-/**
- * Per-edge bridge test, sizes precomputed once. A bridge spans two DIFFERENT
- * communities, in the SAME space, that are both real regions
- * (>= MIN_REGION_SIZE members) — an edge poking out of a 2-node islet is
- * not map furniture, and a cross-space edge is never a bridge no matter how
- * large the two communities are (D13/App-PR: no bridge may span spaces).
- * Community ids are space-namespaced (see communitiesFor), which makes two
- * same-space communities compare unequal when they should, but a
- * cross-space PAIR also compares unequal — namespacing alone can't tell
- * "different community" from "different space", so the space check below
- * is required, not redundant.
- */
-export function bridgeEdgeTest(
-  communities: Map<string, string>,
-): (source: string, target: string) => boolean {
-  const sizes = new Map<string, number>();
-  for (const community of communities.values()) {
-    sizes.set(community, (sizes.get(community) ?? 0) + 1);
-  }
-  return (source, target) => {
-    const a = communities.get(source);
-    const b = communities.get(target);
-    return (
-      a !== undefined &&
-      b !== undefined &&
-      a !== b &&
-      communitySpace(a) === communitySpace(b) &&
-      (sizes.get(a) ?? 0) >= MIN_REGION_SIZE &&
-      (sizes.get(b) ?? 0) >= MIN_REGION_SIZE
-    );
-  };
-}
-
-export interface Region {
-  /** Convex hull of member GRAPH positions, counter-clockwise. */
-  hull: { x: number; y: number }[];
-  /** Highest-degree member's name — the region's label. */
-  name: string;
-  memberCount: number;
-}
-
-/**
- * Andrew's monotone chain convex hull. Returns the hull counter-clockwise
- * without repeating the first point; degenerate inputs (<3 points, collinear)
- * return what they can — the fat-stroke drawing below renders a 2-point hull
- * as a capsule, which is fine.
- */
-export function convexHull(points: { x: number; y: number }[]): { x: number; y: number }[] {
-  const pts = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
-  if (pts.length <= 2) return pts;
-  const cross = (
-    o: { x: number; y: number },
-    a: { x: number; y: number },
-    b: { x: number; y: number },
-  ) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
-  const lower: { x: number; y: number }[] = [];
-  for (const p of pts) {
-    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0)
-      lower.pop();
-    lower.push(p);
-  }
-  const upper: { x: number; y: number }[] = [];
-  for (let i = pts.length - 1; i >= 0; i--) {
-    const p = pts[i];
-    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0)
-      upper.pop();
-    upper.push(p);
-  }
-  lower.pop();
-  upper.pop();
-  return lower.concat(upper);
-}
-
-/**
- * Regions worth naming: communities with >= MIN_REGION_SIZE members, hulled
- * over their CURRENT graph positions (so hulls flex live with a drag) and
- * named after their highest-degree member (degree ties break alphabetically,
- * then by id — deterministic). Sorted largest-first so the caller can give
- * the dominant region the bigger type.
- */
 /** The member a region is named after: highest degree, ties broken by
  *  smaller name then smaller id — deterministic, so the drawn region labels
  *  never flicker between members. */
@@ -382,6 +291,23 @@ export function regionLeader<T extends { id: string; name: string; degree: numbe
   return hub;
 }
 
+export interface Region {
+  /** Highest-degree member's name — the region's label. */
+  name: string;
+  memberCount: number;
+  /** Mean of member GRAPH positions — where the name sits. */
+  centroid: { x: number; y: number };
+  /** Axis-aligned bounds of member GRAPH positions — how much of the screen
+   *  the region spans decides whether its name is worth drawing. */
+  bounds: { minX: number; maxX: number; minY: number; maxY: number };
+}
+
+/**
+ * Regions worth naming: communities with >= MIN_REGION_SIZE members, measured
+ * over their CURRENT graph positions (so names follow a drag) and named after
+ * their highest-degree member. Sorted largest-first so the caller can give
+ * the dominant region the bigger type.
+ */
 export function communityRegions(graph: Graph, communities: Map<string, string>): Region[] {
   const members = new Map<string, string[]>();
   for (const [id, community] of communities) {
@@ -398,136 +324,113 @@ export function communityRegions(graph: Graph, communities: Map<string, string>)
         degree: graph.degree(id),
       })),
     ).id;
+    let sumX = 0;
+    let sumY = 0;
+    const bounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
+    for (const id of ids) {
+      const x = graph.getNodeAttribute(id, "x") as number;
+      const y = graph.getNodeAttribute(id, "y") as number;
+      sumX += x;
+      sumY += y;
+      bounds.minX = Math.min(bounds.minX, x);
+      bounds.maxX = Math.max(bounds.maxX, x);
+      bounds.minY = Math.min(bounds.minY, y);
+      bounds.maxY = Math.max(bounds.maxY, y);
+    }
     regions.push({
-      hull: convexHull(
-        ids.map((id) => ({
-          x: graph.getNodeAttribute(id, "x") as number,
-          y: graph.getNodeAttribute(id, "y") as number,
-        })),
-      ),
       name: graph.getNodeAttribute(hubId, "label") as string,
       memberCount: ids.length,
+      centroid: { x: sumX / ids.length, y: sumY / ids.length },
+      bounds,
     });
   }
   return regions.sort((a, b) => b.memberCount - a.memberCount || (a.name < b.name ? -1 : 1));
 }
 
-/** The three dashed orientation rings: even steps out to just past the
- *  farthest node. Zero/negative extent -> no rings. */
-export function graticuleRadii(maxNodeRadius: number): number[] {
-  if (maxNodeRadius <= 0) return [];
-  const outer = maxNodeRadius * 1.05;
-  return [outer / 3, (outer * 2) / 3, outer];
-}
-
 export interface CartographyScene {
   regions: Region[];
-  /** Graph-space distance of the farthest node from the origin (forceCenter
-   *  pins the cluster there), for the graticule. */
-  maxNodeRadius: number;
+  /** GRAPH positions of every drawn node — each one deposits a terrain wash. */
+  points: { x: number; y: number }[];
 }
 
-/** Everything drawCartography needs, computed once per paint from live state. */
+/** Everything the two cartography paints need, computed once per paint from
+ *  live state. */
 export function cartographyScene(graph: Graph, communities: Map<string, string>): CartographyScene {
-  let maxNodeRadius = 0;
+  const points: { x: number; y: number }[] = [];
   graph.forEachNode((_id, attrs) => {
-    maxNodeRadius = Math.max(maxNodeRadius, Math.hypot(attrs.x as number, attrs.y as number));
+    points.push({ x: attrs.x as number, y: attrs.y as number });
   });
-  return { regions: communityRegions(graph, communities), maxNodeRadius };
+  return { regions: communityRegions(graph, communities), points };
 }
 
 /**
- * Trace the hull as a smooth organic blob, the artifact's hull silhouette:
- * a closed Catmull-Rom spline through the hull vertices pushed outward by
- * `pad` along their corner bisectors, emitted as cubic Béziers. The spline
- * INTERPOLATES its points (unlike a midpoint-quadratic, which sags halfway
- * back toward the polygon at sparse corners), so every node keeps >= pad
- * clearance at the vertices while the segments between them bow gently
- * outward — continuously curving everywhere, no straight runs. One closed
- * path -> ONE translucent fill stays uniform (a two-pass fat stroke stacks
- * inks into a donut band). Degenerate hulls: 1 distinct point becomes a
- * circle, 2 a capsule.
+ * One node's wash, pre-rendered once per (ink, devicePixelRatio): a radial
+ * gradient from the terrain ink at the centre to transparent at
+ * TERRAIN_RADIUS_PX. Drawing ~1,500 of these per frame as drawImage calls is
+ * cheap; building a gradient per node per frame is not. Returns null where
+ * there is no 2D canvas to render into (jsdom) — drawCartography then falls
+ * back to flat discs, the same picture at test granularity.
  */
-function traceSmoothHull(
+const spriteCache = new Map<string, HTMLCanvasElement>();
+export function terrainSprite(ink: string, dpr: number): HTMLCanvasElement | null {
+  if (typeof document === "undefined") return null;
+  const key = `${ink}@${dpr}`;
+  const cached = spriteCache.get(key);
+  if (cached) return cached;
+  const canvas = document.createElement("canvas");
+  const side = Math.ceil(TERRAIN_RADIUS_PX * 2 * dpr);
+  canvas.width = side;
+  canvas.height = side;
+  const ctx = canvas.getContext("2d");
+  if (!ctx || typeof ctx.createRadialGradient !== "function") return null;
+  const c = side / 2;
+  const gradient = ctx.createRadialGradient(c, c, 0, c, c, c);
+  gradient.addColorStop(0, ink);
+  gradient.addColorStop(1, transparentLike(ink));
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, side, side);
+  spriteCache.set(key, canvas);
+  return canvas;
+}
+
+/** The same colour at alpha 0, so the gradient fades in place instead of
+ *  toward black (CSS `transparent` is rgba(0,0,0,0)). Non-rgba inks (jsdom's
+ *  empty computed styles) get plain transparent. */
+function transparentLike(ink: string): string {
+  const m = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/.exec(ink);
+  return m ? `rgba(${m[1]}, ${m[2]}, ${m[3]}, 0)` : "rgba(0, 0, 0, 0)";
+}
+
+/**
+ * Paint the terrain underlay in VIEWPORT space. `project` maps graph coords
+ * to viewport CSS px (AtlasView passes sigma's graphToViewport); `viewport`
+ * is the canvas size in CSS px, for culling. One wash per drawn node,
+ * source-over, so overlaps stack: a lone node is a faint halo, a crowd is a
+ * landmass. Nothing is outlined — the map's shapes come from density alone.
+ */
+export function drawCartography(
   ctx: CanvasRenderingContext2D,
-  hull: { x: number; y: number }[],
-  pad: number,
+  scene: CartographyScene,
+  project: (pos: { x: number; y: number }) => { x: number; y: number },
+  palette: GraphPalette,
+  viewport: { width: number; height: number },
+  sprite: CanvasImageSource | null = terrainSprite(palette.terrain, 1),
 ): void {
-  const pts = hull.filter(
-    (p, i) =>
-      i === 0 || Math.hypot(p.x - hull[i - 1].x, p.y - hull[i - 1].y) > 1e-6,
-  );
-  if (
-    pts.length > 1 &&
-    Math.hypot(pts[0].x - pts[pts.length - 1].x, pts[0].y - pts[pts.length - 1].y) <= 1e-6
-  ) {
-    pts.pop();
-  }
-  if (pts.length === 0) return;
-  if (pts.length === 1) {
-    ctx.moveTo(pts[0].x + pad, pts[0].y);
-    ctx.arc(pts[0].x, pts[0].y, pad, 0, 2 * Math.PI);
-    return;
-  }
-  if (pts.length === 2) {
-    // Capsule: two half-circle caps joined by the (auto-drawn) side lines.
-    const [a, b] = pts;
-    const angle = Math.atan2(b.y - a.y, b.x - a.x);
-    ctx.moveTo(a.x + pad * Math.cos(angle + Math.PI / 2), a.y + pad * Math.sin(angle + Math.PI / 2));
-    ctx.arc(a.x, a.y, pad, angle + Math.PI / 2, angle - Math.PI / 2);
-    ctx.arc(b.x, b.y, pad, angle - Math.PI / 2, angle + Math.PI / 2);
-    return;
-  }
-
-  const n = pts.length;
-  const cx = pts.reduce((s, p) => s + p.x, 0) / n;
-  const cy = pts.reduce((s, p) => s + p.y, 0) / n;
-  // Push each vertex out along its corner bisector (the two adjacent edge
-  // normals averaged), signed away from the centroid — winding-proof
-  // (projection flips graph-space CCW to screen CW).
-  const expanded = pts.map((p, i) => {
-    const prev = pts[(i + n - 1) % n];
-    const next = pts[(i + 1) % n];
-    const edgeNormal = (a: { x: number; y: number }, b: { x: number; y: number }) => {
-      const len = Math.hypot(b.x - a.x, b.y - a.y);
-      return { x: (b.y - a.y) / len, y: -(b.x - a.x) / len };
-    };
-    const n1 = edgeNormal(prev, p);
-    const n2 = edgeNormal(p, next);
-    let bx = n1.x + n2.x;
-    let by = n1.y + n2.y;
-    const blen = Math.hypot(bx, by);
-    if (blen < 1e-6) {
-      bx = p.x - cx;
-      by = p.y - cy;
+  const r = TERRAIN_RADIUS_PX;
+  ctx.save();
+  ctx.fillStyle = palette.terrain;
+  for (const point of scene.points) {
+    const at = project(point);
+    if (at.x < -r || at.y < -r || at.x > viewport.width + r || at.y > viewport.height + r) continue;
+    if (sprite) {
+      ctx.drawImage(sprite, at.x - r, at.y - r, r * 2, r * 2);
+    } else {
+      ctx.beginPath();
+      ctx.arc(at.x, at.y, r, 0, 2 * Math.PI);
+      ctx.fill();
     }
-    const len = Math.hypot(bx, by) || 1;
-    bx /= len;
-    by /= len;
-    if (bx * (p.x - cx) + by * (p.y - cy) < 0) {
-      bx = -bx;
-      by = -by;
-    }
-    return { x: p.x + bx * pad, y: p.y + by * pad };
-  });
-
-  // Closed uniform Catmull-Rom through the expanded ring, as cubic Béziers
-  // (the standard CR->Bézier handles: p1 + (p2-p0)/6 and p2 - (p3-p1)/6).
-  ctx.moveTo(expanded[0].x, expanded[0].y);
-  for (let i = 0; i < n; i++) {
-    const p0 = expanded[(i + n - 1) % n];
-    const p1 = expanded[i];
-    const p2 = expanded[(i + 1) % n];
-    const p3 = expanded[(i + 2) % n];
-    ctx.bezierCurveTo(
-      p1.x + (p2.x - p0.x) / 6,
-      p1.y + (p2.y - p0.y) / 6,
-      p2.x - (p3.x - p1.x) / 6,
-      p2.y - (p3.y - p1.y) / 6,
-      p2.x,
-      p2.y,
-    );
   }
+  ctx.restore();
 }
 
 /** One region name that earned its place on this paint, in viewport CSS px. */
@@ -535,9 +438,9 @@ export interface PlacedLabel {
   name: string;
   /** Horizontal centre of the text (drawn with textAlign "center"). */
   x: number;
-  /** Text baseline (drawn with textBaseline "bottom"). */
+  /** Vertical centre of the text (drawn with textBaseline "middle"). */
   y: number;
-  /** Font size in px: 16 for the first label placed, 13 for every other. */
+  /** Font size in px: 15 for the first label placed, 12 for every other. */
   size: number;
 }
 
@@ -548,11 +451,11 @@ export interface PlacedLabel {
  * would report.
  *
  * Regions arrive largest-first (communityRegions sorts them) and are walked in
- * that order, so the biggest region always wins a contested spot. A region is
- * skipped when its hull is a speck on screen (narrower than
- * MIN_LABELLED_HULL_PX) or when its label box would touch one already placed;
- * placement stops at MAX_REGION_LABELS. Hulls themselves are always drawn —
- * only the names are thinned — and because on-screen hull width grows with
+ * that order, so the biggest region always wins a contested spot. A name sits
+ * on its region's centroid, like a place name on a map. A region is skipped
+ * when its members span a speck on screen (narrower than
+ * MIN_LABELLED_SPAN_PX) or when its label box would touch one already placed;
+ * placement stops at MAX_REGION_LABELS. Because on-screen span grows with
  * zoom, more names appear as you approach.
  */
 export function placeRegionLabels(
@@ -564,18 +467,26 @@ export function placeRegionLabels(
   const boxes: { left: number; right: number; top: number; bottom: number }[] = [];
   for (const region of scene.regions) {
     if (placed.length >= MAX_REGION_LABELS) break;
-    const screenHull = region.hull.map(project);
-    if (screenHull.length === 0) continue;
-    const xs = screenHull.map((p) => p.x);
-    if (Math.max(...xs) - Math.min(...xs) < MIN_LABELLED_HULL_PX) continue;
-    const cx = xs.reduce((sum, x) => sum + x, 0) / xs.length;
-    const top = Math.min(...screenHull.map((p) => p.y));
-    const size = placed.length === 0 ? 16 : 13;
-    // The smooth blob can bow a touch past the raw hull top between two
-    // expanded vertices, so the name gets pad + 14 of lift, not pad + 8.
-    const baseline = top - HULL_PAD - 14;
+    const { bounds } = region;
+    // Project all four corners: the camera may rotate, so a graph-space width
+    // is not a screen width.
+    const corners = [
+      project({ x: bounds.minX, y: bounds.minY }),
+      project({ x: bounds.maxX, y: bounds.minY }),
+      project({ x: bounds.minX, y: bounds.maxY }),
+      project({ x: bounds.maxX, y: bounds.maxY }),
+    ];
+    const xs = corners.map((p) => p.x);
+    if (Math.max(...xs) - Math.min(...xs) < MIN_LABELLED_SPAN_PX) continue;
+    const at = project(region.centroid);
+    const size = placed.length === 0 ? 15 : 12;
     const halfWidth = measure(region.name, size) / 2;
-    const box = { left: cx - halfWidth, right: cx + halfWidth, top: baseline - size, bottom: baseline };
+    const box = {
+      left: at.x - halfWidth,
+      right: at.x + halfWidth,
+      top: at.y - size / 2,
+      bottom: at.y + size / 2,
+    };
     const overlaps = boxes.some(
       (other) =>
         other.left < box.right + LABEL_BOX_PAD &&
@@ -585,60 +496,27 @@ export function placeRegionLabels(
     );
     if (overlaps) continue;
     boxes.push(box);
-    placed.push({ name: region.name, x: cx, y: baseline, size });
+    placed.push({ name: region.name, x: at.x, y: at.y, size });
   }
   return placed;
 }
 
+/** Halo stroke around a place name, in CSS px — ground-coloured, so the name
+ *  stays legible over the nodes it sits among. */
+const LABEL_HALO_WIDTH = 3;
+
 /**
- * Paint the cartography underlay in VIEWPORT space. `project` maps graph
- * coords to viewport CSS px (AtlasView passes sigma's graphToViewport).
- * Draw order: graticule (deepest) -> hull blobs -> region names. Each hull
- * is a smooth Catmull-Rom blob around the pad-expanded vertices, filled
- * once with the translucent wash and stroked once with a 1px border — the
- * artifact's exact hull anatomy (fill --kg-hull, stroke --kg-hull-border,
- * stroke-width 1, continuously curving Q-spline silhouette).
+ * Paint the region names ABOVE the nodes (AtlasView's overlay canvas), in
+ * VIEWPORT space: italic serif with wide tracking (the artifact's .region
+ * style), centred on the region's centroid, each with a ground-coloured halo
+ * — only the ones that survive the placement pass (see placeRegionLabels).
  */
-export function drawCartography(
+export function drawRegionNames(
   ctx: CanvasRenderingContext2D,
   scene: CartographyScene,
   project: (pos: { x: number; y: number }) => { x: number; y: number },
   palette: GraphPalette,
 ): void {
-  const center = project({ x: 0, y: 0 });
-  const edge = project({ x: scene.maxNodeRadius, y: 0 });
-  const pxPerUnit =
-    scene.maxNodeRadius > 0
-      ? Math.hypot(edge.x - center.x, edge.y - center.y) / scene.maxNodeRadius
-      : 0;
-
-  ctx.save();
-  ctx.strokeStyle = palette.graticule;
-  ctx.lineWidth = 1;
-  ctx.setLineDash([1, 7]);
-  for (const radius of graticuleRadii(scene.maxNodeRadius)) {
-    ctx.beginPath();
-    ctx.arc(center.x, center.y, radius * pxPerUnit, 0, 2 * Math.PI);
-    ctx.stroke();
-  }
-  ctx.setLineDash([]);
-
-  for (const region of scene.regions) {
-    const screenHull = region.hull.map(project);
-    if (screenHull.length === 0) continue;
-    ctx.beginPath();
-    traceSmoothHull(ctx, screenHull, HULL_PAD);
-    ctx.closePath();
-    ctx.fillStyle = palette.hull;
-    ctx.fill();
-    ctx.strokeStyle = palette.hullBorder;
-    ctx.lineWidth = 1;
-    ctx.stroke();
-  }
-
-  // Region names last, above their hulls: italic serif with wide tracking
-  // (the artifact's .region style), centered above the hull's top edge — but
-  // only the ones that survive the placement pass (see placeRegionLabels).
   const measure = (text: string, size: number): number => {
     ctx.font = regionLabelFont(size);
     ctx.letterSpacing = regionLabelTracking(size);
@@ -646,13 +524,18 @@ export function drawCartography(
     ctx.letterSpacing = "0px";
     return width;
   };
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.lineJoin = "round";
+  ctx.lineWidth = LABEL_HALO_WIDTH;
+  ctx.strokeStyle = palette.surface;
+  ctx.fillStyle = palette.labelMuted;
   for (const label of placeRegionLabels(scene, project, measure)) {
     ctx.font = regionLabelFont(label.size);
     // Same tracking the measurement used; jsdom's mock ctx simply ignores it.
     ctx.letterSpacing = regionLabelTracking(label.size);
-    ctx.fillStyle = palette.labelMuted;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "bottom";
+    ctx.strokeText(label.name, label.x, label.y);
     ctx.fillText(label.name, label.x, label.y);
     ctx.letterSpacing = "0px";
   }

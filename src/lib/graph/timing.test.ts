@@ -29,8 +29,7 @@ const PALETTE: GraphPalette = {
   label: "#999999",
   labelMuted: "#aaaaaa",
   surface: "#000000",
-  hull: "rgba(1,2,3,0.05)",
-  hullBorder: "rgba(1,2,3,0.16)",
+  terrain: "rgba(1,2,3,0.045)",
   graticule: "rgba(4,5,6,0.13)",
   bridge: "#bbbbbb",
   memory: "#cccccc",
@@ -70,12 +69,8 @@ describe.skipIf(!existsSync(CAPTURE))("graph pipeline timing on a real capture",
         typeof drawableModel === "function"
           ? ms("drawableModel", () => drawableModel(model), lines)
           : model;
-      const communities = ms("communityDetection", () => communitiesFor(drawable, new Map()), lines);
-      const atlas = ms(
-        "toSigmaGraph",
-        () => buildAtlasGraph(drawable, PALETTE, communities),
-        lines,
-      );
+      ms("communityDetection", () => communitiesFor(drawable, new Map()), lines);
+      const atlas = ms("toSigmaGraph", () => buildAtlasGraph(drawable, PALETTE), lines);
       ms("runAtlasLayout", () => runAtlasLayout(atlas), lines);
       const sim = ms("createAtlasSimulation", () => createAtlasSimulation(atlas), lines);
       sim.stop();

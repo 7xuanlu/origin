@@ -6,15 +6,14 @@ import type { GraphPalette } from "./palette";
 import type { SpaceCartography } from "./community";
 import {
   communitiesFor,
-  bridgeEdgeTest,
-  convexHull,
   communityRegions,
-  graticuleRadii,
   cartographyScene,
   drawCartography,
+  drawRegionNames,
   placeRegionLabels,
   MAX_REGION_LABELS,
-  MIN_LABELLED_HULL_PX,
+  MIN_LABELLED_SPAN_PX,
+  TERRAIN_RADIUS_PX,
 } from "./cartography";
 import type { CartographyScene, Region } from "./cartography";
 
@@ -30,8 +29,7 @@ const PALETTE: GraphPalette = {
   label: "#999999",
   labelMuted: "#aaaaaa",
   surface: "#000000",
-  hull: "rgba(1,2,3,0.05)",
-  hullBorder: "rgba(1,2,3,0.16)",
+  terrain: "rgba(1,2,3,0.045)",
   graticule: "rgba(4,5,6,0.13)",
   bridge: "#bbbbbb",
   memory: "#cccccc",
@@ -332,7 +330,8 @@ describe("communitiesFor", () => {
       new Map<string, SpaceCartography>(),
     );
     expect(communities.get("s1")).not.toBe(communities.get("n1"));
-    expect(bridgeEdgeTest(communities)("s1", "n1")).toBe(false);
+    // Cross-space: the space segment (2nd id component) must differ too.
+    expect(communities.get("s1")!.split(":")[1]).not.toBe(communities.get("n1")!.split(":")[1]);
   });
 
   it("still honors durable cartography for a space named exactly the old no-space sentinel", () => {
@@ -358,7 +357,7 @@ describe("communitiesFor", () => {
     expect(communities.get("s1")).toMatch(/^durable:/);
     expect(communities.get("s1")).toBe(communities.get("s3"));
     expect(communities.get("n1")).toMatch(/^fallback:/);
-    expect(bridgeEdgeTest(communities)("s1", "n1")).toBe(false);
+    expect(communities.get("s1")!.split(":")[1]).not.toBe(communities.get("n1")!.split(":")[1]);
   });
 
   it("pools null-space and empty-string-space nodes into ONE unscoped bucket that may bridge itself", () => {
@@ -382,9 +381,10 @@ describe("communitiesFor", () => {
       ],
     );
     const communities = communitiesFor(m, new Map<string, SpaceCartography>());
-    // One bucket, so two unscoped regions CAN bridge each other.
+    // One bucket: different communities but the SAME space segment, so two
+    // unscoped regions CAN bridge each other (unlike a true cross-space pair).
     expect(communities.get("p1")).not.toBe(communities.get("q1"));
-    expect(bridgeEdgeTest(communities)("p1", "q1")).toBe(true);
+    expect(communities.get("p1")!.split(":")[1]).toBe(communities.get("q1")!.split(":")[1]);
   });
 
   function memoryNode(id: string, space: string | null = null): GraphNode {
@@ -534,89 +534,6 @@ describe("communitiesFor", () => {
   });
 });
 
-describe("bridgeEdgeTest", () => {
-  it("flags only edges spanning two regions of at least 3 members", () => {
-    const communities = communitiesFor(twoTriangles(), new Map<string, SpaceCartography>());
-    const isBridge = bridgeEdgeTest(communities);
-    expect(isBridge("a1", "b1")).toBe(true);
-    expect(isBridge("a1", "a2")).toBe(false);
-    expect(isBridge("b2", "b3")).toBe(false);
-  });
-
-  it("does not dress an edge into a sub-region islet as a bridge", () => {
-    // Community 0 has 3 members, community 1 only 2.
-    const communities = new Map<string, string>([
-      ["r1", "0"],
-      ["r2", "0"],
-      ["r3", "0"],
-      ["p1", "1"],
-      ["p2", "1"],
-    ]);
-    const isBridge = bridgeEdgeTest(communities);
-    expect(isBridge("r1", "p1")).toBe(false);
-    expect(isBridge("r1", "missing")).toBe(false);
-  });
-
-  it("never bridges across a space boundary, even between two real regions of the required size", () => {
-    // Two 3-member regions, one per space, joined by a cross-space edge —
-    // namespacing alone makes their community ids differ (see
-    // communitiesFor), so without an explicit same-space check this reads
-    // as two distinct real regions and gets flagged a bridge.
-    const m = modelOf(
-      [
-        node("hubA", { space: "Alpha" }),
-        node("sA1", { space: "Alpha" }),
-        node("sA2", { space: "Alpha" }),
-        node("hubB", { space: "Beta" }),
-        node("sB1", { space: "Beta" }),
-        node("sB2", { space: "Beta" }),
-      ],
-      [
-        edge("ea1", "hubA", "sA1"),
-        edge("ea2", "hubA", "sA2"),
-        edge("eb1", "hubB", "sB1"),
-        edge("eb2", "hubB", "sB2"),
-        edge("cross", "hubA", "hubB"),
-      ],
-    );
-    const communities = communitiesFor(m, new Map<string, SpaceCartography>());
-    const isBridge = bridgeEdgeTest(communities);
-    expect(isBridge("hubA", "hubB")).toBe(false);
-  });
-});
-
-describe("convexHull", () => {
-  it("drops interior points and returns the outer ring", () => {
-    const hull = convexHull([
-      { x: 0, y: 0 },
-      { x: 10, y: 0 },
-      { x: 10, y: 10 },
-      { x: 0, y: 10 },
-      { x: 5, y: 5 },
-    ]);
-    expect(hull).toHaveLength(4);
-    expect(hull).toEqual(
-      expect.arrayContaining([
-        { x: 0, y: 0 },
-        { x: 10, y: 0 },
-        { x: 10, y: 10 },
-        { x: 0, y: 10 },
-      ]),
-    );
-  });
-
-  it("returns what it can for degenerate input", () => {
-    expect(convexHull([{ x: 1, y: 2 }])).toEqual([{ x: 1, y: 2 }]);
-    expect(
-      convexHull([
-        { x: 0, y: 0 },
-        { x: 4, y: 4 },
-        { x: 2, y: 2 },
-      ]),
-    ).toHaveLength(2);
-  });
-});
-
 function graphOf(
   nodes: { id: string; x: number; y: number; label: string }[],
   edges: [string, string][] = [],
@@ -628,7 +545,7 @@ function graphOf(
 }
 
 describe("communityRegions", () => {
-  it("hulls communities of 3+, names them after the highest-degree member, and sorts largest-first", () => {
+  it("measures communities of 3+, names them after the highest-degree member, and sorts largest-first", () => {
     const graph = graphOf(
       [
         { id: "a1", x: 0, y: 0, label: "Wenlan" },
@@ -662,7 +579,8 @@ describe("communityRegions", () => {
     expect(regions).toHaveLength(2);
     expect(regions[0].name).toBe("Wenlan");
     expect(regions[0].memberCount).toBe(4);
-    expect(regions[0].hull).toHaveLength(4);
+    expect(regions[0].centroid).toEqual({ x: 5, y: 5 });
+    expect(regions[0].bounds).toEqual({ minX: 0, maxX: 10, minY: 0, maxY: 10 });
     expect(regions[1].name).toBe("Claude Code");
     expect(regions[1].memberCount).toBe(3);
   });
@@ -682,43 +600,34 @@ describe("communityRegions", () => {
   });
 });
 
-describe("graticuleRadii", () => {
-  it("spaces three rings evenly out to 5% past the farthest node", () => {
-    expect(graticuleRadii(300)).toEqual([105, 210, 315]);
-  });
-
-  it("draws nothing for an empty or single-origin graph", () => {
-    expect(graticuleRadii(0)).toEqual([]);
-    expect(graticuleRadii(-5)).toEqual([]);
-  });
-});
-
 describe("cartographyScene", () => {
-  it("measures the farthest node from the origin", () => {
+  it("collects one point per node, in graph coords", () => {
     const graph = graphOf([
       { id: "a", x: 3, y: 4, label: "A" },
       { id: "b", x: -1, y: 0, label: "B" },
     ]);
     const scene = cartographyScene(graph, new Map([["a", "0"], ["b", "1"]]));
-    expect(scene.maxNodeRadius).toBe(5);
+    expect(scene.points).toEqual(
+      expect.arrayContaining([
+        { x: 3, y: 4 },
+        { x: -1, y: 0 },
+      ]),
+    );
+    expect(scene.points).toHaveLength(2);
     expect(scene.regions).toHaveLength(0);
   });
 });
 
-interface StrokeCall {
-  strokeStyle: string;
-  lineWidth: number;
-  dash: number[];
-}
-
 function mockCtx() {
-  const strokes: StrokeCall[] = [];
   const fills: string[] = [];
-  const texts: { text: string; x: number; y: number; font: string; fillStyle: string }[] = [];
+  const haloTexts: { text: string; x: number; y: number; strokeStyle: string; lineWidth: number; lineJoin: string }[] = [];
+  const texts: { text: string; x: number; y: number; font: string; fillStyle: string; textBaseline: string }[] = [];
+  /** "stroke:<name>" / "fill:<name>" in call order — lets a test assert the
+   *  halo is drawn before the fill for each label. */
+  const drawOrder: string[] = [];
   /** What the context looked like at each measureText call — the placement
    *  pass has to measure in the same font AND tracking it later draws with. */
   const measures: { text: string; font: string; letterSpacing: string }[] = [];
-  let dash: number[] = [];
   const ctx = {
     strokeStyle: "",
     fillStyle: "",
@@ -732,22 +641,20 @@ function mockCtx() {
     save: vi.fn(),
     restore: vi.fn(),
     beginPath: vi.fn(),
-    closePath: vi.fn(),
-    moveTo: vi.fn(),
-    lineTo: vi.fn(),
-    bezierCurveTo: vi.fn(),
     arc: vi.fn(),
-    setLineDash: vi.fn((d: number[]) => {
-      dash = d;
-    }),
-    stroke: vi.fn(() => {
-      strokes.push({ strokeStyle: ctx.strokeStyle, lineWidth: ctx.lineWidth, dash });
-    }),
+    setLineDash: vi.fn(),
+    stroke: vi.fn(),
     fill: vi.fn(() => {
       fills.push(ctx.fillStyle);
     }),
+    drawImage: vi.fn(),
+    strokeText: vi.fn((text: string, x: number, y: number) => {
+      haloTexts.push({ text, x, y, strokeStyle: ctx.strokeStyle, lineWidth: ctx.lineWidth, lineJoin: ctx.lineJoin });
+      drawOrder.push(`stroke:${text}`);
+    }),
     fillText: vi.fn((text: string, x: number, y: number) => {
-      texts.push({ text, x, y, font: ctx.font, fillStyle: ctx.fillStyle });
+      texts.push({ text, x, y, font: ctx.font, fillStyle: ctx.fillStyle, textBaseline: ctx.textBaseline });
+      drawOrder.push(`fill:${text}`);
     }),
     // The real 2D context measures the label; jsdom's has no text engine, so
     // the mock reports a deterministic 7px per character at the label size.
@@ -756,164 +663,153 @@ function mockCtx() {
       return { width: text.length * 7 };
     }),
   };
-  return { ctx: ctx as unknown as CanvasRenderingContext2D, strokes, fills, texts, measures };
+  return { ctx: ctx as unknown as CanvasRenderingContext2D, fills, haloTexts, texts, drawOrder, measures };
 }
 
 describe("drawCartography", () => {
   const identity = (pos: { x: number; y: number }) => pos;
+  const viewport = { width: 800, height: 600 };
 
-  function sceneWithRegions() {
-    const graph = graphOf(
-      [
-        { id: "a1", x: 100, y: 100, label: "Wenlan" },
-        { id: "a2", x: 200, y: 100, label: "Tauri" },
-        { id: "a3", x: 150, y: 200, label: "React" },
-      ],
-      [
-        ["a1", "a2"],
-        ["a1", "a3"],
-      ],
-    );
-    const communities = new Map<string, string>([
-      ["a1", "0"],
-      ["a2", "0"],
-      ["a3", "0"],
-    ]);
-    return cartographyScene(graph, communities);
+  function sceneOfPoints(points: { x: number; y: number }[]): CartographyScene {
+    return { regions: [], points };
   }
 
-  it("draws three dashed graticule rings in the graticule ink", () => {
-    const { ctx, strokes } = mockCtx();
-    drawCartography(ctx, sceneWithRegions(), identity, PALETTE);
-    const rings = strokes.filter((s) => s.dash.length === 2);
-    expect(rings).toHaveLength(3);
-    expect(rings[0]).toMatchObject({ strokeStyle: PALETTE.graticule, lineWidth: 1, dash: [1, 7] });
-    // Ring radii come from the farthest node (|(150,200)| ≈ 250) — the rings
-    // are the arcs centered on the projected origin (identity → (0,0));
-    // hull-corner arcs sit at hull vertices and never at the origin here.
-    const arc = ctx.arc as ReturnType<typeof vi.fn>;
-    const rings2 = arc.mock.calls.filter((c) => c[0] === 0 && c[1] === 0);
-    expect(rings2).toHaveLength(3);
-    expect(rings2[2][2]).toBeCloseTo(Math.hypot(150, 200) * 1.05, 5);
-  });
-
-  it("paints each region as ONE smooth pad-expanded blob: a uniform wash fill plus a 1px border stroke", () => {
-    const { ctx, strokes, fills } = mockCtx();
-    drawCartography(ctx, sceneWithRegions(), identity, PALETTE);
-    const hullStrokes = strokes.filter((s) => s.dash.length === 0);
-    // Exactly one stroke — a second pass over the same translucent path is
-    // the stacked-band bug the single expanded blob exists to avoid.
-    expect(hullStrokes).toHaveLength(1);
-    expect(hullStrokes[0]).toMatchObject({ strokeStyle: PALETTE.hullBorder, lineWidth: 1 });
-    expect(fills).toEqual([PALETTE.hull]);
-    // Continuously curving silhouette: one cubic Bézier per hull vertex, no
-    // straight edge runs (lineTo) and no corner arcs.
-    const bezier = ctx.bezierCurveTo as ReturnType<typeof vi.fn>;
-    expect(bezier).toHaveBeenCalledTimes(3);
-    expect(ctx.lineTo).not.toHaveBeenCalled();
-    // The spline INTERPOLATES the expanded ring, so every curve endpoint
-    // sits exactly HULL_PAD out from its raw hull vertex — the no-sag
-    // clearance guarantee.
-    const raw = [
+  it("paints one arc per point, radius TERRAIN_RADIUS_PX, filled with palette.terrain, when no sprite is given", () => {
+    const { ctx, fills } = mockCtx();
+    const scene = sceneOfPoints([
       { x: 100, y: 100 },
-      { x: 200, y: 100 },
-      { x: 150, y: 200 },
-    ];
-    for (const call of bezier.mock.calls) {
-      const end = { x: call[4], y: call[5] };
-      const nearest = Math.min(...raw.map((v) => Math.hypot(end.x - v.x, end.y - v.y)));
-      expect(nearest).toBeCloseTo(26, 6);
-    }
-  });
-
-  it("names the dominant region in 16px italic serif muted ink above the hull", () => {
-    const { ctx, texts } = mockCtx();
-    void ctx;
-    drawCartography(ctx, sceneWithRegions(), identity, PALETTE);
-    expect(texts).toHaveLength(1);
-    expect(texts[0].text).toBe("Wenlan");
-    expect(texts[0].font).toBe("italic 500 16px Fraunces, Georgia, serif");
-    expect(texts[0].fillStyle).toBe(PALETTE.labelMuted);
-    // Above the raw hull's top edge (y=100) by pad 26 + 14 — the extra 6px
-    // clears the smooth blob's outward bow between expanded vertices.
-    expect(texts[0].y).toBe(100 - 26 - 14);
-    // Centered on the hull's x centroid.
-    expect(texts[0].x).toBe(150);
-  });
-
-  it("drops to 13px for secondary regions", () => {
-    // Both hulls are >= MIN_LABELLED_HULL_PX wide on screen and far enough
-    // apart vertically that neither label box touches the other, so the
-    // placement pass keeps both and only the size differs.
-    const graph = graphOf(
-      [
-        { id: "a1", x: 0, y: 0, label: "Alpha" },
-        { id: "a2", x: 120, y: 0, label: "A2" },
-        { id: "a3", x: 60, y: 40, label: "A3" },
-        { id: "a4", x: 60, y: 20, label: "A4" },
-        { id: "b1", x: 0, y: 300, label: "Beta" },
-        { id: "b2", x: 120, y: 300, label: "B2" },
-        { id: "b3", x: 60, y: 340, label: "B3" },
-      ],
-      [
-        ["a1", "a2"],
-        ["a1", "a3"],
-        ["a1", "a4"],
-        ["b1", "b2"],
-        ["b1", "b3"],
-      ],
-    );
-    const communities = new Map<string, string>([
-      ["a1", "0"],
-      ["a2", "0"],
-      ["a3", "0"],
-      ["a4", "0"],
-      ["b1", "1"],
-      ["b2", "1"],
-      ["b3", "1"],
+      { x: 200, y: 150 },
     ]);
-    const { ctx, texts } = mockCtx();
-    drawCartography(ctx, cartographyScene(graph, communities), identity, PALETTE);
-    expect(texts.map((t) => t.text)).toEqual(["Alpha", "Beta"]);
-    expect(texts[0].font).toContain("16px");
-    expect(texts[1].font).toContain("13px");
+    drawCartography(ctx, scene, identity, PALETTE, viewport, null);
+    const arc = ctx.arc as ReturnType<typeof vi.fn>;
+    expect(arc.mock.calls).toEqual([
+      [100, 100, TERRAIN_RADIUS_PX, 0, 2 * Math.PI],
+      [200, 150, TERRAIN_RADIUS_PX, 0, 2 * Math.PI],
+    ]);
+    expect(fills).toEqual([PALETTE.terrain, PALETTE.terrain]);
+    // No outline, no dash — the map's shapes come from density alone.
+    expect(ctx.stroke).not.toHaveBeenCalled();
+    expect(ctx.setLineDash).not.toHaveBeenCalled();
   });
 
-  it("scales graticule radii by the projection's px-per-unit", () => {
+  it("culls a point more than TERRAIN_RADIUS_PX outside the viewport", () => {
     const { ctx } = mockCtx();
-    const half = (pos: { x: number; y: number }) => ({ x: pos.x / 2, y: pos.y / 2 });
-    const graph = graphOf([{ id: "a", x: 300, y: 0, label: "A" }]);
-    drawCartography(ctx, cartographyScene(graph, new Map([["a", "0"]])), half, PALETTE);
+    const scene = sceneOfPoints([
+      { x: 100, y: 100 },
+      { x: 900, y: 300 }, // viewport.width + TERRAIN_RADIUS_PX is 834
+    ]);
+    drawCartography(ctx, scene, identity, PALETTE, viewport, null);
     const arc = ctx.arc as ReturnType<typeof vi.fn>;
-    // maxNodeRadius 300 → outer ring 315 graph units → 157.5 at half scale.
-    expect(arc.mock.calls[2][2]).toBeCloseTo(157.5, 5);
+    expect(arc).toHaveBeenCalledTimes(1);
+    expect(arc.mock.calls[0][0]).toBe(100);
+  });
+
+  it("draws the sprite instead of an arc when one is given", () => {
+    const { ctx } = mockCtx();
+    const sprite = {} as CanvasImageSource;
+    const scene = sceneOfPoints([
+      { x: 100, y: 100 },
+      { x: 200, y: 150 },
+    ]);
+    drawCartography(ctx, scene, identity, PALETTE, viewport, sprite);
+    const drawImage = ctx.drawImage as ReturnType<typeof vi.fn>;
+    const r = TERRAIN_RADIUS_PX;
+    expect(drawImage.mock.calls).toEqual([
+      [sprite, 100 - r, 100 - r, r * 2, r * 2],
+      [sprite, 200 - r, 150 - r, r * 2, r * 2],
+    ]);
+    expect(ctx.arc).not.toHaveBeenCalled();
+  });
+
+  it("draws no region names — that's drawRegionNames' job now", () => {
+    const { ctx, texts } = mockCtx();
+    const region: Region = {
+      name: "Wenlan",
+      memberCount: 3,
+      centroid: { x: 100, y: 100 },
+      bounds: { minX: 0, maxX: 200, minY: 0, maxY: 200 },
+    };
+    const scene: CartographyScene = { regions: [region], points: [{ x: 100, y: 100 }] };
+    drawCartography(ctx, scene, identity, PALETTE, viewport, null);
+    expect(texts).toHaveLength(0);
+    expect(ctx.fillText).not.toHaveBeenCalled();
+  });
+});
+
+describe("drawRegionNames", () => {
+  const identity = (pos: { x: number; y: number }) => pos;
+
+  /** A region with no real hull — just enough to place a label: a centroid
+   *  and a bounds box `spanX` wide (must clear MIN_LABELLED_SPAN_PX to earn
+   *  a name). */
+  function region(name: string, centroidX: number, centroidY: number, spanX = 200): Region {
+    return {
+      name,
+      memberCount: 3,
+      centroid: { x: centroidX, y: centroidY },
+      bounds: {
+        minX: centroidX - spanX / 2,
+        maxX: centroidX + spanX / 2,
+        minY: centroidY - 10,
+        maxY: centroidY + 10,
+      },
+    };
+  }
+
+  it("draws the dominant region at 15px and the next at 12px, centred on the projected centroid", () => {
+    const { ctx, texts } = mockCtx();
+    const scene: CartographyScene = {
+      regions: [region("Wenlan", 100, 100), region("Tauri", 600, 300)],
+      points: [],
+    };
+    drawRegionNames(ctx, scene, identity, PALETTE);
+    expect(texts.map((t) => t.text)).toEqual(["Wenlan", "Tauri"]);
+    expect(texts[0].font).toBe("italic 500 15px Fraunces, Georgia, serif");
+    expect(texts[1].font).toBe("italic 500 12px Fraunces, Georgia, serif");
+    expect(texts[0].fillStyle).toBe(PALETTE.labelMuted);
+    expect(texts[0].x).toBe(100);
+    expect(texts[0].y).toBe(100);
+    expect(texts[1].x).toBe(600);
+    expect(texts[1].y).toBe(300);
+    expect(texts[0].textBaseline).toBe("middle");
+  });
+
+  it("strokes a surface-coloured halo before the fill, for every drawn name", () => {
+    const { ctx, haloTexts, drawOrder } = mockCtx();
+    const scene: CartographyScene = {
+      regions: [region("Wenlan", 100, 100), region("Tauri", 600, 300)],
+      points: [],
+    };
+    drawRegionNames(ctx, scene, identity, PALETTE);
+    expect(haloTexts).toEqual([
+      { text: "Wenlan", x: 100, y: 100, strokeStyle: PALETTE.surface, lineWidth: 3, lineJoin: "round" },
+      { text: "Tauri", x: 600, y: 300, strokeStyle: PALETTE.surface, lineWidth: 3, lineJoin: "round" },
+    ]);
+    expect(drawOrder).toEqual(["stroke:Wenlan", "fill:Wenlan", "stroke:Tauri", "fill:Tauri"]);
   });
 });
 
 describe("placeRegionLabels", () => {
   const identity = (pos: { x: number; y: number }) => pos;
-  // A fixed 7px per character keeps the overlap arithmetic in the tests exact.
+  // A fixed per-character rate keeps the overlap arithmetic in the tests exact.
   const measure = (text: string, size: number) => text.length * (size / 2);
 
-  /** A rectangular hull `width` wide and 20 tall, with its top-left at (x, y). */
+  /** A `width`-wide, 20-tall region with its bounds' top-left at (x, y);
+   *  the centroid sits at the box's own centre. */
   function boxRegion(name: string, x: number, y: number, width: number, members = 3): Region {
     return {
       name,
       memberCount: members,
-      hull: [
-        { x, y },
-        { x: x + width, y },
-        { x: x + width, y: y + 20 },
-        { x, y: y + 20 },
-      ],
+      centroid: { x: x + width / 2, y: y + 10 },
+      bounds: { minX: x, maxX: x + width, minY: y, maxY: y + 20 },
     };
   }
 
-  const sceneOf = (regions: Region[]): CartographyScene => ({ regions, maxNodeRadius: 100 });
+  const sceneOf = (regions: Region[]): CartographyScene => ({ regions, points: [] });
 
-  it("skips a region whose hull is a speck on screen", () => {
-    const wide = boxRegion("Wide", 0, 0, MIN_LABELLED_HULL_PX);
-    const speck = boxRegion("Speck", 0, 500, MIN_LABELLED_HULL_PX - 1);
+  it("skips a region whose bounds are a speck on screen", () => {
+    const wide = boxRegion("Wide", 0, 0, MIN_LABELLED_SPAN_PX);
+    const speck = boxRegion("Speck", 0, 500, MIN_LABELLED_SPAN_PX - 1);
     const placed = placeRegionLabels(sceneOf([wide, speck]), identity, measure);
     expect(placed.map((label) => label.name)).toEqual(["Wide"]);
   });
@@ -932,9 +828,9 @@ describe("placeRegionLabels", () => {
     const small = boxRegion("Small", 0, 400, 200, 4);
     const placed = placeRegionLabels(sceneOf([big, small]), identity, measure);
     expect(placed.map((label) => label.name)).toEqual(["Big", "Small"]);
-    // First placed is the dominant one; every other label drops to 13px.
-    expect(placed[0].size).toBe(16);
-    expect(placed[1].size).toBe(13);
+    // First placed is the dominant one; every other label drops to 12px.
+    expect(placed[0].size).toBe(15);
+    expect(placed[1].size).toBe(12);
   });
 
   it("walks regions in the order they arrive, so the largest wins a contested spot", () => {
@@ -955,56 +851,41 @@ describe("placeRegionLabels", () => {
     expect(placed[placed.length - 1].name).toBe(`R${MAX_REGION_LABELS - 1}`);
   });
 
-  it("reads hull width in SCREEN px, so zooming in reveals more names", () => {
-    // 60 graph units wide: a speck at 1x, comfortably labelled at 2x.
-    const scene = sceneOf([boxRegion("Zoomed", 0, 0, 60)]);
+  it("reads region width in SCREEN px, so zooming in reveals more names", () => {
+    // 80 graph units wide: a speck at 1x, comfortably labelled at 2x (160px).
+    const scene = sceneOf([boxRegion("Zoomed", 0, 0, 80)]);
     const doubled = (pos: { x: number; y: number }) => ({ x: pos.x * 2, y: pos.y * 2 });
     expect(placeRegionLabels(scene, identity, measure)).toHaveLength(0);
     expect(placeRegionLabels(scene, doubled, measure)).toHaveLength(1);
   });
 
-  it("centres the name on the hull's screen centroid, lifted clear of the blob", () => {
-    const placed = placeRegionLabels(sceneOf([boxRegion("Mid", 40, 200, 100)]), identity, measure);
-    expect(placed[0].x).toBe(90);
-    // Hull top 200, minus HULL_PAD 26 and the 14px blob-bow clearance.
-    expect(placed[0].y).toBe(200 - 26 - 14);
+  it("centres the name on the region's projected centroid, with no lift", () => {
+    const placed = placeRegionLabels(sceneOf([boxRegion("Mid", 40, 200, 140)]), identity, measure);
+    expect(placed[0].x).toBe(110);
+    expect(placed[0].y).toBe(210);
   });
 });
 
 describe("region label measurement includes its tracking", () => {
   const identity = (pos: { x: number; y: number }) => pos;
 
-  /** Two triangular regions side by side, 220px between their hull centres,
-   *  each named with a 25-character name. At 7px per character the two label
-   *  boxes clear each other by 45px; with the artifact's 0.14em tracking they
-   *  overlap by 9px. So whether the second name is drawn says exactly which
-   *  width the placement pass measured. */
-  function twoWideRegions() {
-    const graph = graphOf(
-      [
-        { id: "a1", x: 0, y: 0, label: "Deterministic Fixture Set" },
-        { id: "a2", x: 120, y: 0, label: "Left Wing" },
-        { id: "a3", x: 60, y: 60, label: "Left Foot" },
-        { id: "b1", x: 220, y: 0, label: "Reproducible Layout Notes" },
-        { id: "b2", x: 340, y: 0, label: "Right Wing" },
-        { id: "b3", x: 280, y: 60, label: "Right Foot" },
-      ],
-      [
-        ["a1", "a2"],
-        ["a1", "a3"],
-        ["b1", "b2"],
-        ["b1", "b3"],
-      ],
-    );
-    const communities = new Map<string, string>([
-      ["a1", "0"],
-      ["a2", "0"],
-      ["a3", "0"],
-      ["b1", "1"],
-      ["b2", "1"],
-      ["b3", "1"],
-    ]);
-    return cartographyScene(graph, communities);
+  /** Two regions side by side, each named with a 25-character name and each
+   *  wide enough on screen to clear MIN_LABELLED_SPAN_PX. At a flat 7px per
+   *  character the two label boxes clear each other; with the artifact's
+   *  0.14em tracking added they overlap. So whether the second name survives
+   *  says exactly which width the placement pass measured. `gap` is the
+   *  distance between the two centroids. */
+  function twoWideRegions(gap: number): CartographyScene {
+    const region = (name: string, centroidX: number): Region => ({
+      name,
+      memberCount: 3,
+      centroid: { x: centroidX, y: 0 },
+      bounds: { minX: centroidX - 75, maxX: centroidX + 75, minY: -10, maxY: 10 },
+    });
+    return {
+      regions: [region("Deterministic Fixture Set", 0), region("Reproducible Layout Notes", gap)],
+      points: [],
+    };
   }
 
   /** mockCtx reports a flat 7px per character; a real canvas adds the
@@ -1024,10 +905,10 @@ describe("region label measurement includes its tracking", () => {
 
   it("sets the same letter spacing for measuring that it later draws with", () => {
     const { ctx, texts, measures } = mockCtx();
-    drawCartography(ctx, twoWideRegions(), identity, PALETTE);
+    drawRegionNames(ctx, twoWideRegions(200), identity, PALETTE);
     expect(measures.length).toBeGreaterThan(0);
     for (const call of measures) {
-      // 16px label -> 2.2px, 13px label -> 1.8px. Never the 0 that measuring
+      // 15px label -> 2.1px, 12px label -> 1.7px. Never the 0 that measuring
       // in the bare font would leave behind.
       const size = Number(/(\d+)px/.exec(call.font)?.[1]);
       expect(call.letterSpacing).toBe(`${(size * 0.14).toFixed(1)}px`);
@@ -1038,20 +919,15 @@ describe("region label measurement includes its tracking", () => {
 
   it("drops a second name whose box only fits when the tracking is ignored", () => {
     const { ctx, texts } = trackingAwareCtx();
-    drawCartography(ctx, twoWideRegions(), identity, PALETTE);
+    drawRegionNames(ctx, twoWideRegions(200), identity, PALETTE);
     expect(texts.map((t) => t.text)).toEqual(["Deterministic Fixture Set"]);
   });
 
   it("keeps both names when they are far enough apart for the tracked width", () => {
     const { ctx, texts } = trackingAwareCtx();
-    const scene = twoWideRegions();
     // Push the right region 200px further out: now even the tracked boxes
     // clear, so the thinning is about real width and not a blanket rule.
-    for (const region of scene.regions) {
-      if (region.name !== "Reproducible Layout Notes") continue;
-      region.hull = region.hull.map((p) => ({ x: p.x + 200, y: p.y }));
-    }
-    drawCartography(ctx, scene, identity, PALETTE);
+    drawRegionNames(ctx, twoWideRegions(400), identity, PALETTE);
     expect(texts.map((t) => t.text).sort()).toEqual([
       "Deterministic Fixture Set",
       "Reproducible Layout Notes",

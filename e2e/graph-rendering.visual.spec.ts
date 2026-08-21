@@ -30,6 +30,10 @@ test("renders Graph as a structured canvas instead of a flat orange field", asyn
   // seven wiki pages plus the three entities that have a connection.
   await expect(page.getByText(/^7 pages · 3 entities(?: · \d+ regions?)?$/)).toBeVisible();
 
+  // The terrain underlay: one faint wash per drawn node (alpha ~0.04 each,
+  // stacking where nodes crowd), in a single ink. It is the one 2D canvas on
+  // the map, so it is what can be read back; the WebGL node layer is covered
+  // by the screenshot below.
   const canvas = graph.locator('canvas[data-testid="atlas-cartography"]');
   await expect(canvas).toHaveCount(1);
   await expect(canvas).toBeVisible();
@@ -65,9 +69,11 @@ test("renders Graph as a structured canvas instead of a flat orange field", asyn
               const green = pixels[offset + 1] ?? 0;
               const blue = pixels[offset + 2] ?? 0;
               const alpha = pixels[offset + 3] ?? 0;
-              if (alpha < 12) continue;
+              if (alpha === 0) continue;
               coloredPixels += 1;
-              colors.add(`${red >> 4}:${green >> 4}:${blue >> 4}:${alpha >> 4}`);
+              // Raw alpha in the key: the wash is a gradient, so a painted
+              // terrain shows many alpha steps where a flat fill shows one.
+              colors.add(`${red >> 4}:${green >> 4}:${blue >> 4}:${alpha}`);
               if (red > 170 && green > 55 && green < 175 && blue < 100) {
                 orangePixels += 1;
               }

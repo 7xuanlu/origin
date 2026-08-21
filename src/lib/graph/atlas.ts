@@ -19,10 +19,9 @@ import {
   MEMORY_EDGE_TYPE,
 } from "./model";
 import { nodeFillFor, type GraphPalette } from "./palette";
-import { bridgeEdgeTest } from "./cartography";
 
 const MIN_NODE_SIZE = 3;
-const MAX_NODE_SIZE = 12;
+const MAX_NODE_SIZE = 14;
 /** Wiki pages sit on the same scale as entities. Round 3 pulled the base from
  *  3.5 down to the unconfirmed-entity 3: with shared-source overlap no longer
  *  counting toward size (see buildAtlasGraph), a page reads as a subject
@@ -36,8 +35,10 @@ const MEMORY_MAX_SIZE = 4;
 /** Px added per doubling of degree. Linear growth (round 1's degree * 0.5)
  *  saturated the cap on real data — 1,600 entities where the hubs run to
  *  hundreds of links drew as one uniform field of 8s. log2 keeps the hubs
- *  visibly bigger while leaving the long tail distinguishable. */
-const DEGREE_GAIN = 1.6;
+ *  visibly bigger while leaving the long tail distinguishable; the gain and
+ *  cap went up together (1.6/12 -> 1.9/14) so a hub reads as a landmark on
+ *  the relief map, not just a slightly larger dot. */
+const DEGREE_GAIN = 1.9;
 
 // Base by stability/kind (confirmed 4, unconfirmed 3, page 3, memory 2)
 // plus DEGREE_GAIN per doubling of degree, capped. Size still encodes
@@ -52,12 +53,12 @@ function nodeSizeFor(confirmed: boolean | null, degree: number, entityType?: str
   return Math.min(MAX_NODE_SIZE, base + growth);
 }
 
-/** Edge ink and stroke by verb. Shared-source edges are the lightest thing on
- *  the map (they stand for an inferred overlap, not an asserted link); a
- *  bridge stays amber and a hair thinner, per the artifact. */
-export function edgeSizeFor(type: string, bridge: boolean): number {
-  if (type === SHARED_SOURCE_EDGE_TYPE) return 0.8;
-  return bridge ? 1.4 : 1.5;
+/** Edge stroke by verb, in CSS px. Edges are the quietest ink on the map — a
+ *  hairline at rest, so the points and the terrain carry the picture; a
+ *  shared-source edge (an inferred overlap, not an asserted link) is thinner
+ *  still. Hover emphasis recolours, it does not thicken. */
+export function edgeSizeFor(type: string): number {
+  return type === SHARED_SOURCE_EDGE_TYPE ? 0.6 : 1;
 }
 
 /**
@@ -68,11 +69,7 @@ export function edgeSizeFor(type: string, bridge: boolean): number {
  * distinct relations between the same pair as distinct edges (see model.ts)
  * — a simple graph would throw adding the second one.
  */
-export function buildAtlasGraph(
-  model: GraphModel,
-  palette: GraphPalette,
-  communities?: Map<string, string>,
-): Graph {
+export function buildAtlasGraph(model: GraphModel, palette: GraphPalette): Graph {
   const graph = new Graph({ multi: true });
   // ponytail: the old graph's confirmed-glow halo (r+3 disc at 0.1 alpha) is
   // skipped — it needs a custom WebGL node program in sigma; the tiered fills
@@ -111,25 +108,16 @@ export function buildAtlasGraph(
 
   // ponytail: parallel edges between the same pair draw fully overlapped —
   // a view decision (see model.ts's parallel-edge note), fine at round-1 scale.
-  const isBridge = communities ? bridgeEdgeTest(communities) : () => false;
   for (const edge of model.edges) {
-    // Cross-region edges are the map's bridges: amber, a hair thinner
-    // (the artifact's 1.4 stroke), flagged so the theme-flip recolor keeps
-    // them amber. ponytail: the artifact dashes them too — sigma's stock
-    // edge programs can't dash; custom WebGL program if the solid amber
-    // isn't distinct enough.
-    const bridge = isBridge(edge.source, edge.target);
     graph.addEdgeWithKey(edge.id, edge.source, edge.target, {
-      // Kept on the edge so the theme-flip and cartography recolors can
-      // recompute ink and stroke without re-reading the model.
+      // Kept on the edge so the hover reducer can read the verb without
+      // re-reading the model.
       edgeType: edge.type,
-      // Rendered 1:1 in CSS px (AtlasView pins zoomToSizeRatioFunction to 1),
-      // calibrated to the old canvas graph's exact stroke: lineWidth 1 at its
-      // fixed k=1.499 zoom ≈ 1.5 CSS px. Needs minEdgeThickness lowered in
-      // AtlasView — sigma's default floor (1.7) silently bumps this back up.
-      size: edgeSizeFor(edge.type, bridge),
-      color: bridge ? palette.bridge : palette.edge,
-      bridge,
+      // Rendered 1:1 in CSS px (AtlasView pins zoomToSizeRatioFunction to 1).
+      // Needs minEdgeThickness lowered in AtlasView — sigma's default floor
+      // (1.7) silently bumps a hairline back up.
+      size: edgeSizeFor(edge.type),
+      color: palette.edge,
     });
   }
   return graph;
@@ -513,7 +501,7 @@ export interface AtlasSimulation extends Simulation<AtlasSimNode, undefined> {
 
 export interface AtlasSimNode extends SimulationNodeDatum {
   id: string;
-  /** Collision radius: the drawn disc, plus a page's ring, plus COLLIDE_PAD. */
+  /** Collision radius: the drawn disc plus COLLIDE_PAD. */
   radius: number;
 }
 
@@ -542,7 +530,7 @@ const COLLIDE_PAD = 2;
  *  inferred overlap, so it sits long and slack — it should suggest that two
  *  pages are near each other, not staple them together. A wikilink is an
  *  asserted link between pages, so it is shorter and firmer, but still longer
- *  than a relation because page discs carry a ring. */
+ *  than a relation so page clusters read as a stratum, not a clump. */
 const LINK_LAYOUT: Record<string, { distance: number; strength: number }> = {
   [SHARED_SOURCE_EDGE_TYPE]: { distance: 70, strength: 0.15 },
   [WIKILINK_EDGE_TYPE]: { distance: 50, strength: 0.5 },
@@ -962,15 +950,11 @@ export function createAtlasSimulation(
   const nodes: AtlasSimNode[] = [];
   graph.forEachNode((id, attrs) => {
     if (excluded.has(id)) return;
-    // A page is drawn as a disc plus a detached ring, so its footprint is
-    // wider than its `size` — collide against the ring or the rings overlap.
-    const ring =
-      attrs.entityType === PAGE_NODE_TYPE ? PAGE_RING_GAP + PAGE_RING_WIDTH : 0;
     nodes.push({
       id,
       x: attrs.x as number,
       y: attrs.y as number,
-      radius: (attrs.size as number) + ring + COLLIDE_PAD,
+      radius: (attrs.size as number) + COLLIDE_PAD,
     });
   });
 
@@ -1175,14 +1159,22 @@ export function edgeDisplay(
   return { ...attrs, hidden: true };
 }
 
+/** The node-label typeface: the app's body face, with the system font behind
+ *  it for the rare machine that has not loaded it. */
+export const NODE_LABEL_FONT = '12px "Instrument Sans", -apple-system, sans-serif';
+/** Ground-coloured halo stroke behind a node label, in CSS px — the label
+ *  stays legible where it crosses an edge or a neighbouring disc. */
+const NODE_LABEL_HALO_WIDTH = 3;
+
 /**
- * Sector-radial label drawer, ported verbatim from the old canvas graph:
- * 12px system font at 85% ink, placed left/right/above/below the node by its
- * angle from the graph center (0,0 — forceCenter pins the cluster there) so
- * labels face INWARD toward the cluster instead of expanding the bbox.
- * Graph y is negated for the angle: sigma renders graph +y screen-up while
- * the old canvas rendered it screen-down, and inward placement must track
- * the on-screen quadrant, not the raw coordinate. Wired into sigma via
+ * Sector-radial label drawer, ported from the old canvas graph: 12px body
+ * font at 85% ink, placed left/right/above/below the node by its angle from
+ * the graph center (0,0 — forceCenter pins the cluster there) so labels face
+ * INWARD toward the cluster instead of expanding the bbox. Graph y is negated
+ * for the angle: sigma renders graph +y screen-up while the old canvas
+ * rendered it screen-down, and inward placement must track the on-screen
+ * quadrant, not the raw coordinate. `halo`, when given, is the ground colour
+ * stroked behind the text first. Wired into sigma via
  * settings.defaultDrawNodeLabel (data carries the node key plus viewport
  * x/y/size — see sigma's renderLabels call site).
  */
@@ -1191,6 +1183,7 @@ export function drawRadialNodeLabel(
   data: Record<string, any>,
   settings: Record<string, any>,
   graph: Graph,
+  halo?: string,
 ): void {
   if (!data.label) return;
   const pad = (data.size as number) + 8;
@@ -1199,52 +1192,29 @@ export function drawRadialNodeLabel(
   const angle = Math.atan2(-gy, gx);
   const sector = Math.round((angle + Math.PI) / (Math.PI / 2)) % 4;
 
-  context.font = "12px -apple-system, sans-serif";
-  context.fillStyle = settings.labelColor?.color ?? "#000000";
-  context.globalAlpha = 0.85;
+  let x = data.x as number;
+  let y = data.y as number;
   if (sector === 0 || sector === 2) {
     const isRight = sector === 0;
     context.textAlign = isRight ? "left" : "right";
     context.textBaseline = "middle";
-    context.fillText(data.label, data.x + (isRight ? pad : -pad), data.y);
+    x += isRight ? pad : -pad;
   } else {
     const isBelow = sector === 1;
     context.textAlign = "center";
     context.textBaseline = isBelow ? "top" : "bottom";
-    context.fillText(data.label, data.x, data.y + (isBelow ? pad : -pad));
+    y += isBelow ? pad : -pad;
   }
+
+  context.font = NODE_LABEL_FONT;
+  context.fillStyle = settings.labelColor?.color ?? "#000000";
+  context.globalAlpha = 0.85;
+  if (halo) {
+    context.lineJoin = "round";
+    context.lineWidth = NODE_LABEL_HALO_WIDTH;
+    context.strokeStyle = halo;
+    context.strokeText(data.label, x, y);
+  }
+  context.fillText(data.label, x, y);
   context.globalAlpha = 1;
-}
-
-/** Ring stroke width in CSS px. Thinned from 1.5 in round 3: at real page
- *  density the fatter ring merged neighbouring pages into one teal mass. */
-const PAGE_RING_WIDTH = 1;
-/** Clear air between the disc and its ring — without the gap the ring reads as
- *  a slightly fatter dot rather than a different kind of thing. Tightened from
- *  3 for the same density reason as the stroke above. */
-const PAGE_RING_GAP = 2;
-
-/**
- * The halo ring that marks a wiki page. Sigma v3.0.3 ships only disc node
- * programs (`node-circle` / `node-point`, both borderless), and no `@sigma/*`
- * package is installed, so a square marker would mean either a new dependency
- * or a hand-written WebGL program — neither was in scope. The ring is drawn on
- * a plain 2D canvas stacked ABOVE sigma instead, the same technique the
- * cartography underlay uses below it. `positions` are viewport CSS px.
- */
-export function drawPageRings(
-  ctx: CanvasRenderingContext2D,
-  positions: { x: number; y: number; size: number }[],
-  palette: GraphPalette,
-): void {
-  if (positions.length === 0) return;
-  ctx.save();
-  ctx.strokeStyle = palette.page;
-  ctx.lineWidth = PAGE_RING_WIDTH;
-  for (const { x, y, size } of positions) {
-    ctx.beginPath();
-    ctx.arc(x, y, size + PAGE_RING_GAP, 0, 2 * Math.PI);
-    ctx.stroke();
-  }
-  ctx.restore();
 }

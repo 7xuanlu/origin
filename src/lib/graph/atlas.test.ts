@@ -19,8 +19,8 @@ import {
   hoverStateFor,
   nodeDisplay,
   edgeDisplay,
-  drawPageRings,
   drawRadialNodeLabel,
+  NODE_LABEL_FONT,
 } from "./atlas";
 import type { HoverState, AtlasSimNode, AtlasSimLink } from "./atlas";
 
@@ -38,8 +38,7 @@ const PALETTE: GraphPalette = {
   // Black surface keeps the composite math legible: composited channel is
   // just slotChannel * alpha.
   surface: "#000000",
-  hull: "rgba(1,2,3,0.05)",
-  hullBorder: "rgba(1,2,3,0.16)",
+  terrain: "rgba(1,2,3,0.05)",
   graticule: "rgba(4,5,6,0.13)",
   bridge: "#bbbbbb",
   memory: "#cccccc",
@@ -128,7 +127,7 @@ describe("buildAtlasGraph", () => {
     expect(graph.getNodeAttribute("x", "color")).toBe("#333333");
   });
 
-  it("gives a confirmed node a larger size base than an unconfirmed one at equal degree, capped at 12", () => {
+  it("gives a confirmed node a larger size base than an unconfirmed one at equal degree, capped at 14", () => {
     const model = makeModel([
       node({ id: "conf", confirmed: true, degree: 2 }),
       node({ id: "unconf", confirmed: false, degree: 2 }),
@@ -136,12 +135,12 @@ describe("buildAtlasGraph", () => {
       node({ id: "hub", confirmed: true, degree: 300 }),
     ]);
     const graph = buildAtlasGraph(model, PALETTE);
-    // base + 1.6 * log2(1 + degree); log2(3) = 1.585.
-    const growth = 1.6 * Math.log2(3);
+    // base + 1.9 * log2(1 + degree); log2(3) = 1.585.
+    const growth = 1.9 * Math.log2(3);
     expect(graph.getNodeAttribute("conf", "size")).toBeCloseTo(4 + growth, 10);
     expect(graph.getNodeAttribute("unconf", "size")).toBeCloseTo(3 + growth, 10);
     expect(graph.getNodeAttribute("unknown", "size")).toBeCloseTo(3 + growth, 10);
-    expect(graph.getNodeAttribute("hub", "size")).toBe(12);
+    expect(graph.getNodeAttribute("hub", "size")).toBe(14);
   });
 
   it("keeps a wiki page on the entity scale and a memory below it, capped", () => {
@@ -152,7 +151,7 @@ describe("buildAtlasGraph", () => {
       node({ id: "memhub", entityType: "memory", confirmed: true, degree: 300 }),
     ]);
     const graph = buildAtlasGraph(model, PALETTE);
-    const growth = 1.6 * Math.log2(4);
+    const growth = 1.9 * Math.log2(4);
     expect(graph.getNodeAttribute("page", "size")).toBeCloseTo(3 + growth, 10);
     expect(graph.getNodeAttribute("entity", "size")).toBeCloseTo(3 + growth, 10);
     // Memories are context: they start lowest and are capped well under the
@@ -178,37 +177,9 @@ describe("buildAtlasGraph", () => {
       ],
     );
     const graph = buildAtlasGraph(model, PALETTE);
-    expect(graph.getEdgeAttribute("w", "size")).toBe(1.5);
-    expect(graph.getEdgeAttribute("s", "size")).toBe(0.8);
+    expect(graph.getEdgeAttribute("w", "size")).toBe(1);
+    expect(graph.getEdgeAttribute("s", "size")).toBe(0.6);
     expect(graph.getEdgeAttribute("s", "edgeType")).toBe("shared_source");
-  });
-
-  it("rings every page node just outside its disc, in the page ink", () => {
-    const calls: string[] = [];
-    const ctx = {
-      save: () => calls.push("save"),
-      restore: () => calls.push("restore"),
-      beginPath: () => calls.push("beginPath"),
-      stroke: () => calls.push("stroke"),
-      arc: (x: number, y: number, r: number) => calls.push(`arc:${x},${y},${r}`),
-      strokeStyle: "",
-      lineWidth: 0,
-    } as unknown as CanvasRenderingContext2D;
-    drawPageRings(ctx, [{ x: 10, y: 20, size: 5 }], PALETTE);
-    expect(ctx.strokeStyle).toBe(PALETTE.page);
-    expect(ctx.lineWidth).toBe(1);
-    // Radius is the disc plus a 2px gap, so the ring reads as a separate mark
-    // rather than a slightly fatter dot — round 3 tightened both the gap and
-    // the stroke so dense page clusters stop merging into one teal mass.
-    expect(calls).toContain("arc:10,20,7");
-    expect(calls.filter((c) => c === "stroke")).toHaveLength(1);
-  });
-
-  it("draws nothing when there are no pages on the map", () => {
-    let touched = false;
-    const ctx = { save: () => (touched = true) } as unknown as CanvasRenderingContext2D;
-    drawPageRings(ctx, [], PALETTE);
-    expect(touched).toBe(false);
   });
 
   it("stores confirmed on the node so theme recoloring can recompute the tiered fill", () => {
@@ -216,56 +187,24 @@ describe("buildAtlasGraph", () => {
     expect(graph.getNodeAttribute("a", "confirmed")).toBeNull();
   });
 
-  it("colors edges with the palette's quiet edge tone, size 1.5 (CSS px — old graph's exact stroke)", () => {
+  it("colors edges with the palette's quiet edge tone, size 1 (CSS px — the hairline default)", () => {
     const model = makeModel(
       [node({ id: "a" }), node({ id: "b" })],
       [edge({ id: "e1", source: "a", target: "b" })],
     );
     const graph = buildAtlasGraph(model, PALETTE);
     expect(graph.getEdgeAttribute("e1", "color")).toBe(PALETTE.edge);
-    expect(graph.getEdgeAttribute("e1", "size")).toBe(1.5);
+    expect(graph.getEdgeAttribute("e1", "size")).toBe(1);
   });
 
-  it("paints an edge between two real regions in the amber bridge ink, slightly thinner", () => {
-    // Two triangles joined by a1–b1 — the canonical bridge fixture.
-    const model = makeModel(
-      ["a1", "a2", "a3", "b1", "b2", "b3"].map((id) => node({ id })),
-      [
-        edge({ id: "ea1", source: "a1", target: "a2" }),
-        edge({ id: "ea2", source: "a2", target: "a3" }),
-        edge({ id: "ea3", source: "a3", target: "a1" }),
-        edge({ id: "eb1", source: "b1", target: "b2" }),
-        edge({ id: "eb2", source: "b2", target: "b3" }),
-        edge({ id: "eb3", source: "b3", target: "b1" }),
-        edge({ id: "bridge", source: "a1", target: "b1" }),
-      ],
-    );
-    const communities = new Map<string, string>([
-      ["a1", "0"],
-      ["a2", "0"],
-      ["a3", "0"],
-      ["b1", "1"],
-      ["b2", "1"],
-      ["b3", "1"],
-    ]);
-    const graph = buildAtlasGraph(model, PALETTE, communities);
-    expect(graph.getEdgeAttribute("bridge", "color")).toBe(PALETTE.bridge);
-    expect(graph.getEdgeAttribute("bridge", "size")).toBe(1.4);
-    expect(graph.getEdgeAttribute("bridge", "bridge")).toBe(true);
-    // Intra-region edges keep the quiet tone.
-    expect(graph.getEdgeAttribute("ea1", "color")).toBe(PALETTE.edge);
-    expect(graph.getEdgeAttribute("ea1", "size")).toBe(1.5);
-    expect(graph.getEdgeAttribute("ea1", "bridge")).toBe(false);
-  });
-
-  it("treats every edge as normal when no community map is passed", () => {
+  it("paints nothing amber at rest — every edge carries palette.edge and no bridge attribute", () => {
     const model = makeModel(
       [node({ id: "a" }), node({ id: "b" })],
       [edge({ id: "e1", source: "a", target: "b" })],
     );
     const graph = buildAtlasGraph(model, PALETTE);
     expect(graph.getEdgeAttribute("e1", "color")).toBe(PALETTE.edge);
-    expect(graph.getEdgeAttribute("e1", "bridge")).toBe(false);
+    expect(graph.getEdgeAttribute("e1", "bridge")).toBeUndefined();
   });
 
   it("keeps distinct parallel relations between the same pair as distinct edges", () => {
@@ -605,7 +544,11 @@ describe("drawRadialNodeLabel", () => {
       globalAlpha: 1,
       textAlign: "",
       textBaseline: "",
+      lineJoin: "",
+      lineWidth: 0,
+      strokeStyle: "",
       fillText: vi.fn(),
+      strokeText: vi.fn(),
     };
   }
 
@@ -651,14 +594,14 @@ describe("drawRadialNodeLabel", () => {
     expect(ctx.fillText).toHaveBeenCalledWith("Alice", 100, 38);
   });
 
-  it("draws 12px system-font ink from settings.labelColor at 85% alpha, restored after", () => {
+  it("draws the shared node-label font from settings.labelColor at 85% alpha, restored after", () => {
     const ctx = mockCtx();
     let alphaAtDraw = 0;
     ctx.fillText.mockImplementation(() => {
       alphaAtDraw = ctx.globalAlpha;
     });
     drawRadialNodeLabel(ctx as any, data, settings, graphWithNodeAt(10, 0));
-    expect(ctx.font).toBe("12px -apple-system, sans-serif");
+    expect(ctx.font).toBe(NODE_LABEL_FONT);
     expect(ctx.fillStyle).toBe("#abcdef");
     expect(alphaAtDraw).toBe(0.85);
     expect(ctx.globalAlpha).toBe(1); // restored — the labels canvas is shared
@@ -668,6 +611,25 @@ describe("drawRadialNodeLabel", () => {
     const ctx = mockCtx();
     drawRadialNodeLabel(ctx as any, { ...data, label: "" }, settings, graphWithNodeAt(10, 0));
     expect(ctx.fillText).not.toHaveBeenCalled();
+  });
+
+  it("strokes a ground-coloured halo behind the label, before the fill, when one is given", () => {
+    const ctx = mockCtx();
+    const order: string[] = [];
+    ctx.strokeText.mockImplementation(() => order.push("stroke"));
+    ctx.fillText.mockImplementation(() => order.push("fill"));
+    drawRadialNodeLabel(ctx as any, data, settings, graphWithNodeAt(10, 0), "#0a0a0a");
+    expect(ctx.lineJoin).toBe("round");
+    expect(ctx.lineWidth).toBe(3);
+    expect(ctx.strokeStyle).toBe("#0a0a0a");
+    expect(ctx.strokeText).toHaveBeenCalledWith("Alice", 88, 50);
+    expect(order).toEqual(["stroke", "fill"]);
+  });
+
+  it("strokes nothing when no halo colour is given", () => {
+    const ctx = mockCtx();
+    drawRadialNodeLabel(ctx as any, data, settings, graphWithNodeAt(10, 0));
+    expect(ctx.strokeText).not.toHaveBeenCalled();
   });
 });
 
@@ -693,8 +655,8 @@ describe("shared-source edges and node size", () => {
       ],
     );
     const graph = buildAtlasGraph(model, PALETTE);
-    expect(graph.getNodeAttribute("asserted", "size")).toBeCloseTo(3 + 1.6 * Math.log2(4), 10);
-    expect(graph.getNodeAttribute("overlap", "size")).toBeCloseTo(3 + 1.6 * Math.log2(2), 10);
+    expect(graph.getNodeAttribute("asserted", "size")).toBeCloseTo(3 + 1.9 * Math.log2(4), 10);
+    expect(graph.getNodeAttribute("overlap", "size")).toBeCloseTo(3 + 1.9 * Math.log2(2), 10);
   });
 
   it("never sizes a node below its base, however many shared-source edges touch it", () => {
@@ -893,7 +855,7 @@ describe("simulation forces (round 4)", () => {
     );
   }
 
-  it("gives each sim node a collision radius wider than its disc, and pages wider still", () => {
+  it("gives every sim node the same collision radius rule — disc plus COLLIDE_PAD, pages included", () => {
     const model = makeModel(
       [node({ id: "e", degree: 1 }), node({ id: "p", entityType: "page", degree: 1 })],
       [edge({ id: "e1", source: "e", target: "p", type: "about" })],
@@ -904,9 +866,9 @@ describe("simulation forces (round 4)", () => {
     const byId = new Map(sim.nodes().map((n) => [n.id, n]));
     const entity = byId.get("e")!;
     const page = byId.get("p")!;
+    // Pages no longer carry a separate ring term — same pad as any entity.
     expect(entity.radius).toBe((graph.getNodeAttribute("e", "size") as number) + 2);
-    // Page adds its detached ring (gap 2 + width 1) on top of the same pad.
-    expect(page.radius).toBe((graph.getNodeAttribute("p", "size") as number) + 3 + 2);
+    expect(page.radius).toBe((graph.getNodeAttribute("p", "size") as number) + 2);
   });
 
   it("registers a collide force, so two discs dropped on the same spot separate", () => {

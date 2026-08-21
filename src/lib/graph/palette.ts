@@ -46,14 +46,14 @@ export interface GraphPalette {
   labelMuted: string;
   /** Graph ground (--mem-surface) — what translucent node fills composite against. */
   surface: string;
-  /** Community hull fill — rgba; drawn on the 2D underlay, not sigma. */
-  hull: string;
-  /** Community hull border — rgba; 2D underlay. */
-  hullBorder: string;
-  /** Dashed orientation rings — rgba; 2D underlay. */
-  graticule: string;
-  /** Cross-community edge ink — opaque (sigma-consumed). */
+  /** The one soft wash every drawn node deposits on the 2D underlay — rgba;
+   *  stacks into terrain where nodes crowd. */
+  terrain: string;
+  /** Amber accent the PageCanvas spokes wear — opaque (sigma-consumed). */
   bridge: string;
+  /** Dot-grid ink behind the PageCanvas — rgba; the Atlas no longer draws a
+   *  graticule. */
+  graticule: string;
   /** The one muted fill every memory node wears — memories carry no entity
    *  type, so they get a slot-free colour rather than a sixth category. */
   memory: string;
@@ -81,10 +81,9 @@ function readPalette(): GraphPalette {
     label: read("--mem-text"),
     labelMuted: read("--mem-text-tertiary"),
     surface: read("--mem-surface"),
-    hull: read("--kg-hull"),
-    hullBorder: read("--kg-hull-border"),
-    graticule: read("--kg-graticule"),
+    terrain: read("--kg-terrain"),
     bridge: read("--kg-bridge"),
+    graticule: read("--kg-graticule"),
     memory: read("--kg-memory"),
     page: read("--kg-page"),
   };
