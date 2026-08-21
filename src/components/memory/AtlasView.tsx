@@ -178,9 +178,6 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // pointer actually moved during the current press — the latter gates
   // clickNode so a drag-release doesn't also fire entity navigation.
   const draggedNodeRef = useRef<string | null>(null);
-  /** Was the node under the pointer already pinned before this drag? A packed
-   *  island node is, and must stay pinned when the pointer lets go. */
-  const draggedNodeWasPinnedRef = useRef(false);
   const movedDuringPressRef = useRef(false);
   // Cached cartography (hulls + graticule). Recomputing every hull on every
   // afterRender meant a plain camera pan or a hover re-hulled all 66 regions;
@@ -777,11 +774,6 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       // its orbit on the next tick unless the sim knows a hand is on it.
       sim.setDraggingId(node);
       const simNode = sim.nodes().find((n) => n.id === node);
-      // Nodes outside the biggest component are parked on the shelf by
-      // shelveComponents and pinned there; a drag moves the pin, and release
-      // leaves it at the new spot rather than handing it back to charge +
-      // forceCenter, which would fling it into the core.
-      draggedNodeWasPinnedRef.current = simNode?.fx != null;
       // Leaf memories aren't sim members (see nonSimulatedIds) — dragging one
       // is pure direct manipulation via mousemovebody's graphology writes, so
       // there's nothing here to pin or reheat; setDraggingId above is what
@@ -834,18 +826,25 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       if (draggedNode) {
         graph.setNodeAttribute(draggedNode, "highlighted", false);
         const simNode = sim.nodes().find((n) => n.id === draggedNode);
-        if (simNode && !draggedNodeWasPinnedRef.current) {
+        // Every component is live now (see atlas.ts's groupCenterForce) — its
+        // own anchor holds it at its shelf slot, so releasing fx/fy here
+        // never hands a shelved node back to unconstrained charge/forceCenter.
+        if (simNode) {
           simNode.fx = null;
           simNode.fy = null;
         }
         draggedNodeRef.current = null;
-        draggedNodeWasPinnedRef.current = false;
       }
       sim.setDraggingId(null);
       container.style.cursor = hoverStateRef.current.hovered ? "pointer" : "default";
       // Natural decay is the inertia tail; reduced motion skips it outright.
-      if (prefersReducedMotion()) sim.stop();
-      else sim.alphaTarget(0);
+      // That tail is also what walks a released shelf component back onto its
+      // slot, so skipping it needs the same correction applied in one step —
+      // otherwise a component dragged toward the core just stays there.
+      if (prefersReducedMotion()) {
+        sim.settleShelf();
+        sim.stop();
+      } else sim.alphaTarget(0);
     });
 
     // Direct wheel zoom. Sigma's default quantizes the gesture into 1.7x

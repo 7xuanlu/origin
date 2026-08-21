@@ -8,6 +8,7 @@ import {
   buildAtlasGraph,
   runAtlasLayout,
   createAtlasSimulation,
+  relaxShelf,
   nonSimulatedIds,
   satellitePlan,
   placeSatellites,
@@ -21,7 +22,7 @@ import {
   drawPageRings,
   drawRadialNodeLabel,
 } from "./atlas";
-import type { HoverState, AtlasSimNode } from "./atlas";
+import type { HoverState, AtlasSimNode, AtlasSimLink } from "./atlas";
 
 const PALETTE: GraphPalette = {
   project: "#111111",
@@ -434,16 +435,61 @@ describe("createAtlasSimulation", () => {
     expect(after).not.toEqual(before);
   });
 
-  it("invokes onTick after every writeback — settle, then the pack pass, then once per manual tick", () => {
+  it("invokes onTick after every writeback — settle, the pack pass, then once per manual tick", () => {
     const graph = starGraph();
     const onTick = vi.fn();
     const sim = createAtlasSimulation(graph, onTick);
-    // The settle runs as a single wrapped tick(220) call → one writeback;
-    // round 4's component packing runs the same writeback path afterwards so
-    // satellites follow their moved anchors → a second.
+    // The settle runs as a single wrapped tick(settleTicks) call → one
+    // writeback; the final pack-and-anchor pass writes back explicitly so
+    // satellites follow their moved anchors → a second. TWO in total, not
+    // three: the knot relax in between runs on relaxShelf's scratch
+    // simulation, which never touches this graph or this callback.
     expect(onTick).toHaveBeenCalledTimes(2);
     sim.tick(1);
     expect(onTick).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("relaxShelf", () => {
+  it("owns the shelved nodes and only them, opens them, and leaves the core exactly where it was", () => {
+    const nodes: AtlasSimNode[] = [
+      { id: "core0", x: 0, y: 0, radius: 5 },
+      { id: "core1", x: 40, y: 0, radius: 5 },
+      // Two shelved nodes dropped on nearly the same point: the knot this
+      // pass exists to open.
+      { id: "s0", x: 0, y: -200, radius: 5 },
+      { id: "s1", x: 1, y: -200, radius: 5 },
+    ];
+    const links: AtlasSimLink[] = [
+      { source: "core0", target: "core1", type: "knows" },
+      { source: "s0", target: "s1", type: "knows" },
+    ];
+    const placement = [
+      ["core0", "core1"],
+      ["s0", "s1"],
+    ];
+    const degree = new Map([
+      ["core0", 1],
+      ["core1", 1],
+      ["s0", 1],
+      ["s1", 1],
+    ]);
+
+    const sim = relaxShelf(nodes, links, placement, degree);
+
+    // The perf guard, asserted structurally rather than on a stopwatch: the
+    // core is already settled, so relaxing it again would only buy back the
+    // whole O(core) charge cost this scratch pass was split out to avoid.
+    expect(sim.nodes().map((n) => n.id).sort()).toEqual(["s0", "s1"]);
+    // Core positions come back byte-identical — it was never simulated.
+    expect(nodes[0]).toMatchObject({ x: 0, y: 0 });
+    expect(nodes[1]).toMatchObject({ x: 40, y: 0 });
+    // The shelved pair opened to its link's rest length...
+    const [s0, s1] = [nodes[2] as AtlasSimNode, nodes[3] as AtlasSimNode];
+    expect(Math.hypot((s0.x ?? 0) - (s1.x ?? 0), (s0.y ?? 0) - (s1.y ?? 0))).toBeGreaterThan(10);
+    // ...around the centroid it started on, held there by its own group anchor.
+    expect(((s0.x ?? 0) + (s1.x ?? 0)) / 2).toBeCloseTo(0.5, 1);
+    expect(((s0.y ?? 0) + (s1.y ?? 0)) / 2).toBeCloseTo(-200, 1);
   });
 });
 
@@ -1149,15 +1195,23 @@ describe("shelveComponents", () => {
     expect(shelveComponents(graph)).toEqual([]);
   });
 
-  it("holds the shelved components still through a drag reheat", () => {
+  it("holds each shelved component's centroid still through a drag reheat", () => {
     const graph = buildAtlasGraph(componentsModel([9, 6, 5]), PALETTE);
     runAtlasLayout(graph);
     const sim = createAtlasSimulation(graph);
-    const placement = [
+    const groups = [
       ["c1n0", "c1n1", "c1n2", "c1n3", "c1n4", "c1n5"],
       ["c2n0", "c2n1", "c2n2", "c2n3", "c2n4"],
     ];
-    const before = placement.map((ids) => box(graph, ids));
+    const centroidOf = (ids: string[]) => {
+      const xs = ids.map((id) => graph.getNodeAttribute(id, "x") as number);
+      const ys = ids.map((id) => graph.getNodeAttribute(id, "y") as number);
+      return {
+        x: xs.reduce((a, b) => a + b, 0) / xs.length,
+        y: ys.reduce((a, b) => a + b, 0) / ys.length,
+      };
+    };
+    const before = groups.map(centroidOf);
     // Exactly AtlasView's downNode: pin the pressed core node, jump alpha to
     // 0.3 and reheat.
     const pressed = sim.nodes().find((n) => n.id === "c0n0") as {
@@ -1170,22 +1224,49 @@ describe("shelveComponents", () => {
     pressed.fy = pressed.y;
     sim.alpha(0.3).alphaTarget(0.3);
     sim.tick(60);
-    placement.forEach((ids, i) => {
-      expect(box(graph, ids)).toEqual(before[i]);
+
+    // Every component is live now (see shelfAnchorForce) — collide and link
+    // can still shuffle nodes WITHIN a shelved component on a core reheat,
+    // that is the fix — but the component as a whole has to stay on its
+    // slot; an exact-box freeze no longer applies.
+    //
+    // The bound is tight on purpose. A hold that only corrects POSITION
+    // leaves each tick's velocity to carry the component a little further,
+    // every tick, forever: ~2.2 units here, and 27 units on the real capture
+    // where the core's mass sits 3,000 units away and pushes that much
+    // harder. Cancelling the component's bulk velocity is what makes the
+    // residual vanish rather than merely look small at fixture scale.
+    groups.forEach((ids, i) => {
+      const after = centroidOf(ids);
+      const b = before[i] as { x: number; y: number };
+      expect(Math.hypot(after.x - b.x, after.y - b.y)).toBeLessThan(0.5);
     });
+    // The two shelved components still keep clear of each other.
+    const [b1, b2] = groups.map((ids) => box(graph, ids)) as [
+      { minX: number; maxX: number; minY: number; maxY: number },
+      { minX: number; maxX: number; minY: number; maxY: number },
+    ];
+    const overlaps = b1.minX < b2.maxX && b2.minX < b1.maxX && b1.minY < b2.maxY && b2.minY < b1.maxY;
+    expect(overlaps).toBe(false);
   });
 
   it("holds the core in place through a reheat instead of chasing the shelf's mass", () => {
     const graph = buildAtlasGraph(componentsModel([24, 6, 6, 6, 6]), PALETTE);
     runAtlasLayout(graph);
     const sim = createAtlasSimulation(graph);
-    const pressed = sim.nodes().find((n) => n.fx == null) as {
+    // Every component is live now — the core under groupCenterForce, the
+    // shelved ones under shelfAnchorForce — so fx == null no longer picks out
+    // the core; every node's fx is null right after creation. c0 is the core
+    // by construction (24 of 48 nodes, by far the largest), so select it by
+    // id instead.
+    const core = sim.nodes().filter((n) => n.id.startsWith("c0n"));
+    const pressed = core[0] as {
       fx?: number | null;
       fy?: number | null;
       x?: number;
       y?: number;
     };
-    const rest = sim.nodes().filter((n) => n.fx == null && n !== pressed);
+    const rest = core.filter((n) => n !== pressed);
     const centroid = () => ({
       x: rest.reduce((sum, n) => sum + (n.x ?? 0), 0) / rest.length,
       y: rest.reduce((sum, n) => sum + (n.y ?? 0), 0) / rest.length,
@@ -1199,13 +1280,278 @@ describe("shelveComponents", () => {
     sim.tick(60);
 
     const after = centroid();
-    // The shelf is pinned BELOW the core, so a centre force that averaged
-    // every node would see a centroid below the origin every tick and walk
-    // the core upward to compensate — the two zones would drift apart.
-    // 18 units on a 430-unit span as written. d3's own forceCenter, which
-    // averages the pinned shelf in too, gives 268; averaging only the free
-    // nodes but pulling them to a centroid of (0,0) rather than to where the
-    // shelf pass left them gives 54.
+    // The shelf sits BELOW the core, so a centre force that averaged every
+    // node would see a centroid below the origin every tick and walk the
+    // core upward to compensate — the two zones would drift apart. Each
+    // component holding its OWN centroid (not a shared one across the whole
+    // graph) is what keeps the core from chasing the shelf's mass.
     expect(Math.hypot(after.x - before.x, after.y - before.y)).toBeLessThan(span * 0.08);
+  });
+
+  /** Runs AtlasView's gesture — pin `dragged` 50 units away, jump alpha to
+   *  0.3, reheat — once per compass direction, and returns the MEAN distance
+   *  its chain neighbor travelled.
+   *
+   *  Two measurement traps this avoids. Distance from the neighbor to the
+   *  drag target is not the quantity: the link holds the pair at its rest
+   *  length, so a neighbor that follows perfectly still stops ~30 units short
+   *  and that gap can grow while it is doing exactly the right thing. And a
+   *  single direction is not enough: how far a neighbor gets depends on what
+   *  is in the way (a shelved component dragged sideways runs into the one
+   *  beside it on its row and stops at 7 units, while the same drag downward
+   *  covers 44), so one axis measures collide, not the anchor. */
+  function meanNeighborTravel(sizes: number[], dragged: string) {
+    const neighbor = dragged.replace("n0", "n1");
+    const travels = ([
+      [50, 0],
+      [-50, 0],
+      [0, 50],
+      [0, -50],
+    ] as const).map(([dx, dy]) => {
+      const graph = buildAtlasGraph(componentsModel(sizes), PALETTE);
+      runAtlasLayout(graph);
+      const sim = createAtlasSimulation(graph);
+      const byId = new Map(sim.nodes().map((n) => [n.id, n]));
+      const pressed = byId.get(dragged) as { fx?: number | null; fy?: number | null; x?: number; y?: number };
+      const follower = byId.get(neighbor) as { x?: number; y?: number };
+      const from = { x: follower.x ?? 0, y: follower.y ?? 0 };
+      pressed.fx = (pressed.x ?? 0) + dx;
+      pressed.fy = (pressed.y ?? 0) + dy;
+      sim.alpha(0.3).alphaTarget(0.3);
+      sim.tick(120);
+      sim.stop();
+      return Math.hypot((follower.x ?? 0) - from.x, (follower.y ?? 0) - from.y);
+    });
+    return travels.reduce((a, b) => a + b, 0) / travels.length;
+  }
+
+  it("pulls a shelved component's neighbor along about as readily as a core one", () => {
+    const core = meanNeighborTravel([9, 5], "c0n0");
+    const shelf = meanNeighborTravel([9, 5], "c1n0");
+    // The bug this round exists to fix: under the old fx/fy freeze a shelved
+    // neighbor travelled exactly 0, in every direction.
+    expect(shelf).toBeGreaterThan(10);
+    // "Dragging should feel the same everywhere" — the shelf anchor is a
+    // tenth of a link's strength precisely so a hand still wins.
+    expect(shelf).toBeGreaterThan(0.5 * core);
+  });
+
+  it("holds an untouched component's centroid while a NEIGHBORING shelf component is dragged", () => {
+    const graph = buildAtlasGraph(componentsModel([9, 5, 5]), PALETTE);
+    runAtlasLayout(graph);
+    const sim = createAtlasSimulation(graph);
+    const byId = new Map(sim.nodes().map((n) => [n.id, n]));
+    const untouched = ["c2n0", "c2n1", "c2n2", "c2n3", "c2n4"].map(
+      (id) => byId.get(id) as { x?: number; y?: number },
+    );
+    const centroid = () => ({
+      x: untouched.reduce((sum, n) => sum + (n.x ?? 0), 0) / untouched.length,
+      y: untouched.reduce((sum, n) => sum + (n.y ?? 0), 0) / untouched.length,
+    });
+    const before = centroid();
+
+    const dragged = byId.get("c1n0") as { fx?: number | null; fy?: number | null; x?: number; y?: number };
+    dragged.fx = (dragged.x ?? 0) + 50;
+    dragged.fy = dragged.y ?? 0;
+    sim.alpha(0.3).alphaTarget(0.3);
+    sim.tick(60);
+
+    const after = centroid();
+    expect(Math.hypot(after.x - before.x, after.y - before.y)).toBeLessThan(0.5);
+  });
+
+  it("lets a TWO-node shelf component follow a drag instead of clamping its one free node to the anchor", () => {
+    const graph = buildAtlasGraph(componentsModel([9, 2]), PALETTE);
+    runAtlasLayout(graph);
+    const sim = createAtlasSimulation(graph);
+    const byId = new Map(sim.nodes().map((n) => [n.id, n]));
+    const dragged = byId.get("c1n0") as { fx?: number | null; fy?: number | null; x?: number; y?: number };
+    const neighbor = byId.get("c1n1") as { x?: number; y?: number };
+    const from = { x: neighbor.x ?? 0, y: neighbor.y ?? 0 };
+
+    // A pair is the worst case for any group-centroid hold: pin one node and
+    // the other is the group's ENTIRE free set, so "hold the free centroid at
+    // the group target" degenerates into "teleport the neighbor to the middle
+    // of the slot", away from the hand. Drag far enough that following and
+    // clamping cannot be confused — a clamped neighbor stays put whatever the
+    // drag distance, a following one tracks it.
+    dragged.fx = (dragged.x ?? 0) + 200;
+    dragged.fy = dragged.y ?? 0;
+    sim.alpha(0.3).alphaTarget(0.3);
+    sim.tick(60);
+
+    const travel = Math.hypot((neighbor.x ?? 0) - from.x, (neighbor.y ?? 0) - from.y);
+    expect(travel).toBeGreaterThan(100);
+    // And it went WITH the drag, not to the group's own centre.
+    expect((neighbor.x ?? 0) - from.x).toBeGreaterThan(100);
+  });
+
+  /** The real mouseup path: pin a shelved node, haul the component `distance`
+   *  units toward the core (the shelf is below it, so +y), then let go the way
+   *  AtlasView does — clear fx/fy, alphaTarget(0), and let the simulation cool
+   *  to alphaMin. Returns where the component ended up relative to its slot. */
+  function dragAndRelease(distance: number, reducedMotion = false) {
+    const graph = buildAtlasGraph(componentsModel([9, 2]), PALETTE);
+    runAtlasLayout(graph);
+    const sim = createAtlasSimulation(graph);
+    const core = Array.from({ length: 9 }, (_, i) => `c0n${i}`);
+    const shelf = ["c1n0", "c1n1"];
+    const centroidOf = (group: string[]) => ({
+      x: group.reduce((sum, id) => sum + (graph.getNodeAttribute(id, "x") as number), 0) / group.length,
+      y: group.reduce((sum, id) => sum + (graph.getNodeAttribute(id, "y") as number), 0) / group.length,
+    });
+    const slot = centroidOf(shelf);
+
+    const dragged = sim.nodes().find((n) => n.id === "c1n0") as {
+      fx?: number | null;
+      fy?: number | null;
+      x?: number;
+      y?: number;
+    };
+    dragged.fx = dragged.x;
+    dragged.fy = (dragged.y ?? 0) + distance;
+    sim.alpha(0.3).alphaTarget(0.3);
+    sim.tick(60);
+
+    dragged.fx = null;
+    dragged.fy = null;
+    if (reducedMotion) {
+      sim.settleShelf();
+      sim.stop();
+    } else {
+      sim.alphaTarget(0);
+      // alphaDecay 0.03 from 0.3 reaches alphaMin in ~190; the cap only keeps
+      // a regression here from hanging the suite.
+      for (let i = 0; i < 400 && sim.alpha() >= sim.alphaMin(); i += 1) sim.tick(1);
+      sim.stop();
+    }
+
+    const after = centroidOf(shelf);
+    const c = box(graph, core);
+    const s = box(graph, shelf);
+    return {
+      offset: Math.hypot(after.x - slot.x, after.y - slot.y),
+      overlapsCore: s.minX < c.maxX && c.minX < s.maxX && s.minY < c.maxY && c.minY < s.maxY,
+    };
+  }
+
+  it("walks a RELEASED component all the way back to its slot, not part of the way", () => {
+    // The failure this catches: hold a component's bulk velocity at zero and
+    // the spring's own return velocity is cancelled again every tick, leaving
+    // one alpha-scaled impulse per tick to do the whole journey — and alpha is
+    // a finite budget. Measured that way, this 200-unit drag settled 77.5
+    // units from its slot with its box 13 units inside the core's; the
+    // 100-unit drag settled 33.4 out, past the 24-unit SHELF_GAP that is
+    // supposed to separate the zones. Steering the bulk velocity home instead
+    // (SHELF_RETURN_RATE) is not alpha-scaled, so the return completes.
+    const far = dragAndRelease(200);
+    expect(far.offset).toBeLessThan(2);
+    expect(far.overlapsCore).toBe(false);
+    const near = dragAndRelease(100);
+    expect(near.offset).toBeLessThan(2);
+    expect(near.overlapsCore).toBe(false);
+  });
+
+  it("puts a released component back on its slot in ONE step when reduced motion skips the cooling tail", () => {
+    // AtlasView's mouseup stops the simulation outright under reduced motion,
+    // so there is no tail to walk the component home — without settleShelf it
+    // simply stays where the drag left it, 61 units off slot and overlapping
+    // the core.
+    const settled = dragAndRelease(200, true);
+    expect(settled.offset).toBeLessThan(0.5);
+    expect(settled.overlapsCore).toBe(false);
+  });
+
+  it("keeps a long shelf component from swinging its far end up into the core over a long reheat", () => {
+    // Chains this long are the case a centroid hold cannot catch: holding the
+    // CENTRE says nothing about which way a body points, and an elongated
+    // component in the core's repulsion field pivots to point at the core —
+    // its top edge rises even though its centroid has barely moved. Under the
+    // centroid-only hold this fixture's five-node chain rose 9.1 units toward
+    // the core in 120 ticks and its centroid drifted 1.8; both are near zero
+    // once each node is sprung to its own slot.
+    const graph = buildAtlasGraph(componentsModel([24, 6, 5]), PALETTE);
+    runAtlasLayout(graph);
+    const sim = createAtlasSimulation(graph);
+    const ids = [24, 6, 5].map((size, c) => Array.from({ length: size }, (_, i) => `c${c}n${i}`));
+    const centroidOf = (group: string[]) => {
+      const xs = group.map((id) => graph.getNodeAttribute(id, "x") as number);
+      const ys = group.map((id) => graph.getNodeAttribute(id, "y") as number);
+      return { x: xs.reduce((a, b) => a + b, 0) / xs.length, y: ys.reduce((a, b) => a + b, 0) / ys.length };
+    };
+    const before = ids.map(centroidOf);
+    const boxBefore = ids.map((group) => box(graph, group));
+
+    const pressed = sim.nodes().find((n) => n.id === "c0n0") as {
+      fx?: number | null;
+      fy?: number | null;
+      x?: number;
+      y?: number;
+    };
+    pressed.fx = pressed.x;
+    pressed.fy = pressed.y;
+    sim.alpha(0.3).alphaTarget(0.3);
+    sim.tick(120);
+
+    const core = box(graph, ids[0] as string[]);
+    for (let i = 1; i < ids.length; i += 1) {
+      const shelf = box(graph, ids[i] as string[]);
+      const overlaps =
+        shelf.minX < core.maxX && core.minX < shelf.maxX && shelf.minY < core.maxY && core.minY < shelf.maxY;
+      expect(overlaps).toBe(false);
+      // The shelf is BELOW the core, so "rising toward the core" is maxY
+      // climbing. Bounded well inside the SHELF_GAP the packing left.
+      const rise = shelf.maxY - (boxBefore[i] as { maxY: number }).maxY;
+      expect(rise).toBeLessThan(5);
+      const after = centroidOf(ids[i] as string[]);
+      const b = before[i] as { x: number; y: number };
+      expect(Math.hypot(after.x - b.x, after.y - b.y)).toBeLessThan(0.5);
+    }
+  });
+
+  it("opens a knot: an overlapping dense cluster clears every pair of discs once settled", () => {
+    const spokeCount = 20;
+    const nodes: GraphNode[] = [node({ id: "hub", entityType: "page", degree: spokeCount })];
+    const edges: GraphEdge[] = [];
+    for (let i = 0; i < spokeCount; i += 1) {
+      const id = `p${i}`;
+      // Ring neighbor plus the hub spoke gives every page node degree 2+, so
+      // none of them is a satellite (see nonSimulatedIds) — the whole
+      // cluster stays in the sim, discs and all.
+      nodes.push(node({ id, entityType: "page", degree: 2 }));
+      edges.push(edge({ id: `h${i}`, source: "hub", target: id, type: "about" }));
+    }
+    for (let i = 0; i < spokeCount; i += 1) {
+      edges.push(
+        edge({ id: `ring${i}`, source: `p${i}`, target: `p${(i + 1) % spokeCount}`, type: "wikilink" }),
+      );
+    }
+    const graph = buildAtlasGraph(makeModel(nodes, edges), PALETTE);
+    // Seeded overlapping — every node on the same point, standing in for the
+    // real capture's "Lucian Threads" cluster, which froze mid-settle as a
+    // collapsed knot under the old fx/fy-pin design (see the round 5 spec).
+    graph.forEachNode((id) => {
+      graph.setNodeAttribute(id, "x", 0);
+      graph.setNodeAttribute(id, "y", 0);
+    });
+
+    const sim = createAtlasSimulation(graph);
+    const simNodes = sim.nodes();
+    let minClearance = Infinity;
+    for (let i = 0; i < simNodes.length; i += 1) {
+      for (let j = i + 1; j < simNodes.length; j += 1) {
+        const a = simNodes[i] as AtlasSimNode;
+        const b = simNodes[j] as AtlasSimNode;
+        const dist = Math.hypot((a.x ?? 0) - (b.x ?? 0), (a.y ?? 0) - (b.y ?? 0));
+        minClearance = Math.min(minClearance, dist - (a.radius + b.radius));
+      }
+    }
+    // Every pair of discs cleared, not just ring neighbors — the knot opened
+    // rather than merely stretching along one axis. Collide runs at strength
+    // 0.7 (not 1), so a linked pair settles right at its two radii's shared
+    // boundary rather than genuinely apart — measured clearance here is
+    // -0.00007, float noise around exactly touching, not real overlap; the
+    // knot started at clearance ~-16 (every node stacked on (0,0)).
+    expect(minClearance).toBeGreaterThan(-0.01);
   });
 });
