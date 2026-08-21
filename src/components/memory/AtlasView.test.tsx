@@ -83,7 +83,7 @@ vi.mock("sigma", () => {
       ratio,
     }));
     // Real sigma renders synchronously on refresh() and fires afterRender at
-    // the end of the frame. The underlay repaint hangs off that event, so a
+    // the end of the frame. The overlay repaint hangs off that event, so a
     // no-op here would silently pass any "it repainted" assertion.
     refresh() {
       this.handlers.get("afterRender")?.({});
@@ -427,8 +427,8 @@ describe("AtlasView", () => {
     expect(ctx.fillText).toHaveBeenCalledWith("Alice", expect.any(Number), expect.any(Number));
     expect(ctx.font).toBe('12px "Instrument Sans", -apple-system, sans-serif');
     expect(ctx.fillStyle).toBe("#123456");
-    // Ground-coloured halo under the name, so labels stay legible over the
-    // terrain and neighbouring nodes: the stroke lands before the fill.
+    // Ground-coloured halo under the name, so labels stay legible over
+    // neighbouring nodes: the stroke lands before the fill.
     expect(ctx.strokeText).toHaveBeenCalledWith("Alice", expect.any(Number), expect.any(Number));
     expect(ctx.lineWidth).toBe(3);
     expect(ctx.strokeStyle).toBe("#11131a");
@@ -1022,15 +1022,15 @@ describe("AtlasView", () => {
     return entities;
   }
 
-  it("paints the rebuilt renderer's underlay when the small-groups chip flips", async () => {
+  it("paints the rebuilt renderer's overlay when the small-groups chip flips", async () => {
     mockStarWithSmallStar();
 
     renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
 
     // Stub the prototype, not one canvas: the chip rebuilds the renderer, and
-    // the underlay this has to watch does not exist until that happens.
-    const painter = recordingUnderlayCtx();
+    // the overlay this has to watch does not exist until that happens.
+    const painter = recordingOverlayCtx();
     const originalGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(painter.ctx) as any;
     try {
@@ -1041,7 +1041,7 @@ describe("AtlasView", () => {
       // changes only the DRAWN model, while `communities` and the palette are
       // derived from the full model and the theme, so neither of the two
       // repaint effects re-runs. The rebuilt renderer has to paint its own
-      // first frame or the map loses its terrain and every place name.
+      // first frame or the map loses every place name.
       expect(painter.state.paints).toBeGreaterThan(0);
       expect(painter.state.regionNames.length).toBeGreaterThan(0);
     } finally {
@@ -1055,7 +1055,7 @@ describe("AtlasView", () => {
     renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
 
-    const painter = recordingUnderlayCtx();
+    const painter = recordingOverlayCtx();
     const originalGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(painter.ctx) as any;
     try {
@@ -1111,26 +1111,30 @@ describe("AtlasView", () => {
     expect(screen.queryByRole("button", { name: "Hide small groups" })).not.toBeInTheDocument();
   });
 
-  it("mounts the cartography underlay canvas beneath sigma and removes it on unmount", async () => {
+  it("mounts the place-name overlay canvas above sigma, and nothing under it, and removes it on unmount", async () => {
     mockConnectedPair();
 
     const { unmount } = renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
 
     const container = capturedSigmaInstances[0].container as HTMLElement;
-    const underlay = document.querySelector('canvas[data-testid="atlas-cartography"]');
-    expect(underlay).toBeInTheDocument();
-    // Appended BEFORE the sigma mock ran, so it stacks under sigma's canvases.
-    expect(underlay!.parentElement).toBe(container);
+    const overlay = document.querySelector('canvas[data-testid="atlas-region-names"]');
+    expect(overlay).toBeInTheDocument();
+    // Appended AFTER the sigma mock ran, so it stacks above sigma's canvases.
+    expect(overlay!.parentElement).toBe(container);
+    // The overlay is the only canvas the Atlas adds: no terrain or wash
+    // underlay exists to put a shadow or an aura under the nodes.
+    expect(container.querySelectorAll("canvas")).toHaveLength(1);
+    expect(container.querySelector('canvas[data-testid="atlas-cartography"]')).toBeNull();
 
     unmount();
     // Query the DETACHED container, not the document: React unmount removes
     // the whole subtree from the document either way, so a document-level
     // query passes even if the cleanup leaks the canvas (mutation-proven).
-    expect(container.querySelector('canvas[data-testid="atlas-cartography"]')).toBeNull();
+    expect(container.querySelector('canvas[data-testid="atlas-region-names"]')).toBeNull();
   });
 
-  it("repaints both helper canvases on every sigma afterRender: terrain under, names over", async () => {
+  it("repaints the place-name overlay on every sigma afterRender, names over the nodes", async () => {
     mockConnectedPair();
 
     renderWithQuery(<AtlasView />);
@@ -1141,17 +1145,13 @@ describe("AtlasView", () => {
     expect(typeof handler).toBe("function");
 
     // jsdom's getContext("2d") is null (the mount-time paint no-ops on that);
-    // hand the handler recording ctxs and re-fire it like a render would.
-    const underlay = document.querySelector(
-      'canvas[data-testid="atlas-cartography"]',
-    ) as HTMLCanvasElement;
+    // hand the handler a recording ctx and re-fire it like a render would.
     const overlay = document.querySelector(
       'canvas[data-testid="atlas-region-names"]',
     ) as HTMLCanvasElement;
     // The overlay is appended AFTER sigma mounts so it stacks above sigma's
     // canvases — names sit on the map, never under the nodes.
     expect(overlay).toBeInTheDocument();
-    expect(overlay.compareDocumentPosition(underlay) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
     const ctx = {
       strokeStyle: "",
       fillStyle: "",
@@ -1190,39 +1190,26 @@ describe("AtlasView", () => {
       strokeText: vi.fn(() => order.push("stroke")),
       fillText: vi.fn(() => order.push("fill")),
     };
-    underlay.getContext = vi.fn().mockReturnValue(ctx) as any;
     overlay.getContext = vi.fn().mockReturnValue(overCtx) as any;
 
     handler!({});
 
-    // Both sized to sigma's viewport and cleared before painting.
-    expect(underlay.width).toBe(400);
-    expect(underlay.height).toBe(600);
-    expect(ctx.clearRect).toHaveBeenCalledWith(0, 0, 400, 600);
+    // Sized to sigma's viewport and cleared before painting.
     expect(overlay.width).toBe(400);
     expect(overlay.height).toBe(600);
     expect(overCtx.clearRect).toHaveBeenCalledWith(0, 0, 400, 600);
-    // Terrain: one soft wash per drawn node that lands in the viewport (the
-    // fake projection x6 puts part of the trio past the 400px edge, which is
-    // exactly the culling), nothing outlined. jsdom has no 2D context to bake
-    // the gradient sprite in, so the wash falls back to a flat disc — an arc
-    // + fill per node, no strokes, no dashed rings, no names on the underlay.
-    expect(ctx.arc.mock.calls.length).toBeGreaterThan(0);
-    expect(ctx.arc.mock.calls.length).toBeLessThanOrEqual(3);
-    for (const call of ctx.arc.mock.calls) {
-      expect(call.slice(2)).toEqual([34, 0, 2 * Math.PI]);
-    }
-    expect(ctx.fill).toHaveBeenCalledTimes(ctx.arc.mock.calls.length);
-    expect(ctx.stroke).not.toHaveBeenCalled();
-    expect(ctx.setLineDash).not.toHaveBeenCalled();
-    expect(ctx.fillText).not.toHaveBeenCalled();
-    // One community of three, so exactly one place name, on the OVERLAY — the
-    // label placer keeps it because nothing else competes for the space — and
-    // its ground-coloured halo is stroked before the fill.
+    // One community of three, so exactly one place name — the label placer
+    // keeps it because nothing else competes for the space — and its
+    // ground-coloured halo is stroked before the fill. Text is ALL the 2D
+    // layer paints: no discs, no washes, no outlines under the nodes.
     expect(overCtx.fillText).toHaveBeenCalledTimes(1);
     expect(overCtx.strokeText).toHaveBeenCalledTimes(1);
     expect(order).toEqual(["stroke", "fill"]);
     expect(overCtx.arc).not.toHaveBeenCalled();
+    expect(overCtx.fill).not.toHaveBeenCalled();
+    expect(overCtx.stroke).not.toHaveBeenCalled();
+    expect(overCtx.drawImage).not.toHaveBeenCalled();
+    expect(ctx.clearRect).not.toHaveBeenCalled();
   });
 
   // Two 3-cliques joined by one bridge (a1–b1). Peak-climbing puts each
@@ -1359,7 +1346,7 @@ describe("AtlasView", () => {
     expect(document.getElementById("atlas-search-option-1")).toHaveTextContent("Isolate");
   });
 
-  it("Regions chip hides the cartography underlay and repaints it on re-show", async () => {
+  it("Regions chip hides the place-name overlay and repaints it on re-show", async () => {
     mockConnectedPair();
 
     renderWithQuery(<AtlasView />);
@@ -1367,18 +1354,18 @@ describe("AtlasView", () => {
     const instance = capturedSigmaInstances[0];
 
     const chip = screen.getByRole("button", { name: "Regions" });
-    const underlay = document.querySelector('[data-testid="atlas-cartography"]') as HTMLCanvasElement;
+    const overlay = document.querySelector('[data-testid="atlas-region-names"]') as HTMLCanvasElement;
     expect(chip).toHaveAttribute("aria-pressed", "true");
-    expect(underlay.style.display).not.toBe("none");
+    expect(overlay.style.display).not.toBe("none");
 
     fireEvent.click(chip);
     expect(chip).toHaveAttribute("aria-pressed", "false");
-    expect(underlay.style.display).toBe("none");
+    expect(overlay.style.display).toBe("none");
 
     // Re-show must refresh: the hidden canvas kept its stale last frame.
     const refreshSpy = vi.spyOn(instance, "refresh");
     fireEvent.click(chip);
-    expect(underlay.style.display).not.toBe("none");
+    expect(overlay.style.display).not.toBe("none");
     expect(refreshSpy).toHaveBeenCalled();
   });
 
@@ -1710,14 +1697,11 @@ describe("AtlasView", () => {
     });
   }
 
-  // Records what the cartography underlay actually painted. drawCartography
-  // clears once per paint before drawing, so resetting on clearRect leaves
+  // Records what the place-name overlay actually painted. The overlay clears
+  // once per paint before drawing, so resetting on clearRect leaves
   // `regionNames` holding the MOST RECENT paint only — immune to however many
   // extra repaints a render happens to trigger — while `paints` counts them.
-  // One recording ctx for BOTH helper canvases (terrain underlay, then the
-  // place-name overlay): `paints` counts every clearRect, `regionNames` holds
-  // the names the overlay drew in its latest frame.
-  function recordingUnderlayCtx() {
+  function recordingOverlayCtx() {
     const state = { paints: 0, regionNames: [] as string[] };
     const ctx = {
       strokeStyle: "",
@@ -1757,11 +1741,11 @@ describe("AtlasView", () => {
     return { ctx, state };
   }
 
-  it("paints the terrain and names on mount through the post-mount effects, with no second draw of its own", async () => {
+  it("paints the names on mount through the post-mount effects, with no second draw of its own", async () => {
     mockTwoTrianglesInSpace();
     // The helper canvases only exist once the mount effect has run, so stub
     // the prototype to catch the very first paint.
-    const painter = recordingUnderlayCtx();
+    const painter = recordingOverlayCtx();
     const originalGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(painter.ctx) as any;
     try {
@@ -1794,7 +1778,7 @@ describe("AtlasView", () => {
     const overlay = document.querySelector(
       'canvas[data-testid="atlas-region-names"]',
     ) as HTMLCanvasElement;
-    const painter = recordingUnderlayCtx();
+    const painter = recordingOverlayCtx();
     overlay.getContext = vi.fn().mockReturnValue(painter.ctx) as any;
     instance.handlers.get("afterRender")!({});
     expect(painter.state.regionNames).toEqual(["Alice", "Bob"]);

@@ -8,20 +8,11 @@ import {
   communitiesFor,
   communityRegions,
   cartographyScene,
-  drawCartography,
   drawRegionNames,
   placeRegionLabels,
   MAX_REGION_LABELS,
   MIN_LABELLED_SPAN_PX,
   REGION_NAME_LIFT_MIN_PX,
-  TERRAIN_CELL_PX,
-  KERNEL_PEAK,
-  LAND_MIN,
-  LAND_FULL,
-  landCover,
-  shadeField,
-  parseInk,
-  TERRAIN_RADIUS_PX,
 } from "./cartography";
 import type { CartographyScene, Region } from "./cartography";
 
@@ -37,7 +28,6 @@ const PALETTE: GraphPalette = {
   label: "#999999",
   labelMuted: "#aaaaaa",
   surface: "#000000",
-  terrain: "rgba(1,2,3,0.045)",
   graticule: "rgba(4,5,6,0.13)",
   bridge: "#bbbbbb",
   memory: "#cccccc",
@@ -611,23 +601,16 @@ describe("communityRegions", () => {
 });
 
 describe("cartographyScene", () => {
-  it("collects one point per knowledge node, in graph coords, and leaves memories out of the terrain", () => {
+  it("is the named regions and nothing else — no terrain points, nothing to paint under the nodes", () => {
     const graph = graphOf([
       { id: "a", x: 3, y: 4, label: "A" },
       { id: "b", x: -1, y: 0, label: "B" },
+      { id: "c", x: 0, y: 1, label: "C" },
       { id: "m", x: 7, y: 7, label: "M", entityType: "memory" },
     ]);
-    const scene = cartographyScene(graph, new Map([["a", "0"], ["b", "1"]]));
-    expect(scene.points).toEqual(
-      expect.arrayContaining([
-        { x: 3, y: 4 },
-        { x: -1, y: 0 },
-      ]),
-    );
-    // The memory is context around a subject, not land of its own: ~2,000 of
-    // them on the real map saturated the field into one blot.
-    expect(scene.points).toHaveLength(2);
-    expect(scene.regions).toHaveLength(0);
+    const scene = cartographyScene(graph, new Map([["a", "0"], ["b", "0"], ["c", "0"]]));
+    expect(Object.keys(scene)).toEqual(["regions"]);
+    expect(scene.regions.map((r) => r.name)).toEqual(["A"]);
   });
 });
 
@@ -679,152 +662,6 @@ function mockCtx() {
   return { ctx: ctx as unknown as CanvasRenderingContext2D, fills, haloTexts, texts, drawOrder, measures };
 }
 
-describe("drawCartography", () => {
-  const identity = (pos: { x: number; y: number }) => pos;
-  const viewport = { width: 800, height: 600 };
-
-  function sceneOfPoints(points: { x: number; y: number }[]): CartographyScene {
-    return { regions: [], points };
-  }
-
-  it("paints one arc per point, radius TERRAIN_RADIUS_PX, filled with palette.terrain, when there is no field (jsdom)", () => {
-    const { ctx, fills } = mockCtx();
-    const scene = sceneOfPoints([
-      { x: 100, y: 100 },
-      { x: 200, y: 150 },
-    ]);
-    drawCartography(ctx, scene, identity, PALETTE, viewport, null);
-    const arc = ctx.arc as ReturnType<typeof vi.fn>;
-    expect(arc.mock.calls).toEqual([
-      [100, 100, TERRAIN_RADIUS_PX, 0, 2 * Math.PI],
-      [200, 150, TERRAIN_RADIUS_PX, 0, 2 * Math.PI],
-    ]);
-    expect(fills).toEqual([PALETTE.terrain, PALETTE.terrain]);
-    // No outline, no dash — the map's shapes come from density alone.
-    expect(ctx.stroke).not.toHaveBeenCalled();
-    expect(ctx.setLineDash).not.toHaveBeenCalled();
-  });
-
-  it("culls a point more than TERRAIN_RADIUS_PX outside the viewport", () => {
-    const { ctx } = mockCtx();
-    const scene = sceneOfPoints([
-      { x: 100, y: 100 },
-      { x: 900, y: 300 }, // viewport.width + TERRAIN_RADIUS_PX is 834
-    ]);
-    drawCartography(ctx, scene, identity, PALETTE, viewport, null);
-    const arc = ctx.arc as ReturnType<typeof vi.fn>;
-    expect(arc).toHaveBeenCalledTimes(1);
-    expect(arc.mock.calls[0][0]).toBe(100);
-  });
-
-  /** A fake density field: records the kernel stamps, hands back a buffer
-   *  whose alpha channel the test seeds, and records what was put back. */
-  function fakeField(alpha: number[]) {
-    const cols = Math.ceil(viewport.width / TERRAIN_CELL_PX);
-    const rows = Math.ceil(viewport.height / TERRAIN_CELL_PX);
-    const data = new Uint8ClampedArray(cols * rows * 4);
-    alpha.forEach((a, i) => {
-      data[i * 4 + 3] = a;
-    });
-    const image = { data, width: cols, height: rows };
-    const fctx = {
-      globalCompositeOperation: "source-over",
-      clearRect: vi.fn(),
-      drawImage: vi.fn(),
-      getImageData: vi.fn(() => image),
-      putImageData: vi.fn(),
-    };
-    const kernel = { width: 16, height: 16 } as HTMLCanvasElement;
-    const canvas = { width: 0, height: 0 } as HTMLCanvasElement;
-    return { field: { canvas, ctx: fctx as unknown as CanvasRenderingContext2D, kernel }, fctx, image, cols, rows };
-  }
-
-  it("stamps one kernel per point into the coarse field, shades it, and draws the field scaled up — no arcs", () => {
-    const { ctx } = mockCtx();
-    const { field, fctx, cols, rows } = fakeField([]);
-    const scene = sceneOfPoints([
-      { x: 100, y: 100 },
-      { x: 200, y: 150 },
-      { x: 900, y: 300 }, // culled: past viewport.width + TERRAIN_RADIUS_PX
-    ]);
-    drawCartography(ctx, scene, identity, PALETTE, viewport, field);
-    // Field sized to the viewport in cells, cleared, kernels summed with `lighter`.
-    expect(field.canvas.width).toBe(cols);
-    expect(field.canvas.height).toBe(rows);
-    expect(fctx.clearRect).toHaveBeenCalledWith(0, 0, cols, rows);
-    const kr = 8;
-    expect(fctx.drawImage.mock.calls).toEqual([
-      [field.kernel, 100 / TERRAIN_CELL_PX - kr, 100 / TERRAIN_CELL_PX - kr],
-      [field.kernel, 200 / TERRAIN_CELL_PX - kr, 150 / TERRAIN_CELL_PX - kr],
-    ]);
-    expect(fctx.getImageData).toHaveBeenCalledWith(0, 0, cols, rows);
-    expect(fctx.putImageData).toHaveBeenCalledTimes(1);
-    // The shaded field lands on the underlay scaled back up to CSS px.
-    const drawImage = ctx.drawImage as ReturnType<typeof vi.fn>;
-    expect(drawImage.mock.calls).toEqual([
-      [field.canvas, 0, 0, cols, rows, 0, 0, cols * TERRAIN_CELL_PX, rows * TERRAIN_CELL_PX],
-    ]);
-    expect(ctx.arc).not.toHaveBeenCalled();
-  });
-
-  it("draws nothing at all when every point is off screen", () => {
-    const { ctx } = mockCtx();
-    const { field, fctx } = fakeField([]);
-    drawCartography(ctx, sceneOfPoints([{ x: 5000, y: 5000 }]), identity, PALETTE, viewport, field);
-    expect(fctx.getImageData).not.toHaveBeenCalled();
-    expect(ctx.drawImage).not.toHaveBeenCalled();
-  });
-
-  it("shades the field as terrain ink at the ink's alpha times the land cover: one node is sea, a crowd is land", () => {
-    const data = new Uint8ClampedArray(4 * 4);
-    const one = Math.round(255 * KERNEL_PEAK); // exactly one kernel deep: a lone node
-    const crowd = Math.round(255 * KERNEL_PEAK * LAND_FULL); // LAND_FULL nodes deep
-    const half = Math.round(255 * KERNEL_PEAK * (LAND_MIN + LAND_FULL) / 2);
-    data[3] = 0;
-    data[7] = one;
-    data[11] = half;
-    data[15] = crowd;
-    shadeField(data, { r: 10, g: 20, b: 30, a: 0.5 });
-    // Every pixel takes the ink's colour…
-    for (let i = 0; i < 16; i += 4) expect([data[i], data[i + 1], data[i + 2]]).toEqual([10, 20, 30]);
-    // …and the alpha is the coastline: nothing below LAND_MIN (a lone node's
-    // peak of 1 included), the full ink at LAND_FULL, the ramp between.
-    expect(data[3]).toBe(0);
-    expect(data[7]).toBe(0);
-    expect(data[11]).toBe(Math.round(255 * 0.5 * landCover((LAND_MIN + LAND_FULL) / 2)));
-    expect(data[15]).toBe(Math.round(255 * 0.5));
-  });
-
-  it("landCover is a smooth 0..1 ramp from LAND_MIN to LAND_FULL", () => {
-    expect(LAND_MIN).toBeGreaterThan(1); // a single node can never be land
-    expect(landCover(0)).toBe(0);
-    expect(landCover(LAND_MIN)).toBe(0);
-    expect(landCover((LAND_MIN + LAND_FULL) / 2)).toBeCloseTo(0.5, 6);
-    expect(landCover(LAND_FULL)).toBe(1);
-    expect(landCover(LAND_FULL + 5)).toBe(1);
-  });
-
-  it("parses rgb/rgba inks and shades anything else as opaque black, loudly", () => {
-    expect(parseInk("rgba(169, 174, 242, 0.16)")).toEqual({ r: 169, g: 174, b: 242, a: 0.16 });
-    expect(parseInk("rgb(1,2,3)")).toEqual({ r: 1, g: 2, b: 3, a: 1 });
-    expect(parseInk("")).toEqual({ r: 0, g: 0, b: 0, a: 1 });
-  });
-
-  it("draws no region names — that's drawRegionNames' job now", () => {
-    const { ctx, texts } = mockCtx();
-    const region: Region = {
-      name: "Wenlan",
-      memberCount: 3,
-      centroid: { x: 100, y: 100 },
-      bounds: { minX: 0, maxX: 200, minY: 0, maxY: 200 },
-    };
-    const scene: CartographyScene = { regions: [region], points: [{ x: 100, y: 100 }] };
-    drawCartography(ctx, scene, identity, PALETTE, viewport, null);
-    expect(texts).toHaveLength(0);
-    expect(ctx.fillText).not.toHaveBeenCalled();
-  });
-});
-
 describe("drawRegionNames", () => {
   const identity = (pos: { x: number; y: number }) => pos;
 
@@ -849,7 +686,6 @@ describe("drawRegionNames", () => {
     const { ctx, texts } = mockCtx();
     const scene: CartographyScene = {
       regions: [region("Wenlan", 100, 100), region("Tauri", 600, 300)],
-      points: [],
     };
     drawRegionNames(ctx, scene, identity, PALETTE);
     expect(texts.map((t) => t.text)).toEqual(["Wenlan", "Tauri"]);
@@ -868,7 +704,6 @@ describe("drawRegionNames", () => {
     const { ctx, haloTexts, drawOrder } = mockCtx();
     const scene: CartographyScene = {
       regions: [region("Wenlan", 100, 100), region("Tauri", 600, 300)],
-      points: [],
     };
     drawRegionNames(ctx, scene, identity, PALETTE);
     expect(haloTexts).toEqual([
@@ -895,7 +730,7 @@ describe("placeRegionLabels", () => {
     };
   }
 
-  const sceneOf = (regions: Region[]): CartographyScene => ({ regions, points: [] });
+  const sceneOf = (regions: Region[]): CartographyScene => ({ regions });
 
   it("skips a region whose bounds are a speck on screen", () => {
     const wide = boxRegion("Wide", 0, 0, MIN_LABELLED_SPAN_PX);
@@ -984,7 +819,6 @@ describe("region label measurement includes its tracking", () => {
     });
     return {
       regions: [region("Deterministic Fixture Set", 0), region("Reproducible Layout Notes", gap)],
-      points: [],
     };
   }
 

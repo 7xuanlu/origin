@@ -30,16 +30,18 @@ test("renders Graph as a structured canvas instead of a flat orange field", asyn
   // seven wiki pages plus the three entities that have a connection.
   await expect(page.getByText(/^7 pages · 3 entities(?: · \d+ regions?)?$/)).toBeVisible();
 
-  // The terrain underlay: a density field shaded in a single ink — land only
-  // where knowledge nodes crowd, a soft ramp at the coast, nothing under a
-  // lone point. It is the one 2D canvas on the map, so it is what can be
-  // read back; the WebGL node layer is covered by the screenshot below.
-  const canvas = graph.locator('canvas[data-testid="atlas-cartography"]');
+  // The place-name overlay: region names in a muted ink with a ground-
+  // coloured halo, drawn above the nodes. It is the ONLY 2D canvas on the
+  // map — nothing is painted under the nodes (no terrain, wash or hull, so
+  // no shadow or aura around a point) — and it is what can be read back; the
+  // WebGL node layer is covered by the screenshot below.
+  await expect(graph.locator("canvas[data-testid]")).toHaveCount(1);
+  const canvas = graph.locator('canvas[data-testid="atlas-region-names"]');
   await expect(canvas).toHaveCount(1);
   await expect(canvas).toBeVisible();
   await expect(canvas).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
 
-  const readUnderlay = (): Promise<CanvasEvidence> =>
+  const readOverlay = (): Promise<CanvasEvidence> =>
     canvas.evaluate((node): CanvasEvidence => {
       if (!(node instanceof HTMLCanvasElement)) {
         return { coloredPixels: 0, orangeCoverage: 1, sampledPixels: 0, uniqueColors: 0 };
@@ -53,8 +55,8 @@ test("renders Graph as a structured canvas instead of a flat orange field", asyn
       let coloredPixels = 0;
       let orangePixels = 0;
       let sampledPixels = 0;
-      for (let y = 0; y < node.height; y += 4) {
-        for (let x = 0; x < node.width; x += 4) {
+      for (let y = 0; y < node.height; y += 2) {
+        for (let x = 0; x < node.width; x += 2) {
           sampledPixels += 1;
           const offset = (y * node.width + x) * 4;
           const red = pixels[offset] ?? 0;
@@ -63,8 +65,8 @@ test("renders Graph as a structured canvas instead of a flat orange field", asyn
           const alpha = pixels[offset + 3] ?? 0;
           if (alpha === 0) continue;
           coloredPixels += 1;
-          // Raw alpha in the key: the coast is a ramp, so a painted
-          // terrain shows many alpha steps where a flat fill shows one.
+          // Raw alpha in the key: anti-aliased text shows many alpha steps
+          // where a flat fill shows one.
           colors.add(`${red >> 4}:${green >> 4}:${blue >> 4}:${alpha}`);
           if (red > 170 && green > 55 && green < 175 && blue < 100) {
             orangePixels += 1;
@@ -79,39 +81,28 @@ test("renders Graph as a structured canvas instead of a flat orange field", asyn
       };
     });
 
-  // The snapshot first, at the default fit, before the camera moves.
   await expect(page).toHaveScreenshot("graph-1280x900-light.png", {
     animations: "disabled",
     fullPage: false,
     maxDiffPixelRatio: 0.002,
   });
 
-  // At fit, ten nodes spread by the layout are open sea: no halo, no drop
-  // shadow under a lone point. (Sampled every 4th px, so a stray coast pixel
-  // is tolerated, a wash per node is not.)
-  const atFit = await readUnderlay();
-  expect(atFit.sampledPixels).toBeGreaterThan(0);
-  expect(atFit.coloredPixels).toBeLessThan(5);
-
-  // Zoom out over the map and the same nodes crowd into one island: land
-  // appears, with the ramped coast showing as many alpha steps.
-  const box = await graph.boundingBox();
-  if (!box) throw new Error("atlas-view has no box");
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  for (let i = 0; i < 6; i += 1) {
-    await page.mouse.wheel(0, 400);
-    await page.waitForTimeout(250);
-  }
-  let evidence: CanvasEvidence = atFit;
+  // At the default fit the fixture's one named region earns its place name:
+  // some text pixels, anti-aliased through many alphas, none of them orange.
+  // Text is all this canvas carries, so a painted wash would show up here as
+  // a flood of colored pixels far beyond what a name can account for.
+  let evidence: CanvasEvidence = { coloredPixels: 0, orangeCoverage: 1, sampledPixels: 0, uniqueColors: 0 };
   await expect
     .poll(
       async () => {
-        evidence = await readUnderlay();
+        evidence = await readOverlay();
         return evidence.coloredPixels;
       },
       { timeout: 10_000 },
     )
     .toBeGreaterThan(25);
+  expect(evidence.sampledPixels).toBeGreaterThan(0);
+  expect(evidence.coloredPixels / evidence.sampledPixels).toBeLessThan(0.02);
   expect(evidence.uniqueColors).toBeGreaterThan(8);
   expect(evidence.orangeCoverage).toBeLessThan(0.25);
   expect(browserErrors.pageErrors).toEqual([]);

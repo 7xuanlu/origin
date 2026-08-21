@@ -34,9 +34,7 @@ import type { CartographyScene } from "../../lib/graph/cartography";
 import {
   communitiesFor,
   cartographyScene,
-  drawCartography,
   drawRegionNames,
-  terrainField,
   isUnscopedSpace,
   MIN_REGION_SIZE,
 } from "../../lib/graph/cartography";
@@ -47,7 +45,7 @@ import type { SpaceCartography } from "../../lib/graph/community";
 
 // One shared empty map for the unresolved query. An inline `new Map()` default
 // mints a fresh identity on every render, and this map feeds the memoized
-// community climb and the canvas underlay — a new identity re-runs the climb
+// community climb and the place-name overlay — a new identity re-runs the climb
 // and repaints every edge each render until the fetch lands.
 const EMPTY_CARTOGRAPHY: Map<string, SpaceCartography> = new Map();
 
@@ -177,7 +175,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // clickNode so a drag-release doesn't also fire entity navigation.
   const draggedNodeRef = useRef<string | null>(null);
   const movedDuringPressRef = useRef(false);
-  // Cached cartography scene (terrain points + named regions). Rebuilding it
+  // Cached cartography scene (the named regions). Rebuilding it
   // on every afterRender meant a plain camera pan or a hover re-measured all
   // 66 regions; the scene only actually changes when node positions or
   // communities do, so paints mark it dirty and the afterRender handler
@@ -363,13 +361,12 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const [searchFocused, setSearchFocused] = useState(false);
-  // Regions on/off governs only the two cartography canvases (terrain under,
-  // names over); the count line keeps reporting regions either way.
-  // Ref mirror so the sigma mount effect (which recreates the underlay per
+  // Regions on/off governs only the place-name overlay canvas; the count line
+  // keeps reporting regions either way.
+  // Ref mirror so the sigma mount effect (which recreates the overlay per
   // model) can apply the current choice without re-running on toggle.
   const [showRegions, setShowRegions] = useState(true);
   const showRegionsRef = useRef(true);
-  const underlayRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
 
   const matches = useMemo(() => {
@@ -466,22 +463,12 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       // Preview/debug handle only — stripped from prod builds.
       (window as unknown as Record<string, unknown>).__ATLAS_SIM = sim;
     }
-    // Terrain underlay — a plain 2D canvas appended BEFORE sigma mounts so
-    // sigma's own canvases stack above it. Redrawn on every afterRender, so
-    // the terrain flexes live with drags and tracks camera moves for free.
-    const underlay = document.createElement("canvas");
-    underlay.dataset.testid = "atlas-cartography";
-    underlay.style.position = "absolute";
-    underlay.style.inset = "0";
-    underlay.style.width = "100%";
-    underlay.style.height = "100%";
-    underlay.style.display = showRegionsRef.current ? "" : "none";
-    container.appendChild(underlay);
-    underlayRef.current = underlay;
-
-    // Place-name overlay — appended AFTER sigma mounts (below) so it stacks
-    // ABOVE sigma's canvases, the mirror of the terrain underlay: region
-    // names sit on top of the nodes like names on a map, never under them.
+    // Place-name overlay — a plain 2D canvas appended AFTER sigma mounts
+    // (below) so it stacks ABOVE sigma's canvases: region names sit on top
+    // of the nodes like names on a map, never under them. Redrawn on every
+    // afterRender, so the names follow drags and camera moves for free. It
+    // is the only thing the Atlas paints outside sigma — nothing is drawn
+    // under the nodes.
     const overlay = document.createElement("canvas");
     overlay.dataset.testid = "atlas-region-names";
     overlay.style.position = "absolute";
@@ -554,30 +541,6 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       (window as unknown as Record<string, unknown>).__ATLAS_SIGMA = renderer;
     }
 
-    // The coarse density field the terrain is summed into, kept for the life
-    // of the mount (it resizes itself to the viewport on each paint). Null in
-    // jsdom, where drawCartography falls back to flat discs.
-    const field = terrainField();
-    const drawUnderlay = (scene: CartographyScene) => {
-      const ctx = underlay.getContext("2d");
-      if (!ctx) return; // jsdom
-      const { width, height } = renderer.getDimensions();
-      const dpr = window.devicePixelRatio || 1;
-      if (underlay.width !== width * dpr || underlay.height !== height * dpr) {
-        underlay.width = width * dpr;
-        underlay.height = height * dpr;
-      }
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, width, height);
-      drawCartography(
-        ctx,
-        scene,
-        (pos) => renderer.graphToViewport(pos),
-        paletteRef.current,
-        { width, height },
-        field,
-      );
-    };
     const drawOverlay = (scene: CartographyScene) => {
       const ctx = overlay.getContext("2d");
       if (!ctx) return; // jsdom
@@ -591,15 +554,13 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       ctx.clearRect(0, 0, width, height);
       drawRegionNames(ctx, scene, (pos) => renderer.graphToViewport(pos), paletteRef.current);
     };
-    // One handler paints both helper canvases from one scene — rebuilt only
-    // when a paint marked it dirty — so the names never draw a frame behind
-    // the terrain, and sigma sees a single afterRender listener.
+    // One handler paints the overlay from one scene — rebuilt only when a
+    // paint marked it dirty — and sigma sees a single afterRender listener.
     renderer.on("afterRender", () => {
       if (sceneDirtyRef.current || sceneRef.current === null) {
         sceneRef.current = cartographyScene(graph, communitiesRef.current);
         sceneDirtyRef.current = false;
       }
-      drawUnderlay(sceneRef.current);
       drawOverlay(sceneRef.current);
     });
     // Default zoom: sigma's fit stretches a small cluster edge-to-edge no
@@ -642,8 +603,8 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     // `communities` changes, and `communities` is derived from the FULL
     // model. Toggling the small-groups chip rebuilds the renderer off
     // `visibleModel` WITHOUT changing `communities`, so nothing ever painted:
-    // the fresh canvases stayed at their untouched 300x150 default and the
-    // terrain and every region name vanished from the map.
+    // the fresh canvas stayed at its untouched 300x150 default and every
+    // region name vanished from the map.
     renderer.refresh();
     renderer.on("clickNode", ({ node }) => {
       // A moved drag must not also navigate on release.
@@ -787,8 +748,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       sigmaRef.current = null;
       graphRef.current = null;
       renderer.kill();
-      // Sigma removes its own canvases; these two are ours to remove.
-      underlay.remove();
+      // Sigma removes its own canvases; the overlay is ours to remove.
       overlay.remove();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -811,8 +771,8 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       color: palette.edge,
     }));
     renderer.setSetting("labelColor", { color: palette.label });
-    // refresh() re-fires afterRender, which repaints the cartography underlay
-    // with the palette paletteRef now carries.
+    // refresh() re-fires afterRender, which repaints the place names with
+    // the palette paletteRef now carries.
     renderer.refresh();
   }, [palette]);
 
@@ -837,13 +797,11 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   }, [communities]);
 
   useEffect(() => {
-    const underlay = underlayRef.current;
     const overlay = overlayRef.current;
-    if (!underlay || !overlay) return;
-    underlay.style.display = showRegions ? "" : "none";
+    if (!overlay) return;
     overlay.style.display = showRegions ? "" : "none";
-    // The canvases keep their last frame while hidden; repaint on re-show so
-    // they match wherever the camera and drags went in the meantime.
+    // The canvas keeps its last frame while hidden; repaint on re-show so it
+    // matches wherever the camera and drags went in the meantime.
     if (showRegions) sigmaRef.current?.refresh();
   }, [showRegions]);
 

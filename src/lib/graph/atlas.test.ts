@@ -38,7 +38,6 @@ const PALETTE: GraphPalette = {
   // Black surface keeps the composite math legible: composited channel is
   // just slotChannel * alpha.
   surface: "#000000",
-  terrain: "rgba(1,2,3,0.05)",
   graticule: "rgba(4,5,6,0.13)",
   bridge: "#bbbbbb",
   memory: "#cccccc",

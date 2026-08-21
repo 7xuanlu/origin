@@ -29,7 +29,6 @@ const PALETTE: GraphPalette = {
   label: "#999999",
   labelMuted: "#aaaaaa",
   surface: "#000000",
-  terrain: "rgba(1,2,3,0.045)",
   graticule: "rgba(4,5,6,0.13)",
   bridge: "#bbbbbb",
   memory: "#cccccc",

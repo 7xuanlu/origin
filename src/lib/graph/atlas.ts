@@ -54,7 +54,7 @@ function nodeSizeFor(confirmed: boolean | null, degree: number, entityType?: str
 }
 
 /** Edge stroke by verb, in CSS px. Edges are the quietest ink on the map — a
- *  hairline at rest, so the points and the terrain carry the picture; a
+ *  hairline at rest, so the points carry the picture; a
  *  shared-source edge (an inferred overlap, not an asserted link) is thinner
  *  still. Hover emphasis recolours, it does not thicken. */
 export function edgeSizeFor(type: string): number {
