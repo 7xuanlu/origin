@@ -358,7 +358,7 @@ describe("communitiesFor", () => {
     expect(communities.get("s1")!.split(":")[1]).not.toBe(communities.get("n1")!.split(":")[1]);
   });
 
-  it("pools null-space and empty-string-space nodes into ONE unscoped bucket that may bridge itself", () => {
+  it("pools null-space and empty-string-space nodes into ONE unscoped bucket that may group across itself", () => {
     const m = modelOf(
       [
         node("p1", { space: null }),
@@ -774,6 +774,21 @@ describe("placeRegionLabels", () => {
     const placed = placeRegionLabels(sceneOf(regions), identity, measure);
     expect(placed).toHaveLength(MAX_REGION_LABELS);
     expect(placed[placed.length - 1].name).toBe(`R${MAX_REGION_LABELS - 1}`);
+  });
+
+  it("does not let regions outside the viewport spend the cap: the one in view still gets its name", () => {
+    // A dozen big regions far off to the left (zoomed in past them), then a
+    // smaller one inside the 800x600 viewport.
+    const offscreen = Array.from({ length: MAX_REGION_LABELS }, (_, i) =>
+      boxRegion(`Off${i}`, -5000, i * 300, 200, 9),
+    );
+    const inView = boxRegion("Here", 100, 100, 200, 4);
+    const viewport = { width: 800, height: 600 };
+    const placed = placeRegionLabels(sceneOf([...offscreen, inView]), identity, measure, viewport);
+    expect(placed.map((label) => label.name)).toEqual(["Here"]);
+    // Without a viewport the cap is spent on the off-screen dozen, as before.
+    const blind = placeRegionLabels(sceneOf([...offscreen, inView]), identity, measure);
+    expect(blind.map((label) => label.name)).not.toContain("Here");
   });
 
   it("reads region width in SCREEN px, so zooming in reveals more names", () => {

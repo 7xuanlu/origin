@@ -552,7 +552,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, height);
-      drawRegionNames(ctx, scene, (pos) => renderer.graphToViewport(pos), paletteRef.current);
+      drawRegionNames(ctx, scene, (pos) => renderer.graphToViewport(pos), paletteRef.current, { width, height });
     };
     // One handler paints the overlay from one scene — rebuilt only when a
     // paint marked it dirty — and sigma sees a single afterRender listener.
@@ -594,8 +594,8 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
         camera.setState({ x: display.x, y: display.y, ratio: Math.min(camera.ratio, 1) });
       }
     }
-    // First paint of THIS renderer, and the only thing that draws the two
-    // canvases above at all. Sigma's constructor render already happened
+    // First paint of THIS renderer, and the only thing that draws the
+    // overlay canvas above at all. Sigma's constructor render already happened
     // before the afterRender listeners existed, and the simulation rests at
     // alpha 0 straight out of createAtlasSimulation (atlas.ts settles it
     // synchronously, then stops), so no tick will schedule one either. This

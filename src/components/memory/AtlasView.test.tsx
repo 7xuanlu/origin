@@ -19,6 +19,9 @@ vi.mock("../../lib/tauri", async () => {
 // the drawn graph itself is verified live in preview. This test only proves
 // the three states, retry, mount/teardown, and the click handoff.
 const capturedSigmaInstances = vi.hoisted(() => [] as any[]);
+/** The mock viewport. Tests that watch the names of a far component widen
+ *  it (see graphToViewport below). */
+let mockDimensions = { width: 400, height: 600 };
 vi.mock("sigma", () => {
   class MouseCaptorMock {
     handlers = new Map<string, (payload: any) => void>();
@@ -52,7 +55,7 @@ vi.mock("sigma", () => {
       return { x: [-50, 50], y: [-40, 40] };
     }
     getDimensions() {
-      return { width: 400, height: 600 };
+      return mockDimensions;
     }
     getCustomBBox() {
       return this.customBBox;
@@ -64,9 +67,18 @@ vi.mock("sigma", () => {
       return coords;
     }
     // Fake fit density: 6 px per graph unit, so the density cap (target 1.5)
-    // must zoom out by exactly 4x.
+    // must zoom out by exactly 4x. Centred on the middle of the mock
+    // viewport, as the real projection is, so a node near the graph origin
+    // lands ON screen — the place-name pass culls names whose box falls
+    // outside the viewport. At 6 px/unit a wing component (60+ graph units
+    // out) projects past the default 400x600; tests that watch its name
+    // widen mockDimensions instead, the way a real fit keeps the whole map
+    // in view.
     graphToViewport(coords: { x: number; y: number }) {
-      return { x: coords.x * 6, y: coords.y * 6 };
+      return {
+        x: mockDimensions.width / 2 + coords.x * 6,
+        y: mockDimensions.height / 2 + coords.y * 6,
+      };
     }
     camera = { ratio: 1, setState: vi.fn(), animate: vi.fn(), getBoundedRatio: (r: number) => r };
     getCamera() {
@@ -259,6 +271,7 @@ describe("AtlasView", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     capturedSigmaInstances.length = 0;
+    mockDimensions = { width: 400, height: 600 };
     entitiesSource = async () => [];
     detailSource = async (id: string) => ({
       entity: makeEntity({ id }),
@@ -1051,6 +1064,7 @@ describe("AtlasView", () => {
 
   it("names a shelved small group that is big enough to be a region", async () => {
     mockStarWithSmallStar();
+    mockDimensions = { width: 2000, height: 1200 }; // the shelf sits out on a wing; keep it in view
 
     renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
@@ -1743,6 +1757,7 @@ describe("AtlasView", () => {
 
   it("paints the names on mount through the post-mount effects, with no second draw of its own", async () => {
     mockTwoTrianglesInSpace();
+    mockDimensions = { width: 2000, height: 1200 }; // both triangles in view, like a real fit
     // The helper canvases only exist once the mount effect has run, so stub
     // the prototype to catch the very first paint.
     const painter = recordingOverlayCtx();
@@ -1764,6 +1779,7 @@ describe("AtlasView", () => {
 
   it("re-renders the place names when a space's cartography status changes, without a full remount", async () => {
     mockTwoTrianglesInSpace();
+    mockDimensions = { width: 2000, height: 1200 }; // both triangles in view, like a real fit
     // Starts on the default (empty) fallback climb: two 3-cliques joined by
     // "rb" — an ordinary edge; nothing is painted as a bridge any more.
     const { qc } = renderWithQuery(<AtlasView />);

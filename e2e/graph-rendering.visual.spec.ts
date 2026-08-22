@@ -35,7 +35,10 @@ test("renders Graph as a structured canvas instead of a flat orange field", asyn
   // map — nothing is painted under the nodes (no terrain, wash or hull, so
   // no shadow or aura around a point) — and it is what can be read back; the
   // WebGL node layer is covered by the screenshot below.
-  await expect(graph.locator("canvas[data-testid]")).toHaveCount(1);
+  // Every canvas sigma does not own — tagged or not — must be this one.
+  const ours = graph.locator('canvas:not([class*="sigma-"])');
+  await expect(ours).toHaveCount(1);
+  await expect(ours).toHaveAttribute("data-testid", "atlas-region-names");
   const canvas = graph.locator('canvas[data-testid="atlas-region-names"]');
   await expect(canvas).toHaveCount(1);
   await expect(canvas).toBeVisible();
@@ -81,12 +84,6 @@ test("renders Graph as a structured canvas instead of a flat orange field", asyn
       };
     });
 
-  await expect(page).toHaveScreenshot("graph-1280x900-light.png", {
-    animations: "disabled",
-    fullPage: false,
-    maxDiffPixelRatio: 0.002,
-  });
-
   // At the default fit the fixture's one named region earns its place name:
   // some text pixels, anti-aliased through many alphas, none of them orange.
   // Text is all this canvas carries, so a painted wash would show up here as
@@ -105,6 +102,14 @@ test("renders Graph as a structured canvas instead of a flat orange field", asyn
   expect(evidence.coloredPixels / evidence.sampledPixels).toBeLessThan(0.02);
   expect(evidence.uniqueColors).toBeGreaterThan(8);
   expect(evidence.orangeCoverage).toBeLessThan(0.25);
+
+  // The snapshot only once the overlay has painted its name, so it can never
+  // capture a blank or stale overlay that the poll above would still pass.
+  await expect(page).toHaveScreenshot("graph-1280x900-light.png", {
+    animations: "disabled",
+    fullPage: false,
+    maxDiffPixelRatio: 0.002,
+  });
   expect(browserErrors.pageErrors).toEqual([]);
   expect(browserErrors.consoleErrors).toEqual([]);
 });

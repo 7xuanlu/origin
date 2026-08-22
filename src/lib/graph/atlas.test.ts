@@ -1041,8 +1041,17 @@ describe("shelveComponents", () => {
     const { graph, placement } = shelved([6, 5, 5, 5, 5, 5, 5, 5, 5]);
     const core = box(graph, placement[0] as string[]);
     const shelf = placement.slice(1).map((ids) => box(graph, ids));
-    const rows = shelf.filter((b) => b.maxY <= core.minY - SHELF_TOP_GAP + 1e-6);
+    // Wings sit beside the core; everything else is a row.
+    const wings = shelf.filter(
+      (b) => b.minX >= core.maxX + SHELF_TOP_GAP - 1e-6 || b.maxX <= core.minX - SHELF_TOP_GAP + 1e-6,
+    );
+    const rows = shelf.filter((b) => !wings.includes(b));
     expect(rows.length).toBeGreaterThan(0);
+    // Every row clears the lowest point of the core AND the wings — a wing's
+    // first component may be taller than the core, and a row can be wider
+    // than it, so clearing the core alone could run a row under a wing.
+    const shelfBottom = Math.min(core.minY, ...wings.map((b) => b.minY));
+    for (const b of rows) expect(b.maxY).toBeLessThanOrEqual(shelfBottom - SHELF_TOP_GAP + 1e-6);
     const budget = SHELF_WIDTH_FACTOR * (core.maxX - core.minX);
     const byRow = new Map<string, typeof rows>();
     for (const b of rows) {

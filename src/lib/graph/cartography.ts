@@ -32,7 +32,9 @@ export const REGION_NAME_LIFT_MAX_PX = 60;
 
 /** Hard ceiling on drawn region names per paint, at any zoom. Real data has
  *  66 regions with memories off and 148 with them on; at fit-to-screen a map
- *  needs a handful of place names, not a gazetteer. */
+ *  needs a handful of place names, not a gazetteer. Counts only names that
+ *  land in the viewport: zoomed in, a dozen big regions off to the side must
+ *  not spend the cap and leave the regions in view nameless. */
 export const MAX_REGION_LABELS = 12;
 
 /** Clear air demanded around a candidate label before it may sit next to an
@@ -147,7 +149,7 @@ function climbFallback(nodeIds: string[], edges: { source: string; target: strin
 
 /**
  * Node id -> opaque community id, partitioned per space (D13/App-PR: no
- * region or bridge edge may span spaces). Each space is handled
+ * region may span spaces). Each space is handled
  * independently and resolves to exactly one of three id families, never
  * more than one per space:
  *
@@ -385,12 +387,14 @@ export interface PlacedLabel {
  * members span a speck on screen (narrower than MIN_LABELLED_SPAN_PX) or when
  * its label box would touch one already placed; placement stops at
  * MAX_REGION_LABELS. Because on-screen span grows with zoom, more names
- * appear as you approach.
+ * appear as you approach. With a `viewport` (CSS px), a name whose box lies
+ * wholly outside it is skipped without counting toward the cap.
  */
 export function placeRegionLabels(
   scene: CartographyScene,
   project: (pos: { x: number; y: number }) => { x: number; y: number },
   measure: (text: string, size: number) => number,
+  viewport?: { width: number; height: number },
 ): PlacedLabel[] {
   const placed: PlacedLabel[] = [];
   const boxes: { left: number; right: number; top: number; bottom: number }[] = [];
@@ -423,6 +427,12 @@ export function placeRegionLabels(
       top: at.y - size / 2,
       bottom: at.y + size / 2,
     };
+    if (
+      viewport &&
+      (box.right < 0 || box.left > viewport.width || box.bottom < 0 || box.top > viewport.height)
+    ) {
+      continue;
+    }
     const overlaps = boxes.some(
       (other) =>
         other.left < box.right + LABEL_BOX_PAD &&
@@ -452,6 +462,7 @@ export function drawRegionNames(
   scene: CartographyScene,
   project: (pos: { x: number; y: number }) => { x: number; y: number },
   palette: GraphPalette,
+  viewport?: { width: number; height: number },
 ): void {
   const measure = (text: string, size: number): number => {
     ctx.font = regionLabelFont(size);
@@ -467,7 +478,7 @@ export function drawRegionNames(
   ctx.lineWidth = LABEL_HALO_WIDTH;
   ctx.strokeStyle = palette.surface;
   ctx.fillStyle = palette.labelMuted;
-  for (const label of placeRegionLabels(scene, project, measure)) {
+  for (const label of placeRegionLabels(scene, project, measure, viewport)) {
     ctx.font = regionLabelFont(label.size);
     // Same tracking the measurement used; jsdom's mock ctx simply ignores it.
     ctx.letterSpacing = regionLabelTracking(label.size);

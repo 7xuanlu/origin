@@ -179,10 +179,12 @@ export function runAtlasLayout(graph: Graph): void {
   });
 }
 
-/** Graph-space clearance between a leaf memory and the disc it orbits. Went
- *  6 -> 10 with the memory discs shrinking (1.5-3 px): at 6 the first ring
- *  of grey discs touched the page disc and read as a grey ring round a teal
- *  one, a donut, on the real map with memories on. */
+/** Graph-space distance from the anchor disc's EDGE to a first-ring leaf
+ *  memory's CENTRE (the leaf's own radius, 1.5-3 px, comes out of it, so the
+ *  edge-to-edge clearance is 7-8.5). Went 6 -> 10 with the memory discs
+ *  shrinking: at 6 the first ring of discs touched the page disc and read
+ *  as a grey ring round a teal one, a donut, on the real map with memories
+ *  on. */
 const SATELLITE_GAP = 10;
 
 /**
@@ -550,9 +552,14 @@ export function shelveComponents(graph: Graph): string[][] {
   const maxWidth = SHELF_WIDTH_FACTOR * boxWidth(core);
   const rows = [...shelfRows(overflow, maxWidth), ...shelfRows(singletons, maxWidth)];
 
-  // Graph +y is screen-up (see drawRadialNodeLabel), so "below the core" is
+  // Graph +y is screen-up (see drawRadialNodeLabel), so "below" is
   // DECREASING y: each row hangs off the bottom edge of the one above it.
-  let rowTop = core.minY - SHELF_TOP_GAP;
+  // Rows clear the lowest of the core and BOTH wings, not just the core: a
+  // wing's first component is accepted whatever its height, so a tall one
+  // can reach below the core, and a row wider than the core would run under
+  // it.
+  const shelfBottom = Math.min(core.minY, ...left.items.map((box) => box.minY), ...right.items.map((box) => box.minY));
+  let rowTop = shelfBottom - SHELF_TOP_GAP;
   for (const row of rows) {
     const rowWidth = row.reduce((sum, box) => sum + boxWidth(box), 0) + SHELF_GAP * (row.length - 1);
     let rowLeft = -rowWidth / 2;
