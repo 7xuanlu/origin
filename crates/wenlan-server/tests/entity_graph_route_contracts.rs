@@ -480,3 +480,62 @@ async fn create_entity_unfiled_reports_null_space_on_wire() {
     );
     assert_eq!(created.write_outcome, Some(WriteOutcome::Created));
 }
+
+/// Migration 125 (KG observation identity, PR 1): `idx_observations_identity`
+/// makes a duplicate `POST .../observations` idempotent at the route layer
+/// too -- the second call still returns 200 with the same id, plus a
+/// warning surfacing the duplicate instead of a silently-doubled row.
+#[tokio::test]
+async fn add_entity_observation_twice_returns_same_id_and_warns() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+
+    let entity_request = CreateEntityRequest {
+        name: "Route Contract Dedup Entity".to_string(),
+        entity_type: "concept".to_string(),
+        space: Default::default(),
+        source_agent: Some("entity-graph-route-contract".to_string()),
+        confidence: Some(0.9),
+    };
+    let (status, entity): (StatusCode, CreateEntityResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities",
+        json_body(&entity_request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let observation_uri = format!("/api/memory/entities/{}/observations", entity.id);
+    let observation_request = AddEntityObservationRequest {
+        content: "The identical observation, posted twice.".to_string(),
+        source_agent: Some("entity-graph-route-contract".to_string()),
+        confidence: Some(0.8),
+    };
+
+    let (status, first): (StatusCode, AddObservationResponse) = request_typed(
+        &router,
+        Method::POST,
+        &observation_uri,
+        json_body(&observation_request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(first.warnings.is_empty());
+
+    let (status, second): (StatusCode, AddObservationResponse) = request_typed(
+        &router,
+        Method::POST,
+        &observation_uri,
+        json_body(&observation_request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        second.id, first.id,
+        "the duplicate POST returns the same id"
+    );
+    assert!(
+        !second.warnings.is_empty(),
+        "the duplicate POST must carry a warning"
+    );
+}

@@ -338,14 +338,18 @@ pub async fn add_observation(
         }
     }
 
-    let id = db
-        .add_observation(
+    let (id, created) = db
+        .add_observation_dedup(
             &req.entity_id,
             content,
             req.source_agent.as_deref(),
             req.confidence,
         )
         .await?;
+    let mut warnings = Vec::new();
+    if !created {
+        warnings.push("duplicate observation: returned existing id".to_string());
+    }
 
     // Activity log (no verify step yet — observations have no canonical quality check)
     let detail = format!("entity_id={}, content_len={}", req.entity_id, content.len());
@@ -365,7 +369,7 @@ pub async fn add_observation(
     Ok(WriteResult {
         id,
         attached_to: None,
-        warnings: vec![],
+        warnings,
         wrote: true,
         revision_card_id: None,
         gated: false,

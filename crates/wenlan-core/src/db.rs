@@ -1068,7 +1068,7 @@ pub const EMBEDDING_DIM: usize = 768;
 /// `entities` table, skip every `version < N` branch, and quietly operate
 /// against a schema it cannot see. Refusing to open is recoverable; writing is
 /// not.
-pub const SCHEMA_VERSION: u32 = 124;
+pub const SCHEMA_VERSION: u32 = 125;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -3412,6 +3412,9 @@ CREATE TABLE IF NOT EXISTS relations (
 CREATE INDEX IF NOT EXISTS idx_observations_entity ON observations(entity_id);
 -- idx_observations_source_memory is created by migration 79/85 after
 -- reconciling legacy observations tables that do not have source_memory_id.
+-- idx_observations_identity is the identity index migration 125 adds;
+-- listed here so a brand-new database matches a migrated one.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_identity ON observations(entity_id, lower(trim(content)));
 CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_entity, to_entity);
 CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(to_entity, from_entity);
 
@@ -9366,6 +9369,14 @@ impl MemoryDB {
             // migrate_124_kg_integrity_repair.
             if version < 124 {
                 self.migrate_124_kg_integrity_repair(version).await?;
+            }
+
+            // Migration 125 (KG observation identity, PR 1): dedupe
+            // `observations` and add the `UNIQUE` expression index that
+            // gives an observation an identity going forward. See
+            // migrate_125_observation_identity.
+            if version < 125 {
+                self.migrate_125_observation_identity(version).await?;
             }
         }
 
@@ -16230,6 +16241,75 @@ impl MemoryDB {
             "[migration] Migration 124 applied: {retired} orphan entity edge(s) retired, \
              {requeued} parked derivation job(s) requeued, \
              {downgraded} cross-space active edge(s) downgraded to legacy"
+        );
+        Ok(())
+    }
+
+    /// Migration 125 (KG observation identity, PR 1): an observation's
+    /// identity is `(entity_id, lower(trim(content)))` -- two writers
+    /// (`commit_entity_enrichment_at_version` and `add_observation`) always
+    /// insert, so prod has accumulated duplicate rows for the same fact.
+    /// Deletes the duplicates first, keeping the oldest survivor per
+    /// identity (smallest `created_at`, ties broken by smallest `rowid`),
+    /// then creates the `UNIQUE` expression index that enforces the
+    /// identity going forward. Idempotent -- a second run finds no
+    /// duplicate row (the index already blocks new ones) and `CREATE UNIQUE
+    /// INDEX IF NOT EXISTS` is a no-op.
+    async fn migrate_125_observation_identity(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(125, prior_version).await?;
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m125 begin: {e}")))?;
+
+        let result: Result<u64, WenlanError> = async {
+            let deleted = conn
+                .execute(
+                    "DELETE FROM observations WHERE rowid IN ( \
+                         SELECT o.rowid FROM observations o \
+                         JOIN observations k ON k.entity_id = o.entity_id \
+                           AND lower(trim(k.content)) = lower(trim(o.content)) \
+                           AND (k.created_at < o.created_at \
+                                OR (k.created_at = o.created_at AND k.rowid < o.rowid)))",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m125 dedupe: {e}")))?;
+
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_identity \
+                 ON observations(entity_id, lower(trim(content)))",
+                (),
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m125 index: {e}")))?;
+
+            Ok(deleted)
+        }
+        .await;
+
+        let deleted = match result {
+            Ok(value) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m125 commit: {e}")))?;
+                value
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+
+        conn.execute("PRAGMA user_version = 125", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m125 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 125 applied: {deleted} duplicate observation(s) deleted, \
+             idx_observations_identity created"
         );
         Ok(())
     }
@@ -34390,6 +34470,9 @@ impl MemoryDB {
     /// best-effort/unmirrored write here would permanently drift the exact
     /// watermark Stage 2 uses as its proof surface) -- same
     /// transaction-then-`update_entity_shadow_page` pattern as `store_entity`.
+    ///
+    /// Thin wrapper over [`Self::add_observation_dedup`] for the ~8 existing
+    /// callers that only need an id back.
     pub async fn add_observation(
         &self,
         entity_id: &str,
@@ -34397,6 +34480,23 @@ impl MemoryDB {
         source_agent: Option<&str>,
         confidence: Option<f32>,
     ) -> Result<String, WenlanError> {
+        self.add_observation_dedup(entity_id, content, source_agent, confidence)
+            .await
+            .map(|(id, _created)| id)
+    }
+
+    /// [`Self::add_observation`], reporting whether the row was actually
+    /// created. Identity is `(entity_id, lower(trim(content)))` (migration
+    /// 125's `idx_observations_identity`): when the insert is ignored as a
+    /// duplicate, returns the existing row's id instead and `created =
+    /// false` so the caller can surface the duplicate.
+    pub async fn add_observation_dedup(
+        &self,
+        entity_id: &str,
+        content: &str,
+        source_agent: Option<&str>,
+        confidence: Option<f32>,
+    ) -> Result<(String, bool), WenlanError> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
         let now_iso = chrono::Utc::now().to_rfc3339();
@@ -34406,9 +34506,9 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("add_observation begin: {}", e)))?;
 
-        let result: Result<(), WenlanError> = async {
-            conn.execute(
-                "INSERT INTO observations (id, entity_id, content, source_agent, confidence, confirmed, created_at)
+        let result: Result<bool, WenlanError> = async {
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO observations (id, entity_id, content, source_agent, confidence, confirmed, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
                 libsql::params![
                     id.clone(),
@@ -34420,7 +34520,8 @@ impl MemoryDB {
                 ],
             )
             .await
-            .map_err(|e| WenlanError::VectorDb(format!("add_observation: {}", e)))?;
+            .map_err(|e| WenlanError::VectorDb(format!("add_observation: {}", e)))?
+                > 0;
 
             // G6 Stage 2 PR 2c sub-step 2: direct targeted write -- adding
             // an observation only touches the entity's `updated_at`. The
@@ -34434,23 +34535,49 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("add_observation shadow: {}", e)))?;
 
-            Ok(())
+            Ok(inserted)
         }
         .await;
 
-        match result {
-            Ok(()) => {
+        let inserted = match result {
+            Ok(inserted) => {
                 conn.execute("COMMIT", ())
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("add_observation commit: {}", e)))?;
+                inserted
             }
             Err(e) => {
                 let _ = conn.execute("ROLLBACK", ()).await;
                 return Err(e);
             }
+        };
+
+        if inserted {
+            return Ok((id, true));
         }
 
-        Ok(id)
+        // Duplicate: the identity index blocked the insert. Look up the
+        // surviving row's id so the caller still gets one back.
+        let mut rows = conn
+            .query(
+                "SELECT id FROM observations WHERE entity_id = ?1 AND lower(trim(content)) = lower(trim(?2))",
+                libsql::params![entity_id.to_string(), content.to_string()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("add_observation dedup lookup: {}", e)))?;
+        let existing_id = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("add_observation dedup row: {}", e)))?
+            .ok_or_else(|| {
+                WenlanError::VectorDb(
+                    "add_observation: insert was ignored but no matching row found".into(),
+                )
+            })?
+            .get::<String>(0)
+            .map_err(|e| WenlanError::VectorDb(format!("add_observation dedup id: {}", e)))?;
+
+        Ok((existing_id, false))
     }
 
     /// Merge `alias_id` into `canonical_id`. Re-points all FK references, registers
@@ -34848,6 +34975,22 @@ impl MemoryDB {
                     }
                 }
             }
+
+            // Identity is (entity, normalised text): an alias-side
+            // observation whose identity already exists on the canonical
+            // would collide with `idx_observations_identity` (migration 125)
+            // once re-pointed, so drop it first rather than let the UPDATE
+            // below hit a unique violation.
+            conn.execute(
+                "DELETE FROM observations \
+                 WHERE entity_id = ?2 AND EXISTS ( \
+                     SELECT 1 FROM observations c \
+                      WHERE c.entity_id = ?1 \
+                        AND lower(trim(c.content)) = lower(trim(observations.content)))",
+                libsql::params![canonical_id, alias_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("merge_entities obs dedupe: {e}")))?;
 
             conn.execute(
                 "UPDATE observations SET entity_id = ?1 WHERE entity_id = ?2",
@@ -36794,8 +36937,12 @@ impl MemoryDB {
                         continue;
                     };
                     let observation_id = uuid::Uuid::new_v4().to_string();
+                    // Identity is (entity, normalised text) -- when two
+                    // memories yield the same sentence, `idx_observations_identity`
+                    // (migration 125) keeps the first source's provenance and
+                    // this insert quietly no-ops rather than erroring.
                     conn.execute(
-                        "INSERT INTO observations
+                        "INSERT OR IGNORE INTO observations
                              (id, entity_id, content, source_memory_id, source_agent,
                               confidence, confirmed, created_at)
                          VALUES (?1, ?2, ?3, ?4, 'post_ingest', NULL, 0, ?5)",
