@@ -672,6 +672,7 @@ describe("drawRegionNames", () => {
     return {
       name,
       memberCount: 3,
+      island: false,
       centroid: { x: centroidX, y: centroidY },
       bounds: {
         minX: centroidX - spanX / 2,
@@ -725,6 +726,7 @@ describe("placeRegionLabels", () => {
     return {
       name,
       memberCount: members,
+      island: false,
       centroid: { x: x + width / 2, y: y + 10 },
       bounds: { minX: x, maxX: x + width, minY: y, maxY: y + 20 },
     };
@@ -808,6 +810,7 @@ describe("placeRegionLabels", () => {
     const tall: Region = {
       name: "Tall",
       memberCount: 5,
+      island: false,
       centroid: { x: 100, y: 200 },
       bounds: { minX: 0, maxX: 200, minY: 100, maxY: 300 },
     };
@@ -829,6 +832,7 @@ describe("region label measurement includes its tracking", () => {
     const region = (name: string, centroidX: number): Region => ({
       name,
       memberCount: 3,
+      island: false,
       centroid: { x: centroidX, y: 0 },
       bounds: { minX: centroidX - 75, maxX: centroidX + 75, minY: -10, maxY: 10 },
     });

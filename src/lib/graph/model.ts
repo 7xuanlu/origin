@@ -656,6 +656,41 @@ export function smallGroupNodeCount(model: GraphModel): number {
   return model.nodes.length - kept.size;
 }
 
+/**
+ * The memory layer, hung on an already-laid-out map. `base` is the model the
+ * map is shaped by (built with the memory layer OFF, so its page edges are
+ * the shared-source ones and nothing a memory says moves an entity);
+ * `withMemories` is the same graph built with the layer ON. The result is
+ * `base` plus every memory of `withMemories` that touches a node `base`
+ * draws, plus the edges between those memories and those nodes. Nothing in
+ * `base` changes — not a node, not a degree, not an edge — which is what
+ * makes the map identical with the chip on and off. A memory whose every
+ * link is to a node `base` does not draw (a hidden small group, or an entity
+ * that exists only because of memories) is left out with it.
+ */
+export function attachMemories(base: GraphModel, withMemories: GraphModel): GraphModel {
+  const anchored = new Set(base.nodes.map((node) => node.id));
+  const memoryIds = new Set<string>();
+  const memoryEdges: GraphEdge[] = [];
+  const degree = new Map<string, number>();
+  for (const edge of withMemories.edges) {
+    const sourceIsMemory = memorySourceId(edge.source) !== null;
+    const targetIsMemory = memorySourceId(edge.target) !== null;
+    if (sourceIsMemory === targetIsMemory) continue;
+    const memory = sourceIsMemory ? edge.source : edge.target;
+    const other = sourceIsMemory ? edge.target : edge.source;
+    if (!anchored.has(other)) continue;
+    memoryIds.add(memory);
+    memoryEdges.push(edge);
+    degree.set(memory, (degree.get(memory) ?? 0) + 1);
+  }
+  if (memoryIds.size === 0) return base;
+  const memoryNodes = withMemories.nodes
+    .filter((node) => memoryIds.has(node.id))
+    .map((node) => ({ ...node, degree: degree.get(node.id) ?? 0 }));
+  return { ...base, nodes: [...base.nodes, ...memoryNodes], edges: [...base.edges, ...memoryEdges] };
+}
+
 /** 1-hop ego graph: the center entity plus its direct neighbors. */
 export function buildEgoModel(detail: EntityDetail): GraphModel {
   return buildGraphModel([detail.entity], [detail]);

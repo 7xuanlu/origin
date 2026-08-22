@@ -21,6 +21,7 @@ import {
   pageNodeId,
   componentSizeByNode,
   drawableModel,
+  attachMemories,
   smallGroupNodeCount,
   DEFAULT_LAYERS,
   MIN_COMPONENT_SIZE,
@@ -705,5 +706,70 @@ describe("componentSizeByNode / drawableModel", () => {
     const full = model(["a", "b", "c", "d", "e"], [["a", "b"], ["b", "c"], ["c", "d"], ["d", "e"]]);
     expect(drawableModel(full)).toBe(full);
     expect(smallGroupNodeCount(full)).toBe(0);
+  });
+});
+
+describe("attachMemories", () => {
+  /** Five linked entities (the drawable core), one isolate, two pages that
+   *  both cite m1, and three memories: m1 mentions A and the isolate, m2
+   *  mentions the isolate only, m3 is cited by a page and mentions nothing. */
+  function graph(): KnowledgeGraph {
+    return makeGraph({
+      entities: ["A", "B", "C", "D", "E", "iso"].map((id) => makeEntity({ id, name: id })),
+      relations: [
+        makeGraphRelation({ id: "r1", from_entity: "A", to_entity: "B" }),
+        makeGraphRelation({ id: "r2", from_entity: "B", to_entity: "C" }),
+        makeGraphRelation({ id: "r3", from_entity: "C", to_entity: "D" }),
+        makeGraphRelation({ id: "r4", from_entity: "D", to_entity: "E" }),
+      ],
+      memories: [
+        makeGraphMemory({ source_id: "m1" }),
+        makeGraphMemory({ source_id: "m2" }),
+        makeGraphMemory({ source_id: "m3" }),
+      ],
+      memory_links: [
+        { memory_id: "m1", entity_id: "A" },
+        { memory_id: "m1", entity_id: "iso" },
+        { memory_id: "m2", entity_id: "iso" },
+      ],
+      pages: [makePage({ id: "p1" }), makePage({ id: "p2" })],
+      page_links: [
+        // Both pages are about core entities, so they draw with the core.
+        pageLink(["page", "p1"], ["entity", "A"], "about"),
+        pageLink(["page", "p2"], ["entity", "E"], "about"),
+        pageLink(["page", "p1"], ["memory", "m1"], "cites"),
+        pageLink(["page", "p2"], ["memory", "m1"], "cites"),
+        pageLink(["page", "p1"], ["memory", "m3"], "cites"),
+      ],
+    });
+  }
+
+  it("hangs the memories that touch a drawn node on the base, and leaves the base itself untouched", () => {
+    const base = drawableModel(buildKnowledgeGraphModel(graph(), { layers: { entity: true, page: true, memory: false } }));
+    const full = buildKnowledgeGraphModel(graph(), { layers: ALL_LAYERS });
+    const result = attachMemories(base, full);
+    // Every base node and edge survives as-is — shared-source page edge
+    // included, which the memory-on model would not even have.
+    for (const node of base.nodes) expect(result.nodes).toContainEqual(node);
+    for (const edge of base.edges) expect(result.edges).toContainEqual(edge);
+    expect(base.edges.some((edge) => edge.type === "shared_source")).toBe(true);
+    const memoryIds = result.nodes.filter((node) => node.kind === "memory").map((node) => node.id).sort();
+    // m1 (mentions A, cited by both pages) and m3 (cited by p1); m2 mentions
+    // only the isolate, which the base does not draw, so it is left out.
+    expect(memoryIds).toEqual(["mem:m1", "mem:m3"]);
+    // m1's link to the undrawn isolate is dropped with it; its degree counts
+    // only the edges that are drawn.
+    const m1 = result.nodes.find((node) => node.id === "mem:m1")!;
+    expect(m1.degree).toBe(3);
+    expect(result.edges.some((edge) => edge.source === "mem:m1" && edge.target === "iso")).toBe(false);
+  });
+
+  it("returns the base itself when no memory touches it", () => {
+    const base = drawableModel(buildKnowledgeGraphModel(graph(), { layers: { entity: true, page: false, memory: false } }));
+    const full = buildKnowledgeGraphModel(
+      makeGraph({ ...graph(), memory_links: [{ memory_id: "m2", entity_id: "iso" }], page_links: [] }),
+      { layers: ALL_LAYERS },
+    );
+    expect(attachMemories(base, full)).toBe(base);
   });
 });

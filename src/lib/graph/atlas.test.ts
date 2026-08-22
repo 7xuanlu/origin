@@ -4,6 +4,7 @@ import type Graph from "graphology";
 import type { ForceLink, SimulationLinkDatum } from "d3-force";
 import type { GraphModel, GraphNode, GraphEdge } from "./model";
 import type { GraphPalette } from "./palette";
+import { compositeOver } from "./palette";
 import {
   buildAtlasGraph,
   runAtlasLayout,
@@ -13,9 +14,12 @@ import {
   satellitePlan,
   placeSatellites,
   shelveComponents,
-  SHELF_GAP,
-  SHELF_TOP_GAP,
-  SHELF_WIDTH_FACTOR,
+  ISLAND_GAP,
+  satelliteAnchor,
+  annotateDust,
+  dustVisibleCount,
+  lodFor,
+  HOVER_DUST_MAX,
   hoverStateFor,
   nodeDisplay,
   edgeDisplay,
@@ -495,6 +499,41 @@ describe("nodeDisplay", () => {
     expect(result.label).toBe("");
     expect(result.zIndex).toBe(0);
   });
+
+  const rest: HoverState = { hovered: null, neighbors: new Set() };
+
+  it("hides dust past the zoom's visible count, and shows it all when its anchor is hovered", () => {
+    const dust = { ...attrs, dustRank: 7, dustOf: "hub" };
+    const opening = lodFor(1);
+    expect(nodeDisplay(rest, "m", dust, PALETTE, opening).hidden).toBe(true);
+    expect(nodeDisplay(rest, "m", { ...dust, dustRank: 5 }, PALETTE, opening).hidden).toBeUndefined();
+    const hoverHub: HoverState = { hovered: "hub", neighbors: new Set(["m"]) };
+    expect(nodeDisplay(hoverHub, "m", dust, PALETTE, opening).hidden).toBeUndefined();
+    // ...up to HOVER_DUST_MAX of them; the rest wait for the zoom.
+    expect(nodeDisplay(hoverHub, "m", { ...dust, dustRank: HOVER_DUST_MAX }, PALETTE, opening).hidden).toBe(true);
+    expect(nodeDisplay(hoverHub, "m", { ...dust, dustRank: HOVER_DUST_MAX }, PALETTE, lodFor(4)).hidden).toBeUndefined();
+    // Zoomed in twice: eighteen show; four times: everything.
+    expect(nodeDisplay(rest, "m", dust, PALETTE, lodFor(2)).hidden).toBeUndefined();
+    expect(nodeDisplay(rest, "m", { ...dust, dustRank: 40 }, PALETTE, lodFor(2)).hidden).toBe(true);
+    expect(nodeDisplay(rest, "m", { ...dust, dustRank: 400 }, PALETTE, lodFor(4)).hidden).toBeUndefined();
+  });
+
+  it("draws an island node dim and nameless at the opening view, solid once zoomed in", () => {
+    const island = { ...attrs, island: true };
+    const dim = nodeDisplay(rest, "i", island, PALETTE, lodFor(1));
+    expect(dim.label).toBe("");
+    expect(dim.color).not.toBe(attrs.color);
+    expect(dim.color).toBe(compositeOver(attrs.color, PALETTE.surface, 0.3));
+    const solid = nodeDisplay(rest, "i", island, PALETTE, lodFor(2));
+    expect(solid).toEqual(island);
+  });
+
+  it("steps the visible dust count 6 / 18 / all with zoom", () => {
+    expect(dustVisibleCount(1)).toBe(6);
+    expect(dustVisibleCount(1.9)).toBe(6);
+    expect(dustVisibleCount(2)).toBe(18);
+    expect(dustVisibleCount(4)).toBe(Infinity);
+  });
 });
 
 describe("edgeDisplay", () => {
@@ -532,6 +571,21 @@ describe("edgeDisplay", () => {
     const r2 = edgeDisplay(state, "e2", "a", "b", attrs, PALETTE);
     expect(r1.color).toBe(PALETTE.edgeStrong);
     expect(r2.color).toBe(PALETTE.edgeStrong);
+  });
+
+  it("hides a memory's edges at rest and shows them while an endpoint is hovered", () => {
+    const rest: HoverState = { hovered: null, neighbors: new Set() };
+    const ends = { source: { dustRank: 0, dustOf: "b" }, target: {} };
+    expect(edgeDisplay(rest, "e1", "m", "b", attrs, PALETTE, lodFor(1), ends).hidden).toBe(true);
+    const hover: HoverState = { hovered: "b", neighbors: new Set(["m"]) };
+    expect(edgeDisplay(hover, "e1", "m", "b", attrs, PALETTE, lodFor(1), ends).hidden).toBeUndefined();
+  });
+
+  it("hides an island's edges while the island is dim", () => {
+    const rest: HoverState = { hovered: null, neighbors: new Set() };
+    const ends = { source: { island: true }, target: { island: true } };
+    expect(edgeDisplay(rest, "e1", "a", "b", attrs, PALETTE, lodFor(1), ends).hidden).toBe(true);
+    expect(edgeDisplay(rest, "e1", "a", "b", attrs, PALETTE, lodFor(2), ends)).toEqual(attrs);
   });
 });
 
@@ -688,7 +742,7 @@ describe("nonSimulatedIds and satellites", () => {
     );
   }
 
-  it("excludes degree-1 memories and isolates, but keeps every other node", () => {
+  it("excludes every memory and every isolate, but keeps every other node", () => {
     const graph = buildAtlasGraph(
       makeModel(
         [...leafModel().nodes, node({ id: "iso" })],
@@ -696,7 +750,51 @@ describe("nonSimulatedIds and satellites", () => {
       ),
       PALETTE,
     );
-    expect(nonSimulatedIds(graph).sort()).toEqual(["iso", "leaf1", "leaf2"]);
+    // `busy` links two entities and is STILL a satellite: a memory never
+    // gets springs of its own, whatever its degree.
+    expect(nonSimulatedIds(graph).sort()).toEqual(["busy", "iso", "leaf1", "leaf2"]);
+  });
+
+  it("anchors a multi-link memory on its most-connected neighbour, ties to the smaller id", () => {
+    const graph = buildAtlasGraph(leafModel(), PALETTE);
+    // hub has degree 4 (peer, leaf1, leaf2, busy); peer has 2.
+    expect(satelliteAnchor(graph, "busy")).toBe("hub");
+    const tie = buildAtlasGraph(
+      makeModel(
+        [node({ id: "b" }), node({ id: "a" }), node({ id: "m", entityType: "memory", confirmed: null })],
+        [
+          edge({ id: "e1", source: "m", target: "b", type: "mentions" }),
+          edge({ id: "e2", source: "m", target: "a", type: "mentions" }),
+        ],
+      ),
+      PALETTE,
+    );
+    expect(satelliteAnchor(tie, "m")).toBe("a");
+    // A memory whose only neighbours are memories has no anchor.
+    const lonely = buildAtlasGraph(
+      makeModel(
+        [
+          node({ id: "m1", entityType: "memory", confirmed: null }),
+          node({ id: "m2", entityType: "memory", confirmed: null }),
+        ],
+        [edge({ id: "e1", source: "m1", target: "m2", type: "mentions" })],
+      ),
+      PALETTE,
+    );
+    expect(satelliteAnchor(lonely, "m1")).toBeUndefined();
+  });
+
+  it("numbers each anchor's satellites by rank and writes the dust bookkeeping onto the graph", () => {
+    const graph = buildAtlasGraph(leafModel(), PALETTE);
+    const plan = satellitePlan(graph);
+    const hubPlan = plan.filter((sat) => sat.anchor === "hub").sort((a, b) => a.rank - b.rank);
+    expect(hubPlan.map((sat) => sat.id)).toEqual(["busy", "leaf1", "leaf2"]);
+    expect(hubPlan.map((sat) => sat.rank)).toEqual([0, 1, 2]);
+    annotateDust(graph, plan);
+    expect(graph.getNodeAttribute("hub", "dustCount")).toBe(3);
+    expect(graph.getNodeAttribute("leaf2", "dustRank")).toBe(2);
+    expect(graph.getNodeAttribute("leaf2", "dustOf")).toBe("hub");
+    expect(graph.getNodeAttribute("peer", "dustCount")).toBeUndefined();
   });
 
   it("does not treat a degree-1 ENTITY as a satellite — only memories orbit", () => {
@@ -704,32 +802,69 @@ describe("nonSimulatedIds and satellites", () => {
     expect(nonSimulatedIds(graph)).not.toContain("peer");
   });
 
-  it("orbits each leaf around its one neighbour at the neighbour's radius plus a gap", () => {
+  it("orbits each memory around its anchor at the anchor's radius plus a gap", () => {
     const graph = buildAtlasGraph(leafModel(), PALETTE);
     graph.setNodeAttribute("hub", "x", 40);
     graph.setNodeAttribute("hub", "y", -15);
     const plan = satellitePlan(graph);
-    expect(plan.map((s) => s.id).sort()).toEqual(["leaf1", "leaf2"]);
+    expect(plan.map((s) => s.id).sort()).toEqual(["busy", "leaf1", "leaf2"]);
     placeSatellites(graph, plan);
     const hubSize = graph.getNodeAttribute("hub", "size") as number;
-    for (const id of ["leaf1", "leaf2"]) {
-      const dx = (graph.getNodeAttribute(id, "x") as number) - 40;
-      const dy = (graph.getNodeAttribute(id, "y") as number) + 15;
-      expect(Math.hypot(dx, dy)).toBeCloseTo(hubSize + 10, 10);
+    for (const sat of plan) {
+      const dx = (graph.getNodeAttribute(sat.id, "x") as number) - 40;
+      const dy = (graph.getNodeAttribute(sat.id, "y") as number) + 15;
+      expect(Math.hypot(dx, dy)).toBeCloseTo(sat.radius, 10);
+      expect(sat.radius).toBeGreaterThanOrEqual(hubSize + 10);
     }
-    // Two leaves on one anchor sit on opposite sides of it, not on top of
-    // each other.
-    expect(plan[0].angle).not.toBe(plan[1].angle);
+    // Three on one anchor sit apart, not on top of each other.
+    expect(new Set(plan.map((s) => s.angle.toFixed(6))).size).toBe(3);
   });
 
-  it("keeps leaf memories out of the simulation and its links", () => {
+  it("keeps every memory out of the simulation and its links", () => {
     const graph = buildAtlasGraph(leafModel(), PALETTE);
     const sim = createAtlasSimulation(graph);
-    expect(sim.nodes().map((n) => n.id).sort()).toEqual(["busy", "hub", "peer"]);
+    expect(sim.nodes().map((n) => n.id).sort()).toEqual(["hub", "peer"]);
     const linkForce = sim.force<ForceLink<AtlasSimNode, SimulationLinkDatum<AtlasSimNode>>>("link");
-    // hub-peer, busy-hub, busy-peer: the two leaf edges are drawn but never
+    // Only hub-peer: every memory edge is drawn (on hover) but never
     // simulated, so d3 is never asked to resolve an endpoint it does not own.
-    expect(linkForce?.links()).toHaveLength(3);
+    expect(linkForce?.links()).toHaveLength(1);
+  });
+
+  it("lays the map out the same with the memories on and off", () => {
+    // Two components of entities, as the base model draws them; the memory
+    // layer then hangs memories on both (attachMemories keeps every base
+    // node's degree, so the fixtures agree on size).
+    const entities = (): { nodes: GraphNode[]; edges: GraphEdge[] } => {
+      const nodes: GraphNode[] = [];
+      const edges: GraphEdge[] = [];
+      for (let i = 0; i < 8; i += 1) {
+        nodes.push(node({ id: `a${i}`, degree: i === 0 ? 7 : 1 }));
+        if (i > 0) edges.push(edge({ id: `ae${i}`, source: "a0", target: `a${i}` }));
+      }
+      for (let i = 0; i < 5; i += 1) {
+        nodes.push(node({ id: `b${i}`, degree: i === 0 || i === 4 ? 1 : 2 }));
+        if (i > 0) edges.push(edge({ id: `be${i}`, source: `b${i - 1}`, target: `b${i}` }));
+      }
+      return { nodes, edges };
+    };
+    const bare = entities();
+    const dressed = entities();
+    for (let i = 0; i < 30; i += 1) {
+      const id = `m${String(i).padStart(2, "0")}`;
+      dressed.nodes.push(node({ id, entityType: "memory", confirmed: null, degree: i % 3 === 0 ? 2 : 1 }));
+      dressed.edges.push(edge({ id: `${id}-a`, source: id, target: i % 2 ? "a0" : "b2", type: "mentions" }));
+      if (i % 3 === 0) dressed.edges.push(edge({ id: `${id}-b`, source: id, target: "a3", type: "mentions" }));
+    }
+    const withoutMemories = buildAtlasGraph(makeModel(bare.nodes, bare.edges), PALETTE);
+    const withMemories = buildAtlasGraph(makeModel(dressed.nodes, dressed.edges), PALETTE);
+    runAtlasLayout(withoutMemories);
+    runAtlasLayout(withMemories);
+    createAtlasSimulation(withoutMemories);
+    createAtlasSimulation(withMemories);
+    for (const { id } of bare.nodes) {
+      expect(withMemories.getNodeAttribute(id, "x")).toBeCloseTo(withoutMemories.getNodeAttribute(id, "x") as number, 6);
+      expect(withMemories.getNodeAttribute(id, "y")).toBeCloseTo(withoutMemories.getNodeAttribute(id, "y") as number, 6);
+    }
   });
 
   it("carries a dragged anchor's leaves along on every tick writeback", () => {
@@ -988,84 +1123,38 @@ describe("shelveComponents", () => {
     expect((core.minY + core.maxY) / 2).toBeCloseTo(0, 6);
   });
 
-  it("puts the two largest shelf components one on each side of the core, each column centred on the core's own centre", () => {
-    const { graph, placement } = shelved([9, 6, 5]);
-    const core = box(graph, placement[0] as string[]);
-    // Grouped components are assigned largest-first to whichever wing column
-    // is currently shorter, tie -> right: with only two, the first (6) goes
-    // right, the second (5) goes left.
-    const right = box(graph, placement[1] as string[]);
-    const left = box(graph, placement[2] as string[]);
-    // A single-component column IS the column, so its own midpoint sits at
-    // the core's vertical centre — the origin, after recentring.
-    expect((right.minY + right.maxY) / 2).toBeCloseTo(0, 6);
-    expect((left.minY + left.maxY) / 2).toBeCloseTo(0, 6);
-    expect(right.minX - core.maxX).toBeCloseTo(SHELF_TOP_GAP, 6);
-    expect(core.minX - left.maxX).toBeCloseTo(SHELF_TOP_GAP, 6);
-  });
+  /** Shortest distance between two boxes (0 when they touch or overlap). */
+  function boxGap(
+    a: { minX: number; maxX: number; minY: number; maxY: number },
+    b: { minX: number; maxX: number; minY: number; maxY: number },
+  ): number {
+    const dx = Math.max(a.minX - b.maxX, b.minX - a.maxX, 0);
+    const dy = Math.max(a.minY - b.maxY, b.minY - a.maxY, 0);
+    return Math.hypot(dx, dy);
+  }
 
-  it("stacks a wing downward SHELF_GAP apart, and keeps its height within the core's unless it holds only one component", () => {
-    const { graph, placement } = shelved([14, 5, 5, 5, 5, 5, 5]);
-    const core = box(graph, placement[0] as string[]);
-    const shelf = placement.slice(1).map((ids) => box(graph, ids));
-    // A wing member's bottom never drops below the core's own bottom edge;
-    // an overflow row, by contrast, sits well clear of it (SHELF_TOP_GAP
-    // below), so this line cleanly separates the two kinds.
-    const wingBoxes = shelf.filter((b) => b.minY >= core.minY - 1e-6);
-    const right = wingBoxes.filter((b) => b.minX >= core.maxX + SHELF_TOP_GAP - 1e-6);
-    const left = wingBoxes.filter((b) => b.maxX <= core.minX - SHELF_TOP_GAP + 1e-6);
-    expect(right.length + left.length).toBe(wingBoxes.length);
-    const coreHeight = core.maxY - core.minY;
-    for (const column of [right, left]) {
-      expect(column.length).toBeGreaterThan(1);
-      const sorted = [...column].sort((a, b) => b.maxY - a.maxY);
-      for (let i = 1; i < sorted.length; i += 1) {
-        const prev = sorted[i - 1] as { minY: number };
-        const next = sorted[i] as { maxY: number };
-        expect(prev.minY - next.maxY).toBeCloseTo(SHELF_GAP, 6);
+  it("packs every other component as an island at least ISLAND_GAP clear of the core and of each other", () => {
+    const { graph, placement } = shelved([9, 6, 5, 5, 5, 5, 5, 3, 1]);
+    const boxes = placement.map((ids) => box(graph, ids));
+    const core = boxes[0] as ReturnType<typeof box>;
+    for (let i = 1; i < boxes.length; i += 1) {
+      expect(boxGap(core, boxes[i] as ReturnType<typeof box>)).toBeGreaterThanOrEqual(ISLAND_GAP - 1e-6);
+      for (let j = i + 1; j < boxes.length; j += 1) {
+        expect(boxGap(boxes[i] as ReturnType<typeof box>, boxes[j] as ReturnType<typeof box>)).toBeGreaterThanOrEqual(
+          ISLAND_GAP - 1e-6,
+        );
       }
-      const stackHeight =
-        (sorted[0] as { maxY: number }).maxY - (sorted[sorted.length - 1] as { minY: number }).minY;
-      expect(stackHeight).toBeLessThanOrEqual(coreHeight + 1e-6);
-      // The column is slid so its own midpoint sits on the core's vertical
-      // centre (0, after recentring), not pinned to the core's top edge.
-      const top = (sorted[0] as { maxY: number }).maxY;
-      const bottom = (sorted[sorted.length - 1] as { minY: number }).minY;
-      expect((top + bottom) / 2).toBeCloseTo(0, 6);
     }
   });
 
-  it("sends whatever overflows the wings to rows below the core, width-budgeted like before", () => {
-    // A narrow core against eight same-size components: the wings fill up
-    // fast and the rest has to fall through to rows.
-    const { graph, placement } = shelved([6, 5, 5, 5, 5, 5, 5, 5, 5]);
-    const core = box(graph, placement[0] as string[]);
-    const shelf = placement.slice(1).map((ids) => box(graph, ids));
-    // Wings sit beside the core; everything else is a row.
-    const wings = shelf.filter(
-      (b) => b.minX >= core.maxX + SHELF_TOP_GAP - 1e-6 || b.maxX <= core.minX - SHELF_TOP_GAP + 1e-6,
-    );
-    const rows = shelf.filter((b) => !wings.includes(b));
-    expect(rows.length).toBeGreaterThan(0);
-    // Every row clears the lowest point of the core AND the wings — a wing's
-    // first component may be taller than the core, and a row can be wider
-    // than it, so clearing the core alone could run a row under a wing.
-    const shelfBottom = Math.min(core.minY, ...wings.map((b) => b.minY));
-    for (const b of rows) expect(b.maxY).toBeLessThanOrEqual(shelfBottom - SHELF_TOP_GAP + 1e-6);
-    const budget = SHELF_WIDTH_FACTOR * (core.maxX - core.minX);
-    const byRow = new Map<string, typeof rows>();
-    for (const b of rows) {
-      const key = b.maxY.toFixed(6);
-      const list = byRow.get(key);
-      if (list) list.push(b);
-      else byRow.set(key, [b]);
-    }
-    for (const row of byRow.values()) {
-      const width = Math.max(...row.map((b) => b.maxX)) - Math.min(...row.map((b) => b.minX));
-      // A row may only exceed the budget when a single component does.
-      const widest = Math.max(...row.map((b) => b.maxX - b.minX));
-      expect(width).toBeLessThanOrEqual(Math.max(budget, widest) + 1e-6);
-    }
+  it("spreads the islands all round the core rather than piling them on one side", () => {
+    const { graph, placement } = shelved([9, 5, 5, 5, 5, 5, 5, 5, 5]);
+    const angles = placement.slice(1).map((ids) => {
+      const b = box(graph, ids);
+      return Math.atan2((b.minY + b.maxY) / 2, (b.minX + b.maxX) / 2);
+    });
+    const quadrants = new Set(angles.map((a) => Math.floor(((a + Math.PI) / (2 * Math.PI)) * 4) % 4));
+    expect(quadrants.size).toBe(4);
   });
 
   it("never overlaps two components", () => {
@@ -1104,70 +1193,51 @@ describe("shelveComponents", () => {
     }
   });
 
-  it("puts lone nodes last, on rows of their own", () => {
-    const { graph, placement } = shelved([9, 5, 1, 1, 3]);
-    // Largest-first among the grouped ones, then the singletons.
+  it("places islands largest first, lone nodes last", () => {
+    const { placement } = shelved([9, 5, 1, 1, 3]);
     expect(placement.slice(1).map((ids) => ids.length)).toEqual([5, 3, 1, 1]);
-    const grouped = placement.slice(1, 3).map((ids) => box(graph, ids));
-    const singles = placement.slice(3).map((ids) => box(graph, ids));
-    const groupedBottom = Math.min(...grouped.map((b) => b.minY));
-    for (const single of singles) {
-      expect(single.maxY).toBeLessThanOrEqual(groupedBottom + 1e-6);
-    }
-    // And the two lone nodes share their own row.
-    expect((singles[0] as { maxY: number }).maxY).toBeCloseTo(
-      (singles[1] as { maxY: number }).maxY,
-      6,
-    );
   });
 
-  it("keeps a shelved component clear of the core's satellite halo", () => {
+  it("measures a component by its discs alone — a memory halo never moves an island", () => {
     const leaves = 40;
-    const nodes: GraphNode[] = [];
-    const edges: GraphEdge[] = [];
-    for (let i = 0; i < 6; i += 1) {
-      nodes.push(node({ id: `k${i}` }));
-      if (i > 0) edges.push(edge({ id: `ke${i}`, source: `k${i - 1}`, target: `k${i}` }));
+    const build = (withLeaves: boolean) => {
+      const nodes: GraphNode[] = [];
+      const edges: GraphEdge[] = [];
+      for (let i = 0; i < 6; i += 1) {
+        nodes.push(node({ id: `k${i}` }));
+        if (i > 0) edges.push(edge({ id: `ke${i}`, source: `k${i - 1}`, target: `k${i}` }));
+      }
+      if (withLeaves) {
+        for (let i = 0; i < leaves; i += 1) {
+          const id = `leaf${String(i).padStart(3, "0")}`;
+          nodes.push(node({ id, entityType: "memory", confirmed: null, degree: 1 }));
+          edges.push(edge({ id: `m${i}`, source: id, target: "k0", type: "mentions" }));
+        }
+      }
+      for (let i = 0; i < 5; i += 1) {
+        nodes.push(node({ id: `s${i}` }));
+        if (i > 0) edges.push(edge({ id: `se${i}`, source: `s${i - 1}`, target: `s${i}` }));
+      }
+      const graph = buildAtlasGraph(makeModel(nodes, edges), PALETTE);
+      // Placed by hand instead of laid out, so the two graphs start equal.
+      for (let i = 0; i < 6; i += 1) {
+        graph.setNodeAttribute(`k${i}`, "x", i * 40);
+        graph.setNodeAttribute(`k${i}`, "y", 0);
+      }
+      for (let i = 0; i < 5; i += 1) {
+        graph.setNodeAttribute(`s${i}`, "x", i * 40);
+        graph.setNodeAttribute(`s${i}`, "y", 500);
+      }
+      return graph;
+    };
+    const bare = build(false);
+    const haloed = build(true);
+    expect(shelveComponents(bare)[0]).toContain("k0");
+    expect(shelveComponents(haloed)[0]).toContain("k0");
+    for (const id of ["k0", "k3", "s0", "s4"]) {
+      expect(haloed.getNodeAttribute(id, "x")).toBeCloseTo(bare.getNodeAttribute(id, "x") as number, 6);
+      expect(haloed.getNodeAttribute(id, "y")).toBeCloseTo(bare.getNodeAttribute(id, "y") as number, 6);
     }
-    for (let i = 0; i < leaves; i += 1) {
-      const id = `leaf${String(i).padStart(3, "0")}`;
-      nodes.push(node({ id, entityType: "memory", confirmed: null, degree: 1 }));
-      edges.push(edge({ id: `m${i}`, source: id, target: "k0", type: "mentions" }));
-    }
-    for (let i = 0; i < 5; i += 1) {
-      nodes.push(node({ id: `s${i}` }));
-      if (i > 0) edges.push(edge({ id: `se${i}`, source: `s${i - 1}`, target: `s${i}` }));
-    }
-    const graph = buildAtlasGraph(makeModel(nodes, edges), PALETTE);
-    // Placed by hand instead of laid out: the whole core sits on one line, so
-    // the ONLY thing that can reach below it is k0's halo.
-    for (let i = 0; i < 6; i += 1) {
-      graph.setNodeAttribute(`k${i}`, "x", i * 40);
-      graph.setNodeAttribute(`k${i}`, "y", 0);
-    }
-    for (let i = 0; i < 5; i += 1) {
-      graph.setNodeAttribute(`s${i}`, "x", i * 40);
-      graph.setNodeAttribute(`s${i}`, "y", 500);
-    }
-    const placement = shelveComponents(graph);
-    placeSatellites(graph, satellitePlan(graph));
-    expect(placement[0]).toContain("k0");
-    // s (5 nodes) is a WING now, not a row below the core, so what it has to
-    // clear is the core's bbox INCLUDING the halo, on whichever side it
-    // landed — not just k0's own bottom edge.
-    const shelf = box(graph, ["s0", "s1", "s2", "s3", "s4"]);
-    const leafIds = Array.from({ length: leaves }, (_, i) => `leaf${String(i).padStart(3, "0")}`);
-    const coreWithHalo = box(graph, ["k0", "k1", "k2", "k3", "k4", "k5", ...leafIds]);
-    const leafSize = graph.getNodeAttribute("leaf000", "size") as number;
-    let lowest = Infinity;
-    for (const id of leafIds) {
-      lowest = Math.min(lowest, (graph.getNodeAttribute(id, "y") as number) - leafSize);
-    }
-    // The halo hangs well below the core's own discs.
-    expect(lowest).toBeLessThan(-(graph.getNodeAttribute("k0", "size") as number) * 2);
-    const clearsRight = shelf.minX >= coreWithHalo.maxX + SHELF_TOP_GAP - 1e-6;
-    const clearsLeft = shelf.maxX <= coreWithHalo.minX - SHELF_TOP_GAP + 1e-6;
-    expect(clearsRight || clearsLeft).toBe(true);
   });
 
   it("is deterministic: the same graph shelves the same way twice", () => {
@@ -1431,8 +1501,8 @@ describe("shelveComponents", () => {
     // one alpha-scaled impulse per tick to do the whole journey — and alpha is
     // a finite budget. Measured that way, this 200-unit drag settled 77.5
     // units from its slot with its box 13 units inside the core's; the
-    // 100-unit drag settled 33.4 out, past the 24-unit SHELF_GAP that is
-    // supposed to separate the zones. Steering the bulk velocity home instead
+    // 100-unit drag settled 33.4 out, past the gap that is supposed to
+    // separate the zones. Steering the bulk velocity home instead
     // (SHELF_RETURN_RATE) is not alpha-scaled, so the return completes.
     const far = dragAndRelease(200);
     expect(far.offset).toBeLessThan(2);
@@ -1486,24 +1556,19 @@ describe("shelveComponents", () => {
     sim.tick(120);
 
     const core = box(graph, ids[0] as string[]);
-    const coreBefore = boxBefore[0] as { minX: number; maxX: number };
     for (let i = 1; i < ids.length; i += 1) {
       const shelf = box(graph, ids[i] as string[]);
       const overlaps =
         shelf.minX < core.maxX && core.minX < shelf.maxX && shelf.minY < core.maxY && core.minY < shelf.maxY;
       expect(overlaps).toBe(false);
-      // Both of this fixture's shelf components sit in a wing beside the
-      // core (two grouped components, each an empty column's guaranteed
-      // fit), so "swinging toward the core" now shows up as its NEAR
-      // horizontal edge closing the gap, not a climbing top edge. Read the
-      // side off which half of the core this component landed on.
-      const shelfBefore = boxBefore[i] as { minX: number; maxX: number };
-      const isRight = shelf.minX > core.minX;
-      const clearanceBefore = isRight ? shelfBefore.minX - coreBefore.maxX : coreBefore.minX - shelfBefore.maxX;
-      const clearanceAfter = isRight ? shelf.minX - core.maxX : core.minX - shelf.maxX;
-      // Well short of the SHELF_TOP_GAP clearance the packing left, so the
-      // wing never gets close to overlapping the core.
-      expect(clearanceBefore - clearanceAfter).toBeLessThan(SHELF_TOP_GAP / 2);
+      // Measured on the island packing: the island's own box does not move
+      // much (every edge within 8 units over 120 ticks) — it is the CORE
+      // that breathes out a little under the hold, which is its own
+      // business and is what the overlap check above covers.
+      const shelfBefore = boxBefore[i] as ReturnType<typeof box>;
+      for (const side of ["minX", "maxX", "minY", "maxY"] as const) {
+        expect(Math.abs(shelf[side] - shelfBefore[side])).toBeLessThan(8);
+      }
       const after = centroidOf(ids[i] as string[]);
       const b = before[i] as { x: number; y: number };
       expect(Math.hypot(after.x - b.x, after.y - b.y)).toBeLessThan(0.5);

@@ -306,18 +306,25 @@ export interface Region {
   /** Axis-aligned bounds of member GRAPH positions — how much of the screen
    *  the region spans decides whether its name is worth drawing. */
   bounds: { minX: number; maxX: number; minY: number; maxY: number };
+  /** True when every member is an island node (see atlas.ts's
+   *  shelveComponents) — the name is held back while the islands are dim. */
+  island: boolean;
 }
 
 /**
- * Regions worth naming: communities with >= MIN_REGION_SIZE members, measured
- * over their CURRENT graph positions (so names follow a drag) and named after
- * their highest-degree member. Sorted largest-first so the caller can give
+ * Regions worth naming: communities with >= MIN_REGION_SIZE members (memory
+ * dust excepted), measured over their CURRENT graph positions (so names
+ * follow a drag) and named after their highest-degree member. Sorted largest-first so the caller can give
  * the dominant region the bigger type.
  */
 export function communityRegions(graph: Graph, communities: Map<string, string>): Region[] {
   const members = new Map<string, string[]>();
   for (const [id, community] of communities) {
     if (!graph.hasNode(id)) continue;
+    // A memory is dust on its anchor (atlas.ts's satellitePlan), not a
+    // place: it neither counts toward a region nor widens one, so the names
+    // on the map are the same with the memory layer on and off.
+    if (graph.getNodeAttribute(id, "dustOf") !== undefined) continue;
     pushInto(members, community, id);
   }
   const regions: Region[] = [];
@@ -333,9 +340,11 @@ export function communityRegions(graph: Graph, communities: Map<string, string>)
     let sumX = 0;
     let sumY = 0;
     const bounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
+    let island = true;
     for (const id of ids) {
       const x = graph.getNodeAttribute(id, "x") as number;
       const y = graph.getNodeAttribute(id, "y") as number;
+      if (graph.getNodeAttribute(id, "island") !== true) island = false;
       sumX += x;
       sumY += y;
       bounds.minX = Math.min(bounds.minX, x);
@@ -348,6 +357,7 @@ export function communityRegions(graph: Graph, communities: Map<string, string>)
       memberCount: ids.length,
       centroid: { x: sumX / ids.length, y: sumY / ids.length },
       bounds,
+      island,
     });
   }
   return regions.sort((a, b) => b.memberCount - a.memberCount || (a.name < b.name ? -1 : 1));

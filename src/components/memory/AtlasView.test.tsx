@@ -80,7 +80,14 @@ vi.mock("sigma", () => {
         y: mockDimensions.height / 2 + coords.y * 6,
       };
     }
-    camera = { ratio: 1, setState: vi.fn(), animate: vi.fn(), getBoundedRatio: (r: number) => r };
+    camera = {
+      ratio: 1,
+      setState: vi.fn(),
+      animate: vi.fn(),
+      getBoundedRatio: (r: number) => r,
+      // The zoom level-of-detail listener (AtlasView mount) subscribes here.
+      on: vi.fn(),
+    };
     getCamera() {
       return this.camera;
     }
@@ -1062,9 +1069,9 @@ describe("AtlasView", () => {
     }
   });
 
-  it("names a shelved small group that is big enough to be a region", async () => {
+  it("names an island small group only once the view is zoomed in enough for the islands to come up solid", async () => {
     mockStarWithSmallStar();
-    mockDimensions = { width: 2000, height: 1200 }; // the shelf sits out on a wing; keep it in view
+    mockDimensions = { width: 2000, height: 1200 }; // the island sits out on the rim; keep it in view
 
     renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
@@ -1076,10 +1083,20 @@ describe("AtlasView", () => {
       fireEvent.click(screen.getByRole("button", { name: "Show small groups" }));
       await waitFor(() => expect(capturedSigmaInstances).toHaveLength(2));
 
-      // The small star sits on the shelf, below the core — being off in that
-      // zone must not cost it its region. Its leader is its degree-3 hub.
+      // At the opening view the island is dim and nameless: only the core's
+      // own name is on the map.
+      expect(painter.state.regionNames).toContain("Alice");
+      expect(painter.state.regionNames).not.toContain("Shelf Hub");
+
+      // Zoom in twice (camera ratio halves): the islands come up solid and
+      // the small star earns its name. Its leader is its degree-3 hub.
+      const instance = capturedSigmaInstances[1]!;
+      const onCamera = instance.camera.on.mock.calls.find((call: unknown[]) => call[0] === "updated")?.[1] as
+        | ((state: { ratio: number }) => void)
+        | undefined;
+      expect(onCamera).toBeDefined();
+      onCamera!({ ratio: 0.5 });
       expect(painter.state.regionNames).toContain("Shelf Hub");
-      // ...and the core keeps its own.
       expect(painter.state.regionNames).toContain("Alice");
     } finally {
       HTMLCanvasElement.prototype.getContext = originalGetContext;
