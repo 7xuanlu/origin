@@ -1256,12 +1256,12 @@ export function nodeDisplay(
 }
 
 /**
- * Edge display override for sigma's edgeReducer. A memory's edges are drawn
- * on hover only — at rest the memory sits by its anchor and the thread adds
- * nothing but ink; hovering the memory or either endpoint reveals where else
- * it points. An island's edges are hidden while the island is dim. Then the
- * hover rule: edges incident to the hovered node get emphasized, everything
- * else hides.
+ * Edge display override for sigma's edgeReducer. A memory's thread to its
+ * anchor is drawn whenever the memory itself is (the zoom's `dustVisible`
+ * tier, see nodeDisplay), so a shown dot is never loose; its other edges, and
+ * a hidden memory's thread, wait for a hover of the memory or either endpoint.
+ * An island's edges are hidden while the island is dim. Then the hover rule:
+ * edges incident to the hovered node get emphasized, everything else hides.
  */
 export function edgeDisplay(
   state: HoverState,
@@ -1278,7 +1278,11 @@ export function edgeDisplay(
   if (state.hovered !== null) return { ...attrs, hidden: true };
   if (endpointAttrs) {
     const { source: s, target: t } = endpointAttrs;
-    if (s.dustRank !== undefined || t.dustRank !== undefined) return { ...attrs, hidden: true };
+    if (s.dustRank !== undefined || t.dustRank !== undefined) {
+      const [dust, dustId, other] = s.dustRank !== undefined ? [s, source, target] : [t, target, source];
+      const shown = (dust.dustRank as number) < lod.dustVisible;
+      if (!shown || dust.dustOf !== other || dustId === other) return { ...attrs, hidden: true };
+    }
     if ((s.island || t.island) && !lod.islandsSolid) return { ...attrs, hidden: true };
   }
   return attrs;

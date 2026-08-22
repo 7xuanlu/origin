@@ -573,12 +573,22 @@ describe("edgeDisplay", () => {
     expect(r2.color).toBe(PALETTE.edgeStrong);
   });
 
-  it("hides a memory's edges at rest and shows them while an endpoint is hovered", () => {
+  it("draws a shown memory's thread to its anchor and hides the rest until a hover", () => {
     const rest: HoverState = { hovered: null, neighbors: new Set() };
-    const ends = { source: { dustRank: 0, dustOf: "b" }, target: {} };
-    expect(edgeDisplay(rest, "e1", "m", "b", attrs, PALETTE, lodFor(1), ends).hidden).toBe(true);
+    // Dot shown at this zoom (rank 0 < 6): its anchor thread is drawn...
+    const anchored = { source: { dustRank: 0, dustOf: "b" }, target: {} };
+    expect(edgeDisplay(rest, "e1", "m", "b", attrs, PALETTE, lodFor(1), anchored)).toEqual(attrs);
+    // ...either way round...
+    expect(edgeDisplay(rest, "e1", "b", "m", attrs, PALETTE, lodFor(1), { source: {}, target: { dustRank: 0, dustOf: "b" } })).toEqual(attrs);
+    // ...but not its edge to some other entity (it would cross the map).
+    expect(edgeDisplay(rest, "e2", "m", "c", attrs, PALETTE, lodFor(1), anchored).hidden).toBe(true);
+    // A dot the zoom hides keeps its thread hidden too.
+    const deep = { source: { dustRank: 10, dustOf: "b" }, target: {} };
+    expect(edgeDisplay(rest, "e1", "m", "b", attrs, PALETTE, lodFor(1), deep).hidden).toBe(true);
+    expect(edgeDisplay(rest, "e1", "m", "b", attrs, PALETTE, lodFor(2), deep)).toEqual(attrs);
+    // Hovering an endpoint shows everything incident as before.
     const hover: HoverState = { hovered: "b", neighbors: new Set(["m"]) };
-    expect(edgeDisplay(hover, "e1", "m", "b", attrs, PALETTE, lodFor(1), ends).hidden).toBeUndefined();
+    expect(edgeDisplay(hover, "e1", "m", "b", attrs, PALETTE, lodFor(1), deep).hidden).toBeUndefined();
   });
 
   it("hides an island's edges while the island is dim", () => {
