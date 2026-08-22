@@ -4,6 +4,7 @@ import type Graph from "graphology";
 import type { ForceLink, SimulationLinkDatum } from "d3-force";
 import type { GraphModel, GraphNode, GraphEdge } from "./model";
 import type { GraphPalette } from "./palette";
+import { compositeOver } from "./palette";
 import {
   buildAtlasGraph,
   runAtlasLayout,
@@ -13,14 +14,17 @@ import {
   satellitePlan,
   placeSatellites,
   shelveComponents,
-  SHELF_GAP,
-  SHELF_TOP_GAP,
-  SHELF_WIDTH_FACTOR,
+  ISLAND_GAP,
+  satelliteAnchor,
+  annotateDust,
+  dustVisibleCount,
+  lodFor,
+  HOVER_DUST_MAX,
   hoverStateFor,
   nodeDisplay,
   edgeDisplay,
-  drawPageRings,
   drawRadialNodeLabel,
+  NODE_LABEL_FONT,
 } from "./atlas";
 import type { HoverState, AtlasSimNode, AtlasSimLink } from "./atlas";
 
@@ -38,8 +42,6 @@ const PALETTE: GraphPalette = {
   // Black surface keeps the composite math legible: composited channel is
   // just slotChannel * alpha.
   surface: "#000000",
-  hull: "rgba(1,2,3,0.05)",
-  hullBorder: "rgba(1,2,3,0.16)",
   graticule: "rgba(4,5,6,0.13)",
   bridge: "#bbbbbb",
   memory: "#cccccc",
@@ -128,7 +130,7 @@ describe("buildAtlasGraph", () => {
     expect(graph.getNodeAttribute("x", "color")).toBe("#333333");
   });
 
-  it("gives a confirmed node a larger size base than an unconfirmed one at equal degree, capped at 12", () => {
+  it("gives a confirmed node a larger size base than an unconfirmed one at equal degree, capped at 14", () => {
     const model = makeModel([
       node({ id: "conf", confirmed: true, degree: 2 }),
       node({ id: "unconf", confirmed: false, degree: 2 }),
@@ -136,12 +138,12 @@ describe("buildAtlasGraph", () => {
       node({ id: "hub", confirmed: true, degree: 300 }),
     ]);
     const graph = buildAtlasGraph(model, PALETTE);
-    // base + 1.6 * log2(1 + degree); log2(3) = 1.585.
-    const growth = 1.6 * Math.log2(3);
+    // base + 1.9 * log2(1 + degree); log2(3) = 1.585.
+    const growth = 1.9 * Math.log2(3);
     expect(graph.getNodeAttribute("conf", "size")).toBeCloseTo(4 + growth, 10);
     expect(graph.getNodeAttribute("unconf", "size")).toBeCloseTo(3 + growth, 10);
     expect(graph.getNodeAttribute("unknown", "size")).toBeCloseTo(3 + growth, 10);
-    expect(graph.getNodeAttribute("hub", "size")).toBe(12);
+    expect(graph.getNodeAttribute("hub", "size")).toBe(14);
   });
 
   it("keeps a wiki page on the entity scale and a memory below it, capped", () => {
@@ -152,13 +154,13 @@ describe("buildAtlasGraph", () => {
       node({ id: "memhub", entityType: "memory", confirmed: true, degree: 300 }),
     ]);
     const graph = buildAtlasGraph(model, PALETTE);
-    const growth = 1.6 * Math.log2(4);
+    const growth = 1.9 * Math.log2(4);
     expect(graph.getNodeAttribute("page", "size")).toBeCloseTo(3 + growth, 10);
     expect(graph.getNodeAttribute("entity", "size")).toBeCloseTo(3 + growth, 10);
     // Memories are context: they start lowest and are capped well under the
     // entity/page ceiling, so a much-cited memory can never dominate.
-    expect(graph.getNodeAttribute("memory", "size")).toBe(4);
-    expect(graph.getNodeAttribute("memhub", "size")).toBe(4);
+    expect(graph.getNodeAttribute("memory", "size")).toBe(3);
+    expect(graph.getNodeAttribute("memhub", "size")).toBe(3);
   });
 
   it("draws a shared-source edge thinner than a real link and keeps the verb on the edge", () => {
@@ -178,37 +180,9 @@ describe("buildAtlasGraph", () => {
       ],
     );
     const graph = buildAtlasGraph(model, PALETTE);
-    expect(graph.getEdgeAttribute("w", "size")).toBe(1.5);
-    expect(graph.getEdgeAttribute("s", "size")).toBe(0.8);
+    expect(graph.getEdgeAttribute("w", "size")).toBe(1);
+    expect(graph.getEdgeAttribute("s", "size")).toBe(0.6);
     expect(graph.getEdgeAttribute("s", "edgeType")).toBe("shared_source");
-  });
-
-  it("rings every page node just outside its disc, in the page ink", () => {
-    const calls: string[] = [];
-    const ctx = {
-      save: () => calls.push("save"),
-      restore: () => calls.push("restore"),
-      beginPath: () => calls.push("beginPath"),
-      stroke: () => calls.push("stroke"),
-      arc: (x: number, y: number, r: number) => calls.push(`arc:${x},${y},${r}`),
-      strokeStyle: "",
-      lineWidth: 0,
-    } as unknown as CanvasRenderingContext2D;
-    drawPageRings(ctx, [{ x: 10, y: 20, size: 5 }], PALETTE);
-    expect(ctx.strokeStyle).toBe(PALETTE.page);
-    expect(ctx.lineWidth).toBe(1);
-    // Radius is the disc plus a 2px gap, so the ring reads as a separate mark
-    // rather than a slightly fatter dot — round 3 tightened both the gap and
-    // the stroke so dense page clusters stop merging into one teal mass.
-    expect(calls).toContain("arc:10,20,7");
-    expect(calls.filter((c) => c === "stroke")).toHaveLength(1);
-  });
-
-  it("draws nothing when there are no pages on the map", () => {
-    let touched = false;
-    const ctx = { save: () => (touched = true) } as unknown as CanvasRenderingContext2D;
-    drawPageRings(ctx, [], PALETTE);
-    expect(touched).toBe(false);
   });
 
   it("stores confirmed on the node so theme recoloring can recompute the tiered fill", () => {
@@ -216,56 +190,24 @@ describe("buildAtlasGraph", () => {
     expect(graph.getNodeAttribute("a", "confirmed")).toBeNull();
   });
 
-  it("colors edges with the palette's quiet edge tone, size 1.5 (CSS px — old graph's exact stroke)", () => {
+  it("colors edges with the palette's quiet edge tone, size 1 (CSS px — the hairline default)", () => {
     const model = makeModel(
       [node({ id: "a" }), node({ id: "b" })],
       [edge({ id: "e1", source: "a", target: "b" })],
     );
     const graph = buildAtlasGraph(model, PALETTE);
     expect(graph.getEdgeAttribute("e1", "color")).toBe(PALETTE.edge);
-    expect(graph.getEdgeAttribute("e1", "size")).toBe(1.5);
+    expect(graph.getEdgeAttribute("e1", "size")).toBe(1);
   });
 
-  it("paints an edge between two real regions in the amber bridge ink, slightly thinner", () => {
-    // Two triangles joined by a1–b1 — the canonical bridge fixture.
-    const model = makeModel(
-      ["a1", "a2", "a3", "b1", "b2", "b3"].map((id) => node({ id })),
-      [
-        edge({ id: "ea1", source: "a1", target: "a2" }),
-        edge({ id: "ea2", source: "a2", target: "a3" }),
-        edge({ id: "ea3", source: "a3", target: "a1" }),
-        edge({ id: "eb1", source: "b1", target: "b2" }),
-        edge({ id: "eb2", source: "b2", target: "b3" }),
-        edge({ id: "eb3", source: "b3", target: "b1" }),
-        edge({ id: "bridge", source: "a1", target: "b1" }),
-      ],
-    );
-    const communities = new Map<string, string>([
-      ["a1", "0"],
-      ["a2", "0"],
-      ["a3", "0"],
-      ["b1", "1"],
-      ["b2", "1"],
-      ["b3", "1"],
-    ]);
-    const graph = buildAtlasGraph(model, PALETTE, communities);
-    expect(graph.getEdgeAttribute("bridge", "color")).toBe(PALETTE.bridge);
-    expect(graph.getEdgeAttribute("bridge", "size")).toBe(1.4);
-    expect(graph.getEdgeAttribute("bridge", "bridge")).toBe(true);
-    // Intra-region edges keep the quiet tone.
-    expect(graph.getEdgeAttribute("ea1", "color")).toBe(PALETTE.edge);
-    expect(graph.getEdgeAttribute("ea1", "size")).toBe(1.5);
-    expect(graph.getEdgeAttribute("ea1", "bridge")).toBe(false);
-  });
-
-  it("treats every edge as normal when no community map is passed", () => {
+  it("paints nothing amber at rest — every edge carries palette.edge and no bridge attribute", () => {
     const model = makeModel(
       [node({ id: "a" }), node({ id: "b" })],
       [edge({ id: "e1", source: "a", target: "b" })],
     );
     const graph = buildAtlasGraph(model, PALETTE);
     expect(graph.getEdgeAttribute("e1", "color")).toBe(PALETTE.edge);
-    expect(graph.getEdgeAttribute("e1", "bridge")).toBe(false);
+    expect(graph.getEdgeAttribute("e1", "bridge")).toBeUndefined();
   });
 
   it("keeps distinct parallel relations between the same pair as distinct edges", () => {
@@ -557,6 +499,41 @@ describe("nodeDisplay", () => {
     expect(result.label).toBe("");
     expect(result.zIndex).toBe(0);
   });
+
+  const rest: HoverState = { hovered: null, neighbors: new Set() };
+
+  it("hides dust past the zoom's visible count, and shows it all when its anchor is hovered", () => {
+    const dust = { ...attrs, dustRank: 7, dustOf: "hub" };
+    const opening = lodFor(1);
+    expect(nodeDisplay(rest, "m", dust, PALETTE, opening).hidden).toBe(true);
+    expect(nodeDisplay(rest, "m", { ...dust, dustRank: 5 }, PALETTE, opening).hidden).toBeUndefined();
+    const hoverHub: HoverState = { hovered: "hub", neighbors: new Set(["m"]) };
+    expect(nodeDisplay(hoverHub, "m", dust, PALETTE, opening).hidden).toBeUndefined();
+    // ...up to HOVER_DUST_MAX of them; the rest wait for the zoom.
+    expect(nodeDisplay(hoverHub, "m", { ...dust, dustRank: HOVER_DUST_MAX }, PALETTE, opening).hidden).toBe(true);
+    expect(nodeDisplay(hoverHub, "m", { ...dust, dustRank: HOVER_DUST_MAX }, PALETTE, lodFor(4)).hidden).toBeUndefined();
+    // Zoomed in twice: eighteen show; four times: everything.
+    expect(nodeDisplay(rest, "m", dust, PALETTE, lodFor(2)).hidden).toBeUndefined();
+    expect(nodeDisplay(rest, "m", { ...dust, dustRank: 40 }, PALETTE, lodFor(2)).hidden).toBe(true);
+    expect(nodeDisplay(rest, "m", { ...dust, dustRank: 400 }, PALETTE, lodFor(4)).hidden).toBeUndefined();
+  });
+
+  it("draws an island node dim and nameless at the opening view, solid once zoomed in", () => {
+    const island = { ...attrs, island: true };
+    const dim = nodeDisplay(rest, "i", island, PALETTE, lodFor(1));
+    expect(dim.label).toBe("");
+    expect(dim.color).not.toBe(attrs.color);
+    expect(dim.color).toBe(compositeOver(attrs.color, PALETTE.surface, 0.3));
+    const solid = nodeDisplay(rest, "i", island, PALETTE, lodFor(2));
+    expect(solid).toEqual(island);
+  });
+
+  it("steps the visible dust count 6 / 18 / all with zoom", () => {
+    expect(dustVisibleCount(1)).toBe(6);
+    expect(dustVisibleCount(1.9)).toBe(6);
+    expect(dustVisibleCount(2)).toBe(18);
+    expect(dustVisibleCount(4)).toBe(Infinity);
+  });
 });
 
 describe("edgeDisplay", () => {
@@ -595,6 +572,31 @@ describe("edgeDisplay", () => {
     expect(r1.color).toBe(PALETTE.edgeStrong);
     expect(r2.color).toBe(PALETTE.edgeStrong);
   });
+
+  it("draws a shown memory's thread to its anchor and hides the rest until a hover", () => {
+    const rest: HoverState = { hovered: null, neighbors: new Set() };
+    // Dot shown at this zoom (rank 0 < 6): its anchor thread is drawn...
+    const anchored = { source: { dustRank: 0, dustOf: "b" }, target: {} };
+    expect(edgeDisplay(rest, "e1", "m", "b", attrs, PALETTE, lodFor(1), anchored)).toEqual(attrs);
+    // ...either way round...
+    expect(edgeDisplay(rest, "e1", "b", "m", attrs, PALETTE, lodFor(1), { source: {}, target: { dustRank: 0, dustOf: "b" } })).toEqual(attrs);
+    // ...but not its edge to some other entity (it would cross the map).
+    expect(edgeDisplay(rest, "e2", "m", "c", attrs, PALETTE, lodFor(1), anchored).hidden).toBe(true);
+    // A dot the zoom hides keeps its thread hidden too.
+    const deep = { source: { dustRank: 10, dustOf: "b" }, target: {} };
+    expect(edgeDisplay(rest, "e1", "m", "b", attrs, PALETTE, lodFor(1), deep).hidden).toBe(true);
+    expect(edgeDisplay(rest, "e1", "m", "b", attrs, PALETTE, lodFor(2), deep)).toEqual(attrs);
+    // Hovering an endpoint shows everything incident as before.
+    const hover: HoverState = { hovered: "b", neighbors: new Set(["m"]) };
+    expect(edgeDisplay(hover, "e1", "m", "b", attrs, PALETTE, lodFor(1), deep).hidden).toBeUndefined();
+  });
+
+  it("hides an island's edges while the island is dim", () => {
+    const rest: HoverState = { hovered: null, neighbors: new Set() };
+    const ends = { source: { island: true }, target: { island: true } };
+    expect(edgeDisplay(rest, "e1", "a", "b", attrs, PALETTE, lodFor(1), ends).hidden).toBe(true);
+    expect(edgeDisplay(rest, "e1", "a", "b", attrs, PALETTE, lodFor(2), ends)).toEqual(attrs);
+  });
 });
 
 describe("drawRadialNodeLabel", () => {
@@ -605,7 +607,11 @@ describe("drawRadialNodeLabel", () => {
       globalAlpha: 1,
       textAlign: "",
       textBaseline: "",
+      lineJoin: "",
+      lineWidth: 0,
+      strokeStyle: "",
       fillText: vi.fn(),
+      strokeText: vi.fn(),
     };
   }
 
@@ -651,14 +657,14 @@ describe("drawRadialNodeLabel", () => {
     expect(ctx.fillText).toHaveBeenCalledWith("Alice", 100, 38);
   });
 
-  it("draws 12px system-font ink from settings.labelColor at 85% alpha, restored after", () => {
+  it("draws the shared node-label font from settings.labelColor at 85% alpha, restored after", () => {
     const ctx = mockCtx();
     let alphaAtDraw = 0;
     ctx.fillText.mockImplementation(() => {
       alphaAtDraw = ctx.globalAlpha;
     });
     drawRadialNodeLabel(ctx as any, data, settings, graphWithNodeAt(10, 0));
-    expect(ctx.font).toBe("12px -apple-system, sans-serif");
+    expect(ctx.font).toBe(NODE_LABEL_FONT);
     expect(ctx.fillStyle).toBe("#abcdef");
     expect(alphaAtDraw).toBe(0.85);
     expect(ctx.globalAlpha).toBe(1); // restored — the labels canvas is shared
@@ -668,6 +674,25 @@ describe("drawRadialNodeLabel", () => {
     const ctx = mockCtx();
     drawRadialNodeLabel(ctx as any, { ...data, label: "" }, settings, graphWithNodeAt(10, 0));
     expect(ctx.fillText).not.toHaveBeenCalled();
+  });
+
+  it("strokes a ground-coloured halo behind the label, before the fill, when one is given", () => {
+    const ctx = mockCtx();
+    const order: string[] = [];
+    ctx.strokeText.mockImplementation(() => order.push("stroke"));
+    ctx.fillText.mockImplementation(() => order.push("fill"));
+    drawRadialNodeLabel(ctx as any, data, settings, graphWithNodeAt(10, 0), "#0a0a0a");
+    expect(ctx.lineJoin).toBe("round");
+    expect(ctx.lineWidth).toBe(3);
+    expect(ctx.strokeStyle).toBe("#0a0a0a");
+    expect(ctx.strokeText).toHaveBeenCalledWith("Alice", 88, 50);
+    expect(order).toEqual(["stroke", "fill"]);
+  });
+
+  it("strokes nothing when no halo colour is given", () => {
+    const ctx = mockCtx();
+    drawRadialNodeLabel(ctx as any, data, settings, graphWithNodeAt(10, 0));
+    expect(ctx.strokeText).not.toHaveBeenCalled();
   });
 });
 
@@ -693,8 +718,8 @@ describe("shared-source edges and node size", () => {
       ],
     );
     const graph = buildAtlasGraph(model, PALETTE);
-    expect(graph.getNodeAttribute("asserted", "size")).toBeCloseTo(3 + 1.6 * Math.log2(4), 10);
-    expect(graph.getNodeAttribute("overlap", "size")).toBeCloseTo(3 + 1.6 * Math.log2(2), 10);
+    expect(graph.getNodeAttribute("asserted", "size")).toBeCloseTo(3 + 1.9 * Math.log2(4), 10);
+    expect(graph.getNodeAttribute("overlap", "size")).toBeCloseTo(3 + 1.9 * Math.log2(2), 10);
   });
 
   it("never sizes a node below its base, however many shared-source edges touch it", () => {
@@ -727,7 +752,7 @@ describe("nonSimulatedIds and satellites", () => {
     );
   }
 
-  it("excludes degree-1 memories and isolates, but keeps every other node", () => {
+  it("excludes every memory and every isolate, but keeps every other node", () => {
     const graph = buildAtlasGraph(
       makeModel(
         [...leafModel().nodes, node({ id: "iso" })],
@@ -735,7 +760,51 @@ describe("nonSimulatedIds and satellites", () => {
       ),
       PALETTE,
     );
-    expect(nonSimulatedIds(graph).sort()).toEqual(["iso", "leaf1", "leaf2"]);
+    // `busy` links two entities and is STILL a satellite: a memory never
+    // gets springs of its own, whatever its degree.
+    expect(nonSimulatedIds(graph).sort()).toEqual(["busy", "iso", "leaf1", "leaf2"]);
+  });
+
+  it("anchors a multi-link memory on its most-connected neighbour, ties to the smaller id", () => {
+    const graph = buildAtlasGraph(leafModel(), PALETTE);
+    // hub has degree 4 (peer, leaf1, leaf2, busy); peer has 2.
+    expect(satelliteAnchor(graph, "busy")).toBe("hub");
+    const tie = buildAtlasGraph(
+      makeModel(
+        [node({ id: "b" }), node({ id: "a" }), node({ id: "m", entityType: "memory", confirmed: null })],
+        [
+          edge({ id: "e1", source: "m", target: "b", type: "mentions" }),
+          edge({ id: "e2", source: "m", target: "a", type: "mentions" }),
+        ],
+      ),
+      PALETTE,
+    );
+    expect(satelliteAnchor(tie, "m")).toBe("a");
+    // A memory whose only neighbours are memories has no anchor.
+    const lonely = buildAtlasGraph(
+      makeModel(
+        [
+          node({ id: "m1", entityType: "memory", confirmed: null }),
+          node({ id: "m2", entityType: "memory", confirmed: null }),
+        ],
+        [edge({ id: "e1", source: "m1", target: "m2", type: "mentions" })],
+      ),
+      PALETTE,
+    );
+    expect(satelliteAnchor(lonely, "m1")).toBeUndefined();
+  });
+
+  it("numbers each anchor's satellites by rank and writes the dust bookkeeping onto the graph", () => {
+    const graph = buildAtlasGraph(leafModel(), PALETTE);
+    const plan = satellitePlan(graph);
+    const hubPlan = plan.filter((sat) => sat.anchor === "hub").sort((a, b) => a.rank - b.rank);
+    expect(hubPlan.map((sat) => sat.id)).toEqual(["busy", "leaf1", "leaf2"]);
+    expect(hubPlan.map((sat) => sat.rank)).toEqual([0, 1, 2]);
+    annotateDust(graph, plan);
+    expect(graph.getNodeAttribute("hub", "dustCount")).toBe(3);
+    expect(graph.getNodeAttribute("leaf2", "dustRank")).toBe(2);
+    expect(graph.getNodeAttribute("leaf2", "dustOf")).toBe("hub");
+    expect(graph.getNodeAttribute("peer", "dustCount")).toBeUndefined();
   });
 
   it("does not treat a degree-1 ENTITY as a satellite — only memories orbit", () => {
@@ -743,32 +812,69 @@ describe("nonSimulatedIds and satellites", () => {
     expect(nonSimulatedIds(graph)).not.toContain("peer");
   });
 
-  it("orbits each leaf around its one neighbour at the neighbour's radius plus a gap", () => {
+  it("orbits each memory around its anchor at the anchor's radius plus a gap", () => {
     const graph = buildAtlasGraph(leafModel(), PALETTE);
     graph.setNodeAttribute("hub", "x", 40);
     graph.setNodeAttribute("hub", "y", -15);
     const plan = satellitePlan(graph);
-    expect(plan.map((s) => s.id).sort()).toEqual(["leaf1", "leaf2"]);
+    expect(plan.map((s) => s.id).sort()).toEqual(["busy", "leaf1", "leaf2"]);
     placeSatellites(graph, plan);
     const hubSize = graph.getNodeAttribute("hub", "size") as number;
-    for (const id of ["leaf1", "leaf2"]) {
-      const dx = (graph.getNodeAttribute(id, "x") as number) - 40;
-      const dy = (graph.getNodeAttribute(id, "y") as number) + 15;
-      expect(Math.hypot(dx, dy)).toBeCloseTo(hubSize + 6, 10);
+    for (const sat of plan) {
+      const dx = (graph.getNodeAttribute(sat.id, "x") as number) - 40;
+      const dy = (graph.getNodeAttribute(sat.id, "y") as number) + 15;
+      expect(Math.hypot(dx, dy)).toBeCloseTo(sat.radius, 10);
+      expect(sat.radius).toBeGreaterThanOrEqual(hubSize + 10);
     }
-    // Two leaves on one anchor sit on opposite sides of it, not on top of
-    // each other.
-    expect(plan[0].angle).not.toBe(plan[1].angle);
+    // Three on one anchor sit apart, not on top of each other.
+    expect(new Set(plan.map((s) => s.angle.toFixed(6))).size).toBe(3);
   });
 
-  it("keeps leaf memories out of the simulation and its links", () => {
+  it("keeps every memory out of the simulation and its links", () => {
     const graph = buildAtlasGraph(leafModel(), PALETTE);
     const sim = createAtlasSimulation(graph);
-    expect(sim.nodes().map((n) => n.id).sort()).toEqual(["busy", "hub", "peer"]);
+    expect(sim.nodes().map((n) => n.id).sort()).toEqual(["hub", "peer"]);
     const linkForce = sim.force<ForceLink<AtlasSimNode, SimulationLinkDatum<AtlasSimNode>>>("link");
-    // hub-peer, busy-hub, busy-peer: the two leaf edges are drawn but never
+    // Only hub-peer: every memory edge is drawn (on hover) but never
     // simulated, so d3 is never asked to resolve an endpoint it does not own.
-    expect(linkForce?.links()).toHaveLength(3);
+    expect(linkForce?.links()).toHaveLength(1);
+  });
+
+  it("lays the map out the same with the memories on and off", () => {
+    // Two components of entities, as the base model draws them; the memory
+    // layer then hangs memories on both (attachMemories keeps every base
+    // node's degree, so the fixtures agree on size).
+    const entities = (): { nodes: GraphNode[]; edges: GraphEdge[] } => {
+      const nodes: GraphNode[] = [];
+      const edges: GraphEdge[] = [];
+      for (let i = 0; i < 8; i += 1) {
+        nodes.push(node({ id: `a${i}`, degree: i === 0 ? 7 : 1 }));
+        if (i > 0) edges.push(edge({ id: `ae${i}`, source: "a0", target: `a${i}` }));
+      }
+      for (let i = 0; i < 5; i += 1) {
+        nodes.push(node({ id: `b${i}`, degree: i === 0 || i === 4 ? 1 : 2 }));
+        if (i > 0) edges.push(edge({ id: `be${i}`, source: `b${i - 1}`, target: `b${i}` }));
+      }
+      return { nodes, edges };
+    };
+    const bare = entities();
+    const dressed = entities();
+    for (let i = 0; i < 30; i += 1) {
+      const id = `m${String(i).padStart(2, "0")}`;
+      dressed.nodes.push(node({ id, entityType: "memory", confirmed: null, degree: i % 3 === 0 ? 2 : 1 }));
+      dressed.edges.push(edge({ id: `${id}-a`, source: id, target: i % 2 ? "a0" : "b2", type: "mentions" }));
+      if (i % 3 === 0) dressed.edges.push(edge({ id: `${id}-b`, source: id, target: "a3", type: "mentions" }));
+    }
+    const withoutMemories = buildAtlasGraph(makeModel(bare.nodes, bare.edges), PALETTE);
+    const withMemories = buildAtlasGraph(makeModel(dressed.nodes, dressed.edges), PALETTE);
+    runAtlasLayout(withoutMemories);
+    runAtlasLayout(withMemories);
+    createAtlasSimulation(withoutMemories);
+    createAtlasSimulation(withMemories);
+    for (const { id } of bare.nodes) {
+      expect(withMemories.getNodeAttribute(id, "x")).toBeCloseTo(withoutMemories.getNodeAttribute(id, "x") as number, 6);
+      expect(withMemories.getNodeAttribute(id, "y")).toBeCloseTo(withoutMemories.getNodeAttribute(id, "y") as number, 6);
+    }
   });
 
   it("carries a dragged anchor's leaves along on every tick writeback", () => {
@@ -893,7 +999,7 @@ describe("simulation forces (round 4)", () => {
     );
   }
 
-  it("gives each sim node a collision radius wider than its disc, and pages wider still", () => {
+  it("gives every sim node the same collision radius rule — disc plus COLLIDE_PAD, pages included", () => {
     const model = makeModel(
       [node({ id: "e", degree: 1 }), node({ id: "p", entityType: "page", degree: 1 })],
       [edge({ id: "e1", source: "e", target: "p", type: "about" })],
@@ -904,9 +1010,9 @@ describe("simulation forces (round 4)", () => {
     const byId = new Map(sim.nodes().map((n) => [n.id, n]));
     const entity = byId.get("e")!;
     const page = byId.get("p")!;
+    // Pages no longer carry a separate ring term — same pad as any entity.
     expect(entity.radius).toBe((graph.getNodeAttribute("e", "size") as number) + 2);
-    // Page adds its detached ring (gap 2 + width 1) on top of the same pad.
-    expect(page.radius).toBe((graph.getNodeAttribute("p", "size") as number) + 3 + 2);
+    expect(page.radius).toBe((graph.getNodeAttribute("p", "size") as number) + 2);
   });
 
   it("registers a collide force, so two discs dropped on the same spot separate", () => {
@@ -1027,59 +1133,38 @@ describe("shelveComponents", () => {
     expect((core.minY + core.maxY) / 2).toBeCloseTo(0, 6);
   });
 
-  it("puts every other component BELOW the core, never around it", () => {
-    const { graph, placement } = shelved([9, 6, 5, 5]);
-    const core = box(graph, placement[0] as string[]);
-    for (const ids of placement.slice(1)) {
-      const shelf = box(graph, ids);
-      // Graph +y is screen-up, so "below" is smaller y. The whole shelf box
-      // clears the core's bottom edge by at least SHELF_TOP_GAP.
-      expect(shelf.maxY).toBeLessThanOrEqual(core.minY - SHELF_TOP_GAP + 1e-6);
-    }
-    const first = box(graph, placement[1] as string[]);
-    expect(first.maxY).toBeCloseTo(core.minY - SHELF_TOP_GAP, 6);
-  });
+  /** Shortest distance between two boxes (0 when they touch or overlap). */
+  function boxGap(
+    a: { minX: number; maxX: number; minY: number; maxY: number },
+    b: { minX: number; maxX: number; minY: number; maxY: number },
+  ): number {
+    const dx = Math.max(a.minX - b.maxX, b.minX - a.maxX, 0);
+    const dy = Math.max(a.minY - b.maxY, b.minY - a.maxY, 0);
+    return Math.hypot(dx, dy);
+  }
 
-  it("orders the shelf largest-first, left to right, one SHELF_GAP apart", () => {
-    const { graph, placement } = shelved([12, 7, 6, 5]);
-    const shelf = placement.slice(1);
-    expect(shelf.map((ids) => ids.length)).toEqual([7, 6, 5]);
-    const boxes = shelf.map((ids) => box(graph, ids));
+  it("packs every other component as an island at least ISLAND_GAP clear of the core and of each other", () => {
+    const { graph, placement } = shelved([9, 6, 5, 5, 5, 5, 5, 3, 1]);
+    const boxes = placement.map((ids) => box(graph, ids));
+    const core = boxes[0] as ReturnType<typeof box>;
     for (let i = 1; i < boxes.length; i += 1) {
-      const left = boxes[i - 1] as { maxX: number };
-      const right = boxes[i] as { minX: number };
-      expect(right.minX - left.maxX).toBeCloseTo(SHELF_GAP, 6);
+      expect(boxGap(core, boxes[i] as ReturnType<typeof box>)).toBeGreaterThanOrEqual(ISLAND_GAP - 1e-6);
+      for (let j = i + 1; j < boxes.length; j += 1) {
+        expect(boxGap(boxes[i] as ReturnType<typeof box>, boxes[j] as ReturnType<typeof box>)).toBeGreaterThanOrEqual(
+          ISLAND_GAP - 1e-6,
+        );
+      }
     }
   });
 
-  it("centres each shelf row under the core", () => {
-    const { graph, placement } = shelved([12, 7, 6, 5]);
-    const boxes = placement.slice(1).map((ids) => box(graph, ids));
-    const rowLeft = Math.min(...boxes.map((b) => b.minX));
-    const rowRight = Math.max(...boxes.map((b) => b.maxX));
-    expect((rowLeft + rowRight) / 2).toBeCloseTo(0, 6);
-  });
-
-  it("wraps to another row once a row would run wider than the core allows", () => {
-    // Eight shelf components against a narrow core: one row cannot hold them.
-    const { graph, placement } = shelved([6, 5, 5, 5, 5, 5, 5, 5, 5]);
-    const core = box(graph, placement[0] as string[]);
-    const boxes = placement.slice(1).map((ids) => box(graph, ids));
-    const rows = new Map<string, { minX: number; maxX: number }[]>();
-    for (const b of boxes) {
-      const key = b.maxY.toFixed(6);
-      const list = rows.get(key);
-      if (list) list.push(b);
-      else rows.set(key, [b]);
-    }
-    expect(rows.size).toBeGreaterThan(1);
-    const budget = SHELF_WIDTH_FACTOR * (core.maxX - core.minX);
-    for (const row of rows.values()) {
-      const width = Math.max(...row.map((b) => b.maxX)) - Math.min(...row.map((b) => b.minX));
-      // A row may only exceed the budget when a single component does.
-      const widest = Math.max(...row.map((b) => b.maxX - b.minX));
-      expect(width).toBeLessThanOrEqual(Math.max(budget, widest) + 1e-6);
-    }
+  it("spreads the islands all round the core rather than piling them on one side", () => {
+    const { graph, placement } = shelved([9, 5, 5, 5, 5, 5, 5, 5, 5]);
+    const angles = placement.slice(1).map((ids) => {
+      const b = box(graph, ids);
+      return Math.atan2((b.minY + b.maxY) / 2, (b.minX + b.maxX) / 2);
+    });
+    const quadrants = new Set(angles.map((a) => Math.floor(((a + Math.PI) / (2 * Math.PI)) * 4) % 4));
+    expect(quadrants.size).toBe(4);
   });
 
   it("never overlaps two components", () => {
@@ -1118,67 +1203,51 @@ describe("shelveComponents", () => {
     }
   });
 
-  it("puts lone nodes last, on rows of their own", () => {
-    const { graph, placement } = shelved([9, 5, 1, 1, 3]);
-    // Largest-first among the grouped ones, then the singletons.
+  it("places islands largest first, lone nodes last", () => {
+    const { placement } = shelved([9, 5, 1, 1, 3]);
     expect(placement.slice(1).map((ids) => ids.length)).toEqual([5, 3, 1, 1]);
-    const grouped = placement.slice(1, 3).map((ids) => box(graph, ids));
-    const singles = placement.slice(3).map((ids) => box(graph, ids));
-    const groupedBottom = Math.min(...grouped.map((b) => b.minY));
-    for (const single of singles) {
-      expect(single.maxY).toBeLessThanOrEqual(groupedBottom + 1e-6);
-    }
-    // And the two lone nodes share their own row.
-    expect((singles[0] as { maxY: number }).maxY).toBeCloseTo(
-      (singles[1] as { maxY: number }).maxY,
-      6,
-    );
   });
 
-  it("keeps a shelved component clear of the core's satellite halo", () => {
+  it("measures a component by its discs alone — a memory halo never moves an island", () => {
     const leaves = 40;
-    const nodes: GraphNode[] = [];
-    const edges: GraphEdge[] = [];
-    for (let i = 0; i < 6; i += 1) {
-      nodes.push(node({ id: `k${i}` }));
-      if (i > 0) edges.push(edge({ id: `ke${i}`, source: `k${i - 1}`, target: `k${i}` }));
+    const build = (withLeaves: boolean) => {
+      const nodes: GraphNode[] = [];
+      const edges: GraphEdge[] = [];
+      for (let i = 0; i < 6; i += 1) {
+        nodes.push(node({ id: `k${i}` }));
+        if (i > 0) edges.push(edge({ id: `ke${i}`, source: `k${i - 1}`, target: `k${i}` }));
+      }
+      if (withLeaves) {
+        for (let i = 0; i < leaves; i += 1) {
+          const id = `leaf${String(i).padStart(3, "0")}`;
+          nodes.push(node({ id, entityType: "memory", confirmed: null, degree: 1 }));
+          edges.push(edge({ id: `m${i}`, source: id, target: "k0", type: "mentions" }));
+        }
+      }
+      for (let i = 0; i < 5; i += 1) {
+        nodes.push(node({ id: `s${i}` }));
+        if (i > 0) edges.push(edge({ id: `se${i}`, source: `s${i - 1}`, target: `s${i}` }));
+      }
+      const graph = buildAtlasGraph(makeModel(nodes, edges), PALETTE);
+      // Placed by hand instead of laid out, so the two graphs start equal.
+      for (let i = 0; i < 6; i += 1) {
+        graph.setNodeAttribute(`k${i}`, "x", i * 40);
+        graph.setNodeAttribute(`k${i}`, "y", 0);
+      }
+      for (let i = 0; i < 5; i += 1) {
+        graph.setNodeAttribute(`s${i}`, "x", i * 40);
+        graph.setNodeAttribute(`s${i}`, "y", 500);
+      }
+      return graph;
+    };
+    const bare = build(false);
+    const haloed = build(true);
+    expect(shelveComponents(bare)[0]).toContain("k0");
+    expect(shelveComponents(haloed)[0]).toContain("k0");
+    for (const id of ["k0", "k3", "s0", "s4"]) {
+      expect(haloed.getNodeAttribute(id, "x")).toBeCloseTo(bare.getNodeAttribute(id, "x") as number, 6);
+      expect(haloed.getNodeAttribute(id, "y")).toBeCloseTo(bare.getNodeAttribute(id, "y") as number, 6);
     }
-    for (let i = 0; i < leaves; i += 1) {
-      const id = `leaf${String(i).padStart(3, "0")}`;
-      nodes.push(node({ id, entityType: "memory", confirmed: null, degree: 1 }));
-      edges.push(edge({ id: `m${i}`, source: id, target: "k0", type: "mentions" }));
-    }
-    for (let i = 0; i < 5; i += 1) {
-      nodes.push(node({ id: `s${i}` }));
-      if (i > 0) edges.push(edge({ id: `se${i}`, source: `s${i - 1}`, target: `s${i}` }));
-    }
-    const graph = buildAtlasGraph(makeModel(nodes, edges), PALETTE);
-    // Placed by hand instead of laid out: the whole core sits on one line, so
-    // the ONLY thing that can reach below it is k0's halo.
-    for (let i = 0; i < 6; i += 1) {
-      graph.setNodeAttribute(`k${i}`, "x", i * 40);
-      graph.setNodeAttribute(`k${i}`, "y", 0);
-    }
-    for (let i = 0; i < 5; i += 1) {
-      graph.setNodeAttribute(`s${i}`, "x", i * 40);
-      graph.setNodeAttribute(`s${i}`, "y", 500);
-    }
-    const placement = shelveComponents(graph);
-    placeSatellites(graph, satellitePlan(graph));
-    expect(placement[0]).toContain("k0");
-    const shelf = box(graph, ["s0", "s1", "s2", "s3", "s4"]);
-    const leafSize = graph.getNodeAttribute("leaf000", "size") as number;
-    let lowest = Infinity;
-    for (let i = 0; i < leaves; i += 1) {
-      lowest = Math.min(
-        lowest,
-        (graph.getNodeAttribute(`leaf${String(i).padStart(3, "0")}`, "y") as number) - leafSize,
-      );
-    }
-    // The halo hangs well below the core's own discs, and the shelf still
-    // clears its lowest leaf by the full SHELF_TOP_GAP.
-    expect(lowest).toBeLessThan(-(graph.getNodeAttribute("k0", "size") as number) * 2);
-    expect(shelf.maxY).toBeLessThanOrEqual(lowest - SHELF_TOP_GAP + 1e-6);
   });
 
   it("is deterministic: the same graph shelves the same way twice", () => {
@@ -1280,11 +1349,12 @@ describe("shelveComponents", () => {
     sim.tick(60);
 
     const after = centroid();
-    // The shelf sits BELOW the core, so a centre force that averaged every
-    // node would see a centroid below the origin every tick and walk the
-    // core upward to compensate — the two zones would drift apart. Each
-    // component holding its OWN centroid (not a shared one across the whole
-    // graph) is what keeps the core from chasing the shelf's mass.
+    // The shelf sits off-centre from the core (in the wings, or below it on
+    // overflow rows), so a centre force that averaged every node would see a
+    // lopsided centroid every tick and walk the core to compensate — the
+    // zones would drift apart. Each component holding its OWN centroid (not
+    // a shared one across the whole graph) is what keeps the core from
+    // chasing the shelf's mass.
     expect(Math.hypot(after.x - before.x, after.y - before.y)).toBeLessThan(span * 0.08);
   });
 
@@ -1441,8 +1511,8 @@ describe("shelveComponents", () => {
     // one alpha-scaled impulse per tick to do the whole journey — and alpha is
     // a finite budget. Measured that way, this 200-unit drag settled 77.5
     // units from its slot with its box 13 units inside the core's; the
-    // 100-unit drag settled 33.4 out, past the 24-unit SHELF_GAP that is
-    // supposed to separate the zones. Steering the bulk velocity home instead
+    // 100-unit drag settled 33.4 out, past the gap that is supposed to
+    // separate the zones. Steering the bulk velocity home instead
     // (SHELF_RETURN_RATE) is not alpha-scaled, so the return completes.
     const far = dragAndRelease(200);
     expect(far.offset).toBeLessThan(2);
@@ -1466,10 +1536,12 @@ describe("shelveComponents", () => {
     // Chains this long are the case a centroid hold cannot catch: holding the
     // CENTRE says nothing about which way a body points, and an elongated
     // component in the core's repulsion field pivots to point at the core —
-    // its top edge rises even though its centroid has barely moved. Under the
-    // centroid-only hold this fixture's five-node chain rose 9.1 units toward
-    // the core in 120 ticks and its centroid drifted 1.8; both are near zero
-    // once each node is sprung to its own slot.
+    // its near edge closes in even though its centroid has barely moved
+    // (measured on this fixture: the five-node left-wing chain's centroid
+    // drifted under 1e-13 over 120 ticks while its clearance from the core
+    // fell by ~21 of the 60-unit gap the packing left. Nowhere near an
+    // overlap, and the per-node springs are what stop it going further —
+    // a centroid-only hold has nothing to say about rotation at all).
     const graph = buildAtlasGraph(componentsModel([24, 6, 5]), PALETTE);
     runAtlasLayout(graph);
     const sim = createAtlasSimulation(graph);
@@ -1499,10 +1571,14 @@ describe("shelveComponents", () => {
       const overlaps =
         shelf.minX < core.maxX && core.minX < shelf.maxX && shelf.minY < core.maxY && core.minY < shelf.maxY;
       expect(overlaps).toBe(false);
-      // The shelf is BELOW the core, so "rising toward the core" is maxY
-      // climbing. Bounded well inside the SHELF_GAP the packing left.
-      const rise = shelf.maxY - (boxBefore[i] as { maxY: number }).maxY;
-      expect(rise).toBeLessThan(5);
+      // Measured on the island packing: the island's own box does not move
+      // much (every edge within 8 units over 120 ticks) — it is the CORE
+      // that breathes out a little under the hold, which is its own
+      // business and is what the overlap check above covers.
+      const shelfBefore = boxBefore[i] as ReturnType<typeof box>;
+      for (const side of ["minX", "maxX", "minY", "maxY"] as const) {
+        expect(Math.abs(shelf[side] - shelfBefore[side])).toBeLessThan(8);
+      }
       const after = centroidOf(ids[i] as string[]);
       const b = before[i] as { x: number; y: number };
       expect(Math.hypot(after.x - b.x, after.y - b.y)).toBeLessThan(0.5);

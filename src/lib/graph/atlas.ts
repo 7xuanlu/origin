@@ -18,11 +18,10 @@ import {
   CITES_EDGE_TYPE,
   MEMORY_EDGE_TYPE,
 } from "./model";
-import { nodeFillFor, type GraphPalette } from "./palette";
-import { bridgeEdgeTest } from "./cartography";
+import { compositeOver, nodeFillFor, type GraphPalette } from "./palette";
 
 const MIN_NODE_SIZE = 3;
-const MAX_NODE_SIZE = 12;
+const MAX_NODE_SIZE = 14;
 /** Wiki pages sit on the same scale as entities. Round 3 pulled the base from
  *  3.5 down to the unconfirmed-entity 3: with shared-source overlap no longer
  *  counting toward size (see buildAtlasGraph), a page reads as a subject
@@ -31,15 +30,17 @@ const PAGE_NODE_BASE = 3;
 /** Memory nodes start below the smallest entity and stay there: they are
  *  context around the subjects, and a memory linked to six entities must not
  *  outgrow the entities themselves. */
-const MEMORY_NODE_BASE = 2;
-const MEMORY_MAX_SIZE = 4;
+const MEMORY_NODE_BASE = 1.5;
+const MEMORY_MAX_SIZE = 3;
 /** Px added per doubling of degree. Linear growth (round 1's degree * 0.5)
  *  saturated the cap on real data — 1,600 entities where the hubs run to
  *  hundreds of links drew as one uniform field of 8s. log2 keeps the hubs
- *  visibly bigger while leaving the long tail distinguishable. */
-const DEGREE_GAIN = 1.6;
+ *  visibly bigger while leaving the long tail distinguishable; the gain and
+ *  cap went up together (1.6/12 -> 1.9/14) so a hub reads as a landmark on
+ *  the relief map, not just a slightly larger dot. */
+const DEGREE_GAIN = 1.9;
 
-// Base by stability/kind (confirmed 4, unconfirmed 3, page 3, memory 2)
+// Base by stability/kind (confirmed 4, unconfirmed 3, page 3, memory 1.5)
 // plus DEGREE_GAIN per doubling of degree, capped. Size still encodes
 // confirmation at degree 0, as it did before.
 function nodeSizeFor(confirmed: boolean | null, degree: number, entityType?: string): number {
@@ -52,12 +53,12 @@ function nodeSizeFor(confirmed: boolean | null, degree: number, entityType?: str
   return Math.min(MAX_NODE_SIZE, base + growth);
 }
 
-/** Edge ink and stroke by verb. Shared-source edges are the lightest thing on
- *  the map (they stand for an inferred overlap, not an asserted link); a
- *  bridge stays amber and a hair thinner, per the artifact. */
-export function edgeSizeFor(type: string, bridge: boolean): number {
-  if (type === SHARED_SOURCE_EDGE_TYPE) return 0.8;
-  return bridge ? 1.4 : 1.5;
+/** Edge stroke by verb, in CSS px. Edges are the quietest ink on the map — a
+ *  hairline at rest, so the points carry the picture; a
+ *  shared-source edge (an inferred overlap, not an asserted link) is thinner
+ *  still. Hover emphasis recolours, it does not thicken. */
+export function edgeSizeFor(type: string): number {
+  return type === SHARED_SOURCE_EDGE_TYPE ? 0.6 : 1;
 }
 
 /**
@@ -68,11 +69,7 @@ export function edgeSizeFor(type: string, bridge: boolean): number {
  * distinct relations between the same pair as distinct edges (see model.ts)
  * — a simple graph would throw adding the second one.
  */
-export function buildAtlasGraph(
-  model: GraphModel,
-  palette: GraphPalette,
-  communities?: Map<string, string>,
-): Graph {
+export function buildAtlasGraph(model: GraphModel, palette: GraphPalette): Graph {
   const graph = new Graph({ multi: true });
   // ponytail: the old graph's confirmed-glow halo (r+3 disc at 0.1 alpha) is
   // skipped — it needs a custom WebGL node program in sigma; the tiered fills
@@ -92,9 +89,16 @@ export function buildAtlasGraph(
     }
   }
 
-  const n = model.nodes.length;
-  model.nodes.forEach((node, i) => {
-    const angle = (2 * Math.PI * i) / Math.max(n, 1);
+  // Seed circle over the nodes the layout will move — memories are not among
+  // them (see nonSimulatedIds: a memory rides its anchor), so they are left
+  // off the circle and out of its count. That is what keeps the seed, and so
+  // the whole layout, identical with the memory layer on and off.
+  const seeded = model.nodes.filter((node) => node.entityType !== MEMORY_NODE_TYPE);
+  const n = seeded.length;
+  const seedIndex = new Map(seeded.map((node, i) => [node.id, i]));
+  model.nodes.forEach((node) => {
+    const i = seedIndex.get(node.id);
+    const angle = i === undefined ? 0 : (2 * Math.PI * i) / Math.max(n, 1);
     const sizingDegree = Math.max(0, node.degree - (sharedSourceIncident.get(node.id) ?? 0));
     graph.addNode(node.id, {
       label: node.name,
@@ -104,32 +108,23 @@ export function buildAtlasGraph(
       // Kept on the node so the theme-flip recolor (AtlasView) can recompute
       // the stability-tiered fill without re-reading the model.
       confirmed: node.confirmed,
-      x: Math.cos(angle),
-      y: Math.sin(angle),
+      x: i === undefined ? 0 : Math.cos(angle),
+      y: i === undefined ? 0 : Math.sin(angle),
     });
   });
 
   // ponytail: parallel edges between the same pair draw fully overlapped —
   // a view decision (see model.ts's parallel-edge note), fine at round-1 scale.
-  const isBridge = communities ? bridgeEdgeTest(communities) : () => false;
   for (const edge of model.edges) {
-    // Cross-region edges are the map's bridges: amber, a hair thinner
-    // (the artifact's 1.4 stroke), flagged so the theme-flip recolor keeps
-    // them amber. ponytail: the artifact dashes them too — sigma's stock
-    // edge programs can't dash; custom WebGL program if the solid amber
-    // isn't distinct enough.
-    const bridge = isBridge(edge.source, edge.target);
     graph.addEdgeWithKey(edge.id, edge.source, edge.target, {
-      // Kept on the edge so the theme-flip and cartography recolors can
-      // recompute ink and stroke without re-reading the model.
+      // Kept on the edge so the hover reducer can read the verb without
+      // re-reading the model.
       edgeType: edge.type,
-      // Rendered 1:1 in CSS px (AtlasView pins zoomToSizeRatioFunction to 1),
-      // calibrated to the old canvas graph's exact stroke: lineWidth 1 at its
-      // fixed k=1.499 zoom ≈ 1.5 CSS px. Needs minEdgeThickness lowered in
-      // AtlasView — sigma's default floor (1.7) silently bumps this back up.
-      size: edgeSizeFor(edge.type, bridge),
-      color: bridge ? palette.bridge : palette.edge,
-      bridge,
+      // Rendered 1:1 in CSS px (AtlasView pins zoomToSizeRatioFunction to 1).
+      // Needs minEdgeThickness lowered in AtlasView — sigma's default floor
+      // (1.7) silently bumps a hairline back up.
+      size: edgeSizeFor(edge.type),
+      color: palette.edge,
     });
   }
   return graph;
@@ -191,31 +186,58 @@ export function runAtlasLayout(graph: Graph): void {
   });
 }
 
-/** Graph-space clearance between a leaf memory and the disc it orbits. */
-const SATELLITE_GAP = 6;
+/** Graph-space distance from the anchor disc's EDGE to a first-ring leaf
+ *  memory's CENTRE (the leaf's own radius, 1.5-3 px, comes out of it, so the
+ *  edge-to-edge clearance is 7-8.5). Went 6 -> 10 with the memory discs
+ *  shrinking: at 6 the first ring of discs touched the page disc and read
+ *  as a grey ring round a teal one, a donut, on the real map with memories
+ *  on. */
+const SATELLITE_GAP = 10;
 
 /**
- * Nodes no force layout runs on: degree-0 isolates (round 1's ring) plus every
- * degree-1 MEMORY, which round 3 hangs off its one neighbour as a satellite
- * instead. On real data 1,308 of 1,865 memories are such leaves; simulating
- * them buys nothing — a single link has exactly one rest position — and it
- * doubles the cost of every layout step.
+ * Nodes no force layout runs on: degree-0 isolates (round 1's ring) plus EVERY
+ * memory, whatever its degree. A memory is evidence about a subject, not a
+ * place of its own: it rides the subject it says most about (see
+ * satelliteAnchor) instead of pulling subjects together with its own springs.
+ * That is what keeps the map identical with the memory layer on and off — on
+ * real data the layer adds 2,000 memories and 4,910 edges, and simulating
+ * them re-laid the whole map into a pile every time the chip was pressed.
  */
 export function nonSimulatedIds(graph: Graph): string[] {
   const ids: string[] = [];
   graph.forEachNode((id, attrs) => {
-    const degree = graph.degree(id);
-    if (degree === 0 || (degree === 1 && attrs.entityType === MEMORY_NODE_TYPE)) ids.push(id);
+    if (graph.degree(id) === 0 || attrs.entityType === MEMORY_NODE_TYPE) ids.push(id);
   });
   return ids;
 }
 
-/** Where one leaf memory sits relative to the node it hangs off. */
+/** The node a memory rides: its most-connected non-memory neighbour, ties to
+ *  the smaller id so the answer never depends on edge order. A memory linked
+ *  to three entities sits by the hub among them, where the eye looks for it;
+ *  its other links are drawn on hover only (see edgeDisplay). */
+export function satelliteAnchor(graph: Graph, id: string): string | undefined {
+  let best: string | undefined;
+  let bestDegree = -1;
+  for (const neighbour of graph.neighbors(id)) {
+    if (graph.getNodeAttribute(neighbour, "entityType") === MEMORY_NODE_TYPE) continue;
+    const degree = graph.degree(neighbour);
+    if (degree > bestDegree || (degree === bestDegree && best !== undefined && neighbour < best)) {
+      best = neighbour;
+      bestDegree = degree;
+    }
+  }
+  return best;
+}
+
+/** Where one memory sits relative to the node it rides. */
 export interface Satellite {
   id: string;
   anchor: string;
   angle: number;
   radius: number;
+  /** 0-based place in the anchor's halo, inner ring first, ids ascending
+   *  within a ring. The zoom tiers (see dustVisibleCount) show the first N. */
+  rank: number;
 }
 
 /** Smallest arc a satellite may claim on its ring: two disc diameters plus a
@@ -232,9 +254,9 @@ function satelliteRingStep(leafSize: number): number {
 }
 
 /**
- * Deterministic orbits for the leaf memories: each hangs off its one
- * neighbour, sorted by id so the answer never depends on iteration order.
- * Isolates are skipped — they have no anchor to orbit.
+ * Deterministic orbits for the memories: each hangs off its anchor (see
+ * satelliteAnchor), sorted by id so the answer never depends on iteration
+ * order. Isolates are skipped — they have no anchor to orbit.
  *
  * Round 5: leaves fill SHELLS, not a single circle. A ring takes as many
  * leaves as fit at satelliteMinArc spacing and the rest start a new ring
@@ -247,7 +269,7 @@ export function satellitePlan(graph: Graph): Satellite[] {
   const leavesByAnchor = new Map<string, string[]>();
   for (const id of nonSimulatedIds(graph)) {
     if (graph.degree(id) === 0) continue;
-    const anchor = graph.neighbors(id)[0];
+    const anchor = satelliteAnchor(graph, id);
     if (anchor === undefined) continue;
     const list = leavesByAnchor.get(anchor);
     if (list) list.push(id);
@@ -278,6 +300,7 @@ export function satellitePlan(graph: Graph): Satellite[] {
           anchor,
           angle: (2 * Math.PI * i) / count,
           radius,
+          rank: placed + i,
         });
       }
       placed += count;
@@ -305,17 +328,71 @@ export function placeSatellites(graph: Graph, plan: Satellite[], skipId?: string
   }
 }
 
-/** Horizontal clearance between two shelved components, and the vertical
- *  clearance between two shelf rows. */
-export const SHELF_GAP = 24;
-/** Clear air between the core's bottom edge and the top of the shelf. Bigger
- *  than SHELF_GAP so the shelf reads as a separate zone rather than as more
- *  of the core. */
-export const SHELF_TOP_GAP = 60;
-/** A shelf row may run this much wider than the core before it wraps. Wider
- *  than the core so the shelf can hold a few components per row, but bounded
- *  so it never stretches the scene sideways and shrinks the core. */
-export const SHELF_WIDTH_FACTOR = 1.6;
+/** Write the halo bookkeeping the reducers read onto the graph: each memory's
+ *  `dustRank` and `dustOf` (its anchor), and each anchor's `dustCount`. The
+ *  plan is the authority; this just makes it reachable from a node's attrs
+ *  at paint time without a lookup. */
+export function annotateDust(graph: Graph, plan: Satellite[]): void {
+  const counts = new Map<string, number>();
+  for (const satellite of plan) {
+    graph.mergeNodeAttributes(satellite.id, { dustRank: satellite.rank, dustOf: satellite.anchor });
+    counts.set(satellite.anchor, (counts.get(satellite.anchor) ?? 0) + 1);
+  }
+  for (const [anchor, count] of counts) graph.setNodeAttribute(anchor, "dustCount", count);
+}
+
+/**
+ * How many of an anchor's memories are drawn at a given zoom, as a multiple
+ * of the zoom the map opened at (`zoomIn` = mount ratio / current ratio, so 1
+ * at the opening view and 2 when the viewer has zoomed in twice). At the
+ * opening view an anchor shows a pinch of dust — six dots — and a count of
+ * the rest (AtlasView's overlay); closer in, a full first ring and more;
+ * closer still, everything. Hovering the anchor shows everything at any zoom
+ * (see nodeDisplay).
+ */
+export function dustVisibleCount(zoomIn: number): number {
+  if (zoomIn < 2) return 6;
+  if (zoomIn < 4) return 18;
+  return Infinity;
+}
+
+/** How many of an anchor's memories a hover reveals at most. Everything
+ *  would be the honest answer, but the busiest anchor on real data carries
+ *  698 and at the opening zoom they pack into a solid disc; the first rings
+ *  say "a lot" without the blob, and the count beside the anchor says how
+ *  many. Zoom in past 4x to see them all. */
+export const HOVER_DUST_MAX = 48;
+
+/** Zoomed in this much past the opening view, the islands (every component
+ *  but the core) are drawn solid with their names and edges; before that they
+ *  sit dim at the rim so the core is the one thing the eye lands on. */
+export const ISLANDS_SOLID_ZOOM = 2;
+
+/** What the reducers need to know about the camera, refreshed by AtlasView
+ *  before every render. */
+export interface LodState {
+  dustVisible: number;
+  islandsSolid: boolean;
+}
+
+/** The opening view's state: a pinch of dust, islands dim. */
+export const OPENING_LOD: LodState = { dustVisible: dustVisibleCount(1), islandsSolid: false };
+
+export function lodFor(zoomIn: number): LodState {
+  return { dustVisible: dustVisibleCount(zoomIn), islandsSolid: zoomIn >= ISLANDS_SOLID_ZOOM };
+}
+
+/** Clearance between the core's box and the nearest island, and between any
+ *  two islands, in graph units — a moat, so an island never reads as a
+ *  peninsula of the core or of its neighbour. */
+export const ISLAND_GAP = 34;
+/** Islands ring the core on a slight ellipse: screens are wider than tall, so
+ *  a ring squashed to this fraction on y fills the frame instead of piling
+ *  islands into the top and bottom margins. */
+export const ISLAND_RING_SQUASH = 0.8;
+/** How far out an island probes per step while looking for clear water. */
+const ISLAND_STEP = 4;
+const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
 
 /** One component's drawn extent, in graph units. */
 interface ComponentBox {
@@ -329,11 +406,14 @@ interface ComponentBox {
 const boxWidth = (box: ComponentBox): number => box.maxX - box.minX;
 const boxHeight = (box: ComponentBox): number => box.maxY - box.minY;
 
-/** Connected components over the DRAWN graph, in graph node order. Every node
- *  counts, including the leaf memories the sim never touches — a component's
- *  size has to mean what the eye sees, and it is the same number
- *  MIN_COMPONENT_SIZE filters on. */
-function graphComponents(graph: Graph): string[][] {
+/** Connected components over the DRAWN graph, in graph node order, with one
+ *  rule for memories: a memory belongs to its ANCHOR's component and joins
+ *  nothing else. Its other edges are not adjacency here — a memory that
+ *  mentions two entities from two components is evidence about both, not a
+ *  bridge between them, and treating it as one would merge two islands the
+ *  moment the memory layer is turned on. `anchorOf` is the satellite plan's
+ *  memory -> anchor map. */
+function graphComponents(graph: Graph, anchorOf: Map<string, string>): string[][] {
   const parent = new Map<string, string>();
   graph.forEachNode((id) => parent.set(id, id));
   const find = (start: string): string => {
@@ -348,10 +428,16 @@ function graphComponents(graph: Graph): string[][] {
     return root;
   };
   graph.forEachEdge((_key, _attrs, source, target) => {
+    if (anchorOf.has(source) || anchorOf.has(target)) return;
     const a = find(source);
     const b = find(target);
     if (a !== b) parent.set(a, b);
   });
+  for (const [memory, anchor] of anchorOf) {
+    const a = find(memory);
+    const b = find(anchor);
+    if (a !== b) parent.set(a, b);
+  }
   const groups = new Map<string, string[]>();
   graph.forEachNode((id) => {
     const root = find(id);
@@ -362,28 +448,11 @@ function graphComponents(graph: Graph): string[][] {
   return [...groups.values()];
 }
 
-/** How far each anchor's satellite halo reaches past the anchor's own centre:
- *  the outermost shell radius plus that leaf's disc. Measuring the leaves
- *  where they currently sit would depend on placeSatellites having run; the
- *  plan gives the same answer from geometry alone. */
-function satelliteReach(plan: Satellite[], sizeOf: (id: string) => number): Map<string, number> {
-  const reach = new Map<string, number>();
-  for (const satellite of plan) {
-    const outer = satellite.radius + sizeOf(satellite.id);
-    reach.set(satellite.anchor, Math.max(reach.get(satellite.anchor) ?? 0, outer));
-  }
-  return reach;
-}
-
-/** Bounding box of a component's ink: every node's disc, and every anchor's
- *  satellite halo. Satellites are skipped as nodes (their own position is
- *  derived from the anchor) and counted through the anchor's reach instead. */
-function measureComponent(
-  graph: Graph,
-  ids: string[],
-  reach: Map<string, number>,
-  satellites: Set<string>,
-): ComponentBox {
+/** Bounding box of a component's ink: every node's disc. Satellites are
+ *  skipped — a memory's dust is drawn at most a few dots deep at the opening
+ *  view and never counts toward the room a component takes, which is what
+ *  keeps the memory layer from reshaping the map. */
+function measureComponent(graph: Graph, ids: string[], satellites: Set<string>): ComponentBox {
   let minX = Infinity;
   let maxX = -Infinity;
   let minY = Infinity;
@@ -392,7 +461,7 @@ function measureComponent(
     if (satellites.has(id)) continue;
     const x = graph.getNodeAttribute(id, "x") as number;
     const y = graph.getNodeAttribute(id, "y") as number;
-    const pad = Math.max((graph.getNodeAttribute(id, "size") as number) ?? 0, reach.get(id) ?? 0);
+    const pad = (graph.getNodeAttribute(id, "size") as number) ?? 0;
     minX = Math.min(minX, x - pad);
     maxX = Math.max(maxX, x + pad);
     minY = Math.min(minY, y - pad);
@@ -406,59 +475,58 @@ function measureComponent(
   return { ids, minX, maxX, minY, maxY };
 }
 
-/** Greedy row filling: a component joins the current row unless that would
- *  push the row past `maxWidth`. Every row holds at least one component, so a
- *  single component wider than the budget gets a row to itself. */
-function shelfRows(boxes: ComponentBox[], maxWidth: number): ComponentBox[][] {
-  const rows: ComponentBox[][] = [];
-  let row: ComponentBox[] = [];
-  let width = 0;
-  for (const box of boxes) {
-    const added = row.length === 0 ? boxWidth(box) : width + SHELF_GAP + boxWidth(box);
-    if (row.length > 0 && added > maxWidth) {
-      rows.push(row);
-      row = [box];
-      width = boxWidth(box);
-      continue;
-    }
-    row.push(box);
-    width = added;
-  }
-  if (row.length > 0) rows.push(row);
-  return rows;
+/** A placed island: centre and the radius of the circle it claims. */
+interface Island {
+  x: number;
+  y: number;
+  r: number;
+}
+
+/** Shortest distance from a point to an axis-aligned box (0 inside it). */
+function distanceToBox(x: number, y: number, box: ComponentBox): number {
+  const dx = Math.max(box.minX - x, 0, x - box.maxX);
+  const dy = Math.max(box.minY - y, 0, y - box.maxY);
+  return Math.hypot(dx, dy);
 }
 
 /**
- * Round 5, section A. Two zones, never a ring.
+ * Round 7. Islands, not wings.
  *
  * The biggest component is the CORE: it keeps the layout the sim gave it and
- * is recentred so its bbox centre is the origin. Every other component is
- * translated RIGIDLY onto a SHELF below the core — largest first, left to
- * right, rows centred under the core, wrapping once a row would run wider
- * than SHELF_WIDTH_FACTOR times the core. Singleton components go last, on
- * rows of their own, because a row of lone dots reads as a legend rather than
- * as structure.
+ * is recentred so its bbox centre is the origin. Every other component is an
+ * ISLAND — a circle the size of its own half-diagonal — placed largest first
+ * on a golden-angle spiral round the core: each walks out along its own angle
+ * until it clears the core's box and every island already placed by
+ * ISLAND_GAP. Big islands therefore sit nearest the core and the singletons
+ * (lone nodes, shown only when the reader turns the small groups on) end up
+ * on the outer rim. The ring is squashed to ISLAND_RING_SQUASH on y so it
+ * fills a landscape viewport.
  *
- * This replaces round 4's phyllotaxis packing. Arranging the small components
- * AROUND the core drew an almost complete perimeter, which reads as a false
- * core-and-periphery hierarchy and shrinks the one thing a viewer has to
- * grasp first.
+ * A full ring was tried once before (round 4) and dropped because it read as
+ * a false core-and-periphery hierarchy and shrank the core; the wings that
+ * replaced it (round 6) were rejected by the reader outright. The difference
+ * now is zoom: at the opening view the islands are drawn dim, no names, no
+ * edges (see LodState), so the eye lands on the core and the islands are a
+ * rim the viewer knows is there. Zoom in past ISLANDS_SOLID_ZOOM and they
+ * come up solid.
  *
  * Returns the node ids of each component in placement order — the core first,
- * so the caller can tell it from the shelved ones and hold each kind the way
- * it needs (rigid centroid for the core, springs for the shelf).
+ * so the caller can tell it from the islands and hold each kind the way it
+ * needs (rigid centroid for the core, springs for the islands).
  *
  * Pure in the sense that matters here: it reads x/y/size off the graph and
  * writes x/y back, touching nothing else and consulting no clock or random.
  */
 export function shelveComponents(graph: Graph): string[][] {
   if (graph.order === 0) return [];
-  const plan = satellitePlan(graph);
-  const satellites = new Set(plan.map((satellite) => satellite.id));
-  const reach = satelliteReach(plan, (id) => (graph.getNodeAttribute(id, "size") as number) ?? 0);
-  const boxes = graphComponents(graph)
-    .map((ids) => measureComponent(graph, ids, reach, satellites))
-    .sort((a, b) => b.ids.length - a.ids.length || ((a.ids[0] as string) < (b.ids[0] as string) ? -1 : 1));
+  const anchorOf = new Map(satellitePlan(graph).map((satellite) => [satellite.id, satellite.anchor]));
+  const satellites = new Set(anchorOf.keys());
+  // Ranked by the nodes that take room — satellites count for nothing here
+  // either, or the memory layer could promote an island to core.
+  const weight = (box: ComponentBox) => box.ids.filter((id) => !satellites.has(id)).length;
+  const boxes = graphComponents(graph, anchorOf)
+    .map((ids) => measureComponent(graph, ids, satellites))
+    .sort((a, b) => weight(b) - weight(a) || ((a.ids[0] as string) < (b.ids[0] as string) ? -1 : 1));
 
   const translate = (box: ComponentBox, dx: number, dy: number) => {
     for (const id of box.ids) {
@@ -474,30 +542,26 @@ export function shelveComponents(graph: Graph): string[][] {
   const core = boxes[0] as ComponentBox;
   translate(core, -(core.minX + core.maxX) / 2, -(core.minY + core.maxY) / 2);
 
-  const rest = boxes.slice(1);
-  // Sizes already descend, so splitting on "is it a lone node" keeps both
-  // halves largest-first: 4s, then 3s, then pairs, then the singletons.
-  const grouped = rest.filter((box) => box.ids.length > 1);
-  const singletons = rest.filter((box) => box.ids.length === 1);
-  const maxWidth = SHELF_WIDTH_FACTOR * boxWidth(core);
-  const rows = [...shelfRows(grouped, maxWidth), ...shelfRows(singletons, maxWidth)];
-
-  // Graph +y is screen-up (see drawRadialNodeLabel), so "below the core" is
-  // DECREASING y: each row hangs off the bottom edge of the one above it.
-  let rowTop = core.minY - SHELF_TOP_GAP;
-  for (const row of rows) {
-    const rowWidth = row.reduce((sum, box) => sum + boxWidth(box), 0) + SHELF_GAP * (row.length - 1);
-    let left = -rowWidth / 2;
-    let tallest = 0;
-    for (const box of row) {
-      translate(box, left - box.minX, rowTop - box.maxY);
-      left += boxWidth(box) + SHELF_GAP;
-      tallest = Math.max(tallest, boxHeight(box));
+  const placed: Island[] = [];
+  boxes.slice(1).forEach((box, i) => {
+    const r = Math.hypot(boxWidth(box), boxHeight(box)) / 2;
+    const angle = i * GOLDEN_ANGLE;
+    // Start at the core's nearer half-extent: nothing closer can clear it.
+    let d = Math.min(boxWidth(core), boxHeight(core)) / 2;
+    for (;;) {
+      const x = Math.cos(angle) * d;
+      const y = Math.sin(angle) * d * ISLAND_RING_SQUASH;
+      const clearOfCore = distanceToBox(x, y, core) >= r + ISLAND_GAP;
+      if (clearOfCore && placed.every((p) => Math.hypot(p.x - x, p.y - y) >= p.r + r + ISLAND_GAP)) {
+        placed.push({ x, y, r });
+        translate(box, x - (box.minX + box.maxX) / 2, y - (box.minY + box.maxY) / 2);
+        break;
+      }
+      d += ISLAND_STEP;
     }
-    rowTop -= tallest + SHELF_GAP;
-  }
+  });
 
-  return [core.ids, ...rows.flat().map((box) => box.ids)];
+  return [core.ids, ...boxes.slice(1).map((box) => box.ids)];
 }
 
 /** The sim plus the one thing the view has to tell it: which node the pointer
@@ -513,7 +577,7 @@ export interface AtlasSimulation extends Simulation<AtlasSimNode, undefined> {
 
 export interface AtlasSimNode extends SimulationNodeDatum {
   id: string;
-  /** Collision radius: the drawn disc, plus a page's ring, plus COLLIDE_PAD. */
+  /** Collision radius: the drawn disc plus COLLIDE_PAD. */
   radius: number;
 }
 
@@ -542,7 +606,7 @@ const COLLIDE_PAD = 2;
  *  inferred overlap, so it sits long and slack — it should suggest that two
  *  pages are near each other, not staple them together. A wikilink is an
  *  asserted link between pages, so it is shorter and firmer, but still longer
- *  than a relation because page discs carry a ring. */
+ *  than a relation so page clusters read as a stratum, not a clump. */
 const LINK_LAYOUT: Record<string, { distance: number; strength: number }> = {
   [SHARED_SOURCE_EDGE_TYPE]: { distance: 70, strength: 0.15 },
   [WIKILINK_EDGE_TYPE]: { distance: 50, strength: 0.5 },
@@ -941,9 +1005,9 @@ export function relaxShelf(
 
 /** d3-force simulation over the live graphology graph — the interaction engine.
  *  Sim nodes are the drawable graph MINUS the nodes nonSimulatedIds names:
- *  degree-0 isolates and every degree-1 memory. Neither is simulated —
+ *  degree-0 isolates and every memory. Neither is simulated —
  *  isolates are not drawn at all once drawableModel drops components under
- *  MIN_COMPONENT_SIZE, and a leaf memory rides its anchor as a satellite.
+ *  MIN_COMPONENT_SIZE, and a memory rides its anchor as a satellite.
  *  Matches the retired ConstellationMap feel: charge -40,
  *  centre-on-origin (groupCenterForce), alphaDecay 0.03, velocityDecay 0.25, d3-default link
  *  force. Parallel edges collapse to one link per undirected pair (d3 sums
@@ -959,25 +1023,22 @@ export function createAtlasSimulation(
 ): AtlasSimulation {
   const excluded = new Set(nonSimulatedIds(graph));
   const satellites = satellitePlan(graph);
+  annotateDust(graph, satellites);
   const nodes: AtlasSimNode[] = [];
   graph.forEachNode((id, attrs) => {
     if (excluded.has(id)) return;
-    // A page is drawn as a disc plus a detached ring, so its footprint is
-    // wider than its `size` — collide against the ring or the rings overlap.
-    const ring =
-      attrs.entityType === PAGE_NODE_TYPE ? PAGE_RING_GAP + PAGE_RING_WIDTH : 0;
     nodes.push({
       id,
       x: attrs.x as number,
       y: attrs.y as number,
-      radius: (attrs.size as number) + ring + COLLIDE_PAD,
+      radius: (attrs.size as number) + COLLIDE_PAD,
     });
   });
 
   const linkByPair = new Map<string, AtlasSimLink>();
   graph.forEachEdge((_edge, attrs, source, target) => {
     // A link to a node the sim doesn't own would make d3 throw looking the
-    // endpoint up; a leaf memory's one edge is drawn but never simulated.
+    // endpoint up; a memory's edges are drawn (on hover) but never simulated.
     if (excluded.has(source) || excluded.has(target)) return;
     const pairKey = [source, target].sort().join("|");
     const type = (attrs.edgeType as string) ?? "";
@@ -1037,9 +1098,9 @@ export function createAtlasSimulation(
       graph.setNodeAttribute(node.id, "x", node.x);
       graph.setNodeAttribute(node.id, "y", node.y);
     }
-    // Leaf memories ride their anchor, so they are re-placed after every
+    // Memories ride their anchor, so they are re-placed after every
     // position writeback — including mid-drag, which is what carries a
-    // dragged entity's memories along with it. The one exception is a leaf
+    // dragged entity's memories along with it. The one exception is a memory
     // the pointer is holding: that one is being positioned by hand.
     placeSatellites(graph, satellites, draggingId);
     onTick?.();
@@ -1059,13 +1120,16 @@ export function createAtlasSimulation(
 
   // Settle to equilibrium synchronously before first paint (≈ full alpha
   // decay at 0.03 when the budget allows it) — see the doc comment above.
-  sim.tick(settleTicks(graph.order));
+  // Budgeted by the nodes the sim owns, not the graph: memories are not
+  // simulated, and counting them would change the settle with the layer.
+  sim.tick(settleTicks(nodes.length));
 
   // Round 5: the settle leaves every small component on roughly one circle
   // around the core (charge pushes out, forceCenter pulls in, and they
-  // balance at about the same radius for all of them). Move them onto a shelf
-  // below the core instead, then copy those positions back INTO the sim so a
-  // later drag flexes the real layout rather than snapping to the ring.
+  // balance at about the same radius for all of them). Pack them as islands
+  // round the core instead (see shelveComponents), then copy those positions
+  // back INTO the sim so a later drag flexes the real layout rather than
+  // snapping to the ring.
   let placement = shelveComponents(graph);
   for (const node of nodes) {
     node.x = graph.getNodeAttribute(node.id, "x") as number;
@@ -1097,11 +1161,16 @@ export function createAtlasSimulation(
     node.vx = 0;
     node.vy = 0;
   }
-  // The core keeps the rigid centroid hold it has always had; every shelved
-  // component is held at the slot this pack just gave it by its own springs.
+  // The core keeps the rigid centroid hold it has always had; every island
+  // is held at the slot this pack just gave it by its own springs.
   center.setGroups(placement.slice(0, 1));
   center.retarget();
   shelfAnchor.setPlacement(placement.slice(1));
+  // Which nodes are islands, for the reducers (dim at the opening view).
+  const islandIds = new Set(placement.slice(1).flat());
+  graph.forEachNode((id) => {
+    graph.setNodeAttribute(id, "island", islandIds.has(id));
+  });
 
   // Same writeback path as a tick, so satellites re-place around their moved
   // anchors and the caller's onTick marks the cartography scene dirty.
@@ -1139,26 +1208,60 @@ export function hoverStateFor(graph: Graph, hovered: string | null): HoverState 
 // pulling in graphology-types as a new direct dependency. `any` matches what
 // sigma already passes through, so it typechecks both ways without one.
 
+/** Dim fill for an island at the opening view: the node's own ink at 30%
+ *  over the ground. Cached per (ink, ground) pair — the reducer runs per node
+ *  per frame. */
+const dimFillCache = new Map<string, string>();
+function dimFill(color: string, surface: string): string {
+  const key = `${color}|${surface}`;
+  let dim = dimFillCache.get(key);
+  if (dim === undefined) {
+    dim = compositeOver(color, surface, 0.3);
+    dimFillCache.set(key, dim);
+  }
+  return dim;
+}
+
 /**
- * Node display override for the hover reducer — pure so it's unit-testable
- * without a sigma renderer. Four cases, pinned by the round-2 spec: no-hover
- * passthrough, the hovered node itself, its neighbors, everyone else.
+ * Node display override for sigma's nodeReducer — pure so it's unit-testable
+ * without a sigma renderer. Two concerns, zoom first, then hover:
+ *
+ * - ZOOM (`lod`). A memory is dust on its anchor: only the first
+ *   `lod.dustVisible` of an anchor's memories are drawn (by `dustRank`),
+ *   unless the anchor is hovered, which shows the first HOVER_DUST_MAX. An island node (`island`) is drawn dim and nameless until
+ *   `lod.islandsSolid`.
+ * - HOVER, the round-2 spec: no-hover passthrough, the hovered node itself,
+ *   its neighbors, everyone else muted and blanked.
  */
 export function nodeDisplay(
   state: HoverState,
   nodeId: string,
   attrs: Record<string, any>,
   palette: GraphPalette,
+  lod: LodState = OPENING_LOD,
 ): Record<string, any> {
-  if (state.hovered === null) return attrs;
+  const dustRank = attrs.dustRank as number | undefined;
+  if (dustRank !== undefined && dustRank >= lod.dustVisible) {
+    const anchorHovered = state.hovered === attrs.dustOf && dustRank < Math.max(lod.dustVisible, HOVER_DUST_MAX);
+    if (!anchorHovered && state.hovered !== nodeId) return { ...attrs, hidden: true };
+  }
+  let base = attrs;
+  if (attrs.island && !lod.islandsSolid) {
+    base = { ...attrs, color: dimFill(attrs.color as string, palette.surface), label: "" };
+  }
+  if (state.hovered === null) return base;
   if (nodeId === state.hovered) return { ...attrs, forceLabel: true, zIndex: 2 };
   if (state.neighbors.has(nodeId)) return { ...attrs, zIndex: 1 };
-  return { ...attrs, color: palette.edge, label: "", zIndex: 0 };
+  return { ...base, color: palette.edge, label: "", zIndex: 0 };
 }
 
 /**
- * Edge display override for the hover reducer — edges incident to the
- * hovered node get emphasized, everything else hides.
+ * Edge display override for sigma's edgeReducer. A memory's thread to its
+ * anchor is drawn whenever the memory itself is (the zoom's `dustVisible`
+ * tier, see nodeDisplay), so a shown dot is never loose; its other edges, and
+ * a hidden memory's thread, wait for a hover of the memory or either endpoint.
+ * An island's edges are hidden while the island is dim. Then the hover rule:
+ * edges incident to the hovered node get emphasized, everything else hides.
  */
 export function edgeDisplay(
   state: HoverState,
@@ -1167,22 +1270,40 @@ export function edgeDisplay(
   target: string,
   attrs: Record<string, any>,
   palette: GraphPalette,
+  lod: LodState = OPENING_LOD,
+  endpointAttrs?: { source: Record<string, any>; target: Record<string, any> },
 ): Record<string, any> {
-  if (state.hovered === null) return attrs;
-  if (source === state.hovered || target === state.hovered) {
-    return { ...attrs, color: palette.edgeStrong, zIndex: 1 };
+  const incident = state.hovered !== null && (source === state.hovered || target === state.hovered);
+  if (incident) return { ...attrs, color: palette.edgeStrong, zIndex: 1 };
+  if (state.hovered !== null) return { ...attrs, hidden: true };
+  if (endpointAttrs) {
+    const { source: s, target: t } = endpointAttrs;
+    if (s.dustRank !== undefined || t.dustRank !== undefined) {
+      const [dust, dustId, other] = s.dustRank !== undefined ? [s, source, target] : [t, target, source];
+      const shown = (dust.dustRank as number) < lod.dustVisible;
+      if (!shown || dust.dustOf !== other || dustId === other) return { ...attrs, hidden: true };
+    }
+    if ((s.island || t.island) && !lod.islandsSolid) return { ...attrs, hidden: true };
   }
-  return { ...attrs, hidden: true };
+  return attrs;
 }
 
+/** The node-label typeface: the app's body face, with the system font behind
+ *  it for the rare machine that has not loaded it. */
+export const NODE_LABEL_FONT = '12px "Instrument Sans", -apple-system, sans-serif';
+/** Ground-coloured halo stroke behind a node label, in CSS px — the label
+ *  stays legible where it crosses an edge or a neighbouring disc. */
+const NODE_LABEL_HALO_WIDTH = 3;
+
 /**
- * Sector-radial label drawer, ported verbatim from the old canvas graph:
- * 12px system font at 85% ink, placed left/right/above/below the node by its
- * angle from the graph center (0,0 — forceCenter pins the cluster there) so
- * labels face INWARD toward the cluster instead of expanding the bbox.
- * Graph y is negated for the angle: sigma renders graph +y screen-up while
- * the old canvas rendered it screen-down, and inward placement must track
- * the on-screen quadrant, not the raw coordinate. Wired into sigma via
+ * Sector-radial label drawer, ported from the old canvas graph: 12px body
+ * font at 85% ink, placed left/right/above/below the node by its angle from
+ * the graph center (0,0 — forceCenter pins the cluster there) so labels face
+ * INWARD toward the cluster instead of expanding the bbox. Graph y is negated
+ * for the angle: sigma renders graph +y screen-up while the old canvas
+ * rendered it screen-down, and inward placement must track the on-screen
+ * quadrant, not the raw coordinate. `halo`, when given, is the ground colour
+ * stroked behind the text first. Wired into sigma via
  * settings.defaultDrawNodeLabel (data carries the node key plus viewport
  * x/y/size — see sigma's renderLabels call site).
  */
@@ -1191,6 +1312,7 @@ export function drawRadialNodeLabel(
   data: Record<string, any>,
   settings: Record<string, any>,
   graph: Graph,
+  halo?: string,
 ): void {
   if (!data.label) return;
   const pad = (data.size as number) + 8;
@@ -1199,52 +1321,29 @@ export function drawRadialNodeLabel(
   const angle = Math.atan2(-gy, gx);
   const sector = Math.round((angle + Math.PI) / (Math.PI / 2)) % 4;
 
-  context.font = "12px -apple-system, sans-serif";
-  context.fillStyle = settings.labelColor?.color ?? "#000000";
-  context.globalAlpha = 0.85;
+  let x = data.x as number;
+  let y = data.y as number;
   if (sector === 0 || sector === 2) {
     const isRight = sector === 0;
     context.textAlign = isRight ? "left" : "right";
     context.textBaseline = "middle";
-    context.fillText(data.label, data.x + (isRight ? pad : -pad), data.y);
+    x += isRight ? pad : -pad;
   } else {
     const isBelow = sector === 1;
     context.textAlign = "center";
     context.textBaseline = isBelow ? "top" : "bottom";
-    context.fillText(data.label, data.x, data.y + (isBelow ? pad : -pad));
+    y += isBelow ? pad : -pad;
   }
+
+  context.font = NODE_LABEL_FONT;
+  context.fillStyle = settings.labelColor?.color ?? "#000000";
+  context.globalAlpha = 0.85;
+  if (halo) {
+    context.lineJoin = "round";
+    context.lineWidth = NODE_LABEL_HALO_WIDTH;
+    context.strokeStyle = halo;
+    context.strokeText(data.label, x, y);
+  }
+  context.fillText(data.label, x, y);
   context.globalAlpha = 1;
-}
-
-/** Ring stroke width in CSS px. Thinned from 1.5 in round 3: at real page
- *  density the fatter ring merged neighbouring pages into one teal mass. */
-const PAGE_RING_WIDTH = 1;
-/** Clear air between the disc and its ring — without the gap the ring reads as
- *  a slightly fatter dot rather than a different kind of thing. Tightened from
- *  3 for the same density reason as the stroke above. */
-const PAGE_RING_GAP = 2;
-
-/**
- * The halo ring that marks a wiki page. Sigma v3.0.3 ships only disc node
- * programs (`node-circle` / `node-point`, both borderless), and no `@sigma/*`
- * package is installed, so a square marker would mean either a new dependency
- * or a hand-written WebGL program — neither was in scope. The ring is drawn on
- * a plain 2D canvas stacked ABOVE sigma instead, the same technique the
- * cartography underlay uses below it. `positions` are viewport CSS px.
- */
-export function drawPageRings(
-  ctx: CanvasRenderingContext2D,
-  positions: { x: number; y: number; size: number }[],
-  palette: GraphPalette,
-): void {
-  if (positions.length === 0) return;
-  ctx.save();
-  ctx.strokeStyle = palette.page;
-  ctx.lineWidth = PAGE_RING_WIDTH;
-  for (const { x, y, size } of positions) {
-    ctx.beginPath();
-    ctx.arc(x, y, size + PAGE_RING_GAP, 0, 2 * Math.PI);
-    ctx.stroke();
-  }
-  ctx.restore();
 }

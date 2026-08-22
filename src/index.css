@@ -395,15 +395,19 @@ html[data-theme="dark"] {
     0 2px 6px rgba(3, 4, 8, 0.38);
   /* Depth on dark: ink-black shadow so surfaces lift without a grey cast. */
   --mem-shadow-toast: var(--mem-shadow-overlay);
-  /* Knowledge-graph slots — validated 5-slot categorical palette + neutral.
-     Order and hex are load-bearing (passes the dataviz ΔE validator: 11.6
-     normal / 1.6 deutan). Slots map project/technology/organization/person/
-     concept; place/event/unknown wear --kg-neutral. Edges never wear a slot. */
-  --kg-project: #c98500;
-  --kg-tool: #3987e5;
-  --kg-org: #d95926;
-  --kg-person: #9085e9;
-  --kg-concept: #008300;
+  /* Knowledge-graph slots — 5 categorical hues + neutral, one material.
+     Every slot sits in the same OKLCH band (L 0.70-0.78, C 0.10-0.13) so the
+     map reads as one set of inks on one ground rather than a chart palette:
+     gold, steel blue, clay, heather, sage. The hue families (and their
+     lightness order) are the ones the earlier dataviz-validated set used, so
+     deutan separation should carry over; the validator itself was not re-run
+     on these hexes. Slots map project/technology/organization/person/concept;
+     place/event/unknown wear --kg-neutral. Edges never wear a slot. */
+  --kg-project: #E0AE57;
+  --kg-tool: #6DA9E7;
+  --kg-org: #E2805E;
+  --kg-person: #B99BDE;
+  --kg-concept: #7CBD89;
   --kg-neutral: #969BAD;
   /* Edge inks must stay OPAQUE: sigma's WebGL pipeline packs colors
      non-premultiplied under premultiplied blending, so any alpha here
@@ -420,24 +424,28 @@ html[data-theme="dark"] {
      ConstellationMap keep the pre-composited values they were tuned against. */
   --canvas-edge: #565B69;
   --canvas-edge-strong: #7C8291;
-  /* Cartography layer (design-mockup artifact, screen 01). Hull/graticule are
-     painted by AtlasView's 2D underlay canvas — real alpha is fine there (the
-     opaque-only rule above is sigma-WebGL-specific). Bridge IS a sigma edge
-     color, hence opaque (the shared amber accent). */
-  --kg-hull: rgba(169, 174, 242, 0.05);
-  --kg-hull-border: rgba(169, 174, 242, 0.16);
-  --kg-graticule: rgba(150, 155, 173, 0.13);
+  /* Bridge is the shared amber accent the PageCanvas spokes still wear; it is
+     a sigma edge color there, hence opaque. The Atlas paints nothing under its
+     nodes — no terrain, wash or hull — so there is no cartography ink token. */
   --kg-bridge: #C7AA5C;
-  /* Memory nodes — one muted fill, no slot. Opaque for the sigma reason
-     above; dimmer than --kg-neutral so memories read as context hanging off
-     the entities rather than as a sixth category. */
-  --kg-memory: #707A8E;
+  /* Dot grid behind the PageCanvas (React Flow background) — not drawn on
+     the Atlas any more. */
+  --kg-graticule: rgba(150, 155, 173, 0.13);
+  /* Memory nodes — one fill, no slot, opaque for the sigma reason above.
+     Parchment: memories are the raw notes the pages are distilled from, so
+     they wear paper's warm, low-chroma tint — the one warm neutral on a cool
+     ground, and the only thing on the map that is not an ink. (A blue-grey
+     was tried first and read as dead pixels among the coloured discs.)
+     Drawn at 0.6 alpha and 1.5-3 px, so it lands as warm dust, never as a
+     sixth category. */
+  --kg-memory: #D7C9AE;
   /* Wiki-page nodes — one swatch, no slot, opaque for the sigma reason above.
-     A cool slate-teal: distinct from every entity slot AND from --kg-memory's
-     grey, so a page never reads as an entity category or as a memory. Pages
-     also carry a 2px ring (AtlasView's overlay canvas) — sigma v3 ships only
-     disc node programs, so shape can't carry the distinction. */
-  --kg-page: #3E8F8A;
+     Teal a notch quieter than the slots (OKLCH C 0.065): pages are the most
+     numerous discs in a cluster, so at slot chroma they shouted. Distinct from every entity hue
+     and from the parchment memories, inside the palette's contrast range —
+     a max-contrast page ink (paper on dark, ink on light) was tried and read
+     as a scatter of loose beads over the map. Solid disc, no ring. */
+  --kg-page: #67A6A1;
 }
 
 /* Light (cool paper workspace with restrained brand warmth) */
@@ -503,13 +511,13 @@ html[data-theme="light"] {
   /* Depth on light: a warm ink-toned shadow (anchored in the body text hue
      rather than flat grey) so the toast feels letterpressed on cream. */
   --mem-shadow-toast: var(--mem-shadow-overlay);
-  /* Knowledge-graph slots — light-theme variant of the validated palette.
-     Order and hex are load-bearing; see the dark block for slot semantics. */
-  --kg-project: #eda100;
-  --kg-tool: #2a78d6;
-  --kg-org: #eb6834;
-  --kg-person: #4a3aa7;
-  --kg-concept: #008300;
+  /* Knowledge-graph slots — light-theme variant: the same five hue families
+     as inks on paper (OKLCH L 0.56-0.66, C 0.11-0.15). See the dark block. */
+  --kg-project: #C0851F;
+  --kg-tool: #2D78BD;
+  --kg-org: #C95A37;
+  --kg-person: #8160B5;
+  --kg-concept: #4A925C;
   --kg-neutral: #8B93A3;
   /* Opaque for the same sigma reason as the dark block:
      rgba(88,97,116,.42/.72) pre-composited over #FFFFFF. */
@@ -519,15 +527,13 @@ html[data-theme="light"] {
      graph values, named separately so the two can move independently. */
   --canvas-edge: #B9BDC5;
   --canvas-edge-strong: #878D9B;
-  /* Cartography layer — light variants (see the dark block's note). */
-  --kg-hull: rgba(94, 88, 200, 0.045);
-  --kg-hull-border: rgba(94, 88, 200, 0.15);
-  --kg-graticule: rgba(139, 147, 163, 0.18);
+  /* Bridge — light variant (see the dark block's note). */
   --kg-bridge: #B5842E;
-  /* Memory nodes — see the dark block. */
-  --kg-memory: #9BA3B2;
+  --kg-graticule: rgba(139, 147, 163, 0.18);
+  /* Memory nodes — parchment, see the dark block. */
+  --kg-memory: #B9A987;
   /* Wiki-page nodes — see the dark block. */
-  --kg-page: #2F7C77;
+  --kg-page: #5E9C98;
 }
 
 .wiki-home {

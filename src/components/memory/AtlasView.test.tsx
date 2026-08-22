@@ -19,6 +19,9 @@ vi.mock("../../lib/tauri", async () => {
 // the drawn graph itself is verified live in preview. This test only proves
 // the three states, retry, mount/teardown, and the click handoff.
 const capturedSigmaInstances = vi.hoisted(() => [] as any[]);
+/** The mock viewport. Tests that watch the names of a far component widen
+ *  it (see graphToViewport below). */
+let mockDimensions = { width: 400, height: 600 };
 vi.mock("sigma", () => {
   class MouseCaptorMock {
     handlers = new Map<string, (payload: any) => void>();
@@ -52,7 +55,7 @@ vi.mock("sigma", () => {
       return { x: [-50, 50], y: [-40, 40] };
     }
     getDimensions() {
-      return { width: 400, height: 600 };
+      return mockDimensions;
     }
     getCustomBBox() {
       return this.customBBox;
@@ -64,11 +67,27 @@ vi.mock("sigma", () => {
       return coords;
     }
     // Fake fit density: 6 px per graph unit, so the density cap (target 1.5)
-    // must zoom out by exactly 4x.
+    // must zoom out by exactly 4x. Centred on the middle of the mock
+    // viewport, as the real projection is, so a node near the graph origin
+    // lands ON screen — the place-name pass culls names whose box falls
+    // outside the viewport. At 6 px/unit a wing component (60+ graph units
+    // out) projects past the default 400x600; tests that watch its name
+    // widen mockDimensions instead, the way a real fit keeps the whole map
+    // in view.
     graphToViewport(coords: { x: number; y: number }) {
-      return { x: coords.x * 6, y: coords.y * 6 };
+      return {
+        x: mockDimensions.width / 2 + coords.x * 6,
+        y: mockDimensions.height / 2 + coords.y * 6,
+      };
     }
-    camera = { ratio: 1, setState: vi.fn(), animate: vi.fn(), getBoundedRatio: (r: number) => r };
+    camera = {
+      ratio: 1,
+      setState: vi.fn(),
+      animate: vi.fn(),
+      getBoundedRatio: (r: number) => r,
+      // The zoom level-of-detail listener (AtlasView mount) subscribes here.
+      on: vi.fn(),
+    };
     getCamera() {
       return this.camera;
     }
@@ -83,7 +102,7 @@ vi.mock("sigma", () => {
       ratio,
     }));
     // Real sigma renders synchronously on refresh() and fires afterRender at
-    // the end of the frame. The underlay repaint hangs off that event, so a
+    // the end of the frame. The overlay repaint hangs off that event, so a
     // no-op here would silently pass any "it repainted" assertion.
     refresh() {
       this.handlers.get("afterRender")?.({});
@@ -259,6 +278,7 @@ describe("AtlasView", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     capturedSigmaInstances.length = 0;
+    mockDimensions = { width: 400, height: 600 };
     entitiesSource = async () => [];
     detailSource = async (id: string) => ({
       entity: makeEntity({ id }),
@@ -391,24 +411,33 @@ describe("AtlasView", () => {
     // A drawn node needs an edge now that degree-0 nodes are hidden, so this
     // interacts with the connected pair rather than a lone entity.
     mockConnectedPair();
+    // jsdom resolves no theme tokens; give the palette a ground colour so the
+    // label halo (stroked in --mem-surface) has an ink to stroke with.
+    document.documentElement.style.setProperty("--mem-surface", "#11131a");
 
     renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
 
     const { settings } = capturedSigmaInstances[0];
-    // Edges are 1.5 CSS px — sigma's default floor (1.7) would bump them up.
-    expect(settings.minEdgeThickness).toBe(1);
+    // Edges are 1 CSS px (0.6 shared-source) — sigma's default floor (1.7)
+    // would bump them up.
+    expect(settings.minEdgeThickness).toBe(0.5);
 
     // Drives the real drawRadialNodeLabel through the graph closure: the
     // drawer reads e1's graph position for the sector, so this throws if the
     // wiring doesn't reach the mounted graph.
+    const order: string[] = [];
     const ctx = {
       font: "",
       fillStyle: "",
+      strokeStyle: "",
+      lineWidth: 0,
+      lineJoin: "",
       globalAlpha: 1,
       textAlign: "",
       textBaseline: "",
-      fillText: vi.fn(),
+      strokeText: vi.fn(() => order.push("stroke")),
+      fillText: vi.fn(() => order.push("fill")),
     };
     settings.defaultDrawNodeLabel(
       ctx,
@@ -416,8 +445,15 @@ describe("AtlasView", () => {
       { labelColor: { color: "#123456" } },
     );
     expect(ctx.fillText).toHaveBeenCalledWith("Alice", expect.any(Number), expect.any(Number));
-    expect(ctx.font).toBe("12px -apple-system, sans-serif");
+    expect(ctx.font).toBe('12px "Instrument Sans", -apple-system, sans-serif');
     expect(ctx.fillStyle).toBe("#123456");
+    // Ground-coloured halo under the name, so labels stay legible over
+    // neighbouring nodes: the stroke lands before the fill.
+    expect(ctx.strokeText).toHaveBeenCalledWith("Alice", expect.any(Number), expect.any(Number));
+    expect(ctx.lineWidth).toBe(3);
+    expect(ctx.strokeStyle).toBe("#11131a");
+    expect(order).toEqual(["stroke", "fill"]);
+    document.documentElement.style.removeProperty("--mem-surface");
   });
 
   it("renders the legend chips, connection sample, and count line over the graph", async () => {
@@ -934,7 +970,7 @@ describe("AtlasView", () => {
     expect(window.localStorage.getItem("atlas.smallGroups")).toBe("false");
   });
 
-  it("puts the revealed small groups on the shelf below the core, never around it", async () => {
+  it("puts the revealed small group on a wing beside the core, clear of its bounds", async () => {
     window.localStorage.setItem("atlas.smallGroups", "true");
     mockStarWithSmallPair();
 
@@ -943,12 +979,17 @@ describe("AtlasView", () => {
     const graph = latestGraph();
     expect(graph.hasNode("p1")).toBe(true);
 
-    const y = (id: string) => graph.getNodeAttribute(id, "y") as number;
-    const coreBottom = Math.min(...["e1", "e2", "e3", "e4", "e5"].map(y));
-    // Graph +y is screen-up: the pair hangs below the whole core, rather than
-    // being tucked into a gap around it.
-    expect(y("p1")).toBeLessThan(coreBottom);
-    expect(y("p2")).toBeLessThan(coreBottom);
+    const x = (id: string) => graph.getNodeAttribute(id, "x") as number;
+    const size = (id: string) => graph.getNodeAttribute(id, "size") as number;
+    const core = ["e1", "e2", "e3", "e4", "e5"];
+    const coreLeft = Math.min(...core.map((id) => x(id) - size(id)));
+    const coreRight = Math.max(...core.map((id) => x(id) + size(id)));
+    // The pair is the largest shelf component, so it takes the first wing:
+    // wholly to one side of the core, never tucked into a gap inside it.
+    const pair = ["p1", "p2"];
+    const pairLeft = Math.min(...pair.map((id) => x(id) - size(id)));
+    const pairRight = Math.max(...pair.map((id) => x(id) + size(id)));
+    expect(pairLeft > coreRight || pairRight < coreLeft).toBe(true);
   });
 
   /** A five-node star (the core) plus a four-node star that MIN_COMPONENT_SIZE
@@ -1001,15 +1042,15 @@ describe("AtlasView", () => {
     return entities;
   }
 
-  it("paints the rebuilt renderer's underlay when the small-groups chip flips", async () => {
+  it("paints the rebuilt renderer's overlay when the small-groups chip flips", async () => {
     mockStarWithSmallStar();
 
     renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
 
     // Stub the prototype, not one canvas: the chip rebuilds the renderer, and
-    // the underlay this has to watch does not exist until that happens.
-    const painter = recordingUnderlayCtx();
+    // the overlay this has to watch does not exist until that happens.
+    const painter = recordingOverlayCtx();
     const originalGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(painter.ctx) as any;
     try {
@@ -1020,7 +1061,7 @@ describe("AtlasView", () => {
       // changes only the DRAWN model, while `communities` and the palette are
       // derived from the full model and the theme, so neither of the two
       // repaint effects re-runs. The rebuilt renderer has to paint its own
-      // first frame or the map loses every hull, name, and ring.
+      // first frame or the map loses every place name.
       expect(painter.state.paints).toBeGreaterThan(0);
       expect(painter.state.regionNames.length).toBeGreaterThan(0);
     } finally {
@@ -1028,37 +1069,48 @@ describe("AtlasView", () => {
     }
   });
 
-  it("hulls and names a shelved small group that is big enough to be a region", async () => {
+  it("names an island small group only once the view is zoomed in enough for the islands to come up solid", async () => {
     mockStarWithSmallStar();
+    mockDimensions = { width: 2000, height: 1200 }; // the island sits out on the rim; keep it in view
 
     renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
 
-    const painter = recordingUnderlayCtx();
+    const painter = recordingOverlayCtx();
     const originalGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(painter.ctx) as any;
     try {
       fireEvent.click(screen.getByRole("button", { name: "Show small groups" }));
       await waitFor(() => expect(capturedSigmaInstances).toHaveLength(2));
 
-      // The small star sits on the shelf, below the core — being off in that
-      // zone must not cost it its region. Its leader is its degree-3 hub.
+      // At the opening view the island is dim and nameless: only the core's
+      // own name is on the map.
+      expect(painter.state.regionNames).toContain("Alice");
+      expect(painter.state.regionNames).not.toContain("Shelf Hub");
+
+      // Zoom in twice (camera ratio halves): the islands come up solid and
+      // the small star earns its name. Its leader is its degree-3 hub.
+      const instance = capturedSigmaInstances[1]!;
+      const onCamera = instance.camera.on.mock.calls.find((call: unknown[]) => call[0] === "updated")?.[1] as
+        | ((state: { ratio: number }) => void)
+        | undefined;
+      expect(onCamera).toBeDefined();
+      onCamera!({ ratio: 0.5 });
       expect(painter.state.regionNames).toContain("Shelf Hub");
-      // ...and the core keeps its own.
       expect(painter.state.regionNames).toContain("Alice");
     } finally {
       HTMLCanvasElement.prototype.getContext = originalGetContext;
     }
   });
 
-  it("counts only regions whose hulls are drawn: a hidden small group adds none until it is shown", async () => {
+  it("counts only regions that are drawn: a hidden small group adds none until it is shown", async () => {
     mockStarWithSmallStar();
 
     renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
 
     // The small star is its own community in the full model, but while its
-    // nodes are hidden nothing draws its hull — so it must not be counted.
+    // nodes are hidden nothing draws or names it — so it must not be counted.
     expect(screen.getByText("5 entities · 1 region")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Show small groups" }));
@@ -1090,26 +1142,30 @@ describe("AtlasView", () => {
     expect(screen.queryByRole("button", { name: "Hide small groups" })).not.toBeInTheDocument();
   });
 
-  it("mounts the cartography underlay canvas beneath sigma and removes it on unmount", async () => {
+  it("mounts the place-name overlay canvas above sigma, and nothing under it, and removes it on unmount", async () => {
     mockConnectedPair();
 
     const { unmount } = renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
 
     const container = capturedSigmaInstances[0].container as HTMLElement;
-    const underlay = document.querySelector('canvas[data-testid="atlas-cartography"]');
-    expect(underlay).toBeInTheDocument();
-    // Appended BEFORE the sigma mock ran, so it stacks under sigma's canvases.
-    expect(underlay!.parentElement).toBe(container);
+    const overlay = document.querySelector('canvas[data-testid="atlas-region-names"]');
+    expect(overlay).toBeInTheDocument();
+    // Appended AFTER the sigma mock ran, so it stacks above sigma's canvases.
+    expect(overlay!.parentElement).toBe(container);
+    // The overlay is the only canvas the Atlas adds: no terrain or wash
+    // underlay exists to put a shadow or an aura under the nodes.
+    expect(container.querySelectorAll("canvas")).toHaveLength(1);
+    expect(container.querySelector('canvas[data-testid="atlas-cartography"]')).toBeNull();
 
     unmount();
     // Query the DETACHED container, not the document: React unmount removes
     // the whole subtree from the document either way, so a document-level
     // query passes even if the cleanup leaks the canvas (mutation-proven).
-    expect(container.querySelector('canvas[data-testid="atlas-cartography"]')).toBeNull();
+    expect(container.querySelector('canvas[data-testid="atlas-region-names"]')).toBeNull();
   });
 
-  it("repaints the underlay on every sigma afterRender: dashed graticule rings from the live graph", async () => {
+  it("repaints the place-name overlay on every sigma afterRender, names over the nodes", async () => {
     mockConnectedPair();
 
     renderWithQuery(<AtlasView />);
@@ -1121,9 +1177,12 @@ describe("AtlasView", () => {
 
     // jsdom's getContext("2d") is null (the mount-time paint no-ops on that);
     // hand the handler a recording ctx and re-fire it like a render would.
-    const underlay = document.querySelector(
-      'canvas[data-testid="atlas-cartography"]',
+    const overlay = document.querySelector(
+      'canvas[data-testid="atlas-region-names"]',
     ) as HTMLCanvasElement;
+    // The overlay is appended AFTER sigma mounts so it stacks above sigma's
+    // canvases — names sit on the map, never under the nodes.
+    expect(overlay).toBeInTheDocument();
     const ctx = {
       strokeStyle: "",
       fillStyle: "",
@@ -1147,23 +1206,41 @@ describe("AtlasView", () => {
       setLineDash: vi.fn(),
       stroke: vi.fn(),
       fill: vi.fn(),
+      drawImage: vi.fn(),
+      strokeText: vi.fn(),
       fillText: vi.fn(),
       measureText: vi.fn((text: string) => ({ width: text.length * 7 })),
     };
-    underlay.getContext = vi.fn().mockReturnValue(ctx) as any;
+    const order: string[] = [];
+    const overCtx = {
+      ...ctx,
+      setTransform: vi.fn(),
+      clearRect: vi.fn(),
+      arc: vi.fn(),
+      fill: vi.fn(),
+      strokeText: vi.fn(() => order.push("stroke")),
+      fillText: vi.fn(() => order.push("fill")),
+    };
+    overlay.getContext = vi.fn().mockReturnValue(overCtx) as any;
 
     handler!({});
 
     // Sized to sigma's viewport and cleared before painting.
-    expect(underlay.width).toBe(400);
-    expect(underlay.height).toBe(600);
-    expect(ctx.clearRect).toHaveBeenCalledWith(0, 0, 400, 600);
-    // The settled trio sits off-origin, so the graticule paints: 3 dashed rings.
-    expect(ctx.setLineDash).toHaveBeenCalledWith([1, 7]);
-    expect(ctx.arc).toHaveBeenCalledTimes(3);
-    // One community of three, so exactly one region name is painted — the
-    // label placer keeps it because nothing else competes for the space.
-    expect(ctx.fillText).toHaveBeenCalledTimes(1);
+    expect(overlay.width).toBe(400);
+    expect(overlay.height).toBe(600);
+    expect(overCtx.clearRect).toHaveBeenCalledWith(0, 0, 400, 600);
+    // One community of three, so exactly one place name — the label placer
+    // keeps it because nothing else competes for the space — and its
+    // ground-coloured halo is stroked before the fill. Text is ALL the 2D
+    // layer paints: no discs, no washes, no outlines under the nodes.
+    expect(overCtx.fillText).toHaveBeenCalledTimes(1);
+    expect(overCtx.strokeText).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(["stroke", "fill"]);
+    expect(overCtx.arc).not.toHaveBeenCalled();
+    expect(overCtx.fill).not.toHaveBeenCalled();
+    expect(overCtx.stroke).not.toHaveBeenCalled();
+    expect(overCtx.drawImage).not.toHaveBeenCalled();
+    expect(ctx.clearRect).not.toHaveBeenCalled();
   });
 
   // Two 3-cliques joined by one bridge (a1–b1). Peak-climbing puts each
@@ -1300,7 +1377,7 @@ describe("AtlasView", () => {
     expect(document.getElementById("atlas-search-option-1")).toHaveTextContent("Isolate");
   });
 
-  it("Regions chip hides the cartography underlay and repaints it on re-show", async () => {
+  it("Regions chip hides the place-name overlay and repaints it on re-show", async () => {
     mockConnectedPair();
 
     renderWithQuery(<AtlasView />);
@@ -1308,18 +1385,18 @@ describe("AtlasView", () => {
     const instance = capturedSigmaInstances[0];
 
     const chip = screen.getByRole("button", { name: "Regions" });
-    const underlay = document.querySelector('[data-testid="atlas-cartography"]') as HTMLCanvasElement;
+    const overlay = document.querySelector('[data-testid="atlas-region-names"]') as HTMLCanvasElement;
     expect(chip).toHaveAttribute("aria-pressed", "true");
-    expect(underlay.style.display).not.toBe("none");
+    expect(overlay.style.display).not.toBe("none");
 
     fireEvent.click(chip);
     expect(chip).toHaveAttribute("aria-pressed", "false");
-    expect(underlay.style.display).toBe("none");
+    expect(overlay.style.display).toBe("none");
 
     // Re-show must refresh: the hidden canvas kept its stale last frame.
     const refreshSpy = vi.spyOn(instance, "refresh");
     fireEvent.click(chip);
-    expect(underlay.style.display).not.toBe("none");
+    expect(overlay.style.display).not.toBe("none");
     expect(refreshSpy).toHaveBeenCalled();
   });
 
@@ -1651,11 +1728,11 @@ describe("AtlasView", () => {
     });
   }
 
-  // Records what the cartography underlay actually painted. drawCartography
-  // clears once per paint before drawing, so resetting on clearRect leaves
+  // Records what the place-name overlay actually painted. The overlay clears
+  // once per paint before drawing, so resetting on clearRect leaves
   // `regionNames` holding the MOST RECENT paint only — immune to however many
   // extra repaints a render happens to trigger — while `paints` counts them.
-  function recordingUnderlayCtx() {
+  function recordingOverlayCtx() {
     const state = { paints: 0, regionNames: [] as string[] };
     const ctx = {
       strokeStyle: "",
@@ -1683,6 +1760,8 @@ describe("AtlasView", () => {
       setLineDash: vi.fn(),
       stroke: vi.fn(),
       fill: vi.fn(),
+      strokeText: vi.fn(),
+      drawImage: vi.fn(),
       fillText: vi.fn((text: string) => {
         state.regionNames.push(text);
       }),
@@ -1693,11 +1772,12 @@ describe("AtlasView", () => {
     return { ctx, state };
   }
 
-  it("paints the underlay on mount through the post-mount effects, with no second draw of its own", async () => {
+  it("paints the names on mount through the post-mount effects, with no second draw of its own", async () => {
     mockTwoTrianglesInSpace();
-    // The underlay canvas only exists once the mount effect has run, so stub
+    mockDimensions = { width: 2000, height: 1200 }; // both triangles in view, like a real fit
+    // The helper canvases only exist once the mount effect has run, so stub
     // the prototype to catch the very first paint.
-    const painter = recordingUnderlayCtx();
+    const painter = recordingOverlayCtx();
     const originalGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(painter.ctx) as any;
     try {
@@ -1714,30 +1794,31 @@ describe("AtlasView", () => {
     }
   });
 
-  it("re-renders bridges and hulls when a space's cartography status changes, without a full remount", async () => {
+  it("re-renders the place names when a space's cartography status changes, without a full remount", async () => {
     mockTwoTrianglesInSpace();
-    // Starts on the default (empty) fallback climb: two 3-cliques, "rb" is
-    // the one cross-region bridge.
+    mockDimensions = { width: 2000, height: 1200 }; // both triangles in view, like a real fit
+    // Starts on the default (empty) fallback climb: two 3-cliques joined by
+    // "rb" — an ordinary edge; nothing is painted as a bridge any more.
     const { qc } = renderWithQuery(<AtlasView />);
     await waitFor(() => expect(capturedSigmaInstances).toHaveLength(1));
     const instance = capturedSigmaInstances[0];
     const graph = instance.graph;
 
-    expect(graph.getEdgeAttribute("rb", "bridge")).toBe(true);
+    expect(graph.getEdgeAttribute("rb", "bridge")).toBeUndefined();
 
-    // Watch the hulls, not just the edge colours: on the fallback climb the
-    // two triangles are two named regions (leaders a1/b1 — the degree-3 hubs).
-    const underlay = document.querySelector(
-      'canvas[data-testid="atlas-cartography"]',
+    // Watch the names: on the fallback climb the two triangles are two named
+    // regions (leaders a1/b1 — the degree-3 hubs).
+    const overlay = document.querySelector(
+      'canvas[data-testid="atlas-region-names"]',
     ) as HTMLCanvasElement;
-    const painter = recordingUnderlayCtx();
-    underlay.getContext = vi.fn().mockReturnValue(painter.ctx) as any;
+    const painter = recordingOverlayCtx();
+    overlay.getContext = vi.fn().mockReturnValue(painter.ctx) as any;
     instance.handlers.get("afterRender")!({});
     expect(painter.state.regionNames).toEqual(["Alice", "Bob"]);
     const paintsBeforeChange = painter.state.paints;
 
     // Durable arrives: the daemon puts all 6 members in ONE community, so
-    // the bridge collapses into an ordinary intra-region edge.
+    // the two regions merge into one.
     const allOneCommunity = {
       communities: {
         schema_version: "community-read-v1" as const,
@@ -1771,24 +1852,21 @@ describe("AtlasView", () => {
     mockListCommunityMembers.mockResolvedValue(allOneCommunity.members);
     await qc.invalidateQueries({ queryKey: ["constellation-cartography"] });
 
-    await waitFor(() => expect(graph.getEdgeAttribute("rb", "bridge")).toBe(false));
-    // The hulls repainted on their OWN — no test-fired afterRender here — and
+    // The names repainted on their OWN — no test-fired afterRender here — and
     // the two regions have become the one merged region the daemon declared.
-    // Recolouring the edges alone would leave the old two-hull picture on the
-    // underlay, which is exactly what the round-1 test could not see.
+    await waitFor(() => expect(painter.state.regionNames).toEqual(["Alice"]));
     expect(painter.state.paints).toBeGreaterThan(paintsBeforeChange);
-    expect(painter.state.regionNames).toEqual(["Alice"]);
     // Same sigma instance and the same graphology graph — no remount, no
     // layout/camera reset.
     expect(capturedSigmaInstances).toHaveLength(1);
     expect(capturedSigmaInstances[0].graph).toBe(graph);
 
     // ready -> error: the space's community read starts failing, so the
-    // renderer must fall back to the client-side climb again — bridge back.
+    // renderer must fall back to the client-side climb again — two names back.
     mockListCommunities.mockRejectedValue(new Error("connection reset"));
     await qc.invalidateQueries({ queryKey: ["constellation-cartography"] });
 
-    await waitFor(() => expect(graph.getEdgeAttribute("rb", "bridge")).toBe(true));
+    await waitFor(() => expect(painter.state.regionNames).toEqual(["Alice", "Bob"]));
     expect(capturedSigmaInstances).toHaveLength(1);
   });
 
@@ -2002,7 +2080,7 @@ describe("AtlasView", () => {
     mouseCaptor.handlers.get("mousemovebody")?.(dragEvent(500, 500));
     sim.tick(1);
 
-    const anchorRadius = (graph.getNodeAttribute("e1", "size") as number) + 6;
+    const anchorRadius = (graph.getNodeAttribute("e1", "size") as number) + 10;
     const dx = (graph.getNodeAttribute("mem:m1", "x") as number) - 500;
     const dy = (graph.getNodeAttribute("mem:m1", "y") as number) - 500;
     expect(Math.hypot(dx, dy)).toBeCloseTo(anchorRadius, 6);
