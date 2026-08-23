@@ -706,10 +706,9 @@ pub async fn import_phase3_store(
         }
         for obs in &kg.observations {
             if let Some(entity_id) = entity_cache.get(&obs.entity.to_lowercase()) {
-                if db
-                    .add_observation(entity_id, &obs.content, Some(source), None)
+                if let Ok((_id, true)) = db
+                    .add_observation_dedup(entity_id, &obs.content, Some(source), None)
                     .await
-                    .is_ok()
                 {
                     observations_added += 1;
                 }

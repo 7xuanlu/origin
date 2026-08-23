@@ -163,8 +163,8 @@ async fn full_population_is_validated_while_opaque_evidence_is_capped() {
     conn.execute("PRAGMA foreign_keys = OFF", ()).await.unwrap();
     for index in 0..101 {
         conn.execute(
-            "INSERT INTO observations (id, entity_id, content, confirmed, created_at) VALUES (?1, 'missing-id', 'secret observation', 0, 1)",
-            libsql::params![format!("obs-{index:03}")],
+            "INSERT INTO observations (id, entity_id, content, confirmed, created_at) VALUES (?1, 'missing-id', ?2, 0, 1)",
+            libsql::params![format!("obs-{index:03}"), format!("secret observation {index}")],
         ).await.unwrap();
     }
     drop(conn);
