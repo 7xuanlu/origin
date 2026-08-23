@@ -453,6 +453,9 @@ pub struct MergeEntityResponse {
     /// it can gain fewer links than this count.
     pub memory_links: u64,
     pub observations: u64,
+    /// Distinct re-pointed edges newly landing on the canonical; a
+    /// loser↔canonical edge is retired, not re-pointed, and is not
+    /// counted.
     pub edges: u64,
     pub aliases_added: Vec<String>,
     pub applied: bool,

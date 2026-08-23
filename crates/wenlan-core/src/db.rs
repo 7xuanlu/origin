@@ -477,7 +477,9 @@ pub struct MergePreview {
     /// Edges the merge will move onto the canonical -- excludes a loser
     /// edge whose re-pointed (src, dst, relation_type) already names an
     /// existing canonical edge, since `merge_entities` re-asserts that same
-    /// content-addressed edge id rather than creating a second one.
+    /// content-addressed edge id rather than creating a second one. A
+    /// loser↔canonical edge is retired, not re-pointed (a self-loop is
+    /// not a relation), and is not counted.
     pub edges: u64,
     /// Loser name + loser aliases, minus names the canonical already
     /// carries as an alias -- what `merge_entities` would add to the
@@ -498,6 +500,9 @@ pub struct MergeOutcome {
     /// `memory_entities` and the legacy `memories.entity_id` column).
     pub memory_links: u64,
     pub observations: u64,
+    /// Distinct re-pointed edge identities newly landing on the canonical.
+    /// A loser↔canonical edge is retired, not re-pointed (a self-loop is
+    /// not a relation), and is not counted.
     pub edges: u64,
     pub aliases_added: Vec<String>,
 }
@@ -34704,13 +34709,16 @@ impl MemoryDB {
     /// to the canonical -- NOT a per-row count of `entity_id`'s edges. Two
     /// of `entity_id`'s edges can collapse onto the SAME re-pointed
     /// identity (most commonly reciprocal same-type edges `entity_id ->
-    /// exclude_entity_id` and `exclude_entity_id -> entity_id`, which both
-    /// re-point to the self-loop `exclude_entity_id -> exclude_entity_id`),
-    /// and `dual_write_edge_with_payload`'s content-addressed edge id means
+    /// exclude_entity_id` and `exclude_entity_id -> entity_id`), and
+    /// `dual_write_edge_with_payload`'s content-addressed edge id means
     /// only ONE edge lands for that identity -- counting per-row would
-    /// overstate what the merge actually adds. Excludes an identity that
-    /// already exists among `exclude_entity_id`'s active edges, since
-    /// re-asserting it is an upsert onto that same row, not a new edge.
+    /// overstate what the merge actually adds. A loser↔canonical edge
+    /// would re-point onto a self-loop (`exclude_entity_id ->
+    /// exclude_entity_id`); the merge retires it instead of re-asserting it
+    /// (a self-loop is not a relation), so it is not counted. Excludes an
+    /// identity that already exists among `exclude_entity_id`'s active
+    /// edges, since re-asserting it is an upsert onto that same row, not a
+    /// new edge.
     async fn edges_will_move_delta(
         conn: &libsql::Connection,
         entity_id: &str,
@@ -34728,7 +34736,7 @@ impl MemoryDB {
                        AND e1.dst_kind = 'entity' AND (e1.src_id = ?1 OR e1.dst_id = ?1) \
                        AND e1.valid_until IS NULL \
                  ) repointed \
-                 WHERE NOT EXISTS ( \
+                 WHERE repointed.new_src <> repointed.new_dst AND NOT EXISTS ( \
                      SELECT 1 FROM edges e2 \
                       WHERE e2.edge_type = 'relates' AND e2.src_kind = 'entity' \
                         AND e2.dst_kind = 'entity' AND e2.valid_until IS NULL \
@@ -35246,6 +35254,13 @@ impl MemoryDB {
                             })?
                     {
                         graph_changes.push(change);
+                    }
+                    if plan.src_id == plan.dst_id {
+                        // A loser<->canonical edge re-points onto the canonical itself. A
+                        // self-loop is not a relation (`create_relation_with_span` refuses
+                        // one; the extraction writer skips one), so retire the old edge
+                        // without re-asserting it.
+                        continue;
                     }
                     // Mirror the re-pointed relation's semantic fields onto the
                     // corrected edge (G6 Stage 1). Previously re-read post-write

@@ -29286,34 +29286,52 @@ async fn count_entity_memory_links_union(db: &MemoryDB, entity_id: &str) -> i64 
     .unwrap()
 }
 
-/// Two of the loser's edges can re-point onto the SAME `(src, dst,
-/// semantic_type)` identity -- most commonly reciprocal same-type edges
-/// between the loser and canonical, which both collapse onto the
-/// canonical's own self-loop -- and `dual_write_edge_with_payload`'s
+/// A loser↔canonical edge would re-point onto the canonical's own
+/// self-loop -- not a relation (`create_relation_with_span` refuses one;
+/// the extraction writer skips one) -- so `merge_entities` retires it
+/// instead of re-asserting it, and the edge count must not include it.
+/// Separately, two of the loser's edges can still collapse onto the SAME
+/// `(src, dst, semantic_type)` identity that already exists on the
+/// canonical (a loser->other edge whose re-pointed identity duplicates an
+/// existing canonical->other edge), and `dual_write_edge_with_payload`'s
 /// content-addressed edge id means only ONE edge lands for that identity.
-/// `merge_entities_preview`/`merge_entities` must count DISTINCT
-/// re-pointed identities, not one row per source edge, or the receipt
-/// overstates what actually lands (Sol's PR 2 review: receipt said 2, one
-/// lands). Seeds the reciprocal pair plus one ordinary loser edge to a
-/// third entity (unaffected by the collapse), then checks the preview's
-/// count, the applied `MergeOutcome`'s count, and the identities that
-/// actually newly appear among the canonical's active edges all agree.
+/// Seeds a reciprocal `leads` pair between loser and canonical (both would
+/// become the self-loop -- retired, not counted), a `works_on` edge from
+/// both loser and canonical to a third entity (the re-pointed identity
+/// already exists on the canonical -- not counted), and a `leads` edge
+/// from loser to the third entity (new -- counted). Checks the preview's
+/// count, the applied `MergeOutcome`'s count, the identities that actually
+/// newly appear among the canonical's active edges, that no active
+/// self-loop lands on the canonical, that both loser↔canonical edges are
+/// invalidated, and that exactly one edge survives for each of the
+/// `works_on` and `leads` canonical->other identities.
 #[tokio::test]
-async fn merge_entities_preview_counts_distinct_repointed_edge_identities() {
+async fn merge_entities_retires_loser_canonical_edges_and_counts_distinct_identities() {
     let (db, _tmp) = test_db().await;
     let (canonical, alias) = seed_two_entities(&db).await;
     let other = db.create_entity("Carol", "person", None).await.unwrap();
 
-    // Reciprocal same-type edges between loser and canonical: both
-    // re-point to the self-loop canonical --leads--> canonical.
+    // Reciprocal same-type edges between loser and canonical: both would
+    // re-point onto the canonical's own self-loop, so `merge_entities`
+    // retires them instead of re-asserting them.
     db.create_relation(&alias, &canonical, "leads", None, Some(0.9), None, None)
         .await
         .unwrap();
     db.create_relation(&canonical, &alias, "leads", None, Some(0.9), None, None)
         .await
         .unwrap();
-    // An ordinary loser edge to a third entity -- untouched by the collapse.
-    db.create_relation(&alias, &other, "works_at", None, Some(0.9), None, None)
+    // (`works_on` is already the canonical relation type; `create_relation`
+    // rewrites e.g. `works_at` to it, so the seeds use the stored form.)
+    // The loser's works_on edge to `other` re-points onto an identity the
+    // canonical already has -- content-addressed dedup, not a new edge.
+    db.create_relation(&alias, &other, "works_on", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+    db.create_relation(&canonical, &other, "works_on", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+    // An ordinary loser edge to `other` -- new identity, counted.
+    db.create_relation(&alias, &other, "leads", None, Some(0.9), None, None)
         .await
         .unwrap();
 
@@ -29321,9 +29339,10 @@ async fn merge_entities_preview_counts_distinct_repointed_edge_identities() {
 
     let preview = db.merge_entities_preview(&canonical, &alias).await.unwrap();
     assert_eq!(
-        preview.edges, 2,
-        "the reciprocal pair collapses onto one self-loop identity, plus the \
-         ordinary edge to `other`, is 2 distinct identities -- not 3 rows"
+        preview.edges, 1,
+        "only the new loser->other leads edge counts: the reciprocal pair \
+         is retired as a self-loop, and the works_on re-point already \
+         exists on the canonical"
     );
 
     let outcome = db.merge_entities(&canonical, &alias).await.unwrap();
@@ -29339,6 +29358,85 @@ async fn merge_entities_preview_counts_distinct_repointed_edge_identities() {
         newly_appeared, preview.edges,
         "the preview's edges count must equal the identities that actually \
          newly appear among the canonical's active edges after the merge"
+    );
+
+    let conn = db.conn.lock().await;
+    let self_loops: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' \
+             AND src_id = ?1 AND dst_id = ?1 AND valid_until IS NULL",
+            libsql::params![canonical.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        self_loops, 0,
+        "no active self-loop should land on the canonical"
+    );
+
+    let loser_touching: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' \
+             AND (src_id = ?1 OR dst_id = ?1) AND valid_until IS NULL",
+            libsql::params![alias.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        loser_touching, 0,
+        "both loser-canonical edges should be invalidated, not re-asserted"
+    );
+
+    let works_on_survivors: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' \
+             AND src_id = ?1 AND dst_id = ?2 AND semantic_type = 'works_on' \
+             AND valid_until IS NULL",
+            libsql::params![canonical.as_str(), other.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        works_on_survivors, 1,
+        "content-addressed dedup should leave exactly one works_on edge"
+    );
+
+    let leads_survivors: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' \
+             AND src_id = ?1 AND dst_id = ?2 AND semantic_type = 'leads' \
+             AND valid_until IS NULL",
+            libsql::params![canonical.as_str(), other.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        leads_survivors, 1,
+        "exactly one canonical->other leads edge should survive"
     );
 }
 
