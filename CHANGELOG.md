@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.17.0](https://github.com/7xuanlu/wenlan/compare/v0.16.0...v0.17.0) (2026-08-23)
+
+
+### Features
+
+* **app:** redesign the Atlas default view — place names, islands, memory dust ([#572](https://github.com/7xuanlu/wenlan/issues/572)) ([7d345ae](https://github.com/7xuanlu/wenlan/commit/7d345ae2710b04a83a8b50f8376a06e982a8edc4))
+* **cli,server:** merge entities and declare aliases ([#575](https://github.com/7xuanlu/wenlan/issues/575)) ([d1c92ea](https://github.com/7xuanlu/wenlan/commit/d1c92ea287325a4509a99e79734ad3368ad590b7))
+
+
+### Bug Fixes
+
+* **app:** count only knowledge pages in the Home pages metric ([#570](https://github.com/7xuanlu/wenlan/issues/570)) ([ec9619e](https://github.com/7xuanlu/wenlan/commit/ec9619e9a8c94a08f188abe9e0971bbed0aa2b0b))
+* **app:** cut the Atlas insight rail ([#571](https://github.com/7xuanlu/wenlan/issues/571)) ([7a2755b](https://github.com/7xuanlu/wenlan/commit/7a2755b5e35de1ff2517bae77bdcb22fca528c14))
+* **app:** keep atlas shelf clusters live under drag physics ([#569](https://github.com/7xuanlu/wenlan/issues/569)) ([5d42c7a](https://github.com/7xuanlu/wenlan/commit/5d42c7a0a09cde32e3d1cc3ebaea3dfc90e4bd29))
+* **app:** stop the entry animation defeating the archived row fade ([#568](https://github.com/7xuanlu/wenlan/issues/568)) ([0ed56b2](https://github.com/7xuanlu/wenlan/commit/0ed56b2b23e2a9b06b2061a8912d8c03b61846b1))
+* **core:** give observations an identity and clean duplicates ([#573](https://github.com/7xuanlu/wenlan/issues/573)) ([b5a5c54](https://github.com/7xuanlu/wenlan/commit/b5a5c546f2980007d01c4e390f3ae6f0e2330b44))
+* keep archive-superseded memories visible and labelled in app lists ([#564](https://github.com/7xuanlu/wenlan/issues/564)) ([dbfb120](https://github.com/7xuanlu/wenlan/commit/dbfb1206d5a10c85488cda43e32a1ac38b43a327))
+* **release:** auto-open the release-as cleanup PR and reject stale overrides ([#566](https://github.com/7xuanlu/wenlan/issues/566)) ([c99ade8](https://github.com/7xuanlu/wenlan/commit/c99ade8691f4be1c8c7069d4e05ece4923d883c9))
+* **release:** make the recovery dispatch rerun-safe ([#560](https://github.com/7xuanlu/wenlan/issues/560)) ([f326b5a](https://github.com/7xuanlu/wenlan/commit/f326b5affc1e7bb344c69e4cfc04ec2fc55c21fb))
+* **release:** put MSYS_NO_PATHCONV on the Windows tag-check step, not the macOS one ([#561](https://github.com/7xuanlu/wenlan/issues/561)) ([b7f13e1](https://github.com/7xuanlu/wenlan/commit/b7f13e13dc9f594185e9666e0cb5de7062c9184f))
+* **release:** read Windows bundle checksums via stdin so sha256sum does not escape them ([#562](https://github.com/7xuanlu/wenlan/issues/562)) ([e57847d](https://github.com/7xuanlu/wenlan/commit/e57847d1fedb3c1b3c1b24ec09bbdbc263043ef7))
+* **release:** stop Git Bash path conversion breaking the Windows bundle tag check ([#559](https://github.com/7xuanlu/wenlan/issues/559)) ([f05adc0](https://github.com/7xuanlu/wenlan/commit/f05adc09ee65eb84662db05e802df067bc94813d))
+* use the shared superseder predicates in the community parity gate and summary buckets ([#565](https://github.com/7xuanlu/wenlan/issues/565)) ([7487c7e](https://github.com/7xuanlu/wenlan/commit/7487c7e3b66d5c3ca46f3e9a4c163e9053537d8c))
+
+
+### Code Refactoring
+
+* pre-launch audit — remove dead surface, fix correctness, trim deps ([#574](https://github.com/7xuanlu/wenlan/issues/574)) ([54c8a7e](https://github.com/7xuanlu/wenlan/commit/54c8a7eac1a58ec0e9e853e7b12e20fe682fe411))
+
 ## [0.16.0](https://github.com/7xuanlu/wenlan/compare/v0.15.8...v0.16.0) (2026-08-19)
 
 
