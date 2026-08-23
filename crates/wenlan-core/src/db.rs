@@ -3412,9 +3412,14 @@ CREATE TABLE IF NOT EXISTS relations (
 CREATE INDEX IF NOT EXISTS idx_observations_entity ON observations(entity_id);
 -- idx_observations_source_memory is created by migration 79/85 after
 -- reconciling legacy observations tables that do not have source_memory_id.
--- idx_observations_identity is the identity index migration 125 adds;
--- listed here so a brand-new database matches a migrated one.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_identity ON observations(entity_id, lower(trim(content)));
+-- idx_observations_identity is NOT listed here on purpose: SCHEMA is
+-- execute_batch'd on EVERY open, unconditionally and before run_migrations
+-- (see the `entities` split comment above for the same trap). Creating a
+-- UNIQUE index here would run it against a database that may still hold
+-- pre-125 duplicates, aborting the open with a UNIQUE constraint failure
+-- before migration 125 ever gets a chance to dedupe them. A fresh install
+-- replays the whole migration chain from user_version 0, so migration 125
+-- creates the index there too -- see migrate_125_observation_identity.
 CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_entity, to_entity);
 CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(to_entity, from_entity);
 
@@ -16255,6 +16260,12 @@ impl MemoryDB {
     /// identity going forward. Idempotent -- a second run finds no
     /// duplicate row (the index already blocks new ones) and `CREATE UNIQUE
     /// INDEX IF NOT EXISTS` is a no-op.
+    ///
+    /// SQLite's `trim()`/`lower()` are ASCII-only: `trim()` strips only
+    /// plain spaces (not tabs, newlines, or Unicode whitespace) and
+    /// `lower()` case-folds only `A`-`Z`. The identity is narrower than a
+    /// true "normalised text" comparison -- two observations differing only
+    /// in non-ASCII casing or non-space whitespace are treated as distinct.
     async fn migrate_125_observation_identity(
         &self,
         prior_version: i64,
@@ -34526,14 +34537,20 @@ impl MemoryDB {
             // G6 Stage 2 PR 2c sub-step 2: direct targeted write -- adding
             // an observation only touches the entity's `updated_at`. The
             // matching `UPDATE entities SET updated_at` retired at Stage 3.
-            conn.execute(
-                "UPDATE pages SET entity_updated_at = ?1, last_modified = ?2
-                 WHERE kind = 'entity'
-                   AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
-                libsql::params![now, now_iso.clone(), entity_id.to_string()],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("add_observation shadow: {}", e)))?;
+            // Only touch it when a row was actually inserted: a duplicate is
+            // a no-op read, and re-stamping `updated_at`/`last_modified` on
+            // every repeat call would drift the shadow page's watermark for
+            // content that never changed.
+            if inserted {
+                conn.execute(
+                    "UPDATE pages SET entity_updated_at = ?1, last_modified = ?2
+                     WHERE kind = 'entity'
+                       AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
+                    libsql::params![now, now_iso.clone(), entity_id.to_string()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("add_observation shadow: {}", e)))?;
+            }
 
             Ok(inserted)
         }
@@ -36941,6 +36958,15 @@ impl MemoryDB {
                     // memories yield the same sentence, `idx_observations_identity`
                     // (migration 125) keeps the first source's provenance and
                     // this insert quietly no-ops rather than erroring.
+                    //
+                    // Accepted limitation: reprocessing above deletes only
+                    // this source's own rows (`DELETE ... WHERE
+                    // source_memory_id = ?1`), so if the *first* (surviving,
+                    // provenance-holding) source is later re-enriched and no
+                    // longer yields this sentence, the observation disappears
+                    // even though a second source still asserts it -- there is
+                    // no re-derivation from remaining sources on delete. Out
+                    // of scope for this PR; tracked as a known gap, not a bug.
                     conn.execute(
                         "INSERT OR IGNORE INTO observations
                              (id, entity_id, content, source_memory_id, source_agent,

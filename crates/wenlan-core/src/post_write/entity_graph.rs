@@ -346,34 +346,45 @@ pub async fn add_observation(
             req.confidence,
         )
         .await?;
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     if !created {
-        warnings.push("duplicate observation: returned existing id".to_string());
+        warnings.push(format!(
+            "duplicate observation on entity {}: returned existing id",
+            req.entity_id
+        ));
     }
 
-    // Activity log (no verify step yet — observations have no canonical quality check)
-    let detail = format!("entity_id={}, content_len={}", req.entity_id, content.len());
-    if let Err(e) = db
-        .log_agent_activity(
-            agent,
-            "observation_add",
-            std::slice::from_ref(&id),
-            None,
-            &detail,
-        )
-        .await
-    {
-        log::warn!("[add_observation] activity log failed: {e}");
+    // Activity log (no verify step yet — observations have no canonical quality check).
+    // Skipped on the duplicate path: the identity index rejected the insert, so nothing
+    // actually happened and there is no write to attribute to the agent.
+    if created {
+        let detail = format!("entity_id={}, content_len={}", req.entity_id, content.len());
+        if let Err(e) = db
+            .log_agent_activity(
+                agent,
+                "observation_add",
+                std::slice::from_ref(&id),
+                None,
+                &detail,
+            )
+            .await
+        {
+            log::warn!("[add_observation] activity log failed: {e}");
+        }
     }
 
     Ok(WriteResult {
         id,
         attached_to: None,
         warnings,
-        wrote: true,
+        wrote: created,
         revision_card_id: None,
         gated: false,
-        outcome: WriteOutcome::Wrote,
+        outcome: if created {
+            WriteOutcome::Wrote
+        } else {
+            WriteOutcome::Unchanged
+        },
         acknowledged: false,
     })
 }

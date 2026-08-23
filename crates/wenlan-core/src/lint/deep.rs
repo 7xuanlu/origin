@@ -242,6 +242,11 @@ async fn structured_conflicts(context: &LintContext<'_, '_>) -> Result<RowCheck,
 // `semantic_candidates.rs::load_relations`, PR 2c fix round finding 3): a
 // canonical-only entity (no `entities` row) no longer silently drops its
 // observations out of this scope filter.
+//
+// Migration 125 added a UNIQUE index on (entity_id, LOWER(TRIM(content))) --
+// the same identity this check groups by -- so post-125 this check can only
+// ever Pass; it now serves as a tripwire on that write-time invariant rather
+// than a live inventory of duplicates.
 async fn observation_duplicates(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     let (scope, params) = scope_clause(context.scope().filter(), "e.space", true);
     rows(

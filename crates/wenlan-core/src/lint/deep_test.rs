@@ -45,6 +45,12 @@ async fn deep_profile_detects_structural_and_advisory_counterexamples() {
              -- population entirely. observations/relations/edges/
              -- memory_entities below reference 'entity_a' as a bare id --
              -- no FK to `entities` remains to satisfy.
+             -- obs_a/obs_b are deliberately near-duplicates (not identical):
+             -- migration 125's idx_observations_identity is a UNIQUE index
+             -- on (entity_id, lower(trim(content))), so two rows with the
+             -- exact same content can no longer coexist here. Observation
+             -- content dedup is covered by an explicit Pass assertion below
+             -- instead of this structural fixture.
              INSERT INTO pages
                  (id,title,summary,content,kind,entity_type,confidence,entity_confirmed,
                   embedding,space,workspace,source_memory_ids,version,status,
@@ -56,7 +62,7 @@ async fn deep_profile_detects_structural_and_advisory_counterexamples() {
              VALUES ('entity_a','page_entity_a',0);
              INSERT INTO observations
                  (id,entity_id,content,created_at)
-             VALUES ('obs_a','entity_a','same',0),('obs_b','entity_a','same',0);
+             VALUES ('obs_a','entity_a','same a',0),('obs_b','entity_a','same b',0);
              INSERT INTO relations
                  (id,from_entity,to_entity,relation_type,created_at)
              VALUES ('rel_a','entity_a','entity_a','legacy_custom_type',0);
@@ -97,13 +103,23 @@ async fn deep_profile_detects_structural_and_advisory_counterexamples() {
         MEMORY_DUPLICATES,
         RETRIEVAL_SUBSTRATE,
         CONFLICTS,
-        OBSERVATION_DUPLICATES,
         PAGE_DUPLICATES,
     ] {
         assert_eq!(check(&report, id).outcome(), LintOutcome::Finding, "{id}");
         assert_eq!(check(&report, id).gate_effect(), LintGateEffect::Advisory);
         assert!(!check(&report, id).evidence().is_empty());
     }
+    // obs_a/obs_b no longer share identical content (migration 125's unique
+    // index forbids seeding that here -- see the fixture comment above), so
+    // observation content dedup is now a Pass: this check has become a
+    // tripwire for the invariant the index enforces at write time.
+    let observation_duplicates = check(&report, OBSERVATION_DUPLICATES);
+    assert_eq!(observation_duplicates.outcome(), LintOutcome::Pass);
+    assert_eq!(
+        observation_duplicates.gate_effect(),
+        LintGateEffect::Advisory
+    );
+    assert!(observation_duplicates.evidence().is_empty());
     assert_eq!(
         check(&report, PAGE_BODY).outcome(),
         LintOutcome::NotRunPrerequisite

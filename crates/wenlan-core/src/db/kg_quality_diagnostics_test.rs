@@ -53,8 +53,12 @@ async fn insert_observations(db: &MemoryDB, entity_id: &str, count: usize) {
         transaction
             .execute(
                 "INSERT INTO observations (id, entity_id, content, created_at)
-             VALUES (?1, ?2, 'observation', 1)",
-                libsql::params![format!("{entity_id}-obs-{index:02}"), entity_id],
+             VALUES (?1, ?2, ?3, 1)",
+                libsql::params![
+                    format!("{entity_id}-obs-{index:02}"),
+                    entity_id,
+                    format!("observation {index}")
+                ],
             )
             .await
             .unwrap();
