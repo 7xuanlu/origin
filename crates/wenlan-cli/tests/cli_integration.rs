@@ -479,6 +479,7 @@ fn each_subcommand_has_help() {
         "connect",
         "sources",
         "outbox",
+        "entities",
     ] {
         cli().args([sub, "--help"]).assert().success();
     }
@@ -535,6 +536,30 @@ fn connect_command_has_help() {
     ] {
         cli().args(args).assert().success();
     }
+}
+
+#[test]
+fn entities_subcommands_have_help() {
+    for args in [
+        &["entities", "merge", "--help"][..],
+        &["entities", "alias", "--help"][..],
+    ] {
+        cli().args(args).assert().success();
+    }
+}
+
+#[test]
+fn entities_commands_require_arguments() {
+    cli()
+        .args(["entities", "merge", "Alicia"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--into"));
+
+    cli()
+        .args(["entities", "alias", "Alicia"])
+        .assert()
+        .failure();
 }
 
 #[test]

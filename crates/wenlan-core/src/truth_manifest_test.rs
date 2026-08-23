@@ -201,19 +201,24 @@ fn manifest_counts_match_the_spec() {
     // 165 after the dead recent-relations, entity-suggestions and community
     // proposal/page-assignment routes were deleted (KG review 2026-08-16). Then
     // 162 after the uncalled GET `/api/ping` and the redundant GET/PUT
-    // `/api/config/skip-apps` pair were deleted (audit 2026-08-22).
+    // `/api/config/skip-apps` pair were deleted (audit 2026-08-22), then 164
+    // after the entity merge/alias surface added POST
+    // `/api/memory/entities/{id}/merge` and POST
+    // `/api/memory/entities/{id}/aliases` (2026-08-22).
     assert_eq!(
         HTTP_READERS.len(),
-        162,
+        164,
         "registered (method, path, handler) triples"
     );
     assert_eq!(MCP_READERS.len(), 29, "#[tool( declarations");
-    assert_eq!(CLI_READERS.len(), 19, "Commands variants");
+    // No hand-bumped CLI count here: `wenlan-cli`'s
+    // `catalog_tests::truth_manifest_cli_rows_match_clap_subcommands` derives
+    // the expected set from clap's `Commands` enum, which this crate cannot see.
 
     let entries: Vec<_> = runtime_entries().collect();
     assert_eq!(
         entries.len(),
-        166,
+        168,
         "(builder, method, path) runtime entries"
     );
     assert_eq!(
@@ -221,7 +226,7 @@ fn manifest_counts_match_the_spec() {
             .iter()
             .filter(|(b, _, _)| *b == Builder::Main)
             .count(),
-        160,
+        162,
         "main builder entries"
     );
     assert_eq!(
@@ -397,7 +402,7 @@ fn marker_shape_allowlist_is_fail_closed() {
             .iter()
             .filter(|r| r.marker_shape == MarkerShape::None)
             .count(),
-        156
+        158
     );
 }
 

@@ -11,9 +11,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use wenlan_types::requests::{AddObservationRequest, CreateEntityRequest, CreateRelationRequest};
+use wenlan_types::requests::{
+    AddEntityAliasRequest, AddObservationRequest, CreateEntityRequest, CreateRelationRequest,
+    MergeEntityRequest,
+};
 use wenlan_types::responses::{
-    AddObservationResponse, CreateEntityResponse, CreateRelationResponse,
+    AddObservationResponse, CreateEntityResponse, CreateRelationResponse, EntityAliasesResponse,
+    MergeEntityResponse,
 };
 use wenlan_types::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};
 
@@ -57,6 +61,11 @@ pub(crate) fn register_crud(router: TrackedRouter<SharedState>) -> TrackedRouter
         .route(
             "/api/memory/entities/{entity_id}/observations",
             post(handle_add_entity_observation),
+        )
+        .route("/api/memory/entities/{id}/merge", post(handle_merge_entity))
+        .route(
+            "/api/memory/entities/{id}/aliases",
+            post(handle_add_entity_alias),
         )
         .route(
             "/api/memory/observations/{id}",
@@ -383,6 +392,130 @@ pub async fn handle_add_entity_observation(
     Ok(Json(wenlan_types::responses::AddObservationResponse {
         id: result.id,
         warnings: result.warnings,
+    }))
+}
+
+/// POST /api/memory/entities/{id}/merge -- merge `{id}` (the loser) into
+/// `into` (the canonical). `dry_run` returns the preview without mutating
+/// anything; `applied` on the response tells the caller which happened.
+pub async fn handle_merge_entity(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    Path(id): Path<String>,
+    Json(req): Json<MergeEntityRequest>,
+) -> Result<Json<MergeEntityResponse>, ServerError> {
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    if req.dry_run {
+        let preview = db.merge_entities_preview(&req.into, &id).await?;
+        return Ok(Json(MergeEntityResponse {
+            canonical_id: preview.canonical_id,
+            canonical_name: preview.canonical_name,
+            loser_id: preview.loser_id,
+            loser_name: preview.loser_name,
+            memory_links: preview.memory_links,
+            observations: preview.observations,
+            edges: preview.edges,
+            aliases_added: preview.aliases_added,
+            applied: false,
+        }));
+    }
+    // One locked pass: the merge validates the ids itself and reports the
+    // names and counts it actually moved, so an apply needs no preview.
+    let outcome = db.merge_entities(&req.into, &id).await?;
+    if !outcome.merged {
+        return Err(ServerError::NotFound(format!("entity {id} not found")));
+    }
+    Ok(Json(MergeEntityResponse {
+        canonical_id: req.into,
+        canonical_name: outcome.canonical_name,
+        loser_id: id,
+        loser_name: outcome.loser_name,
+        memory_links: outcome.memory_links,
+        observations: outcome.observations,
+        edges: outcome.edges,
+        aliases_added: outcome.aliases_added,
+        applied: true,
+    }))
+}
+
+/// POST /api/memory/entities/{id}/aliases -- declare `alias` as an
+/// additional name for entity `{id}`. Idempotent when `{id}` already owns
+/// the alias; 409 when another active entity owns it.
+pub async fn handle_add_entity_alias(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    Path(id): Path<String>,
+    Json(req): Json<AddEntityAliasRequest>,
+) -> Result<Json<EntityAliasesResponse>, ServerError> {
+    if req.alias.trim().is_empty() {
+        return Err(ServerError::ValidationError(
+            "alias must not be empty".into(),
+        ));
+    }
+    let alias = req.alias.trim();
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    // 404 when `id` does not name a live entity; idempotent when it already
+    // owns the alias.
+    let Some((_, aliases)) = db.entity_name_and_aliases(&id).await? else {
+        return Err(ServerError::NotFound(format!("entity {id} not found")));
+    };
+    let alias_lower = alias.to_lowercase();
+    if aliases.contains(&alias_lower) {
+        return Ok(Json(EntityAliasesResponse {
+            entity_id: id,
+            aliases,
+        }));
+    }
+    if let Some(owner_id) = db.resolve_entity_by_alias(&alias_lower).await? {
+        if owner_id != id {
+            // `store_entity` self-seeds every live entity's aliases with its
+            // own lowercased name, so this conflict is most often "that's
+            // someone else's current name" rather than a previously-declared
+            // alias -- say so and point at merge.
+            let owner_name = db
+                .entity_name_and_aliases(&owner_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|(name, _)| name);
+            if owner_name
+                .as_deref()
+                .is_some_and(|name| name.to_lowercase() == alias_lower)
+            {
+                return Err(ServerError::Conflict(format!(
+                    "alias {:?} is the name of live entity {owner_id}; use \
+                     POST /api/memory/entities/{owner_id}/merge (CLI: wenlan \
+                     entities merge ...) instead",
+                    alias
+                )));
+            }
+            return Err(ServerError::Conflict(format!(
+                "alias {:?} is already owned by entity {owner_id}",
+                alias
+            )));
+        }
+    }
+    db.add_entity_alias(alias, &id, "api").await?;
+    // `add_entity_alias` skips silently when the write-time ownership guard
+    // fails: re-read and confirm the alias actually landed.
+    let aliases = db
+        .entity_name_and_aliases(&id)
+        .await?
+        .map(|(_, aliases)| aliases)
+        .unwrap_or_default();
+    if !aliases.contains(&alias_lower) {
+        return Err(ServerError::Conflict(format!(
+            "alias {:?} was not recorded for entity {id}",
+            alias
+        )));
+    }
+    Ok(Json(EntityAliasesResponse {
+        entity_id: id,
+        aliases,
     }))
 }
 

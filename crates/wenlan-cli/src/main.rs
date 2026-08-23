@@ -175,6 +175,11 @@ enum Commands {
         #[command(subcommand)]
         command: commands::outbox::OutboxCommand,
     },
+    /// Merge or alias knowledge-graph entities (id or exact name).
+    Entities {
+        #[command(subcommand)]
+        cmd: commands::entities::EntitiesCmd,
+    },
 }
 
 #[tokio::main]
@@ -371,6 +376,36 @@ async fn main() -> anyhow::Result<ExitCode> {
         Commands::Outbox { command } => {
             commands::outbox::run(&client, format, cli.quiet, command).await?
         }
+        Commands::Entities { cmd } => {
+            commands::entities::run(&client, format, cli.quiet, cmd).await?
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+    use std::collections::BTreeSet;
+
+    /// Every top-level clap subcommand must have a row in the M5 truth
+    /// manifest, and the manifest must not list a command that no longer
+    /// exists. Clap is the source of truth; the manifest is the catalog.
+    #[test]
+    fn truth_manifest_cli_rows_match_clap_subcommands() {
+        let clap_names: BTreeSet<String> = Cli::command()
+            .get_subcommands()
+            .map(|c| format!("wenlan {}", c.get_name()))
+            .filter(|name| name != "wenlan help")
+            .collect();
+        let manifest: BTreeSet<String> = wenlan_core::truth_manifest::CLI_READERS
+            .iter()
+            .map(|r| r.subcommand.to_string())
+            .collect();
+        assert_eq!(
+            clap_names, manifest,
+            "CLI_READERS in wenlan-core/src/truth_manifest.rs drifted from the clap `Commands` enum"
+        );
+    }
 }

@@ -14,16 +14,19 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use wenlan_types::{
     requests::{
-        ListMemoriesRequest, SearchMemoryRequest, SearchRequest, SetDefaultSpaceRequest,
-        StoreMemoryRequest, UpdateAgentRequest,
+        AddEntityAliasRequest, ListEntitiesRequest, ListMemoriesRequest, MergeEntityRequest,
+        SearchMemoryRequest, SearchRequest, SetDefaultSpaceRequest, StoreMemoryRequest,
+        UpdateAgentRequest,
     },
     responses::{
-        AgentResponse, DefaultSpaceResponse, HealthResponse, ListMemoriesResponse,
-        MemoryDetailResponse, PendingRevisionItem, RevisionAcceptResponse, RevisionDismissResponse,
-        SearchMemoryResponse, SearchResponse, StoreMemoryResponse,
+        AgentResponse, DefaultSpaceResponse, EntityAliasesResponse, HealthResponse,
+        ListEntitiesResponse, ListMemoriesResponse, MemoryDetailResponse, MergeEntityResponse,
+        PendingRevisionItem, RevisionAcceptResponse, RevisionDismissResponse, SearchMemoryResponse,
+        SearchResponse, StoreMemoryResponse,
     },
     sources::Source,
-    BriefReadRequest, BriefReadResponse, BriefUpdateReceipt, BriefUpdateRequest, OutboxDrainReport,
+    BriefReadRequest, BriefReadResponse, BriefUpdateReceipt, BriefUpdateRequest, EntityDetail,
+    OutboxDrainReport,
 };
 
 mod lint;
@@ -452,6 +455,113 @@ impl WenlanClient {
         self.get_json(&format!("/api/memory/{}/detail", source_id), true)
             .await
     }
+
+    /// GET /api/memory/entities/{id} — full entity detail by id. `Ok(None)` on 404
+    /// (used by the CLI's id-or-name resolver to fall back to a name search).
+    pub async fn get_entity(&self, id: &str) -> Result<Option<EntityDetail>> {
+        let url = format!("{}/api/memory/entities/{}", self.base_url, id);
+        let resp = self
+            .send(
+                self.http.get(&url),
+                &format!("GET {} failed (is the daemon running?)", url),
+            )
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        resp.json()
+            .await
+            .map(Some)
+            .context("parsing /api/memory/entities/{id} response")
+    }
+
+    /// POST /api/memory/entities/list — every live entity in scope, unfiltered
+    /// by name. Used for exact-name lookup: the daemon has no by-name filter
+    /// on this route, so callers filter the returned list client-side.
+    pub async fn list_entities(&self) -> Result<ListEntitiesResponse> {
+        let url = format!("{}/api/memory/entities/list", self.base_url);
+        let req = ListEntitiesRequest {
+            entity_type: None,
+            space: None,
+        };
+        let resp = self
+            .send(
+                self.http.post(&url).json(&req),
+                &format!("POST {} failed", url),
+            )
+            .await?;
+        let resp = ensure_daemon_success(resp, &url).await?;
+        resp.json()
+            .await
+            .context("parsing /api/memory/entities/list response")
+    }
+
+    /// POST /api/memory/entities/{id}/merge — merge `loser_id` into `into`.
+    pub async fn merge_entity(
+        &self,
+        loser_id: &str,
+        into: String,
+        dry_run: bool,
+    ) -> Result<MergeEntityResponse> {
+        let url = format!("{}/api/memory/entities/{}/merge", self.base_url, loser_id);
+        let req = MergeEntityRequest { into, dry_run };
+        let resp = self
+            .send(
+                self.http.post(&url).json(&req),
+                &format!("POST {} failed", url),
+            )
+            .await?;
+        let resp = ensure_daemon_success(resp, &url).await?;
+        resp.json()
+            .await
+            .context("parsing /api/memory/entities/{id}/merge response")
+    }
+
+    /// POST /api/memory/entities/{id}/aliases — declare `alias` as an additional name.
+    pub async fn add_entity_alias(&self, id: &str, alias: String) -> Result<EntityAliasesResponse> {
+        let url = format!("{}/api/memory/entities/{}/aliases", self.base_url, id);
+        let req = AddEntityAliasRequest { alias };
+        let resp = self
+            .send(
+                self.http.post(&url).json(&req),
+                &format!("POST {} failed", url),
+            )
+            .await?;
+        let resp = ensure_daemon_success(resp, &url).await?;
+        resp.json()
+            .await
+            .context("parsing /api/memory/entities/{id}/aliases response")
+    }
+}
+
+/// Non-success response -> `anyhow::Error` carrying the daemon's own error
+/// message, not just the status line `error_for_status()` alone gives.
+/// Used only by `list_entities`, `merge_entity`, `add_entity_alias`; every
+/// other client method keeps `error_for_status()` as-is.
+async fn ensure_daemon_success(resp: reqwest::Response, url: &str) -> Result<reqwest::Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let msg = daemon_error_message(&body);
+    anyhow::bail!("daemon returned {status} for {url}: {msg}");
+}
+
+/// Pull the daemon's message out of an error response body: the `error`
+/// string when the body is a `{"error": "..."}` JSON object (the shape
+/// every `ServerError` response uses), else the raw body trimmed.
+fn daemon_error_message(body: &str) -> String {
+    #[derive(Deserialize)]
+    struct ErrorEnvelope {
+        error: String,
+    }
+    serde_json::from_str::<ErrorEnvelope>(body)
+        .map(|envelope| envelope.error)
+        .unwrap_or_else(|_| body.trim().to_string())
 }
 
 fn build_list_request(
@@ -469,7 +579,25 @@ fn build_list_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_list_request, WenlanClient};
+    use super::{build_list_request, daemon_error_message, WenlanClient};
+
+    #[test]
+    fn daemon_error_message_reads_error_envelope() {
+        let body =
+            r#"{"error":"alias \"origin-core\" is the name of live entity e1; use merge instead"}"#;
+        assert_eq!(
+            daemon_error_message(body),
+            "alias \"origin-core\" is the name of live entity e1; use merge instead"
+        );
+    }
+
+    #[test]
+    fn daemon_error_message_falls_back_to_raw_text() {
+        assert_eq!(
+            daemon_error_message("  Internal Server Error  "),
+            "Internal Server Error"
+        );
+    }
 
     #[test]
     fn list_request_can_filter_unconfirmed_memories() {

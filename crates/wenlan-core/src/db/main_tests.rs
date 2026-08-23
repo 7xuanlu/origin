@@ -23705,6 +23705,39 @@ async fn test_add_entity_alias() {
     assert_eq!(r2, Some(id.clone()));
 }
 
+/// Storage and lookup must agree on trimming: `add_entity_alias` trims before
+/// it stores, and `resolve_entity_by_alias` trims before it looks up, so a
+/// padded alias and its unpadded lookups all land on the same entity.
+#[tokio::test]
+async fn add_entity_alias_trims_before_storing_and_resolving() {
+    let (db, _dir) = test_db().await;
+    let id = db
+        .store_entity("Alice Chen", "person", None, Some("test"), None)
+        .await
+        .unwrap();
+    db.add_entity_alias("  ali  ", &id, "test").await.unwrap();
+
+    for candidate in ["ali", "  ali", "ALI "] {
+        assert_eq!(
+            db.resolve_entity_by_alias(candidate).await.unwrap(),
+            Some(id.clone()),
+            "candidate {candidate:?}"
+        );
+    }
+
+    let detail = db.get_entity_detail(&id).await.unwrap();
+    assert!(
+        detail.entity.aliases.contains(&"ali".to_string()),
+        "{:?}",
+        detail.entity.aliases
+    );
+    assert!(
+        !detail.entity.aliases.iter().any(|a| a != a.trim()),
+        "no padded alias should be stored: {:?}",
+        detail.entity.aliases
+    );
+}
+
 /// Ordinary sequential writers must not be able to create an alias collision:
 /// `add_entity_alias` skips the append when another active entity page already
 /// claims the alias, which is what `entity_aliases`' `UNIQUE(alias_name)` +
@@ -28559,6 +28592,427 @@ async fn merge_entities_canonical_missing_not_found() {
     );
 }
 
+/// Migration 125's identity index would otherwise turn the alias-side
+/// re-point (`UPDATE observations SET entity_id = canonical ...`) into a
+/// unique violation whenever both entities independently observed the same
+/// fact. `merge_entities` deletes the alias's colliding row first, so the
+/// canonical keeps its own copy plus each side's unique observation: shared
+/// (canonical's) + canonical-unique + alias-unique = 3, none left on the
+/// alias id.
+#[tokio::test]
+async fn merge_entities_dedups_overlapping_observations() {
+    let (db, _tmp) = test_db().await;
+    let (canonical, alias) = seed_two_entities(&db).await;
+    // Distinct source_agent values on the two "Shared fact" inserts let the
+    // post-merge assertion tell the canonical's own row apart from a
+    // same-content row that merely reused its id.
+    let canonical_shared_id = db
+        .add_observation(&canonical, "Shared fact", Some("canonical-source"), None)
+        .await
+        .unwrap();
+    db.add_observation(&canonical, "Canonical unique", None, None)
+        .await
+        .unwrap();
+    db.add_observation(&alias, "Shared fact", Some("alias-source"), None)
+        .await
+        .unwrap();
+    db.add_observation(&alias, "Alias unique", None, None)
+        .await
+        .unwrap();
+
+    db.merge_entities(&canonical, &alias).await.unwrap();
+
+    let conn = db.conn.lock().await;
+    let canonical_count: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM observations WHERE entity_id = ?1",
+            libsql::params![canonical.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        canonical_count, 3,
+        "shared (kept once) + canonical-unique + alias-unique"
+    );
+
+    // The row count alone can't tell which of the two identical-content
+    // rows survived. Assert the surviving row is the canonical's own --
+    // same id, same source_agent -- not the alias's row re-pointed under
+    // the canonical's entity_id.
+    let row = conn
+        .query(
+            "SELECT id, source_agent FROM observations WHERE entity_id = ?1 AND content = ?2",
+            libsql::params![canonical.as_str(), "Shared fact"],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .expect("the shared observation must still exist on the canonical");
+    assert_eq!(
+        row.get::<String>(0).unwrap(),
+        canonical_shared_id,
+        "the canonical's own shared-observation row must survive the merge, not the alias's"
+    );
+    assert_eq!(
+        row.get::<Option<String>>(1).unwrap(),
+        Some("canonical-source".to_string())
+    );
+    let alias_count: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM observations WHERE entity_id = ?1",
+            libsql::params![alias.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(alias_count, 0, "no observation rows left on the alias id");
+}
+
+/// `merge_entities_preview`'s counts must equal what `merge_entities` itself
+/// moves -- not what's merely attached to the loser. Seeds one memory link
+/// and one observation the loser SHARES with the canonical (both dedup away
+/// rather than move) alongside one of each the loser holds alone (both must
+/// move), then checks the preview's counts, the applied `MergeOutcome`'s
+/// counts, and the actual pre/post-merge row deltas on the canonical all
+/// agree.
+///
+/// `memory_links` specifically must count BOTH sources `/api/memory/graph`'s
+/// own union draws from -- the `memory_entities` link table AND the legacy
+/// direct `memories.entity_id` column -- so this also seeds a memory linked
+/// to the loser only through the legacy column, and one linked through both
+/// sources at once (must still count once, not twice).
+#[tokio::test]
+async fn merge_entities_preview_counts_match_post_merge_deltas() {
+    let (db, _tmp) = test_db().await;
+    let (canonical, alias) = seed_two_entities(&db).await;
+
+    db.link_memory_entities("shared_memory", &[canonical.as_str(), alias.as_str()])
+        .await
+        .unwrap();
+    db.link_memory_entities("alias_only_memory", &[alias.as_str()])
+        .await
+        .unwrap();
+    // Legacy-column-only link: a `memories` row whose `entity_id` names the
+    // loser directly, with no corresponding `memory_entities` row.
+    insert_memory_with_entity(
+        &db,
+        "legacy_only_memory",
+        "Legacy only",
+        "legacy column link only",
+        1712707200,
+        1712707200,
+        "enriched",
+        &alias,
+    )
+    .await;
+    // Both sources at once: a `memories` row with `entity_id = alias` AND a
+    // `memory_entities` row for the same memory id -- must count once.
+    insert_memory_with_entity(
+        &db,
+        "both_sources_memory",
+        "Both sources",
+        "legacy column and link table",
+        1712707200,
+        1712707200,
+        "enriched",
+        &alias,
+    )
+    .await;
+    db.link_memory_entities("both_sources_memory", &[alias.as_str()])
+        .await
+        .unwrap();
+    db.add_observation(&canonical, "Shared fact", None, None)
+        .await
+        .unwrap();
+    db.add_observation(&alias, "Shared fact", None, None)
+        .await
+        .unwrap();
+    db.add_observation(&alias, "Alias unique fact", None, None)
+        .await
+        .unwrap();
+
+    let canonical_memory_links_before = count_entity_memory_links_union(&db, &canonical).await;
+    let canonical_observations_before = count_entity_rows(
+        &db,
+        "SELECT COUNT(*) FROM observations WHERE entity_id = ?1",
+        &canonical,
+    )
+    .await;
+
+    let preview = db.merge_entities_preview(&canonical, &alias).await.unwrap();
+    assert_eq!(
+        preview.memory_links, 3,
+        "alias-only, legacy-only, and both-sources links should each count once"
+    );
+    assert_eq!(
+        preview.observations, 1,
+        "only the alias-unique observation should be counted as moving"
+    );
+
+    let outcome = db.merge_entities(&canonical, &alias).await.unwrap();
+    assert!(outcome.merged);
+    assert_eq!(
+        outcome.memory_links, preview.memory_links,
+        "the outcome's own count must match the preview's"
+    );
+    assert_eq!(
+        outcome.observations, preview.observations,
+        "the outcome's own count must match the preview's"
+    );
+
+    let canonical_memory_links_after = count_entity_memory_links_union(&db, &canonical).await;
+    let canonical_observations_after = count_entity_rows(
+        &db,
+        "SELECT COUNT(*) FROM observations WHERE entity_id = ?1",
+        &canonical,
+    )
+    .await;
+    assert_eq!(
+        canonical_memory_links_after - canonical_memory_links_before,
+        preview.memory_links as i64,
+        "the preview's memory_links count must equal the real post-merge union delta on the canonical"
+    );
+    assert_eq!(
+        canonical_observations_after - canonical_observations_before,
+        preview.observations as i64,
+        "the preview's observations count must equal the real post-merge delta"
+    );
+}
+
+async fn count_entity_rows(db: &MemoryDB, sql: &str, entity_id: &str) -> i64 {
+    let conn = db.conn.lock().await;
+    conn.query(sql, libsql::params![entity_id])
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap()
+}
+
+/// Distinct memories linked to `entity_id` through EITHER `memory_links`
+/// source -- `memory_entities`, or the legacy `memories.entity_id` column
+/// (`chunk_index = 0` only) -- the same union `/api/memory/graph` draws
+/// from. `count_entity_rows` only ever queries one table at a time, so this
+/// is a separate helper rather than a redefinition of it.
+async fn count_entity_memory_links_union(db: &MemoryDB, entity_id: &str) -> i64 {
+    let conn = db.conn.lock().await;
+    conn.query(
+        "SELECT COUNT(*) FROM ( \
+             SELECT memory_id AS mid FROM memory_entities WHERE entity_id = ?1 \
+             UNION \
+             SELECT source_id AS mid FROM memories \
+              WHERE entity_id = ?1 AND source = 'memory' AND chunk_index = 0)",
+        libsql::params![entity_id],
+    )
+    .await
+    .unwrap()
+    .next()
+    .await
+    .unwrap()
+    .unwrap()
+    .get(0)
+    .unwrap()
+}
+
+/// A loser↔canonical edge would re-point onto the canonical's own
+/// self-loop -- not a relation (`create_relation_with_span` refuses one;
+/// the extraction writer skips one) -- so `merge_entities` retires it
+/// instead of re-asserting it, and the edge count must not include it.
+/// Separately, two of the loser's edges can still collapse onto the SAME
+/// `(src, dst, semantic_type)` identity that already exists on the
+/// canonical (a loser->other edge whose re-pointed identity duplicates an
+/// existing canonical->other edge), and `dual_write_edge_with_payload`'s
+/// content-addressed edge id means only ONE edge lands for that identity.
+/// Seeds a reciprocal `leads` pair between loser and canonical (both would
+/// become the self-loop -- retired, not counted), a `works_on` edge from
+/// both loser and canonical to a third entity (the re-pointed identity
+/// already exists on the canonical -- not counted), and a `leads` edge
+/// from loser to the third entity (new -- counted). Checks the preview's
+/// count, the applied `MergeOutcome`'s count, the identities that actually
+/// newly appear among the canonical's active edges, that no active
+/// self-loop lands on the canonical, that both loser↔canonical edges are
+/// invalidated, and that exactly one edge survives for each of the
+/// `works_on` and `leads` canonical->other identities.
+#[tokio::test]
+async fn merge_entities_retires_loser_canonical_edges_and_counts_distinct_identities() {
+    let (db, _tmp) = test_db().await;
+    let (canonical, alias) = seed_two_entities(&db).await;
+    let other = db.create_entity("Carol", "person", None).await.unwrap();
+
+    // Reciprocal same-type edges between loser and canonical: both would
+    // re-point onto the canonical's own self-loop, so `merge_entities`
+    // retires them instead of re-asserting them.
+    db.create_relation(&alias, &canonical, "leads", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+    db.create_relation(&canonical, &alias, "leads", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+    // (`works_on` is already the canonical relation type; `create_relation`
+    // rewrites e.g. `works_at` to it, so the seeds use the stored form.)
+    // The loser's works_on edge to `other` re-points onto an identity the
+    // canonical already has -- content-addressed dedup, not a new edge.
+    db.create_relation(&alias, &other, "works_on", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+    db.create_relation(&canonical, &other, "works_on", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+    // An ordinary loser edge to `other` -- new identity, counted.
+    db.create_relation(&alias, &other, "leads", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+
+    let before = canonical_touching_edge_identities(&db, &canonical).await;
+
+    let preview = db.merge_entities_preview(&canonical, &alias).await.unwrap();
+    assert_eq!(
+        preview.edges, 1,
+        "only the new loser->other leads edge counts: the reciprocal pair \
+         is retired as a self-loop, and the works_on re-point already \
+         exists on the canonical"
+    );
+
+    let outcome = db.merge_entities(&canonical, &alias).await.unwrap();
+    assert!(outcome.merged);
+    assert_eq!(
+        outcome.edges, preview.edges,
+        "the outcome's own count must match the preview's"
+    );
+
+    let after = canonical_touching_edge_identities(&db, &canonical).await;
+    let newly_appeared = after.difference(&before).count() as u64;
+    assert_eq!(
+        newly_appeared, preview.edges,
+        "the preview's edges count must equal the identities that actually \
+         newly appear among the canonical's active edges after the merge"
+    );
+
+    let conn = db.conn.lock().await;
+    let self_loops: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' \
+             AND src_id = ?1 AND dst_id = ?1 AND valid_until IS NULL",
+            libsql::params![canonical.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        self_loops, 0,
+        "no active self-loop should land on the canonical"
+    );
+
+    let loser_touching: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' \
+             AND (src_id = ?1 OR dst_id = ?1) AND valid_until IS NULL",
+            libsql::params![alias.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        loser_touching, 0,
+        "both loser-canonical edges should be invalidated, not re-asserted"
+    );
+
+    let works_on_survivors: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' \
+             AND src_id = ?1 AND dst_id = ?2 AND semantic_type = 'works_on' \
+             AND valid_until IS NULL",
+            libsql::params![canonical.as_str(), other.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        works_on_survivors, 1,
+        "content-addressed dedup should leave exactly one works_on edge"
+    );
+
+    let leads_survivors: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' \
+             AND src_id = ?1 AND dst_id = ?2 AND semantic_type = 'leads' \
+             AND valid_until IS NULL",
+            libsql::params![canonical.as_str(), other.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        leads_survivors, 1,
+        "exactly one canonical->other leads edge should survive"
+    );
+}
+
+/// `(src_id, dst_id, semantic_type)` for every active `relates` edge
+/// touching `entity_id` -- a repointed identity always touches the
+/// canonical on at least one side, so this is the same universe
+/// `edges_will_move_delta`'s `NOT EXISTS` scan checks against.
+async fn canonical_touching_edge_identities(
+    db: &MemoryDB,
+    entity_id: &str,
+) -> std::collections::HashSet<(String, String, Option<String>)> {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT src_id, dst_id, semantic_type FROM edges \
+             WHERE edge_type = 'relates' AND src_kind = 'entity' AND dst_kind = 'entity' \
+               AND valid_until IS NULL AND (src_id = ?1 OR dst_id = ?1)",
+            libsql::params![entity_id],
+        )
+        .await
+        .unwrap();
+    let mut set = std::collections::HashSet::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        set.insert((
+            row.get::<String>(0).unwrap(),
+            row.get::<String>(1).unwrap(),
+            row.get::<Option<String>>(2).unwrap(),
+        ));
+    }
+    set
+}
+
 // ==================== supersede_relation ====================
 
 #[tokio::test]
@@ -31454,6 +31908,49 @@ async fn ambient_enrichment_commit_refuses_junk_names_and_canonicalizes_types() 
     );
 }
 
+/// Spec acceptance 2: once "origin" is declared an alias of "wenlan", the
+/// ambient enrichment lane's own resolution step (the same alias-lookup
+/// `resolve_or_create_entity` runs) must land a re-extracted "Origin" on the
+/// existing canonical entity instead of minting a duplicate.
+#[tokio::test]
+async fn commit_entity_enrichment_resolves_extracted_name_to_declared_alias() {
+    let (db, _dir) = test_db().await;
+    let content = "wenlan shipped a new feature today.";
+    db.upsert_documents(vec![make_memory_doc(
+        "mem_origin_alias",
+        content,
+        "knowledge",
+        "work",
+        "agent",
+    )])
+    .await
+    .unwrap();
+
+    let canonical = db.create_entity("wenlan", "project", None).await.unwrap();
+    db.add_entity_alias("origin", &canonical, "test")
+        .await
+        .unwrap();
+
+    let kg = extracted_entity_with_observation(
+        "Origin",
+        "project",
+        "Origin shipped a new feature today.",
+    );
+    assert!(db
+        .commit_entity_enrichment_at_version("mem_origin_alias", 1, &kg, content)
+        .await
+        .unwrap());
+
+    let stored = db.list_entities(None, None).await.unwrap();
+    assert_eq!(
+        stored.len(),
+        1,
+        "the extracted 'Origin' must resolve to the existing aliased entity, not create a duplicate"
+    );
+    assert_eq!(stored[0].id, canonical);
+    assert_eq!(stored[0].name, "wenlan");
+}
+
 fn extracted_graph(
     from: &str,
     to: &str,
@@ -31847,7 +32344,7 @@ async fn migration_113_and_114_replay_against_a_genuine_schema_112_pages_shape()
         .await
         .expect("a schema-112 database with entities must open on the current build");
     assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
-    assert_eq!(user_version(&db).await, 124);
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
 
     let conn = db.conn.lock().await;
     for (entity_id, source_agent, created_at) in [
@@ -53208,7 +53705,7 @@ async fn migration_124_retires_orphan_edges_requeues_parked_jobs_and_downgrades_
     db.run_migrations(&crate::events::NoopEmitter)
         .await
         .expect("migration 124 must apply");
-    assert_eq!(user_version(&db).await, 124);
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
 
     let (valid_until, _, tag, _) = relates_edge_state(&db, &orphan_edge).await;
     assert!(valid_until.is_some(), "the orphan edge is retired");
@@ -53244,6 +53741,576 @@ async fn migration_124_retires_orphan_edges_requeues_parked_jobs_and_downgrades_
     let (valid_until, _, tag, _) = relates_edge_state(&db, &orphan_edge).await;
     assert!(valid_until.is_none());
     assert!(tag.is_none());
+}
+
+/// Migration 125 (KG observation identity, PR 1): an observation's identity
+/// is `(entity_id, lower(trim(content)))`. `test_db()` already carries
+/// `idx_observations_identity` (migration 125 is its sole creator -- the
+/// fresh-schema `SCHEMA` block runs before `run_migrations` on every open,
+/// so putting the index there would fail the first open of a DB that still
+/// holds duplicates; a fresh install gets the index by replaying the
+/// migration chain from version 0), so duplicates are seeded by dropping the
+/// index, inserting raw rows, rewinding `user_version` to 124, and replaying
+/// migration 125 for real -- proving both halves (dedup DELETE, `CREATE
+/// UNIQUE INDEX`) through the actual migration path rather than asserting on
+/// hand-run SQL.
+#[tokio::test]
+async fn migration_125_dedups_observations_and_adds_identity_index() {
+    let (db, _dir) = test_db().await;
+    db.test_seed_entity_shadow_page(TestEntity::new("m125-e", "M125 Entity", "concept"))
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("DROP INDEX IF EXISTS idx_observations_identity", ())
+            .await
+            .unwrap();
+        // Oldest survivor by created_at, a case/whitespace-variant
+        // duplicate, and an unrelated observation that must survive intact.
+        conn.execute(
+            "INSERT INTO observations (id, entity_id, content, created_at) \
+             VALUES ('m125-old', 'm125-e', 'Foo bar', 100)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations (id, entity_id, content, created_at) \
+             VALUES ('m125-dup', 'm125-e', 'foo bar  ', 200)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations (id, entity_id, content, created_at) \
+             VALUES ('m125-other', 'm125-e', 'Other', 150)",
+            (),
+        )
+        .await
+        .unwrap();
+        // A group of 3+ duplicates (prod has 16 such groups): oldest by
+        // `created_at` must survive out of every member, not just a pair.
+        conn.execute(
+            "INSERT INTO observations (id, entity_id, content, created_at) \
+             VALUES ('m125-triple-a', 'm125-e', 'Triple', 50), \
+                    ('m125-triple-b', 'm125-e', 'triple', 60), \
+                    ('m125-triple-c', 'm125-e', ' TRIPLE ', 70)",
+            (),
+        )
+        .await
+        .unwrap();
+        // A `created_at` tie (prod has 18 such groups): the delete's
+        // secondary sort is smallest `rowid`, so the first-inserted row
+        // (lower rowid) must survive.
+        conn.execute(
+            "INSERT INTO observations (id, entity_id, content, created_at) \
+             VALUES ('m125-tie-a', 'm125-e', 'Tie', 300), \
+                    ('m125-tie-b', 'm125-e', 'TIE', 300)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA user_version = 124", ()).await.unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("migration 125 must apply");
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+
+    {
+        let conn = db.conn.lock().await;
+        let remaining: i64 = conn
+            .query(
+                "SELECT COUNT(*) FROM observations WHERE entity_id = 'm125-e'",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(
+            remaining, 4,
+            "the case/whitespace duplicate, the group-of-3, and the created_at \
+             tie all collapse to one survivor each (2 unrelated + 1 + 1)"
+        );
+
+        let survivor: String = conn
+            .query(
+                "SELECT id FROM observations \
+                 WHERE entity_id = 'm125-e' AND lower(trim(content)) = 'foo bar'",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap();
+        assert_eq!(survivor, "m125-old", "the oldest row per identity survives");
+
+        let triple_survivor: String = conn
+            .query(
+                "SELECT id FROM observations \
+                 WHERE entity_id = 'm125-e' AND lower(trim(content)) = 'triple'",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap();
+        assert_eq!(
+            triple_survivor, "m125-triple-a",
+            "the oldest of a 3-way duplicate group survives"
+        );
+
+        let tie_survivor: String = conn
+            .query(
+                "SELECT id FROM observations \
+                 WHERE entity_id = 'm125-e' AND lower(trim(content)) = 'tie'",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap();
+        assert_eq!(
+            tie_survivor, "m125-tie-a",
+            "a created_at tie breaks on smallest rowid (first inserted)"
+        );
+
+        let idx_count: i64 = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_observations_identity'",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(idx_count, 1, "the identity index exists");
+
+        let changed = conn
+            .execute(
+                "INSERT OR IGNORE INTO observations (id, entity_id, content, created_at) \
+                 VALUES ('m125-probe', 'm125-e', 'FOO BAR', 999)",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            changed, 0,
+            "the index blocks a case/whitespace-variant duplicate insert"
+        );
+
+        // Idempotency: rewind and replay finds nothing left to dedupe, and
+        // `CREATE UNIQUE INDEX IF NOT EXISTS` is a no-op.
+        conn.execute("PRAGMA user_version = 124", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("re-running migration 125 must be a no-op");
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+    let conn = db.conn.lock().await;
+    let remaining: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM observations WHERE entity_id = 'm125-e'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap();
+    assert_eq!(remaining, 4, "re-run finds no further duplicates");
+}
+
+/// BLOCKER 1 (review, PR 1 fix round): `SCHEMA` is `execute_batch`'d on
+/// every open, unconditionally and *before* `run_migrations` (see the
+/// `entities`-split comment near `SCHEMA`'s definition). An earlier draft of
+/// this migration put `CREATE UNIQUE INDEX idx_observations_identity`
+/// straight into `SCHEMA`, which would abort every future open of the real
+/// prod database (163 pre-125 duplicate rows) with a `UNIQUE constraint
+/// failed` before migration 125 ever ran. This test proves the fix through
+/// the real, on-disk open path (`MemoryDB::new_with_shared_embedder`, not
+/// `test_db()`, which never re-opens): seed duplicates with no index
+/// present, drop the handle, and reopen on the same path. The open must
+/// succeed, and migration 125 -- not `SCHEMA` -- must be what dedupes and
+/// creates the index.
+#[tokio::test]
+async fn reopening_a_db_with_pre_125_duplicate_observations_migrates_cleanly() {
+    let dir = tempdir().unwrap();
+    let embedder = shared_embedder();
+    let db = MemoryDB::new_with_shared_embedder(
+        dir.path(),
+        Arc::new(crate::events::NoopEmitter),
+        Arc::clone(&embedder),
+    )
+    .await
+    .expect("fresh open must succeed");
+    db.test_seed_entity_shadow_page(TestEntity::new("m125-reopen-e", "Reopen Entity", "concept"))
+        .await
+        .unwrap();
+    {
+        let conn = db.conn.lock().await;
+        // Simulate a database that predates migration 125: no identity
+        // index, and two writers' worth of raw duplicate rows already on
+        // disk, exactly like prod's 163 duplicates.
+        conn.execute("DROP INDEX IF EXISTS idx_observations_identity", ())
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO observations (id, entity_id, content, created_at) \
+             VALUES ('m125-reopen-old', 'm125-reopen-e', 'Same fact', 100)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations (id, entity_id, content, created_at) \
+             VALUES ('m125-reopen-dup', 'm125-reopen-e', 'same fact', 200)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA user_version = 124", ()).await.unwrap();
+    }
+    drop(db);
+
+    let reopened = MemoryDB::new_with_shared_embedder(
+        dir.path(),
+        Arc::new(crate::events::NoopEmitter),
+        embedder,
+    )
+    .await
+    .expect(
+        "reopen must succeed: SCHEMA must not contain a UNIQUE index that \
+         could fail against pre-125 duplicates before migration 125 runs",
+    );
+
+    let conn = reopened.conn.lock().await;
+    let mut version_rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+    assert_eq!(
+        version_rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap(),
+        i64::from(SCHEMA_VERSION),
+        "reopen must replay migration 125 (and everything after it)"
+    );
+    drop(version_rows);
+
+    let remaining: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM observations WHERE entity_id = 'm125-reopen-e'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap();
+    assert_eq!(
+        remaining, 1,
+        "migration 125 must dedupe the pre-existing duplicate on reopen"
+    );
+
+    let idx_count: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_observations_identity'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap();
+    assert_eq!(
+        idx_count, 1,
+        "migration 125 must create the identity index on reopen"
+    );
+}
+
+/// `post_write::add_observation`'s duplicate-detection wrapper
+/// (`add_observation_dedup`): a second identical observation returns the
+/// same id instead of minting a new row, and carries a warning the caller
+/// can surface.
+#[tokio::test]
+async fn add_observation_twice_returns_existing_id_and_warns() {
+    let (db, _dir) = test_db().await;
+    let entity_id = db
+        .create_entity("M125 Dedup Entity", "concept", None)
+        .await
+        .unwrap();
+    let make_req = || wenlan_types::requests::AddObservationRequest {
+        entity_id: entity_id.clone(),
+        content: "Same text".to_string(),
+        source_agent: None,
+        confidence: None,
+    };
+
+    let first = crate::post_write::add_observation(&db, make_req(), "test-agent")
+        .await
+        .unwrap();
+    assert!(first.warnings.is_empty());
+
+    let (watermark_before, activity_count_before): (i64, i64) = {
+        let conn = db.conn.lock().await;
+        let watermark: i64 = conn
+            .query(
+                "SELECT entity_updated_at FROM pages WHERE kind = 'entity'
+                   AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+                libsql::params![entity_id.as_str()],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        let activity_count: i64 = conn
+            .query(
+                "SELECT COUNT(*) FROM agent_activity WHERE action = 'observation_add'",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        (watermark, activity_count)
+    };
+
+    let second = crate::post_write::add_observation(&db, make_req(), "test-agent")
+        .await
+        .unwrap();
+    assert_eq!(second.id, first.id, "the second call returns the same id");
+    assert!(
+        second
+            .warnings
+            .iter()
+            .any(|w| w.contains("duplicate observation")),
+        "the second call must carry a duplicate warning, got {:?}",
+        second.warnings
+    );
+    assert!(
+        !second.wrote,
+        "a duplicate observation must report wrote:false"
+    );
+    assert_eq!(second.outcome, crate::post_write::WriteOutcome::Unchanged);
+
+    let conn = db.conn.lock().await;
+    let count: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM observations WHERE entity_id = ?1",
+            libsql::params![entity_id.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap();
+    assert_eq!(count, 1, "only one row was created");
+
+    let watermark_after: i64 = conn
+        .query(
+            "SELECT entity_updated_at FROM pages WHERE kind = 'entity'
+               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![entity_id.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        watermark_after, watermark_before,
+        "a duplicate observation must not touch the entity's freshness watermark"
+    );
+    let activity_count_after: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM agent_activity WHERE action = 'observation_add'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        activity_count_after, activity_count_before,
+        "a duplicate observation must not record a new activity event"
+    );
+}
+
+/// `commit_entity_enrichment_at_version`'s `INSERT OR IGNORE` (migration
+/// 125): reprocessing the same source memory must not accumulate duplicates
+/// (already true via the per-source DELETE), and a second, different source
+/// memory extracting the identical sentence for the same entity must not
+/// create a second row either -- the identity index is what stops that case,
+/// and the first source keeps provenance.
+#[tokio::test]
+async fn enrichment_commit_reprocess_keeps_one_observation_per_identity() {
+    let (db, _dir) = test_db().await;
+    db.upsert_documents(vec![make_memory_doc(
+        "mem_m125_source_a",
+        "Rust is a systems language.",
+        "fact",
+        "work",
+        "agent",
+    )])
+    .await
+    .unwrap();
+    db.upsert_documents(vec![make_memory_doc(
+        "mem_m125_source_b",
+        "Rust is a systems language, restated.",
+        "fact",
+        "work",
+        "agent",
+    )])
+    .await
+    .unwrap();
+
+    let extracted = extracted_graph("Rust", "Systems", "Rust is a systems language");
+
+    assert!(db
+        .commit_entity_enrichment_at_version(
+            "mem_m125_source_a",
+            1,
+            &extracted,
+            "Rust is a systems language.",
+        )
+        .await
+        .unwrap());
+    // Reprocessing the same source clears its own prior row first, so this
+    // must not duplicate even without the identity index.
+    assert!(db
+        .commit_entity_enrichment_at_version(
+            "mem_m125_source_a",
+            1,
+            &extracted,
+            "Rust is a systems language.",
+        )
+        .await
+        .unwrap());
+
+    {
+        let conn = db.conn.lock().await;
+        let count: i64 = conn
+            .query(
+                "SELECT COUNT(*) FROM observations WHERE content = 'Rust is a systems language'",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "reprocessing the same source must not duplicate the observation"
+        );
+    }
+
+    // A second, different source memory extracts the identical sentence for
+    // the same entity.
+    assert!(db
+        .commit_entity_enrichment_at_version(
+            "mem_m125_source_b",
+            1,
+            &extracted,
+            "Rust is a systems language, restated.",
+        )
+        .await
+        .unwrap());
+
+    let conn = db.conn.lock().await;
+    let count: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM observations WHERE content = 'Rust is a systems language'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "a second source committing the identical sentence must not create a duplicate row"
+    );
+
+    let source_memory_id: Option<String> = conn
+        .query(
+            "SELECT source_memory_id FROM observations \
+             WHERE content = 'Rust is a systems language'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        source_memory_id.as_deref(),
+        Some("mem_m125_source_a"),
+        "the first source keeps provenance"
+    );
 }
 
 #[tokio::test]

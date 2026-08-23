@@ -441,6 +441,93 @@ pub struct MigrationProgress {
     pub phase: String,
 }
 
+/// Parse the `pages.aliases` JSON-array-of-strings column into a `Vec`.
+/// `NULL`/empty/malformed input yields an empty vec rather than an error --
+/// aliases are additive display data on `Entity`, never load-bearing for a read.
+pub(crate) fn parse_pages_aliases(raw: Option<String>) -> Vec<String> {
+    raw.as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default()
+}
+
+/// Names a merge adds to the canonical's `pages.aliases`: the loser's alias
+/// array plus its bare lowercased name, minus whatever the canonical already
+/// carries -- the same candidate set `merge_entities`' canonical-shadow UNION
+/// writes, so `MergePreview` and `MergeOutcome` report it identically.
+pub(crate) fn aliases_gained(
+    canonical_aliases_json: Option<String>,
+    loser_aliases_json: Option<String>,
+    loser_name: &str,
+) -> Vec<String> {
+    let canonical: HashSet<String> = parse_pages_aliases(canonical_aliases_json)
+        .into_iter()
+        .collect();
+    let mut gained: BTreeSet<String> = parse_pages_aliases(loser_aliases_json)
+        .into_iter()
+        .filter(|a| !canonical.contains(a))
+        .collect();
+    let loser_name_lower = loser_name.to_lowercase();
+    if !loser_name_lower.is_empty() && !canonical.contains(&loser_name_lower) {
+        gained.insert(loser_name_lower);
+    }
+    gained.into_iter().collect()
+}
+
+/// Read-only counts for what `MemoryDB::merge_entities(canonical_id, alias_id)`
+/// would move, computed without mutating anything -- backs the `/merge` route's
+/// `dry_run` branch and the CLI's `--dry-run` flag.
+#[derive(Debug, Clone)]
+pub struct MergePreview {
+    pub canonical_id: String,
+    pub canonical_name: String,
+    pub loser_id: String,
+    pub loser_name: String,
+    /// Distinct memories the merge will newly link to the canonical -- see
+    /// `memory_links_delta` for the two link sources it unions and why
+    /// `/api/memory/graph` can show fewer links gained than this count.
+    pub memory_links: u64,
+    /// Observations the merge will move onto the canonical -- excludes a
+    /// loser row whose `(entity_id, lower(trim(content)))` identity already
+    /// exists on the canonical, which `merge_entities` deletes rather than
+    /// moves (migration 125's identity index).
+    pub observations: u64,
+    /// Edges the merge will move onto the canonical -- excludes a loser
+    /// edge whose re-pointed (src, dst, relation_type) already names an
+    /// existing canonical edge, since `merge_entities` re-asserts that same
+    /// content-addressed edge id rather than creating a second one. A
+    /// loser↔canonical edge is retired, not re-pointed (a self-loop is
+    /// not a relation), and is not counted.
+    pub edges: u64,
+    /// Loser name + loser aliases, minus names the canonical already
+    /// carries as an alias -- what `merge_entities` would add to the
+    /// canonical's `pages.aliases` array.
+    pub aliases_added: Vec<String>,
+}
+
+/// What `MemoryDB::merge_entities(canonical_id, alias_id)` actually moved,
+/// captured from inside its own transaction so the counts can't drift from
+/// a separately-locked `MergePreview` taken earlier. `merged: false` is the
+/// idempotent no-op case (the loser was already gone); every other field is
+/// `0`/empty in that case.
+#[derive(Debug, Clone)]
+pub struct MergeOutcome {
+    pub merged: bool,
+    /// Canonical and loser names as the merge read them (the route answers
+    /// an apply from this alone, without a separate preview).
+    pub canonical_name: String,
+    pub loser_name: String,
+    /// Distinct memories newly linked to the canonical -- see
+    /// `memory_links_delta` for the union this counts (both
+    /// `memory_entities` and the legacy `memories.entity_id` column).
+    pub memory_links: u64,
+    pub observations: u64,
+    /// Distinct re-pointed edge identities newly landing on the canonical.
+    /// A loser↔canonical edge is retired, not re-pointed (a self-loop is
+    /// not a relation), and is not counted.
+    pub edges: u64,
+    pub aliases_added: Vec<String>,
+}
+
 /// Counts returned by the migration-55 startup backfill, for an operator notice.
 #[derive(Debug, Default, PartialEq)]
 pub struct Migration55Report {
@@ -1068,7 +1155,7 @@ pub const EMBEDDING_DIM: usize = 768;
 /// `entities` table, skip every `version < N` branch, and quietly operate
 /// against a schema it cannot see. Refusing to open is recoverable; writing is
 /// not.
-pub const SCHEMA_VERSION: u32 = 124;
+pub const SCHEMA_VERSION: u32 = 125;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -3327,6 +3414,14 @@ CREATE TABLE IF NOT EXISTS relations (
 CREATE INDEX IF NOT EXISTS idx_observations_entity ON observations(entity_id);
 -- idx_observations_source_memory is created by migration 79/85 after
 -- reconciling legacy observations tables that do not have source_memory_id.
+-- idx_observations_identity is NOT listed here on purpose: SCHEMA is
+-- execute_batch'd on EVERY open, unconditionally and before run_migrations
+-- (see the `entities` split comment above for the same trap). Creating a
+-- UNIQUE index here would run it against a database that may still hold
+-- pre-125 duplicates, aborting the open with a UNIQUE constraint failure
+-- before migration 125 ever gets a chance to dedupe them. A fresh install
+-- replays the whole migration chain from user_version 0, so migration 125
+-- creates the index there too -- see migrate_125_observation_identity.
 CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_entity, to_entity);
 CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(to_entity, from_entity);
 
@@ -9281,6 +9376,14 @@ impl MemoryDB {
             // migrate_124_kg_integrity_repair.
             if version < 124 {
                 self.migrate_124_kg_integrity_repair(version).await?;
+            }
+
+            // Migration 125 (KG observation identity, PR 1): dedupe
+            // `observations` and add the `UNIQUE` expression index that
+            // gives an observation an identity going forward. See
+            // migrate_125_observation_identity.
+            if version < 125 {
+                self.migrate_125_observation_identity(version).await?;
             }
         }
 
@@ -16145,6 +16248,81 @@ impl MemoryDB {
             "[migration] Migration 124 applied: {retired} orphan entity edge(s) retired, \
              {requeued} parked derivation job(s) requeued, \
              {downgraded} cross-space active edge(s) downgraded to legacy"
+        );
+        Ok(())
+    }
+
+    /// Migration 125 (KG observation identity, PR 1): an observation's
+    /// identity is `(entity_id, lower(trim(content)))` -- two writers
+    /// (`commit_entity_enrichment_at_version` and `add_observation`) always
+    /// insert, so prod has accumulated duplicate rows for the same fact.
+    /// Deletes the duplicates first, keeping the oldest survivor per
+    /// identity (smallest `created_at`, ties broken by smallest `rowid`),
+    /// then creates the `UNIQUE` expression index that enforces the
+    /// identity going forward. Idempotent -- a second run finds no
+    /// duplicate row (the index already blocks new ones) and `CREATE UNIQUE
+    /// INDEX IF NOT EXISTS` is a no-op.
+    ///
+    /// SQLite's `trim()`/`lower()` are ASCII-only: `trim()` strips only
+    /// plain spaces (not tabs, newlines, or Unicode whitespace) and
+    /// `lower()` case-folds only `A`-`Z`. The identity is narrower than a
+    /// true "normalised text" comparison -- two observations differing only
+    /// in non-ASCII casing or non-space whitespace are treated as distinct.
+    async fn migrate_125_observation_identity(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(125, prior_version).await?;
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m125 begin: {e}")))?;
+
+        let result: Result<u64, WenlanError> = async {
+            let deleted = conn
+                .execute(
+                    "DELETE FROM observations WHERE rowid IN ( \
+                         SELECT o.rowid FROM observations o \
+                         JOIN observations k ON k.entity_id = o.entity_id \
+                           AND lower(trim(k.content)) = lower(trim(o.content)) \
+                           AND (k.created_at < o.created_at \
+                                OR (k.created_at = o.created_at AND k.rowid < o.rowid)))",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m125 dedupe: {e}")))?;
+
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_identity \
+                 ON observations(entity_id, lower(trim(content)))",
+                (),
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m125 index: {e}")))?;
+
+            Ok(deleted)
+        }
+        .await;
+
+        let deleted = match result {
+            Ok(value) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m125 commit: {e}")))?;
+                value
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+
+        conn.execute("PRAGMA user_version = 125", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m125 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 125 applied: {deleted} duplicate observation(s) deleted, \
+             idx_observations_identity created"
         );
         Ok(())
     }
@@ -28779,7 +28957,7 @@ impl MemoryDB {
         // off `entities` too, now that `store_entity` no longer writes it --
         // a shadow-only entity has no legacy row for the fallback to find.
         let fetch_limit = (limit * 3) as i64;
-        let sql = "SELECT m.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, vector_distance_cos(p.embedding, vector32(?1)) AS dist
+        let sql = "SELECT m.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, vector_distance_cos(p.embedding, vector32(?1)) AS dist, p.aliases
                    FROM vector_top_k('idx_pages_embedding', vector32(?1), ?2) AS vt
                    JOIN pages p ON p.rowid = vt.id
                    JOIN entity_page_map m ON m.page_id = p.id
@@ -28813,6 +28991,7 @@ impl MemoryDB {
                         confirmed: row.get::<i64>(6).unwrap_or(0) != 0,
                         created_at: row.get::<i64>(7).unwrap_or(0),
                         updated_at: row.get::<i64>(8).unwrap_or(0),
+                        aliases: parse_pages_aliases(row.get::<Option<String>>(10).unwrap_or(None)),
                     };
                     let distance: f64 = row.get::<f64>(9).unwrap_or(1.0);
                     results.push(EntitySearchResult {
@@ -28836,7 +29015,7 @@ impl MemoryDB {
         // row here and silently dropped out of auto-link/dedup matching.
         if results.is_empty() {
             let fallback_sql =
-                "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, vector_distance_cos(p.embedding, vector32(?1)) as distance
+                "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, vector_distance_cos(p.embedding, vector32(?1)) as distance, p.aliases
                  FROM entity_page_map epm
                  JOIN pages p ON p.id = epm.page_id
                  WHERE p.kind = 'entity' AND p.status = 'active' AND p.embedding IS NOT NULL
@@ -28864,6 +29043,9 @@ impl MemoryDB {
                             confirmed: row.get::<i64>(6).unwrap_or(0) != 0,
                             created_at: row.get::<i64>(7).unwrap_or(0),
                             updated_at: row.get::<i64>(8).unwrap_or(0),
+                            aliases: parse_pages_aliases(
+                                row.get::<Option<String>>(10).unwrap_or(None),
+                            ),
                         };
                         let distance: f64 = row.get::<f64>(9).unwrap_or(1.0);
                         results.push(EntitySearchResult {
@@ -33418,7 +33600,7 @@ impl MemoryDB {
                  WHERE p.kind = 'entity' AND p.status = 'active'
                    AND EXISTS (SELECT 1 FROM json_each(p.aliases) WHERE value = ?1)
                  ORDER BY p.created_at, epm.entity_id LIMIT 1",
-                libsql::params![name.to_lowercase()],
+                libsql::params![name.trim().to_lowercase()],
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("alias lookup: {}", e)))?;
@@ -33476,7 +33658,7 @@ impl MemoryDB {
                     WHERE p2.kind = 'entity' AND p2.status = 'active'
                       AND epm2.entity_id <> ?3
                       AND EXISTS (SELECT 1 FROM json_each(p2.aliases) WHERE value = ?1))",
-            libsql::params![alias.to_lowercase(), now_iso, entity_id.to_string()],
+            libsql::params![alias.trim().to_lowercase(), now_iso, entity_id.to_string()],
         )
         .await
         .map_err(|e| WenlanError::VectorDb(format!("add alias shadow: {}", e)))?;
@@ -33647,7 +33829,8 @@ impl MemoryDB {
         let mut rows = conn
             .query(
                 "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
-                        p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at \
+                        p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
+                        p.aliases \
                  FROM entity_page_map epm \
                  JOIN pages p ON p.id = epm.page_id \
                  WHERE p.kind = 'entity' AND p.status = 'active' AND LOWER(p.title) = LOWER(?1)",
@@ -33677,6 +33860,7 @@ impl MemoryDB {
                 confirmed: row.get::<i64>(6).unwrap_or(0) != 0,
                 created_at: row.get::<i64>(7).unwrap_or(0),
                 updated_at: row.get::<i64>(8).unwrap_or(0),
+                aliases: parse_pages_aliases(row.get::<Option<String>>(9).unwrap_or(None)),
             });
         }
         Ok(entities)
@@ -33744,6 +33928,9 @@ impl MemoryDB {
     /// best-effort/unmirrored write here would permanently drift the exact
     /// watermark Stage 2 uses as its proof surface) -- same
     /// transaction-then-`update_entity_shadow_page` pattern as `store_entity`.
+    ///
+    /// Thin wrapper over [`Self::add_observation_dedup`] for the ~8 existing
+    /// callers that only need an id back.
     pub async fn add_observation(
         &self,
         entity_id: &str,
@@ -33751,6 +33938,23 @@ impl MemoryDB {
         source_agent: Option<&str>,
         confidence: Option<f32>,
     ) -> Result<String, WenlanError> {
+        self.add_observation_dedup(entity_id, content, source_agent, confidence)
+            .await
+            .map(|(id, _created)| id)
+    }
+
+    /// [`Self::add_observation`], reporting whether the row was actually
+    /// created. Identity is `(entity_id, lower(trim(content)))` (migration
+    /// 125's `idx_observations_identity`): when the insert is ignored as a
+    /// duplicate, returns the existing row's id instead and `created =
+    /// false` so the caller can surface the duplicate.
+    pub async fn add_observation_dedup(
+        &self,
+        entity_id: &str,
+        content: &str,
+        source_agent: Option<&str>,
+        confidence: Option<f32>,
+    ) -> Result<(String, bool), WenlanError> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
         let now_iso = chrono::Utc::now().to_rfc3339();
@@ -33760,9 +33964,9 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("add_observation begin: {}", e)))?;
 
-        let result: Result<(), WenlanError> = async {
-            conn.execute(
-                "INSERT INTO observations (id, entity_id, content, source_agent, confidence, confirmed, created_at)
+        let result: Result<bool, WenlanError> = async {
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO observations (id, entity_id, content, source_agent, confidence, confirmed, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
                 libsql::params![
                     id.clone(),
@@ -33774,47 +33978,294 @@ impl MemoryDB {
                 ],
             )
             .await
-            .map_err(|e| WenlanError::VectorDb(format!("add_observation: {}", e)))?;
+            .map_err(|e| WenlanError::VectorDb(format!("add_observation: {}", e)))?
+                > 0;
 
             // G6 Stage 2 PR 2c sub-step 2: direct targeted write -- adding
             // an observation only touches the entity's `updated_at`. The
             // matching `UPDATE entities SET updated_at` retired at Stage 3.
-            conn.execute(
-                "UPDATE pages SET entity_updated_at = ?1, last_modified = ?2
-                 WHERE kind = 'entity'
-                   AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
-                libsql::params![now, now_iso.clone(), entity_id.to_string()],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("add_observation shadow: {}", e)))?;
+            // Only touch it when a row was actually inserted: a duplicate is
+            // a no-op read, and re-stamping `updated_at`/`last_modified` on
+            // every repeat call would drift the shadow page's watermark for
+            // content that never changed.
+            if inserted {
+                conn.execute(
+                    "UPDATE pages SET entity_updated_at = ?1, last_modified = ?2
+                     WHERE kind = 'entity'
+                       AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
+                    libsql::params![now, now_iso.clone(), entity_id.to_string()],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("add_observation shadow: {}", e)))?;
+            }
 
-            Ok(())
+            Ok(inserted)
         }
         .await;
 
-        match result {
-            Ok(()) => {
+        let inserted = match result {
+            Ok(inserted) => {
                 conn.execute("COMMIT", ())
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("add_observation commit: {}", e)))?;
+                inserted
             }
             Err(e) => {
                 let _ = conn.execute("ROLLBACK", ()).await;
                 return Err(e);
             }
+        };
+
+        if inserted {
+            return Ok((id, true));
         }
 
-        Ok(id)
+        // Duplicate: the identity index blocked the insert. Look up the
+        // surviving row's id so the caller still gets one back.
+        let mut rows = conn
+            .query(
+                "SELECT id FROM observations WHERE entity_id = ?1 AND lower(trim(content)) = lower(trim(?2))",
+                libsql::params![entity_id.to_string(), content.to_string()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("add_observation dedup lookup: {}", e)))?;
+        let existing_id = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("add_observation dedup row: {}", e)))?
+            .ok_or_else(|| {
+                WenlanError::VectorDb(
+                    "add_observation: insert was ignored but no matching row found".into(),
+                )
+            })?
+            .get::<String>(0)
+            .map_err(|e| WenlanError::VectorDb(format!("add_observation dedup id: {}", e)))?;
+
+        Ok((existing_id, false))
+    }
+
+    /// `MergePreview.memory_links` / `MergeOutcome.memory_links`: the count
+    /// of distinct memories `/api/memory/graph`'s own `memory_links` UNION
+    /// (`scoped_entities.rs`) would show moving from `entity_id` onto
+    /// `exclude_entity_id` -- i.e. linked to `entity_id` through either
+    /// source (the `memory_entities` link table, or the legacy direct
+    /// `memories.entity_id` column, `chunk_index = 0` only so a chunked
+    /// memory isn't counted once per chunk) and NOT already linked to
+    /// `exclude_entity_id` through either source. Both `memory_entities`
+    /// (`INSERT OR IGNORE`) and the legacy column (`UPDATE`) move rows in
+    /// `merge_entities`, so a count of only one source undercounts what the
+    /// graph shows moving.
+    async fn memory_links_delta(
+        conn: &libsql::Connection,
+        entity_id: &str,
+        exclude_entity_id: &str,
+    ) -> Result<i64, libsql::Error> {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM ( \
+                     SELECT memory_id AS mid FROM memory_entities WHERE entity_id = ?1 \
+                     UNION \
+                     SELECT source_id AS mid FROM memories \
+                      WHERE entity_id = ?1 AND source = 'memory' AND chunk_index = 0 \
+                 ) loser_links \
+                 WHERE loser_links.mid NOT IN ( \
+                     SELECT memory_id FROM memory_entities WHERE entity_id = ?2 \
+                     UNION \
+                     SELECT source_id FROM memories \
+                      WHERE entity_id = ?2 AND source = 'memory' AND chunk_index = 0)",
+                libsql::params![entity_id, exclude_entity_id],
+            )
+            .await?;
+        Ok(rows.next().await?.and_then(|r| r.get(0).ok()).unwrap_or(0))
+    }
+
+    /// `MergePreview.edges` / `MergeOutcome.edges`: the count of DISTINCT
+    /// re-pointed `(src, dst, semantic_type)` identities the merge will add
+    /// to the canonical -- NOT a per-row count of `entity_id`'s edges. Two
+    /// of `entity_id`'s edges can collapse onto the SAME re-pointed
+    /// identity (most commonly reciprocal same-type edges `entity_id ->
+    /// exclude_entity_id` and `exclude_entity_id -> entity_id`), and
+    /// `dual_write_edge_with_payload`'s content-addressed edge id means
+    /// only ONE edge lands for that identity -- counting per-row would
+    /// overstate what the merge actually adds. A loser↔canonical edge
+    /// would re-point onto a self-loop (`exclude_entity_id ->
+    /// exclude_entity_id`); the merge retires it instead of re-asserting it
+    /// (a self-loop is not a relation), so it is not counted. Excludes an
+    /// identity that already exists among `exclude_entity_id`'s active
+    /// edges, since re-asserting it is an upsert onto that same row, not a
+    /// new edge.
+    async fn edges_will_move_delta(
+        conn: &libsql::Connection,
+        entity_id: &str,
+        exclude_entity_id: &str,
+    ) -> Result<i64, libsql::Error> {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM ( \
+                     SELECT DISTINCT \
+                         (CASE WHEN e1.src_id = ?1 THEN ?2 ELSE e1.src_id END) AS new_src, \
+                         (CASE WHEN e1.dst_id = ?1 THEN ?2 ELSE e1.dst_id END) AS new_dst, \
+                         e1.semantic_type AS semantic_type \
+                     FROM edges e1 \
+                     WHERE e1.edge_type = 'relates' AND e1.src_kind = 'entity' \
+                       AND e1.dst_kind = 'entity' AND (e1.src_id = ?1 OR e1.dst_id = ?1) \
+                       AND e1.valid_until IS NULL \
+                 ) repointed \
+                 WHERE repointed.new_src <> repointed.new_dst AND NOT EXISTS ( \
+                     SELECT 1 FROM edges e2 \
+                      WHERE e2.edge_type = 'relates' AND e2.src_kind = 'entity' \
+                        AND e2.dst_kind = 'entity' AND e2.valid_until IS NULL \
+                        AND e2.semantic_type IS repointed.semantic_type \
+                        AND e2.src_id = repointed.new_src \
+                        AND e2.dst_id = repointed.new_dst)",
+                libsql::params![entity_id, exclude_entity_id],
+            )
+            .await?;
+        Ok(rows.next().await?.and_then(|r| r.get(0).ok()).unwrap_or(0))
+    }
+
+    /// Read-only preview of `merge_entities(canonical_id, alias_id)`: the
+    /// rows the merge will actually move onto the canonical, plus the alias
+    /// names it would add, without touching the database. Each count
+    /// excludes rows `merge_entities` would drop as duplicates rather than
+    /// move (see `MergePreview`'s field docs) -- a naive "everything
+    /// attached to the loser" count overstates the receipt whenever the two
+    /// entities share memory links, observation text, or a relation. Errors
+    /// the same way `merge_entities` does: same id is a validation error, an
+    /// unknown canonical or loser is not-found.
+    /// The live entity shadow page for `entity_id` as `(title, entity_type,
+    /// aliases_json)`; `None` when no active `kind='entity'` page maps to
+    /// it. `label` prefixes the error text with the caller's name.
+    async fn read_entity_page(
+        conn: &libsql::Connection,
+        entity_id: &str,
+        label: &str,
+    ) -> Result<Option<(String, String, Option<String>)>, WenlanError> {
+        let mut rows = conn
+            .query(
+                "SELECT p.title, p.entity_type, p.aliases FROM entity_page_map epm \
+                 JOIN pages p ON p.id = epm.page_id \
+                 WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
+                libsql::params![entity_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("{label} read entity page: {e}")))?;
+        Ok(rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("{label} row: {e}")))?
+            .map(|r| {
+                (
+                    r.get::<String>(0).unwrap_or_default(),
+                    r.get::<String>(1).unwrap_or_default(),
+                    r.get::<Option<String>>(2).unwrap_or(None),
+                )
+            }))
+    }
+
+    /// Name and aliases of the live entity `entity_id` (`None` when it is
+    /// not live) -- the one-row read the alias route needs, instead of the
+    /// full `get_entity_detail` (which also loads every observation and
+    /// relation).
+    pub async fn entity_name_and_aliases(
+        &self,
+        entity_id: &str,
+    ) -> Result<Option<(String, Vec<String>)>, WenlanError> {
+        let conn = self.conn.lock().await;
+        Ok(
+            Self::read_entity_page(&conn, entity_id, "entity_name_and_aliases")
+                .await?
+                .map(|(title, _, aliases_json)| (title, parse_pages_aliases(aliases_json))),
+        )
+    }
+
+    pub async fn merge_entities_preview(
+        &self,
+        canonical_id: &str,
+        alias_id: &str,
+    ) -> Result<MergePreview, WenlanError> {
+        if canonical_id == alias_id {
+            return Err(WenlanError::Validation(
+                "merge_entities_preview: canonical and alias are the same id".into(),
+            ));
+        }
+
+        let conn = self.conn.lock().await;
+
+        let Some((loser_name, _, loser_aliases_json)) =
+            Self::read_entity_page(&conn, alias_id, "merge_entities_preview").await?
+        else {
+            return Err(WenlanError::NotFound(format!(
+                "entity {alias_id} not found"
+            )));
+        };
+        let Some((canonical_name, _, canonical_aliases_json)) =
+            Self::read_entity_page(&conn, canonical_id, "merge_entities_preview").await?
+        else {
+            return Err(WenlanError::NotFound(format!(
+                "entity {canonical_id} not found"
+            )));
+        };
+
+        // Excludes a memory already linked to the canonical through either
+        // source -- see `memory_links_delta`.
+        let memory_links: i64 = Self::memory_links_delta(&conn, alias_id, canonical_id)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("merge_entities_preview links: {e}")))?;
+
+        // Excludes a loser observation whose (entity_id, lower(trim(content)))
+        // identity already exists on the canonical -- `merge_entities` deletes
+        // that row (migration 125's identity index) rather than moving it.
+        let observations: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM observations o \
+                     WHERE o.entity_id = ?1 \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM observations c \
+                          WHERE c.entity_id = ?2 \
+                            AND lower(trim(c.content)) = lower(trim(o.content)))",
+                    libsql::params![alias_id, canonical_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("merge_entities_preview obs: {e}")))?;
+            rows.next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("merge_entities_preview obs row: {e}")))?
+                .and_then(|r| r.get(0).ok())
+                .unwrap_or(0)
+        };
+
+        // Distinct re-pointed identities the merge will add -- see
+        // `edges_will_move_delta`.
+        let edges: i64 = Self::edges_will_move_delta(&conn, alias_id, canonical_id)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("merge_entities_preview edges: {e}")))?;
+
+        let aliases_added = aliases_gained(canonical_aliases_json, loser_aliases_json, &loser_name);
+
+        Ok(MergePreview {
+            canonical_id: canonical_id.to_string(),
+            canonical_name,
+            loser_id: alias_id.to_string(),
+            loser_name,
+            memory_links: memory_links.max(0) as u64,
+            observations: observations.max(0) as u64,
+            edges: edges.max(0) as u64,
+            aliases_added,
+        })
     }
 
     /// Merge `alias_id` into `canonical_id`. Re-points all FK references, registers
     /// the alias name, cleans dangling alias-table rows, and deletes the alias entity.
-    /// Idempotent: returns `Ok(())` if `alias_id` is already gone.
+    /// Idempotent: returns `Ok(MergeOutcome { merged: false, .. })` if `alias_id`
+    /// is already gone. Otherwise returns the rows actually moved, captured from
+    /// inside this call's own transaction (never a separately-locked preview).
     pub async fn merge_entities(
         &self,
         canonical_id: &str,
         alias_id: &str,
-    ) -> Result<(), WenlanError> {
+    ) -> Result<MergeOutcome, WenlanError> {
         if canonical_id == alias_id {
             return Err(WenlanError::Validation(
                 "merge_entities: canonical and alias are the same id".into(),
@@ -33852,33 +34303,28 @@ impl MemoryDB {
             row.get(0).unwrap_or(0)
         };
         if alias_exists == 0 {
-            return Ok(());
+            return Ok(MergeOutcome {
+                merged: false,
+                canonical_name: String::new(),
+                loser_name: String::new(),
+                memory_links: 0,
+                observations: 0,
+                edges: 0,
+                aliases_added: Vec::new(),
+            });
         }
 
-        let canonical_exists: i64 = {
-            let mut rows = conn
-                .query(
-                    "SELECT COUNT(*) FROM entity_page_map epm \
-                     JOIN pages p ON p.id = epm.page_id \
-                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
-                    libsql::params![canonical_id],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("merge_entities count canonical: {e}"))
-                })?;
-            let row = rows
-                .next()
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities row: {e}")))?
-                .ok_or_else(|| WenlanError::VectorDb("merge_entities: no count row".into()))?;
-            row.get(0).unwrap_or(0)
-        };
-        if canonical_exists == 0 {
+        // One read of the canonical's shadow page gives its liveness, name,
+        // type (T16 promotion input below) and pre-merge aliases (the
+        // `MergeOutcome::aliases_added` baseline, taken under the same held
+        // lock as everything else here so it can't race a concurrent writer).
+        let Some((canonical_name, canonical_type, canonical_aliases_json)) =
+            Self::read_entity_page(&conn, canonical_id, "merge_entities").await?
+        else {
             return Err(WenlanError::NotFound(format!(
                 "canonical entity {canonical_id} not found"
             )));
-        }
+        };
 
         // Name/type reads below source from the canonical shadow's scalar
         // mirror (`pages.title`/`pages.entity_type`) rather than
@@ -33917,24 +34363,6 @@ impl MemoryDB {
                 .await
                 .map_err(|e| {
                     WenlanError::VectorDb(format!("merge_entities read alias type: {e}"))
-                })?;
-            rows.next()
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities row: {e}")))?
-                .and_then(|r| r.get::<String>(0).ok())
-                .unwrap_or_default()
-        };
-        let canonical_type: String = {
-            let mut rows = conn
-                .query(
-                    "SELECT p.entity_type FROM entity_page_map epm \
-                     JOIN pages p ON p.id = epm.page_id \
-                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
-                    libsql::params![canonical_id],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("merge_entities read canonical type: {e}"))
                 })?;
             rows.next()
                 .await
@@ -34096,216 +34524,270 @@ impl MemoryDB {
             plans
         };
 
+        // `MergeOutcome::edges` -- same distinct-re-pointed-identity delta
+        // `merge_entities_preview` computes (see `edges_will_move_delta`).
+        // Read here, still under the lock held since function entry and
+        // before any mutation below, so it can't drift from what the
+        // transaction actually does.
+        let edges_will_move: i64 = Self::edges_will_move_delta(&conn, alias_id, canonical_id)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("merge_entities edges count: {e}")))?;
+
+        // `MergeOutcome::memory_links` -- same union-of-both-sources delta
+        // `merge_entities_preview` computes (see `memory_links_delta`). Read
+        // here, still under the lock held since function entry and before
+        // any mutation below, so it can't drift from what the transaction
+        // actually moves.
+        let memory_links_will_move: i64 = Self::memory_links_delta(&conn, alias_id, canonical_id)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("merge_entities links count: {e}")))?;
+
         conn.execute("BEGIN TRANSACTION", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities begin: {e}")))?;
 
-        let result: Result<Vec<CommunityGenerationUpdate>, WenlanError> = async {
-            // G6 Stage 2 PR 2b: the `relations` endpoint repoint stops here —
-            // `edges` is the sole live producer of `relates` edges now, and a
-            // merge-time repoint would keep mutating a store the Q3
-            // frozen-store tripwire audits assume is byte-stable post-flip
-            // (the whole point of those audits is "constant output = healthy";
-            // a live repoint would defeat that signal). `merge_edge_plans`
-            // above now scans `edges` directly and carries every alias-side
-            // edge shadow needed to reassert the corrected canonical edge
-            // below, so nothing here depends on the old `relations` write.
-            let mut graph_changes = Vec::new();
-            for plan in &merge_edge_plans {
-                if let Some(change) =
-                    Self::dual_write_invalidate_edge(&conn, &plan.old_edge_id, None)
-                        .await
-                        .map_err(|error| {
-                            WenlanError::VectorDb(format!(
-                                "merge_entities invalidate old edge: {error}"
-                            ))
-                        })?
-                {
-                    graph_changes.push(change);
-                }
-                // Mirror the re-pointed relation's semantic fields onto the
-                // corrected edge (G6 Stage 1). Previously re-read post-write
-                // from `relations` after the endpoint UPDATEs moved the row;
-                // now sourced directly from the plan's pre-merge snapshot
-                // (G6 Stage 2 PR 2b) since the repoint that read depended on
-                // no longer happens.
-                let semantic_patch = Self::relates_semantic_patch(
-                    plan.confidence,
-                    plan.explanation.as_deref(),
-                    plan.source_agent.as_deref(),
-                    plan.created_at,
-                );
-                let (new_edge_id, reactivation_changes) = Self::dual_write_edge_with_payload(
-                    &conn,
-                    "relates",
-                    "entity",
-                    &plan.src_id,
-                    "entity",
-                    &plan.dst_id,
-                    &plan.relation_type,
-                    &plan.lineage,
-                    &plan.space,
-                    plan.cross_space_downgrade,
-                    None,
-                    plan.payload.as_deref(),
-                    Some(&plan.relation_type),
-                    semantic_patch.as_deref(),
-                )
-                .await
-                .map_err(|error| {
-                    WenlanError::VectorDb(format!(
-                        "merge_entities reassert corrected edge: {error}"
-                    ))
-                })?;
-                graph_changes.extend(reactivation_changes);
+        let result: Result<(Vec<CommunityGenerationUpdate>, u64, Vec<String>), WenlanError> =
+            async {
+                // G6 Stage 2 PR 2b: the `relations` endpoint repoint stops here —
+                // `edges` is the sole live producer of `relates` edges now, and a
+                // merge-time repoint would keep mutating a store the Q3
+                // frozen-store tripwire audits assume is byte-stable post-flip
+                // (the whole point of those audits is "constant output = healthy";
+                // a live repoint would defeat that signal). `merge_edge_plans`
+                // above now scans `edges` directly and carries every alias-side
+                // edge shadow needed to reassert the corrected canonical edge
+                // below, so nothing here depends on the old `relations` write.
+                let mut graph_changes = Vec::new();
+                for plan in &merge_edge_plans {
+                    if let Some(change) =
+                        Self::dual_write_invalidate_edge(&conn, &plan.old_edge_id, None)
+                            .await
+                            .map_err(|error| {
+                                WenlanError::VectorDb(format!(
+                                    "merge_entities invalidate old edge: {error}"
+                                ))
+                            })?
+                    {
+                        graph_changes.push(change);
+                    }
+                    if plan.src_id == plan.dst_id {
+                        // A loser<->canonical edge re-points onto the canonical itself. A
+                        // self-loop is not a relation (`create_relation_with_span` refuses
+                        // one; the extraction writer skips one), so retire the old edge
+                        // without re-asserting it.
+                        continue;
+                    }
+                    // Mirror the re-pointed relation's semantic fields onto the
+                    // corrected edge (G6 Stage 1). Previously re-read post-write
+                    // from `relations` after the endpoint UPDATEs moved the row;
+                    // now sourced directly from the plan's pre-merge snapshot
+                    // (G6 Stage 2 PR 2b) since the repoint that read depended on
+                    // no longer happens.
+                    let semantic_patch = Self::relates_semantic_patch(
+                        plan.confidence,
+                        plan.explanation.as_deref(),
+                        plan.source_agent.as_deref(),
+                        plan.created_at,
+                    );
+                    let (new_edge_id, reactivation_changes) = Self::dual_write_edge_with_payload(
+                        &conn,
+                        "relates",
+                        "entity",
+                        &plan.src_id,
+                        "entity",
+                        &plan.dst_id,
+                        &plan.relation_type,
+                        &plan.lineage,
+                        &plan.space,
+                        plan.cross_space_downgrade,
+                        None,
+                        plan.payload.as_deref(),
+                        Some(&plan.relation_type),
+                        semantic_patch.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        WenlanError::VectorDb(format!(
+                            "merge_entities reassert corrected edge: {error}"
+                        ))
+                    })?;
+                    graph_changes.extend(reactivation_changes);
 
-                if plan.grounded {
-                    let grounded_transition = conn
-                        .execute(
-                            "UPDATE edges SET grounded = 1, root_id = ?1, \
+                    if plan.grounded {
+                        let grounded_transition = conn
+                            .execute(
+                                "UPDATE edges SET grounded = 1, root_id = ?1, \
                             payload = COALESCE(payload, ?2) \
                          WHERE edge_id = ?3 AND valid_until IS NULL AND grounded = 0",
-                            libsql::params![
-                                plan.root_id.clone(),
-                                plan.payload.clone(),
-                                new_edge_id.clone()
-                            ],
-                        )
-                        .await
-                        .map_err(|error| {
-                            WenlanError::VectorDb(format!(
-                                "merge_entities preserve edge grounding: {error}"
-                            ))
-                        })?;
-                    if grounded_transition == 0 {
-                        conn.execute(
-                            "UPDATE edges SET root_id = ?1, payload = COALESCE(payload, ?2) \
+                                libsql::params![
+                                    plan.root_id.clone(),
+                                    plan.payload.clone(),
+                                    new_edge_id.clone()
+                                ],
+                            )
+                            .await
+                            .map_err(|error| {
+                                WenlanError::VectorDb(format!(
+                                    "merge_entities preserve edge grounding: {error}"
+                                ))
+                            })?;
+                        if grounded_transition == 0 {
+                            conn.execute(
+                                "UPDATE edges SET root_id = ?1, payload = COALESCE(payload, ?2) \
                              WHERE edge_id = ?3 AND valid_until IS NULL",
-                            libsql::params![
-                                plan.root_id.clone(),
-                                plan.payload.clone(),
-                                new_edge_id
-                            ],
-                        )
-                        .await
-                        .map_err(|error| {
-                            WenlanError::VectorDb(format!(
-                                "merge_entities preserve grounded edge metadata: {error}"
-                            ))
-                        })?;
-                    } else if plan.lineage == "assertion" {
-                        graph_changes.push(CommunityGraphChange {
-                            space: plan.space.clone(),
-                            src_id: plan.src_id.clone(),
-                            dst_id: plan.dst_id.clone(),
-                        });
+                                libsql::params![
+                                    plan.root_id.clone(),
+                                    plan.payload.clone(),
+                                    new_edge_id
+                                ],
+                            )
+                            .await
+                            .map_err(|error| {
+                                WenlanError::VectorDb(format!(
+                                    "merge_entities preserve grounded edge metadata: {error}"
+                                ))
+                            })?;
+                        } else if plan.lineage == "assertion" {
+                            graph_changes.push(CommunityGraphChange {
+                                space: plan.space.clone(),
+                                src_id: plan.src_id.clone(),
+                                dst_id: plan.dst_id.clone(),
+                            });
+                        }
                     }
                 }
-            }
 
-            conn.execute(
-                "UPDATE observations SET entity_id = ?1 WHERE entity_id = ?2",
-                libsql::params![canonical_id, alias_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("merge_entities obs: {e}")))?;
+                // Identity is (entity, normalised text): an alias-side
+                // observation whose identity already exists on the canonical
+                // would collide with `idx_observations_identity` (migration 125)
+                // once re-pointed, so drop it first rather than let the UPDATE
+                // below hit a unique violation.
+                conn.execute(
+                    "DELETE FROM observations \
+                 WHERE entity_id = ?2 AND EXISTS ( \
+                     SELECT 1 FROM observations c \
+                      WHERE c.entity_id = ?1 \
+                        AND lower(trim(c.content)) = lower(trim(observations.content)))",
+                    libsql::params![canonical_id, alias_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("merge_entities obs dedupe: {e}")))?;
 
-            conn.execute(
-                "UPDATE memories SET entity_id = ?1 WHERE entity_id = ?2",
-                libsql::params![canonical_id, alias_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("merge_entities mem: {e}")))?;
+                // `changes()` (libsql's `execute` return value) after this UPDATE is
+                // exactly `MergeOutcome::observations`: the dedup DELETE just above
+                // already dropped the loser rows that collide with a canonical
+                // identity, so every row this UPDATE touches is a genuine move.
+                let observations_moved = conn
+                    .execute(
+                        "UPDATE observations SET entity_id = ?1 WHERE entity_id = ?2",
+                        libsql::params![canonical_id, alias_id],
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("merge_entities obs: {e}")))?;
 
-            conn.execute(
-                "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id)
-                 SELECT memory_id, ?1 FROM memory_entities WHERE entity_id = ?2",
-                libsql::params![canonical_id, alias_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("merge_entities memory links: {e}")))?;
+                conn.execute(
+                    "UPDATE memories SET entity_id = ?1 WHERE entity_id = ?2",
+                    libsql::params![canonical_id, alias_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("merge_entities mem: {e}")))?;
 
-            conn.execute(
-                "DELETE FROM memory_entities WHERE entity_id = ?1",
-                libsql::params![alias_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("merge_entities old links: {e}")))?;
+                // `MergeOutcome::memory_links` is `memory_links_will_move`,
+                // read before this transaction started (see its definition
+                // above) -- `changes()` here would count only this table's
+                // rows, undercounting the legacy `memories.entity_id` column
+                // the UPDATE above also moves.
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id)
+                     SELECT memory_id, ?1 FROM memory_entities WHERE entity_id = ?2",
+                    libsql::params![canonical_id, alias_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("merge_entities memory links: {e}")))?;
 
-            conn.execute(
-                "UPDATE pages SET entity_id = ?1 WHERE entity_id = ?2",
-                libsql::params![canonical_id, alias_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("merge_entities pages: {e}")))?;
+                conn.execute(
+                    "DELETE FROM memory_entities WHERE entity_id = ?1",
+                    libsql::params![alias_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("merge_entities old links: {e}")))?;
 
-            // The `entity_aliases` FK-guard delete that stood here retired at
-            // G6 Stage 3, as its own comment predicted it eventually would:
-            // it existed only to clear a NO ACTION foreign key ahead of the
-            // raw `DELETE FROM entities` below, and both that delete and both
-            // tables are gone.
+                conn.execute(
+                    "UPDATE pages SET entity_id = ?1 WHERE entity_id = ?2",
+                    libsql::params![canonical_id, alias_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("merge_entities pages: {e}")))?;
 
-            // T16 band cleanup for the loser (complements ON DELETE CASCADE).
-            conn.execute(
-                "DELETE FROM entity_minhash_bands WHERE entity_id = ?1",
-                libsql::params![alias_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("merge_entities band cleanup: {e}")))?;
+                // The `entity_aliases` FK-guard delete that stood here retired at
+                // G6 Stage 3, as its own comment predicted it eventually would:
+                // it existed only to clear a NO ACTION foreign key ahead of the
+                // raw `DELETE FROM entities` below, and both that delete and both
+                // tables are gone.
 
-            // M3 PR-1 item C (beyond Sol's enumerated list): the loser's shadow
-            // page would otherwise be orphaned by the entity delete below (the
-            // map row cascades on the entity FK, never the page). Delete it
-            // first so its own ON DELETE CASCADE drops the map row.
-            //
-            // G6 Stage 2 PR 2c sub-step 3 item 4: capture the loser's
-            // `aliases` JSON before deleting its shadow page -- the old
-            // redirect above moved ALL of the loser's `entity_aliases`
-            // rows (not just its self-alias) onto the canonical id, so the
-            // canonical bridge below must union the loser's full alias set
-            // to match, not just its bare name.
-            let mut loser_aliases_json: Option<String> = None;
-            if let Some(loser_page_id) =
-                entity_page_adapter::page_id_for_entity(&conn, alias_id).await?
-            {
-                let mut loser_rows = conn
-                    .query(
-                        "SELECT aliases FROM pages WHERE id = ?1",
-                        libsql::params![loser_page_id.clone()],
+                // T16 band cleanup for the loser (complements ON DELETE CASCADE).
+                conn.execute(
+                    "DELETE FROM entity_minhash_bands WHERE entity_id = ?1",
+                    libsql::params![alias_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("merge_entities band cleanup: {e}")))?;
+
+                // M3 PR-1 item C (beyond Sol's enumerated list): the loser's shadow
+                // page would otherwise be orphaned by the entity delete below (the
+                // map row cascades on the entity FK, never the page). Delete it
+                // first so its own ON DELETE CASCADE drops the map row.
+                //
+                // G6 Stage 2 PR 2c sub-step 3 item 4: capture the loser's
+                // `aliases` JSON before deleting its shadow page -- the old
+                // redirect above moved ALL of the loser's `entity_aliases`
+                // rows (not just its self-alias) onto the canonical id, so the
+                // canonical bridge below must union the loser's full alias set
+                // to match, not just its bare name.
+                let mut loser_aliases_json: Option<String> = None;
+                if let Some(loser_page_id) =
+                    entity_page_adapter::page_id_for_entity(&conn, alias_id).await?
+                {
+                    let mut loser_rows = conn
+                        .query(
+                            "SELECT aliases FROM pages WHERE id = ?1",
+                            libsql::params![loser_page_id.clone()],
+                        )
+                        .await
+                        .map_err(|e| {
+                            WenlanError::VectorDb(format!("merge_entities loser aliases read: {e}"))
+                        })?;
+                    if let Some(row) = loser_rows.next().await.map_err(|e| {
+                        WenlanError::VectorDb(format!("merge_entities loser aliases row: {e}"))
+                    })? {
+                        loser_aliases_json = row.get::<Option<String>>(0).unwrap_or(None);
+                    }
+                    drop(loser_rows);
+
+                    conn.execute(
+                        "DELETE FROM pages WHERE kind = 'entity' AND id = ?1",
+                        libsql::params![loser_page_id],
                     )
                     .await
                     .map_err(|e| {
-                        WenlanError::VectorDb(format!("merge_entities loser aliases read: {e}"))
+                        WenlanError::VectorDb(format!("merge_entities loser shadow: {e}"))
                     })?;
-                if let Some(row) = loser_rows.next().await.map_err(|e| {
-                    WenlanError::VectorDb(format!("merge_entities loser aliases row: {e}"))
-                })? {
-                    loser_aliases_json = row.get::<Option<String>>(0).unwrap_or(None);
                 }
-                drop(loser_rows);
 
+                // The loser's `DELETE FROM entities` retired at G6 Stage 3; its
+                // shadow-page delete just above is now the whole removal.
+
+                // The canonical's shadowed fields drifted in this merge: aliases
+                // gained the loser's full alias set, and entity_type may have
+                // been promoted. Aliases is a page-payload UNION of the
+                // canonical's existing array, the loser's captured array, and
+                // the loser's bare name (the union covers the same ground the
+                // old `entity_aliases` redirect + register did). G6 Stage 2 PR
+                // 2c sub-step 3 item 5: entity_type is now the pre-computed
+                // `final_entity_type` (item 4's `entities` subquery bridge
+                // retired with the rest of the entities writes in this item).
                 conn.execute(
-                    "DELETE FROM pages WHERE kind = 'entity' AND id = ?1",
-                    libsql::params![loser_page_id],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities loser shadow: {e}")))?;
-            }
-
-            // The loser's `DELETE FROM entities` retired at G6 Stage 3; its
-            // shadow-page delete just above is now the whole removal.
-
-            // The canonical's shadowed fields drifted in this merge: aliases
-            // gained the loser's full alias set, and entity_type may have
-            // been promoted. Aliases is a page-payload UNION of the
-            // canonical's existing array, the loser's captured array, and
-            // the loser's bare name (the union covers the same ground the
-            // old `entity_aliases` redirect + register did). G6 Stage 2 PR
-            // 2c sub-step 3 item 5: entity_type is now the pre-computed
-            // `final_entity_type` (item 4's `entities` subquery bridge
-            // retired with the rest of the entities writes in this item).
-            conn.execute(
-                "UPDATE pages SET
+                    "UPDATE pages SET
                     entity_type = ?5,
                     aliases = (SELECT json_group_array(value) FROM (
                         SELECT value FROM json_each(pages.aliases)
@@ -34318,35 +34800,57 @@ impl MemoryDB {
                     last_modified = ?4
                  WHERE kind = 'entity'
                    AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
-                libsql::params![
-                    canonical_id.to_string(),
-                    loser_aliases_json,
-                    alias_name
-                        .as_deref()
-                        .map(|n| n.to_lowercase())
-                        .unwrap_or_default(),
-                    now_iso.clone(),
-                    final_entity_type.clone(),
-                ],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("merge_entities canonical shadow: {e}")))?;
-
-            Self::bump_community_graph_generations(&conn, graph_changes)
+                    libsql::params![
+                        canonical_id.to_string(),
+                        loser_aliases_json.clone(),
+                        alias_name
+                            .as_deref()
+                            .map(|n| n.to_lowercase())
+                            .unwrap_or_default(),
+                        now_iso.clone(),
+                        final_entity_type.clone(),
+                    ],
+                )
                 .await
-                .map_err(|error| {
-                    WenlanError::VectorDb(format!("merge_entities community generation: {error}"))
-                })
-        }
-        .await;
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("merge_entities canonical shadow: {e}"))
+                })?;
+
+                let generation_updates =
+                    Self::bump_community_graph_generations(&conn, graph_changes)
+                        .await
+                        .map_err(|error| {
+                            WenlanError::VectorDb(format!(
+                                "merge_entities community generation: {error}"
+                            ))
+                        })?;
+
+                let aliases_added = aliases_gained(
+                    canonical_aliases_json.clone(),
+                    loser_aliases_json,
+                    alias_name.as_deref().unwrap_or(""),
+                );
+
+                Ok((generation_updates, observations_moved, aliases_added))
+            }
+            .await;
 
         match result {
-            Ok(generation_updates) => {
+            Ok((generation_updates, observations_moved, aliases_added)) => {
                 conn.execute("COMMIT", ())
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("merge_entities commit: {e}")))?;
                 self.record_community_dirty_nodes(generation_updates);
-                Ok(())
+
+                Ok(MergeOutcome {
+                    merged: true,
+                    canonical_name,
+                    loser_name: alias_name.unwrap_or_default(),
+                    memory_links: memory_links_will_move.max(0) as u64,
+                    observations: observations_moved,
+                    edges: edges_will_move.max(0) as u64,
+                    aliases_added,
+                })
             }
             Err(e) => {
                 if let Err(rollback_err) = conn.execute("ROLLBACK", ()).await {
@@ -34860,7 +35364,8 @@ impl MemoryDB {
 
         let mut sql = String::from(
             "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
-                    p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at \
+                    p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
+                    p.aliases \
              FROM entity_page_map epm \
              JOIN pages p ON p.id = epm.page_id \
              WHERE p.kind = 'entity' AND p.status = 'active'",
@@ -34914,6 +35419,7 @@ impl MemoryDB {
                 confirmed: row.get::<i64>(6).unwrap_or(0) != 0,
                 created_at: row.get::<i64>(7).unwrap_or(0),
                 updated_at: row.get::<i64>(8).unwrap_or(0),
+                aliases: parse_pages_aliases(row.get::<Option<String>>(9).unwrap_or(None)),
             });
         }
         Ok(entities)
@@ -34934,7 +35440,8 @@ impl MemoryDB {
         let mut rows = conn
             .query(
                 "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
-                        p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at \
+                        p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
+                        p.aliases \
                  FROM entity_page_map epm \
                  JOIN pages p ON p.id = epm.page_id \
                  WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
@@ -34963,6 +35470,7 @@ impl MemoryDB {
                 confirmed: row.get::<i64>(6).unwrap_or(0) != 0,
                 created_at: row.get::<i64>(7).unwrap_or(0),
                 updated_at: row.get::<i64>(8).unwrap_or(0),
+                aliases: parse_pages_aliases(row.get::<Option<String>>(9).unwrap_or(None)),
             }
         } else {
             return Err(WenlanError::NotFound("entity not found".to_string()));
@@ -36148,8 +36656,21 @@ impl MemoryDB {
                         continue;
                     };
                     let observation_id = uuid::Uuid::new_v4().to_string();
+                    // Identity is (entity, normalised text) -- when two
+                    // memories yield the same sentence, `idx_observations_identity`
+                    // (migration 125) keeps the first source's provenance and
+                    // this insert quietly no-ops rather than erroring.
+                    //
+                    // Accepted limitation: reprocessing above deletes only
+                    // this source's own rows (`DELETE ... WHERE
+                    // source_memory_id = ?1`), so if the *first* (surviving,
+                    // provenance-holding) source is later re-enriched and no
+                    // longer yields this sentence, the observation disappears
+                    // even though a second source still asserts it -- there is
+                    // no re-derivation from remaining sources on delete. Out
+                    // of scope for this PR; tracked as a known gap, not a bug.
                     conn.execute(
-                        "INSERT INTO observations
+                        "INSERT OR IGNORE INTO observations
                              (id, entity_id, content, source_memory_id, source_agent,
                               confidence, confirmed, created_at)
                          VALUES (?1, ?2, ?3, ?4, 'post_ingest', NULL, 0, ?5)",

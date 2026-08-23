@@ -231,8 +231,10 @@ pub const HTTP_READERS: &[HttpReader] = &[
     HttpReader { method: ReaderMethod::Post, path: "/api/memory/entities/search", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "no prose fields" },
     HttpReader { method: ReaderMethod::Get, path: "/api/memory/entities/{entity_id}", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "entity name, not page prose — see demotion note" },
     HttpReader { method: ReaderMethod::Post, path: "/api/memory/entities/{entity_id}/observations", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "no prose fields" },
+    HttpReader { method: ReaderMethod::Post, path: "/api/memory/entities/{id}/aliases", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "no prose fields" },
     HttpReader { method: ReaderMethod::Put, path: "/api/memory/entities/{id}/confirm", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "no prose fields" },
     HttpReader { method: ReaderMethod::Delete, path: "/api/memory/entities/{id}/delete", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "no prose fields" },
+    HttpReader { method: ReaderMethod::Post, path: "/api/memory/entities/{id}/merge", builder: Builder::Main, page_bearing: PageBearing::No, class: TruthClass::NotApplicable, marker_shape: MarkerShape::None, adapter: "—", evidence: "no prose fields" },
     HttpReader { method: ReaderMethod::Get, path: "/api/memory/graph", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_get_knowledge_graph", evidence: "GraphPageNode.title, GraphMemoryNode.title via dismissed card" },
     HttpReader { method: ReaderMethod::Post, path: "/api/memory/link-entity", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_link_entity", evidence: "opaque response type — fail-closed" },
     HttpReader { method: ReaderMethod::Post, path: "/api/memory/list", builder: Builder::Main, page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "handle_list_memories", evidence: "IndexedFileInfo.title/content via dismissed card" },
@@ -376,7 +378,7 @@ pub const MCP_READERS: &[McpReader] = &[
     McpReader { tool: "write_page", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "tool handler" },
 ];
 
-/// All 19 top-level `Commands` variants in `crates/wenlan-cli/src/main.rs`.
+/// All 22 top-level `Commands` variants in `crates/wenlan-cli/src/main.rs`.
 #[rustfmt::skip]
 pub const CLI_READERS: &[CliReader] = &[
     CliReader { subcommand: "wenlan status", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
@@ -391,6 +393,7 @@ pub const CLI_READERS: &[CliReader] = &[
     CliReader { subcommand: "wenlan connect", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan search", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan recall", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
+    CliReader { subcommand: "wenlan brief", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan pages", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::CollectionAndNamedPage, adapter: "enforce_projection_directory_invariant" },
     CliReader { subcommand: "wenlan sources", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan capture", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
@@ -398,6 +401,8 @@ pub const CLI_READERS: &[CliReader] = &[
     CliReader { subcommand: "wenlan curate", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan agents", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan spaces", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
+    CliReader { subcommand: "wenlan outbox", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
+    CliReader { subcommand: "wenlan entities", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
 ];
 
 /// Look up a registered HTTP reader by its runtime identity.
