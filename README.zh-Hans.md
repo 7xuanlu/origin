@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=ec9a46d70592bfcd1816a33c3331c9a40006d3d3feabb933948fb7820193dec8 -->
+<!-- README_SYNC: source=README.md sha256=7b7171a095587f65f249b9f82d918776815fd3a1325bdc1eb74ee83823d8fa53 -->
 
 <p align="center">
   <picture>
@@ -347,7 +347,7 @@ pnpm dev:all
 pnpm build:all
 ```
 
-`pnpm dev:all` 是桌面 app 受支持的开发入口。它让开发用的端口、数据、进程归属、app 标识、MCP socket 与 Remote Access 状态都与已安装的生产运行时隔离；未处于该隔离环境的 debug build 会拒绝启动。完整开发流程见本 repository 的 [AGENTS.md](AGENTS.md) 与 [CONTRIBUTING.md](CONTRIBUTING.md)，以及仓库内的 [app/AGENTS.md](app/AGENTS.md)。安全性问题请见 [SECURITY.md](SECURITY.md)，也请阅读 [Code of Conduct](CODE_OF_CONDUCT.md)。
+`pnpm dev:all` 是桌面 app 受支持的开发入口。它让开发用的端口、数据、进程归属、app 标识、MCP socket 与 Remote Access 状态都与已安装的生产运行时隔离；未处于该隔离环境的 debug build 会拒绝启动。完整开发流程见本 repository 的 [AGENTS.md](AGENTS.md) 与 [CONTRIBUTING.md](CONTRIBUTING.md)，以及仓库内的 [app/AGENTS.md](app/AGENTS.md)。安全性问题请见 [SECURITY.md](SECURITY.md)，隐私政策请见 [PRIVACY.md](PRIVACY.md)，也请阅读 [Code of Conduct](CODE_OF_CONDUCT.md)。
 
 ---
 

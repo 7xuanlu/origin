@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=ec9a46d70592bfcd1816a33c3331c9a40006d3d3feabb933948fb7820193dec8 -->
+<!-- README_SYNC: source=README.md sha256=7b7171a095587f65f249b9f82d918776815fd3a1325bdc1eb74ee83823d8fa53 -->
 
 <p align="center">
   <picture>
@@ -347,7 +347,7 @@ pnpm dev:all
 pnpm build:all
 ```
 
-`pnpm dev:all` es el punto de entrada de desarrollo admitido para la aplicación de escritorio. Mantiene los puertos de desarrollo, los datos, la propiedad de los procesos, la identidad de la aplicación, los sockets MCP y el estado de Remote Access separados del runtime de producción instalado; una compilación de depuración iniciada sin ese aislamiento se niega a ejecutarse. Consulta el [AGENTS.md](AGENTS.md) y [CONTRIBUTING.md](CONTRIBUTING.md) de este repositorio, además del [app/AGENTS.md](app/AGENTS.md) dentro del repositorio, para el flujo de trabajo de desarrollo completo. Reportes de seguridad: [SECURITY.md](SECURITY.md). Por favor, lee también el [Código de Conducta](CODE_OF_CONDUCT.md).
+`pnpm dev:all` es el punto de entrada de desarrollo admitido para la aplicación de escritorio. Mantiene los puertos de desarrollo, los datos, la propiedad de los procesos, la identidad de la aplicación, los sockets MCP y el estado de Remote Access separados del runtime de producción instalado; una compilación de depuración iniciada sin ese aislamiento se niega a ejecutarse. Consulta el [AGENTS.md](AGENTS.md) y [CONTRIBUTING.md](CONTRIBUTING.md) de este repositorio, además del [app/AGENTS.md](app/AGENTS.md) dentro del repositorio, para el flujo de trabajo de desarrollo completo. Reportes de seguridad: [SECURITY.md](SECURITY.md). Política de privacidad: [PRIVACY.md](PRIVACY.md). Por favor, lee también el [Código de Conducta](CODE_OF_CONDUCT.md).
 
 ---
 

@@ -9826,7 +9826,6 @@ async fn enrichment_parity_contract() {
                 &distillation,
                 None,
                 &opts,
-                None,
             )
             .await;
         }
