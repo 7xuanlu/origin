@@ -4,6 +4,8 @@
 use anyhow::Result;
 use clap::Subcommand;
 
+use wenlan_types::responses::ListEntitiesResponse;
+
 use crate::client::WenlanClient;
 use crate::output::OutputFormat;
 
@@ -50,38 +52,46 @@ pub async fn run(
 
 /// Resolve `id_or_name` to an entity's (id, name): a direct id lookup first,
 /// falling back to an exact case-insensitive name match against
-/// `/api/memory/entities/search` (a vector-similarity endpoint, not an exact
-/// lookup — so ranked results are filtered client-side down to exact name
-/// matches). Errors when zero or more than one entity matches the name.
-async fn resolve_entity(client: &WenlanClient, id_or_name: &str) -> Result<(String, String)> {
+/// `/api/memory/entities/list` (every live entity in scope, no by-name
+/// filter on the route, so results are filtered client-side down to exact
+/// name matches). Errors when zero or more than one entity matches the name.
+/// `list_cache` lets callers that resolve two arguments reuse one
+/// `/api/memory/entities/list` response instead of fetching it twice.
+async fn resolve_entity_with(
+    client: &WenlanClient,
+    id_or_name: &str,
+    list_cache: &mut Option<ListEntitiesResponse>,
+) -> Result<(String, String)> {
     if let Some(detail) = client.get_entity(id_or_name).await? {
         return Ok((detail.entity.id, detail.entity.name));
     }
-    // Not an id: fall back to an exact, case-insensitive name match. Uses
-    // `/api/memory/entities/list` (every live entity in scope, no by-name
-    // filter on the route) rather than the vector-similarity `/search`
-    // route, so a lookup can't silently resolve to the wrong near-namesake.
-    let response = client.list_entities().await?;
+    if list_cache.is_none() {
+        *list_cache = Some(client.list_entities().await?);
+    }
     let name_lower = id_or_name.to_lowercase();
-    let mut matches = response
+    let matches: Vec<_> = list_cache
+        .as_ref()
+        .expect("just populated above")
         .entities
-        .into_iter()
-        .filter(|e| e.name.to_lowercase() == name_lower);
-    let first = matches
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no entity found with id or exact name '{}'", id_or_name))?;
-    let mut candidates = vec![format!("{} ({})", first.id, first.name)];
-    for extra in matches {
-        candidates.push(format!("{} ({})", extra.id, extra.name));
+        .iter()
+        .filter(|e| e.name.to_lowercase() == name_lower)
+        .collect();
+    match matches.as_slice() {
+        [] => anyhow::bail!("no entity found with id or exact name '{}'", id_or_name),
+        [only] => Ok((only.id.clone(), only.name.clone())),
+        many => {
+            let candidates = many
+                .iter()
+                .map(|e| format!("{} ({})", e.id, e.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "multiple entities match name '{}': {}",
+                id_or_name,
+                candidates
+            )
+        }
     }
-    if candidates.len() > 1 {
-        anyhow::bail!(
-            "multiple entities match name '{}': {}",
-            id_or_name,
-            candidates.join(", ")
-        );
-    }
-    Ok((first.id, first.name))
 }
 
 async fn merge(
@@ -92,8 +102,9 @@ async fn merge(
     into: &str,
     dry_run: bool,
 ) -> Result<()> {
-    let (loser_id, _) = resolve_entity(client, loser).await?;
-    let (canonical_id, _) = resolve_entity(client, into).await?;
+    let mut list_cache = None;
+    let (loser_id, _) = resolve_entity_with(client, loser, &mut list_cache).await?;
+    let (canonical_id, _) = resolve_entity_with(client, into, &mut list_cache).await?;
     let response = client
         .merge_entity(&loser_id, canonical_id, dry_run)
         .await?;
@@ -132,7 +143,7 @@ async fn alias_cmd(
     entity: &str,
     alias: &str,
 ) -> Result<()> {
-    let (entity_id, entity_name) = resolve_entity(client, entity).await?;
+    let (entity_id, entity_name) = resolve_entity_with(client, entity, &mut None).await?;
     let response = client
         .add_entity_alias(&entity_id, alias.to_string())
         .await?;

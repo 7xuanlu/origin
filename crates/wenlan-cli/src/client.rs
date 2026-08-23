@@ -15,14 +15,14 @@ use serde::{Deserialize, Serialize};
 use wenlan_types::{
     requests::{
         AddEntityAliasRequest, ListEntitiesRequest, ListMemoriesRequest, MergeEntityRequest,
-        SearchEntitiesRequest, SearchMemoryRequest, SearchRequest, SetDefaultSpaceRequest,
-        StoreMemoryRequest, UpdateAgentRequest,
+        SearchMemoryRequest, SearchRequest, SetDefaultSpaceRequest, StoreMemoryRequest,
+        UpdateAgentRequest,
     },
     responses::{
         AgentResponse, DefaultSpaceResponse, EntityAliasesResponse, HealthResponse,
         ListEntitiesResponse, ListMemoriesResponse, MemoryDetailResponse, MergeEntityResponse,
-        PendingRevisionItem, RevisionAcceptResponse, RevisionDismissResponse,
-        SearchEntitiesResponse, SearchMemoryResponse, SearchResponse, StoreMemoryResponse,
+        PendingRevisionItem, RevisionAcceptResponse, RevisionDismissResponse, SearchMemoryResponse,
+        SearchResponse, StoreMemoryResponse,
     },
     sources::Source,
     BriefReadRequest, BriefReadResponse, BriefUpdateReceipt, BriefUpdateRequest, EntityDetail,
@@ -570,28 +570,6 @@ impl WenlanClient {
             .context("parsing /api/memory/entities/{id} response")
     }
 
-    /// POST /api/memory/entities/search — vector similarity search over entity names.
-    pub async fn search_entities(
-        &self,
-        query: String,
-        limit: usize,
-    ) -> Result<SearchEntitiesResponse> {
-        let url = format!("{}/api/memory/entities/search", self.base_url);
-        let req = SearchEntitiesRequest { query, limit };
-        let resp = self
-            .send(
-                self.http.post(&url).json(&req),
-                &format!("POST {} failed", url),
-            )
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json()
-            .await
-            .context("parsing /api/memory/entities/search response")
-    }
-
     /// POST /api/memory/entities/list — every live entity in scope, unfiltered
     /// by name. Used for exact-name lookup: the daemon has no by-name filter
     /// on this route, so callers filter the returned list client-side.
@@ -653,11 +631,8 @@ impl WenlanClient {
 
 /// Non-success response -> `anyhow::Error` carrying the daemon's own error
 /// message, not just the status line `error_for_status()` alone gives.
-/// Used only by `list_entities`, `merge_entity`, `add_entity_alias`: PR 2
-/// review finding 5 -- `wenlan entities alias wenlan origin-core` printed
-/// only `HTTP status client error (409 Conflict) for url ...`, dropping the
-/// daemon's `{"error": "..."}` body (e.g. the "use merge instead" guidance)
-/// entirely. Every other client method keeps `error_for_status()` as-is.
+/// Used only by `list_entities`, `merge_entity`, `add_entity_alias`; every
+/// other client method keeps `error_for_status()` as-is.
 async fn ensure_daemon_success(resp: reqwest::Response, url: &str) -> Result<reqwest::Response> {
     if resp.status().is_success() {
         return Ok(resp);

@@ -407,8 +407,8 @@ pub async fn handle_merge_entity(
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
-    let preview = db.merge_entities_preview(&req.into, &id).await?;
     if req.dry_run {
+        let preview = db.merge_entities_preview(&req.into, &id).await?;
         return Ok(Json(MergeEntityResponse {
             canonical_id: preview.canonical_id,
             canonical_name: preview.canonical_name,
@@ -421,21 +421,17 @@ pub async fn handle_merge_entity(
             applied: false,
         }));
     }
-    // The preview above and this call are two separately-locked reads, so a
-    // concurrent writer could move between them -- use the outcome's own
-    // counts (captured from inside its own transaction) for the response
-    // rather than trusting the preview's numbers to still hold.
+    // One locked pass: the merge validates the ids itself and reports the
+    // names and counts it actually moved, so an apply needs no preview.
     let outcome = db.merge_entities(&req.into, &id).await?;
     if !outcome.merged {
-        return Err(ServerError::NotFound(format!(
-            "entity {id} no longer exists"
-        )));
+        return Err(ServerError::NotFound(format!("entity {id} not found")));
     }
     Ok(Json(MergeEntityResponse {
-        canonical_id: preview.canonical_id,
-        canonical_name: preview.canonical_name,
-        loser_id: preview.loser_id,
-        loser_name: preview.loser_name,
+        canonical_id: req.into,
+        canonical_name: outcome.canonical_name,
+        loser_id: id,
+        loser_name: outcome.loser_name,
         memory_links: outcome.memory_links,
         observations: outcome.observations,
         edges: outcome.edges,
@@ -462,43 +458,55 @@ pub async fn handle_add_entity_alias(
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
-    // 404 when `id` does not name a live entity.
-    let detail = db.get_entity_detail(&id).await?;
+    // 404 when `id` does not name a live entity; idempotent when it already
+    // owns the alias.
+    let Some((_, aliases)) = db.entity_name_and_aliases(&id).await? else {
+        return Err(ServerError::NotFound(format!("entity {id} not found")));
+    };
     let alias_lower = alias.to_lowercase();
-    if !detail.entity.aliases.contains(&alias_lower) {
-        if let Some(owner_id) = db.resolve_entity_by_alias(&alias_lower).await? {
-            if owner_id != id {
-                // `store_entity` self-seeds every live entity's aliases with
-                // its own lowercased name, so this conflict is most often
-                // "that's someone else's current name" rather than a
-                // previously-declared alias -- say so and point at merge.
-                let owner_name = db
-                    .get_entity_detail(&owner_id)
-                    .await
-                    .ok()
-                    .map(|d| d.entity.name);
-                if owner_name
-                    .as_deref()
-                    .is_some_and(|name| name.to_lowercase() == alias_lower)
-                {
-                    return Err(ServerError::Conflict(format!(
-                        "alias {:?} is the name of live entity {owner_id}; use \
-                         POST /api/memory/entities/{owner_id}/merge (CLI: wenlan \
-                         entities merge ...) instead",
-                        alias
-                    )));
-                }
+    if aliases.contains(&alias_lower) {
+        return Ok(Json(EntityAliasesResponse {
+            entity_id: id,
+            aliases,
+        }));
+    }
+    if let Some(owner_id) = db.resolve_entity_by_alias(&alias_lower).await? {
+        if owner_id != id {
+            // `store_entity` self-seeds every live entity's aliases with its
+            // own lowercased name, so this conflict is most often "that's
+            // someone else's current name" rather than a previously-declared
+            // alias -- say so and point at merge.
+            let owner_name = db
+                .entity_name_and_aliases(&owner_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|(name, _)| name);
+            if owner_name
+                .as_deref()
+                .is_some_and(|name| name.to_lowercase() == alias_lower)
+            {
                 return Err(ServerError::Conflict(format!(
-                    "alias {:?} is already owned by entity {owner_id}",
+                    "alias {:?} is the name of live entity {owner_id}; use \
+                     POST /api/memory/entities/{owner_id}/merge (CLI: wenlan \
+                     entities merge ...) instead",
                     alias
                 )));
             }
+            return Err(ServerError::Conflict(format!(
+                "alias {:?} is already owned by entity {owner_id}",
+                alias
+            )));
         }
-        db.add_entity_alias(alias, &id, "api").await?;
     }
-    let aliases = db.get_entity_detail(&id).await?.entity.aliases;
-    // The write above is idempotent-checked, not re-verified here until now:
-    // confirm the alias actually landed before reporting success.
+    db.add_entity_alias(alias, &id, "api").await?;
+    // `add_entity_alias` skips silently when the write-time ownership guard
+    // fails: re-read and confirm the alias actually landed.
+    let aliases = db
+        .entity_name_and_aliases(&id)
+        .await?
+        .map(|(_, aliases)| aliases)
+        .unwrap_or_default();
     if !aliases.contains(&alias_lower) {
         return Err(ServerError::Conflict(format!(
             "alias {:?} was not recorded for entity {id}",

@@ -450,6 +450,29 @@ pub(crate) fn parse_pages_aliases(raw: Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Names a merge adds to the canonical's `pages.aliases`: the loser's alias
+/// array plus its bare lowercased name, minus whatever the canonical already
+/// carries -- the same candidate set `merge_entities`' canonical-shadow UNION
+/// writes, so `MergePreview` and `MergeOutcome` report it identically.
+pub(crate) fn aliases_gained(
+    canonical_aliases_json: Option<String>,
+    loser_aliases_json: Option<String>,
+    loser_name: &str,
+) -> Vec<String> {
+    let canonical: HashSet<String> = parse_pages_aliases(canonical_aliases_json)
+        .into_iter()
+        .collect();
+    let mut gained: BTreeSet<String> = parse_pages_aliases(loser_aliases_json)
+        .into_iter()
+        .filter(|a| !canonical.contains(a))
+        .collect();
+    let loser_name_lower = loser_name.to_lowercase();
+    if !loser_name_lower.is_empty() && !canonical.contains(&loser_name_lower) {
+        gained.insert(loser_name_lower);
+    }
+    gained.into_iter().collect()
+}
+
 /// Read-only counts for what `MemoryDB::merge_entities(canonical_id, alias_id)`
 /// would move, computed without mutating anything -- backs the `/merge` route's
 /// `dry_run` branch and the CLI's `--dry-run` flag.
@@ -459,15 +482,9 @@ pub struct MergePreview {
     pub canonical_name: String,
     pub loser_id: String,
     pub loser_name: String,
-    /// Distinct memories the merge will newly link to the canonical, over
-    /// both link sources the merge moves (`memory_entities`, the
-    /// current-schema link table, UNION the legacy direct
-    /// `memories.entity_id` column): a memory linked to the loser through
-    /// either source counts once, and one already linked to the canonical
-    /// through either source is excluded. `/api/memory/graph` draws from the
-    /// same union but hides superseded memories and pending revisions, so
-    /// the graph can gain fewer links than this count (every moved link
-    /// still exists; it shows once the memory is live again).
+    /// Distinct memories the merge will newly link to the canonical -- see
+    /// `memory_links_delta` for the two link sources it unions and why
+    /// `/api/memory/graph` can show fewer links gained than this count.
     pub memory_links: u64,
     /// Observations the merge will move onto the canonical -- excludes a
     /// loser row whose `(entity_id, lower(trim(content)))` identity already
@@ -495,8 +512,12 @@ pub struct MergePreview {
 #[derive(Debug, Clone)]
 pub struct MergeOutcome {
     pub merged: bool,
+    /// Canonical and loser names as the merge read them (the route answers
+    /// an apply from this alone, without a separate preview).
+    pub canonical_name: String,
+    pub loser_name: String,
     /// Distinct memories newly linked to the canonical -- see
-    /// `MergePreview::memory_links` for the union this counts (both
+    /// `memory_links_delta` for the union this counts (both
     /// `memory_entities` and the legacy `memories.entity_id` column).
     pub memory_links: u64,
     pub observations: u64,
@@ -34758,6 +34779,52 @@ impl MemoryDB {
     /// entities share memory links, observation text, or a relation. Errors
     /// the same way `merge_entities` does: same id is a validation error, an
     /// unknown canonical or loser is not-found.
+    /// The live entity shadow page for `entity_id` as `(title, entity_type,
+    /// aliases_json)`; `None` when no active `kind='entity'` page maps to
+    /// it. `label` prefixes the error text with the caller's name.
+    async fn read_entity_page(
+        conn: &libsql::Connection,
+        entity_id: &str,
+        label: &str,
+    ) -> Result<Option<(String, String, Option<String>)>, WenlanError> {
+        let mut rows = conn
+            .query(
+                "SELECT p.title, p.entity_type, p.aliases FROM entity_page_map epm \
+                 JOIN pages p ON p.id = epm.page_id \
+                 WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
+                libsql::params![entity_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("{label} read entity page: {e}")))?;
+        Ok(rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("{label} row: {e}")))?
+            .map(|r| {
+                (
+                    r.get::<String>(0).unwrap_or_default(),
+                    r.get::<String>(1).unwrap_or_default(),
+                    r.get::<Option<String>>(2).unwrap_or(None),
+                )
+            }))
+    }
+
+    /// Name and aliases of the live entity `entity_id` (`None` when it is
+    /// not live) -- the one-row read the alias route needs, instead of the
+    /// full `get_entity_detail` (which also loads every observation and
+    /// relation).
+    pub async fn entity_name_and_aliases(
+        &self,
+        entity_id: &str,
+    ) -> Result<Option<(String, Vec<String>)>, WenlanError> {
+        let conn = self.conn.lock().await;
+        Ok(
+            Self::read_entity_page(&conn, entity_id, "entity_name_and_aliases")
+                .await?
+                .map(|(title, _, aliases_json)| (title, parse_pages_aliases(aliases_json))),
+        )
+    }
+
     pub async fn merge_entities_preview(
         &self,
         canonical_id: &str,
@@ -34771,57 +34838,16 @@ impl MemoryDB {
 
         let conn = self.conn.lock().await;
 
-        let loser: Option<(String, Option<String>)> = {
-            let mut rows = conn
-                .query(
-                    "SELECT p.title, p.aliases FROM entity_page_map epm \
-                     JOIN pages p ON p.id = epm.page_id \
-                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
-                    libsql::params![alias_id],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("merge_entities_preview read loser: {e}"))
-                })?;
-            rows.next()
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities_preview row: {e}")))?
-                .map(|r| {
-                    (
-                        r.get::<String>(0).unwrap_or_default(),
-                        r.get::<Option<String>>(1).unwrap_or(None),
-                    )
-                })
-        };
-        let Some((loser_name, loser_aliases_json)) = loser else {
+        let Some((loser_name, _, loser_aliases_json)) =
+            Self::read_entity_page(&conn, alias_id, "merge_entities_preview").await?
+        else {
             return Err(WenlanError::NotFound(format!(
                 "entity {alias_id} not found"
             )));
         };
-
-        let canonical: Option<(String, Option<String>)> = {
-            let mut rows = conn
-                .query(
-                    "SELECT p.title, p.aliases FROM entity_page_map epm \
-                     JOIN pages p ON p.id = epm.page_id \
-                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
-                    libsql::params![canonical_id],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("merge_entities_preview read canonical: {e}"))
-                })?;
-            rows.next()
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities_preview row: {e}")))?
-                .map(|r| {
-                    (
-                        r.get::<String>(0).unwrap_or_default(),
-                        r.get::<Option<String>>(1).unwrap_or(None),
-                    )
-                })
-        };
-        let Some((canonical_name, canonical_aliases_json)) = canonical else {
+        let Some((canonical_name, _, canonical_aliases_json)) =
+            Self::read_entity_page(&conn, canonical_id, "merge_entities_preview").await?
+        else {
             return Err(WenlanError::NotFound(format!(
                 "entity {canonical_id} not found"
             )));
@@ -34862,21 +34888,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities_preview edges: {e}")))?;
 
-        // Same candidate set `merge_entities`' canonical-shadow UNION adds:
-        // the loser's alias array plus its bare (lowercased) name, minus
-        // whatever the canonical already carries.
-        let canonical_aliases: HashSet<String> = parse_pages_aliases(canonical_aliases_json)
-            .into_iter()
-            .collect();
-        let mut aliases_added: std::collections::BTreeSet<String> =
-            parse_pages_aliases(loser_aliases_json)
-                .into_iter()
-                .filter(|a| !canonical_aliases.contains(a))
-                .collect();
-        let loser_name_lower = loser_name.to_lowercase();
-        if !loser_name_lower.is_empty() && !canonical_aliases.contains(&loser_name_lower) {
-            aliases_added.insert(loser_name_lower);
-        }
+        let aliases_added = aliases_gained(canonical_aliases_json, loser_aliases_json, &loser_name);
 
         Ok(MergePreview {
             canonical_id: canonical_id.to_string(),
@@ -34886,7 +34898,7 @@ impl MemoryDB {
             memory_links: memory_links.max(0) as u64,
             observations: observations.max(0) as u64,
             edges: edges.max(0) as u64,
-            aliases_added: aliases_added.into_iter().collect(),
+            aliases_added,
         })
     }
 
@@ -34939,6 +34951,8 @@ impl MemoryDB {
         if alias_exists == 0 {
             return Ok(MergeOutcome {
                 merged: false,
+                canonical_name: String::new(),
+                loser_name: String::new(),
                 memory_links: 0,
                 observations: 0,
                 edges: 0,
@@ -34946,30 +34960,17 @@ impl MemoryDB {
             });
         }
 
-        let canonical_exists: i64 = {
-            let mut rows = conn
-                .query(
-                    "SELECT COUNT(*) FROM entity_page_map epm \
-                     JOIN pages p ON p.id = epm.page_id \
-                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
-                    libsql::params![canonical_id],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("merge_entities count canonical: {e}"))
-                })?;
-            let row = rows
-                .next()
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities row: {e}")))?
-                .ok_or_else(|| WenlanError::VectorDb("merge_entities: no count row".into()))?;
-            row.get(0).unwrap_or(0)
-        };
-        if canonical_exists == 0 {
+        // One read of the canonical's shadow page gives its liveness, name,
+        // type (T16 promotion input below) and pre-merge aliases (the
+        // `MergeOutcome::aliases_added` baseline, taken under the same held
+        // lock as everything else here so it can't race a concurrent writer).
+        let Some((canonical_name, canonical_type, canonical_aliases_json)) =
+            Self::read_entity_page(&conn, canonical_id, "merge_entities").await?
+        else {
             return Err(WenlanError::NotFound(format!(
                 "canonical entity {canonical_id} not found"
             )));
-        }
+        };
 
         // Name/type reads below source from the canonical shadow's scalar
         // mirror (`pages.title`/`pages.entity_type`) rather than
@@ -35014,46 +35015,6 @@ impl MemoryDB {
                 .map_err(|e| WenlanError::VectorDb(format!("merge_entities row: {e}")))?
                 .and_then(|r| r.get::<String>(0).ok())
                 .unwrap_or_default()
-        };
-        let canonical_type: String = {
-            let mut rows = conn
-                .query(
-                    "SELECT p.entity_type FROM entity_page_map epm \
-                     JOIN pages p ON p.id = epm.page_id \
-                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
-                    libsql::params![canonical_id],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("merge_entities read canonical type: {e}"))
-                })?;
-            rows.next()
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities row: {e}")))?
-                .and_then(|r| r.get::<String>(0).ok())
-                .unwrap_or_default()
-        };
-        // Pre-merge snapshot of the canonical's own aliases, read under the
-        // same held lock as everything else here -- needed to compute
-        // `MergeOutcome::aliases_added` (what's genuinely new) the same way
-        // `merge_entities_preview` does, without a second, separately-locked
-        // read that could race a concurrent writer.
-        let canonical_aliases_json: Option<String> = {
-            let mut rows = conn
-                .query(
-                    "SELECT p.aliases FROM entity_page_map epm \
-                     JOIN pages p ON p.id = epm.page_id \
-                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
-                    libsql::params![canonical_id],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("merge_entities read canonical aliases: {e}"))
-                })?;
-            rows.next()
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities row: {e}")))?
-                .and_then(|r| r.get::<Option<String>>(0).unwrap_or(None))
         };
         // Generic types eligible for promotion (case-insensitive). Promote only
         // when canonical is generic AND alias is concrete.
@@ -35510,28 +35471,13 @@ impl MemoryDB {
                             ))
                         })?;
 
-                // Same candidate set `merge_entities_preview` computes: the
-                // loser's alias array plus its bare (lowercased) name, minus
-                // whatever the canonical already carried before this merge.
-                let canonical_aliases: HashSet<String> =
-                    parse_pages_aliases(canonical_aliases_json.clone())
-                        .into_iter()
-                        .collect();
-                let mut aliases_added: std::collections::BTreeSet<String> =
-                    parse_pages_aliases(loser_aliases_json)
-                        .into_iter()
-                        .filter(|a| !canonical_aliases.contains(a))
-                        .collect();
-                let loser_name_lower = alias_name.as_deref().unwrap_or("").to_lowercase();
-                if !loser_name_lower.is_empty() && !canonical_aliases.contains(&loser_name_lower) {
-                    aliases_added.insert(loser_name_lower);
-                }
+                let aliases_added = aliases_gained(
+                    canonical_aliases_json.clone(),
+                    loser_aliases_json,
+                    alias_name.as_deref().unwrap_or(""),
+                );
 
-                Ok((
-                    generation_updates,
-                    observations_moved,
-                    aliases_added.into_iter().collect(),
-                ))
+                Ok((generation_updates, observations_moved, aliases_added))
             }
             .await;
 
@@ -35544,6 +35490,8 @@ impl MemoryDB {
 
                 Ok(MergeOutcome {
                     merged: true,
+                    canonical_name,
+                    loser_name: alias_name.unwrap_or_default(),
                     memory_links: memory_links_will_move.max(0) as u64,
                     observations: observations_moved,
                     edges: edges_will_move.max(0) as u64,

@@ -539,6 +539,30 @@ fn connect_command_has_help() {
 }
 
 #[test]
+fn entities_subcommands_have_help() {
+    for args in [
+        &["entities", "merge", "--help"][..],
+        &["entities", "alias", "--help"][..],
+    ] {
+        cli().args(args).assert().success();
+    }
+}
+
+#[test]
+fn entities_commands_require_arguments() {
+    cli()
+        .args(["entities", "merge", "Alicia"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--into"));
+
+    cli()
+        .args(["entities", "alias", "Alicia"])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn connect_claude_code_dry_run_explains_tools_only() {
     let runtime = IsolatedRuntime::new();
 

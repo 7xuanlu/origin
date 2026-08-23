@@ -489,21 +489,7 @@ async fn create_entity_unfiled_reports_null_space_on_wire() {
 async fn add_entity_observation_twice_returns_same_id_and_warns() {
     let (router, _tmp, _db) = common::test_app_no_gate().await;
 
-    let entity_request = CreateEntityRequest {
-        name: "Route Contract Dedup Entity".to_string(),
-        entity_type: "concept".to_string(),
-        space: Default::default(),
-        source_agent: Some("entity-graph-route-contract".to_string()),
-        confidence: Some(0.9),
-    };
-    let (status, entity): (StatusCode, CreateEntityResponse) = request_typed(
-        &router,
-        Method::POST,
-        "/api/memory/entities",
-        json_body(&entity_request),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    let entity = create_test_entity(&router, "Route Contract Dedup Entity", "concept").await;
 
     let observation_uri = format!("/api/memory/entities/{}/observations", entity.id);
     let observation_request = AddEntityObservationRequest {
@@ -777,21 +763,7 @@ async fn create_entity_named_after_alias_resolves_to_canonical() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let origin_request = CreateEntityRequest {
-        name: "Origin".to_string(),
-        entity_type: "project".to_string(),
-        space: Default::default(),
-        source_agent: Some("entity-graph-route-contract".to_string()),
-        confidence: Some(0.9),
-    };
-    let (status, resolved): (StatusCode, CreateEntityResponse) = request_typed(
-        &router,
-        Method::POST,
-        "/api/memory/entities",
-        json_body(&origin_request),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    let resolved = create_test_entity(&router, "Origin", "project").await;
     assert_eq!(
         resolved.id, wenlan.id,
         "creating an entity named after a declared alias must resolve to the canonical"
@@ -830,21 +802,7 @@ async fn add_entity_alias_trims_padding() {
         aliases.aliases
     );
 
-    let origin_request = CreateEntityRequest {
-        name: "Origin".to_string(),
-        entity_type: "project".to_string(),
-        space: Default::default(),
-        source_agent: Some("entity-graph-route-contract".to_string()),
-        confidence: Some(0.9),
-    };
-    let (status, resolved): (StatusCode, CreateEntityResponse) = request_typed(
-        &router,
-        Method::POST,
-        "/api/memory/entities",
-        json_body(&origin_request),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    let resolved = create_test_entity(&router, "Origin", "project").await;
     assert_eq!(
         resolved.id, wenlan.id,
         "a trimmed alias must still resolve an unpadded name to the canonical"
