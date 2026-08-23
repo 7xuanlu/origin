@@ -81,6 +81,8 @@ main|post|/api/memory/entities|wenlan_server::entity_graph_routes::handle_create
 main|post|/api/memory/entities/list|wenlan_server::entity_graph_routes::handle_list_entities
 main|post|/api/memory/entities/search|wenlan_server::entity_graph_routes::handle_search_entities
 main|post|/api/memory/entities/{entity_id}/observations|wenlan_server::entity_graph_routes::handle_add_entity_observation
+main|post|/api/memory/entities/{id}/aliases|wenlan_server::entity_graph_routes::handle_add_entity_alias
+main|post|/api/memory/entities/{id}/merge|wenlan_server::entity_graph_routes::handle_merge_entity
 main|post|/api/memory/link-entity|wenlan_server::entity_graph_routes::handle_link_entity
 main|post|/api/memory/list|wenlan_server::memory_routes::handle_list_memories
 main|post|/api/memory/observations|wenlan_server::entity_graph_routes::handle_add_observation

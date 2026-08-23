@@ -61,6 +61,7 @@ fn sample_entity() -> Entity {
         confirmed: true,
         created_at: 1_700_000_000,
         updated_at: 1_700_000_100,
+        aliases: vec!["alicia".into()],
     }
 }
 
@@ -75,6 +76,7 @@ fn entity_json() -> serde_json::Value {
         "confirmed": true,
         "created_at": 1_700_000_000,
         "updated_at": 1_700_000_100,
+        "aliases": ["alicia"],
     })
 }
 

@@ -175,6 +175,11 @@ enum Commands {
         #[command(subcommand)]
         command: commands::outbox::OutboxCommand,
     },
+    /// Merge or alias knowledge-graph entities (id or exact name).
+    Entities {
+        #[command(subcommand)]
+        cmd: commands::entities::EntitiesCmd,
+    },
 }
 
 #[tokio::main]
@@ -370,6 +375,9 @@ async fn main() -> anyhow::Result<ExitCode> {
         Commands::Spaces { cmd } => commands::space::run(&client, format, cli.quiet, cmd).await?,
         Commands::Outbox { command } => {
             commands::outbox::run(&client, format, cli.quiet, command).await?
+        }
+        Commands::Entities { cmd } => {
+            commands::entities::run(&client, format, cli.quiet, cmd).await?
         }
     }
     Ok(ExitCode::SUCCESS)

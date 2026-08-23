@@ -16,6 +16,10 @@ pub struct Entity {
     pub confirmed: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Former names this entity has absorbed via a merge or an explicit
+    /// alias declaration (lowercase). Empty for an entity with no aliases.
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 /// An entity search result with distance score.

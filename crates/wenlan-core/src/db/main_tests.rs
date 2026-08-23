@@ -29026,13 +29026,17 @@ async fn merge_entities_canonical_missing_not_found() {
 async fn merge_entities_dedups_overlapping_observations() {
     let (db, _tmp) = test_db().await;
     let (canonical, alias) = seed_two_entities(&db).await;
-    db.add_observation(&canonical, "Shared fact", None, None)
+    // Distinct source_agent values on the two "Shared fact" inserts let the
+    // post-merge assertion tell the canonical's own row apart from a
+    // same-content row that merely reused its id.
+    let canonical_shared_id = db
+        .add_observation(&canonical, "Shared fact", Some("canonical-source"), None)
         .await
         .unwrap();
     db.add_observation(&canonical, "Canonical unique", None, None)
         .await
         .unwrap();
-    db.add_observation(&alias, "Shared fact", None, None)
+    db.add_observation(&alias, "Shared fact", Some("alias-source"), None)
         .await
         .unwrap();
     db.add_observation(&alias, "Alias unique", None, None)
@@ -29058,6 +29062,31 @@ async fn merge_entities_dedups_overlapping_observations() {
     assert_eq!(
         canonical_count, 3,
         "shared (kept once) + canonical-unique + alias-unique"
+    );
+
+    // The row count alone can't tell which of the two identical-content
+    // rows survived. Assert the surviving row is the canonical's own --
+    // same id, same source_agent -- not the alias's row re-pointed under
+    // the canonical's entity_id.
+    let row = conn
+        .query(
+            "SELECT id, source_agent FROM observations WHERE entity_id = ?1 AND content = ?2",
+            libsql::params![canonical.as_str(), "Shared fact"],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .expect("the shared observation must still exist on the canonical");
+    assert_eq!(
+        row.get::<String>(0).unwrap(),
+        canonical_shared_id,
+        "the canonical's own shared-observation row must survive the merge, not the alias's"
+    );
+    assert_eq!(
+        row.get::<Option<String>>(1).unwrap(),
+        Some("canonical-source".to_string())
     );
     let alias_count: i64 = conn
         .query(
@@ -31968,6 +31997,49 @@ async fn ambient_enrichment_commit_refuses_junk_names_and_canonicalizes_types() 
         observations.is_empty(),
         "a refused entity must not drag its observations into the graph"
     );
+}
+
+/// Spec acceptance 2: once "origin" is declared an alias of "wenlan", the
+/// ambient enrichment lane's own resolution step (the same alias-lookup
+/// `resolve_or_create_entity` runs) must land a re-extracted "Origin" on the
+/// existing canonical entity instead of minting a duplicate.
+#[tokio::test]
+async fn commit_entity_enrichment_resolves_extracted_name_to_declared_alias() {
+    let (db, _dir) = test_db().await;
+    let content = "wenlan shipped a new feature today.";
+    db.upsert_documents(vec![make_memory_doc(
+        "mem_origin_alias",
+        content,
+        "knowledge",
+        "work",
+        "agent",
+    )])
+    .await
+    .unwrap();
+
+    let canonical = db.create_entity("wenlan", "project", None).await.unwrap();
+    db.add_entity_alias("origin", &canonical, "test")
+        .await
+        .unwrap();
+
+    let kg = extracted_entity_with_observation(
+        "Origin",
+        "project",
+        "Origin shipped a new feature today.",
+    );
+    assert!(db
+        .commit_entity_enrichment_at_version("mem_origin_alias", 1, &kg, content)
+        .await
+        .unwrap());
+
+    let stored = db.list_entities(None, None).await.unwrap();
+    assert_eq!(
+        stored.len(),
+        1,
+        "the extracted 'Origin' must resolve to the existing aliased entity, not create a duplicate"
+    );
+    assert_eq!(stored[0].id, canonical);
+    assert_eq!(stored[0].name, "wenlan");
 }
 
 fn extracted_graph(
@@ -53761,11 +53833,15 @@ async fn migration_124_retires_orphan_edges_requeues_parked_jobs_and_downgrades_
 
 /// Migration 125 (KG observation identity, PR 1): an observation's identity
 /// is `(entity_id, lower(trim(content)))`. `test_db()` already carries
-/// `idx_observations_identity` (both the migration and the fresh-schema DDL
-/// create it), so duplicates are seeded by dropping the index, inserting
-/// raw rows, rewinding `user_version` to 124, and replaying migration 125
-/// for real -- proving both halves (dedup DELETE, `CREATE UNIQUE INDEX`)
-/// through the actual migration path rather than asserting on hand-run SQL.
+/// `idx_observations_identity` (migration 125 is its sole creator -- the
+/// fresh-schema `SCHEMA` block runs before `run_migrations` on every open,
+/// so putting the index there would fail the first open of a DB that still
+/// holds duplicates; a fresh install gets the index by replaying the
+/// migration chain from version 0), so duplicates are seeded by dropping the
+/// index, inserting raw rows, rewinding `user_version` to 124, and replaying
+/// migration 125 for real -- proving both halves (dedup DELETE, `CREATE
+/// UNIQUE INDEX`) through the actual migration path rather than asserting on
+/// hand-run SQL.
 #[tokio::test]
 async fn migration_125_dedups_observations_and_adds_identity_index() {
     let (db, _dir) = test_db().await;
@@ -54098,6 +54174,38 @@ async fn add_observation_twice_returns_existing_id_and_warns() {
         .unwrap();
     assert!(first.warnings.is_empty());
 
+    let (watermark_before, activity_count_before): (i64, i64) = {
+        let conn = db.conn.lock().await;
+        let watermark: i64 = conn
+            .query(
+                "SELECT entity_updated_at FROM pages WHERE kind = 'entity'
+                   AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+                libsql::params![entity_id.as_str()],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        let activity_count: i64 = conn
+            .query(
+                "SELECT COUNT(*) FROM agent_activity WHERE action = 'observation_add'",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        (watermark, activity_count)
+    };
+
     let second = crate::post_write::add_observation(&db, make_req(), "test-agent")
         .await
         .unwrap();
@@ -54110,6 +54218,11 @@ async fn add_observation_twice_returns_existing_id_and_warns() {
         "the second call must carry a duplicate warning, got {:?}",
         second.warnings
     );
+    assert!(
+        !second.wrote,
+        "a duplicate observation must report wrote:false"
+    );
+    assert_eq!(second.outcome, crate::post_write::WriteOutcome::Unchanged);
 
     let conn = db.conn.lock().await;
     let count: i64 = conn
@@ -54126,6 +54239,42 @@ async fn add_observation_twice_returns_existing_id_and_warns() {
         .get::<i64>(0)
         .unwrap();
     assert_eq!(count, 1, "only one row was created");
+
+    let watermark_after: i64 = conn
+        .query(
+            "SELECT entity_updated_at FROM pages WHERE kind = 'entity'
+               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![entity_id.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        watermark_after, watermark_before,
+        "a duplicate observation must not touch the entity's freshness watermark"
+    );
+    let activity_count_after: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM agent_activity WHERE action = 'observation_add'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        activity_count_after, activity_count_before,
+        "a duplicate observation must not record a new activity event"
+    );
 }
 
 /// `commit_entity_enrichment_at_version`'s `INSERT OR IGNORE` (migration

@@ -12,13 +12,13 @@ use wenlan_core::truth_contract::{CONTRACT_HEADER, INTENT_HEADER};
 use wenlan_server::{router::build_router, state::ServerState};
 use wenlan_types::entities::EntityDetail;
 use wenlan_types::requests::{
-    AddEntityObservationRequest, AddObservationRequest, ConfirmEntityRequest,
-    ConfirmObservationRequest, CreateEntityRequest, CreateRelationRequest, LinkEntityRequest,
-    ListEntitiesRequest, UpdateObservationRequest,
+    AddEntityAliasRequest, AddEntityObservationRequest, AddObservationRequest,
+    ConfirmEntityRequest, ConfirmObservationRequest, CreateEntityRequest, CreateRelationRequest,
+    LinkEntityRequest, ListEntitiesRequest, MergeEntityRequest, UpdateObservationRequest,
 };
 use wenlan_types::responses::{
-    AddObservationResponse, CreateEntityResponse, CreateRelationResponse, ListEntitiesResponse,
-    SearchEntitiesResponse, SuccessResponse,
+    AddObservationResponse, CreateEntityResponse, CreateRelationResponse, EntityAliasesResponse,
+    ListEntitiesResponse, MergeEntityResponse, SearchEntitiesResponse, SuccessResponse,
 };
 use wenlan_types::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};
 
@@ -538,4 +538,226 @@ async fn add_entity_observation_twice_returns_same_id_and_warns() {
         !second.warnings.is_empty(),
         "the duplicate POST must carry a warning"
     );
+}
+
+async fn create_test_entity(
+    router: &common::AppRouter,
+    name: &str,
+    entity_type: &str,
+) -> CreateEntityResponse {
+    let request = CreateEntityRequest {
+        name: name.to_string(),
+        entity_type: entity_type.to_string(),
+        space: Default::default(),
+        source_agent: Some("entity-graph-route-contract".to_string()),
+        confidence: Some(0.9),
+    };
+    let (status, entity): (StatusCode, CreateEntityResponse) = request_typed(
+        router,
+        Method::POST,
+        "/api/memory/entities",
+        json_body(&request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    entity
+}
+
+/// A `dry_run` merge previews the counts and alias additions without
+/// mutating anything: the loser stays live, nothing is re-pointed.
+#[tokio::test]
+async fn merge_entity_dry_run_previews_without_mutating() {
+    let (router, _tmp, db) = common::test_app_no_gate().await;
+
+    let canonical = create_test_entity(&router, "Merge Canonical", "org").await;
+    let loser = create_test_entity(&router, "Merge Loser", "org").await;
+    db.add_observation(&loser.id, "A fact about the loser.", None, None)
+        .await
+        .unwrap();
+    db.link_memory_entities("merge-dry-run-memory", &[loser.id.as_str()])
+        .await
+        .unwrap();
+
+    let merge_uri = format!("/api/memory/entities/{}/merge", loser.id);
+    let (status, preview): (StatusCode, MergeEntityResponse) = request_typed(
+        &router,
+        Method::POST,
+        &merge_uri,
+        json_body(&MergeEntityRequest {
+            into: canonical.id.clone(),
+            dry_run: true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!preview.applied, "a dry run must not report applied");
+    assert_eq!(preview.canonical_id, canonical.id);
+    assert_eq!(preview.loser_id, loser.id);
+    assert_eq!(preview.observations, 1);
+    assert_eq!(preview.memory_links, 1);
+    assert!(preview.aliases_added.contains(&"merge loser".to_string()));
+
+    // A dry run must not delete the loser or mutate anything.
+    let loser_uri = format!("/api/memory/entities/{}", loser.id);
+    let (status, _detail): (StatusCode, EntityDetail) =
+        request_typed(&router, Method::GET, &loser_uri, Body::empty()).await;
+    assert_eq!(status, StatusCode::OK, "dry run must not delete the loser");
+}
+
+/// An applied merge deletes the loser's shadow page (404 afterwards),
+/// registers the loser's name as a canonical alias, and reports the same
+/// counts the preview would.
+#[tokio::test]
+async fn merge_entity_apply_deletes_loser_and_registers_alias() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+
+    let canonical = create_test_entity(&router, "Apply Canonical", "org").await;
+    let loser = create_test_entity(&router, "Apply Loser", "org").await;
+
+    let merge_uri = format!("/api/memory/entities/{}/merge", loser.id);
+    let (status, applied): (StatusCode, MergeEntityResponse) = request_typed(
+        &router,
+        Method::POST,
+        &merge_uri,
+        json_body(&MergeEntityRequest {
+            into: canonical.id.clone(),
+            dry_run: false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(applied.applied);
+    assert_eq!(applied.memory_links, 0);
+    assert_eq!(applied.observations, 0);
+    assert_eq!(applied.edges, 0);
+    assert_eq!(applied.aliases_added, vec!["apply loser".to_string()]);
+
+    let loser_uri = format!("/api/memory/entities/{}", loser.id);
+    let (status, _error): (StatusCode, ErrorEnvelope) =
+        request_typed(&router, Method::GET, &loser_uri, Body::empty()).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the loser must be gone after an applied merge"
+    );
+
+    let canonical_uri = format!("/api/memory/entities/{}", canonical.id);
+    let (status, detail): (StatusCode, EntityDetail) =
+        request_typed(&router, Method::GET, &canonical_uri, Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        detail.entity.aliases.contains(&"apply loser".to_string()),
+        "canonical aliases: {:?}",
+        detail.entity.aliases
+    );
+}
+
+/// Adding an alias is idempotent for its own owner, 409s when another
+/// active entity already owns the alias, and 404s for an unknown entity.
+#[tokio::test]
+async fn add_entity_alias_conflict_and_idempotent() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+
+    let owner_a = create_test_entity(&router, "Bluebird Robotics", "org").await;
+    let owner_b = create_test_entity(&router, "Fernwood Bakery", "org").await;
+
+    let alias_uri_a = format!("/api/memory/entities/{}/aliases", owner_a.id);
+    let (status, aliases): (StatusCode, EntityAliasesResponse) = request_typed(
+        &router,
+        Method::POST,
+        &alias_uri_a,
+        json_body(&AddEntityAliasRequest {
+            alias: "Codename".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // The owner's own lowercased name is self-seeded at creation (store_entity),
+    // so "codename" joins it rather than being the sole entry.
+    assert!(
+        aliases.aliases.contains(&"codename".to_string()),
+        "{:?}",
+        aliases.aliases
+    );
+
+    // Re-adding the same alias to its own owner is a no-op, not an error.
+    let (status, aliases_again): (StatusCode, EntityAliasesResponse) = request_typed(
+        &router,
+        Method::POST,
+        &alias_uri_a,
+        json_body(&AddEntityAliasRequest {
+            alias: "Codename".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(aliases_again.aliases, aliases.aliases);
+
+    // A different entity claiming the same alias is a conflict.
+    let alias_uri_b = format!("/api/memory/entities/{}/aliases", owner_b.id);
+    let (status, error): (StatusCode, ErrorEnvelope) = request_typed(
+        &router,
+        Method::POST,
+        &alias_uri_b,
+        json_body(&AddEntityAliasRequest {
+            alias: "Codename".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(error.error.contains(&owner_a.id), "{}", error.error);
+
+    let (status, _error): (StatusCode, ErrorEnvelope) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/missing/aliases",
+        json_body(&AddEntityAliasRequest {
+            alias: "Codename".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Spec acceptance 2: once "Origin" is declared an alias of "wenlan",
+/// `POST /api/memory/entities {name:"Origin"}` must resolve to the same
+/// canonical id instead of creating a duplicate entity.
+#[tokio::test]
+async fn create_entity_named_after_alias_resolves_to_canonical() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+
+    let wenlan = create_test_entity(&router, "wenlan", "project").await;
+
+    let alias_uri = format!("/api/memory/entities/{}/aliases", wenlan.id);
+    let (status, _aliases): (StatusCode, EntityAliasesResponse) = request_typed(
+        &router,
+        Method::POST,
+        &alias_uri,
+        json_body(&AddEntityAliasRequest {
+            alias: "Origin".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let origin_request = CreateEntityRequest {
+        name: "Origin".to_string(),
+        entity_type: "project".to_string(),
+        space: Default::default(),
+        source_agent: Some("entity-graph-route-contract".to_string()),
+        confidence: Some(0.9),
+    };
+    let (status, resolved): (StatusCode, CreateEntityResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities",
+        json_body(&origin_request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        resolved.id, wenlan.id,
+        "creating an entity named after a declared alias must resolve to the canonical"
+    );
+    assert_eq!(resolved.write_outcome, Some(WriteOutcome::ResolvedExisting));
 }

@@ -11,9 +11,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use wenlan_types::requests::{AddObservationRequest, CreateEntityRequest, CreateRelationRequest};
+use wenlan_types::requests::{
+    AddEntityAliasRequest, AddObservationRequest, CreateEntityRequest, CreateRelationRequest,
+    MergeEntityRequest,
+};
 use wenlan_types::responses::{
-    AddObservationResponse, CreateEntityResponse, CreateRelationResponse,
+    AddObservationResponse, CreateEntityResponse, CreateRelationResponse, EntityAliasesResponse,
+    MergeEntityResponse,
 };
 use wenlan_types::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};
 
@@ -57,6 +61,11 @@ pub(crate) fn register_crud(router: TrackedRouter<SharedState>) -> TrackedRouter
         .route(
             "/api/memory/entities/{entity_id}/observations",
             post(handle_add_entity_observation),
+        )
+        .route("/api/memory/entities/{id}/merge", post(handle_merge_entity))
+        .route(
+            "/api/memory/entities/{id}/aliases",
+            post(handle_add_entity_alias),
         )
         .route(
             "/api/memory/observations/{id}",
@@ -383,6 +392,68 @@ pub async fn handle_add_entity_observation(
     Ok(Json(wenlan_types::responses::AddObservationResponse {
         id: result.id,
         warnings: result.warnings,
+    }))
+}
+
+/// POST /api/memory/entities/{id}/merge -- merge `{id}` (the loser) into
+/// `into` (the canonical). `dry_run` returns the preview without mutating
+/// anything; `applied` on the response tells the caller which happened.
+pub async fn handle_merge_entity(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    Path(id): Path<String>,
+    Json(req): Json<MergeEntityRequest>,
+) -> Result<Json<MergeEntityResponse>, ServerError> {
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    let preview = db.merge_entities_preview(&req.into, &id).await?;
+    if !req.dry_run {
+        db.merge_entities(&req.into, &id).await?;
+    }
+    Ok(Json(MergeEntityResponse {
+        canonical_id: preview.canonical_id,
+        canonical_name: preview.canonical_name,
+        loser_id: preview.loser_id,
+        loser_name: preview.loser_name,
+        memory_links: preview.memory_links,
+        observations: preview.observations,
+        edges: preview.edges,
+        aliases_added: preview.aliases_added,
+        applied: !req.dry_run,
+    }))
+}
+
+/// POST /api/memory/entities/{id}/aliases -- declare `alias` as an
+/// additional name for entity `{id}`. Idempotent when `{id}` already owns
+/// the alias; 409 when another active entity owns it.
+pub async fn handle_add_entity_alias(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    Path(id): Path<String>,
+    Json(req): Json<AddEntityAliasRequest>,
+) -> Result<Json<EntityAliasesResponse>, ServerError> {
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    // 404 when `id` does not name a live entity.
+    let detail = db.get_entity_detail(&id).await?;
+    let alias_lower = req.alias.to_lowercase();
+    if !detail.entity.aliases.contains(&alias_lower) {
+        if let Some(owner_id) = db.resolve_entity_by_alias(&alias_lower).await? {
+            if owner_id != id {
+                return Err(ServerError::Conflict(format!(
+                    "alias {:?} is already owned by entity {owner_id}",
+                    req.alias
+                )));
+            }
+        }
+        db.add_entity_alias(&req.alias, &id, "api").await?;
+    }
+    let aliases = db.get_entity_detail(&id).await?.entity.aliases;
+    Ok(Json(EntityAliasesResponse {
+        entity_id: id,
+        aliases,
     }))
 }
 

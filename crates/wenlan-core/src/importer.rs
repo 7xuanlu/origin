@@ -1105,6 +1105,60 @@ mod tests {
         assert_eq!(result2.skipped, 2);
     }
 
+    /// `import_phase3_store`'s KG-observation loop only counts a row it
+    /// actually created (migration 125 identity): two extraction results
+    /// that both observe the same fact for the same entity must add the
+    /// observation once, not twice.
+    #[tokio::test]
+    async fn test_import_phase3_store_dedups_kg_observations() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        db.create_entity("Import Dedup Entity", "concept", None)
+            .await
+            .unwrap();
+
+        let prepared = ImportPrepared {
+            memories: vec![],
+            texts: vec![],
+            duplicates: HashSet::new(),
+        };
+        let observation = crate::extract::ExtractedObservation {
+            entity: "Import Dedup Entity".to_string(),
+            content: "Duplicate fact".to_string(),
+        };
+        let kg_results = vec![
+            KgExtractionResult {
+                index: 0,
+                entities: vec![ExtractedEntity {
+                    name: "Import Dedup Entity".to_string(),
+                    entity_type: "concept".to_string(),
+                }],
+                observations: vec![observation.clone()],
+                relations: vec![],
+            },
+            KgExtractionResult {
+                index: 1,
+                entities: vec![],
+                observations: vec![observation],
+                relations: vec![],
+            },
+        ];
+
+        let result = import_phase3_store(
+            &db,
+            &prepared,
+            &[],
+            &kg_results,
+            "chatgpt",
+            &crate::tuning::ConfidenceConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.observations_added, 1,
+            "a duplicate observation row must not be counted as created"
+        );
+    }
+
     #[tokio::test]
     async fn test_import_memories_input_too_large() {
         let (db, _dir) = crate::db::tests::test_db().await;

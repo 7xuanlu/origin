@@ -479,6 +479,7 @@ fn each_subcommand_has_help() {
         "connect",
         "sources",
         "outbox",
+        "entities",
     ] {
         cli().args([sub, "--help"]).assert().success();
     }

@@ -14,16 +14,19 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use wenlan_types::{
     requests::{
-        ListMemoriesRequest, SearchMemoryRequest, SearchRequest, SetDefaultSpaceRequest,
-        StoreMemoryRequest, UpdateAgentRequest,
+        AddEntityAliasRequest, ListMemoriesRequest, MergeEntityRequest, SearchEntitiesRequest,
+        SearchMemoryRequest, SearchRequest, SetDefaultSpaceRequest, StoreMemoryRequest,
+        UpdateAgentRequest,
     },
     responses::{
-        AgentResponse, DefaultSpaceResponse, HealthResponse, ListMemoriesResponse,
-        MemoryDetailResponse, PendingRevisionItem, RevisionAcceptResponse, RevisionDismissResponse,
+        AgentResponse, DefaultSpaceResponse, EntityAliasesResponse, HealthResponse,
+        ListMemoriesResponse, MemoryDetailResponse, MergeEntityResponse, PendingRevisionItem,
+        RevisionAcceptResponse, RevisionDismissResponse, SearchEntitiesResponse,
         SearchMemoryResponse, SearchResponse, StoreMemoryResponse,
     },
     sources::Source,
-    BriefReadRequest, BriefReadResponse, BriefUpdateReceipt, BriefUpdateRequest, OutboxDrainReport,
+    BriefReadRequest, BriefReadResponse, BriefUpdateReceipt, BriefUpdateRequest, EntityDetail,
+    OutboxDrainReport,
 };
 
 mod lint;
@@ -543,6 +546,91 @@ impl WenlanClient {
         resp.json()
             .await
             .context("parsing /api/memory/{id}/detail response")
+    }
+
+    /// GET /api/memory/entities/{id} — full entity detail by id. `Ok(None)` on 404
+    /// (used by the CLI's id-or-name resolver to fall back to a name search).
+    pub async fn get_entity(&self, id: &str) -> Result<Option<EntityDetail>> {
+        let url = format!("{}/api/memory/entities/{}", self.base_url, id);
+        let resp = self
+            .send(
+                self.http.get(&url),
+                &format!("GET {} failed (is the daemon running?)", url),
+            )
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        resp.json()
+            .await
+            .map(Some)
+            .context("parsing /api/memory/entities/{id} response")
+    }
+
+    /// POST /api/memory/entities/search — vector similarity search over entity names.
+    pub async fn search_entities(
+        &self,
+        query: String,
+        limit: usize,
+    ) -> Result<SearchEntitiesResponse> {
+        let url = format!("{}/api/memory/entities/search", self.base_url);
+        let req = SearchEntitiesRequest { query, limit };
+        let resp = self
+            .send(
+                self.http.post(&url).json(&req),
+                &format!("POST {} failed", url),
+            )
+            .await?;
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        resp.json()
+            .await
+            .context("parsing /api/memory/entities/search response")
+    }
+
+    /// POST /api/memory/entities/{id}/merge — merge `loser_id` into `into`.
+    pub async fn merge_entity(
+        &self,
+        loser_id: &str,
+        into: String,
+        dry_run: bool,
+    ) -> Result<MergeEntityResponse> {
+        let url = format!("{}/api/memory/entities/{}/merge", self.base_url, loser_id);
+        let req = MergeEntityRequest { into, dry_run };
+        let resp = self
+            .send(
+                self.http.post(&url).json(&req),
+                &format!("POST {} failed", url),
+            )
+            .await?;
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        resp.json()
+            .await
+            .context("parsing /api/memory/entities/{id}/merge response")
+    }
+
+    /// POST /api/memory/entities/{id}/aliases — declare `alias` as an additional name.
+    pub async fn add_entity_alias(&self, id: &str, alias: String) -> Result<EntityAliasesResponse> {
+        let url = format!("{}/api/memory/entities/{}/aliases", self.base_url, id);
+        let req = AddEntityAliasRequest { alias };
+        let resp = self
+            .send(
+                self.http.post(&url).json(&req),
+                &format!("POST {} failed", url),
+            )
+            .await?;
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        resp.json()
+            .await
+            .context("parsing /api/memory/entities/{id}/aliases response")
     }
 }
 
