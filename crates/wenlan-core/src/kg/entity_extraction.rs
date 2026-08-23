@@ -5,6 +5,7 @@ use crate::db::MemoryDB;
 use crate::error::WenlanError;
 use crate::llm_provider::{LlmProvider, LlmRequest};
 use crate::prompts::PromptRegistry;
+use crate::read_scope::ReadScope;
 use std::sync::Arc;
 
 /// Extract KG entities from `content` via LLM, create/upsert them in the DB,
@@ -80,7 +81,10 @@ pub async fn extract_entities_for_content(
                     source_agent: Some("post_ingest".to_string()),
                     confidence: None,
                 };
-                if let Err(e) = crate::post_write::add_observation(db, req, "post_ingest").await {
+                if let Err(e) =
+                    crate::post_write::add_observation(db, req, "post_ingest", &ReadScope::Global)
+                        .await
+                {
                     log::warn!("[extract_entities_for_content] add_observation failed: {e}");
                 }
             }
@@ -210,7 +214,10 @@ pub async fn commit_kg(
                     source_agent: Some("post_ingest".to_string()),
                     confidence: None,
                 };
-                if let Err(e) = crate::post_write::add_observation(db, req, "post_ingest").await {
+                if let Err(e) =
+                    crate::post_write::add_observation(db, req, "post_ingest", &ReadScope::Global)
+                        .await
+                {
                     log::warn!("[post_ingest] add_observation failed: {e}");
                 }
             }

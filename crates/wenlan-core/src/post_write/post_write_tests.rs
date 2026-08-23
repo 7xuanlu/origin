@@ -604,7 +604,7 @@ async fn add_observation_rejects_missing_entity() {
         confidence: None,
     };
     assert!(matches!(
-        add_observation(&db, req, "test").await,
+        add_observation(&db, req, "test", &crate::read_scope::ReadScope::Global).await,
         Err(WenlanError::Validation(_))
     ));
 }
@@ -623,7 +623,7 @@ async fn add_observation_rejects_short_content() {
         confidence: None,
     };
     assert!(matches!(
-        add_observation(&db, req, "test").await,
+        add_observation(&db, req, "test", &crate::read_scope::ReadScope::Global).await,
         Err(WenlanError::Validation(_))
     ));
 }
@@ -641,7 +641,9 @@ async fn add_observation_happy_path() {
         source_agent: Some("test".to_string()),
         confidence: Some(0.9),
     };
-    let result = add_observation(&db, req, "test").await.unwrap();
+    let result = add_observation(&db, req, "test", &crate::read_scope::ReadScope::Global)
+        .await
+        .unwrap();
     assert!(!result.id.is_empty());
 
     // Verify the observation was actually persisted

@@ -1,5 +1,5 @@
 use super::{WriteOutcome, WriteResult};
-use crate::{db::MemoryDB, error::WenlanError};
+use crate::{db::MemoryDB, error::WenlanError, read_scope::ReadScope};
 use wenlan_types::requests::{AddObservationRequest, CreateEntityRequest, CreateRelationRequest};
 
 /// Create or resolve an entity. Canonical entry point for both
@@ -316,14 +316,18 @@ pub async fn create_relation_with_span(
 }
 
 /// Add an observation to an existing entity. Canonical entry for both
-/// agent-triggered (`/api/memory/observations`) and daemon-internal callers.
+/// agent-triggered (`/api/memory/observations`, `POST
+/// .../entities/{entity_id}/observations`) and daemon-internal callers.
+/// `scope` gates the entity-existence check: an entity outside `scope`
+/// reads as not-existing, same as a missing one.
 pub async fn add_observation(
     db: &MemoryDB,
     req: AddObservationRequest,
     agent: &str,
+    scope: &ReadScope,
 ) -> Result<WriteResult, WenlanError> {
     // Pre-write validation
-    if !db.entity_exists(&req.entity_id).await? {
+    if !db.entity_exists_in_scope(scope, &req.entity_id).await? {
         return Err(WenlanError::Validation(format!(
             "entity_id '{}' does not exist",
             req.entity_id
