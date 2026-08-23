@@ -297,7 +297,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             .await?
         }
         Commands::Background { command } => commands::service::run_background(command).await?,
-        Commands::Restart => commands::service::restart()?,
+        Commands::Restart => commands::service::restart().await?,
         Commands::Doctor => commands::setup::run_doctor().await?,
         Commands::Lint {
             profile,

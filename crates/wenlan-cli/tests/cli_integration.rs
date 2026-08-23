@@ -343,6 +343,104 @@ fn spawn_shutdown_stub_response(
     (base, received)
 }
 
+// A restart-cycle daemon models launchd across `wenlan restart`: it answers the
+// shutdown POST, closes its listener, and only re-listens once a start/kickstart
+// verb lands in the fake launchctl log after that close -- the same "does not
+// come back until told to" behavior a real KeepAlive job has.
+#[cfg(target_os = "macos")]
+fn spawn_restart_cycle_daemon(log_path: PathBuf) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind restart cycle daemon");
+    let address = listener.local_addr().expect("restart cycle daemon address");
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept shutdown request");
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .expect("read shutdown request line");
+        assert!(
+            request_line.starts_with("POST /api/shutdown"),
+            "expected a shutdown request, got {request_line:?}"
+        );
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read shutdown header");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        reader
+            .get_mut()
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nshutting down",
+            )
+            .expect("write shutdown response");
+        // Mark how much of the launchctl log exists right now: everything after
+        // this point is what restart()'s start step produces, so the daemon
+        // must not come back before that.
+        let offset = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+        drop(reader);
+        drop(listener);
+
+        loop {
+            let contents = fs::read_to_string(&log_path).unwrap_or_default();
+            if contents.len() as u64 > offset {
+                let started = contents[offset as usize..]
+                    .lines()
+                    .any(|line| line.starts_with("start ") || line.starts_with("kickstart "));
+                if started {
+                    break;
+                }
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let restarted = TcpListener::bind(address).expect("rebind restart cycle daemon");
+        while let Ok((health, _)) = restarted.accept() {
+            let mut health_reader = BufReader::new(health);
+            let mut request_line = String::new();
+            if health_reader.read_line(&mut request_line).is_err() {
+                continue;
+            }
+            loop {
+                let mut line = String::new();
+                if health_reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty()
+                {
+                    break;
+                }
+            }
+            let _ = health_reader.get_mut().write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
+            );
+        }
+    });
+    format!("http://{address}")
+}
+
+#[cfg(target_os = "macos")]
+fn restart_health_probe_ok(base_url: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let host = bind_addr_from_stub_host(base_url);
+    let Ok(mut stream) = TcpStream::connect(host) else {
+        return false;
+    };
+    let request = format!("GET /api/health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = String::new();
+    if stream.read_to_string(&mut response).is_err() {
+        return false;
+    }
+    response.starts_with("HTTP/1.1 200")
+}
+
 // Every caller is a launchd/unix background-lifecycle test, so on Windows this
 // is dead code and `-D warnings` fails the whole `cli_integration` target. CI's
 // lint job runs on Linux, so nothing caught it: `cargo clippy --workspace
@@ -1011,12 +1109,69 @@ fn restart_after_install_succeeds_isolated() {
         .assert()
         .success();
 
-    // Installed → restart stops then starts the service and reports it.
+    let log = runtime.data.path().join("restart_launchctl.log");
+    let base_url = spawn_restart_cycle_daemon(log.clone());
+    let bind_addr = bind_addr_from_stub_host(&base_url);
+
+    // Installed → restart gracefully stops the daemon, waits for it to exit,
+    // starts it, and only reports success once health answers again.
     cli_with_isolated_runtime(&runtime)
+        .env("WENLAN_BIND_ADDR", bind_addr)
+        .env("WENLAN_TEST_LAUNCHCTL_LOG", &log)
         .arg("restart")
         .assert()
         .success()
         .stdout(predicate::str::contains("Restarted com.wenlan.server"));
+
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|l| l.starts_with("stop ")),
+        "restart must use the graceful HTTP shutdown, not `launchctl stop`; launchctl calls were:\n{calls}"
+    );
+    assert!(
+        calls
+            .lines()
+            .any(|l| l.starts_with("start ") || l.starts_with("kickstart ")),
+        "restart must start the service after the graceful stop; launchctl calls were:\n{calls}"
+    );
+
+    assert!(
+        restart_health_probe_ok(&base_url),
+        "daemon must answer /api/health after `wenlan restart` returns"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn restart_without_a_daemon_fails_loud_after_starting_the_service() {
+    let runtime = IsolatedRuntime::new();
+
+    cli_with_isolated_runtime(&runtime)
+        .args(["background", "on"])
+        .assert()
+        .success();
+
+    let log = runtime.data.path().join("restart_no_daemon_launchctl.log");
+
+    // Nothing answers on the isolated port: restart must still issue the start
+    // (loud failure, no racy stop) and only fail once its 30s health deadline
+    // elapses.
+    cli_with_isolated_runtime(&runtime)
+        .env("WENLAN_TEST_LAUNCHCTL_LOG", &log)
+        .arg("restart")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("did not become healthy"))
+        .stderr(predicate::str::contains("http://127.0.0.1:9/api/health"))
+        .stderr(predicate::str::contains("wenlan status"));
+
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls
+            .lines()
+            .any(|l| l.starts_with("start ") || l.starts_with("kickstart ")),
+        "restart must still attempt to start the service even when health never answers; launchctl calls were:\n{calls}"
+    );
 }
 
 #[cfg(target_os = "macos")]
