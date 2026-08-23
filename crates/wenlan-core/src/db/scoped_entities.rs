@@ -36,7 +36,8 @@ impl MemoryDB {
         super::push_read_scope_filter_folded(scope, "p.space", &mut conditions, &mut values);
         let sql = format!(
             "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
-                    p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at \
+                    p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
+                    p.aliases \
              FROM entity_page_map epm \
              JOIN pages p ON p.id = epm.page_id \
              WHERE p.kind = 'entity' AND p.status = 'active' AND {} \
@@ -86,7 +87,8 @@ impl MemoryDB {
         super::push_read_scope_filter_folded(scope, "p.space", &mut conditions, &mut values);
         let entity_sql = format!(
             "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
-                    p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at \
+                    p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
+                    p.aliases \
              FROM entity_page_map epm \
              JOIN pages p ON p.id = epm.page_id \
              WHERE p.kind = 'entity' AND p.status = 'active' AND {} LIMIT 1",
@@ -372,7 +374,7 @@ impl MemoryDB {
         };
         let sql = format!(
             "SELECT m.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, \
-                    p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
+                    p.entity_confirmed, p.entity_created_at, p.entity_updated_at, p.aliases, \
                     vector_distance_cos(p.embedding, vector32(?1)) AS distance \
              FROM entity_page_map m \
              JOIN pages p ON p.id = m.page_id \
@@ -395,7 +397,7 @@ impl MemoryDB {
         })? {
             results.push(EntitySearchResult {
                 entity: entity_from_row(&row, "search_entities_by_vector_scoped")?,
-                distance: row.get::<f64>(9).map_err(|error| {
+                distance: row.get::<f64>(10).map_err(|error| {
                     WenlanError::VectorDb(format!(
                         "search_entities_by_vector_scoped distance: {error}"
                     ))
@@ -1138,5 +1140,9 @@ fn entity_from_row(row: &libsql::Row, context: &str) -> Result<Entity, WenlanErr
         updated_at: row
             .get(8)
             .map_err(|error| WenlanError::VectorDb(format!("{context} updated_at: {error}")))?,
+        aliases: super::parse_pages_aliases(
+            row.get::<Option<String>>(9)
+                .map_err(|error| WenlanError::VectorDb(format!("{context} aliases: {error}")))?,
+        ),
     })
 }

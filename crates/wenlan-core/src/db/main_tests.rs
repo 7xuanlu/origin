@@ -24161,6 +24161,39 @@ async fn test_add_entity_alias() {
     assert_eq!(r2, Some(id.clone()));
 }
 
+/// Storage and lookup must agree on trimming: `add_entity_alias` trims before
+/// it stores, and `resolve_entity_by_alias` trims before it looks up, so a
+/// padded alias and its unpadded lookups all land on the same entity.
+#[tokio::test]
+async fn add_entity_alias_trims_before_storing_and_resolving() {
+    let (db, _dir) = test_db().await;
+    let id = db
+        .store_entity("Alice Chen", "person", None, Some("test"), None)
+        .await
+        .unwrap();
+    db.add_entity_alias("  ali  ", &id, "test").await.unwrap();
+
+    for candidate in ["ali", "  ali", "ALI "] {
+        assert_eq!(
+            db.resolve_entity_by_alias(candidate).await.unwrap(),
+            Some(id.clone()),
+            "candidate {candidate:?}"
+        );
+    }
+
+    let detail = db.get_entity_detail(&id).await.unwrap();
+    assert!(
+        detail.entity.aliases.contains(&"ali".to_string()),
+        "{:?}",
+        detail.entity.aliases
+    );
+    assert!(
+        !detail.entity.aliases.iter().any(|a| a != a.trim()),
+        "no padded alias should be stored: {:?}",
+        detail.entity.aliases
+    );
+}
+
 /// Ordinary sequential writers must not be able to create an alias collision:
 /// `add_entity_alias` skips the append when another active entity page already
 /// claims the alias, which is what `entity_aliases`' `UNIQUE(alias_name)` +
@@ -29026,13 +29059,17 @@ async fn merge_entities_canonical_missing_not_found() {
 async fn merge_entities_dedups_overlapping_observations() {
     let (db, _tmp) = test_db().await;
     let (canonical, alias) = seed_two_entities(&db).await;
-    db.add_observation(&canonical, "Shared fact", None, None)
+    // Distinct source_agent values on the two "Shared fact" inserts let the
+    // post-merge assertion tell the canonical's own row apart from a
+    // same-content row that merely reused its id.
+    let canonical_shared_id = db
+        .add_observation(&canonical, "Shared fact", Some("canonical-source"), None)
         .await
         .unwrap();
     db.add_observation(&canonical, "Canonical unique", None, None)
         .await
         .unwrap();
-    db.add_observation(&alias, "Shared fact", None, None)
+    db.add_observation(&alias, "Shared fact", Some("alias-source"), None)
         .await
         .unwrap();
     db.add_observation(&alias, "Alias unique", None, None)
@@ -29059,6 +29096,31 @@ async fn merge_entities_dedups_overlapping_observations() {
         canonical_count, 3,
         "shared (kept once) + canonical-unique + alias-unique"
     );
+
+    // The row count alone can't tell which of the two identical-content
+    // rows survived. Assert the surviving row is the canonical's own --
+    // same id, same source_agent -- not the alias's row re-pointed under
+    // the canonical's entity_id.
+    let row = conn
+        .query(
+            "SELECT id, source_agent FROM observations WHERE entity_id = ?1 AND content = ?2",
+            libsql::params![canonical.as_str(), "Shared fact"],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .expect("the shared observation must still exist on the canonical");
+    assert_eq!(
+        row.get::<String>(0).unwrap(),
+        canonical_shared_id,
+        "the canonical's own shared-observation row must survive the merge, not the alias's"
+    );
+    assert_eq!(
+        row.get::<Option<String>>(1).unwrap(),
+        Some("canonical-source".to_string())
+    );
     let alias_count: i64 = conn
         .query(
             "SELECT COUNT(*) FROM observations WHERE entity_id = ?1",
@@ -29073,6 +29135,338 @@ async fn merge_entities_dedups_overlapping_observations() {
         .get(0)
         .unwrap();
     assert_eq!(alias_count, 0, "no observation rows left on the alias id");
+}
+
+/// `merge_entities_preview`'s counts must equal what `merge_entities` itself
+/// moves -- not what's merely attached to the loser. Seeds one memory link
+/// and one observation the loser SHARES with the canonical (both dedup away
+/// rather than move) alongside one of each the loser holds alone (both must
+/// move), then checks the preview's counts, the applied `MergeOutcome`'s
+/// counts, and the actual pre/post-merge row deltas on the canonical all
+/// agree.
+///
+/// `memory_links` specifically must count BOTH sources `/api/memory/graph`'s
+/// own union draws from -- the `memory_entities` link table AND the legacy
+/// direct `memories.entity_id` column -- so this also seeds a memory linked
+/// to the loser only through the legacy column, and one linked through both
+/// sources at once (must still count once, not twice).
+#[tokio::test]
+async fn merge_entities_preview_counts_match_post_merge_deltas() {
+    let (db, _tmp) = test_db().await;
+    let (canonical, alias) = seed_two_entities(&db).await;
+
+    db.link_memory_entities("shared_memory", &[canonical.as_str(), alias.as_str()])
+        .await
+        .unwrap();
+    db.link_memory_entities("alias_only_memory", &[alias.as_str()])
+        .await
+        .unwrap();
+    // Legacy-column-only link: a `memories` row whose `entity_id` names the
+    // loser directly, with no corresponding `memory_entities` row.
+    insert_memory_with_entity(
+        &db,
+        "legacy_only_memory",
+        "Legacy only",
+        "legacy column link only",
+        1712707200,
+        1712707200,
+        "enriched",
+        &alias,
+    )
+    .await;
+    // Both sources at once: a `memories` row with `entity_id = alias` AND a
+    // `memory_entities` row for the same memory id -- must count once.
+    insert_memory_with_entity(
+        &db,
+        "both_sources_memory",
+        "Both sources",
+        "legacy column and link table",
+        1712707200,
+        1712707200,
+        "enriched",
+        &alias,
+    )
+    .await;
+    db.link_memory_entities("both_sources_memory", &[alias.as_str()])
+        .await
+        .unwrap();
+    db.add_observation(&canonical, "Shared fact", None, None)
+        .await
+        .unwrap();
+    db.add_observation(&alias, "Shared fact", None, None)
+        .await
+        .unwrap();
+    db.add_observation(&alias, "Alias unique fact", None, None)
+        .await
+        .unwrap();
+
+    let canonical_memory_links_before = count_entity_memory_links_union(&db, &canonical).await;
+    let canonical_observations_before = count_entity_rows(
+        &db,
+        "SELECT COUNT(*) FROM observations WHERE entity_id = ?1",
+        &canonical,
+    )
+    .await;
+
+    let preview = db.merge_entities_preview(&canonical, &alias).await.unwrap();
+    assert_eq!(
+        preview.memory_links, 3,
+        "alias-only, legacy-only, and both-sources links should each count once"
+    );
+    assert_eq!(
+        preview.observations, 1,
+        "only the alias-unique observation should be counted as moving"
+    );
+
+    let outcome = db.merge_entities(&canonical, &alias).await.unwrap();
+    assert!(outcome.merged);
+    assert_eq!(
+        outcome.memory_links, preview.memory_links,
+        "the outcome's own count must match the preview's"
+    );
+    assert_eq!(
+        outcome.observations, preview.observations,
+        "the outcome's own count must match the preview's"
+    );
+
+    let canonical_memory_links_after = count_entity_memory_links_union(&db, &canonical).await;
+    let canonical_observations_after = count_entity_rows(
+        &db,
+        "SELECT COUNT(*) FROM observations WHERE entity_id = ?1",
+        &canonical,
+    )
+    .await;
+    assert_eq!(
+        canonical_memory_links_after - canonical_memory_links_before,
+        preview.memory_links as i64,
+        "the preview's memory_links count must equal the real post-merge union delta on the canonical"
+    );
+    assert_eq!(
+        canonical_observations_after - canonical_observations_before,
+        preview.observations as i64,
+        "the preview's observations count must equal the real post-merge delta"
+    );
+}
+
+async fn count_entity_rows(db: &MemoryDB, sql: &str, entity_id: &str) -> i64 {
+    let conn = db.conn.lock().await;
+    conn.query(sql, libsql::params![entity_id])
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap()
+}
+
+/// Distinct memories linked to `entity_id` through EITHER `memory_links`
+/// source -- `memory_entities`, or the legacy `memories.entity_id` column
+/// (`chunk_index = 0` only) -- the same union `/api/memory/graph` draws
+/// from. `count_entity_rows` only ever queries one table at a time, so this
+/// is a separate helper rather than a redefinition of it.
+async fn count_entity_memory_links_union(db: &MemoryDB, entity_id: &str) -> i64 {
+    let conn = db.conn.lock().await;
+    conn.query(
+        "SELECT COUNT(*) FROM ( \
+             SELECT memory_id AS mid FROM memory_entities WHERE entity_id = ?1 \
+             UNION \
+             SELECT source_id AS mid FROM memories \
+              WHERE entity_id = ?1 AND source = 'memory' AND chunk_index = 0)",
+        libsql::params![entity_id],
+    )
+    .await
+    .unwrap()
+    .next()
+    .await
+    .unwrap()
+    .unwrap()
+    .get(0)
+    .unwrap()
+}
+
+/// A loser↔canonical edge would re-point onto the canonical's own
+/// self-loop -- not a relation (`create_relation_with_span` refuses one;
+/// the extraction writer skips one) -- so `merge_entities` retires it
+/// instead of re-asserting it, and the edge count must not include it.
+/// Separately, two of the loser's edges can still collapse onto the SAME
+/// `(src, dst, semantic_type)` identity that already exists on the
+/// canonical (a loser->other edge whose re-pointed identity duplicates an
+/// existing canonical->other edge), and `dual_write_edge_with_payload`'s
+/// content-addressed edge id means only ONE edge lands for that identity.
+/// Seeds a reciprocal `leads` pair between loser and canonical (both would
+/// become the self-loop -- retired, not counted), a `works_on` edge from
+/// both loser and canonical to a third entity (the re-pointed identity
+/// already exists on the canonical -- not counted), and a `leads` edge
+/// from loser to the third entity (new -- counted). Checks the preview's
+/// count, the applied `MergeOutcome`'s count, the identities that actually
+/// newly appear among the canonical's active edges, that no active
+/// self-loop lands on the canonical, that both loser↔canonical edges are
+/// invalidated, and that exactly one edge survives for each of the
+/// `works_on` and `leads` canonical->other identities.
+#[tokio::test]
+async fn merge_entities_retires_loser_canonical_edges_and_counts_distinct_identities() {
+    let (db, _tmp) = test_db().await;
+    let (canonical, alias) = seed_two_entities(&db).await;
+    let other = db.create_entity("Carol", "person", None).await.unwrap();
+
+    // Reciprocal same-type edges between loser and canonical: both would
+    // re-point onto the canonical's own self-loop, so `merge_entities`
+    // retires them instead of re-asserting them.
+    db.create_relation(&alias, &canonical, "leads", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+    db.create_relation(&canonical, &alias, "leads", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+    // (`works_on` is already the canonical relation type; `create_relation`
+    // rewrites e.g. `works_at` to it, so the seeds use the stored form.)
+    // The loser's works_on edge to `other` re-points onto an identity the
+    // canonical already has -- content-addressed dedup, not a new edge.
+    db.create_relation(&alias, &other, "works_on", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+    db.create_relation(&canonical, &other, "works_on", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+    // An ordinary loser edge to `other` -- new identity, counted.
+    db.create_relation(&alias, &other, "leads", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+
+    let before = canonical_touching_edge_identities(&db, &canonical).await;
+
+    let preview = db.merge_entities_preview(&canonical, &alias).await.unwrap();
+    assert_eq!(
+        preview.edges, 1,
+        "only the new loser->other leads edge counts: the reciprocal pair \
+         is retired as a self-loop, and the works_on re-point already \
+         exists on the canonical"
+    );
+
+    let outcome = db.merge_entities(&canonical, &alias).await.unwrap();
+    assert!(outcome.merged);
+    assert_eq!(
+        outcome.edges, preview.edges,
+        "the outcome's own count must match the preview's"
+    );
+
+    let after = canonical_touching_edge_identities(&db, &canonical).await;
+    let newly_appeared = after.difference(&before).count() as u64;
+    assert_eq!(
+        newly_appeared, preview.edges,
+        "the preview's edges count must equal the identities that actually \
+         newly appear among the canonical's active edges after the merge"
+    );
+
+    let conn = db.conn.lock().await;
+    let self_loops: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' \
+             AND src_id = ?1 AND dst_id = ?1 AND valid_until IS NULL",
+            libsql::params![canonical.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        self_loops, 0,
+        "no active self-loop should land on the canonical"
+    );
+
+    let loser_touching: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' \
+             AND (src_id = ?1 OR dst_id = ?1) AND valid_until IS NULL",
+            libsql::params![alias.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        loser_touching, 0,
+        "both loser-canonical edges should be invalidated, not re-asserted"
+    );
+
+    let works_on_survivors: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' \
+             AND src_id = ?1 AND dst_id = ?2 AND semantic_type = 'works_on' \
+             AND valid_until IS NULL",
+            libsql::params![canonical.as_str(), other.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        works_on_survivors, 1,
+        "content-addressed dedup should leave exactly one works_on edge"
+    );
+
+    let leads_survivors: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'relates' \
+             AND src_id = ?1 AND dst_id = ?2 AND semantic_type = 'leads' \
+             AND valid_until IS NULL",
+            libsql::params![canonical.as_str(), other.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        leads_survivors, 1,
+        "exactly one canonical->other leads edge should survive"
+    );
+}
+
+/// `(src_id, dst_id, semantic_type)` for every active `relates` edge
+/// touching `entity_id` -- a repointed identity always touches the
+/// canonical on at least one side, so this is the same universe
+/// `edges_will_move_delta`'s `NOT EXISTS` scan checks against.
+async fn canonical_touching_edge_identities(
+    db: &MemoryDB,
+    entity_id: &str,
+) -> std::collections::HashSet<(String, String, Option<String>)> {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT src_id, dst_id, semantic_type FROM edges \
+             WHERE edge_type = 'relates' AND src_kind = 'entity' AND dst_kind = 'entity' \
+               AND valid_until IS NULL AND (src_id = ?1 OR dst_id = ?1)",
+            libsql::params![entity_id],
+        )
+        .await
+        .unwrap();
+    let mut set = std::collections::HashSet::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        set.insert((
+            row.get::<String>(0).unwrap(),
+            row.get::<String>(1).unwrap(),
+            row.get::<Option<String>>(2).unwrap(),
+        ));
+    }
+    set
 }
 
 // ==================== supersede_relation ====================
@@ -31968,6 +32362,49 @@ async fn ambient_enrichment_commit_refuses_junk_names_and_canonicalizes_types() 
         observations.is_empty(),
         "a refused entity must not drag its observations into the graph"
     );
+}
+
+/// Spec acceptance 2: once "origin" is declared an alias of "wenlan", the
+/// ambient enrichment lane's own resolution step (the same alias-lookup
+/// `resolve_or_create_entity` runs) must land a re-extracted "Origin" on the
+/// existing canonical entity instead of minting a duplicate.
+#[tokio::test]
+async fn commit_entity_enrichment_resolves_extracted_name_to_declared_alias() {
+    let (db, _dir) = test_db().await;
+    let content = "wenlan shipped a new feature today.";
+    db.upsert_documents(vec![make_memory_doc(
+        "mem_origin_alias",
+        content,
+        "knowledge",
+        "work",
+        "agent",
+    )])
+    .await
+    .unwrap();
+
+    let canonical = db.create_entity("wenlan", "project", None).await.unwrap();
+    db.add_entity_alias("origin", &canonical, "test")
+        .await
+        .unwrap();
+
+    let kg = extracted_entity_with_observation(
+        "Origin",
+        "project",
+        "Origin shipped a new feature today.",
+    );
+    assert!(db
+        .commit_entity_enrichment_at_version("mem_origin_alias", 1, &kg, content)
+        .await
+        .unwrap());
+
+    let stored = db.list_entities(None, None).await.unwrap();
+    assert_eq!(
+        stored.len(),
+        1,
+        "the extracted 'Origin' must resolve to the existing aliased entity, not create a duplicate"
+    );
+    assert_eq!(stored[0].id, canonical);
+    assert_eq!(stored[0].name, "wenlan");
 }
 
 fn extracted_graph(
@@ -53761,11 +54198,15 @@ async fn migration_124_retires_orphan_edges_requeues_parked_jobs_and_downgrades_
 
 /// Migration 125 (KG observation identity, PR 1): an observation's identity
 /// is `(entity_id, lower(trim(content)))`. `test_db()` already carries
-/// `idx_observations_identity` (both the migration and the fresh-schema DDL
-/// create it), so duplicates are seeded by dropping the index, inserting
-/// raw rows, rewinding `user_version` to 124, and replaying migration 125
-/// for real -- proving both halves (dedup DELETE, `CREATE UNIQUE INDEX`)
-/// through the actual migration path rather than asserting on hand-run SQL.
+/// `idx_observations_identity` (migration 125 is its sole creator -- the
+/// fresh-schema `SCHEMA` block runs before `run_migrations` on every open,
+/// so putting the index there would fail the first open of a DB that still
+/// holds duplicates; a fresh install gets the index by replaying the
+/// migration chain from version 0), so duplicates are seeded by dropping the
+/// index, inserting raw rows, rewinding `user_version` to 124, and replaying
+/// migration 125 for real -- proving both halves (dedup DELETE, `CREATE
+/// UNIQUE INDEX`) through the actual migration path rather than asserting on
+/// hand-run SQL.
 #[tokio::test]
 async fn migration_125_dedups_observations_and_adds_identity_index() {
     let (db, _dir) = test_db().await;
@@ -54098,6 +54539,38 @@ async fn add_observation_twice_returns_existing_id_and_warns() {
         .unwrap();
     assert!(first.warnings.is_empty());
 
+    let (watermark_before, activity_count_before): (i64, i64) = {
+        let conn = db.conn.lock().await;
+        let watermark: i64 = conn
+            .query(
+                "SELECT entity_updated_at FROM pages WHERE kind = 'entity'
+                   AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+                libsql::params![entity_id.as_str()],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        let activity_count: i64 = conn
+            .query(
+                "SELECT COUNT(*) FROM agent_activity WHERE action = 'observation_add'",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        (watermark, activity_count)
+    };
+
     let second = crate::post_write::add_observation(&db, make_req(), "test-agent")
         .await
         .unwrap();
@@ -54110,6 +54583,11 @@ async fn add_observation_twice_returns_existing_id_and_warns() {
         "the second call must carry a duplicate warning, got {:?}",
         second.warnings
     );
+    assert!(
+        !second.wrote,
+        "a duplicate observation must report wrote:false"
+    );
+    assert_eq!(second.outcome, crate::post_write::WriteOutcome::Unchanged);
 
     let conn = db.conn.lock().await;
     let count: i64 = conn
@@ -54126,6 +54604,42 @@ async fn add_observation_twice_returns_existing_id_and_warns() {
         .get::<i64>(0)
         .unwrap();
     assert_eq!(count, 1, "only one row was created");
+
+    let watermark_after: i64 = conn
+        .query(
+            "SELECT entity_updated_at FROM pages WHERE kind = 'entity'
+               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+            libsql::params![entity_id.as_str()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        watermark_after, watermark_before,
+        "a duplicate observation must not touch the entity's freshness watermark"
+    );
+    let activity_count_after: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM agent_activity WHERE action = 'observation_add'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        activity_count_after, activity_count_before,
+        "a duplicate observation must not record a new activity event"
+    );
 }
 
 /// `commit_entity_enrichment_at_version`'s `INSERT OR IGNORE` (migration

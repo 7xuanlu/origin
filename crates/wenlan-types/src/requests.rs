@@ -217,6 +217,23 @@ pub struct SearchEntitiesRequest {
     pub limit: usize,
 }
 
+/// `POST /api/memory/entities/{id}/merge` — merge `{id}` (the loser) into
+/// `into` (the canonical). `dry_run` returns the preview counts without
+/// mutating anything.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MergeEntityRequest {
+    pub into: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `POST /api/memory/entities/{id}/aliases` — declare `alias` as an
+/// additional name for entity `{id}`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddEntityAliasRequest {
+    pub alias: String,
+}
+
 // ===== Profile & Agents =====
 
 #[derive(Debug, Serialize, Deserialize)]

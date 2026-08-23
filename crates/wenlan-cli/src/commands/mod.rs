@@ -4,6 +4,7 @@
 pub mod agents;
 pub mod brief;
 pub mod curate;
+pub mod entities;
 pub mod ingest;
 pub mod lint;
 pub mod list;

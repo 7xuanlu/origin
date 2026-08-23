@@ -438,6 +438,34 @@ pub struct SearchEntitiesResponse {
     pub results: Vec<EntitySearchResult>,
 }
 
+/// `POST /api/memory/entities/{id}/merge` response. `applied` is `false`
+/// for a `dry_run` preview (nothing mutated) and `true` once the merge ran.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MergeEntityResponse {
+    pub canonical_id: String,
+    pub canonical_name: String,
+    pub loser_id: String,
+    pub loser_name: String,
+    /// Distinct memories newly linked to the canonical (both link sources
+    /// the merge moves). The graph hides superseded memories and pending
+    /// revisions, so it can gain fewer links than this count.
+    pub memory_links: u64,
+    pub observations: u64,
+    /// Distinct re-pointed edges newly landing on the canonical; a
+    /// loser↔canonical edge is retired, not re-pointed, and is not
+    /// counted.
+    pub edges: u64,
+    pub aliases_added: Vec<String>,
+    pub applied: bool,
+}
+
+/// `POST /api/memory/entities/{id}/aliases` response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EntityAliasesResponse {
+    pub entity_id: String,
+    pub aliases: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchPagesResponse {
     pub pages: Vec<Page>,
