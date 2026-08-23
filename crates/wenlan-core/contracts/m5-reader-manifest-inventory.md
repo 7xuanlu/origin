@@ -741,10 +741,11 @@ must be demoted individually with a recorded reason. **Every MCP tool is
 | `verify_lint_repair` | yes | automatic | `none` | tool handler |
 | `write_page` | yes | automatic | `none` | tool handler |
 
-## CLI — all 20 `Commands` variants
+## CLI — all 22 `Commands` variants
 
-From `crates/wenlan-cli/src/main.rs:29`. The count is 20, not 19: `Connect` is a
-tuple variant, easy to miss when scanning for brace-shaped variants. The CLI
+From `crates/wenlan-cli/src/main.rs:45`. The count is 22, not 20: `Connect` and
+`Brief` are tuple variants, easy to miss when scanning for brace-shaped
+variants, and `Outbox` is the last brace variant before `Entities`. The CLI
 renders daemon responses, so it inherits the daemon's classification and adds
 the projection-directory reader.
 
@@ -762,6 +763,7 @@ the projection-directory reader.
 | `wenlan connect` | yes | automatic | `none` | subcommand renderer |
 | `wenlan search` | yes | automatic | `none` | subcommand renderer |
 | `wenlan recall` | yes | automatic | `none` | subcommand renderer |
+| `wenlan brief` | yes | automatic | `none` | subcommand renderer |
 | `wenlan pages` | yes | automatic | **`collection` + `named_page`** | enforce_projection_directory_invariant |
 | `wenlan sources` | yes | automatic | `none` | subcommand renderer |
 | `wenlan capture` | yes | automatic | `none` | subcommand renderer |
@@ -769,6 +771,7 @@ the projection-directory reader.
 | `wenlan curate` | yes | automatic | `none` | subcommand renderer |
 | `wenlan agents` | yes | automatic | `none` | subcommand renderer |
 | `wenlan spaces` | yes | automatic | `none` | subcommand renderer |
+| `wenlan outbox` | yes | automatic | `none` | subcommand renderer |
 | `wenlan entities` | yes | automatic | `none` | subcommand renderer |
 
 ## Projection, export, internal

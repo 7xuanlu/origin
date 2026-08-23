@@ -34220,7 +34220,7 @@ impl MemoryDB {
                  WHERE p.kind = 'entity' AND p.status = 'active'
                    AND EXISTS (SELECT 1 FROM json_each(p.aliases) WHERE value = ?1)
                  ORDER BY p.created_at, epm.entity_id LIMIT 1",
-                libsql::params![name.to_lowercase()],
+                libsql::params![name.trim().to_lowercase()],
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("alias lookup: {}", e)))?;
@@ -34278,7 +34278,7 @@ impl MemoryDB {
                     WHERE p2.kind = 'entity' AND p2.status = 'active'
                       AND epm2.entity_id <> ?3
                       AND EXISTS (SELECT 1 FROM json_each(p2.aliases) WHERE value = ?1))",
-            libsql::params![alias.to_lowercase(), now_iso, entity_id.to_string()],
+            libsql::params![alias.trim().to_lowercase(), now_iso, entity_id.to_string()],
         )
         .await
         .map_err(|e| WenlanError::VectorDb(format!("add alias shadow: {}", e)))?;

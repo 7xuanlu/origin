@@ -24161,6 +24161,39 @@ async fn test_add_entity_alias() {
     assert_eq!(r2, Some(id.clone()));
 }
 
+/// Storage and lookup must agree on trimming: `add_entity_alias` trims before
+/// it stores, and `resolve_entity_by_alias` trims before it looks up, so a
+/// padded alias and its unpadded lookups all land on the same entity.
+#[tokio::test]
+async fn add_entity_alias_trims_before_storing_and_resolving() {
+    let (db, _dir) = test_db().await;
+    let id = db
+        .store_entity("Alice Chen", "person", None, Some("test"), None)
+        .await
+        .unwrap();
+    db.add_entity_alias("  ali  ", &id, "test").await.unwrap();
+
+    for candidate in ["ali", "  ali", "ALI "] {
+        assert_eq!(
+            db.resolve_entity_by_alias(candidate).await.unwrap(),
+            Some(id.clone()),
+            "candidate {candidate:?}"
+        );
+    }
+
+    let detail = db.get_entity_detail(&id).await.unwrap();
+    assert!(
+        detail.entity.aliases.contains(&"ali".to_string()),
+        "{:?}",
+        detail.entity.aliases
+    );
+    assert!(
+        !detail.entity.aliases.iter().any(|a| a != a.trim()),
+        "no padded alias should be stored: {:?}",
+        detail.entity.aliases
+    );
+}
+
 /// Ordinary sequential writers must not be able to create an alias collision:
 /// `add_entity_alias` skips the append when another active entity page already
 /// claims the alias, which is what `entity_aliases`' `UNIQUE(alias_name)` +

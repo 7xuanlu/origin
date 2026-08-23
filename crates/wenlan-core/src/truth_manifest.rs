@@ -381,7 +381,7 @@ pub const MCP_READERS: &[McpReader] = &[
     McpReader { tool: "write_page", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "tool handler" },
 ];
 
-/// All 20 top-level `Commands` variants in `crates/wenlan-cli/src/main.rs`.
+/// All 22 top-level `Commands` variants in `crates/wenlan-cli/src/main.rs`.
 #[rustfmt::skip]
 pub const CLI_READERS: &[CliReader] = &[
     CliReader { subcommand: "wenlan status", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
@@ -396,6 +396,7 @@ pub const CLI_READERS: &[CliReader] = &[
     CliReader { subcommand: "wenlan connect", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan search", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan recall", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
+    CliReader { subcommand: "wenlan brief", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan pages", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::CollectionAndNamedPage, adapter: "enforce_projection_directory_invariant" },
     CliReader { subcommand: "wenlan sources", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan capture", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
@@ -403,6 +404,7 @@ pub const CLI_READERS: &[CliReader] = &[
     CliReader { subcommand: "wenlan curate", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan agents", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan spaces", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
+    CliReader { subcommand: "wenlan outbox", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan entities", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
 ];
 

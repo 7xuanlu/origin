@@ -799,6 +799,72 @@ async fn create_entity_named_after_alias_resolves_to_canonical() {
     assert_eq!(resolved.write_outcome, Some(WriteOutcome::ResolvedExisting));
 }
 
+/// A padded alias is trimmed before it is stored and before it is matched --
+/// storage and lookup must agree, or a later `POST /api/memory/entities` with
+/// the unpadded name silently fails to resolve to the canonical.
+#[tokio::test]
+async fn add_entity_alias_trims_padding() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+
+    let wenlan = create_test_entity(&router, "wenlan", "project").await;
+
+    let alias_uri = format!("/api/memory/entities/{}/aliases", wenlan.id);
+    let (status, aliases): (StatusCode, EntityAliasesResponse) = request_typed(
+        &router,
+        Method::POST,
+        &alias_uri,
+        json_body(&AddEntityAliasRequest {
+            alias: "  Origin  ".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        aliases.aliases.contains(&"origin".to_string()),
+        "{:?}",
+        aliases.aliases
+    );
+    assert!(
+        !aliases.aliases.iter().any(|a| a != a.trim()),
+        "no padded alias should be stored: {:?}",
+        aliases.aliases
+    );
+
+    let origin_request = CreateEntityRequest {
+        name: "Origin".to_string(),
+        entity_type: "project".to_string(),
+        space: Default::default(),
+        source_agent: Some("entity-graph-route-contract".to_string()),
+        confidence: Some(0.9),
+    };
+    let (status, resolved): (StatusCode, CreateEntityResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities",
+        json_body(&origin_request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        resolved.id, wenlan.id,
+        "a trimmed alias must still resolve an unpadded name to the canonical"
+    );
+    assert_eq!(resolved.write_outcome, Some(WriteOutcome::ResolvedExisting));
+
+    // Re-adding the same padded alias stays idempotent.
+    let (status, aliases_again): (StatusCode, EntityAliasesResponse) = request_typed(
+        &router,
+        Method::POST,
+        &alias_uri,
+        json_body(&AddEntityAliasRequest {
+            alias: "  Origin  ".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(aliases_again.aliases, aliases.aliases);
+}
+
 /// Merging an entity into itself is a validation error, not a self-merge
 /// no-op.
 #[tokio::test]

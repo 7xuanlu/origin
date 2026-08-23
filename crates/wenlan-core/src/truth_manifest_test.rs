@@ -209,7 +209,9 @@ fn manifest_counts_match_the_spec() {
         "registered (method, path, handler) triples"
     );
     assert_eq!(MCP_READERS.len(), 29, "#[tool( declarations");
-    assert_eq!(CLI_READERS.len(), 20, "Commands variants");
+    // 22 after `wenlan brief` and `wenlan outbox` were added to the catalog
+    // (they had shipped without rows); `wenlan entities` landed in the same PR.
+    assert_eq!(CLI_READERS.len(), 22, "Commands variants");
 
     let entries: Vec<_> = runtime_entries().collect();
     assert_eq!(

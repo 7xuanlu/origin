@@ -457,13 +457,14 @@ pub async fn handle_add_entity_alias(
             "alias must not be empty".into(),
         ));
     }
+    let alias = req.alias.trim();
     let db = {
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
     // 404 when `id` does not name a live entity.
     let detail = db.get_entity_detail(&id).await?;
-    let alias_lower = req.alias.to_lowercase();
+    let alias_lower = alias.to_lowercase();
     if !detail.entity.aliases.contains(&alias_lower) {
         if let Some(owner_id) = db.resolve_entity_by_alias(&alias_lower).await? {
             if owner_id != id {
@@ -484,16 +485,16 @@ pub async fn handle_add_entity_alias(
                         "alias {:?} is the name of live entity {owner_id}; use \
                          POST /api/memory/entities/{owner_id}/merge (CLI: wenlan \
                          entities merge ...) instead",
-                        req.alias
+                        alias
                     )));
                 }
                 return Err(ServerError::Conflict(format!(
                     "alias {:?} is already owned by entity {owner_id}",
-                    req.alias
+                    alias
                 )));
             }
         }
-        db.add_entity_alias(&req.alias, &id, "api").await?;
+        db.add_entity_alias(alias, &id, "api").await?;
     }
     let aliases = db.get_entity_detail(&id).await?.entity.aliases;
     // The write above is idempotent-checked, not re-verified here until now:
@@ -501,7 +502,7 @@ pub async fn handle_add_entity_alias(
     if !aliases.contains(&alias_lower) {
         return Err(ServerError::Conflict(format!(
             "alias {:?} was not recorded for entity {id}",
-            req.alias
+            alias
         )));
     }
     Ok(Json(EntityAliasesResponse {
