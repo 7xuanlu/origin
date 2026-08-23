@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 use crate::client::{SyncStats, WenlanClient};
-use crate::output::{print_json, OutputFormat};
+use crate::output::{print_json, ResolvedFormat};
 
 #[derive(clap::Subcommand)]
 pub enum SourcesCommand {
@@ -23,7 +23,7 @@ pub enum SourcesCommand {
 
 pub async fn run_sources(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     command: SourcesCommand,
 ) -> Result<()> {
@@ -34,7 +34,7 @@ pub async fn run_sources(
 
 pub async fn run(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     path: PathBuf,
 ) -> Result<()> {
@@ -51,9 +51,8 @@ pub async fn run(
         return Ok(());
     }
     match format {
-        OutputFormat::Json => print_json(&stats)?,
-        OutputFormat::Table => print!("{}", format_stats(&id, &stats)),
-        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
+        ResolvedFormat::Json => print_json(&stats)?,
+        ResolvedFormat::Table => print!("{}", format_stats(&id, &stats)),
     }
     Ok(())
 }

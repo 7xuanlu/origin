@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useQuery } from "@tanstack/react-query";
-import { search, getIndexStatus, type SearchResult } from "../lib/tauri";
+import { search, type SearchResult } from "../lib/tauri";
 import { useState, useEffect, useRef } from "react";
 
 export function useSearch(sourceFilter?: string) {
@@ -38,16 +38,9 @@ export function useSearch(sourceFilter?: string) {
   return {
     query,
     setQuery,
+    debouncedQuery,
     results,
     isLoading: searchQuery.isFetching && debouncedQuery.length > 0,
     error: searchQuery.error,
   };
-}
-
-export function useIndexStatus() {
-  return useQuery({
-    queryKey: ["indexStatus"],
-    queryFn: getIndexStatus,
-    refetchInterval: 5000,
-  });
 }

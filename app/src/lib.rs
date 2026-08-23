@@ -27,7 +27,6 @@ pub mod plugin_install;
 // outside tests. See the module doc comment.
 #[allow(dead_code)]
 mod presence;
-pub mod privacy;
 pub mod remote_access;
 mod search;
 pub mod sources;
@@ -1197,7 +1196,6 @@ pub fn run() {
             search::detect_obsidian_vaults,
             search::read_text_file,
             search::quick_capture,
-            search::ingest_clipboard,
             search::ingest_webpage,
             search::distill_review,
             search::redistill_page,
@@ -1229,10 +1227,6 @@ pub fn run() {
             search::reorder_space,
             search::toggle_space_starred,
             search::set_document_space,
-            search::add_space,
-            search::remove_space,
-            search::rename_space,
-            search::pin_space,
             search::set_traffic_lights_visible,
             // Memory layer commands
             search::store_memory,
@@ -1243,10 +1237,8 @@ pub fn run() {
             search::acknowledge_onboarding_milestone,
             search::reset_onboarding_milestones,
             search::save_temp_file,
-            search::search_memory,
             search::confirm_memory,
             search::set_stability_cmd,
-            search::list_memories,
             search::delete_memory,
             search::create_entity_cmd,
             search::list_entities_cmd,
@@ -1303,7 +1295,6 @@ pub fn run() {
             // Activity feed command
             search::list_agent_activity,
             // Setup wizard commands
-            search::get_setup_status,
             search::get_setup_completed,
             search::set_setup_completed,
             search::should_show_wizard,
@@ -1323,7 +1314,6 @@ pub fn run() {
             search::get_nurture_cards_cmd,
             search::correct_memory_cmd,
             // Quality gate commands
-            search::get_rejection_log,
             // Page commands
             search::get_page,
             search::create_page,
@@ -1392,7 +1382,6 @@ pub fn run() {
             search::is_run_at_login_enabled,
             search::set_run_at_login,
             search::quit_wenlan_full,
-            search::quit_origin_full,
             acknowledge_guarded_quit_request,
             cancel_guarded_quit_request,
             daemon_start::start_daemon_sidecar,

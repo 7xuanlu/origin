@@ -60,7 +60,7 @@ struct ServeArgs {
     #[arg(long)]
     user_id: Option<String>,
 
-    /// Comma-separated list of allowed Wenlan headers
+    /// Comma-separated list of allowed Origin header values
     #[arg(long, default_value = "https://claude.ai,https://chatgpt.com")]
     allowed_origins: String,
 }

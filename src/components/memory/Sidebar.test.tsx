@@ -51,7 +51,6 @@ vi.mock("./IdentityCard", async () => {
     },
   };
 });
-vi.mock("./SpaceList", () => ({ default: () => <div data-testid="space-list">Spaces</div> }));
 vi.mock("./RecentSpaces", () => ({
   RecentSpaces: ({ onSelectSpace, spaces }: { readonly onSelectSpace: (space: Space) => void; readonly spaces: readonly Space[] }) => (
     <nav aria-label="Recent spaces" data-count={spaces.length}>

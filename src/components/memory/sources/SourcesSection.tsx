@@ -10,6 +10,7 @@ import {
   openFile,
   type RegisteredSource,
 } from "../../../lib/tauri";
+import { folderName } from "../../../lib/dateFormat";
 import AddSourceDialog from "./AddSourceDialog";
 import { Button, Card } from "../settings/primitives";
 
@@ -17,10 +18,6 @@ function shortenPath(p: string): string {
   const home = "~";
   // Replace /Users/<user> prefix with ~
   return p.replace(/^\/Users\/[^/]+/, home);
-}
-
-function folderName(p: string): string {
-  return p.split("/").filter(Boolean).pop() || p;
 }
 
 function relativeTime(ts: number | null): string {

@@ -14,6 +14,7 @@ import {
   type SyncStatusStr,
   type IndexedFileInfo,
 } from "../../lib/tauri";
+import { folderName } from "../../lib/dateFormat";
 import AddSourceMenu from "./sources/AddSourceMenu";
 import ContentRenderer from "./ContentRenderer";
 import { toast } from "sonner";
@@ -26,10 +27,6 @@ const SUPPORTED_EXTENSIONS = ["md", "txt", "pdf"];
 // set — PDFs and binaries stay Open-only (no inline viewer). Plain text goes
 // through the markdown renderer too; with no markup it just renders as prose.
 const TEXT_RENDER_EXTENSIONS = ["md", "markdown", "mdx", "txt", "text"];
-
-function folderName(p: string): string {
-  return p.split("/").filter(Boolean).pop() || p;
-}
 
 function ext(name: string): string {
   const dot = name.lastIndexOf(".");

@@ -8,12 +8,12 @@ use wenlan_types::{OutboxEnvelope, OutboxPayload, OUTBOX_SCHEMA};
 
 use crate::client::WenlanClient;
 use crate::outbox;
-use crate::output::{print_json, OutputFormat};
+use crate::output::{print_json, ResolvedFormat};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     text: Option<String>,
     file: Option<PathBuf>,
@@ -64,15 +64,12 @@ pub async fn run(
             let path = outbox::enqueue(&envelope)?;
             if !quiet {
                 match format {
-                    OutputFormat::Json => print_json(&serde_json::json!({
+                    ResolvedFormat::Json => print_json(&serde_json::json!({
                         "status": "queued",
                         "path": path.display().to_string(),
                         "operation_id": operation_id,
                     }))?,
-                    OutputFormat::Table => println!("queued: {}", path.display()),
-                    OutputFormat::Auto => {
-                        unreachable!("Auto resolved by main before dispatch")
-                    }
+                    ResolvedFormat::Table => println!("queued: {}", path.display()),
                 }
             }
             return Ok(());
@@ -83,15 +80,14 @@ pub async fn run(
         return Ok(());
     }
     match format {
-        OutputFormat::Json => print_json(&resp)?,
-        OutputFormat::Table => {
+        ResolvedFormat::Json => print_json(&resp)?,
+        ResolvedFormat::Table => {
             let destination = resp.space.as_deref().unwrap_or("Uncategorized");
             println!(
                 "Stored memory {} in {} ({} chunk(s))",
                 resp.source_id, destination, resp.chunks_created
             );
         }
-        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
     }
     Ok(())
 }

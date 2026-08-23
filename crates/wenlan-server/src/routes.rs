@@ -4,7 +4,7 @@ use crate::route_registry::{get, post, TrackedRouter};
 use crate::state::{ServerState, SharedState};
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue},
     response::Json,
     Extension,
 };
@@ -23,7 +23,6 @@ pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<Shar
         .route("/api/status", get(handle_status))
         .route("/api/search", post(handle_search))
         .route("/api/context", post(handle_context))
-        .route("/api/ping", get(handle_ping))
         .route("/api/llm/test", post(handle_test_llm))
         .route("/api/shutdown", post(handle_shutdown))
         .route("/api/debug/pipeline", get(handle_pipeline_status))
@@ -240,15 +239,11 @@ pub async fn handle_search(
     let supplemental_pages = if req.query == "recent context" {
         None
     } else {
-        let agent_name = headers
-            .get("x-agent-name")
-            .and_then(|v| v.to_str().ok())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("unknown");
+        let agent_name = crate::memory_routes::extract_agent_name(&headers, None);
         let trust_level = if agent_name == "unknown" {
             "unknown".to_string()
         } else {
-            db.get_agent(agent_name)
+            db.get_agent(&agent_name)
                 .await
                 .ok()
                 .flatten()
@@ -415,17 +410,16 @@ pub async fn handle_context(
     }))
 }
 
-/// GET /api/ping
-pub async fn handle_ping() -> Result<(StatusCode, &'static str), ServerError> {
-    Ok((StatusCode::OK, "pong"))
-}
-
 /// GET /api/debug/pipeline
 pub async fn handle_pipeline_status(
     State(state): State<Arc<RwLock<ServerState>>>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
+    // Snapshot the DB Arc so the read guard is not held across the await
+    // (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
     let status = db
         .pipeline_status()
         .await

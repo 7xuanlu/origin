@@ -5,7 +5,9 @@
 //! `docs/superpowers/specs/2026-07-03-per-claim-citations-design.md`.
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 
+use regex::Regex;
 use wenlan_types::pages::PageCitation;
 
 use crate::db::MemoryDB;
@@ -16,6 +18,19 @@ use crate::WenlanError;
 /// Cap on source text length embedded in the numbered block, matching
 /// `MEM_SNIPPET_CAP` in `synthesis/distill.rs`.
 const SOURCE_TEXT_CAP: usize = 800;
+
+// Module-level `LazyLock` statics so each pattern compiles once, matching the
+// idiom at `temporal_query.rs:38-54`.
+static RE_MARKERS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[\d+\]").unwrap());
+static RE_DOUBLE_SPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" {2,}").unwrap());
+static RE_SPACED_MARKER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\s*(\d+)\s*\]").unwrap());
+static RE_COMMA_MARKER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[(\d+(?:\s*,\s*\d+)+)\]").unwrap());
+/// Shared by `strip_out_of_range` and `process_citation_output`.
+static RE_MARKER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[(\d+)\]").unwrap());
+static RE_PARAGRAPH_BREAK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n\s*\n").unwrap());
+static RE_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 
 /// One numbered source available for citation at distill time.
 pub struct NumberedSource {
@@ -85,10 +100,11 @@ pub fn build_numbered_block(sources: &[NumberedSource]) -> String {
 /// Remove every `[N]` marker from body prose, collapsing the resulting
 /// doubled whitespace.
 pub fn strip_markers(body: &str) -> String {
-    let marker_re = regex::Regex::new(r"\[\d+\]").expect("static regex");
-    let stripped = marker_re.replace_all(body, "");
-    let space_re = regex::Regex::new(r" {2,}").expect("static regex");
-    space_re.replace_all(&stripped, " ").trim().to_string()
+    let stripped = RE_MARKERS.replace_all(body, "");
+    RE_DOUBLE_SPACE
+        .replace_all(&stripped, " ")
+        .trim()
+        .to_string()
 }
 
 /// Per-body citation counts.
@@ -124,11 +140,9 @@ fn bidirectional_support(span: &str, source: &str) -> f64 {
 
 /// Normalize raw LLM marker output: `[ 1 ]` -> `[1]`, `[1,3]` -> `[1][3]`.
 fn normalize_markers(body: &str) -> String {
-    let spaced_re = regex::Regex::new(r"\[\s*(\d+)\s*\]").expect("static regex");
-    let normalized = spaced_re.replace_all(body, "[$1]");
+    let normalized = RE_SPACED_MARKER.replace_all(body, "[$1]");
 
-    let comma_re = regex::Regex::new(r"\[(\d+(?:\s*,\s*\d+)+)\]").expect("static regex");
-    comma_re
+    RE_COMMA_MARKER
         .replace_all(&normalized, |caps: &regex::Captures| {
             caps[1]
                 .split(',')
@@ -141,10 +155,9 @@ fn normalize_markers(body: &str) -> String {
 /// Strip out-of-range markers (index 0 or > sources.len()), counting each
 /// removal into `stripped`. Returns the cleaned body.
 fn strip_out_of_range(body: &str, num_sources: usize, stripped: &mut usize) -> String {
-    let marker_re = regex::Regex::new(r"\[(\d+)\]").expect("static regex");
     let mut out = String::with_capacity(body.len());
     let mut last_end = 0;
-    for cap in marker_re.captures_iter(body) {
+    for cap in RE_MARKER.captures_iter(body) {
         let m = cap.get(0).expect("group 0 always present");
         let n: usize = cap[1].parse().unwrap_or(0);
         out.push_str(&body[last_end..m.start()]);
@@ -179,11 +192,10 @@ pub fn process_citation_output(
     let mut stripped = 0usize;
     let clean_body = strip_out_of_range(&normalized, sources.len(), &mut stripped);
 
-    let marker_re = regex::Regex::new(r"\[(\d+)\]").expect("static regex");
     let mut bare_body = String::with_capacity(clean_body.len());
     let mut marker_positions: Vec<(u32, usize)> = Vec::new();
     let mut last_end = 0;
-    for cap in marker_re.captures_iter(&clean_body) {
+    for cap in RE_MARKER.captures_iter(&clean_body) {
         let m = cap.get(0).expect("group 0 always present");
         let n: u32 = cap[1].parse().unwrap_or(0);
         bare_body.push_str(&clean_body[last_end..m.start()]);
@@ -204,10 +216,9 @@ pub fn process_citation_output(
     // true claims (live smoke 2026-07-03: 2/3 supported claims scored 0.0).
     // A claim that fails at sentence scope retries against its enclosing
     // paragraph; the record's `scope` field keeps the weaker guarantee visible.
-    let para_re = regex::Regex::new(r"\n\s*\n").expect("static regex");
     let mut para_spans: Vec<(usize, usize)> = Vec::new();
     let mut pprev = 0;
-    for m in para_re.find_iter(&bare_body) {
+    for m in RE_PARAGRAPH_BREAK.find_iter(&bare_body) {
         para_spans.push((pprev, m.start()));
         pprev = m.end();
     }
@@ -324,8 +335,7 @@ fn attempt_key(page_id: &str, page_version: i64) -> String {
 /// annotate-only guard to compare the model output against the input body
 /// independent of incidental whitespace reflow.
 fn normalize_ws(s: &str) -> String {
-    let re = regex::Regex::new(r"\s+").expect("static regex");
-    re.replace_all(s.trim(), " ").to_string()
+    RE_WHITESPACE.replace_all(s.trim(), " ").to_string()
 }
 
 /// Build a changelog entry for the annotate-only sweep and append it to the

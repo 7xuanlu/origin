@@ -5,7 +5,9 @@ use std::sync::Arc;
 use wenlan_core::db::MemoryDB;
 use wenlan_core::events::NoopEmitter;
 use wenlan_core::llm_provider::{LlmBackend, LlmError, LlmProvider, LlmRequest};
-use wenlan_core::maintenance::{run_maintenance_tick, MaintenanceTickConfig};
+use wenlan_core::maintenance::{
+    run_maintenance_stage_slice, MaintenanceStage, MaintenanceTickConfig,
+};
 use wenlan_core::post_write::{create_page, update_page};
 use wenlan_core::prompts::PromptRegistry;
 use wenlan_core::synthesis::distill::distill_pages_scoped;
@@ -151,7 +153,6 @@ fn maintenance_config() -> MaintenanceTickConfig {
         token_limit: 3_500,
         max_unlinked_cluster_size: 20,
         max_grouped_cluster_size: 20,
-        max_per_tick: 5,
     }
 }
 
@@ -199,13 +200,32 @@ async fn full_flow_capture_staging_detect_compile_creates_unconfirmed_page_and_k
         .expect("page exists");
     assert_eq!(page.review_status, "unconfirmed");
 
-    let maintenance = run_maintenance_tick(&db, None, &prompts, &maintenance_config(), None)
-        .await
-        .expect("run maintenance carding pass");
+    let discovery = run_maintenance_stage_slice(
+        &db,
+        None,
+        &prompts,
+        &maintenance_config(),
+        None,
+        MaintenanceStage::CrossSpaceDiscovery,
+    )
+    .await
+    .expect("run cross-space discovery slice");
     assert_eq!(
-        maintenance.discovery_cards_emitted, 0,
+        discovery.result.discovery_cards_emitted, 0,
         "same-space compile must not become a cross-space card"
     );
+
+    // The retro slice audits one Page per call; this database has exactly one.
+    run_maintenance_stage_slice(
+        &db,
+        None,
+        &prompts,
+        &maintenance_config(),
+        None,
+        MaintenanceStage::RetroReview,
+    )
+    .await
+    .expect("run retro review slice");
 
     let keep_cards: Vec<_> = db
         .get_pending_refinements()
@@ -404,11 +424,18 @@ async fn merge_card_accept_moves_data_now_and_defers_prose_recompile_atomically(
         .expect("confirm second merge page");
 
     let prompts = PromptRegistry::default();
-    let maintenance = run_maintenance_tick(&db, None, &prompts, &maintenance_config(), None)
-        .await
-        .expect("detect merge card");
+    let maintenance = run_maintenance_stage_slice(
+        &db,
+        None,
+        &prompts,
+        &maintenance_config(),
+        None,
+        MaintenanceStage::NearDuplicate,
+    )
+    .await
+    .expect("detect merge card");
     assert_eq!(
-        maintenance.merge_cards_emitted, 1,
+        maintenance.result.merge_cards_emitted, 1,
         "near-duplicate confirmed pages should mint one merge card"
     );
 
@@ -746,10 +773,17 @@ async fn cross_space_cluster_mints_discovery_card_not_page() {
         formation_threshold: 0.0,
         ..maintenance_config()
     };
-    let maintenance = run_maintenance_tick(&db, None, &prompts, &config, None)
-        .await
-        .expect("run cross-space discovery pass");
-    assert_eq!(maintenance.discovery_cards_emitted, 1);
+    let maintenance = run_maintenance_stage_slice(
+        &db,
+        None,
+        &prompts,
+        &config,
+        None,
+        MaintenanceStage::CrossSpaceDiscovery,
+    )
+    .await
+    .expect("run cross-space discovery pass");
+    assert_eq!(maintenance.result.discovery_cards_emitted, 1);
     let active_pages = db
         .list_pages("active", 10, 0)
         .await

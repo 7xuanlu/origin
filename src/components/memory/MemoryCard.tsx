@@ -2,6 +2,7 @@
 import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { FACET_COLORS, STABILITY_TIERS, agentDisplayName, type MemoryItem, type MemoryVersionItem, type PendingRevision, getPendingRevision, acceptPendingRevision, dismissPendingRevision } from "../../lib/tauri";
+import { formatTimeAgo } from "../../lib/dateFormat";
 import ContentRenderer from "./ContentRenderer";
 import MemoryListRow from "./MemoryListRow";
 
@@ -20,16 +21,6 @@ interface MemoryCardProps {
   lineClamp?: number;
   hideBorderBottom?: boolean;
   presentation?: "card" | "parent-list";
-}
-
-function timeAgo(ts: number): string {
-  const now = Date.now() / 1000;
-  const diff = now - ts;
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
-  return new Date(ts * 1000).toLocaleDateString();
 }
 
 export default function MemoryCard({
@@ -170,7 +161,7 @@ export default function MemoryCard({
                 color: "var(--mem-text-tertiary)",
               }}
             >
-              {timeAgo(memory.last_modified)}
+              {formatTimeAgo(memory.last_modified)}
             </span>
           </div>
 
@@ -357,7 +348,7 @@ export default function MemoryCard({
                   </>
                 )}
                 <span style={{ opacity: 0.4 }}>&middot;</span>
-                <span>{timeAgo(memory.last_modified)}</span>
+                <span>{formatTimeAgo(memory.last_modified)}</span>
               </div>
             ) : (
               <div
@@ -397,7 +388,7 @@ export default function MemoryCard({
                   </>
                 )}
                 <span style={{ opacity: 0.4 }}>&middot;</span>
-                <span>{isNew ? "new" : timeAgo(memory.last_modified)}</span>
+                <span>{isNew ? "new" : formatTimeAgo(memory.last_modified)}</span>
                 {(memory.version ?? 1) > 1 && (
                   <>
                     <span style={{ opacity: 0.4 }}>&middot;</span>
@@ -415,7 +406,7 @@ export default function MemoryCard({
                       <div key={i} className="text-xs text-zinc-500">
                         <span className="text-zinc-400">v{entry.version}</span>
                         {' '}{entry.delta || 'updated'}
-                        <span className="text-zinc-600 ml-1">{timeAgo(entry.at)}</span>
+                        <span className="text-zinc-600 ml-1">{formatTimeAgo(entry.at)}</span>
                       </div>
                     ))}
                   </div>

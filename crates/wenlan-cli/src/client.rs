@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use wenlan_types::{
     requests::{
         AddEntityAliasRequest, ListEntitiesRequest, ListMemoriesRequest, MergeEntityRequest,
@@ -132,109 +132,50 @@ impl WenlanClient {
         }
     }
 
-    /// GET /api/health — daemon liveness + version.
-    pub async fn health(&self) -> Result<HealthResponse> {
-        let url = format!("{}/api/health", self.base_url);
-        let resp = self
-            .send(
-                self.http.get(&url),
-                &format!("GET {} failed (is the daemon running?)", url),
-            )
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json().await.context("parsing /api/health response")
-    }
+    // ===== Generic request helpers =====
+    //
+    // Every endpoint below is build-url / send / error_for_status / deserialize,
+    // differing only in verb, path, request body, and response type. These
+    // helpers hold that sequence once; each public method is a path expression
+    // plus one delegating call. `hint_daemon_running` on `get_json` preserves
+    // the "(is the daemon running?)" hint that health/list_sources/
+    // list_pending_revisions/get_memory_detail carried before this existed —
+    // the other GETs did not have it and still don't. The `.context("parsing
+    // ... response")` text below is now generic ("parsing {path} response")
+    // rather than each endpoint's previous literal wording; nothing in
+    // crates/wenlan-cli/tests asserts the old text.
 
-    /// POST /api/search — hybrid memory search.
-    pub async fn search(&self, query: String, limit: usize) -> Result<SearchResponse> {
-        let url = format!("{}/api/search", self.base_url);
-        let req = SearchRequest {
-            query,
-            limit,
-            source_filter: None,
-            space: None,
-        };
-        let resp = self
-            .send(
-                self.http.post(&url).json(&req),
-                &format!("POST {} failed", url),
-            )
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json().await.context("parsing /api/search response")
-    }
-
-    /// POST /api/memory/search — semantic recall for one query.
-    pub async fn recall(&self, query: String, limit: usize) -> Result<SearchMemoryResponse> {
-        let url = format!("{}/api/memory/search", self.base_url);
-        let request = SearchMemoryRequest {
-            query,
-            limit,
-            memory_type: None,
-            space: None,
-            source_agent: None,
-            rerank: false,
-        };
-        let response = self
-            .send(
-                self.http.post(&url).json(&request),
-                &format!("POST {url} failed"),
-            )
-            .await?
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {url}"))?;
-        response
-            .json()
-            .await
-            .context("parsing /api/memory/search response")
-    }
-
-    /// POST /api/brief — complete Brief plus optional same-Space recall.
-    pub async fn brief(&self, request: &BriefReadRequest) -> Result<BriefReadResponse> {
-        let url = format!("{}/api/brief", self.base_url);
-        let response = self
-            .send(
-                self.http.post(&url).json(request),
-                &format!("POST {url} failed"),
-            )
-            .await?
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {url}"))?;
-        response.json().await.context("parsing /api/brief response")
-    }
-
-    /// PATCH /api/brief — item-level handoff deltas.
-    pub async fn update_brief(&self, request: &BriefUpdateRequest) -> Result<BriefUpdateReceipt> {
-        let url = format!("{}/api/brief", self.base_url);
-        let response = self
-            .send(
-                self.http.patch(&url).json(request),
-                &format!("PATCH {url} failed"),
-            )
-            .await?
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {url}"))?;
-        response
-            .json()
-            .await
-            .context("parsing PATCH /api/brief response")
-    }
-
-    /// POST /api/memory/store — write a memory.
-    pub async fn store(
+    /// GET `path` (e.g. "/api/health") and deserialize the JSON response.
+    async fn get_json<R: DeserializeOwned>(
         &self,
-        content: String,
-        memory_type: Option<String>,
-    ) -> Result<StoreMemoryResponse> {
-        let url = format!("{}/api/memory/store", self.base_url);
-        let req = Self::store_request(content, memory_type);
+        path: &str,
+        hint_daemon_running: bool,
+    ) -> Result<R> {
+        let url = format!("{}{}", self.base_url, path);
+        let what = if hint_daemon_running {
+            format!("GET {} failed (is the daemon running?)", url)
+        } else {
+            format!("GET {} failed", url)
+        };
+        let resp = self.send(self.http.get(&url), &what).await?;
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        resp.json()
+            .await
+            .with_context(|| format!("parsing {} response", path))
+    }
+
+    /// POST `path` with a JSON `body` and deserialize the JSON response.
+    async fn post_json<B: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<R> {
+        let url = format!("{}{}", self.base_url, path);
         let resp = self
             .send(
-                self.http.post(&url).json(&req),
+                self.http.post(&url).json(body),
                 &format!("POST {} failed", url),
             )
             .await?;
@@ -243,7 +184,132 @@ impl WenlanClient {
             .with_context(|| format!("daemon returned error for {}", url))?;
         resp.json()
             .await
-            .context("parsing /api/memory/store response")
+            .with_context(|| format!("parsing {} response", path))
+    }
+
+    /// POST `path` with no body and deserialize the JSON response.
+    async fn post_empty_json<R: DeserializeOwned>(&self, path: &str) -> Result<R> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .send(self.http.post(&url), &format!("POST {} failed", url))
+            .await?;
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        resp.json()
+            .await
+            .with_context(|| format!("parsing {} response", path))
+    }
+
+    /// PUT `path` with a JSON `body` and deserialize the JSON response.
+    async fn put_json<B: Serialize, R: DeserializeOwned>(&self, path: &str, body: &B) -> Result<R> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .send(
+                self.http.put(&url).json(body),
+                &format!("PUT {} failed", url),
+            )
+            .await?;
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        resp.json()
+            .await
+            .with_context(|| format!("parsing {} response", path))
+    }
+
+    /// PATCH `path` with a JSON `body` and deserialize the JSON response.
+    async fn patch_json<B: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<R> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .send(
+                self.http.patch(&url).json(body),
+                &format!("PATCH {} failed", url),
+            )
+            .await?;
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        resp.json()
+            .await
+            .with_context(|| format!("parsing {} response", path))
+    }
+
+    /// POST `path` with a JSON `body`, treating any 2xx as success and
+    /// discarding the response body.
+    async fn post_ok<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        let url = format!("{}{}", self.base_url, path);
+        self.send(
+            self.http.post(&url).json(body),
+            &format!("POST {} failed", url),
+        )
+        .await?
+        .error_for_status()
+        .with_context(|| format!("daemon returned error for {}", url))?;
+        Ok(())
+    }
+
+    /// DELETE `path`, treating any 2xx as success and discarding the response body.
+    async fn delete_ok(&self, path: &str) -> Result<()> {
+        let url = format!("{}{}", self.base_url, path);
+        self.send(self.http.delete(&url), &format!("DELETE {} failed", url))
+            .await?
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        Ok(())
+    }
+
+    /// GET /api/health — daemon liveness + version.
+    pub async fn health(&self) -> Result<HealthResponse> {
+        self.get_json("/api/health", true).await
+    }
+
+    /// POST /api/search — hybrid memory search.
+    pub async fn search(&self, query: String, limit: usize) -> Result<SearchResponse> {
+        let req = SearchRequest {
+            query,
+            limit,
+            source_filter: None,
+            space: None,
+        };
+        self.post_json("/api/search", &req).await
+    }
+
+    /// POST /api/memory/search — semantic recall for one query.
+    pub async fn recall(&self, query: String, limit: usize) -> Result<SearchMemoryResponse> {
+        let request = SearchMemoryRequest {
+            query,
+            limit,
+            memory_type: None,
+            space: None,
+            source_agent: None,
+            rerank: false,
+        };
+        self.post_json("/api/memory/search", &request).await
+    }
+
+    /// POST /api/brief — complete Brief plus optional same-Space recall.
+    pub async fn brief(&self, request: &BriefReadRequest) -> Result<BriefReadResponse> {
+        self.post_json("/api/brief", request).await
+    }
+
+    /// PATCH /api/brief — item-level handoff deltas.
+    pub async fn update_brief(&self, request: &BriefUpdateRequest) -> Result<BriefUpdateReceipt> {
+        self.patch_json("/api/brief", request).await
+    }
+
+    /// POST /api/memory/store — write a memory.
+    pub async fn store(
+        &self,
+        content: String,
+        memory_type: Option<String>,
+    ) -> Result<StoreMemoryResponse> {
+        let req = Self::store_request(content, memory_type);
+        self.post_json("/api/memory/store", &req).await
     }
 
     pub fn store_request(content: String, memory_type: Option<String>) -> StoreMemoryRequest {
@@ -264,63 +330,24 @@ impl WenlanClient {
 
     /// POST /api/outbox/drain — ask the daemon to replay queued envelopes.
     pub async fn drain_outbox(&self) -> Result<OutboxDrainReport> {
-        let url = format!("{}/api/outbox/drain", self.base_url);
-        let response = self
-            .send(self.http.post(&url), &format!("POST {url} failed"))
-            .await?
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {url}"))?;
-        response
-            .json()
-            .await
-            .context("parsing /api/outbox/drain response")
+        self.post_empty_json("/api/outbox/drain").await
     }
 
     /// GET /api/sources — list registered sources.
     pub async fn list_sources(&self) -> Result<Vec<Source>> {
-        let url = format!("{}/api/sources", self.base_url);
-        let resp = self
-            .send(
-                self.http.get(&url),
-                &format!("GET {} failed (is the daemon running?)", url),
-            )
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json().await.context("parsing /api/sources response")
+        self.get_json("/api/sources", true).await
     }
 
     /// POST /api/sources — register a source. Returns the created `Source`.
     pub async fn add_source(&self, source_type: &str, path: &str) -> Result<Source> {
-        let url = format!("{}/api/sources", self.base_url);
         let req = serde_json::json!({ "source_type": source_type, "path": path });
-        let resp = self
-            .send(
-                self.http.post(&url).json(&req),
-                &format!("POST {} failed", url),
-            )
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json()
-            .await
-            .context("parsing POST /api/sources response")
+        self.post_json("/api/sources", &req).await
     }
 
     /// POST /api/sources/{id}/sync — sync a registered source, returning stats.
     pub async fn sync_source(&self, id: &str) -> Result<SyncStats> {
-        let url = format!("{}/api/sources/{}/sync", self.base_url, id);
-        let resp = self
-            .send(self.http.post(&url), &format!("POST {} failed", url))
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json()
+        self.post_empty_json(&format!("/api/sources/{}/sync", id))
             .await
-            .context("parsing /api/sources/{id}/sync response")
     }
 
     /// POST /api/memory/list — list memories with optional filters.
@@ -330,61 +357,24 @@ impl WenlanClient {
         memory_type: Option<String>,
         confirmed: Option<bool>,
     ) -> Result<ListMemoriesResponse> {
-        let url = format!("{}/api/memory/list", self.base_url);
         let req = build_list_request(limit, memory_type, confirmed);
-        let resp = self
-            .send(
-                self.http.post(&url).json(&req),
-                &format!("POST {} failed", url),
-            )
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json()
-            .await
-            .context("parsing /api/memory/list response")
+        self.post_json("/api/memory/list", &req).await
     }
 
     /// GET /api/agents — list registered agents.
     pub async fn list_agents(&self) -> Result<Vec<AgentResponse>> {
-        let url = format!("{}/api/agents", self.base_url);
-        let resp = self
-            .send(self.http.get(&url), &format!("GET {} failed", url))
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json().await.context("parsing /api/agents response")
+        self.get_json("/api/agents", false).await
     }
 
     /// GET /api/agents/{name} — fetch a single agent.
     pub async fn get_agent(&self, name: &str) -> Result<AgentResponse> {
-        let url = format!("{}/api/agents/{}", self.base_url, name);
-        let resp = self
-            .send(self.http.get(&url), &format!("GET {} failed", url))
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json()
-            .await
-            .context("parsing /api/agents/{name} response")
+        self.get_json(&format!("/api/agents/{}", name), false).await
     }
 
     /// POST /api/spaces — register a new space.
     pub async fn create_space(&self, name: &str) -> Result<()> {
-        let url = format!("{}/api/spaces", self.base_url);
-        self.send(
-            self.http
-                .post(&url)
-                .json(&serde_json::json!({"name": name})),
-            &format!("POST {} failed", url),
-        )
-        .await?
-        .error_for_status()
-        .with_context(|| format!("daemon returned error for {}", url))?;
-        Ok(())
+        self.post_ok("/api/spaces", &serde_json::json!({"name": name}))
+            .await
     }
 
     /// POST /api/spaces/{from}/move-to/{to} — bulk reassign memories from one space to another.
@@ -411,141 +401,59 @@ impl WenlanClient {
 
     /// GET /api/spaces — list all spaces.
     pub async fn list_spaces(&self) -> Result<Vec<wenlan_types::Space>> {
-        let url = format!("{}/api/spaces", self.base_url);
-        let resp = self
-            .send(self.http.get(&url), &format!("GET {} failed", url))
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json().await.context("parsing /api/spaces response")
+        self.get_json("/api/spaces", false).await
     }
 
     /// GET /api/spaces/default — fetch the daemon-owned default save Space.
     pub async fn get_default_space(&self) -> Result<DefaultSpaceResponse> {
-        let url = format!("{}/api/spaces/default", self.base_url);
-        let resp = self
-            .send(self.http.get(&url), &format!("GET {} failed", url))
-            .await?
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json()
-            .await
-            .context("parsing /api/spaces/default response")
+        self.get_json("/api/spaces/default", false).await
     }
 
     /// PUT /api/spaces/default — replace the daemon-owned default save Space.
     pub async fn set_default_space(&self, space_id: String) -> Result<DefaultSpaceResponse> {
-        let url = format!("{}/api/spaces/default", self.base_url);
-        let resp = self
-            .send(
-                self.http
-                    .put(&url)
-                    .json(&SetDefaultSpaceRequest { space_id }),
-                &format!("PUT {} failed", url),
-            )
-            .await?
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json()
+        self.put_json("/api/spaces/default", &SetDefaultSpaceRequest { space_id })
             .await
-            .context("parsing /api/spaces/default response")
     }
 
     /// DELETE /api/spaces/default — clear the daemon-owned default save Space.
     pub async fn clear_default_space(&self) -> Result<()> {
-        let url = format!("{}/api/spaces/default", self.base_url);
-        self.send(self.http.delete(&url), &format!("DELETE {} failed", url))
-            .await?
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        Ok(())
+        self.delete_ok("/api/spaces/default").await
     }
 
     /// PUT /api/agents/{name} — update an agent's metadata.
     pub async fn update_agent(&self, name: &str, req: UpdateAgentRequest) -> Result<AgentResponse> {
-        let url = format!("{}/api/agents/{}", self.base_url, name);
-        let resp = self
-            .send(
-                self.http.put(&url).json(&req),
-                &format!("PUT {} failed", url),
-            )
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json()
-            .await
-            .context("parsing /api/agents/{name} update response")
+        self.put_json(&format!("/api/agents/{}", name), &req).await
     }
 
     /// GET /api/memory/pending-revisions — staged revisions awaiting human accept/dismiss.
     pub async fn list_pending_revisions(&self, limit: usize) -> Result<Vec<PendingRevisionItem>> {
-        let url = format!(
-            "{}/api/memory/pending-revisions?limit={}",
-            self.base_url, limit
-        );
-        let resp = self
-            .send(
-                self.http.get(&url),
-                &format!("GET {} failed (is the daemon running?)", url),
-            )
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json()
-            .await
-            .context("parsing /api/memory/pending-revisions response")
+        self.get_json(
+            &format!("/api/memory/pending-revisions?limit={}", limit),
+            true,
+        )
+        .await
     }
 
     /// POST /api/memory/revision/{id}/accept — replace the original with the revision.
     /// `id` is the revision's own `source_id` (the daemon also accepts a target id, legacy).
     pub async fn accept_revision(&self, id: &str) -> Result<RevisionAcceptResponse> {
-        let url = format!("{}/api/memory/revision/{}/accept", self.base_url, id);
-        let resp = self
-            .send(self.http.post(&url), &format!("POST {} failed", url))
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json()
+        self.post_empty_json(&format!("/api/memory/revision/{}/accept", id))
             .await
-            .context("parsing accept-revision response")
     }
 
     /// POST /api/memory/revision/{id}/dismiss — unstage the false revision: keep BOTH it and the original.
     /// `id` is the revision's own `source_id` (the daemon also accepts a target id, legacy).
     pub async fn dismiss_revision(&self, id: &str) -> Result<RevisionDismissResponse> {
-        let url = format!("{}/api/memory/revision/{}/dismiss", self.base_url, id);
-        let resp = self
-            .send(self.http.post(&url), &format!("POST {} failed", url))
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json()
+        self.post_empty_json(&format!("/api/memory/revision/{}/dismiss", id))
             .await
-            .context("parsing dismiss-revision response")
     }
 
     /// GET /api/memory/{id}/detail — the assembled (chunks-joined) memory by source_id.
     /// Used by `wenlan curate` to fetch the ORIGINAL a revision would replace, so the
     /// card can show an original->revision diff.
     pub async fn get_memory_detail(&self, source_id: &str) -> Result<MemoryDetailResponse> {
-        let url = format!("{}/api/memory/{}/detail", self.base_url, source_id);
-        let resp = self
-            .send(
-                self.http.get(&url),
-                &format!("GET {} failed (is the daemon running?)", url),
-            )
-            .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
-        resp.json()
+        self.get_json(&format!("/api/memory/{}/detail", source_id), true)
             .await
-            .context("parsing /api/memory/{id}/detail response")
     }
 
     /// GET /api/memory/entities/{id} — full entity detail by id. `Ok(None)` on 404

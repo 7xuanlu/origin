@@ -1722,7 +1722,6 @@ async fn fire_maintenance_stage_safe(
         token_limit: distillation_cfg.ondevice_token_limit,
         max_unlinked_cluster_size: distillation_cfg.max_unlinked_cluster_size,
         max_grouped_cluster_size: distillation_cfg.max_grouped_cluster_size,
-        max_per_tick: 5,
     };
     let result =
         std::panic::AssertUnwindSafe(wenlan_core::maintenance::run_maintenance_stage_slice(

@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Generic page export framework.
+//! Page export to an external vault, plus the shared `ExportResult`/`ExportStats` shapes.
 
 pub mod knowledge;
 pub mod obsidian;
 pub mod provenance;
-
-use crate::error::WenlanError;
-use crate::pages::Page;
 
 // ExportStats moved to wenlan-types in Phase 5-D PR2 so the Tauri app can
 // deserialize it without pulling in the full wenlan-core dep.
@@ -16,10 +13,4 @@ pub use wenlan_types::ExportStats;
 pub struct ExportResult {
     pub concept_id: String,
     pub path: String,
-}
-
-/// Trait for exporting pages to external formats/systems.
-pub trait PageExporter {
-    fn export(&self, page: &Page) -> Result<ExportResult, WenlanError>;
-    fn export_all(&self, pages: &[Page]) -> Result<ExportStats, WenlanError>;
 }

@@ -373,7 +373,7 @@ where
 
 #[rustfmt::skip]
 const NON_SENSITIVE_PATHS: &[&str] = &[
-    "/api/health", "/api/status", "/api/ping", "/api/lint", "/api/repairs/plan", "/api/repairs/plan/entries", "/api/repairs/prepare", "/api/repairs/apply", "/api/repairs/verify", "/api/llm/test", "/api/shutdown", "/api/debug/pipeline",
+    "/api/health", "/api/status", "/api/lint", "/api/repairs/plan", "/api/repairs/plan/entries", "/api/repairs/prepare", "/api/repairs/apply", "/api/repairs/verify", "/api/llm/test", "/api/shutdown", "/api/debug/pipeline",
     "/api/steep", "/api/distill", "/api/distill/{page_id}",
     "/api/ingest/text", "/api/ingest/webpage", "/api/ingest/memory", "/api/documents/{source}/{source_id}",
     "/api/import/memories", "/api/import/chat-export", "/api/memory/store", "/api/memory/confirm/{source_id}",
@@ -382,7 +382,7 @@ const NON_SENSITIVE_PATHS: &[&str] = &[
     "/api/memory/relations", "/api/memory/observations", "/api/memory/link-entity", "/api/spaces/{name}",
     "/api/spaces/{from}/move-to/{to}", "/api/pages/{id}/archive", "/api/pages/{id}/review",
     "/api/refinery/queue/{id}/reject", "/api/refinery/queue/{id}/accept", "/api/sources/{id}", "/api/sources/{id}/sync",
-    "/api/config", "/api/config/skip-apps", "/api/config/routing", "/api/setup/status", "/api/setup/anthropic-key", "/api/on-device-model",
+    "/api/config", "/api/config/routing", "/api/setup/status", "/api/setup/anthropic-key", "/api/on-device-model",
     "/api/on-device-model/download", "/api/outbox/drain", "/api/outbox/status", "/api/chunks/{id}/update", "/api/chunks/time-range", "/api/chunks/delete-bulk",
     "/api/memory/entities/{id}/confirm", "/api/memory/entities/{id}/delete", "/api/memory/entities/{entity_id}/observations",
     "/api/memory/entities/{id}/merge", "/api/memory/entities/{id}/aliases",

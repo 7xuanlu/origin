@@ -15,26 +15,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
-/// Cosine similarity between two vectors (used for raw score comparison).
-fn raw_cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    let mut dot = 0.0f64;
-    let mut norm_a = 0.0f64;
-    let mut norm_b = 0.0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        let x = *x as f64;
-        let y = *y as f64;
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 {
-        0.0
-    } else {
-        dot / denom
-    }
-}
-
 /// Controls which quality gate checks run on negative seeds during eval.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateMode {
@@ -247,7 +227,8 @@ pub async fn run_eval(
                 if let Ok(embs) = db.generate_embeddings(&[case.query.clone(), top.content.clone()])
                 {
                     if embs.len() == 2 {
-                        empty_set_cosines.push(raw_cosine_similarity(&embs[0], &embs[1]));
+                        empty_set_cosines
+                            .push(crate::topic_match::cosine_similarity(&embs[0], &embs[1]));
                     }
                 }
             }
@@ -273,7 +254,8 @@ pub async fn run_eval(
         if let Some(top) = results.first() {
             if let Ok(embs) = db.generate_embeddings(&[case.query.clone(), top.content.clone()]) {
                 if embs.len() == 2 {
-                    normal_top1_cosines.push(raw_cosine_similarity(&embs[0], &embs[1]));
+                    normal_top1_cosines
+                        .push(crate::topic_match::cosine_similarity(&embs[0], &embs[1]));
                 }
             }
         }
@@ -470,33 +452,23 @@ mod tests {
         assert_eq!(doc_none.supersedes, None);
     }
 
-    #[test]
-    fn test_raw_cosine_similarity_identical() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![1.0, 0.0, 0.0];
-        assert!((raw_cosine_similarity(&a, &b) - 1.0).abs() < 1e-6);
-    }
+    // Identical/orthogonal cosine cases are covered by `topic_match::tests`;
+    // these two keep the eval-specific inputs (non-unit partial angle, a
+    // genuine zero-magnitude vector) that suite doesn't exercise.
 
     #[test]
-    fn test_raw_cosine_similarity_orthogonal() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![0.0, 1.0, 0.0];
-        assert!(raw_cosine_similarity(&a, &b).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_raw_cosine_similarity_partial() {
+    fn test_cosine_similarity_partial() {
         let a = vec![1.0, 1.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
-        let sim = raw_cosine_similarity(&a, &b);
+        let sim = crate::topic_match::cosine_similarity(&a, &b);
         // cos(45 degrees) = 1/sqrt(2) ~ 0.707
         assert!((sim - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-6);
     }
 
     #[test]
-    fn test_raw_cosine_similarity_zero_vector() {
+    fn test_cosine_similarity_zero_vector() {
         let a = vec![0.0, 0.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
-        assert_eq!(raw_cosine_similarity(&a, &b), 0.0);
+        assert_eq!(crate::topic_match::cosine_similarity(&a, &b), 0.0);
     }
 }

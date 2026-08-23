@@ -2,21 +2,12 @@
 import type { SearchResult } from "../../lib/tauri";
 import { FACET_COLORS } from "../../lib/tauri";
 import { highlightTerms, hasKeywordMatch, relevanceLabel } from "../../lib/highlight";
+import { formatTimeAgo } from "../../lib/dateFormat";
 
 interface MemorySearchResultProps {
   result: SearchResult;
   query: string;
   onClick?: (sourceId: string) => void;
-}
-
-function timeAgo(ts: number): string {
-  const now = Date.now() / 1000;
-  const diff = now - ts;
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
-  return new Date(ts * 1000).toLocaleDateString();
 }
 
 const MARK_CLASS =
@@ -112,7 +103,7 @@ export default function MemorySearchResult({
 
         {/* Timestamp */}
         <span style={{ opacity: 0.4 }}>&middot;</span>
-        <span>{timeAgo(result.last_modified)}</span>
+        <span>{formatTimeAgo(result.last_modified)}</span>
 
         {/* Relevance label — right-aligned */}
         <span className="ml-auto" style={{

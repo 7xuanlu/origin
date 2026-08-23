@@ -11,9 +11,6 @@ use std::path::{Path, PathBuf};
 pub struct PromptRegistry {
     pub classify_memory: String,
     pub classify_memory_quality: String,
-    pub classify_memory_quality_strict: String,
-    pub classify_screen: String,
-    pub merge_memories: String,
     pub detect_contradiction: String,
     pub resolve_dual_pool: String,
     pub doc_reconcile: String,
@@ -25,7 +22,6 @@ pub struct PromptRegistry {
     pub rerank_results: String,
     pub summarize_activity_system: String,
     pub summarize_activity_user: String,
-    pub batch_classify: String,
     pub extract_knowledge_graph: String,
     pub extract_structured_fields: String, // template with {memory_type}, {fields_json}, {required}, {optional}
     pub correct_memory: String,            // template with {original}, {correction}
@@ -42,9 +38,6 @@ impl Default for PromptRegistry {
         Self {
             classify_memory: defaults::CLASSIFY_MEMORY.to_string(),
             classify_memory_quality: defaults::CLASSIFY_MEMORY_QUALITY.to_string(),
-            classify_memory_quality_strict: defaults::CLASSIFY_MEMORY_QUALITY_STRICT.to_string(),
-            classify_screen: defaults::CLASSIFY_SCREEN.to_string(),
-            merge_memories: defaults::MERGE_MEMORIES.to_string(),
             detect_contradiction: defaults::DETECT_CONTRADICTION.to_string(),
             resolve_dual_pool: defaults::RESOLVE_DUAL_POOL.to_string(),
             doc_reconcile: defaults::DOC_RECONCILE.to_string(),
@@ -56,7 +49,6 @@ impl Default for PromptRegistry {
             rerank_results: defaults::RERANK_RESULTS.to_string(),
             summarize_activity_system: defaults::SUMMARIZE_ACTIVITY_SYSTEM.to_string(),
             summarize_activity_user: defaults::SUMMARIZE_ACTIVITY_USER.to_string(),
-            batch_classify: defaults::BATCH_CLASSIFY.to_string(),
             extract_knowledge_graph: defaults::EXTRACT_KNOWLEDGE_GRAPH.to_string(),
             extract_structured_fields: defaults::EXTRACT_STRUCTURED_FIELDS.to_string(),
             correct_memory: defaults::CORRECT_MEMORY.to_string(),
@@ -79,12 +71,6 @@ impl PromptRegistry {
         let fields: Vec<(&str, &mut String)> = vec![
             ("classify_memory", &mut reg.classify_memory),
             ("classify_memory_quality", &mut reg.classify_memory_quality),
-            (
-                "classify_memory_quality_strict",
-                &mut reg.classify_memory_quality_strict,
-            ),
-            ("classify_screen", &mut reg.classify_screen),
-            ("merge_memories", &mut reg.merge_memories),
             ("detect_contradiction", &mut reg.detect_contradiction),
             ("resolve_dual_pool", &mut reg.resolve_dual_pool),
             ("doc_reconcile", &mut reg.doc_reconcile),
@@ -99,7 +85,6 @@ impl PromptRegistry {
                 &mut reg.summarize_activity_system,
             ),
             ("summarize_activity_user", &mut reg.summarize_activity_user),
-            ("batch_classify", &mut reg.batch_classify),
             ("extract_knowledge_graph", &mut reg.extract_knowledge_graph),
             (
                 "extract_structured_fields",
@@ -157,10 +142,7 @@ impl PromptRegistry {
 
     /// Returns the prompt override directory path.
     pub fn override_dir() -> PathBuf {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("wenlan")
-            .join("prompts")
+        crate::config::data_root().join("prompts")
     }
 }
 
@@ -169,14 +151,24 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// `override_dir` must resolve under `WENLAN_DATA_DIR` like the rest of
+    /// the data-root readers, not a hand-rolled `dirs::data_local_dir()` copy
+    /// that ignores `--data-dir` isolation.
+    #[test]
+    fn override_dir_respects_wenlan_data_dir() {
+        temp_env::with_var("WENLAN_DATA_DIR", Some("/tmp/wenlan-test-scratch"), || {
+            assert_eq!(
+                PromptRegistry::override_dir(),
+                PathBuf::from("/tmp/wenlan-test-scratch").join("prompts")
+            );
+        });
+    }
+
     #[test]
     fn test_default_registry_has_all_prompts() {
         let reg = PromptRegistry::default();
         assert!(!reg.classify_memory.is_empty());
         assert!(!reg.classify_memory_quality.is_empty());
-        assert!(!reg.classify_memory_quality_strict.is_empty());
-        assert!(!reg.classify_screen.is_empty());
-        assert!(!reg.merge_memories.is_empty());
         assert!(!reg.detect_contradiction.is_empty());
         assert!(!reg.resolve_dual_pool.is_empty());
         assert!(!reg.summarize_decisions.is_empty());
@@ -186,7 +178,6 @@ mod tests {
         assert!(!reg.rerank_results.is_empty());
         assert!(!reg.summarize_activity_system.is_empty());
         assert!(!reg.summarize_activity_user.is_empty());
-        assert!(!reg.batch_classify.is_empty());
         assert!(!reg.extract_knowledge_graph.is_empty());
         assert!(!reg.extract_structured_fields.is_empty());
         assert!(!reg.correct_memory.is_empty());

@@ -546,40 +546,6 @@ export interface Space {
   updated_at: number;
 }
 
-// Legacy types — kept for MemoryView.tsx backwards compat
-export interface SpaceRule {
-  kind: "app" | "path" | "keyword" | "url_pattern";
-  pattern: string;
-}
-
-export interface LegacySpace {
-  id: string;
-  name: string;
-  icon: string;
-  color: string;
-  rules: SpaceRule[];
-  pinned: boolean;
-  auto_detected: boolean;
-  created_at: number;
-}
-
-export interface ActivityStream {
-  id: string;
-  space_id: string;
-  name: string;
-  started_at: number;
-  ended_at: number | null;
-  app_sequence: string[];
-}
-
-export interface SpaceData {
-  spaces: LegacySpace[];
-  activity_streams: ActivityStream[];
-  document_spaces: Record<string, string>;
-  document_tags: Record<string, string[]>;
-  tags: string[];
-}
-
 export async function listAllTags(): Promise<TagData> {
   return invoke("list_all_tags");
 }
@@ -657,29 +623,6 @@ export async function setDocumentSpace(
   spaceId: string,
 ): Promise<void> {
   return invoke("set_document_space", { source, sourceId, spaceId });
-}
-
-export async function addLegacySpace(
-  name: string,
-  icon: string,
-  color: string,
-): Promise<void> {
-  return invoke("add_space", { name, icon, color });
-}
-
-export async function removeLegacySpace(spaceId: string): Promise<void> {
-  return invoke("remove_space", { spaceId });
-}
-
-export async function renameLegacySpace(
-  spaceId: string,
-  newName: string,
-): Promise<void> {
-  return invoke("rename_space", { spaceId, newName });
-}
-
-export async function pinLegacySpace(spaceId: string): Promise<void> {
-  return invoke("pin_space", { spaceId });
 }
 
 // ── Session Snapshots ───────────────────────────────────────────────────
@@ -2644,11 +2587,6 @@ export async function cancelGuardedQuitRequest(
   deliveryId: number,
 ): Promise<boolean> {
   return invoke("cancel_guarded_quit_request", { requestId, deliveryId });
-}
-
-/** @deprecated Use quitWenlanFull. Kept as a legacy Origin bridge alias. */
-export async function quitOriginFull(): Promise<void> {
-  return invoke("quit_origin_full");
 }
 
 // ── Page map ─────────────────────────────────────────────────────────

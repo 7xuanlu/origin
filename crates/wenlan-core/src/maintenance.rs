@@ -18,10 +18,7 @@ use crate::synthesis::distill::{
     automatic_refresh_exceeds_source_cap, refresh_page, RefreshReason,
     AUTOMATIC_PAGE_REFRESH_SOURCE_CAP,
 };
-use wenlan_types::pages::Page;
 
-const RETRO_SWEEP_COMPLETE_KEY: &str = "maintenance_retro_sweep_v1_complete";
-const RETRO_SWEEP_PAUSE_KEY: &str = "maintenance_retro_sweep_v1_pause";
 // v1 stored a numeric OFFSET that cannot identify a row after stale-set
 // mutation. v2 deliberately starts a fresh keyset pass on upgrade.
 const MAINTENANCE_STALE_CURSOR_KEY: &str = "maintenance_stale_page_cursor_v2";
@@ -79,7 +76,6 @@ pub struct MaintenanceTickConfig {
     pub token_limit: usize,
     pub max_unlinked_cluster_size: usize,
     pub max_grouped_cluster_size: usize,
-    pub max_per_tick: usize,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -125,97 +121,6 @@ pub struct MaintenanceSliceWork {
     pub truncated: bool,
 }
 
-pub async fn run_maintenance_tick(
-    db: &MemoryDB,
-    llm: Option<&Arc<dyn LlmProvider>>,
-    prompts: &PromptRegistry,
-    config: &MaintenanceTickConfig,
-    knowledge_path: Option<&Path>,
-) -> Result<MaintenanceTickResult, WenlanError> {
-    let mut result = MaintenanceTickResult::default();
-    let max_per_tick = config.max_per_tick.max(1);
-
-    let retro = run_retro_sweep(db, config, max_per_tick).await?;
-    result.retro_expected_card_volume = retro.expected_card_volume;
-    result.retro_cards_emitted = retro.cards_emitted;
-    result.retro_stub_cards_emitted = retro.stub_cards_emitted;
-    result.retro_paused = retro.paused;
-    result.merge_cards_emitted += retro.merge_cards_emitted;
-
-    let near_duplicates =
-        duplicates::detect_near_duplicate_pages(db, config.page_match_threshold, max_per_tick)
-            .await?;
-    for pair in near_duplicates.iter().take(max_per_tick) {
-        if emit_page_merge_card(db, pair).await? {
-            result.merge_cards_emitted += 1;
-        }
-    }
-
-    result.orphan_labels_checked = db.list_orphan_link_labels(1).await?.len();
-
-    let discovery_clusters = db
-        .find_cross_space_distillation_clusters(
-            config.formation_threshold,
-            config.page_min_cluster_size,
-            max_per_tick,
-            config.token_limit,
-            config.max_unlinked_cluster_size,
-            config.max_grouped_cluster_size,
-        )
-        .await?;
-    for cluster in discovery_clusters.iter().take(max_per_tick) {
-        if emit_cross_space_discovery_card(db, &cluster.source_ids).await? {
-            result.discovery_cards_emitted += 1;
-        }
-    }
-
-    let Some(provider) = llm.filter(|provider| provider.is_available()) else {
-        let stale = db.list_stale_pages("source_updated").await?;
-        for page in stale.iter().take(max_per_tick) {
-            if page_is_human_owned(page) {
-                result.stale_human_queued += 1;
-            } else {
-                result.stale_machine_queued += 1;
-            }
-        }
-        return Ok(result);
-    };
-
-    let stale = db.list_stale_pages("source_updated").await?;
-    for page in stale.iter().take(max_per_tick) {
-        let human_owned = page_is_human_owned(page);
-        let outcome = refresh_page(
-            db,
-            provider,
-            prompts,
-            &page.id,
-            RefreshReason::SourceChanged,
-            knowledge_path,
-        )
-        .await?;
-        if human_owned || outcome.gated {
-            result.stale_human_cards += usize::from(outcome.gated);
-        } else {
-            result.stale_machine_refreshed += usize::from(outcome.wrote);
-        }
-    }
-
-    let overview = crate::synthesis::overview::refresh_overview_page(
-        db,
-        provider,
-        prompts,
-        "maintenance",
-        knowledge_path,
-    )
-    .await?;
-    result.overview_refreshed = usize::from(overview.wrote);
-
-    Ok(result)
-}
-
-/// Run one maintenance stage and at most one emitted/refreshed item. The
-/// explicit full-tick API above remains available to foreground callers; the
-/// automatic scheduler uses this cooperative boundary.
 async fn load_maintenance_stale_cursor(
     db: &MemoryDB,
 ) -> Result<Option<StalePageCursor>, WenlanError> {
@@ -237,6 +142,9 @@ async fn persist_maintenance_stale_cursor(
         .await
 }
 
+/// Run one maintenance stage and at most one emitted/refreshed item. This is
+/// the only maintenance entry point; the automatic scheduler drives it one
+/// cooperative slice at a time.
 pub async fn run_maintenance_stage_slice(
     db: &MemoryDB,
     llm: Option<&Arc<dyn LlmProvider>>,
@@ -548,146 +456,10 @@ pub async fn run_maintenance_stage_slice(
     })
 }
 
-#[derive(Debug, Default)]
-struct RetroSweepResult {
-    expected_card_volume: usize,
-    cards_emitted: usize,
-    merge_cards_emitted: usize,
-    stub_cards_emitted: usize,
-    paused: bool,
-}
-
-#[derive(Debug)]
-enum RetroCardCandidate {
-    PageMerge(duplicates::NearDuplicatePair),
-    KeepOrArchive(StubPageCandidate),
-}
-
 #[derive(Debug)]
 struct StubPageCandidate {
     page_id: String,
     source_count: usize,
-}
-
-async fn run_retro_sweep(
-    db: &MemoryDB,
-    config: &MaintenanceTickConfig,
-    max_per_tick: usize,
-) -> Result<RetroSweepResult, WenlanError> {
-    if db
-        .get_app_metadata(RETRO_SWEEP_COMPLETE_KEY)
-        .await?
-        .as_deref()
-        == Some("1")
-    {
-        return Ok(RetroSweepResult::default());
-    }
-
-    let paused = db.get_app_metadata(RETRO_SWEEP_PAUSE_KEY).await?.as_deref() == Some("1");
-    if paused && pending_retro_review_count(db).await? > 0 {
-        return Ok(RetroSweepResult {
-            paused: true,
-            ..RetroSweepResult::default()
-        });
-    }
-    if paused {
-        db.set_app_metadata(RETRO_SWEEP_PAUSE_KEY, "0").await?;
-    }
-
-    let candidates = collect_retro_candidates(db, config).await?;
-    let expected_card_volume = candidates.len();
-    if expected_card_volume == 0 {
-        db.set_app_metadata(RETRO_SWEEP_COMPLETE_KEY, "1").await?;
-        db.set_app_metadata(RETRO_SWEEP_PAUSE_KEY, "0").await?;
-        return Ok(RetroSweepResult::default());
-    }
-
-    let mut result = RetroSweepResult {
-        expected_card_volume,
-        ..RetroSweepResult::default()
-    };
-    for candidate in candidates.iter().take(max_per_tick) {
-        match candidate {
-            RetroCardCandidate::PageMerge(pair) => {
-                let emitted = emit_page_merge_card(db, pair).await?;
-                result.cards_emitted += usize::from(emitted);
-                result.merge_cards_emitted += usize::from(emitted);
-            }
-            RetroCardCandidate::KeepOrArchive(stub) => {
-                let emitted =
-                    emit_keep_or_archive_card(db, &stub.page_id, stub.source_count).await?;
-                result.cards_emitted += usize::from(emitted);
-                result.stub_cards_emitted += usize::from(emitted);
-            }
-        }
-    }
-
-    if expected_card_volume > result.cards_emitted {
-        db.set_app_metadata(RETRO_SWEEP_PAUSE_KEY, "1").await?;
-        result.paused = true;
-    } else {
-        db.set_app_metadata(RETRO_SWEEP_COMPLETE_KEY, "1").await?;
-        db.set_app_metadata(RETRO_SWEEP_PAUSE_KEY, "0").await?;
-    }
-    Ok(result)
-}
-
-async fn collect_retro_candidates(
-    db: &MemoryDB,
-    config: &MaintenanceTickConfig,
-) -> Result<Vec<RetroCardCandidate>, WenlanError> {
-    let mut candidates = Vec::new();
-    for pair in duplicates::detect_all_near_duplicate_pages(db, config.page_match_threshold).await?
-    {
-        let id = page_merge_card_id(&pair.left_id, &pair.right_id);
-        if db.get_refinement_proposal(&id).await?.is_none() {
-            candidates.push(RetroCardCandidate::PageMerge(pair));
-        }
-    }
-    for stub in list_distilled_stub_pages(db).await? {
-        let id = keep_or_archive_card_id(&stub.page_id);
-        if db.get_refinement_proposal(&id).await?.is_none() {
-            candidates.push(RetroCardCandidate::KeepOrArchive(stub));
-        }
-    }
-    Ok(candidates)
-}
-
-async fn list_distilled_stub_pages(db: &MemoryDB) -> Result<Vec<StubPageCandidate>, WenlanError> {
-    let mut out = Vec::new();
-    for page in db.list_pages("active", i64::MAX, 0).await? {
-        if !page_is_retro_stub_candidate(&page) {
-            continue;
-        }
-        let source_count = effective_page_source_count(db, &page).await?;
-        if source_count < STUB_PAGE_SOURCE_FLOOR {
-            out.push(StubPageCandidate {
-                page_id: page.id,
-                source_count,
-            });
-        }
-    }
-    out.sort_by(|left, right| {
-        left.source_count
-            .cmp(&right.source_count)
-            .then_with(|| left.page_id.cmp(&right.page_id))
-    });
-    Ok(out)
-}
-
-fn page_is_retro_stub_candidate(page: &Page) -> bool {
-    page.creation_kind == "distilled"
-        && !page_is_human_owned(page)
-        && !page.title.eq_ignore_ascii_case("overview")
-}
-
-async fn effective_page_source_count(db: &MemoryDB, page: &Page) -> Result<usize, WenlanError> {
-    let sources = db.get_page_sources(&page.id).await?;
-    if sources.is_empty() {
-        Ok(page.source_memory_ids.len())
-    } else {
-        Ok(sources.len())
-    }
 }
 
 pub(crate) async fn emit_keep_or_archive_card(
@@ -723,22 +495,6 @@ pub(crate) async fn emit_keep_or_archive_card(
     db.resolve_refinement_if_open(&id, "awaiting_review")
         .await?;
     Ok(true)
-}
-
-async fn pending_retro_review_count(db: &MemoryDB) -> Result<usize, WenlanError> {
-    Ok(db
-        .get_pending_refinements()
-        .await?
-        .into_iter()
-        .filter(|proposal| {
-            matches!(proposal.status.as_str(), "pending" | "awaiting_review")
-                && retro_review_action(&proposal.action)
-        })
-        .count())
-}
-
-fn retro_review_action(action: &str) -> bool {
-    matches!(action, "page_merge" | "page_keep_or_archive")
 }
 
 async fn emit_page_merge_card(
@@ -1018,7 +774,6 @@ mod tests {
             token_limit: 3500,
             max_unlinked_cluster_size: 20,
             max_grouped_cluster_size: 20,
-            max_per_tick: 5,
         }
     }
 
@@ -1030,7 +785,6 @@ mod tests {
             token_limit: 3500,
             max_unlinked_cluster_size: 20,
             max_grouped_cluster_size: 20,
-            max_per_tick: 5,
         }
     }
 
@@ -1136,17 +890,18 @@ mod tests {
             .await;
         }
 
-        let result = run_maintenance_tick(
+        let report = run_maintenance_stage_slice(
             &db,
             None,
             &PromptRegistry::default(),
             &discovery_config(),
             None,
+            MaintenanceStage::CrossSpaceDiscovery,
         )
         .await
         .unwrap();
 
-        assert_eq!(result.discovery_cards_emitted, 1);
+        assert_eq!(report.result.discovery_cards_emitted, 1);
         assert_eq!(active_page_count(&db).await, 0);
         assert_eq!(page_source_count(&db).await, 0);
 
@@ -1178,7 +933,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dismissed_cross_space_discovery_card_stays_dismissed_across_next_tick() {
+    async fn dismissed_cross_space_discovery_card_stays_dismissed_across_next_slice() {
         let (db, _db_dir) = new_test_db().await;
         let embedding = unit_vec(43);
         let now = chrono::Utc::now().timestamp();
@@ -1198,16 +953,17 @@ mod tests {
             .await;
         }
 
-        let first = run_maintenance_tick(
+        let first = run_maintenance_stage_slice(
             &db,
             None,
             &PromptRegistry::default(),
             &discovery_config(),
             None,
+            MaintenanceStage::CrossSpaceDiscovery,
         )
         .await
         .unwrap();
-        assert_eq!(first.discovery_cards_emitted, 1);
+        assert_eq!(first.result.discovery_cards_emitted, 1);
         let card = db
             .get_pending_refinements()
             .await
@@ -1219,16 +975,17 @@ mod tests {
             .await
             .unwrap();
 
-        let second = run_maintenance_tick(
+        let second = run_maintenance_stage_slice(
             &db,
             None,
             &PromptRegistry::default(),
             &discovery_config(),
             None,
+            MaintenanceStage::CrossSpaceDiscovery,
         )
         .await
         .unwrap();
-        assert_eq!(second.discovery_cards_emitted, 0);
+        assert_eq!(second.result.discovery_cards_emitted, 0);
         let dismissed = db
             .get_refinement_proposal(&card.id)
             .await
@@ -1238,7 +995,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dismissed_page_merge_card_stays_dismissed_across_next_tick() {
+    async fn dismissed_page_merge_card_stays_dismissed_across_next_slice() {
         let (db, _db_dir) = new_test_db().await;
         let source = "Rust ownership prevents data races at compile time.";
         for id in ["mem_dup_a", "mem_dup_b", "mem_dup_c"] {
@@ -1259,10 +1016,17 @@ mod tests {
         )
         .await;
 
-        let first = run_maintenance_tick(&db, None, &PromptRegistry::default(), &config(), None)
-            .await
-            .unwrap();
-        assert_eq!(first.merge_cards_emitted, 1);
+        let first = run_maintenance_stage_slice(
+            &db,
+            None,
+            &PromptRegistry::default(),
+            &config(),
+            None,
+            MaintenanceStage::NearDuplicate,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.result.merge_cards_emitted, 1);
         let card = db
             .get_pending_refinements()
             .await
@@ -1274,10 +1038,17 @@ mod tests {
             .await
             .unwrap();
 
-        let second = run_maintenance_tick(&db, None, &PromptRegistry::default(), &config(), None)
-            .await
-            .unwrap();
-        assert_eq!(second.merge_cards_emitted, 0);
+        let second = run_maintenance_stage_slice(
+            &db,
+            None,
+            &PromptRegistry::default(),
+            &config(),
+            None,
+            MaintenanceStage::NearDuplicate,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.result.merge_cards_emitted, 0);
         let dismissed = db
             .get_refinement_proposal(&card.id)
             .await
@@ -1287,7 +1058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retro_sweep_cards_near_duplicate_pages_and_distilled_stub_pages_without_mutation() {
+    async fn slices_card_near_duplicate_pages_and_distilled_stub_pages_without_mutation() {
         let (db, _db_dir) = new_test_db().await;
         let source = "Rust ownership prevents data races at compile time.";
         for id in ["retro_mem_dup_a", "retro_mem_dup_b", "retro_mem_dup_c"] {
@@ -1317,27 +1088,55 @@ mod tests {
 
         let mut retro_config = config();
         retro_config.page_match_threshold = 1.0;
-        let result =
-            run_maintenance_tick(&db, None, &PromptRegistry::default(), &retro_config, None)
-                .await
-                .unwrap();
 
-        assert_eq!(result.retro_expected_card_volume, 2);
-        assert_eq!(result.retro_cards_emitted, 2);
-        assert_eq!(result.retro_stub_cards_emitted, 1);
+        // Only one review card may be open at a time, so the near-duplicate
+        // pair is carded first and dismissed before the retro lane runs.
+        let near_duplicate = run_maintenance_stage_slice(
+            &db,
+            None,
+            &PromptRegistry::default(),
+            &retro_config,
+            None,
+            MaintenanceStage::NearDuplicate,
+        )
+        .await
+        .unwrap();
+        assert_eq!(near_duplicate.result.merge_cards_emitted, 1);
+        let merge_card = db
+            .get_pending_refinements()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.action == "page_merge")
+            .expect("the near-duplicate slice should card the pair");
+        db.resolve_refinement_if_open(&merge_card.id, "dismissed")
+            .await
+            .unwrap();
+
+        // The retro lane audits one Page per slice; the stub is the third by id.
+        let mut stub_cards = 0;
+        for _ in 0..3 {
+            let report = run_maintenance_stage_slice(
+                &db,
+                None,
+                &PromptRegistry::default(),
+                &retro_config,
+                None,
+                MaintenanceStage::RetroReview,
+            )
+            .await
+            .unwrap();
+            stub_cards += report.result.retro_stub_cards_emitted;
+        }
+        assert_eq!(stub_cards, 1);
         assert_eq!(page_status(&db, "retro_page_dup_b").await, "active");
         assert_eq!(page_status(&db, "retro_stub_page").await, "active");
 
         let pending = db.get_pending_refinements().await.unwrap();
-        assert_eq!(
-            pending.iter().filter(|p| p.action == "page_merge").count(),
-            1,
-            "retro sweep should card the near-duplicate pair"
-        );
         let stub = pending
             .iter()
             .find(|p| p.action == "page_keep_or_archive")
-            .expect("retro sweep should card a <3-source distilled stub");
+            .expect("the retro slice should card a <3-source distilled stub");
         assert_eq!(stub.source_ids, vec!["retro_stub_page".to_string()]);
         assert!(
             stub.payload
@@ -1346,121 +1145,6 @@ mod tests {
                 .contains("\"source_count\":1"),
             "stub payload should carry the source count"
         );
-    }
-
-    #[tokio::test]
-    async fn dismissed_keep_or_archive_card_stays_dismissed_across_next_tick() {
-        let (db, _db_dir) = new_test_db().await;
-        store_test_memory(&db, "stub_dismiss_mem", "Small source.").await;
-        insert_distilled_test_page(
-            &db,
-            "stub_dismiss_page",
-            "Thin machine stub.",
-            &["stub_dismiss_mem"],
-        )
-        .await;
-
-        let first = run_maintenance_tick(&db, None, &PromptRegistry::default(), &config(), None)
-            .await
-            .unwrap();
-        assert_eq!(first.retro_stub_cards_emitted, 1);
-        let card = db
-            .get_pending_refinements()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|p| p.action == "page_keep_or_archive")
-            .expect("keep-or-archive card exists");
-        db.resolve_refinement_if_open(&card.id, "dismissed")
-            .await
-            .unwrap();
-
-        let second = run_maintenance_tick(&db, None, &PromptRegistry::default(), &config(), None)
-            .await
-            .unwrap();
-        assert_eq!(second.retro_stub_cards_emitted, 0);
-        let dismissed = db
-            .get_refinement_proposal(&card.id)
-            .await
-            .unwrap()
-            .expect("dismissed keep-or-archive card remains");
-        assert_eq!(dismissed.status, "dismissed");
-    }
-
-    #[tokio::test]
-    async fn retro_sweep_large_predicted_volume_emits_one_batch_and_pauses() {
-        let (db, _db_dir) = new_test_db().await;
-        for idx in 0..5 {
-            let mem_id = format!("retro_batch_mem_{idx}");
-            let page_id = format!("retro_batch_stub_{idx}");
-            let content = format!("Thin machine stub {idx} with distinct audit context.");
-            store_test_memory(&db, &mem_id, &content).await;
-            insert_distilled_test_page(&db, &page_id, &content, &[&mem_id]).await;
-        }
-        let mut batch_config = config();
-        batch_config.max_per_tick = 2;
-        batch_config.page_match_threshold = 1.0;
-
-        let first =
-            run_maintenance_tick(&db, None, &PromptRegistry::default(), &batch_config, None)
-                .await
-                .unwrap();
-
-        assert_eq!(first.retro_expected_card_volume, 5);
-        assert_eq!(first.retro_cards_emitted, 2);
-        assert_eq!(first.retro_stub_cards_emitted, 2);
-        assert!(first.retro_paused);
-        assert_eq!(
-            db.get_pending_refinements()
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|p| p.action == "page_keep_or_archive")
-                .count(),
-            2,
-            "large retro sweep should not flood all predicted cards at once"
-        );
-        assert_eq!(
-            db.get_app_metadata("maintenance_retro_sweep_v1_pause")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("1")
-        );
-
-        let second =
-            run_maintenance_tick(&db, None, &PromptRegistry::default(), &batch_config, None)
-                .await
-                .unwrap();
-        assert_eq!(second.retro_cards_emitted, 0);
-        assert!(second.retro_paused);
-    }
-
-    #[tokio::test]
-    async fn stale_machine_page_survives_noop_refresh_for_retry() {
-        let (db, _db_dir) = new_test_db().await;
-        let source = "Rust ownership prevents data races at compile time.";
-        store_test_memory(&db, "mem_stale", source).await;
-        insert_test_page(&db, "page_stale", "Old machine prose.", &["mem_stale"]).await;
-        db.set_page_stale("page_stale", "source_updated")
-            .await
-            .unwrap();
-
-        let llm: Arc<dyn LlmProvider> = Arc::new(TestProvider {
-            body: String::new(),
-        });
-        let result =
-            run_maintenance_tick(&db, Some(&llm), &PromptRegistry::default(), &config(), None)
-                .await
-                .unwrap();
-
-        assert_eq!(result.stale_machine_refreshed, 0);
-        let page = db
-            .get_page("page_stale")
-            .await
-            .unwrap()
-            .expect("stale page remains");
-        assert_eq!(page.stale_reason.as_deref(), Some("source_updated"));
     }
 
     #[tokio::test]

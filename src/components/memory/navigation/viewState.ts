@@ -3,7 +3,6 @@ import type { SettingsSection } from "../settings/SettingsSidebar";
 export type View =
   | { readonly kind: "activity" }
   | { readonly kind: "connect-agent" }
-  | { readonly kind: "decisions" }
   | { readonly kind: "distill-review" }
   | { readonly kind: "entity"; readonly entityId: string }
   | { readonly kind: "graph" }
@@ -31,7 +30,6 @@ export function activeNavigationForView(view: View): GlobalNavigation | null {
     case "home":
       return "home";
     case "activity":
-    case "decisions":
     case "distill-review":
     case "memory":
     case "recaps":

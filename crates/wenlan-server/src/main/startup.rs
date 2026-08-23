@@ -748,17 +748,6 @@ pub(super) async fn prepare_startup_state(
         }
     }
 
-    // Import any legacy tag data from the pre-PR-B2 spaces.db file.
-    if !repair_recovery_pending {
-        match wenlan_core::spaces::import_legacy_tags(&db_arc).await {
-            Ok(n) if n > 0 => {
-                tracing::info!("[startup] imported {} legacy tag triples from spaces.db", n)
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("[startup] legacy tags import failed: {e}"),
-        }
-    }
-
     // Spawn the ingest coalescer. HTTP `/api/memory/store` handlers submit
     // fully-built RawDocuments + pre-computed chunk counts; the coalescer
     // runs the full ingest pipeline (batched quality gate, partition,

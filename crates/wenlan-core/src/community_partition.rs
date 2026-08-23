@@ -148,6 +148,10 @@ pub fn modularity(graph: &ProjectedGraph, membership: &[usize]) -> f64 {
 }
 
 /// Deterministic weighted label propagation matching the legacy baseline.
+///
+/// Gate-only: no production caller. Kept for the M4 Leiden-beats-label-propagation
+/// baseline in `tests/m4_community_gates.rs`; production partitioning goes through
+/// `full_partition`.
 pub fn label_propagation_partition(graph: &ProjectedGraph) -> PartitionOutput {
     let mut membership = (0..graph.node_ids.len()).collect::<Vec<_>>();
 
@@ -183,6 +187,9 @@ pub fn label_propagation_partition(graph: &ProjectedGraph) -> PartitionOutput {
 }
 
 /// Count communities whose induced subgraph is disconnected.
+///
+/// Gate-only: no production caller. Kept as the connectedness metric for
+/// `tests/m4_community_gates.rs`.
 pub fn disconnected_community_count(graph: &ProjectedGraph, membership: &[usize]) -> usize {
     assert_eq!(
         graph.node_ids.len(),
@@ -524,6 +531,9 @@ impl IncrementalOutput {
 /// The previous partition must already satisfy the connected-community
 /// invariant. Only communities touched by accepted frontier moves can change
 /// connectedness, so the postcondition checks exactly that bounded set.
+///
+/// Gate-only: no production caller. Kept for `tests/m4_community_gates.rs`;
+/// production calls `incremental_partition_recoverable` directly.
 pub fn incremental_partition(
     graph: &ProjectedGraph,
     state: IncrementalPartitionState,
@@ -750,6 +760,9 @@ fn modularity_move_delta(
 
 /// Rebind partitioner groups to prior durable community IDs by maximum member
 /// overlap. Partitioner labels never become durable identity.
+///
+/// Gate-only: no production caller. Pins the unweighted stability baseline in
+/// `tests/m4_community_gates.rs`; production uses `rebind_durable_ids_weighted`.
 pub fn rebind_durable_ids(previous_ids: &[String], new_membership: &[usize]) -> Vec<String> {
     assert_eq!(
         previous_ids.len(),

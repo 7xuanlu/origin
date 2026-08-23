@@ -52,8 +52,9 @@ export function ImportFlow() {
         .then((imports) => {
           if (!alive) return;
           if (imports.length > 0) {
-            setPending(imports[0]);
-            setDismissed(false);
+            const next = imports[0];
+            if (next.id !== prevPendingRef.current?.id) setDismissed(false);
+            setPending(next);
           } else if (prevPendingRef.current) {
             // Was pending, now done
             setPending(null);

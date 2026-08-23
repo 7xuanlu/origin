@@ -32,16 +32,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
 axum = "0.8"
-tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 rand = "0.10"
 base64 = "0.22"
 subtle = "2"
 http = "1"
-tokio-util = "0.7"
 dirs = "6"
 semver = "1"
-sha2 = { workspace = true }
 wenlan-types = { workspace = true }
 
 [dev-dependencies]

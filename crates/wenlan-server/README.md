@@ -37,7 +37,7 @@ All user-facing data lives under `~/.wenlan/`:
 ~/.wenlan/.git/                git repo — skills auto-commit per logical batch
 ```
 
-The libSQL store lives under the platform data directory (`dirs::data_local_dir()/origin/memorydb/origin_memory.db`). On macOS that resolves to `~/Library/Application Support/wenlan/memorydb/`; on Linux `~/.local/share/wenlan/memorydb/`; on Windows `%LOCALAPPDATA%\origin\memorydb\`. `~/.wenlan/db` is a symlink on macOS + Linux so the user-facing tree stays single-rooted (Windows skips the symlink since it needs Developer Mode or admin and the alias is cosmetic). Use `open ~/.wenlan/`, `code ~/.wenlan/`, or symlink `~/.wenlan/pages/` into an Obsidian vault for the graph view.
+The libSQL store lives under the platform data directory (`dirs::data_local_dir()/wenlan/memorydb/origin_memory.db`). On macOS that resolves to `~/Library/Application Support/wenlan/memorydb/`; on Linux `~/.local/share/wenlan/memorydb/`; on Windows `%LOCALAPPDATA%\wenlan\memorydb\`. `~/.wenlan/db` is a symlink on macOS + Linux so the user-facing tree stays single-rooted (Windows skips the symlink since it needs Developer Mode or admin and the alias is cosmetic). Use `open ~/.wenlan/`, `code ~/.wenlan/`, or symlink `~/.wenlan/pages/` into an Obsidian vault for the graph view.
 
 ## Service Commands
 

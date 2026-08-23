@@ -5,7 +5,7 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::client::WenlanClient;
-use crate::output::OutputFormat;
+use crate::output::ResolvedFormat;
 
 #[derive(Subcommand)]
 pub enum SpaceCmd {
@@ -44,7 +44,7 @@ pub enum SpaceCmd {
 
 pub async fn run(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     cmd: SpaceCmd,
 ) -> Result<()> {
@@ -59,14 +59,14 @@ pub async fn run(
     }
 }
 
-async fn list(client: &WenlanClient, format: OutputFormat, quiet: bool) -> Result<()> {
+async fn list(client: &WenlanClient, format: ResolvedFormat, quiet: bool) -> Result<()> {
     let spaces = client.list_spaces().await?;
     if quiet {
         return Ok(());
     }
     match format {
-        OutputFormat::Json => crate::output::print_json(&spaces)?,
-        OutputFormat::Table => {
+        ResolvedFormat::Json => crate::output::print_json(&spaces)?,
+        ResolvedFormat::Table => {
             if spaces.is_empty() {
                 println!("(no spaces registered)");
                 return Ok(());
@@ -85,13 +85,12 @@ async fn list(client: &WenlanClient, format: OutputFormat, quiet: bool) -> Resul
                 );
             }
         }
-        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
     }
     Ok(())
 }
 async fn add(
     client: &WenlanClient,
-    _format: OutputFormat,
+    _format: ResolvedFormat,
     quiet: bool,
     name: &str,
     set_default: bool,
@@ -130,7 +129,7 @@ async fn add(
 }
 async fn default_cmd(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     name: Option<&str>,
     clear: bool,
@@ -154,8 +153,8 @@ async fn default_cmd(
         return Ok(());
     }
     match format {
-        OutputFormat::Json => crate::output::print_json(&response)?,
-        OutputFormat::Table => match response.space {
+        ResolvedFormat::Json => crate::output::print_json(&response)?,
+        ResolvedFormat::Table => match response.space {
             Some(space) => {
                 if name.is_some() {
                     println!("Set Default save space to '{}'.", space.name);
@@ -167,13 +166,12 @@ async fn default_cmd(
                 println!("(no Default save space set; new writes use Uncategorized)");
             }
         },
-        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
     }
     Ok(())
 }
 async fn move_cmd(
     client: &WenlanClient,
-    _format: OutputFormat,
+    _format: ResolvedFormat,
     quiet: bool,
     from: &str,
     to: &str,
@@ -187,14 +185,19 @@ async fn move_cmd(
     }
     Ok(())
 }
-async fn show(client: &WenlanClient, format: OutputFormat, quiet: bool, name: &str) -> Result<()> {
+async fn show(
+    client: &WenlanClient,
+    format: ResolvedFormat,
+    quiet: bool,
+    name: &str,
+) -> Result<()> {
     let space = client.get_space(name).await?;
     if quiet {
         return Ok(());
     }
     match format {
-        OutputFormat::Json => crate::output::print_json(&space)?,
-        OutputFormat::Table => {
+        ResolvedFormat::Json => crate::output::print_json(&space)?,
+        ResolvedFormat::Table => {
             println!("Name:           {}", space.name);
             if let Some(desc) = &space.description {
                 println!("Description:    {}", desc);
@@ -208,7 +211,6 @@ async fn show(client: &WenlanClient, format: OutputFormat, quiet: bool, name: &s
                 println!("Default:        yes");
             }
         }
-        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
     }
     Ok(())
 }

@@ -2,7 +2,7 @@
 import { forwardRef, useEffect, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { getMemoryStats, listSpaces, type Page, type Space } from "../../lib/tauri";
+import { listSpaces, type Page, type Space } from "../../lib/tauri";
 import { rankRecentPages, readRecentPageHistory } from "../../lib/recentPages";
 import { rankRecentSpaces, readRecentSpaceHistory } from "../../lib/recentSpaces";
 import IdentityCard from "./IdentityCard";
@@ -79,11 +79,6 @@ export default function Sidebar({
 }: SidebarProps) {
   const { t } = useTranslation();
   const asideRef = useRef<HTMLElement>(null);
-  const { data: _stats } = useQuery({
-    queryKey: ["memoryStats"],
-    queryFn: getMemoryStats,
-    refetchInterval: 10000,
-  });
   const { data: pages = [] } = useQuery({
     queryKey: ["pages", "active"],
     queryFn: listAllActivePages,

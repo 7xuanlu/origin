@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { openSpaceEntity } from "./helpers/spaceEntity";
 import { collectBrowserErrors, installTauriMock } from "./tauriMock";
+import { pngDimensions } from "./helpers/png";
 
 const evidenceDir = path.join(
   process.cwd(),
@@ -20,12 +21,6 @@ async function settle(page: Page): Promise<void> {
     await document.fonts.ready;
     for (const animation of document.getAnimations()) animation.finish();
   });
-}
-
-async function pngDimensions(filePath: string): Promise<{ readonly height: number; readonly width: number }> {
-  const bytes = await readFile(filePath);
-  if (bytes.toString("ascii", 1, 4) !== "PNG") throw new Error(`Not a PNG: ${filePath}`);
-  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
 }
 
 async function capture(page: Page, name: string): Promise<string> {

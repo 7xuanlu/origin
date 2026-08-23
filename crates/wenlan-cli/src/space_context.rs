@@ -267,6 +267,11 @@ fn longest_mapping(cwd: &Path, config: &Path) -> Option<String> {
 
     mappings
         .into_iter()
+        // `.rev()` makes `max_by_key` below (which returns the LAST maximum)
+        // return the FIRST-defined mapping among equal-length prefix matches,
+        // matching the documented tie-break (plugin/skills/README.md,
+        // plugin/examples/spaces.toml) and resolve-space.sh's strict `>` check.
+        .rev()
         .filter_map(|(prefix, space)| {
             let expanded = if prefix == "~" {
                 dirs::home_dir()
@@ -412,6 +417,39 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.space.as_deref(), Some("inner"));
         assert_eq!(resolved.source, CliSpaceSource::CwdConfig);
+    }
+
+    #[test]
+    fn cli_space_equal_length_mapping_prefix_first_defined_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let config = tmp.path().join("spaces.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[[mapping]]\nprefix = \"{}\"\nspace = \"first\"\n\
+                 [[mapping]]\nprefix = \"{}\"\nspace = \"second\"\n",
+                repo.display(),
+                repo.display()
+            ),
+        )
+        .unwrap();
+        let inputs = CliSpaceInputs {
+            strict_space: None,
+            default_space: None,
+            explicit_space: None,
+            all_spaces: false,
+            cwd: Some(repo.clone()),
+            spaces_file: Some(config),
+        };
+        let resolved = resolve_cli_space_with(
+            &inputs,
+            CliSpaceOperation::Read,
+            &registered(&["first", "second"]),
+        )
+        .unwrap();
+        assert_eq!(resolved.space.as_deref(), Some("first"));
     }
 
     #[test]

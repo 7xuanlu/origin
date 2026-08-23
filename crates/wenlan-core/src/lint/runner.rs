@@ -399,17 +399,17 @@ impl LintRunner {
         self
     }
 
-    async fn scan_pages(&self, root: &Path, profile: LintProfile) -> Result<PageScan, PageFsError> {
-        let root = root.to_path_buf();
-        let run_remaining = self
-            .run_budget(profile)
-            .saturating_sub(self.clock.elapsed());
-        let timeout = self.page_budget(profile).min(run_remaining);
+    /// Run `work` in a cancellable, deadline-bounded blocking task. Shared by
+    /// `scan_pages` and `verify_pages`, which differ only in the closure and
+    /// the budget arithmetic that produces `timeout`.
+    async fn run_page_task<T: Send + 'static>(
+        &self,
+        timeout: std::time::Duration,
+        work: impl FnOnce(PageScanControl) -> Result<T, PageFsError> + Send + 'static,
+    ) -> Result<T, PageFsError> {
         let control = PageScanControl::with_timeout(timeout);
         let worker_control = control.clone();
-        let mut task = tokio::task::spawn_blocking(move || {
-            scan_page_root_controlled(&root, profile == LintProfile::Deep, &worker_control)
-        });
+        let mut task = tokio::task::spawn_blocking(move || work(worker_control));
         tokio::select! {
             biased;
             _ = self.gate.cancelled() => {
@@ -429,6 +429,19 @@ impl LintRunner {
         }
     }
 
+    async fn scan_pages(&self, root: &Path, profile: LintProfile) -> Result<PageScan, PageFsError> {
+        let root = root.to_path_buf();
+        let run_remaining = self
+            .run_budget(profile)
+            .saturating_sub(self.clock.elapsed());
+        let timeout = self.page_budget(profile).min(run_remaining);
+        let deep = profile == LintProfile::Deep;
+        self.run_page_task(timeout, move |control| {
+            scan_page_root_controlled(&root, deep, &control)
+        })
+        .await
+    }
+
     async fn verify_pages(
         &self,
         root: &Path,
@@ -443,29 +456,11 @@ impl LintRunner {
         let timeout = page_remaining.min(run_remaining);
         let root = root.to_path_buf();
         let scan = scan.clone();
-        let control = PageScanControl::with_timeout(timeout);
-        let worker_control = control.clone();
-        let mut task = tokio::task::spawn_blocking(move || {
-            scan.verify_unchanged_with_control(&root, &worker_control)
+        self.run_page_task(timeout, move |control| {
+            scan.verify_unchanged_with_control(&root, &control)
                 .map(PageFsReceipt::after_normalized_bytes)
-        });
-        tokio::select! {
-            biased;
-            _ = self.gate.cancelled() => {
-                control.cancel();
-                let _ = task.await;
-                Err(PageFsError::Canceled)
-            },
-            result = tokio::time::timeout(timeout, &mut task) => match result {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(PageFsError::ReadDirectory),
-                Err(_) => {
-                    control.cancel();
-                    let _ = task.await;
-                    Err(PageFsError::DeadlineExceeded)
-                },
-            },
-        }
+        })
+        .await
     }
 
     #[cfg(test)]

@@ -93,6 +93,10 @@ pub struct DeleteResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConfirmResponse {
     pub confirmed: bool,
+    /// Whether a memory row actually matched the requested id. Defaulted to
+    /// `true` so a newer client reads an older daemon's 200 as a real update.
+    #[serde(default = "crate::requests::default_true")]
+    pub updated: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

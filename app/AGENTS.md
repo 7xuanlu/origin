@@ -48,6 +48,6 @@ HTTP calls, and eval fixtures used by the app crate.
 ```bash
 cd app && cargo test
 cargo fmt --check --all
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --exclude wenlan-app --all-targets -- -D warnings
 pnpm test:all
 ```

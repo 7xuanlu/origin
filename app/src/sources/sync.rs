@@ -47,7 +47,10 @@ pub async fn sync_obsidian_vault(
         s.client.clone()
     };
 
-    let path = format!("/api/sources/{}/sync", source.id);
+    let path = format!(
+        "/api/sources/{}/sync",
+        crate::api::percent_encode_path_segment(&source.id)
+    );
     let stats: SyncStats = client
         .post_empty(&path)
         .await

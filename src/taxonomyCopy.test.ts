@@ -26,9 +26,6 @@ describe("taxonomy and product copy", () => {
 
     expect(tauri).toContain("goal: \"bg-emerald-500/20");
     expect(tauri).toContain("goal: \"protected\"");
-    expect(read("src/components/memory/StructuredEditor.tsx")).toContain(
-      "legacy_goal",
-    );
   });
 
   it("does not advertise goal in import or agent-trust copy", () => {
@@ -50,7 +47,6 @@ describe("taxonomy and product copy", () => {
       "src/components/onboarding/WhatHappensNextCard.tsx",
       "src/components/onboarding/FirstPageModal.tsx",
       "src/components/onboarding/GhostPagesRow.tsx",
-      "src/components/ChatImport/ImportProgress.tsx",
       "src/components/intelligence/IntelligenceSetup.tsx",
       "src/components/memory/Greeting.tsx",
       "src/components/memory/ActivityFeed.tsx",
@@ -71,13 +67,8 @@ describe("taxonomy and product copy", () => {
 
   it("uses space language in product-owned UI while preserving domain wire fields", () => {
     const productOwnedFiles = [
-      "src/components/memory/DecisionLog.tsx",
       "src/components/memory/MemoryDetail.tsx",
       "src/components/memory/PageDetail.tsx",
-      "src/components/RecapDetail.tsx",
-      "src/components/MemoryView.tsx",
-      "src/components/memory/AddMemoryForm.tsx",
-      "src/components/memory/NurtureCard.tsx",
       "src/components/memory/MemoryCard.tsx",
       "src/components/memory/MemorySearchResult.tsx",
     ];

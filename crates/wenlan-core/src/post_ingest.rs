@@ -25,7 +25,6 @@ use crate::db::MemoryDB;
 use crate::error::WenlanError;
 use crate::llm_provider::LlmProvider;
 use crate::prompts::PromptRegistry;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use wenlan_types::requests::UpdatePageRequest;
 
@@ -56,6 +55,32 @@ pub struct PageGrowthSliceReport {
     pub llm_calls: usize,
 }
 
+/// Shared retry cap for durable enrichment stages. Also passed as the
+/// selector argument (e.g. `get_classification_candidate`), so a lane's
+/// local constant can never drift from what the selector enforces.
+pub(crate) const ENRICHMENT_MAX_ATTEMPTS: u32 = 3;
+
+/// Record a retry/abandon receipt for `step_name` at the input's version:
+/// `abandoned` once `prior_attempts + 1` reaches `ENRICHMENT_MAX_ATTEMPTS`,
+/// `needs_retry` otherwise.
+pub(crate) async fn record_stage_failure(
+    db: &MemoryDB,
+    source_id: &str,
+    step_name: &str,
+    prior_attempts: u32,
+    version: i64,
+    error: &str,
+) -> Result<bool, WenlanError> {
+    let attempt = prior_attempts.saturating_add(1);
+    let status = if attempt >= ENRICHMENT_MAX_ATTEMPTS {
+        "abandoned"
+    } else {
+        "needs_retry"
+    };
+    db.record_enrichment_step_at_version(source_id, step_name, status, Some(error), version)
+        .await
+}
+
 /// Advance one durable title stage. The selector admits only titles that still
 /// look automatically truncated; the derived title and receipt commit together
 /// against both the memory generation and the title snapshot.
@@ -63,26 +88,22 @@ pub async fn run_title_enrichment_slice(
     db: &MemoryDB,
     llm: &Arc<dyn LlmProvider>,
 ) -> Result<TitleEnrichmentSliceReport, WenlanError> {
-    const MAX_ATTEMPTS: u32 = 3;
-    let Some(input) = db.get_title_enrichment_candidate(MAX_ATTEMPTS).await? else {
+    let Some(input) = db
+        .get_title_enrichment_candidate(ENRICHMENT_MAX_ATTEMPTS)
+        .await?
+    else {
         return Ok(TitleEnrichmentSliceReport::default());
     };
     let Some(title) = crate::refinery::generate_short_title(llm, &input.content).await else {
-        let attempt = input.prior_attempts.saturating_add(1);
-        let status = if attempt >= MAX_ATTEMPTS {
-            "abandoned"
-        } else {
-            "needs_retry"
-        };
-        let committed = db
-            .record_enrichment_step_at_version(
-                &input.source_id,
-                "title_enrich",
-                status,
-                Some("title generation failed or output was rejected"),
-                input.version,
-            )
-            .await?;
+        let committed = record_stage_failure(
+            db,
+            &input.source_id,
+            "title_enrich",
+            input.prior_attempts,
+            input.version,
+            "title generation failed or output was rejected",
+        )
+        .await?;
         return Ok(TitleEnrichmentSliceReport {
             selected: true,
             committed,
@@ -99,28 +120,6 @@ pub async fn run_title_enrichment_slice(
     })
 }
 
-async fn record_page_growth_failure(
-    db: &MemoryDB,
-    input: &crate::db::PageGrowthInput,
-    error: &str,
-) -> Result<bool, WenlanError> {
-    const MAX_ATTEMPTS: u32 = 3;
-    let attempt = input.prior_attempts.saturating_add(1);
-    let status = if attempt >= MAX_ATTEMPTS {
-        "abandoned"
-    } else {
-        "needs_retry"
-    };
-    db.record_enrichment_step_at_version(
-        &input.source_id,
-        "page_growth",
-        status,
-        Some(error),
-        input.version,
-    )
-    .await
-}
-
 /// Advance one restart-safe Page-growth item. Matching is CPU-only and occurs
 /// before admission to the model. A no-match result is terminal for the
 /// current memory generation; a match gets exactly one model request and a
@@ -132,9 +131,8 @@ pub async fn run_page_growth_slice(
     growth_threshold: f64,
     knowledge_path: Option<&std::path::Path>,
 ) -> Result<PageGrowthSliceReport, WenlanError> {
-    const MAX_ATTEMPTS: u32 = 3;
     let Some(input) = db
-        .get_page_growth_candidate(MAX_ATTEMPTS, crate::db::entity_sweep_enabled())
+        .get_page_growth_candidate(ENRICHMENT_MAX_ATTEMPTS, crate::db::entity_sweep_enabled())
         .await?
     else {
         return Ok(PageGrowthSliceReport::default());
@@ -143,9 +141,15 @@ pub async fn run_page_growth_slice(
     let mem_embedding = match db.generate_embeddings(std::slice::from_ref(&input.content)) {
         Ok(mut embeddings) => embeddings.pop(),
         Err(error) => {
-            let committed =
-                record_page_growth_failure(db, &input, &format!("memory embedding: {error}"))
-                    .await?;
+            let committed = record_stage_failure(
+                db,
+                &input.source_id,
+                "page_growth",
+                input.prior_attempts,
+                input.version,
+                &format!("memory embedding: {error}"),
+            )
+            .await?;
             return Ok(PageGrowthSliceReport {
                 selected: true,
                 committed,
@@ -154,8 +158,15 @@ pub async fn run_page_growth_slice(
         }
     };
     let Some(mem_embedding) = mem_embedding else {
-        let committed =
-            record_page_growth_failure(db, &input, "memory embedding was empty").await?;
+        let committed = record_stage_failure(
+            db,
+            &input.source_id,
+            "page_growth",
+            input.prior_attempts,
+            input.version,
+            "memory embedding was empty",
+        )
+        .await?;
         return Ok(PageGrowthSliceReport {
             selected: true,
             committed,
@@ -228,9 +239,12 @@ pub async fn run_page_growth_slice(
         .last()
         .is_none_or(|source| source.locator != input.source_id)
     {
-        let committed = record_page_growth_failure(
+        let committed = record_stage_failure(
             db,
-            &input,
+            &input.source_id,
+            "page_growth",
+            input.prior_attempts,
+            input.version,
             "triggering memory could not be resolved for citation",
         )
         .await?;
@@ -273,9 +287,15 @@ pub async fn run_page_growth_slice(
     {
         Ok(response) => response,
         Err(error) => {
-            let committed =
-                record_page_growth_failure(db, &input, &format!("page growth LLM: {error}"))
-                    .await?;
+            let committed = record_stage_failure(
+                db,
+                &input.source_id,
+                "page_growth",
+                input.prior_attempts,
+                input.version,
+                &format!("page growth LLM: {error}"),
+            )
+            .await?;
             return Ok(PageGrowthSliceReport {
                 selected: true,
                 matched: true,
@@ -288,8 +308,15 @@ pub async fn run_page_growth_slice(
     let updated = crate::llm_provider::strip_think_tags(&response);
     let updated = updated.trim();
     if updated.is_empty() {
-        let committed =
-            record_page_growth_failure(db, &input, "page growth output was empty").await?;
+        let committed = record_stage_failure(
+            db,
+            &input.source_id,
+            "page_growth",
+            input.prior_attempts,
+            input.version,
+            "page growth output was empty",
+        )
+        .await?;
         return Ok(PageGrowthSliceReport {
             selected: true,
             matched: true,
@@ -303,9 +330,15 @@ pub async fn run_page_growth_slice(
         crate::citations::process_citation_output(updated, &numbered);
     if let Some(threshold) = crate::post_write::merge_shrink_threshold() {
         if !crate::retrieval::integrity::body_shrink_ok(&page.content, &updated_body, threshold) {
-            let committed =
-                record_page_growth_failure(db, &input, "page growth shrink guard rejected output")
-                    .await?;
+            let committed = record_stage_failure(
+                db,
+                &input.source_id,
+                "page_growth",
+                input.prior_attempts,
+                input.version,
+                "page growth shrink guard rejected output",
+            )
+            .await?;
             return Ok(PageGrowthSliceReport {
                 selected: true,
                 matched: true,
@@ -370,47 +403,23 @@ pub async fn run_page_growth_slice(
     })
 }
 
-/// True iff the caller has signalled cancellation. `None` (the default-OFF
-/// path) is never cancelled, so the flag is fully inert unless an operator
-/// opts into `WENLAN_ENABLE_REFLECTION_DEBOUNCE` and a newer same-agent write
-/// supersedes this one mid-burst. Checked only BETWEEN best-effort steps so a
-/// step is never half-applied (clean-boundary cancellation).
-fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
-    cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false)
-}
-
 /// Run post-ingest enrichment (async, non-blocking).
 /// Called after store_memory fast track returns.
-///
-/// `cancel` is an opt-in cooperative-cancellation signal (T22 debounced
-/// reflection). When `Some` and flipped to `true` by a newer same-agent write,
-/// enrichment returns early at the next clean step boundary. `None` (the
-/// default) keeps the path byte-identical to pre-T22 behaviour — every step
-/// runs to completion.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_post_ingest_enrichment(
     db: &MemoryDB,
     source_id: &str,
     content: &str,
     entity_id: Option<&str>,
-    _memory_type: Option<&str>,
     space: Option<&str>,
-    _structured_fields: Option<&str>,
     llm: Option<&Arc<dyn LlmProvider>>,
     prompts: &PromptRegistry,
     tuning: &crate::tuning::RefineryConfig,
     distillation: &crate::tuning::DistillationConfig,
     knowledge_path: Option<&std::path::Path>,
-    cancel: Option<&AtomicBool>,
     precomputed_kg: Option<Vec<crate::extract::KgExtractionResult>>,
 ) -> Result<(), WenlanError> {
     log::info!("[post_ingest] enriching {source_id}");
-
-    // Checkpoint 0: bail before any work if a newer write already superseded us.
-    if is_cancelled(cancel) {
-        log::info!("[post_ingest] {source_id}: cancelled before first step");
-        return Ok(());
-    }
 
     // 1. Entity auto-linking (only if not already linked)
     if entity_id.is_none() {
@@ -436,11 +445,6 @@ pub async fn run_post_ingest_enrichment(
         db.record_enrichment_step(source_id, "entity_link", "skipped", None)
             .await
             .ok();
-    }
-
-    if is_cancelled(cancel) {
-        log::info!("[post_ingest] {source_id}: cancelled after entity_link");
-        return Ok(());
     }
 
     // 2b. Store-time entity extraction with time-windowed batching
@@ -603,16 +607,6 @@ pub async fn run_post_ingest_enrichment(
             .ok();
     }
 
-    if is_cancelled(cancel) {
-        log::info!("[post_ingest] {source_id}: cancelled after entity_extract");
-        return Ok(());
-    }
-
-    if is_cancelled(cancel) {
-        log::info!("[post_ingest] {source_id}: cancelled before title_enrich");
-        return Ok(());
-    }
-
     // 5. Title enrichment — generate short topic title if current title is a truncation
     if let Some(llm_ref) = llm {
         match enrich_title(db, source_id, content, llm_ref, false).await {
@@ -660,11 +654,6 @@ pub async fn run_post_ingest_enrichment(
     // scheduler (BurstEnd trigger) at the natural end of agent work sessions,
     // not on every write. generate_recaps_public remains in refinery's public
     // API for standalone core consumers. See 2026-04-12-event-driven-steep-triggers.
-
-    if is_cancelled(cancel) {
-        log::info!("[post_ingest] {source_id}: cancelled before page_growth");
-        return Ok(());
-    }
 
     // 7. Concept growth — update matching page with new memory
     let projection = knowledge_path.map(|path| {
@@ -861,9 +850,11 @@ pub(crate) async fn grow_page(
         .iter()
         .filter(|e| e.source_kind == "memory")
         .filter_map(|e| e.locator.clone())
+        .filter(|locator| locator != source_id)
         .collect();
+    let mut seen = std::collections::HashSet::new();
+    locators.retain(|locator| seen.insert(locator.clone()));
     locators.push(source_id.to_string());
-    locators.dedup();
     let mems = db.get_memories_by_source_ids(&locators).await?;
     // Resolve each source's typed kind (spec §5.1): the existing evidence is
     // pre-filtered to 'memory', but the newly-triggering `source_id` may be a
@@ -883,8 +874,12 @@ pub(crate) async fn grow_page(
             text: m.content.chars().take(800).collect(),
         })
         .collect();
-    if numbered.is_empty() {
-        // The triggering memory failed to resolve — nothing to cite against.
+    if numbered
+        .last()
+        .is_none_or(|s| s.locator.as_str() != source_id)
+    {
+        // The triggering memory failed to resolve (or the list shifted) —
+        // nothing to cite against.
         return Ok(false);
     }
     let existing_sources = &numbered[..numbered.len() - 1];
@@ -1015,6 +1010,7 @@ async fn write_grown_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     /// Helper to create an in-memory test database.
     async fn test_db() -> (MemoryDB, tempfile::TempDir) {
@@ -1126,15 +1122,12 @@ mod tests {
             "mem_enrich_test",
             "The capital of France is Paris",
             None,
-            Some("fact"),
-            None,
             None,
             None,
             &crate::prompts::PromptRegistry::default(),
             &crate::tuning::RefineryConfig::default(),
             &crate::tuning::DistillationConfig::default(),
             None,
-            None, // cancel — T22, inert
             None, // precomputed_kg
         )
         .await
@@ -1156,15 +1149,12 @@ mod tests {
             "mem_step_record",
             "The capital of France is Paris",
             None,
-            Some("fact"),
-            None,
             None,
             None,
             &crate::prompts::PromptRegistry::default(),
             &crate::tuning::RefineryConfig::default(),
             &crate::tuning::DistillationConfig::default(),
             None,
-            None, // cancel — T22, inert
             None, // precomputed_kg
         )
         .await
@@ -1429,14 +1419,11 @@ mod tests {
             "mem_batch_anchor",
             anchor_content,
             None,
-            Some("fact"),
-            None,
             None,
             Some(&canned),
             &prompts,
             &crate::tuning::RefineryConfig::default(),
             &crate::tuning::DistillationConfig::default(),
-            None,
             None,
             None,
         )
@@ -1476,14 +1463,11 @@ mod tests {
             "mem_batch_anchor",
             anchor_content,
             None,
-            Some("fact"),
-            None,
             None,
             Some(&canned),
             &prompts,
             &crate::tuning::RefineryConfig::default(),
             &crate::tuning::DistillationConfig::default(),
-            None,
             None,
             None,
         )
@@ -1502,216 +1486,6 @@ mod tests {
         );
     }
 
-    // ---- T22: cooperative-cancellation (debounced reflection) ----
-
-    /// Default-OFF guarantee, expressed at the core boundary: passing a cancel
-    /// flag that is `false` must be inert — every enrichment step still runs.
-    #[tokio::test]
-    async fn test_enrichment_runs_all_steps_when_not_cancelled() {
-        let (db, _dir) = test_db().await;
-        let doc = make_doc("mem_t22_inert", "The capital of France is Paris");
-        db.upsert_documents(vec![doc]).await.unwrap();
-
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
-        run_post_ingest_enrichment(
-            &db,
-            "mem_t22_inert",
-            "The capital of France is Paris",
-            None,
-            Some("fact"),
-            None,
-            None,
-            None,
-            &crate::prompts::PromptRegistry::default(),
-            &crate::tuning::RefineryConfig::default(),
-            &crate::tuning::DistillationConfig::default(),
-            None,
-            Some(cancel.as_ref()),
-            None, // precomputed_kg
-        )
-        .await
-        .unwrap();
-
-        let steps = db.get_enrichment_steps("mem_t22_inert").await.unwrap();
-        let names: std::collections::HashSet<&str> =
-            steps.iter().map(|s| s.step.as_str()).collect();
-        // Same step coverage as the no-cancel path (test_enrichment_records_per_step_outcomes).
-        assert!(
-            names.contains("entity_link"),
-            "entity_link must run when cancel=false"
-        );
-        assert!(
-            !names.contains("entity_extract"),
-            "cancel=false must not turn a missing provider into a terminal entity result"
-        );
-        assert!(
-            names.contains("title_enrich"),
-            "title_enrich must run when cancel=false"
-        );
-        assert!(
-            names.contains("page_growth"),
-            "page_growth must run when cancel=false"
-        );
-    }
-
-    /// Cancelled before the first step → return Ok(()) with NO steps written.
-    #[tokio::test]
-    async fn test_enrichment_early_returns_when_cancelled_before_first_step() {
-        let (db, _dir) = test_db().await;
-        let doc = make_doc("mem_t22_precancel", "The capital of France is Paris");
-        db.upsert_documents(vec![doc]).await.unwrap();
-
-        let cancel = std::sync::Arc::new(AtomicBool::new(true));
-        run_post_ingest_enrichment(
-            &db,
-            "mem_t22_precancel",
-            "The capital of France is Paris",
-            None,
-            Some("fact"),
-            None,
-            None,
-            None,
-            &crate::prompts::PromptRegistry::default(),
-            &crate::tuning::RefineryConfig::default(),
-            &crate::tuning::DistillationConfig::default(),
-            None,
-            Some(cancel.as_ref()),
-            None, // precomputed_kg
-        )
-        .await
-        .unwrap();
-
-        let steps = db.get_enrichment_steps("mem_t22_precancel").await.unwrap();
-        assert!(
-            steps.is_empty(),
-            "no enrichment steps must be written when cancelled before the first step, got {steps:?}"
-        );
-    }
-
-    /// Cancel concurrently with enrichment: whatever steps did run must form a
-    /// clean contiguous PREFIX of the canonical step sequence, never a step that
-    /// was half-applied or a later step that ran after an earlier one was
-    /// skipped. This proves the `is_cancelled` checkpoints cut only at clean
-    /// boundaries between whole steps (combined with the cancelled-before-first
-    /// test, which is the empty-prefix case, and the not-cancelled test, which
-    /// is the full-prefix case).
-    ///
-    /// The exact cut point depends on the scheduler race (the no-LLM path is
-    /// fast), so we assert the invariant that must hold for EVERY cut point
-    /// rather than a fixed one. Run on a multi-thread runtime so the flipper and
-    /// the enrichment make progress in parallel.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_enrichment_cancel_midway_preserves_committed_steps() {
-        // Canonical order recorded by the no-LLM path. Entity extraction is
-        // deliberately absent: it remains backlog until a provider exists.
-        const CANON: [&str; 3] = ["entity_link", "title_enrich", "page_growth"];
-
-        let (db, _dir) = test_db().await;
-        let doc = make_doc("mem_t22_midway", "The capital of France is Paris");
-        db.upsert_documents(vec![doc]).await.unwrap();
-        let db = std::sync::Arc::new(db);
-
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
-        let cancel_task = cancel.clone();
-        let db_task = db.clone();
-        let handle = tokio::spawn(async move {
-            run_post_ingest_enrichment(
-                &db_task,
-                "mem_t22_midway",
-                "The capital of France is Paris",
-                None,
-                Some("fact"),
-                None,
-                None,
-                None,
-                &crate::prompts::PromptRegistry::default(),
-                &crate::tuning::RefineryConfig::default(),
-                &crate::tuning::DistillationConfig::default(),
-                None,
-                Some(cancel_task.as_ref()),
-                None, // precomputed_kg
-            )
-            .await
-            .unwrap();
-        });
-
-        // Flip cancel the moment the first step is observed, then let the rest
-        // settle. Bounded spin so a logic bug can't hang the test.
-        for _ in 0..2000 {
-            let steps = db.get_enrichment_steps("mem_t22_midway").await.unwrap();
-            if steps.iter().any(|s| s.step == "entity_link") {
-                cancel.store(true, Ordering::SeqCst);
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        handle.await.unwrap();
-
-        let steps = db.get_enrichment_steps("mem_t22_midway").await.unwrap();
-        let names: std::collections::HashSet<&str> =
-            steps.iter().map(|s| s.step.as_str()).collect();
-
-        // Invariant 1: the recorded steps are exactly the first K of CANON for
-        // some K — a contiguous prefix. No later step ever ran while an earlier
-        // one was skipped (that would mean a checkpoint failed to cut cleanly).
-        let k = CANON.iter().take_while(|s| names.contains(**s)).count();
-        for (i, step) in CANON.iter().enumerate() {
-            let present = names.contains(*step);
-            let expected = i < k;
-            assert_eq!(
-                present, expected,
-                "step {step:?} present={present} but prefix length is {k}: recorded steps must be a contiguous prefix of the canonical order, got {names:?}"
-            );
-        }
-        // Invariant 2: every recorded step is complete (has a non-empty status),
-        // i.e. no step was half-written when cancellation hit.
-        for st in &steps {
-            assert!(
-                !st.status.is_empty(),
-                "step {:?} was recorded without a status — a half-written step",
-                st.step
-            );
-        }
-    }
-
-    /// The memory row stored synchronously before enrichment must remain
-    /// retrievable after a cancelled enrichment — cancellation only delays
-    /// enrichment, it never drops data.
-    #[tokio::test]
-    async fn test_memory_row_intact_after_cancel() {
-        let (db, _dir) = test_db().await;
-        let doc = make_doc("mem_t22_rowintact", "Tokyo is the capital of Japan");
-        db.upsert_documents(vec![doc]).await.unwrap();
-
-        let cancel = std::sync::Arc::new(AtomicBool::new(true));
-        run_post_ingest_enrichment(
-            &db,
-            "mem_t22_rowintact",
-            "Tokyo is the capital of Japan",
-            None,
-            Some("fact"),
-            None,
-            None,
-            None,
-            &crate::prompts::PromptRegistry::default(),
-            &crate::tuning::RefineryConfig::default(),
-            &crate::tuning::DistillationConfig::default(),
-            None,
-            Some(cancel.as_ref()),
-            None, // precomputed_kg
-        )
-        .await
-        .unwrap();
-
-        // Row still present and retrievable despite the cancelled enrichment.
-        let items = db.list_memories(None, None, None, None, 10).await.unwrap();
-        let row = items.iter().find(|i| i.source_id == "mem_t22_rowintact");
-        assert!(
-            row.is_some(),
-            "the stored memory row must survive a cancelled enrichment"
-        );
-    }
-
     #[tokio::test]
     async fn test_enrichment_honesty_end_to_end() {
         let (db, _dir) = test_db().await;
@@ -1724,15 +1498,12 @@ mod tests {
             "mem_honest_a",
             "The Eiffel Tower is in Paris",
             None,
-            Some("fact"),
-            None,
             None,
             None,
             &crate::prompts::PromptRegistry::default(),
             &crate::tuning::RefineryConfig::default(),
             &crate::tuning::DistillationConfig::default(),
             None,
-            None, // cancel — T22, inert
             None, // precomputed_kg
         )
         .await
@@ -1809,14 +1580,11 @@ mod tests {
             "mem_pkg_a",
             "Alice joined Acme",
             None,
-            Some("fact"),
-            None,
             None,
             Some(&canned_a),
             &prompts,
             &crate::tuning::RefineryConfig::default(),
             &crate::tuning::DistillationConfig::default(),
-            None,
             None,
             None, // precomputed_kg = None
         )
@@ -1835,14 +1603,11 @@ mod tests {
             "mem_pkg_b",
             "Alice joined Acme",
             None,
-            Some("fact"),
-            None,
             None,
             Some(&canned_b_no_extract),
             &prompts,
             &crate::tuning::RefineryConfig::default(),
             &crate::tuning::DistillationConfig::default(),
-            None,
             None,
             Some(precomputed), // precomputed_kg = Some(kg)
         )
@@ -2400,14 +2165,11 @@ mod tests {
             source_id,
             content,
             Some(&entity_id),
-            Some("fact"),
             Some("work"),
-            None,
             Some(&stub),
             &crate::prompts::PromptRegistry::default(),
             &crate::tuning::RefineryConfig::default(),
             &distillation,
-            None,
             None,
             None,
         )
@@ -2500,14 +2262,11 @@ mod tests {
             source_id,
             content,
             None,
-            Some("fact"),
             Some("work"),
-            None,
             Some(&stub),
             &crate::prompts::PromptRegistry::default(),
             &tuning,
             &distillation,
-            None,
             None,
             Some(precomputed_kg),
         )

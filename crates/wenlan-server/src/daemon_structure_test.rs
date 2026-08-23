@@ -35,7 +35,6 @@ const MAIN_BASELINE_ORDER: &[&str] = &[
     "let mut deep_bgebase_pending = false",
     "reranker_mode_resolved(",
     "import_legacy_default_once(",
-    "import_legacy_tags(",
     "IngestBatcher::spawn(",
     "maintenance_coordinator.finish_recovery(",
     "let shared: SharedState",
@@ -106,7 +105,6 @@ const STARTUP_CHILD_ORDER: &[&str] = &[
     "let mut deep_bgebase_pending = false",
     "reranker_mode_resolved(",
     "import_legacy_default_once(",
-    "import_legacy_tags(",
     "IngestBatcher::spawn(",
 ];
 

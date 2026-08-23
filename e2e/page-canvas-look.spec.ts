@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import { installTauriMock } from "./tauriMock";
+import { box, openCanvas, seedLargeMap } from "./helpers/pageCanvas";
 
 /**
  * The canvas's control surface in every state, both themes, photographed to
@@ -12,47 +13,6 @@ import { installTauriMock } from "./tauriMock";
  * the real font, still land clear of each other.
  */
 const THEMES = ["light", "dark"] as const;
-
-async function openCanvas(page: Page): Promise<void> {
-  await page.goto("/");
-  await page
-    .getByRole("navigation", { name: "Primary navigation" })
-    .getByRole("button", { name: "Wiki", exact: true })
-    .click();
-  await page.getByRole("button", { name: "Open Fixture architecture" }).click();
-  await page.getByRole("button", { name: "Canvas" }).click();
-  await expect(page.getByRole("region", { name: "Canvas for Fixture architecture" })).toBeVisible();
-}
-
-function box(page: Page, label: string) {
-  return page.locator(".react-flow__node").filter({ hasText: label }).first();
-}
-
-/**
- * A map the size a real page grows to. Four boxes cannot show whether a radial
- * layout is a mind map or a flowchart, so seed the mock straight through its own
- * command surface before the canvas ever asks for it.
- */
-async function seedLargeMap(page: Page): Promise<void> {
-  await page.evaluate(async () => {
-    const add = async (parent: string, label: string): Promise<string> => {
-      const result = (await window.__wenlanTauriInvoke("create_page_map_node", {
-        pageId: "page-architecture",
-        body: { parent_id: parent, label, ref_kind: "section", ref_id: label },
-      })) as { node: { id: string } };
-      return result.node.id;
-    };
-    const ingest = await add("n_root", "Ingest pipeline");
-    await add(ingest, "Chunking");
-    await add(ingest, "Embedding queue");
-    const api = await add("n_root", "HTTP surface");
-    await add(api, "Auth");
-    await add(api, "Rate limits");
-    await add("n_root", "Observability");
-    await add("n_query", "Reranking");
-    await add("n_query", "Filters");
-  });
-}
 
 for (const theme of THEMES) {
   test.describe(`canvas look — ${theme}`, () => {

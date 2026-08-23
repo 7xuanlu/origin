@@ -89,6 +89,14 @@ wenlan background off
 wenlan restart
 ```
 
+### `wenlan restart`
+
+Restart the Wenlan background process. Required after an update.
+
+```bash
+wenlan restart
+```
+
 ### `wenlan enrichment <status|configure|disable>`
 
 Models and provider keys are capability only; they do not authorize automatic
@@ -167,11 +175,19 @@ wenlan search "rust" --format json | jq '.results[].score'
 
 ### `wenlan recall <query>`
 
-Get the working memory bundle for a query (pages + decisions + relevant memories + graph context).
+Search memories and return a ranked list plus optional supplemental pages (`POST /api/memory/search`).
 
 ```bash
 wenlan recall "what we agreed on for the API"
 wenlan recall "memory layer" --format json
+```
+
+### `wenlan brief`
+
+Read the current Space Brief, optionally with related context.
+
+```bash
+wenlan brief
 ```
 
 ### `wenlan capture [text] [--file <path>] [--type <type>]`
@@ -180,8 +196,8 @@ Store a memory. Provide content positionally, via `--file`, or pipe via stdin.
 
 ```bash
 wenlan capture "remember this insight" --type fact
-wenlan capture --file notes.md --type page
-echo "stdin pipe content" | wenlan capture --type quick_thought
+wenlan capture --file notes.md --type decision
+echo "stdin pipe content" | wenlan capture --type lesson
 ```
 
 ### `wenlan memories [--limit N] [--type X] [--pending]`
@@ -193,6 +209,15 @@ wenlan memories
 wenlan memories --limit 5
 wenlan memories --type fact --format json
 wenlan memories --pending
+```
+
+### `wenlan pages [query]`
+
+Browse distilled pages, or open one in your editor by title query.
+
+```bash
+wenlan pages
+wenlan pages "project roadmap"
 ```
 
 ### `wenlan agents list/show/edit`
@@ -217,6 +242,14 @@ wenlan spaces default work
 wenlan spaces move scratch career
 ```
 
+### `wenlan curate`
+
+Walk pending revisions (conflicts / merges) awaiting your accept or dismiss.
+
+```bash
+wenlan curate
+```
+
 ### `wenlan sources add <path>`
 
 Register or resync a file or folder source.
@@ -224,6 +257,23 @@ Register or resync a file or folder source.
 ```bash
 wenlan sources add ~/Notes
 wenlan sources add ~/Notes/project.md
+```
+
+### `wenlan outbox <status|drain>`
+
+Inspect or drain writes queued while the daemon was unreachable.
+
+```bash
+wenlan outbox status
+wenlan outbox drain
+```
+
+### `wenlan lint`
+
+Check memory, Pages, runtime, and operation health through the daemon.
+
+```bash
+wenlan lint
 ```
 
 ## Output formats

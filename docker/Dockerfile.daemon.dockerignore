@@ -18,7 +18,6 @@ docs/
 # Node + plugin tooling (not needed by daemon build)
 node_modules/
 plugin/
-homebrew/
 
 # Editor / OS junk
 .vscode/

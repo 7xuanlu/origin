@@ -29,10 +29,11 @@ pub async fn guard_local_only(req: Request, next: Next) -> Result<Response, Stat
         }
     }
 
-    // DNS-rebinding defense applies only to the default loopback bind. When the
-    // operator sets WENLAN_BIND_ADDR (Docker/LAN), the Host is legitimately
-    // non-loopback and access control is their responsibility.
-    if wenlan_core::env_compat::var_compat("WENLAN_BIND_ADDR").is_none() {
+    // DNS-rebinding defense applies unless the operator deliberately bound the
+    // daemon to a routable address (Docker/LAN), where the Host is legitimately
+    // non-loopback and access control is their responsibility. A loopback bind
+    // — and a bind value we cannot parse — keeps the check on.
+    if bind_scope_from_env() != BindScope::External {
         if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
             if !host_is_local(host) {
                 return Err(StatusCode::FORBIDDEN);
@@ -41,6 +42,62 @@ pub async fn guard_local_only(req: Request, next: Next) -> Result<Response, Stat
     }
 
     Ok(next.run(req).await)
+}
+
+/// How the operator's `WENLAN_BIND_ADDR` value classifies for the two security
+/// checks that key off it: this module's DNS-rebinding Host guard and the lint
+/// external-egress gate (`lint_routes.rs`). Both treat an unparseable value
+/// conservatively — it is neither a trusted loopback bind nor a deliberate
+/// exposure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindScope {
+    /// Unset — the daemon uses its default loopback bind.
+    Unset,
+    /// Set to a loopback address.
+    Loopback,
+    /// A routable address or a hostname: deliberately exposed.
+    External,
+    /// Set, but not `host:port`.
+    Unparseable,
+}
+
+pub(crate) fn bind_scope_from_env() -> BindScope {
+    bind_scope(wenlan_core::env_compat::var_compat("WENLAN_BIND_ADDR"))
+}
+
+pub(crate) fn bind_scope(bind: Option<std::ffi::OsString>) -> BindScope {
+    let Some(bind) = bind else {
+        return BindScope::Unset;
+    };
+    let Ok(bind) = bind.into_string() else {
+        return BindScope::Unparseable;
+    };
+    if let Ok(address) = bind.parse::<std::net::SocketAddr>() {
+        return if address.ip().is_loopback() {
+            BindScope::Loopback
+        } else {
+            BindScope::External
+        };
+    }
+    // Not a `SocketAddr` literal (e.g. a hostname, which `SocketAddr::parse`
+    // cannot resolve). `TcpListener::bind` resolves hostnames at bind time
+    // (main.rs), so `host:port` with a real hostname is a valid, deliberate
+    // exposure (Docker/LAN) — fall back to splitting it ourselves.
+    let Some((host, port)) = bind.rsplit_once(':') else {
+        return BindScope::Unparseable;
+    };
+    if host.is_empty() || port.parse::<u16>().is_err() {
+        return BindScope::Unparseable;
+    }
+    if host == "localhost" {
+        return BindScope::Loopback;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_loopback() => BindScope::Loopback,
+        Ok(_) => BindScope::External,
+        // A hostname we can't resolve here still resolves for `TcpListener::bind`.
+        Err(_) => BindScope::External,
+    }
 }
 
 /// True for `localhost` / `127.0.0.1` / `::1`, with or without a `:port`.
@@ -118,6 +175,42 @@ mod tests {
     fn origin_cross_site_and_null_rejected() {
         for o in ["https://evil.com", "http://attacker.test:1420", "null"] {
             assert!(!origin_is_local(o), "expected rejected origin: {o}");
+        }
+    }
+
+    /// The Host (DNS-rebinding) check is skipped ONLY for a bind value that
+    /// resolves to a routable address or a hostname (`TcpListener::bind`
+    /// resolves both). A loopback bind — or a value we cannot parse at all —
+    /// must keep the check on, because merely setting the variable is not
+    /// evidence the daemon was deliberately exposed.
+    #[test]
+    fn bind_scope_classifies_host_check_exemption() {
+        for (bind, expected) in [
+            (None, BindScope::Unset),
+            (Some("127.0.0.1:7878"), BindScope::Loopback),
+            (Some("[::1]:7878"), BindScope::Loopback),
+            (Some("0.0.0.0:7878"), BindScope::External),
+            (Some("192.168.1.5:7878"), BindScope::External),
+            (Some("not-a-socket"), BindScope::Unparseable),
+            (Some(""), BindScope::Unparseable),
+            (Some("localhost:7878"), BindScope::Loopback),
+            (Some("wenlan:7878"), BindScope::External),
+            (Some("10.0.0.5:7878"), BindScope::External),
+            (Some("myhost"), BindScope::Unparseable),
+        ] {
+            let scope = bind_scope(bind.map(Into::into));
+            assert_eq!(scope, expected, "bind={bind:?}");
+            assert_eq!(
+                scope == BindScope::External,
+                matches!(
+                    bind,
+                    Some("0.0.0.0:7878")
+                        | Some("192.168.1.5:7878")
+                        | Some("wenlan:7878")
+                        | Some("10.0.0.5:7878")
+                ),
+                "only a routable bind or hostname may skip the Host check: bind={bind:?}"
+            );
         }
     }
 }

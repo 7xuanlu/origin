@@ -38,8 +38,8 @@ cargo build --release -p wenlan -p wenlan-server
 ### Running Tests
 
 ```bash
-# Workspace tests
-cargo test --workspace
+# Workspace tests (excludes wenlan-app; see Architecture Overview)
+cargo test --workspace --exclude wenlan-app
 
 # Per-crate
 cargo test -p wenlan-types
@@ -52,7 +52,7 @@ cargo test -p wenlan
 
 ```bash
 cargo fmt --check --all
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --exclude wenlan-app --all-targets -- -D warnings
 ```
 
 ## Architecture Overview
@@ -65,7 +65,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 - **Desktop app**: `wenlan-app` in `app/` (AGPL-3.0-only). Tauri + React; folded into this monorepo on 2026-07-20.
 - **Database**: libSQL (vectors + knowledge graph + FTS).
 
-See `CLAUDE.md` for a full module-by-module breakdown.
+See `crates/wenlan-core/REFERENCE.md` and `crates/wenlan-server/REFERENCE.md` for the module-by-module breakdown.
 
 ## Finding Work
 
@@ -78,11 +78,11 @@ Look for issues labeled [`good first issue`](https://github.com/7xuanlu/wenlan/l
 3. Ensure all tests pass and linting is clean
 4. Open a PR using the template, describing what changed and how to test it
 
-CI runs `cargo fmt --check --all`, `cargo clippy --workspace --all-targets`, and `cargo test` across all daemon crates.
+CI runs `cargo fmt --check --all`, `cargo clippy --workspace --exclude wenlan-app --all-targets -- -D warnings`, and cargo-nextest slices across the daemon crates. The `wenlan-app` desktop crate is checked separately, after sidecar binaries are staged.
 
 ## Code Conventions
 
-These conventions keep the codebase consistent. See `CLAUDE.md` for the full list.
+These conventions keep the codebase consistent.
 
 - **SQL safety**: Always use parameterized queries. Never interpolate user input into SQL strings.
 - **NULL semantics**: Store `Option<T>` as SQL NULL, not empty string

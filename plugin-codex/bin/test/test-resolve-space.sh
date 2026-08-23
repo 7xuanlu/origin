@@ -86,7 +86,12 @@ mkdir -p "$unknown_repo"
 git -C "$unknown_repo" init -q
 out="$(SPACES_FILE=/does/not/exist WENLAN_BIN="$fake_bin/wenlan" WENLAN_SPACE='' \
     WENLAN_DEFAULT_SPACE='' "$RESOLVER" --cwd "$unknown_repo" 2>/dev/null)"
-assert_eq 'unregistered repo basename is skipped' $'\tunscoped' "$out"
+assert_eq 'unregistered repo basename is skipped without the flag' $'\tunscoped' "$out"
+
+out="$(SPACES_FILE=/does/not/exist WENLAN_BIN="$fake_bin/wenlan" WENLAN_SPACE='' \
+    WENLAN_DEFAULT_SPACE='' "$RESOLVER" --cwd "$unknown_repo" --new-repo-fallback 2>/dev/null)"
+assert_eq 'unregistered repo basename falls back with --new-repo-fallback' \
+    'unregistered-repo	cwd-repo-new' "$out"
 
 space_repo="$tmpbase/My Project"
 mkdir -p "$space_repo"

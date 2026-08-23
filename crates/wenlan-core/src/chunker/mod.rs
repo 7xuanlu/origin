@@ -111,29 +111,6 @@ impl ChunkingEngine {
             ContentType::PlainText => "text",
         };
 
-        // Screen captures: LLM-formatted uses markdown strategy (has ### headers),
-        // raw screen captures use per-window chunking (each ## section = 1 chunk).
-        let is_llm_formatted = metadata.get("llm_formatted").is_some_and(|v| v == "true");
-        let is_screen = metadata.get("screen_capture").is_some_and(|v| v == "true")
-            || file_path.starts_with("screen_");
-        let is_raw_screen = is_screen && !is_llm_formatted;
-
-        if is_raw_screen {
-            let context = ChunkContext {
-                content,
-                title,
-                file_path,
-                metadata,
-            };
-            return split_window_chunks(context);
-        }
-
-        let strategy_name = if is_llm_formatted {
-            "markdown"
-        } else {
-            strategy_name
-        };
-
         let context = ChunkContext {
             content,
             title,
@@ -146,58 +123,6 @@ impl ChunkingEngine {
             .expect("Strategy should exist")
             .chunk(context)
     }
-}
-
-/// Split screen capture content into per-window chunks.
-/// Each `## ` section becomes exactly one chunk — no subdivision.
-/// Pass 1 prioritizes 1-window-per-chunk; the LLM pass will re-chunk later.
-fn split_window_chunks(context: ChunkContext) -> Vec<ChunkInfo> {
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut byte_offset: usize = 0;
-
-    for line in context.content.lines() {
-        if line.starts_with("## ") && !current.is_empty() {
-            let trimmed = current.trim();
-            if !trimmed.is_empty() {
-                chunks.push(ChunkInfo {
-                    content: trimmed.to_string(),
-                    chunk_type: "markdown".to_string(),
-                    language: None,
-                    byte_range: Some((byte_offset, byte_offset + current.len())),
-                    semantic_unit: Some("window".to_string()),
-                });
-            }
-            byte_offset += current.len() + 1;
-            current.clear();
-        }
-        if !current.is_empty() {
-            current.push('\n');
-        }
-        current.push_str(line);
-    }
-    // Flush last section
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        chunks.push(ChunkInfo {
-            content: trimmed.to_string(),
-            chunk_type: "markdown".to_string(),
-            language: None,
-            byte_range: Some((byte_offset, byte_offset + current.len())),
-            semantic_unit: Some("window".to_string()),
-        });
-    }
-    // Fallback: if no ## headers were found, emit the whole content as one chunk
-    if chunks.is_empty() && !context.content.trim().is_empty() {
-        chunks.push(ChunkInfo {
-            content: context.content.trim().to_string(),
-            chunk_type: "markdown".to_string(),
-            language: None,
-            byte_range: Some((0, context.content.len())),
-            semantic_unit: Some("window".to_string()),
-        });
-    }
-    chunks
 }
 
 impl Default for ChunkingEngine {
@@ -250,24 +175,6 @@ mod tests {
     }
 
     #[test]
-    fn test_llm_formatted_uses_markdown_strategy() {
-        let engine = ChunkingEngine::new();
-        let mut metadata = HashMap::new();
-        metadata.insert("llm_formatted".to_string(), "true".to_string());
-
-        // source_id with no extension would normally route to "text"
-        let chunks = engine.chunk(
-            "# Screen Capture\n\nSome formatted content\n\n## Section Two\n\nMore content here",
-            "Test",
-            "screen_sustained_focus_abc123",
-            &metadata,
-        );
-
-        assert!(!chunks.is_empty());
-        assert_eq!(chunks[0].chunk_type, "markdown");
-    }
-
-    #[test]
     fn test_non_screen_stays_text() {
         let engine = ChunkingEngine::new();
         let metadata = HashMap::new();
@@ -276,71 +183,5 @@ mod tests {
 
         assert!(!chunks.is_empty());
         assert_eq!(chunks[0].chunk_type, "text");
-    }
-
-    #[test]
-    fn test_raw_screen_capture_per_window_chunking() {
-        let engine = ChunkingEngine::new();
-        let mut metadata = HashMap::new();
-        metadata.insert("screen_capture".to_string(), "true".to_string());
-
-        // 3 windows — should produce 3 chunks (one per window)
-        let content = "## VS Code — main.rs\nfn main() { println!(\"hello\"); }\n\n## Chrome — Google\nSearch results for Rust\n\n## Finder — Documents\nfile1.txt file2.txt";
-        let chunks = engine.chunk(content, "Test", "ctx_1740000000", &metadata);
-
-        assert_eq!(
-            chunks.len(),
-            3,
-            "Expected 1 chunk per window, got {}",
-            chunks.len()
-        );
-        assert!(chunks[0].content.contains("VS Code"));
-        assert!(chunks[1].content.contains("Chrome"));
-        assert!(chunks[2].content.contains("Finder"));
-        assert_eq!(chunks[0].semantic_unit, Some("window".to_string()));
-    }
-
-    #[test]
-    fn test_raw_screen_capture_single_window() {
-        let engine = ChunkingEngine::new();
-        let mut metadata = HashMap::new();
-        metadata.insert("screen_capture".to_string(), "true".to_string());
-
-        let content = "## VS Code — main.rs\nfn main() {}";
-        let chunks = engine.chunk(content, "Test", "ctx_1740000000", &metadata);
-
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].content.contains("VS Code"));
-    }
-
-    #[test]
-    fn test_raw_screen_no_headers_fallback() {
-        let engine = ChunkingEngine::new();
-        let mut metadata = HashMap::new();
-        metadata.insert("screen_capture".to_string(), "true".to_string());
-
-        let content = "Just some plain text without any headers";
-        let chunks = engine.chunk(content, "Test", "ctx_1740000000", &metadata);
-
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].content, content);
-    }
-
-    #[test]
-    fn test_screen_source_id_uses_window_chunking() {
-        let engine = ChunkingEngine::new();
-        let metadata = HashMap::new();
-
-        // Raw screen capture (no llm_formatted) with screen_ prefix → per-window chunks
-        let chunks = engine.chunk(
-            "## App Title\nSome OCR content from the screen capture that was structured.",
-            "Test",
-            "screen_sustained_focus_abc123",
-            &metadata,
-        );
-
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].chunk_type, "markdown");
-        assert_eq!(chunks[0].semantic_unit, Some("window".to_string()));
     }
 }

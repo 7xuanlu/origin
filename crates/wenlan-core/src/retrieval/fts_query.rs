@@ -62,7 +62,8 @@ pub fn fts_recall_hardening_enabled() -> bool {
 /// Safe tokens are emitted as-is. Tokens are joined with a single space,
 /// preserving the implicit AND-matching default.
 ///
-/// Iterates via `chars()` — never byte-slices — for UTF-8 safety per AGENTS.md.
+/// Iterates via `chars()` — never byte-slices — for UTF-8 safety per
+/// CONTRIBUTING.md "Code Conventions".
 pub fn sanitize_fts_query(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();

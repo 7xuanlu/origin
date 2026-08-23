@@ -32,6 +32,15 @@ fn port_range_start() -> u16 {
 // strategy.
 const RELAY_URL: &str = "https://origin-relay.originmemory.workers.dev";
 
+/// Timeouts for the relay registration POST. Same reasoning as
+/// `app/src/api.rs`'s `build_http_client`: reqwest's default client has no
+/// timeouts at all, and a black-holing relay host (captive-portal wifi, a
+/// Worker outage, a corporate proxy) would otherwise leave Remote Access on
+/// "Starting" until the user toggles it off. The total is short because
+/// registration is optional — the tunnel URL works without it.
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Get or create a persistent relay user ID.
 /// Stored in ~/.config/wenlan-mcp/relay_id
 fn get_or_create_relay_id() -> Result<String, String> {
@@ -88,7 +97,19 @@ async fn register_with_relay(tunnel_url: &str) -> Option<String> {
         "secret": &relay_id, // simple shared secret
     });
 
-    match reqwest::Client::new()
+    let client = match reqwest::Client::builder()
+        .connect_timeout(RELAY_CONNECT_TIMEOUT)
+        .timeout(RELAY_REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            log::warn!("[remote-access] Relay HTTP client build failed: {}", e);
+            return None;
+        }
+    };
+
+    match client
         .post(format!("{}/register", RELAY_URL))
         .json(&body)
         .send()
@@ -1523,9 +1544,15 @@ async fn start_tunnel(
     ),
     String,
 > {
-    // 0. Clean up any orphaned MCP processes from previous app sessions
-    cleanup_orphaned_mcp();
-    cleanup_owned_cloudflared(None);
+    // 0. Clean up any orphaned MCP processes from previous app sessions.
+    // On a blocking thread: the sweep spawns `lsof`/`ps`/`kill` per port and
+    // sleeps synchronously, which would park a tokio worker for ~half a second
+    // and stall every other Tauri command scheduled onto it.
+    let _ = tokio::task::spawn_blocking(|| {
+        cleanup_orphaned_mcp();
+        cleanup_owned_cloudflared(None);
+    })
+    .await;
     if !remote_generation_is_current(app_handle, generation).await {
         return Err("Remote access start cancelled.".to_string());
     }
@@ -1713,13 +1740,21 @@ async fn transition_off(
         let _ = child.kill();
     }
 
-    // Sweep for any orphaned processes the handles didn't cover
-    cleanup_orphaned_mcp();
-    cleanup_owned_cloudflared(None);
-
     let _ = app_handle.emit("remote-access-status", &RemoteAccessStatus::Off);
     drop(ra);
     drop(app_state);
+
+    // Sweep for any orphaned processes the handles didn't cover. Deliberately
+    // after the guards are dropped and on a blocking thread — it spawns
+    // `lsof`/`ps`/`kill` and sleeps synchronously, so running it above would
+    // park a tokio worker for ~half a second while still holding the AppState
+    // read guard and the remote-access mutex.
+    let _ = tokio::task::spawn_blocking(|| {
+        cleanup_orphaned_mcp();
+        cleanup_owned_cloudflared(None);
+    })
+    .await;
+
     Some(generation)
 }
 

@@ -291,6 +291,19 @@ async fn memory_core_routes_preserve_typed_contracts() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(confirmed.confirmed);
+    assert!(confirmed.updated, "a seeded id must report a touched row");
+
+    // An unknown id must not report success: the UPDATE matches nothing.
+    let (status, missing_confirm): (StatusCode, ErrorEnvelope) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/confirm/no-such-memory",
+        Some(r#"{"confirmed":true}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing_confirm.error, "memory no-such-memory");
 
     let (status, listed): (StatusCode, ListMemoriesResponse) = request_typed(
         &router,

@@ -2,10 +2,11 @@ use crate::client::{WenlanClient, WenlanError};
 use crate::types::*;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
+    handler::server::tool::ToolCallContext,
     handler::server::wrapper::Parameters,
     model::{
-        CallToolResult, Content, Implementation, InitializeResult, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, Tool,
+        CallToolRequestParams, CallToolResult, Content, Implementation, InitializeResult,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, Tool,
     },
     service::{NotificationContext, RequestContext, RoleServer},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
@@ -350,7 +351,6 @@ fn add_repair_plan_source_reports(
 
 #[derive(Clone)]
 pub struct WenlanMcpServer {
-    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
     client: WenlanClient,
     transport: TransportMode,
@@ -408,7 +408,7 @@ pub struct RecallParams {
     )]
     pub query: String,
     #[schemars(
-        description = "Max memory results (distilled pages are returned separately), default 10. Use 3-5 for quick lookups, 10-20 for exploration."
+        description = "Max memory results (distilled pages are returned separately), default 10, capped at 100. Use 3-5 for quick lookups, 10-20 for exploration."
     )]
     #[serde(default, deserialize_with = "deserialize_optional_usize_lenient")]
     pub limit: Option<usize>,
@@ -1111,7 +1111,10 @@ impl WenlanMcpServer {
         let space_arg = effective_space(&params.space);
         let req = SearchMemoryRequest {
             query: params.query,
-            limit: params.limit.unwrap_or(10),
+            // Clamp: an unbounded caller-supplied limit either trips the MCP
+            // client's 8MB response cap (client.rs MAX_RESPONSE_BYTES) as an
+            // opaque transport error, or floods the agent's context window.
+            limit: params.limit.unwrap_or(10).clamp(1, 100),
             memory_type: params.memory_type,
             space: space_arg,
             source_agent: self.resolve_source_agent(None),
@@ -1674,13 +1677,19 @@ impl WenlanMcpServer {
         let path = format!("/api/memory/confirm/{}", memory_id);
         match self
             .client
-            .post::<serde_json::Value, serde_json::Value>(&path, &serde_json::json!({}))
+            .post::<serde_json::Value, ConfirmResponse>(&path, &serde_json::json!({}))
             .await
         {
-            Ok(_) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Memory {} confirmed.",
-                memory_id
-            ))])),
+            // The daemon 404s an unknown id, but an older daemon returns 200
+            // without `updated`, which defaults to `true` so that response
+            // still reads as success (mirrors forget_impl's flag branch).
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
+                if resp.updated {
+                    format!("Memory {} confirmed.", memory_id)
+                } else {
+                    format!("Memory {} not found.", memory_id)
+                },
+            )])),
             Err(e) => Ok(tool_error(e, "confirm_memory")),
         }
     }
@@ -2736,12 +2745,46 @@ impl WenlanMcpServer {
         }
         tools
     }
+
+    /// Refuse a `LOCAL_ONLY_TOOL_NAMES` tool reaching this server over HTTP.
+    /// Unlike `visible_tools()`, which only hides the name from `list_tools`,
+    /// this is consulted by `call_tool` before dispatch, so a name added to
+    /// `LOCAL_ONLY_TOOL_NAMES` without a matching inline guard is still refused
+    /// rather than merely unlisted.
+    fn local_only_refusal(&self, name: &str) -> Option<CallToolResult> {
+        (self.transport == TransportMode::Http && LOCAL_ONLY_TOOL_NAMES.contains(&name)).then(
+            || {
+                CallToolResult::error(vec![Content::text(
+                    "This tool is not available over remote connections. Use local stdio MCP on the machine running Wenlan."
+                        .to_string(),
+                )])
+            },
+        )
+    }
 }
 
 // ===== ServerHandler =====
 
 #[tool_handler]
 impl ServerHandler for WenlanMcpServer {
+    // Overrides the `#[tool_handler]`-generated `call_tool` (which dispatches
+    // purely by name via `self.tool_router`) so a `LOCAL_ONLY_TOOL_NAMES` tool
+    // is refused before dispatch even if the caller never saw it in
+    // `list_tools`. Keep the belt-and-braces inline guards in each `*_impl`
+    // for now (removing them requires rewriting the tests that call `*_impl`
+    // directly, tools.rs:4405 et al.).
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(refusal) = self.local_only_refusal(request.name.as_ref()) {
+            return Ok(refusal);
+        }
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -2993,6 +3036,53 @@ mod tests {
             }
             other => panic!("unexpected tool error content: {other:?}"),
         }
+    }
+
+    // ===== call_tool boundary: every LOCAL_ONLY_TOOL_NAMES entry is refused =====
+    //
+    // Table test for the hole the finder flagged: LOCAL_ONLY_TOOL_NAMES only fed
+    // `visible_tools()` (hiding from `list_tools`), so a name added there without
+    // a matching hand-rolled `if` guard in its handler stayed fully callable over
+    // HTTP. `local_only_refusal` is now the single source of truth `call_tool`
+    // consults before dispatch; this asserts every declared name is actually
+    // covered, not just the ones someone remembered to guard by hand.
+
+    #[test]
+    fn local_only_refusal_covers_every_declared_name_over_http() {
+        let server = make_server(TransportMode::Http, "agent", None);
+        for name in LOCAL_ONLY_TOOL_NAMES {
+            let result = server
+                .local_only_refusal(name)
+                .unwrap_or_else(|| panic!("expected {name} to be refused over HTTP"));
+            let content = &result.content[0];
+            match content.raw {
+                rmcp::model::RawContent::Text(ref tc) => {
+                    assert!(
+                        tc.text.contains("not available over remote connections"),
+                        "refusal for {name} missing the standard message: {}",
+                        tc.text
+                    );
+                }
+                _ => panic!("expected text content for {name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn local_only_refusal_allows_every_declared_name_over_stdio() {
+        let server = make_server(TransportMode::Stdio, "agent", None);
+        for name in LOCAL_ONLY_TOOL_NAMES {
+            assert!(
+                server.local_only_refusal(name).is_none(),
+                "{name} should not be refused over stdio"
+            );
+        }
+    }
+
+    #[test]
+    fn local_only_refusal_ignores_unlisted_name_over_http() {
+        let server = make_server(TransportMode::Http, "agent", None);
+        assert!(server.local_only_refusal("recall").is_none());
     }
 
     // ===== Transport resolution (existing) =====

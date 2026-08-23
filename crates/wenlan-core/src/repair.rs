@@ -1394,11 +1394,12 @@ struct ResolvedTarget {
     evidence_id: LintDigest,
 }
 
-pub fn semantic_record_digest(kind: &str, durable_id: &str) -> LintDigest {
+fn semantic_record_digest(kind: &str, durable_id: &str) -> LintDigest {
     crate::lint::semantic_record_digest(kind, durable_id)
 }
 
-pub async fn prepare_memory_reclassification(
+#[cfg(test)]
+pub(crate) async fn prepare_memory_reclassification(
     db: &MemoryDB,
     store: &RepairArtifactStore,
     request: PrepareRepairRequest,
@@ -2088,7 +2089,8 @@ pub(crate) async fn validate_tag_record_set_on_connection(
     Ok(())
 }
 
-pub async fn apply_repair(
+#[cfg(test)]
+pub(crate) async fn apply_repair(
     db: &MemoryDB,
     store: &RepairArtifactStore,
     request: ApplyRepairRequest,

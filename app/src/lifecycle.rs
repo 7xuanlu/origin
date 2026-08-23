@@ -420,17 +420,29 @@ fn service_cli_path() -> Result<PathBuf> {
     service_cli_path_for_app_exe(&current_app_path()?)
 }
 
-fn run_service_cli(subcommand: &str) -> Result<()> {
+/// Argv the app hands the bundled `wenlan` CLI to register and start the
+/// daemon LaunchAgent. Must stay in step with `BackgroundCommand::On` in
+/// `crates/wenlan-cli/src/main.rs`, which maps to `service::install()`.
+///
+/// Limit worth knowing: this cannot be type-checked against the CLI's clap
+/// definition from here — `Cli`/`Commands` live in the CLI's `main.rs`, not
+/// its library target, and the app crate does not depend on wenlan-cli. The
+/// other half of the guard is `crates/wenlan-cli/tests/cli_integration.rs`,
+/// which exercises `["background", "on"]` end to end and asserts the removed
+/// `install`/`uninstall` verbs are gone.
+const SERVICE_CLI_BACKGROUND_ON: [&str; 2] = ["background", "on"];
+
+fn run_service_cli(args: &[&str]) -> Result<()> {
     let bin = service_cli_path()?;
     let (data_dir_env, data_dir) = crate::identity_paths::sidecar_data_dir_env();
     let out = Command::new(&bin)
         .env(data_dir_env, &data_dir)
-        .arg(subcommand)
+        .args(args)
         .output()?;
     if !out.status.success() {
         anyhow::bail!(
             "wenlan {} failed: {}",
-            subcommand,
+            args.join(" "),
             String::from_utf8_lossy(&out.stderr)
         );
     }
@@ -544,25 +556,74 @@ pub fn prepare_server_plist_for_startup(launchctl: &dyn LaunchctlExec) -> Result
     ensure_server_plist_data_dir_env(launchctl)
 }
 
-/// Run `wenlan install`. Resolves the CLI binary alongside our exe; the CLI
-/// owns service-manager integration and expects `wenlan-server` next to it.
+/// Run `wenlan background on`. Resolves the CLI binary alongside our exe; the
+/// CLI owns service-manager integration and expects `wenlan-server` next to it.
 pub fn install_server_plist_via_subprocess(launchctl: &dyn LaunchctlExec) -> Result<()> {
-    run_service_cli("install")?;
+    run_service_cli(&SERVICE_CLI_BACKGROUND_ON)?;
     ensure_server_plist_data_dir_env(launchctl)
 }
 
-pub fn uninstall_server_plist_via_subprocess() -> Result<()> {
-    if !server_plist_path().map(|p| p.exists()).unwrap_or(false) {
+/// Unload `plist`; if launchctl refuses, succeed only when `label` is no
+/// longer loaded, otherwise return an error so the caller keeps the plist
+/// file.
+fn unload_plist_or_verify_absent(
+    launchctl: &dyn LaunchctlExec,
+    plist: &Path,
+    label: &str,
+) -> Result<()> {
+    let plist_arg = plist.to_string_lossy().to_string();
+    let failure = match launchctl.run(&["unload", &plist_arg]) {
+        Ok(out) if out.status.success() => return Ok(()),
+        Ok(out) => String::from_utf8_lossy(&out.stderr).to_string(),
+        Err(e) => e.to_string(),
+    };
+    if label_is_loaded(launchctl, label) {
+        anyhow::bail!("launchctl unload failed for {label}: {failure}");
+    }
+    log::warn!(
+        "[lifecycle] launchctl unload failed for {label} but it is not loaded (stale plist?): {failure}"
+    );
+    Ok(())
+}
+
+/// Deregister the server LaunchAgent: unload it, then delete its plist.
+///
+/// Done in-process rather than through the CLI, because the CLI has no
+/// deregister verb. `wenlan background off` is a reversible runtime stop that
+/// deliberately keeps the launchd registration, so it would leave the plist's
+/// `RunAtLoad true` respawn in place — breaking both the Quit invariant below
+/// ("both plists unloaded … no auto-restart on reboot") and the Run-at-Login
+/// toggle, whose state `is_run_at_login_enabled` reads back out of launchctl.
+/// Unlike `cleanup_legacy_server_plist`, this is strict on purpose: the
+/// server LaunchAgent has `KeepAlive`/`RunAtLoad`, so deleting the plist
+/// while the job is still loaded would leave it running with no
+/// registration left to unload later.
+pub fn uninstall_server_plist(launchctl: &dyn LaunchctlExec) -> Result<()> {
+    let plist = server_plist_path()?;
+    if !plist.exists() {
         return Ok(());
     }
-    run_service_cli("uninstall")
+    unload_plist_or_verify_absent(launchctl, &plist, SERVER_PLIST_LABEL)?;
+    std::fs::remove_file(&plist)?;
+    Ok(())
+}
+
+/// True iff `label` appears as the exact third (`Label`) field of some
+/// `launchctl list` line. `launchctl list` output is `PID\tStatus\tLabel`;
+/// comparing with `==` rather than a substring match keeps
+/// `com.origin.server.staging` from reading as `com.origin.server` (H4).
+fn label_is_loaded(launchctl: &dyn LaunchctlExec, label: &str) -> bool {
+    let out = match launchctl.run(&["list"]) {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .any(|line| line.split_whitespace().nth(2) == Some(label))
 }
 
 /// Returns true iff BOTH current Wenlan plists are loaded in launchctl.
-///
-/// `launchctl list` output is `PID\tStatus\tLabel`. We must compare the third
-/// whitespace-separated field with `==`; a substring match would treat
-/// `com.origin.server.staging` as `com.origin.server` (H4).
 pub fn is_run_at_login_enabled(launchctl: &dyn LaunchctlExec) -> bool {
     // An isolated dev app has its own bundle identifier and never owns the
     // installed LaunchAgents, so reporting the user's production state here
@@ -571,18 +632,7 @@ pub fn is_run_at_login_enabled(launchctl: &dyn LaunchctlExec) -> bool {
     if std::env::var_os("WENLAN_DEV_APP_ID").is_some() {
         return false;
     }
-    let out = match launchctl.run(&["list"]) {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let server = stdout
-        .lines()
-        .any(|line| line.split_whitespace().nth(2) == Some(SERVER_PLIST_LABEL));
-    let app = stdout
-        .lines()
-        .any(|line| line.split_whitespace().nth(2) == Some(APP_PLIST_LABEL));
-    server && app
+    label_is_loaded(launchctl, SERVER_PLIST_LABEL) && label_is_loaded(launchctl, APP_PLIST_LABEL)
 }
 
 /// First-run install of both plists. Detects stale paths (e.g. app moved)
@@ -662,7 +712,7 @@ fn first_run_install_if_needed_at_path(
     if server_plist_stale {
         match install_server_plist_via_subprocess(launchctl) {
             Ok(()) => server_replacement_ready = true,
-            Err(e) => log::warn!("[first-run] wenlan install failed: {e}"),
+            Err(e) => log::warn!("[first-run] wenlan background on failed: {e}"),
         }
     }
 
@@ -678,7 +728,9 @@ fn first_run_install_if_needed_at_path(
             log::warn!("[first-run] legacy server plist cleanup failed: {e}");
         }
     } else {
-        log::warn!("[first-run] preserving legacy server plist because wenlan install failed");
+        log::warn!(
+            "[first-run] preserving legacy server plist because wenlan background on failed"
+        );
     }
 
     log::info!("[first-run] LaunchAgents installed");
@@ -715,7 +767,7 @@ pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> R
         uninstall_app_plist(launchctl)?;
         let legacy_app_cleanup_result = remove_legacy_app_plist_file_if_owned();
         let legacy_server_cleanup_result = cleanup_legacy_server_plist(launchctl);
-        let uninstall_result = uninstall_server_plist_via_subprocess();
+        let uninstall_result = uninstall_server_plist(launchctl);
         legacy_app_cleanup_result?;
         legacy_server_cleanup_result?;
         uninstall_result?;
@@ -755,7 +807,7 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
         if let Err(e) = uninstall_app_plist(&launchctl) {
             log::warn!("[quit] uninstall_app_plist failed: {e}");
         }
-        if let Err(e) = uninstall_server_plist_via_subprocess() {
+        if let Err(e) = uninstall_server_plist(&launchctl) {
             log::warn!("[quit] uninstall_server_plist failed: {e}");
         }
         if let Err(e) = cleanup_legacy_app_plist(&launchctl) {
@@ -847,6 +899,8 @@ mod tests {
         load_status: Mutex<u32>,
         /// Status code to return for unload subcommands. Default 0 = ok.
         unload_status: Mutex<u32>,
+        /// Canned `launchctl list` stdout body. Default empty = nothing loaded.
+        list_stdout: Mutex<String>,
     }
     impl LaunchctlExec for MockLaunchctl {
         fn run(&self, args: &[&str]) -> io::Result<Output> {
@@ -860,9 +914,13 @@ mod tests {
                 Some("unload") => *self.unload_status.lock().unwrap(),
                 _ => 0,
             };
+            let stdout = match args.first().copied() {
+                Some("list") => self.list_stdout.lock().unwrap().as_bytes().to_vec(),
+                _ => vec![],
+            };
             Ok(Output {
                 status: exit_status(status_code),
-                stdout: vec![],
+                stdout,
                 stderr: vec![],
             })
         }
@@ -1485,6 +1543,50 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn uninstall_server_plist_keeps_file_when_unload_fails_and_still_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let plist = server_plist_path().unwrap();
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, "<plist/>").unwrap();
+
+        let mock = MockLaunchctl {
+            unload_status: Mutex::new(1),
+            list_stdout: Mutex::new(format!("123\t0\t{}\n", SERVER_PLIST_LABEL)),
+            ..Default::default()
+        };
+
+        let err = uninstall_server_plist(&mock).unwrap_err();
+        assert!(err.to_string().contains(SERVER_PLIST_LABEL));
+        assert!(
+            plist.exists(),
+            "plist must survive a failed unload while the job is still loaded"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn uninstall_server_plist_removes_file_when_unload_fails_but_not_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let plist = server_plist_path().unwrap();
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, "<plist/>").unwrap();
+
+        let mock = MockLaunchctl {
+            unload_status: Mutex::new(1),
+            ..Default::default()
+        };
+
+        uninstall_server_plist(&mock).unwrap();
+        assert!(
+            !plist.exists(),
+            "stale plist removed once launchctl confirms the job is not loaded"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn first_run_install_cleans_legacy_plists_even_when_user_opted_out() {
         let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
@@ -2072,7 +2174,25 @@ mod tests {
             external_bins
                 .iter()
                 .any(|bin| bin.as_str() == Some("binaries/wenlan")),
-            "wenlan CLI must be bundled because lifecycle service management runs `wenlan install/uninstall`"
+            "wenlan CLI must be bundled because lifecycle service management runs `wenlan background on`"
+        );
+    }
+
+    /// The app used to send `wenlan install` / `wenlan uninstall`; both verbs
+    /// were removed from the CLI, so clap exited 2 and every Run-at-Login
+    /// toggle and the Quit teardown failed. See the constant's doc comment for
+    /// why this cannot be checked against clap directly from this crate.
+    #[test]
+    fn background_on_is_the_argv_the_app_sends_to_register_the_daemon() {
+        assert_eq!(SERVICE_CLI_BACKGROUND_ON, ["background", "on"]);
+        assert!(
+            !SERVICE_CLI_BACKGROUND_ON.contains(&"install"),
+            "`wenlan install` was removed from the CLI in v0.10"
+        );
+        assert!(
+            !SERVICE_CLI_BACKGROUND_ON.contains(&"uninstall"),
+            "`wenlan uninstall` was removed from the CLI in v0.10; deregistering \
+             is done in-process by uninstall_server_plist"
         );
     }
 

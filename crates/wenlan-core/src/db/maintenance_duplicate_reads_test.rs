@@ -29,12 +29,6 @@ async fn insert_page(
     .unwrap();
 }
 
-fn unit_vector(axis: usize) -> String {
-    let mut values = vec![0.0; 768];
-    values[axis] = 1.0;
-    serde_json::to_string(&values).unwrap()
-}
-
 #[tokio::test]
 async fn near_duplicate_reader_preserves_pair_order_cursor_and_raw_sources() {
     let (db, _tmp) = crate::db::tests::test_db().await;
@@ -139,35 +133,4 @@ async fn near_duplicate_reader_keeps_connection_locked_until_reader_drop() {
         .expect("probe resumes after reader drop")
         .unwrap()
         .unwrap();
-}
-
-#[tokio::test]
-async fn embedding_pair_reader_preserves_distance_order_and_sql_limit() {
-    let (db, _tmp) = crate::db::tests::test_db().await;
-    let first = unit_vector(1);
-    let other = unit_vector(2);
-    insert_page(&db, "a", "A", &[], Some(&first)).await;
-    insert_page(&db, "b", "B", &[], Some(&first)).await;
-    insert_page(&db, "c", "C", &[], Some(&other)).await;
-    insert_page(&db, "overview", "OvErViEw", &[], Some(&first)).await;
-
-    let limited = db
-        .embedding_near_duplicate_pairs(1.0, Some(1))
-        .await
-        .unwrap();
-    assert_eq!(limited.len(), 1);
-    assert_eq!(
-        (limited[0].left_id.as_str(), limited[0].right_id.as_str()),
-        ("a", "b")
-    );
-    assert!(limited[0].distance.abs() < f64::EPSILON);
-
-    let all = db.embedding_near_duplicate_pairs(1.0, None).await.unwrap();
-    assert_eq!(all.len(), 3);
-    assert!(all
-        .windows(2)
-        .all(|rows| rows[0].distance <= rows[1].distance));
-    assert!(all
-        .iter()
-        .all(|row| row.left_id != "overview" && row.right_id != "overview"));
 }

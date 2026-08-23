@@ -139,7 +139,7 @@ enum Commands {
         /// Read content from a file.
         #[arg(short, long)]
         file: Option<std::path::PathBuf>,
-        /// Memory type (e.g. fact, task, decision).
+        /// Memory type (e.g. fact, decision).
         #[arg(short = 't', long = "type")]
         memory_type: Option<String>,
     },

@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::client::WenlanClient;
 use crate::outbox;
-use crate::output::{print_json, OutputFormat};
+use crate::output::{print_json, ResolvedFormat};
 
 #[derive(Debug, Subcommand)]
 pub enum OutboxCommand {
@@ -27,7 +27,7 @@ struct StatusOutput {
 
 pub async fn run(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     command: OutboxCommand,
 ) -> Result<()> {
@@ -50,8 +50,8 @@ pub async fn run(
             };
             if !quiet {
                 match format {
-                    OutputFormat::Json => print_json(&output)?,
-                    OutputFormat::Table => {
+                    ResolvedFormat::Json => print_json(&output)?,
+                    ResolvedFormat::Table => {
                         println!("Queued: {}", output.queued);
                         for file in &output.queued_files {
                             println!("  {file}");
@@ -61,7 +61,6 @@ pub async fn run(
                             println!("  {file}");
                         }
                     }
-                    OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
                 }
             }
         }
@@ -69,8 +68,8 @@ pub async fn run(
             let report = client.drain_outbox().await?;
             if !quiet {
                 match format {
-                    OutputFormat::Json => print_json(&report)?,
-                    OutputFormat::Table => {
+                    ResolvedFormat::Json => print_json(&report)?,
+                    ResolvedFormat::Table => {
                         println!(
                             "Applied: {}, duplicate: {}, failed: {}, remaining: {}",
                             report.applied, report.duplicate, report.failed, report.remaining
@@ -83,7 +82,6 @@ pub async fn run(
                             }
                         }
                     }
-                    OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
                 }
             }
         }

@@ -15,7 +15,7 @@ sources, settings, remote access, imports, profile, and review surfaces.
 | Sources UI | `SourcesView.tsx`, `sources/` | add/list/sync source workflows |
 | Memory rendering | `MemoryCard.tsx`, `ContentRenderer.tsx`, `MemoryDetail.tsx` | classifier/rendering invariants |
 | Remote access UI | `RemoteAccessPanel.tsx` | talks to Rust remote-access commands |
-| Review lanes | `DistillReviewPanel.tsx`, `RefiningList.tsx`, `WorthAGlanceScroll.tsx` | pending/refinement flows |
+| Review lanes | `DistillReviewPanel.tsx`, `RefiningList.tsx` | pending/refinement flows |
 
 ## CONVENTIONS
 

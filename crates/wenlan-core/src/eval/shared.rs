@@ -2013,15 +2013,12 @@ pub async fn enrich_db_for_eval_local(
                 source_id,
                 content,
                 None, // entity_id: let auto_link_entity + extraction decide
-                None,
-                None,
-                None,
+                None, // space
                 Some(llm),
                 &prompts,
                 &refinery,
                 &distillation,
                 None, // knowledge_path
-                None, // cancel
                 None, // precomputed_kg — Task 1.4 will re-route through the orchestrator
             )
             .await?;
@@ -2146,15 +2143,12 @@ pub(crate) async fn enrich_post_ingest_batched(
             source_id,
             content,
             None, // entity_id: let auto_link_entity + extraction decide
-            None,
-            None,
-            None,
+            None, // space
             Some(llm),
             prompts,
             refinery,
             distillation,
             None, // knowledge_path
-            None, // cancel
             precomputed,
         )
         .await?;
@@ -3370,15 +3364,12 @@ mod tests {
                 source_id,
                 content,
                 None, // entity_id
-                None,
-                None,
-                None,
+                None, // space
                 Some(&llm),
                 &prompts,
                 &refinery,
                 &distillation,
                 None, // knowledge_path
-                None, // cancel
                 None, // precomputed_kg
             )
             .await
@@ -3458,13 +3449,10 @@ mod tests {
                 content,
                 None,
                 None,
-                None,
-                None,
                 Some(&llm),
                 &prompts,
                 &refinery,
                 &distillation,
-                None,
                 None,
                 None,
             )

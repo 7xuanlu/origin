@@ -3229,7 +3229,7 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        1020,
+        1027,
         "PR-D integration must expose the frozen 967 support calls, the 6 PR-D test identities, \
          the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, \
          the 7 G6 BindPageLink repair-test calls (G6 Stage 2 PR 2b, item 3: \
@@ -3317,7 +3317,17 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
          edge to prove provenance survives the fold), and the new vocab re-type acceptance test \
          synthesis/refinement_queue.rs::apply_refinement_vocab_promote_retypes_proposing_entities \
          contributes a test_primary_session / TestDbSession::query / TestDbRows::next / \
-         TestDbRow::get chain reading the shadow page's entity_type after the promote"
+         TestDbRow::get chain reading the shadow page's entity_type after the promote; \
+         plus the pre-launch simplification audit's net +7: importer.rs's \
+         test_import_phase3_links_memory_entities was deleted with the rest of that file's \
+         retired legacy-import coverage (-4: test_primary_session|1, TestDbSession::query|1, \
+         TestDbRows::next|1, TestDbRow::get|1), and derived_artifact_state.rs gained two \
+         RED-controlled tests pinning summary_eligible_predicate's new pending-revision and \
+         'hide'-mode-superseder peer filters (+11: \
+         summary_eligibility_excludes_a_pending_revision_peer contributes test_primary_session|1, \
+         TestDbSession::execute|1, TestDbSession::query|1, TestDbRows::next|1, TestDbRow::get|1, \
+         and summary_eligibility_excludes_a_hide_superseded_peer the same five plus a second \
+         TestDbSession::execute for the superseder row)"
     );
 }
 
@@ -3767,30 +3777,6 @@ pub(crate) fn unrelated(value: Connection) -> Connection { value }
             "DB-internal or unrelated surface {allowed} was rejected: {violations:?}"
         );
     }
-}
-
-#[test]
-fn eval_judge_relic_is_private_and_module_graph_classified() {
-    let root = super::repo_root();
-    let module_path = "crates/wenlan-core/src/eval/eval_judge.rs";
-    assert!(
-        root.join(module_path).is_file(),
-        "the historical eval_judge relic must remain present"
-    );
-    let eval_module = std::fs::read_to_string(root.join("crates/wenlan-core/src/eval/mod.rs"))
-        .expect("read eval module");
-    assert!(
-        eval_module
-            .lines()
-            .any(|line| line.trim() == "mod eval_judge;"),
-        "eval_judge must be wired as a private empty module"
-    );
-    assert!(
-        analyze_repository(&root)
-            .visited_files
-            .contains(module_path),
-        "eval_judge must be classified by the compiler module graph"
-    );
 }
 
 #[test]

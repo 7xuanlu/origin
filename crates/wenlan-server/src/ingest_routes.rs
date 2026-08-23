@@ -93,13 +93,18 @@ pub async fn handle_ingest_text(
         ..Default::default()
     };
 
-    let chunks_created = {
+    // Snapshot the DB Arc and drop the guard before the upsert: it embeds and
+    // writes a transaction, the heaviest await in the daemon, and tokio's
+    // write-preferring RwLock would queue every other handler behind it
+    // (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
         let s = state.read().await;
-        let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-        db.upsert_documents(vec![doc])
-            .await
-            .map_err(|e| ServerError::IngestFailed(e.to_string()))?
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
+    let chunks_created = db
+        .upsert_documents(vec![doc])
+        .await
+        .map_err(|e| ServerError::IngestFailed(e.to_string()))?;
 
     Ok(Json(IngestResponse {
         chunks_created,
@@ -144,13 +149,18 @@ pub async fn handle_ingest_webpage(
         ..Default::default()
     };
 
-    let chunks_created = {
+    // Snapshot the DB Arc and drop the guard before the upsert: it embeds and
+    // writes a transaction, the heaviest await in the daemon, and tokio's
+    // write-preferring RwLock would queue every other handler behind it
+    // (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
         let s = state.read().await;
-        let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-        db.upsert_documents(vec![doc])
-            .await
-            .map_err(|e| ServerError::IngestFailed(e.to_string()))?
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
+    let chunks_created = db
+        .upsert_documents(vec![doc])
+        .await
+        .map_err(|e| ServerError::IngestFailed(e.to_string()))?;
 
     Ok(Json(IngestResponse {
         chunks_created,
@@ -189,13 +199,18 @@ pub async fn handle_ingest_memory(
         ..Default::default()
     };
 
-    let chunks_created = {
+    // Snapshot the DB Arc and drop the guard before the upsert: it embeds and
+    // writes a transaction, the heaviest await in the daemon, and tokio's
+    // write-preferring RwLock would queue every other handler behind it
+    // (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
         let s = state.read().await;
-        let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-        db.upsert_documents(vec![doc])
-            .await
-            .map_err(|e| ServerError::IngestFailed(e.to_string()))?
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
+    let chunks_created = db
+        .upsert_documents(vec![doc])
+        .await
+        .map_err(|e| ServerError::IngestFailed(e.to_string()))?;
 
     Ok(Json(IngestResponse {
         chunks_created,
@@ -208,8 +223,10 @@ pub async fn handle_delete_document(
     State(state): State<Arc<RwLock<ServerState>>>,
     Path((source, source_id)): Path<(String, String)>,
 ) -> Result<Json<DeleteResponse>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
     db.delete_by_source_id(&source, &source_id)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;

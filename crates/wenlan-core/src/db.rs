@@ -1553,6 +1553,17 @@ pub async fn rerank_results_light(
     results
 }
 
+/// Parse a `WENLAN_*` boolean feature flag: truthy iff the var is set to
+/// `1`, `true`, or `yes` (case-insensitive, trimmed); unset or any other
+/// value is falsey. Shared by every OPT-IN flag below so a var can't parse
+/// differently between call sites.
+fn truthy_flag_env(var: &str) -> bool {
+    std::env::var(var)
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 /// True iff `WENLAN_ENABLE_PAGE_CHANNEL` is set to a truthy value
 /// (`1`, `true`, or `yes`, case-insensitive). The page-channel is OPT-IN:
 /// unset or a falsey value (`0`/`false`/`no`/"") leaves it disabled.
@@ -1567,10 +1578,7 @@ pub async fn rerank_results_light(
 /// Truthy-only parse (not `is_ok()`): operators enable the channel by setting
 /// the var to a truthy value; any other value or unset = disabled.
 pub fn page_channel_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_PAGE_CHANNEL")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_PAGE_CHANNEL")
 }
 
 /// True iff `WENLAN_ENABLE_EVICTION` is set to a truthy value (`1`, `true`, or
@@ -1586,10 +1594,7 @@ pub fn page_channel_enabled() -> bool {
 /// the "no memory count cap" contract). Truthy-only parse, verbatim copy of
 /// [`page_channel_enabled`]. T21 Stage 1.
 pub fn eviction_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_EVICTION")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_EVICTION")
 }
 
 /// True iff `WENLAN_ENABLE_GLOBAL_PRELUDE` is set to a truthy value
@@ -1607,10 +1612,7 @@ pub fn eviction_enabled() -> bool {
 /// MUST share this helper so the env var cannot disagree between production and
 /// eval (which would make baseline filenames lie). Mirrors [`page_channel_enabled`].
 pub fn global_prelude_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_GLOBAL_PRELUDE")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_GLOBAL_PRELUDE")
 }
 
 /// Expansion temperature for the legacy `search_memory_expanded` paraphrase
@@ -1743,28 +1745,7 @@ pub fn select_evictions(
 /// write path byte-identical (no extra vector query, no LLM call, no mutation).
 /// Truthy-only parse, mirrors [`page_channel_enabled`].
 pub fn dual_pool_resolve_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_DUAL_POOL_RESOLVE")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
-}
-
-/// True iff `WENLAN_ENABLE_REFLECTION_DEBOUNCE` is set to a truthy value
-/// (`1`, `true`, or `yes`, case-insensitive). When enabled, `handle_store_memory`
-/// routes its deferred post-ingest enrichment through a per-agent debouncer
-/// (`wenlan_server::reflection_debounce::ReflectionDebouncer`) so a burst of
-/// rapid same-agent stores coalesces to a single reflection of the last write
-/// instead of N overlapping enrichment tasks.
-///
-/// Default OFF: unset or any falsey value (`0`/`false`/`no`/`""`) leaves the
-/// write path byte-identical — the existing detached `tokio::spawn` runs
-/// verbatim with `cancel = None`, no debouncer consulted. Truthy-only parse,
-/// mirrors [`page_channel_enabled`].
-pub fn reflection_debounce_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_REFLECTION_DEBOUNCE")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_DUAL_POOL_RESOLVE")
 }
 
 /// True iff `WENLAN_ENABLE_TEMPORAL_GROUNDING` is set to a truthy value
@@ -1778,10 +1759,7 @@ pub fn reflection_debounce_enabled() -> bool {
 /// write path byte-identical to pre-T11. Truthy-only parse, mirrors
 /// [`page_channel_enabled`].
 pub fn temporal_grounding_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_TEMPORAL_GROUNDING")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_TEMPORAL_GROUNDING")
 }
 
 /// True iff `WENLAN_ENABLE_EPISODE_CHANNEL` is set to a truthy value
@@ -1797,10 +1775,7 @@ pub fn temporal_grounding_enabled() -> bool {
 /// eval (which would make baseline filenames lie). Mirrors
 /// [`page_channel_enabled`] (truthy-only parse).
 pub fn episode_channel_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_EPISODE_CHANNEL")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_EPISODE_CHANNEL")
 }
 
 /// True iff `WENLAN_ENABLE_ENTITY_MINHASH` is set to a truthy value
@@ -1816,10 +1791,7 @@ pub fn episode_channel_enabled() -> bool {
 /// [`page_channel_enabled`] (truthy-only parse) so production and any future
 /// eval wiring can't disagree on the flag.
 pub fn entity_minhash_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_ENTITY_MINHASH")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_ENTITY_MINHASH")
 }
 
 /// Minimum verbatim word count for an episode co-write. Short turns ("ok",
@@ -1912,10 +1884,7 @@ fn child_vector_id(parent_id: &str, field: &str) -> String {
 /// importance column backfills passively while this flag is off; only the READ
 /// into ranking is gated. Mirrors [`page_channel_enabled`] (truthy-only parse).
 pub fn salience_prior_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_SALIENCE_PRIOR")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_SALIENCE_PRIOR")
 }
 
 /// True iff `WENLAN_ENABLE_SESSION_DIVERSITY` is set to a truthy value
@@ -1927,10 +1896,7 @@ pub fn salience_prior_enabled() -> bool {
 /// `retrieval::session_diversity::session_key` and are never counted
 /// against the cap — safe to enable in production until a real session column ships.
 pub fn session_diversity_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_SESSION_DIVERSITY")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_SESSION_DIVERSITY")
 }
 
 /// Parse `WENLAN_SESSION_DIVERSITY_MAX` as a `usize`.
@@ -1950,10 +1916,7 @@ fn session_diversity_max() -> usize {
 /// lookups. See [`crate::retrieval::signals::query_warrants_graph`]. The gate is
 /// strictly a cost/noise saver: ambiguous queries still augment.
 pub fn graph_gate_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_GRAPH_GATE")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_GRAPH_GATE")
 }
 
 /// True iff `WENLAN_ENABLE_GRAPH_SEED` is set to a truthy value
@@ -1964,10 +1927,7 @@ pub fn graph_gate_enabled() -> bool {
 /// Controls: `WENLAN_GRAPH_HOP_DEPTH` (default 1), `WENLAN_GRAPH_SEED_TOP_K` (default 10),
 /// `WENLAN_GRAPH_FRONTIER_CAP` (default 64).
 pub fn graph_seed_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_GRAPH_SEED")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_GRAPH_SEED")
 }
 
 /// True iff `WENLAN_ENABLE_TEMPORAL_FILTER` is set to a truthy value
@@ -1982,10 +1942,7 @@ pub fn graph_seed_enabled() -> bool {
 /// All call sites MUST share this helper so the env var cannot disagree between
 /// production and eval.
 pub fn temporal_filter_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_TEMPORAL_FILTER")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_TEMPORAL_FILTER")
 }
 
 /// True iff `WENLAN_ENABLE_TEMPORAL_SOFT_BOOST` is set to a truthy value
@@ -1999,10 +1956,7 @@ pub fn temporal_filter_enabled() -> bool {
 /// `search_memory`. Mirrors [`salience_prior_enabled`] (truthy-only parse) so
 /// production and eval cannot disagree on the flag.
 pub fn temporal_soft_boost_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_TEMPORAL_SOFT_BOOST")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_TEMPORAL_SOFT_BOOST")
 }
 
 /// Parse `WENLAN_TEMPORAL_BONUS` as an `f64`. Defaults to `0.5` when unset, when
@@ -2048,10 +2002,7 @@ pub fn temporal_bonus() -> f64 {
 /// Truthy-only parse, mirrors [`page_channel_enabled`], so production and eval
 /// cannot disagree on the flag.
 pub fn khop_traversal_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_GRAPH_KHOP")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_ENABLE_GRAPH_KHOP")
 }
 
 /// True iff `WENLAN_GRAPH_MEMORY_STREAM` is NOT explicitly disabled. DEFAULT ON
@@ -2219,10 +2170,7 @@ fn genesis_shadow_enabled_value(value: Option<&str>) -> bool {
 /// bypass −0.0117 agg, BH-sig negative). Default-OFF escape hatch only — see
 /// `is_preference_query` docs for the full measurement story.
 pub fn rerank_skip_preference_enabled() -> bool {
-    std::env::var("WENLAN_RERANK_SKIP_PREFERENCE")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_RERANK_SKIP_PREFERENCE")
 }
 
 /// True iff `WENLAN_GRAPH_SURFACE_NEW` is truthy. OPT-IN, default OFF. Only
@@ -2235,10 +2183,7 @@ pub fn rerank_skip_preference_enabled() -> bool {
 /// added under the bounded [`graph_surface_budget`], drawn from the same
 /// type+degree-filtered anchors. The higher-recall, higher-noise arm.
 pub fn graph_surface_new_enabled() -> bool {
-    std::env::var("WENLAN_GRAPH_SURFACE_NEW")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_GRAPH_SURFACE_NEW")
 }
 
 /// Max `memory_entities` degree for an entity to qualify as a graph anchor
@@ -2301,10 +2246,7 @@ pub fn is_person_like(entity_type: &str) -> bool {
 /// across queries (fine for single-query ranking; a future cross-query
 /// score_threshold would need a different normalization).
 pub fn magnitude_fusion_enabled() -> bool {
-    std::env::var("WENLAN_MAGNITUDE_FUSION")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    truthy_flag_env("WENLAN_MAGNITUDE_FUSION")
 }
 
 /// Sign-correct a raw FTS5 bm25 score into a non-negative magnitude.
@@ -2346,22 +2288,6 @@ fn normalize_fts_magnitudes(scores: &[f32]) -> Vec<f32> {
         // Single element or all-equal: no spread to normalize → treat as full.
         vec![1.0; scores.len()]
     }
-}
-
-/// Bigram Jaccard similarity between two strings (0.0–1.0).
-/// Used for content-based deduplication in search results.
-fn bigram_jaccard(a: &str, b: &str) -> f64 {
-    fn bigrams(s: &str) -> HashSet<(char, char)> {
-        let lower: Vec<char> = s.chars().flat_map(|c| c.to_lowercase()).collect();
-        lower.windows(2).map(|w| (w[0], w[1])).collect()
-    }
-    let ba = bigrams(a);
-    let bb = bigrams(b);
-    let union = ba.union(&bb).count();
-    if union == 0 {
-        return 1.0;
-    }
-    ba.intersection(&bb).count() as f64 / union as f64
 }
 
 /// Row data for clustering algorithm
@@ -2422,24 +2348,13 @@ fn cluster_mem_row_from_sql_row_at(
     })
 }
 
-/// Cosine similarity between two embedding vectors.
+/// Cosine similarity between two embedding vectors. Thin forward to the
+/// single guarded implementation in `topic_match` (dedup of three
+/// near-identical copies that used to live in db.rs, eval/runner.rs, and
+/// topic_match.rs) — kept as a same-name wrapper because callers outside this
+/// batch's owned files still call `db::cosine_similarity`/`crate::db::cosine_similarity`.
 pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    let mut dot = 0.0f64;
-    let mut norm_a = 0.0f64;
-    let mut norm_b = 0.0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        let x = *x as f64;
-        let y = *y as f64;
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 {
-        0.0
-    } else {
-        dot / denom
-    }
+    crate::topic_match::cosine_similarity(a, b)
 }
 
 /// Greedy clustering: attach each memory to the first cluster where
@@ -24539,41 +24454,6 @@ impl MemoryDB {
             .is_some())
     }
 
-    pub async fn find_similar_chunk(
-        &self,
-        embedding: &[f32],
-        threshold: f32,
-    ) -> Result<bool, WenlanError> {
-        let conn = self.conn.lock().await;
-        let vec_str = Self::vec_to_sql(embedding);
-
-        // Use vector_distance for a reliable brute-force scan (small table is fine).
-        // DiskANN index may not be immediately consistent after insert.
-        let mut rows = conn
-            .query(
-                "SELECT vector_distance_cos(embedding, vector32(?1)) AS dist
-                 FROM memories
-                 ORDER BY dist ASC
-                 LIMIT 1",
-                libsql::params![vec_str],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
-
-        if let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-        {
-            let distance: f64 = row
-                .get(0)
-                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
-            Ok(distance < threshold as f64)
-        } else {
-            Ok(false)
-        }
-    }
-
     /// Check if similar content already exists in the memory store.
     /// Returns Some((source_id, cosine_similarity)) if a match is found,
     /// None otherwise. The caller compares similarity against their threshold.
@@ -24784,24 +24664,34 @@ impl MemoryDB {
 
     // ===== Chunk Methods (matching VectorDB API) =====
 
+    /// Split `(doc, resolved_write_space)` pairs into a plain doc `Vec` and a
+    /// `source_id -> ResolvedWriteSpace` map. Shared by the write-spaces
+    /// variants of `upsert_documents`.
+    fn split_write_spaces(
+        docs: Vec<(
+            RawDocument,
+            Option<crate::space_context::ResolvedWriteSpace>,
+        )>,
+    ) -> (
+        Vec<RawDocument>,
+        HashMap<String, crate::space_context::ResolvedWriteSpace>,
+    ) {
+        let write_spaces: HashMap<String, crate::space_context::ResolvedWriteSpace> = docs
+            .iter()
+            .filter_map(|(doc, resolved)| {
+                resolved
+                    .as_ref()
+                    .map(|resolved| (doc.source_id.clone(), resolved.clone()))
+            })
+            .collect();
+        let docs: Vec<RawDocument> = docs.into_iter().map(|(doc, _)| doc).collect();
+        (docs, write_spaces)
+    }
+
     /// Chunk, embed, and upsert documents. Returns the number of memory rows created.
     pub async fn upsert_documents(&self, docs: Vec<RawDocument>) -> Result<usize, WenlanError> {
-        if docs.is_empty() {
-            return Ok(0);
-        }
-        let has_memory_docs = docs.iter().any(|doc| doc.source == "memory");
-        let episode_enabled = has_memory_docs && episode_channel_enabled();
-        let fact_enabled =
-            has_memory_docs && crate::retrieval::fact_channel::fact_channel_enabled();
-        self.upsert_documents_with_derived_channels(
-            docs,
-            episode_enabled,
-            fact_enabled,
-            None,
-            None,
-            None,
-        )
-        .await
+        self.upsert_documents_with_derived_channels(docs, None, None, None, None, None)
+            .await
     }
 
     /// Upsert top-level writes while resolving their stable Space IDs inside
@@ -24816,26 +24706,11 @@ impl MemoryDB {
             Option<crate::space_context::ResolvedWriteSpace>,
         )>,
     ) -> Result<usize, WenlanError> {
-        if docs.is_empty() {
-            return Ok(0);
-        }
-        let write_spaces: HashMap<String, crate::space_context::ResolvedWriteSpace> = docs
-            .iter()
-            .filter_map(|(doc, resolved)| {
-                resolved
-                    .as_ref()
-                    .map(|resolved| (doc.source_id.clone(), resolved.clone()))
-            })
-            .collect();
-        let docs: Vec<RawDocument> = docs.into_iter().map(|(doc, _)| doc).collect();
-        let has_memory_docs = docs.iter().any(|doc| doc.source == "memory");
-        let episode_enabled = has_memory_docs && episode_channel_enabled();
-        let fact_enabled =
-            has_memory_docs && crate::retrieval::fact_channel::fact_channel_enabled();
+        let (docs, write_spaces) = Self::split_write_spaces(docs);
         self.upsert_documents_with_derived_channels(
             docs,
-            episode_enabled,
-            fact_enabled,
+            None,
+            None,
             None,
             None,
             Some(write_spaces),
@@ -24852,50 +24727,8 @@ impl MemoryDB {
         docs: Vec<RawDocument>,
         receipt: OperationReceipt<'_>,
     ) -> Result<usize, WenlanError> {
-        if docs.is_empty() {
-            return Ok(0);
-        }
-        let has_memory_docs = docs.iter().any(|doc| doc.source == "memory");
-        let episode_enabled = has_memory_docs && episode_channel_enabled();
-        let fact_enabled =
-            has_memory_docs && crate::retrieval::fact_channel::fact_channel_enabled();
-        self.upsert_documents_with_derived_channels(
-            docs,
-            episode_enabled,
-            fact_enabled,
-            None,
-            Some(receipt),
-            None,
-        )
-        .await
-    }
-
-    /// Chunk, embed, and atomically record the fixed enrichment origin for
-    /// imported memory documents. Fresh rows enter the bulk catch-up FIFO;
-    /// conflict updates retain any prior interactive promotion. This keeps
-    /// restart-safe background classification eligible without opening a crash
-    /// window between the memory rows and their provenance receipt.
-    pub async fn upsert_documents_with_enrichment_origin(
-        &self,
-        docs: Vec<RawDocument>,
-        origin: EnrichmentOrigin,
-    ) -> Result<usize, WenlanError> {
-        if docs.is_empty() {
-            return Ok(0);
-        }
-        let has_memory_docs = docs.iter().any(|doc| doc.source == "memory");
-        let episode_enabled = has_memory_docs && episode_channel_enabled();
-        let fact_enabled =
-            has_memory_docs && crate::retrieval::fact_channel::fact_channel_enabled();
-        self.upsert_documents_with_derived_channels(
-            docs,
-            episode_enabled,
-            fact_enabled,
-            Some(origin),
-            None,
-            None,
-        )
-        .await
+        self.upsert_documents_with_derived_channels(docs, None, None, None, Some(receipt), None)
+            .await
     }
 
     /// Import/bulk-write variant that preserves both the enrichment-origin
@@ -24908,26 +24741,11 @@ impl MemoryDB {
         )>,
         origin: EnrichmentOrigin,
     ) -> Result<usize, WenlanError> {
-        if docs.is_empty() {
-            return Ok(0);
-        }
-        let write_spaces: HashMap<String, crate::space_context::ResolvedWriteSpace> = docs
-            .iter()
-            .filter_map(|(doc, resolved)| {
-                resolved
-                    .as_ref()
-                    .map(|resolved| (doc.source_id.clone(), resolved.clone()))
-            })
-            .collect();
-        let docs: Vec<RawDocument> = docs.into_iter().map(|(doc, _)| doc).collect();
-        let has_memory_docs = docs.iter().any(|doc| doc.source == "memory");
-        let episode_enabled = has_memory_docs && episode_channel_enabled();
-        let fact_enabled =
-            has_memory_docs && crate::retrieval::fact_channel::fact_channel_enabled();
+        let (docs, write_spaces) = Self::split_write_spaces(docs);
         self.upsert_documents_with_derived_channels(
             docs,
-            episode_enabled,
-            fact_enabled,
+            None,
+            None,
             Some(origin),
             None,
             Some(write_spaces),
@@ -24942,11 +24760,10 @@ impl MemoryDB {
         episode_enabled: bool,
         fact_enabled: bool,
     ) -> Result<usize, WenlanError> {
-        let has_memory_docs = docs.iter().any(|doc| doc.source == "memory");
         self.upsert_documents_with_derived_channels(
             docs,
-            has_memory_docs && episode_enabled,
-            has_memory_docs && fact_enabled,
+            Some(episode_enabled),
+            Some(fact_enabled),
             None,
             None,
             None,
@@ -24954,11 +24771,16 @@ impl MemoryDB {
         .await
     }
 
+    /// Shared implementation behind every `upsert_documents*` wrapper.
+    /// `episode_enabled_override`/`fact_enabled_override` let the
+    /// `#[cfg(test)]` helper force a channel on/off regardless of the env
+    /// flags; every production wrapper passes `None` and gets the flags
+    /// derived from `docs` here (previously each wrapper re-derived them).
     async fn upsert_documents_with_derived_channels(
         &self,
         mut docs: Vec<RawDocument>,
-        episode_enabled: bool,
-        fact_enabled: bool,
+        episode_enabled_override: Option<bool>,
+        fact_enabled_override: Option<bool>,
         enrichment_origin: Option<EnrichmentOrigin>,
         operation_receipt: Option<OperationReceipt<'_>>,
         write_spaces: Option<HashMap<String, crate::space_context::ResolvedWriteSpace>>,
@@ -24966,6 +24788,11 @@ impl MemoryDB {
         if docs.is_empty() {
             return Ok(0);
         }
+        let has_memory_docs = docs.iter().any(|doc| doc.source == "memory");
+        let episode_enabled =
+            episode_enabled_override.unwrap_or(has_memory_docs && episode_channel_enabled());
+        let fact_enabled = fact_enabled_override
+            .unwrap_or(has_memory_docs && crate::retrieval::fact_channel::fact_channel_enabled());
         let _episode_activity = episode_enabled.then(|| {
             self.begin_derived_artifact_write(
                 crate::derived_artifact_state::DerivedArtifact::Episode,
@@ -26710,7 +26537,10 @@ impl MemoryDB {
                     if !final_results[i].is_recap && !final_results[j].is_recap {
                         continue;
                     }
-                    let sim = bigram_jaccard(&final_results[i].content, &final_results[j].content);
+                    let sim = crate::contradiction::bigram_jaccard(
+                        &final_results[i].content,
+                        &final_results[j].content,
+                    );
                     if sim > 0.5 {
                         // Drop the lower-scoring one (j, since results are sorted by score desc)
                         drop_indices.insert(j);
@@ -26740,7 +26570,10 @@ impl MemoryDB {
                     if drop_indices.contains(&j) {
                         continue;
                     }
-                    let sim = bigram_jaccard(&final_results[i].content, &final_results[j].content);
+                    let sim = crate::contradiction::bigram_jaccard(
+                        &final_results[i].content,
+                        &final_results[j].content,
+                    );
                     if sim > 0.92 {
                         // Drop the lower-scoring one (j, since results are sorted by score desc)
                         drop_indices.insert(j);
@@ -26979,19 +26812,6 @@ impl MemoryDB {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(Self::EPISODE_CHANNEL_LIMIT_DEFAULT)
-    }
-
-    /// Max subqueries (including the original) for `search_memory_decomposed`.
-    /// Env override `WENLAN_QUERY_DECOMP_MAX_SUBQUERIES` lets the eval harness
-    /// sweep the cap without recompile. Default 4 matches Cognee's CoT max_iter.
-    const QUERY_DECOMP_MAX_DEFAULT: usize = 4;
-
-    fn query_decomp_max_subqueries() -> usize {
-        std::env::var("WENLAN_QUERY_DECOMP_MAX_SUBQUERIES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(Self::QUERY_DECOMP_MAX_DEFAULT)
     }
 
     /// Hybrid search over the verbatim `source='episode'` tier (T2).
@@ -28034,262 +27854,6 @@ impl MemoryDB {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        merged = cap_per_document(merged, DEFAULT_PER_DOCUMENT_CAP);
-        merged.truncate(limit);
-        Ok(merged)
-    }
-
-    /// Hybrid search with **pseudo-relevance feedback** (PRF): iterate by
-    /// drafting a short answer from the current top-K retrieved snippets and
-    /// feeding that draft back as the next retrieval query, RRF-merging each
-    /// round's pool until the candidate set converges (no new ids) or the
-    /// `WENLAN_PRF_ROUNDS` budget (default 0, clamp <= 4) is exhausted.
-    ///
-    /// The original literal query is always RRF round 0, which weights the
-    /// literal query as one equal RRF stream; a strong off-topic draft answer
-    /// can still displace mid-rank literal hits — this is recall expansion, not
-    /// a protection guarantee. Distinct from `search_memory_expanded`
-    /// (paraphrases the literal query up front, no draft, no loop): PRF reads
-    /// the retrieved *content*, drafts an answer, and iterates.
-    ///
-    /// Graceful degradation: `WENLAN_PRF_ROUNDS=0`/unset, `llm.is_none()`, an
-    /// LLM timeout/error, or a blank draft all fall back to the round-0 pool,
-    /// never an error. When dark (rounds 0) the output is id-order-identical to
-    /// a plain `search_memory` (scores are re-derived as `1/(60+rank)`;
-    /// raw_score is not preserved). Each LLM call is wrapped in a 10s
-    /// `tokio::time::timeout` (mirrors `search_memory_expanded`).
-    pub async fn search_memory_prf(
-        &self,
-        query: &str,
-        limit: usize,
-        memory_type: Option<&str>,
-        scope: &ReadScope,
-        source_agent: Option<&str>,
-        llm: Option<Arc<dyn crate::llm_provider::LlmProvider>>,
-    ) -> Result<Vec<SearchResult>, WenlanError> {
-        use crate::retrieval::prf;
-
-        let rounds = prf::prf_rounds();
-        let fetch_pool = limit * 2;
-
-        // Round 0: the literal query is always the first RRF stream.
-        let round0 = self
-            .search_memory(
-                query,
-                fetch_pool,
-                memory_type,
-                scope,
-                source_agent,
-                None,
-                None,
-                None,
-            )
-            .await?;
-        let mut seen = prf::candidate_set(&round0);
-        let mut acc: Vec<Vec<SearchResult>> = vec![round0];
-
-        // Only iterate when both a round budget and an LLM are present. Without
-        // either, PRF is exactly a plain (pool-widened) search of the literal
-        // query — the round-0 stream merged through RRF below.
-        if rounds > 0 {
-            if let Some(ref llm) = llm {
-                for _ in 0..rounds {
-                    // Feedback comes from the round-0 literal-query pool (the
-                    // highest-quality anchor). A fixed-string draft therefore
-                    // converges after one feedback round.
-                    let snippets = prf::feedback_snippets(&acc[0], 5, 200);
-                    if snippets.is_empty() {
-                        break;
-                    }
-                    let req = prf::draft_answer_request(query, &snippets);
-                    let draft_result =
-                        tokio::time::timeout(std::time::Duration::from_secs(10), llm.generate(req))
-                            .await;
-                    let draft = match draft_result {
-                        Ok(Ok(text)) if !text.trim().is_empty() => text,
-                        Ok(Ok(_)) => {
-                            log::warn!("[memory_db] prf: blank draft, stopping (best-so-far)");
-                            break;
-                        }
-                        Ok(Err(e)) => {
-                            log::warn!("[memory_db] prf draft LLM failed: {e}");
-                            break;
-                        }
-                        Err(_) => {
-                            log::warn!("[memory_db] prf draft timed out");
-                            break;
-                        }
-                    };
-
-                    // Retrieve with the draft answer as the next query. A failed
-                    // search is logged and the loop stops with best-so-far.
-                    match self
-                        .search_memory(
-                            &draft,
-                            fetch_pool,
-                            memory_type,
-                            scope,
-                            source_agent,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await
-                    {
-                        Ok(hits) => {
-                            let cur = prf::candidate_set(&hits);
-                            acc.push(hits);
-                            if prf::converged(&seen, &cur) {
-                                break;
-                            }
-                            seen.extend(cur);
-                        }
-                        Err(e) => {
-                            log::warn!("[memory_db] prf feedback search failed: {e}");
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // If round 0 somehow produced nothing AND no feedback rounds ran, fall
-        // back to a plain search on the original query (mirrors expanded).
-        if acc.iter().all(|r| r.is_empty()) {
-            return self
-                .search_memory(
-                    query,
-                    limit,
-                    memory_type,
-                    scope,
-                    source_agent,
-                    None,
-                    None,
-                    None,
-                )
-                .await;
-        }
-
-        // RRF merge — verbatim block (mirrors search_memory_expanded /
-        // search_memory_decomposed): each round contributes one equal-weight
-        // stream scored 1/(60 + rank), deduped on result.id.
-        let mut score_map: HashMap<String, f32> = HashMap::new();
-        let mut result_map: HashMap<String, SearchResult> = HashMap::new();
-
-        for ranked in acc {
-            for (rank, result) in ranked.into_iter().enumerate() {
-                let rrf_score = 1.0 / (60.0 + rank as f32);
-                *score_map.entry(result.id.clone()).or_default() += rrf_score;
-                result_map.entry(result.id.clone()).or_insert(result);
-            }
-        }
-
-        let mut merged: Vec<SearchResult> = result_map
-            .into_values()
-            .map(|mut r| {
-                r.score = *score_map.get(&r.id).unwrap_or(&0.0);
-                r
-            })
-            .collect();
-        merged.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        merged = cap_per_document(merged, DEFAULT_PER_DOCUMENT_CAP);
-        merged.truncate(limit);
-        Ok(merged)
-    }
-
-    /// Hybrid search with LLM query *decomposition* BEFORE search.
-    ///
-    /// Splits a compositional query into independent factual subqueries
-    /// (`retrieval::decompose`), runs `search_memory` per subquery, and RRF-merges
-    /// the pools. Unlike `search_memory_expanded` (paraphrases of one clause), each
-    /// stream is a DISTINCT clause, so a memory satisfying clause B is not drowned
-    /// by vocabulary variants of clause A. The original full query is always the
-    /// first stream, so the worst case degrades to a plain single-query search.
-    /// Graceful degradation: no LLM / parse failure / all-subquery-search failure
-    /// falls back to `search_memory(query, ...)`.
-    pub async fn search_memory_decomposed(
-        &self,
-        query: &str,
-        limit: usize,
-        memory_type: Option<&str>,
-        scope: &ReadScope,
-        source_agent: Option<&str>,
-        llm: Option<Arc<dyn crate::llm_provider::LlmProvider>>,
-    ) -> Result<Vec<SearchResult>, WenlanError> {
-        let queries = crate::retrieval::decompose::decompose_query(
-            llm.as_ref(),
-            query,
-            Self::query_decomp_max_subqueries(),
-        )
-        .await;
-
-        let fetch_pool = limit * 2;
-        let mut all_ranked: Vec<Vec<SearchResult>> = Vec::with_capacity(queries.len());
-        for q in &queries {
-            match self
-                .search_memory(
-                    q,
-                    fetch_pool,
-                    memory_type,
-                    scope,
-                    source_agent,
-                    None,
-                    None,
-                    None,
-                )
-                .await
-            {
-                Ok(results) => all_ranked.push(results),
-                Err(e) => {
-                    log::warn!("[memory_db] decompose search failed for subquery '{q}': {e}");
-                }
-            }
-        }
-
-        // If every subquery search failed, fall back to a plain search.
-        if all_ranked.is_empty() {
-            return self
-                .search_memory(
-                    query,
-                    limit,
-                    memory_type,
-                    scope,
-                    source_agent,
-                    None,
-                    None,
-                    None,
-                )
-                .await;
-        }
-
-        // RRF merge — each subquery contributes one equal-weight stream.
-        let mut score_map: HashMap<String, f32> = HashMap::new();
-        let mut result_map: HashMap<String, SearchResult> = HashMap::new();
-        for ranked in all_ranked {
-            for (rank, result) in ranked.into_iter().enumerate() {
-                let rrf_score = 1.0 / (60.0 + rank as f32);
-                *score_map.entry(result.id.clone()).or_default() += rrf_score;
-                result_map.entry(result.id.clone()).or_insert(result);
-            }
-        }
-
-        let mut merged: Vec<SearchResult> = result_map
-            .into_values()
-            .map(|mut r| {
-                r.score = *score_map.get(&r.id).unwrap_or(&0.0);
-                r
-            })
-            .collect();
-        merged.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
         merged = cap_per_document(merged, DEFAULT_PER_DOCUMENT_CAP);
         merged.truncate(limit);
         Ok(merged)
@@ -29670,8 +29234,8 @@ impl MemoryDB {
     ///
     /// **Recency caveat**: `page.last_modified` is parsed from RFC3339; on parse
     /// failure, `last_modified=0` (1970-01-01). Page-channel rows MUST stay out of
-    /// recency-based scoring paths (`signals::recency_decay` etc.) or a malformed
-    /// timestamp silently demotes the page to maximum decay. Current consumer
+    /// any future recency-based scoring path or a malformed timestamp silently
+    /// demotes the page to maximum decay. Current consumer
     /// (PR-B Task 3 two-stage RRF merge) does not route page rows through recency,
     /// so this is documented as an invariant rather than enforced at the type level.
     // consumed by search_memory_cross_rerank (page-channel RRF, PR-B Task 3) and
@@ -33011,6 +32575,85 @@ impl MemoryDB {
             .await
     }
 
+    /// Shared 26-column `memories` row projection powering every `MemoryItem`
+    /// reader below (`list_memories_scoped`, `get_memory_detail`,
+    /// `get_memories_by_source_ids[_scoped]`, `load_memories_by_type_scoped`).
+    /// `title_expr` differs only for `load_memories_by_type_scoped`, which
+    /// GROUPs across possibly-differing per-chunk titles and needs
+    /// `MAX(title) as title`; `is_archived` is the per-scope archive-flag
+    /// subquery each caller already resolves via `superseder_archives`.
+    fn memory_item_columns(title_expr: &str, is_archived: &str) -> String {
+        format!(
+            "source_id, {title_expr},
+                GROUP_CONCAT(content, '\n') as content,
+                MAX(summary) as summary,
+                MAX(memory_type) as memory_type,
+                MAX(space) as space,
+                MAX(source_agent) as source_agent,
+                MAX(confidence) as confidence,
+                MAX(confirmed) as confirmed,
+                MAX(stability) as stability,
+                MAX(pinned) as pinned,
+                MAX(supersedes) as supersedes,
+                MAX(last_modified) as last_modified,
+                COUNT(*) as chunk_count,
+                MAX(entity_id) as entity_id,
+                MAX(quality) as quality,
+                MAX(is_recap) as is_recap,
+                (SELECT CASE
+                    WHEN COUNT(es.source_id) = 0 THEN 'raw'
+                    WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
+                    WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
+                    ELSE 'enrichment_partial'
+                END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
+                MAX(supersede_mode) as supersede_mode,
+                MAX(structured_fields) as structured_fields,
+                MAX(retrieval_cue) as retrieval_cue,
+                SUM(access_count) as access_count,
+                MAX(source_text) as source_text,
+                MAX(version) as version,
+                MAX(changelog) as changelog,
+                {is_archived} AS is_archived"
+        )
+    }
+
+    /// Map one `memories` row (the `memory_item_columns` projection, columns
+    /// 0..25) into a `MemoryItem`. Shared by every reader below so a column
+    /// added to the projection only needs its index added once instead of
+    /// once per reader.
+    fn memory_item_from_row(row: &libsql::Row) -> MemoryItem {
+        MemoryItem {
+            source_id: row.get::<String>(0).unwrap_or_default(),
+            title: row.get::<String>(1).unwrap_or_default(),
+            content: row.get::<String>(2).unwrap_or_default(),
+            summary: row.get::<Option<String>>(3).unwrap_or(None),
+            memory_type: row.get::<Option<String>>(4).unwrap_or(None),
+            space: row.get::<Option<String>>(5).unwrap_or(None),
+            source_agent: row.get::<Option<String>>(6).unwrap_or(None),
+            confidence: row.get::<Option<f64>>(7).unwrap_or(None).map(|v| v as f32),
+            confirmed: row.get::<i64>(8).unwrap_or(0) != 0,
+            stability: row.get::<Option<String>>(9).unwrap_or(None),
+            pinned: row.get::<i64>(10).unwrap_or(0) != 0,
+            supersedes: row.get::<Option<String>>(11).unwrap_or(None),
+            last_modified: row.get::<i64>(12).unwrap_or(0),
+            chunk_count: row.get::<u64>(13).unwrap_or(0),
+            entity_id: row.get::<Option<String>>(14).unwrap_or(None),
+            quality: row.get::<Option<String>>(15).unwrap_or(None),
+            is_recap: row.get::<i64>(16).unwrap_or(0) != 0,
+            enrichment_status: row.get::<String>(17).unwrap_or_else(|_| "raw".to_string()),
+            supersede_mode: row.get::<String>(18).unwrap_or_else(|_| "hide".to_string()),
+            structured_fields: row.get::<Option<String>>(19).unwrap_or(None),
+            retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
+            access_count: row.get::<u64>(21).unwrap_or(0),
+            source_text: row.get::<Option<String>>(22).unwrap_or(None),
+            version: row.get::<i64>(23).unwrap_or(1),
+            changelog: row.get::<Option<String>>(24).unwrap_or(None),
+            is_archived: row.get::<i64>(25).unwrap_or(0) != 0,
+            pending_revision: false,
+            merged_from: None,
+        }
+    }
+
     pub async fn list_memories_scoped(
         &self,
         scope: &ReadScope,
@@ -33023,37 +32666,9 @@ impl MemoryDB {
 
         let hidden_by_superseder = not_hidden_by_superseder(scope, "memories");
         let is_archived = superseder_archives(scope, "memories");
+        let columns = Self::memory_item_columns("title", &is_archived);
         let mut sql = format!(
-            "SELECT source_id, title,
-                    GROUP_CONCAT(content, '\n') as content,
-                    MAX(summary) as summary,
-                    MAX(memory_type) as memory_type,
-                    MAX(space) as space,
-                    MAX(source_agent) as source_agent,
-                    MAX(confidence) as confidence,
-                    MAX(confirmed) as confirmed,
-                    MAX(stability) as stability,
-                    MAX(pinned) as pinned,
-                    MAX(supersedes) as supersedes,
-                    MAX(last_modified) as last_modified,
-                    COUNT(*) as chunk_count,
-                    MAX(entity_id) as entity_id,
-                    MAX(quality) as quality,
-                    MAX(is_recap) as is_recap,
-                    (SELECT CASE
-                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
-                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
-                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
-                        ELSE 'enrichment_partial'
-                    END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
-                    MAX(supersede_mode) as supersede_mode,
-                    MAX(structured_fields) as structured_fields,
-                    MAX(retrieval_cue) as retrieval_cue,
-                    SUM(access_count) as access_count,
-                    MAX(source_text) as source_text,
-                    MAX(version) as version,
-                    MAX(changelog) as changelog,
-                    {is_archived} AS is_archived
+            "SELECT {columns}
              FROM memories
              WHERE source = 'memory'
                AND pending_revision = 0
@@ -33098,36 +32713,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            items.push(MemoryItem {
-                source_id: row.get::<String>(0).unwrap_or_default(),
-                title: row.get::<String>(1).unwrap_or_default(),
-                content: row.get::<String>(2).unwrap_or_default(),
-                summary: row.get::<Option<String>>(3).unwrap_or(None),
-                memory_type: row.get::<Option<String>>(4).unwrap_or(None),
-                space: row.get::<Option<String>>(5).unwrap_or(None),
-                source_agent: row.get::<Option<String>>(6).unwrap_or(None),
-                confidence: row.get::<Option<f64>>(7).unwrap_or(None).map(|v| v as f32),
-                confirmed: row.get::<i64>(8).unwrap_or(0) != 0,
-                stability: row.get::<Option<String>>(9).unwrap_or(None),
-                pinned: row.get::<i64>(10).unwrap_or(0) != 0,
-                supersedes: row.get::<Option<String>>(11).unwrap_or(None),
-                last_modified: row.get::<i64>(12).unwrap_or(0),
-                chunk_count: row.get::<u64>(13).unwrap_or(0),
-                entity_id: row.get::<Option<String>>(14).unwrap_or(None),
-                quality: row.get::<Option<String>>(15).unwrap_or(None),
-                is_recap: row.get::<i64>(16).unwrap_or(0) != 0,
-                enrichment_status: row.get::<String>(17).unwrap_or_else(|_| "raw".to_string()),
-                supersede_mode: row.get::<String>(18).unwrap_or_else(|_| "hide".to_string()),
-                structured_fields: row.get::<Option<String>>(19).unwrap_or(None),
-                retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
-                access_count: row.get::<u64>(21).unwrap_or(0),
-                source_text: row.get::<Option<String>>(22).unwrap_or(None),
-                version: row.get::<i64>(23).unwrap_or(1),
-                changelog: row.get::<Option<String>>(24).unwrap_or(None),
-                is_archived: row.get::<i64>(25).unwrap_or(0) != 0,
-                pending_revision: false,
-                merged_from: None,
-            });
+            items.push(Self::memory_item_from_row(&row));
         }
         Ok(items)
     }
@@ -33141,37 +32727,9 @@ impl MemoryDB {
         // Detail is reached by id from any surface, so it reads unscoped; the
         // flag has to agree with whichever list the click came from.
         let is_archived = superseder_archives(&ReadScope::Global, "memories");
+        let columns = Self::memory_item_columns("title", &is_archived);
         let sql = format!(
-            "SELECT source_id, title,
-                    GROUP_CONCAT(content, '\n') as content,
-                    MAX(summary) as summary,
-                    MAX(memory_type) as memory_type,
-                    MAX(space) as space,
-                    MAX(source_agent) as source_agent,
-                    MAX(confidence) as confidence,
-                    MAX(confirmed) as confirmed,
-                    MAX(stability) as stability,
-                    MAX(pinned) as pinned,
-                    MAX(supersedes) as supersedes,
-                    MAX(last_modified) as last_modified,
-                    COUNT(*) as chunk_count,
-                    MAX(entity_id) as entity_id,
-                    MAX(quality) as quality,
-                    MAX(is_recap) as is_recap,
-                    (SELECT CASE
-                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
-                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
-                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
-                        ELSE 'enrichment_partial'
-                    END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
-                    MAX(supersede_mode) as supersede_mode,
-                    MAX(structured_fields) as structured_fields,
-                    MAX(retrieval_cue) as retrieval_cue,
-                    SUM(access_count) as access_count,
-                    MAX(source_text) as source_text,
-                    MAX(version) as version,
-                    MAX(changelog) as changelog,
-                    {is_archived} AS is_archived
+            "SELECT {columns}
              FROM memories
              WHERE pending_revision = 0
                AND source != 'episode'
@@ -33189,36 +32747,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            Ok(Some(MemoryItem {
-                source_id: row.get::<String>(0).unwrap_or_default(),
-                title: row.get::<String>(1).unwrap_or_default(),
-                content: row.get::<String>(2).unwrap_or_default(),
-                summary: row.get::<Option<String>>(3).unwrap_or(None),
-                memory_type: row.get::<Option<String>>(4).unwrap_or(None),
-                space: row.get::<Option<String>>(5).unwrap_or(None),
-                source_agent: row.get::<Option<String>>(6).unwrap_or(None),
-                confidence: row.get::<Option<f64>>(7).unwrap_or(None).map(|v| v as f32),
-                confirmed: row.get::<i64>(8).unwrap_or(0) != 0,
-                stability: row.get::<Option<String>>(9).unwrap_or(None),
-                pinned: row.get::<i64>(10).unwrap_or(0) != 0,
-                supersedes: row.get::<Option<String>>(11).unwrap_or(None),
-                last_modified: row.get::<i64>(12).unwrap_or(0),
-                chunk_count: row.get::<u64>(13).unwrap_or(0),
-                entity_id: row.get::<Option<String>>(14).unwrap_or(None),
-                quality: row.get::<Option<String>>(15).unwrap_or(None),
-                is_recap: row.get::<i64>(16).unwrap_or(0) != 0,
-                enrichment_status: row.get::<String>(17).unwrap_or_else(|_| "raw".to_string()),
-                supersede_mode: row.get::<String>(18).unwrap_or_else(|_| "hide".to_string()),
-                structured_fields: row.get::<Option<String>>(19).unwrap_or(None),
-                retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
-                access_count: row.get::<u64>(21).unwrap_or(0),
-                source_text: row.get::<Option<String>>(22).unwrap_or(None),
-                version: row.get::<i64>(23).unwrap_or(1),
-                changelog: row.get::<Option<String>>(24).unwrap_or(None),
-                is_archived: row.get::<i64>(25).unwrap_or(0) != 0,
-                pending_revision: false,
-                merged_from: None,
-            }))
+            Ok(Some(Self::memory_item_from_row(&row)))
         } else {
             Ok(None)
         }
@@ -33243,37 +32772,9 @@ impl MemoryDB {
         // Fetched by id from any surface, so unscoped -- same reasoning as
         // `get_memory_detail`.
         let is_archived = superseder_archives(&ReadScope::Global, "memories");
+        let columns = Self::memory_item_columns("title", &is_archived);
         let sql = format!(
-            "SELECT source_id, title,
-                GROUP_CONCAT(content, '\n') as content,
-                MAX(summary) as summary,
-                MAX(memory_type) as memory_type,
-                MAX(space) as space,
-                MAX(source_agent) as source_agent,
-                MAX(confidence) as confidence,
-                MAX(confirmed) as confirmed,
-                MAX(stability) as stability,
-                MAX(pinned) as pinned,
-                MAX(supersedes) as supersedes,
-                MAX(last_modified) as last_modified,
-                COUNT(*) as chunk_count,
-                MAX(entity_id) as entity_id,
-                MAX(quality) as quality,
-                MAX(is_recap) as is_recap,
-                (SELECT CASE
-                    WHEN COUNT(es.source_id) = 0 THEN 'raw'
-                    WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
-                    WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
-                    ELSE 'enrichment_partial'
-                END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
-                MAX(supersede_mode) as supersede_mode,
-                MAX(structured_fields) as structured_fields,
-                MAX(retrieval_cue) as retrieval_cue,
-                SUM(access_count) as access_count,
-                MAX(source_text) as source_text,
-                MAX(version) as version,
-                MAX(changelog) as changelog,
-                {is_archived} AS is_archived
+            "SELECT {columns}
              FROM memories
              WHERE pending_revision = 0
                AND source != 'episode'
@@ -33298,36 +32799,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            let item = MemoryItem {
-                source_id: row.get::<String>(0).unwrap_or_default(),
-                title: row.get::<String>(1).unwrap_or_default(),
-                content: row.get::<String>(2).unwrap_or_default(),
-                summary: row.get::<Option<String>>(3).unwrap_or(None),
-                memory_type: row.get::<Option<String>>(4).unwrap_or(None),
-                space: row.get::<Option<String>>(5).unwrap_or(None),
-                source_agent: row.get::<Option<String>>(6).unwrap_or(None),
-                confidence: row.get::<Option<f64>>(7).unwrap_or(None).map(|v| v as f32),
-                confirmed: row.get::<i64>(8).unwrap_or(0) != 0,
-                stability: row.get::<Option<String>>(9).unwrap_or(None),
-                pinned: row.get::<i64>(10).unwrap_or(0) != 0,
-                supersedes: row.get::<Option<String>>(11).unwrap_or(None),
-                last_modified: row.get::<i64>(12).unwrap_or(0),
-                chunk_count: row.get::<u64>(13).unwrap_or(0),
-                entity_id: row.get::<Option<String>>(14).unwrap_or(None),
-                quality: row.get::<Option<String>>(15).unwrap_or(None),
-                is_recap: row.get::<i64>(16).unwrap_or(0) != 0,
-                enrichment_status: row.get::<String>(17).unwrap_or_else(|_| "raw".to_string()),
-                supersede_mode: row.get::<String>(18).unwrap_or_else(|_| "hide".to_string()),
-                structured_fields: row.get::<Option<String>>(19).unwrap_or(None),
-                retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
-                access_count: row.get::<u64>(21).unwrap_or(0),
-                source_text: row.get::<Option<String>>(22).unwrap_or(None),
-                version: row.get::<i64>(23).unwrap_or(1),
-                changelog: row.get::<Option<String>>(24).unwrap_or(None),
-                is_archived: row.get::<i64>(25).unwrap_or(0) != 0,
-                pending_revision: false,
-                merged_from: None,
-            };
+            let item = Self::memory_item_from_row(&row);
             map.insert(item.source_id.clone(), item);
         }
         // Return in input order, skipping missing ids.
@@ -33369,41 +32841,13 @@ impl MemoryDB {
             .collect::<Vec<_>>();
         push_read_scope_filter_folded(scope, "space", &mut conditions, &mut values);
         let is_archived = superseder_archives(scope, "memories");
+        let columns = Self::memory_item_columns("title", &is_archived);
+        let conditions_sql = conditions.join(" AND ");
         let sql = format!(
-            "SELECT source_id, title,
-                GROUP_CONCAT(content, '\n') as content,
-                MAX(summary) as summary,
-                MAX(memory_type) as memory_type,
-                MAX(space) as space,
-                MAX(source_agent) as source_agent,
-                MAX(confidence) as confidence,
-                MAX(confirmed) as confirmed,
-                MAX(stability) as stability,
-                MAX(pinned) as pinned,
-                MAX(supersedes) as supersedes,
-                MAX(last_modified) as last_modified,
-                COUNT(*) as chunk_count,
-                MAX(entity_id) as entity_id,
-                MAX(quality) as quality,
-                MAX(is_recap) as is_recap,
-                (SELECT CASE
-                    WHEN COUNT(es.source_id) = 0 THEN 'raw'
-                    WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
-                    WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
-                    ELSE 'enrichment_partial'
-                END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
-                MAX(supersede_mode) as supersede_mode,
-                MAX(structured_fields) as structured_fields,
-                MAX(retrieval_cue) as retrieval_cue,
-                SUM(access_count) as access_count,
-                MAX(source_text) as source_text,
-                MAX(version) as version,
-                MAX(changelog) as changelog,
-                {is_archived} AS is_archived
+            "SELECT {columns}
              FROM memories
-             WHERE {}
-             GROUP BY source_id",
-            conditions.join(" AND ")
+             WHERE {conditions_sql}
+             GROUP BY source_id"
         );
         let conn = self.conn.lock().await;
         let mut rows = conn
@@ -33417,43 +32861,11 @@ impl MemoryDB {
         while let Some(row) = rows.next().await.map_err(|e| {
             WenlanError::VectorDb(format!("get_memories_by_source_ids_scoped row: {e}"))
         })? {
-            let item = MemoryItem {
-                source_id: row.get::<String>(0).unwrap_or_default(),
-                title: row.get::<String>(1).unwrap_or_default(),
-                content: row.get::<String>(2).unwrap_or_default(),
-                summary: row.get::<Option<String>>(3).unwrap_or(None),
-                memory_type: row.get::<Option<String>>(4).unwrap_or(None),
-                space: row.get::<Option<String>>(5).unwrap_or(None),
-                source_agent: row.get::<Option<String>>(6).unwrap_or(None),
-                confidence: row.get::<Option<f64>>(7).unwrap_or(None).map(|v| v as f32),
-                confirmed: row.get::<i64>(8).unwrap_or(0) != 0,
-                stability: row.get::<Option<String>>(9).unwrap_or(None),
-                pinned: row.get::<i64>(10).unwrap_or(0) != 0,
-                supersedes: row.get::<Option<String>>(11).unwrap_or(None),
-                last_modified: row.get::<i64>(12).unwrap_or(0),
-                chunk_count: row.get::<u64>(13).unwrap_or(0),
-                entity_id: row.get::<Option<String>>(14).unwrap_or(None),
-                quality: row.get::<Option<String>>(15).unwrap_or(None),
-                is_recap: row.get::<i64>(16).unwrap_or(0) != 0,
-                enrichment_status: row.get::<String>(17).unwrap_or_else(|_| "raw".to_string()),
-                supersede_mode: row.get::<String>(18).unwrap_or_else(|_| "hide".to_string()),
-                structured_fields: row.get::<Option<String>>(19).unwrap_or(None),
-                retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
-                access_count: row.get::<u64>(21).unwrap_or(0),
-                source_text: row.get::<Option<String>>(22).unwrap_or(None),
-                version: row.get::<i64>(23).unwrap_or(1),
-                changelog: row.get::<Option<String>>(24).unwrap_or(None),
-                is_archived: row.get::<i64>(25).unwrap_or(0) != 0,
-                pending_revision: false,
-                merged_from: None,
-            };
+            let item = Self::memory_item_from_row(&row);
             map.insert(item.source_id.clone(), item);
         }
 
-        Ok(source_ids
-            .iter()
-            .filter_map(|id| map.get(id).cloned())
-            .collect())
+        Ok(source_ids.iter().filter_map(|id| map.remove(id)).collect())
     }
 
     /// Load confirmed memories of a specific type, excluding superseded ones.
@@ -33488,44 +32900,15 @@ impl MemoryDB {
             }
         };
 
+        let columns = Self::memory_item_columns("MAX(title) as title", &is_archived);
         let sql = format!(
-            "SELECT source_id, MAX(title) as title,
-                    GROUP_CONCAT(content, '\n') as content,
-                    MAX(summary) as summary,
-                    MAX(memory_type) as memory_type,
-                    MAX(space) as space,
-                    MAX(source_agent) as source_agent,
-                    MAX(confidence) as confidence,
-                    MAX(confirmed) as confirmed,
-                    MAX(stability) as stability,
-                    MAX(pinned) as pinned,
-                    MAX(supersedes) as supersedes,
-                    MAX(last_modified) as last_modified,
-                    COUNT(*) as chunk_count,
-                    MAX(entity_id) as entity_id,
-                    MAX(quality) as quality,
-                    MAX(is_recap) as is_recap,
-                    (SELECT CASE
-                        WHEN COUNT(es.source_id) = 0 THEN 'raw'
-                        WHEN SUM(CASE WHEN es.status = 'failed' OR es.status = 'abandoned' THEN 1 ELSE 0 END) = 0 THEN 'enriched'
-                        WHEN SUM(CASE WHEN es.status IN ('ok','skipped') THEN 1 ELSE 0 END) = 0 THEN 'enrichment_failed'
-                        ELSE 'enrichment_partial'
-                    END FROM enrichment_steps es WHERE es.source_id = memories.source_id) AS enrichment_status,
-                    MAX(supersede_mode) as supersede_mode,
-                    MAX(structured_fields) as structured_fields,
-                    MAX(retrieval_cue) as retrieval_cue,
-                    SUM(access_count) as access_count,
-                    MAX(source_text) as source_text,
-                    MAX(version) as version,
-                    MAX(changelog) as changelog,
-                    {is_archived} AS is_archived
+            "SELECT {columns}
              FROM memories
              WHERE source = 'memory' AND memory_type = ?1 AND confirmed != 0
-             {} {}
+             {supersedes_exclusion} {space_clause}
              GROUP BY source_id
              ORDER BY last_modified DESC
-             LIMIT ?2",
-            supersedes_exclusion, space_clause
+             LIMIT ?2"
         );
 
         let mut rows = match scope {
@@ -33549,36 +32932,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            items.push(MemoryItem {
-                source_id: row.get::<String>(0).unwrap_or_default(),
-                title: row.get::<String>(1).unwrap_or_default(),
-                content: row.get::<String>(2).unwrap_or_default(),
-                summary: row.get::<Option<String>>(3).unwrap_or(None),
-                memory_type: row.get::<Option<String>>(4).unwrap_or(None),
-                space: row.get::<Option<String>>(5).unwrap_or(None),
-                source_agent: row.get::<Option<String>>(6).unwrap_or(None),
-                confidence: row.get::<Option<f64>>(7).unwrap_or(None).map(|v| v as f32),
-                confirmed: row.get::<i64>(8).unwrap_or(0) != 0,
-                stability: row.get::<Option<String>>(9).unwrap_or(None),
-                pinned: row.get::<i64>(10).unwrap_or(0) != 0,
-                supersedes: row.get::<Option<String>>(11).unwrap_or(None),
-                last_modified: row.get::<i64>(12).unwrap_or(0),
-                chunk_count: row.get::<u64>(13).unwrap_or(0),
-                entity_id: row.get::<Option<String>>(14).unwrap_or(None),
-                quality: row.get::<Option<String>>(15).unwrap_or(None),
-                is_recap: row.get::<i64>(16).unwrap_or(0) != 0,
-                enrichment_status: row.get::<String>(17).unwrap_or_else(|_| "raw".to_string()),
-                supersede_mode: row.get::<String>(18).unwrap_or_else(|_| "hide".to_string()),
-                structured_fields: row.get::<Option<String>>(19).unwrap_or(None),
-                retrieval_cue: row.get::<Option<String>>(20).unwrap_or(None),
-                access_count: row.get::<u64>(21).unwrap_or(0),
-                source_text: row.get::<Option<String>>(22).unwrap_or(None),
-                version: row.get::<i64>(23).unwrap_or(1),
-                changelog: row.get::<Option<String>>(24).unwrap_or(None),
-                is_archived: row.get::<i64>(25).unwrap_or(0) != 0,
-                pending_revision: false,
-                merged_from: None,
-            });
+            items.push(Self::memory_item_from_row(&row));
         }
         Ok(items)
     }
@@ -40680,7 +40034,13 @@ impl MemoryDB {
         }
     }
 
-    pub async fn set_stability(&self, source_id: &str, stability: &str) -> Result<(), WenlanError> {
+    /// Returns `true` when a memory row actually matched `source_id`; `false`
+    /// means the UPDATE touched nothing, so callers must not report success.
+    pub async fn set_stability(
+        &self,
+        source_id: &str,
+        stability: &str,
+    ) -> Result<bool, WenlanError> {
         if !matches!(stability, "new" | "learned" | "confirmed") {
             return Err(WenlanError::VectorDb(format!(
                 "invalid stability: {}",
@@ -40689,21 +40049,22 @@ impl MemoryDB {
         }
         let conn = self.conn.lock().await;
         let confirmed_int: i64 = if stability == "confirmed" { 1 } else { 0 };
-        if stability == "confirmed" {
+        let rows_affected = if stability == "confirmed" {
             conn.execute(
                 "UPDATE memories SET stability = ?1, confirmed = ?2, confidence = 1.0 WHERE source_id = ?3 AND source = 'memory'",
                 libsql::params![stability.to_string(), confirmed_int, source_id.to_string()],
-            ).await.map_err(|e| WenlanError::VectorDb(format!("set_stability: {}", e)))?;
+            ).await.map_err(|e| WenlanError::VectorDb(format!("set_stability: {}", e)))?
         } else {
             conn.execute(
                 "UPDATE memories SET stability = ?1, confirmed = ?2 WHERE source_id = ?3 AND source = 'memory'",
                 libsql::params![stability.to_string(), confirmed_int, source_id.to_string()],
-            ).await.map_err(|e| WenlanError::VectorDb(format!("set_stability: {}", e)))?;
-        }
-        Ok(())
+            ).await.map_err(|e| WenlanError::VectorDb(format!("set_stability: {}", e)))?
+        };
+        Ok(rows_affected > 0)
     }
 
-    pub async fn confirm_memory(&self, source_id: &str) -> Result<(), WenlanError> {
+    /// Returns `true` when a memory row matched `source_id` (see `set_stability`).
+    pub async fn confirm_memory(&self, source_id: &str) -> Result<bool, WenlanError> {
         self.set_stability(source_id, "confirmed").await
     }
 
@@ -42143,60 +41504,6 @@ impl MemoryDB {
         Ok(())
     }
 
-    /// Delete session data (activities, capture_refs, snapshots) overlapping a time range.
-    pub async fn delete_session_by_time_range(
-        &self,
-        start: i64,
-        end: i64,
-    ) -> Result<(), WenlanError> {
-        let conn = self.conn.lock().await;
-        // Find overlapping activity IDs
-        let mut rows = conn
-            .query(
-                "SELECT id FROM activities WHERE started_at <= ?2 AND ended_at >= ?1",
-                libsql::params![start, end],
-            )
-            .await
-            .map_err(|e| {
-                WenlanError::VectorDb(format!("delete_session_by_time_range query: {}", e))
-            })?;
-        let mut ids = vec![];
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-        {
-            let id: String = row
-                .get(0)
-                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
-            ids.push(id);
-        }
-        drop(rows);
-
-        for id in &ids {
-            conn.execute(
-                "UPDATE capture_refs SET snapshot_id = NULL WHERE activity_id = ?1 AND snapshot_id IS NOT NULL",
-                [id.as_str()],
-            ).await.map_err(|e| WenlanError::VectorDb(format!("delete_session unlink: {}", e)))?;
-            conn.execute(
-                "DELETE FROM session_snapshots WHERE activity_id = ?1",
-                [id.as_str()],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("delete_session snapshots: {}", e)))?;
-            conn.execute(
-                "DELETE FROM capture_refs WHERE activity_id = ?1",
-                [id.as_str()],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("delete_session captures: {}", e)))?;
-            conn.execute("DELETE FROM activities WHERE id = ?1", [id.as_str()])
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("delete_session activity: {}", e)))?;
-        }
-        Ok(())
-    }
-
     // ==================== Briefing Cache ====================
 
     /// Get the cached briefing (content, generated_at, memory_count).
@@ -42707,87 +42014,6 @@ impl MemoryDB {
         Ok(results)
     }
 
-    /// Get pending contradiction items from the refinement queue.
-    pub async fn get_pending_contradiction_items(
-        &self,
-    ) -> Result<Vec<crate::briefing::ContradictionItem>, WenlanError> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn.query(
-            "SELECT id, source_ids FROM refinement_queue WHERE action = 'detect_contradiction' AND status = 'awaiting_review'",
-            (),
-        ).await.map_err(|e| WenlanError::VectorDb(format!("get_pending_contradictions: {}", e)))?;
-
-        let mut items = vec![];
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-        {
-            let id: String = row
-                .get(0)
-                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
-            let source_ids_json: String = row
-                .get(1)
-                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
-            let source_ids: Vec<String> =
-                serde_json::from_str(&source_ids_json).unwrap_or_default();
-
-            if source_ids.len() < 2 {
-                continue;
-            }
-
-            let new_source_id = source_ids[0].clone();
-            let existing_source_id = source_ids[1].clone();
-
-            // Fetch content for both source memories — must drop conn first since get_chunk_content needs it
-            // Instead, inline the queries here to keep the same connection lock
-            let mut new_rows = conn
-                .query(
-                    "SELECT content FROM memories WHERE source_id = ?1 AND chunk_index = 0 LIMIT 1",
-                    [new_source_id.as_str()],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("contradiction new content: {}", e)))?;
-            let new_content = if let Some(r) = new_rows
-                .next()
-                .await
-                .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-            {
-                r.get::<String>(0).unwrap_or_default()
-            } else {
-                continue; // skip if source memory not found
-            };
-
-            let mut existing_rows = conn
-                .query(
-                    "SELECT content FROM memories WHERE source_id = ?1 AND chunk_index = 0 LIMIT 1",
-                    [existing_source_id.as_str()],
-                )
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("contradiction existing content: {}", e))
-                })?;
-            let existing_content = if let Some(r) = existing_rows
-                .next()
-                .await
-                .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-            {
-                r.get::<String>(0).unwrap_or_default()
-            } else {
-                continue; // skip if source memory not found
-            };
-
-            items.push(crate::briefing::ContradictionItem {
-                id,
-                new_content,
-                existing_content,
-                new_source_id,
-                existing_source_id,
-            });
-        }
-        Ok(items)
-    }
-
     /// Return the subset of `candidate_ids` that currently have an unresolved
     /// contradiction in `refinement_queue`.
     ///
@@ -42891,30 +42117,6 @@ impl MemoryDB {
     }
 
     // ==================== Refinement Queue ====================
-
-    /// Get source_ids from active proposals (pending/applied) to prevent re-queuing.
-    /// Dismissed proposals are excluded so memories can be re-tried with improved prompts.
-    pub async fn get_all_proposal_source_ids(
-        &self,
-    ) -> Result<std::collections::HashSet<String>, WenlanError> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn.query(
-            "SELECT source_ids FROM refinement_queue WHERE status IN ('pending', 'awaiting_review', 'auto_applied')",
-            (),
-        ).await.map_err(|e| WenlanError::VectorDb(format!("get_proposal_ids: {}", e)))?;
-        let mut ids = std::collections::HashSet::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-        {
-            let json: String = row.get(0).unwrap_or_default();
-            if let Ok(source_ids) = serde_json::from_str::<Vec<String>>(&json) {
-                ids.extend(source_ids);
-            }
-        }
-        Ok(ids)
-    }
 
     /// Insert a refinement proposal into the queue.
     pub async fn insert_refinement_proposal(
@@ -43560,32 +42762,6 @@ impl MemoryDB {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn find_cross_space_distillation_clusters(
-        &self,
-        similarity_threshold: f64,
-        min_size: usize,
-        max_clusters: usize,
-        token_limit: usize,
-        max_unlinked_cluster_size: usize,
-        max_grouped_cluster_size: usize,
-    ) -> Result<Vec<DistillationCluster>, WenlanError> {
-        let memories = self.query_distillation_staging_pool(None, None).await?;
-        if memories.is_empty() {
-            return Ok(vec![]);
-        }
-        Ok(cluster_distillation_rows(
-            &memories,
-            similarity_threshold,
-            min_size,
-            max_clusters,
-            token_limit,
-            max_unlinked_cluster_size,
-            max_grouped_cluster_size,
-            DistillationClusterMode::Global,
-        ))
-    }
-
     /// Cooperative automatic-only cross-space candidate probe. Each call
     /// advances a stable seed cursor and asks DiskANN for a fixed neighbor
     /// window; it never falls back to a full-table cosine sort. This is a
@@ -43909,40 +43085,6 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
             .is_some();
         Ok(has)
-    }
-
-    /// Diagnostic: count rows in memories table by key filters.
-    pub async fn debug_memory_counts(&self) -> String {
-        async fn count(conn: &libsql::Connection, sql: &str) -> i64 {
-            match conn.query(sql, ()).await {
-                Ok(mut rows) => match rows.next().await {
-                    Ok(Some(row)) => row.get::<i64>(0).unwrap_or(-1),
-                    _ => -2,
-                },
-                Err(_) => -3,
-            }
-        }
-        let conn = self.conn.lock().await;
-        let total = count(&conn, "SELECT COUNT(*) FROM memories").await;
-        let source_memory = count(
-            &conn,
-            "SELECT COUNT(*) FROM memories WHERE source = 'memory'",
-        )
-        .await;
-        let chunk0 = count(&conn, "SELECT COUNT(*) FROM memories WHERE chunk_index = 0").await;
-        let null_entity = count(
-            &conn,
-            "SELECT COUNT(*) FROM memories WHERE entity_id IS NULL",
-        )
-        .await;
-        let unlinked = count(
-            &conn,
-            "SELECT COUNT(*) FROM memories WHERE source = 'memory' AND entity_id IS NULL AND is_recap = 0 AND chunk_index = 0",
-        ).await;
-        format!(
-            "total={}, source=memory:{}, chunk0={}, null_entity={}, unlinked(full_query)={}",
-            total, source_memory, chunk0, null_entity, unlinked
-        )
     }
 
     /// Count memories that have been through enrichment (have enrichment_steps rows).
@@ -50228,32 +49370,6 @@ impl MemoryDB {
             .await?
             .map(|m| m.jaccard)
             .unwrap_or(0.0))
-    }
-
-    /// Get all memory source_ids that are already covered by active pages.
-    pub async fn get_covered_memory_ids(
-        &self,
-    ) -> Result<std::collections::HashSet<String>, WenlanError> {
-        let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT source_memory_ids FROM pages WHERE status = 'active'",
-                (),
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("covered ids: {e}")))?;
-        let mut covered = std::collections::HashSet::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-        {
-            let json: String = row.get(0).unwrap_or_default();
-            if let Ok(ids) = serde_json::from_str::<Vec<String>>(&json) {
-                covered.extend(ids);
-            }
-        }
-        Ok(covered)
     }
 
     pub async fn delete_page(&self, id: &str) -> Result<(), WenlanError> {

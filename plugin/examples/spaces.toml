@@ -1,4 +1,4 @@
-# Sample ~/.origin/spaces.toml — copy this file to ~/.origin/spaces.toml
+# Sample ~/.wenlan/spaces.toml — copy this file to ~/.wenlan/spaces.toml
 # and edit to taste.
 #
 # Maps a cwd path-prefix to a space name. Longest matching prefix wins.
@@ -8,8 +8,8 @@
 # the cwd, the first-defined mapping wins.
 
 [[mapping]]
-prefix = "~/Repos/origin"
-space  = "origin"
+prefix = "~/Repos/wenlan"
+space  = "wenlan"
 
 [[mapping]]
 prefix = "~/notes/brainstorms"
@@ -22,7 +22,3 @@ space  = "career"
 [[mapping]]
 prefix = "~/notes/health"
 space  = "health"
-
-# Optional. If set, this overrides cwd-repo inference for any cwd that
-# does not match a [[mapping]] above. Default is "personal".
-default = "personal"

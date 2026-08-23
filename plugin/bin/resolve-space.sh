@@ -7,12 +7,14 @@ set -u
 
 cwd=""
 arg=""
+new_repo_fallback=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --cwd) cwd="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
         --arg) arg="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
         --topic) shift $(( $# > 1 ? 2 : 1 )) ;;
+        --new-repo-fallback) new_repo_fallback=1; shift ;;
         *) shift ;;
     esac
 done
@@ -102,6 +104,9 @@ if [ -n "$cwd" ] && [ -d "$cwd" ]; then
         wenlan_bin="${WENLAN_BIN:-wenlan}"
         if "$wenlan_bin" spaces show "$repo_name" --format json >/dev/null 2>&1; then
             printf '%s\tcwd-repo\n' "$repo_name"
+            exit 0
+        elif [ "$new_repo_fallback" = "1" ]; then
+            printf '%s\tcwd-repo-new\n' "$repo_name"
             exit 0
         fi
     fi

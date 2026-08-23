@@ -625,17 +625,17 @@ pub fn write_wenlan_entry_toml(config_path: &std::path::Path) -> Result<(), AppE
     Ok(())
 }
 
-/// Remove the raw `wenlan`/legacy `origin` `mcpServers` entries from a JSON
-/// client config — the inverse of `write_wenlan_entry`, and the fix for the
-/// double-registration Diagnostics surfaces (a plugin *and* a raw entry for
-/// one client). Symmetric with detection: it removes exactly the keys
-/// `has_configured_entry` recognizes, so `client_config_has_raw_entry` reads
-/// `false` afterwards. Every sibling server and unrelated key survives.
-/// A missing file, or a file with neither key present, is `Err` — there is
-/// nothing to remove, and the caller surfaces that verbatim. Backs the file
-/// up first (like `write_wenlan_entry`), but only once a removal is certain,
-/// so the no-op error path leaves no stray `.bak`.
-pub fn remove_wenlan_entry(config_path: &std::path::Path) -> Result<(), AppError> {
+/// Shared body of the four JSON removal verbs below: exists-check, parse,
+/// remove every key in `keys` from `mcpServers`, then — only once a removal is
+/// certain — back the file up before writing it back, so a no-op leaves no
+/// stray `.bak`. `not_found` is the caller's nothing-was-removed message,
+/// which the UI surfaces verbatim. Every sibling server and unrelated key
+/// survives.
+fn remove_json_keys(
+    config_path: &std::path::Path,
+    keys: &[&str],
+    not_found: &str,
+) -> Result<(), AppError> {
     if !config_path.exists() {
         return Err(AppError::Generic(
             "No config file found — nothing to remove".into(),
@@ -650,16 +650,18 @@ pub fn remove_wenlan_entry(config_path: &std::path::Path) -> Result<(), AppError
         .get_mut("mcpServers")
         .and_then(|servers| servers.as_object_mut())
         .map(|servers| {
-            let wenlan = servers.remove(MCP_SERVER_KEY).is_some();
-            let legacy = servers.remove(LEGACY_MCP_SERVER_KEY).is_some();
-            wenlan || legacy
+            // Deliberately not `any`/`fold`: every key must be removed, so
+            // this must not short-circuit on the first match.
+            let mut removed = false;
+            for key in keys {
+                removed |= servers.remove(*key).is_some();
+            }
+            removed
         })
         .unwrap_or(false);
 
     if !removed {
-        return Err(AppError::Generic(
-            "No Wenlan MCP entry found to remove".into(),
-        ));
+        return Err(AppError::Generic(not_found.into()));
     }
 
     let backup_path = config_path.with_extension("json.bak");
@@ -670,11 +672,14 @@ pub fn remove_wenlan_entry(config_path: &std::path::Path) -> Result<(), AppError
     Ok(())
 }
 
-/// TOML variant for Codex CLI (`[mcp_servers.*]` tables) — mirrors
-/// `remove_wenlan_entry`'s contract and `has_configured_entry_toml`'s key set,
-/// using the same format-preserving `toml_edit` round-trip
-/// `write_wenlan_entry_toml` writes with.
-pub fn remove_wenlan_entry_toml(config_path: &std::path::Path) -> Result<(), AppError> {
+/// TOML counterpart of [`remove_json_keys`] for Codex CLI's `[mcp_servers.*]`
+/// tables, using the format-preserving `toml_edit` round-trip
+/// `write_wenlan_entry_toml` writes with. Same contract, same ordering.
+fn remove_toml_keys(
+    config_path: &std::path::Path,
+    keys: &[&str],
+    not_found: &str,
+) -> Result<(), AppError> {
     use toml_edit::DocumentMut;
 
     if !config_path.exists() {
@@ -691,22 +696,54 @@ pub fn remove_wenlan_entry_toml(config_path: &std::path::Path) -> Result<(), App
         .get_mut("mcp_servers")
         .and_then(|servers| servers.as_table_like_mut())
         .map(|servers| {
-            let wenlan = servers.remove(MCP_SERVER_KEY).is_some();
-            let legacy = servers.remove(LEGACY_MCP_SERVER_KEY).is_some();
-            wenlan || legacy
+            // Deliberately not `any`/`fold`: every key must be removed, so
+            // this must not short-circuit on the first match.
+            let mut removed = false;
+            for key in keys {
+                removed |= servers.remove(key).is_some();
+            }
+            removed
         })
         .unwrap_or(false);
 
     if !removed {
-        return Err(AppError::Generic(
-            "No Wenlan MCP entry found to remove".into(),
-        ));
+        return Err(AppError::Generic(not_found.into()));
     }
 
     let backup_path = config_path.with_extension("toml.bak");
     std::fs::copy(config_path, &backup_path)?;
     std::fs::write(config_path, doc.to_string())?;
     Ok(())
+}
+
+/// Remove the raw `wenlan`/legacy `origin` `mcpServers` entries from a JSON
+/// client config — the inverse of `write_wenlan_entry`, and the fix for the
+/// double-registration Diagnostics surfaces (a plugin *and* a raw entry for
+/// one client). Symmetric with detection: it removes exactly the keys
+/// `has_configured_entry` recognizes, so `client_config_has_raw_entry` reads
+/// `false` afterwards. Every sibling server and unrelated key survives.
+/// A missing file, or a file with neither key present, is `Err` — there is
+/// nothing to remove, and the caller surfaces that verbatim. Backs the file
+/// up first (like `write_wenlan_entry`), but only once a removal is certain,
+/// so the no-op error path leaves no stray `.bak`.
+pub fn remove_wenlan_entry(config_path: &std::path::Path) -> Result<(), AppError> {
+    remove_json_keys(
+        config_path,
+        &[MCP_SERVER_KEY, LEGACY_MCP_SERVER_KEY],
+        "No Wenlan MCP entry found to remove",
+    )
+}
+
+/// TOML variant for Codex CLI (`[mcp_servers.*]` tables) — mirrors
+/// `remove_wenlan_entry`'s contract and `has_configured_entry_toml`'s key set,
+/// using the same format-preserving `toml_edit` round-trip
+/// `write_wenlan_entry_toml` writes with.
+pub fn remove_wenlan_entry_toml(config_path: &std::path::Path) -> Result<(), AppError> {
+    remove_toml_keys(
+        config_path,
+        &[MCP_SERVER_KEY, LEGACY_MCP_SERVER_KEY],
+        "No Wenlan MCP entry found to remove",
+    )
 }
 
 /// Remove ONLY the legacy `origin` `mcpServers` entry from a JSON client
@@ -720,68 +757,22 @@ pub fn remove_wenlan_entry_toml(config_path: &std::path::Path) -> Result<(), App
 /// caller. Backs the file up first (like `remove_wenlan_entry`), but only once
 /// a removal is certain, so the no-op error path leaves no stray `.bak`.
 pub fn remove_legacy_origin_entry(config_path: &std::path::Path) -> Result<(), AppError> {
-    if !config_path.exists() {
-        return Err(AppError::Generic(
-            "No config file found — nothing to remove".into(),
-        ));
-    }
-    let contents = std::fs::read_to_string(config_path)?;
-    let mut root = serde_json::from_str::<serde_json::Value>(&contents).map_err(|e| {
-        AppError::Generic(format!("Invalid JSON in {}: {}", config_path.display(), e))
-    })?;
-
-    let removed = root
-        .get_mut("mcpServers")
-        .and_then(|servers| servers.as_object_mut())
-        .map(|servers| servers.remove(LEGACY_MCP_SERVER_KEY).is_some())
-        .unwrap_or(false);
-
-    if !removed {
-        return Err(AppError::Generic(
-            "No legacy origin MCP entry found to remove".into(),
-        ));
-    }
-
-    let backup_path = config_path.with_extension("json.bak");
-    std::fs::copy(config_path, &backup_path)?;
-    let formatted =
-        serde_json::to_string_pretty(&root).map_err(|e| AppError::Generic(e.to_string()))?;
-    std::fs::write(config_path, formatted)?;
-    Ok(())
+    remove_json_keys(
+        config_path,
+        &[LEGACY_MCP_SERVER_KEY],
+        "No legacy origin MCP entry found to remove",
+    )
 }
 
 /// TOML variant for Codex CLI (`[mcp_servers.*]` tables) — mirrors
 /// `remove_legacy_origin_entry`'s contract (removes only `origin`, keeps
 /// `wenlan`) using the same format-preserving `toml_edit` round-trip.
 pub fn remove_legacy_origin_entry_toml(config_path: &std::path::Path) -> Result<(), AppError> {
-    use toml_edit::DocumentMut;
-
-    if !config_path.exists() {
-        return Err(AppError::Generic(
-            "No config file found — nothing to remove".into(),
-        ));
-    }
-    let contents = std::fs::read_to_string(config_path)?;
-    let mut doc: DocumentMut = contents.parse().map_err(|e| {
-        AppError::Generic(format!("Invalid TOML in {}: {}", config_path.display(), e))
-    })?;
-
-    let removed = doc
-        .get_mut("mcp_servers")
-        .and_then(|servers| servers.as_table_like_mut())
-        .map(|servers| servers.remove(LEGACY_MCP_SERVER_KEY).is_some())
-        .unwrap_or(false);
-
-    if !removed {
-        return Err(AppError::Generic(
-            "No legacy origin MCP entry found to remove".into(),
-        ));
-    }
-
-    let backup_path = config_path.with_extension("toml.bak");
-    std::fs::copy(config_path, &backup_path)?;
-    std::fs::write(config_path, doc.to_string())?;
-    Ok(())
+    remove_toml_keys(
+        config_path,
+        &[LEGACY_MCP_SERVER_KEY],
+        "No legacy origin MCP entry found to remove",
+    )
 }
 
 #[cfg(test)]

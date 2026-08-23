@@ -3,7 +3,7 @@ import { useCallback, useState, useEffect, useRef, type ReactNode } from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { resizeWindow, resizeWindowCentered } from "./lib/resizeWindow";
+import { resizeWindowCentered } from "./lib/resizeWindow";
 import {
   acknowledgeGuardedQuitRequest,
   cancelGuardedQuitRequest,
@@ -11,21 +11,13 @@ import {
   setTrafficLightsVisible,
   shouldShowWizard,
   setSetupCompleted,
-  type IndexedFileInfo,
 } from "./lib/tauri";
-import { markProcessing, clearProcessing } from "./lib/processingStore";
-import { recordCapture } from "./lib/captureHeartbeat";
-import Spotlight from "./components/Spotlight";
-import RecapDetail from "./components/RecapDetail";
-import EntityDetail from "./components/memory/EntityDetail";
 import Main from "./components/memory/Main";
 import SetupWizard from "./components/SetupWizard";
 import { RuntimeOverlays } from "./components/RuntimeOverlays";
 
 const MEMORY_WIDTH = 1280;
 const MEMORY_HEIGHT = 720;
-
-type Page = "spotlight" | "home" | "memory" | "recap" | "entity";
 
 export default function App() {
   const queryClient = useQueryClient();
@@ -51,13 +43,8 @@ export default function App() {
   }
 
   const [migration, setMigration] = useState<{ current: number; total: number; phase: string } | null>(null);
-  const [page, setPage] = useState<Page>("home");
-  const [selectedSnapshot, setSelectedSnapshot] = useState<IndexedFileInfo | null>(null);
-  const [selectedEntityId, setSelectedEntityId] = useState<string | null>(null);
   const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
   const [selectedPageId, setSelectedPageId] = useState<string | null>(null);
-  const [initialView, setInitialView] = useState<"import" | null>(null);
-  const [prevPage, setPrevPage] = useState<Page>("spotlight");
   const quitGuardRef = useRef<(() => Promise<boolean>) | null>(null);
   const quitAttemptRef = useRef<{
     requestId: number;
@@ -177,37 +164,20 @@ export default function App() {
     };
   }, []);
 
-  // Global capture-event → processingStore bridge (persists across page navigation)
+  // Spotlight mode is retired — Home is the only reachable page, so traffic
+  // lights are always visible and the window is never always-on-top.
   useEffect(() => {
-    const unlisten = listen<{ source: string; source_id: string; processing: boolean }>("capture-event", (event) => {
-      const { source, source_id, processing } = event.payload;
-      if (source_id) {
-        recordCapture(source);
-        if (processing) markProcessing(source_id);
-        else clearProcessing(source_id);
-      }
-    });
-    return () => { unlisten.then((f) => f()); };
+    setTrafficLightsVisible(true).catch(() => {});
+    getCurrentWindow().setAlwaysOnTop(false);
   }, []);
-
-  // Spotlight mode: hide traffic lights + always on top; Memory mode: reverse
-  useEffect(() => {
-    const isSpotlight = page === "spotlight";
-    setTrafficLightsVisible(!isSpotlight).catch(() => {});
-    import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
-      getCurrentWindow().setAlwaysOnTop(isSpotlight);
-    });
-  }, [page]);
 
   // Cmd+K: summon main window and focus the header search input.
   // (Spotlight page mode is retired — the event name is kept to avoid a Rust
-  // shortcut-registration change. The Spotlight component is still in the tree
-  // but unreachable via normal navigation.)
+  // shortcut-registration change.)
   useEffect(() => {
     const unlisten = listen("toggle-spotlight", async () => {
       const { getCurrentWindow } = await import("@tauri-apps/api/window");
       const win = getCurrentWindow();
-      setPage("home");
       if (!(await win.isVisible())) {
         await win.show();
       }
@@ -219,11 +189,10 @@ export default function App() {
     return () => { unlisten.then((f) => f()); };
   }, []);
 
-  // Cmd+Shift+K: show Memory page
+  // Cmd+Shift+K: show Memory page (no-op now that Home is the only page —
+  // the listener is kept so the Rust-side shortcut registration is untouched).
   useEffect(() => {
-    const unlisten = listen("show-memory", () => {
-      setPage("home");
-    });
+    const unlisten = listen("show-memory", () => {});
     return () => { unlisten.then((f) => f()); };
   }, []);
 
@@ -234,8 +203,6 @@ export default function App() {
       if (sourceId) {
         setSelectedMemoryId(sourceId);
         setSelectedPageId(null);
-        setInitialView(null);
-        setPage("home");
         // Ensure main window is visible and focused
         const { getCurrentWindow } = await import("@tauri-apps/api/window");
         const win = getCurrentWindow();
@@ -246,21 +213,10 @@ export default function App() {
     return () => { unlisten.then((f) => f()); };
   }, []);
 
-  // Resize window based on current page
-  const prevPageRef = useRef<Page | null>(null); // null = first mount
+  // Home is the only reachable page, so the window is always sized/centered once on mount.
   useEffect(() => {
-    const fullSizePages = ["memory", "home", "recap", "entity"];
-    if (fullSizePages.includes(page)) {
-      const isFirstMount = prevPageRef.current === null;
-      const comingFromSpotlight = prevPageRef.current === "spotlight";
-      if (isFirstMount || comingFromSpotlight) {
-        resizeWindowCentered(MEMORY_WIDTH, MEMORY_HEIGHT);
-      } else {
-        resizeWindow(MEMORY_WIDTH, MEMORY_HEIGHT);
-      }
-    }
-    prevPageRef.current = page;
-  }, [page]);
+    resizeWindowCentered(MEMORY_WIDTH, MEMORY_HEIGHT);
+  }, []);
 
   // isPending, not isLoading: isLoading is (isPending && isFetching), which goes
   // false whenever the query is paused rather than fetching — that would fall
@@ -289,38 +245,12 @@ export default function App() {
   } else {
     body = (
       <div className="w-screen min-h-screen bg-[var(--bg-secondary)]">
-        {page === "spotlight" && (
-          <Spotlight
-            onOpenMemory={() => { setSelectedPageId(null); setPage("home"); }}
-            onOpenPage={(pageId) => { setSelectedPageId(pageId); setSelectedMemoryId(null); setInitialView(null); setPage("home"); }}
-            onOpenRecap={(snap) => { setSelectedPageId(null); setSelectedSnapshot(snap); setPrevPage("spotlight"); setPage("recap"); }}
-            onEntityClick={(id) => { setSelectedPageId(null); setSelectedEntityId(id); setPrevPage("spotlight"); setPage("entity"); }}
-          />
-        )}
-        {page === "home" && (
-          <Main
-            initialMemoryId={selectedMemoryId}
-            initialPageId={selectedPageId}
-            initialView={initialView}
-            onRegisterQuitGuard={registerQuitGuard}
-            onBackFromDetail={() => { setSelectedMemoryId(null); setSelectedPageId(null); setPage("home"); }}
-          />
-        )}
-        {page === "recap" && selectedSnapshot && (
-          <RecapDetail snapshot={selectedSnapshot} onBack={() => setPage(prevPage)} />
-        )}
-        {page === "entity" && selectedEntityId && (
-          <div className="h-screen overflow-y-auto">
-            <EntityDetail
-              key={selectedEntityId}
-              entityId={selectedEntityId}
-              onBack={() => setPage(prevPage)}
-              onEntityClick={(id) => setSelectedEntityId(id)}
-              onMemoryClick={(sid) => { setSelectedMemoryId(sid); setSelectedPageId(null); setInitialView(null); setPage("home"); }}
-              onPageClick={(pageId) => { setSelectedPageId(pageId); setSelectedMemoryId(null); setInitialView(null); setPage("home"); }}
-            />
-          </div>
-        )}
+        <Main
+          initialMemoryId={selectedMemoryId}
+          initialPageId={selectedPageId}
+          onRegisterQuitGuard={registerQuitGuard}
+          onBackFromDetail={() => { setSelectedMemoryId(null); setSelectedPageId(null); }}
+        />
       </div>
     );
   }

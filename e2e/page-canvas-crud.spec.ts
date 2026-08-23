@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { collectBrowserErrors, installTauriMock, type TauriMockController } from "./tauriMock";
+import { box, openCanvas as openCanvasBase } from "./helpers/pageCanvas";
 
 /**
  * The canvas advertises a shortcut for every way to change a map, and the
@@ -9,21 +10,8 @@ import { collectBrowserErrors, installTauriMock, type TauriMockController } from
  * behaviour that jsdom cannot produce.
  */
 async function openCanvas(page: Page): Promise<void> {
-  await page.goto("/");
-  await page
-    .getByRole("navigation", { name: "Primary navigation" })
-    .getByRole("button", { name: "Wiki", exact: true })
-    .click();
-  await page.getByRole("button", { name: "Open Fixture architecture" }).click();
-  await expect(page.getByRole("heading", { level: 1, name: "Fixture architecture" })).toBeVisible();
-  await page.getByRole("button", { name: "Canvas" }).click();
-  await expect(page.getByRole("region", { name: "Canvas for Fixture architecture" })).toBeVisible();
+  await openCanvasBase(page);
   await expect(box(page, "Storage layer")).toBeVisible();
-}
-
-/** A box on the canvas, addressed the way a reader sees it: by its name. */
-function box(page: Page, label: string): Locator {
-  return page.locator(".react-flow__node").filter({ hasText: label }).first();
 }
 
 function surface(page: Page): Locator {

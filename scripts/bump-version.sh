@@ -61,14 +61,6 @@ echo "  Updated $CODEX_PLUGIN_MANIFEST"
 # Claude Code session. The pin lives in the runner shell script, not
 # .mcp.json, so dev users can override the wenlan-mcp binary via
 # WENLAN_MCP_DEV_BIN.
-PLUGIN_MCP_RUNNER="plugin/bin/wenlan-mcp-runner.sh"
-if [[ "$(uname)" == "Darwin" ]]; then
-    sed -i '' -E "s|(wenlan-mcp@\\^)[0-9]+\\.[0-9]+\\.[0-9]+|\\1${NEW_VERSION}|g" "$PLUGIN_MCP_RUNNER"
-else
-    sed -i -E "s|(wenlan-mcp@\\^)[0-9]+\\.[0-9]+\\.[0-9]+|\\1${NEW_VERSION}|g" "$PLUGIN_MCP_RUNNER"
-fi
-echo "  Updated $PLUGIN_MCP_RUNNER (wenlan-mcp pin)"
-
 CODEX_PLUGIN_MCP_RUNNER="plugin-codex/bin/wenlan-mcp-runner.sh"
 if [[ "$(uname)" == "Darwin" ]]; then
     sed -i '' -E "s|(wenlan-mcp@\\^)[0-9]+\\.[0-9]+\\.[0-9]+|\\1${NEW_VERSION}|g" "$CODEX_PLUGIN_MCP_RUNNER"

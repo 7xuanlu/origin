@@ -1370,29 +1370,6 @@ const en = {
       done: "complete",
       error: "failed",
     },
-    progress: {
-      failedTitle: "Import failed",
-      unknownError: "An unknown error occurred during import.",
-      readyTitle: "Your pages are ready to explore",
-      compiledPages:
-        "Compiled {{pages}} pages from {{memories}} memories.",
-      readingTitle: "Reading your conversations",
-      memoriesProgress: "{{processed}} / {{total}} memories",
-      soFar:
-        "So far: {{people}} people · {{projects}} projects · {{pages}} pages · {{decisions}} decisions · {{tools}} tools",
-      readConversations: "✓ Read {{count}} conversations",
-      compilingTitle: "Compiling your pages",
-      pagesProgress: "{{written}} / {{total}} pages",
-      justCompiled: "Just compiled:",
-    },
-    upgrade: {
-      title: "This is a large archive",
-      description:
-        "This is a {{memoryCount}}-memory archive. Local processing will take approximately {{hours}} hours. Add an Anthropic API key to process in ~15 minutes, or continue with local.",
-      placeholder: "Anthropic API key (sk-ant-...)",
-      useCloud: "Use cloud (fast)",
-      continueLocal: "Continue with local",
-    },
   },
   intelligence: {
     modelDescriptions: {
@@ -2913,29 +2890,6 @@ const zhHans = {
       done: "完成",
       error: "失败",
     },
-    progress: {
-      failedTitle: "导入失败",
-      unknownError: "导入过程中发生未知错误。",
-      readyTitle: "你的页面已可探索",
-      compiledPages:
-        "已从 {{memories}} 条记忆整理出 {{pages}} 个页面。",
-      readingTitle: "正在读取你的对话",
-      memoriesProgress: "{{processed}} / {{total}} 条记忆",
-      soFar:
-        "目前：{{people}} 个人物 · {{projects}} 个项目 · {{pages}} 个页面 · {{decisions}} 个决策 · {{tools}} 个工具",
-      readConversations: "✓ 已读取 {{count}} 个对话",
-      compilingTitle: "正在整理你的页面",
-      pagesProgress: "{{written}} / {{total}} 个页面",
-      justCompiled: "刚整理完成：",
-    },
-    upgrade: {
-      title: "这是一个大型归档",
-      description:
-        "这是一个包含 {{memoryCount}} 条记忆的归档。本地处理大约需要 {{hours}} 小时。添加 Anthropic API key 可在约 15 分钟内处理，或继续使用本地处理。",
-      placeholder: "Anthropic API key (sk-ant-...)",
-      useCloud: "使用云端（更快）",
-      continueLocal: "继续本地处理",
-    },
   },
   intelligence: {
     modelDescriptions: {
@@ -4453,29 +4407,6 @@ const zhHant = {
       stageB: "分類並擷取實體",
       done: "完成",
       error: "失敗",
-    },
-    progress: {
-      failedTitle: "匯入失敗",
-      unknownError: "匯入過程中發生未知錯誤。",
-      readyTitle: "你的頁面已可探索",
-      compiledPages:
-        "已從 {{memories}} 則記憶整理出 {{pages}} 個頁面。",
-      readingTitle: "正在讀取你的對話",
-      memoriesProgress: "{{processed}} / {{total}} 則記憶",
-      soFar:
-        "目前：{{people}} 個人物 · {{projects}} 個專案 · {{pages}} 個頁面 · {{decisions}} 個決策 · {{tools}} 個工具",
-      readConversations: "✓ 已讀取 {{count}} 個對話",
-      compilingTitle: "正在整理你的頁面",
-      pagesProgress: "{{written}} / {{total}} 個頁面",
-      justCompiled: "剛整理完成：",
-    },
-    upgrade: {
-      title: "這是一個大型封存",
-      description:
-        "這是一個包含 {{memoryCount}} 則記憶的封存。本機處理大約需要 {{hours}} 小時。加入 Anthropic API key 可在約 15 分鐘內處理，或繼續使用本機處理。",
-      placeholder: "Anthropic API key (sk-ant-...)",
-      useCloud: "使用雲端（較快）",
-      continueLocal: "繼續本機處理",
     },
   },
   intelligence: {

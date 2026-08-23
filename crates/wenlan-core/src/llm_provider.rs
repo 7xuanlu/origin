@@ -292,96 +292,8 @@ fn context_seq_max_for_batch(batch_len: usize, parallel_seqs: usize) -> u32 {
     }
 }
 
-#[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct BatchLogRecord {
-    pub(crate) n_seqs: usize,
-    pub(crate) call_class: String,
-    pub(crate) wall_ms: u64,
-}
-
-#[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct BatchLogSummary {
-    pub(crate) batching_rate: f64,
-    pub(crate) wall_ms_share_by_class: std::collections::HashMap<String, f64>,
-}
-
-/// Aggregate a batch of `BatchLogRecord`s to compute:
-/// - `batching_rate`: fraction of records with n_seqs >= 2 (i.e., batched requests)
-/// - `wall_ms_share_by_class`: per-class wall-time share as a fraction of total wall_ms
-///
-/// Used for offline log analysis. A parser (see `parse_batch_log_line`) transforms
-/// emitted `[batch_log]` stderr lines into `BatchLogRecord`s, which can then be
-/// aggregated over a collection interval.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn aggregate_batch_log(records: &[BatchLogRecord]) -> BatchLogSummary {
-    let batching_rate = if records.is_empty() {
-        0.0
-    } else {
-        let batched_count = records.iter().filter(|record| record.n_seqs >= 2).count();
-        batched_count as f64 / records.len() as f64
-    };
-
-    let total_wall_ms: u128 = records.iter().map(|record| record.wall_ms as u128).sum();
-    let mut wall_ms_share_by_class = std::collections::HashMap::new();
-
-    if total_wall_ms > 0 {
-        for record in records {
-            *wall_ms_share_by_class
-                .entry(record.call_class.clone())
-                .or_insert(0.0) += record.wall_ms as f64;
-        }
-        for share in wall_ms_share_by_class.values_mut() {
-            *share /= total_wall_ms as f64;
-        }
-    }
-
-    BatchLogSummary {
-        batching_rate,
-        wall_ms_share_by_class,
-    }
-}
-
 fn batch_log_call_class(label: Option<&str>) -> &str {
     label.unwrap_or("unknown")
-}
-
-/// Parse a `[batch_log]` stderr line into a `BatchLogRecord`.
-/// The expected format is: `[batch_log] n_seqs=N call_class=TAG wall_ms=MS`
-/// Returns None if the line does not match the expected format.
-#[cfg(test)]
-fn parse_batch_log_line(line: &str) -> Option<BatchLogRecord> {
-    // Trim and check prefix
-    let line = line.trim();
-    if !line.starts_with("[batch_log] ") {
-        return None;
-    }
-    let rest = &line["[batch_log] ".len()..];
-
-    // Parse key=value pairs
-    let mut n_seqs: Option<usize> = None;
-    let mut call_class: Option<String> = None;
-    let mut wall_ms: Option<u64> = None;
-
-    for part in rest.split_whitespace() {
-        if let Some(val) = part.strip_prefix("n_seqs=") {
-            n_seqs = val.parse().ok();
-        } else if let Some(val) = part.strip_prefix("call_class=") {
-            call_class = Some(val.to_string());
-        } else if let Some(val) = part.strip_prefix("wall_ms=") {
-            wall_ms = val.parse().ok();
-        }
-    }
-
-    match (n_seqs, call_class, wall_ms) {
-        (Some(n), Some(c), Some(w)) => Some(BatchLogRecord {
-            n_seqs: n,
-            call_class: c,
-            wall_ms: w,
-        }),
-        _ => None,
-    }
 }
 
 /// On-device LLM provider that runs inference on a dedicated `std::thread`.
@@ -613,6 +525,9 @@ impl OnDeviceProvider {
             } else {
                 m
             };
+            // Process-lifetime setting: read once here rather than per batch
+            // inside the worker loop below.
+            let batch_log_enabled = std::env::var_os("WENLAN_BATCH_LOG").is_some();
 
             std::thread::Builder::new()
                 .name(format!("llm-provider-worker-{i}"))
@@ -711,7 +626,6 @@ impl OnDeviceProvider {
                         let target_ctx_size =
                             batch_reqs.iter().map(|r| r.ctx_size).max().unwrap_or(0);
                         let target_seq_max = context_seq_max_for_batch(batch_reqs.len(), m);
-                        let batch_log_enabled = std::env::var("WENLAN_BATCH_LOG").is_ok();
 
                         if persistent_ctx.is_none()
                             || persistent_ctx_size != target_ctx_size
@@ -783,6 +697,9 @@ impl OnDeviceProvider {
                             };
 
                             if let Some(t) = t {
+                                // Consumed by scripts/seed-lme-s-n90.sh:166-174, which
+                                // parses this line format to compute batching rate and
+                                // per-class wall-time share.
                                 let call_class = batch_log_call_class(req.label.as_deref());
                                 eprintln!(
                                     "[batch_log] n_seqs={} call_class={} wall_ms={}",
@@ -1177,10 +1094,6 @@ impl ApiProvider {
         }
     }
 
-    pub fn with_default_model(api_key: String) -> Self {
-        Self::new(api_key, DEFAULT_ROUTINE_MODEL.to_string())
-    }
-
     pub fn model(&self) -> &str {
         &self.model
     }
@@ -1306,10 +1219,6 @@ pub struct OpenAICompatibleProvider {
 }
 
 impl OpenAICompatibleProvider {
-    pub fn new(endpoint: String, model: String) -> Self {
-        Self::new_with_key(endpoint, model, None)
-    }
-
     pub fn new_with_key(endpoint: String, model: String, api_key: Option<String>) -> Self {
         // Ensure endpoint doesn't have trailing slash
         let endpoint = endpoint.trim_end_matches('/').to_string();
@@ -1441,11 +1350,6 @@ impl ClaudeCliProvider {
     /// Haiku via Max plan.
     pub fn haiku() -> Self {
         Self::new("haiku")
-    }
-
-    /// Sonnet via Max plan.
-    pub fn sonnet() -> Self {
-        Self::new("sonnet")
     }
 }
 
@@ -1875,79 +1779,6 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_batch_log_rate_and_class_share() {
-        let records = vec![
-            BatchLogRecord {
-                n_seqs: 1,
-                call_class: "distill".to_string(),
-                wall_ms: 100,
-            },
-            BatchLogRecord {
-                n_seqs: 4,
-                call_class: "extract".to_string(),
-                wall_ms: 60,
-            },
-            BatchLogRecord {
-                n_seqs: 2,
-                call_class: "extract".to_string(),
-                wall_ms: 40,
-            },
-            BatchLogRecord {
-                n_seqs: 1,
-                call_class: "classify".to_string(),
-                wall_ms: 50,
-            },
-        ];
-
-        let summary = aggregate_batch_log(&records);
-        assert!((summary.batching_rate - 0.5).abs() < 1e-9);
-        assert!((summary.wall_ms_share_by_class["extract"] - 0.4).abs() < 1e-9);
-        assert!((summary.wall_ms_share_by_class["distill"] - 0.4).abs() < 1e-9);
-        assert!((summary.wall_ms_share_by_class["classify"] - 0.2).abs() < 1e-9);
-
-        let empty = aggregate_batch_log(&[]);
-        assert_eq!(empty.batching_rate, 0.0);
-        assert!(empty.wall_ms_share_by_class.is_empty());
-    }
-
-    #[test]
-    fn batch_log_round_trip_parse_and_aggregate() {
-        // Test that the emitted [batch_log] format can be parsed back into
-        // BatchLogRecord and fed to the aggregator. This ensures the emitted
-        // format and aggregator input stay reconciled. The emitted format is:
-        // [batch_log] n_seqs=N call_class=TAG wall_ms=MS
-        let lines = [
-            "[batch_log] n_seqs=1 call_class=distill wall_ms=100",
-            "[batch_log] n_seqs=4 call_class=extract wall_ms=60",
-            "[batch_log] n_seqs=2 call_class=extract wall_ms=40",
-            "[batch_log] n_seqs=1 call_class=classify wall_ms=50",
-        ];
-
-        let parsed: Vec<BatchLogRecord> = lines
-            .iter()
-            .filter_map(|line| parse_batch_log_line(line))
-            .collect();
-
-        assert_eq!(parsed.len(), 4, "all lines should parse");
-        let summary = aggregate_batch_log(&parsed);
-
-        // Verify the parsed records produce the same aggregation as the
-        // hand-constructed records from the previous test.
-        assert!((summary.batching_rate - 0.5).abs() < 1e-9);
-        assert!((summary.wall_ms_share_by_class["extract"] - 0.4).abs() < 1e-9);
-        assert!((summary.wall_ms_share_by_class["distill"] - 0.4).abs() < 1e-9);
-        assert!((summary.wall_ms_share_by_class["classify"] - 0.2).abs() < 1e-9);
-
-        // Test malformed lines are rejected
-        assert!(parse_batch_log_line("garbage").is_none());
-        assert!(parse_batch_log_line("[batch_log] n_seqs=1").is_none());
-        assert!(
-            parse_batch_log_line("[batch_log] n_seqs=invalid call_class=test wall_ms=100")
-                .is_none()
-        );
-    }
-
-    #[test]
     fn test_llm_request_clone() {
         let req = LlmRequest {
             system_prompt: Some("You are helpful.".into()),
@@ -2008,20 +1839,21 @@ mod tests {
 
     #[test]
     fn test_api_provider_no_key() {
-        let provider = ApiProvider::with_default_model(String::new());
+        let provider = ApiProvider::new(String::new(), DEFAULT_ROUTINE_MODEL.to_string());
         assert!(!provider.is_available());
         assert_eq!(provider.name(), "api");
     }
 
     #[test]
     fn test_api_provider_with_key() {
-        let provider = ApiProvider::with_default_model("sk-ant-test".to_string());
+        let provider =
+            ApiProvider::new("sk-ant-test".to_string(), DEFAULT_ROUTINE_MODEL.to_string());
         assert!(provider.is_available());
     }
 
     #[tokio::test]
     async fn test_api_provider_empty_key_fails() {
-        let provider = ApiProvider::with_default_model(String::new());
+        let provider = ApiProvider::new(String::new(), DEFAULT_ROUTINE_MODEL.to_string());
         let result = provider
             .generate(LlmRequest {
                 system_prompt: None,
@@ -2194,8 +2026,11 @@ mod tests {
 
     #[test]
     fn openai_compatible_provider_stores_config() {
-        let provider =
-            OpenAICompatibleProvider::new("http://localhost:11434/v1".into(), "qwen3.5:9b".into());
+        let provider = OpenAICompatibleProvider::new_with_key(
+            "http://localhost:11434/v1".into(),
+            "qwen3.5:9b".into(),
+            None,
+        );
         assert_eq!(provider.endpoint(), "http://localhost:11434/v1");
         assert_eq!(provider.model(), "qwen3.5:9b");
         assert_eq!(provider.name(), "external");
@@ -2205,14 +2040,17 @@ mod tests {
 
     #[test]
     fn openai_compatible_provider_strips_trailing_slash() {
-        let provider =
-            OpenAICompatibleProvider::new("http://localhost:11434/v1/".into(), "model".into());
+        let provider = OpenAICompatibleProvider::new_with_key(
+            "http://localhost:11434/v1/".into(),
+            "model".into(),
+            None,
+        );
         assert_eq!(provider.endpoint(), "http://localhost:11434/v1");
     }
 
     #[test]
     fn openai_compatible_provider_not_available_when_empty() {
-        let provider = OpenAICompatibleProvider::new("".into(), "".into());
+        let provider = OpenAICompatibleProvider::new_with_key("".into(), "".into(), None);
         assert!(!provider.is_available());
     }
 

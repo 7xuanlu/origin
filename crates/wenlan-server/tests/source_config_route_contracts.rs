@@ -16,11 +16,6 @@ struct ErrorEnvelope {
 }
 
 #[derive(Debug, Serialize)]
-struct SkipAppsRequest {
-    apps: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
 struct AnthropicKeyRequest {
     api_key: String,
 }
@@ -287,29 +282,6 @@ async fn moved_source_and_config_routes_preserve_typed_http_contracts() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(error.error.contains("invalid everyday_source"));
-
-    let (status, skip_apps): (StatusCode, Vec<String>) =
-        request_typed(&router, Method::GET, "/api/config/skip-apps", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(skip_apps.is_empty());
-
-    let skip_apps_request = SkipAppsRequest {
-        apps: vec!["R5 Contract App".to_string()],
-    };
-    let (status, updated): (StatusCode, SuccessResponse) = request_typed(
-        &router,
-        Method::PUT,
-        "/api/config/skip-apps",
-        json_body(&skip_apps_request),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(updated.ok);
-
-    let (status, skip_apps): (StatusCode, Vec<String>) =
-        request_typed(&router, Method::GET, "/api/config/skip-apps", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(skip_apps, ["R5 Contract App"]);
 
     let (status, routing): (StatusCode, ResolvedRoutingResponse) =
         request_typed(&router, Method::GET, "/api/config/routing", None).await;

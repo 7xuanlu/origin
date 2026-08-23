@@ -6,8 +6,10 @@
 #   docker buildx build --platform linux/amd64,linux/arm64 \
 #     -f docker/Dockerfile.daemon -t wenlan-server:dev .
 #
-# Run:
-#   docker run --rm -p 7878:7878 -v origin-data:/data wenlan-server:dev
+# Run (publish on loopback only: the daemon has no authentication, and with
+# WENLAN_BIND_ADDR set to a routable address its Host-header guard is off, so a
+# bare `-p 7878:7878` would expose every read/write/shutdown route to the LAN):
+#   docker run --rm -p 127.0.0.1:7878:7878 -v origin-data:/data wenlan-server:dev
 #
 # Why glibc (not musl): the ONNX Runtime crate (`ort` 2.x, pulled in via
 # `fastembed`) does not publish prebuilt musl binaries. Building ort against
@@ -15,6 +17,23 @@
 # the build simple. Runtime image is distroless/cc which ships glibc + ld.so.
 
 ARG RUST_VERSION=1
+
+# wenlan-server links the GNU OpenMP runtime for its CPU inference path, so it
+# needs libgomp.so.1. distroless/cc ships only glibc, libgcc, and libstdc++, so
+# the loader would otherwise find no libgomp and the daemon would exit before
+# it can serve. Stage the library from a pinned Debian index; BuildKit builds
+# this stage for the same --platform as the final image, so the ABI matches.
+FROM debian:13-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS libgomp
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libgomp1; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /staged; \
+    for lib in /usr/lib/*-linux-gnu/libgomp.so.1*; do \
+      dir="$(dirname "$lib")"; \
+      mkdir -p "/staged$dir"; \
+      cp -a "$lib" "/staged$dir/"; \
+    done
 
 # Debian trixie (13) ships glibc 2.41+, which provides the `__isoc23_strtoull`
 # symbol that ort_sys's onnxruntime build needs (added in glibc 2.38). The
@@ -42,6 +61,10 @@ RUN strip target/release/wenlan-server
 RUN mkdir -p /data-skeleton
 
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
+# Staged under its original /usr/lib/<triplet>/ path so the loader resolves
+# libgomp.so.1 from the same directory it already resolves libstdc++ from,
+# without an ld.so.cache rebuild or an LD_LIBRARY_PATH override.
+COPY --from=libgomp --chown=0:0 /staged/ /
 COPY --from=builder /src/target/release/wenlan-server /usr/local/bin/wenlan-server
 # Copy the ONNX Runtime shared library that `ort`'s build script placed next
 # to the binary via the `copy-dylibs` feature. Without this, the daemon
@@ -59,6 +82,9 @@ EXPOSE 7878
 # publishing (-p 7878:7878) works. Falls back to 127.0.0.1 outside Docker.
 ENV WENLAN_BIND_ADDR=0.0.0.0:7878
 ENV WENLAN_PORT=7878
-ENV WENLAN_DATA_DIR=/data
+# Nested one level inside the volume on purpose: the daemon writes its
+# data-root lock to the root's PARENT, so a root of /data would put the lock
+# at /.wenlan-daemon-*.lock, which the nonroot account cannot create.
+ENV WENLAN_DATA_DIR=/data/wenlan
 VOLUME ["/data"]
 ENTRYPOINT ["/usr/local/bin/wenlan-server"]

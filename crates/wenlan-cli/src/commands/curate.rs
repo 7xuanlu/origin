@@ -12,7 +12,7 @@ use serde::Serialize;
 use wenlan_types::responses::PendingRevisionItem;
 
 use crate::client::WenlanClient;
-use crate::output::{print_json, OutputFormat};
+use crate::output::{print_json, ResolvedFormat};
 
 /// One logical revision: all per-chunk rows sharing a `revision_source_id`, joined.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -61,7 +61,7 @@ const DEFAULT_LIMIT: usize = 20;
 
 pub async fn run(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     action: Option<CurateAction>,
 ) -> Result<()> {
@@ -75,13 +75,12 @@ pub async fn run(
                 return Ok(());
             }
             match format {
-                OutputFormat::Json => print_json(&resp)?,
-                OutputFormat::Table => println!(
+                ResolvedFormat::Json => print_json(&resp)?,
+                ResolvedFormat::Table => println!(
                     "{} revision for {}",
                     if resp.wrote { "accepted" } else { "no-op" },
                     resp.target_source_id
                 ),
-                OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
             }
             Ok(())
         }
@@ -91,13 +90,12 @@ pub async fn run(
                 return Ok(());
             }
             match format {
-                OutputFormat::Json => print_json(&resp)?,
-                OutputFormat::Table => println!(
+                ResolvedFormat::Json => print_json(&resp)?,
+                ResolvedFormat::Table => println!(
                     "{} revision for {}",
                     if resp.wrote { "dismissed" } else { "no-op" },
                     resp.target_source_id
                 ),
-                OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
             }
             Ok(())
         }
@@ -106,7 +104,7 @@ pub async fn run(
 
 async fn list_revisions(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     limit: usize,
 ) -> Result<()> {
@@ -117,9 +115,8 @@ async fn list_revisions(
         return Ok(());
     }
     match format {
-        OutputFormat::Json => print_json(&groups)?,
-        OutputFormat::Table => print_table(&groups),
-        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
+        ResolvedFormat::Json => print_json(&groups)?,
+        ResolvedFormat::Table => print_table(&groups),
     }
     Ok(())
 }

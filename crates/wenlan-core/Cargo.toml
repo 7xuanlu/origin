@@ -8,7 +8,6 @@ description = "Core business logic for Wenlan — memory storage, retrieval, and
 
 [features]
 default = []
-closed-core-eval = []
 eval-harness = []
 # Redirect config reads/writes to a disposable per-process directory so a test
 # binary can never resolve to the developer's real `config.json` (rationale on
@@ -60,11 +59,6 @@ sysinfo = { workspace = true }
 
 # Business logic (phase 3d)
 reqwest = { workspace = true }
-# NOTE: rusqlite uses the `buildtime_bindgen` feature (NOT `bundled`) so it
-# links against libsql's statically-bundled SQLite instead of a second copy.
-# Having two bundled SQLite builds in the same binary causes libsql's
-# thread-mode assertion to fail at runtime.
-rusqlite = { version = "0.31", default-features = false }
 # tempfile is used from eval/ runners (non-test code paths) in addition to
 # the dev-dependency usage by other modules.
 tempfile = { workspace = true }
@@ -72,7 +66,7 @@ fs2 = { workspace = true }
 cap-std = { workspace = true }
 cap-fs-ext = { workspace = true }
 
-# Benchmark binaries (model_benchmark, deep_distill, etc.)
+# Benchmark binaries (model_benchmark, model_probe, fixture_gen)
 env_logger = "0.11"
 
 # tiktoken-rs is used from eval/ token_efficiency module (non-test code paths)

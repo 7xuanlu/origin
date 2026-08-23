@@ -13,7 +13,6 @@
 //! a divergent eval shortcut. (Google "Rules of ML", Rule #32: "Re-use code
 //! between your training pipeline and your serving pipeline whenever possible.")
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::db::MemoryDB;
@@ -171,7 +170,7 @@ pub async fn run_classification_enrichment(
 
     // Extract structured fields — only if the agent didn't supply them.
     if !opts.agent_supplied_structured_fields {
-        let prompt = crate::memory_schema::extraction_prompt_with_template(
+        let prompt = crate::schema::extraction_prompt_with_template(
             &final_memory_type,
             &prompts.extract_structured_fields,
         );
@@ -262,8 +261,10 @@ pub async fn run_classification_enrichment_slice(
     llm: &Arc<dyn LlmProvider>,
     prompts: &PromptRegistry,
 ) -> Result<ClassificationSliceReport, WenlanError> {
-    const MAX_ATTEMPTS: u32 = 3;
-    let Some(input) = db.get_classification_candidate(MAX_ATTEMPTS).await? else {
+    let Some(input) = db
+        .get_classification_candidate(crate::post_ingest::ENRICHMENT_MAX_ATTEMPTS)
+        .await?
+    else {
         return Ok(ClassificationSliceReport::default());
     };
 
@@ -280,21 +281,15 @@ pub async fn run_classification_enrichment_slice(
     let classification = match generated {
         Ok(Ok(output)) => crate::llm_provider::parse_classify_response(&output),
         Ok(Err(error)) => {
-            let attempt = input.prior_attempts.saturating_add(1);
-            let status = if attempt >= MAX_ATTEMPTS {
-                "abandoned"
-            } else {
-                "needs_retry"
-            };
-            let committed = db
-                .record_enrichment_step_at_version(
-                    &input.source_id,
-                    "classify",
-                    status,
-                    Some(&error.to_string()),
-                    input.version,
-                )
-                .await?;
+            let committed = crate::post_ingest::record_stage_failure(
+                db,
+                &input.source_id,
+                "classify",
+                input.prior_attempts,
+                input.version,
+                &error.to_string(),
+            )
+            .await?;
             return Ok(ClassificationSliceReport {
                 selected: true,
                 committed,
@@ -302,21 +297,15 @@ pub async fn run_classification_enrichment_slice(
             });
         }
         Err(_) => {
-            let attempt = input.prior_attempts.saturating_add(1);
-            let status = if attempt >= MAX_ATTEMPTS {
-                "abandoned"
-            } else {
-                "needs_retry"
-            };
-            let committed = db
-                .record_enrichment_step_at_version(
-                    &input.source_id,
-                    "classify",
-                    status,
-                    Some("classification timed out after 30s"),
-                    input.version,
-                )
-                .await?;
+            let committed = crate::post_ingest::record_stage_failure(
+                db,
+                &input.source_id,
+                "classify",
+                input.prior_attempts,
+                input.version,
+                "classification timed out after 30s",
+            )
+            .await?;
             return Ok(ClassificationSliceReport {
                 selected: true,
                 committed,
@@ -325,21 +314,15 @@ pub async fn run_classification_enrichment_slice(
         }
     };
     let Some(classification) = classification else {
-        let attempt = input.prior_attempts.saturating_add(1);
-        let status = if attempt >= MAX_ATTEMPTS {
-            "abandoned"
-        } else {
-            "needs_retry"
-        };
-        let committed = db
-            .record_enrichment_step_at_version(
-                &input.source_id,
-                "classify",
-                status,
-                Some("classification response was invalid"),
-                input.version,
-            )
-            .await?;
+        let committed = crate::post_ingest::record_stage_failure(
+            db,
+            &input.source_id,
+            "classify",
+            input.prior_attempts,
+            input.version,
+            "classification response was invalid",
+        )
+        .await?;
         return Ok(ClassificationSliceReport {
             selected: true,
             committed,
@@ -395,8 +378,10 @@ pub async fn run_structured_extract_slice(
     llm: &Arc<dyn LlmProvider>,
     prompts: &PromptRegistry,
 ) -> Result<StructuredExtractSliceReport, WenlanError> {
-    const MAX_ATTEMPTS: u32 = 3;
-    let Some(input) = db.get_structured_extract_candidate(MAX_ATTEMPTS).await? else {
+    let Some(input) = db
+        .get_structured_extract_candidate(crate::post_ingest::ENRICHMENT_MAX_ATTEMPTS)
+        .await?
+    else {
         return Ok(StructuredExtractSliceReport::default());
     };
     if input.origin.structured_fields_explicit {
@@ -418,7 +403,7 @@ pub async fn run_structured_extract_slice(
     }
 
     let memory_type = input.memory_type.as_deref().unwrap_or("fact");
-    let prompt = crate::memory_schema::extraction_prompt_with_template(
+    let prompt = crate::schema::extraction_prompt_with_template(
         memory_type,
         &prompts.extract_structured_fields,
     );
@@ -437,21 +422,15 @@ pub async fn run_structured_extract_slice(
     let output = match generated {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
-            let attempt = input.prior_attempts.saturating_add(1);
-            let status = if attempt >= MAX_ATTEMPTS {
-                "abandoned"
-            } else {
-                "needs_retry"
-            };
-            let committed = db
-                .record_enrichment_step_at_version(
-                    &input.source_id,
-                    "structured_extract",
-                    status,
-                    Some(&error.to_string()),
-                    input.version,
-                )
-                .await?;
+            let committed = crate::post_ingest::record_stage_failure(
+                db,
+                &input.source_id,
+                "structured_extract",
+                input.prior_attempts,
+                input.version,
+                &error.to_string(),
+            )
+            .await?;
             return Ok(StructuredExtractSliceReport {
                 selected: true,
                 committed,
@@ -459,21 +438,15 @@ pub async fn run_structured_extract_slice(
             });
         }
         Err(_) => {
-            let attempt = input.prior_attempts.saturating_add(1);
-            let status = if attempt >= MAX_ATTEMPTS {
-                "abandoned"
-            } else {
-                "needs_retry"
-            };
-            let committed = db
-                .record_enrichment_step_at_version(
-                    &input.source_id,
-                    "structured_extract",
-                    status,
-                    Some("structured extraction timed out after 30s"),
-                    input.version,
-                )
-                .await?;
+            let committed = crate::post_ingest::record_stage_failure(
+                db,
+                &input.source_id,
+                "structured_extract",
+                input.prior_attempts,
+                input.version,
+                "structured extraction timed out after 30s",
+            )
+            .await?;
             return Ok(StructuredExtractSliceReport {
                 selected: true,
                 committed,
@@ -509,8 +482,7 @@ pub async fn run_structured_extract_slice(
 /// Locking: this fn holds NO `RwLock` guard. The caller snapshots `db`, `llm`,
 /// `prompts`, `refinery`, `distillation`, and `knowledge_path` out of its state
 /// guard and drops that guard BEFORE calling (per the never-hold-a-guard-across-
-/// `.await` rule). `cancel` threads the reflection-debounce cooperative-cancel
-/// flag; `None` runs every step to completion.
+/// `.await` rule).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_canonical_enrichment(
     db: &MemoryDB,
@@ -523,7 +495,6 @@ pub async fn run_canonical_enrichment(
     distillation: &DistillationConfig,
     knowledge_path: Option<&std::path::Path>,
     opts: &EnrichmentOpts,
-    cancel: Option<&AtomicBool>,
 ) -> EnrichmentOutcome {
     // Phase 1: classify + extract + apply_enrichment + tags. Runs only when an
     // LLM is available; the no-LLM path leaves the classification at the sync
@@ -554,15 +525,12 @@ pub async fn run_canonical_enrichment(
         source_id,
         content,
         entity_id,
-        Some(outcome.final_memory_type.as_str()),
         outcome.final_domain.as_deref(),
-        outcome.final_structured_fields.as_deref(),
         llm,
         prompts,
         refinery,
         distillation,
         knowledge_path,
-        cancel,
         None, // precomputed_kg
     )
     .await
@@ -830,7 +798,6 @@ mod tests {
             &distillation,
             None,
             &opts,
-            None,
         )
         .await;
 
@@ -884,7 +851,6 @@ mod tests {
             &distillation,
             None,
             &opts,
-            None,
         )
         .await;
 
@@ -938,7 +904,6 @@ mod tests {
             &distillation,
             None,
             &opts,
-            None,
         )
         .await;
 
@@ -983,7 +948,6 @@ mod tests {
             &distillation,
             None,
             &opts,
-            None,
         )
         .await;
 

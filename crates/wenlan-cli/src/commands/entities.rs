@@ -7,7 +7,7 @@ use clap::Subcommand;
 use wenlan_types::responses::ListEntitiesResponse;
 
 use crate::client::WenlanClient;
-use crate::output::OutputFormat;
+use crate::output::ResolvedFormat;
 
 #[derive(Subcommand)]
 pub enum EntitiesCmd {
@@ -34,7 +34,7 @@ pub enum EntitiesCmd {
 
 pub async fn run(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     cmd: EntitiesCmd,
 ) -> Result<()> {
@@ -96,7 +96,7 @@ async fn resolve_entity_with(
 
 async fn merge(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     loser: &str,
     into: &str,
@@ -112,8 +112,8 @@ async fn merge(
         return Ok(());
     }
     match format {
-        OutputFormat::Json => crate::output::print_json(&response)?,
-        OutputFormat::Table => {
+        ResolvedFormat::Json => crate::output::print_json(&response)?,
+        ResolvedFormat::Table => {
             let verb = if response.applied {
                 "Merged"
             } else {
@@ -131,14 +131,13 @@ async fn merge(
                 println!("Aliases added: {}", response.aliases_added.join(", "));
             }
         }
-        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
     }
     Ok(())
 }
 
 async fn alias_cmd(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     entity: &str,
     alias: &str,
@@ -151,11 +150,10 @@ async fn alias_cmd(
         return Ok(());
     }
     match format {
-        OutputFormat::Json => crate::output::print_json(&response)?,
-        OutputFormat::Table => {
+        ResolvedFormat::Json => crate::output::print_json(&response)?,
+        ResolvedFormat::Table => {
             println!("'{}' aliases: {}", entity_name, response.aliases.join(", "));
         }
-        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
     }
     Ok(())
 }

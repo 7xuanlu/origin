@@ -91,6 +91,25 @@ describe("ImportFlow", () => {
     expect(queryByText(/Importing/)).toBeNull();
   });
 
+  it("keeps a dismissed refining strip hidden across polls that keep reporting the same import", async () => {
+    mockListPendingImports.mockResolvedValue([
+      { id: "imp_1", vendor: "chatgpt", stage: "stage_b", total_conversations: 77 },
+    ]);
+    const { getByRole, queryByRole } = render(<ImportFlow />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    expect(getByRole("button", { name: "Dismiss" })).toBeTruthy();
+
+    await act(async () => {
+      getByRole("button", { name: "Dismiss" }).click();
+    });
+    expect(queryByRole("button", { name: "Dismiss" })).toBeNull();
+
+    // Next poll still reports the same pending import (same id) — the strip
+    // must not resurrect itself.
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(queryByRole("button", { name: "Dismiss" })).toBeNull();
+  });
+
   it("marks the dismiss icon aria-hidden while the dismiss button keeps its own accessible name", async () => {
     const mockOpen = open as ReturnType<typeof vi.fn>;
     mockOpen.mockResolvedValue("/tmp/export.zip");

@@ -11,6 +11,7 @@ import {
   type MemoryItem,
   type PendingRevision,
 } from "../../lib/tauri";
+import { formatTimeAgo } from "../../lib/dateFormat";
 import ContentRenderer from "./ContentRenderer";
 
 interface MemoryListRowProps {
@@ -21,16 +22,6 @@ interface MemoryListRowProps {
   onUnpin?: (sourceId: string) => void;
   onClick?: (sourceId: string) => void;
   style?: React.CSSProperties;
-}
-
-function timeAgo(ts: number): string {
-  const now = Date.now() / 1000;
-  const diff = now - ts;
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
-  return new Date(ts * 1000).toLocaleDateString();
 }
 
 export default function MemoryListRow({
@@ -168,7 +159,7 @@ export default function MemoryListRow({
           </div>
           <div>
             <dt>{t("memoryList.updated")}</dt>
-            <dd>{timeAgo(memory.last_modified)}</dd>
+            <dd>{formatTimeAgo(memory.last_modified)}</dd>
           </div>
         </dl>
 

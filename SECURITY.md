@@ -27,10 +27,7 @@ We are especially interested in:
 
 ## Supported Versions
 
-| Version | Supported |
-|---------|-----------|
-| 0.7.x   | Yes       |
-| < 0.7.0 | Best-effort |
+The latest released version is supported; older releases are best-effort.
 
 ## Links
 

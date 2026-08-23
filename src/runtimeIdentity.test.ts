@@ -193,7 +193,6 @@ describe("runtime product identity", () => {
       "src/components/memory/PageDetail.tsx",
       "src/components/memory/ImportView.tsx",
       "src/components/memory/SpaceDetail.tsx",
-      "src/components/memory/WorthAGlanceScroll.tsx",
       "src/components/memory/settings/SettingsSidebar.tsx",
       "src/components/ChatImport/ImportFlow.tsx",
     ];
