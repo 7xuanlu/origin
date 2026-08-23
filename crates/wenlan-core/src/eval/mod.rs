@@ -11,7 +11,6 @@ pub mod context_path;
 pub mod cost;
 pub mod engine_throughput;
 pub mod entity_dedup;
-mod eval_judge;
 pub mod fixtures;
 pub mod gen;
 pub mod kg_faithfulness;

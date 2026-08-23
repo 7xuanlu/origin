@@ -14,7 +14,6 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [features]
 default = []
-closed-core-eval = []
 review-fixtures = []
 
 [build-dependencies]
@@ -52,7 +51,7 @@ notify = { version = "7", features = ["macos_kqueue"] }
 notify-debouncer-full = "0.4"
 
 # HTTP client for wenlan-server daemon
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "charset", "http2", "system-proxy", "rustls-tls-native-roots"] }
 
 # Error handling
 thiserror = "2"
@@ -66,16 +65,13 @@ getrandom = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 log = "0.4"
-env_logger = "0.11"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "tracing-log"] }
 tracing-appender = "0.2"
 tracing = "0.1"
 dirs = "6"
 async-trait = "0.1"
-futures = "0.3"
 tempfile = "3"
-
-serde_yaml = "0.9"
+open = "5"
 
 # Workspace crates
 wenlan-types = { workspace = true }
@@ -98,4 +94,4 @@ raw-window-handle = "0.6"
 serial_test = "3"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy", "closed-core-eval", "review-fixtures"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy", "review-fixtures"))'] }

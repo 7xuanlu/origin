@@ -72,15 +72,21 @@ fn config() -> MaintenanceTickConfig {
         token_limit: 3500,
         max_unlinked_cluster_size: 20,
         max_grouped_cluster_size: 20,
-        max_per_tick: 5,
     }
 }
 
 async fn emitted_page_merge_source_ids(db: &MemoryDB) -> Vec<String> {
-    let result = run_maintenance_tick(db, None, &PromptRegistry::default(), &config(), None)
-        .await
-        .unwrap();
-    assert_eq!(result.merge_cards_emitted, 1);
+    let report = run_maintenance_stage_slice(
+        db,
+        None,
+        &PromptRegistry::default(),
+        &config(),
+        None,
+        MaintenanceStage::NearDuplicate,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.result.merge_cards_emitted, 1);
 
     let cards: Vec<_> = db
         .get_pending_refinements()

@@ -15,7 +15,7 @@ The modules whose job is not evident from the name:
 | Module | Purpose |
 |---|---|
 | `main.rs` | Binary entry — daemon startup plus internal maintenance commands, tracing init, port binding with existing-daemon fallback, `MemoryDB::new`, LLM provider init, background tasks, `axum::serve` |
-| `state.rs` | `ServerState` with `db: Option<Arc<MemoryDB>>`, `llm`, `prompts`, `tuning`, `quality_gate`, `space_store`, `access_tracker`, `llm_processing_ids`, `watch_paths`. `SharedState = Arc<RwLock<ServerState>>` |
+| `state.rs` | `ServerState` with `db: Option<Arc<MemoryDB>>`, `shutdown`, `bound_port`, the LLM handles (`llm`, `api_llm`, `synthesis_llm`, `external_llm`), `reranker` + `reranker_status`, `prompts`, `tuning`, `quality_gate`, `write_signal`, `maintenance_coordinator`, `ingest_batcher`, `repair_root`, `presence_root`, `lint_config`. `SharedState = Arc<RwLock<ServerState>>` |
 | `router.rs` | Axum composition root — assembles the module-owned registration helpers plus the remaining inline registrations, then applies the truth/security/lifecycle layers |
 | `routes.rs` | General endpoints: health, status, search/context, diagnostics, recent activity, steep/distill |
 | `memory_routes.rs` | Memory CRUD/search/enrichment, classification, statistics, scheduler-handoff, rerank, attribution, update, revision, contradiction tests |

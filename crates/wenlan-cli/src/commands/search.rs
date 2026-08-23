@@ -5,11 +5,11 @@ use anyhow::Result;
 use wenlan_types::responses::SearchResponse;
 
 use crate::client::WenlanClient;
-use crate::output::{print_json, OutputFormat};
+use crate::output::{print_json, ResolvedFormat};
 
 pub async fn run(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     query: String,
     limit: usize,
@@ -19,9 +19,8 @@ pub async fn run(
         return Ok(());
     }
     match format {
-        OutputFormat::Json => print_json(&resp)?,
-        OutputFormat::Table => print_table(&resp),
-        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
+        ResolvedFormat::Json => print_json(&resp)?,
+        ResolvedFormat::Table => print_table(&resp),
     }
     Ok(())
 }

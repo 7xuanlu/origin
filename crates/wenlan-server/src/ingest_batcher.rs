@@ -156,9 +156,16 @@ async fn run_coalescer(
 
         let batch_size = batch.len();
         let fill_elapsed = batch_started.elapsed();
+        // Move each request's document into the processor instead of cloning it
+        // (full content + metadata per doc); only the oneshot responders are
+        // kept behind so outcomes can be delivered after `process` returns.
+        let mut responders: Vec<oneshot::Sender<StoreOutcome>> = Vec::with_capacity(batch.len());
         let items: Vec<(RawDocument, usize, Option<ResolvedWriteSpace>)> = batch
-            .iter()
-            .map(|r| (r.doc.clone(), r.chunks_predicted, r.write_space.clone()))
+            .into_iter()
+            .map(|r| {
+                responders.push(r.response);
+                (r.doc, r.chunks_predicted, r.write_space)
+            })
             .collect();
 
         let process_started = tokio::time::Instant::now();
@@ -204,7 +211,7 @@ async fn run_coalescer(
         // violation), fill the missing slots with an explicit error so
         // callers aren't left hanging forever. This should never fire in
         // practice — it's defense against a future processor bug.
-        let missing = batch.len().saturating_sub(outcomes.len());
+        let missing = responders.len().saturating_sub(outcomes.len());
         let mut outcomes = outcomes;
         for _ in 0..missing {
             outcomes.push(StoreOutcome::UpsertFailed(
@@ -212,8 +219,8 @@ async fn run_coalescer(
             ));
         }
 
-        for (req, outcome) in batch.into_iter().zip(outcomes) {
-            let _ = req.response.send(outcome);
+        for (responder, outcome) in responders.into_iter().zip(outcomes) {
+            let _ = responder.send(outcome);
         }
     }
 }

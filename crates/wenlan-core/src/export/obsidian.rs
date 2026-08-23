@@ -2,7 +2,8 @@
 //! Obsidian vault exporter for pages.
 
 use crate::error::WenlanError;
-use crate::export::{ExportResult, ExportStats, PageExporter};
+use crate::export::provenance::yaml_quoted;
+use crate::export::{ExportResult, ExportStats};
 use crate::pages::Page;
 use std::path::PathBuf;
 
@@ -14,10 +15,8 @@ impl ObsidianExporter {
     pub fn new(vault_path: PathBuf) -> Self {
         Self { vault_path }
     }
-}
 
-impl PageExporter for ObsidianExporter {
-    fn export(&self, page: &Page) -> Result<ExportResult, WenlanError> {
+    pub fn export(&self, page: &Page) -> Result<ExportResult, WenlanError> {
         std::fs::create_dir_all(&self.vault_path)?;
 
         let filename = format!("{}.md", slugify(&page.title));
@@ -35,7 +34,7 @@ impl PageExporter for ObsidianExporter {
         })
     }
 
-    fn export_all(&self, pages: &[Page]) -> Result<ExportStats, WenlanError> {
+    pub fn export_all(&self, pages: &[Page]) -> Result<ExportStats, WenlanError> {
         let mut stats = ExportStats::default();
         for page in pages {
             match self.export(page) {
@@ -52,12 +51,12 @@ impl PageExporter for ObsidianExporter {
 
 fn build_frontmatter(page: &Page) -> String {
     let mut fm = String::new();
-    fm.push_str(&format!("title: {}\n", page.title));
+    fm.push_str(&format!("title: {}\n", yaml_quoted(&page.title)));
     if let Some(ref space) = page.space {
-        fm.push_str(&format!("tags:\n  - {}\n", space));
+        fm.push_str(&format!("tags:\n  - {}\n", yaml_quoted(space)));
     }
     if let Some(ref summary) = page.summary {
-        fm.push_str(&format!("aliases:\n  - {}\n", summary));
+        fm.push_str(&format!("aliases:\n  - {}\n", yaml_quoted(summary)));
     }
     fm.push_str(&format!("origin_id: {}\n", page.id));
     fm.push_str(&format!("origin_version: {}\n", page.version));
@@ -146,7 +145,7 @@ mod tests {
 
         // Check frontmatter
         assert!(file_content.starts_with("---\n"));
-        assert!(file_content.contains("title: libSQL Architecture"));
+        assert!(file_content.contains("title: \"libSQL Architecture\""));
         assert!(file_content.contains("origin_id: concept_abc"));
         assert!(file_content.contains("origin_version: 2"));
         assert!(file_content.contains("created: 2026-04-01"));
@@ -160,6 +159,26 @@ mod tests {
 
         // Check file name
         assert!(result.path.ends_with("libsql-architecture.md"));
+    }
+
+    #[test]
+    fn test_obsidian_export_quotes_colon_in_title() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exporter = ObsidianExporter::new(dir.path().to_path_buf());
+        let mut page = test_concept();
+        page.title = "Wenlan: local-first memory".to_string();
+
+        let result = exporter.export(&page).unwrap();
+        let file_content = std::fs::read_to_string(&result.path).unwrap();
+
+        let frontmatter_end = file_content.match_indices("---\n").nth(1).unwrap().0;
+        let frontmatter = &file_content[4..frontmatter_end];
+        let parsed: serde_yaml::Value = serde_yaml::from_str(frontmatter)
+            .expect("frontmatter with a colon in the title must still be valid YAML");
+        assert_eq!(
+            parsed.get("title").and_then(|v| v.as_str()),
+            Some("Wenlan: local-first memory")
+        );
     }
 
     #[test]

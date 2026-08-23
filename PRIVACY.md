@@ -12,7 +12,9 @@ All data stays on your machine:
 
 - `~/.wenlan/pages/` -- wiki pages (Markdown)
 - `~/.wenlan/sessions/` -- session logs (Markdown)
-- `~/.wenlan/db/` -- symlink to the libSQL database at `~/Library/Application Support/wenlan/memorydb/`
+- `~/.wenlan/sources/` -- uploaded source documents
+- `~/.wenlan/spaces.toml` -- Space mapping config
+- `~/.wenlan/db/` -- symlink to the platform data directory (macOS: `~/Library/Application Support/wenlan/`; Linux: `~/.local/share/wenlan/`; Windows: `%LOCALAPPDATA%\wenlan\`), with the libSQL database at `<data dir>/memorydb/`
 - `~/.wenlan/bin/` -- installed binaries
 
 The daemon listens on `127.0.0.1:7878` (localhost only). No data is sent to any remote server by default.
@@ -21,8 +23,8 @@ The daemon listens on `127.0.0.1:7878` (localhost only). No data is sent to any 
 
 None by default. Two opt-in integrations exist:
 
-- **Anthropic API (BYOK):** If you run `wenlan key set anthropic`, your memories are sent to the Anthropic API for richer extraction and synthesis. Anthropic's privacy policy applies to that data. Wenlan does not store or relay your API key beyond the local config file.
-- **On-device model:** If you run `wenlan model install`, a Qwen model is downloaded from Hugging Face Hub. No memory data leaves your machine in this mode.
+- **Anthropic API (BYOK):** If you run `wenlan keys set anthropic`, your memories are sent to the Anthropic API for richer extraction and synthesis. Anthropic's privacy policy applies to that data. Wenlan does not store or relay your API key beyond the local config file.
+- **On-device model:** If you run `wenlan models install`, a Qwen model is downloaded from Hugging Face Hub. No memory data leaves your machine in this mode.
 
 ## Telemetry
 
@@ -30,9 +32,9 @@ None. Wenlan collects no usage analytics, crash reports, or diagnostics.
 
 ## Data deletion
 
-- Delete individual memories: `/forget` skill or `wenlan` CLI.
-- Delete everything: remove `~/.wenlan/` and `~/Library/Application Support/wenlan/`.
-- Uninstall the daemon: `wenlan uninstall`.
+- Delete individual memories: `/forget` skill.
+- Delete everything: remove `~/.wenlan/` and your platform data directory (`~/Library/Application Support/wenlan/` on macOS, `~/.local/share/wenlan/` on Linux, `%LOCALAPPDATA%\wenlan\` on Windows).
+- Uninstall the daemon: run `wenlan background off` to stop it and disable autostart (this is a reversible runtime stop, not an uninstall), then remove the service registration for your platform -- `~/Library/LaunchAgents/com.wenlan.server.plist` (macOS), `~/.config/systemd/user/wenlan-server.service` (Linux), or the `WenlanServer` scheduled task (Windows) -- and delete `~/.wenlan/bin/`.
 
 ## Contact
 

@@ -137,9 +137,14 @@ async fn handle_ws_connection(mut socket: WebSocket, state: Arc<RwLock<ServerSta
 }
 
 async fn get_index_progress(state: &Arc<RwLock<ServerState>>) -> IndexProgressData {
-    let s = state.read().await;
+    // Snapshot the DB Arc so the read guard is not held across the count
+    // (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
+        let s = state.read().await;
+        s.db.clone()
+    };
 
-    let files_indexed = if let Some(db) = &s.db {
+    let files_indexed = if let Some(db) = db {
         db.count().await.unwrap_or(0)
     } else {
         0
@@ -176,8 +181,10 @@ async fn handle_ws_ingest(
         ..Default::default()
     };
 
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or("Database not initialized")?;
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or("Database not initialized")?
+    };
 
     let chunks = db
         .upsert_documents(vec![doc])

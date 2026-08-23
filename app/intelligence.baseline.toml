@@ -52,12 +52,6 @@ full_trust_weight = 1.0
 review_trust_weight = 0.7
 untrusted_weight = 0.4
 
-[packager]
-session_gap_secs = 600
-min_session_captures = 3
-max_session_duration_secs = 7200
-packager_interval_secs = 300
-
 [eval]
 enabled = true
 signal_capture = true

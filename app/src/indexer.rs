@@ -223,6 +223,55 @@ pub fn watch_path(watcher: &mut FileWatcher, path: &Path) -> Result<(), AppError
     Ok(())
 }
 
+/// Remove a path from an existing file watcher.
+///
+/// The mirror of [`watch_path`]: because registration walks the tree and
+/// watches each directory individually, unwatching only the root leaves every
+/// subdirectory registered and the debouncer keeps ingesting files under a
+/// source the user disconnected. Walks the same tree with the same
+/// `WATCH_SKIP_DIRS` filter and ignores per-directory errors — a directory
+/// that was never watched, or has since been deleted, is not a failure.
+pub fn unwatch_path(watcher: &mut FileWatcher, path: &Path) {
+    let skip: std::collections::HashSet<&str> = WATCH_SKIP_DIRS.iter().copied().collect();
+    let mut count = 0;
+
+    unwatch_path_filtered(watcher, path, &skip, &mut count);
+
+    log::info!("Unwatched {} directories under {}", count, path.display());
+}
+
+fn unwatch_path_filtered(
+    watcher: &mut FileWatcher,
+    dir: &Path,
+    skip: &std::collections::HashSet<&str>,
+    count: &mut usize,
+) {
+    if watcher.unwatch(dir).is_ok() {
+        *count += 1;
+    }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        if name_str.starts_with('.') || skip.contains(name_str.as_ref()) {
+            continue;
+        }
+
+        unwatch_path_filtered(watcher, &path, skip, count);
+    }
+}
+
 fn watch_path_filtered(
     watcher: &mut FileWatcher,
     dir: &Path,

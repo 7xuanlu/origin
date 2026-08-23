@@ -22,44 +22,6 @@ tags are 2-4 semantic keywords (lowercase)\n\
 quality is low (vague/trivial), medium (useful), or high (specific+actionable)\n\
 importance is 1-10: 1 = purely mundane/derivable, 10 = identity-defining or a major decision";
 
-pub(crate) const CLASSIFY_MEMORY_QUALITY_STRICT: &str = "\
-Classify this memory. Respond with ONLY valid JSON:\n\
-{\"memory_type\": \"...\", \"domain\": \"...\", \"tags\": [\"...\", \"...\"], \"quality\": \"...\", \"importance\": <1-10>}\n\n\
-memory_type must be one of: identity, preference, decision, lesson, gotcha, fact\n\
-- decision: a choice was made between alternatives, or a direction was chosen with rationale (e.g. \"switched from X to Y because...\", \"chose to use X over Y\")\n\
-- fact: objective knowledge without a choice (e.g. \"X supports feature Y\", \"the API returns JSON\")\n\
-domain is a short topic label (1-3 words, lowercase)\n\
-tags are 2-4 semantic keywords (lowercase)\n\
-quality must be one of: low, medium, high (how specific and actionable is this memory?)\n\
-importance must be an integer 1-10: 1 = purely mundane/derivable, 10 = identity-defining or a major decision";
-
-// Used by llm_formatter in the app crate; referenced again once llm_formatter
-// moves into wenlan-core in a later phase.
-//
-// Profile memories split into 2 subtypes after the taxonomy refactor.
-// "goal" is folded to "identity" by MemoryType::FromStr (aspirations are
-// part of who the user is) and must not appear in this prompt.
-#[allow(dead_code)]
-pub(crate) const CLASSIFY_PROFILE_SUBTYPE: &str = "\
-Classify this profile memory into one of exactly 2 types. Respond with ONLY the type name.\n\n\
-identity — who the user is (role, background, expertise, values, aspirations)\n\
-preference — how the user likes things done (tools, workflow, style)\n\n\
-Respond with one word: identity or preference";
-
-pub(crate) const CLASSIFY_SCREEN: &str = "\
-You classify screen capture text from a desktop application.\n\
-Classify the content into exactly one space from: [{spaces_str}].\n\
-Provide 2-4 semantic tags (lowercase single words or short phrases) describing the content.\n\
-Optionally provide a short stream_name describing the work session (e.g. \"debugging auth flow\").\n\
-Respond with ONLY valid JSON: {\"summary\": \"...\", \"space\": \"...\", \"tags\": [\"...\"], \"stream_name\": \"...\"}\n\
-IMPORTANT: Inside JSON strings, escape newlines as \\n and quotes as \\\".\n\
-The summary should be 1-2 sentences describing what the user was doing.";
-
-pub(crate) const MERGE_MEMORIES: &str = "\
-Combine these notes into one clean paragraph that states the key facts directly.\n\
-\n\
-Rules: 2-4 sentences. State facts directly — never start with 'The most recent memory' or 'This memory' or any meta-commentary. Write fresh — do not copy input sentences. If notes contradict, keep the most recent. Stop after the paragraph. No labels, headers, or multiple drafts.";
-
 pub(crate) const DETECT_CONTRADICTION: &str = "\
 Compare two memories. Respond with exactly one of:\n\
 - CONSISTENT (if they agree or are unrelated)\n\
@@ -170,10 +132,6 @@ pub(crate) const SUMMARIZE_ACTIVITY_USER: &str = "\
 Summarize this activity session in 1-2 sentences and give 3-5 topic tags.\n\n\
 Apps: {apps}\n\nLog:\n{log}\n\n\
 Respond ONLY with JSON: {\"summary\": \"...\", \"tags\": [\"...\"]}";
-
-pub(crate) const BATCH_CLASSIFY: &str = "\
-Classify each memory. Return a JSON array.\n\
-For each: {\"i\": <number>, \"type\": \"<identity|preference|decision|lesson|gotcha|fact>\", \"domain\": \"<work|personal|health|finance|technology|travel|food>\", \"tags\": [\"<tag>\"]}";
 
 pub(crate) const EXTRACT_KNOWLEDGE_GRAPH: &str = "\
 Extract entities and relations from these memories.\n\

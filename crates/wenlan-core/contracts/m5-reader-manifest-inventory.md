@@ -546,8 +546,6 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `GET` | `/api/config` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `PUT` | `/api/config` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `GET` | `/api/config/routing` | main | no | not_applicable | `none` | — | no prose fields |
-| `GET` | `/api/config/skip-apps` | main | no | not_applicable | `none` | — | no prose fields |
-| `PUT` | `/api/config/skip-apps` | main | no | not_applicable | `none` | — | no prose fields |
 | `POST` | `/api/context` | main | yes | automatic | `none` | `handle_context` | ChatContextResponse.context, KnowledgeContext.graph_context, Searc |
 | `GET` | `/api/debug/pipeline` | main | yes | automatic | `none` | `handle_pipeline_status` | opaque response type — fail-closed |
 | `GET` | `/api/decisions` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
@@ -647,7 +645,6 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `POST` | `/api/pages/{id}/review` | main | no | not_applicable | `none` | — | receipt only: version, content digest, nonce digest — no prose |
 | `GET` | `/api/pages/{id}/revisions` | main | yes | automatic | **`named_page`** | `handle_get_page_revisions` | PageChangelogEntry.citations_summary, PageChangelogEntry.delta_sum |
 | `GET` | `/api/pages/{id}/sources` | main | yes | automatic | **`named_page`** | `handle_get_page_sources` | MemoryItem.content, MemoryItem.source_text, MemoryItem.summary, Me |
-| `GET` | `/api/ping` | main | yes | automatic | `none` | `handle_ping` | opaque response type — fail-closed |
 | `GET` | `/api/profile` | main | no | not_applicable | `none` | — | no prose fields |
 | `PUT` | `/api/profile` | main | no | not_applicable | `none` | — | no prose fields |
 | `GET` | `/api/profile/narrative` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
@@ -939,7 +936,6 @@ carrying the authority of agreement.
 | `core/db/kg_quality_duplicate_candidates.rs::duplicate_name_groups_for_merge_candidates` | `pub(crate)` | no | no | — | — |
 | `core/db/kg_quality_duplicate_candidates.rs::entities_for_minhash_merge_candidates` | `pub(crate)` | no | no | — | — |
 | `core/db/kg_quality_embedding_refresh.rs::stale_entity_embedding_candidates_for_refresh` | `pub(crate)` | no | no | — | — |
-| `core/db/maintenance_duplicate_reads.rs::embedding_near_duplicate_pairs` | `pub(crate)` | no | no | — | — |
 | `core/db/maintenance_duplicate_reads.rs::scan_near_duplicate_slice` | `pub(crate)` | no | no | — | — |
 | `core/db/maintenance_retro_scan.rs::scan_automatic_retro_stub_slice` | `pub(crate)` | no | no | — | — |
 | `core/db/presence_review.rs::page_binding` | `private` | no | no | — | — |
@@ -990,7 +986,6 @@ carrying the authority of agreement.
 | `core/db.rs::augment_with_graph_seeded_scoped` | `private` | no | no | — | `core/db/scoped_entities.rs::get_observations_for_entities_scoped` |
 | `core/db.rs::find_best_overlapping_page` | `pub` | no | no | — | `core/db.rs::load_page_source_index` |
 | `core/db.rs::find_cross_space_distillation_cluster_slice` | `pub` | no | no | — | `core/db.rs::query_distillation_ann_neighbors`, `core/db.rs::query_distillation_seed_slice` |
-| `core/db.rs::find_cross_space_distillation_clusters` | `pub` | no | no | — | `core/db.rs::query_distillation_staging_pool` |
 | `core/db.rs::find_distillation_clusters_scoped` | `pub` | no | no | — | `core/db.rs::query_distillation_staging_pool` |
 | `core/db.rs::get_page` | `pub` | no | **yes** | `server/page_map_routes.rs::ensure_page_is_active`, `server/page_map_routes.rs::visible_page`, `server/page_routes.rs::handle_create_page`, `server/page_routes.rs::handle_refresh_page`, `server/page_routes.rs::handle_update_page` | `core/db.rs::get_page_inner` |
 | `core/db.rs::get_page_browse` | `pub` | no | no | — | `core/db.rs::get_page_inner` |
@@ -1024,11 +1019,11 @@ carrying the authority of agreement.
 | `core/db/truth_exposure.rs::page_visibility` | `pub` | no | no | — | `core/db/truth_exposure.rs::page_truth_states` |
 | `core/export/knowledge.rs::plan_truth_cutover` | `pub` | no | **yes** | `server/cmd_cutover.rs::run` | `core/db/truth_exposure.rs::page_truth_states` |
 | `core/kg/reweave.rs::reweave_entity_links` | `pub` | no | no | — | `core/db.rs::search_entities_by_vector` |
+| `core/kg_quality.rs::entity_self_retrieval` | `pub` | no | no | — | `core/db.rs::search_entities_by_vector` |
 | `core/kg_quality.rs::find_merge_candidates` | `pub` | no | no | — | `core/db/kg_quality_duplicate_candidates.rs::duplicate_name_groups_for_merge_candidates` |
 | `core/kg_quality.rs::refresh_stale_entity_embeddings` | `pub` | no | no | — | `core/db/kg_quality_embedding_refresh.rs::stale_entity_embedding_candidates_for_refresh` |
 | `core/kg_quality.rs::scan_contradictions` | `pub` | no | no | — | `core/db/kg_quality_diagnostics.rs::list_contradiction_observation_counts` |
 | `core/kg_quality.rs::surface_minhash_merge_candidates` | `private` | no | no | — | `core/db/kg_quality_duplicate_candidates.rs::entities_for_minhash_merge_candidates` |
-| `core/kg_quality.rs::verify_entity` | `pub` | no | no | — | `core/db.rs::search_entities_by_vector` |
 | `core/lint/deep.rs::run` | `pub(super)` | yes | no | — | `core/lint/deep.rs::observation_duplicates`, `core/lint/deep.rs::page_body_result`, `core/lint/deep.rs::page_duplicates` |
 | `core/lint/kg/query.rs::load` | `pub(super)` | yes | no | — | `core/lint/kg/query.rs::entity_integrity`, `core/lint/kg/query.rs::observation_integrity`, `core/lint/kg/query/aggregate.rs::advisory_metrics` |
 | `core/lint/pages/db_checks.rs::run` | `pub(crate)` | yes | no | — | `core/lint/pages/db_checks.rs::load_rows` |
@@ -1039,7 +1034,6 @@ carrying the authority of agreement.
 | `core/m6/signals.rs::orphan_wikilink_slot` | `private` | no | no | — | `core/m6/independence.rs::distinct_group_count`, `core/m6/signals.rs::containing_revisions`, `core/m6/signals.rs::scoped_root_ids` |
 | `core/m6/signals.rs::space_overview` | `pub` | no | no | — | `core/m6/independence.rs::distinct_group_count`, `core/m6/signals.rs::scoped_root_ids` |
 | `core/maintenance.rs::run_maintenance_stage_slice` | `pub` | no | **yes** | `server/scheduler.rs::fire_maintenance_stage_safe` | `core/db.rs::get_stale_page_after`, `core/db/maintenance_duplicate_reads.rs::scan_near_duplicate_slice`, `core/db/maintenance_retro_scan.rs::scan_automatic_retro_stub_slice` |
-| `core/maintenance/duplicates.rs::detect_near_duplicate_pages_inner` | `private` | no | no | — | `core/db/maintenance_duplicate_reads.rs::embedding_near_duplicate_pairs` |
 | `core/onboarding.rs::check_after_refinery_pass` | `pub` | no | no | — | `core/db.rs::oldest_active_page` |
 | `core/page_map_improve.rs::source_suggestions` | `private` | no | no | — | `core/db.rs::find_active_page_id_by_title` |
 | `core/post_ingest.rs::auto_link_entity` | `pub(crate)` | no | no | — | `core/db.rs::search_entities_by_vector` |
@@ -1047,7 +1041,6 @@ carrying the authority of agreement.
 | `core/post_ingest.rs::run_page_growth_slice` | `pub` | no | **yes** | `server/scheduler/ambient.rs::run_ambient_job` | `core/db.rs::find_matching_page_scoped` |
 | `core/post_ingest.rs::run_post_ingest_enrichment` | `pub` | no | no | — | `core/db.rs::get_entity_detail` |
 | `core/post_write.rs::rename_page_title_cas` | `pub(crate)` | no | no | — | `core/db/repair_page_rename.rs::rename_page_title_cas_inner` |
-| `core/post_write/entity_graph.rs::create_entity` | `pub` | yes | no | — | `core/db.rs::search_entities_by_vector` |
 | `core/post_write/page_create.rs::create_page_impl` | `pub(super)` | no | no | — | `core/db.rs::find_matching_page_scoped` |
 | `core/refinery/mod.rs::run_redistill_page_slice` | `pub` | no | no | — | `core/db.rs::get_stale_page_after` |
 | `core/repair.rs::apply_repair_with_pages_inner` | `private` | no | no | — | `core/db/repair_deterministic.rs::apply_deterministic_repair_cas` |
@@ -1101,8 +1094,6 @@ carrying the authority of agreement.
 | `core/db.rs::run_entity_enrichment_slice_with_auto_link` | `pub` | no | **yes** | `server/scheduler/ambient.rs::run_ambient_job` | `core/db.rs::run_entity_enrichment_slice_inner` |
 | `core/db.rs::search_corrections_by_topic_scoped` | `pub` | no | no | — | `core/db.rs::search_memory` |
 | `core/db.rs::search_memory_cross_rerank` | `pub` | no | **yes** | `server/memory_routes.rs::handle_search_memory` | `core/db.rs::search_memory_cross_rerank_cued` |
-| `core/db.rs::search_memory_decomposed` | `pub` | no | no | — | `core/db.rs::search_memory` |
-| `core/db.rs::search_memory_prf` | `pub` | no | no | — | `core/db.rs::search_memory` |
 | `core/db.rs::try_accept_page_revision` | `pub(crate)` | no | no | — | `core/db.rs::try_update_page_content` |
 | `core/db.rs::try_update_page_content_if_stale` | `pub` | no | no | — | `core/db.rs::try_update_page_content` |
 | `core/db.rs::try_update_page_content_with_changelog` | `pub` | no | no | — | `core/db.rs::try_update_page_content` |
@@ -1164,18 +1155,15 @@ carrying the authority of agreement.
 | `core/importer.rs::resolve_entity_bulk` | `pub(crate)` | no | no | — | `core/db.rs::resolve_or_create_entity` |
 | `core/ingest.rs::run_canonical_enrichment` | `pub` | no | no | — | `core/post_ingest.rs::run_post_ingest_enrichment` |
 | `core/kg_quality.rs::run_rethink` | `pub` | no | no | — | `core/kg_quality.rs::find_merge_candidates`, `core/kg_quality.rs::refresh_stale_entity_embeddings`, `core/kg_quality.rs::scan_contradictions` |
+| `core/kg_quality.rs::verify_entity` | `pub` | no | no | — | `core/kg_quality.rs::entity_self_retrieval` |
 | `core/kg_quality.rs::verify_page` | `pub` | no | no | — | `core/db.rs::search_memory` |
 | `core/lint/semantic.rs::run_agent_submit` | `private` | no | no | — | `core/truth_adapter.rs::verdicts` |
 | `core/m6/oracle.rs::recompute_full` | `pub` | no | no | — | `core/m6/signals.rs::community_overview`, `core/m6/signals.rs::evidence_cluster`, `core/m6/signals.rs::orphan_wikilink`, `core/m6/signals.rs::space_overview` |
 | `core/m6/shadow.rs::admitted_proposals` | `private` | no | no | — | `core/m6/signals.rs::community_overview`, `core/m6/signals.rs::evidence_cluster`, `core/m6/signals.rs::orphan_wikilink`, `core/m6/signals.rs::space_overview` |
-| `core/maintenance.rs::list_distilled_stub_pages` | `private` | no | no | — | `core/db.rs::list_pages` |
-| `core/maintenance.rs::run_maintenance_tick` | `pub` | no | no | — | `core/db.rs::find_cross_space_distillation_clusters`, `core/db.rs::list_stale_pages` |
-| `core/maintenance/duplicates.rs::detect_all_near_duplicate_pages` | `pub(super)` | no | no | — | `core/maintenance/duplicates.rs::detect_near_duplicate_pages_inner` |
-| `core/maintenance/duplicates.rs::detect_near_duplicate_pages` | `pub(super)` | no | no | — | `core/maintenance/duplicates.rs::detect_near_duplicate_pages_inner` |
-| `core/maintenance/duplicates.rs::list_page_source_sets` | `private` | no | no | — | `core/db.rs::list_pages` |
 | `core/maintenance/page_merge_order.rs::load_candidate` | `private` | no | no | — | `core/db.rs::get_page` |
 | `core/page_map_improve.rs::improve_page_map` | `pub` | no | **yes** | `server/page_map_routes.rs::handle_improve_page_map` | `core/db.rs::get_page`, `core/page_map_improve.rs::source_suggestions` |
 | `core/page_map_improve.rs::run_proactive_page_maps` | `pub` | no | no | — | `core/db.rs::list_pages` |
+| `core/post_write/entity_graph.rs::create_entity` | `pub` | yes | no | — | `core/db.rs::resolve_or_create_entity`, `core/kg_quality.rs::entity_self_retrieval` |
 | `core/post_write/page_create.rs::replace_source_page_impl` | `pub(super)` | no | no | — | `core/db.rs::get_page` |
 | `core/post_write/page_create.rs::write_document_source_page_impl` | `pub(super)` | no | no | — | `core/db.rs::insert_document_source_page_at_hash` |
 | `core/post_write/page_dispatch.rs::page_write` | `pub` | no | no | — | `core/post_write/page_create.rs::create_page_impl` |
@@ -1188,7 +1176,6 @@ carrying the authority of agreement.
 | `core/repair.rs::apply_rename_page_title` | `private` | no | no | — | `core/post_write.rs::rename_page_title_cas` |
 | `core/repair.rs::apply_repair_with_pages` | `pub` | no | **yes** | `server/repair_routes.rs::handle_apply` | `core/repair.rs::apply_repair_with_pages_inner` |
 | `core/repair.rs::capture_page_projection_rollback` | `pub(crate)` | no | no | — | `core/repair.rs::projection_page_row_from_snapshot` |
-| `core/repair.rs::prepare_memory_reclassification` | `pub` | no | no | — | `core/repair.rs::prepare_memory_reclassification_with_pages` |
 | `core/repair.rs::projection_page_row_on_connection` | `pub(crate)` | no | no | — | `core/repair.rs::projection_page_row_from_connection` |
 | `core/repair_plan.rs::deterministic_target_still_actionable` | `pub(crate)` | no | no | — | `core/repair_plan/deterministic.rs::target_still_actionable` |
 | `core/sources/page_watcher.rs::sync_one_file` | `private` | no | no | — | `core/db.rs::get_page` |
@@ -1265,12 +1252,9 @@ carrying the authority of agreement.
 | `core/eval/shared.rs::run_entity_extraction_for_eval_cli` | `pub` | no | no | — | `core/importer.rs::resolve_entity_bulk` |
 | `core/export/knowledge.rs::write_page_gated#1` | `pub` | yes | no | — | `core/truth_adapter.rs::page_write_permit` |
 | `core/export/knowledge.rs::write_page_gated#2` | `pub` | yes | no | — | `core/truth_adapter.rs::page_write_permit` |
-| `core/importer.rs::import_phase3_store` | `pub` | no | no | — | `core/importer.rs::resolve_entity_bulk` |
 | `core/lint/semantic.rs::run` | `pub(super)` | yes | no | — | `core/lint/semantic.rs::run_agent_submit` |
 | `core/m6/shadow.rs::prepare` | `private` | yes | no | — | `core/m6/shadow.rs::admitted_proposals` |
 | `core/m6/shadow.rs::sample_oracle` | `private` | no | no | — | `core/m6/oracle.rs::recompute_full` |
-| `core/maintenance.rs::collect_retro_candidates` | `private` | no | no | — | `core/maintenance.rs::list_distilled_stub_pages`, `core/maintenance/duplicates.rs::detect_all_near_duplicate_pages` |
-| `core/maintenance/duplicates.rs::source_overlap_pairs` | `private` | no | no | — | `core/maintenance/duplicates.rs::list_page_source_sets` |
 | `core/maintenance/page_merge_order.rs::order_survivor` | `pub(super)` | no | no | — | `core/maintenance/page_merge_order.rs::load_candidate` |
 | `core/post_ingest.rs::write_grown_page` | `private` | no | no | — | `core/db.rs::find_page_by_source_memory` |
 | `core/post_write/page_dispatch.rs::create_page_with_tuning` | `pub` | no | **yes** | `server/page_routes.rs::handle_create_page` | `core/post_write/page_dispatch.rs::page_write` |
@@ -1282,7 +1266,6 @@ carrying the authority of agreement.
 | `core/reconcile.rs::write_revision` | `pub` | no | no | — | `core/ingest.rs::run_canonical_enrichment` |
 | `core/refinery/mod.rs::maybe_refresh_overview_page` | `private` | no | no | — | `core/synthesis/overview.rs::refresh_overview_page` |
 | `core/refinery/mod.rs::run_periodic_steep_with_api` | `pub` | no | **yes** | `server/routes.rs::handle_steep` | `core/refinery/mod.rs::run_periodic_steep_with_api_scope` |
-| `core/repair.rs::apply_repair` | `pub` | no | no | — | `core/repair.rs::apply_repair_with_pages` |
 | `core/repair.rs::capture_page_projection_on_connection` | `pub(crate)` | no | no | — | `core/repair.rs::projection_page_row_on_connection` |
 | `core/repair.rs::validate_deterministic_target_resolved` | `pub(crate)` | no | no | — | `core/repair_plan.rs::deterministic_target_still_actionable` |
 | `core/repair_plan/deterministic.rs::resolve_page_projections` | `private` | no | no | — | `core/repair.rs::capture_page_projection_rollback` |

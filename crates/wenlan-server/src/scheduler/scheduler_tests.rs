@@ -805,7 +805,7 @@ fn scheduler_pins_exact_sysinfo_with_macos_memory_accounting_fix() {
     assert!(
         manifest
             .lines()
-            .any(|line| line.trim() == "sysinfo = \"=0.38.3\""),
+            .any(|line| line.trim().starts_with("sysinfo =") && line.contains("\"=0.38.3\"")),
         "the scheduler must retain the reviewed exact sysinfo 0.38.3 pin"
     );
 
@@ -3415,7 +3415,7 @@ async fn maintenance_provider_panic_isolated_and_scheduler_state_survives() {
 }
 
 #[tokio::test]
-async fn maintenance_tick_detects_page_merge_cards_and_routes_stale_pages() {
+async fn maintenance_slices_detect_page_merge_cards_and_route_stale_pages() {
     let (db, _db_dir) = new_test_db().await;
     let source = "Rust ownership prevents data races at compile time.";
     for id in [
@@ -3481,32 +3481,70 @@ async fn maintenance_tick_detects_page_merge_cards_and_routes_stale_pages() {
         });
     let prompts = wenlan_core::prompts::PromptRegistry::default();
 
-    let result = wenlan_core::maintenance::run_maintenance_tick(
-        &db,
-        Some(&llm),
-        &prompts,
-        &wenlan_core::maintenance::MaintenanceTickConfig {
-            page_match_threshold: 0.85,
-            formation_threshold: 0.60,
-            page_min_cluster_size: 3,
-            token_limit: 3500,
-            max_unlinked_cluster_size: 20,
-            max_grouped_cluster_size: 20,
-            max_per_tick: 5,
-        },
-        None,
-    )
-    .await
-    .unwrap();
+    let config = wenlan_core::maintenance::MaintenanceTickConfig {
+        page_match_threshold: 0.85,
+        formation_threshold: 0.60,
+        page_min_cluster_size: 3,
+        token_limit: 3500,
+        max_unlinked_cluster_size: 20,
+        max_grouped_cluster_size: 20,
+    };
+    let run_stage = |stage| {
+        let db = &db;
+        let llm = &llm;
+        let prompts = &prompts;
+        let config = &config;
+        async move {
+            wenlan_core::maintenance::run_maintenance_stage_slice(
+                db,
+                Some(llm),
+                prompts,
+                config,
+                None,
+                stage,
+            )
+            .await
+            .unwrap()
+            .result
+        }
+    };
 
-    assert_eq!(result.merge_cards_emitted, 1);
-    assert_eq!(result.stale_machine_refreshed, 1);
-    assert_eq!(result.stale_human_cards, 1);
+    // Distilled page birth mints a keep-or-archive card, and an open review
+    // card pauses the automatic retro/near-duplicate lanes. Clear the birth
+    // cards first so this test exercises detection, not the pause probe.
+    for card in db.get_pending_refinements().await.unwrap() {
+        if card.action == "page_keep_or_archive" {
+            db.resolve_refinement_if_open(&card.id, "dismissed")
+                .await
+                .unwrap();
+        }
+    }
+
+    // The scheduler drives one stage per slice, so the tick's combined
+    // assertions become one slice per stage. Stale pages are one-per-slice,
+    // hence two calls for the machine-owned and human-owned pages.
+    let near_duplicate = run_stage(wenlan_core::maintenance::MaintenanceStage::NearDuplicate).await;
+    assert_eq!(near_duplicate.merge_cards_emitted, 1);
+
+    let orphan = run_stage(wenlan_core::maintenance::MaintenanceStage::OrphanInventory).await;
     assert!(
-        result.orphan_labels_checked >= 1,
-        "the maintenance tick must run the orphan wikilink check"
+        orphan.orphan_labels_checked >= 1,
+        "the orphan inventory stage must run the orphan wikilink check"
     );
-    assert_eq!(result.overview_refreshed, 1);
+
+    let first_stale = run_stage(wenlan_core::maintenance::MaintenanceStage::StalePage).await;
+    let second_stale = run_stage(wenlan_core::maintenance::MaintenanceStage::StalePage).await;
+    assert_eq!(
+        first_stale.stale_machine_refreshed + second_stale.stale_machine_refreshed,
+        1
+    );
+    assert_eq!(
+        first_stale.stale_human_cards + second_stale.stale_human_cards,
+        1
+    );
+
+    let overview = run_stage(wenlan_core::maintenance::MaintenanceStage::Overview).await;
+    assert_eq!(overview.overview_refreshed, 1);
 
     let proposals = db.get_pending_refinements().await.unwrap();
     let merge_card = proposals

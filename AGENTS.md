@@ -40,8 +40,10 @@ selected explicitly with `-p wenlan-app`.
 - A missing fixture or unavailable gate is `unchecked`, never a pass. Follow
   `docs/ci-flake-policy.md` before rerunning or quarantining an intermittent CI failure.
 
-Hook installation is explicit: `bash scripts/setup-hooks.sh`. Do not claim hooks are
-active without checking the current worktree.
+Hooks install automatically via `package.json`'s `postinstall`
+(`scripts/install-git-hooks.mjs`) when you run `pnpm install`. The manual fallback for
+a checkout without `pnpm install` is `git config core.hooksPath .githooks`. Do not
+claim hooks are active without checking the current worktree.
 
 ## Repository invariants
 

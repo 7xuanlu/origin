@@ -24,3 +24,6 @@ If you have a local `plans/` or `superpowers/` directory, treat everything in it
 - Release operator runbook: `RELEASING.md` at the repo root
 - AI-assisted install path used by the README: `setup-with-ai.md`
 - Intermittent CI failure policy: `ci-flake-policy.md`
+- Review-flavor UI environment for realistic native rendering: `review-environment.md`
+- Windows Vulkan development and live verification: `windows-vulkan.md`
+- Eval sweep results and receipts: `eval-sweep-results.md`

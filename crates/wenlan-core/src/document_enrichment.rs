@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Canonical document-tier enrichment route (folder / multi-format ingest).
 //!
-//! `run_document_enrichment` is the ONE shared path that turns a single queued
-//! file into a searchable, provenance-stamped, digested document — mirroring the
-//! skew-discipline of [`crate::ingest::run_canonical_enrichment`] for the
-//! memory tier. Every consumer (the folder-ingest scheduler, the CLI, any future
-//! caller) drives THIS function; none re-implements a subset. Sharing the code
-//! is what keeps seed-vs-production fidelity by construction (Google "Rules of
-//! ML", Rule #32: re-use code between training and serving pipelines).
+//! [`run_document_enrichment_slice`] is the path the scheduler actually drives:
+//! the ambient Document lane (`wenlan-server/src/scheduler/ambient.rs:309` via
+//! `run_document_enrichment_slice_tick`, ambient.rs:518-530) calls it once per
+//! ambient turn, spending exactly one LLM request and yielding at its durable
+//! checkpoint. [`run_document_enrichment`] is the unbudgeted variant retained
+//! for tests — it map-folds a whole document in one call sequence with no
+//! per-turn checkpoint yield. Both are thin wrappers over the private
+//! `run_document_enrichment_with_request_budget`, differing only in its
+//! `requests_remaining` argument (`None` for the unbudgeted variant, `Some(1)`
+//! for the slice). Sharing that inner function is what keeps seed-vs-production
+//! fidelity by construction (Google "Rules of ML", Rule #32: re-use code
+//! between training and serving pipelines) — mirroring the skew-discipline of
+//! [`crate::ingest::run_canonical_enrichment`] for the memory tier.
 //!
 //! Pipeline for one file:
 //! 1. **Parse** via [`crate::sources::directory::file_to_documents`], wrapped in
@@ -17,10 +23,12 @@
 //!    so EVERY chunk is embedded + provenance-stamped and the document is
 //!    immediately searchable — before any LLM digest runs (§8-q2).
 //! 3. **Map-fold**: one analysis LLM call per chunk, folding into a rolling
-//!    digest capped at ~15K chars. Each chunk's analysis is persisted as that
-//!    chunk's summary and the queue is checkpointed AFTER every chunk
-//!    ([`crate::db::MemoryDB::checkpoint_chunk`]), so a restart resumes
-//!    mid-document without re-sending already-analyzed chunks to the LLM.
+//!    digest capped at ~15K chars, with the fold spanning multiple ambient
+//!    turns under the slice's one-request-per-turn budget. Each chunk's
+//!    analysis is persisted as that chunk's summary and the queue is
+//!    checkpointed AFTER every chunk ([`crate::db::MemoryDB::checkpoint_chunk`]),
+//!    so a restart (or the next ambient turn) resumes mid-document without
+//!    re-sending already-analyzed chunks to the LLM.
 //! 4. **Outputs**: a summary + best-effort entities + exactly ONE
 //!    `creation_kind='source'` page citing its own chunks (chunk-granular).
 //!

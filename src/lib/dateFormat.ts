@@ -21,3 +21,19 @@ export function formatLocaleDate(
     dateTime: date.toISOString(),
   };
 }
+
+/** Relative "time ago" label for a Unix-seconds timestamp. */
+export function formatTimeAgo(ts: number): string {
+  const now = Date.now() / 1000;
+  const diff = now - ts;
+  if (diff < 60) return "just now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
+  return new Date(ts * 1000).toLocaleDateString();
+}
+
+/** Last path segment, used as a display name for a folder/source path. */
+export function folderName(p: string): string {
+  return p.split("/").filter(Boolean).pop() || p;
+}

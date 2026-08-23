@@ -156,7 +156,11 @@ export PATH="${BIN_DIR}:${PATH}"
 
 if [[ -n "${REQUESTED_TAG}" ]]; then
   EXACT_RUNTIME_PORT="$(derive_isolated_port "${REQUESTED_TAG}")"
-  EXACT_RUNTIME_DATA_DIR="${HOME}/Library/Application Support/wenlan/releases/${SAFE_TAG}"
+  if [[ "${OS}" == "Darwin" ]]; then
+    EXACT_RUNTIME_DATA_DIR="${HOME}/Library/Application Support/wenlan/releases/${SAFE_TAG}"
+  else
+    EXACT_RUNTIME_DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/wenlan/releases/${SAFE_TAG}"
+  fi
 fi
 
 # ── Next steps ────────────────────────────────────────────────────────────────
@@ -178,7 +182,7 @@ if [[ -z "${REQUESTED_TAG}" ]]; then
   printf '\n'
   printf '  3. Register Wenlan as a background service (launchd):\n'
   printf '\n'
-  printf '       wenlan install\n'
+  printf '       wenlan background on\n'
   printf '\n'
   printf '  4. Verify the daemon and memory setup:\n'
   printf '\n'
@@ -218,14 +222,14 @@ else
   printf '\n'
   printf '     Data dir: %s\n' "${EXACT_RUNTIME_DATA_DIR}"
   printf '\n'
-  printf '  4. Do not run wenlan install for exact tagged installs.\n'
+  printf '  4. Do not run wenlan background on for exact tagged installs.\n'
   printf '\n'
   printf '     That replaces the stable com.wenlan.server LaunchAgent.\n'
   printf '\n'
 fi
 printf '\033[1;33mNote:\033[0m Wenlan can store and retrieve memories without a local model or API key.\n'
-printf '      Distill cycles are opt-in with `wenlan model install`.\n'
-printf '      Anthropic can be configured with `wenlan key set anthropic`.\n'
+printf '      Distill cycles are opt-in with `wenlan models install`.\n'
+printf '      Anthropic can be configured with `wenlan keys set anthropic`.\n'
 if [[ -n "${REQUESTED_TAG}" ]]; then
   printf '      Manual release page for this install: %s\n' "${RELEASE_PAGE}"
 fi

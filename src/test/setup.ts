@@ -16,11 +16,6 @@ vi.mock('@tauri-apps/api/event', () => ({
 }));
 
 // Mock Tauri plugin imports that components use
-vi.mock('@tauri-apps/plugin-global-shortcut', () => ({
-  register: vi.fn(),
-  unregister: vi.fn(),
-}));
-
 vi.mock('@tauri-apps/plugin-dialog', () => ({
   open: vi.fn(),
   save: vi.fn(),

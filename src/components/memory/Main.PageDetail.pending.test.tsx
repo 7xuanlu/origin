@@ -50,7 +50,6 @@ vi.mock("./HomePage", () => ({
   ),
 }));
 vi.mock("./AtlasView", () => ({ default: () => <div /> }));
-vi.mock("./MemoryStatusBar", () => ({ default: () => <div /> }));
 vi.mock("./MemorySearchResult", () => ({ default: () => <div /> }));
 vi.mock("./MemoryDetail", () => ({
   default: ({ sourceId }: { sourceId: string }) => (
@@ -133,7 +132,6 @@ vi.mock("./spaces", () => ({ SpacesOverview: () => <div /> }));
 vi.mock("./settings/SettingsSidebar", () => ({ default: () => <aside /> }));
 vi.mock("./SpaceDetail", () => ({ default: () => <div /> }));
 vi.mock("./SourcesView", () => ({ default: () => <div /> }));
-vi.mock("./DecisionLog", () => ({ default: () => <div /> }));
 vi.mock("./RecapsList", () => ({ RecapsList: () => <div /> }));
 vi.mock("./ImportView", () => ({
   ImportView: () => <div data-testid="import-view" />,
@@ -143,7 +141,6 @@ vi.mock("./AboutWenlanDialog", () => ({ default: () => <div /> }));
 interface RenderMainProps {
   initialMemoryId?: string | null;
   initialPageId?: string | null;
-  initialView?: "import" | null;
   onRegisterQuitGuard?: (guard: (() => Promise<boolean>) | null) => void;
 }
 
@@ -342,7 +339,7 @@ describe("Main published PageDetail navigation guards", () => {
     expect(confirmSpy).toHaveBeenCalledTimes(3);
   });
 
-  it("guards prop-driven page, memory, and import replacements while dirty", async () => {
+  it("guards prop-driven page and memory replacements while dirty", async () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
     const { user, rerenderMain } = renderMain();
     expect(await screen.findByText("Pending page")).toBeInTheDocument();
@@ -357,10 +354,6 @@ describe("Main published PageDetail navigation guards", () => {
       initialPageId: "page-one",
     });
     await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(2));
-    expect(screen.getByText("Pending page")).toBeInTheDocument();
-
-    rerenderMain({ initialPageId: "page-one", initialView: "import" });
-    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(3));
     expect(screen.getByText("Pending page")).toBeInTheDocument();
 
     confirmSpy.mockReturnValue(true);

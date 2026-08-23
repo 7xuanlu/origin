@@ -2,8 +2,8 @@
 //! module: this emits a structured routing object from the deep-path LLM call.
 //! Slice-1 wires only `use_graph`; `temporal_window` + `subqueries` are emitted
 //! and logged (parked for #13/#11). Reconciliation: `use_graph` here supersedes
-//! the T7 `route.rs` strategy router's graph routing on the deep path; the
-//! `subqueries` field reuses the JSON-array contract of `decompose.rs`.
+//! the T7 `route.rs` strategy router's graph routing on the deep path; this
+//! module owns the `subqueries` JSON-array contract.
 
 use crate::temporal_query::DateRange;
 use std::sync::Arc;

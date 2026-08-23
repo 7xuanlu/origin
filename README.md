@@ -340,13 +340,12 @@ cargo build
 cargo test
 
 # desktop app (Cargo target and root-level frontend tooling)
-cargo build -p wenlan-app
 pnpm install
 pnpm dev:all
 pnpm build:all
 ```
 
-`pnpm dev:all` is the supported development entry point for the desktop app. It keeps development ports, data, process ownership, app identity, MCP sockets, and Remote Access state separate from the installed production runtime; a debug app started without that isolation refuses to run. See this repository's [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md), plus the in-tree [app/AGENTS.md](app/AGENTS.md), for the complete development workflow. Security reports: [SECURITY.md](SECURITY.md). Please also read the [Code of Conduct](CODE_OF_CONDUCT.md).
+`pnpm dev:all` is the supported development entry point for the desktop app. It keeps development ports, data, process ownership, app identity, MCP sockets, and Remote Access state separate from the installed production runtime; a debug app started without that isolation refuses to run. See this repository's [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md), plus the in-tree [app/AGENTS.md](app/AGENTS.md), for the complete development workflow. Security reports: [SECURITY.md](SECURITY.md). Privacy policy: [PRIVACY.md](PRIVACY.md). Please also read the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ---
 

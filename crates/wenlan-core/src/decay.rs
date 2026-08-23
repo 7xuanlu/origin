@@ -11,16 +11,6 @@ pub fn access_boost(access_count: u64) -> f64 {
     1.0 + (1.0 + access_count as f64).ln() * 0.1
 }
 
-/// Compute effective score (search-time): base_score * recency * access
-pub fn effective_score(
-    base_score: f64,
-    decay_rate: f64,
-    days_since_last_access: f64,
-    access_count: u64,
-) -> f64 {
-    base_score * recency_boost(decay_rate, days_since_last_access) * access_boost(access_count)
-}
-
 /// Compute effective confidence (stored): confidence * recency * access
 pub fn effective_confidence(
     confidence: f64,
@@ -101,13 +91,6 @@ mod tests {
         // 10 accesses: 1 + ln(11) * 0.1 ≈ 1.2397
         let boost = access_boost(10);
         assert!((boost - 1.2397).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_effective_score_combined() {
-        let score = effective_score(0.8, 0.05, 14.0, 5);
-        let expected = 0.8 * recency_boost(0.05, 14.0) * access_boost(5);
-        assert!((score - expected).abs() < 0.001);
     }
 
     #[test]

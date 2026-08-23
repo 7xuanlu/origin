@@ -524,20 +524,6 @@ describe('spaces', () => {
     expect(mockInvoke).toHaveBeenCalledWith('confirm_space', { name: 'work' });
   });
 
-  it('addLegacySpace passes name, icon, color', async () => {
-    await tauri.addLegacySpace('Work', 'briefcase', 'blue');
-    expect(mockInvoke).toHaveBeenCalledWith('add_space', { name: 'Work', icon: 'briefcase', color: 'blue' });
-  });
-
-  it('removeLegacySpace passes spaceId', async () => {
-    await tauri.removeLegacySpace('space-1');
-    expect(mockInvoke).toHaveBeenCalledWith('remove_space', { spaceId: 'space-1' });
-  });
-
-  it('renameLegacySpace passes spaceId and newName', async () => {
-    await tauri.renameLegacySpace('space-1', 'Personal');
-    expect(mockInvoke).toHaveBeenCalledWith('rename_space', { spaceId: 'space-1', newName: 'Personal' });
-  });
 });
 
 describe('session snapshots', () => {
@@ -736,13 +722,6 @@ describe('setDocumentSpace', () => {
   it('passes all args', async () => {
     await tauri.setDocumentSpace('local_files', 'doc1', 'space-1');
     expect(mockInvoke).toHaveBeenCalledWith('set_document_space', { source: 'local_files', sourceId: 'doc1', spaceId: 'space-1' });
-  });
-});
-
-describe('pinLegacySpace', () => {
-  it('passes spaceId', async () => {
-    await tauri.pinLegacySpace('space-1');
-    expect(mockInvoke).toHaveBeenCalledWith('pin_space', { spaceId: 'space-1' });
   });
 });
 

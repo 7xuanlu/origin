@@ -134,33 +134,28 @@ pub fn select_pages_for_context(
     search_result_source_ids: &std::collections::HashSet<String>,
     cap: usize,
 ) -> Vec<Page> {
-    let mut selected: Vec<Page> = pages
+    // Decorate-sort-undecorate: bucket the score so ties are transitive
+    // (float epsilon comparison is not a total order and can panic
+    // `sort_by`), and compute overlap once per page instead of on every
+    // comparison.
+    let mut scored: Vec<(i64, usize, Page)> = pages
         .iter()
         .filter(|page| page.review_status == "confirmed")
         .cloned()
+        .map(|page| {
+            let overlap = page
+                .source_memory_ids
+                .iter()
+                .filter(|sid| search_result_source_ids.contains(sid.as_str()))
+                .count();
+            let bucket = ((page.relevance_score as f64) / 1e-6).round() as i64;
+            (bucket, overlap, page)
+        })
         .collect();
 
-    selected.sort_by(|left, right| {
-        if (left.relevance_score - right.relevance_score).abs() <= 1e-6 {
-            let left_overlap = left
-                .source_memory_ids
-                .iter()
-                .filter(|sid| search_result_source_ids.contains(sid.as_str()))
-                .count();
-            let right_overlap = right
-                .source_memory_ids
-                .iter()
-                .filter(|sid| search_result_source_ids.contains(sid.as_str()))
-                .count();
-            return right_overlap.cmp(&left_overlap);
-        }
+    scored.sort_by(|(lb, lo, _), (rb, ro, _)| rb.cmp(lb).then_with(|| ro.cmp(lo)));
 
-        right
-            .relevance_score
-            .partial_cmp(&left.relevance_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
+    let mut selected: Vec<Page> = scored.into_iter().map(|(_, _, page)| page).collect();
     selected.truncate(cap);
     selected
 }

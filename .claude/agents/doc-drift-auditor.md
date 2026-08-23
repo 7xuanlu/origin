@@ -21,6 +21,5 @@ Check these four surfaces. For each finding give `file:line` (or the artifact) +
 
 Also surface the **known drift backlog** the CI teeth grandfathered, so it gets burned down rather than forgotten:
 - The `BASELINE_UNDOCUMENTED` list in `drift_guard.rs` (flags undocumented at contract-introduction) — report how many remain.
-- `crates/wenlan-types/AUDIT.md` is a known-stale historical audit (stale by date, 2026-04-12; the app code it discusses is back in-repo); recommend updating or removing it.
 
 Do not open a PR yourself unless explicitly asked; print the report.

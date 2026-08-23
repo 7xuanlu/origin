@@ -6,7 +6,7 @@ use clap::Subcommand;
 use wenlan_types::requests::UpdateAgentRequest;
 
 use crate::client::WenlanClient;
-use crate::output::{print_json, OutputFormat};
+use crate::output::{print_json, ResolvedFormat};
 
 #[derive(Subcommand)]
 pub enum AgentsCmd {
@@ -38,7 +38,7 @@ pub enum AgentsCmd {
 
 pub async fn run(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     cmd: AgentsCmd,
 ) -> Result<()> {
@@ -67,14 +67,14 @@ pub async fn run(
     }
 }
 
-async fn list(client: &WenlanClient, format: OutputFormat, quiet: bool) -> Result<()> {
+async fn list(client: &WenlanClient, format: ResolvedFormat, quiet: bool) -> Result<()> {
     let agents = client.list_agents().await?;
     if quiet {
         return Ok(());
     }
     match format {
-        OutputFormat::Json => print_json(&agents)?,
-        OutputFormat::Table => {
+        ResolvedFormat::Json => print_json(&agents)?,
+        ResolvedFormat::Table => {
             if agents.is_empty() {
                 println!("(no agents registered)");
                 return Ok(());
@@ -89,19 +89,23 @@ async fn list(client: &WenlanClient, format: OutputFormat, quiet: bool) -> Resul
                 );
             }
         }
-        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
     }
     Ok(())
 }
 
-async fn show(client: &WenlanClient, format: OutputFormat, quiet: bool, name: &str) -> Result<()> {
+async fn show(
+    client: &WenlanClient,
+    format: ResolvedFormat,
+    quiet: bool,
+    name: &str,
+) -> Result<()> {
     let agent = client.get_agent(name).await?;
     if quiet {
         return Ok(());
     }
     match format {
-        OutputFormat::Json => print_json(&agent)?,
-        OutputFormat::Table => {
+        ResolvedFormat::Json => print_json(&agent)?,
+        ResolvedFormat::Table => {
             println!("Agent: {}", agent.name);
             println!("  ID:            {}", agent.id);
             println!(
@@ -124,7 +128,6 @@ async fn show(client: &WenlanClient, format: OutputFormat, quiet: bool, name: &s
                     .unwrap_or_else(|| "-".to_string())
             );
         }
-        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
     }
     Ok(())
 }
@@ -132,7 +135,7 @@ async fn show(client: &WenlanClient, format: OutputFormat, quiet: bool, name: &s
 #[allow(clippy::too_many_arguments)]
 async fn edit(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     name: &str,
     trust: Option<String>,
@@ -157,13 +160,12 @@ async fn edit(
         return Ok(());
     }
     match format {
-        OutputFormat::Json => print_json(&updated)?,
-        OutputFormat::Table => {
+        ResolvedFormat::Json => print_json(&updated)?,
+        ResolvedFormat::Table => {
             println!("Updated agent {}", updated.name);
             println!("  Trust:         {}", updated.trust_level);
             println!("  Enabled:       {}", updated.enabled);
         }
-        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
     }
     Ok(())
 }

@@ -9,8 +9,8 @@ export const TRUTH_STATUS_QUERY_KEY = ["truth-status"] as const;
  * (`listPagesExplicitBrowse`, `getPage(id, "explicit")`). A machine-triggered
  * refetch — reconnect, window
  * refocus — must not resend the human-intent marker on behalf of a call the
- * user did not make; see the `SpaceList.tsx` polling note in
- * `crates/wenlan-core/src/truth_contract.rs`.
+ * user did not make; see the policy application in `PagesOverview.tsx` and
+ * the rationale in `crates/wenlan-core/src/truth_contract.rs`.
  */
 export const EXPLICIT_BROWSE_QUERY_POLICY = {
   refetchOnReconnect: false,

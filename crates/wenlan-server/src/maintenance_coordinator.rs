@@ -315,6 +315,11 @@ impl MaintenanceCoordinator {
         }
     }
 
+    /// Unapproved-request variant of the repair fence. Production always goes
+    /// through `acquire_approved_repair`; this one is kept only so the
+    /// state-machine tests still cover the `approved_request: None` branch of
+    /// `acquire_repair_inner`.
+    #[cfg(test)]
     pub async fn acquire_repair(
         &self,
         manifest_id: &str,
@@ -477,6 +482,10 @@ impl MaintenanceCoordinator {
         }
     }
 
+    /// Assert the durable fence is held and idle. No production caller —
+    /// `acquire_repair_verification` is the shipped path; kept for the fence
+    /// state-machine tests.
+    #[cfg(test)]
     pub fn require_repair(&self, manifest_id: &str) -> Result<(), MaintenanceFenceError> {
         let state = self.state.lock().unwrap();
         match state.repair_lease.as_ref() {
@@ -564,6 +573,9 @@ impl MaintenanceCoordinator {
     }
 
     /// Restore an applied-but-unverified repair fence during daemon startup.
+    /// Startup uses `rearm_approved_repair`; this manifest-id-only variant has
+    /// no production caller and is kept for the fence state-machine tests.
+    #[cfg(test)]
     pub fn rearm_repair(&self, manifest_id: &str) -> Result<(), MaintenanceFenceError> {
         let mut state = self.state.lock().unwrap();
         if state.recovery_complete {
@@ -846,18 +858,6 @@ impl Drop for AnalysisGuard {
         state.active_analysis = state.active_analysis.saturating_sub(1);
         drop(state);
         self.coordinator.notify.notify_waiters();
-    }
-}
-
-impl BackgroundMaintenanceGuard {
-    /// Retain the same background ownership inside a detached scheduler task.
-    pub fn child(&self) -> Self {
-        let mut state = self.coordinator.state.lock().unwrap();
-        state.active_background = state.active_background.saturating_add(1);
-        drop(state);
-        Self {
-            coordinator: self.coordinator.clone(),
-        }
     }
 }
 

@@ -121,33 +121,12 @@ pub fn extraction_prompt_with_template(memory_type: &str, template: &str) -> Str
 /// Convert structured_fields JSON into a deterministic pipe-delimited string.
 /// Returns None if JSON is invalid or empty. Keys are sorted for determinism.
 pub fn flatten_structured_fields(json_str: &str) -> Option<String> {
-    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json_str).ok()?;
-    if map.is_empty() {
-        return None;
+    let parts = split_structured_fields_to_facts(json_str);
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" | "))
     }
-    let mut pairs: Vec<(String, String)> = map
-        .into_iter()
-        .filter_map(|(k, v)| {
-            let val = match v {
-                serde_json::Value::String(s) if !s.is_empty() => s,
-                serde_json::Value::Bool(b) => b.to_string(),
-                serde_json::Value::Number(n) => n.to_string(),
-                _ => return None,
-            };
-            Some((k, val))
-        })
-        .collect();
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    if pairs.is_empty() {
-        return None;
-    }
-    Some(
-        pairs
-            .into_iter()
-            .map(|(k, v)| format!("{}: {}", k, v))
-            .collect::<Vec<_>>()
-            .join(" | "),
-    )
 }
 
 /// Split structured_fields JSON into one "key: value" string per scalar field

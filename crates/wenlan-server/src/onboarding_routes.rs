@@ -9,7 +9,7 @@
 //! Handlers follow the canonical snapshot-and-drop pattern: clone the
 //! `Arc<MemoryDB>` out of the `RwLock<ServerState>` read guard, drop the
 //! guard, then call the async DB method. Never hold the guard across
-//! `.await` (see CLAUDE.md).
+//! `.await` (see AGENTS.md "Repository invariants").
 
 use crate::error::ServerError;
 use crate::route_registry::{get, post, TrackedRouter};

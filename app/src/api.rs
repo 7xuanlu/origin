@@ -533,7 +533,10 @@ impl WenlanClient {
         page_id: &str,
         body: &wenlan_types::requests::UpdatePageRequest,
     ) -> Result<wenlan_types::responses::PageWriteResponse, PageUpdateRequestError> {
-        let path = format!("/api/memory/{page_id}/update-page");
+        let path = format!(
+            "/api/memory/{}/update-page",
+            percent_encode_path_segment(page_id)
+        );
         let response = self
             .client
             .post(self.url(&path))
@@ -701,7 +704,7 @@ impl WenlanClient {
         page_id: &str,
         body: &crate::presence::ReviewPageBody,
     ) -> Result<PageReviewOutcome, String> {
-        let path = format!("/api/pages/{}/review", page_id);
+        let path = format!("/api/pages/{}/review", percent_encode_path_segment(page_id));
         let resp = self
             .client
             .post(self.url(&path))
@@ -829,7 +832,7 @@ impl WenlanClient {
     }
 
     pub async fn remove_source(&self, id: &str) -> Result<(), String> {
-        let path = format!("/api/sources/{}", id);
+        let path = format!("/api/sources/{}", percent_encode_path_segment(id));
         self.delete_empty(&path).await
     }
 
@@ -837,7 +840,7 @@ impl WenlanClient {
         &self,
         id: &str,
     ) -> Result<wenlan_types::responses::SyncStatsResponse, String> {
-        let path = format!("/api/sources/{}/sync", id);
+        let path = format!("/api/sources/{}/sync", percent_encode_path_segment(id));
         self.post_empty(&path).await
     }
 
@@ -850,7 +853,10 @@ impl WenlanClient {
     }
 
     pub async fn acknowledge_onboarding_milestone(&self, id: &str) -> Result<(), String> {
-        let path = format!("/api/onboarding/milestones/{}/acknowledge", id);
+        let path = format!(
+            "/api/onboarding/milestones/{}/acknowledge",
+            percent_encode_path_segment(id)
+        );
         let resp = self
             .client
             .post(self.url(&path))
@@ -915,7 +921,10 @@ impl WenlanClient {
         &self,
         source_id: &str,
     ) -> Result<wenlan_types::EnrichmentStatusResponse, String> {
-        let path = format!("/api/memory/{}/enrichment-status", source_id);
+        let path = format!(
+            "/api/memory/{}/enrichment-status",
+            percent_encode_path_segment(source_id)
+        );
         self.get_json(&path).await
     }
 
@@ -923,7 +932,10 @@ impl WenlanClient {
         &self,
         source_id: &str,
     ) -> Result<wenlan_types::responses::ListMemoryRevisionsResponse, String> {
-        let path = format!("/api/memory/{}/revisions", source_id);
+        let path = format!(
+            "/api/memory/{}/revisions",
+            percent_encode_path_segment(source_id)
+        );
         self.get_json(&path).await
     }
 
@@ -951,7 +963,10 @@ impl WenlanClient {
         &self,
         page_id: &str,
     ) -> Result<Vec<wenlan_types::PageSourceWithMemory>, String> {
-        let path = format!("/api/pages/{}/sources", page_id);
+        let path = format!(
+            "/api/pages/{}/sources",
+            percent_encode_path_segment(page_id)
+        );
         self.get_json(&path).await
     }
 
@@ -959,12 +974,15 @@ impl WenlanClient {
         &self,
         page_id: &str,
     ) -> Result<wenlan_types::responses::PageLinksResponse, String> {
-        let path = format!("/api/pages/{}/links", page_id);
+        let path = format!("/api/pages/{}/links", percent_encode_path_segment(page_id));
         self.get_json(&path).await
     }
 
     pub async fn get_page_revisions(&self, page_id: &str) -> Result<serde_json::Value, String> {
-        let path = format!("/api/pages/{}/revisions", page_id);
+        let path = format!(
+            "/api/pages/{}/revisions",
+            percent_encode_path_segment(page_id)
+        );
         self.get_json(&path).await
     }
 
@@ -1046,12 +1064,15 @@ impl WenlanClient {
     }
 
     pub async fn get_page_map(&self, page_id: &str) -> Result<serde_json::Value, String> {
-        let path = format!("/api/pages/{}/map", page_id);
+        let path = format!("/api/pages/{}/map", percent_encode_path_segment(page_id));
         self.page_map_call(reqwest::Method::GET, &path, None).await
     }
 
     pub async fn improve_page_map(&self, page_id: &str) -> Result<serde_json::Value, String> {
-        let path = format!("/api/pages/{}/map/improve", page_id);
+        let path = format!(
+            "/api/pages/{}/map/improve",
+            percent_encode_path_segment(page_id)
+        );
         self.page_map_call(reqwest::Method::POST, &path, Some(serde_json::json!({})))
             .await
     }
@@ -1061,7 +1082,10 @@ impl WenlanClient {
         page_id: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let path = format!("/api/pages/{}/map/nodes", page_id);
+        let path = format!(
+            "/api/pages/{}/map/nodes",
+            percent_encode_path_segment(page_id)
+        );
         self.page_map_call(reqwest::Method::POST, &path, Some(body))
             .await
     }
@@ -1072,7 +1096,11 @@ impl WenlanClient {
         node_id: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let path = format!("/api/pages/{}/map/nodes/{}", page_id, node_id);
+        let path = format!(
+            "/api/pages/{}/map/nodes/{}",
+            percent_encode_path_segment(page_id),
+            percent_encode_path_segment(node_id)
+        );
         self.page_map_call(reqwest::Method::PATCH, &path, Some(body))
             .await
     }
@@ -1083,7 +1111,11 @@ impl WenlanClient {
         node_id: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let path = format!("/api/pages/{}/map/nodes/{}", page_id, node_id);
+        let path = format!(
+            "/api/pages/{}/map/nodes/{}",
+            percent_encode_path_segment(page_id),
+            percent_encode_path_segment(node_id)
+        );
         self.page_map_call(reqwest::Method::DELETE, &path, Some(body))
             .await
     }
@@ -1093,7 +1125,10 @@ impl WenlanClient {
         page_id: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let path = format!("/api/pages/{}/map/layout", page_id);
+        let path = format!(
+            "/api/pages/{}/map/layout",
+            percent_encode_path_segment(page_id)
+        );
         self.page_map_call(reqwest::Method::PUT, &path, Some(body))
             .await
     }
@@ -1211,16 +1246,22 @@ impl WenlanClient {
         &self,
         id: &str,
     ) -> Result<wenlan_types::responses::AcceptRefinementResponse, String> {
-        self.post_empty(&format!("/api/refinery/queue/{id}/accept"))
-            .await
+        self.post_empty(&format!(
+            "/api/refinery/queue/{}/accept",
+            percent_encode_path_segment(id)
+        ))
+        .await
     }
 
     pub async fn reject_refinement(
         &self,
         id: &str,
     ) -> Result<wenlan_types::responses::RejectRefinementResponse, String> {
-        self.post_empty(&format!("/api/refinery/queue/{id}/reject"))
-            .await
+        self.post_empty(&format!(
+            "/api/refinery/queue/{}/reject",
+            percent_encode_path_segment(id)
+        ))
+        .await
     }
 
     // ── Config ─────────────────────────────────────────────────────────────
@@ -1368,7 +1409,11 @@ fn daemon_port() -> u16 {
         .unwrap_or(7878)
 }
 
-fn percent_encode_path_segment(value: &str) -> String {
+/// Percent-encode one URL path segment or query value (RFC 3986 unreserved set).
+/// Names reaching the daemon are user-supplied — a space called `Archive#2026` or
+/// a local-file `source_id` that is an absolute path would otherwise rewrite the
+/// request target. Shared with `search.rs`; keep this the only copy.
+pub(crate) fn percent_encode_path_segment(value: &str) -> String {
     value
         .bytes()
         .flat_map(|byte| match byte {

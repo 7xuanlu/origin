@@ -2,8 +2,8 @@
 //! Knowledge graph quality checks: post-store verification and periodic rethink.
 
 use crate::db::{
-    ContradictionObservationCount, DuplicateNameGroup, MemoryDB, MinHashEntityInput,
-    StaleEntityEmbeddingCandidate,
+    ContradictionObservationCount, DuplicateNameGroup, EntitySearchResult, MemoryDB,
+    MinHashEntityInput, StaleEntityEmbeddingCandidate,
 };
 use crate::error::WenlanError;
 use crate::llm_provider::LlmProvider;
@@ -16,8 +16,28 @@ use std::sync::Arc;
 pub struct VerificationResult {
     pub entity_self_retrieval_passed: Option<bool>,
     pub concept_self_retrieval_passed: Option<bool>,
-    pub relation_consistency_passed: Option<bool>,
     pub warnings: Vec<String>,
+}
+
+/// Entity self-retrieval test: search by name, check if this entity appears in
+/// the top-k neighbours. Returns the neighbours alongside the warnings so a
+/// caller that also needs them (e.g. merge-candidate enqueue) does not have to
+/// re-run the same vector search.
+pub async fn entity_self_retrieval(
+    db: &MemoryDB,
+    entity_id: &str,
+    entity_name: &str,
+) -> Result<(Vec<EntitySearchResult>, Vec<String>), WenlanError> {
+    let mut warnings = Vec::new();
+    let results = db.search_entities_by_vector(entity_name, 5).await?;
+    let found = results.iter().any(|r| r.entity.id == entity_id);
+    if !found {
+        warnings.push(format!(
+            "Entity '{}' ({}) not found in top-5 self-retrieval results",
+            entity_name, entity_id
+        ));
+    }
+    Ok((results, warnings))
 }
 
 /// Run post-store verification checks on a newly created/linked entity.
@@ -26,27 +46,18 @@ pub async fn verify_entity(
     entity_id: &str,
     entity_name: &str,
 ) -> Result<VerificationResult, WenlanError> {
-    let mut warnings = Vec::new();
-
-    // Entity self-retrieval test: search by name, check if this entity appears in top 5
-    let self_retrieval_passed = match db.search_entities_by_vector(entity_name, 5).await {
-        Ok(results) => {
-            let found = results.iter().any(|r| r.entity.id == entity_id);
-            if !found {
-                warnings.push(format!(
-                    "Entity '{}' ({}) not found in top-5 self-retrieval results",
-                    entity_name, entity_id
-                ));
+    let (self_retrieval_passed, warnings) =
+        match entity_self_retrieval(db, entity_id, entity_name).await {
+            Ok((results, warnings)) => {
+                let found = results.iter().any(|r| r.entity.id == entity_id);
+                (Some(found), warnings)
             }
-            Some(found)
-        }
-        Err(_) => None, // Embedding not available, skip check
-    };
+            Err(_) => (None, Vec::new()), // Embedding not available, skip check
+        };
 
     Ok(VerificationResult {
         entity_self_retrieval_passed: self_retrieval_passed,
         concept_self_retrieval_passed: None,
-        relation_consistency_passed: None,
         warnings,
     })
 }
@@ -88,7 +99,6 @@ pub async fn verify_page(
     Ok(VerificationResult {
         entity_self_retrieval_passed: None,
         concept_self_retrieval_passed: self_retrieval_passed,
-        relation_consistency_passed: None,
         warnings,
     })
 }

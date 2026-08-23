@@ -92,13 +92,11 @@ fn external_egress_allowed_for_bind() -> bool {
 }
 
 fn external_egress_allowed_for_bind_value(bind: Option<std::ffi::OsString>) -> bool {
-    let Some(bind) = bind else {
-        return true;
-    };
-    bind.into_string()
-        .ok()
-        .and_then(|bind| bind.parse::<std::net::SocketAddr>().ok())
-        .is_some_and(|address| address.ip().is_loopback())
+    use crate::security::BindScope;
+    matches!(
+        crate::security::bind_scope(bind),
+        BindScope::Unset | BindScope::Loopback
+    )
 }
 
 fn select_semantic_provider(

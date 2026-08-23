@@ -28,6 +28,7 @@ const setSearchQueryMock = vi.hoisted(() => vi.fn());
 const useSearchMock = vi.hoisted(() => vi.fn(() => ({
   query: "",
   setQuery: setSearchQueryMock,
+  debouncedQuery: "",
   results: [] as SearchResult[],
 })));
 
@@ -86,7 +87,6 @@ vi.mock("./AtlasView", () => ({
   ),
 }));
 vi.mock("./EntityDetail", () => ({ default: () => <div data-testid="entity-detail" /> }));
-vi.mock("./MemoryStatusBar", () => ({ default: () => <div /> }));
 vi.mock("./MemorySearchResult", () => ({
   default: (props: { result: { content: string; source_id: string }; onClick?: (sourceId: string) => void }) => (
     <button type="button" onClick={() => props.onClick?.(props.result.source_id)}>
@@ -124,7 +124,6 @@ vi.mock("./SettingsPage", () => ({
   ),
 }));
 vi.mock("../SetupWizard", () => ({ SetupWizard: () => <div /> }));
-vi.mock("../ViewToggle", () => ({ default: () => <div /> }));
 vi.mock("./Sidebar", () => ({
   default: (props: {
     activeNavigation?: string | null;
@@ -356,7 +355,7 @@ describe("Main search", () => {
     draftIdentityMock.mockReset();
     draftIdentityMock.mockReturnValue({ draftId: "draft-new", version: 1 });
     useSearchMock.mockReset();
-    useSearchMock.mockReturnValue({ query: "", setQuery: setSearchQueryMock, results: [] });
+    useSearchMock.mockReturnValue({ query: "", setQuery: setSearchQueryMock, debouncedQuery: "", results: [] });
     localStorage.clear();
     vi.unstubAllGlobals();
     await i18n.changeLanguage("en");
@@ -723,6 +722,7 @@ describe("Main search", () => {
       const [query, setLocalQuery] = useState("");
       return {
         query,
+        debouncedQuery: query,
         results: [],
         setQuery: ((next: string) => {
           setSearchQueryMock(next);
@@ -766,6 +766,7 @@ describe("Main search", () => {
       const [query, setLocalQuery] = useState("");
       return {
         query,
+        debouncedQuery: query,
         results: [],
         setQuery: ((next: string) => {
           setSearchQueryMock(next);
@@ -799,6 +800,7 @@ describe("Main search", () => {
       const [query, setLocalQuery] = useState("");
       return {
         query,
+        debouncedQuery: query,
         results: [],
         setQuery: ((next: string) => {
           setSearchQueryMock(next);
@@ -869,7 +871,6 @@ describe("Main search", () => {
   it.each([
     ["memory", { initialMemoryId: "memory-1" }, "memory-detail"],
     ["page", { initialPageId: "page-1" }, "page-detail"],
-    ["import", { initialView: "import" as const }, "import-view"],
   ])("cancels a withdrawn external %s destination while draft flush is pending", async (
     _label,
     externalProps,
@@ -1005,6 +1006,7 @@ describe("Main search", () => {
     useSearchMock.mockReturnValue({
       query: "source",
       setQuery: setSearchQueryMock,
+      debouncedQuery: "source",
       results: [{
         id: "source-hit",
         content: "Source credibility notes",

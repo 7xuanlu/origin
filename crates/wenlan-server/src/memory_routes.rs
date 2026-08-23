@@ -133,12 +133,12 @@ fn compute_warnings_and_extraction(
     match (extracted_fields, agent_fields) {
         (Some(_), _) => {
             let fields = fields_map(extracted_fields, None).unwrap_or_default();
-            let schema = wenlan_core::memory_schema::MemorySchema::for_type(memory_type_str);
+            let schema = wenlan_core::schema::MemorySchema::for_type(memory_type_str);
             (schema.validate(&fields), "llm".to_string())
         }
         (None, Some(_)) => {
             let fields = fields_map(None, agent_fields).unwrap_or_default();
-            let schema = wenlan_core::memory_schema::MemorySchema::for_type(memory_type_str);
+            let schema = wenlan_core::schema::MemorySchema::for_type(memory_type_str);
             (schema.validate(&fields), "agent".to_string())
         }
         (None, None) => (Vec::new(), "none".to_string()),
@@ -485,14 +485,9 @@ pub async fn handle_store_memory(
     let pending_revision = false;
     let final_supersedes = req.supersedes.clone();
 
-    let db = {
-        let s = state.read().await;
-        s.db.clone()
-    };
     #[cfg(test)]
     wait_at_store_lock_test_hook(StoreLockTestStage::ActivityAgentLookup).await;
-    let agent_for_activity =
-        extract_agent_name_with_db(&headers, req.source_agent.as_deref(), db.as_deref()).await;
+    let agent_for_activity = extract_agent_name(&headers, req.source_agent.as_deref());
     let supersedes_for_activity = final_supersedes.clone();
 
     let supersede_mode = if memory_type_str == "decision" {
@@ -850,7 +845,8 @@ pub async fn handle_store_memory(
     //
     // Spawned so the HTTP response isn't delayed by these background queries.
     // We snapshot Arc<MemoryDB> out of the read guard BEFORE the spawn so no
-    // lock is held across `.await` (per CLAUDE.md). The daemon currently has
+    // lock is held across `.await` (per AGENTS.md "Repository invariants").
+    // The daemon currently has
     // no UI to notify, so a fresh `NoopEmitter` is used inline — the emit is
     // cosmetic for the HTTP-only path. Milestones are still persisted via
     // `record_milestone` in the DB and surfaced to the UI through the
@@ -952,7 +948,7 @@ pub async fn handle_search_memory(
     let (db, reranker) = {
         // Snapshot the Arcs we need before any await so we never hold the
         // read guard across the search call (LLM reranker or model load can
-        // be slow; see AGENTS.md "Async and locking" guidance).
+        // be slow; see AGENTS.md "Repository invariants").
         let s = state.read().await;
         let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?.clone();
         let reranker = s.reranker.clone();
@@ -1005,40 +1001,32 @@ pub async fn handle_search_memory(
         .filter(|r| r.source == "memory")
         .map(|r| r.source_id.clone())
         .collect();
-    {
-        let s = state.read().await;
-        s.access_tracker.record_accesses(&memory_source_ids);
-        if let Some(db) = s.db.as_ref() {
-            if let Err(e) = db.log_accesses(&memory_source_ids).await {
-                tracing::warn!("Failed to log accesses: {}", e);
-            }
-        }
+    // Both logging calls use the `db` Arc snapshotted above, so no read guard is
+    // held across these awaits (AGENTS.md: never hold a tokio RwLock guard
+    // across .await).
+    if let Err(e) = db.log_accesses(&memory_source_ids).await {
+        tracing::warn!("Failed to log accesses: {}", e);
     }
 
     {
-        let s = state.read().await;
         // Resolve attribution from x-agent-name header, falling back to the
         // deprecated body `source_agent` field. Previously this passed `None`
         // for the body fallback, so requests that sent only body `source_agent`
         // (no header) were logged to `agent_activity` as "unknown", producing
         // the `agent_name="unknown"` rows visible in `/api/retrievals/recent`.
-        let agent =
-            extract_agent_name_with_db(&headers, req.source_agent.as_deref(), s.db.as_deref())
-                .await;
+        let agent = extract_agent_name(&headers, req.source_agent.as_deref());
         let detail = format!("found {} results", results.len());
-        if let Some(db) = s.db.as_ref() {
-            if let Err(e) = db
-                .log_agent_activity(
-                    &agent,
-                    "search",
-                    &memory_source_ids,
-                    Some(&req.query),
-                    &detail,
-                )
-                .await
-            {
-                tracing::warn!("Failed to log agent activity: {}", e);
-            }
+        if let Err(e) = db
+            .log_agent_activity(
+                &agent,
+                "search",
+                &memory_source_ids,
+                Some(&req.query),
+                &detail,
+            )
+            .await
+        {
+            tracing::warn!("Failed to log agent activity: {}", e);
         }
     }
 
@@ -1064,15 +1052,11 @@ pub async fn handle_search_memory(
                 // Resolve caller trust from the `x-agent-name` header
                 // (mirror routes.rs handle_context: unknown→"unknown", else
                 // db.get_agent(name) → trust_level, default "unknown").
-                let agent_name = headers
-                    .get("x-agent-name")
-                    .and_then(|v| v.to_str().ok())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("unknown");
+                let agent_name = extract_agent_name(&headers, None);
                 let trust_level = if agent_name == "unknown" {
                     "unknown".to_string()
                 } else {
-                    db.get_agent(agent_name)
+                    db.get_agent(&agent_name)
                         .await
                         .ok()
                         .flatten()
@@ -1135,18 +1119,21 @@ pub async fn handle_confirm_memory(
     body: Option<Json<ConfirmRequest>>,
 ) -> Result<Json<ConfirmResponse>, ServerError> {
     let confirmed = body.map(|b| b.confirmed).unwrap_or(true);
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
-    if confirmed {
-        db.set_stability(&source_id, "confirmed")
-            .await
-            .map_err(|e| ServerError::Internal(e.to_string()))?;
-    } else {
-        db.set_stability(&source_id, "new")
-            .await
-            .map_err(|e| ServerError::Internal(e.to_string()))?;
+    // Snapshot the DB Arc so the read guard is not held across the awaits below
+    // (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    let stability = if confirmed { "confirmed" } else { "new" };
+    let updated = db
+        .set_stability(&source_id, stability)
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
+    if !updated {
+        return Err(ServerError::NotFound(format!("memory {}", source_id)));
     }
-    Ok(Json(ConfirmResponse { confirmed }))
+    Ok(Json(ConfirmResponse { confirmed, updated }))
 }
 
 /// POST /api/memory/list
@@ -1183,8 +1170,8 @@ pub async fn handle_delete_memory(
 ) -> Result<Json<DeleteResponse>, ServerError> {
     // Snapshot Arc<MemoryDB> + resolve agent name from the RwLock guard,
     // then drop the guard BEFORE any `.await` calls. Follows the pattern
-    // established in `handle_store_memory` (see CLAUDE.md: "Never hold a
-    // `tokio::sync::RwLock` read or write guard across `.await`.")
+    // established in `handle_store_memory` (see AGENTS.md "Repository
+    // invariants": "Never hold a `tokio::sync::RwLock` guard across `.await`.")
     let (db, agent) = {
         let s = state.read().await;
         let db = s.db.clone().ok_or(ServerError::DbNotInitialized)?;
@@ -1230,8 +1217,12 @@ pub struct MemoryStatsResponse {
 pub async fn handle_get_memory_stats(
     State(state): State<Arc<RwLock<ServerState>>>,
 ) -> Result<Json<MemoryStatsResponse>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
+    // Snapshot the DB Arc so the read guard is not held across the awaits below
+    // (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
     let stats = db
         .get_memory_stats()
         .await
@@ -1439,18 +1430,6 @@ pub(crate) fn extract_agent_name(
         return agent.to_string();
     }
     "unknown".to_string()
-}
-
-/// Thin wrapper kept for call-site ergonomics. Previously this also consulted
-/// the DB for a "most-recent-agent-in-last-5-min" fallback — that was a loose-
-/// observation footgun (DELETE requests could be attributed to whatever agent
-/// last called anything, even a totally unrelated tool). Deleted.
-async fn extract_agent_name_with_db(
-    headers: &HeaderMap,
-    deprecated_body_agent: Option<&str>,
-    _db: Option<&wenlan_core::db::MemoryDB>,
-) -> String {
-    extract_agent_name(headers, deprecated_body_agent)
 }
 
 // ===== Nurture Cards =====
@@ -1772,9 +1751,13 @@ pub async fn handle_set_stability(
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
-    db.set_stability(&id, &req.stability)
+    let updated = db
+        .set_stability(&id, &req.stability)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;
+    if !updated {
+        return Err(ServerError::NotFound(format!("memory {}", id)));
+    }
     Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
 }
 
@@ -2750,7 +2733,7 @@ mod search_agent_attribution_tests {
     #[tokio::test]
     async fn search_with_body_source_agent_persists_attribution() {
         // Regression: before the fix, the search handler resolved attribution
-        // via `extract_agent_name_with_db(&headers, None, ...)` — discarding
+        // via `extract_agent_name(&headers, None)` — discarding
         // the body `source_agent` field entirely. Result: requests that sent
         // body `source_agent` but no `x-agent-name` header were attributed to
         // "unknown" in `agent_activity`, masking real callers in

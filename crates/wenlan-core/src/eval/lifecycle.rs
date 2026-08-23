@@ -564,7 +564,7 @@ async fn run_lifecycle_phases(
     let all_seeds_meta: Vec<(String, String, Option<String>, Option<String>)> =
         cases.iter().flat_map(|c| c.seeds_meta.clone()).collect();
     let mut seen = HashSet::new();
-    for (source_id, content, memory_type, domain) in &all_seeds_meta {
+    for (source_id, content, _memory_type, domain) in &all_seeds_meta {
         if !seen.insert(source_id.clone()) {
             continue;
         }
@@ -576,15 +576,12 @@ async fn run_lifecycle_phases(
             source_id,
             content,
             None, // entity_id
-            memory_type.as_deref(),
             domain.as_deref(),
-            None, // structured_fields
             None, // llm — defer recap/title to Insights phase
             &prompts,
             &refinery_cfg,
             &distillation_cfg,
             None, // knowledge_path — eval should not write to knowledge directory
-            None, // cancel — eval runs enrichment to completion (no debounce)
             None, // precomputed_kg
         )
         .await;

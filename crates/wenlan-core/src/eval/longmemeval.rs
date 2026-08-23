@@ -1582,9 +1582,8 @@ pub async fn run_longmemeval_headroom_probe_per_question(
 /// - `gold_in_date30` — Zep-style question-date prefix `(date: ...) question`
 /// - `gold_in_union`  — presence anywhere in the union of per-stream pools
 ///   (original + subqueries, 30 each): the ceiling for ANY downstream ranker
-/// - `gold_in_rrf30`  — top-30 of the equal-weight RRF merge, mirroring the
-///   production `search_memory_decomposed` merge: what the CURRENT merge
-///   realizes of that ceiling
+/// - `gold_in_rrf30`  — top-30 of the equal-weight RRF merge this probe
+///   defines: what that merge realizes of the ceiling
 ///
 /// Pool-size control is by construction: union ≤ 4 streams × 30 = 120, and the
 /// headroom probe already measured the single-query limit=100 ceiling on the
@@ -1612,8 +1611,8 @@ struct SubqFixtureRow {
 }
 
 /// Load the pre-generated subquery fixture (JSONL: `{query_id, subqueries}`).
-/// Subqueries exclude the original question (the probe prepends it, mirroring
-/// `retrieval::decompose::parse_subqueries`). Fails loud on malformed lines —
+/// Subqueries exclude the original question; the probe prepends it. Fails loud
+/// on malformed lines —
 /// the fixture is generated input, not user data.
 fn load_subquery_fixture(path: &Path) -> Result<HashMap<String, Vec<String>>, WenlanError> {
     let text = std::fs::read_to_string(path)
@@ -1627,9 +1626,8 @@ fn load_subquery_fixture(path: &Path) -> Result<HashMap<String, Vec<String>>, We
     Ok(map)
 }
 
-/// Equal-weight RRF merge of per-stream ranked id lists, truncated to `k`.
-/// Mirrors the `search_memory_decomposed` merge (score = Σ 1/(60+rank)), with
-/// a stable id tiebreak the production code leaves to HashMap order.
+/// Equal-weight RRF merge of per-stream ranked id lists, truncated to `k`
+/// (score = Σ 1/(60+rank)), with a stable id tiebreak.
 fn rrf_merge_ids(streams: &[Vec<String>], k: usize) -> Vec<String> {
     let mut scores: HashMap<&str, f32> = HashMap::new();
     for ranked in streams {
@@ -1925,8 +1923,8 @@ async fn ce_rank_ids(
 /// - OFF arm: base `search_memory(question, 30)` pool (current CE-path shape
 ///   under `RERANK_POOL_FLOOR=30`)
 /// - ON arm: equal-weight RRF merge of original+subquery streams (30 each,
-///   per-stream dedup by source_id), truncated to 30 — the
-///   `search_memory_decomposed` merge feeding the CE instead of bypassing it
+///   per-stream dedup by source_id), truncated to 30 — the decomposed merge
+///   feeding the CE instead of bypassing it
 ///
 /// Atomic questions (no subqueries in the fixture) have byte-identical pools;
 /// the CE is deterministic, so the OFF metrics are emitted for both arms

@@ -6,7 +6,6 @@ import { useTranslation } from "react-i18next";
 import {
   listMemoriesRich,
   listSpaces,
-  getMemoryStats,
   openFile,
   searchEntities,
   searchPages,
@@ -22,7 +21,6 @@ import MemoryStream from "./MemoryStream";
 import type { SortMode } from "./MemoryStream";
 import HomePage from "./HomePage";
 import AtlasView from "./AtlasView";
-import MemoryStatusBar from "./MemoryStatusBar";
 import MemorySearchResult from "./MemorySearchResult";
 import MemoryDetail from "./MemoryDetail";
 import PageDetail from "./PageDetail";
@@ -40,7 +38,6 @@ import {
   type PageDraftEditorHandle,
 } from "./pages/PageDraftEditor";
 import SourcesView from "./SourcesView";
-import DecisionLog from "./DecisionLog";
 import { RecapsList } from "./RecapsList";
 import AboutWenlanDialog from "./AboutWenlanDialog";
 import { readPreference, writePreference } from "../../lib/preferenceStorage";
@@ -56,7 +53,6 @@ import "./navigation/navigation-shell.css";
 interface MainProps {
   initialMemoryId?: string | null;
   initialPageId?: string | null;
-  initialView?: "import" | null;
   onBackFromDetail?: () => void;
   onRegisterQuitGuard?: (guard: (() => Promise<boolean>) | null) => void;
 }
@@ -85,7 +81,6 @@ function scrollDestinationKey(view: View): string {
 export default function Main({
   initialMemoryId,
   initialPageId,
-  initialView,
   onBackFromDetail,
   onRegisterQuitGuard,
 }: MainProps) {
@@ -101,10 +96,6 @@ export default function Main({
   const pendingDraftSearchCancelRef = useRef<(() => void) | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const sidebarToggleRef = useRef<HTMLButtonElement>(null);
-  const initialViewRequestRef = useRef({
-    observed: initialView ?? null,
-    pending: false,
-  });
   const initialPageRequestRef = useRef<{
     observed: string | null;
     pending: string | null;
@@ -123,7 +114,6 @@ export default function Main({
   const [view, setView] = useState<View>(
     initialMemoryId ? { kind: "memory", sourceId: initialMemoryId }
     : initialPageId ? { kind: "page", pageId: initialPageId }
-    : initialView === "import" ? { kind: "import" }
     : { kind: "home" },
   );
   const viewRef = useRef(view);
@@ -221,20 +211,6 @@ export default function Main({
     if (!canLeaveCurrentPage()) return () => {};
     return afterPageDraftFlush(action);
   };
-
-  // Respond to externally requested destinations only after the current editor is safe to leave.
-  useEffect(() => {
-    const request = initialViewRequestRef.current;
-    const next = initialView ?? null;
-    if (request.observed !== next) {
-      request.observed = next;
-      request.pending = next === "import";
-    }
-    if (!request.pending || pageSavePending) return;
-    request.pending = false;
-    if (view.kind === "import" || !canLeaveCurrentPage()) return;
-    return afterPageDraftFlush(() => setView({ kind: "import" }));
-  }, [initialView, pageSavePending]);
 
   useEffect(() => {
     const request = initialPageRequestRef.current;
@@ -350,13 +326,12 @@ export default function Main({
     setPageEditDirty(false);
     applyBackNavigation();
   };
-  const [statusMessage, _setStatusMessage] = useState<string | null>(null);
   const [sortMode, setSortMode] = useState<SortMode>("recent");
   const [stabilityFilter, setStabilityFilter] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     return readPreference(SIDEBAR_KEY, LEGACY_SIDEBAR_KEY) === "true";
   });
-  const { query, setQuery, results } = useSearch();
+  const { query, setQuery, debouncedQuery, results } = useSearch();
   const handleSearchQueryChange = (nextQuery: string) => {
     if (!query && nextQuery && !canLeaveCurrentPage()) return;
     if (!query && nextQuery && view.kind === "page-draft") {
@@ -386,22 +361,16 @@ export default function Main({
     if (view.kind !== "page-draft") setPendingDraftSearchQuery(null);
   }, [view.kind]);
 
-  const [debouncedEntityQuery, setDebouncedEntityQuery] = useState("");
-  useEffect(() => {
-    const timer = setTimeout(() => setDebouncedEntityQuery(query), 300);
-    return () => clearTimeout(timer);
-  }, [query]);
-
   const { data: entityResults = [] } = useQuery({
-    queryKey: ["searchEntities", debouncedEntityQuery],
-    queryFn: () => searchEntities(debouncedEntityQuery, 5),
-    enabled: debouncedEntityQuery.length > 0,
+    queryKey: ["searchEntities", debouncedQuery],
+    queryFn: () => searchEntities(debouncedQuery, 5),
+    enabled: debouncedQuery.length > 0,
   });
 
   const { data: conceptResults = [] } = useQuery({
-    queryKey: ["searchPages", debouncedEntityQuery],
-    queryFn: () => searchPages(debouncedEntityQuery, 5),
-    enabled: debouncedEntityQuery.length > 0,
+    queryKey: ["searchPages", debouncedQuery],
+    queryFn: () => searchPages(debouncedQuery, 5),
+    enabled: debouncedQuery.length > 0,
   });
 
   const toggleSidebar = () => {
@@ -460,13 +429,7 @@ export default function Main({
   const { data: memories = [] } = useQuery({
     queryKey: ["memories"],
     queryFn: () => listMemoriesRich(undefined, undefined, undefined, 200),
-    refetchInterval: 5000,
-  });
-
-  const { data: _stats } = useQuery({
-    queryKey: ["memoryStats"],
-    queryFn: getMemoryStats,
-    refetchInterval: 10000,
+    refetchInterval: view.kind === "stream" ? 5000 : false,
   });
 
   // Listen for capture events
@@ -474,22 +437,12 @@ export default function Main({
     const unlisten = listen<{ source: string }>("capture-event", () => {
       queryClient.invalidateQueries({ queryKey: ["memories"] });
       queryClient.invalidateQueries({ queryKey: ["memoryStats"] });
-      queryClient.invalidateQueries({ queryKey: ["homeStats"] });
       queryClient.invalidateQueries({ queryKey: ["recentChanges"] });
       queryClient.invalidateQueries({ queryKey: ["recentRetrievals"] });
-      queryClient.invalidateQueries({ queryKey: ["recentConceptItems"] });
-      queryClient.invalidateQueries({ queryKey: ["recentMemoryItems"] });
-      queryClient.invalidateQueries({ queryKey: ["unconfirmedMemories"] });
-      queryClient.invalidateQueries({ queryKey: ["home-recaps"] });
-      queryClient.invalidateQueries({ queryKey: ["home-memories"] });
-      queryClient.invalidateQueries({ queryKey: ["briefing"] });
-      queryClient.invalidateQueries({ queryKey: ["contradictions"] });
       queryClient.invalidateQueries({ queryKey: ["spaces"] });
     });
     return () => { unlisten.then((f) => f()); };
   }, [queryClient]);
-
-  // Status message hidden — impact stats shown on home page instead
 
   // Cmd+K global shortcut (fired from App.tsx) — focus the header search input.
   useEffect(() => {
@@ -535,7 +488,7 @@ export default function Main({
         } else if (view.kind === "page-draft") {
           // PageDraftEditor owns Escape so it can await the same flush gate as Back.
           return;
-        } else if (view.kind === "entity" || view.kind === "memory" || view.kind === "settings" || view.kind === "import" || view.kind === "graph" || view.kind === "page" || view.kind === "space" || view.kind === "distill-review" || view.kind === "decisions") {
+        } else if (view.kind === "entity" || view.kind === "memory" || view.kind === "settings" || view.kind === "import" || view.kind === "graph" || view.kind === "page" || view.kind === "space" || view.kind === "distill-review") {
           navigateBack();
         }
       }
@@ -889,12 +842,6 @@ export default function Main({
               onSetupAgent={() => navigateTo({ kind: "connect-agent" })}
               onImport={() => navigateTo({ kind: "import" })}
             />
-          ) : view.kind === "decisions" ? (
-            <DecisionLog
-              onBack={navigateBack}
-              onSelectMemory={(sid) => navigateTo({ kind: "memory", sourceId: sid })}
-              onSelectPage={(id) => navigateTo({ kind: "page", pageId: id })}
-            />
           ) : view.kind === "pages" ? (
             <PagesOverview
               onCreatePage={(space) => navigateTo({ kind: "page-draft", space })}
@@ -1051,9 +998,6 @@ export default function Main({
       </div>
 
       <AboutWenlanDialog open={aboutOpen} onClose={() => setAboutOpen(false)} />
-
-      {/* Status bar */}
-      <MemoryStatusBar message={statusMessage} />
     </div>
   );
 }

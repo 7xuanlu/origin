@@ -180,8 +180,10 @@ pub async fn handle_archive_page(
     State(state): State<Arc<RwLock<ServerState>>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
     // `ServerError::from` maps the entity-shadow fence's WenlanError::Validation
     // to a 4xx (ValidationError), matching the neighboring page-write handlers.
     db.archive_page(&id).await.map_err(ServerError::from)?;
@@ -403,7 +405,6 @@ pub async fn handle_export_pages(
     };
     let exporter =
         wenlan_core::export::obsidian::ObsidianExporter::new(std::path::PathBuf::from(expanded));
-    use wenlan_core::export::PageExporter;
     let stats = exporter
         .export_all(&exportable)
         .map_err(|e| ServerError::Internal(e.to_string()))?;
@@ -418,8 +419,8 @@ pub async fn handle_export_page(
     Json(req): Json<wenlan_types::requests::ExportPageRequest>,
 ) -> Result<Json<wenlan_types::responses::ExportPageResponse>, ServerError> {
     // Clone Arc out of the guard so we don't hold the RwLock read guard
-    // across the DB await. (CLAUDE.md: never hold tokio::sync::RwLock guards
-    // across .await.)
+    // across the DB await. (AGENTS.md "Repository invariants": never hold
+    // tokio::sync::RwLock guards across .await.)
     let db = {
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
@@ -456,7 +457,6 @@ pub async fn handle_export_page(
 
     let exporter =
         wenlan_core::export::obsidian::ObsidianExporter::new(std::path::PathBuf::from(expanded));
-    use wenlan_core::export::PageExporter;
     let result = exporter
         .export(&page)
         .map_err(|e| ServerError::Internal(e.to_string()))?;

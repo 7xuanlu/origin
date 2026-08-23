@@ -87,15 +87,6 @@ fn d_04_f32() -> f32 {
 fn d_30_u64() -> u64 {
     30
 }
-fn d_600() -> i64 {
-    600
-}
-fn d_7200() -> i64 {
-    7200
-}
-fn d_300() -> u64 {
-    300
-}
 fn d_015_f64() -> f64 {
     0.15
 }
@@ -198,7 +189,6 @@ pub struct TuningConfig {
     pub narrative: NarrativeConfig,
     pub briefing: BriefingConfig,
     pub confidence: ConfidenceConfig,
-    pub packager: PackagerConfig,
     pub eval: EvalConfig,
     pub search_scoring: SearchScoringConfig,
     #[serde(default)]
@@ -256,14 +246,6 @@ pub struct RefineryConfig {
     pub consolidation_batch_size: usize,
     #[serde(default = "d_30_i64")]
     pub batch_window_secs: i64,
-    /// Debounce window (seconds) for background reflection coalescing. When
-    /// `WENLAN_ENABLE_REFLECTION_DEBOUNCE` is truthy, per-agent mid-burst
-    /// enrichment spawns inside this window are cancelled/coalesced so only the
-    /// latest write triggers a reflection. Inert when the flag is unset/0.
-    /// Default 5s (mirrors the page-channel opt-in precedent — feature is OFF
-    /// by default, so this value only matters once an operator opts in).
-    #[serde(default = "d_5_u64")]
-    pub reflection_debounce_secs: u64,
     #[serde(default = "d_168_u64")]
     pub kg_rethink_interval_hours: u64,
     #[serde(default = "d_5_usize")]
@@ -469,18 +451,6 @@ pub struct EvictionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct PackagerConfig {
-    #[serde(default = "d_600")]
-    pub session_gap_secs: i64,
-    #[serde(default = "d_3_usize")]
-    pub min_session_captures: usize,
-    #[serde(default = "d_7200")]
-    pub max_session_duration_secs: i64,
-    #[serde(default = "d_300")]
-    pub packager_interval_secs: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct EvalConfig {
     #[serde(default = "d_true")]
     pub enabled: bool,
@@ -555,7 +525,6 @@ impl Default for RefineryConfig {
             consolidation_confidence_threshold: d_03(),
             consolidation_batch_size: d_10_usize(),
             batch_window_secs: d_30_i64(),
-            reflection_debounce_secs: d_5_u64(),
             kg_rethink_interval_hours: d_168_u64(),
             entity_backfill_batch_size: d_5_usize(),
         }
@@ -602,16 +571,6 @@ impl Default for EvictionConfig {
             evict_confidence_floor: d_01_f64(),
             per_space_cap: None,
             recover_before_delete: d_true(),
-        }
-    }
-}
-impl Default for PackagerConfig {
-    fn default() -> Self {
-        Self {
-            session_gap_secs: d_600(),
-            min_session_captures: d_3_usize(),
-            max_session_duration_secs: d_7200(),
-            packager_interval_secs: d_300(),
         }
     }
 }
@@ -689,16 +648,28 @@ impl TuningConfig {
 
     /// Returns the default tuning config file path.
     pub fn config_path() -> PathBuf {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("wenlan")
-            .join("intelligence.toml")
+        crate::config::data_root().join("intelligence.toml")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `WENLAN_DATA_DIR` must isolate `intelligence.toml` alongside the rest
+    /// of the daemon's data-dir-scoped state (`config.rs::data_root`), not
+    /// just `config.json` — a `--data-dir` scratch daemon must never read the
+    /// developer's real tuning config.
+    #[test]
+    fn config_path_honors_wenlan_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        temp_env::with_var("WENLAN_DATA_DIR", Some(dir.path()), || {
+            assert_eq!(
+                TuningConfig::config_path(),
+                dir.path().join("intelligence.toml")
+            );
+        });
+    }
 
     #[test]
     fn test_default_matches_current_values() {
@@ -726,7 +697,6 @@ mod tests {
         assert_eq!(cfg.refinery.consolidation_batch_size, 10);
         assert_eq!(cfg.refinery.batch_window_secs, 30);
         assert_eq!(cfg.refinery.kg_rethink_interval_hours, 168);
-        assert_eq!(cfg.refinery.reflection_debounce_secs, 5);
         // Narrative
         assert_eq!(cfg.narrative.stale_secs, 86400);
         assert_eq!(cfg.narrative.max_memories, 12);
@@ -746,11 +716,6 @@ mod tests {
         assert_eq!(cfg.confidence.full_trust_weight, 1.0);
         assert_eq!(cfg.confidence.review_trust_weight, 0.7);
         assert_eq!(cfg.confidence.untrusted_weight, 0.4);
-        // Packager
-        assert_eq!(cfg.packager.session_gap_secs, 600);
-        assert_eq!(cfg.packager.min_session_captures, 3);
-        assert_eq!(cfg.packager.max_session_duration_secs, 7200);
-        assert_eq!(cfg.packager.packager_interval_secs, 300);
     }
 
     #[test]

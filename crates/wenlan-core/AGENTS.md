@@ -11,8 +11,11 @@ detailed module map, database layout, feature-flag wiring, or historical measure
   mutex. Share the database through `Arc<MemoryDB>`.
 - UI notifications go through `EventEmitter`; daemon code uses `NoopEmitter` and the app
   supplies its adapter.
-- All write consumers call `ingest::run_canonical_enrichment`. Add new write-time
-  behavior there rather than recreating a subset in the server, importer, or eval seed.
+- The durable write-time seam is the ambient slice lanes (`run_classification_enrichment_slice`,
+  `run_structured_extract_slice`, `run_title_enrichment_slice`, `run_page_growth_slice`,
+  `run_document_enrichment_slice`), indexed from `wenlan-server/src/scheduler/ambient.rs`.
+  `ingest::run_canonical_enrichment` is the reconcile/eval route only — add new write-time
+  behavior to the slice lane it belongs to, not there.
 - A new channel must have an executable substrate/liveness check. Do not report a null
   experiment over an empty or stale substrate as product evidence.
 - Retrieval feature defaults and experiment receipts live in `REFERENCE.md` and

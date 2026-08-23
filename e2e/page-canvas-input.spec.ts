@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { expect, test, type Page } from "@playwright/test";
 import { installTauriMock } from "./tauriMock";
+import { openCanvas, seedLargeMap } from "./helpers/pageCanvas";
 
 /**
  * Where the canvas's pointer and keyboard input actually lands.
@@ -10,17 +11,6 @@ import { installTauriMock } from "./tauriMock";
  * text selection, and a keystroke that misses the surface reaches the browser
  * instead of the map.
  */
-async function openCanvas(page: Page): Promise<void> {
-  await page.goto("/");
-  await page
-    .getByRole("navigation", { name: "Primary navigation" })
-    .getByRole("button", { name: "Wiki", exact: true })
-    .click();
-  await page.getByRole("button", { name: "Open Fixture architecture" }).click();
-  await page.getByRole("button", { name: "Canvas" }).click();
-  await expect(page.getByRole("region", { name: "Canvas for Fixture architecture" })).toBeVisible();
-}
-
 async function marquees(page: Page): Promise<number> {
   return page.locator(".react-flow__selection").count();
 }
@@ -213,28 +203,6 @@ async function scale(page: Page): Promise<number> {
   return page.evaluate(() => {
     const vp = document.querySelector(".react-flow__viewport") as HTMLElement;
     return new DOMMatrixReadOnly(getComputedStyle(vp).transform).a;
-  });
-}
-
-/** A map the size a real page grows to: thirteen boxes over three rings. */
-async function seedLargeMap(page: Page): Promise<void> {
-  await page.evaluate(async () => {
-    const add = async (parent: string, label: string): Promise<string> => {
-      const result = (await window.__wenlanTauriInvoke("create_page_map_node", {
-        pageId: "page-architecture",
-        body: { parent_id: parent, label, ref_kind: "section", ref_id: label },
-      })) as { node: { id: string } };
-      return result.node.id;
-    };
-    const ingest = await add("n_root", "Ingest pipeline");
-    await add(ingest, "Chunking");
-    await add(ingest, "Embedding queue");
-    const api = await add("n_root", "HTTP surface");
-    await add(api, "Auth");
-    await add(api, "Rate limits");
-    await add("n_root", "Observability");
-    await add("n_query", "Reranking");
-    await add("n_query", "Filters");
   });
 }
 

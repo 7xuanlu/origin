@@ -245,14 +245,6 @@ describe("sources, page export, and knowledge wrappers", () => {
     });
   });
 
-  it("quitOriginFull remains a legacy alias", async () => {
-    const { invoke } = await import("@tauri-apps/api/core");
-    const { quitOriginFull } = await import("../tauri");
-    (invoke as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
-    await quitOriginFull();
-    expect(invoke).toHaveBeenCalledWith("quit_origin_full");
-  });
-
   it("getWenlanMcpEntry calls the typed MCP entry command", async () => {
     const { invoke } = await import("@tauri-apps/api/core");
     const { getWenlanMcpEntry } = await import("../tauri");

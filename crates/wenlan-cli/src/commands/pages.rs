@@ -14,7 +14,7 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 
-use crate::output::{print_json, OutputFormat};
+use crate::output::{print_json, ResolvedFormat};
 
 /// One distilled page on disk.
 #[derive(Debug, Clone)]
@@ -175,7 +175,7 @@ fn collapse_by_title(pages: &[PageEntry]) -> Vec<(String, usize)> {
 }
 
 pub fn run(
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     query: Option<String>,
     limit: usize,
@@ -202,7 +202,7 @@ pub fn run(
                 &groups[..total_titles.min(limit)]
             };
             match format {
-                OutputFormat::Json => {
+                ResolvedFormat::Json => {
                     let items: Vec<_> = shown
                         .iter()
                         .map(|(title, count)| serde_json::json!({ "title": title, "count": count }))
@@ -213,8 +213,7 @@ pub fn run(
                         "total_titles": total_titles,
                     }))?;
                 }
-                OutputFormat::Table => print_list(shown, total_titles, total_pages, &dir),
-                OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
+                ResolvedFormat::Table => print_list(shown, total_titles, total_pages, &dir),
             }
         }
         // Query -> open the match.

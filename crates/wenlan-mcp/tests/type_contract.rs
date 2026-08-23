@@ -18,7 +18,7 @@ use wenlan_types::import::PendingImport;
 use wenlan_types::memory::{IndexedFileInfo, SearchResult};
 use wenlan_types::memory::{MemoryItem, RejectionRecord};
 use wenlan_types::responses::{
-    ChatContextResponse, CreateRelationResponse, DeleteResponse, KnowledgeContext,
+    ChatContextResponse, ConfirmResponse, CreateRelationResponse, DeleteResponse, KnowledgeContext,
     ListMemoriesResponse, MemoryDetailResponse, ProfileContext, SearchMemoryResponse,
     StoreMemoryResponse, TierTokenEstimates,
 };
@@ -656,6 +656,45 @@ async fn t8_forget_roundtrip() {
 
     let missing_text = text_of(&missing_result);
     assert_eq!(missing_text, "Memory not found");
+}
+
+#[tokio::test]
+async fn t8b_confirm_memory_reports_missing_row() {
+    let (hit_mock, hit_client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/memory/confirm/mem_hit"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&ConfirmResponse {
+            confirmed: true,
+            updated: true,
+        }))
+        .mount(&hit_mock)
+        .await;
+
+    let hit_text = text_of(
+        &make_server(hit_client)
+            .confirm_memory_impl("mem_hit")
+            .await
+            .expect("confirm_memory_impl failed for updated=true"),
+    );
+    assert_eq!(hit_text, "Memory mem_hit confirmed.");
+
+    let (miss_mock, miss_client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/memory/confirm/mem_miss"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&ConfirmResponse {
+            confirmed: true,
+            updated: false,
+        }))
+        .mount(&miss_mock)
+        .await;
+
+    let miss_text = text_of(
+        &make_server(miss_client)
+            .confirm_memory_impl("mem_miss")
+            .await
+            .expect("confirm_memory_impl failed for updated=false"),
+    );
+    assert_eq!(miss_text, "Memory mem_miss not found.");
 }
 
 #[tokio::test]

@@ -69,16 +69,21 @@ pub async fn create_entity(
     // was first created.
     let mut warnings: Vec<String> = Vec::new();
 
-    // 1. Self-retrieval verification
-    if let Ok(result) = crate::kg_quality::verify_entity(db, &id, name).await {
-        for w in &result.warnings {
-            log::warn!("[create_entity] {w}");
-            warnings.push(w.clone());
+    // 1. Self-retrieval verification (also returns the neighbours used below,
+    //    so the merge-candidate check does not re-run the same vector search).
+    let neighbors = match crate::kg_quality::entity_self_retrieval(db, &id, name).await {
+        Ok((results, entity_warnings)) => {
+            for w in &entity_warnings {
+                log::warn!("[create_entity] {w}");
+                warnings.push(w.clone());
+            }
+            Some(results)
         }
-    }
+        Err(_) => None,
+    };
 
     // 2. Merge-candidate refinery enqueue: similar entity in [0.85, 0.9) with same type
-    if let Ok(results) = db.search_entities_by_vector(name, 5).await {
+    if let Some(results) = neighbors {
         for r in &results {
             if r.entity.id == id {
                 continue;

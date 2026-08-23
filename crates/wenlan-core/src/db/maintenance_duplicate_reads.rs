@@ -14,13 +14,6 @@ pub(crate) struct NearDuplicatePairRead {
     pub(crate) eligible: bool,
 }
 
-#[derive(Debug)]
-pub(crate) struct PageEmbeddingDistanceRead {
-    pub(crate) left_id: String,
-    pub(crate) right_id: String,
-    pub(crate) distance: f64,
-}
-
 pub(crate) struct NearDuplicateSliceReader<'db> {
     conn: tokio::sync::MutexGuard<'db, libsql::Connection>,
 }
@@ -30,77 +23,6 @@ impl MemoryDB {
         NearDuplicateSliceReader {
             conn: self.conn.lock().await,
         }
-    }
-
-    pub(crate) async fn embedding_near_duplicate_pairs(
-        &self,
-        threshold: f64,
-        limit: Option<usize>,
-    ) -> Result<Vec<PageEmbeddingDistanceRead>, WenlanError> {
-        let conn = self.conn.lock().await;
-        let sql = match limit {
-            Some(_) => {
-                "SELECT a.id, b.id, vector_distance_cos(a.embedding, b.embedding) AS dist \
-                 FROM pages a \
-                 JOIN pages b ON a.id < b.id \
-                 WHERE a.status = 'active' \
-                   AND b.status = 'active' \
-                   AND a.embedding IS NOT NULL \
-                   AND b.embedding IS NOT NULL \
-                   AND COALESCE(a.review_status, 'confirmed') = 'confirmed' \
-                   AND COALESCE(b.review_status, 'confirmed') = 'confirmed' \
-                   AND a.space = b.space \
-                   AND lower(a.title) != 'overview' \
-                   AND lower(b.title) != 'overview' \
-                   AND vector_distance_cos(a.embedding, b.embedding) <= ?1 \
-                 ORDER BY dist ASC \
-                 LIMIT ?2"
-            }
-            None => {
-                "SELECT a.id, b.id, vector_distance_cos(a.embedding, b.embedding) AS dist \
-                 FROM pages a \
-                 JOIN pages b ON a.id < b.id \
-                 WHERE a.status = 'active' \
-                   AND b.status = 'active' \
-                   AND a.embedding IS NOT NULL \
-                   AND b.embedding IS NOT NULL \
-                   AND COALESCE(a.review_status, 'confirmed') = 'confirmed' \
-                   AND COALESCE(b.review_status, 'confirmed') = 'confirmed' \
-                   AND a.space = b.space \
-                   AND lower(a.title) != 'overview' \
-                   AND lower(b.title) != 'overview' \
-                   AND vector_distance_cos(a.embedding, b.embedding) <= ?1 \
-                 ORDER BY dist ASC"
-            }
-        };
-        let mut rows = match limit {
-            Some(limit) => {
-                conn.query(sql, libsql::params![threshold, limit as i64])
-                    .await
-            }
-            None => conn.query(sql, libsql::params![threshold]).await,
-        }
-        .map_err(|e| WenlanError::VectorDb(format!("page near-duplicate query: {e}")))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("page near-duplicate row: {e}")))?
-        {
-            let left_id = row
-                .get(0)
-                .map_err(|e| WenlanError::VectorDb(format!("near-dup left id: {e}")))?;
-            let right_id = row
-                .get(1)
-                .map_err(|e| WenlanError::VectorDb(format!("near-dup right id: {e}")))?;
-            out.push(PageEmbeddingDistanceRead {
-                left_id,
-                right_id,
-                distance: row.get(2).unwrap_or(1.0),
-            });
-        }
-        Ok(out)
     }
 }
 

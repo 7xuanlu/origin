@@ -4,39 +4,37 @@ use std::sync::LazyLock;
 
 struct PiiPattern {
     regex: Regex,
-    label: &'static str,
+    replacement: String,
+}
+
+fn pii_pattern(pattern: &str, label: &'static str) -> PiiPattern {
+    PiiPattern {
+        regex: Regex::new(pattern).unwrap(),
+        replacement: format!("[REDACTED:{label}]"),
+    }
 }
 
 static PII_PATTERNS: LazyLock<Vec<PiiPattern>> = LazyLock::new(|| {
     vec![
-        PiiPattern {
-            regex: Regex::new(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b").unwrap(),
-            label: "CREDIT_CARD",
-        },
-        PiiPattern {
-            regex: Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap(),
-            label: "SSN",
-        },
-        PiiPattern {
-            regex: Regex::new(r"(?i)AKIA[0-9A-Z]{16}").unwrap(),
-            label: "AWS_KEY",
-        },
-        PiiPattern {
-            regex: Regex::new(r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA )?PRIVATE KEY-----").unwrap(),
-            label: "PRIVATE_KEY",
-        },
-        PiiPattern {
-            regex: Regex::new(r#"(?i)(?:api_key|apikey|api-key|secret_key|secret|token|password|passwd)\s*[=:]\s*["']?[A-Za-z0-9\-_.]{8,}["']?"#).unwrap(),
-            label: "API_KEY",
-        },
-        PiiPattern {
-            regex: Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").unwrap(),
-            label: "EMAIL",
-        },
-        PiiPattern {
-            regex: Regex::new(r"(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b").unwrap(),
-            label: "PHONE",
-        },
+        pii_pattern(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b", "CREDIT_CARD"),
+        pii_pattern(r"\b\d{3}-\d{2}-\d{4}\b", "SSN"),
+        pii_pattern(r"(?i)AKIA[0-9A-Z]{16}", "AWS_KEY"),
+        pii_pattern(
+            r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA )?PRIVATE KEY-----",
+            "PRIVATE_KEY",
+        ),
+        pii_pattern(
+            r#"(?i)(?:api_key|apikey|api-key|secret_key|secret|token|password|passwd)\s*[=:]\s*["']?[A-Za-z0-9\-_.]{8,}["']?"#,
+            "API_KEY",
+        ),
+        pii_pattern(
+            r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+            "EMAIL",
+        ),
+        pii_pattern(
+            r"(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",
+            "PHONE",
+        ),
     ]
 });
 
@@ -44,10 +42,12 @@ static PII_PATTERNS: LazyLock<Vec<PiiPattern>> = LazyLock::new(|| {
 pub fn redact_pii(text: &str) -> String {
     let mut result = text.to_string();
     for pattern in PII_PATTERNS.iter() {
-        result = pattern
+        if let std::borrow::Cow::Owned(next) = pattern
             .regex
-            .replace_all(&result, &format!("[REDACTED:{}]", pattern.label))
-            .to_string();
+            .replace_all(&result, pattern.replacement.as_str())
+        {
+            result = next;
+        }
     }
     result
 }

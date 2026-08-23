@@ -1,9 +1,0 @@
-[[mapping]]
-prefix = "/tmp/origin-test/ideas-zone"
-space  = "ideas"
-
-[[mapping]]
-prefix = "/tmp/origin-test/career"
-space  = "career"
-
-default = "personal"

@@ -199,10 +199,12 @@ fn manifest_counts_match_the_spec() {
     // `/api/brief`. The outbox PR added GET `/api/outbox/status` and POST
     // `/api/outbox/drain`. The router coverage assertion caught every drift. Then
     // 165 after the dead recent-relations, entity-suggestions and community
-    // proposal/page-assignment routes were deleted (KG review 2026-08-16).
+    // proposal/page-assignment routes were deleted (KG review 2026-08-16). Then
+    // 162 after the uncalled GET `/api/ping` and the redundant GET/PUT
+    // `/api/config/skip-apps` pair were deleted (audit 2026-08-22).
     assert_eq!(
         HTTP_READERS.len(),
-        165,
+        162,
         "registered (method, path, handler) triples"
     );
     assert_eq!(MCP_READERS.len(), 29, "#[tool( declarations");
@@ -211,7 +213,7 @@ fn manifest_counts_match_the_spec() {
     let entries: Vec<_> = runtime_entries().collect();
     assert_eq!(
         entries.len(),
-        169,
+        166,
         "(builder, method, path) runtime entries"
     );
     assert_eq!(
@@ -219,7 +221,7 @@ fn manifest_counts_match_the_spec() {
             .iter()
             .filter(|(b, _, _)| *b == Builder::Main)
             .count(),
-        163,
+        160,
         "main builder entries"
     );
     assert_eq!(
@@ -235,7 +237,7 @@ fn manifest_counts_match_the_spec() {
         .iter()
         .filter(|r| r.page_bearing == PageBearing::Yes)
         .count();
-    assert_eq!(bearing, 60, "page-bearing HTTP routes");
+    assert_eq!(bearing, 59, "page-bearing HTTP routes");
 }
 
 #[test]
@@ -395,7 +397,7 @@ fn marker_shape_allowlist_is_fail_closed() {
             .iter()
             .filter(|r| r.marker_shape == MarkerShape::None)
             .count(),
-        159
+        156
     );
 }
 

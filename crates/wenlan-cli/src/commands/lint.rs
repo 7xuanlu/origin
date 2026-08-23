@@ -10,14 +10,14 @@ use wenlan_types::lint::{
 };
 
 use crate::client::WenlanClient;
-use crate::output::{print_json, OutputFormat};
+use crate::output::{print_json, ResolvedFormat};
 
 const MAX_AGENT_SUBMISSION_BYTES: usize = 64 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     profile: Option<LintProfile>,
     space: Option<String>,
@@ -74,8 +74,8 @@ pub async fn run(
         Ok(())
     } else {
         match format {
-            OutputFormat::Json | OutputFormat::Auto => print_json(&report),
-            OutputFormat::Table => {
+            ResolvedFormat::Json => print_json(&report),
+            ResolvedFormat::Table => {
                 print!("{}", render_human(&report));
                 Ok(())
             }

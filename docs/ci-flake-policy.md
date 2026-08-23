@@ -14,8 +14,8 @@ job is not automatically a flake, and a green rerun is not automatically a fix.
 3. **Two matching occurrences require an owner and a fix.** Two independent
    occurrences of the same test and symptom, on any branches or runners, are
    enough to open a tracking issue and prioritize deflaking. Prefer event-driven
-   waits (`wait_until`, as used in
-   `crates/wenlan-server/src/reflection_debounce.rs`) or poll-with-deadline (as
+   waits (`wait_until_reached`, as used in
+   `crates/wenlan-core/src/lint/runner.rs`) or poll-with-deadline (as
    used in `crates/wenlan-cli/src/commands/service.rs`). Do not use bare sleeps
    or single-shot assertions on asynchronous or process state.
 4. **Quarantine must fail closed.** Do not add `#[ignore]` or exclude a test from

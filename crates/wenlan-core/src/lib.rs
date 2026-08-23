@@ -8,8 +8,6 @@
 
 pub use wenlan_types;
 
-pub mod access_tracker;
-pub mod activity;
 pub mod briefing;
 pub mod cache;
 pub mod chat_import;
@@ -21,7 +19,6 @@ pub mod community_grouping;
 pub mod community_partition;
 pub mod community_routing;
 pub mod config;
-pub mod context_packager;
 pub mod contradiction;
 pub mod db;
 pub mod decay;
@@ -43,11 +40,9 @@ pub mod ingest;
 pub mod kg;
 pub mod kg_quality;
 pub mod lint;
-pub mod llm_classifier;
 pub mod llm_provider;
 pub mod m6;
 pub mod maintenance;
-pub mod memory_schema;
 pub mod migrate_rename;
 pub mod migrations;
 pub mod narrative;
@@ -75,7 +70,6 @@ pub mod router;
 pub mod schema;
 pub mod sources;
 pub mod space_context;
-pub mod spaces;
 pub mod synthesis;
 pub mod tags;
 pub(crate) mod temporal_query;

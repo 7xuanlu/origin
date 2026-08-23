@@ -342,7 +342,6 @@ cargo build
 cargo test
 
 # aplicación de escritorio (target de Cargo y herramientas frontend en la raíz)
-cargo build -p wenlan-app
 pnpm install
 pnpm dev:all
 pnpm build:all

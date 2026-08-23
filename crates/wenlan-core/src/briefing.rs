@@ -30,18 +30,6 @@ pub struct BriefingStats {
     pub new_today: u64,
 }
 
-/// Returns true if the cached briefing is stale.
-pub fn is_cache_stale(
-    generated_at: i64,
-    cached_count: u64,
-    current_count: u64,
-    tuning: &BriefingConfig,
-) -> bool {
-    let now = chrono::Utc::now().timestamp();
-    now - generated_at > tuning.stale_secs
-        || current_count >= cached_count + tuning.stale_memory_delta
-}
-
 /// Build the topic extraction prompt from recent memory titles.
 fn extract_topics_prompt(memories: &[BriefingMemory], tuning: &BriefingConfig) -> String {
     memories
@@ -167,10 +155,6 @@ pub async fn generate_briefing(
         .await?;
     let response = assemble_briefing_response(llm, prompts, tuning, stats, memories, now).await?;
 
-    let memory_count = db.get_memory_count().await?;
-    db.upsert_briefing_cache(&response.content, memory_count)
-        .await?;
-
     Ok(response)
 }
 
@@ -202,29 +186,6 @@ pub async fn generate_briefing_scoped(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_cache_stale_fresh() {
-        let now = chrono::Utc::now().timestamp();
-        let tuning = BriefingConfig::default();
-        assert!(!is_cache_stale(now - 3600, 10, 10, &tuning));
-        assert!(!is_cache_stale(now - 3600, 10, 14, &tuning));
-    }
-
-    #[test]
-    fn test_is_cache_stale_by_time() {
-        let now = chrono::Utc::now().timestamp();
-        let tuning = BriefingConfig::default();
-        assert!(is_cache_stale(now - 7 * 3600, 10, 10, &tuning));
-    }
-
-    #[test]
-    fn test_is_cache_stale_by_count() {
-        let now = chrono::Utc::now().timestamp();
-        let tuning = BriefingConfig::default();
-        assert!(is_cache_stale(now - 3600, 10, 15, &tuning));
-        assert!(!is_cache_stale(now - 3600, 10, 14, &tuning));
-    }
 
     fn mem(title: &str) -> BriefingMemory {
         BriefingMemory {

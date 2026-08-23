@@ -34,7 +34,7 @@ The runner picks the MCP server binary from four paths, in order:
 1. **Filesystem override** — if `plugin/bin/wenlan-mcp.local` exists (typically a symlink to a locally-built binary, gitignored), the runner exec's it. Most reliable: survives plugin reloads that don't re-read env.
 2. **Env var override** — `WENLAN_MCP_DEV_BIN=/abs/path/to/wenlan-mcp` (or the legacy `ORIGIN_MCP_DEV_BIN`). Convenient if you already export it; requires Claude Code to inherit the var at startup.
 3. **Installed runtime** — `~/.wenlan/bin/wenlan-mcp`, when `/setup` has installed it.
-4. **Default** — `npx -y wenlan-mcp@^0.13.2`. What end users get before local setup completes.
+4. **Default** — `npx -y wenlan-mcp@^<version>`, where the version is read from the sibling `plugin.json` at spawn time (`@latest` if it cannot be read). What end users get before local setup completes.
 
 To set up the filesystem override during dev:
 

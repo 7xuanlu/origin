@@ -9,7 +9,6 @@ main|get|/api/communities|wenlan_server::community_routes::handle_list_communiti
 main|get|/api/communities/members|wenlan_server::community_routes::handle_list_community_members
 main|get|/api/config|wenlan_server::config_routes::handle_get_config
 main|get|/api/config/routing|wenlan_server::config_routes::handle_get_resolved_routing
-main|get|/api/config/skip-apps|wenlan_server::config_routes::handle_get_skip_apps
 main|get|/api/debug/pipeline|wenlan_server::routes::handle_pipeline_status
 main|get|/api/decisions|wenlan_server::decisions_routes::handle_list_decisions
 main|get|/api/decisions/domains|wenlan_server::decisions_routes::handle_list_decision_domains
@@ -46,7 +45,6 @@ main|get|/api/pages/{id}/links|wenlan_server::page_routes::handle_get_page_links
 main|get|/api/pages/{id}/map|wenlan_server::page_map_routes::handle_get_page_map
 main|get|/api/pages/{id}/revisions|wenlan_server::page_routes::handle_get_page_revisions
 main|get|/api/pages/{id}/sources|wenlan_server::page_routes::handle_get_page_sources
-main|get|/api/ping|wenlan_server::routes::handle_ping
 main|get|/api/profile|wenlan_server::profile_agents_routes::handle_get_profile
 main|get|/api/profile/narrative|wenlan_server::profile_narrative_routes::handle_get_profile_narrative
 main|get|/api/refinery/queue|wenlan_server::refinery_routes::handle_list_refinements
@@ -130,7 +128,6 @@ main|post|/api/steep|wenlan_server::routes::handle_steep
 main|put|/api/agents/{name}|wenlan_server::profile_agents_routes::handle_update_agent
 main|put|/api/chunks/{id}/update|wenlan_server::indexed_files_routes::handle_update_chunk
 main|put|/api/config|wenlan_server::config_routes::handle_update_config
-main|put|/api/config/skip-apps|wenlan_server::config_routes::handle_update_skip_apps
 main|put|/api/documents/{source_id}/tags|wenlan_server::activity_tag_routes::handle_set_document_tags
 main|put|/api/memory/entities/{id}/confirm|wenlan_server::entity_graph_routes::handle_confirm_entity
 main|put|/api/memory/observations/{id}|wenlan_server::entity_graph_routes::handle_update_observation

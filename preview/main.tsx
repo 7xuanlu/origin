@@ -22,13 +22,9 @@ import SettingsSidebar, {
 } from "../src/components/memory/settings/SettingsSidebar";
 import { initializeI18n } from "../src/i18n";
 import { resetReviewFixtures, REVIEW_FAIL } from "./fixtures";
-import BakeoffHarness from "./bakeoff/BakeoffHarness";
-import type { BakeoffRenderer } from "./bakeoff/bakeoffResult";
 import "../src/index.css";
 
-// Lazy so sigma lands in its own vite chunk, same as the bake-off adapters
-// (see BakeoffHarness) — that chunk stays once the bake-off scaffolding is
-// deleted in a later round.
+// Lazy so sigma lands in its own vite chunk.
 const AtlasView = lazy(() => import("../src/components/memory/AtlasView"));
 
 const VARIANTS = [
@@ -76,7 +72,7 @@ const client = new QueryClient({
   defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
 });
 
-type Mode = "page" | "review" | "wizard" | "settings" | "atlas" | "entity" | "bakeoff";
+type Mode = "page" | "review" | "wizard" | "settings" | "atlas" | "entity";
 
 // Quick-select entities for the "entity" tab: gk-wenlan is the highest-degree
 // hub, gk-lucian shows a person node with mixed in/out edges, gk-remote-office
@@ -88,7 +84,7 @@ const ENTITY_VARIANTS = [
 ];
 
 // Deep links: ?mode=wizard&step=connect, ?mode=settings&section=intelligence,
-// ?mode=graph, ?mode=atlas, ?mode=entity&entity=gk-lucian, ?theme=light. Without these
+// ?mode=atlas, ?mode=entity&entity=gk-lucian, ?theme=light. Without these
 // every surface would only be reachable by clicking, so a screenshot pass
 // couldn't address one — which is the whole point of these modes existing.
 const params = new URLSearchParams(window.location.search);
@@ -111,7 +107,7 @@ const BAR_H = SHOW_BAR ? 41 : 0;
 
 function Harness() {
   const [mode, setMode] = useState<Mode>(
-    param("mode", ["page", "review", "wizard", "settings", "atlas", "entity", "bakeoff"] as const, "review"),
+    param("mode", ["page", "review", "wizard", "settings", "atlas", "entity"] as const, "review"),
   );
   const [pageId, setPageId] = useState(params.get("page") ?? "page-cited");
   const [entityId, setEntityId] = useState(params.get("entity") ?? "gk-wenlan");
@@ -128,11 +124,6 @@ function Harness() {
       "general",
     ),
   );
-  const [renderer, setRenderer] = useState<BakeoffRenderer>(
-    param("renderer", ["cytoscape", "sigma", "g6"] as const, "cytoscape"),
-  );
-  const bakeoffN = Number(params.get("n")) || 1000;
-
   const applyTheme = (next: string) => {
     document.documentElement.setAttribute("data-theme", next);
     setTheme(next);
@@ -181,9 +172,6 @@ function Harness() {
         <button onClick={() => setMode("entity")} style={tab(mode === "entity")}>
           Entity
         </button>
-        <button onClick={() => setMode("bakeoff")} style={tab(mode === "bakeoff")}>
-          Bakeoff
-        </button>
         <span style={{ opacity: 0.4 }}>|</span>
         {mode === "wizard" ? (
           WIZARD_STEPS.map((s) => (
@@ -207,12 +195,6 @@ function Harness() {
           ENTITY_VARIANTS.map((v) => (
             <button key={v.id} onClick={() => setEntityId(v.id)} style={tab(entityId === v.id)}>
               {v.label}
-            </button>
-          ))
-        ) : mode === "bakeoff" ? (
-          (["cytoscape", "sigma", "g6"] as const).map((r) => (
-            <button key={r} onClick={() => setRenderer(r)} style={tab(renderer === r)}>
-              {r}
             </button>
           ))
         ) : mode === "atlas" ? null : (
@@ -324,13 +306,6 @@ function Harness() {
               onBack={() => console.log("[preview] onBack")}
             />
           </Suspense>
-        </div>
-      ) : mode === "bakeoff" ? (
-        // Full-bleed like graph/wizard. renderer/n are URL-driven
-        // (?mode=bakeoff&renderer=cytoscape&n=1000); the sub-tab row above
-        // only switches renderer at a fixed n.
-        <div style={{ height: `calc(100vh - ${BAR_H}px)` }}>
-          <BakeoffHarness renderer={renderer} n={bakeoffN} />
         </div>
       ) : (
         <div style={{ maxWidth: 860, margin: "0 auto", padding: "24px 16px" }}>

@@ -69,14 +69,15 @@ async fn entity_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()>
                     OR (e.confidence IS NOT NULL AND (e.confidence < 0 OR e.confidence > 1))
                     OR (e.space IS NOT NULL AND e.space != '{unfiled}' AND NOT EXISTS(
                         SELECT 1 FROM spaces s WHERE s.name=e.space))
-                  THEN 1 ELSE 0 END
+                  THEN 1 ELSE 0 END AS flag, e.id AS id
                FROM (SELECT epm.entity_id AS id, p.title AS name, p.entity_type AS entity_type,
                             p.entity_confirmed AS confirmed, p.confidence AS confidence,
                             p.space AS space
                        FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
-                      WHERE p.kind='entity' AND p.status='active') e{clause} ORDER BY e.id",
+                      WHERE p.kind='entity' AND p.status='active') e{clause}",
             unfiled = crate::db::UNFILED_SPACE_ID
         ),
+        "id",
         params,
     )
     .await
@@ -103,14 +104,15 @@ async fn observation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck
             "SELECT CASE WHEN e.id IS NULL OR TRIM(o.content)=''
                     OR COALESCE(o.confirmed,-1) NOT IN (0,1)
                     OR (o.confidence IS NOT NULL AND (o.confidence < 0 OR o.confidence > 1))
-                  THEN 1 ELSE 0 END
+                  THEN 1 ELSE 0 END AS flag, o.id AS id
                FROM observations o
                LEFT JOIN (SELECT epm.entity_id AS id, p.space AS space
                             FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
                            WHERE p.kind='entity' AND p.status='active') e
                  ON e.id=o.entity_id
-               {clause} ORDER BY o.id"
+               {clause}"
         ),
+        "id",
         params,
     )
     .await
@@ -132,7 +134,7 @@ async fn relation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, (
         context,
         &format!(
             "SELECT CASE WHEN f.id IS NULL OR t.id IS NULL OR TRIM(r.semantic_type)=''
-                  THEN 1 ELSE 0 END
+                  THEN 1 ELSE 0 END AS flag, r.edge_id AS edge_id
                FROM (SELECT * FROM edges WHERE edge_type='relates' AND valid_until IS NULL) r
                LEFT JOIN (SELECT epm.entity_id AS id, p.space AS space
                             FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
@@ -142,8 +144,9 @@ async fn relation_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, (
                             FROM entity_page_map epm JOIN pages p ON p.id = epm.page_id
                            WHERE p.kind='entity' AND p.status='active') t
                  ON t.id=r.dst_id
-               {clause} ORDER BY r.edge_id"
+               {clause}"
         ),
+        "edge_id",
         params,
     )
     .await
@@ -158,7 +161,8 @@ async fn link_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
     row_check(
         context,
         &format!(
-            "SELECT CASE WHEN m.source_id IS NULL OR e.entity_id IS NULL THEN 1 ELSE 0 END
+            "SELECT CASE WHEN m.source_id IS NULL OR e.entity_id IS NULL THEN 1 ELSE 0 END AS flag,
+                    me.memory_id AS memory_id, me.entity_id AS entity_id
                FROM memory_entities me
                LEFT JOIN (SELECT source_id, MAX(id) AS id, MAX(space) AS space FROM memories
                            GROUP BY source_id) m
@@ -167,34 +171,52 @@ async fn link_integrity(context: &LintContext<'_, '_>) -> Result<RowCheck, ()> {
                           JOIN pages p ON p.id = epm.page_id
                           WHERE p.kind = 'entity' AND p.status = 'active') e
                  ON e.entity_id=me.entity_id
-               {clause} ORDER BY me.memory_id, me.entity_id"
+               {clause}"
         ),
+        "memory_id, entity_id",
         params,
     )
     .await
 }
 
+/// Aggregate a `SELECT <flag expr> AS flag, <order-by columns> FROM ... {clause}`
+/// body DB-side instead of streaming every row into Rust: `body_sql` is
+/// wrapped in a bounded CTE (population/affected counts plus up to
+/// `LINT_MAX_EVIDENCE_PER_CHECK` evidence positions), mirroring
+/// `lint/pages/provenance_checks/source.rs`'s `ordered`/`summary` pattern.
+/// `order_by` names the `flagged` columns to order evidence positions by
+/// (e.g. `"id"` or `"memory_id, entity_id"`).
 async fn row_check(
     context: &LintContext<'_, '_>,
-    sql: &str,
+    body_sql: &str,
+    order_by: &str,
     params: libsql::params::Params,
 ) -> Result<RowCheck, ()> {
+    // One extra row beyond the cap proves truncation happened.
+    let limit = usize::from(LINT_MAX_EVIDENCE_PER_CHECK) + 1;
+    let sql = format!(
+        "WITH flagged AS ({body_sql}),
+         ordered AS MATERIALIZED (
+           SELECT flag, ROW_NUMBER() OVER (ORDER BY {order_by}) - 1 AS position FROM flagged
+         )
+         SELECT 0 AS row_kind, COUNT(*), COALESCE(SUM(flag),0) FROM ordered
+         UNION ALL
+         SELECT 1, position, 0 FROM ordered WHERE flag = 1
+         ORDER BY row_kind, 2
+         LIMIT {limit}"
+    );
     let mut rows = context
         .snapshot()
-        .query(sql, params)
+        .query(&sql, params)
         .await
         .map_err(|_| ())?;
-    let mut population = 0_u64;
-    let mut affected = 0_u64;
+    let summary = rows.next().await.map_err(|_| ())?.ok_or(())?;
+    let population = u64::try_from(summary.get::<i64>(1).map_err(|_| ())?).map_err(|_| ())?;
+    let affected = u64::try_from(summary.get::<i64>(2).map_err(|_| ())?).map_err(|_| ())?;
     let mut evidence_positions = Vec::new();
     while let Some(row) = rows.next().await.map_err(|_| ())? {
-        if row.get::<i64>(0).map_err(|_| ())? != 0 {
-            affected = affected.saturating_add(1);
-            if evidence_positions.len() < usize::from(LINT_MAX_EVIDENCE_PER_CHECK) {
-                evidence_positions.push(usize::try_from(population).map_err(|_| ())?);
-            }
-        }
-        population = population.saturating_add(1);
+        evidence_positions
+            .push(usize::try_from(row.get::<i64>(1).map_err(|_| ())?).map_err(|_| ())?);
     }
     Ok(RowCheck {
         population,

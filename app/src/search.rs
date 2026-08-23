@@ -10,6 +10,7 @@
 //! All data/DB commands proxy through `state.client`.
 
 use crate::activity;
+use crate::api::percent_encode_path_segment;
 use crate::config;
 use crate::sources::SourceStatus;
 use crate::state::{AppState, IndexStatus};
@@ -25,6 +26,20 @@ use wenlan_types::*;
 
 type State = Arc<RwLock<AppState>>;
 type WatcherState = Arc<tokio::sync::Mutex<Option<crate::indexer::FileWatcher>>>;
+
+/// Snapshot the daemon client and drop the `AppState` read guard before the
+/// caller's HTTP round-trip.
+///
+/// Holding a `tokio::sync::RwLock` read guard across `.await` is forbidden by
+/// AGENTS.md "Repository invariants", and here it can freeze the whole app:
+/// tokio's RwLock is write-preferring, so one queued writer — a config write,
+/// or `indexer::sync_source` fired by the file watcher — blocks every later
+/// reader until the in-flight request finishes, which `api::REQUEST_TIMEOUT`
+/// bounds at 600 s. Commands that also need other `AppState` fields use the
+/// scoped-block form instead (see `suggest_tags`).
+async fn daemon_client(state: &tauri::State<'_, State>) -> crate::api::WenlanClient {
+    state.read().await.client.clone()
+}
 
 // ── Request types (kept for Tauri IPC deserialization) ─────────────────
 
@@ -49,22 +64,6 @@ pub struct StoreMemoryRequest {
     pub supersedes: Option<String>,
     pub structured_fields: Option<serde_json::Value>,
     pub retrieval_cue: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SearchMemoryRequest {
-    pub query: String,
-    pub limit: Option<usize>,
-    pub memory_type: Option<String>,
-    pub domain: Option<String>,
-    pub source_agent: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListMemoriesRequest {
-    pub memory_type: Option<String>,
-    pub domain: Option<String>,
-    pub limit: Option<usize>,
 }
 
 // ── Response types ────────────────────────────────────────────────────
@@ -319,17 +318,6 @@ mod ingest_command_tests {
 }
 
 #[tauri::command]
-pub async fn get_setup_status(
-    state: tauri::State<'_, State>,
-) -> Result<crate::api::SetupStatusResponse, String> {
-    let client = {
-        let s = state.read().await;
-        s.client.clone()
-    };
-    client.get_setup_status().await
-}
-
-#[tauri::command]
 pub async fn get_setup_completed(state: tauri::State<'_, State>) -> Result<bool, String> {
     let client = {
         let s = state.read().await;
@@ -472,8 +460,8 @@ pub async fn rebuild_activities(state: tauri::State<'_, State>) -> Result<usize,
 pub async fn get_capture_stats(
     state: tauri::State<'_, State>,
 ) -> Result<HashMap<String, u64>, String> {
-    let s = state.read().await;
-    s.client.get_capture_stats().await
+    let client = daemon_client(&state).await;
+    client.get_capture_stats().await
 }
 
 #[tauri::command]
@@ -645,13 +633,14 @@ pub async fn rotate_remote_token(
 
 // ── File / open commands ──────────────────────────────────────────────
 
+/// Hand `path` — a filesystem path or a URL, both of which callers pass — to
+/// the desktop's default handler via the `open` crate rather than a hand-built
+/// per-OS argv: its Windows launcher never routes the path through `cmd.exe`
+/// (so a filename containing shell metacharacters cannot inject a second
+/// command), and it covers macOS/Linux/BSD the same way.
 #[tauri::command]
 pub async fn open_file(path: String) -> Result<(), String> {
-    std::process::Command::new("open")
-        .arg(&path)
-        .spawn()
-        .map_err(|e| format!("Failed to open file: {}", e))?;
-    Ok(())
+    open::that_detached(&path).map_err(|e| format!("Failed to open file: {}", e))
 }
 
 #[derive(serde::Serialize)]
@@ -852,7 +841,7 @@ pub async fn remove_watch_path(
 
     let mut watcher_guard = watcher.lock().await;
     if let Some(w) = watcher_guard.as_mut() {
-        let _ = w.unwatch(&path);
+        crate::indexer::unwatch_path(w, &path);
     }
 
     // Remove from config.sources
@@ -944,14 +933,14 @@ pub async fn search(
     limit: Option<usize>,
     source_filter: Option<String>,
 ) -> Result<Vec<SearchResult>, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::SearchRequest {
         query,
         limit: limit.unwrap_or(10),
         source_filter,
         space: None,
     };
-    let resp: responses::SearchResponse = s.client.post_json("/api/search", &req).await?;
+    let resp: responses::SearchResponse = client.post_json("/api/search", &req).await?;
     Ok(search_results_from_response(resp))
 }
 
@@ -967,31 +956,6 @@ fn append_supplemental_pages(
 
 fn search_results_from_response(resp: responses::SearchResponse) -> Vec<SearchResult> {
     append_supplemental_pages(resp.results, resp.supplemental_pages)
-}
-
-fn search_memory_results_from_response(resp: responses::SearchMemoryResponse) -> Vec<SearchResult> {
-    append_supplemental_pages(resp.results, resp.supplemental_pages)
-}
-
-#[tauri::command]
-pub async fn search_memory(
-    state: tauri::State<'_, State>,
-    req: SearchMemoryRequest,
-) -> Result<Vec<SearchResult>, String> {
-    let s = state.read().await;
-    let daemon_req = requests::SearchMemoryRequest {
-        query: req.query,
-        limit: req.limit.unwrap_or(10),
-        memory_type: req.memory_type,
-        space: req.domain,
-        source_agent: req.source_agent,
-        rerank: false,
-    };
-    let resp: responses::SearchMemoryResponse = s
-        .client
-        .post_json("/api/memory/search", &daemon_req)
-        .await?;
-    Ok(search_memory_results_from_response(resp))
 }
 
 // ── Memory CRUD ───────────────────────────────────────────────────────
@@ -1036,7 +1000,7 @@ pub async fn store_memory(
     state: tauri::State<'_, State>,
     req: StoreMemoryRequest,
 ) -> Result<StoreMemoryResponse, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let daemon_req = requests::StoreMemoryRequest {
         content: req.content,
         memory_type: req.memory_type,
@@ -1051,7 +1015,7 @@ pub async fn store_memory(
         retrieval_cue: req.retrieval_cue,
     };
     let resp: responses::StoreMemoryResponse =
-        s.client.post_json("/api/memory/store", &daemon_req).await?;
+        client.post_json("/api/memory/store", &daemon_req).await?;
     Ok(StoreMemoryResponse {
         source_id: resp.source_id,
         warnings: resp.warnings,
@@ -1066,12 +1030,23 @@ pub async fn confirm_memory(
     source_id: String,
     confirmed: bool,
 ) -> Result<(), String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::ConfirmRequest { confirmed };
-    let _resp: responses::ConfirmResponse = s
-        .client
-        .post_json(&format!("/api/memory/confirm/{}", source_id), &req)
+    let resp: responses::ConfirmResponse = client
+        .post_json(
+            &format!(
+                "/api/memory/confirm/{}",
+                percent_encode_path_segment(&source_id)
+            ),
+            &req,
+        )
         .await?;
+    // The daemon 404s an unknown id; an older daemon answers 200 without
+    // `updated`, which defaults to `true` so that response still reads as
+    // success. Branch on the flag so an explicit `false` reports a no-op.
+    if !resp.updated {
+        return Err(format!("memory {} not found", source_id));
+    }
     Ok(())
 }
 
@@ -1081,40 +1056,25 @@ pub async fn set_stability_cmd(
     source_id: String,
     stability: String,
 ) -> Result<(), String> {
-    // Stability is set via confirm for "confirmed" stability, otherwise via reclassify
-    // For now, proxy confirm for "confirmed" and return error for others
-    let s = state.read().await;
+    // "confirmed" goes through the confirm endpoint (it also flips the confirmed flag);
+    // every other stability value is a direct PUT to /api/memory/{id}/stability.
+    let client = daemon_client(&state).await;
+    let encoded_id = percent_encode_path_segment(&source_id);
     if stability == "confirmed" {
         let req = requests::ConfirmRequest { confirmed: true };
-        let _resp: responses::ConfirmResponse = s
-            .client
-            .post_json(&format!("/api/memory/confirm/{}", source_id), &req)
+        let resp: responses::ConfirmResponse = client
+            .post_json(&format!("/api/memory/confirm/{}", encoded_id), &req)
             .await?;
+        if !resp.updated {
+            return Err(format!("memory {} not found", source_id));
+        }
     } else {
         let req = requests::SetStabilityRequest { stability };
-        let _resp: responses::SuccessResponse = s
-            .client
-            .put_json(&format!("/api/memory/{}/stability", source_id), &req)
+        let _resp: responses::SuccessResponse = client
+            .put_json(&format!("/api/memory/{}/stability", encoded_id), &req)
             .await?;
     }
     Ok(())
-}
-
-#[tauri::command]
-pub async fn list_memories(
-    state: tauri::State<'_, State>,
-    req: ListMemoriesRequest,
-) -> Result<Vec<IndexedFileInfo>, String> {
-    let s = state.read().await;
-    let daemon_req = requests::ListMemoriesRequest {
-        memory_type: req.memory_type,
-        space: req.domain,
-        limit: req.limit.unwrap_or(100),
-        confirmed: None,
-    };
-    let resp: responses::ListMemoriesResponse =
-        s.client.post_json("/api/memory/list", &daemon_req).await?;
-    Ok(resp.memories)
 }
 
 #[tauri::command]
@@ -1122,10 +1082,12 @@ pub async fn delete_memory(
     state: tauri::State<'_, State>,
     source_id: String,
 ) -> Result<(), String> {
-    let s = state.read().await;
-    let _resp: responses::DeleteResponse = s
-        .client
-        .delete_path(&format!("/api/memory/delete/{}", source_id))
+    let client = daemon_client(&state).await;
+    let _resp: responses::DeleteResponse = client
+        .delete_path(&format!(
+            "/api/memory/delete/{}",
+            percent_encode_path_segment(&source_id)
+        ))
         .await?;
     Ok(())
 }
@@ -1136,11 +1098,16 @@ pub async fn reclassify_memory_cmd(
     source_id: String,
     memory_type: String,
 ) -> Result<String, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::ReclassifyMemoryRequest { memory_type };
-    let resp: responses::ReclassifyMemoryResponse = s
-        .client
-        .post_json(&format!("/api/memory/reclassify/{}", source_id), &req)
+    let resp: responses::ReclassifyMemoryResponse = client
+        .post_json(
+            &format!(
+                "/api/memory/reclassify/{}",
+                percent_encode_path_segment(&source_id)
+            ),
+            &req,
+        )
         .await?;
     Ok(resp.memory_type)
 }
@@ -1155,7 +1122,7 @@ pub async fn list_memories_cmd(
     confirmed: Option<bool>,
     limit: Option<usize>,
 ) -> Result<Vec<MemoryItem>, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let daemon_req = requests::ListMemoriesRequest {
         memory_type,
         space: domain,
@@ -1163,7 +1130,7 @@ pub async fn list_memories_cmd(
         confirmed,
     };
     let resp: responses::ListMemoriesResponse =
-        s.client.post_json("/api/memory/list", &daemon_req).await?;
+        client.post_json("/api/memory/list", &daemon_req).await?;
 
     // The daemon returns IndexedFileInfo; the UI expects MemoryItem. Most
     // fields overlap; extras like entity_id and quality aren't surfaced by
@@ -1224,7 +1191,10 @@ async fn get_memory_detail_response(
     source_id: &str,
 ) -> Result<Option<MemoryItem>, String> {
     let response: Option<responses::MemoryDetailResponse> = client
-        .get_optional_json(&format!("/api/memory/{}/detail", source_id))
+        .get_optional_json(&format!(
+            "/api/memory/{}/detail",
+            percent_encode_path_segment(source_id)
+        ))
         .await?;
     Ok(response.and_then(|response| response.memory))
 }
@@ -1262,7 +1232,11 @@ pub async fn list_memories_by_ids(
         return Ok(vec![]);
     }
     let client = state.read().await.client.clone();
-    let ids_param = ids.join(",");
+    let ids_param = ids
+        .iter()
+        .map(|id| percent_encode_path_segment(id))
+        .collect::<Vec<_>>()
+        .join(",");
     let resp: responses::PinnedMemoriesResponse = client
         .get_json(&format!("/api/memory/by-ids?ids={}", ids_param))
         .await?;
@@ -1271,15 +1245,15 @@ pub async fn list_memories_by_ids(
 
 #[tauri::command]
 pub async fn get_memory_stats_cmd(state: tauri::State<'_, State>) -> Result<MemoryStats, String> {
-    let s = state.read().await;
-    let resp: responses::MemoryStatsResponse = s.client.get_json("/api/memory/stats").await?;
+    let client = daemon_client(&state).await;
+    let resp: responses::MemoryStatsResponse = client.get_json("/api/memory/stats").await?;
     Ok(resp.stats)
 }
 
 #[tauri::command]
 pub async fn get_home_stats(state: tauri::State<'_, State>) -> Result<HomeStats, String> {
-    let s = state.read().await;
-    s.client.get_json::<HomeStats>("/api/home-stats").await
+    let client = daemon_client(&state).await;
+    client.get_json::<HomeStats>("/api/home-stats").await
 }
 
 #[tauri::command]
@@ -1291,16 +1265,21 @@ pub async fn update_memory_cmd(
     confirmed: Option<bool>,
     memory_type: Option<String>,
 ) -> Result<(), String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::UpdateMemoryRequest {
         content,
         space: domain,
         confirmed,
         memory_type,
     };
-    let _resp: responses::SuccessResponse = s
-        .client
-        .put_json(&format!("/api/memory/{}/update", source_id), &req)
+    let _resp: responses::SuccessResponse = client
+        .put_json(
+            &format!(
+                "/api/memory/{}/update",
+                percent_encode_path_segment(&source_id)
+            ),
+            &req,
+        )
         .await?;
     Ok(())
 }
@@ -1310,10 +1289,12 @@ pub async fn get_version_chain_cmd(
     state: tauri::State<'_, State>,
     source_id: String,
 ) -> Result<Vec<MemoryVersionItem>, String> {
-    let s = state.read().await;
-    let resp: responses::VersionChainResponse = s
-        .client
-        .get_json(&format!("/api/memory/{}/versions", source_id))
+    let client = daemon_client(&state).await;
+    let resp: responses::VersionChainResponse = client
+        .get_json(&format!(
+            "/api/memory/{}/versions",
+            percent_encode_path_segment(&source_id)
+        ))
         .await?;
     Ok(resp.versions)
 }
@@ -1324,8 +1305,8 @@ pub async fn get_version_chain_cmd(
 pub async fn list_indexed_files(
     state: tauri::State<'_, State>,
 ) -> Result<Vec<IndexedFileInfo>, String> {
-    let s = state.read().await;
-    let resp: responses::IndexedFilesResponse = s.client.get_json("/api/indexed-files").await?;
+    let client = daemon_client(&state).await;
+    let resp: responses::IndexedFilesResponse = client.get_json("/api/indexed-files").await?;
     Ok(resp.files)
 }
 
@@ -1335,10 +1316,12 @@ pub async fn get_chunks(
     _source: String,
     source_id: String,
 ) -> Result<Vec<MemoryDetail>, String> {
-    let s = state.read().await;
-    let chunks: Vec<MemoryDetail> = s
-        .client
-        .get_json(&format!("/api/chunks/{}", source_id))
+    let client = daemon_client(&state).await;
+    let chunks: Vec<MemoryDetail> = client
+        .get_json(&format!(
+            "/api/chunks/{}",
+            percent_encode_path_segment(&source_id)
+        ))
         .await?;
     Ok(chunks)
 }
@@ -1349,11 +1332,13 @@ pub async fn update_chunk(
     id: String,
     content: String,
 ) -> Result<(), String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::UpdateChunkRequest { content };
-    let _resp: responses::SuccessResponse = s
-        .client
-        .put_json(&format!("/api/chunks/{}/update", id), &req)
+    let _resp: responses::SuccessResponse = client
+        .put_json(
+            &format!("/api/chunks/{}/update", percent_encode_path_segment(&id)),
+            &req,
+        )
         .await?;
     Ok(())
 }
@@ -1364,10 +1349,13 @@ pub async fn delete_file_chunks(
     source: String,
     source_id: String,
 ) -> Result<(), String> {
-    let s = state.read().await;
-    let _resp: responses::DeleteResponse = s
-        .client
-        .delete_path(&format!("/api/documents/{}/{}", source, source_id))
+    let client = daemon_client(&state).await;
+    let _resp: responses::DeleteResponse = client
+        .delete_path(&format!(
+            "/api/documents/{}/{}",
+            percent_encode_path_segment(&source),
+            percent_encode_path_segment(&source_id)
+        ))
         .await?;
     Ok(())
 }
@@ -1385,10 +1373,10 @@ pub async fn delete_by_time_range(
             .retain(|a| !(a.started_at <= end && a.ended_at >= start));
         s.save_all_activities();
     }
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::DeleteByTimeRangeRequest { start, end };
     let _resp: responses::DeleteCountResponse =
-        s.client.delete_json("/api/chunks/time-range", &req).await?;
+        client.delete_json("/api/chunks/time-range", &req).await?;
     Ok(())
 }
 
@@ -1403,7 +1391,7 @@ pub async fn delete_bulk(
     state: tauri::State<'_, State>,
     items: Vec<BulkDeleteItem>,
 ) -> Result<(), String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::BulkDeleteRequest {
         items: items
             .into_iter()
@@ -1414,7 +1402,7 @@ pub async fn delete_bulk(
             .collect(),
     };
     let _resp: responses::DeleteCountResponse =
-        s.client.post_json("/api/chunks/delete-bulk", &req).await?;
+        client.post_json("/api/chunks/delete-bulk", &req).await?;
     Ok(())
 }
 
@@ -1450,7 +1438,7 @@ pub async fn quick_capture(
         metadata.insert("domain".to_string(), d.clone());
     }
 
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let ingest_req = requests::IngestMemoryRequest {
         source: "manual".to_string(),
         source_id: source_id.clone(),
@@ -1460,53 +1448,8 @@ pub async fn quick_capture(
         tags: req.tags,
         metadata: Some(metadata),
     };
-    let resp: responses::IngestResponse = s
-        .client
-        .post_json("/api/ingest/memory", &ingest_req)
-        .await?;
-    Ok(resp.chunks_created)
-}
-
-#[tauri::command]
-pub async fn ingest_clipboard(
-    state: tauri::State<'_, State>,
-    content: String,
-) -> Result<usize, String> {
-    let trimmed = content.trim();
-    if trimmed.len() < 4 {
-        return Ok(0);
-    }
-
-    // Generate deterministic source_id from content hash
-    let hash = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        content.hash(&mut hasher);
-        format!("{:x}", hasher.finish())
-    };
-    let source_id = format!("clipboard_{}", &hash[..12.min(hash.len())]);
-
-    let title = {
-        let first_line = trimmed.lines().next().unwrap_or("Clipboard");
-        if first_line.chars().count() > 60 {
-            format!("{}...", first_line.chars().take(60).collect::<String>())
-        } else {
-            first_line.to_string()
-        }
-    };
-
-    let s = state.read().await;
-    let ingest_req = requests::IngestTextRequest {
-        source: "clipboard".to_string(),
-        source_id,
-        title,
-        content,
-        url: None,
-        metadata: None,
-    };
     let resp: responses::IngestResponse =
-        s.client.post_json("/api/ingest/text", &ingest_req).await?;
+        client.post_json("/api/ingest/memory", &ingest_req).await?;
     Ok(resp.chunks_created)
 }
 
@@ -1518,7 +1461,7 @@ pub async fn import_memories_cmd(
     content: String,
     _label: Option<String>,
 ) -> Result<responses::ImportMemoriesResponse, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::ImportMemoriesRequest {
         source,
         content,
@@ -1526,7 +1469,7 @@ pub async fn import_memories_cmd(
         space: Default::default(),
     };
     let result: responses::ImportMemoriesResponse =
-        s.client.post_json("/api/import/memories", &req).await?;
+        client.post_json("/api/import/memories", &req).await?;
 
     // Emit event for UI refresh
     use tauri::Emitter;
@@ -1540,16 +1483,16 @@ pub async fn import_chat_export(
     state: tauri::State<'_, State>,
     path: String,
 ) -> Result<wenlan_types::import::ImportChatExportResponse, String> {
-    let s = state.read().await;
-    s.client.import_chat_export(&path).await
+    let client = daemon_client(&state).await;
+    client.import_chat_export(&path).await
 }
 
 #[tauri::command]
 pub async fn list_pending_imports(
     state: tauri::State<'_, State>,
 ) -> Result<Vec<wenlan_types::import::PendingImport>, String> {
-    let s = state.read().await;
-    s.client.list_pending_imports().await
+    let client = daemon_client(&state).await;
+    client.list_pending_imports().await
 }
 
 // ── Onboarding milestones ───────────────────────────────────────────
@@ -1618,7 +1561,7 @@ pub async fn create_entity_cmd(
     entity_type: String,
     domain: Option<String>,
 ) -> Result<String, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::CreateEntityRequest {
         name,
         entity_type,
@@ -1627,7 +1570,7 @@ pub async fn create_entity_cmd(
         confidence: None,
     };
     let resp: responses::CreateEntityResponse =
-        s.client.post_json("/api/memory/entities", &req).await?;
+        client.post_json("/api/memory/entities", &req).await?;
     Ok(resp.id)
 }
 
@@ -1637,15 +1580,13 @@ pub async fn list_entities_cmd(
     entity_type: Option<String>,
     domain: Option<String>,
 ) -> Result<Vec<Entity>, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::ListEntitiesRequest {
         entity_type,
         space: domain,
     };
-    let resp: responses::ListEntitiesResponse = s
-        .client
-        .post_json("/api/memory/entities/list", &req)
-        .await?;
+    let resp: responses::ListEntitiesResponse =
+        client.post_json("/api/memory/entities/list", &req).await?;
     Ok(resp.entities)
 }
 
@@ -1655,13 +1596,12 @@ pub async fn search_entities_cmd(
     query: String,
     limit: Option<usize>,
 ) -> Result<Vec<EntitySearchResult>, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::SearchEntitiesRequest {
         query,
         limit: limit.unwrap_or(20),
     };
-    let resp: responses::SearchEntitiesResponse = s
-        .client
+    let resp: responses::SearchEntitiesResponse = client
         .post_json("/api/memory/entities/search", &req)
         .await?;
     Ok(resp.results)
@@ -1672,9 +1612,12 @@ pub async fn get_entity_detail_cmd(
     state: tauri::State<'_, State>,
     entity_id: String,
 ) -> Result<EntityDetail, String> {
-    let s = state.read().await;
-    s.client
-        .get_json(&format!("/api/memory/entities/{}", entity_id))
+    let client = daemon_client(&state).await;
+    client
+        .get_json(&format!(
+            "/api/memory/entities/{}",
+            percent_encode_path_segment(&entity_id)
+        ))
         .await
 }
 
@@ -1688,8 +1631,8 @@ pub async fn get_entity_detail_cmd(
 pub async fn get_knowledge_graph_cmd(
     state: tauri::State<'_, State>,
 ) -> Result<KnowledgeGraphResponse, String> {
-    let s = state.read().await;
-    s.client.get_json("/api/memory/graph").await
+    let client = daemon_client(&state).await;
+    client.get_json("/api/memory/graph").await
 }
 
 #[tauri::command]
@@ -1698,12 +1641,14 @@ pub async fn update_observation_cmd(
     observation_id: String,
     content: String,
 ) -> Result<(), String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::UpdateObservationRequest { content };
-    let _resp: responses::SuccessResponse = s
-        .client
+    let _resp: responses::SuccessResponse = client
         .put_json(
-            &format!("/api/memory/observations/{}", observation_id),
+            &format!(
+                "/api/memory/observations/{}",
+                percent_encode_path_segment(&observation_id)
+            ),
             &req,
         )
         .await?;
@@ -1715,10 +1660,12 @@ pub async fn delete_observation_cmd(
     state: tauri::State<'_, State>,
     observation_id: String,
 ) -> Result<(), String> {
-    let s = state.read().await;
-    let _resp: responses::SuccessResponse = s
-        .client
-        .delete_path(&format!("/api/memory/observations/{}", observation_id))
+    let client = daemon_client(&state).await;
+    let _resp: responses::SuccessResponse = client
+        .delete_path(&format!(
+            "/api/memory/observations/{}",
+            percent_encode_path_segment(&observation_id)
+        ))
         .await?;
     Ok(())
 }
@@ -1728,10 +1675,12 @@ pub async fn delete_entity_cmd(
     state: tauri::State<'_, State>,
     entity_id: String,
 ) -> Result<(), String> {
-    let s = state.read().await;
-    let _resp: responses::SuccessResponse = s
-        .client
-        .delete_path(&format!("/api/memory/entities/{}/delete", entity_id))
+    let client = daemon_client(&state).await;
+    let _resp: responses::SuccessResponse = client
+        .delete_path(&format!(
+            "/api/memory/entities/{}/delete",
+            percent_encode_path_segment(&entity_id)
+        ))
         .await?;
     Ok(())
 }
@@ -1742,11 +1691,16 @@ pub async fn confirm_entity_cmd(
     entity_id: String,
     confirmed: bool,
 ) -> Result<(), String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::ConfirmEntityRequest { confirmed };
-    let _resp: responses::SuccessResponse = s
-        .client
-        .put_json(&format!("/api/memory/entities/{}/confirm", entity_id), &req)
+    let _resp: responses::SuccessResponse = client
+        .put_json(
+            &format!(
+                "/api/memory/entities/{}/confirm",
+                percent_encode_path_segment(&entity_id)
+            ),
+            &req,
+        )
         .await?;
     Ok(())
 }
@@ -1757,12 +1711,14 @@ pub async fn confirm_observation_cmd(
     observation_id: String,
     confirmed: bool,
 ) -> Result<(), String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::ConfirmObservationRequest { confirmed };
-    let _resp: responses::SuccessResponse = s
-        .client
+    let _resp: responses::SuccessResponse = client
         .put_json(
-            &format!("/api/memory/observations/{}/confirm", observation_id),
+            &format!(
+                "/api/memory/observations/{}/confirm",
+                percent_encode_path_segment(&observation_id)
+            ),
             &req,
         )
         .await?;
@@ -1777,7 +1733,7 @@ pub async fn add_observation_cmd(
     source_agent: Option<String>,
     confidence: Option<f32>,
 ) -> Result<String, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::AddObservationRequest {
         entity_id,
         content,
@@ -1785,7 +1741,7 @@ pub async fn add_observation_cmd(
         confidence,
     };
     let resp: responses::AddObservationResponse =
-        s.client.post_json("/api/memory/observations", &req).await?;
+        client.post_json("/api/memory/observations", &req).await?;
     Ok(resp.id)
 }
 
@@ -1793,9 +1749,8 @@ pub async fn add_observation_cmd(
 
 #[tauri::command]
 pub async fn get_profile(state: tauri::State<'_, State>) -> Result<Option<Profile>, String> {
-    let s = state.read().await;
-    match s
-        .client
+    let client = daemon_client(&state).await;
+    match client
         .get_json::<responses::ProfileResponse>("/api/profile")
         .await
     {
@@ -1823,7 +1778,7 @@ pub async fn update_profile(
     bio: Option<String>,
     avatar_path: Option<String>,
 ) -> Result<(), String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::UpdateProfileRequest {
         name,
         display_name,
@@ -1831,14 +1786,14 @@ pub async fn update_profile(
         bio,
         avatar_path,
     };
-    let _resp: responses::ProfileResponse = s.client.put_json("/api/profile", &req).await?;
+    let _resp: responses::ProfileResponse = client.put_json("/api/profile", &req).await?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn list_agents(state: tauri::State<'_, State>) -> Result<Vec<AgentConnection>, String> {
-    let s = state.read().await;
-    let agents: Vec<responses::AgentResponse> = s.client.get_json("/api/agents").await?;
+    let client = daemon_client(&state).await;
+    let agents: Vec<responses::AgentResponse> = client.get_json("/api/agents").await?;
     Ok(agents
         .into_iter()
         .map(|a| AgentConnection {
@@ -1862,10 +1817,12 @@ pub async fn get_agent(
     state: tauri::State<'_, State>,
     name: String,
 ) -> Result<Option<AgentConnection>, String> {
-    let s = state.read().await;
-    match s
-        .client
-        .get_json::<responses::AgentResponse>(&format!("/api/agents/{}", name))
+    let client = daemon_client(&state).await;
+    match client
+        .get_json::<responses::AgentResponse>(&format!(
+            "/api/agents/{}",
+            percent_encode_path_segment(&name)
+        ))
         .await
     {
         Ok(a) => Ok(Some(AgentConnection {
@@ -1895,7 +1852,7 @@ pub async fn update_agent(
     trust_level: Option<String>,
     display_name: Option<String>,
 ) -> Result<(), String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::UpdateAgentRequest {
         agent_type,
         description,
@@ -1903,9 +1860,11 @@ pub async fn update_agent(
         trust_level,
         display_name,
     };
-    let _resp: responses::AgentResponse = s
-        .client
-        .put_json(&format!("/api/agents/{}", name), &req)
+    let _resp: responses::AgentResponse = client
+        .put_json(
+            &format!("/api/agents/{}", percent_encode_path_segment(&name)),
+            &req,
+        )
         .await?;
     Ok(())
 }
@@ -1919,13 +1878,18 @@ async fn delete_agent_response(
     client: &crate::api::WenlanClient,
     name: &str,
 ) -> Result<DeleteAgentResponse, String> {
-    client.delete_path(&format!("/api/agents/{}", name)).await
+    client
+        .delete_path(&format!(
+            "/api/agents/{}",
+            percent_encode_path_segment(name)
+        ))
+        .await
 }
 
 #[tauri::command]
 pub async fn delete_agent(state: tauri::State<'_, State>, name: String) -> Result<(), String> {
-    let s = state.read().await;
-    let DeleteAgentResponse { deleted: _deleted } = delete_agent_response(&s.client, &name).await?;
+    let client = daemon_client(&state).await;
+    let DeleteAgentResponse { deleted: _deleted } = delete_agent_response(&client, &name).await?;
     Ok(())
 }
 
@@ -1996,7 +1960,7 @@ pub async fn set_avatar(
     let dest_str = dest.to_string_lossy().to_string();
 
     // Update profile via daemon
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::UpdateProfileRequest {
         name: None,
         display_name: None,
@@ -2004,16 +1968,15 @@ pub async fn set_avatar(
         bio: None,
         avatar_path: Some(dest_str.clone()),
     };
-    let _resp: responses::ProfileResponse = s.client.put_json("/api/profile", &req).await?;
+    let _resp: responses::ProfileResponse = client.put_json("/api/profile", &req).await?;
 
     Ok(dest_str)
 }
 
 #[tauri::command]
 pub async fn get_avatar_data_url(state: tauri::State<'_, State>) -> Result<Option<String>, String> {
-    let s = state.read().await;
-    let profile = match s
-        .client
+    let client = daemon_client(&state).await;
+    let profile = match client
         .get_json::<responses::ProfileResponse>("/api/profile")
         .await
     {
@@ -2046,9 +2009,8 @@ pub async fn get_avatar_data_url(state: tauri::State<'_, State>) -> Result<Optio
 
 #[tauri::command]
 pub async fn remove_avatar(state: tauri::State<'_, State>) -> Result<(), String> {
-    let s = state.read().await;
-    let profile = match s
-        .client
+    let client = daemon_client(&state).await;
+    let profile = match client
         .get_json::<responses::ProfileResponse>("/api/profile")
         .await
     {
@@ -2067,7 +2029,7 @@ pub async fn remove_avatar(state: tauri::State<'_, State>) -> Result<(), String>
         bio: None,
         avatar_path: Some(String::new()),
     };
-    let _resp: responses::ProfileResponse = s.client.put_json("/api/profile", &req).await?;
+    let _resp: responses::ProfileResponse = client.put_json("/api/profile", &req).await?;
     Ok(())
 }
 
@@ -2075,20 +2037,24 @@ pub async fn remove_avatar(state: tauri::State<'_, State>) -> Result<(), String>
 
 #[tauri::command]
 pub async fn pin_memory(state: tauri::State<'_, State>, source_id: String) -> Result<(), String> {
-    let s = state.read().await;
-    let _resp: responses::SuccessResponse = s
-        .client
-        .post_empty(&format!("/api/memory/{}/pin", source_id))
+    let client = daemon_client(&state).await;
+    let _resp: responses::SuccessResponse = client
+        .post_empty(&format!(
+            "/api/memory/{}/pin",
+            percent_encode_path_segment(&source_id)
+        ))
         .await?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn unpin_memory(state: tauri::State<'_, State>, source_id: String) -> Result<(), String> {
-    let s = state.read().await;
-    let _resp: responses::SuccessResponse = s
-        .client
-        .post_empty(&format!("/api/memory/{}/unpin", source_id))
+    let client = daemon_client(&state).await;
+    let _resp: responses::SuccessResponse = client
+        .post_empty(&format!(
+            "/api/memory/{}/unpin",
+            percent_encode_path_segment(&source_id)
+        ))
         .await?;
     Ok(())
 }
@@ -2097,8 +2063,8 @@ pub async fn unpin_memory(state: tauri::State<'_, State>, source_id: String) -> 
 pub async fn list_pinned_memories(
     state: tauri::State<'_, State>,
 ) -> Result<Vec<MemoryItem>, String> {
-    let s = state.read().await;
-    let resp: responses::PinnedMemoriesResponse = s.client.get_json("/api/memory/pinned").await?;
+    let client = daemon_client(&state).await;
+    let resp: responses::PinnedMemoriesResponse = client.get_json("/api/memory/pinned").await?;
     Ok(resp.memories)
 }
 
@@ -2109,9 +2075,12 @@ pub async fn accept_pending_revision(
     state: tauri::State<'_, State>,
     source_id: String,
 ) -> Result<responses::RevisionAcceptResponse, String> {
-    let s = state.read().await;
-    s.client
-        .post_empty(&format!("/api/memory/revision/{}/accept", source_id))
+    let client = daemon_client(&state).await;
+    client
+        .post_empty(&format!(
+            "/api/memory/revision/{}/accept",
+            percent_encode_path_segment(&source_id)
+        ))
         .await
 }
 
@@ -2120,9 +2089,12 @@ pub async fn dismiss_pending_revision(
     state: tauri::State<'_, State>,
     source_id: String,
 ) -> Result<responses::RevisionDismissResponse, String> {
-    let s = state.read().await;
-    s.client
-        .post_empty(&format!("/api/memory/revision/{}/dismiss", source_id))
+    let client = daemon_client(&state).await;
+    client
+        .post_empty(&format!(
+            "/api/memory/revision/{}/dismiss",
+            percent_encode_path_segment(&source_id)
+        ))
         .await
 }
 
@@ -2133,9 +2105,12 @@ pub async fn dismiss_contradiction(
     state: tauri::State<'_, State>,
     source_id: String,
 ) -> Result<responses::ContradictionDismissResponse, String> {
-    let s = state.read().await;
-    s.client
-        .post_empty(&format!("/api/memory/contradiction/{}/dismiss", source_id))
+    let client = daemon_client(&state).await;
+    client
+        .post_empty(&format!(
+            "/api/memory/contradiction/{}/dismiss",
+            percent_encode_path_segment(&source_id)
+        ))
         .await
 }
 
@@ -2182,10 +2157,12 @@ pub async fn get_pending_revision(
     state: tauri::State<'_, State>,
     source_id: String,
 ) -> Result<Option<PendingRevision>, String> {
-    let s = state.read().await;
-    let revision: Option<PendingRevision> = s
-        .client
-        .get_json(&format!("/api/memory/pending-revision/{}", source_id))
+    let client = daemon_client(&state).await;
+    let revision: Option<PendingRevision> = client
+        .get_json(&format!(
+            "/api/memory/pending-revision/{}",
+            percent_encode_path_segment(&source_id)
+        ))
         .await?;
     Ok(revision)
 }
@@ -2195,20 +2172,20 @@ pub async fn list_pending_revisions(
     state: tauri::State<'_, State>,
     limit: Option<usize>,
 ) -> Result<Vec<responses::PendingRevisionItem>, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let path = match limit {
         Some(limit) => format!("/api/memory/pending-revisions?limit={limit}"),
         None => "/api/memory/pending-revisions".to_string(),
     };
-    s.client.get_json(&path).await
+    client.get_json(&path).await
 }
 
 // ── Briefing / narrative ──────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn get_briefing(state: tauri::State<'_, State>) -> Result<BriefingResponse, String> {
-    let s = state.read().await;
-    let resp: BriefingResponse = s.client.get_json("/api/briefing").await?;
+    let client = daemon_client(&state).await;
+    let resp: BriefingResponse = client.get_json("/api/briefing").await?;
     Ok(resp)
 }
 
@@ -2223,8 +2200,8 @@ pub async fn get_pending_contradictions(
 pub async fn get_profile_narrative(
     state: tauri::State<'_, State>,
 ) -> Result<NarrativeResponse, String> {
-    let s = state.read().await;
-    let resp: NarrativeResponse = s.client.get_json("/api/profile/narrative").await?;
+    let client = daemon_client(&state).await;
+    let resp: NarrativeResponse = client.get_json("/api/profile/narrative").await?;
     Ok(resp)
 }
 
@@ -2232,9 +2209,8 @@ pub async fn get_profile_narrative(
 pub async fn regenerate_narrative(
     state: tauri::State<'_, State>,
 ) -> Result<NarrativeResponse, String> {
-    let s = state.read().await;
-    let resp: NarrativeResponse = s
-        .client
+    let client = daemon_client(&state).await;
+    let resp: NarrativeResponse = client
         .post_empty("/api/profile/narrative/regenerate")
         .await?;
     Ok(resp)
@@ -2249,15 +2225,18 @@ pub async fn list_agent_activity(
     agent_name: Option<String>,
     since: Option<i64>,
 ) -> Result<Vec<AgentActivityRow>, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let mut path = format!("/api/activities?limit={}", limit.unwrap_or(50));
     if let Some(name) = agent_name {
-        path.push_str(&format!("&agent_name={}", name));
+        path.push_str(&format!(
+            "&agent_name={}",
+            percent_encode_path_segment(&name)
+        ));
     }
     if let Some(since_val) = since {
         path.push_str(&format!("&since={}", since_val));
     }
-    let resp: responses::ActivityResponse = s.client.get_json(&path).await?;
+    let resp: responses::ActivityResponse = client.get_json(&path).await?;
     Ok(resp.activities)
 }
 
@@ -2265,8 +2244,8 @@ pub async fn list_agent_activity(
 
 #[tauri::command]
 pub async fn list_spaces(state: tauri::State<'_, State>) -> Result<Vec<Space>, String> {
-    let s = state.read().await;
-    s.client.get_json("/api/spaces").await
+    let client = daemon_client(&state).await;
+    client.get_json("/api/spaces").await
 }
 
 #[tauri::command]
@@ -2275,8 +2254,8 @@ pub async fn get_space(
     name: String,
 ) -> Result<Option<Space>, String> {
     // No direct get-by-name endpoint, but we can list and filter
-    let s = state.read().await;
-    let spaces: Vec<Space> = s.client.get_json("/api/spaces").await?;
+    let client = daemon_client(&state).await;
+    let spaces: Vec<Space> = client.get_json("/api/spaces").await?;
     Ok(spaces.into_iter().find(|sp| sp.name == name))
 }
 
@@ -2294,7 +2273,12 @@ async fn delete_space_response(
     client: &crate::api::WenlanClient,
     name: &str,
 ) -> Result<DeleteSpaceResponse, String> {
-    client.delete_path(&format!("/api/spaces/{}", name)).await
+    client
+        .delete_path(&format!(
+            "/api/spaces/{}",
+            percent_encode_path_segment(name)
+        ))
+        .await
 }
 
 async fn toggle_space_starred_response(
@@ -2302,7 +2286,10 @@ async fn toggle_space_starred_response(
     name: &str,
 ) -> Result<ToggleSpaceStarredResponse, String> {
     client
-        .post_empty(&format!("/api/spaces/{}/star", name))
+        .post_empty(&format!(
+            "/api/spaces/{}/star",
+            percent_encode_path_segment(name)
+        ))
         .await
 }
 
@@ -2312,9 +2299,9 @@ pub async fn create_space(
     name: String,
     description: Option<String>,
 ) -> Result<Space, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::CreateSpaceRequest { name, description };
-    s.client.post_json("/api/spaces", &req).await
+    client.post_json("/api/spaces", &req).await
 }
 
 #[tauri::command]
@@ -2324,13 +2311,16 @@ pub async fn update_space(
     new_name: String,
     description: Option<String>,
 ) -> Result<Space, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::UpdateSpaceRequest {
         new_name: Some(new_name),
         description,
     };
-    s.client
-        .put_json(&format!("/api/spaces/{}", name), &req)
+    client
+        .put_json(
+            &format!("/api/spaces/{}", percent_encode_path_segment(&name)),
+            &req,
+        )
         .await
 }
 
@@ -2359,10 +2349,12 @@ pub async fn move_space(
 
 #[tauri::command]
 pub async fn confirm_space(state: tauri::State<'_, State>, name: String) -> Result<(), String> {
-    let s = state.read().await;
-    let _resp: responses::SuccessResponse = s
-        .client
-        .post_empty(&format!("/api/spaces/{}/confirm", name))
+    let client = daemon_client(&state).await;
+    let _resp: responses::SuccessResponse = client
+        .post_empty(&format!(
+            "/api/spaces/{}/confirm",
+            percent_encode_path_segment(&name)
+        ))
         .await?;
     Ok(())
 }
@@ -2373,9 +2365,9 @@ pub async fn reorder_space(
     name: String,
     new_order: i64,
 ) -> Result<(), String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::ReorderSpaceRequest { name, new_order };
-    let _resp: responses::SuccessResponse = s.client.post_json("/api/spaces/reorder", &req).await?;
+    let _resp: responses::SuccessResponse = client.post_json("/api/spaces/reorder", &req).await?;
     Ok(())
 }
 
@@ -2400,68 +2392,18 @@ pub async fn set_document_space(
     source_id: String,
     space_id: String,
 ) -> Result<(), String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::SetDocumentSpaceRequest {
         space_name: space_id,
     };
-    let _resp: responses::SuccessResponse = s
-        .client
-        .post_json(&format!("/api/documents/{}/space", source_id), &req)
-        .await?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn add_space(
-    state: tauri::State<'_, State>,
-    name: String,
-    _icon: String,
-    _color: String,
-) -> Result<(), String> {
-    let s = state.read().await;
-    let req = requests::CreateSpaceRequest {
-        name,
-        description: None,
-    };
-    let _space: Space = s.client.post_json("/api/spaces", &req).await?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn remove_space(state: tauri::State<'_, State>, space_id: String) -> Result<(), String> {
-    let client = {
-        let s = state.read().await;
-        s.client.clone()
-    };
-    let DeleteSpaceResponse { deleted: _deleted } =
-        delete_space_response(&client, &space_id).await?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn rename_space(
-    state: tauri::State<'_, State>,
-    space_id: String,
-    new_name: String,
-) -> Result<(), String> {
-    let s = state.read().await;
-    let req = requests::UpdateSpaceRequest {
-        new_name: Some(new_name),
-        description: None,
-    };
-    let _space: Space = s
-        .client
-        .put_json(&format!("/api/spaces/{}", space_id), &req)
-        .await?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn pin_space(state: tauri::State<'_, State>, space_id: String) -> Result<(), String> {
-    let s = state.read().await;
-    let _resp: responses::SuccessResponse = s
-        .client
-        .post_empty(&format!("/api/spaces/{}/pin", space_id))
+    let _resp: responses::SuccessResponse = client
+        .post_json(
+            &format!(
+                "/api/documents/{}/space",
+                percent_encode_path_segment(&source_id)
+            ),
+            &req,
+        )
         .await?;
     Ok(())
 }
@@ -2498,14 +2440,6 @@ mod space_command_type_tests {
     async fn redistill_page_command_uses_typed_response(state: tauri::State<'_, State>) {
         let _: Result<crate::api::PageRedistillResponse, String> =
             redistill_page(state, "page_1".to_string()).await;
-    }
-
-    #[allow(dead_code)]
-    async fn legacy_space_aliases_keep_void_tauri_surface(state: tauri::State<'_, State>) {
-        let _: Result<(), String> =
-            add_space(state.clone(), String::new(), String::new(), String::new()).await;
-        let _: Result<(), String> = remove_space(state.clone(), String::new()).await;
-        let _: Result<(), String> = rename_space(state, String::new(), String::new()).await;
     }
 
     #[test]
@@ -2569,7 +2503,13 @@ pub async fn set_document_tags(
     let client = state.read().await.client.clone();
     let req = SetDocumentTagsRequest { source, tags };
     let resp: responses::TagsResponse = client
-        .put_json(&format!("/api/documents/{}/tags", source_id), &req)
+        .put_json(
+            &format!(
+                "/api/documents/{}/tags",
+                percent_encode_path_segment(&source_id)
+            ),
+            &req,
+        )
         .await?;
     Ok(resp.tags)
 }
@@ -2577,8 +2517,9 @@ pub async fn set_document_tags(
 #[tauri::command]
 pub async fn delete_tag(state: tauri::State<'_, State>, name: String) -> Result<(), String> {
     let client = state.read().await.client.clone();
-    let _resp: responses::SuccessResponse =
-        client.delete_path(&format!("/api/tags/{}", name)).await?;
+    let _resp: responses::SuccessResponse = client
+        .delete_path(&format!("/api/tags/{}", percent_encode_path_segment(&name)))
+        .await?;
     Ok(())
 }
 
@@ -2593,7 +2534,7 @@ pub async fn suggest_tags(
     // the read guard is dropped before the HTTP call. Holding a
     // `tokio::sync::RwLock` read guard across `.await` would block any
     // writer (config updates, sensor toggles, etc.) for the full
-    // duration of the round-trip. See CLAUDE.md "Async and locking".
+    // duration of the round-trip. See AGENTS.md "Repository invariants".
     //
     // Local signal: the app that was active at the document's timestamp.
     // Activities are tracked in-process by the Tauri app (the daemon has
@@ -2609,36 +2550,20 @@ pub async fn suggest_tags(
         (s.client.clone(), activity_app)
     }; // guard dropped here
 
-    // Build the query string with percent-encoded values. Using a
-    // minimal encoder — source/source_id are usually simple ASCII
-    // identifiers but may contain spaces or slashes, and the app name
-    // commonly has spaces. Matches RFC 3986 unreserved set.
+    // Build the query string with percent-encoded values —
+    // source/source_id are usually simple ASCII identifiers but may contain
+    // spaces or slashes, and the app name commonly has spaces.
     let mut path = String::from("/api/suggest-tags?source=");
-    path.push_str(&percent_encode(&source));
+    path.push_str(&percent_encode_path_segment(&source));
     path.push_str("&source_id=");
-    path.push_str(&percent_encode(&source_id));
+    path.push_str(&percent_encode_path_segment(&source_id));
     if let Some(ref app) = activity_app {
         path.push_str("&activity_app=");
-        path.push_str(&percent_encode(app));
+        path.push_str(&percent_encode_path_segment(app));
     }
 
     let resp: responses::TagsResponse = client.get_json(&path).await?;
     Ok(resp.tags)
-}
-
-/// Percent-encode a string for inclusion in a URL query parameter value.
-/// Encodes every byte that isn't in the RFC 3986 unreserved set
-/// (alphanumeric + `-._~`).
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{:02X}", b));
-        }
-    }
-    out
 }
 
 // ── Sessions ───────────────────────────────────────────────────────────
@@ -2648,9 +2573,9 @@ pub async fn get_session_snapshots(
     state: tauri::State<'_, State>,
     limit: Option<usize>,
 ) -> Result<Vec<wenlan_types::SessionSnapshot>, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let path = format!("/api/snapshots?limit={}", limit.unwrap_or(10));
-    s.client.get_json(&path).await
+    client.get_json(&path).await
 }
 
 #[tauri::command]
@@ -2658,9 +2583,12 @@ pub async fn get_snapshot_captures(
     state: tauri::State<'_, State>,
     snapshot_id: String,
 ) -> Result<Vec<wenlan_types::SnapshotCapture>, String> {
-    let s = state.read().await;
-    s.client
-        .get_json(&format!("/api/snapshots/{}/captures", snapshot_id))
+    let client = daemon_client(&state).await;
+    client
+        .get_json(&format!(
+            "/api/snapshots/{}/captures",
+            percent_encode_path_segment(&snapshot_id)
+        ))
         .await
 }
 
@@ -2669,11 +2597,11 @@ pub async fn get_snapshot_captures_with_content(
     state: tauri::State<'_, State>,
     snapshot_id: String,
 ) -> Result<Vec<wenlan_types::SnapshotCaptureWithContent>, String> {
-    let s = state.read().await;
-    s.client
+    let client = daemon_client(&state).await;
+    client
         .get_json(&format!(
             "/api/snapshots/{}/captures-with-content",
-            snapshot_id
+            percent_encode_path_segment(&snapshot_id)
         ))
         .await
 }
@@ -2683,10 +2611,12 @@ pub async fn delete_snapshot(
     state: tauri::State<'_, State>,
     snapshot_id: String,
 ) -> Result<(), String> {
-    let s = state.read().await;
-    let _resp: responses::SuccessResponse = s
-        .client
-        .post_empty(&format!("/api/snapshots/{}/delete", snapshot_id))
+    let client = daemon_client(&state).await;
+    let _resp: responses::SuccessResponse = client
+        .post_empty(&format!(
+            "/api/snapshots/{}/delete",
+            percent_encode_path_segment(&snapshot_id)
+        ))
         .await?;
     Ok(())
 }
@@ -2699,8 +2629,8 @@ pub async fn get_nurture_cards_cmd(
     _limit: Option<usize>,
     _domain: Option<String>,
 ) -> Result<Vec<MemoryItem>, String> {
-    let s = state.read().await;
-    let resp: responses::NurtureCardsResponse = s.client.get_json("/api/memory/nurture").await?;
+    let client = daemon_client(&state).await;
+    let resp: responses::NurtureCardsResponse = client.get_json("/api/memory/nurture").await?;
     Ok(resp.cards)
 }
 
@@ -2710,12 +2640,12 @@ pub async fn correct_memory_cmd(
     source_id: String,
     correction_prompt: String,
 ) -> Result<String, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let req = requests::CorrectMemoryRequest { correction_prompt };
     let CorrectMemoryResponse {
         corrected,
         source_id: _source_id,
-    } = correct_memory_response(&s.client, &source_id, &req).await?;
+    } = correct_memory_response(&client, &source_id, &req).await?;
     Ok(corrected)
 }
 
@@ -2731,7 +2661,13 @@ async fn correct_memory_response(
     req: &requests::CorrectMemoryRequest,
 ) -> Result<CorrectMemoryResponse, String> {
     client
-        .post_json(&format!("/api/memory/{}/correct", source_id), req)
+        .post_json(
+            &format!(
+                "/api/memory/{}/correct",
+                percent_encode_path_segment(source_id)
+            ),
+            req,
+        )
         .await
 }
 
@@ -2805,7 +2741,7 @@ pub async fn get_page(
     // rather than the previous silent `Err(_) => Ok(None)` which hid
     // wrapper/deserialization bugs behind a "not found" UI.
     match client
-        .get_json::<serde_json::Value>(&format!("/api/pages/{}", id))
+        .get_json::<serde_json::Value>(&format!("/api/pages/{}", percent_encode_path_segment(&id)))
         .await
     {
         Ok(wire) => Ok(page_from_wire(wire)),
@@ -2927,7 +2863,10 @@ async fn update_page_draft_response(
     request: DraftUpdateRequest,
 ) -> Result<serde_json::Value, String> {
     let response: DraftPageResponse = client
-        .put_json(&format!("/api/pages/drafts/{id}"), &request)
+        .put_json(
+            &format!("/api/pages/drafts/{}", percent_encode_path_segment(id)),
+            &request,
+        )
         .await?;
     Ok(response.page)
 }
@@ -2938,7 +2877,13 @@ async fn publish_page_draft_response(
     request: DraftVersionRequest,
 ) -> Result<serde_json::Value, String> {
     let response: DraftPageResponse = client
-        .post_json(&format!("/api/pages/drafts/{id}/publish"), &request)
+        .post_json(
+            &format!(
+                "/api/pages/drafts/{}/publish",
+                percent_encode_path_segment(id)
+            ),
+            &request,
+        )
         .await?;
     Ok(response.page)
 }
@@ -2949,7 +2894,10 @@ async fn discard_page_draft_response(
     request: DraftVersionRequest,
 ) -> Result<(), String> {
     let response: DraftDiscardResponse = client
-        .delete_json(&format!("/api/pages/drafts/{id}"), &request)
+        .delete_json(
+            &format!("/api/pages/drafts/{}", percent_encode_path_segment(id)),
+            &request,
+        )
         .await?;
     if response.status == "deleted" {
         Ok(())
@@ -3512,15 +3460,15 @@ pub async fn update_page(
 
 #[tauri::command]
 pub async fn archive_page(state: tauri::State<'_, State>, id: String) -> Result<(), String> {
-    let s = state.read().await;
-    let PageStatusResponse { status: _status } = archive_page_response(&s.client, &id).await?;
+    let client = daemon_client(&state).await;
+    let PageStatusResponse { status: _status } = archive_page_response(&client, &id).await?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn delete_page(state: tauri::State<'_, State>, id: String) -> Result<(), String> {
-    let s = state.read().await;
-    let PageStatusResponse { status: _status } = delete_page_response(&s.client, &id).await?;
+    let client = daemon_client(&state).await;
+    let PageStatusResponse { status: _status } = delete_page_response(&client, &id).await?;
     Ok(())
 }
 
@@ -3534,7 +3482,10 @@ async fn archive_page_response(
     id: &str,
 ) -> Result<PageStatusResponse, String> {
     client
-        .post_empty(&format!("/api/pages/{}/archive", id))
+        .post_empty(&format!(
+            "/api/pages/{}/archive",
+            percent_encode_path_segment(id)
+        ))
         .await
 }
 
@@ -3542,7 +3493,9 @@ async fn delete_page_response(
     client: &crate::api::WenlanClient,
     id: &str,
 ) -> Result<PageStatusResponse, String> {
-    client.delete_path(&format!("/api/pages/{}", id)).await
+    client
+        .delete_path(&format!("/api/pages/{}", percent_encode_path_segment(id)))
+        .await
 }
 
 #[cfg(test)]
@@ -3697,20 +3650,34 @@ mod search_response_type_tests {
         assert_eq!(results[0].source, "page");
         assert_eq!(results[0].source_id, "page_1");
     }
+}
 
-    #[test]
-    fn search_memory_results_include_supplemental_pages() {
-        let resp = responses::SearchMemoryResponse {
-            results: vec![search_result("memory", "mem_1")],
-            took_ms: 1.0,
-            supplemental_pages: Some(vec![search_result("page", "page_1")]),
-        };
-
-        let results = search_memory_results_from_response(resp);
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].source, "memory");
-        assert_eq!(results[1].source, "page");
+/// Build the `/api/pages` query string. Shared by `list_pages` and
+/// `list_pages_explicit_browse`, which differ only in the client verb they
+/// dispatch to.
+fn pages_query_path(
+    status: Option<String>,
+    domain: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> String {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(s) = status {
+        params.push(format!("status={}", percent_encode_path_segment(&s)));
+    }
+    if let Some(d) = domain {
+        params.push(format!("domain={}", percent_encode_path_segment(&d)));
+    }
+    if let Some(l) = limit {
+        params.push(format!("limit={}", l));
+    }
+    if let Some(o) = offset {
+        params.push(format!("offset={}", o));
+    }
+    if params.is_empty() {
+        "/api/pages".to_string()
+    } else {
+        format!("/api/pages?{}", params.join("&"))
     }
 }
 
@@ -3723,25 +3690,7 @@ pub async fn list_pages(
     offset: Option<usize>,
 ) -> Result<Vec<Page>, String> {
     let client = state.read().await.client.clone();
-    // Build query string from the filter params that were previously ignored.
-    let mut params: Vec<String> = Vec::new();
-    if let Some(s) = status {
-        params.push(format!("status={}", s));
-    }
-    if let Some(d) = domain {
-        params.push(format!("domain={}", d));
-    }
-    if let Some(l) = limit {
-        params.push(format!("limit={}", l));
-    }
-    if let Some(o) = offset {
-        params.push(format!("offset={}", o));
-    }
-    let path = if params.is_empty() {
-        "/api/pages".to_string()
-    } else {
-        format!("/api/pages?{}", params.join("&"))
-    };
+    let path = pages_query_path(status, domain, limit, offset);
     let resp: responses::SearchPagesResponse = client.get_json(&path).await?;
     Ok(resp.pages)
 }
@@ -3781,24 +3730,7 @@ pub async fn list_pages_explicit_browse(
     offset: Option<usize>,
 ) -> Result<Vec<Page>, String> {
     let client = state.read().await.client.clone();
-    let mut params: Vec<String> = Vec::new();
-    if let Some(s) = status {
-        params.push(format!("status={}", s));
-    }
-    if let Some(d) = domain {
-        params.push(format!("domain={}", d));
-    }
-    if let Some(l) = limit {
-        params.push(format!("limit={}", l));
-    }
-    if let Some(o) = offset {
-        params.push(format!("offset={}", o));
-    }
-    let path = if params.is_empty() {
-        "/api/pages".to_string()
-    } else {
-        format!("/api/pages?{}", params.join("&"))
-    };
+    let path = pages_query_path(status, domain, limit, offset);
     let resp: responses::SearchPagesResponse = client.get_json_explicit_browse(&path).await?;
     Ok(resp.pages)
 }
@@ -3810,7 +3742,10 @@ pub async fn get_page_explicit_browse(
 ) -> Result<Option<serde_json::Value>, String> {
     let client = state.read().await.client.clone();
     match client
-        .get_json_explicit_browse::<serde_json::Value>(&format!("/api/pages/{}", id))
+        .get_json_explicit_browse::<serde_json::Value>(&format!(
+            "/api/pages/{}",
+            percent_encode_path_segment(&id)
+        ))
         .await
     {
         Ok(wire) => Ok(page_from_wire(wire)),
@@ -3981,7 +3916,10 @@ pub async fn export_page_to_obsidian(
     vault_path: String,
 ) -> Result<responses::ExportPageResponse, String> {
     let client = state.read().await.client.clone();
-    let path = format!("/api/pages/{}/export", page_id);
+    let path = format!(
+        "/api/pages/{}/export",
+        percent_encode_path_segment(&page_id)
+    );
     let req = requests::ExportPageRequest { vault_path };
     client.post_json(&path, &req).await
 }
@@ -4014,32 +3952,20 @@ pub async fn count_knowledge_files(state: tauri::State<'_, State>) -> Result<u64
     Ok(resp.count)
 }
 
-// ── Quality gate / rejections ─────────────────────────────────────────
-
-#[tauri::command]
-pub async fn get_rejection_log(
-    state: tauri::State<'_, State>,
-    _limit: Option<usize>,
-    _reason: Option<String>,
-) -> Result<Vec<RejectionRecord>, String> {
-    let s = state.read().await;
-    s.client.get_json("/api/memory/rejections").await
-}
-
 // ── Decision log ──────────────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn list_decisions_cmd(
     state: tauri::State<'_, State>,
     domain: Option<String>,
-    _limit: Option<usize>,
+    limit: Option<usize>,
 ) -> Result<Vec<MemoryItem>, String> {
-    let s = state.read().await;
-    let mut path = "/api/decisions?limit=200".to_string();
+    let client = daemon_client(&state).await;
+    let mut path = format!("/api/decisions?limit={}", limit.unwrap_or(200));
     if let Some(d) = domain {
-        path.push_str(&format!("&domain={}", d));
+        path.push_str(&format!("&domain={}", percent_encode_path_segment(&d)));
     }
-    let resp: responses::DecisionsResponse = s.client.get_json(&path).await?;
+    let resp: responses::DecisionsResponse = client.get_json(&path).await?;
     Ok(resp.decisions)
 }
 
@@ -4047,9 +3973,9 @@ pub async fn list_decisions_cmd(
 pub async fn list_decision_domains_cmd(
     state: tauri::State<'_, State>,
 ) -> Result<Vec<String>, String> {
-    let s = state.read().await;
+    let client = daemon_client(&state).await;
     let resp: responses::DecisionDomainsResponse =
-        s.client.get_json("/api/decisions/domains").await?;
+        client.get_json("/api/decisions/domains").await?;
     Ok(resp.domains)
 }
 
@@ -4124,66 +4050,6 @@ pub async fn add_source(
     }
 }
 
-// ponytail: legacy bridge for pre-v0.10.0 daemons only; new directory sources
-// go straight to the daemon (register_directory_source_with_daemon). Remove
-// once the minimum supported daemon is raised to v0.10.0 (§6).
-#[allow(dead_code)]
-async fn add_directory_source(
-    state: &tauri::State<'_, State>,
-    watcher: &tauri::State<'_, WatcherState>,
-    path_buf: PathBuf,
-    path: &str,
-) -> Result<crate::sources::Source, String> {
-    let dirname = path_buf
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "dir".to_string());
-    let slug = crate::sources::obsidian::slugify(&dirname);
-    let id = format!(
-        "{}-{}",
-        crate::sources::SourceType::Directory.as_str(),
-        slug
-    );
-
-    let mut cfg = config::load_config();
-    if cfg.sources.iter().any(|s| s.path == path_buf) {
-        return Err(format!("Source already registered for path: {}", path));
-    }
-
-    let source = crate::sources::Source {
-        id: id.clone(),
-        source_type: crate::sources::SourceType::Directory,
-        path: path_buf.clone(),
-        status: crate::sources::SyncStatus::Active,
-        last_sync: None,
-        file_count: 0,
-        memory_count: 0,
-        last_sync_errors: 0,
-        last_sync_error_detail: None,
-    };
-
-    cfg.sources.push(source.clone());
-    config::save_config(&cfg).map_err(|e| e.to_string())?;
-
-    {
-        let mut app_state = state.write().await;
-        if !app_state.watch_paths.contains(&path_buf) {
-            app_state.watch_paths.push(path_buf.clone());
-        }
-    }
-    let mut watcher_guard = watcher.lock().await;
-    if watcher_guard.is_none() {
-        let state_arc = state.inner().clone();
-        *watcher_guard =
-            Some(crate::indexer::create_file_watcher(state_arc).map_err(|e| e.to_string())?);
-    }
-    if let Some(w) = watcher_guard.as_mut() {
-        crate::indexer::watch_path(w, &path_buf).map_err(|e| e.to_string())?;
-    }
-
-    Ok(source)
-}
-
 #[cfg(test)]
 mod already_registered_tests {
     #[test]
@@ -4241,7 +4107,11 @@ mod managed_blob_paths_tests {
 }
 
 #[tauri::command]
-pub async fn remove_source(state: tauri::State<'_, State>, id: String) -> Result<(), String> {
+pub async fn remove_source(
+    state: tauri::State<'_, State>,
+    watcher: tauri::State<'_, WatcherState>,
+    id: String,
+) -> Result<(), String> {
     let local_source = config::load_config()
         .sources
         .iter()
@@ -4250,7 +4120,7 @@ pub async fn remove_source(state: tauri::State<'_, State>, id: String) -> Result
 
     if let Some(source) = local_source {
         if source.source_type == crate::sources::SourceType::Directory {
-            return remove_directory_source(&state, &id, source).await;
+            return remove_directory_source(&state, &watcher, &id, source).await;
         }
     }
 
@@ -4268,6 +4138,7 @@ pub async fn remove_source(state: tauri::State<'_, State>, id: String) -> Result
 
 async fn remove_directory_source(
     state: &tauri::State<'_, State>,
+    watcher: &tauri::State<'_, WatcherState>,
     id: &str,
     source: crate::sources::Source,
 ) -> Result<(), String> {
@@ -4283,8 +4154,26 @@ async fn remove_directory_source(
         let _ = std::fs::remove_dir_all(&blob); // best-effort; missing dir is fine
     }
 
-    let mut app_state = state.write().await;
-    app_state.watch_paths.retain(|p| p != &source.path);
+    {
+        let mut app_state = state.write().await;
+        if let Some(local) = app_state.sources.get_mut("local_files") {
+            if let Some(local) = local
+                .as_any_mut()
+                .downcast_mut::<crate::sources::local_files::LocalFilesSource>()
+            {
+                local.remove_watch_path(&source.path);
+            }
+        }
+        app_state.watch_paths.retain(|p| p != &source.path);
+    }
+
+    // Pruning `watch_paths` does not stop ingestion — the debouncer callback
+    // never consults it. The live watcher must be told, or files under a
+    // disconnected folder keep flowing into the daemon until the app restarts.
+    let mut watcher_guard = watcher.lock().await;
+    if let Some(w) = watcher_guard.as_mut() {
+        crate::indexer::unwatch_path(w, &source.path);
+    }
     Ok(())
 }
 
@@ -4780,22 +4669,6 @@ pub async fn quit_wenlan_full(app_handle: tauri::AppHandle) -> Result<(), String
     crate::lifecycle::quit_origin(&app_handle)
         .await
         .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn quit_origin_full(app_handle: tauri::AppHandle) -> Result<(), String> {
-    quit_wenlan_full(app_handle).await
-}
-
-#[cfg(test)]
-mod lifecycle_command_tests {
-    use super::*;
-
-    #[test]
-    fn exposes_wenlan_and_legacy_quit_commands() {
-        let _quit_wenlan = quit_wenlan_full;
-        let _quit_origin = quit_origin_full;
-    }
 }
 
 #[cfg(test)]

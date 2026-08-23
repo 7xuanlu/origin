@@ -581,7 +581,7 @@ struct Cli {
     /// When set, the daemon reads/writes the DB at `<dir>/memorydb/origin_memory.db`
     /// and config at `<dir>/config.json` instead of the default
     /// the platform data directory under `dirs::data_local_dir().join("wenlan/")`.
-    /// macOS: `~/Library/Application Support/wenlan/`. Linux: `~/.local/share/wenlan/`. Windows: `%LOCALAPPDATA%\origin\`. Also honored via `WENLAN_DATA_DIR` env.
+    /// macOS: `~/Library/Application Support/wenlan/`. Linux: `~/.local/share/wenlan/`. Windows: `%LOCALAPPDATA%\wenlan\`. Also honored via `WENLAN_DATA_DIR` env.
     #[arg(long, global = true)]
     data_dir: Option<std::path::PathBuf>,
 
@@ -800,11 +800,10 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
 /// admitted vs rejected → upsert survivors in a single transaction →
 /// emit per-doc outcomes in input order.
 ///
-/// Fail-open policy on gate infrastructure failure: if the batched gate
+/// Fail-closed policy on gate infrastructure failure: if the batched gate
 /// evaluator itself returns an error (DB unreachable, embedding panicked
-/// inside FastEmbed, etc.), every doc is admitted rather than rejected —
-/// matches `QualityGate::evaluate`'s per-doc behavior, which also fails
-/// open rather than wedging stores behind the gate.
+/// inside FastEmbed, etc.), the whole batch is rejected with
+/// `RejectionReason::EmbeddingUnavailable` rather than admitted unscored.
 async fn ingest_batch_process(
     db: std::sync::Arc<wenlan_core::db::MemoryDB>,
     gate: wenlan_core::quality_gate::QualityGate,

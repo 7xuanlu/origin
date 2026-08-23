@@ -27,7 +27,6 @@ use crate::synthesis::distill::{
 };
 use crate::synthesis::refinement_queue::process_refinement_queue;
 
-use crate::activity::ACTIVITY_GAP_SECS;
 use crate::db::{MemoryDB, StalePageCursor};
 use crate::error::WenlanError;
 use crate::llm_provider::{LlmBackend, LlmProvider, LlmRequest};
@@ -42,6 +41,11 @@ use std::sync::Arc;
 /// with the pending count discovered THIS tick (the staging pool is
 /// re-queried fresh every time, not a persisted queue).
 const COMPILE_QUEUE_DEPTH_KEY: &str = "compile_queue_depth_v1";
+
+/// 30-min inactivity → new activity. Formerly `activity::ACTIVITY_GAP_SECS`;
+/// moved here since burst grouping was its only wenlan-core consumer (the
+/// live activity model lives in the app crate, `app/src/activity.rs`).
+const ACTIVITY_GAP_SECS: i64 = 1800;
 
 /// Persist the compile queue depth so `/api/status` can report it without
 /// re-running cluster discovery. Called after every routed compile.

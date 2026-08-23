@@ -4,12 +4,10 @@
 use crate::ingest_batcher::IngestBatcher;
 use crate::lifecycle::ShutdownHandle;
 use crate::maintenance_coordinator::MaintenanceCoordinator;
-use crate::reflection_debounce::ReflectionDebouncer;
 use crate::scheduler::WriteSignal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use wenlan_core::access_tracker::AccessTracker;
 use wenlan_core::db::MemoryDB;
 use wenlan_core::lint::observation::{LintRunObserver, NoopLintRunObserver};
 use wenlan_core::llm_provider::LlmProvider;
@@ -125,20 +123,12 @@ pub struct ServerState {
     pub prompts: PromptRegistry,
     /// Intelligence tuning parameters.
     pub tuning: TuningConfig,
-    /// Debounced access tracker.
-    pub access_tracker: AccessTracker,
     /// Pre-store quality gate.
     pub quality_gate: QualityGate,
-    /// Configured directory watch paths.
-    pub watch_paths: Vec<PathBuf>,
     /// Write-event tracker for the event-driven steep scheduler.
     pub write_signal: WriteSignal,
     /// Excludes daemon-owned background writers from an approved apply-to-verify window.
     pub maintenance_coordinator: MaintenanceCoordinator,
-    /// Per-agent debouncer for background reflection (T22). Coalesces
-    /// mid-burst enrichment spawns when `WENLAN_ENABLE_REFLECTION_DEBOUNCE`
-    /// is truthy; inert (never consulted) when the flag is unset/0.
-    pub reflection_debouncer: ReflectionDebouncer,
     /// Coalescing batcher for concurrent `/api/memory/store` calls. Groups
     /// requests that arrive within a short window into a single batched
     /// upsert (one FastEmbed call, one libSQL transaction) instead of N
@@ -184,12 +174,9 @@ impl Default for ServerState {
             reranker_mode: String::from("off"),
             prompts: PromptRegistry::default(),
             tuning: TuningConfig::default(),
-            access_tracker: AccessTracker::new(),
             quality_gate: QualityGate::new(wenlan_core::tuning::GateConfig::default()),
-            watch_paths: Vec::new(),
             write_signal: WriteSignal::new(),
             maintenance_coordinator: MaintenanceCoordinator::default(),
-            reflection_debouncer: ReflectionDebouncer::new(),
             ingest_batcher: None,
             repair_root: None,
             presence_root: None,

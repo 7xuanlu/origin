@@ -122,7 +122,6 @@ pub async fn write_revision(
         distillation,
         None,
         &opts,
-        None,
     )
     .await;
     Ok(source_id)
@@ -331,6 +330,10 @@ impl Frontier {
 /// One sweep tick: both frontiers, shared judge budget, watermark semantics per
 /// spec §3.2 (advance only past judged / zero-candidate items; retry on LLM
 /// failure; 3-tick poison-pill ejection; back-pressure hold at the pending cap).
+///
+/// Not on the production path: the ambient scheduler fires
+/// [`run_reconcile_slice`] instead. This full-budget entry is retained for the
+/// `doc_reconcile_e2e` test, which needs a whole tick per call.
 pub async fn run_reconcile_tick(
     db: &MemoryDB,
     llm: &Arc<dyn LlmProvider>,

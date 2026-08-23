@@ -22,24 +22,10 @@ Never read, edit, or overwrite that receipt as authority.
 ## 1. Resolve repository and Space
 
 ```bash
-repo="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
-if [ -n "$repo" ]; then
-  common="$(git -C "$PWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
-  case "$common" in
-    */.git) project="$(basename "$(dirname "$common")")" ;;
-    *) project="$(basename "$repo")" ;;
-  esac
-else
-  project=""
-fi
 handoff_arg="<the Space name passed to /handoff, empty when none>"
-resolved="$("$CLAUDE_PLUGIN_ROOT/bin/resolve-space.sh" --cwd "$PWD" --arg "$handoff_arg" 2>/dev/null)"
+resolved="$("$CLAUDE_PLUGIN_ROOT/bin/resolve-space.sh" --cwd "$PWD" --arg "$handoff_arg" --new-repo-fallback 2>/dev/null)"
 space="$(printf '%s\n' "$resolved" | cut -f1)"
 source_layer="$(printf '%s\n' "$resolved" | cut -f2)"
-if [ -z "$space" ] && [ -n "$project" ]; then
-  space="$project"
-  source_layer="cwd-repo-new"
-fi
 ```
 
 If the user passed a Space name (`/wenlan:handoff <space>`), pass it as

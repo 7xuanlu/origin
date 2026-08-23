@@ -737,10 +737,6 @@ export const HANDLERS: Record<string, (a: any) => Promise<unknown>> = {
   get_version_chain_cmd: (a) => get(`/api/memory/${enc(a.sourceId)}/versions`),
   search: (a) =>
     post("/api/search", { query: a.query, limit: a?.limit ?? 20 }).then((r) => r.results ?? []),
-  search_memory: (a) =>
-    post("/api/memory/search", { query: a.query, limit: a?.limit ?? 20 }).then(
-      (r) => r.results ?? r.memories ?? [],
-    ),
 
   // --- entities / knowledge ---
   list_entities_cmd: (a) =>
@@ -816,7 +812,6 @@ export const HANDLERS: Record<string, (a: any) => Promise<unknown>> = {
   reject_refinement: (a) => post(`/api/refinery/queue/${enc(a.id)}/reject`),
   list_decisions_cmd: () => get("/api/decisions?limit=200").then((r) => r.decisions ?? r),
   list_decision_domains_cmd: () => get("/api/decisions/domains").then((r) => r.domains ?? r),
-  get_working_memory: () => get("/api/memory/working").then((r) => r ?? null),
   pin_memory: (a) => post(`/api/memory/${enc(a.sourceId)}/pin`),
   unpin_memory: (a) => post(`/api/memory/${enc(a.sourceId)}/unpin`),
   confirm_memory: (a) => post(`/api/memory/confirm/${enc(a.sourceId)}`, { confirmed: true }),
@@ -1034,7 +1029,6 @@ export const DEFAULTS: Record<string, unknown> = {
   acknowledge_guarded_quit_request: true,
   cancel_guarded_quit_request: true,
   quit_wenlan_full: null,
-  quit_origin_full: null,
   // Preview's daemon is reachable (wire_state above), so a Start would find it up.
   start_daemon_sidecar: { status: "already_running" },
 };

@@ -342,7 +342,6 @@ cargo build
 cargo test
 
 # 桌面 app（Cargo target 与根目录的前端工具链）
-cargo build -p wenlan-app
 pnpm install
 pnpm dev:all
 pnpm build:all

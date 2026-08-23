@@ -72,7 +72,9 @@ pub async fn handle_list_sources() -> Json<Vec<Source>> {
 
 /// POST /api/sources
 pub async fn handle_add_source(
-    State(state): State<Arc<RwLock<ServerState>>>,
+    // Registration is unchanged; the handler itself no longer touches
+    // `ServerState` now that the inert `watch_paths` list is gone.
+    State(_state): State<Arc<RwLock<ServerState>>>,
     Json(body): Json<AddSourceRequest>,
 ) -> Result<Json<Source>, ServerError> {
     let path = PathBuf::from(&body.path);
@@ -156,13 +158,6 @@ pub async fn handle_add_source(
     config.sources.push(source.clone());
     wenlan_core::config::save_config(&config)?;
 
-    if st == SourceType::Directory {
-        let mut s = state.write().await;
-        if !s.watch_paths.contains(&path) {
-            s.watch_paths.push(path);
-        }
-    }
-
     Ok(Json(source))
 }
 
@@ -172,23 +167,20 @@ pub async fn handle_remove_source(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ServerError> {
     let mut config = wenlan_core::config::load_config();
-    let source = config
-        .sources
-        .iter()
-        .find(|s| s.id == id)
-        .cloned()
-        .ok_or_else(|| ServerError::NotFound(format!("Source not found: {}", id)))?;
+    if !config.sources.iter().any(|s| s.id == id) {
+        return Err(ServerError::NotFound(format!("Source not found: {}", id)));
+    }
 
     config.sources.retain(|s| s.id != id);
     wenlan_core::config::save_config(&config)?;
 
-    {
-        let mut s = state.write().await;
-        s.watch_paths.retain(|p| p != &source.path);
-    }
-
-    let s = state.read().await;
-    if let Some(ref db) = s.db {
+    // Snapshot the DB Arc before the await so the read guard is not held across
+    // it (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
+        let s = state.read().await;
+        s.db.clone()
+    };
+    if let Some(db) = db {
         let _ = db.delete_all_sync_state(&id).await;
     }
 
@@ -609,7 +601,19 @@ pub async fn handle_sync_source(
         return sync_directory_source(db, &source, &config).await.map(Json);
     }
 
-    let md_files = scan_vault(&source.path);
+    // Vault files are frequently cloud "online-only" placeholders (see the
+    // module doc): every filesystem call below runs off the runtime so one
+    // on-demand download cannot stall a tokio worker, matching the Directory
+    // branch above.
+    let vault_root = source.path.clone();
+    let vault_display = vault_root.display().to_string();
+    let md_files = tokio::task::spawn_blocking(move || scan_vault(&vault_root))
+        .await
+        .map_err(|error| {
+            ServerError::Internal(format!(
+                "vault scan task failed for source {id} at {vault_display}: {error}"
+            ))
+        })?;
     let mut ingested: usize = 0;
     let mut skipped: usize = 0;
     let mut errors: usize = 0;
@@ -624,18 +628,29 @@ pub async fn handle_sync_source(
         let is_gdrive = is_google_drive_path(file_path);
 
         // Read file metadata + content.
-        let metadata = match std::fs::metadata(file_path) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("[sync] stat failed for {}: {}", file_path.display(), e);
-                errors += 1;
-                file_errors += 1;
-                if is_gdrive {
-                    gdrive_errors += 1;
+        let metadata_path = file_path.clone();
+        let metadata =
+            match tokio::task::spawn_blocking(move || std::fs::metadata(metadata_path)).await {
+                Ok(Ok(m)) => m,
+                Ok(Err(e)) => {
+                    tracing::warn!("[sync] stat failed for {}: {}", file_path.display(), e);
+                    errors += 1;
+                    file_errors += 1;
+                    if is_gdrive {
+                        gdrive_errors += 1;
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+                Err(e) => {
+                    tracing::warn!("[sync] stat task failed for {}: {}", file_path.display(), e);
+                    errors += 1;
+                    file_errors += 1;
+                    if is_gdrive {
+                        gdrive_errors += 1;
+                    }
+                    continue;
+                }
+            };
         let mtime_ns = metadata
             .modified()
             .ok()
@@ -652,18 +667,29 @@ pub async fn handle_sync_source(
             }
         }
 
-        let content = match std::fs::read_to_string(file_path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("[sync] read failed for {}: {}", file_path.display(), e);
-                errors += 1;
-                file_errors += 1;
-                if is_gdrive {
-                    gdrive_errors += 1;
+        let read_path = file_path.clone();
+        let content =
+            match tokio::task::spawn_blocking(move || std::fs::read_to_string(read_path)).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    tracing::warn!("[sync] read failed for {}: {}", file_path.display(), e);
+                    errors += 1;
+                    file_errors += 1;
+                    if is_gdrive {
+                        gdrive_errors += 1;
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+                Err(e) => {
+                    tracing::warn!("[sync] read task failed for {}: {}", file_path.display(), e);
+                    errors += 1;
+                    file_errors += 1;
+                    if is_gdrive {
+                        gdrive_errors += 1;
+                    }
+                    continue;
+                }
+            };
 
         // Hash check — skip if content unchanged despite mtime change.
         let hash = content_hash(&content);
@@ -856,7 +882,6 @@ mod tests {
 
         assert_eq!(source.source_type, SourceType::Directory);
         assert_eq!(source.path, file_path);
-        assert!(state.read().await.watch_paths.contains(&file_path));
     }
 
     #[tokio::test]

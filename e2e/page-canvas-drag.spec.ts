@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { expect, test, type Page } from "@playwright/test";
 import { collectBrowserErrors, installTauriMock } from "./tauriMock";
+import { openCanvas } from "./helpers/pageCanvas";
 
 /**
  * Dragging a box's connector into empty space is the canvas's primary way to
@@ -8,15 +9,6 @@ import { collectBrowserErrors, installTauriMock } from "./tauriMock";
  * drag across and the Tauri webview refuses synthetic ones. Chromium is the
  * only place this interaction can actually be observed.
  */
-async function openCanvas(page: Page): Promise<void> {
-  await page.goto("/");
-  const navigation = page.getByRole("navigation", { name: "Primary navigation" });
-  await navigation.getByRole("button", { name: "Wiki", exact: true }).click();
-  await page.getByRole("button", { name: "Open Fixture architecture" }).click();
-  await expect(page.getByRole("heading", { level: 1, name: "Fixture architecture" })).toBeVisible();
-  await page.getByRole("button", { name: "Canvas" }).click();
-  await expect(page.getByRole("region", { name: "Canvas for Fixture architecture" })).toBeVisible();
-}
 
 /** Grab the dot under a box and let go somewhere empty. */
 async function dragConnectorToEmptySpace(page: Page): Promise<void> {

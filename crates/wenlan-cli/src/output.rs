@@ -20,19 +20,29 @@ pub enum OutputFormat {
     Table,
 }
 
+/// A format that has already been resolved from `OutputFormat::Auto`.
+/// Commands take this, never `OutputFormat`, so the compiler proves
+/// resolution happened instead of each command carrying a dead `Auto` arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedFormat {
+    Json,
+    Table,
+}
+
 impl OutputFormat {
     /// Resolve `Auto` to a concrete format based on whether stdout is a TTY.
     /// `Json` and `Table` pass through unchanged.
-    pub fn resolve(self) -> OutputFormat {
+    pub fn resolve(self) -> ResolvedFormat {
         match self {
             OutputFormat::Auto => {
                 if std::io::stdout().is_terminal() {
-                    OutputFormat::Table
+                    ResolvedFormat::Table
                 } else {
-                    OutputFormat::Json
+                    ResolvedFormat::Json
                 }
             }
-            other => other,
+            OutputFormat::Json => ResolvedFormat::Json,
+            OutputFormat::Table => ResolvedFormat::Table,
         }
     }
 }

@@ -11,7 +11,7 @@ use wenlan_types::{
 
 use crate::client::WenlanClient;
 use crate::outbox;
-use crate::output::{print_json, OutputFormat};
+use crate::output::{print_json, ResolvedFormat};
 
 #[derive(Debug, Args)]
 pub struct BriefArgs {
@@ -35,7 +35,7 @@ pub enum BriefCommand {
 
 pub async fn run(
     client: &WenlanClient,
-    format: OutputFormat,
+    format: ResolvedFormat,
     quiet: bool,
     args: BriefArgs,
     effective_space: Option<String>,
@@ -76,11 +76,8 @@ pub async fn run(
             };
             if !quiet {
                 match format {
-                    OutputFormat::Json => print_json(&receipt)?,
-                    OutputFormat::Table => print!("{}", format_update_receipt(&receipt)),
-                    OutputFormat::Auto => {
-                        unreachable!("Auto resolved by main before dispatch")
-                    }
+                    ResolvedFormat::Json => print_json(&receipt)?,
+                    ResolvedFormat::Table => print!("{}", format_update_receipt(&receipt)),
                 }
             }
         }
@@ -94,11 +91,8 @@ pub async fn run(
                 .await?;
             if !quiet {
                 match format {
-                    OutputFormat::Json => print_json(&response)?,
-                    OutputFormat::Table => print!("{}", format_brief(&response)),
-                    OutputFormat::Auto => {
-                        unreachable!("Auto resolved by main before dispatch")
-                    }
+                    ResolvedFormat::Json => print_json(&response)?,
+                    ResolvedFormat::Table => print!("{}", format_brief(&response)),
                 }
             }
         }
@@ -113,18 +107,17 @@ struct QueuedOutput<'a> {
     operation_id: &'a str,
 }
 
-fn print_queued(format: OutputFormat, path: &Path, operation_id: &str) -> Result<()> {
+fn print_queued(format: ResolvedFormat, path: &Path, operation_id: &str) -> Result<()> {
     match format {
-        OutputFormat::Json => print_json(&QueuedOutput {
+        ResolvedFormat::Json => print_json(&QueuedOutput {
             status: "queued",
             path: path.display().to_string(),
             operation_id,
         }),
-        OutputFormat::Table => {
+        ResolvedFormat::Table => {
             println!("queued: {}", path.display());
             Ok(())
         }
-        OutputFormat::Auto => unreachable!("Auto resolved by main before dispatch"),
     }
 }
 

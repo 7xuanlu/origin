@@ -46,10 +46,6 @@ cat > "$TMPDIR_TEST/plugin-codex/.codex-plugin/plugin.json" <<EOF
 {"name": "wenlan", "version": "0.4.1+codex"}
 EOF
 
-cat > "$TMPDIR_TEST/plugin/bin/wenlan-mcp-runner.sh" <<EOF
-exec npx -y wenlan-mcp@^0.4.1 "\$@"
-EOF
-
 cat > "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh" <<EOF
 exec npx -y wenlan-mcp@^0.4.1 --agent-name "\${agent_name}" "\$@"
 EOF
@@ -153,7 +149,6 @@ APP_PKG_VER=$(jq -r .version "$TMPDIR_TEST/package.json")
 [[ "$APP_TAURI_VER" == "0.5.0" ]] || { echo "FAIL: app/tauri.conf.json not bumped (got $APP_TAURI_VER)"; exit 1; }
 [[ "$APP_PKG_VER" == "0.5.0" ]] || { echo "FAIL: package.json not bumped (got $APP_PKG_VER)"; exit 1; }
 grep -q '# x-release-please-version' "$TMPDIR_TEST/app/Cargo.toml" || { echo "FAIL: app/Cargo.toml lost its x-release-please-version marker"; exit 1; }
-grep -q 'wenlan-mcp@\^0.5.0' "$TMPDIR_TEST/plugin/bin/wenlan-mcp-runner.sh" || { echo "FAIL: runner pin not bumped"; exit 1; }
 grep -q '/v0.5.0/install.sh' "$TMPDIR_TEST/plugin/skills/setup/SKILL.md" || { echo "FAIL: setup skill installer not bumped"; exit 1; }
 grep -q 'wenlan-mcp@\^0.5.0' "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh" || { echo "FAIL: Codex runner pin not bumped"; exit 1; }
 grep -q 'wenlan-mcp@\^0.5.0' "$TMPDIR_TEST/plugin-codex/README.md" || { echo "FAIL: Codex README runner pin not bumped"; exit 1; }

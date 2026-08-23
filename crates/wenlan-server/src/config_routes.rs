@@ -19,10 +19,6 @@ pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<Shar
             "/api/config",
             get(handle_get_config).put(handle_update_config),
         )
-        .route(
-            "/api/config/skip-apps",
-            get(handle_get_skip_apps).put(handle_update_skip_apps),
-        )
         .route("/api/config/routing", get(handle_get_resolved_routing))
         .route("/api/setup/status", get(handle_get_setup_status))
         .route(
@@ -138,27 +134,6 @@ pub async fn handle_update_config(
         apply_external_provider(&mut s, &cfg);
     }
     Ok(Json(config_to_response(&cfg)))
-}
-
-/// GET /api/config/skip-apps — return skip-apps list.
-pub async fn handle_get_skip_apps() -> Result<Json<Vec<String>>, ServerError> {
-    let cfg = config::load_config();
-    Ok(Json(cfg.skip_apps))
-}
-
-#[derive(serde::Deserialize)]
-pub struct SkipAppsRequest {
-    pub apps: Vec<String>,
-}
-
-/// PUT /api/config/skip-apps — update skip-apps list.
-pub async fn handle_update_skip_apps(
-    Json(req): Json<SkipAppsRequest>,
-) -> Result<Json<SuccessResponse>, ServerError> {
-    let mut cfg = config::load_config();
-    cfg.skip_apps = req.apps;
-    config::save_config(&cfg).map_err(|e| ServerError::Internal(e.to_string()))?;
-    Ok(Json(SuccessResponse { ok: true }))
 }
 
 #[derive(Debug, Serialize)]

@@ -90,8 +90,12 @@ pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<Shar
 pub async fn handle_get_profile(
     State(state): State<Arc<RwLock<ServerState>>>,
 ) -> Result<Json<ProfileResponse>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
+    // Snapshot the DB Arc; the guard must not be held across the DB awaits
+    // below (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
     let profile = db
         .get_profile()
         .await
@@ -115,8 +119,12 @@ pub async fn handle_update_profile(
     State(state): State<Arc<RwLock<ServerState>>>,
     Json(req): Json<UpdateProfileRequest>,
 ) -> Result<Json<ProfileResponse>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
+    // Snapshot the DB Arc; the guard must not be held across the DB awaits
+    // below (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
     let profile = db
         .get_profile()
         .await
@@ -154,8 +162,12 @@ pub async fn handle_update_profile(
 pub async fn handle_list_agents(
     State(state): State<Arc<RwLock<ServerState>>>,
 ) -> Result<Json<Vec<AgentResponse>>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
+    // Snapshot the DB Arc; the guard must not be held across the DB awaits
+    // below (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
     let agents = db
         .list_agents()
         .await
@@ -167,8 +179,12 @@ pub async fn handle_get_agent(
     State(state): State<Arc<RwLock<ServerState>>>,
     Path(name): Path<String>,
 ) -> Result<Json<AgentResponse>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
+    // Snapshot the DB Arc; the guard must not be held across the DB awaits
+    // below (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
     let agent = db
         .get_agent(&name)
         .await
@@ -182,8 +198,12 @@ pub async fn handle_update_agent(
     Path(name): Path<String>,
     Json(req): Json<UpdateAgentRequest>,
 ) -> Result<Json<AgentResponse>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
+    // Snapshot the DB Arc; the guard must not be held across the DB awaits
+    // below (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
     db.get_agent(&name)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?
@@ -210,8 +230,12 @@ pub async fn handle_delete_agent(
     State(state): State<Arc<RwLock<ServerState>>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    let s = state.read().await;
-    let db = s.db.as_ref().ok_or(ServerError::DbNotInitialized)?;
+    // Snapshot the DB Arc; the guard must not be held across the DB awaits
+    // below (AGENTS.md: never hold a tokio RwLock guard across .await).
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
     db.delete_agent(&name)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?;

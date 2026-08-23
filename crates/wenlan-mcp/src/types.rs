@@ -5,17 +5,16 @@
 //! cross-repo refactor; later PRs may remove the module entirely and import
 //! `wenlan_types::*` at call sites directly.
 
-pub use wenlan_types::memory::{RecentActivityItem, RejectionRecord, SearchResult, Space};
+pub use wenlan_types::memory::{RejectionRecord, SearchResult, Space};
 pub use wenlan_types::requests::{
     ChatContextRequest, CreateConceptRequest, CreateEntityRequest, CreateRelationRequest,
-    ListMemoriesRequest, SearchMemoryRequest, SearchPagesRequest, StoreMemoryRequest,
+    ListMemoriesRequest, SearchMemoryRequest, StoreMemoryRequest,
 };
 pub use wenlan_types::responses::{
-    AcceptRefinementResponse, AddObservationResponse, ChatContextResponse,
-    ContradictionDismissResponse, CreateEntityResponse, CreatePageResponse, CreateRelationResponse,
-    DeleteResponse, ListMemoriesResponse, ListMemoryRevisionsResponse, ListPageRevisionsResponse,
-    ListRefinementsResponse, MemoryRevisionEntry, NurtureCardsResponse, OrphanLink,
-    OrphanLinksResponse, PageChangelogEntry, RejectRefinementResponse, RevisionAcceptResponse,
-    RevisionDismissResponse, SearchMemoryResponse, SearchPagesResponse, StoreMemoryResponse,
+    AcceptRefinementResponse, ChatContextResponse, ConfirmResponse, CreateEntityResponse,
+    CreatePageResponse, CreateRelationResponse, DeleteResponse, ListMemoriesResponse,
+    ListMemoryRevisionsResponse, ListPageRevisionsResponse, ListRefinementsResponse,
+    RejectRefinementResponse, RevisionAcceptResponse, RevisionDismissResponse,
+    SearchMemoryResponse, StoreMemoryResponse,
 };
 pub use wenlan_types::PageSourceWithMemory;

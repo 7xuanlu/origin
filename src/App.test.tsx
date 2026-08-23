@@ -42,7 +42,6 @@ vi.mock("./lib/tauri", () => ({
 }));
 
 vi.mock("./lib/resizeWindow", () => ({
-  resizeWindow: vi.fn(),
   resizeWindowCentered: vi.fn(),
 }));
 
