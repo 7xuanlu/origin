@@ -381,7 +381,7 @@ pub const MCP_READERS: &[McpReader] = &[
     McpReader { tool: "write_page", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "tool handler" },
 ];
 
-/// All 19 top-level `Commands` variants in `crates/wenlan-cli/src/main.rs`.
+/// All 20 top-level `Commands` variants in `crates/wenlan-cli/src/main.rs`.
 #[rustfmt::skip]
 pub const CLI_READERS: &[CliReader] = &[
     CliReader { subcommand: "wenlan status", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
@@ -403,6 +403,7 @@ pub const CLI_READERS: &[CliReader] = &[
     CliReader { subcommand: "wenlan curate", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan agents", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan spaces", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
+    CliReader { subcommand: "wenlan entities", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
 ];
 
 /// Look up a registered HTTP reader by its runtime identity.

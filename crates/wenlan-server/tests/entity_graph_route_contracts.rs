@@ -719,6 +719,43 @@ async fn add_entity_alias_conflict_and_idempotent() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// An empty (or whitespace-only) alias is a validation error, not a stored
+/// blank entry in the entity's alias list.
+#[tokio::test]
+async fn add_entity_alias_empty_is_422() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+    let owner = create_test_entity(&router, "Empty Alias Owner", "org").await;
+
+    let detail_uri = format!("/api/memory/entities/{}", owner.id);
+    let (status, before): (StatusCode, EntityDetail) =
+        request_typed(&router, Method::GET, &detail_uri, Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let alias_uri = format!("/api/memory/entities/{}/aliases", owner.id);
+    for alias in ["", "   "] {
+        let (status, error): (StatusCode, ErrorEnvelope) = request_typed(
+            &router,
+            Method::POST,
+            &alias_uri,
+            json_body(&AddEntityAliasRequest {
+                alias: alias.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "alias {alias:?}");
+        assert!(error.error.contains("empty"), "{}", error.error);
+    }
+
+    let (status, after): (StatusCode, EntityDetail) =
+        request_typed(&router, Method::GET, &detail_uri, Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        after.entity.aliases, before.entity.aliases,
+        "a rejected empty alias must not change the alias list"
+    );
+    assert!(!after.entity.aliases.contains(&"".to_string()));
+}
+
 /// Spec acceptance 2: once "Origin" is declared an alias of "wenlan",
 /// `POST /api/memory/entities {name:"Origin"}` must resolve to the same
 /// canonical id instead of creating a duplicate entity.

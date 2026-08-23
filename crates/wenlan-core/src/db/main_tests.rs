@@ -29111,6 +29111,12 @@ async fn merge_entities_dedups_overlapping_observations() {
 /// move), then checks the preview's counts, the applied `MergeOutcome`'s
 /// counts, and the actual pre/post-merge row deltas on the canonical all
 /// agree.
+///
+/// `memory_links` specifically must count BOTH sources `/api/memory/graph`'s
+/// own union draws from -- the `memory_entities` link table AND the legacy
+/// direct `memories.entity_id` column -- so this also seeds a memory linked
+/// to the loser only through the legacy column, and one linked through both
+/// sources at once (must still count once, not twice).
 #[tokio::test]
 async fn merge_entities_preview_counts_match_post_merge_deltas() {
     let (db, _tmp) = test_db().await;
@@ -29120,6 +29126,35 @@ async fn merge_entities_preview_counts_match_post_merge_deltas() {
         .await
         .unwrap();
     db.link_memory_entities("alias_only_memory", &[alias.as_str()])
+        .await
+        .unwrap();
+    // Legacy-column-only link: a `memories` row whose `entity_id` names the
+    // loser directly, with no corresponding `memory_entities` row.
+    insert_memory_with_entity(
+        &db,
+        "legacy_only_memory",
+        "Legacy only",
+        "legacy column link only",
+        1712707200,
+        1712707200,
+        "enriched",
+        &alias,
+    )
+    .await;
+    // Both sources at once: a `memories` row with `entity_id = alias` AND a
+    // `memory_entities` row for the same memory id -- must count once.
+    insert_memory_with_entity(
+        &db,
+        "both_sources_memory",
+        "Both sources",
+        "legacy column and link table",
+        1712707200,
+        1712707200,
+        "enriched",
+        &alias,
+    )
+    .await;
+    db.link_memory_entities("both_sources_memory", &[alias.as_str()])
         .await
         .unwrap();
     db.add_observation(&canonical, "Shared fact", None, None)
@@ -29132,12 +29167,7 @@ async fn merge_entities_preview_counts_match_post_merge_deltas() {
         .await
         .unwrap();
 
-    let canonical_memory_links_before = count_entity_rows(
-        &db,
-        "SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?1",
-        &canonical,
-    )
-    .await;
+    let canonical_memory_links_before = count_entity_memory_links_union(&db, &canonical).await;
     let canonical_observations_before = count_entity_rows(
         &db,
         "SELECT COUNT(*) FROM observations WHERE entity_id = ?1",
@@ -29147,8 +29177,8 @@ async fn merge_entities_preview_counts_match_post_merge_deltas() {
 
     let preview = db.merge_entities_preview(&canonical, &alias).await.unwrap();
     assert_eq!(
-        preview.memory_links, 1,
-        "only the alias-only memory link should be counted as moving"
+        preview.memory_links, 3,
+        "alias-only, legacy-only, and both-sources links should each count once"
     );
     assert_eq!(
         preview.observations, 1,
@@ -29166,12 +29196,7 @@ async fn merge_entities_preview_counts_match_post_merge_deltas() {
         "the outcome's own count must match the preview's"
     );
 
-    let canonical_memory_links_after = count_entity_rows(
-        &db,
-        "SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?1",
-        &canonical,
-    )
-    .await;
+    let canonical_memory_links_after = count_entity_memory_links_union(&db, &canonical).await;
     let canonical_observations_after = count_entity_rows(
         &db,
         "SELECT COUNT(*) FROM observations WHERE entity_id = ?1",
@@ -29181,7 +29206,7 @@ async fn merge_entities_preview_counts_match_post_merge_deltas() {
     assert_eq!(
         canonical_memory_links_after - canonical_memory_links_before,
         preview.memory_links as i64,
-        "the preview's memory_links count must equal the real post-merge delta"
+        "the preview's memory_links count must equal the real post-merge union delta on the canonical"
     );
     assert_eq!(
         canonical_observations_after - canonical_observations_before,
@@ -29201,6 +29226,116 @@ async fn count_entity_rows(db: &MemoryDB, sql: &str, entity_id: &str) -> i64 {
         .unwrap()
         .get(0)
         .unwrap()
+}
+
+/// Distinct memories linked to `entity_id` through EITHER `memory_links`
+/// source -- `memory_entities`, or the legacy `memories.entity_id` column
+/// (`chunk_index = 0` only) -- the same union `/api/memory/graph` draws
+/// from. `count_entity_rows` only ever queries one table at a time, so this
+/// is a separate helper rather than a redefinition of it.
+async fn count_entity_memory_links_union(db: &MemoryDB, entity_id: &str) -> i64 {
+    let conn = db.conn.lock().await;
+    conn.query(
+        "SELECT COUNT(*) FROM ( \
+             SELECT memory_id AS mid FROM memory_entities WHERE entity_id = ?1 \
+             UNION \
+             SELECT source_id AS mid FROM memories \
+              WHERE entity_id = ?1 AND source = 'memory' AND chunk_index = 0)",
+        libsql::params![entity_id],
+    )
+    .await
+    .unwrap()
+    .next()
+    .await
+    .unwrap()
+    .unwrap()
+    .get(0)
+    .unwrap()
+}
+
+/// Two of the loser's edges can re-point onto the SAME `(src, dst,
+/// semantic_type)` identity -- most commonly reciprocal same-type edges
+/// between the loser and canonical, which both collapse onto the
+/// canonical's own self-loop -- and `dual_write_edge_with_payload`'s
+/// content-addressed edge id means only ONE edge lands for that identity.
+/// `merge_entities_preview`/`merge_entities` must count DISTINCT
+/// re-pointed identities, not one row per source edge, or the receipt
+/// overstates what actually lands (Sol's PR 2 review: receipt said 2, one
+/// lands). Seeds the reciprocal pair plus one ordinary loser edge to a
+/// third entity (unaffected by the collapse), then checks the preview's
+/// count, the applied `MergeOutcome`'s count, and the identities that
+/// actually newly appear among the canonical's active edges all agree.
+#[tokio::test]
+async fn merge_entities_preview_counts_distinct_repointed_edge_identities() {
+    let (db, _tmp) = test_db().await;
+    let (canonical, alias) = seed_two_entities(&db).await;
+    let other = db.create_entity("Carol", "person", None).await.unwrap();
+
+    // Reciprocal same-type edges between loser and canonical: both
+    // re-point to the self-loop canonical --leads--> canonical.
+    db.create_relation(&alias, &canonical, "leads", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+    db.create_relation(&canonical, &alias, "leads", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+    // An ordinary loser edge to a third entity -- untouched by the collapse.
+    db.create_relation(&alias, &other, "works_at", None, Some(0.9), None, None)
+        .await
+        .unwrap();
+
+    let before = canonical_touching_edge_identities(&db, &canonical).await;
+
+    let preview = db.merge_entities_preview(&canonical, &alias).await.unwrap();
+    assert_eq!(
+        preview.edges, 2,
+        "the reciprocal pair collapses onto one self-loop identity, plus the \
+         ordinary edge to `other`, is 2 distinct identities -- not 3 rows"
+    );
+
+    let outcome = db.merge_entities(&canonical, &alias).await.unwrap();
+    assert!(outcome.merged);
+    assert_eq!(
+        outcome.edges, preview.edges,
+        "the outcome's own count must match the preview's"
+    );
+
+    let after = canonical_touching_edge_identities(&db, &canonical).await;
+    let newly_appeared = after.difference(&before).count() as u64;
+    assert_eq!(
+        newly_appeared, preview.edges,
+        "the preview's edges count must equal the identities that actually \
+         newly appear among the canonical's active edges after the merge"
+    );
+}
+
+/// `(src_id, dst_id, semantic_type)` for every active `relates` edge
+/// touching `entity_id` -- a repointed identity always touches the
+/// canonical on at least one side, so this is the same universe
+/// `edges_will_move_delta`'s `NOT EXISTS` scan checks against.
+async fn canonical_touching_edge_identities(
+    db: &MemoryDB,
+    entity_id: &str,
+) -> std::collections::HashSet<(String, String, Option<String>)> {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT src_id, dst_id, semantic_type FROM edges \
+             WHERE edge_type = 'relates' AND src_kind = 'entity' AND dst_kind = 'entity' \
+               AND valid_until IS NULL AND (src_id = ?1 OR dst_id = ?1)",
+            libsql::params![entity_id],
+        )
+        .await
+        .unwrap();
+    let mut set = std::collections::HashSet::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        set.insert((
+            row.get::<String>(0).unwrap(),
+            row.get::<String>(1).unwrap(),
+            row.get::<Option<String>>(2).unwrap(),
+        ));
+    }
+    set
 }
 
 // ==================== supersede_relation ====================

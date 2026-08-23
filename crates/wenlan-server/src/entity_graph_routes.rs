@@ -452,6 +452,11 @@ pub async fn handle_add_entity_alias(
     Path(id): Path<String>,
     Json(req): Json<AddEntityAliasRequest>,
 ) -> Result<Json<EntityAliasesResponse>, ServerError> {
+    if req.alias.trim().is_empty() {
+        return Err(ServerError::ValidationError(
+            "alias must not be empty".into(),
+        ));
+    }
     let db = {
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?

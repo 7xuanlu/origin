@@ -209,7 +209,7 @@ fn manifest_counts_match_the_spec() {
         "registered (method, path, handler) triples"
     );
     assert_eq!(MCP_READERS.len(), 29, "#[tool( declarations");
-    assert_eq!(CLI_READERS.len(), 19, "Commands variants");
+    assert_eq!(CLI_READERS.len(), 20, "Commands variants");
 
     let entries: Vec<_> = runtime_entries().collect();
     assert_eq!(

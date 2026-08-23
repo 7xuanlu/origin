@@ -459,9 +459,15 @@ pub struct MergePreview {
     pub canonical_name: String,
     pub loser_id: String,
     pub loser_name: String,
-    /// Memory links the merge will move onto the canonical -- excludes a
-    /// memory already linked to both, which `merge_entities`' `INSERT OR
-    /// IGNORE ... SELECT` leaves alone rather than duplicating.
+    /// Distinct memories the merge will newly link to the canonical, over
+    /// both link sources the merge moves (`memory_entities`, the
+    /// current-schema link table, UNION the legacy direct
+    /// `memories.entity_id` column): a memory linked to the loser through
+    /// either source counts once, and one already linked to the canonical
+    /// through either source is excluded. `/api/memory/graph` draws from the
+    /// same union but hides superseded memories and pending revisions, so
+    /// the graph can gain fewer links than this count (every moved link
+    /// still exists; it shows once the memory is live again).
     pub memory_links: u64,
     /// Observations the merge will move onto the canonical -- excludes a
     /// loser row whose `(entity_id, lower(trim(content)))` identity already
@@ -487,6 +493,9 @@ pub struct MergePreview {
 #[derive(Debug, Clone)]
 pub struct MergeOutcome {
     pub merged: bool,
+    /// Distinct memories newly linked to the canonical -- see
+    /// `MergePreview::memory_links` for the union this counts (both
+    /// `memory_entities` and the legacy `memories.entity_id` column).
     pub memory_links: u64,
     pub observations: u64,
     pub edges: u64,
@@ -34655,6 +34664,83 @@ impl MemoryDB {
         Ok((existing_id, false))
     }
 
+    /// `MergePreview.memory_links` / `MergeOutcome.memory_links`: the count
+    /// of distinct memories `/api/memory/graph`'s own `memory_links` UNION
+    /// (`scoped_entities.rs`) would show moving from `entity_id` onto
+    /// `exclude_entity_id` -- i.e. linked to `entity_id` through either
+    /// source (the `memory_entities` link table, or the legacy direct
+    /// `memories.entity_id` column, `chunk_index = 0` only so a chunked
+    /// memory isn't counted once per chunk) and NOT already linked to
+    /// `exclude_entity_id` through either source. Both `memory_entities`
+    /// (`INSERT OR IGNORE`) and the legacy column (`UPDATE`) move rows in
+    /// `merge_entities`, so a count of only one source undercounts what the
+    /// graph shows moving.
+    async fn memory_links_delta(
+        conn: &libsql::Connection,
+        entity_id: &str,
+        exclude_entity_id: &str,
+    ) -> Result<i64, libsql::Error> {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM ( \
+                     SELECT memory_id AS mid FROM memory_entities WHERE entity_id = ?1 \
+                     UNION \
+                     SELECT source_id AS mid FROM memories \
+                      WHERE entity_id = ?1 AND source = 'memory' AND chunk_index = 0 \
+                 ) loser_links \
+                 WHERE loser_links.mid NOT IN ( \
+                     SELECT memory_id FROM memory_entities WHERE entity_id = ?2 \
+                     UNION \
+                     SELECT source_id FROM memories \
+                      WHERE entity_id = ?2 AND source = 'memory' AND chunk_index = 0)",
+                libsql::params![entity_id, exclude_entity_id],
+            )
+            .await?;
+        Ok(rows.next().await?.and_then(|r| r.get(0).ok()).unwrap_or(0))
+    }
+
+    /// `MergePreview.edges` / `MergeOutcome.edges`: the count of DISTINCT
+    /// re-pointed `(src, dst, semantic_type)` identities the merge will add
+    /// to the canonical -- NOT a per-row count of `entity_id`'s edges. Two
+    /// of `entity_id`'s edges can collapse onto the SAME re-pointed
+    /// identity (most commonly reciprocal same-type edges `entity_id ->
+    /// exclude_entity_id` and `exclude_entity_id -> entity_id`, which both
+    /// re-point to the self-loop `exclude_entity_id -> exclude_entity_id`),
+    /// and `dual_write_edge_with_payload`'s content-addressed edge id means
+    /// only ONE edge lands for that identity -- counting per-row would
+    /// overstate what the merge actually adds. Excludes an identity that
+    /// already exists among `exclude_entity_id`'s active edges, since
+    /// re-asserting it is an upsert onto that same row, not a new edge.
+    async fn edges_will_move_delta(
+        conn: &libsql::Connection,
+        entity_id: &str,
+        exclude_entity_id: &str,
+    ) -> Result<i64, libsql::Error> {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM ( \
+                     SELECT DISTINCT \
+                         (CASE WHEN e1.src_id = ?1 THEN ?2 ELSE e1.src_id END) AS new_src, \
+                         (CASE WHEN e1.dst_id = ?1 THEN ?2 ELSE e1.dst_id END) AS new_dst, \
+                         e1.semantic_type AS semantic_type \
+                     FROM edges e1 \
+                     WHERE e1.edge_type = 'relates' AND e1.src_kind = 'entity' \
+                       AND e1.dst_kind = 'entity' AND (e1.src_id = ?1 OR e1.dst_id = ?1) \
+                       AND e1.valid_until IS NULL \
+                 ) repointed \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM edges e2 \
+                      WHERE e2.edge_type = 'relates' AND e2.src_kind = 'entity' \
+                        AND e2.dst_kind = 'entity' AND e2.valid_until IS NULL \
+                        AND e2.semantic_type IS repointed.semantic_type \
+                        AND e2.src_id = repointed.new_src \
+                        AND e2.dst_id = repointed.new_dst)",
+                libsql::params![entity_id, exclude_entity_id],
+            )
+            .await?;
+        Ok(rows.next().await?.and_then(|r| r.get(0).ok()).unwrap_or(0))
+    }
+
     /// Read-only preview of `merge_entities(canonical_id, alias_id)`: the
     /// rows the merge will actually move onto the canonical, plus the alias
     /// names it would add, without touching the database. Each count
@@ -34733,29 +34819,11 @@ impl MemoryDB {
             )));
         };
 
-        // Excludes a memory already linked to the canonical -- `merge_entities`'
-        // `INSERT OR IGNORE INTO memory_entities ... SELECT` leaves that row
-        // alone rather than duplicating it.
-        let memory_links: i64 = {
-            let mut rows = conn
-                .query(
-                    "SELECT COUNT(*) FROM memory_entities me \
-                     WHERE me.entity_id = ?1 \
-                       AND NOT EXISTS ( \
-                         SELECT 1 FROM memory_entities c \
-                          WHERE c.entity_id = ?2 AND c.memory_id = me.memory_id)",
-                    libsql::params![alias_id, canonical_id],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities_preview links: {e}")))?;
-            rows.next()
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("merge_entities_preview links row: {e}"))
-                })?
-                .and_then(|r| r.get(0).ok())
-                .unwrap_or(0)
-        };
+        // Excludes a memory already linked to the canonical through either
+        // source -- see `memory_links_delta`.
+        let memory_links: i64 = Self::memory_links_delta(&conn, alias_id, canonical_id)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("merge_entities_preview links: {e}")))?;
 
         // Excludes a loser observation whose (entity_id, lower(trim(content)))
         // identity already exists on the canonical -- `merge_entities` deletes
@@ -34780,37 +34848,11 @@ impl MemoryDB {
                 .unwrap_or(0)
         };
 
-        // Excludes a loser edge whose re-pointed (src, dst, semantic_type)
-        // already names an existing canonical edge -- `dual_write_edge_with_
-        // payload`'s content-addressed edge id makes that re-point an upsert
-        // onto the SAME row, not a new one.
-        let edges: i64 = {
-            let mut rows = conn
-                .query(
-                    "SELECT COUNT(*) FROM edges e1 \
-                     WHERE e1.edge_type = 'relates' AND e1.src_kind = 'entity' \
-                       AND e1.dst_kind = 'entity' AND (e1.src_id = ?1 OR e1.dst_id = ?1) \
-                       AND e1.valid_until IS NULL \
-                       AND NOT EXISTS ( \
-                         SELECT 1 FROM edges e2 \
-                          WHERE e2.edge_type = 'relates' AND e2.src_kind = 'entity' \
-                            AND e2.dst_kind = 'entity' AND e2.valid_until IS NULL \
-                            AND e2.edge_id != e1.edge_id \
-                            AND e2.semantic_type IS e1.semantic_type \
-                            AND e2.src_id = (CASE WHEN e1.src_id = ?1 THEN ?2 ELSE e1.src_id END) \
-                            AND e2.dst_id = (CASE WHEN e1.dst_id = ?1 THEN ?2 ELSE e1.dst_id END))",
-                    libsql::params![alias_id, canonical_id],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities_preview edges: {e}")))?;
-            rows.next()
-                .await
-                .map_err(|e| {
-                    WenlanError::VectorDb(format!("merge_entities_preview edges row: {e}"))
-                })?
-                .and_then(|r| r.get(0).ok())
-                .unwrap_or(0)
-        };
+        // Distinct re-pointed identities the merge will add -- see
+        // `edges_will_move_delta`.
+        let edges: i64 = Self::edges_will_move_delta(&conn, alias_id, canonical_id)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("merge_entities_preview edges: {e}")))?;
 
         // Same candidate set `merge_entities`' canonical-shadow UNION adds:
         // the loser's alias array plus its bare (lowercased) name, minus
@@ -35159,43 +35201,29 @@ impl MemoryDB {
             plans
         };
 
-        // `MergeOutcome::edges` -- same dedup-aware count `merge_entities_preview`
-        // computes (a loser edge whose re-pointed (src, dst, semantic_type)
-        // already names an existing canonical edge is an upsert onto that same
-        // content-addressed id, not a move). Read here, still under the lock
-        // held since function entry and before any mutation below, so it can't
-        // drift from what the transaction actually does.
-        let edges_will_move: i64 = {
-            let mut rows = conn
-                .query(
-                    "SELECT COUNT(*) FROM edges e1 \
-                     WHERE e1.edge_type = 'relates' AND e1.src_kind = 'entity' \
-                       AND e1.dst_kind = 'entity' AND (e1.src_id = ?1 OR e1.dst_id = ?1) \
-                       AND e1.valid_until IS NULL \
-                       AND NOT EXISTS ( \
-                         SELECT 1 FROM edges e2 \
-                          WHERE e2.edge_type = 'relates' AND e2.src_kind = 'entity' \
-                            AND e2.dst_kind = 'entity' AND e2.valid_until IS NULL \
-                            AND e2.edge_id != e1.edge_id \
-                            AND e2.semantic_type IS e1.semantic_type \
-                            AND e2.src_id = (CASE WHEN e1.src_id = ?1 THEN ?2 ELSE e1.src_id END) \
-                            AND e2.dst_id = (CASE WHEN e1.dst_id = ?1 THEN ?2 ELSE e1.dst_id END))",
-                    libsql::params![alias_id, canonical_id],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities edges count: {e}")))?;
-            rows.next()
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("merge_entities edges count row: {e}")))?
-                .and_then(|r| r.get(0).ok())
-                .unwrap_or(0)
-        };
+        // `MergeOutcome::edges` -- same distinct-re-pointed-identity delta
+        // `merge_entities_preview` computes (see `edges_will_move_delta`).
+        // Read here, still under the lock held since function entry and
+        // before any mutation below, so it can't drift from what the
+        // transaction actually does.
+        let edges_will_move: i64 = Self::edges_will_move_delta(&conn, alias_id, canonical_id)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("merge_entities edges count: {e}")))?;
+
+        // `MergeOutcome::memory_links` -- same union-of-both-sources delta
+        // `merge_entities_preview` computes (see `memory_links_delta`). Read
+        // here, still under the lock held since function entry and before
+        // any mutation below, so it can't drift from what the transaction
+        // actually moves.
+        let memory_links_will_move: i64 = Self::memory_links_delta(&conn, alias_id, canonical_id)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("merge_entities links count: {e}")))?;
 
         conn.execute("BEGIN TRANSACTION", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merge_entities begin: {e}")))?;
 
-        let result: Result<(Vec<CommunityGenerationUpdate>, u64, u64, Vec<String>), WenlanError> =
+        let result: Result<(Vec<CommunityGenerationUpdate>, u64, Vec<String>), WenlanError> =
             async {
                 // G6 Stage 2 PR 2b: the `relations` endpoint repoint stops here —
                 // `edges` is the sole live producer of `relates` edges now, and a
@@ -35334,20 +35362,18 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("merge_entities mem: {e}")))?;
 
-                // `changes()` after `INSERT OR IGNORE` counts only rows actually
-                // inserted (SQLite semantics), which is exactly
-                // `MergeOutcome::memory_links`: a memory already linked to the
-                // canonical is silently ignored here, not moved.
-                let memory_links_moved = conn
-                    .execute(
-                        "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id)
+                // `MergeOutcome::memory_links` is `memory_links_will_move`,
+                // read before this transaction started (see its definition
+                // above) -- `changes()` here would count only this table's
+                // rows, undercounting the legacy `memories.entity_id` column
+                // the UPDATE above also moves.
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id)
                      SELECT memory_id, ?1 FROM memory_entities WHERE entity_id = ?2",
-                        libsql::params![canonical_id, alias_id],
-                    )
-                    .await
-                    .map_err(|e| {
-                        WenlanError::VectorDb(format!("merge_entities memory links: {e}"))
-                    })?;
+                    libsql::params![canonical_id, alias_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("merge_entities memory links: {e}")))?;
 
                 conn.execute(
                     "DELETE FROM memory_entities WHERE entity_id = ?1",
@@ -35488,7 +35514,6 @@ impl MemoryDB {
 
                 Ok((
                     generation_updates,
-                    memory_links_moved,
                     observations_moved,
                     aliases_added.into_iter().collect(),
                 ))
@@ -35496,7 +35521,7 @@ impl MemoryDB {
             .await;
 
         match result {
-            Ok((generation_updates, memory_links_moved, observations_moved, aliases_added)) => {
+            Ok((generation_updates, observations_moved, aliases_added)) => {
                 conn.execute("COMMIT", ())
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("merge_entities commit: {e}")))?;
@@ -35504,7 +35529,7 @@ impl MemoryDB {
 
                 Ok(MergeOutcome {
                     merged: true,
-                    memory_links: memory_links_moved,
+                    memory_links: memory_links_will_move.max(0) as u64,
                     observations: observations_moved,
                     edges: edges_will_move.max(0) as u64,
                     aliases_added,

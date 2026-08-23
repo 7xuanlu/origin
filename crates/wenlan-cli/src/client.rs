@@ -607,9 +607,7 @@ impl WenlanClient {
                 &format!("POST {} failed", url),
             )
             .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
+        let resp = ensure_daemon_success(resp, &url).await?;
         resp.json()
             .await
             .context("parsing /api/memory/entities/list response")
@@ -630,9 +628,7 @@ impl WenlanClient {
                 &format!("POST {} failed", url),
             )
             .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
+        let resp = ensure_daemon_success(resp, &url).await?;
         resp.json()
             .await
             .context("parsing /api/memory/entities/{id}/merge response")
@@ -648,13 +644,41 @@ impl WenlanClient {
                 &format!("POST {} failed", url),
             )
             .await?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("daemon returned error for {}", url))?;
+        let resp = ensure_daemon_success(resp, &url).await?;
         resp.json()
             .await
             .context("parsing /api/memory/entities/{id}/aliases response")
     }
+}
+
+/// Non-success response -> `anyhow::Error` carrying the daemon's own error
+/// message, not just the status line `error_for_status()` alone gives.
+/// Used only by `list_entities`, `merge_entity`, `add_entity_alias`: PR 2
+/// review finding 5 -- `wenlan entities alias wenlan origin-core` printed
+/// only `HTTP status client error (409 Conflict) for url ...`, dropping the
+/// daemon's `{"error": "..."}` body (e.g. the "use merge instead" guidance)
+/// entirely. Every other client method keeps `error_for_status()` as-is.
+async fn ensure_daemon_success(resp: reqwest::Response, url: &str) -> Result<reqwest::Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let msg = daemon_error_message(&body);
+    anyhow::bail!("daemon returned {status} for {url}: {msg}");
+}
+
+/// Pull the daemon's message out of an error response body: the `error`
+/// string when the body is a `{"error": "..."}` JSON object (the shape
+/// every `ServerError` response uses), else the raw body trimmed.
+fn daemon_error_message(body: &str) -> String {
+    #[derive(Deserialize)]
+    struct ErrorEnvelope {
+        error: String,
+    }
+    serde_json::from_str::<ErrorEnvelope>(body)
+        .map(|envelope| envelope.error)
+        .unwrap_or_else(|_| body.trim().to_string())
 }
 
 fn build_list_request(
@@ -672,7 +696,25 @@ fn build_list_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_list_request, WenlanClient};
+    use super::{build_list_request, daemon_error_message, WenlanClient};
+
+    #[test]
+    fn daemon_error_message_reads_error_envelope() {
+        let body =
+            r#"{"error":"alias \"origin-core\" is the name of live entity e1; use merge instead"}"#;
+        assert_eq!(
+            daemon_error_message(body),
+            "alias \"origin-core\" is the name of live entity e1; use merge instead"
+        );
+    }
+
+    #[test]
+    fn daemon_error_message_falls_back_to_raw_text() {
+        assert_eq!(
+            daemon_error_message("  Internal Server Error  "),
+            "Internal Server Error"
+        );
+    }
 
     #[test]
     fn list_request_can_filter_unconfirmed_memories() {

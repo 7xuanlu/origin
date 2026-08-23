@@ -446,6 +446,11 @@ pub struct MergeEntityResponse {
     pub canonical_name: String,
     pub loser_id: String,
     pub loser_name: String,
+    /// Distinct memories newly linked to the canonical, over both link
+    /// sources the merge moves (the `memory_entities` link table UNION the
+    /// legacy direct `memories.entity_id` column). The graph draws from the
+    /// same union but hides superseded memories and pending revisions, so
+    /// it can gain fewer links than this count.
     pub memory_links: u64,
     pub observations: u64,
     pub edges: u64,

@@ -741,9 +741,9 @@ must be demoted individually with a recorded reason. **Every MCP tool is
 | `verify_lint_repair` | yes | automatic | `none` | tool handler |
 | `write_page` | yes | automatic | `none` | tool handler |
 
-## CLI — all 19 `Commands` variants
+## CLI — all 20 `Commands` variants
 
-From `crates/wenlan-cli/src/main.rs:29`. The count is 19, not 18: `Connect` is a
+From `crates/wenlan-cli/src/main.rs:29`. The count is 20, not 19: `Connect` is a
 tuple variant, easy to miss when scanning for brace-shaped variants. The CLI
 renders daemon responses, so it inherits the daemon's classification and adds
 the projection-directory reader.
@@ -769,6 +769,7 @@ the projection-directory reader.
 | `wenlan curate` | yes | automatic | `none` | subcommand renderer |
 | `wenlan agents` | yes | automatic | `none` | subcommand renderer |
 | `wenlan spaces` | yes | automatic | `none` | subcommand renderer |
+| `wenlan entities` | yes | automatic | `none` | subcommand renderer |
 
 ## Projection, export, internal
 
