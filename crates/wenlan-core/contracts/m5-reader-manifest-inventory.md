@@ -522,9 +522,9 @@ A surface that transmits anyway is a failing test on that surface. That gate is
 soft, and saying so plainly is what cooperative-tier means. It is also no longer
 load-bearing: the shape gate holds even when this one is bypassed.
 
-## HTTP — all 165 registered `(method, path, handler)` triples
+## HTTP — all 167 registered `(method, path, handler)` triples
 
-60 page-bearing, 105 not.
+60 page-bearing, 107 not.
 
 | Method | Path | Builder | Page-bearing | Class | Marker-shape | Adapter | Evidence |
 |---|---|---|---|---|---|---|---|
@@ -907,7 +907,7 @@ carrying the authority of agreement.
 | `core/db.rs::get_stale_page_after` | `pub` | no | no | — | — |
 | `core/db.rs::insert_page_with_kind_inner` | `private` | no | no | — | — |
 | `core/db.rs::list_active_page_titles_scoped` | `pub` | no | no | — | — |
-| `core/db.rs::list_entities` | `pub` | no | **yes** | `server/cmd_prune_junk_entities.rs::collect_candidates` | — |
+| `core/db.rs::list_entities` | `pub` | yes | no | — | — |
 | `core/db.rs::list_pages_by_space` | `pub` | no | no | — | — |
 | `core/db.rs::list_pages_inner` | `private` | no | no | — | — |
 | `core/db.rs::list_pages_stale` | `pub` | no | no | — | — |
@@ -1068,7 +1068,6 @@ carrying the authority of agreement.
 | `core/synthesis/wikilinks.rs::resolve_against_pages` | `pub` | no | no | — | `core/db.rs::find_unique_active_page_id_by_title_scoped` |
 | `core/truth_adapter.rs::verdicts` | `private` | no | no | — | `core/db/truth_exposure.rs::page_truth_states` |
 | `server/cmd_backfill.rs::run` | `pub` | yes | no | — | `core/db.rs::find_stale_archived_pages` |
-| `server/cmd_prune_junk_entities.rs::collect_candidates` | `private` | no | no | `server/cmd_prune_junk_entities.rs::run` | `core/db.rs::list_entities` |
 | `server/entity_graph_routes.rs::handle_add_entity_alias` | `pub` | no | no | — | `core/db.rs::get_entity_detail` |
 | `server/entity_graph_routes.rs::handle_create_entity` | `pub` | no | no | — | `core/db.rs::get_entity_detail` |
 | `server/entity_graph_routes.rs::handle_get_entity_detail` | `pub` | no | no | — | `core/db/scoped_entities.rs::get_entity_detail_scoped` |
@@ -1211,7 +1210,7 @@ carrying the authority of agreement.
 | `server/brief_routes.rs::handle_read_brief` | `pub` | no | **yes** | `server/routes.rs::handle_context` | `core/db.rs::search_memory` |
 | `server/cmd_cutover.rs::run` | `pub` | yes | no | — | `core/export/knowledge.rs::plan_truth_cutover` |
 | `server/cmd_prune_junk_entities.rs::restore` | `pub` | yes | no | — | `core/db.rs::restore_entity` |
-| `server/cmd_prune_junk_entities.rs::run` | `pub` | yes | no | — | `core/db.rs::archive_entity`, `server/cmd_prune_junk_entities.rs::collect_candidates` |
+| `server/cmd_prune_junk_entities.rs::run` | `pub` | yes | no | — | `core/db.rs::archive_entity` |
 | `server/main/runtime.rs::register_optional_runtime_workers` | `pub(super)` | no | no | `server/main.rs::run_daemon` | `core/db/claim_derivation.rs::reconcile_supported_pages` |
 | `server/main/startup.rs::prepare_startup_state` | `pub(super)` | no | no | `server/main.rs::run_daemon` | `core/db.rs::list_pages` |
 | `server/memory_routes.rs::handle_search_memory` | `pub` | no | no | — | `core/db.rs::search_memory` |

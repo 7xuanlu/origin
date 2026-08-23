@@ -57,17 +57,22 @@ async fn resolve_entity(client: &WenlanClient, id_or_name: &str) -> Result<(Stri
     if let Some(detail) = client.get_entity(id_or_name).await? {
         return Ok((detail.entity.id, detail.entity.name));
     }
-    let response = client.search_entities(id_or_name.to_string(), 50).await?;
+    // Not an id: fall back to an exact, case-insensitive name match. Uses
+    // `/api/memory/entities/list` (every live entity in scope, no by-name
+    // filter on the route) rather than the vector-similarity `/search`
+    // route, so a lookup can't silently resolve to the wrong near-namesake.
+    let response = client.list_entities().await?;
+    let name_lower = id_or_name.to_lowercase();
     let mut matches = response
-        .results
+        .entities
         .into_iter()
-        .filter(|r| r.entity.name.eq_ignore_ascii_case(id_or_name));
+        .filter(|e| e.name.to_lowercase() == name_lower);
     let first = matches
         .next()
         .ok_or_else(|| anyhow::anyhow!("no entity found with id or exact name '{}'", id_or_name))?;
-    let mut candidates = vec![format!("{} ({})", first.entity.id, first.entity.name)];
+    let mut candidates = vec![format!("{} ({})", first.id, first.name)];
     for extra in matches {
-        candidates.push(format!("{} ({})", extra.entity.id, extra.entity.name));
+        candidates.push(format!("{} ({})", extra.id, extra.name));
     }
     if candidates.len() > 1 {
         anyhow::bail!(
@@ -76,7 +81,7 @@ async fn resolve_entity(client: &WenlanClient, id_or_name: &str) -> Result<(Stri
             candidates.join(", ")
         );
     }
-    Ok((first.entity.id, first.entity.name))
+    Ok((first.id, first.name))
 }
 
 async fn merge(

@@ -29104,6 +29104,105 @@ async fn merge_entities_dedups_overlapping_observations() {
     assert_eq!(alias_count, 0, "no observation rows left on the alias id");
 }
 
+/// `merge_entities_preview`'s counts must equal what `merge_entities` itself
+/// moves -- not what's merely attached to the loser. Seeds one memory link
+/// and one observation the loser SHARES with the canonical (both dedup away
+/// rather than move) alongside one of each the loser holds alone (both must
+/// move), then checks the preview's counts, the applied `MergeOutcome`'s
+/// counts, and the actual pre/post-merge row deltas on the canonical all
+/// agree.
+#[tokio::test]
+async fn merge_entities_preview_counts_match_post_merge_deltas() {
+    let (db, _tmp) = test_db().await;
+    let (canonical, alias) = seed_two_entities(&db).await;
+
+    db.link_memory_entities("shared_memory", &[canonical.as_str(), alias.as_str()])
+        .await
+        .unwrap();
+    db.link_memory_entities("alias_only_memory", &[alias.as_str()])
+        .await
+        .unwrap();
+    db.add_observation(&canonical, "Shared fact", None, None)
+        .await
+        .unwrap();
+    db.add_observation(&alias, "Shared fact", None, None)
+        .await
+        .unwrap();
+    db.add_observation(&alias, "Alias unique fact", None, None)
+        .await
+        .unwrap();
+
+    let canonical_memory_links_before = count_entity_rows(
+        &db,
+        "SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?1",
+        &canonical,
+    )
+    .await;
+    let canonical_observations_before = count_entity_rows(
+        &db,
+        "SELECT COUNT(*) FROM observations WHERE entity_id = ?1",
+        &canonical,
+    )
+    .await;
+
+    let preview = db.merge_entities_preview(&canonical, &alias).await.unwrap();
+    assert_eq!(
+        preview.memory_links, 1,
+        "only the alias-only memory link should be counted as moving"
+    );
+    assert_eq!(
+        preview.observations, 1,
+        "only the alias-unique observation should be counted as moving"
+    );
+
+    let outcome = db.merge_entities(&canonical, &alias).await.unwrap();
+    assert!(outcome.merged);
+    assert_eq!(
+        outcome.memory_links, preview.memory_links,
+        "the outcome's own count must match the preview's"
+    );
+    assert_eq!(
+        outcome.observations, preview.observations,
+        "the outcome's own count must match the preview's"
+    );
+
+    let canonical_memory_links_after = count_entity_rows(
+        &db,
+        "SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?1",
+        &canonical,
+    )
+    .await;
+    let canonical_observations_after = count_entity_rows(
+        &db,
+        "SELECT COUNT(*) FROM observations WHERE entity_id = ?1",
+        &canonical,
+    )
+    .await;
+    assert_eq!(
+        canonical_memory_links_after - canonical_memory_links_before,
+        preview.memory_links as i64,
+        "the preview's memory_links count must equal the real post-merge delta"
+    );
+    assert_eq!(
+        canonical_observations_after - canonical_observations_before,
+        preview.observations as i64,
+        "the preview's observations count must equal the real post-merge delta"
+    );
+}
+
+async fn count_entity_rows(db: &MemoryDB, sql: &str, entity_id: &str) -> i64 {
+    let conn = db.conn.lock().await;
+    conn.query(sql, libsql::params![entity_id])
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap()
+}
+
 // ==================== supersede_relation ====================
 
 #[tokio::test]

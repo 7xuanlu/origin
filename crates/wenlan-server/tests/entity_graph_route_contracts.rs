@@ -761,3 +761,207 @@ async fn create_entity_named_after_alias_resolves_to_canonical() {
     );
     assert_eq!(resolved.write_outcome, Some(WriteOutcome::ResolvedExisting));
 }
+
+/// Merging an entity into itself is a validation error, not a self-merge
+/// no-op.
+#[tokio::test]
+async fn merge_entity_same_id_is_422() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+    let entity = create_test_entity(&router, "Merge Same Id", "org").await;
+
+    let merge_uri = format!("/api/memory/entities/{}/merge", entity.id);
+    let (status, error): (StatusCode, ErrorEnvelope) = request_typed(
+        &router,
+        Method::POST,
+        &merge_uri,
+        json_body(&MergeEntityRequest {
+            into: entity.id.clone(),
+            dry_run: false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(error.error.contains("same id"), "{}", error.error);
+}
+
+/// An unknown `into` (the canonical) is a 404, not a silent no-op.
+#[tokio::test]
+async fn merge_entity_unknown_into_is_404() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+    let loser = create_test_entity(&router, "Merge Unknown Into", "org").await;
+
+    let merge_uri = format!("/api/memory/entities/{}/merge", loser.id);
+    let (status, _error): (StatusCode, ErrorEnvelope) = request_typed(
+        &router,
+        Method::POST,
+        &merge_uri,
+        json_body(&MergeEntityRequest {
+            into: "no-such-canonical".to_string(),
+            dry_run: false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// An unknown loser (`{id}` in the path) is a 404, not a silent no-op.
+#[tokio::test]
+async fn merge_entity_unknown_loser_is_404() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+    let canonical = create_test_entity(&router, "Merge Unknown Loser", "org").await;
+
+    let (status, _error): (StatusCode, ErrorEnvelope) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/no-such-loser/merge",
+        json_body(&MergeEntityRequest {
+            into: canonical.id.clone(),
+            dry_run: false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Omitting `dry_run` from the request body defaults to an apply (the
+/// field's `#[serde(default)]` is `false`), not a safe no-op -- the loser
+/// must be gone afterward exactly like an explicit `dry_run: false`.
+#[tokio::test]
+async fn merge_entity_missing_dry_run_field_applies() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+
+    let canonical = create_test_entity(&router, "Missing DryRun Canonical", "org").await;
+    let loser = create_test_entity(&router, "Missing DryRun Loser", "org").await;
+
+    let merge_uri = format!("/api/memory/entities/{}/merge", loser.id);
+    let body =
+        Body::from(serde_json::to_vec(&serde_json::json!({ "into": canonical.id })).unwrap());
+    let (status, applied): (StatusCode, MergeEntityResponse) =
+        request_typed(&router, Method::POST, &merge_uri, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(applied.applied, "omitting dry_run must default to an apply");
+
+    let loser_uri = format!("/api/memory/entities/{}", loser.id);
+    let (status, _error): (StatusCode, ErrorEnvelope) =
+        request_typed(&router, Method::GET, &loser_uri, Body::empty()).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the loser must be gone after the default (non-dry-run) apply"
+    );
+}
+
+/// An applied merge with a real observation, memory link, and edge on the
+/// loser reports counts equal to what the transaction actually moved
+/// (Findings 2 and 3): the preview's dedup-aware counts and the outcome's
+/// own `changes()`-captured counts must agree, not just both be nonzero.
+#[tokio::test]
+async fn merge_entity_apply_counts_match_what_moved() {
+    let (router, _tmp, db) = common::test_app_no_gate().await;
+
+    let canonical = create_test_entity(&router, "Counts Canonical", "org").await;
+    let loser = create_test_entity(&router, "Counts Loser", "org").await;
+    let other = create_test_entity(&router, "Counts Edge Target", "org").await;
+
+    db.add_observation(
+        &loser.id,
+        "A fact that must move onto the canonical.",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    db.link_memory_entities("merge-counts-memory", &[loser.id.as_str()])
+        .await
+        .unwrap();
+
+    let relation_request = CreateRelationRequest {
+        from_entity: loser.id.clone(),
+        to_entity: other.id.clone(),
+        relation_type: "depends_on".to_string(),
+        source_agent: Some("entity-graph-route-contract".to_string()),
+        confidence: Some(0.8),
+        explanation: None,
+        source_memory_id: None,
+        span: None,
+        model_version: None,
+        prompt_version: None,
+    };
+    let (status, _relation): (StatusCode, CreateRelationResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/relations",
+        json_body(&relation_request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let merge_uri = format!("/api/memory/entities/{}/merge", loser.id);
+    let (status, preview): (StatusCode, MergeEntityResponse) = request_typed(
+        &router,
+        Method::POST,
+        &merge_uri,
+        json_body(&MergeEntityRequest {
+            into: canonical.id.clone(),
+            dry_run: true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(preview.memory_links, 1);
+    assert_eq!(preview.observations, 1);
+    assert_eq!(preview.edges, 1);
+
+    let (status, applied): (StatusCode, MergeEntityResponse) = request_typed(
+        &router,
+        Method::POST,
+        &merge_uri,
+        json_body(&MergeEntityRequest {
+            into: canonical.id.clone(),
+            dry_run: false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(applied.applied);
+    assert_eq!(applied.memory_links, preview.memory_links);
+    assert_eq!(applied.observations, preview.observations);
+    assert_eq!(applied.edges, preview.edges);
+    assert_eq!(applied.memory_links, 1);
+    assert_eq!(applied.observations, 1);
+    assert_eq!(applied.edges, 1);
+}
+
+/// When the alias conflict's owner is a live entity whose own name equals
+/// the alias, the 409 must say so and point at the merge path instead of
+/// the generic "already owned by" wording.
+#[tokio::test]
+async fn add_entity_alias_conflict_with_live_namesake_points_at_merge() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+
+    let origin = create_test_entity(&router, "Origin", "project").await;
+    let wenlan = create_test_entity(&router, "wenlan", "project").await;
+
+    let alias_uri = format!("/api/memory/entities/{}/aliases", wenlan.id);
+    let (status, error): (StatusCode, ErrorEnvelope) = request_typed(
+        &router,
+        Method::POST,
+        &alias_uri,
+        json_body(&AddEntityAliasRequest {
+            alias: "Origin".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(error.error.contains(&origin.id), "{}", error.error);
+    assert!(
+        error.error.contains("/merge"),
+        "must point at the merge route: {}",
+        error.error
+    );
+    assert!(
+        error.error.contains("wenlan entities merge"),
+        "must point at the CLI merge command: {}",
+        error.error
+    );
+}

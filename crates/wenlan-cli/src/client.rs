@@ -14,15 +14,15 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use wenlan_types::{
     requests::{
-        AddEntityAliasRequest, ListMemoriesRequest, MergeEntityRequest, SearchEntitiesRequest,
-        SearchMemoryRequest, SearchRequest, SetDefaultSpaceRequest, StoreMemoryRequest,
-        UpdateAgentRequest,
+        AddEntityAliasRequest, ListEntitiesRequest, ListMemoriesRequest, MergeEntityRequest,
+        SearchEntitiesRequest, SearchMemoryRequest, SearchRequest, SetDefaultSpaceRequest,
+        StoreMemoryRequest, UpdateAgentRequest,
     },
     responses::{
         AgentResponse, DefaultSpaceResponse, EntityAliasesResponse, HealthResponse,
-        ListMemoriesResponse, MemoryDetailResponse, MergeEntityResponse, PendingRevisionItem,
-        RevisionAcceptResponse, RevisionDismissResponse, SearchEntitiesResponse,
-        SearchMemoryResponse, SearchResponse, StoreMemoryResponse,
+        ListEntitiesResponse, ListMemoriesResponse, MemoryDetailResponse, MergeEntityResponse,
+        PendingRevisionItem, RevisionAcceptResponse, RevisionDismissResponse,
+        SearchEntitiesResponse, SearchMemoryResponse, SearchResponse, StoreMemoryResponse,
     },
     sources::Source,
     BriefReadRequest, BriefReadResponse, BriefUpdateReceipt, BriefUpdateRequest, EntityDetail,
@@ -590,6 +590,29 @@ impl WenlanClient {
         resp.json()
             .await
             .context("parsing /api/memory/entities/search response")
+    }
+
+    /// POST /api/memory/entities/list — every live entity in scope, unfiltered
+    /// by name. Used for exact-name lookup: the daemon has no by-name filter
+    /// on this route, so callers filter the returned list client-side.
+    pub async fn list_entities(&self) -> Result<ListEntitiesResponse> {
+        let url = format!("{}/api/memory/entities/list", self.base_url);
+        let req = ListEntitiesRequest {
+            entity_type: None,
+            space: None,
+        };
+        let resp = self
+            .send(
+                self.http.post(&url).json(&req),
+                &format!("POST {} failed", url),
+            )
+            .await?;
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {}", url))?;
+        resp.json()
+            .await
+            .context("parsing /api/memory/entities/list response")
     }
 
     /// POST /api/memory/entities/{id}/merge — merge `loser_id` into `into`.
