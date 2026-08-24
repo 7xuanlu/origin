@@ -187,7 +187,7 @@ daemon_postmortem() {
     fi
     [ -x "$bin" ] || { info daemon-replay "skipped: $bin is not executable"; return 0; }
     local replay="$GAUNTLET_OUT/checks/daemon-replay.log" rc=0
-    _replay_capped "$bin" "$replay" 127.0.0.1:17917 || rc=$?
+    _replay_capped "$bin" "$replay" "$data_root" 127.0.0.1:17917 || rc=$?
     # 124: still running (healthy) at 30s, i.e. the binary is fine and the
     # fault is in how the service runs it. Anything else is the daemon's exit.
     info daemon-replay "rc=$rc (124 = still running at 30s) $(tail -c 1500 "$replay" | tr '\n' '|')"
@@ -198,7 +198,7 @@ daemon_postmortem() {
     # both failing points away from it (network/TLS under the service env).
     local replay2="$GAUNTLET_OUT/checks/daemon-replay-cache-dir.log" rc2=0
     mkdir -p "$data_root/replay-cache"
-    _replay_capped "$bin" "$replay2" 127.0.0.1:17918 \
+    _replay_capped "$bin" "$replay2" "$data_root" 127.0.0.1:17918 \
         FASTEMBED_CACHE_DIR="$data_root/replay-cache" || rc2=$?
     info daemon-replay-cache-dir "rc=$rc2 (124 = still running at 30s) $(tail -c 1500 "$replay2" | tr '\n' '|')"
 }
@@ -208,12 +208,11 @@ daemon_postmortem() {
 # gauntlet run a replay whose daemon survived init outlived the cap and hung
 # every macOS job into its timeout-minutes, losing the verdict row. A KILL
 # watchdog cannot be ignored or waited out. Exit 124 = killed while running.
-# Usage: _replay_capped <bin> <logfile> <bind_addr> [EXTRA=env ...]
-# Reads $data_root from the calling daemon_postmortem scope. The cap is
-# GAUNTLET_REPLAY_CAP seconds (default 30; the test shortens it).
+# Usage: _replay_capped <bin> <logfile> <data_root> <bind_addr> [EXTRA=env ...]
+# The cap is GAUNTLET_REPLAY_CAP seconds (default 30; the test shortens it).
 _replay_capped() {
-    local bin="$1" log="$2" bind="$3" cap="${GAUNTLET_REPLAY_CAP:-30}"
-    shift 3
+    local bin="$1" log="$2" data_root="$3" bind="$4" cap="${GAUNTLET_REPLAY_CAP:-30}"
+    shift 4
     (
         cd / || exit 125
         env -i HOME="$HOME" USER="${USER:-$(id -un)}" PATH=/usr/bin:/bin:/usr/sbin:/sbin \

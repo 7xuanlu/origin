@@ -157,6 +157,19 @@ try {
     } catch { Info "screenshot" "skipped: $($_.Exception.Message)" }
 
     if ($App) { Stop-Process -Id $App.Id -Force -ErrorAction SilentlyContinue }
+    # A surviving daemon is only an orphan if the app really died: prove the
+    # kill landed before blaming the sidecar (adversarial review, F13).
+    Check -Name "app-exited-after-kill" -Script {
+        if (-not $App) { throw "no app process handle to kill" }
+        for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            if (-not (Get-Process -Id $App.Id -ErrorAction SilentlyContinue)) {
+                Write-Output "app pid $($App.Id) exited"
+                return
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        throw "app pid $($App.Id) still alive 10s after Stop-Process"
+    }
     Check -Name "sidecar-exits-after-app" -Script {
         $left = $null
         for ($attempt = 0; $attempt -lt 20; $attempt++) {
