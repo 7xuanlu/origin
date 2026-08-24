@@ -194,7 +194,7 @@ La captura y la sustitución explícita son fundamentales. Las etapas basadas en
 | **Clasifica** | Con el modelo en el dispositivo, Wenlan asigna `identity` (identidad), `preference` (preferencia), `decision` (decisión), `lesson` (lección), `gotcha` (advertencia) o `fact` (hecho); un tipo preciso proporcionado por el cliente tiene prioridad. |
 | **Enriquece** | Con el modelo en el dispositivo, añade campos estructurados, pistas de recuperación, fechas de eventos, calidad, importancia y etiquetas cuando estén disponibles. |
 | **Vincula** | Mantiene la procedencia y, cuando el enriquecimiento está habilitado, conecta Memorias con entidades y relaciones en el grafo de conocimiento. |
-| **Reconcilia** | Los reemplazos explícitos preservan una cadena de `supersedes` (sustituye). Un paso opcional en el dispositivo puede poner en cola conflictos protegidos para revisión en lugar de sobrescribir el historial; está desactivado por defecto y debe habilitarse explícitamente. |
+| **Reconcilia** | Los reemplazos explícitos preservan una cadena de `supersedes` (sustituye). Un reemplazo de un agente cuyo nivel de confianza sea inferior a "full" se pone en cola para revisión humana automáticamente, sin necesidad de ninguna opción. Un paso opcional en el dispositivo también puede poner en cola conflictos protegidos para revisión en lugar de sobrescribir el historial; ese paso está desactivado por defecto y debe habilitarse explícitamente. |
 
 Configuración avanzada: establece `WENLAN_ENABLE_DUAL_POOL_RESOLVE=1` para habilitar ese paso de reconciliación.
 

@@ -192,7 +192,7 @@ Capture and explicit supersession are core. Model-backed stages run only when th
 | **Classify** | With the on-device model, Wenlan assigns `identity`, `preference`, `decision`, `lesson`, `gotcha`, or `fact`; a precise type supplied by the caller remains authoritative. |
 | **Enrich** | With the on-device model, adds structured fields, retrieval cues, event dates, quality, importance, and tags when available. |
 | **Link** | Retains provenance and, when enrichment is enabled, connects Memories to entities and relations in the knowledge graph. |
-| **Reconcile** | Explicit replacements preserve a `supersedes` chain. An optional on-device pass can queue protected conflicts for review instead of overwriting history; it is off by default and must be explicitly enabled. |
+| **Reconcile** | Explicit replacements preserve a `supersedes` chain. A replacement from an agent whose trust level is below full queues for human review automatically, no flag required. An optional on-device pass can also queue protected conflicts for review instead of overwriting history; that pass is off by default and must be explicitly enabled. |
 
 Advanced configuration: set `WENLAN_ENABLE_DUAL_POOL_RESOLVE=1` to enable that reconcile pass.
 

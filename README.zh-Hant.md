@@ -194,7 +194,7 @@ Capture 與明確的 supersession 屬於核心流程。模型支援的階段只�
 | **Classify** | 設定本地模型後，Wenlan 將記憶分為 `identity`、`preference`、`decision`、`lesson`、`gotcha` 或 `fact`；呼叫端明確提供的準確類型優先。 |
 | **Enrich** | 設定本地模型後，在可用時補充結構化欄位、檢索提示、事件日期、品質、重要性與標籤。 |
 | **Link** | 保留出處；啟用 enrichment 後，把記憶連結到知識圖譜中的實體與關係。 |
-| **Reconcile** | 明確取代舊說法時保留 `supersedes` 鏈。可選的本地模型流程可以把受保護內容的衝突放入審核，而不是覆蓋歷史；它預設關閉，必須明確啟用。 |
+| **Reconcile** | 明確取代舊說法時保留 `supersedes` 鏈。若發起替換的 agent 信任等級低於 full，該替換會自動進入人工審核佇列，無需任何開關。可選的本地模型流程還可以把受保護內容的衝突放入審核，而不是覆蓋歷史；這個流程預設關閉，必須明確啟用。 |
 
 進階設定：使用 `WENLAN_ENABLE_DUAL_POOL_RESOLVE=1` 啟用這個 Reconcile 流程。
 
