@@ -386,6 +386,43 @@ async fn filter_draft_echo(
         .ok_or_else(draft_not_found)
 }
 
+/// Decide whether a publish title-conflict 409 may disclose the conflicting
+/// page's identity, and if so, which identity. Page ids are reusable, so the
+/// pair captured inside the publish transaction can be stale by the time the
+/// handler runs: the visibility check and the disclosed identity must come
+/// from one reload of the row, and the reloaded row must still fold to the
+/// conflicting title. Any failure or mismatch degrades to omission — the 409
+/// itself is already established and never turns into a 500 here.
+async fn visible_conflict_identity(
+    db: &wenlan_core::db::MemoryDB,
+    view: &crate::truth_guard::TruthView,
+    existing_page_id: &str,
+    wanted_key: &str,
+) -> Option<(String, String)> {
+    let page = match db.get_page(existing_page_id).await {
+        Ok(page) => page,
+        Err(e) => {
+            tracing::warn!(
+                "[page] conflict identity reload failed for {existing_page_id}; omitting: {e}"
+            );
+            return None;
+        }
+    };
+    let visible = match wenlan_core::truth_adapter::filter_page(db, &view.grant, page).await {
+        Ok(visible) => visible?,
+        Err(e) => {
+            tracing::warn!(
+                "[page] conflict identity filter failed for {existing_page_id}; omitting: {e}"
+            );
+            return None;
+        }
+    };
+    if wenlan_core::db::MemoryDB::page_title_key(&visible.title) != wanted_key {
+        return None;
+    }
+    Some((visible.id, visible.title))
+}
+
 fn draft_version_conflict(current_version: i64) -> ServerError {
     ServerError::Structured {
         status: axum::http::StatusCode::CONFLICT,
@@ -489,27 +526,20 @@ pub async fn handle_publish_page_draft(
             existing_page_id,
             existing_page_title,
         } => {
-            // The conflicting page's id and title are that page's content:
-            // name them only to a caller `filter_page` would show the page
-            // itself. The 409 code survives either way — the caller still
-            // needs to know the publish was refused — but a hidden page's
-            // identity fields are omitted, matching the wire contract that
-            // marks both optional (`parsePageDraftError` in src/lib/tauri.ts).
-            let existing = db
-                .get_page(&existing_page_id)
-                .await
-                .map_err(|e| ServerError::Internal(e.to_string()))?;
-            let visible = wenlan_core::truth_adapter::filter_page(&db, &view.grant, existing)
-                .await
-                .map_err(|e| ServerError::Internal(e.to_string()))?
-                .is_some();
+            let disclosed = visible_conflict_identity(
+                &db,
+                &view,
+                &existing_page_id,
+                &wenlan_core::db::MemoryDB::page_title_key(&existing_page_title),
+            )
+            .await;
             let mut body = serde_json::json!({
                 "code": "page_title_conflict",
                 "error": "A Page with this title already exists",
             });
-            if visible {
-                body["existing_page_id"] = existing_page_id.into();
-                body["existing_page_title"] = existing_page_title.into();
+            if let Some((current_id, current_title)) = disclosed {
+                body["existing_page_id"] = current_id.into();
+                body["existing_page_title"] = current_title.into();
             }
             return Err(ServerError::Structured {
                 status: axum::http::StatusCode::CONFLICT,
@@ -1636,5 +1666,99 @@ mod create_page_endpoint_tests {
             2,
             "below configured threshold should mint a new page"
         );
+    }
+}
+
+#[cfg(test)]
+mod conflict_identity_tests {
+    use super::visible_conflict_identity;
+    use crate::truth_guard::TruthView;
+    use std::sync::Arc;
+    use wenlan_core::db::MemoryDB;
+
+    const PAGE: &str = "page_00000000-0000-4000-8000-0000000000c1";
+
+    async fn test_db() -> (Arc<MemoryDB>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let emitter: Arc<dyn wenlan_core::events::EventEmitter> =
+            Arc::new(wenlan_core::events::NoopEmitter);
+        let db = Arc::new(MemoryDB::new(tmp.path(), emitter).await.unwrap());
+        (db, tmp)
+    }
+
+    async fn publish(db: &MemoryDB, id: &str, title: &str) -> wenlan_core::pages::Page {
+        let draft = db
+            .create_page_draft_with_id(id, title, "Body", None, None)
+            .await
+            .unwrap();
+        match db.publish_page_draft(id, draft.version).await.unwrap() {
+            wenlan_core::pages::PageDraftPublishOutcome::Published(page) => page,
+            _ => panic!("expected a clean publish"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_visible_conflicting_page_discloses_its_current_identity() {
+        let (db, _tmp) = test_db().await;
+        let page = publish(&db, PAGE, "Secret Plan").await;
+        let wanted = MemoryDB::page_title_key("  secret PLAN ");
+        let got = visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted).await;
+        assert_eq!(got, Some((page.id, page.title)));
+    }
+
+    #[tokio::test]
+    async fn a_concurrently_deleted_page_degrades_to_omission() {
+        let (db, _tmp) = test_db().await;
+        publish(&db, PAGE, "Secret Plan").await;
+        db.delete_page(PAGE).await.unwrap();
+        let wanted = MemoryDB::page_title_key("Secret Plan");
+        assert_eq!(
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted).await,
+            None
+        );
+    }
+
+    /// Replace the row's title out from under the open `MemoryDB`, the way a
+    /// concurrent writer would between the publish transaction and the
+    /// handler's reload. Same direct-file seam as the routes tests.
+    async fn overwrite_title(tmp: &tempfile::TempDir, id: &str, title: &str) {
+        let raw = libsql::Builder::new_local(tmp.path().join("origin_memory.db"))
+            .build()
+            .await
+            .unwrap();
+        let conn = raw.connect().unwrap();
+        conn.execute(
+            "UPDATE pages SET title = ?1 WHERE id = ?2",
+            libsql::params![title, id],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_replaced_row_with_an_unrelated_title_stays_omitted() {
+        // Page ids are reusable and rows are mutable: between the publish
+        // transaction and this reload the id can hold a different title. The
+        // reloaded row no longer folds to the conflicting title, so neither
+        // the stale captured title nor the new row's title may be disclosed.
+        let (db, tmp) = test_db().await;
+        publish(&db, PAGE, "Secret Plan").await;
+        overwrite_title(&tmp, PAGE, "Innocuous Note").await;
+        let wanted = MemoryDB::page_title_key("Secret Plan");
+        assert_eq!(
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_row_still_folding_to_the_conflict_discloses_the_reloaded_row() {
+        let (db, tmp) = test_db().await;
+        let page = publish(&db, PAGE, "Secret Plan").await;
+        overwrite_title(&tmp, PAGE, "SECRET plan").await;
+        let wanted = MemoryDB::page_title_key("Secret Plan");
+        let got = visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted).await;
+        // The identity comes from the reloaded row, never the stale capture.
+        assert_eq!(got, Some((page.id, "SECRET plan".to_string())));
     }
 }

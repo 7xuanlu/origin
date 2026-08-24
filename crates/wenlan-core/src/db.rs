@@ -49920,9 +49920,55 @@ impl MemoryDB {
     /// bundled SQLite `lower()` is ASCII-only (no ICU), so any SQL-side
     /// `LOWER(title)` fold disagrees with the Rust fold on Unicode titles —
     /// two seams meant one identity for conflicts and a different one for
-    /// links, leaving cross-case Unicode links orphaned.
-    pub(crate) fn page_title_key(title: &str) -> String {
+    /// links, leaving cross-case Unicode links orphaned. (The eligible row
+    /// sets still differ on purpose: the publish conflict scan includes
+    /// `kind='entity'` shadow rows, link resolution excludes them.)
+    ///
+    /// `pub` because the server's conflict-disclosure check folds through the
+    /// same seam.
+    pub fn page_title_key(title: &str) -> String {
         title.trim().to_lowercase()
+    }
+
+    /// One scope scan folding every active non-entity page title. Value is
+    /// the unique owning page id, or `None` when two pages fold to the same
+    /// key — the resolver's ambiguity contract. Callers resolving many labels
+    /// (a page's wikilinks, the orphan sweep) build this once per scope
+    /// instead of scanning per label.
+    pub(crate) async fn folded_title_owners_scoped(
+        &self,
+        scope: Option<&str>,
+    ) -> Result<std::collections::HashMap<String, Option<String>>, WenlanError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, title FROM pages
+                 WHERE status = 'active'
+                   AND COALESCE(kind, 'concept') != 'entity'
+                   AND space = COALESCE(?1, '00000000-0000-4000-8000-000000000001')",
+                libsql::params![scope],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("folded_title_owners_scoped: {e}")))?;
+        let mut owners: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("folded_title_owners_scoped row: {e}")))?
+        {
+            let id: String = row
+                .get::<String>(0)
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+            let title: String = row
+                .get::<String>(1)
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+            owners
+                .entry(Self::page_title_key(&title))
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(id));
+        }
+        Ok(owners)
     }
 
     pub async fn find_unique_active_page_id_by_title_scoped(
@@ -49934,43 +49980,11 @@ impl MemoryDB {
         if wanted.is_empty() {
             return Ok(None);
         }
-        let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT id, title FROM pages
-                 WHERE status = 'active'
-                   AND COALESCE(kind, 'concept') != 'entity'
-                   AND space = COALESCE(?1, '00000000-0000-4000-8000-000000000001')
-                 ORDER BY id ASC",
-                libsql::params![scope],
-            )
-            .await
-            .map_err(|e| {
-                WenlanError::VectorDb(format!("find_unique_active_page_id_by_title_scoped: {e}"))
-            })?;
-        let mut found: Option<String> = None;
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-        {
-            let title: String = row
-                .get::<String>(1)
-                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
-            if Self::page_title_key(&title) != wanted {
-                continue;
-            }
-            if found.is_some() {
-                // Ambiguous label: same contract as the old LIMIT 2 query —
-                // two case-fold matches resolve to nothing.
-                return Ok(None);
-            }
-            found = Some(
-                row.get::<String>(0)
-                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?,
-            );
-        }
-        Ok(found)
+        Ok(self
+            .folded_title_owners_scoped(scope)
+            .await?
+            .remove(&wanted)
+            .flatten())
     }
 
     /// Replace the entire outbound-link set for a page in one BEGIN/COMMIT.
@@ -50182,14 +50196,28 @@ impl MemoryDB {
         };
 
         let mut resolved_labels = std::collections::BTreeSet::new();
+        // One folded-title scan per distinct source scope for the whole
+        // sweep, instead of one full scan per orphan label. The sweep only
+        // deletes orphan rows and mints edges — it creates no pages — so a
+        // snapshot per scope stays faithful to the per-label lookups it
+        // replaces.
+        let mut owner_maps: std::collections::HashMap<
+            Option<String>,
+            std::collections::HashMap<String, Option<String>>,
+        > = std::collections::HashMap::new();
         for (source_page_id, label_key, label, scope) in orphan_rows {
             let trimmed = label_key.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            let Some(target) = self
-                .find_unique_active_page_id_by_title_scoped(trimmed, scope.as_deref())
-                .await?
+            if !owner_maps.contains_key(&scope) {
+                let owners = self.folded_title_owners_scoped(scope.as_deref()).await?;
+                owner_maps.insert(scope.clone(), owners);
+            }
+            let Some(target) = owner_maps
+                .get(&scope)
+                .and_then(|owners| owners.get(&Self::page_title_key(trimmed)).cloned())
+                .flatten()
             else {
                 continue;
             };

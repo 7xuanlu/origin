@@ -46665,6 +46665,59 @@ async fn find_unique_active_page_id_by_title_scoped_excludes_entity_kind_shadow(
 }
 
 #[tokio::test]
+async fn find_unique_folds_untrimmed_stored_titles() {
+    // Ordinary PageWrite creation stores `req.title` unchanged, so a title can
+    // sit in the table with padding. The fold trims stored titles too: the
+    // padded row must resolve for its trimmed lookup, and a clean twin must
+    // then make the pair ambiguous.
+    let (db, _dir) = test_db().await;
+    db.insert_page(
+        "page_00000000-0000-4000-8000-0000000000d1",
+        "  Padded Title  ",
+        None,
+        "Body",
+        None,
+        Some("work"),
+        &[],
+        "2026-08-24T00:00:00Z",
+    )
+    .await
+    .unwrap();
+
+    let found = db
+        .find_unique_active_page_id_by_title_scoped("padded title", Some("work"))
+        .await
+        .unwrap();
+    assert_eq!(
+        found.as_deref(),
+        Some("page_00000000-0000-4000-8000-0000000000d1"),
+        "a stored title with padding must match its trimmed fold"
+    );
+
+    db.insert_page(
+        "page_00000000-0000-4000-8000-0000000000d2",
+        "Padded Title",
+        None,
+        "Body",
+        None,
+        Some("work"),
+        &[],
+        "2026-08-24T00:00:00Z",
+    )
+    .await
+    .unwrap();
+
+    let ambiguous = db
+        .find_unique_active_page_id_by_title_scoped("padded title", Some("work"))
+        .await
+        .unwrap();
+    assert!(
+        ambiguous.is_none(),
+        "whitespace-only title twins must be ambiguous, not first-wins"
+    );
+}
+
+#[tokio::test]
 async fn count_active_pages_excludes_entity_kind_shadow() {
     let (db, _dir) = test_db().await;
     db.store_entity("Count Marker", "person", None, None, None)
