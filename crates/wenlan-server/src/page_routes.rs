@@ -355,15 +355,35 @@ fn page_draft_error(err: wenlan_core::WenlanError) -> ServerError {
                 "error": "Page draft id already belongs to another Page",
             }),
         },
-        wenlan_core::WenlanError::NotFound(_) => ServerError::Structured {
-            status: axum::http::StatusCode::NOT_FOUND,
-            body: serde_json::json!({
-                "code": "page_draft_not_found",
-                "error": "Page draft not found",
-            }),
-        },
+        wenlan_core::WenlanError::NotFound(_) => draft_not_found(),
         other => ServerError::from(other),
     }
+}
+
+fn draft_not_found() -> ServerError {
+    ServerError::Structured {
+        status: axum::http::StatusCode::NOT_FOUND,
+        body: serde_json::json!({
+            "code": "page_draft_not_found",
+            "error": "Page draft not found",
+        }),
+    }
+}
+
+/// Pass a draft-chain page echo through the caller's truth grant, the same
+/// contract as `handle_get_page`: a page this caller may not see is not there,
+/// and the structured draft 404 is the honest wire answer. Fresh drafts and
+/// publishes are `Unevaluated` and pass in full; this bites only when a
+/// publish replay echoes a page since classified unsupported.
+async fn filter_draft_echo(
+    db: &wenlan_core::db::MemoryDB,
+    view: &crate::truth_guard::TruthView,
+    page: wenlan_core::pages::Page,
+) -> Result<wenlan_core::pages::Page, ServerError> {
+    wenlan_core::truth_adapter::filter_page(db, &view.grant, Some(page))
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?
+        .ok_or_else(draft_not_found)
 }
 
 fn draft_version_conflict(current_version: i64) -> ServerError {
@@ -391,6 +411,7 @@ async fn draft_db(
 pub async fn handle_create_page_draft(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
     Json(req): Json<CreatePageDraftRequest>,
 ) -> Result<Json<PageDraftResponse>, ServerError> {
     let db = draft_db(&state).await?;
@@ -408,12 +429,14 @@ pub async fn handle_create_page_draft(
         )
         .await
         .map_err(page_draft_error)?;
+    let page = filter_draft_echo(&db, &view, page).await?;
     Ok(Json(PageDraftResponse { page }))
 }
 
 /// PUT /api/pages/drafts/{id}
 pub async fn handle_update_page_draft(
     State(state): State<Arc<RwLock<ServerState>>>,
+    view: crate::truth_guard::TruthView,
     Path(id): Path<String>,
     Json(req): Json<UpdatePageDraftRequest>,
 ) -> Result<Json<PageDraftResponse>, ServerError> {
@@ -430,6 +453,7 @@ pub async fn handle_update_page_draft(
         .map_err(page_draft_error)?
     {
         wenlan_core::pages::PageDraftUpdateOutcome::Updated(page) => {
+            let page = filter_draft_echo(&db, &view, page).await?;
             Ok(Json(PageDraftResponse { page }))
         }
         wenlan_core::pages::PageDraftUpdateOutcome::VersionConflict { current_version } => {
@@ -441,6 +465,7 @@ pub async fn handle_update_page_draft(
 /// POST /api/pages/drafts/{id}/publish
 pub async fn handle_publish_page_draft(
     State(state): State<Arc<RwLock<ServerState>>>,
+    view: crate::truth_guard::TruthView,
     Path(id): Path<String>,
     Json(req): Json<PageDraftVersionRequest>,
 ) -> Result<Json<PageDraftResponse>, ServerError> {
@@ -475,6 +500,7 @@ pub async fn handle_publish_page_draft(
             })
         }
     };
+    let page = filter_draft_echo(&db, &view, page).await?;
     // First projection write for this page: `reconcile` only repairs pages
     // already in the projection state, so skipping here would leave the
     // published page invisible to `wenlan pages` until another write projects

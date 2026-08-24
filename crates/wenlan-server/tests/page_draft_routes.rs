@@ -135,6 +135,35 @@ async fn draft_lifecycle_create_update_publish_discard() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["page"]["version"], 3);
 
+    // A queued update or discard racing in after publish gets the structured
+    // 404 (only draft rows are findable as drafts) — the editor's discard
+    // path treats page_draft_not_found as completed cleanup.
+    let (status, body) = send(
+        &router,
+        Method::PUT,
+        &format!("/api/pages/drafts/{DRAFT_A}"),
+        Some(json!({
+            "expected_version": 3,
+            "title": "Launch checklist",
+            "content": "Late autosave",
+            "space": null,
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "page_draft_not_found");
+    let (status, body) = send(
+        &router,
+        Method::DELETE,
+        &format!("/api/pages/drafts/{DRAFT_A}"),
+        Some(json!({"expected_version": 3})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "page_draft_not_found");
+
     // Discard: a fresh draft deletes with {"status":"deleted"}.
     let (status, body) = send(
         &router,
