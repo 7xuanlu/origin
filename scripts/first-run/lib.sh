@@ -186,15 +186,10 @@ daemon_postmortem() {
         return 0
     fi
     [ -x "$bin" ] || { info daemon-replay "skipped: $bin is not executable"; return 0; }
-    local replay="$GAUNTLET_OUT/checks/daemon-replay.log" rc=0 timeout_bin
-    timeout_bin="$(command -v timeout || command -v gtimeout || true)"
-    (
-        cd / && env -i HOME="$HOME" USER="${USER:-$(id -un)}" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-            RUST_LOG=info WENLAN_DATA_DIR="$data_root" WENLAN_BIND_ADDR=127.0.0.1:17917 \
-            ${timeout_bin:+"$timeout_bin" 30} "$bin"
-    ) >"$replay" 2>&1 || rc=$?
-    # 124: still running after 30s, i.e. the binary is fine and the fault is
-    # in how the service runs it. Anything else is the daemon's own exit.
+    local replay="$GAUNTLET_OUT/checks/daemon-replay.log" rc=0
+    _replay_capped "$bin" "$replay" 127.0.0.1:17917 || rc=$?
+    # 124: still running (healthy) at 30s, i.e. the binary is fine and the
+    # fault is in how the service runs it. Anything else is the daemon's exit.
     info daemon-replay "rc=$rc (124 = still running at 30s) $(tail -c 1500 "$replay" | tr '\n' '|')"
 
     # Discriminating replay: identical environment shape, but with an explicit
@@ -203,11 +198,39 @@ daemon_postmortem() {
     # both failing points away from it (network/TLS under the service env).
     local replay2="$GAUNTLET_OUT/checks/daemon-replay-cache-dir.log" rc2=0
     mkdir -p "$data_root/replay-cache"
-    ( cd / && env -i HOME="$HOME" USER="${USER:-$(id -un)}" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-          RUST_LOG=info WENLAN_DATA_DIR="$data_root" WENLAN_BIND_ADDR=127.0.0.1:17918 \
-          FASTEMBED_CACHE_DIR="$data_root/replay-cache" \
-          ${timeout_bin:+"$timeout_bin" 30} "$bin" ) >"$replay2" 2>&1 || rc2=$?
+    _replay_capped "$bin" "$replay2" 127.0.0.1:17918 \
+        FASTEMBED_CACHE_DIR="$data_root/replay-cache" || rc2=$?
     info daemon-replay-cache-dir "rc=$rc2 (124 = still running at 30s) $(tail -c 1500 "$replay2" | tr '\n' '|')"
+}
+
+# Run the daemon exactly as launchd would (cwd /, minimal env) for at most
+# 30 s, then SIGKILL. `timeout` proved insufficient here: in the from-main
+# gauntlet run a replay whose daemon survived init outlived the cap and hung
+# every macOS job into its timeout-minutes, losing the verdict row. A KILL
+# watchdog cannot be ignored or waited out. Exit 124 = killed while running.
+# Usage: _replay_capped <bin> <logfile> <bind_addr> [EXTRA=env ...]
+# Reads $data_root from the calling daemon_postmortem scope. The cap is
+# GAUNTLET_REPLAY_CAP seconds (default 30; the test shortens it).
+_replay_capped() {
+    local bin="$1" log="$2" bind="$3" cap="${GAUNTLET_REPLAY_CAP:-30}"
+    shift 3
+    (
+        cd / || exit 125
+        env -i HOME="$HOME" USER="${USER:-$(id -un)}" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            RUST_LOG=info WENLAN_DATA_DIR="$data_root" WENLAN_BIND_ADDR="$bind" \
+            "$@" "$bin" >"$log" 2>&1 &
+        pid=$!
+        for _ in $(seq "$cap"); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            exit 124
+        fi
+        wait "$pid"
+    )
 }
 
 collect() {

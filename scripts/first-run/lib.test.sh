@@ -119,6 +119,29 @@ empty_rc="$(
 )"
 assert "evaluate returns 1 when no findings were recorded" [ "$empty_rc" = 1 ]
 
+# The post-mortem replay watchdog must SIGKILL a daemon that ignores TERM and
+# report 124: a TERM-only cap let a recovered daemon hang the job past its
+# timeout-minutes and lose the verdict row (from-main run, all macOS legs).
+cat >"$tmp/stubborn.sh" <<'EOS'
+#!/bin/sh
+trap '' TERM
+while :; do sleep 1; done
+EOS
+chmod +x "$tmp/stubborn.sh"
+watchdog_rc="$(
+    GAUNTLET_OUT="$tmp/run/findings-watchdog-macos" GAUNTLET_CHANNEL=watchdog \
+    GAUNTLET_REPLAY_CAP=2 bash -c '
+        . "$1/lib.sh" >/dev/null
+        data_root="$GAUNTLET_OUT"
+        if _replay_capped "$2" "$GAUNTLET_OUT/checks/stubborn.log" 127.0.0.1:17999; then
+            echo 0
+        else
+            echo $?
+        fi
+    ' _ "$here" "$tmp/stubborn.sh"
+)"
+assert "replay watchdog kills a TERM-ignoring daemon with rc 124" [ "$watchdog_rc" = 124 ]
+
 echo "== summary.py"
 summary="$(python3 "$here/summary.py" "$tmp/run")"
 assert "table header"              grep -q '^| Channel | Label | PASS | FAIL | INFO | seconds-to-health | Worst |$' <<<"$summary"
