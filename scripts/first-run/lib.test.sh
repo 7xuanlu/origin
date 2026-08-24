@@ -108,6 +108,17 @@ clean_rc="$(
 )"
 assert "evaluate returns 0 without FAIL rows" [ "$clean_rc" = 0 ]
 
+# A channel that recorded nothing (missing or empty TSV) is unchecked, never a
+# pass: evaluate must fail rather than read an absent file as zero FAIL rows.
+empty_rc="$(
+    GAUNTLET_OUT="$tmp/run/findings-empty-linux" GAUNTLET_CHANNEL=empty bash -c '
+        . "$1/lib.sh" >/dev/null
+        rm -f "$GAUNTLET_TSV"
+        if evaluate >/dev/null; then echo 0; else echo $?; fi
+    ' _ "$here"
+)"
+assert "evaluate returns 1 when no findings were recorded" [ "$empty_rc" = 1 ]
+
 echo "== summary.py"
 summary="$(python3 "$here/summary.py" "$tmp/run")"
 assert "table header"              grep -q '^| Channel | Label | PASS | FAIL | INFO | seconds-to-health | Worst |$' <<<"$summary"

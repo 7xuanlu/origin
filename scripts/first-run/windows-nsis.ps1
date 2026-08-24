@@ -56,18 +56,25 @@ try {
         if ($proc.ExitCode -ne 0) { throw "installer exit $($proc.ExitCode)" }
     }
 
-    $candidate = Join-Path $env:LOCALAPPDATA "Wenlan\Wenlan.exe"
+    # The GUI executable is wenlan-app.exe (Cargo package name; Tauri names the
+    # main binary after the crate's default-run, not the productName). The
+    # display name Wenlan.exe resolves case-insensitively to the CLI sidecar
+    # wenlan.exe — launching that was this script's own bug in the first runs.
+    $candidate = Join-Path $env:LOCALAPPDATA "Wenlan\wenlan-app.exe"
     if (Test-Path $candidate) { $AppExe = $candidate }
     else {
         foreach ($root in @($env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
             if ($AppExe -or -not $root -or -not (Test-Path $root)) { continue }
-            $hit = Get-ChildItem -Path $root -Recurse -Depth 3 -Filter "Wenlan.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            $hit = Get-ChildItem -Path $root -Recurse -Depth 3 -Filter "wenlan-app.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($hit) { $AppExe = $hit.FullName }
         }
     }
-    Check -Name "app-exe-found" -Script { if (-not $AppExe) { throw "Wenlan.exe not found under LOCALAPPDATA or Program Files" }; Write-Output $AppExe }
+    Check -Name "app-exe-found" -Script { if (-not $AppExe) { throw "wenlan-app.exe not found under LOCALAPPDATA or Program Files" }; Write-Output $AppExe }
     if ($AppExe) { $Install = Split-Path -Parent $AppExe }
     Info "install-dir" "$Install"
+    if ($Install) {
+        Info "install-dir-exes" ((Get-ChildItem -Path $Install -Filter *.exe -File -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) $($_.Length)" }) -join "; ")
+    }
 
     $entry = Get-UninstallEntry
     Check -Name "uninstall-key-present" -Script { if (-not $entry) { throw "no uninstall entry with DisplayName 'Wenlan' under HKCU/HKLM" }; Write-Output $entry.PSPath }
@@ -76,7 +83,7 @@ try {
     Check -Name "bundled-binaries" -Script {
         if (-not $Install) { throw "no install dir" }
         $missing = @($Bundled | Where-Object { -not (Test-Path (Join-Path $Install $_)) })
-        if ($missing.Count -ne 0) { throw ("missing beside Wenlan.exe: " + ($missing -join ", ")) }
+        if ($missing.Count -ne 0) { throw ("missing beside wenlan-app.exe: " + ($missing -join ", ")) }
         Write-Output ("present: " + ($Bundled -join ", "))
     }
 
@@ -98,7 +105,7 @@ try {
     Check -Name "app-alive-30s" -Script {
         if (-not $App) { throw "app was not launched" }
         Start-Sleep -Seconds 30
-        if ($App.HasExited) { throw "Wenlan.exe exited within 30s (exit $($App.ExitCode))" }
+        if ($App.HasExited) { throw "wenlan-app.exe exited within 30s (exit $($App.ExitCode))" }
         Write-Output "pid=$($App.Id) alive after 30s"
     }
     if ($App -and $App.HasExited) {

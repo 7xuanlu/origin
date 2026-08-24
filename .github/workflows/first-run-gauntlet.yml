@@ -344,11 +344,15 @@ jobs:
           mkdir -p "$GAUNTLET_OUT"
           listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
           detail="free"
+          st=INFO
           if [ -n "$listeners" ]; then
+            # A busy port means later health/CLI checks could pass against a
+            # daemon this channel never installed — fail the leg as infra.
             detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
+            st=FAIL
           fi
-          printf '%s\tport-7878-precheck\tINFO\t0\t%s\n' "$GAUNTLET_CHANNEL" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[INFO] port-7878-precheck: $detail"
+          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
+          echo "[$st] port-7878-precheck: $detail"
       - name: Run channel
         run: bash scripts/first-run/macos-app.sh
       - name: Upload findings
@@ -384,11 +388,15 @@ jobs:
           mkdir -p "$GAUNTLET_OUT"
           listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
           detail="free"
+          st=INFO
           if [ -n "$listeners" ]; then
+            # A busy port means later health/CLI checks could pass against a
+            # daemon this channel never installed — fail the leg as infra.
             detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
+            st=FAIL
           fi
-          printf '%s\tport-7878-precheck\tINFO\t0\t%s\n' "$GAUNTLET_CHANNEL" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[INFO] port-7878-precheck: $detail"
+          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
+          echo "[$st] port-7878-precheck: $detail"
       - name: Run channel
         run: bash scripts/first-run/npx-setup.sh
       - name: Upload findings
@@ -421,11 +429,15 @@ jobs:
           mkdir -p "$GAUNTLET_OUT"
           listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
           detail="free"
+          st=INFO
           if [ -n "$listeners" ]; then
+            # A busy port means later health/CLI checks could pass against a
+            # daemon this channel never installed — fail the leg as infra.
             detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
+            st=FAIL
           fi
-          printf '%s\tport-7878-precheck\tINFO\t0\t%s\n' "$GAUNTLET_CHANNEL" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[INFO] port-7878-precheck: $detail"
+          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
+          echo "[$st] port-7878-precheck: $detail"
       - name: Run channel
         run: bash scripts/first-run/brew.sh
       - name: Upload findings
@@ -466,11 +478,15 @@ jobs:
           mkdir -p "$GAUNTLET_OUT"
           listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
           detail="free"
+          st=INFO
           if [ -n "$listeners" ]; then
+            # A busy port means later health/CLI checks could pass against a
+            # daemon this channel never installed — fail the leg as infra.
             detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
+            st=FAIL
           fi
-          printf '%s\tport-7878-precheck\tINFO\t0\t%s\n' "$GAUNTLET_CHANNEL" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[INFO] port-7878-precheck: $detail"
+          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
+          echo "[$st] port-7878-precheck: $detail"
       - name: Port 7878 precheck (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -478,12 +494,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:GAUNTLET_OUT | Out-Null
           $listeners = Get-NetTCPConnection -LocalPort 7878 -State Listen -ErrorAction SilentlyContinue
           $detail = "free"
+          $st = "INFO"
           if ($listeners) {
+            # A busy port means later health/CLI checks could pass against a
+            # daemon this channel never installed — fail the leg as infra.
             $detail = "BUSY: " + (($listeners | ForEach-Object { "$($_.LocalAddress):$($_.LocalPort) pid=$($_.OwningProcess)" }) -join "|")
+            $st = "FAIL"
           }
-          $line = "{0}`tport-7878-precheck`tINFO`t0`t{1}" -f $env:GAUNTLET_CHANNEL, $detail
+          $line = "{0}`tport-7878-precheck`t{1}`t0`t{2}" -f $env:GAUNTLET_CHANNEL, $st, $detail
           Add-Content -Path (Join-Path $env:GAUNTLET_OUT "findings.tsv") -Value $line -Encoding utf8
-          Write-Host "[INFO] port-7878-precheck: $detail"
+          Write-Host "[$st] port-7878-precheck: $detail"
       - name: Run channel
         if: runner.os != 'Windows'
         run: bash scripts/first-run/npx-mcp.sh
@@ -525,11 +545,15 @@ jobs:
           mkdir -p "$GAUNTLET_OUT"
           listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
           detail="free"
+          st=INFO
           if [ -n "$listeners" ]; then
+            # A busy port means later health/CLI checks could pass against a
+            # daemon this channel never installed — fail the leg as infra.
             detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
+            st=FAIL
           fi
-          printf '%s\tport-7878-precheck\tINFO\t0\t%s\n' "$GAUNTLET_CHANNEL" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[INFO] port-7878-precheck: $detail"
+          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
+          echo "[$st] port-7878-precheck: $detail"
       - name: Run channel
         run: bash scripts/first-run/linux-install.sh
       - name: Upload findings
@@ -563,12 +587,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:GAUNTLET_OUT | Out-Null
           $listeners = Get-NetTCPConnection -LocalPort 7878 -State Listen -ErrorAction SilentlyContinue
           $detail = "free"
+          $st = "INFO"
           if ($listeners) {
+            # A busy port means later health/CLI checks could pass against a
+            # daemon this channel never installed — fail the leg as infra.
             $detail = "BUSY: " + (($listeners | ForEach-Object { "$($_.LocalAddress):$($_.LocalPort) pid=$($_.OwningProcess)" }) -join "|")
+            $st = "FAIL"
           }
-          $line = "{0}`tport-7878-precheck`tINFO`t0`t{1}" -f $env:GAUNTLET_CHANNEL, $detail
+          $line = "{0}`tport-7878-precheck`t{1}`t0`t{2}" -f $env:GAUNTLET_CHANNEL, $st, $detail
           Add-Content -Path (Join-Path $env:GAUNTLET_OUT "findings.tsv") -Value $line -Encoding utf8
-          Write-Host "[INFO] port-7878-precheck: $detail"
+          Write-Host "[$st] port-7878-precheck: $detail"
       - name: Run channel
         shell: pwsh
         run: pwsh -File scripts/first-run/windows-zip.ps1
@@ -603,12 +631,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:GAUNTLET_OUT | Out-Null
           $listeners = Get-NetTCPConnection -LocalPort 7878 -State Listen -ErrorAction SilentlyContinue
           $detail = "free"
+          $st = "INFO"
           if ($listeners) {
+            # A busy port means later health/CLI checks could pass against a
+            # daemon this channel never installed — fail the leg as infra.
             $detail = "BUSY: " + (($listeners | ForEach-Object { "$($_.LocalAddress):$($_.LocalPort) pid=$($_.OwningProcess)" }) -join "|")
+            $st = "FAIL"
           }
-          $line = "{0}`tport-7878-precheck`tINFO`t0`t{1}" -f $env:GAUNTLET_CHANNEL, $detail
+          $line = "{0}`tport-7878-precheck`t{1}`t0`t{2}" -f $env:GAUNTLET_CHANNEL, $st, $detail
           Add-Content -Path (Join-Path $env:GAUNTLET_OUT "findings.tsv") -Value $line -Encoding utf8
-          Write-Host "[INFO] port-7878-precheck: $detail"
+          Write-Host "[$st] port-7878-precheck: $detail"
       - name: Run channel
         shell: pwsh
         run: pwsh -File scripts/first-run/windows-nsis.ps1
@@ -642,11 +674,15 @@ jobs:
           mkdir -p "$GAUNTLET_OUT"
           listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
           detail="free"
+          st=INFO
           if [ -n "$listeners" ]; then
+            # A busy port means later health/CLI checks could pass against a
+            # daemon this channel never installed — fail the leg as infra.
             detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
+            st=FAIL
           fi
-          printf '%s\tport-7878-precheck\tINFO\t0\t%s\n' "$GAUNTLET_CHANNEL" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[INFO] port-7878-precheck: $detail"
+          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
+          echo "[$st] port-7878-precheck: $detail"
       - name: Run channel
         run: bash scripts/first-run/cargo-mcp.sh
       - name: Upload findings
@@ -694,11 +730,15 @@ jobs:
           mkdir -p "$GAUNTLET_OUT"
           listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
           detail="free"
+          st=INFO
           if [ -n "$listeners" ]; then
+            # A busy port means later health/CLI checks could pass against a
+            # daemon this channel never installed — fail the leg as infra.
             detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
+            st=FAIL
           fi
-          printf '%s\tport-7878-precheck\tINFO\t0\t%s\n' "$GAUNTLET_CHANNEL" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[INFO] port-7878-precheck: $detail"
+          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
+          echo "[$st] port-7878-precheck: $detail"
       - name: Run channel
         run: bash scripts/first-run/plugin-setup.sh
       - name: Upload findings
@@ -767,6 +807,15 @@ jobs:
         if: always()
         env:
           RESOLVE_RESULT: ${{ needs.resolve.result }}
+          RUN_MACOS_APP: ${{ needs.resolve.outputs.run-macos-app }}
+          RUN_NPX_SETUP: ${{ needs.resolve.outputs.run-npx-setup }}
+          RUN_BREW: ${{ needs.resolve.outputs.run-brew }}
+          RUN_NPX_MCP: ${{ needs.resolve.outputs.run-npx-mcp }}
+          RUN_LINUX_INSTALL: ${{ needs.resolve.outputs.run-linux-install }}
+          RUN_WINDOWS_ZIP: ${{ needs.resolve.outputs.run-windows-zip }}
+          RUN_WINDOWS_NSIS: ${{ needs.resolve.outputs.run-windows-nsis }}
+          RUN_CARGO_MCP: ${{ needs.resolve.outputs.run-cargo-mcp }}
+          RUN_PLUGIN_SETUP: ${{ needs.resolve.outputs.run-plugin-setup }}
         run: |
           set -euo pipefail
           status=0
@@ -774,6 +823,27 @@ jobs:
             echo "::error::resolve job ended with '$RESOLVE_RESULT'; no channel could run" >&2
             status=1
           fi
+          # Unchecked is not a pass: every selected channel leg must have
+          # produced a non-empty findings.tsv. A leg that dies before its
+          # first check (checkout failure, timeout, syntax error) uploads
+          # nothing, and grepping only what exists would let it read green.
+          # The per-channel leg lists mirror each job's matrix — keep in sync.
+          expected=""
+          if [ "$RUN_MACOS_APP" = "true" ]; then expected="$expected findings-macos-app"; fi
+          if [ "$RUN_NPX_SETUP" = "true" ]; then expected="$expected findings-npx-setup"; fi
+          if [ "$RUN_BREW" = "true" ]; then expected="$expected findings-brew"; fi
+          if [ "$RUN_NPX_MCP" = "true" ]; then expected="$expected findings-npx-mcp-macos-15 findings-npx-mcp-ubuntu-24.04 findings-npx-mcp-ubuntu-24.04-arm findings-npx-mcp-windows-2025"; fi
+          if [ "$RUN_LINUX_INSTALL" = "true" ]; then expected="$expected findings-linux-install-ubuntu-24.04 findings-linux-install-ubuntu-24.04-arm"; fi
+          if [ "$RUN_WINDOWS_ZIP" = "true" ]; then expected="$expected findings-windows-zip"; fi
+          if [ "$RUN_WINDOWS_NSIS" = "true" ]; then expected="$expected findings-windows-nsis"; fi
+          if [ "$RUN_CARGO_MCP" = "true" ]; then expected="$expected findings-cargo-mcp"; fi
+          if [ "$RUN_PLUGIN_SETUP" = "true" ]; then expected="$expected findings-plugin-setup-ubuntu-24.04 findings-plugin-setup-macos-15"; fi
+          for leg in $expected; do
+            if [ ! -s "all-findings/$leg/findings.tsv" ]; then
+              echo "::error::$leg produced no findings.tsv — that leg is unchecked, not green" >&2
+              status=1
+            fi
+          done
           if failing="$(grep -rl --include=findings.tsv $'\tFAIL\t' all-findings)"; then
             echo "::error::FAIL rows found in:" >&2
             while IFS= read -r path; do

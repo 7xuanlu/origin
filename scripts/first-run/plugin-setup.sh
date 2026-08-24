@@ -78,10 +78,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Step 0 (best effort): the marketplace path a real user takes. May need login.
+# Step 0: the marketplace path a real user takes. Installing the claude CLI
+# itself is environment, so best effort; but once the CLI exists, the
+# published marketplace install must actually work — an exit failure there is
+# a product finding, not an environment artifact. stdin stays closed so a
+# login prompt fails fast instead of hanging.
 best_effort claude-code-install npm i -g @anthropic-ai/claude-code
-best_effort claude-marketplace-add claude plugin marketplace add 7xuanlu/wenlan
-best_effort claude-plugin-install claude plugin install wenlan@7xuanlu-wenlan
+if command -v claude >/dev/null 2>&1; then
+    check claude-marketplace-add -- bash -c 'exec </dev/null; claude plugin marketplace add 7xuanlu/wenlan'
+    check claude-plugin-install -- bash -c 'exec </dev/null; claude plugin install wenlan@7xuanlu-wenlan'
+else
+    info claude-marketplace-add "unchecked: claude CLI unavailable on this runner"
+    info claude-plugin-install "unchecked: claude CLI unavailable on this runner"
+fi
 info plugin-diff-vs-main "$(diff -rq "$RELEASE_SRC/plugin" "$REPO_ROOT/plugin" 2>&1 | head -20)"
 
 # Step 1: SessionStart hook with no runtime.

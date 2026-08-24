@@ -196,6 +196,18 @@ daemon_postmortem() {
     # 124: still running after 30s, i.e. the binary is fine and the fault is
     # in how the service runs it. Anything else is the daemon's own exit.
     info daemon-replay "rc=$rc (124 = still running at 30s) $(tail -c 1500 "$replay" | tr '\n' '|')"
+
+    # Discriminating replay: identical environment shape, but with an explicit
+    # absolute writable embedder cache. Default failing while this one lives
+    # past init pins the crash on the cwd-relative fastembed default cache;
+    # both failing points away from it (network/TLS under the service env).
+    local replay2="$GAUNTLET_OUT/checks/daemon-replay-cache-dir.log" rc2=0
+    mkdir -p "$data_root/replay-cache"
+    ( cd / && env -i HOME="$HOME" USER="${USER:-$(id -un)}" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+          RUST_LOG=info WENLAN_DATA_DIR="$data_root" WENLAN_BIND_ADDR=127.0.0.1:17918 \
+          FASTEMBED_CACHE_DIR="$data_root/replay-cache" \
+          ${timeout_bin:+"$timeout_bin" 30} "$bin" ) >"$replay2" 2>&1 || rc2=$?
+    info daemon-replay-cache-dir "rc=$rc2 (124 = still running at 30s) $(tail -c 1500 "$replay2" | tr '\n' '|')"
 }
 
 collect() {
@@ -208,6 +220,12 @@ collect() {
 
 evaluate() {
     local fails
+    # A run that recorded nothing is unchecked, never a pass: a channel that
+    # dies before its first check must not evaluate green.
+    if [ ! -s "$GAUNTLET_TSV" ]; then
+        printf '\n==> no findings recorded (%s missing or empty): unchecked, not a pass\n' "$GAUNTLET_TSV"
+        return 1
+    fi
     printf '\n==> findings for %s\n' "$GAUNTLET_CHANNEL"
     awk -F'\t' '{ printf "  %-4s %-40s rc=%s\n", $3, $2, $4 }' "$GAUNTLET_TSV" 2>/dev/null
     fails="$(awk -F'\t' '$3 == "FAIL"' "$GAUNTLET_TSV" 2>/dev/null | wc -l | tr -d ' ')"

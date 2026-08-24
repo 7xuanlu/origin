@@ -99,6 +99,11 @@ function Collect {
 
 function Evaluate {
     Write-Host ""
+    # A run that recorded nothing is unchecked, never a pass.
+    if (-not (Test-Path $script:GauntletTsv) -or -not (Get-Content $script:GauntletTsv -ErrorAction SilentlyContinue)) {
+        Write-Host "==> no findings recorded ($script:GauntletTsv missing or empty): unchecked, not a pass"
+        return $false
+    }
     Write-Host "==> findings for $script:GauntletChannel"
     $fails = 0
     if (Test-Path $script:GauntletTsv) {

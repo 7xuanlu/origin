@@ -51,9 +51,12 @@ WENLAN_PATH="$(command -v wenlan || true)"
 info brew-wenlan-path "${WENLAN_PATH:-not on PATH}"
 info brew-server-next-to-cli "$(ls -l "$(dirname "${WENLAN_PATH:-/nonexistent}")/wenlan-server" 2>&1 || true)"
 
-# The documented next step. The formula ships no wenlan-server, so this should fail
-# with the installer hint; an unexpected success is a finding too (row FAILs).
-check_fails brew-background-on "wenlan-server not found next to origin at" -- wenlan background on
+# The documented next step. Today it fails because the formula ships no
+# wenlan-server (finding F7) — that is a real user-facing failure, so it is a
+# plain check and stays red until packaging or the docs change. Encoding the
+# known defect as the success condition would hide the breakage and turn the
+# eventual fix into a false red.
+check brew-background-on -- wenlan background on
 info brew-status-without-daemon "$(WENLAN_NO_AUTOSTART=1 wenlan status 2>&1 || true)"
 
 # Stand-in daemon from the release archive so the brew CLI and MCP can be exercised.
