@@ -49915,48 +49915,62 @@ impl MemoryDB {
     /// Find exactly one active page whose title and scope match. Automatic
     /// wikilink resolution refuses ambiguous same-scope titles instead of
     /// attaching to whichever row SQLite happens to return first.
+    /// One case-fold for page-title identity, shared by the wikilink resolver
+    /// below and the publish title-conflict check in `page_drafts.rs`. The
+    /// bundled SQLite `lower()` is ASCII-only (no ICU), so any SQL-side
+    /// `LOWER(title)` fold disagrees with the Rust fold on Unicode titles —
+    /// two seams meant one identity for conflicts and a different one for
+    /// links, leaving cross-case Unicode links orphaned.
+    pub(crate) fn page_title_key(title: &str) -> String {
+        title.trim().to_lowercase()
+    }
+
     pub async fn find_unique_active_page_id_by_title_scoped(
         &self,
         label: &str,
         scope: Option<&str>,
     ) -> Result<Option<String>, WenlanError> {
-        let trimmed = label.trim();
-        if trimmed.is_empty() {
+        let wanted = Self::page_title_key(label);
+        if wanted.is_empty() {
             return Ok(None);
         }
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id FROM pages
-                 WHERE LOWER(title) = LOWER(?1) AND status = 'active'
+                "SELECT id, title FROM pages
+                 WHERE status = 'active'
                    AND COALESCE(kind, 'concept') != 'entity'
-                   AND space = COALESCE(?2, '00000000-0000-4000-8000-000000000001')
-                 ORDER BY id ASC LIMIT 2",
-                libsql::params![trimmed, scope],
+                   AND space = COALESCE(?1, '00000000-0000-4000-8000-000000000001')
+                 ORDER BY id ASC",
+                libsql::params![scope],
             )
             .await
             .map_err(|e| {
                 WenlanError::VectorDb(format!("find_unique_active_page_id_by_title_scoped: {e}"))
             })?;
-        let first = match rows
+        let mut found: Option<String> = None;
+        while let Some(row) = rows
             .next()
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
-            Some(row) => row
-                .get::<String>(0)
-                .map_err(|e| WenlanError::VectorDb(e.to_string()))?,
-            None => return Ok(None),
-        };
-        if rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-            .is_some()
-        {
-            return Ok(None);
+            let title: String = row
+                .get::<String>(1)
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+            if Self::page_title_key(&title) != wanted {
+                continue;
+            }
+            if found.is_some() {
+                // Ambiguous label: same contract as the old LIMIT 2 query —
+                // two case-fold matches resolve to nothing.
+                return Ok(None);
+            }
+            found = Some(
+                row.get::<String>(0)
+                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?,
+            );
         }
-        Ok(Some(first))
+        Ok(found)
     }
 
     /// Replace the entire outbound-link set for a page in one BEGIN/COMMIT.

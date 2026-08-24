@@ -1002,7 +1002,7 @@ carrying the authority of agreement.
 | `core/db.rs::find_best_overlapping_page` | `pub` | no | no | — | `core/db.rs::load_page_source_index` |
 | `core/db.rs::find_cross_space_distillation_cluster_slice` | `pub` | no | no | — | `core/db.rs::query_distillation_ann_neighbors`, `core/db.rs::query_distillation_seed_slice` |
 | `core/db.rs::find_distillation_clusters_scoped` | `pub` | no | no | — | `core/db.rs::query_distillation_staging_pool` |
-| `core/db.rs::get_page` | `pub` | no | **yes** | `server/page_map_routes.rs::ensure_page_is_active`, `server/page_map_routes.rs::visible_page`, `server/page_routes.rs::handle_create_page`, `server/page_routes.rs::handle_refresh_page`, `server/page_routes.rs::handle_update_page` | `core/db.rs::get_page_inner` |
+| `core/db.rs::get_page` | `pub` | no | **yes** | `server/page_map_routes.rs::ensure_page_is_active`, `server/page_map_routes.rs::visible_page`, `server/page_routes.rs::handle_create_page`, `server/page_routes.rs::handle_publish_page_draft`, `server/page_routes.rs::handle_refresh_page`, `server/page_routes.rs::handle_update_page` | `core/db.rs::get_page_inner` |
 | `core/db.rs::get_page_browse` | `pub` | no | no | — | `core/db.rs::get_page_inner` |
 | `core/db.rs::graph_stream_touches` | `pub` | no | no | — | `core/db.rs::search_entities_by_vector` |
 | `core/db.rs::insert_document_source_page_at_hash` | `pub(crate)` | no | no | — | `core/db.rs::insert_page_with_kind_inner` |
@@ -1292,7 +1292,7 @@ carrying the authority of agreement.
 | `core/synthesis/distill.rs::refresh_page` | `pub` | no | no | — | `core/synthesis/distill.rs::refresh_page_with_prompt` |
 | `core/synthesis/refinement_queue.rs::apply_cross_space_discovery` | `private` | no | no | — | `core/post_write/page_dispatch.rs::page_write` |
 | `core/synthesis/refinement_queue.rs::apply_refinement` | `pub` | no | no | — | `core/synthesis/refinement_queue.rs::apply_refinement_with_decision` |
-| `core/truth_adapter.rs::filter_page` | `pub` | no | **yes** | `server/page_map_routes.rs::visible_page`, `server/page_routes.rs::filter_draft_echo`, `server/page_routes.rs::handle_get_page`, `server/page_routes.rs::handle_get_page_revisions` | `core/truth_adapter.rs::filter_pages` |
+| `core/truth_adapter.rs::filter_page` | `pub` | no | **yes** | `server/page_map_routes.rs::visible_page`, `server/page_routes.rs::filter_draft_echo`, `server/page_routes.rs::handle_get_page`, `server/page_routes.rs::handle_get_page_revisions`, `server/page_routes.rs::handle_publish_page_draft` | `core/truth_adapter.rs::filter_pages` |
 | `server/main.rs::run_daemon` | `private` | no | no | `server/main.rs::main` | `server/main/runtime.rs::register_optional_runtime_workers`, `server/main/startup.rs::prepare_startup_state` |
 | `server/page_map_routes.rs::build_map_response` | `private` | no | no | `server/page_map_routes.rs::handle_get_page_map`, `server/page_map_routes.rs::handle_improve_page_map`, `server/page_map_routes.rs::handle_put_page_map_layout` | `server/page_map_routes.rs::wire_node` |
 | `server/page_map_routes.rs::ensure_page_exists` | `private` | no | no | `server/page_map_routes.rs::handle_get_page_map` | `server/page_map_routes.rs::visible_page` |

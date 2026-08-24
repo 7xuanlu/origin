@@ -1317,6 +1317,84 @@ async fn publish_appends_history_and_maintains_wikilinks() {
     assert_eq!(published.version, 2);
 }
 
+/// Link identity and conflict identity share one fold. The bundled SQLite
+/// `lower()` is ASCII-only, so a SQL-side fold resolves `[[launch]]` against
+/// "Launch" but leaves `[[i σχεδιο проект]]` orphaned next to
+/// "I ΣΧΕΔΙΟ ПРОЕКТ" — while the publish conflict check (Rust fold) calls the
+/// same pair a duplicate title. Both now run through `page_title_key`.
+#[tokio::test]
+async fn wikilinks_fold_unicode_titles_like_the_conflict_check() {
+    let (db, _tmp) = test_db().await;
+    let referrer = db
+        .create_page_draft("Referrer", "See [[i σχεδιο проект]]", None, None)
+        .await
+        .unwrap();
+    match db.publish_page_draft(&referrer.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::Published(_) => {}
+        other => panic!("referrer publish failed: {other:?}"),
+    }
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM page_links \
+             WHERE source_page_id=?1 AND target_page_id IS NULL",
+            &referrer.id,
+        )
+        .await,
+        1,
+        "no page carries that title yet, so the link must record as an orphan"
+    );
+
+    // Publish the target under different Greek/Cyrillic casing, with a body
+    // that links back to the referrer cross-case too.
+    let target = db
+        .create_page_draft("I ΣΧΕΔΙΟ ПРОЕКТ", "Back to [[rEfErReR]]", None, None)
+        .await
+        .unwrap();
+    let published = match db.publish_page_draft(&target.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::Published(page) => page,
+        other => panic!("target publish failed: {other:?}"),
+    };
+    assert_eq!(published.title, "I ΣΧΕΔΙΟ ПРОЕКТ");
+
+    // The outgoing cross-case link resolved at publish time.
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM edges \
+             WHERE edge_type='links' AND src_id=?1 AND valid_until IS NULL",
+            &target.id,
+        )
+        .await,
+        1,
+        "the published body's cross-case [[rEfErReR]] link must mint an edge"
+    );
+
+    // The pre-existing Unicode orphan resolved through the same fold: the
+    // orphan row is gone and the referrer carries an active links edge.
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM page_links \
+             WHERE source_page_id=?1 AND target_page_id IS NULL",
+            &referrer.id,
+        )
+        .await,
+        0,
+        "the Greek/Cyrillic orphan must resolve once its target publishes"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM edges \
+             WHERE edge_type='links' AND src_id=?1 AND valid_until IS NULL",
+            &referrer.id,
+        )
+        .await,
+        1
+    );
+}
+
 #[tokio::test]
 async fn update_and_discard_after_publish_report_draft_not_found() {
     let (db, _tmp) = test_db().await;

@@ -489,15 +489,32 @@ pub async fn handle_publish_page_draft(
             existing_page_id,
             existing_page_title,
         } => {
+            // The conflicting page's id and title are that page's content:
+            // name them only to a caller `filter_page` would show the page
+            // itself. The 409 code survives either way — the caller still
+            // needs to know the publish was refused — but a hidden page's
+            // identity fields are omitted, matching the wire contract that
+            // marks both optional (`parsePageDraftError` in src/lib/tauri.ts).
+            let existing = db
+                .get_page(&existing_page_id)
+                .await
+                .map_err(|e| ServerError::Internal(e.to_string()))?;
+            let visible = wenlan_core::truth_adapter::filter_page(&db, &view.grant, existing)
+                .await
+                .map_err(|e| ServerError::Internal(e.to_string()))?
+                .is_some();
+            let mut body = serde_json::json!({
+                "code": "page_title_conflict",
+                "error": "A Page with this title already exists",
+            });
+            if visible {
+                body["existing_page_id"] = existing_page_id.into();
+                body["existing_page_title"] = existing_page_title.into();
+            }
             return Err(ServerError::Structured {
                 status: axum::http::StatusCode::CONFLICT,
-                body: serde_json::json!({
-                    "code": "page_title_conflict",
-                    "error": "A Page with this title already exists",
-                    "existing_page_id": existing_page_id,
-                    "existing_page_title": existing_page_title,
-                }),
-            })
+                body,
+            });
         }
     };
     let page = filter_draft_echo(&db, &view, page).await?;

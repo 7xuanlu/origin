@@ -359,3 +359,176 @@ async fn create_space_semantics_header_inheritance_and_registration() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert!(body.get("code").is_none(), "{body}");
 }
+
+/// Stamp a judged-Unsupported verdict on an active page.
+///
+/// The daemon deliberately exposes no verdict-writing API, so this mirrors the
+/// finalizer's two writes directly against the db file — the same raw-SQL seam
+/// `refinery_routes.rs` uses. `extractor_version` is hardcoded to mirror
+/// `claim_derivation::EXTRACTOR_VERSION` (private); if that constant bumps,
+/// the verdict decays to `Unevaluated`, the page stays visible, and the hiding
+/// assertions below fail loudly at this comment.
+async fn mark_page_unsupported(
+    tmp: &tempfile::TempDir,
+    db: &std::sync::Arc<wenlan_core::db::MemoryDB>,
+    page_id: &str,
+) {
+    let page = db
+        .get_page(page_id)
+        .await
+        .unwrap()
+        .expect("page under test exists");
+    let digest = wenlan_core::provenance::revision_content_digest(&page.content);
+    let raw = libsql::Builder::new_local(tmp.path().join("origin_memory.db").to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = raw.connect().unwrap();
+    conn.execute(
+        "INSERT INTO page_truth_state
+             (page_id, page_version, support_status, provisional_reason,
+              evaluated_at, human_reviewed, updated_at)
+         VALUES (?1, ?2, 'provisional', 'refuted by fixture', 1, 0, 1)
+         ON CONFLICT(page_id) DO UPDATE SET
+             page_version = ?2, support_status = 'provisional',
+             provisional_reason = 'refuted by fixture', evaluated_at = 1,
+             human_reviewed = 0, updated_at = 1",
+        libsql::params![page_id, page.version],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO claim_derivation_markers
+             (page_id, page_version, page_version_digest, extractor_version,
+              inventory_count, created_at)
+         VALUES (?1, ?2, ?3, 1, 1, 0)",
+        libsql::params![page_id, page.version, digest],
+    )
+    .await
+    .unwrap();
+    db.set_app_metadata("claim_promoter_enforcement", "1")
+        .await
+        .unwrap();
+    db.set_truth_cutover_generation(1).await.unwrap();
+}
+
+/// Live-cutover teeth for `filter_draft_echo`: every other test in this file
+/// runs at generation 0, where the truth adapters are pass-through — removing
+/// the filter calls would leave them all green. This one hides the published
+/// page and requires the publish replay to stop echoing it.
+#[tokio::test]
+async fn publish_replay_of_a_hidden_page_reports_draft_not_found() {
+    let (router, tmp, db) = common::test_app().await;
+    let (status, _) = send(
+        &router,
+        Method::POST,
+        "/api/pages/drafts",
+        Some(json!({"draft_id": DRAFT_A, "title": "Hidden plan", "content": "Body"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &router,
+        Method::POST,
+        &format!("/api/pages/drafts/{DRAFT_A}/publish"),
+        Some(json!({"expected_version": 1})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Control: with no verdict the exact replay echoes the active page, so
+    // the 404 below can only come from the verdict stamped in between.
+    let (status, body) = send(
+        &router,
+        Method::POST,
+        &format!("/api/pages/drafts/{DRAFT_A}/publish"),
+        Some(json!({"expected_version": 1})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    mark_page_unsupported(&tmp, &db, DRAFT_A).await;
+
+    // For this automatic caller the hidden page is not there, and the replay
+    // must say so rather than echo prose the truth contract withholds.
+    let (status, body) = send(
+        &router,
+        Method::POST,
+        &format!("/api/pages/drafts/{DRAFT_A}/publish"),
+        Some(json!({"expected_version": 1})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "page_draft_not_found", "{body}");
+}
+
+/// The 409 must survive, but a hidden page's id and title are that page's
+/// content and stay off the wire for a caller the truth contract hides it
+/// from. Both optional fields are asserted present before the verdict and
+/// absent after it, so this fails if either the leak returns or the fixture
+/// stops hiding the page.
+#[tokio::test]
+async fn title_conflict_with_a_hidden_page_omits_its_identity() {
+    let (router, tmp, db) = common::test_app().await;
+    let (status, _) = send(
+        &router,
+        Method::POST,
+        "/api/pages/drafts",
+        Some(json!({"draft_id": DRAFT_A, "title": "Secret plan", "content": "Body"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &router,
+        Method::POST,
+        &format!("/api/pages/drafts/{DRAFT_A}/publish"),
+        Some(json!({"expected_version": 1})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &router,
+        Method::POST,
+        "/api/pages/drafts",
+        Some(json!({"draft_id": DRAFT_B, "title": "  SECRET PLAN ", "content": "Other"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Control: while the page is visible the conflict names it.
+    let (status, body) = send(
+        &router,
+        Method::POST,
+        &format!("/api/pages/drafts/{DRAFT_B}/publish"),
+        Some(json!({"expected_version": 1})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "page_title_conflict");
+    assert_eq!(body["existing_page_id"], DRAFT_A, "{body}");
+    assert_eq!(body["existing_page_title"], "Secret plan", "{body}");
+
+    mark_page_unsupported(&tmp, &db, DRAFT_A).await;
+
+    let (status, body) = send(
+        &router,
+        Method::POST,
+        &format!("/api/pages/drafts/{DRAFT_B}/publish"),
+        Some(json!({"expected_version": 1})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "page_title_conflict", "{body}");
+    assert_eq!(body["error"], "A Page with this title already exists");
+    assert!(body.get("existing_page_id").is_none(), "{body}");
+    assert!(body.get("existing_page_title").is_none(), "{body}");
+}

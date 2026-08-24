@@ -611,14 +611,16 @@ impl MemoryDB {
         }
         // Same-scope title uniqueness among active Pages, compared on the
         // stored (sentinel-mirrored) scope column so unfiled matches unfiled.
-        // The case fold runs in Rust: the bundled SQLite lower() is ASCII-only
-        // (no ICU), while the editor contract folds Unicode titles too — the
-        // same reason migration 31 re-ran canonicalization in Rust.
+        // `page_title_key` folds in Rust: the bundled SQLite lower() is
+        // ASCII-only (no ICU), while the editor contract folds Unicode titles
+        // too — the same reason migration 31 re-ran canonicalization in Rust.
+        // The wikilink resolver folds through the same seam, so "conflicts
+        // with" and "links to" agree on what counts as the same title.
         let scope = current
             .space
             .clone()
             .unwrap_or_else(|| super::UNFILED_SPACE_ID.to_string());
-        let wanted = title.to_lowercase();
+        let wanted = Self::page_title_key(&title);
         let mut rows = tx
             .query(
                 "SELECT id, title FROM pages
@@ -639,7 +641,7 @@ impl MemoryDB {
             let existing_page_title: String = row
                 .get(1)
                 .map_err(|error| WenlanError::VectorDb(format!("title conflict title: {error}")))?;
-            if existing_page_title.trim().to_lowercase() == wanted {
+            if Self::page_title_key(&existing_page_title) == wanted {
                 conflict = Some((existing_page_id, existing_page_title));
                 break;
             }
