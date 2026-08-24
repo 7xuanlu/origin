@@ -21,7 +21,9 @@ pub enum AgentsCmd {
     Edit {
         /// Agent name.
         name: String,
-        /// New trust level (e.g. "trusted", "limited", "untrusted").
+        /// New trust level: "full", "review", or "unknown". A store with
+        /// `supersedes` from an agent below "full" stages for human review
+        /// instead of taking effect.
         #[arg(long)]
         trust: Option<String>,
         /// Enable or disable the agent.

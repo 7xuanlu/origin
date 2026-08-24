@@ -255,6 +255,19 @@ answer twelve times. One row is the whole mechanism:
 `supersedes = page.id`, `pending_revision = true` (`post_write.rs:3098`-`:3105`).
 Every reader below reads `memories`, and none of them knows that row is a page.
 
+**A second producer of these same two columns exists, added later (task #7,
+2026-08-23) and out of scope for this audit's line-by-line pointers below.**
+An ordinary agent correction also sets `supersedes` and `pending_revision =
+true`, from `memory_routes.rs`'s store handler, whenever the storing agent's
+`trust_level` is not `"full"`. Unlike the page card above, it is not a
+synthetic copy of anything — the row IS the memory the agent captured. The
+Tier A/B split below still applies to it the same way: a reader with no
+`pending_revision` filter exposes the *proposed correction text* before a
+human accepts it, same as it would expose a staged page card's body. This
+file's line-number pointers were accurate at the 2026-07-27/28 audit date and
+are not maintained against later drift; do not trust them for the current
+source tree.
+
 Two things end the exposure, and both are narrower than the demotions assumed.
 Accept consumes the card: `accept_pending_revision_with_knowledge_path`
 (`post_write.rs:4174`) resolves it, and `try_update_page_content` deletes it in

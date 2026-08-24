@@ -14458,6 +14458,50 @@ async fn distillation_staging_pool_excludes_edges_only_cites_backing() {
     );
 }
 
+/// Task #7 proposal gate: the three distillation pool queries did not
+/// exclude a staged (`pending_revision = 1`) row before this change, unlike
+/// their sibling `load_summary_buckets`. A pending correction is a
+/// proposal, not content, and must not seed or join a page cluster before a
+/// human accepts it.
+#[tokio::test]
+async fn distillation_pool_excludes_a_pending_revision_row() {
+    let (db, _dir) = test_db().await;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    for (sid, pending) in [
+        ("mem_pending_pool_eligible", false),
+        ("mem_pending_pool_staged", true),
+    ] {
+        let doc = RawDocument {
+            source: "memory".to_string(),
+            source_id: sid.to_string(),
+            content: format!("Content about {sid}"),
+            title: sid.to_string(),
+            url: None,
+            last_modified: now,
+            memory_type: Some("fact".to_string()),
+            space: Some("test".to_string()),
+            pending_revision: pending,
+            ..Default::default()
+        };
+        db.upsert_documents(vec![doc]).await.unwrap();
+    }
+
+    let pool = db
+        .query_distillation_staging_pool(None, None)
+        .await
+        .unwrap();
+    let pool_ids: Vec<&str> = pool.iter().map(|m| m.source_id.as_str()).collect();
+    assert!(
+        !pool_ids.contains(&"mem_pending_pool_staged"),
+        "a staged revision must not enter the distillation pool: {pool_ids:?}"
+    );
+    assert!(
+        pool_ids.contains(&"mem_pending_pool_eligible"),
+        "an otherwise-identical non-pending memory must remain eligible: {pool_ids:?}"
+    );
+}
+
 #[tokio::test]
 async fn find_distillation_clusters_includes_memories_without_enrichment_steps() {
     // The EXISTS enrichment_steps gate was removed when distillation was

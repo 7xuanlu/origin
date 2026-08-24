@@ -147,6 +147,7 @@ async fn t1_remember_roundtrip() {
         quality: None,
         warnings: vec![],
         near_duplicate: None,
+        gated: false,
         extraction_method: "none".into(),
 
         enrichment: String::new(),
@@ -296,6 +297,7 @@ async fn t2_remember_surfaces_warnings_when_present() {
         quality: None,
         warnings: vec!["decision memory missing required 'claim' field".into()],
         near_duplicate: None,
+        gated: false,
         extraction_method: "agent".into(),
 
         enrichment: String::new(),
@@ -354,6 +356,7 @@ async fn t3_structured_fields_schema_is_object() {
         quality: None,
         warnings: vec![],
         near_duplicate: None,
+        gated: false,
         extraction_method: "agent".into(),
 
         enrichment: String::new(),
@@ -482,6 +485,7 @@ async fn t5_memory_type_hint_preserved_without_forcing_domain() {
         quality: Some("medium".into()),
         warnings: vec![],
         near_duplicate: None,
+        gated: false,
         extraction_method: "llm".into(),
 
         enrichment: String::new(),
@@ -749,6 +753,7 @@ async fn t10_remember_request_does_not_contain_user_id() {
         quality: None,
         warnings: vec![],
         near_duplicate: None,
+        gated: false,
         extraction_method: "none".into(),
 
         enrichment: String::new(),
@@ -802,6 +807,7 @@ async fn t11_extraction_method_none_not_in_text() {
         quality: None,
         warnings: vec![],
         near_duplicate: None,
+        gated: false,
         extraction_method: "none".into(),
 
         enrichment: String::new(),
@@ -958,6 +964,7 @@ async fn origin_client_sends_x_agent_name_header() {
         quality: None,
         warnings: vec![],
         near_duplicate: None,
+        gated: false,
         extraction_method: "none".into(),
         enrichment: String::new(),
         hint: String::new(),
@@ -1014,6 +1021,7 @@ async fn origin_client_omits_x_agent_name_when_unset() {
         quality: None,
         warnings: vec![],
         near_duplicate: None,
+        gated: false,
         extraction_method: "none".into(),
         enrichment: String::new(),
         hint: String::new(),

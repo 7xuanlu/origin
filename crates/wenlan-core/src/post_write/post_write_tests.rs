@@ -4856,6 +4856,122 @@ async fn accept_pending_revision_returns_not_found_on_re_call_after_success() {
     assert!(matches!(err, WenlanError::NotFound(_)));
 }
 
+// ── proposal gate (task #7): memory-target revision accept/dismiss ──────
+
+/// Accept must both suppress the original and make the correction the one
+/// search returns -- checking `confirmed`/`pending_revision` alone would
+/// miss a retrieval-side predicate drifting out of sync with them.
+#[tokio::test]
+async fn accepting_a_gated_memory_correction_makes_it_live_and_hides_the_target() {
+    let (db, _tmp) = crate::db::tests::test_db().await;
+    seed_pending_revision(&db, "mem_gate_accept_target", "mem_gate_accept_rev").await;
+
+    accept_pending_revision_with_knowledge_path(&db, "mem_gate_accept_target", "test-agent", None)
+        .await
+        .unwrap();
+
+    let target = db
+        .get_memory_detail("mem_gate_accept_target")
+        .await
+        .unwrap()
+        .expect("the superseded original must still exist");
+    assert!(!target.confirmed, "accept must suppress the original");
+
+    let revision = db
+        .get_memory_detail("mem_gate_accept_rev")
+        .await
+        .unwrap()
+        .expect("the accepted revision must now be non-pending");
+    assert!(revision.confirmed, "the accepted correction must be live");
+
+    let hits = db
+        .search_memory(
+            "revised content",
+            10,
+            None,
+            &crate::read_scope::ReadScope::Global,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let ids: Vec<_> = hits.into_iter().map(|r| r.source_id).collect();
+    assert!(
+        ids.contains(&"mem_gate_accept_rev".to_string()),
+        "search must surface the now-live correction, got: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"mem_gate_accept_target".to_string()),
+        "search must no longer surface the superseded original, got: {ids:?}"
+    );
+}
+
+/// Default 6: two staged corrections on one target are resolved by
+/// `ORDER BY last_modified DESC` when addressed by target id. Accepting the
+/// newest must not touch the older sibling's pending state.
+#[tokio::test]
+async fn accepting_the_latest_of_two_staged_corrections_leaves_the_older_pending() {
+    let (db, _tmp) = crate::db::tests::test_db().await;
+    let now = chrono::Utc::now().timestamp();
+    let conn = db.test_primary_session().await;
+    conn.execute(
+        "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) VALUES ('mem_two_target', 'mem_two_target', 'mem_two_target', 'original content', 0, 'text', 'fact', 'test', 'claude-code', ?1, ?1, 1, 'confirmed', 'memory')",
+        libsql::params![now],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source, supersedes, pending_revision) VALUES ('mem_two_rev_older', 'mem_two_rev_older', 'mem_two_rev_older', 'older revision content', 0, 'text', 'fact', 'test', 'claude-code', ?1, ?1, 0, 'new', 'memory', 'mem_two_target', 1)",
+        libsql::params![now],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source, supersedes, pending_revision) VALUES ('mem_two_rev_newer', 'mem_two_rev_newer', 'mem_two_rev_newer', 'newer revision content', 0, 'text', 'fact', 'test', 'claude-code', ?1, ?1, 0, 'new', 'memory', 'mem_two_target', 1)",
+        libsql::params![now + 1],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    let accepted = accept_pending_revision(&db, "mem_two_target", "test-agent")
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted.revision_source_id, "mem_two_rev_newer",
+        "addressing by target id must resolve to the latest staged revision"
+    );
+
+    let newer = db
+        .get_memory_detail("mem_two_rev_newer")
+        .await
+        .unwrap()
+        .expect("the accepted revision must be non-pending");
+    assert!(
+        newer.confirmed,
+        "the accepted (latest) revision must be live"
+    );
+
+    // get_memory_detail filters pending_revision = 1 rows out entirely, so
+    // its continued absence here is itself the "still pending" assertion.
+    assert!(
+        db.get_memory_detail("mem_two_rev_older")
+            .await
+            .unwrap()
+            .is_none(),
+        "a still-pending sibling must not surface through get_memory_detail"
+    );
+    let queue = db.list_pending_revisions(10).await.unwrap();
+    assert!(
+        queue
+            .iter()
+            .any(|item| item.revision_source_id == "mem_two_rev_older"),
+        "the older sibling must remain in the pending-revisions queue, got: {queue:?}"
+    );
+}
+
 // ── dismiss_pending_revision ─────────────────────────────────────────────
 
 #[tokio::test]
@@ -4889,6 +5005,40 @@ async fn dismiss_pending_revision_returns_not_found_on_re_call() {
         .await
         .unwrap_err();
     assert!(matches!(err, WenlanError::NotFound(_)));
+}
+
+/// Regression guard for the spec's read of the brief: dismiss unstages, it
+/// does not delete. Both rows must survive, the false `supersedes` link
+/// must clear, and the target must be untouched.
+#[tokio::test]
+async fn dismissing_a_gated_memory_correction_keeps_both_rows() {
+    let (db, _tmp) = crate::db::tests::test_db().await;
+    seed_pending_revision(&db, "mem_gate_dismiss_target", "mem_gate_dismiss_rev").await;
+
+    dismiss_pending_revision(&db, "mem_gate_dismiss_target", "test-agent")
+        .await
+        .unwrap();
+
+    let revision = db
+        .get_memory_detail("mem_gate_dismiss_rev")
+        .await
+        .unwrap()
+        .expect("dismiss must unstage, not delete, the correction");
+    assert!(
+        revision.supersedes.is_none(),
+        "dismiss must clear the supersedes link"
+    );
+    assert!(
+        !revision.confirmed,
+        "an unstaged correction is an ordinary new memory, not auto-confirmed"
+    );
+
+    let target = db
+        .get_memory_detail("mem_gate_dismiss_target")
+        .await
+        .unwrap()
+        .expect("the target must remain after dismiss");
+    assert!(target.confirmed, "dismiss must leave the target untouched");
 }
 
 // ── dismiss_contradiction ────────────────────────────────────────────────
