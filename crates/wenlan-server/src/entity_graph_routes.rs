@@ -11,6 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use wenlan_core::read_scope::ReadScope;
 use wenlan_types::requests::{
     AddEntityAliasRequest, AddObservationRequest, CreateEntityRequest, CreateRelationRequest,
     MergeEntityRequest,
@@ -160,7 +161,10 @@ pub async fn handle_add_observation(
             .cloned()
             .ok_or(ServerError::DbNotInitialized)?
     };
-    let result = wenlan_core::post_write::add_observation(&db, req, &agent).await?;
+    // Body-addressed, not id-in-path -- out of scope for write-space
+    // scoping (spec non-goal); always resolves the entity globally.
+    let result =
+        wenlan_core::post_write::add_observation(&db, req, &agent, &ReadScope::Global).await?;
     Ok(Json(AddObservationResponse {
         id: result.id,
         warnings: result.warnings,
@@ -337,9 +341,12 @@ pub async fn handle_search_entities(
 // Batch 3 — Entity / Observation CRUD
 // =====================================================================
 
-/// PUT /api/memory/entities/{id}/confirm
+/// PUT /api/memory/entities/{id}/confirm -- scoped to the request space
+/// (`X-Wenlan-Space`, legacy `X-Origin-Space` honored too): an id outside
+/// the scope 404s the same as a missing one.
 pub async fn handle_confirm_entity(
     State(state): State<Arc<RwLock<ServerState>>>,
+    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
     Path(id): Path<String>,
     Json(req): Json<wenlan_types::requests::ConfirmEntityRequest>,
 ) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
@@ -347,30 +354,33 @@ pub async fn handle_confirm_entity(
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
-    db.confirm_entity(&id, req.confirmed)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
+    db.confirm_entity_in_scope(&scope, &id, req.confirmed)
+        .await?;
     Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
 }
 
-/// DELETE /api/memory/entities/{id}/delete
+/// DELETE /api/memory/entities/{id}/delete -- scoped like confirm above.
 pub async fn handle_delete_entity(
     State(state): State<Arc<RwLock<ServerState>>>,
+    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
     Path(id): Path<String>,
 ) -> Result<Json<wenlan_types::responses::SuccessResponse>, ServerError> {
     let db = {
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
-    db.delete_entity(&id)
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
+    db.delete_entity_in_scope(&scope, &id).await?;
     Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
 }
 
-/// POST /api/memory/entities/{entity_id}/observations
+/// POST /api/memory/entities/{entity_id}/observations -- scoped like
+/// confirm/delete above; `POST /api/memory/observations` (body-addressed)
+/// stays Global.
 pub async fn handle_add_entity_observation(
     State(state): State<Arc<RwLock<ServerState>>>,
+    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
     Path(entity_id): Path<String>,
     headers: HeaderMap,
     Json(req): Json<wenlan_types::requests::AddEntityObservationRequest>,
@@ -380,6 +390,7 @@ pub async fn handle_add_entity_observation(
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
+    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
     // Same validity contract as `POST /api/memory/observations`: entity must
     // exist, content >= 5 chars, confidence in [0, 1].
     let req = AddObservationRequest {
@@ -388,7 +399,7 @@ pub async fn handle_add_entity_observation(
         source_agent: req.source_agent,
         confidence: req.confidence,
     };
-    let result = wenlan_core::post_write::add_observation(&db, req, &agent).await?;
+    let result = wenlan_core::post_write::add_observation(&db, req, &agent, &scope).await?;
     Ok(Json(wenlan_types::responses::AddObservationResponse {
         id: result.id,
         warnings: result.warnings,
@@ -398,8 +409,11 @@ pub async fn handle_add_entity_observation(
 /// POST /api/memory/entities/{id}/merge -- merge `{id}` (the loser) into
 /// `into` (the canonical). `dry_run` returns the preview without mutating
 /// anything; `applied` on the response tells the caller which happened.
+/// Scoped like confirm/delete above: either id outside the request space
+/// 404s, same as either id being missing.
 pub async fn handle_merge_entity(
     State(state): State<Arc<RwLock<ServerState>>>,
+    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
     Path(id): Path<String>,
     Json(req): Json<MergeEntityRequest>,
 ) -> Result<Json<MergeEntityResponse>, ServerError> {
@@ -407,8 +421,11 @@ pub async fn handle_merge_entity(
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
+    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
     if req.dry_run {
-        let preview = db.merge_entities_preview(&req.into, &id).await?;
+        let preview = db
+            .merge_entities_preview_in_scope(&scope, &req.into, &id)
+            .await?;
         return Ok(Json(MergeEntityResponse {
             canonical_id: preview.canonical_id,
             canonical_name: preview.canonical_name,
@@ -423,9 +440,9 @@ pub async fn handle_merge_entity(
     }
     // One locked pass: the merge validates the ids itself and reports the
     // names and counts it actually moved, so an apply needs no preview.
-    let outcome = db.merge_entities(&req.into, &id).await?;
+    let outcome = db.merge_entities_in_scope(&scope, &req.into, &id).await?;
     if !outcome.merged {
-        return Err(ServerError::NotFound(format!("entity {id} not found")));
+        return Err(ServerError::NotFound("entity not found".to_string()));
     }
     Ok(Json(MergeEntityResponse {
         canonical_id: req.into,
@@ -442,9 +459,12 @@ pub async fn handle_merge_entity(
 
 /// POST /api/memory/entities/{id}/aliases -- declare `alias` as an
 /// additional name for entity `{id}`. Idempotent when `{id}` already owns
-/// the alias; 409 when another active entity owns it.
+/// the alias; 409 when another active entity owns it. Scoped like
+/// confirm/delete above: `{id}` outside the request space 404s, same as a
+/// missing id.
 pub async fn handle_add_entity_alias(
     State(state): State<Arc<RwLock<ServerState>>>,
+    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
     Path(id): Path<String>,
     Json(req): Json<AddEntityAliasRequest>,
 ) -> Result<Json<EntityAliasesResponse>, ServerError> {
@@ -453,66 +473,14 @@ pub async fn handle_add_entity_alias(
             "alias must not be empty".into(),
         ));
     }
-    let alias = req.alias.trim();
     let db = {
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
-    // 404 when `id` does not name a live entity; idempotent when it already
-    // owns the alias.
-    let Some((_, aliases)) = db.entity_name_and_aliases(&id).await? else {
-        return Err(ServerError::NotFound(format!("entity {id} not found")));
-    };
-    let alias_lower = alias.to_lowercase();
-    if aliases.contains(&alias_lower) {
-        return Ok(Json(EntityAliasesResponse {
-            entity_id: id,
-            aliases,
-        }));
-    }
-    if let Some(owner_id) = db.resolve_entity_by_alias(&alias_lower).await? {
-        if owner_id != id {
-            // `store_entity` self-seeds every live entity's aliases with its
-            // own lowercased name, so this conflict is most often "that's
-            // someone else's current name" rather than a previously-declared
-            // alias -- say so and point at merge.
-            let owner_name = db
-                .entity_name_and_aliases(&owner_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|(name, _)| name);
-            if owner_name
-                .as_deref()
-                .is_some_and(|name| name.to_lowercase() == alias_lower)
-            {
-                return Err(ServerError::Conflict(format!(
-                    "alias {:?} is the name of live entity {owner_id}; use \
-                     POST /api/memory/entities/{owner_id}/merge (CLI: wenlan \
-                     entities merge ...) instead",
-                    alias
-                )));
-            }
-            return Err(ServerError::Conflict(format!(
-                "alias {:?} is already owned by entity {owner_id}",
-                alias
-            )));
-        }
-    }
-    db.add_entity_alias(alias, &id, "api").await?;
-    // `add_entity_alias` skips silently when the write-time ownership guard
-    // fails: re-read and confirm the alias actually landed.
+    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
     let aliases = db
-        .entity_name_and_aliases(&id)
-        .await?
-        .map(|(_, aliases)| aliases)
-        .unwrap_or_default();
-    if !aliases.contains(&alias_lower) {
-        return Err(ServerError::Conflict(format!(
-            "alias {:?} was not recorded for entity {id}",
-            alias
-        )));
-    }
+        .add_entity_alias_in_scope(&scope, &id, &req.alias)
+        .await?;
     Ok(Json(EntityAliasesResponse {
         entity_id: id,
         aliases,

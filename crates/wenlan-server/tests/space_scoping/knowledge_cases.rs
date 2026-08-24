@@ -405,6 +405,299 @@ pub async fn detail_and_relation_endpoints_are_scoped() {
     assert!(global_graph_pages.contains(&work_source));
 }
 
+/// #576: the five id-addressed entity write routes (confirm, delete,
+/// observations, merge, aliases) are scoped like the reads above -- an id
+/// outside the request space is indistinguishable from a missing one, an
+/// unknown space is a 422, and the in-scope (or header-less) request still
+/// succeeds. These routes stay in `NON_SENSITIVE_PATHS` (not the wave_4
+/// catalog): the oracle here proves the scope directly against the core
+/// write instead.
+pub async fn entity_writes_are_scoped() {
+    let fixture = ScopeFixture::new().await;
+
+    // ---- confirm: mismatch == missing, unknown space is 422, in-scope OKs ----
+    let work_confirm = seed_entity(&fixture, "Write Scope Confirm", Some("work")).await;
+    let confirm_uri = format!("/api/memory/entities/{work_confirm}/confirm");
+    let confirm_body = json!({"confirmed": true});
+    let mismatch = body_bytes(
+        fixture
+            .send(
+                HttpMethod::PUT,
+                &confirm_uri,
+                Some(confirm_body.clone()),
+                Some("personal"),
+            )
+            .await,
+    )
+    .await;
+    let missing = body_bytes(
+        fixture
+            .send(
+                HttpMethod::PUT,
+                "/api/memory/entities/missing-entity/confirm",
+                Some(confirm_body.clone()),
+                Some("personal"),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(mismatch.0, StatusCode::NOT_FOUND);
+    assert_eq!(mismatch, missing);
+    assert_eq!(mismatch.1, br#"{"error":"entity not found"}"#);
+    let (status, _) = json_body(
+        fixture
+            .send(
+                HttpMethod::PUT,
+                &confirm_uri,
+                Some(confirm_body.clone()),
+                Some("missing-space"),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, confirmed) = json_body(
+        fixture
+            .send(
+                HttpMethod::PUT,
+                &confirm_uri,
+                Some(confirm_body),
+                Some("work"),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{confirmed}");
+
+    // ---- observations: keeps its 422 "does not exist" shape (id-bearing) ----
+    let work_obs = seed_entity(&fixture, "Write Scope Observation", Some("work")).await;
+    let obs_uri = format!("/api/memory/entities/{work_obs}/observations");
+    let obs_body = json!({"content": "An observation on the scoped entity."});
+    let (status, error) = json_body(
+        fixture
+            .send(
+                HttpMethod::POST,
+                &obs_uri,
+                Some(obs_body.clone()),
+                Some("personal"),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+    assert!(error["error"].as_str().unwrap().contains("does not exist"));
+    let (status, _) = json_body(
+        fixture
+            .send(
+                HttpMethod::POST,
+                &obs_uri,
+                Some(obs_body.clone()),
+                Some("missing-space"),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, added) = json_body(
+        fixture
+            .send(HttpMethod::POST, &obs_uri, Some(obs_body), Some("work"))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+
+    // ---- aliases: mismatch == missing, unknown space is 422, in-scope OKs ----
+    let work_alias = seed_entity(&fixture, "Write Scope Alias", Some("work")).await;
+    let alias_uri = format!("/api/memory/entities/{work_alias}/aliases");
+    let alias_body = json!({"alias": "Scoped Alias"});
+    let alias_mismatch = body_bytes(
+        fixture
+            .send(
+                HttpMethod::POST,
+                &alias_uri,
+                Some(alias_body.clone()),
+                Some("personal"),
+            )
+            .await,
+    )
+    .await;
+    let alias_missing = body_bytes(
+        fixture
+            .send(
+                HttpMethod::POST,
+                "/api/memory/entities/missing-entity/aliases",
+                Some(alias_body.clone()),
+                Some("personal"),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(alias_mismatch.0, StatusCode::NOT_FOUND);
+    assert_eq!(alias_mismatch, alias_missing);
+    assert_eq!(alias_mismatch.1, br#"{"error":"entity not found"}"#);
+    let (status, _) = json_body(
+        fixture
+            .send(
+                HttpMethod::POST,
+                &alias_uri,
+                Some(alias_body.clone()),
+                Some("missing-space"),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, aliases) = json_body(
+        fixture
+            .send(HttpMethod::POST, &alias_uri, Some(alias_body), Some("work"))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{aliases}");
+
+    // ---- merge: dry-run and apply, either id out of scope, either direction --
+    // 404 and both entities left untouched; unknown space is 422; in-scope OKs.
+    let work_canon = seed_entity(&fixture, "Write Scope Canon", Some("work")).await;
+    let personal_loser = seed_entity(&fixture, "Write Scope Loser", Some("personal")).await;
+    let personal_canon =
+        seed_entity(&fixture, "Write Scope Personal Canon", Some("personal")).await;
+    let work_loser = seed_entity(&fixture, "Write Scope Work Loser", Some("work")).await;
+
+    for (loser, canon, dry_run) in [
+        (&personal_loser, &work_canon, true),
+        (&personal_loser, &work_canon, false),
+        (&work_loser, &personal_canon, true),
+        (&work_loser, &personal_canon, false),
+    ] {
+        let merge_uri = format!("/api/memory/entities/{loser}/merge");
+        let (status, error) = json_body(
+            fixture
+                .send(
+                    HttpMethod::POST,
+                    &merge_uri,
+                    Some(json!({"into": canon, "dry_run": dry_run})),
+                    Some("work"),
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+    }
+    for id in [&personal_loser, &work_canon, &personal_canon, &work_loser] {
+        let (status, _) = json_body(
+            fixture
+                .send(
+                    HttpMethod::GET,
+                    &format!("/api/memory/entities/{id}"),
+                    None,
+                    None,
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "entity {id} must survive a scoped-out merge"
+        );
+    }
+    let merge_uri = format!("/api/memory/entities/{work_loser}/merge");
+    let (status, _) = json_body(
+        fixture
+            .send(
+                HttpMethod::POST,
+                &merge_uri,
+                Some(json!({"into": work_canon, "dry_run": true})),
+                Some("missing-space"),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, applied) = json_body(
+        fixture
+            .send(
+                HttpMethod::POST,
+                &merge_uri,
+                Some(json!({"into": work_canon, "dry_run": false})),
+                Some("work"),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+
+    // ---- delete: mismatch == missing, unknown space is 422, in-scope OKs ----
+    let work_delete = seed_entity(&fixture, "Write Scope Delete", Some("work")).await;
+    let delete_uri = format!("/api/memory/entities/{work_delete}/delete");
+    let delete_mismatch = body_bytes(
+        fixture
+            .send(HttpMethod::DELETE, &delete_uri, None, Some("personal"))
+            .await,
+    )
+    .await;
+    let delete_missing = body_bytes(
+        fixture
+            .send(
+                HttpMethod::DELETE,
+                "/api/memory/entities/missing-entity/delete",
+                None,
+                Some("personal"),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(delete_mismatch.0, StatusCode::NOT_FOUND);
+    assert_eq!(delete_mismatch, delete_missing);
+    assert_eq!(delete_mismatch.1, br#"{"error":"entity not found"}"#);
+    let (status, _) = json_body(
+        fixture
+            .send(
+                HttpMethod::GET,
+                &format!("/api/memory/entities/{work_delete}"),
+                None,
+                None,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the mismatched delete must not have deleted anything"
+    );
+    let (status, _) = json_body(
+        fixture
+            .send(HttpMethod::DELETE, &delete_uri, None, Some("missing-space"))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, deleted) = json_body(
+        fixture
+            .send(HttpMethod::DELETE, &delete_uri, None, Some("work"))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    let (status, _) = json_body(
+        fixture
+            .send(
+                HttpMethod::GET,
+                &format!("/api/memory/entities/{work_delete}"),
+                None,
+                None,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the in-scope delete must have deleted it"
+    );
+}
+
 pub fn registry_matches_completed_contracts() {
     assert_wave_4_knowledge_catalog_contract();
 }

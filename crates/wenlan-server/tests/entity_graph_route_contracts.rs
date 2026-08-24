@@ -92,6 +92,40 @@ where
     (status, decoded)
 }
 
+/// Like [`request_typed`], plus an `X-Wenlan-Space` header -- used to pin
+/// the header name on the id-addressed entity write routes (#576).
+async fn request_typed_with_space<T>(
+    router: &common::AppRouter,
+    method: Method,
+    uri: &str,
+    space: &str,
+    body: Body,
+) -> (StatusCode, T)
+where
+    T: DeserializeOwned,
+{
+    let request = Request::builder()
+        .method(method.clone())
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("X-Wenlan-Space", space)
+        .body(body)
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .unwrap()
+        .to_vec();
+    let decoded = serde_json::from_slice::<T>(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "{method} {uri} returned a non-contract response ({error}): {}",
+            String::from_utf8_lossy(&bytes)
+        )
+    });
+    (status, decoded)
+}
+
 #[tokio::test]
 async fn moved_entity_graph_handlers_preserve_typed_contracts() {
     let (router, _tmp, db) = common::test_app_no_gate().await;
@@ -524,6 +558,32 @@ async fn add_entity_observation_twice_returns_same_id_and_warns() {
         !second.warnings.is_empty(),
         "the duplicate POST must carry a warning"
     );
+}
+
+/// Like [`create_test_entity`], but filed into a named space (which must
+/// already be registered via `db.create_space`) instead of Uncategorized.
+async fn create_test_entity_in_space(
+    router: &common::AppRouter,
+    name: &str,
+    entity_type: &str,
+    space: &str,
+) -> CreateEntityResponse {
+    let request = CreateEntityRequest {
+        name: name.to_string(),
+        entity_type: entity_type.to_string(),
+        space: WriteSpaceTarget::Named(space.to_string()),
+        source_agent: Some("entity-graph-route-contract".to_string()),
+        confidence: Some(0.9),
+    };
+    let (status, entity): (StatusCode, CreateEntityResponse) = request_typed(
+        router,
+        Method::POST,
+        "/api/memory/entities",
+        json_body(&request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    entity
 }
 
 async fn create_test_entity(
@@ -1025,4 +1085,94 @@ async fn add_entity_alias_conflict_with_live_namesake_points_at_merge() {
         "must point at the CLI merge command: {}",
         error.error
     );
+}
+
+/// #576: each of the five id-addressed entity write routes honors
+/// `X-Wenlan-Space` -- a request carrying the entity's own space succeeds
+/// exactly as the header-less path did before scoping landed. Pins the
+/// header name itself, not just the underlying scope behavior (covered by
+/// `wave_4_knowledge_scopes_entity_writes` in `space_scoping_e2e`).
+#[tokio::test]
+async fn entity_write_routes_succeed_with_matching_space_header() {
+    let (router, _tmp, db) = common::test_app_no_gate().await;
+    db.create_space("work", None, false).await.unwrap();
+
+    let confirm_target =
+        create_test_entity_in_space(&router, "Header Scope Confirm", "org", "work").await;
+    let (status, confirmed): (StatusCode, SuccessResponse) = request_typed_with_space(
+        &router,
+        Method::PUT,
+        &format!("/api/memory/entities/{}/confirm", confirm_target.id),
+        "work",
+        json_body(&ConfirmEntityRequest { confirmed: true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(confirmed.ok);
+
+    let observation_target =
+        create_test_entity_in_space(&router, "Header Scope Observation", "org", "work").await;
+    let (status, added): (StatusCode, AddObservationResponse) = request_typed_with_space(
+        &router,
+        Method::POST,
+        &format!(
+            "/api/memory/entities/{}/observations",
+            observation_target.id
+        ),
+        "work",
+        json_body(&AddEntityObservationRequest {
+            content: "An observation reached through the space header.".to_string(),
+            source_agent: None,
+            confidence: None,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!added.id.is_empty());
+
+    let alias_target =
+        create_test_entity_in_space(&router, "Header Scope Alias", "org", "work").await;
+    let (status, aliases): (StatusCode, EntityAliasesResponse) = request_typed_with_space(
+        &router,
+        Method::POST,
+        &format!("/api/memory/entities/{}/aliases", alias_target.id),
+        "work",
+        json_body(&AddEntityAliasRequest {
+            alias: "Header Alias".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(aliases.aliases.contains(&"header alias".to_string()));
+
+    let merge_canonical =
+        create_test_entity_in_space(&router, "Header Scope Merge Canonical", "org", "work").await;
+    let merge_loser =
+        create_test_entity_in_space(&router, "Header Scope Merge Loser", "org", "work").await;
+    let (status, merged): (StatusCode, MergeEntityResponse) = request_typed_with_space(
+        &router,
+        Method::POST,
+        &format!("/api/memory/entities/{}/merge", merge_loser.id),
+        "work",
+        json_body(&MergeEntityRequest {
+            into: merge_canonical.id.clone(),
+            dry_run: false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(merged.applied);
+
+    let delete_target =
+        create_test_entity_in_space(&router, "Header Scope Delete", "org", "work").await;
+    let (status, deleted): (StatusCode, SuccessResponse) = request_typed_with_space(
+        &router,
+        Method::DELETE,
+        &format!("/api/memory/entities/{}/delete", delete_target.id),
+        "work",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(deleted.ok);
 }

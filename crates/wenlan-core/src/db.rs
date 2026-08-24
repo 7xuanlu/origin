@@ -33665,6 +33665,114 @@ impl MemoryDB {
         Ok(())
     }
 
+    /// Declare `alias` as an additional name for the live, in-`scope` entity
+    /// `entity_id` -- the id-addressed HTTP write route's single-pass entry
+    /// point. Everything the route needs (existence+scope probe, ownership
+    /// conflict check, insert, and the post-insert alias list) runs under
+    /// the one lock held for the whole call, so a concurrent alias/merge
+    /// write can't land between the conflict check and the insert the way
+    /// the old route-level sequence of separately-locked calls could.
+    /// `resolve_entity_by_alias`'s SQL is inlined rather than called -- that
+    /// method takes its own `conn.lock()` and would self-deadlock against
+    /// the guard already held here.
+    pub async fn add_entity_alias_in_scope(
+        &self,
+        scope: &ReadScope,
+        entity_id: &str,
+        alias: &str,
+    ) -> Result<Vec<String>, WenlanError> {
+        let alias = alias.trim();
+        let alias_lower = alias.to_lowercase();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+
+        let Some((_, _, aliases_json, space)) =
+            Self::read_entity_page(&conn, entity_id, "add_entity_alias_in_scope").await?
+        else {
+            return Err(WenlanError::NotFound("entity not found".to_string()));
+        };
+        if !scope.matches(space.as_deref()) {
+            return Err(WenlanError::NotFound("entity not found".to_string()));
+        }
+        let aliases = parse_pages_aliases(aliases_json);
+        if aliases.contains(&alias_lower) {
+            return Ok(aliases);
+        }
+
+        let mut owner_rows = conn
+            .query(
+                "SELECT epm.entity_id FROM entity_page_map epm
+                 JOIN pages p ON p.id = epm.page_id
+                 WHERE p.kind = 'entity' AND p.status = 'active'
+                   AND EXISTS (SELECT 1 FROM json_each(p.aliases) WHERE value = ?1)
+                 ORDER BY p.created_at, epm.entity_id LIMIT 1",
+                libsql::params![alias_lower.clone()],
+            )
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("add_entity_alias_in_scope owner lookup: {e}"))
+            })?;
+        let owner_id: Option<String> = owner_rows
+            .next()
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("add_entity_alias_in_scope owner row: {e}"))
+            })?
+            .and_then(|row| row.get::<String>(0).ok());
+        drop(owner_rows);
+
+        if let Some(owner_id) = owner_id {
+            if owner_id != entity_id {
+                // `store_entity` self-seeds every live entity's aliases with
+                // its own lowercased name, so this conflict is most often
+                // "that's someone else's current name" rather than a
+                // previously-declared alias -- say so and point at merge.
+                let owner_name =
+                    Self::read_entity_page(&conn, &owner_id, "add_entity_alias_in_scope owner")
+                        .await?
+                        .map(|(name, ..)| name);
+                if owner_name
+                    .as_deref()
+                    .is_some_and(|name| name.to_lowercase() == alias_lower)
+                {
+                    return Err(WenlanError::Conflict(format!(
+                        "alias {alias:?} is the name of live entity {owner_id}; use \
+                         POST /api/memory/entities/{owner_id}/merge (CLI: wenlan \
+                         entities merge ...) instead"
+                    )));
+                }
+                return Err(WenlanError::Conflict(format!(
+                    "alias {alias:?} is already owned by entity {owner_id}"
+                )));
+            }
+        }
+
+        conn.execute(
+            "UPDATE pages SET
+                aliases = (SELECT json_group_array(value) FROM (
+                    SELECT value FROM json_each(pages.aliases)
+                    UNION
+                    SELECT ?1
+                    ORDER BY value
+                )),
+                last_modified = ?2
+             WHERE kind = 'entity'
+               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
+            libsql::params![alias_lower, now_iso, entity_id.to_string()],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("add_entity_alias_in_scope insert: {e}")))?;
+
+        let Some((_, _, aliases_json, _)) =
+            Self::read_entity_page(&conn, entity_id, "add_entity_alias_in_scope reread").await?
+        else {
+            return Err(WenlanError::VectorDb(
+                "add_entity_alias_in_scope: entity vanished mid-call".to_string(),
+            ));
+        };
+        Ok(parse_pages_aliases(aliases_json))
+    }
+
     /// Resolve a relation type string against the vocabulary (case-insensitive).
     /// Returns `Some(canonical)` if the input matches a canonical or an alias,
     /// `None` if the input is not in the vocabulary.
@@ -34140,10 +34248,10 @@ impl MemoryDB {
         conn: &libsql::Connection,
         entity_id: &str,
         label: &str,
-    ) -> Result<Option<(String, String, Option<String>)>, WenlanError> {
+    ) -> Result<Option<(String, String, Option<String>, Option<String>)>, WenlanError> {
         let mut rows = conn
             .query(
-                "SELECT p.title, p.entity_type, p.aliases FROM entity_page_map epm \
+                "SELECT p.title, p.entity_type, p.aliases, p.space FROM entity_page_map epm \
                  JOIN pages p ON p.id = epm.page_id \
                  WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
                 libsql::params![entity_id],
@@ -34159,28 +34267,61 @@ impl MemoryDB {
                     r.get::<String>(0).unwrap_or_default(),
                     r.get::<String>(1).unwrap_or_default(),
                     r.get::<Option<String>>(2).unwrap_or(None),
+                    r.get::<Option<String>>(3).unwrap_or(None),
                 )
             }))
     }
 
-    /// Name and aliases of the live entity `entity_id` (`None` when it is
-    /// not live) -- the one-row read the alias route needs, instead of the
-    /// full `get_entity_detail` (which also loads every observation and
-    /// relation).
-    pub async fn entity_name_and_aliases(
-        &self,
+    /// The `space` of the live `kind='entity'` shadow page mapped to
+    /// `entity_id`, title-free (selects only `p.space`) so the m5 reader
+    /// sweep does not classify write-scoping's existence/scope probe as a
+    /// page-prose reader the way `read_entity_page` (which selects `title`)
+    /// already is. `None` when no active entity page maps to `entity_id`.
+    async fn entity_space(
+        conn: &libsql::Connection,
         entity_id: &str,
-    ) -> Result<Option<(String, Vec<String>)>, WenlanError> {
-        let conn = self.conn.lock().await;
-        Ok(
-            Self::read_entity_page(&conn, entity_id, "entity_name_and_aliases")
-                .await?
-                .map(|(title, _, aliases_json)| (title, parse_pages_aliases(aliases_json))),
-        )
+    ) -> Result<Option<String>, WenlanError> {
+        let mut rows = conn
+            .query(
+                "SELECT p.space FROM entity_page_map epm \
+                 JOIN pages p ON p.id = epm.page_id \
+                 WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active' \
+                 LIMIT 1",
+                libsql::params![entity_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("entity_space: {e}")))?;
+        Ok(rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("entity_space row: {e}")))?
+            .map(|r| {
+                r.get::<Option<String>>(0)
+                    .unwrap_or(None)
+                    .unwrap_or_default()
+            }))
     }
 
-    pub async fn merge_entities_preview(
+    /// True iff `entity_id` names a live entity whose space `scope` covers.
+    /// A missing entity is never in scope, regardless of `scope`.
+    async fn entity_in_scope(
+        conn: &libsql::Connection,
+        entity_id: &str,
+        scope: &ReadScope,
+    ) -> Result<bool, WenlanError> {
+        match Self::entity_space(conn, entity_id).await? {
+            Some(space) => Ok(scope.matches(Some(space.as_str()))),
+            None => Ok(false),
+        }
+    }
+
+    /// Read-only preview of `merge_entities_in_scope(scope, canonical_id,
+    /// alias_id)`: both entities must be live and in `scope`, or the merge
+    /// would either fail outright (canonical) or silently no-op (loser) once
+    /// applied.
+    pub async fn merge_entities_preview_in_scope(
         &self,
+        scope: &ReadScope,
         canonical_id: &str,
         alias_id: &str,
     ) -> Result<MergePreview, WenlanError> {
@@ -34192,20 +34333,22 @@ impl MemoryDB {
 
         let conn = self.conn.lock().await;
 
-        let Some((loser_name, _, loser_aliases_json)) =
+        let Some((loser_name, _, loser_aliases_json, loser_space)) =
             Self::read_entity_page(&conn, alias_id, "merge_entities_preview").await?
         else {
-            return Err(WenlanError::NotFound(format!(
-                "entity {alias_id} not found"
-            )));
+            return Err(WenlanError::NotFound("entity not found".to_string()));
         };
-        let Some((canonical_name, _, canonical_aliases_json)) =
+        if !scope.matches(loser_space.as_deref()) {
+            return Err(WenlanError::NotFound("entity not found".to_string()));
+        }
+        let Some((canonical_name, _, canonical_aliases_json, canonical_space)) =
             Self::read_entity_page(&conn, canonical_id, "merge_entities_preview").await?
         else {
-            return Err(WenlanError::NotFound(format!(
-                "entity {canonical_id} not found"
-            )));
+            return Err(WenlanError::NotFound("entity not found".to_string()));
         };
+        if !scope.matches(canonical_space.as_deref()) {
+            return Err(WenlanError::NotFound("entity not found".to_string()));
+        }
 
         // Excludes a memory already linked to the canonical through either
         // source -- see `memory_links_delta`.
@@ -34256,13 +34399,28 @@ impl MemoryDB {
         })
     }
 
+    /// [`merge_entities_preview_in_scope`] with [`ReadScope::Global`] --
+    /// every internal caller (refinement queue, community gates, tests)
+    /// previews across the whole store, unscoped.
+    pub async fn merge_entities_preview(
+        &self,
+        canonical_id: &str,
+        alias_id: &str,
+    ) -> Result<MergePreview, WenlanError> {
+        self.merge_entities_preview_in_scope(&ReadScope::Global, canonical_id, alias_id)
+            .await
+    }
+
     /// Merge `alias_id` into `canonical_id`. Re-points all FK references, registers
     /// the alias name, cleans dangling alias-table rows, and deletes the alias entity.
     /// Idempotent: returns `Ok(MergeOutcome { merged: false, .. })` if `alias_id`
     /// is already gone. Otherwise returns the rows actually moved, captured from
     /// inside this call's own transaction (never a separately-locked preview).
-    pub async fn merge_entities(
+    /// Both entities must be live and in `scope`; an out-of-scope or missing
+    /// id on either side is `NotFound`, identical to a missing one.
+    pub async fn merge_entities_in_scope(
         &self,
+        scope: &ReadScope,
         canonical_id: &str,
         alias_id: &str,
     ) -> Result<MergeOutcome, WenlanError> {
@@ -34313,18 +34471,27 @@ impl MemoryDB {
                 aliases_added: Vec::new(),
             });
         }
+        // The loser is live (just counted above) but may not be in `scope` --
+        // out-of-scope reads as not-found, same as a missing id, so a
+        // space-locked caller can't learn the id exists by watching this
+        // return `merged: false` (the idempotent-miss shape) instead of an
+        // error.
+        if !Self::entity_in_scope(&conn, alias_id, scope).await? {
+            return Err(WenlanError::NotFound("entity not found".to_string()));
+        }
 
         // One read of the canonical's shadow page gives its liveness, name,
         // type (T16 promotion input below) and pre-merge aliases (the
         // `MergeOutcome::aliases_added` baseline, taken under the same held
         // lock as everything else here so it can't race a concurrent writer).
-        let Some((canonical_name, canonical_type, canonical_aliases_json)) =
+        let Some((canonical_name, canonical_type, canonical_aliases_json, canonical_space)) =
             Self::read_entity_page(&conn, canonical_id, "merge_entities").await?
         else {
-            return Err(WenlanError::NotFound(format!(
-                "canonical entity {canonical_id} not found"
-            )));
+            return Err(WenlanError::NotFound("entity not found".to_string()));
         };
+        if !scope.matches(canonical_space.as_deref()) {
+            return Err(WenlanError::NotFound("entity not found".to_string()));
+        }
 
         // Name/type reads below source from the canonical shadow's scalar
         // mirror (`pages.title`/`pages.entity_type`) rather than
@@ -34861,6 +35028,18 @@ impl MemoryDB {
         }
     }
 
+    /// [`merge_entities_in_scope`] with [`ReadScope::Global`] -- every
+    /// internal caller (refinement queue, community gates, tests) merges
+    /// across the whole store, unscoped.
+    pub async fn merge_entities(
+        &self,
+        canonical_id: &str,
+        alias_id: &str,
+    ) -> Result<MergeOutcome, WenlanError> {
+        self.merge_entities_in_scope(&ReadScope::Global, canonical_id, alias_id)
+            .await
+    }
+
     /// Snapshot the losing relation and soft-invalidate its canonical edge,
     /// returning the snapshot for the caller to record in activity-log
     /// payload (soft-archive via log, not via schema column). `Ok(None)`
@@ -35348,6 +35527,18 @@ impl MemoryDB {
             .is_some())
     }
 
+    /// [`entity_exists`], additionally requiring the entity's space to be
+    /// covered by `scope`. Used by the id-addressed write routes so an
+    /// out-of-scope entity reads as not-existing, same as a missing one.
+    pub async fn entity_exists_in_scope(
+        &self,
+        scope: &ReadScope,
+        entity_id: &str,
+    ) -> Result<bool, WenlanError> {
+        let conn = self.conn.lock().await;
+        Self::entity_in_scope(&conn, entity_id, scope).await
+    }
+
     /// G6 Stage 1.5b Part 3: reads the `kind='entity'` shadow page via
     /// `entity_page_map`, unconditional hard cutover (same program contract
     /// as 1.5a). Every selected field is mirrored 1:1 onto `pages` by
@@ -35829,101 +36020,40 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete_entity begin: {e}")))?;
+        let result = self.delete_entity_body(&conn, entity_id).await;
+        Self::finish_delete_entity_transaction(&conn, result).await
+    }
 
+    /// [`delete_entity`], additionally requiring `entity_id` to name a live
+    /// entity in `scope` before it deletes anything -- an out-of-scope or
+    /// missing id is `NotFound`, not a silent no-op. Used by the HTTP write
+    /// route; `delete_entity` itself stays gate-free for internal callers
+    /// and tests that predate write-scoping (some raw-seed fixtures outside
+    /// the normal `kind='entity'` shadow-page lifecycle, which the gate
+    /// would otherwise reject).
+    pub async fn delete_entity_in_scope(
+        &self,
+        scope: &ReadScope,
+        entity_id: &str,
+    ) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("delete_entity begin: {e}")))?;
         let result: Result<(), WenlanError> = async {
-            conn.execute(
-                "UPDATE memories SET entity_id = NULL WHERE entity_id = ?1",
-                libsql::params![entity_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("delete_entity memories: {e}")))?;
-
-            conn.execute(
-                "UPDATE pages SET entity_id = NULL WHERE entity_id = ?1",
-                libsql::params![entity_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("delete_entity pages: {e}")))?;
-
-            // The `entity_aliases` FK-guard delete retired here at G6 Stage 3
-            // along with the table it guarded and the `DELETE FROM entities`
-            // it had to precede.
-
-            // G6 Stage 2 PR 2c sub-step 3 (m122 fold-in): migration 122
-            // relaxed memory_entities/observations/entity_minhash_bands'
-            // `entity_id ... REFERENCES entities(id) ON DELETE CASCADE` (the
-            // same motivation as entity_aliases above -- a shadow-only
-            // entity id must be insertable), so these three no longer clean
-            // up for free when `entities` loses a row. Explicit deletes
-            // restore the pre-m122 behavior. Can't call
-            // `delete_entity_minhash_bands` here -- it takes its own
-            // `conn.lock()`, which would deadlock against the one already
-            // held in this transaction.
-            conn.execute(
-                "DELETE FROM memory_entities WHERE entity_id = ?1",
-                libsql::params![entity_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("delete_entity memory_entities: {e}")))?;
-            conn.execute(
-                "DELETE FROM observations WHERE entity_id = ?1",
-                libsql::params![entity_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("delete_entity observations: {e}")))?;
-            conn.execute(
-                "DELETE FROM entity_minhash_bands WHERE entity_id = ?1",
-                libsql::params![entity_id],
-            )
-            .await
-            .map_err(|e| {
-                WenlanError::VectorDb(format!("delete_entity entity_minhash_bands: {e}"))
-            })?;
-
-            // KG review 2026-08-16 #2: retract the entity's active edges in
-            // this same transaction. Once the shadow page is gone the fence
-            // cannot resolve the endpoint, and any later in-place UPDATE of
-            // a still-active row (space rename, source rebind) would abort.
-            // Permanent delete, so no restore tag.
-            self.retract_entity_incident_edges_in_transaction(&conn, entity_id, None)
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("delete_entity edges: {e}")))?;
-
-            // Delete the entity's shadow page (M3 PR-1 item C) -- since G6
-            // Stage 3 this IS the entity delete, not a mirror of one. The
-            // `entity_page_map` row has an ON DELETE CASCADE FK to `pages`, so
-            // deleting the shadow removes the map row too.
-            if let Some(shadow_page_id) =
-                entity_page_adapter::page_id_for_entity(&conn, entity_id).await?
-            {
-                conn.execute(
-                    "DELETE FROM pages WHERE kind = 'entity' AND id = ?1",
-                    libsql::params![shadow_page_id],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("delete_entity shadow: {e}")))?;
+            if !Self::entity_in_scope(&conn, entity_id, scope).await? {
+                return Err(WenlanError::NotFound("entity not found".to_string()));
             }
-
-            // G6 Stage 2 PR 2c sub-step 3 (m122 fold-in): belt-and-suspenders.
-            // The shadow-page delete above is guarded by `kind = 'entity'`;
-            // before m122, entity_page_map's own `entities` FK cascade
-            // cleaned up a stray map row regardless of the page's kind (a
-            // schema-level guarantee, not an application-level one). m122
-            // relaxed that FK, so this explicit delete restores the same
-            // coverage.
-            conn.execute(
-                "DELETE FROM entity_page_map WHERE entity_id = ?1",
-                libsql::params![entity_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("delete_entity entity_page_map: {e}")))?;
-
-            // The closing `DELETE FROM entities` retired at G6 Stage 3.
-
-            Ok(())
+            self.delete_entity_body(&conn, entity_id).await
         }
         .await;
+        Self::finish_delete_entity_transaction(&conn, result).await
+    }
 
+    async fn finish_delete_entity_transaction(
+        conn: &libsql::Connection,
+        result: Result<(), WenlanError>,
+    ) -> Result<(), WenlanError> {
         match result {
             Ok(()) => match conn.execute("COMMIT", ()).await {
                 Ok(_) => Ok(()),
@@ -35937,6 +36067,103 @@ impl MemoryDB {
                 Err(e)
             }
         }
+    }
+
+    /// The `delete_entity` transaction body (everything after BEGIN, before
+    /// COMMIT), shared by the gate-free and scope-gated entry points.
+    async fn delete_entity_body(
+        &self,
+        conn: &libsql::Connection,
+        entity_id: &str,
+    ) -> Result<(), WenlanError> {
+        conn.execute(
+            "UPDATE memories SET entity_id = NULL WHERE entity_id = ?1",
+            libsql::params![entity_id],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("delete_entity memories: {e}")))?;
+
+        conn.execute(
+            "UPDATE pages SET entity_id = NULL WHERE entity_id = ?1",
+            libsql::params![entity_id],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("delete_entity pages: {e}")))?;
+
+        // The `entity_aliases` FK-guard delete retired here at G6 Stage 3
+        // along with the table it guarded and the `DELETE FROM entities`
+        // it had to precede.
+
+        // G6 Stage 2 PR 2c sub-step 3 (m122 fold-in): migration 122
+        // relaxed memory_entities/observations/entity_minhash_bands'
+        // `entity_id ... REFERENCES entities(id) ON DELETE CASCADE` (the
+        // same motivation as entity_aliases above -- a shadow-only
+        // entity id must be insertable), so these three no longer clean
+        // up for free when `entities` loses a row. Explicit deletes
+        // restore the pre-m122 behavior. Can't call
+        // `delete_entity_minhash_bands` here -- it takes its own
+        // `conn.lock()`, which would deadlock against the one already
+        // held in this transaction.
+        conn.execute(
+            "DELETE FROM memory_entities WHERE entity_id = ?1",
+            libsql::params![entity_id],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("delete_entity memory_entities: {e}")))?;
+        conn.execute(
+            "DELETE FROM observations WHERE entity_id = ?1",
+            libsql::params![entity_id],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("delete_entity observations: {e}")))?;
+        conn.execute(
+            "DELETE FROM entity_minhash_bands WHERE entity_id = ?1",
+            libsql::params![entity_id],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("delete_entity entity_minhash_bands: {e}")))?;
+
+        // KG review 2026-08-16 #2: retract the entity's active edges in
+        // this same transaction. Once the shadow page is gone the fence
+        // cannot resolve the endpoint, and any later in-place UPDATE of
+        // a still-active row (space rename, source rebind) would abort.
+        // Permanent delete, so no restore tag.
+        self.retract_entity_incident_edges_in_transaction(conn, entity_id, None)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("delete_entity edges: {e}")))?;
+
+        // Delete the entity's shadow page (M3 PR-1 item C) -- since G6
+        // Stage 3 this IS the entity delete, not a mirror of one. The
+        // `entity_page_map` row has an ON DELETE CASCADE FK to `pages`, so
+        // deleting the shadow removes the map row too.
+        if let Some(shadow_page_id) =
+            entity_page_adapter::page_id_for_entity(conn, entity_id).await?
+        {
+            conn.execute(
+                "DELETE FROM pages WHERE kind = 'entity' AND id = ?1",
+                libsql::params![shadow_page_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("delete_entity shadow: {e}")))?;
+        }
+
+        // G6 Stage 2 PR 2c sub-step 3 (m122 fold-in): belt-and-suspenders.
+        // The shadow-page delete above is guarded by `kind = 'entity'`;
+        // before m122, entity_page_map's own `entities` FK cascade
+        // cleaned up a stray map row regardless of the page's kind (a
+        // schema-level guarantee, not an application-level one). m122
+        // relaxed that FK, so this explicit delete restores the same
+        // coverage.
+        conn.execute(
+            "DELETE FROM entity_page_map WHERE entity_id = ?1",
+            libsql::params![entity_id],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("delete_entity entity_page_map: {e}")))?;
+
+        // The closing `DELETE FROM entities` retired at G6 Stage 3.
+
+        Ok(())
     }
 
     /// True if any non-archived memory carries the given space. Legacy data probe:
@@ -37981,7 +38208,6 @@ impl MemoryDB {
         entity_id: &str,
         confirmed: bool,
     ) -> Result<(), WenlanError> {
-        let now_iso = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
         // Transaction so the entity confirm and the shadow-page re-sync
         // (M3 PR-1 item C -- the shadow mirrors `entity_confirmed`) commit
@@ -37989,25 +38215,65 @@ impl MemoryDB {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("confirm_entity begin: {}", e)))?;
-        let result: Result<(), WenlanError> = async {
-            // G6 Stage 2 PR 2c sub-step 2: direct targeted write -- only
-            // `entity_confirmed` changed. Its `UPDATE entities SET confirmed`
-            // counterpart retired at Stage 3.
-            conn.execute(
-                "UPDATE pages SET entity_confirmed = ?1, last_modified = ?2
-                 WHERE kind = 'entity'
-                   AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
-                libsql::params![
-                    if confirmed { 1i64 } else { 0i64 },
-                    now_iso.clone(),
-                    entity_id.to_string()
-                ],
-            )
+        let result = Self::confirm_entity_write(&conn, entity_id, confirmed).await;
+        Self::finish_confirm_entity_transaction(&conn, result).await
+    }
+
+    /// [`confirm_entity`], additionally requiring `entity_id` to name a live
+    /// entity in `scope` before it writes anything -- an out-of-scope or
+    /// missing id is `NotFound`, not a silent no-op. Used by the HTTP write
+    /// route; `confirm_entity` itself stays gate-free for internal callers
+    /// and tests that predate write-scoping.
+    pub async fn confirm_entity_in_scope(
+        &self,
+        scope: &ReadScope,
+        entity_id: &str,
+        confirmed: bool,
+    ) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
             .await
-            .map_err(|e| WenlanError::VectorDb(format!("confirm_entity shadow: {}", e)))?;
-            Ok(())
+            .map_err(|e| WenlanError::VectorDb(format!("confirm_entity begin: {}", e)))?;
+        let result: Result<(), WenlanError> = async {
+            if !Self::entity_in_scope(&conn, entity_id, scope).await? {
+                return Err(WenlanError::NotFound("entity not found".to_string()));
+            }
+            Self::confirm_entity_write(&conn, entity_id, confirmed).await
         }
         .await;
+        Self::finish_confirm_entity_transaction(&conn, result).await
+    }
+
+    /// The `confirm_entity` transaction body (everything after BEGIN, before
+    /// COMMIT), shared by the gate-free and scope-gated entry points.
+    async fn confirm_entity_write(
+        conn: &libsql::Connection,
+        entity_id: &str,
+        confirmed: bool,
+    ) -> Result<(), WenlanError> {
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        // G6 Stage 2 PR 2c sub-step 2: direct targeted write -- only
+        // `entity_confirmed` changed. Its `UPDATE entities SET confirmed`
+        // counterpart retired at Stage 3.
+        conn.execute(
+            "UPDATE pages SET entity_confirmed = ?1, last_modified = ?2
+             WHERE kind = 'entity'
+               AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
+            libsql::params![
+                if confirmed { 1i64 } else { 0i64 },
+                now_iso,
+                entity_id.to_string()
+            ],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("confirm_entity shadow: {}", e)))?;
+        Ok(())
+    }
+
+    async fn finish_confirm_entity_transaction(
+        conn: &libsql::Connection,
+        result: Result<(), WenlanError>,
+    ) -> Result<(), WenlanError> {
         match result {
             Ok(()) => {
                 conn.execute("COMMIT", ())

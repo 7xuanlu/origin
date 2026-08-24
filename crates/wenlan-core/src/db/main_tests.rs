@@ -44813,6 +44813,159 @@ async fn migration_90_entity_page_map_cascades_on_page_delete() {
     assert_eq!(remaining, 0, "map row must cascade away with its page");
 }
 
+// -- #576: id-addressed entity write scoping --
+
+#[tokio::test]
+async fn entity_in_scope_matches_global_space_and_uncategorized() {
+    let (db, _dir) = test_db().await;
+    db.test_seed_entity_shadow_page(
+        TestEntity::new("scope-work", "Scope Work Entity", "concept").space("work"),
+    )
+    .await
+    .unwrap();
+    db.test_seed_entity_shadow_page(
+        TestEntity::new("scope-personal", "Scope Personal Entity", "concept").space("personal"),
+    )
+    .await
+    .unwrap();
+    db.test_seed_entity_shadow_page(TestEntity::new(
+        "scope-unfiled",
+        "Scope Unfiled Entity",
+        "concept",
+    ))
+    .await
+    .unwrap();
+
+    let conn = db.conn.lock().await;
+
+    for id in ["scope-work", "scope-personal", "scope-unfiled"] {
+        assert!(
+            MemoryDB::entity_in_scope(&conn, id, &ReadScope::Global)
+                .await
+                .unwrap(),
+            "Global must cover every space, including unfiled"
+        );
+    }
+
+    assert!(
+        MemoryDB::entity_in_scope(&conn, "scope-work", &ReadScope::Space("work".to_string()))
+            .await
+            .unwrap()
+    );
+    assert!(!MemoryDB::entity_in_scope(
+        &conn,
+        "scope-personal",
+        &ReadScope::Space("work".to_string())
+    )
+    .await
+    .unwrap());
+    assert!(!MemoryDB::entity_in_scope(
+        &conn,
+        "scope-unfiled",
+        &ReadScope::Space("work".to_string())
+    )
+    .await
+    .unwrap());
+
+    assert!(
+        MemoryDB::entity_in_scope(&conn, "scope-unfiled", &ReadScope::Uncategorized)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !MemoryDB::entity_in_scope(&conn, "scope-work", &ReadScope::Uncategorized)
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        !MemoryDB::entity_in_scope(&conn, "no-such-entity", &ReadScope::Global)
+            .await
+            .unwrap(),
+        "a missing id is never in scope, not even Global's"
+    );
+}
+
+#[tokio::test]
+async fn add_entity_alias_in_scope_covers_not_found_conflict_and_ok_paths() {
+    let (db, _dir) = test_db().await;
+    db.test_seed_entity_shadow_page(
+        TestEntity::new("alias-work-owner", "Alias Work Owner", "org").space("work"),
+    )
+    .await
+    .unwrap();
+    db.test_seed_entity_shadow_page(
+        TestEntity::new("alias-work-other", "Alias Work Other", "org").space("work"),
+    )
+    .await
+    .unwrap();
+    db.test_seed_entity_shadow_page(
+        TestEntity::new("alias-work-namesake", "Codename", "org").space("work"),
+    )
+    .await
+    .unwrap();
+
+    // `store_entity` self-seeds every live entity's aliases with its own
+    // lowercased name; `test_seed_entity_shadow_page` seeds "[]" instead, so
+    // restore that production invariant for the namesake before probing the
+    // name-conflict path below.
+    db.add_entity_alias("codename", "alias-work-namesake", "test")
+        .await
+        .unwrap();
+
+    // Missing entity id.
+    assert!(matches!(
+        db.add_entity_alias_in_scope(&ReadScope::Global, "no-such-entity", "Ghost")
+            .await,
+        Err(WenlanError::NotFound(_))
+    ));
+
+    // Live entity, but out of the caller's scope -- reads as not-found, the
+    // same shape as a missing id.
+    assert!(matches!(
+        db.add_entity_alias_in_scope(
+            &ReadScope::Space("personal".to_string()),
+            "alias-work-owner",
+            "Ghost",
+        )
+        .await,
+        Err(WenlanError::NotFound(_))
+    ));
+
+    // In scope: a fresh alias is added and returned.
+    let scope = ReadScope::Space("work".to_string());
+    let aliases = db
+        .add_entity_alias_in_scope(&scope, "alias-work-owner", "Owner Codename")
+        .await
+        .unwrap();
+    assert!(aliases.contains(&"owner codename".to_string()));
+
+    // Idempotent for its own owner.
+    let aliases_again = db
+        .add_entity_alias_in_scope(&scope, "alias-work-owner", "Owner Codename")
+        .await
+        .unwrap();
+    assert_eq!(aliases_again, aliases);
+
+    // Conflict: the alias is a previously-declared alias of a different entity.
+    assert!(matches!(
+        db.add_entity_alias_in_scope(&scope, "alias-work-other", "Owner Codename")
+            .await,
+        Err(WenlanError::Conflict(_))
+    ));
+
+    // Conflict: the alias is the live name of a different entity -- the
+    // message must point at merge instead of the generic wording.
+    let err = db
+        .add_entity_alias_in_scope(&scope, "alias-work-owner", "Codename")
+        .await
+        .unwrap_err();
+    match err {
+        WenlanError::Conflict(msg) => assert!(msg.contains("/merge"), "{msg}"),
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+}
+
 // -- M3 PR-1 migration 91: memories.space unfiled fold --
 
 /// Test-only inverse of migration 91's writable_schema NOT NULL patch --
@@ -54081,9 +54234,10 @@ async fn add_observation_twice_returns_existing_id_and_warns() {
         confidence: None,
     };
 
-    let first = crate::post_write::add_observation(&db, make_req(), "test-agent")
-        .await
-        .unwrap();
+    let first =
+        crate::post_write::add_observation(&db, make_req(), "test-agent", &ReadScope::Global)
+            .await
+            .unwrap();
     assert!(first.warnings.is_empty());
 
     let (watermark_before, activity_count_before): (i64, i64) = {
@@ -54118,9 +54272,10 @@ async fn add_observation_twice_returns_existing_id_and_warns() {
         (watermark, activity_count)
     };
 
-    let second = crate::post_write::add_observation(&db, make_req(), "test-agent")
-        .await
-        .unwrap();
+    let second =
+        crate::post_write::add_observation(&db, make_req(), "test-agent", &ReadScope::Global)
+            .await
+            .unwrap();
     assert_eq!(second.id, first.id, "the second call returns the same id");
     assert!(
         second
