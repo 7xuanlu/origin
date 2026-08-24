@@ -204,10 +204,12 @@ fn manifest_counts_match_the_spec() {
     // `/api/config/skip-apps` pair were deleted (audit 2026-08-22), then 164
     // after the entity merge/alias surface added POST
     // `/api/memory/entities/{id}/merge` and POST
-    // `/api/memory/entities/{id}/aliases` (2026-08-22).
+    // `/api/memory/entities/{id}/aliases` (2026-08-22). Then 166 after GET
+    // `/api/ambient/status` and POST `/api/ambient/sweep` were added
+    // (force-sweep + status surface for the ambient scheduler).
     assert_eq!(
         HTTP_READERS.len(),
-        164,
+        166,
         "registered (method, path, handler) triples"
     );
     assert_eq!(MCP_READERS.len(), 29, "#[tool( declarations");
@@ -218,7 +220,7 @@ fn manifest_counts_match_the_spec() {
     let entries: Vec<_> = runtime_entries().collect();
     assert_eq!(
         entries.len(),
-        168,
+        170,
         "(builder, method, path) runtime entries"
     );
     assert_eq!(
@@ -226,7 +228,7 @@ fn manifest_counts_match_the_spec() {
             .iter()
             .filter(|(b, _, _)| *b == Builder::Main)
             .count(),
-        162,
+        164,
         "main builder entries"
     );
     assert_eq!(
@@ -402,7 +404,7 @@ fn marker_shape_allowlist_is_fail_closed() {
             .iter()
             .filter(|r| r.marker_shape == MarkerShape::None)
             .count(),
-        158
+        160
     );
 }
 

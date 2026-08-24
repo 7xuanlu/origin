@@ -14,7 +14,7 @@ pub(super) enum AmbientJob {
 }
 
 impl AmbientJob {
-    const ALL: [Self; 9] = [
+    pub(super) const ALL: [Self; 9] = [
         Self::Document,
         Self::Classification,
         Self::StructuredExtract,
@@ -25,6 +25,43 @@ impl AmbientJob {
         Self::Citation,
         Self::EdgeGroundingPromote,
     ];
+
+    /// Stable key for this job, used for the `app_metadata` last-run record
+    /// and the `/api/ambient/status` wire response. Never renamed once
+    /// shipped — it is a persisted key, not just a debug label.
+    pub(super) const fn as_key(self) -> &'static str {
+        match self {
+            Self::Document => "document",
+            Self::Classification => "classification",
+            Self::StructuredExtract => "structured_extract",
+            Self::Entity => "entity",
+            Self::Title => "title",
+            Self::PageGrowth => "page_growth",
+            Self::Reconcile => "reconcile",
+            Self::Citation => "citation",
+            Self::EdgeGroundingPromote => "edge_grounding_promote",
+        }
+    }
+}
+
+const AMBIENT_LAST_RUN_KEY_PREFIX: &str = "ambient_last_run_v1";
+
+/// `app_metadata` key recording the last time this job was attempted
+/// (selected or not), by either the passive scheduler tick or a forced sweep.
+pub(super) fn ambient_last_run_key(job: AmbientJob) -> String {
+    format!("{AMBIENT_LAST_RUN_KEY_PREFIX}_{}", job.as_key())
+}
+
+async fn persist_ambient_last_run(db: &wenlan_core::db::MemoryDB, job: AmbientJob) {
+    let epoch = chrono::Utc::now().timestamp().to_string();
+    if let Err(error) = db
+        .set_app_metadata(&ambient_last_run_key(job), &epoch)
+        .await
+    {
+        tracing::warn!(
+            "[scheduler] failed to persist ambient last-run timestamp for {job:?}: {error}"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +190,42 @@ impl AmbientSchedule {
         None
     }
 
+    /// Enumerate every currently-due job for one bounded scheduler tick — at
+    /// most one full round-robin lap.
+    ///
+    /// Without this, a quiet tick only ever fires the single job the cursor
+    /// lands on; an always-due job at an earlier cursor position (Document,
+    /// which has no interval) can starve a job several slots further round
+    /// (e.g. Citation) for many ticks.
+    ///
+    /// The loop bound is "stop the first time `select_due` repeats a job
+    /// already collected this call", not merely "call `select_due` at most
+    /// `ALL.len()` times": collecting due jobs up front does not call
+    /// `note_job_result` in between (that only happens once each job has
+    /// actually run, back in the caller), so a job's due-ness is invariant
+    /// for the whole `drain_due` call. If fewer than `ALL.len()` jobs are
+    /// currently due-and-supported, `select_due`'s own internal scan (itself
+    /// bounded to one lap) can still cross a full circuit within a single
+    /// call and land back on an already-returned job — counting outer
+    /// `select_due` *calls* does not bound total *probes*. Detecting the
+    /// repeat, rather than counting calls, is what actually keeps every job
+    /// in the result at most once.
+    pub(super) fn drain_due(
+        &mut self,
+        now: Instant,
+        availability: AmbientAvailability,
+    ) -> Vec<AmbientJob> {
+        let mut due = Vec::with_capacity(AmbientJob::ALL.len());
+        for _ in 0..AmbientJob::ALL.len() {
+            match self.select_due(now, availability) {
+                Some(job) if due.contains(&job) => break,
+                Some(job) => due.push(job),
+                None => break,
+            }
+        }
+        due
+    }
+
     /// Back off an empty periodic lane, but leave known backlog due. The global
     /// thermal cooldown still limits actual work; this only prevents a second
     /// 30-minute delay from turning catch-up into a multi-week drain.
@@ -258,7 +331,7 @@ pub(super) async fn run_ambient_job_safe(
         distillation,
         knowledge_path,
     ));
-    match futures::FutureExt::catch_unwind(future).await {
+    let report = match futures::FutureExt::catch_unwind(future).await {
         Ok(report) => report,
         Err(error) => {
             let message = if let Some(message) = error.downcast_ref::<&str>() {
@@ -280,7 +353,11 @@ pub(super) async fn run_ambient_job_safe(
                 elapsed: started.elapsed(),
             }
         }
-    }
+    };
+    // Record every attempt (selected or not) so `/api/ambient/status` can
+    // show liveness even for a job that keeps finding nothing to do.
+    persist_ambient_last_run(db, job).await;
+    report
 }
 
 #[allow(clippy::too_many_arguments)]

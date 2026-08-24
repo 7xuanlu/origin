@@ -522,9 +522,9 @@ A surface that transmits anyway is a failing test on that surface. That gate is
 soft, and saying so plainly is what cooperative-tier means. It is also no longer
 load-bearing: the shape gate holds even when this one is bypassed.
 
-## HTTP — all 167 registered `(method, path, handler)` triples
+## HTTP — all 166 registered `(method, path, handler)` triples
 
-60 page-bearing, 107 not.
+59 page-bearing, 107 not.
 
 | Method | Path | Builder | Page-bearing | Class | Marker-shape | Adapter | Evidence |
 |---|---|---|---|---|---|---|---|
@@ -533,6 +533,8 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `DELETE` | `/api/agents/{name}` | main | yes | automatic | `none` | `handle_delete_agent` | opaque response type — fail-closed |
 | `GET` | `/api/agents/{name}` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
 | `PUT` | `/api/agents/{name}` | main | no | not_applicable | `none` | — | DEMOTED — proof in the inventory doc |
+| `GET` | `/api/ambient/status` | main | no | not_applicable | `none` | — | no prose fields |
+| `POST` | `/api/ambient/sweep` | main | no | not_applicable | `none` | — | no prose fields |
 | `PATCH` | `/api/brief` | main | no | not_applicable | `none` | — | BriefUpdateReceipt carries no page prose |
 | `POST` | `/api/brief` | main | yes | automatic | `none` | `handle_read_brief` | Brief.last_session_summary, BriefItem.text, SearchResult.content |
 | `GET` | `/api/briefing` | main | yes | automatic | `none` | `handle_get_briefing` | BriefingResponse.content = revision-card titles |
@@ -1311,7 +1313,7 @@ carrying the authority of agreement.
 | `server/routes.rs::handle_context` | `pub` | no | no | — | `server/brief_routes.rs::handle_read_brief` |
 | `server/scheduler.rs::fire_steep_phase` | `private` | no | no | `server/scheduler.rs::fire_steep_phase_safe` | `core/refinery/mod.rs::run_periodic_steep_phase_with_api` |
 | `server/scheduler.rs::spawn_scheduler` | `pub` | no | **yes** | `server/main.rs::run_daemon` | `server/scheduler.rs::fire_maintenance_stage_safe` |
-| `server/scheduler/ambient.rs::run_ambient_job_safe` | `pub(super)` | no | no | `server/scheduler.rs::spawn_scheduler` | `server/scheduler/ambient.rs::run_ambient_job` |
+| `server/scheduler/ambient.rs::run_ambient_job_safe` | `pub(super)` | no | no | `server/scheduler.rs::spawn_scheduler`, `server/scheduler/ambient_admin.rs::force_ambient_sweep` | `server/scheduler/ambient.rs::run_ambient_job` |
 | `server/source_routes.rs::sync_directory_source` | `pub(crate)` | no | no | `server/scheduler.rs::sync_directory_sources`, `server/source_routes.rs::handle_sync_source` | `core/db.rs::rebind_source_id_with_source_page` |
 
 <!-- m5-reader-sweep:end -->

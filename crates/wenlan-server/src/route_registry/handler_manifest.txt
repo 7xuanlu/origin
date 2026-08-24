@@ -2,6 +2,7 @@
 main|get|/api/activities|wenlan_server::activity_tag_routes::handle_list_activities
 main|get|/api/agents|wenlan_server::profile_agents_routes::handle_list_agents
 main|get|/api/agents/{name}|wenlan_server::profile_agents_routes::handle_get_agent
+main|get|/api/ambient/status|wenlan_server::ambient_routes::handle_ambient_status
 main|get|/api/briefing|wenlan_server::briefing_routes::handle_get_briefing
 main|get|/api/capture-stats|wenlan_server::memory_detail_routes::handle_capture_stats
 main|get|/api/chunks/{source_id}|wenlan_server::indexed_files_routes::handle_get_chunks
@@ -60,6 +61,7 @@ main|get|/api/status|wenlan_server::routes::handle_status
 main|get|/api/suggest-tags|wenlan_server::activity_tag_routes::handle_suggest_tags
 main|get|/api/tags|wenlan_server::activity_tag_routes::handle_list_tags
 main|get|/ws/updates|wenlan_server::websocket::handle_ws_upgrade
+main|post|/api/ambient/sweep|wenlan_server::ambient_routes::handle_ambient_sweep
 main|post|/api/brief|wenlan_server::brief_routes::handle_read_brief
 main|post|/api/chunks/delete-bulk|wenlan_server::indexed_files_routes::handle_delete_bulk
 main|post|/api/context|wenlan_server::routes::handle_context
