@@ -28742,7 +28742,20 @@ impl MemoryDB {
             .map(|(rank, id)| (id.clone(), rank))
             .collect();
         let seeds = crate::retrieval::signals::seed_entities_by_rank(&pool_pairs, top_k);
-        let seeds = self.filter_entity_ids_scoped(&seeds, scope).await?;
+        // Graph augmentation is optional: propagating this error would drop
+        // `results` (already moved here), and the caller's retry-with-empty
+        // path would then erase healthy base hits. Degrade to the base
+        // results instead; the filter's own decode errors stay loud for
+        // callers that ask it directly.
+        let seeds = match self.filter_entity_ids_scoped(&seeds, scope).await {
+            Ok(seeds) => seeds,
+            Err(e) => {
+                log::warn!(
+                    "[augment_seeded] scoped seed filter failed; graph contributes nothing: {e}"
+                );
+                return Ok(results);
+            }
+        };
 
         // BFS to expand seed set
         let expanded = match self
@@ -28970,14 +28983,18 @@ impl MemoryDB {
                 params.push(dp.clone());
             }
 
-            match conn.query(&fts_sql, params).await {
-                Ok(mut rows) => {
-                    // Eval baseline: a mid-scan step or decode error is
-                    // silent truncation of the scored candidate list, so it
-                    // propagates. A query error is lenient only while a
-                    // fallback form remains — the AND form can be invalid
-                    // FTS5 syntax for free text and falls through to the OR
-                    // form, but the final attempt failing is a real error.
+            // Eval baseline: silent truncation of the scored candidate list is
+            // the failure this exists to remove, so the WHOLE attempt — query,
+            // scan, rank, and decode — is fallible as one unit. A failure on a
+            // non-final form (the AND form can be invalid FTS5 syntax for free
+            // text) discards that attempt's partial prefix and falls through
+            // to the next form; the final form's failure is the caller's error.
+            let attempt_result: Result<Vec<SearchResult>, WenlanError> =
+                async {
+                    let mut attempt_results = Vec::new();
+                    let mut rows = conn.query(&fts_sql, params).await.map_err(|e| {
+                        WenlanError::VectorDb(format!("fts_only_search query: {e}"))
+                    })?;
                     while let Some(row) = rows.next().await.map_err(|e| {
                         WenlanError::VectorDb(format!("fts_only_search row scan: {e}"))
                     })? {
@@ -28986,22 +29003,24 @@ impl MemoryDB {
                             WenlanError::VectorDb(format!("fts_only_search rank: {e}"))
                         })?;
                         let score = (-rank) as f32;
-                        results.push(Self::row_to_search_result(&row, score).map_err(|e| {
-                            WenlanError::VectorDb(format!("fts_only_search row decode: {e}"))
-                        })?);
+                        attempt_results.push(Self::row_to_search_result(&row, score).map_err(
+                            |e| WenlanError::VectorDb(format!("fts_only_search row decode: {e}")),
+                        )?);
+                    }
+                    Ok(attempt_results)
+                }
+                .await;
+            match attempt_result {
+                Ok(attempt_results) => {
+                    results = attempt_results;
+                    if !results.is_empty() {
+                        break;
                     }
                 }
                 Err(e) if !is_last_attempt => {
                     log::warn!("[fts_only_search] FTS attempt failed; trying fallback: {e}");
                 }
-                Err(e) => {
-                    return Err(WenlanError::VectorDb(format!(
-                        "fts_only_search final query: {e}"
-                    )));
-                }
-            }
-            if !results.is_empty() {
-                break;
+                Err(e) => return Err(e),
             }
         }
 
@@ -29875,8 +29894,12 @@ impl MemoryDB {
             body: row
                 .get(4)
                 .map_err(|e| WenlanError::VectorDb(e.to_string()))?,
-            source_count: row.get(5).unwrap_or(0),
-            generated_at: row.get(6).unwrap_or(0),
+            source_count: row
+                .get(5)
+                .map_err(|e| WenlanError::VectorDb(format!("summary node source_count: {e}")))?,
+            generated_at: row
+                .get(6)
+                .map_err(|e| WenlanError::VectorDb(format!("summary node generated_at: {e}")))?,
         })
     }
 
@@ -36575,16 +36598,19 @@ impl MemoryDB {
                 a[((a.len() as f64 * p) as usize).min(a.len() - 1)]
             }
         };
-        let memories_linked: i64 = conn
+        let memories_linked: i64 = match conn
             .query("SELECT COUNT(DISTINCT memory_id) FROM memory_entities", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("degree_stats memcount: {e}")))?
             .next()
             .await
-            .ok()
-            .flatten()
-            .and_then(|r| r.get::<i64>(0).ok())
-            .unwrap_or(0);
+            .map_err(|e| WenlanError::VectorDb(format!("degree_stats memcount row: {e}")))?
+        {
+            Some(row) => row
+                .get::<i64>(0)
+                .map_err(|e| WenlanError::VectorDb(format!("degree_stats memcount decode: {e}")))?,
+            None => 0,
+        };
         Ok(MemoryEntitiesDegreeStats {
             edges,
             distinct_entities,

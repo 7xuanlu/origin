@@ -989,34 +989,75 @@ async fn orphan_link_rows_scoped_agrees_with_the_aggregate_twin() {
 }
 
 #[tokio::test]
-async fn a_failed_summary_root_query_empties_the_channel() {
+async fn a_root_that_fails_to_decode_empties_the_channel() {
     let (db, _tmp) = test_db().await;
-    let embedding = db.get_or_compute_embedding("root probe").unwrap();
-    db.insert_summary_node("root", 1, None, "Root", "root probe", &embedding, 1, 1, &[])
+    db.upsert_documents(vec![memory_doc("root-probe-source", "work")])
         .await
         .unwrap();
+    let embedding = db.get_or_compute_embedding("root probe").unwrap();
+    for (id, level, bucket) in [("root", 1, None), ("bucket", 0, Some("work"))] {
+        db.insert_summary_node(
+            id,
+            level,
+            bucket,
+            "Summary",
+            "root probe",
+            &embedding,
+            1,
+            1,
+            &["root-probe-source".to_string()],
+        )
+        .await
+        .unwrap();
+    }
 
+    let scope = ReadScope::Space("work".to_string());
     let healthy = db
-        .search_summary_nodes_scoped("root probe", 10, &ReadScope::Global)
+        .search_summary_nodes_scoped("root probe", 10, &scope)
         .await
         .unwrap();
     assert!(
-        !healthy.is_empty(),
-        "control: a seeded root must be returned"
+        healthy.iter().any(|n| n.id == "root"),
+        "control: the root must be returned"
+    );
+    assert!(
+        healthy.iter().any(|n| n.id == "bucket"),
+        "control: the bucket must be returned"
     );
 
+    // Rebuild summary_nodes without the generated_at NOT NULL constraint and
+    // null out only the root row. The root query still succeeds and the
+    // bucket row still decodes, so an empty result can only come from the
+    // root-decode failure emptying the whole channel — a whole-table
+    // breakage would be a false positive (the bucket arms swallow their own
+    // query errors and would go empty for the wrong reason).
     db.test_secondary_session()
         .unwrap()
-        .execute_batch("ALTER TABLE summary_nodes RENAME TO summary_nodes_broken")
+        .execute_batch(
+            "ALTER TABLE summary_nodes RENAME TO summary_nodes_orig;
+             CREATE TABLE summary_nodes (
+                 id TEXT PRIMARY KEY,
+                 level INTEGER NOT NULL,
+                 bucket_key TEXT,
+                 title TEXT NOT NULL,
+                 body TEXT NOT NULL,
+                 embedding F32_BLOB(768),
+                 source_count INTEGER NOT NULL DEFAULT 0,
+                 generated_at INTEGER,
+                 status TEXT NOT NULL DEFAULT 'active'
+             );
+             INSERT INTO summary_nodes SELECT * FROM summary_nodes_orig;
+             UPDATE summary_nodes SET generated_at = NULL WHERE level = 1;",
+        )
         .await
         .unwrap();
 
     let degraded = db
-        .search_summary_nodes_scoped("root probe", 10, &ReadScope::Global)
+        .search_summary_nodes_scoped("root probe", 10, &scope)
         .await
         .unwrap();
     assert!(
         degraded.is_empty(),
-        "a failed root query must empty the channel, not error"
+        "an undecodable root must empty the whole channel, not error and not degrade to buckets"
     );
 }
