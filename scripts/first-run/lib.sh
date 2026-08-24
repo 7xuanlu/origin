@@ -16,6 +16,8 @@
 #   info NAME VALUE                      informational row (never fails the run)
 #   wait_health URL SECS                 poll /api/health; records seconds-to-health; returns 1 on timeout
 #   assert_version URL EXPECTED          PASS when health .version == EXPECTED (leading v stripped)
+#   stop_process PID [SECS]              TERM, wait up to SECS (15) for exit, then KILL;
+#                                        records seconds-to-exit
 #   collect FILE...                      copy files into $GAUNTLET_OUT/logs/
 #   evaluate                             print the table; return 1 when any FAIL row exists
 #
@@ -30,14 +32,19 @@ mkdir -p "$GAUNTLET_OUT/checks" "$GAUNTLET_OUT/logs"
 
 _gauntlet_escape() {
     # One line, no tabs, capped so the TSV stays readable in a step summary.
-    printf '%s' "$1" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000
+    # Substring, not `head -c`: head closing the pipe early makes tr/printf
+    # print "write error: Broken pipe" into the job log on long outputs.
+    local one
+    one="$(printf '%s' "$1" | tr '\t\r' '  ' | tr '\n' '|')"
+    printf '%s' "${one:0:2000}"
 }
 
 _gauntlet_record() {
     local status="$1" name="$2" rc="$3" detail="$4"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$GAUNTLET_CHANNEL" "$name" "$status" "$rc" \
-        "$(_gauntlet_escape "$detail")" >>"$GAUNTLET_TSV"
-    printf '[%s] %s %s%s\n' "$status" "$name" "(rc=$rc)" "${detail:+ — $(printf '%s' "$detail" | head -c 200 | tr '\n' ' ')}"
+    local one
+    one="$(_gauntlet_escape "$detail")"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$GAUNTLET_CHANNEL" "$name" "$status" "$rc" "$one" >>"$GAUNTLET_TSV"
+    printf '[%s] %s %s%s\n' "$status" "$name" "(rc=$rc)" "${one:+ — ${one:0:200}}"
 }
 
 _gauntlet_run() {
@@ -130,6 +137,26 @@ assert_version() {
         _gauntlet_record FAIL "health-version" 1 "expected $want; health body: $body"
     fi
     return 0
+}
+
+stop_process() {
+    # Graceful stop with a bounded wait. A `kill` followed by an immediate
+    # process check races the daemon's own shutdown (seen on the arm runner),
+    # and how long a clean exit takes is itself worth a row.
+    local pid="$1" secs="${2:-15}" i=0
+    kill -0 "$pid" 2>/dev/null || return 0
+    kill "$pid" 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$secs" ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+        sleep 1
+        info seconds-to-exit "still running ${secs}s after TERM; sent KILL"
+    else
+        info seconds-to-exit "$i"
+    fi
 }
 
 collect() {

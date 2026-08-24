@@ -25,7 +25,7 @@ fi
 cleanup() {
     trap - EXIT
     if [ -n "$DAEMON_PID" ]; then
-        kill "$DAEMON_PID" 2>/dev/null || true
+        stop_process "$DAEMON_PID"
     fi
     (cd "$HOME" && cargo uninstall wenlan-mcp) >"$GAUNTLET_OUT/logs/teardown-cargo-uninstall.log" 2>&1 || true
     rm -rf "$DATA_DIR"

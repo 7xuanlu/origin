@@ -71,6 +71,24 @@ assert "multi-line output is one TSV row"   [ "$(row_count multi)" = 1 ]
 assert "detail is tab-free, newline as |"   [ "$(row_detail multi)" = "a b|c" ]
 assert "every TSV row has exactly 5 fields" [ "$(awk -F'\t' 'NF != 5' "$GAUNTLET_TSV" | wc -l | tr -d ' ')" = 0 ]
 
+# 5000 chars of output: the detail is capped at 2000 and nothing on stderr
+# (a `head -c` truncation used to print "write error: Broken pipe").
+long_err="$(check long -- bash -c 'head -c 5000 /dev/zero | tr "\0" x' 2>&1 >/dev/null)"
+assert "long detail capped at 2000 chars" [ "$(row_detail long | wc -c | tr -d ' ')" = 2001 ]
+assert "long detail truncation is silent" [ -z "$long_err" ]
+
+# The victim must not carry this script's EXIT trap: a bare `sleep 300 &` forks
+# a bash child that, if the TERM below lands before its exec, runs the trap and
+# deletes $tmp under the running test. Reset the trap, then exec.
+(trap - EXIT; exec sleep 300) &
+victim=$!
+disown "$victim"  # keep bash's "Terminated" job notice out of the test output
+stop_process "$victim" 5 >/dev/null
+gone() { ! kill -0 "$1" 2>/dev/null; }
+assert "stop_process ends the process"    gone "$victim"
+assert "stop_process records seconds-to-exit" [ "$(row_status seconds-to-exit)" = INFO ]
+assert "stop_process on a dead pid is a no-op" [ "$(stop_process "$victim" 1 | wc -l | tr -d ' ')" = 0 ]
+
 # port 9 (discard) is closed on every runner; the 1s window keeps this quick.
 if wait_health "http://127.0.0.1:9/api/health" 1 >/dev/null; then wh=0; else wh=$?; fi
 assert "wait_health returns 1 on timeout"     [ "$wh" = 1 ]

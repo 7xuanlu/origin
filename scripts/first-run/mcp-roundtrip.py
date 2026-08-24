@@ -23,9 +23,10 @@ Env:
 
 import json
 import os
-import select
+import queue
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -94,6 +95,27 @@ buf = b""
 next_id = 0
 dead = None  # reason string once the transport is gone
 
+# A pump thread hands stdout chunks over a queue: select() only accepts
+# sockets on Windows (WSAENOTSOCK/WSANOTINITIALISED on a pipe), and a queue
+# read with a timeout is the same wait on every platform. An empty chunk
+# means the server closed stdout.
+_chunks = queue.Queue()
+
+
+def _pump():
+    fd = proc.stdout.fileno()
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            chunk = b""
+        _chunks.put(chunk)
+        if not chunk:
+            return
+
+
+threading.Thread(target=_pump, name="stdout-pump", daemon=True).start()
+
 
 def send(obj):
     try:
@@ -104,9 +126,9 @@ def send(obj):
 
 
 def recv(want_id, timeout=60):
-    # Frame by hand: select() + buffered readline() can hang on a partial
-    # frame or strand a second frame already sitting in Python's buffer
-    # while select() waits on the drained fd.
+    # Frame by hand from raw chunks: a buffered readline() can hang on a
+    # partial frame or strand a second frame already sitting in Python's
+    # buffer while the caller waits for more bytes.
     global buf
     deadline = time.monotonic() + timeout
     while True:
@@ -121,12 +143,13 @@ def recv(want_id, timeout=60):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise Transport(f"timeout waiting for response id={want_id}")
-        ready, _, _ = select.select([proc.stdout], [], [], min(remaining, 1))
-        if ready:
-            chunk = os.read(proc.stdout.fileno(), 65536)
-            if not chunk:
-                raise Transport("wenlan-mcp closed stdout")
-            buf += chunk
+        try:
+            chunk = _chunks.get(timeout=min(remaining, 1))
+        except queue.Empty:
+            continue
+        if not chunk:
+            raise Transport("wenlan-mcp closed stdout")
+        buf += chunk
 
 
 def call(method, params=None, timeout=60):
