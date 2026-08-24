@@ -44905,6 +44905,14 @@ async fn add_entity_alias_in_scope_covers_not_found_conflict_and_ok_paths() {
     .await
     .unwrap();
 
+    // `store_entity` self-seeds every live entity's aliases with its own
+    // lowercased name; `test_seed_entity_shadow_page` seeds "[]" instead, so
+    // restore that production invariant for the namesake before probing the
+    // name-conflict path below.
+    db.add_entity_alias("codename", "alias-work-namesake", "test")
+        .await
+        .unwrap();
+
     // Missing entity id.
     assert!(matches!(
         db.add_entity_alias_in_scope(&ReadScope::Global, "no-such-entity", "Ghost")
