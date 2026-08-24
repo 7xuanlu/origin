@@ -159,9 +159,10 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("merged ids row scan: {e}")))?
         {
-            if let Ok(id) = row.get::<String>(0) {
-                ids.insert(id);
-            }
+            let id = row
+                .get::<String>(0)
+                .map_err(|e| WenlanError::VectorDb(format!("merged ids id: {e}")))?;
+            ids.insert(id);
         }
         Ok(ids)
     }

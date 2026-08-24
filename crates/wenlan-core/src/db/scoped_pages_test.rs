@@ -987,3 +987,36 @@ async fn orphan_link_rows_scoped_agrees_with_the_aggregate_twin() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_failed_summary_root_query_empties_the_channel() {
+    let (db, _tmp) = test_db().await;
+    let embedding = db.get_or_compute_embedding("root probe").unwrap();
+    db.insert_summary_node("root", 1, None, "Root", "root probe", &embedding, 1, 1, &[])
+        .await
+        .unwrap();
+
+    let healthy = db
+        .search_summary_nodes_scoped("root probe", 10, &ReadScope::Global)
+        .await
+        .unwrap();
+    assert!(
+        !healthy.is_empty(),
+        "control: a seeded root must be returned"
+    );
+
+    db.test_secondary_session()
+        .unwrap()
+        .execute_batch("ALTER TABLE summary_nodes RENAME TO summary_nodes_broken")
+        .await
+        .unwrap();
+
+    let degraded = db
+        .search_summary_nodes_scoped("root probe", 10, &ReadScope::Global)
+        .await
+        .unwrap();
+    assert!(
+        degraded.is_empty(),
+        "a failed root query must empty the channel, not error"
+    );
+}

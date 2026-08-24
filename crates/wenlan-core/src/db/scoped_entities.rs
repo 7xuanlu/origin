@@ -324,9 +324,10 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("filter_entity_ids_scoped row scan: {e}")))?
         {
-            if let Ok(id) = row.get::<String>(0) {
-                visible.insert(id);
-            }
+            let id = row
+                .get::<String>(0)
+                .map_err(|e| WenlanError::VectorDb(format!("filter_entity_ids_scoped id: {e}")))?;
+            visible.insert(id);
         }
         Ok(entity_ids
             .iter()

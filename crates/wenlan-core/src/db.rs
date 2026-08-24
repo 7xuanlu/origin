@@ -4180,13 +4180,18 @@ impl MemoryDB {
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chunks'",
                     libsql::params![],
                 ).await.map_err(|e| WenlanError::VectorDb(format!("check chunks: {e}")))?;
-                    rows.next()
+                    match rows
+                        .next()
                         .await
-                        .ok()
-                        .flatten()
-                        .and_then(|r| r.get::<i64>(0).ok())
-                        .unwrap_or(0)
-                        > 0
+                        .map_err(|e| WenlanError::VectorDb(format!("check chunks row: {e}")))?
+                    {
+                        Some(r) => {
+                            r.get::<i64>(0).map_err(|e| {
+                                WenlanError::VectorDb(format!("check chunks count: {e}"))
+                            })? > 0
+                        }
+                        None => false,
+                    }
                 };
 
             if has_chunks {
@@ -4505,9 +4510,10 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
             // PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
-            if let Ok(name) = row.get::<String>(1) {
-                columns.insert(name);
-            }
+            let name = row.get::<String>(1).map_err(|e| {
+                WenlanError::VectorDb(format!("get_table_columns({table}) name: {e}"))
+            })?;
+            columns.insert(name);
         }
         Ok(columns)
     }
@@ -14207,9 +14213,10 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("m113 scan row: {e}")))?
             {
-                if let Ok(id) = row.get::<String>(0) {
-                    unmapped.push(id);
-                }
+                let id = row
+                    .get::<String>(0)
+                    .map_err(|e| WenlanError::VectorDb(format!("m113 scan id: {e}")))?;
+                unmapped.push(id);
             }
 
             let now_iso = chrono::Utc::now().to_rfc3339();
@@ -14325,9 +14332,10 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("m114 scan row: {e}")))?
             {
-                if let Ok(id) = row.get::<String>(0) {
-                    mapped.push(id);
-                }
+                let id = row
+                    .get::<String>(0)
+                    .map_err(|e| WenlanError::VectorDb(format!("m114 scan id: {e}")))?;
+                mapped.push(id);
             }
 
             let now_iso = chrono::Utc::now().to_rfc3339();
@@ -26326,9 +26334,10 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("archived_ids row scan: {e}")))?
             {
-                if let Ok(sid) = row.get::<String>(0) {
-                    ids.insert(sid);
-                }
+                let sid = row
+                    .get::<String>(0)
+                    .map_err(|e| WenlanError::VectorDb(format!("archived_ids id: {e}")))?;
+                ids.insert(sid);
             }
             ids
         };
@@ -28127,7 +28136,13 @@ impl MemoryDB {
     ) -> Result<Vec<SearchResult>, WenlanError> {
         let entity_hits = match self.search_entities_by_vector_scoped(query, 5, scope).await {
             Ok(hits) if !hits.is_empty() => hits,
-            _ => return Ok(results),
+            Ok(_) => return Ok(results),
+            Err(e) => {
+                log::warn!(
+                    "[graph_stream] entity-anchor search failed; graph contributes nothing: {e}"
+                );
+                return Ok(results);
+            }
         };
 
         // v3 (WENLAN_GRAPH_MEMORY_STREAM): live entity→memory stream replaces the
@@ -28858,11 +28873,13 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("naive_vector_search row scan: {e}")))?
         {
-            let distance: f64 = row.get(30).unwrap_or(1.0);
+            let distance: f64 = row
+                .get(30)
+                .map_err(|e| WenlanError::VectorDb(format!("naive_vector_search distance: {e}")))?;
             let score = (1.0 - distance).max(0.0) as f32;
-            if let Ok(result) = Self::row_to_search_result(&row, score) {
-                results.push(result);
-            }
+            results.push(Self::row_to_search_result(&row, score).map_err(|e| {
+                WenlanError::VectorDb(format!("naive_vector_search row decode: {e}"))
+            })?);
         }
 
         results.sort_by(|a, b| {
@@ -28943,7 +28960,8 @@ impl MemoryDB {
         };
         let mut results: Vec<SearchResult> = Vec::new();
 
-        for fts_query in &fts_queries {
+        for (attempt, fts_query) in fts_queries.iter().enumerate() {
+            let is_last_attempt = attempt + 1 == fts_queries.len();
             let mut params: Vec<libsql::Value> = vec![
                 libsql::Value::Text(fts_query.clone()),
                 libsql::Value::Integer(fetch_limit),
@@ -28954,25 +28972,32 @@ impl MemoryDB {
 
             match conn.query(&fts_sql, params).await {
                 Ok(mut rows) => {
-                    // Eval baseline: a mid-scan step error is silent
-                    // truncation of the scored candidate list, so it
-                    // propagates. The query error below stays lenient on
-                    // purpose — the AND form can be invalid FTS5 syntax for
-                    // free-text queries, and falling through to the OR form
-                    // is the documented fallback.
+                    // Eval baseline: a mid-scan step or decode error is
+                    // silent truncation of the scored candidate list, so it
+                    // propagates. A query error is lenient only while a
+                    // fallback form remains — the AND form can be invalid
+                    // FTS5 syntax for free text and falls through to the OR
+                    // form, but the final attempt failing is a real error.
                     while let Some(row) = rows.next().await.map_err(|e| {
                         WenlanError::VectorDb(format!("fts_only_search row scan: {e}"))
                     })? {
                         // FTS5 rank is negative BM25; negate so higher = better
-                        let rank: f64 = row.get(30).unwrap_or(0.0);
+                        let rank: f64 = row.get(30).map_err(|e| {
+                            WenlanError::VectorDb(format!("fts_only_search rank: {e}"))
+                        })?;
                         let score = (-rank) as f32;
-                        if let Ok(result) = Self::row_to_search_result(&row, score) {
-                            results.push(result);
-                        }
+                        results.push(Self::row_to_search_result(&row, score).map_err(|e| {
+                            WenlanError::VectorDb(format!("fts_only_search row decode: {e}"))
+                        })?);
                     }
                 }
+                Err(e) if !is_last_attempt => {
+                    log::warn!("[fts_only_search] FTS attempt failed; trying fallback: {e}");
+                }
                 Err(e) => {
-                    log::warn!("[fts_only_search] FTS search failed: {}", e);
+                    return Err(WenlanError::VectorDb(format!(
+                        "fts_only_search final query: {e}"
+                    )));
                 }
             }
             if !results.is_empty() {
@@ -29709,15 +29734,28 @@ impl MemoryDB {
             ReadScope::Space(space) => vec![libsql::Value::Text(space.clone())],
             ReadScope::Global | ReadScope::Uncategorized => Vec::new(),
         };
-        // Best-effort like the rest of this optional summary channel, but an
-        // aborted lookup is logged rather than read as "no root".
+        // Root-first invariant: no readable root, no summary results. A failed
+        // root lookup or decode must empty the whole channel — scoring buckets
+        // under an unknown root would return results the invariant forbids.
         match conn.query(&root_sql, root_params).await {
             Ok(mut rows) => match rows.next().await {
-                Ok(Some(row)) => root = Self::row_to_summary_node(&row).ok(),
+                Ok(Some(row)) => match Self::row_to_summary_node(&row) {
+                    Ok(node) => root = Some(node),
+                    Err(e) => {
+                        log::warn!("[summary_search] root row undecodable; channel empty: {e}");
+                        return Ok(Vec::new());
+                    }
+                },
                 Ok(None) => {}
-                Err(e) => log::warn!("[summary_search] root scan aborted early: {e}"),
+                Err(e) => {
+                    log::warn!("[summary_search] root scan aborted; channel empty: {e}");
+                    return Ok(Vec::new());
+                }
             },
-            Err(e) => log::warn!("[summary_search] root query failed: {e}"),
+            Err(e) => {
+                log::warn!("[summary_search] root query failed; channel empty: {e}");
+                return Ok(Vec::new());
+            }
         }
 
         // Vector-matched bucket nodes.
@@ -36430,11 +36468,10 @@ impl MemoryDB {
             }
         } // Drop conn lock before vector search (which acquires its own lock)
           // Step C: vector similarity match (cosine distance < 0.15 ≈ similarity > 0.85)
-        if let Ok(hits) = self.search_entities_by_vector(name, 1).await {
-            if let Some(hit) = hits.first() {
-                if hit.distance < 0.15 {
-                    return Ok(Some(hit.entity.id.clone()));
-                }
+        let hits = self.search_entities_by_vector(name, 1).await?;
+        if let Some(hit) = hits.first() {
+            if hit.distance < 0.15 {
+                return Ok(Some(hit.entity.id.clone()));
             }
         }
         Ok(None)
@@ -36524,7 +36561,10 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("degree_stats row scan: {e}")))?
         {
-            degs.push(row.get::<i64>(0).unwrap_or(0));
+            degs.push(
+                row.get::<i64>(0)
+                    .map_err(|e| WenlanError::VectorDb(format!("degree_stats count: {e}")))?,
+            );
         }
         let edges: i64 = degs.iter().sum();
         let distinct_entities = degs.len() as i64;
@@ -50703,9 +50743,22 @@ impl MemoryDB {
                 };
                 match Self::row_to_page(&row) {
                     Ok(page) => {
-                        let distance: f64 = row.get(21).unwrap_or(1.0);
+                        let distance: f64 = match row.get(21) {
+                            Ok(d) => d,
+                            Err(e) if strict_scan => {
+                                return Err(WenlanError::VectorDb(format!(
+                                    "search_pages vector distance: {e}"
+                                )));
+                            }
+                            Err(_) => 1.0,
+                        };
                         let id = page.id.clone();
                         vector_results.push((id, distance, page));
+                    }
+                    Err(e) if strict_scan => {
+                        return Err(WenlanError::VectorDb(format!(
+                            "search_pages vector row decode: {e}"
+                        )));
                     }
                     Err(e) => {
                         log::warn!("[search_pages] skipping malformed vector row: {e}")
@@ -50769,9 +50822,19 @@ impl MemoryDB {
                             break;
                         }
                     };
-                    if let Ok(page) = Self::row_to_page(&row) {
-                        let id = page.id.clone();
-                        fts_results.push((id, page));
+                    match Self::row_to_page(&row) {
+                        Ok(page) => {
+                            let id = page.id.clone();
+                            fts_results.push((id, page));
+                        }
+                        Err(e) if strict_scan => {
+                            return Err(WenlanError::VectorDb(format!(
+                                "search_pages fts row decode: {e}"
+                            )));
+                        }
+                        Err(e) => {
+                            log::warn!("[search_pages] skipping malformed fts row: {e}")
+                        }
                     }
                 },
                 Err(e) => {

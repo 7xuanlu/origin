@@ -1102,7 +1102,9 @@ pub async fn run_e2e_context_eval_longmemeval(
 
         let category = category_name(&sample.question_type);
 
-        if let Ok(tuples) = generate_e2e_answers_for_question(
+        // A failed question must fail the run: silently omitting it would
+        // score a biased partial sample as if it were the full set.
+        let tuples = generate_e2e_answers_for_question(
             &db,
             &sample.question,
             &ground_truth,
@@ -1110,10 +1112,8 @@ pub async fn run_e2e_context_eval_longmemeval(
             search_limit,
             &llm,
         )
-        .await
-        {
-            all_tuples.extend(tuples);
-        }
+        .await?;
+        all_tuples.extend(tuples);
 
         if q_idx % 50 == 49 {
             eprintln!(
