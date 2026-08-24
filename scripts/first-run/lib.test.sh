@@ -120,8 +120,9 @@ empty_rc="$(
 assert "evaluate returns 1 when no findings were recorded" [ "$empty_rc" = 1 ]
 
 # The post-mortem replay watchdog must SIGKILL a daemon that ignores TERM and
-# report 124: a TERM-only cap let a recovered daemon hang the job past its
-# timeout-minutes and lose the verdict row (from-main run, all macOS legs).
+# report 124: the macos-15 runner image ships no timeout/gtimeout, so the old
+# optional cap silently did not exist and a recovered daemon hung every macOS
+# job past its timeout-minutes, losing the verdict row (from-main run).
 cat >"$tmp/stubborn.sh" <<'EOS'
 #!/bin/sh
 trap '' TERM
@@ -132,8 +133,7 @@ watchdog_rc="$(
     GAUNTLET_OUT="$tmp/run/findings-watchdog-macos" GAUNTLET_CHANNEL=watchdog \
     GAUNTLET_REPLAY_CAP=2 bash -c '
         . "$1/lib.sh" >/dev/null
-        data_root="$GAUNTLET_OUT"
-        if _replay_capped "$2" "$GAUNTLET_OUT/checks/stubborn.log" 127.0.0.1:17999; then
+        if _replay_capped "$2" "$GAUNTLET_OUT/checks/stubborn.log" "$GAUNTLET_OUT" 127.0.0.1:17999; then
             echo 0
         else
             echo $?
