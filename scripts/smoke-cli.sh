@@ -8,7 +8,9 @@ set -euo pipefail
 PORT="${PORT:-17881}"
 HOST="http://127.0.0.1:${PORT}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/target/debug"
+# BIN preset (e.g. a release-archive extract) skips the cargo build below.
+BIN_PRESET="${BIN:-}"
+BIN="${BIN:-$ROOT/target/debug}"
 
 # Explicit template: macOS mktemp ignores TMPDIR without one, and the
 # sandboxed dev loop can only write under TMPDIR.
@@ -37,8 +39,10 @@ fail() {
     exit 1
 }
 
-echo "==> Building wenlan-server + wenlan"
-(cd "$ROOT" && cargo build -p wenlan-server -p wenlan)
+if [ -z "$BIN_PRESET" ]; then
+    echo "==> Building wenlan-server + wenlan"
+    (cd "$ROOT" && cargo build -p wenlan-server -p wenlan)
+fi
 
 # Without lsof a failed port check reads as "port free" — fail loud instead.
 command -v lsof >/dev/null 2>&1 || fail "lsof is required (port check + cleanup)"
@@ -66,39 +70,16 @@ for i in $(seq 1 120); do
 done
 [ -n "$healthy" ] || fail "daemon did not become healthy within 120s"
 
-SENTINEL="kumquat-lighthouse-8231"
-CLI() { WENLAN_HOST="$HOST" "$BIN/wenlan" --format json "$@"; }
-
-echo "==> wenlan status"
-STATUS_OUT="$(CLI status)" || fail "wenlan status exited nonzero"
-[ -n "$STATUS_OUT" ] || fail "wenlan status printed nothing"
-
-echo "==> wenlan capture (sentinel)"
-CLI capture "The ${SENTINEL} sentinel sentence lives in the CLI smoke." \
-    --type fact >/dev/null || fail "wenlan capture exited nonzero"
-
-echo "==> wenlan memories contains the sentinel"
-# Capture then match: piping into grep -q can SIGPIPE the CLI under pipefail.
-MEMS_OUT="$(CLI memories --limit 20)" || fail "wenlan memories exited nonzero"
-case "$MEMS_OUT" in
-    *"$SENTINEL"*) ;;
-    *) fail "captured sentinel not listed by wenlan memories" ;;
-esac
-
-echo "==> wenlan search finds the sentinel"
-hit=""
-for i in $(seq 1 30); do
-    SEARCH_OUT="$(CLI search "kumquat lighthouse sentinel sentence" --limit 5)" \
-        || fail "wenlan search exited nonzero"
-    case "$SEARCH_OUT" in
-        *"$SENTINEL"*)
-            echo "    hit after ${i} poll(s)"
-            hit=1
-            break
-            ;;
-    esac
-    sleep 2
-done
-[ -n "$hit" ] || fail "sentinel not retrievable via wenlan search within 60s"
+# The CLI loop itself lives in the first-run gauntlet helper (shared with the
+# release-artifact workflow); it records every step and never exits early.
+GAUNTLET_OUT="$DATA_DIR/gauntlet" GAUNTLET_CHANNEL=smoke-cli \
+WENLAN_BIN="$BIN/wenlan" WENLAN_HOST="$HOST" \
+    bash "$ROOT/scripts/first-run/cli-roundtrip.sh"
+[ -s "$DATA_DIR/gauntlet/findings.tsv" ] || fail "CLI round-trip recorded nothing"
+if grep -q $'\tFAIL\t' "$DATA_DIR/gauntlet/findings.tsv"; then
+    echo "--- findings.tsv ---" >&2
+    cat "$DATA_DIR/gauntlet/findings.tsv" >&2
+    fail "CLI round-trip recorded FAIL rows"
+fi
 
 echo "PASS: CLI surface smoke (status, capture, memories, search) against isolated daemon"
