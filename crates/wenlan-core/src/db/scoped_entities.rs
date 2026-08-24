@@ -322,7 +322,7 @@ impl MemoryDB {
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| WenlanError::VectorDb(format!("entity_detail row scan: {e}")))?
+            .map_err(|e| WenlanError::VectorDb(format!("filter_entity_ids_scoped row scan: {e}")))?
         {
             if let Ok(id) = row.get::<String>(0) {
                 visible.insert(id);
@@ -634,7 +634,9 @@ impl MemoryDB {
         })?;
         let mut results = Vec::new();
         while let Some(row) = rows.next().await.map_err(|e| {
-            WenlanError::VectorDb(format!("get_memories_for_entities_scoped row scan: {e}"))
+            WenlanError::VectorDb(format!(
+                "get_observations_for_entities_scoped row scan: {e}"
+            ))
         })? {
             let id: String = row.get(0).unwrap_or_default();
             let entity_name: String = row.get(2).unwrap_or_default();

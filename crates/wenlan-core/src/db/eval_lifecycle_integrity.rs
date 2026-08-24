@@ -63,7 +63,11 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("count memories: {e}")))?;
-            if let Ok(Some(row)) = rows.next().await {
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("count memories row: {e}")))?
+            {
                 row.get::<i64>(0).unwrap_or(0) as usize
             } else {
                 0
@@ -78,7 +82,11 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("count archived: {e}")))?;
-            if let Ok(Some(row)) = rows.next().await {
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("count archived row: {e}")))?
+            {
                 row.get::<i64>(0).unwrap_or(0) as usize
             } else {
                 0
@@ -97,7 +105,11 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("count entities: {e}")))?;
-            if let Ok(Some(row)) = rows.next().await {
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("count entities row: {e}")))?
+            {
                 row.get::<i64>(0).unwrap_or(0) as usize
             } else {
                 0
@@ -112,7 +124,11 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("count concepts: {e}")))?;
-            if let Ok(Some(row)) = rows.next().await {
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("count concepts row: {e}")))?
+            {
                 row.get::<i64>(0).unwrap_or(0) as usize
             } else {
                 0
