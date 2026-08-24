@@ -47,8 +47,7 @@ desktop app share it — never kill it casually.
 - **Upgrading requires a restart** — installing a new binary never replaces a running
   daemon: the new process detects the healthy incumbent on :7878 and exits
   (`crates/wenlan-server/src/main.rs`). `wenlan background on` stops the running service
-  before reinstalling; `wenlan restart` (graceful stop, wait for exit, start, health
-  check) reloads it explicitly. The MCP
+  before reinstalling; `wenlan restart` (stop then start) reloads it explicitly. The MCP
   version handshake surfaces a stale daemon (`VersionStatus::DaemonOutdated`) and points
   users at `wenlan restart`.
 - **Reranker startup** — enabling the cross-encoder (`WENLAN_RERANKER_ENABLED=1`) blocks

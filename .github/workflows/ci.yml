@@ -193,6 +193,7 @@ jobs:
               # Positive-only globs. With dorny/paths-filter's default
               # `some` quantifier, a negative glob like `!crates/*/npm/**`
               # makes README-only PRs match this filter.
+              - 'scripts/first-run/linux-install.sh'
               - 'crates/**/*.rs'
               # Required integration tests consume non-Rust fixtures here
               # (PDF, Markdown, and text), so fixture-only PRs must not skip.
@@ -222,6 +223,7 @@ jobs:
               - '.github/workflows/release-candidate-observer.yml'
               - '.github/workflows/ci-benchmark.yml'
               - '.github/workflows/coverage.yml'
+              - '.github/workflows/first-run-gauntlet.yml'
               - '.github/workflows/release-pr-maintenance.yml'
               - '.github/workflows/release-please.yml'
               - '.github/workflows/release.yml'
@@ -281,6 +283,7 @@ jobs:
               # Shared CLI/server/MCP code stays on the Ubuntu canonical lane;
               # drift_guard fails if a cfg-bearing source lacks an owner here
               # or in the focused MCP platform-compile filter.
+              - 'scripts/first-run/macos-app.sh'
               - 'crates/wenlan-cli/src/commands/pages.rs'
               - 'crates/wenlan-cli/src/commands/service.rs'
               - 'crates/wenlan-cli/src/commands/setup.rs'
@@ -406,6 +409,11 @@ jobs:
               - 'scripts/smoke-windows.ps1'
               - 'scripts/smoke-windows-llm.ps1'
               - 'scripts/smoke-windows-llm.test.ps1'
+              - 'scripts/first-run/lib.ps1'
+              - 'scripts/first-run/cli-roundtrip.ps1'
+              - 'scripts/first-run/npx-mcp.ps1'
+              - 'scripts/first-run/windows-zip.ps1'
+              - 'scripts/first-run/windows-nsis.ps1'
               - 'scripts/stabilize-rust-cache-toolchains.sh'
               - 'scripts/stabilize-rust-cache-toolchains.test.sh'
               - 'scripts/setup-vulkan-sdk-windows.ps1'
