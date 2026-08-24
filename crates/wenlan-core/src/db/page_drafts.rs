@@ -2,7 +2,7 @@
 
 use super::MemoryDB;
 use crate::error::WenlanError;
-use crate::pages::{Page, PageDraftDeleteOutcome, PageDraftUpdateOutcome};
+use crate::pages::{Page, PageDraftDeleteOutcome, PageDraftPublishOutcome, PageDraftUpdateOutcome};
 
 const PAGE_COLUMNS: &str = "id, title, summary, content, entity_id, space,
     source_memory_ids, version, status, created_at, last_compiled, last_modified,
@@ -528,5 +528,154 @@ impl MemoryDB {
             .await
             .map_err(|error| WenlanError::VectorDb(format!("delete Page draft commit: {error}")))?;
         Ok(PageDraftDeleteOutcome::Deleted)
+    }
+
+    /// Publish a draft as an active Page if the caller still holds its version.
+    ///
+    /// Editor contract (mirrored by `e2e/tauriMock/runtime.ts`): an exact retry
+    /// of a publish that already landed — the row is active at
+    /// `expected_version + 1` — replays the published Page; any other version
+    /// mismatch is a `VersionConflict`; an active Page in the same scope whose
+    /// trimmed title matches case-insensitively blocks with `TitleConflict`.
+    /// Publishing requires both a trimmed title and non-empty content, stamps
+    /// the trimmed title, flips `status` to active, re-derives `kind` from the
+    /// one shared rule, bumps the version, and stamps `last_compiled` /
+    /// `last_modified`. The page embedding is computed best-effort like every
+    /// other page insert; the FTS reindex is the `pages_fts_update` trigger's
+    /// job.
+    pub async fn publish_page_draft(
+        &self,
+        id: &str,
+        expected_version: i64,
+    ) -> Result<PageDraftPublishOutcome, WenlanError> {
+        // Snapshot outside the write transaction so the embedding compute
+        // (slow on first call while the model loads) never holds it. Any
+        // concurrent draft write bumps the version, so if the in-transaction
+        // recheck still sees `expected_version` the snapshot's title and
+        // content are exactly what gets published.
+        let snapshot = {
+            let conn = self.conn.lock().await;
+            Self::required_page_draft_on_conn(&conn, id).await?
+        };
+        let embedding_sql = if snapshot.status == "draft" && snapshot.version == expected_version {
+            let embed_text = crate::pages::page_embedding_text(
+                snapshot.title.trim(),
+                snapshot.summary.as_deref(),
+                &snapshot.content,
+            );
+            match self.generate_embeddings(&[embed_text]) {
+                Ok(vecs) if !vecs.is_empty() => Some(Self::vec_to_sql(&vecs[0])),
+                Ok(_) => {
+                    log::warn!("publish_page_draft: empty embedding result for {id}");
+                    None
+                }
+                Err(e) => {
+                    log::warn!("publish_page_draft: embedding failed for {id}: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("publish Page draft begin: {error}")))?;
+        let current = Self::required_page_draft_on_conn(&tx, id).await?;
+        if current.status == "active" && expected_version.checked_add(1) == Some(current.version) {
+            return Ok(PageDraftPublishOutcome::Published(current));
+        }
+        if current.version != expected_version {
+            return Ok(PageDraftPublishOutcome::VersionConflict {
+                current_version: current.version,
+            });
+        }
+        ensure_draft(&current)?;
+        let title = current.title.trim().to_string();
+        if title.is_empty() || current.content.trim().is_empty() {
+            return Err(WenlanError::Validation(
+                "Title and content are required".to_string(),
+            ));
+        }
+        // Same-scope title uniqueness among active Pages, compared on the
+        // stored (sentinel-mirrored) scope column so unfiled matches unfiled.
+        let scope = current
+            .space
+            .clone()
+            .unwrap_or_else(|| super::UNFILED_SPACE_ID.to_string());
+        let mut rows = tx
+            .query(
+                "SELECT id, title FROM pages
+                 WHERE id<>?1 AND status='active'
+                   AND lower(trim(title))=lower(?2) AND space=?3
+                 LIMIT 1",
+                libsql::params![id, title.as_str(), scope.as_str()],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("publish Page draft title check: {error}"))
+            })?;
+        if let Some(row) = rows.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("publish Page draft title row: {error}"))
+        })? {
+            let existing_page_id: String = row
+                .get(0)
+                .map_err(|error| WenlanError::VectorDb(format!("title conflict id: {error}")))?;
+            let existing_page_title: String = row
+                .get(1)
+                .map_err(|error| WenlanError::VectorDb(format!("title conflict title: {error}")))?;
+            return Ok(PageDraftPublishOutcome::TitleConflict {
+                existing_page_id,
+                existing_page_title,
+            });
+        }
+        drop(rows);
+
+        let kind = crate::pages::page_kind_for(&title, &current.creation_kind, "active");
+        let publish = match &embedding_sql {
+            Some(emb) => {
+                tx.execute(
+                    "UPDATE pages
+                     SET title=?1, status='active', kind=?2, version=version+1,
+                         last_compiled=?3, last_modified=?3, embedding=vector32(?4)
+                     WHERE id=?5 AND status='draft' AND version=?6",
+                    libsql::params![
+                        title.as_str(),
+                        kind,
+                        now.as_str(),
+                        emb.as_str(),
+                        id,
+                        expected_version
+                    ],
+                )
+                .await
+            }
+            None => {
+                tx.execute(
+                    "UPDATE pages
+                     SET title=?1, status='active', kind=?2, version=version+1,
+                         last_compiled=?3, last_modified=?3
+                     WHERE id=?4 AND status='draft' AND version=?5",
+                    libsql::params![title.as_str(), kind, now.as_str(), id, expected_version],
+                )
+                .await
+            }
+        };
+        let affected = publish
+            .map_err(|error| WenlanError::VectorDb(format!("publish Page draft row: {error}")))?;
+        if affected != 1 {
+            return Err(WenlanError::Conflict(format!(
+                "Page draft {id} changed during publish"
+            )));
+        }
+        let outcome =
+            PageDraftPublishOutcome::Published(Self::required_page_draft_on_conn(&tx, id).await?);
+        tx.commit().await.map_err(|error| {
+            WenlanError::VectorDb(format!("publish Page draft commit: {error}"))
+        })?;
+        Ok(outcome)
     }
 }

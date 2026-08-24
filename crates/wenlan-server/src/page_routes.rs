@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::error::ServerError;
 use crate::memory_routes::extract_agent_name;
-use crate::route_registry::{get, post, TrackedRouter};
+use crate::route_registry::{get, post, put, TrackedRouter};
 use crate::state::{ServerState, SharedState};
 use axum::{
     extract::{Path, State},
@@ -11,8 +11,11 @@ use axum::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use wenlan_types::requests::{CreateConceptRequest, ExportPagesRequest, SearchPagesRequest};
-use wenlan_types::responses::CreatePageResponse;
+use wenlan_types::requests::{
+    CreateConceptRequest, CreatePageDraftRequest, ExportPagesRequest, PageDraftVersionRequest,
+    SearchPagesRequest, UpdatePageDraftRequest,
+};
+use wenlan_types::responses::{CreatePageResponse, PageDraftResponse};
 use wenlan_types::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};
 
 pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
@@ -22,6 +25,15 @@ pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<Shar
             get(handle_list_pages).post(handle_create_page),
         )
         .route("/api/pages/search", post(handle_search_pages))
+        .route("/api/pages/drafts", post(handle_create_page_draft))
+        .route(
+            "/api/pages/drafts/{id}",
+            put(handle_update_page_draft).delete(handle_discard_page_draft),
+        )
+        .route(
+            "/api/pages/drafts/{id}/publish",
+            post(handle_publish_page_draft),
+        )
         .route("/api/pages/export", post(handle_export_pages))
         .route(
             "/api/pages/recent-changes",
@@ -325,6 +337,186 @@ pub async fn handle_create_page(
             WriteOutcome::Created
         }),
     }))
+}
+
+/// Map core draft errors onto the editor's wire contract.
+///
+/// The desktop editor (`src/lib/tauri.ts` `parsePageDraftError`) parses a JSON
+/// object with a `code` field out of the error text; the codes and messages
+/// here mirror `e2e/tauriMock/runtime.ts`, the executable spec the UI is
+/// tested against. Anything uncoded (validation, internal) falls through to
+/// the plain `ServerError` mapping.
+fn page_draft_error(err: wenlan_core::WenlanError) -> ServerError {
+    match err {
+        wenlan_core::WenlanError::PageDraftIdConflict(_) => ServerError::Structured {
+            status: axum::http::StatusCode::CONFLICT,
+            body: serde_json::json!({
+                "code": "page_draft_id_conflict",
+                "error": "Page draft id already belongs to another Page",
+            }),
+        },
+        wenlan_core::WenlanError::NotFound(_) => ServerError::Structured {
+            status: axum::http::StatusCode::NOT_FOUND,
+            body: serde_json::json!({
+                "code": "page_draft_not_found",
+                "error": "Page draft not found",
+            }),
+        },
+        other => ServerError::from(other),
+    }
+}
+
+fn draft_version_conflict(current_version: i64) -> ServerError {
+    ServerError::Structured {
+        status: axum::http::StatusCode::CONFLICT,
+        body: serde_json::json!({
+            "code": "draft_version_conflict",
+            "error": "Page draft changed since it was loaded",
+            "current_version": current_version,
+        }),
+    }
+}
+
+async fn draft_db(
+    state: &Arc<RwLock<ServerState>>,
+) -> Result<Arc<wenlan_core::db::MemoryDB>, ServerError> {
+    let s = state.read().await;
+    s.db.clone().ok_or(ServerError::DbNotInitialized)
+}
+
+/// POST /api/pages/drafts
+///
+/// First durable snapshot of a human-authored Page draft. An omitted `space`
+/// key inherits the `X-Wenlan-Space` header; an explicit `null` clears it.
+pub async fn handle_create_page_draft(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    Json(req): Json<CreatePageDraftRequest>,
+) -> Result<Json<PageDraftResponse>, ServerError> {
+    let db = draft_db(&state).await?;
+    let space = if req.space_was_provided() {
+        req.space.clone()
+    } else {
+        header_space
+    };
+    let page = db
+        .create_page_draft_with_id_in_registered_space(
+            &req.draft_id,
+            &req.title,
+            &req.content,
+            space.as_deref(),
+        )
+        .await
+        .map_err(page_draft_error)?;
+    Ok(Json(PageDraftResponse { page }))
+}
+
+/// PUT /api/pages/drafts/{id}
+pub async fn handle_update_page_draft(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdatePageDraftRequest>,
+) -> Result<Json<PageDraftResponse>, ServerError> {
+    let db = draft_db(&state).await?;
+    match db
+        .update_page_draft_in_registered_space(
+            &id,
+            req.expected_version,
+            &req.title,
+            &req.content,
+            req.space.as_deref(),
+        )
+        .await
+        .map_err(page_draft_error)?
+    {
+        wenlan_core::pages::PageDraftUpdateOutcome::Updated(page) => {
+            Ok(Json(PageDraftResponse { page }))
+        }
+        wenlan_core::pages::PageDraftUpdateOutcome::VersionConflict { current_version } => {
+            Err(draft_version_conflict(current_version))
+        }
+    }
+}
+
+/// POST /api/pages/drafts/{id}/publish
+pub async fn handle_publish_page_draft(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    Path(id): Path<String>,
+    Json(req): Json<PageDraftVersionRequest>,
+) -> Result<Json<PageDraftResponse>, ServerError> {
+    let (db, page_root) = {
+        let s = state.read().await;
+        (
+            s.db.clone().ok_or(ServerError::DbNotInitialized)?,
+            s.lint_config.page_root().map(std::path::Path::to_path_buf),
+        )
+    };
+    let page = match db
+        .publish_page_draft(&id, req.expected_version)
+        .await
+        .map_err(page_draft_error)?
+    {
+        wenlan_core::pages::PageDraftPublishOutcome::Published(page) => page,
+        wenlan_core::pages::PageDraftPublishOutcome::VersionConflict { current_version } => {
+            return Err(draft_version_conflict(current_version))
+        }
+        wenlan_core::pages::PageDraftPublishOutcome::TitleConflict {
+            existing_page_id,
+            existing_page_title,
+        } => {
+            return Err(ServerError::Structured {
+                status: axum::http::StatusCode::CONFLICT,
+                body: serde_json::json!({
+                    "code": "page_title_conflict",
+                    "error": "A Page with this title already exists",
+                    "existing_page_id": existing_page_id,
+                    "existing_page_title": existing_page_title,
+                }),
+            })
+        }
+    };
+    // First projection write for this page: `reconcile` only repairs pages
+    // already in the projection state, so skipping here would leave the
+    // published page invisible to `wenlan pages` until another write projects
+    // it. Same root as `handle_create_page` (None disables projection);
+    // DB-first with a warn on projection failure mirrors `handle_delete_page`:
+    // the publish must not be reported as failed once the row flipped.
+    if let Some(page_root) = page_root {
+        let projection =
+            wenlan_core::export::knowledge::KnowledgeProjectionWrite::new(page_root, &db);
+        if let Err(e) = projection.write_page_gated(&db, &page).await {
+            tracing::warn!(
+                "[page] draft {} published but md projection write failed: {}",
+                page.id,
+                e
+            );
+        }
+    }
+    Ok(Json(PageDraftResponse { page }))
+}
+
+/// DELETE /api/pages/drafts/{id}
+///
+/// Drafts are never projected to md, so unlike `handle_delete_page` there is
+/// no projection cleanup here.
+pub async fn handle_discard_page_draft(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    Path(id): Path<String>,
+    Json(req): Json<PageDraftVersionRequest>,
+) -> Result<Json<serde_json::Value>, ServerError> {
+    let db = draft_db(&state).await?;
+    match db
+        .delete_page_draft(&id, req.expected_version)
+        .await
+        .map_err(page_draft_error)?
+    {
+        wenlan_core::pages::PageDraftDeleteOutcome::Deleted => {
+            Ok(Json(serde_json::json!({"status": "deleted"})))
+        }
+        wenlan_core::pages::PageDraftDeleteOutcome::VersionConflict { current_version } => {
+            Err(draft_version_conflict(current_version))
+        }
+    }
 }
 
 fn normalize_page_write_target(

@@ -625,6 +625,10 @@ load-bearing: the shape gate holds even when this one is bypassed.
 | `GET` | `/api/outbox/status` | main | no | not_applicable | `none` | — | outbox counts only |
 | `GET` | `/api/pages` | main | yes | automatic | **`collection`** | `handle_list_pages` | opaque response type — fail-closed |
 | `POST` | `/api/pages` | main | no | not_applicable | `none` | — | no prose fields |
+| `POST` | `/api/pages/drafts` | main | yes | automatic | `none` | `handle_create_page_draft` | PageDraftResponse.page — echoes the caller's own draft snapshot |
+| `DELETE` | `/api/pages/drafts/{id}` | main | no | not_applicable | `none` | — | no prose fields |
+| `PUT` | `/api/pages/drafts/{id}` | main | yes | automatic | `none` | `handle_update_page_draft` | PageDraftResponse.page — echoes the caller's own draft snapshot |
+| `POST` | `/api/pages/drafts/{id}/publish` | main | yes | automatic | `none` | `handle_publish_page_draft` | PageDraftResponse.page — echoes the caller's own draft snapshot |
 | `POST` | `/api/pages/export` | main | yes | automatic | `none` | `handle_export_pages` | EFFECT: writes page prose to the requested vault |
 | `GET` | `/api/pages/orphan-links` | main | yes | automatic | `none` | `handle_list_orphan_links` | OrphanLink.label, OrphanLinksResponse.orphan_labels |
 | `GET` | `/api/pages/recent` | main | yes | automatic | `none` | `handle_recent_pages` | RecentActivityItem.snippet, RecentActivityItem.title; NOT Collection — carries prose and no axes |
@@ -947,6 +951,7 @@ carrying the authority of agreement.
 | `core/db/kg_quality_embedding_refresh.rs::stale_entity_embedding_candidates_for_refresh` | `pub(crate)` | no | no | — | — |
 | `core/db/maintenance_duplicate_reads.rs::scan_near_duplicate_slice` | `pub(crate)` | no | no | — | — |
 | `core/db/maintenance_retro_scan.rs::scan_automatic_retro_stub_slice` | `pub(crate)` | no | no | — | — |
+| `core/db/page_drafts.rs::publish_page_draft` | `pub` | no | **yes** | `server/page_routes.rs::handle_publish_page_draft` | — |
 | `core/db/presence_review.rs::page_binding` | `private` | no | no | — | — |
 | `core/db/repair_deterministic.rs::apply_deterministic_repair_cas` | `pub` | no | no | — | — |
 | `core/db/repair_page_rename.rs::page_on_connection` | `private` | no | no | — | — |
@@ -1078,6 +1083,7 @@ carrying the authority of agreement.
 | `server/memory_revision_routes.rs::handle_list_pending_revisions` | `pub` | no | no | — | `core/db.rs::list_pending_revisions_scoped` |
 | `server/memory_routes.rs::handle_store_memory` | `pub` | no | no | — | `core/db.rs::resolve_entity_by_name` |
 | `server/page_map_routes.rs::compute_ref_state` | `private` | no | no | `server/page_map_routes.rs::wire_node` | `core/db.rs::get_entity_name_type` |
+| `server/page_routes.rs::handle_publish_page_draft` | `pub` | no | no | — | `core/db/page_drafts.rs::publish_page_draft` |
 | `server/routes.rs::handle_distill` | `pub` | no | no | — | `core/db.rs::list_stale_pages_scoped`, `core/db.rs::load_page_source_index` |
 | `server/routes.rs::handle_recent_page_changes` | `pub` | no | no | — | `core/db/scoped_pages.rs::list_recent_changes_scoped` |
 | `server/routes.rs::handle_recent_retrievals` | `pub` | no | no | — | `core/db.rs::list_recent_retrievals_scoped` |

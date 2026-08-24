@@ -3,7 +3,7 @@
 use super::tests::test_db;
 use super::MemoryDB;
 use crate::error::WenlanError;
-use crate::pages::{PageDraftDeleteOutcome, PageDraftUpdateOutcome};
+use crate::pages::{PageDraftDeleteOutcome, PageDraftPublishOutcome, PageDraftUpdateOutcome};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{Barrier, Notify};
@@ -1027,4 +1027,168 @@ async fn description_delete_keep_and_failed_space_paths_do_not_bump_drafts() {
     assert!(db.reassign_memories_space("missing", "dest").await.is_err());
     assert!(db.delete_space("missing", "move:dest").await.is_err());
     assert_eq!(page_version_and_modified(&db, &draft.id).await, before);
+}
+
+async fn page_status_kind_and_embedding(db: &MemoryDB, id: &str) -> (String, String, bool) {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT status, kind, embedding IS NOT NULL FROM pages WHERE id=?1",
+            libsql::params![id],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    (
+        row.get(0).unwrap(),
+        row.get(1).unwrap(),
+        row.get::<i64>(2).unwrap() == 1,
+    )
+}
+
+#[tokio::test]
+async fn publish_flips_draft_to_active_and_replays_idempotently() {
+    let (db, _tmp) = test_db().await;
+    let draft = db
+        .create_page_draft("  Sharding notes  ", "Body text", None, None)
+        .await
+        .unwrap();
+
+    let published = match db.publish_page_draft(&draft.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::Published(page) => page,
+        other => panic!("expected Published, got {other:?}"),
+    };
+    assert_eq!(published.status, "active");
+    assert_eq!(published.title, "Sharding notes");
+    assert_eq!(published.version, 2);
+    assert_eq!(published.creation_kind, "authored");
+    assert_eq!(published.review_status, "unconfirmed");
+    assert_eq!(published.last_compiled, published.last_modified);
+    let (status, kind, has_embedding) = page_status_kind_and_embedding(&db, &draft.id).await;
+    assert_eq!(status, "active");
+    assert_eq!(kind, "authored");
+    assert!(has_embedding, "publish must write the page embedding");
+
+    // Exact retry of the publish that landed replays the active page.
+    let replayed = match db.publish_page_draft(&draft.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::Published(page) => page,
+        other => panic!("expected replay, got {other:?}"),
+    };
+    assert_eq!(replayed.version, 2);
+    assert_eq!(replayed.status, "active");
+
+    // Any other version on the now-active page is a conflict, not "not a draft".
+    assert!(matches!(
+        db.publish_page_draft(&draft.id, 5).await.unwrap(),
+        PageDraftPublishOutcome::VersionConflict { current_version: 2 }
+    ));
+    // The matching version on an active page is the not-a-draft validation.
+    assert!(matches!(
+        db.publish_page_draft(&draft.id, 2).await,
+        Err(WenlanError::Validation(_))
+    ));
+}
+
+#[tokio::test]
+async fn publish_rejects_stale_missing_and_incomplete_drafts() {
+    let (db, _tmp) = test_db().await;
+
+    assert!(matches!(
+        db.publish_page_draft("page_00000000-0000-4000-8000-00000000f001", 1)
+            .await,
+        Err(WenlanError::NotFound(_))
+    ));
+
+    let draft = db
+        .create_page_draft("Draft title", "Body", None, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.publish_page_draft(&draft.id, 7).await.unwrap(),
+        PageDraftPublishOutcome::VersionConflict { current_version: 1 }
+    ));
+
+    // Publishing requires BOTH a trimmed title and non-empty content; a
+    // title-only or body-only draft (legal to save) cannot publish, and the
+    // failed attempt must not mutate the row.
+    let title_only = db
+        .create_page_draft("Title only", "", None, None)
+        .await
+        .unwrap();
+    let body_only = db
+        .create_page_draft("  \t", "Body only", None, None)
+        .await
+        .unwrap();
+    for draft in [&title_only, &body_only] {
+        assert!(matches!(
+            db.publish_page_draft(&draft.id, 1).await,
+            Err(WenlanError::Validation(_))
+        ));
+        let (status, _, _) = page_status_kind_and_embedding(&db, &draft.id).await;
+        assert_eq!(status, "draft");
+        assert_eq!(page_version_and_modified(&db, &draft.id).await.0, 1);
+    }
+}
+
+#[tokio::test]
+async fn publish_blocks_on_same_scope_case_insensitive_title_conflict() {
+    let (db, _tmp) = test_db().await;
+    db.create_space("work", None, false).await.unwrap();
+    seed_non_draft_page(
+        &db,
+        "page_active",
+        "active",
+        "work",
+        3,
+        "2026-01-01T00:00:00Z",
+    )
+    .await;
+
+    // Same scope + case-insensitively equal trimmed title -> conflict, and the
+    // draft stays a draft.
+    let clash = db
+        .create_page_draft("  ACTIVE PAGE ", "Body", Some("work"), Some("work"))
+        .await
+        .unwrap();
+    match db.publish_page_draft(&clash.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::TitleConflict {
+            existing_page_id,
+            existing_page_title,
+        } => {
+            assert_eq!(existing_page_id, "page_active");
+            assert_eq!(existing_page_title, "active page");
+        }
+        other => panic!("expected TitleConflict, got {other:?}"),
+    }
+    let (status, _, _) = page_status_kind_and_embedding(&db, &clash.id).await;
+    assert_eq!(status, "draft");
+
+    // The same title in a different scope (unfiled here) publishes fine.
+    let elsewhere = db
+        .create_page_draft("Active page", "Body", None, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.publish_page_draft(&elsewhere.id, 1).await.unwrap(),
+        PageDraftPublishOutcome::Published(_)
+    ));
+
+    // An archived page with the same title does not block a publish.
+    seed_non_draft_page(
+        &db,
+        "page_archived",
+        "archived",
+        "work",
+        1,
+        "2026-01-01T00:00:00Z",
+    )
+    .await;
+    let vs_archived = db
+        .create_page_draft("Archived page", "Body", Some("work"), Some("work"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.publish_page_draft(&vs_archived.id, 1).await.unwrap(),
+        PageDraftPublishOutcome::Published(_)
+    ));
 }
