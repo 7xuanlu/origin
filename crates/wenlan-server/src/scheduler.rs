@@ -15,6 +15,11 @@ use crate::state::SharedState;
 
 mod ambient;
 use ambient::*;
+mod ambient_admin;
+pub(crate) use ambient_admin::{
+    ambient_status, force_ambient_sweep, AmbientGateSnapshot, AmbientStatusReport,
+    AmbientSweepReport,
+};
 
 /// 30-minute ceiling for adaptive gap — matches ACTIVITY_GAP_SECS in wenlan-core.
 const BURST_GAP_CEILING: Duration = Duration::from_secs(1800);
@@ -445,6 +450,33 @@ fn refresh_last_write_activity(write_signal: &WriteSignal, last_write_activity: 
 
 fn automatic_work_consumes_thermal_turn(selected: bool, llm_calls: usize, panicked: bool) -> bool {
     selected || llm_calls > 0 || panicked
+}
+
+/// Charge the shared thermal cooldown for one drained ambient lap, if any
+/// job in it consumed a thermal turn — against the lap's FULL elapsed wall
+/// time (`lap_completed - lap_started`), never a single job's own slice.
+///
+/// A lap can now run several due jobs back to back (see `drain_due`).
+/// Charging only the last thermal-consuming job's elapsed time — the
+/// previous, single-job-per-tick behavior — would silently discard every
+/// earlier job's wall time and undershoot the 5%-duty-cycle budget more and
+/// more as laps grow longer. Charging the lap's total elapsed time once,
+/// after every due job has run, preserves the invariant regardless of how
+/// many jobs a lap drains.
+fn charge_lap_thermal_cooldown(
+    schedule: &mut AmbientSchedule,
+    lap_started: Instant,
+    lap_completed: Instant,
+    any_job_consumed_thermal_turn: bool,
+    policy: ThermalPolicy,
+) {
+    if any_job_consumed_thermal_turn {
+        schedule.note_thermal_work_completion(
+            lap_completed,
+            lap_completed.saturating_duration_since(lap_started),
+            policy,
+        );
+    }
 }
 
 /// Ambient-only provider facade that fails closed after forwarding one LLM
@@ -1277,6 +1309,23 @@ pub fn spawn_scheduler(
                 sample_host_activity(),
             );
 
+            // Publish the gate state this tick actually observed so
+            // `/api/ambient/status` can report it without re-sampling
+            // CPU/host-activity independently (see `AmbientGateSnapshot`).
+            {
+                let ambient_gate = {
+                    let state = shared.read().await;
+                    state.ambient_gate.clone()
+                };
+                *ambient_gate.lock().unwrap() = Some(AmbientGateSnapshot {
+                    admitted: resource_status.admitted,
+                    blocked_reason: resource_status
+                        .block_reason
+                        .map(|reason| format!("{reason:?}")),
+                    sampled_at_epoch: chrono::Utc::now().timestamp(),
+                });
+            }
+
             // All automatic heavy work shares the same resource and cooldown
             // gate as the ambient lanes. The Idle recap trigger additionally
             // keeps its Wenlan-write batching window in trigger selection.
@@ -1556,8 +1605,17 @@ pub fn spawn_scheduler(
                 break;
             }
 
-            // --- 5. Ambient enrichment: one due job, one durable slice, one
-            //        LLM request maximum. Never detached. ---
+            // --- 5. Ambient enrichment: drain every currently-due job once
+            //        per quiet tick — at most one full round-robin lap
+            //        (`AmbientJob::ALL.len()` attempts) — each still capped
+            //        at one durable slice / one LLM request maximum. Never
+            //        detached. Looping here (instead of firing only the
+            //        first due job) is what lets a later-cursor job such as
+            //        Citation run in the same quiet window as an
+            //        always-due earlier one such as Document; the resource
+            //        gate is still checked once on entry, not per job, so a
+            //        long drain cannot be interrupted mid-lap by its own
+            //        thermal cooldown. ---
             refresh_last_write_activity(&write_signal, &mut last_write_activity);
             let ambient_now = Instant::now();
             if !automatic_work_ran
@@ -1574,84 +1632,135 @@ pub fn spawn_scheduler(
                     ambient_schedule.next_allowed_at,
                 )
             {
-                let ambient_provider_available = resolve_ambient_provider(
-                    everyday_pin,
-                    api_llm.as_ref(),
-                    external_llm.as_ref(),
-                    llm.as_ref(),
-                )
-                .is_some();
-                let availability = AmbientAvailability::for_provider(ambient_provider_available);
-                if let Some(job) = ambient_schedule.select_due(ambient_now, availability) {
-                    // Availability/selection is intentionally cheap, but may
-                    // still race with shutdown. Do not start another ambient
-                    // item after the stop signal became sticky.
-                    if crate::lifecycle::shutdown_requested(&shutdown) {
-                        break;
-                    }
-                    tracing::info!(
-                        "[scheduler] ambient turn started job={:?} cpu_percent={:?} available_memory_mb={:?}",
-                        job,
-                        resource_status
-                            .snapshot
-                            .map(|snapshot| snapshot.cpu_usage_percent),
-                        resource_status
-                            .snapshot
-                            .map(|snapshot| snapshot.available_memory_bytes / (1024 * 1024)),
-                    );
-                    let report = run_ambient_job_safe(
-                        job,
-                        &db,
-                        llm.as_ref(),
-                        api_llm.as_ref(),
-                        external_llm.as_ref(),
-                        everyday_pin,
-                        &prompts,
-                        &refinery_cfg,
-                        &distillation_cfg,
-                        Some(knowledge_path.as_path()),
-                    )
-                    .await;
-                    let completion = Instant::now();
-                    ambient_schedule.note_job_result(
-                        report.job,
-                        completion,
-                        !should_backoff_ambient_lane(report.selected, report.llm_calls),
-                    );
-                    // Fresh-document preparation can be CPU-heavy even before
-                    // an LLM call, so a selected document also consumes the
-                    // conservative thermal turn budget.
-                    if report.panicked
-                        || ambient_work_consumes_thermal_turn(
-                            report.job,
-                            report.selected,
-                            report.llm_calls,
-                            report.page_growth_terminal_no_match_committed,
-                        )
-                    {
-                        ambient_schedule.note_thermal_work_completion(
-                            completion,
-                            report.elapsed,
-                            thermal_policy,
+                // A force-sweep request (`POST /api/ambient/sweep`) and this
+                // tick's own ambient section must never run concurrently: two
+                // ambient jobs in flight at once means doubled on-device LLM
+                // contention and a real risk of the same document/page being
+                // claimed twice. `try_lock` (never `.lock().await`) because
+                // the scheduler must keep servicing its OTHER duties every
+                // poll — it must not block behind a force-sweep lap that can
+                // run for minutes. `ambient_turn_owed` is deliberately left
+                // untouched when the lock is contended: the ambient lane did
+                // not get its turn this tick, so it must not be marked as
+                // having received one (that would starve it behind a
+                // long-running sweep).
+                let ambient_run_lock = {
+                    let state = shared.read().await;
+                    state.ambient_run_lock.clone()
+                };
+                match ambient_run_lock.try_lock() {
+                    Err(_) => {
+                        tracing::debug!(
+                            "[scheduler] ambient tick skipped: force-sweep holds the ambient-run lock"
                         );
                     }
-                    tracing::info!(
-                        "[scheduler] ambient job={:?} selected={} llm_calls={} panicked={} elapsed_ms={} next_eligible_ms={}",
-                        report.job,
-                        report.selected,
-                        report.llm_calls,
-                        report.panicked,
-                        report.elapsed.as_millis(),
-                        ambient_schedule
-                            .next_allowed_at
-                            .saturating_duration_since(completion)
-                            .as_millis(),
-                    );
-                }
-                // The ambient lane received its admission opportunity. Empty
-                // work is enough to release the debt; known selected work owns
-                // the shared cooldown through `note_thermal_work_completion`.
-                ambient_turn_owed = false;
+                    Ok(_ambient_run_guard) => {
+                        let ambient_provider_available = resolve_ambient_provider(
+                            everyday_pin,
+                            api_llm.as_ref(),
+                            external_llm.as_ref(),
+                            llm.as_ref(),
+                        )
+                        .is_some();
+                        let availability =
+                            AmbientAvailability::for_provider(ambient_provider_available);
+                        // Post-lap thermal accounting: the cooldown must
+                        // reflect the FULL lap's wall time, not just the last
+                        // job run. `note_thermal_work_completion` used to be
+                        // called once per job inside this loop with that
+                        // job's own `report.elapsed` — harmless when a tick
+                        // could only ever run one job, but now that
+                        // `drain_due` can return several jobs in one lap,
+                        // only the LAST thermal-consuming job's (typically
+                        // much smaller) elapsed time would size the cooldown,
+                        // silently discarding every earlier job's wall time
+                        // and undershooting the 5%-duty-cycle budget.
+                        // Accumulate a lap-consumed flag instead and charge
+                        // the cooldown once after the loop, against the
+                        // whole lap's elapsed time.
+                        let mut lap_consumed_thermal_turn = false;
+                        for job in ambient_schedule.drain_due(ambient_now, availability) {
+                            // Availability/selection is intentionally cheap,
+                            // but may still race with shutdown. Do not start
+                            // another ambient item after the stop signal
+                            // became sticky.
+                            if crate::lifecycle::shutdown_requested(&shutdown) {
+                                break;
+                            }
+                            tracing::info!(
+                                "[scheduler] ambient turn started job={:?} cpu_percent={:?} available_memory_mb={:?}",
+                                job,
+                                resource_status
+                                    .snapshot
+                                    .map(|snapshot| snapshot.cpu_usage_percent),
+                                resource_status
+                                    .snapshot
+                                    .map(|snapshot| snapshot.available_memory_bytes / (1024 * 1024)),
+                            );
+                            let report = run_ambient_job_safe(
+                                job,
+                                &db,
+                                llm.as_ref(),
+                                api_llm.as_ref(),
+                                external_llm.as_ref(),
+                                everyday_pin,
+                                &prompts,
+                                &refinery_cfg,
+                                &distillation_cfg,
+                                Some(knowledge_path.as_path()),
+                            )
+                            .await;
+                            let completion = Instant::now();
+                            ambient_schedule.note_job_result(
+                                report.job,
+                                completion,
+                                !should_backoff_ambient_lane(report.selected, report.llm_calls),
+                            );
+                            // Fresh-document preparation can be CPU-heavy
+                            // even before an LLM call, so a selected document
+                            // also consumes the conservative thermal turn
+                            // budget.
+                            if report.panicked
+                                || ambient_work_consumes_thermal_turn(
+                                    report.job,
+                                    report.selected,
+                                    report.llm_calls,
+                                    report.page_growth_terminal_no_match_committed,
+                                )
+                            {
+                                lap_consumed_thermal_turn = true;
+                            }
+                            tracing::info!(
+                                "[scheduler] ambient job={:?} selected={} llm_calls={} panicked={} elapsed_ms={}",
+                                report.job,
+                                report.selected,
+                                report.llm_calls,
+                                report.panicked,
+                                report.elapsed.as_millis(),
+                            );
+                        }
+                        let lap_completed = Instant::now();
+                        charge_lap_thermal_cooldown(
+                            &mut ambient_schedule,
+                            ambient_now,
+                            lap_completed,
+                            lap_consumed_thermal_turn,
+                            thermal_policy,
+                        );
+                        tracing::info!(
+                            "[scheduler] ambient lap complete next_eligible_ms={}",
+                            ambient_schedule
+                                .next_allowed_at
+                                .saturating_duration_since(lap_completed)
+                                .as_millis(),
+                        );
+                        // The ambient lane received its admission opportunity
+                        // for this tick. Empty work is enough to release the
+                        // debt; known selected work owns the shared cooldown
+                        // through `note_thermal_work_completion`.
+                        ambient_turn_owed = false;
+                    }
+                };
             }
             if crate::lifecycle::shutdown_requested(&shutdown) {
                 break;
