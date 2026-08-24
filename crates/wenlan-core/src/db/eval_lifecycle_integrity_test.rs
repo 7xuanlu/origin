@@ -244,3 +244,67 @@ async fn archive_scan_keeps_only_archived_memory_heads_and_retains_empty_content
         .iter()
         .any(|input| input.source_id == "archive-empty" && input.content.is_empty()));
 }
+
+#[tokio::test]
+async fn supersedes_scan_surfaces_mid_scan_step_errors() {
+    let (db, _tmp) = crate::db::tests::test_db().await;
+
+    for fixture in [
+        MemoryFixture {
+            id: "merged-ok",
+            source_id: "merged_ok",
+            source: "memory",
+            chunk_index: 0,
+            content: "ok",
+            supersedes: Some("seed_ok"),
+            supersede_mode: "hide",
+        },
+        MemoryFixture {
+            id: "merged-poison",
+            source_id: "merged_poison",
+            source: "memory",
+            chunk_index: 0,
+            content: "poison",
+            supersedes: Some("seed_poison"),
+            supersede_mode: "hide",
+        },
+    ] {
+        insert_memory(&db, fixture).await;
+    }
+
+    // Healthy control: both fixture rows are visible before the poison lands.
+    let healthy = db.eval_lifecycle_supersedes_inputs().await.unwrap();
+    assert_eq!(healthy.len(), 2);
+
+    // Swap the table for a view whose `supersedes` cell raises at one row
+    // (json_extract over malformed JSON) -- a real mid-scan step error. The
+    // old `while let Ok(Some(..))` loop returned Ok with silently truncated
+    // results here.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("ALTER TABLE memories RENAME TO memories_base", ())
+            .await
+            .unwrap();
+        conn.execute(
+            "CREATE VIEW memories AS SELECT source_id, source, \
+             CASE WHEN source_id = 'merged_poison' THEN json_extract('{', '$.x') \
+                  ELSE supersedes END AS supersedes \
+             FROM memories_base",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    let err = match db.eval_lifecycle_supersedes_inputs().await {
+        Ok(rows) => panic!(
+            "expected the poisoned scan to error, got {} rows",
+            rows.len()
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("supersedes row scan"),
+        "expected the surfaced scan error, got: {err}"
+    );
+}

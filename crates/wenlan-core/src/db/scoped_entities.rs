@@ -319,7 +319,11 @@ impl MemoryDB {
             .await
             .map_err(|error| WenlanError::VectorDb(format!("filter_entity_ids_scoped: {error}")))?;
         let mut visible = std::collections::HashSet::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("entity_detail row scan: {e}")))?
+        {
             if let Ok(id) = row.get::<String>(0) {
                 visible.insert(id);
             }
@@ -565,7 +569,9 @@ impl MemoryDB {
             WenlanError::VectorDb(format!("get_memories_for_entities_scoped: {error}"))
         })?;
         let mut best = HashMap::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows.next().await.map_err(|e| {
+            WenlanError::VectorDb(format!("get_memories_for_entities_scoped row scan: {e}"))
+        })? {
             let entity_id: String = row.get(34).unwrap_or_default();
             let rank = anchor_rank
                 .get(entity_id.as_str())
@@ -627,7 +633,9 @@ impl MemoryDB {
             WenlanError::VectorDb(format!("get_observations_for_entities_scoped: {error}"))
         })?;
         let mut results = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows.next().await.map_err(|e| {
+            WenlanError::VectorDb(format!("get_memories_for_entities_scoped row scan: {e}"))
+        })? {
             let id: String = row.get(0).unwrap_or_default();
             let entity_name: String = row.get(2).unwrap_or_default();
             results.push(SearchResult {

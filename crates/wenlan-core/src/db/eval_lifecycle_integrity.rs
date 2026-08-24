@@ -37,7 +37,11 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("supersedes scan: {e}")))?;
 
         let mut inputs = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("supersedes row scan: {e}")))?
+        {
             inputs.push(EvalLifecycleSupersedesInput {
                 source_id: row.get(0).unwrap_or_default(),
                 supersedes: row.get(1).unwrap_or(None),
@@ -134,7 +138,11 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("merged ids: {e}")))?;
 
         let mut ids = HashSet::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("merged ids row scan: {e}")))?
+        {
             if let Ok(id) = row.get::<String>(0) {
                 ids.insert(id);
             }
@@ -156,7 +164,11 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("archive scan: {e}")))?;
 
         let mut inputs = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("archive row scan: {e}")))?
+        {
             inputs.push(EvalLifecycleArchivedInput {
                 source_id: row.get(0).unwrap_or_default(),
                 content: row.get(1).unwrap_or_default(),
