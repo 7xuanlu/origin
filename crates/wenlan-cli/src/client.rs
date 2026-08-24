@@ -30,7 +30,7 @@ use wenlan_types::{
 };
 
 mod lint;
-mod recovery;
+pub(crate) mod recovery;
 pub use lint::origin_host_from_env;
 
 const DEFAULT_HOST: &str = "http://127.0.0.1:7878";

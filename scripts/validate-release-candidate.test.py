@@ -1528,7 +1528,17 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
         # place the candidate must carry exactly that version, not next patch.
         release_as = json.loads(config_text)["packages"]["."].get("release-as")
         next_version = release_as or f"{major}.{minor}.{patch + 1}"
-        VALIDATOR._release_version_policy(config_text, version_txt, next_version)
+        base_version = version_txt
+        if release_as == version_txt:
+            # This tree is the steered release candidate itself: the version
+            # sync already wrote the release-as version into version.txt, and
+            # the released base (main's version.txt) is strictly lower but not
+            # recorded in this tree. Real candidate validation always takes the
+            # base from main, so any strictly lower base exercises the same
+            # closed-schema and release-as checks without misreading the
+            # candidate's own bumped version.txt as the released base.
+            base_version = "0.0.0"
+        VALIDATOR._release_version_policy(config_text, base_version, next_version)
 
     def test_artifact_record_rejects_expiry_digest_and_fork_identity(self) -> None:
         name = "release-candidate-1-1-x86_64-unknown-linux-gnu"

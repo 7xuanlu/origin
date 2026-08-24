@@ -15,6 +15,7 @@ use service_manager::{
 use std::path::{Path, PathBuf};
 
 use crate::client::origin_host_from_env;
+use crate::client::recovery::poll_health;
 
 pub const SERVICE_LABEL: &str = "com.wenlan.server";
 const DEFAULT_LOCAL_BIND_ADDR: &str = "127.0.0.1:7878";
@@ -74,7 +75,7 @@ pub enum BackgroundCommand {
 
 pub async fn run_background(command: BackgroundCommand) -> Result<()> {
     match command {
-        BackgroundCommand::On => install(),
+        BackgroundCommand::On => install().await,
         BackgroundCommand::Off => stop().await,
     }
 }
@@ -265,7 +266,7 @@ fn build_launchd_plist(
     buf
 }
 
-pub fn install() -> Result<()> {
+pub async fn install() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         // wenlan-server is a plain console app and does not speak the Windows
@@ -307,10 +308,27 @@ pub fn install() -> Result<()> {
     let program = current_server_path()?;
     let m = manager()?;
 
-    // Stop any daemon already running under this label so the reinstall swaps
+    // Gracefully stop any daemon that is currently answering, and wait for it
+    // to fully exit, before reinstalling. Swapping the binary under a live
+    // process would otherwise leave the OLD daemon running until something
+    // else kills it (see restart()'s doc comment for the full story).
+    match request_daemon_shutdown().await {
+        Ok(DaemonShutdownRequest::Requested(process)) => {
+            verify_local_daemon_shutdown(process)
+                .await
+                .context("graceful daemon shutdown before reinstall did not complete")?;
+        }
+        Ok(DaemonShutdownRequest::NotRunning) => {}
+        Err(error) => {
+            return Err(error).context("request graceful daemon shutdown before reinstall")
+        }
+    }
+
+    // Stop any daemon still running under this label so the reinstall swaps
     // the binary. Without this, the freshly-installed binary detects the
     // healthy incumbent on port 7878 and exits, leaving the OLD daemon running
-    // (wenlan-server/src/main.rs:582-615). Best-effort: errors if not running.
+    // (wenlan-server/src/main.rs:582-615). Best-effort: errors if not running
+    // (e.g. the graceful shutdown above already stopped it).
     let _ = m.stop(ServiceStopCtx {
         label: label_value.clone(),
     });
@@ -385,6 +403,51 @@ fn current_user_id() -> Result<String> {
     Ok(uid.to_owned())
 }
 
+#[cfg(target_os = "macos")]
+fn kickstart_registered_service() -> Result<()> {
+    let uid = current_user_id()?;
+    let target = format!("gui/{uid}/{SERVICE_LABEL}");
+    let output = std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", &target])
+        .output()
+        .context("spawn launchctl kickstart")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let details = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        anyhow::bail!(
+            "launchctl kickstart failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            details
+        );
+    }
+    Ok(())
+}
+
+/// Best-effort `launchctl print` dump for the restart failure path, so a
+/// timed-out health poll leaves the user something to look at besides the URL
+/// that never answered.
+#[cfg(target_os = "macos")]
+fn print_service_diagnostics() {
+    let Ok(uid) = current_user_id() else {
+        return;
+    };
+    let target = format!("gui/{uid}/{SERVICE_LABEL}");
+    if let Ok(output) = std::process::Command::new("launchctl")
+        .args(["print", &target])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.trim().is_empty() {
+            eprintln!("{}", stdout.trim());
+        }
+    }
+}
+
 fn stop_registered_service() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -442,6 +505,56 @@ fn stop_registered_service() -> Result<()> {
             .context("stop service")?;
         Ok(())
     }
+}
+
+// restart() starts the daemon back up after its graceful stop using whatever
+// fallback each platform's service manager needs, so each platform gets its
+// own definition rather than one function with unused parameters in the
+// branches that do not need them (macOS's `kickstart -k` folds its fallback
+// into the start itself and ignores both arguments).
+#[cfg(target_os = "macos")]
+async fn start_after_graceful_stop(
+    _graceful_failed: bool,
+    _expected_process: Option<DaemonProcessIdentity>,
+) -> Result<()> {
+    kickstart_registered_service()
+        .context("if you ran `wenlan background off`, run `wenlan background on`")
+}
+
+#[cfg(target_os = "linux")]
+async fn start_after_graceful_stop(
+    graceful_failed: bool,
+    expected_process: Option<DaemonProcessIdentity>,
+) -> Result<()> {
+    if graceful_failed {
+        stop_registered_service()
+            .context("graceful daemon shutdown failed; service fallback failed")?;
+        verify_local_daemon_shutdown(expected_process)
+            .await
+            .context("service fallback did not stop the daemon before restart")?;
+    }
+    let label_value = label()?;
+    let m = manager()?;
+    m.start(ServiceStartCtx { label: label_value })
+        .context("start service; if you ran `wenlan background off`, run `wenlan background on`")
+}
+
+#[cfg(target_os = "windows")]
+async fn start_after_graceful_stop(
+    graceful_failed: bool,
+    expected_process: Option<DaemonProcessIdentity>,
+) -> Result<()> {
+    if graceful_failed {
+        let _ = std::process::Command::new("schtasks.exe")
+            .args(["/end", "/tn", WINDOWS_TASK_NAME])
+            .output();
+        verify_local_daemon_shutdown(expected_process)
+            .await
+            .context("service fallback did not stop the daemon before restart")?;
+    }
+    run_schtasks(&["/run", "/tn", WINDOWS_TASK_NAME], "run scheduled task")
+        .context("if you ran `wenlan background off`, run `wenlan background on`")?;
+    Ok(())
 }
 
 async fn request_daemon_shutdown() -> Result<DaemonShutdownRequest> {
@@ -680,39 +793,51 @@ async fn stop() -> Result<()> {
     Ok(())
 }
 
-/// Restart the Wenlan daemon: stop the running process, then start the freshly
-/// registered binary. Required after an upgrade — installing a new binary does
-/// not replace an already-running daemon (the new process detects the healthy
+/// Restart the Wenlan daemon: gracefully stop the running process, wait for
+/// it to fully exit, then start the freshly registered binary and verify
+/// `/api/health` answers before returning. A bare stop-then-start with no
+/// wait races the old process's exit: launchd's `KeepAlive
+/// {SuccessfulExit=false}` never relaunches an exit-0 process, so `start`
+/// issued while the old process is still alive is a silent no-op. Restarting
+/// is also required after an upgrade — installing a new binary does not
+/// replace an already-running daemon (the new process detects the healthy
 /// incumbent on port 7878 and exits). See wenlan-server/src/main.rs:582-615.
-pub fn restart() -> Result<()> {
+pub async fn restart() -> Result<()> {
     if !is_installed() {
         anyhow::bail!("Wenlan background process is not set up. Run `wenlan background on` first.");
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        // No service-manager on Windows: drive Task Scheduler directly,
-        // mirroring stop()'s /end and install()'s /run.
-        let _ = std::process::Command::new("schtasks.exe")
-            .args(["/end", "/tn", WINDOWS_TASK_NAME])
-            .output();
-        run_schtasks(&["/run", "/tn", WINDOWS_TASK_NAME], "run scheduled task")?;
-        remove_autostart_off_marker()?;
-        println!("Restarted Windows scheduled task '{}'.", WINDOWS_TASK_NAME);
-        return Ok(());
+    // Ask the daemon to shut down cooperatively and wait for it to actually
+    // exit — the same graceful path stop() uses. A failure here does not
+    // abort restart(); the OS-specific start step below force-stops as a
+    // fallback where one is needed.
+    let mut expected_process = None;
+    let graceful_failed = match request_daemon_shutdown().await {
+        Ok(DaemonShutdownRequest::Requested(process)) => {
+            expected_process = process;
+            verify_local_daemon_shutdown(process).await.is_err()
+        }
+        Ok(DaemonShutdownRequest::NotRunning) => false,
+        Err(_) => true,
+    };
+
+    start_after_graceful_stop(graceful_failed, expected_process).await?;
+
+    let base_url = local_daemon_base_url()?;
+    let health_url = format!("{base_url}/api/health");
+    if let Err(error) = poll_health(&health_url, std::time::Duration::from_secs(30)).await {
+        #[cfg(target_os = "macos")]
+        print_service_diagnostics();
+        anyhow::bail!(
+            "daemon at {health_url} did not become healthy after restart ({error:#}); the daemon may still be starting; re-check with `wenlan status`"
+        );
     }
 
-    #[cfg_attr(target_os = "windows", allow(unreachable_code))]
-    let label_value = label()?;
-    let m = manager()?;
-    // Best-effort stop: errors if not currently running, which is fine.
-    let _ = m.stop(ServiceStopCtx {
-        label: label_value.clone(),
-    });
-    m.start(ServiceStartCtx { label: label_value })
-        .context("start service")?;
     remove_autostart_off_marker()?;
-    println!("Restarted {}.", SERVICE_LABEL);
+    println!(
+        "Restarted {}; daemon healthy at {}.",
+        SERVICE_LABEL, base_url
+    );
     Ok(())
 }
 

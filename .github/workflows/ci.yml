@@ -1659,6 +1659,29 @@ jobs:
             exit 1
           fi
 
+          pre_restart_pid="$(systemctl --user show wenlan-server -p MainPID --value)"
+          run_bounded restart 60s "$STAGE/wenlan" restart
+
+          if ! run_bounded restart-health 90s bash -c '
+            until curl --connect-timeout 1 --max-time 2 -sf \
+              http://127.0.0.1:7878/api/health >/dev/null; do
+              sleep 1
+            done
+          '; then
+            echo "FAIL: daemon did not become healthy after wenlan restart" >&2
+            timeout --signal=TERM --kill-after=5s 20s \
+              journalctl --user -u wenlan-server --no-pager -n 50 >&2 || true
+            exit 1
+          fi
+
+          post_restart_pid="$(systemctl --user show wenlan-server -p MainPID --value)"
+          if [ "$post_restart_pid" = "$pre_restart_pid" ]; then
+            echo "FAIL: wenlan restart did not replace the daemon process (MainPID stayed $pre_restart_pid)" >&2
+            timeout --signal=TERM --kill-after=5s 20s \
+              journalctl --user -u wenlan-server --no-pager -n 50 >&2 || true
+            exit 1
+          fi
+
           run_bounded stop 45s "$STAGE/wenlan" background off
           receipt probe-persistence start 20s
           test -f "$UNIT_PATH"
