@@ -120,7 +120,7 @@ jobs:
       - name: Select channels
         id: channels
         env:
-          CHANNELS_INPUT: ${{ inputs.channels || 'all' }}
+          CHANNELS_INPUT: ${{ inputs.channels || 'macos-app,npx-setup,plugin-setup,windows-nsis' }}
         run: |
           set -euo pipefail
           known=(macos-app npx-setup brew npx-mcp linux-install windows-zip windows-nsis cargo-mcp plugin-setup)

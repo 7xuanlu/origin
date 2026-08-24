@@ -34,6 +34,7 @@ cleanup() {
     fi
     launchctl bootout "gui/$UID_NUM/com.wenlan.desktop" 2>/dev/null || true
     launchctl bootout "gui/$UID_NUM/com.wenlan.server" 2>/dev/null || true
+    daemon_postmortem "$MACOS/wenlan-server" "$HOME/Library/Application Support/wenlan"
     rm -f "$AGENTS/com.wenlan.desktop.plist" "$AGENTS/com.wenlan.server.plist"
     rm -rf "$APP" "$HOME/Library/Application Support/wenlan" "$MOUNT" "$DL"
     collect "$HOME/Library/Logs/com.wenlan.desktop/wenlan.log"

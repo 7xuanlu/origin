@@ -18,6 +18,9 @@
 #   assert_version URL EXPECTED          PASS when health .version == EXPECTED (leading v stripped)
 #   stop_process PID [SECS]              TERM, wait up to SECS (15) for exit, then KILL;
 #                                        records seconds-to-exit
+#   daemon_postmortem BIN DATA_ROOT       after a failed health wait on a service-managed
+#                                        daemon: collect its own logs, the launchd
+#                                        record, and a foreground replay of the binary
 #   collect FILE...                      copy files into $GAUNTLET_OUT/logs/
 #   evaluate                             print the table; return 1 when any FAIL row exists
 #
@@ -157,6 +160,42 @@ stop_process() {
     else
         info seconds-to-exit "$i"
     fi
+}
+
+daemon_postmortem() {
+    # Call from teardown, after the service is stopped and before the data
+    # root is deleted. The daemon owns its log files (the launchd plist sends
+    # stdout/stderr to /dev/null), so those files plus a foreground replay
+    # under the service's environment shape (cwd /, minimal PATH, the plist
+    # env) are the only way to learn why a managed daemon never got healthy.
+    local bin="$1" data_root="$2" log tail_text
+    collect "$data_root/logs" "$HOME/Library/Logs/com.wenlan.server-fallback"
+    for log in "$data_root/logs/wenlan-server.log" "$data_root/logs/wenlan-server.bootstrap.log"; do
+        if [ -f "$log" ]; then
+            tail_text="$(tail -c 1500 "$log")"
+            info "daemon-log-$(basename "$log" .log)" "$tail_text"
+        else
+            info "daemon-log-$(basename "$log" .log)" "absent: $log"
+        fi
+    done
+    if [ "$(uname -s)" = Darwin ]; then
+        launchctl print "gui/$(id -u)/com.wenlan.server" >"$GAUNTLET_OUT/checks/launchctl-print-server.log" 2>&1 || true
+        info launchd-record "$(grep -E 'state|runs|last exit|stdout path|stderr path' "$GAUNTLET_OUT/checks/launchctl-print-server.log" | tr -s '\t ' ' ')"
+    fi
+    if ! grep -q $'\thealth-timeout\tFAIL' "$GAUNTLET_TSV" 2>/dev/null; then
+        return 0
+    fi
+    [ -x "$bin" ] || { info daemon-replay "skipped: $bin is not executable"; return 0; }
+    local replay="$GAUNTLET_OUT/checks/daemon-replay.log" rc=0 timeout_bin
+    timeout_bin="$(command -v timeout || command -v gtimeout || true)"
+    (
+        cd / && env -i HOME="$HOME" USER="${USER:-$(id -un)}" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            RUST_LOG=info WENLAN_DATA_DIR="$data_root" WENLAN_BIND_ADDR=127.0.0.1:17917 \
+            ${timeout_bin:+"$timeout_bin" 30} "$bin"
+    ) >"$replay" 2>&1 || rc=$?
+    # 124: still running after 30s, i.e. the binary is fine and the fault is
+    # in how the service runs it. Anything else is the daemon's own exit.
+    info daemon-replay "rc=$rc (124 = still running at 30s) $(tail -c 1500 "$replay" | tr '\n' '|')"
 }
 
 collect() {

@@ -31,6 +31,7 @@ cleanup() {
         "$W" background off >"$GAUNTLET_OUT/logs/teardown-background-off.log" 2>&1 || true
     fi
     launchctl bootout "gui/$UID_NUM/com.wenlan.server" 2>/dev/null || true
+    daemon_postmortem "$BIN_DIR/wenlan-server" "$DATA_ROOT"
     rm -f "$PLIST"
     rm -rf "$HOME/.wenlan" "$DATA_ROOT"
     # Empty substring: PASS purely on the nonzero exit.

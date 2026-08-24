@@ -57,6 +57,7 @@ cleanup() {
         systemctl --user daemon-reload 2>/dev/null || true
         journalctl --user -u wenlan-server --no-pager -n 200 >"$GAUNTLET_OUT/logs/journal-wenlan-server.log" 2>&1 || true
         strip_installer_block "$HOME/.bashrc"
+        daemon_postmortem "$BIN_DIR/wenlan-server" "$DATA_ROOT"
         rm -rf "$HOME/.wenlan" "$DATA_ROOT"
         check unit-gone -- test ! -f "$UNIT"
         check port-7878-closed -- bash -c '! ss -ltnH "sport = :7878" | grep -q .'
@@ -65,6 +66,7 @@ cleanup() {
         rm -f "$PLIST"
         strip_installer_block "$HOME/.bashrc"
         strip_installer_block "$HOME/.zshrc"
+        daemon_postmortem "$BIN_DIR/wenlan-server" "$DATA_ROOT"
         rm -rf "$HOME/.wenlan" "$DATA_ROOT"
         # Empty substring: PASS purely on the nonzero exit.
         check_fails no-leftover-service "" -- launchctl print "gui/$UID_NUM/com.wenlan.server"

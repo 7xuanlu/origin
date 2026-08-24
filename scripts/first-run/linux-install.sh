@@ -35,6 +35,7 @@ cleanup() {
     systemctl --user disable --now wenlan-server.service 2>/dev/null || true
     rm -f "$UNIT"
     systemctl --user daemon-reload 2>/dev/null || true
+    daemon_postmortem "$HOME/.wenlan/bin/wenlan-server" "$DATA_ROOT"
     rm -rf "$HOME/.wenlan" "$DATA_ROOT"
     # Drop the two lines install.sh appended to ~/.bashrc.
     if [ -f "$HOME/.bashrc" ]; then

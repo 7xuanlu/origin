@@ -80,12 +80,42 @@ try {
         Write-Output ("present: " + ($Bundled -join ", "))
     }
 
-    if ($AppExe) { $App = Start-Process -FilePath $AppExe -WorkingDirectory $Install -PassThru }
+    # WebView2 is the app's renderer; a missing runtime is the classic reason a
+    # Tauri app exits at once on a fresh Windows box.
+    $wv2 = @(
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+        "HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+    ) | ForEach-Object { (Get-ItemProperty -Path $_ -ErrorAction SilentlyContinue).pv } | Where-Object { $_ }
+    Info "webview2-runtime" $(if ($wv2) { "pv=" + ($wv2 -join ",") } else { "not registered" })
+
+    $AppOut = Join-Path $script:GauntletOut "logs\app-stdout.log"
+    $AppErr = Join-Path $script:GauntletOut "logs\app-stderr.log"
+    $Launched = Get-Date
+    if ($AppExe) {
+        $App = Start-Process -FilePath $AppExe -WorkingDirectory $Install -PassThru `
+            -RedirectStandardOutput $AppOut -RedirectStandardError $AppErr
+    }
     Check -Name "app-alive-30s" -Script {
         if (-not $App) { throw "app was not launched" }
         Start-Sleep -Seconds 30
         if ($App.HasExited) { throw "Wenlan.exe exited within 30s (exit $($App.ExitCode))" }
         Write-Output "pid=$($App.Id) alive after 30s"
+    }
+    if ($App -and $App.HasExited) {
+        # Why it died: its own streams, its log file if it got that far, and
+        # the Application event log (crash reports land there as event 1000).
+        $streams = @()
+        foreach ($f in @($AppOut, $AppErr)) {
+            if (Test-Path $f) { $streams += ("[" + (Split-Path -Leaf $f) + "] " + ((Get-Content $f -Raw -ErrorAction SilentlyContinue) | Out-String).Trim()) }
+        }
+        Info "app-exit-streams" $(if ($streams) { $streams -join " | " } else { "both streams empty" })
+        $events = @()
+        try {
+            $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $Launched.AddSeconds(-5) } -ErrorAction Stop |
+                Where-Object { $_.Message -match 'Wenlan|wenlan' } |
+                ForEach-Object { "id=$($_.Id) $($_.ProviderName): " + ($_.Message -replace '\s+', ' ').Substring(0, [Math]::Min(600, ($_.Message -replace '\s+', ' ').Length)) })
+        } catch { $events = @("event log query failed: $($_.Exception.Message)") }
+        Info "app-exit-events" $(if ($events) { $events -join " || " } else { "no Application events mention Wenlan" })
     }
     if (Wait-Health -Url $Health -Seconds 240) { Assert-Version -Url $Health -Expected $Version }
     Check -Name "sidecar-parent-is-app" -Script {
@@ -131,7 +161,9 @@ try {
         Write-Output "no wenlan-server process within 10s of app exit"
     }
     Info "app-log-dir" (Join-Path $DataDir "logs")
-    Collect (Join-Path $DataDir "logs")
+    Collect (Join-Path $DataDir "logs") (Join-Path $env:TEMP "wenlan\logs")
+    $AppLog = Join-Path $DataDir "logs\wenlan.log"
+    Info "app-log-tail" $(if (Test-Path $AppLog) { ((Get-Content $AppLog -Tail 25) -join "`n") } else { "absent: $AppLog" })
 
     $Uninstaller = if ($Install) { Join-Path $Install "uninstall.exe" } else { "" }
     Info "uninstall-command" "$Uninstaller /S"
