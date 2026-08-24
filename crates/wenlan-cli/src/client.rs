@@ -51,6 +51,25 @@ pub struct SyncStats {
     pub paused: Option<String>,
 }
 
+/// Local mirror of the daemon's `AmbientSweepReport`/`AmbientJobSweepResult`
+/// (defined in `wenlan-server`, which the CLI must not depend on). Typed so
+/// envelope drift fails loud rather than silently deserializing into
+/// `serde_json::Value`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmbientSweepReport {
+    pub phases: Vec<AmbientJobSweepResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmbientJobSweepResult {
+    pub job: String,
+    pub attempted: bool,
+    pub selected: bool,
+    pub llm_calls: usize,
+    pub panicked: bool,
+    pub elapsed_ms: u128,
+}
+
 pub struct WenlanClient {
     base_url: String,
     http: reqwest::Client,
@@ -331,6 +350,28 @@ impl WenlanClient {
     /// POST /api/outbox/drain — ask the daemon to replay queued envelopes.
     pub async fn drain_outbox(&self) -> Result<OutboxDrainReport> {
         self.post_empty_json("/api/outbox/drain").await
+    }
+
+    /// POST /api/ambient/sweep — force one bounded pass over every ambient
+    /// job type, bypassing the idle/resource gate (each job's own per-call
+    /// slice bound is unchanged). Document and Citation phases can call the
+    /// on-device LLM, so a full lap can legitimately take minutes; this
+    /// request gets its own generous timeout rather than the client's
+    /// default, which is sized for ordinary sub-second daemon calls.
+    pub async fn sweep_ambient(&self) -> Result<AmbientSweepReport> {
+        const SWEEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+        let url = format!("{}/api/ambient/sweep", self.base_url);
+        let resp = self
+            .send(
+                self.http.post(&url).timeout(SWEEP_TIMEOUT),
+                &format!("POST {url} failed"),
+            )
+            .await?
+            .error_for_status()
+            .with_context(|| format!("daemon returned error for {url}"))?;
+        resp.json()
+            .await
+            .context("parsing /api/ambient/sweep response")
     }
 
     /// GET /api/sources — list registered sources.

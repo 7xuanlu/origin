@@ -5,6 +5,7 @@
 //! entry-point (`main.rs`) continues to own the daemon lifecycle.
 
 pub mod activity_tag_routes;
+pub mod ambient_routes;
 pub mod brief_files;
 pub mod brief_routes;
 pub mod briefing_routes;

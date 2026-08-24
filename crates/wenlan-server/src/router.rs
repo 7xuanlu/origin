@@ -6,12 +6,13 @@ pub use crate::route_registry::AppRouter;
 use crate::route_registry::{get, TrackedRouter};
 use crate::state::SharedState;
 use crate::{
-    activity_tag_routes, brief_routes, briefing_routes, community_routes, config_routes,
-    decisions_routes, entity_graph_routes, import_routes, indexed_files_routes, ingest_routes,
-    knowledge_routes, lint_routes, memory_detail_routes, memory_revision_routes, memory_routes,
-    onboarding_routes, outbox_routes, page_map_routes, page_routes, pinned_memory_routes,
-    profile_agents_routes, profile_narrative_routes, refinery_routes, repair_routes, routes,
-    security, snapshot_routes, source_routes, spaces_routes, truth_guard, websocket,
+    activity_tag_routes, ambient_routes, brief_routes, briefing_routes, community_routes,
+    config_routes, decisions_routes, entity_graph_routes, import_routes, indexed_files_routes,
+    ingest_routes, knowledge_routes, lint_routes, memory_detail_routes, memory_revision_routes,
+    memory_routes, onboarding_routes, outbox_routes, page_map_routes, page_routes,
+    pinned_memory_routes, profile_agents_routes, profile_narrative_routes, refinery_routes,
+    repair_routes, routes, security, snapshot_routes, source_routes, spaces_routes, truth_guard,
+    websocket,
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use wenlan_core::truth_manifest::Builder;
@@ -48,6 +49,7 @@ pub fn build_router_with_shutdown(state: SharedState, shutdown: ShutdownHandle) 
 
     let router = repair_routes::register(lint_routes::register(TrackedRouter::new(Builder::Main)));
     let router = routes::register(router);
+    let router = ambient_routes::register(router);
     let router = brief_routes::register(router);
     let router = outbox_routes::register(router);
     let router = community_routes::register(router);
