@@ -76,6 +76,16 @@ pub async fn resolve_against_pages(
     if labels.is_empty() {
         return Ok(Vec::new());
     }
+    // The common single-link page takes the keep-nothing scan instead of
+    // paying for a full owner map it would use once.
+    if let [label] = labels {
+        return Ok(vec![Wikilink {
+            label: label.clone(),
+            target_page_id: db
+                .find_unique_active_page_id_by_title_scoped(label, scope)
+                .await?,
+        }]);
+    }
     // One scope scan for the whole label set — the fold and the ambiguity
     // contract live in `folded_title_owners_scoped`.
     let owners = db.folded_title_owners_scoped(scope).await?;

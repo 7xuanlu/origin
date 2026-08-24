@@ -49940,6 +49940,16 @@ impl MemoryDB {
         scope: Option<&str>,
     ) -> Result<std::collections::HashMap<String, Option<String>>, WenlanError> {
         let conn = self.conn.lock().await;
+        Self::folded_title_owners_scoped_on_conn(&conn, scope).await
+    }
+
+    /// [`Self::folded_title_owners_scoped`] on an already-held connection
+    /// guard, for callers whose resolution decisions must share one
+    /// snapshot/transaction with the writes they gate (the orphan sweep).
+    async fn folded_title_owners_scoped_on_conn(
+        conn: &libsql::Connection,
+        scope: Option<&str>,
+    ) -> Result<std::collections::HashMap<String, Option<String>>, WenlanError> {
         let mut rows = conn
             .query(
                 "SELECT id, title FROM pages
@@ -49980,11 +49990,43 @@ impl MemoryDB {
         if wanted.is_empty() {
             return Ok(None);
         }
-        Ok(self
-            .folded_title_owners_scoped(scope)
-            .await?
-            .remove(&wanted)
-            .flatten())
+        // Single-label shape: scan the scope like the map builder above, but
+        // keep nothing — fold each title, compare, and stop at the second
+        // match (ambiguous). Same identity fold, none of the map's retained
+        // allocations; the second match ends the row walk early exactly like
+        // the old `LIMIT 2` SQL did.
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, title FROM pages
+                 WHERE status = 'active'
+                   AND COALESCE(kind, 'concept') != 'entity'
+                   AND space = COALESCE(?1, '00000000-0000-4000-8000-000000000001')",
+                libsql::params![scope],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("find_unique_page_by_title: {e}")))?;
+        let mut owner: Option<String> = None;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("find_unique_page_by_title row: {e}")))?
+        {
+            let title: String = row
+                .get::<String>(1)
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+            if Self::page_title_key(&title) != wanted {
+                continue;
+            }
+            if owner.is_some() {
+                return Ok(None);
+            }
+            owner = Some(
+                row.get::<String>(0)
+                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?,
+            );
+        }
+        Ok(owner)
     }
 
     /// Replace the entire outbound-link set for a page in one BEGIN/COMMIT.
@@ -50166,163 +50208,175 @@ impl MemoryDB {
     /// Resolution is per source Page and space; existing non-NULL targets are
     /// explicit inventory and are never rewritten here.
     pub async fn resolve_orphan_page_links(&self) -> Result<usize, WenlanError> {
-        let orphan_rows: Vec<(String, String, String, Option<String>)> = {
-            let conn = self.conn.lock().await;
-            let mut rows = conn
-                .query(
-                    "SELECT pl.source_page_id, pl.label_key, pl.label, p.space
+        // The whole sweep — orphan list, owner maps, deletes, edge mints —
+        // runs under one connection guard and one transaction, so every
+        // resolution decision is made against the same snapshot it writes
+        // into. A concurrent rename, archive, or new duplicate serializes
+        // before or after the sweep, never mid-sweep. One failed row rolls
+        // back the whole sweep: it is an idempotent repair the next publish
+        // re-runs.
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("resolve_orphan_links begin: {e}")))?;
+        let result: Result<usize, WenlanError> = async {
+            let orphan_rows: Vec<(String, String, String, Option<String>)> = {
+                let mut rows = conn
+                    .query(
+                        "SELECT pl.source_page_id, pl.label_key, pl.label, p.space
                      FROM page_links pl
                      INNER JOIN pages p ON p.id = pl.source_page_id
                      WHERE pl.target_page_id IS NULL AND p.status = 'active'
                      ORDER BY pl.source_page_id ASC, pl.label_key ASC",
-                    (),
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("resolve_orphan_links list: {e}")))?;
-            let mut orphan_rows = Vec::new();
-            while let Some(row) = rows
-                .next()
-                .await
-                .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-            {
-                orphan_rows.push((
-                    row.get::<String>(0).unwrap_or_default(),
-                    row.get::<String>(1).unwrap_or_default(),
-                    row.get::<String>(2).unwrap_or_default(),
-                    row.get::<Option<String>>(3).unwrap_or(None),
-                ));
-            }
-            orphan_rows
-        };
-
-        let mut resolved_labels = std::collections::BTreeSet::new();
-        // One folded-title scan per distinct source scope for the whole
-        // sweep, instead of one full scan per orphan label. The sweep only
-        // deletes orphan rows and mints edges — it creates no pages — so a
-        // snapshot per scope stays faithful to the per-label lookups it
-        // replaces.
-        let mut owner_maps: std::collections::HashMap<
-            Option<String>,
-            std::collections::HashMap<String, Option<String>>,
-        > = std::collections::HashMap::new();
-        for (source_page_id, label_key, label, scope) in orphan_rows {
-            let trimmed = label_key.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if !owner_maps.contains_key(&scope) {
-                let owners = self.folded_title_owners_scoped(scope.as_deref()).await?;
-                owner_maps.insert(scope.clone(), owners);
-            }
-            let Some(target) = owner_maps
-                .get(&scope)
-                .and_then(|owners| owners.get(&Self::page_title_key(trimmed)).cloned())
-                .flatten()
-            else {
-                continue;
-            };
-            let conn = self.conn.lock().await;
-            conn.execute("BEGIN", ())
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("resolve_orphan_links begin: {e}")))?;
-            let row_result: Result<u64, WenlanError> = async {
-                // G6 Stage 2 PR 2b (item 3): resolving an orphan no longer
-                // writes the resolved target into page_links -- the edge
-                // minted below is the sole canonical representation once a
-                // link resolves. The row's whole reason to exist was
-                // "unresolved, needs a later sweep"; once resolved it is no
-                // longer an orphan by definition, so this DELETEs it rather
-                // than leaving a stale `target_page_id IS NULL` row that
-                // would just get rediscovered (and redundantly re-resolved)
-                // by this same sweep's SELECT next time it runs.
-                let changed = conn
-                    .execute(
-                        "DELETE FROM page_links
-                         WHERE source_page_id = ?1 AND label_key = ?2
-                           AND target_page_id IS NULL",
-                        libsql::params![source_page_id.clone(), label_key.as_str()],
+                        (),
                     )
                     .await
                     .map_err(|e| {
-                        WenlanError::VectorDb(format!("resolve_orphan_links delete: {e}"))
+                        WenlanError::VectorDb(format!("resolve_orphan_links list: {e}"))
                     })?;
-                // Dual-write (G6 Stage 0): an orphan row derives no edge, so
-                // resolving its target makes the canonical `links` edge
-                // implied — mint it in the same transaction or the row is
-                // permanent "missing" parity drift. Space/lineage derivation
-                // mirrors `replace_page_links`.
-                if changed > 0 {
-                    if let Some(space) = scope.as_deref() {
-                        let mut dst_rows = conn
-                            .query(
-                                "SELECT space FROM pages WHERE id = ?1",
-                                libsql::params![target.clone()],
+                let mut orphan_rows = Vec::new();
+                while let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?
+                {
+                    orphan_rows.push((
+                        row.get::<String>(0).unwrap_or_default(),
+                        row.get::<String>(1).unwrap_or_default(),
+                        row.get::<String>(2).unwrap_or_default(),
+                        row.get::<Option<String>>(3).unwrap_or(None),
+                    ));
+                }
+                orphan_rows
+            };
+
+            let mut resolved_labels = std::collections::BTreeSet::new();
+            // One folded-title scan per distinct source scope, built inside
+            // this same transaction — the maps read the exact snapshot the
+            // deletes and edge mints below write into.
+            let mut owner_maps: std::collections::HashMap<
+                Option<String>,
+                std::collections::HashMap<String, Option<String>>,
+            > = std::collections::HashMap::new();
+            for (source_page_id, label_key, label, scope) in orphan_rows {
+                let trimmed = label_key.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !owner_maps.contains_key(&scope) {
+                    let owners =
+                        Self::folded_title_owners_scoped_on_conn(&conn, scope.as_deref()).await?;
+                    owner_maps.insert(scope.clone(), owners);
+                }
+                let Some(target) = owner_maps
+                    .get(&scope)
+                    .and_then(|owners| owners.get(&Self::page_title_key(trimmed)).cloned())
+                    .flatten()
+                else {
+                    continue;
+                };
+                let changed: u64 = {
+                    // G6 Stage 2 PR 2b (item 3): resolving an orphan no longer
+                    // writes the resolved target into page_links -- the edge
+                    // minted below is the sole canonical representation once a
+                    // link resolves. The row's whole reason to exist was
+                    // "unresolved, needs a later sweep"; once resolved it is no
+                    // longer an orphan by definition, so this DELETEs it rather
+                    // than leaving a stale `target_page_id IS NULL` row that
+                    // would just get rediscovered (and redundantly re-resolved)
+                    // by this same sweep's SELECT next time it runs.
+                    let changed = conn
+                        .execute(
+                            "DELETE FROM page_links
+                         WHERE source_page_id = ?1 AND label_key = ?2
+                           AND target_page_id IS NULL",
+                            libsql::params![source_page_id.clone(), label_key.as_str()],
+                        )
+                        .await
+                        .map_err(|e| {
+                            WenlanError::VectorDb(format!("resolve_orphan_links delete: {e}"))
+                        })?;
+                    // Dual-write (G6 Stage 0): an orphan row derives no edge, so
+                    // resolving its target makes the canonical `links` edge
+                    // implied — mint it in the same transaction or the row is
+                    // permanent "missing" parity drift. Space/lineage derivation
+                    // mirrors `replace_page_links`.
+                    if changed > 0 {
+                        if let Some(space) = scope.as_deref() {
+                            let mut dst_rows = conn
+                                .query(
+                                    "SELECT space FROM pages WHERE id = ?1",
+                                    libsql::params![target.clone()],
+                                )
+                                .await
+                                .map_err(|e| {
+                                    WenlanError::VectorDb(format!(
+                                        "resolve_orphan_links dst space: {e}"
+                                    ))
+                                })?;
+                            let dst_space: Option<String> =
+                                match dst_rows.next().await.map_err(|e| {
+                                    WenlanError::VectorDb(format!(
+                                        "resolve_orphan_links dst space: {e}"
+                                    ))
+                                })? {
+                                    Some(row) => row.get(0).unwrap_or(None),
+                                    None => None,
+                                };
+                            drop(dst_rows);
+                            let cross_space_downgrade =
+                                Self::resolved_space_downgrades(dst_space.as_deref(), space);
+                            let lineage = if cross_space_downgrade {
+                                "legacy"
+                            } else {
+                                "synthesis"
+                            };
+                            let semantic_patch = serde_json::json!({ "label": label }).to_string();
+                            Self::dual_write_edge_with_payload(
+                                &conn,
+                                "links",
+                                "page",
+                                &source_page_id,
+                                "page",
+                                &target,
+                                &label_key,
+                                lineage,
+                                space,
+                                cross_space_downgrade,
+                                None,
+                                None,
+                                None,
+                                Some(&semantic_patch),
                             )
                             .await
                             .map_err(|e| {
                                 WenlanError::VectorDb(format!(
-                                    "resolve_orphan_links dst space: {e}"
+                                    "resolve_orphan_links edge mint: {e}"
                                 ))
                             })?;
-                        let dst_space: Option<String> =
-                            match dst_rows.next().await.map_err(|e| {
-                                WenlanError::VectorDb(format!(
-                                    "resolve_orphan_links dst space: {e}"
-                                ))
-                            })? {
-                                Some(row) => row.get(0).unwrap_or(None),
-                                None => None,
-                            };
-                        drop(dst_rows);
-                        let cross_space_downgrade =
-                            Self::resolved_space_downgrades(dst_space.as_deref(), space);
-                        let lineage = if cross_space_downgrade {
-                            "legacy"
-                        } else {
-                            "synthesis"
-                        };
-                        let semantic_patch = serde_json::json!({ "label": label }).to_string();
-                        Self::dual_write_edge_with_payload(
-                            &conn,
-                            "links",
-                            "page",
-                            &source_page_id,
-                            "page",
-                            &target,
-                            &label_key,
-                            lineage,
-                            space,
-                            cross_space_downgrade,
-                            None,
-                            None,
-                            None,
-                            Some(&semantic_patch),
-                        )
-                        .await
-                        .map_err(|e| {
-                            WenlanError::VectorDb(format!("resolve_orphan_links edge mint: {e}"))
-                        })?;
+                        }
                     }
+                    changed
+                };
+                if changed > 0 {
+                    resolved_labels.insert(label_key);
                 }
-                Ok(changed)
             }
-            .await;
-            match row_result {
-                Ok(changed) => {
-                    conn.execute("COMMIT", ()).await.map_err(|e| {
-                        WenlanError::VectorDb(format!("resolve_orphan_links commit: {e}"))
-                    })?;
-                    if changed > 0 {
-                        resolved_labels.insert(label_key);
-                    }
-                }
-                Err(error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    return Err(error);
-                }
+            Ok(resolved_labels.len())
+        }
+        .await;
+        match result {
+            Ok(resolved) => {
+                conn.execute("COMMIT", ()).await.map_err(|e| {
+                    WenlanError::VectorDb(format!("resolve_orphan_links commit: {e}"))
+                })?;
+                Ok(resolved)
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(error)
             }
         }
-        Ok(resolved_labels.len())
     }
 
     /// Search pages via vector similarity + FTS5 with RRF fusion.

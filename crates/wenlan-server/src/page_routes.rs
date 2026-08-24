@@ -389,38 +389,29 @@ async fn filter_draft_echo(
 /// Decide whether a publish title-conflict 409 may disclose the conflicting
 /// page's identity, and if so, which identity. Page ids are reusable, so the
 /// pair captured inside the publish transaction can be stale by the time the
-/// handler runs: the visibility check and the disclosed identity must come
-/// from one reload of the row, and the reloaded row must still fold to the
-/// conflicting title. Any failure or mismatch degrades to omission — the 409
-/// itself is already established and never turns into a 500 here.
+/// handler runs. `MemoryDB::conflict_identity_snapshot` makes the row reload,
+/// the truth verdict, and the title-fold recheck under one connection guard,
+/// so no concurrent rename, delete, or id reuse can split the visibility
+/// decision from the disclosed identity. Any failure degrades to omission —
+/// the 409 itself is already established and never turns into a 500 here.
 async fn visible_conflict_identity(
     db: &wenlan_core::db::MemoryDB,
     view: &crate::truth_guard::TruthView,
     existing_page_id: &str,
     wanted_key: &str,
 ) -> Option<(String, String)> {
-    let page = match db.get_page(existing_page_id).await {
-        Ok(page) => page,
+    match db
+        .conflict_identity_snapshot(&view.grant, existing_page_id, wanted_key)
+        .await
+    {
+        Ok(identity) => identity,
         Err(e) => {
             tracing::warn!(
-                "[page] conflict identity reload failed for {existing_page_id}; omitting: {e}"
+                "[page] conflict identity check failed for {existing_page_id}; omitting: {e}"
             );
-            return None;
+            None
         }
-    };
-    let visible = match wenlan_core::truth_adapter::filter_page(db, &view.grant, page).await {
-        Ok(visible) => visible?,
-        Err(e) => {
-            tracing::warn!(
-                "[page] conflict identity filter failed for {existing_page_id}; omitting: {e}"
-            );
-            return None;
-        }
-    };
-    if wenlan_core::db::MemoryDB::page_title_key(&visible.title) != wanted_key {
-        return None;
     }
-    Some((visible.id, visible.title))
 }
 
 fn draft_version_conflict(current_version: i64) -> ServerError {

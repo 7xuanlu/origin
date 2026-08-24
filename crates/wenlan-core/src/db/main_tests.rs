@@ -46717,6 +46717,68 @@ async fn find_unique_folds_untrimmed_stored_titles() {
     );
 }
 
+/// Manual perf receipt, not a CI gate: the Unicode-correct Rust-side fold
+/// must scan every same-scope title because SQLite's LOWER() is ASCII-only.
+/// This measures that scan against the old LOWER() SQL shape it replaced so
+/// the cost claim stays a number, not an argument.
+#[tokio::test]
+#[ignore = "perf receipt; run with -- --ignored find_unique_scan_cost_receipt"]
+async fn find_unique_scan_cost_receipt() {
+    let (db, _dir) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("BEGIN", ()).await.unwrap();
+        for i in 0..2000 {
+            conn.execute(
+                "INSERT INTO pages (id, title, content, source_memory_ids, version, status, \
+                 created_at, last_compiled, last_modified, workspace, space, creation_kind, \
+                 review_status) VALUES (?1, ?2, 'body', '[]', 1, 'active', 'now', 'now', 'now', \
+                 '00000000-0000-4000-8000-000000000001', \
+                 '00000000-0000-4000-8000-000000000001', 'distilled', 'confirmed')",
+                libsql::params![format!("page_bench_{i:05}"), format!("Bench Title {i:05}")],
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute("COMMIT", ()).await.unwrap();
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        let got = db
+            .find_unique_active_page_id_by_title_scoped("bench title 01234", None)
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("page_bench_01234"));
+    }
+    let rust_fold = start.elapsed();
+    let conn = db.conn.lock().await;
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        let mut rows = conn
+            .query(
+                "SELECT id FROM pages WHERE status = 'active' \
+                 AND COALESCE(kind, 'concept') != 'entity' \
+                 AND space = COALESCE(?1, '00000000-0000-4000-8000-000000000001') \
+                 AND LOWER(title) = LOWER(?2) LIMIT 2",
+                libsql::params![Option::<String>::None, "bench title 01234"],
+            )
+            .await
+            .unwrap();
+        let mut n = 0;
+        while rows.next().await.unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 1);
+    }
+    let sql_lower = start.elapsed();
+    println!(
+        "2000-page scope, 100 lookups: rust-fold scan {rust_fold:?} ({:?}/op), \
+         old LOWER() SQL {sql_lower:?} ({:?}/op)",
+        rust_fold / 100,
+        sql_lower / 100
+    );
+}
+
 #[tokio::test]
 async fn count_active_pages_excludes_entity_kind_shadow() {
     let (db, _dir) = test_db().await;

@@ -389,11 +389,23 @@ impl MemoryDB {
         &self,
         page_ids: &[String],
     ) -> Result<HashMap<String, PageTruth>, WenlanError> {
+        if page_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.conn.lock().await;
+        Self::page_truth_states_on_conn(&conn, page_ids).await
+    }
+
+    /// [`Self::page_truth_states`] on an already-held connection guard, for
+    /// callers whose verdict must share one snapshot with their other reads.
+    async fn page_truth_states_on_conn(
+        conn: &libsql::Connection,
+        page_ids: &[String],
+    ) -> Result<HashMap<String, PageTruth>, WenlanError> {
         let mut out = HashMap::new();
         if page_ids.is_empty() {
             return Ok(out);
         }
-        let conn = self.conn.lock().await;
         // Read the reconciliation frontier, shadow switch, truth rows, and
         // eligibility registry under one connection guard. Judge activation
         // atomically changes the registry generation and resets the frontier;
@@ -664,6 +676,87 @@ impl MemoryDB {
                 )
             })
             .collect())
+    }
+
+    /// Atomically decide whether a publish title-conflict response may name
+    /// the conflicting page, and with which identity. One connection guard
+    /// covers the row read, the truth verdict, and the title-fold recheck, so
+    /// the visibility decision and the disclosed identity come from a single
+    /// database snapshot — no concurrent rename, delete, or id reuse can
+    /// interleave, because every writer goes through this same connection
+    /// mutex.
+    ///
+    /// `wanted_key` is the conflicting title's [`Self::page_title_key`] fold.
+    /// `Ok(None)` means "keep the 409 but omit the identity": the row is gone,
+    /// no longer active, hidden from this grant, or no longer folds to the
+    /// conflicting title.
+    pub async fn conflict_identity_snapshot(
+        &self,
+        grant: &TruthGrant,
+        page_id: &str,
+        wanted_key: &str,
+    ) -> Result<Option<(String, String)>, WenlanError> {
+        let conn = self.conn.lock().await;
+        let title = {
+            let mut rows = conn
+                .query(
+                    "SELECT title FROM pages WHERE id = ?1 AND status = 'active'",
+                    libsql::params![page_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("conflict identity row: {e}")))?;
+            match rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("conflict identity next: {e}")))?
+            {
+                Some(row) => row
+                    .get::<String>(0)
+                    .map_err(|e| WenlanError::VectorDb(format!("conflict identity title: {e}")))?,
+                None => return Ok(None),
+            }
+        };
+        if Self::page_title_key(&title) != wanted_key {
+            return Ok(None);
+        }
+        let generation = {
+            let mut rows = conn
+                .query(
+                    "SELECT value FROM app_metadata WHERE key = ?1",
+                    libsql::params![TRUTH_CUTOVER_GENERATION_KEY],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("conflict identity generation: {e}")))?;
+            match rows.next().await.map_err(|e| {
+                WenlanError::VectorDb(format!("conflict identity generation next: {e}"))
+            })? {
+                Some(row) => row
+                    .get::<String>(0)
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<i64>().ok())
+                    .unwrap_or(0),
+                None => 0,
+            }
+        };
+        if generation > 0 {
+            let ids = [page_id.to_string()];
+            let states = Self::page_truth_states_on_conn(&conn, &ids).await?;
+            let truth = states.get(page_id).copied().unwrap_or(PageTruth {
+                support: crate::truth_contract::Support::Unevaluated,
+                human_reviewed: false,
+            });
+            if visible_at(
+                generation,
+                grant,
+                page_id,
+                truth.support,
+                truth.human_reviewed,
+            ) != Visibility::Full
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some((page_id.to_string(), title)))
     }
 
     /// Advance (or roll back) the cutover generation.
