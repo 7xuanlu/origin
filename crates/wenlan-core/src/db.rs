@@ -50199,22 +50199,30 @@ impl MemoryDB {
         Ok(out)
     }
 
+    /// Per-invocation cap on the orphan sweep: bounds how long the sweep can
+    /// hold the sole connection mutex. The sweep re-runs after every publish,
+    /// so a backlog above the cap drains across invocations instead of
+    /// stalling every other request in one.
+    const ORPHAN_SWEEP_BATCH: i64 = 512;
+
     /// Walk the orphan rows and re-resolve them against current page titles.
     /// Returns the number of distinct labels that flipped at least one row
     /// from NULL to a real target — the refinery uses this for the log line.
-    /// Snapshots the orphan rows
-    /// under a brief lock, then drops the connection before the per-label
-    /// lookups so other writers aren't starved while the resolver scans.
-    /// Resolution is per source Page and space; existing non-NULL targets are
-    /// explicit inventory and are never rewritten here.
+    /// The whole sweep holds the connection mutex for one transaction, capped
+    /// at [`Self::ORPHAN_SWEEP_BATCH`] orphan rows per invocation so a large
+    /// backlog cannot stall other database work unboundedly; the remainder is
+    /// picked up by the next sweep. Resolution is per source Page and space;
+    /// existing non-NULL targets are explicit inventory and are never
+    /// rewritten here.
     pub async fn resolve_orphan_page_links(&self) -> Result<usize, WenlanError> {
         // The whole sweep — orphan list, owner maps, deletes, edge mints —
         // runs under one connection guard and one transaction, so every
         // resolution decision is made against the same snapshot it writes
         // into. A concurrent rename, archive, or new duplicate serializes
-        // before or after the sweep, never mid-sweep. One failed row rolls
-        // back the whole sweep: it is an idempotent repair the next publish
-        // re-runs.
+        // before or after the sweep, never mid-sweep. Each orphan repairs
+        // inside its own savepoint: one poisoned row (say, a legacy edge
+        // payload that json_extract rejects) skips only itself, so the good
+        // rows still commit and the sweep makes progress on every run.
         let conn = self.conn.lock().await;
         conn.execute("BEGIN", ())
             .await
@@ -50227,8 +50235,9 @@ impl MemoryDB {
                      FROM page_links pl
                      INNER JOIN pages p ON p.id = pl.source_page_id
                      WHERE pl.target_page_id IS NULL AND p.status = 'active'
-                     ORDER BY pl.source_page_id ASC, pl.label_key ASC",
-                        (),
+                     ORDER BY pl.source_page_id ASC, pl.label_key ASC
+                     LIMIT ?1",
+                        libsql::params![Self::ORPHAN_SWEEP_BATCH],
                     )
                     .await
                     .map_err(|e| {
@@ -50249,8 +50258,15 @@ impl MemoryDB {
                 }
                 orphan_rows
             };
+            if orphan_rows.len() as i64 == Self::ORPHAN_SWEEP_BATCH {
+                log::warn!(
+                    "[orphan_links] sweep cap of {} rows hit; the remainder resolves next sweep",
+                    Self::ORPHAN_SWEEP_BATCH
+                );
+            }
 
             let mut resolved_labels = std::collections::BTreeSet::new();
+            let mut failed_rows: Vec<(String, String, String)> = Vec::new();
             // One folded-title scan per distinct source scope, built inside
             // this same transaction — the maps read the exact snapshot the
             // deletes and edge mints below write into.
@@ -50275,7 +50291,17 @@ impl MemoryDB {
                 else {
                     continue;
                 };
-                let changed: u64 = {
+                // Savepoint per orphan: a row whose repair fails (for example a
+                // pre-existing edge row whose free-text payload json_extract
+                // rejects) rolls back alone, so it cannot make the whole sweep
+                // — and therefore every future sweep over the same ordered
+                // backlog — commit nothing.
+                conn.execute("SAVEPOINT orphan_repair", ())
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("resolve_orphan_links savepoint: {e}"))
+                    })?;
+                let row_result: Result<u64, WenlanError> = async {
                     // G6 Stage 2 PR 2b (item 3): resolving an orphan no longer
                     // writes the resolved target into page_links -- the edge
                     // minted below is the sole canonical representation once a
@@ -50356,11 +50382,40 @@ impl MemoryDB {
                             })?;
                         }
                     }
-                    changed
-                };
-                if changed > 0 {
-                    resolved_labels.insert(label_key);
+                    Ok(changed)
                 }
+                .await;
+                match row_result {
+                    Ok(changed) => {
+                        conn.execute("RELEASE orphan_repair", ()).await.map_err(|e| {
+                            WenlanError::VectorDb(format!("resolve_orphan_links release: {e}"))
+                        })?;
+                        if changed > 0 {
+                            resolved_labels.insert(label_key);
+                        }
+                    }
+                    Err(error) => {
+                        // A failed rollback would leave this orphan's partial
+                        // writes inside the outer transaction, so it aborts the
+                        // sweep (the outer match then rolls everything back).
+                        conn.execute("ROLLBACK TO orphan_repair", ())
+                            .await
+                            .map_err(|e| {
+                                WenlanError::VectorDb(format!(
+                                    "resolve_orphan_links savepoint rollback: {e}"
+                                ))
+                            })?;
+                        let _ = conn.execute("RELEASE orphan_repair", ()).await;
+                        failed_rows.push((source_page_id, label_key, error.to_string()));
+                    }
+                }
+            }
+            if !failed_rows.is_empty() {
+                log::warn!(
+                    "[orphan_links] {} orphan row(s) failed to repair and were left unresolved: {:?}",
+                    failed_rows.len(),
+                    failed_rows
+                );
             }
             Ok(resolved_labels.len())
         }

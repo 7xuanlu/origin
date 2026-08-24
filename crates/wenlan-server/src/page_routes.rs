@@ -399,9 +399,10 @@ async fn visible_conflict_identity(
     view: &crate::truth_guard::TruthView,
     existing_page_id: &str,
     wanted_key: &str,
+    expected_scope: &str,
 ) -> Option<(String, String)> {
     match db
-        .conflict_identity_snapshot(&view.grant, existing_page_id, wanted_key)
+        .conflict_identity_snapshot(&view.grant, existing_page_id, wanted_key, expected_scope)
         .await
     {
         Ok(identity) => identity,
@@ -516,12 +517,14 @@ pub async fn handle_publish_page_draft(
         wenlan_core::pages::PageDraftPublishOutcome::TitleConflict {
             existing_page_id,
             existing_page_title,
+            scope,
         } => {
             let disclosed = visible_conflict_identity(
                 &db,
                 &view,
                 &existing_page_id,
                 &wenlan_core::db::MemoryDB::page_title_key(&existing_page_title),
+                &scope,
             )
             .await;
             let mut body = serde_json::json!({
@@ -1668,6 +1671,8 @@ mod conflict_identity_tests {
     use wenlan_core::db::MemoryDB;
 
     const PAGE: &str = "page_00000000-0000-4000-8000-0000000000c1";
+    /// Stored scope of an unfiled publish: the M1 sentinel space id.
+    const SCOPE: &str = "00000000-0000-4000-8000-000000000001";
 
     async fn test_db() -> (Arc<MemoryDB>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1693,7 +1698,8 @@ mod conflict_identity_tests {
         let (db, _tmp) = test_db().await;
         let page = publish(&db, PAGE, "Secret Plan").await;
         let wanted = MemoryDB::page_title_key("  secret PLAN ");
-        let got = visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted).await;
+        let got =
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted, SCOPE).await;
         assert_eq!(got, Some((page.id, page.title)));
     }
 
@@ -1704,7 +1710,7 @@ mod conflict_identity_tests {
         db.delete_page(PAGE).await.unwrap();
         let wanted = MemoryDB::page_title_key("Secret Plan");
         assert_eq!(
-            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted).await,
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted, SCOPE).await,
             None
         );
     }
@@ -1737,7 +1743,7 @@ mod conflict_identity_tests {
         overwrite_title(&tmp, PAGE, "Innocuous Note").await;
         let wanted = MemoryDB::page_title_key("Secret Plan");
         assert_eq!(
-            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted).await,
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted, SCOPE).await,
             None
         );
     }
@@ -1748,8 +1754,54 @@ mod conflict_identity_tests {
         let page = publish(&db, PAGE, "Secret Plan").await;
         overwrite_title(&tmp, PAGE, "SECRET plan").await;
         let wanted = MemoryDB::page_title_key("Secret Plan");
-        let got = visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted).await;
+        let got =
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted, SCOPE).await;
         // The identity comes from the reloaded row, never the stale capture.
         assert_eq!(got, Some((page.id, "SECRET plan".to_string())));
+    }
+
+    /// Same direct-file seam as `overwrite_title`, for an arbitrary column.
+    async fn overwrite_column(tmp: &tempfile::TempDir, id: &str, column: &str, value: &str) {
+        let raw = libsql::Builder::new_local(tmp.path().join("origin_memory.db"))
+            .build()
+            .await
+            .unwrap();
+        let conn = raw.connect().unwrap();
+        conn.execute(
+            &format!("UPDATE pages SET {column} = ?1 WHERE id = ?2"),
+            libsql::params![value, id],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_page_moved_to_another_space_degrades_to_omission() {
+        // The publish found the conflict in one scope; if the page moves to a
+        // different space before the handler reloads it, it is no longer that
+        // conflict and its identity must not be disclosed.
+        let (db, tmp) = test_db().await;
+        publish(&db, PAGE, "Secret Plan").await;
+        overwrite_column(&tmp, PAGE, "space", "another-space").await;
+        let wanted = MemoryDB::page_title_key("Secret Plan");
+        assert_eq!(
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted, SCOPE).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entity_shadow_conflict_stays_omitted() {
+        // Publish treats entity shadow pages as conflicts, but conflict
+        // responses have never disclosed their identity; the snapshot must
+        // keep that fence.
+        let (db, tmp) = test_db().await;
+        publish(&db, PAGE, "Secret Plan").await;
+        overwrite_column(&tmp, PAGE, "kind", "entity").await;
+        let wanted = MemoryDB::page_title_key("Secret Plan");
+        assert_eq!(
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted, SCOPE).await,
+            None
+        );
     }
 }

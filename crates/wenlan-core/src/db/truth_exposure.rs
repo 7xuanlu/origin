@@ -686,22 +686,27 @@ impl MemoryDB {
     /// interleave, because every writer goes through this same connection
     /// mutex.
     ///
-    /// `wanted_key` is the conflicting title's [`Self::page_title_key`] fold.
-    /// `Ok(None)` means "keep the 409 but omit the identity": the row is gone,
-    /// no longer active, hidden from this grant, or no longer folds to the
-    /// conflicting title.
+    /// `wanted_key` is the conflicting title's [`Self::page_title_key`] fold;
+    /// `expected_scope` is the stored (sentinel-mirrored) scope the publish
+    /// found the conflict in. `Ok(None)` means "keep the 409 but omit the
+    /// identity": the row is gone, no longer active, moved out of the
+    /// conflict's scope, an entity shadow (whose identity conflict responses
+    /// have never disclosed), hidden from this grant, or no longer folds to
+    /// the conflicting title.
     pub async fn conflict_identity_snapshot(
         &self,
         grant: &TruthGrant,
         page_id: &str,
         wanted_key: &str,
+        expected_scope: &str,
     ) -> Result<Option<(String, String)>, WenlanError> {
         let conn = self.conn.lock().await;
         let title = {
             let mut rows = conn
                 .query(
-                    "SELECT title FROM pages WHERE id = ?1 AND status = 'active'",
-                    libsql::params![page_id],
+                    "SELECT title FROM pages WHERE id = ?1 AND status = 'active' \
+                     AND space = ?2 AND COALESCE(kind, 'concept') != 'entity'",
+                    libsql::params![page_id, expected_scope],
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("conflict identity row: {e}")))?;
@@ -738,7 +743,10 @@ impl MemoryDB {
                 None => 0,
             }
         };
-        if generation > 0 {
+        // `!= 0`, not `> 0`: canonical visibility (`page_visibility`) treats
+        // every nonzero generation as active, so a corrupted negative value
+        // must fail closed here too instead of skipping the truth filter.
+        if generation != 0 {
             let ids = [page_id.to_string()];
             let states = Self::page_truth_states_on_conn(&conn, &ids).await?;
             let truth = states.get(page_id).copied().unwrap_or(PageTruth {

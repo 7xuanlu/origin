@@ -52481,6 +52481,97 @@ async fn resolve_orphan_page_links_mints_links_edges() {
     assert_eq!(db.resolve_orphan_page_links().await.unwrap(), 1);
 }
 
+/// One poisoned orphan must not roll back the other repairs: each orphan
+/// commits in its own savepoint, so the sweep makes progress on every run
+/// even when a pre-existing edge row's free-text payload makes that one
+/// row's edge upsert fail.
+#[tokio::test]
+async fn a_poisoned_orphan_does_not_block_the_other_repairs() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, title) in [
+        ("page_a_bad_src", "Bad Src"),
+        ("page_a_poisoned_target", "Poisoned Target"),
+        ("page_b_good_src", "Good Src"),
+        ("page_b_good_target", "Good Target"),
+    ] {
+        db.insert_page(id, title, None, "content", None, None, &[], &now)
+            .await
+            .unwrap();
+    }
+    for (src, label) in [
+        ("page_a_bad_src", "Poisoned Target"),
+        ("page_b_good_src", "Good Target"),
+    ] {
+        db.replace_page_links(
+            src,
+            &[crate::synthesis::wikilinks::Wikilink {
+                label: label.to_string(),
+                target_page_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+    }
+
+    // Pre-existing edge row under the exact id the sweep will upsert, with a
+    // payload the upsert's json functions reject. The bad source sorts before
+    // the good one, so an all-or-nothing sweep would re-run into it first and
+    // commit nothing, forever.
+    let edge_id = crate::provenance::compute_edge_id(
+        "links",
+        "page",
+        "page_a_bad_src",
+        "page",
+        "page_a_poisoned_target",
+        "poisoned target",
+    );
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, \
+             lineage, grounded, space, payload, created_at) \
+             VALUES (?1, 'page_a_bad_src', 'page', 'page_a_poisoned_target', 'page', 'links', \
+                     'legacy', 0, ?2, 'not json', 1)",
+            libsql::params![edge_id, UNFILED_SPACE_ID],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.resolve_orphan_page_links().await.unwrap(),
+        1,
+        "the good orphan must resolve despite the poisoned one"
+    );
+
+    let remaining = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT source_page_id FROM page_links WHERE target_page_id IS NULL \
+                 ORDER BY source_page_id",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut remaining = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            remaining.push(row.get::<String>(0).unwrap());
+        }
+        remaining
+    };
+    assert_eq!(
+        remaining,
+        vec!["page_a_bad_src".to_string()],
+        "only the poisoned orphan stays unresolved"
+    );
+
+    // Re-runnable: the poisoned row keeps failing alone instead of erroring
+    // or blocking the sweep.
+    assert_eq!(db.resolve_orphan_page_links().await.unwrap(), 0);
+}
+
 /// A page merge repoints inbound links rows and copies the absorbed page's
 /// evidence onto the survivor — both moves change which edges the stores
 /// imply, so both must reconcile in the merge transaction.

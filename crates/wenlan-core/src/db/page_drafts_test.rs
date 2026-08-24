@@ -1159,9 +1159,11 @@ async fn publish_blocks_on_same_scope_case_insensitive_title_conflict() {
         PageDraftPublishOutcome::TitleConflict {
             existing_page_id,
             existing_page_title,
+            scope,
         } => {
             assert_eq!(existing_page_id, "page_active");
             assert_eq!(existing_page_title, "active page");
+            assert_eq!(scope, "work");
         }
         other => panic!("expected TitleConflict, got {other:?}"),
     }
@@ -1220,9 +1222,11 @@ async fn publish_folds_unicode_titles_when_checking_conflicts() {
         PageDraftPublishOutcome::TitleConflict {
             existing_page_id,
             existing_page_title,
+            scope,
         } => {
             assert_eq!(existing_page_id, existing.id);
             assert_eq!(existing_page_title, "i σχεδιο проект");
+            assert_eq!(scope, super::UNFILED_SPACE_ID);
         }
         other => panic!("expected TitleConflict, got {other:?}"),
     }

@@ -651,6 +651,7 @@ impl MemoryDB {
             return Ok(PageDraftPublishOutcome::TitleConflict {
                 existing_page_id,
                 existing_page_title,
+                scope,
             });
         }
 

@@ -32,6 +32,10 @@ pub enum PageDraftPublishOutcome {
     TitleConflict {
         existing_page_id: String,
         existing_page_title: String,
+        /// Stored (sentinel-mirrored) scope the conflict was found in. The
+        /// disclosure recheck needs it: a page moved to another space after
+        /// the publish transaction is no longer this conflict.
+        scope: String,
     },
 }
 
