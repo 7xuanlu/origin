@@ -62,7 +62,10 @@ claim hooks are active without checking the current worktree.
 - Dev and production use the same daemon port and data roots by default. Isolated tests
   that can create pages must isolate the daemon port, `WENLAN_DATA_DIR`, and the
   configured knowledge/page path, then verify the live daemon reports those scratch
-  paths.
+  paths. For a scratch daemon, the CLI reads `WENLAN_HOST` (a full URL such as
+  `http://127.0.0.1:17917`, not a port), `wenlan-mcp` takes `--origin-url`, and the
+  default pages folder is `.wenlan/pages` under the OS user-home directory, not under
+  `WENLAN_DATA_DIR` — a portable scratch setup sets `knowledge_path` explicitly.
 - Request defaults: `WENLAN_AGENT_NAME` supplies the CLI identity when no explicit
   agent name is given; `WENLAN_DEFAULT_SPACE` is an overridable CLI/MCP fallback, while
   the strict `WENLAN_SPACE` lock wins over both explicit and default values.

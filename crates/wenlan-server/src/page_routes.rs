@@ -204,7 +204,7 @@ pub async fn handle_archive_page(
 
 /// DELETE /api/pages/{id}
 ///
-/// Removes both the DB row and the projected `.origin/pages/<slug>.md`
+/// Removes both the DB row and the projected `<pages dir>/<slug>.md`
 /// file. DB-first so a transient md removal failure leaves a stale file
 /// (cheap to clean up) rather than a stranded DB row (invisible to the
 /// user). The md side failing is logged but not surfaced as an error —
@@ -270,7 +270,8 @@ pub async fn handle_search_pages(
 
 /// POST /api/pages
 ///
-/// Atomic md-first + DB-index. The `.origin/pages/<slug>.md` file is the
+/// Atomic md-first + DB-index. The `<pages dir>/<slug>.md` file (default
+/// `~/.wenlan/pages/`, slug made unique on collision) is the
 /// human-readable canonical form; the DB row is the hybrid index over it.
 /// If the DB insert fails after the md write succeeds, the md file is
 /// removed so the two stores stay consistent.

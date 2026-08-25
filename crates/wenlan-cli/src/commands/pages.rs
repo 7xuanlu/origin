@@ -296,6 +296,9 @@ fn render_citations(citations: &[wenlan_types::pages::PageCitation]) -> String {
 fn print_list(shown: &[(String, usize)], total_titles: usize, total_pages: usize, dir: &Path) {
     if total_pages == 0 {
         println!("(no pages in {})", dir.display());
+        println!(
+            "  Pages come from the distill tool (/distill in the Claude Code or Codex plugin, or any MCP client) once a few related memories exist, or from the page editor in the Wenlan app."
+        );
         return;
     }
     if shown.len() < total_titles {
