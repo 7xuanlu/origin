@@ -33037,6 +33037,17 @@ impl MemoryDB {
         }
     }
 
+    /// Decode the trailing `id` column an id-branch reader appends after the
+    /// shared `memory_item_columns` projection (`SELECT {columns}, id ...`).
+    /// Reads the row's own reported column count rather than a fixed index,
+    /// so a column added to `memory_item_columns` later can't silently
+    /// misalign this read into a wrong (or absent) value.
+    fn trailing_id_column(row: &libsql::Row) -> Result<String, WenlanError> {
+        let idx = row.column_count() - 1;
+        row.get::<String>(idx)
+            .map_err(|e| WenlanError::VectorDb(format!("trailing id column (index {idx}): {e}")))
+    }
+
     pub async fn list_memories_scoped(
         &self,
         scope: &ReadScope,
@@ -33231,9 +33242,7 @@ impl MemoryDB {
                 .map_err(|e| WenlanError::VectorDb(e.to_string()))?
             {
                 let mut item = Self::memory_item_from_row(&row);
-                // Trailing `id` column, appended after the fixed 0..25
-                // indices the shared columns projection always yields.
-                let matched_id = row.get::<String>(26).unwrap_or_default();
+                let matched_id = Self::trailing_id_column(&row)?;
                 // Return the row under the key it was requested with, per
                 // the join contract every caller relies on: backfill keys
                 // its `by_source` map by the locator it asked with, and
@@ -33305,6 +33314,61 @@ impl MemoryDB {
         })? {
             let item = Self::memory_item_from_row(&row);
             map.insert(item.source_id.clone(), item);
+        }
+
+        // Document source pages store `memories.id` row keys as their
+        // evidence locators (document_enrichment.rs:297), distinct from
+        // `source_id` for multi-chunk documents -- identical resolution to
+        // the unscoped `get_memories_by_source_ids`. Any requested key the
+        // source_id branch above left unresolved is retried as an `id`
+        // lookup, with the same scope predicate re-applied so a chunk
+        // outside the caller's scope stays excluded even when requested by
+        // its exact id.
+        let unresolved: Vec<String> = source_ids
+            .iter()
+            .filter(|id| !map.contains_key(id.as_str()))
+            .cloned()
+            .collect();
+        if !unresolved.is_empty() {
+            let id_placeholders = std::iter::repeat_n("?", unresolved.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut id_conditions = vec![
+                "pending_revision = 0".to_string(),
+                "source = 'memory'".to_string(),
+                format!("id IN ({id_placeholders})"),
+            ];
+            let mut id_values = unresolved
+                .iter()
+                .cloned()
+                .map(libsql::Value::Text)
+                .collect::<Vec<_>>();
+            push_read_scope_filter_folded(scope, "space", &mut id_conditions, &mut id_values);
+            let id_conditions_sql = id_conditions.join(" AND ");
+            let id_sql = format!(
+                "SELECT {columns}, id
+                 FROM memories
+                 WHERE {id_conditions_sql}
+                 GROUP BY id"
+            );
+            let mut id_rows = conn
+                .query(&id_sql, libsql::params_from_iter(id_values))
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!(
+                        "get_memories_by_source_ids_scoped (id branch): {e}"
+                    ))
+                })?;
+            while let Some(row) = id_rows.next().await.map_err(|e| {
+                WenlanError::VectorDb(format!("get_memories_by_source_ids_scoped id row: {e}"))
+            })? {
+                let mut item = Self::memory_item_from_row(&row);
+                let matched_id = Self::trailing_id_column(&row)?;
+                // Same join contract as the unscoped reader: return the row
+                // under the key it was requested with.
+                item.source_id = matched_id.clone();
+                map.insert(matched_id, item);
+            }
         }
 
         Ok(source_ids.iter().filter_map(|id| map.remove(id)).collect())
@@ -49661,7 +49725,13 @@ impl MemoryDB {
                 .collect::<Vec<_>>()
                 .join(",");
             let id_sql = format!(
-                "SELECT id, content FROM memories WHERE source != 'episode' AND id IN ({})",
+                "SELECT id, content FROM memories WHERE source != 'episode' AND id IN ({}) \
+                 AND source_id NOT IN (\
+                     SELECT supersedes FROM memories \
+                     WHERE supersedes IS NOT NULL AND pending_revision = 0 \
+                     AND source = 'memory' AND supersede_mode = 'hide' \
+                     GROUP BY supersedes\
+                 )",
                 id_placeholders
             );
             let id_params: Vec<libsql::Value> = unresolved

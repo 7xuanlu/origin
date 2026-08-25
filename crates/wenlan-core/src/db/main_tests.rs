@@ -7039,6 +7039,44 @@ async fn test_get_memory_contents_by_ids_mixed_request_supersede_hide_exclusion_
     );
 }
 
+/// Codex review finding 2 (2026-08-24, on d584b1cf): the id branch had no
+/// supersede-hide exclusion at all, unlike the source_id branch right above
+/// it -- a chunk requested by its exact `id` would leak even after its
+/// underlying `source_id` was superseded with `supersede_mode = 'hide'`.
+#[tokio::test]
+async fn test_get_memory_contents_by_ids_id_branch_excludes_superseded_hide() {
+    let (db, _dir) = test_db().await;
+    // A document chunk: `id` distinct from `source_id`, so a request for
+    // `id` alone must fall through to the id branch (the source_id branch's
+    // `source_id IN (...)` won't match "hidden_chunk0").
+    insert_doc_chunk(&db, "hidden_chunk0", "hidden_doc", 0, "old chunk content").await;
+
+    // Supersede the chunk's `source_id` ("hidden_doc") with a hide-mode
+    // revision -- the same mechanism the source_id-branch test above uses,
+    // just targeting a chunked document's source_id instead of a plain fact.
+    let mut new_doc = make_memory_doc(
+        "hidden_doc_revised",
+        "revised chunk content",
+        "fact",
+        "personal",
+        "claude",
+    );
+    new_doc.supersedes = Some("hidden_doc".to_string());
+    db.upsert_documents(vec![new_doc]).await.unwrap();
+
+    let results = db
+        .get_memory_contents_by_ids(&["hidden_chunk0".to_string()])
+        .await
+        .unwrap();
+    let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(
+        !ids.contains(&"hidden_chunk0"),
+        "a chunk requested by exact id must be excluded once its source_id \
+         is superseded in hide mode: {:?}",
+        results
+    );
+}
+
 #[tokio::test]
 async fn test_quality_multiplier_in_search() {
     let (db, _dir) = test_db().await;
@@ -26503,6 +26541,88 @@ async fn test_get_memories_by_source_ids_mixed_request_preserves_join_contract()
         .collect();
     assert_eq!(by_id.get("mem_plain"), Some(&"Plain memory content"));
     assert_eq!(by_id.get("chunk_c0"), Some(&"Doc C chunk content"));
+}
+
+/// Same shape as `insert_doc_chunk`, plus an explicit `space` so a scoped
+/// reader test can put a chunk inside or outside a `ReadScope::Space`.
+async fn insert_doc_chunk_with_space(
+    db: &MemoryDB,
+    id: &str,
+    source_id: &str,
+    chunk_index: i64,
+    content: &str,
+    space: &str,
+) {
+    let now_ts = chrono::Utc::now().timestamp();
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, source_agent, space, created_at, last_modified, confirmed, stability, source) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'text', 'fact', 'folder', ?6, ?7, ?7, 1, 'confirmed', 'memory')",
+        libsql::params![
+            id.to_string(),
+            source_id.to_string(),
+            source_id.to_string(),
+            content.to_string(),
+            chunk_index,
+            space.to_string(),
+            now_ts
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+/// Codex review finding 3 (2026-08-24, on d584b1cf): `get_memories_by_source_ids_scoped`
+/// was source_id-only, so the scoped page-sources route (page_routes.rs,
+/// `handle_get_page_sources`) showed a null memory for document chunk
+/// locators once a caller passed a non-Global scope. Mirrors the unscoped
+/// id-shaped-locator test above, plus the scope predicate must still apply
+/// on the id branch: a chunk outside the requested scope must not leak
+/// through just because it was asked for by its exact id.
+#[tokio::test]
+async fn test_get_memories_by_source_ids_scoped_resolves_id_shaped_locator_within_scope_and_excludes_outside_scope(
+) {
+    let (db, _dir) = test_db().await;
+    insert_doc_chunk_with_space(
+        &db,
+        "scoped_chunk_work0",
+        "scoped_doc_work",
+        0,
+        "Work-space chunk content",
+        "work",
+    )
+    .await;
+    insert_doc_chunk_with_space(
+        &db,
+        "scoped_chunk_personal0",
+        "scoped_doc_personal",
+        0,
+        "Personal-space chunk content",
+        "personal",
+    )
+    .await;
+
+    let scope = crate::read_scope::ReadScope::Space("work".to_string());
+    let results = db
+        .get_memories_by_source_ids_scoped(
+            &[
+                "scoped_chunk_work0".to_string(),
+                "scoped_chunk_personal0".to_string(),
+            ],
+            &scope,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "only the in-scope chunk must resolve on the id branch, keyed by \
+         its requested id, not the personal-space chunk: {:?}",
+        results.iter().map(|m| &m.source_id).collect::<Vec<_>>()
+    );
+    assert_eq!(results[0].source_id, "scoped_chunk_work0");
+    assert_eq!(results[0].content, "Work-space chunk content");
 }
 
 // ==================== Migration 43: enrichment_steps ====================

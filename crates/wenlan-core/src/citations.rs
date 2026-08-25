@@ -495,14 +495,41 @@ async fn run_citation_backfill_with_page_limit(
             // Non-empty evidence locators that all failed to resolve to
             // content is a provenance data bug (e.g. a genuinely pruned
             // chunk), not an annotate failure -- it must never spend an LLM
-            // call, count toward the 3-attempt poison-pill, or write '[]'.
-            // The page stays `citations IS NULL` and is retried once its
-            // provenance is repaired.
+            // call or count toward the 3-attempt poison-pill. But leaving
+            // `citations` NULL is its own bug: `get_pages_missing_citations`
+            // orders NULL pages oldest-`last_modified`-first, and this
+            // give-up touches neither citations nor last_modified, so the
+            // exact same page is re-selected on every later tick -- the
+            // same starvation class PR #584 fixed, now starving every page
+            // behind this one forever instead of a bounded 3 attempts.
+            // Treat it exactly like the "no source evidence" give-up right
+            // above: leave the missing-citations selection via `citations =
+            // '[]'`, no attempt recorded. Recovery is unchanged -- any
+            // source-set change (`link_page_source` / `replace_page_sources`)
+            // resets `citations` back to NULL.
             log::warn!(
                 "[citation_backfill] page {page_id} has {} source evidence locator(s) that \
-                 resolved to zero content rows; skipping without spending an attempt",
+                 resolved to zero content rows; giving up without spending an attempt",
                 locators.len()
             );
+            let changelog = build_backfill_changelog(
+                db,
+                &page_id,
+                page.version,
+                &format!(
+                    "citation backfill gave up: {} evidence locator(s) resolve to no content",
+                    locators.len()
+                ),
+            )
+            .await;
+            let _ = db
+                .set_page_citations_with_changelog_at_version(
+                    &page_id,
+                    Some("[]"),
+                    &changelog,
+                    page.version,
+                )
+                .await;
             continue;
         }
 
@@ -1287,9 +1314,18 @@ mod tests {
     /// evidence at all), but every locator fails to resolve to a content row
     /// -- a provenance data bug (e.g. a genuinely pruned chunk), not an
     /// annotate failure. `MockProvider::unavailable()` errors on any call,
-    /// so if the guard failed to skip, the tick would either fall through to
-    /// `record_annotate_failure` (setting the attempt key) or return Err;
-    /// neither happens when the guard fires first.
+    /// so if the guard failed to fire, the slice would either fall through
+    /// to `record_annotate_failure` (setting the attempt key) or return Err.
+    ///
+    /// The give-up must still leave the missing-citations selection
+    /// (`citations = '[]'`, exactly like the "no source evidence" and
+    /// "3 failed attempts" give-ups right above/below): leaving `citations`
+    /// NULL would re-select this exact page on every later slice forever
+    /// (it's always the oldest -- nothing here ever touches
+    /// `last_modified`), starving every page queued behind it. The second
+    /// half of this test is the starvation regression: a second, resolvable
+    /// page queued behind p_orphan must get its turn on the very next
+    /// slice.
     #[tokio::test]
     async fn backfill_empty_numbered_skips_without_attempt_or_llm_call() {
         let (db, _dir) = crate::db::tests::test_db().await;
@@ -1306,21 +1342,23 @@ mod tests {
         let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::unavailable());
         let prompts = PromptRegistry::default();
 
-        run_citation_backfill_tick(&db, &llm, &prompts)
+        let selected = run_citation_backfill_slice(&db, &llm, &prompts)
             .await
-            .expect("the guard must skip before ever calling the (unavailable) LLM");
+            .expect("the guard must fire before ever calling the (unavailable) LLM");
+        assert_eq!(selected, 1, "the slice must select p_orphan");
 
         assert!(
-            db.get_pages_missing_citations(10)
+            !db.get_pages_missing_citations(10)
                 .await
                 .unwrap()
                 .contains(&"p_orphan".to_string()),
-            "citations must stay NULL (not poisoned to '[]') so the page is \
-             retried once its provenance is repaired"
+            "citations must become '[]' (not stay NULL) so the page leaves \
+             the missing-citations selection; NULL would re-select the same \
+             page forever and starve every page behind it"
         );
-        let version = db.get_page("p_orphan").await.unwrap().unwrap().version;
+        let page = db.get_page("p_orphan").await.unwrap().unwrap();
         let attempts = db
-            .get_app_metadata(&attempt_key("p_orphan", version))
+            .get_app_metadata(&attempt_key("p_orphan", page.version))
             .await
             .unwrap();
         assert_eq!(
@@ -1328,6 +1366,31 @@ mod tests {
             "a provenance data bug must not spend an attempt -- an attempt \
              key here would mean the LLM was actually called \
              (MockProvider::unavailable would error and record one)"
+        );
+        let log = db.get_page_changelog("p_orphan").await.unwrap();
+        assert!(
+            log.contains("citation backfill gave up: 1 evidence locator(s) resolve to no content"),
+            "changelog: {log}"
+        );
+
+        // Starvation regression: a second, resolvable page queued behind
+        // p_orphan must get annotated on the very next slice, proving the
+        // give-up actually freed the queue instead of re-selecting p_orphan
+        // forever.
+        seed_backfill_page(&db, "p_resolvable", true).await;
+        let annotated = format!("{BACKFILL_BODY}[1]");
+        let llm2: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(&annotated));
+        let selected2 = run_citation_backfill_slice(&db, &llm2, &prompts)
+            .await
+            .unwrap();
+        assert_eq!(selected2, 1, "the second slice must select p_resolvable");
+        let resolved = db.get_page("p_resolvable").await.unwrap().unwrap();
+        assert_eq!(
+            resolved.citations.len(),
+            1,
+            "p_resolvable must get annotated on the very next slice, not \
+             starved behind p_orphan: {:?}",
+            resolved.citations
         );
     }
 
