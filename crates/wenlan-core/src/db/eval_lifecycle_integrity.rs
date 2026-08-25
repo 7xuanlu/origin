@@ -37,7 +37,11 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("supersedes scan: {e}")))?;
 
         let mut inputs = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("supersedes row scan: {e}")))?
+        {
             inputs.push(EvalLifecycleSupersedesInput {
                 source_id: row.get(0).unwrap_or_default(),
                 supersedes: row.get(1).unwrap_or(None),
@@ -59,7 +63,11 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("count memories: {e}")))?;
-            if let Ok(Some(row)) = rows.next().await {
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("count memories row: {e}")))?
+            {
                 row.get::<i64>(0).unwrap_or(0) as usize
             } else {
                 0
@@ -74,7 +82,11 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("count archived: {e}")))?;
-            if let Ok(Some(row)) = rows.next().await {
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("count archived row: {e}")))?
+            {
                 row.get::<i64>(0).unwrap_or(0) as usize
             } else {
                 0
@@ -93,7 +105,11 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("count entities: {e}")))?;
-            if let Ok(Some(row)) = rows.next().await {
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("count entities row: {e}")))?
+            {
                 row.get::<i64>(0).unwrap_or(0) as usize
             } else {
                 0
@@ -108,7 +124,11 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("count concepts: {e}")))?;
-            if let Ok(Some(row)) = rows.next().await {
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("count concepts row: {e}")))?
+            {
                 row.get::<i64>(0).unwrap_or(0) as usize
             } else {
                 0
@@ -134,10 +154,15 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("merged ids: {e}")))?;
 
         let mut ids = HashSet::new();
-        while let Ok(Some(row)) = rows.next().await {
-            if let Ok(id) = row.get::<String>(0) {
-                ids.insert(id);
-            }
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("merged ids row scan: {e}")))?
+        {
+            let id = row
+                .get::<String>(0)
+                .map_err(|e| WenlanError::VectorDb(format!("merged ids id: {e}")))?;
+            ids.insert(id);
         }
         Ok(ids)
     }
@@ -156,7 +181,11 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("archive scan: {e}")))?;
 
         let mut inputs = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("archive row scan: {e}")))?
+        {
             inputs.push(EvalLifecycleArchivedInput {
                 source_id: row.get(0).unwrap_or_default(),
                 content: row.get(1).unwrap_or_default(),

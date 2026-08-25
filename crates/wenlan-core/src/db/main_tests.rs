@@ -55400,3 +55400,60 @@ async fn reconstruction_refuses_a_pre_rename_shape_and_serves_a_rewound_one() {
         "the reconstructed table must carry `space`, which is what makes it the post-50 shape"
     );
 }
+
+#[tokio::test]
+async fn strict_page_search_fails_on_a_row_the_lenient_path_skips() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "c_strict",
+        "Strict Decode Probe",
+        Some("summary"),
+        "## Facts\n- strict decode probe body",
+        None,
+        Some("architecture"),
+        &["m1"],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let healthy = db
+        .search_pages("strict decode probe", 10, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        healthy.first().map(|p| p.id.as_str()),
+        Some("c_strict"),
+        "control: page must be findable before corruption"
+    );
+
+    // Every hard-decoded pages column is NOT NULL, libsql panics (rather than
+    // erroring) on a stored type mismatch, and both the DiskANN index and the
+    // pages triggers reject broken writes — so the injectable failure is an
+    // FTS5 shadow-table desync: MATCH then fails at step time, which is
+    // exactly the mid-scan rows.next() Err the strict arm must propagate.
+    db.test_secondary_session()
+        .unwrap()
+        .execute("DELETE FROM pages_fts_data", ())
+        .await
+        .unwrap();
+
+    let err = db
+        .search_pages_strict("strict decode probe", 10, None)
+        .await
+        .expect_err("strict scan must propagate the mid-scan failure");
+    assert!(
+        err.to_string().contains("fts row scan"),
+        "unexpected error: {err}"
+    );
+
+    let lenient = db
+        .search_pages("strict decode probe", 10, None)
+        .await
+        .unwrap();
+    assert!(
+        lenient.iter().any(|p| p.id == "c_strict"),
+        "lenient search must degrade to the vector arm and still return the page"
+    );
+}
