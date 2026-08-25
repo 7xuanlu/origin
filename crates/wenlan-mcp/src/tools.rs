@@ -991,7 +991,9 @@ fn format_capture_success(resp: &StoreMemoryResponse) -> String {
 }
 
 fn daemon_setup_hint() -> &'static str {
-    "Install the local Wenlan runtime and run `wenlan setup`.
+    "If Wenlan is already installed, the daemon may just be stopped: run `wenlan status`, then `wenlan background on`.
+
+Otherwise install the local Wenlan runtime and run `wenlan setup`.
 
 Setup choices:
 - Local Memory: store, search, and recall now. No model download or API key.

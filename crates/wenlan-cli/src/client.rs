@@ -139,7 +139,9 @@ impl WenlanClient {
             Ok(response) => Ok(response),
             Err(error) if error.is_connect() => {
                 let Some(retry) = retry else {
-                    return Err(error).with_context(|| what.to_owned());
+                    return Err(error)
+                        .with_context(|| what.to_owned())
+                        .with_context(|| recovery::connect_failure_hint(&self.base_url));
                 };
                 let original = anyhow::Error::new(error).context(what.to_owned());
                 if let Err(recovery_error) = recovery::recover(&self.base_url).await {
@@ -652,6 +654,24 @@ mod tests {
         let request = build_list_request(Some(20), None, None);
         let json = serde_json::to_value(request).expect("serialize list request");
         assert!(json.get("confirmed").is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_failure_says_what_to_do_next() {
+        let client = client_for("http://127.0.0.1:1").with_recovery(false);
+        let error = client
+            .health()
+            .await
+            .expect_err("nothing listens on port 1");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("no Wenlan daemon is listening at http://127.0.0.1:1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("GET http://127.0.0.1:1/api/health failed"),
+            "{text}"
+        );
     }
 
     fn client_for(base_url: &str) -> WenlanClient {

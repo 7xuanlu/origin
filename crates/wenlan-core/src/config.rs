@@ -238,7 +238,16 @@ pub fn outbox_dir() -> PathBuf {
 pub fn load_config() -> Config {
     let path = config_path();
     let mut config = match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Ok(contents) => match serde_json::from_str(&contents) {
+            Ok(config) => config,
+            Err(error) => {
+                log::warn!(
+                    "[config] {} is not valid JSON ({error}); using defaults until it is fixed",
+                    path.display()
+                );
+                Config::default()
+            }
+        },
         Err(_) => Config::default(),
     };
     config.migrate();

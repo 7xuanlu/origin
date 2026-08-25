@@ -30,6 +30,23 @@ pub(crate) fn is_local_daemon_url(base_url: &str) -> bool {
     )
 }
 
+/// The top line of a connect failure when no automatic start was attempted.
+/// The reqwest chain under it ("tcp connect error ... Connection refused")
+/// says what happened; this says what to do.
+pub(crate) fn connect_failure_hint(base_url: &str) -> String {
+    if !is_local_daemon_url(base_url) {
+        return format!("cannot connect to the Wenlan daemon at {base_url} (from WENLAN_HOST)");
+    }
+    let mut hint = format!(
+        "no Wenlan daemon is listening at {base_url} — run `wenlan status`; if Wenlan is \
+         installed, `wenlan background on` starts it"
+    );
+    if std::env::var_os("WENLAN_NO_AUTOSTART").is_some_and(|value| !value.is_empty()) {
+        hint.push_str(" (WENLAN_NO_AUTOSTART is set, so it was not started automatically)");
+    }
+    hint
+}
+
 pub(crate) async fn recover(base_url: &str) -> Result<()> {
     if !is_local_daemon_url(base_url) {
         anyhow::bail!("recovery is only supported for a loopback daemon");
@@ -77,7 +94,22 @@ pub(crate) async fn poll_health(url: &str, deadline: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{autostart_allowed, is_local_daemon_url, poll_health, NO_SERVICE_HINT};
+    use super::{
+        autostart_allowed, connect_failure_hint, is_local_daemon_url, poll_health, NO_SERVICE_HINT,
+    };
+
+    #[test]
+    fn connect_failure_hint_names_the_next_command_for_a_loopback_daemon() {
+        let hint = connect_failure_hint("http://127.0.0.1:1");
+        assert!(
+            hint.starts_with("no Wenlan daemon is listening at http://127.0.0.1:1"),
+            "{hint}"
+        );
+        assert!(hint.contains("`wenlan background on`"), "{hint}");
+        let remote = connect_failure_hint("http://wenlan.example:7878");
+        assert!(remote.contains("WENLAN_HOST"), "{remote}");
+        assert!(!remote.contains("background on"), "{remote}");
+    }
     use std::io::Write;
     use std::net::TcpListener;
     use std::sync::{

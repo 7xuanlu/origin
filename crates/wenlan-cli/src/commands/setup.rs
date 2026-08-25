@@ -263,13 +263,7 @@ pub async fn run_doctor() -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn print_daemon_log_paths() {
-    let data_root = std::env::var_os("WENLAN_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("wenlan")
-        });
+    let data_root = daemon_data_root();
     let fallback_root = dirs::home_dir()
         .map(|home| home.join("Library/Logs/com.wenlan.server-fallback"))
         .unwrap_or_else(|| std::env::temp_dir().join("wenlan-server-fallback"));
@@ -676,9 +670,75 @@ async fn print_daemon_health() {
         Ok(resp) => println!("Daemon: unhealthy ({})", resp.status()),
         Err(_) => {
             println!("Daemon: not reachable on {}", url);
-            print_downgrade_barrier_hint();
+            let log_path = daemon_data_root().join("logs/wenlan-server.log");
+            match last_daemon_error(&log_path) {
+                Some(line) => {
+                    println!("  Last daemon error ({}):", log_path.display());
+                    println!("    {line}");
+                    if line.contains("newer than this build supports") {
+                        print_downgrade_barrier_hint();
+                    } else {
+                        println!(
+                            "  Fix the cause above, then run `wenlan background on` (or open the Wenlan app)."
+                        );
+                    }
+                }
+                None => {
+                    println!("  No daemon error recorded in {}.", log_path.display());
+                    println!(
+                        "  Start it with `wenlan background on` (or open the Wenlan app); if it stops again, that log says why."
+                    );
+                }
+            }
         }
     }
+}
+
+/// The data root the daemon writes to: `WENLAN_DATA_DIR`, else the
+/// platform data directory (`~/Library/Application Support/wenlan` on macOS).
+fn daemon_data_root() -> std::path::PathBuf {
+    std::env::var_os("WENLAN_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("wenlan")
+        })
+}
+
+/// The last `ERROR` line of the daemon log, colour codes stripped, so a
+/// daemon that exited on purpose (newer schema, missing model, bad data
+/// root) is not reported as merely "not running".
+fn last_daemon_error(log_path: &std::path::Path) -> Option<String> {
+    let contents = std::fs::read_to_string(log_path).ok()?;
+    let line = contents
+        .lines()
+        .map(strip_ansi)
+        .rfind(|line| line.contains("ERROR"))?;
+    let line = line.trim();
+    Some(if line.chars().count() > 400 {
+        format!("{}…", line.chars().take(400).collect::<String>())
+    } else {
+        line.to_string()
+    })
+}
+
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// A daemon that refuses to start because the store was migrated by a newer
@@ -849,4 +909,39 @@ fn prompt_secret(prompt: &str) -> anyhow::Result<String> {
     println!();
     read?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::{last_daemon_error, strip_ansi};
+
+    #[test]
+    fn last_daemon_error_returns_the_final_error_line_without_colour_codes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("wenlan-server.log");
+        std::fs::write(
+            &log,
+            concat!(
+                "\x1b[2m2026-08-25T07:01:52Z\x1b[0m \x1b[33m WARN\x1b[0m wenlan_core::db: creating schema...\n",
+                "\x1b[2m2026-08-25T07:01:53Z\x1b[0m \x1b[31mERROR\x1b[0m wenlan_server: first failure\n",
+                "\x1b[2m2026-08-25T07:01:54Z\x1b[0m \x1b[31mERROR\x1b[0m wenlan_server: wenlan-server terminated with an error: Embedding error: could not load the embedding model\n",
+                "\x1b[2m2026-08-25T07:01:55Z\x1b[0m \x1b[32m INFO\x1b[0m wenlan_server: bye\n",
+            ),
+        )
+        .expect("write log");
+        let line = last_daemon_error(&log).expect("an ERROR line");
+        assert!(!line.contains('\x1b'), "{line}");
+        assert!(
+            line.ends_with("could not load the embedding model"),
+            "{line}"
+        );
+        assert!(line.starts_with("2026-08-25T07:01:54Z"), "{line}");
+        assert_eq!(last_daemon_error(&dir.path().join("missing.log")), None);
+    }
+
+    #[test]
+    fn strip_ansi_leaves_plain_text_alone() {
+        assert_eq!(strip_ansi("plain ERROR line"), "plain ERROR line");
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+    }
 }
