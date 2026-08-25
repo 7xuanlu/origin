@@ -395,7 +395,14 @@ async fn record_annotate_failure(
                 expected_source_revision,
             )
             .await;
-        let _ = db.set_app_metadata(&key, "0").await;
+        // Terminal write: `citations` is now poison-pilled to `[]`, so no
+        // future write will ever key on this (page, version,
+        // source_revision) generation again. Delete the counter rather than
+        // resetting it to "0" so app_metadata doesn't keep one dead row per
+        // generation forever.
+        let _ = db
+            .delete_app_metadata_prefix(&format!("citation_backfill_attempts:{page_id}:"))
+            .await;
     } else {
         let _ = db.set_app_metadata(&key, &attempts.to_string()).await;
         log::info!(
@@ -458,8 +465,14 @@ async fn run_citation_backfill_with_page_limit(
         // two reads shows up in `source_revision` but not in
         // `page.source_memory_ids` -- both fences would then pass on a
         // write that still carries the old source list and drops the
-        // freshly attached source.
-        let source_revision = db.get_page_source_revision(&page_id).await?;
+        // freshly attached source. Use the tolerant read here: a page
+        // deleted between selection (`get_pages_missing_citations`, above)
+        // and this read must skip like the `get_page` miss right below it,
+        // not abort the whole slice with `get_page_source_revision`'s
+        // does-not-exist error.
+        let Some(source_revision) = db.try_get_page_source_revision(&page_id).await? else {
+            continue;
+        };
         let Some(page) = db.get_page(&page_id).await? else {
             continue;
         };
@@ -493,6 +506,14 @@ async fn run_citation_backfill_with_page_limit(
                     page.version,
                     source_revision,
                 )
+                .await;
+            // Terminal write (poison-pilled to `[]`): clean up any attempt
+            // rows a prior guard-rejection/provider-error left behind for
+            // this generation before evidence dropped to zero, so
+            // app_metadata doesn't keep a dead row this give-up itself never
+            // wrote.
+            let _ = db
+                .delete_app_metadata_prefix(&format!("citation_backfill_attempts:{page_id}:"))
                 .await;
             continue;
         }
@@ -556,6 +577,11 @@ async fn run_citation_backfill_with_page_limit(
                     page.version,
                     source_revision,
                 )
+                .await;
+            // Terminal write; same cleanup as the "no source evidence"
+            // give-up above.
+            let _ = db
+                .delete_app_metadata_prefix(&format!("citation_backfill_attempts:{page_id}:"))
                 .await;
             continue;
         }
@@ -642,11 +668,13 @@ async fn run_citation_backfill_with_page_limit(
                     )
                     .await?;
                 if committed {
+                    // Terminal write (citations now populated): delete
+                    // rather than reset the counter so app_metadata doesn't
+                    // keep a dead row per generation forever.
                     let _ = db
-                        .set_app_metadata(
-                            &attempt_key(&page_id, page.version, source_revision),
-                            "0",
-                        )
+                        .delete_app_metadata_prefix(&format!(
+                            "citation_backfill_attempts:{page_id}:"
+                        ))
                         .await;
                 }
             }
@@ -1272,9 +1300,161 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            attempts.as_deref(),
-            Some("0"),
-            "attempt key must be cleared"
+            attempts, None,
+            "the terminal write must delete the attempt row, not reset it to \"0\", so \
+             app_metadata doesn't keep a dead row per drained generation"
+        );
+    }
+
+    /// Count `app_metadata` rows keyed under a page's attempt-counter
+    /// prefix. Used to check `delete_app_metadata_prefix` cleanup instead of
+    /// a single known key, since the point of the fix is that NO row for
+    /// this page survives a terminal write, not just the current
+    /// generation's.
+    async fn count_attempt_rows(db: &crate::db::MemoryDB, page_id: &str) -> i64 {
+        let conn = db.test_primary_session().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM app_metadata WHERE key LIKE ?1",
+                libsql::params![format!("citation_backfill_attempts:{page_id}:%")],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    /// Round-4 finding (LOW): every terminal citation write (annotate
+    /// success, attempts-exhausted `[]`, give-up `[]`) used to leave the
+    /// attempt-key row behind forever -- success and the poison-pill wrote
+    /// `"0"` instead of deleting, and the give-up paths never touched the
+    /// key at all even when an earlier failed attempt on the same
+    /// generation had left one. One `app_metadata` row per (page, version,
+    /// source_revision) accumulated permanently. Fixed by
+    /// `delete_app_metadata_prefix`, called on every terminal write instead
+    /// of `set_app_metadata(key, "0")`.
+    #[tokio::test]
+    async fn backfill_terminal_writes_delete_the_attempt_key_prefix() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let prompts = PromptRegistry::default();
+
+        // An unrelated key must survive every cleanup below.
+        db.set_app_metadata("citation_backfill_attempts:unrelated_page:v1:s1", "2")
+            .await
+            .unwrap();
+
+        // -- Success case -- built manually (not `seed_backfill_page`,
+        // which hardcodes evidence memory id "mem_a" and would collide with
+        // the poison-pill page's own seeding below).
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_page(
+            "p_cleanup_success",
+            "T",
+            None,
+            BACKFILL_BODY,
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        insert_test_memory(&db, "mem_cleanup_success", BACKFILL_MEM_CONTENT).await;
+        db.link_page_evidence(
+            "p_cleanup_success",
+            "memory",
+            Some("mem_cleanup_success"),
+            None,
+            "test",
+        )
+        .await
+        .unwrap();
+        let version = db
+            .get_page("p_cleanup_success")
+            .await
+            .unwrap()
+            .unwrap()
+            .version;
+        let source_revision = db
+            .get_page_source_revision("p_cleanup_success")
+            .await
+            .unwrap();
+        // A stray row from an earlier failed attempt on this exact
+        // generation, proving the delete removes something real rather
+        // than deleting nothing.
+        db.set_app_metadata(
+            &attempt_key("p_cleanup_success", version, source_revision),
+            "1",
+        )
+        .await
+        .unwrap();
+
+        let annotated = format!("{BACKFILL_BODY}[1]");
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(&annotated));
+        run_citation_backfill_slice(&db, &llm, &prompts)
+            .await
+            .unwrap();
+        let page = db.get_page("p_cleanup_success").await.unwrap().unwrap();
+        assert_eq!(
+            page.citations.len(),
+            1,
+            "sanity: p_cleanup_success must have actually succeeded"
+        );
+        assert_eq!(
+            count_attempt_rows(&db, "p_cleanup_success").await,
+            0,
+            "the annotate-success terminal write must delete every attempt row for this page"
+        );
+
+        // -- Poison-pill case --
+        db.insert_page(
+            "p_cleanup_poison",
+            "T",
+            None,
+            BACKFILL_BODY,
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        insert_test_memory(&db, "mem_cleanup_poison", BACKFILL_MEM_CONTENT).await;
+        db.link_page_evidence(
+            "p_cleanup_poison",
+            "memory",
+            Some("mem_cleanup_poison"),
+            None,
+            "test",
+        )
+        .await
+        .unwrap();
+        let rewritten = "A completely different sentence about something else.[1]";
+        let llm_poison: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(rewritten));
+        for _ in 0..3 {
+            run_citation_backfill_slice(&db, &llm_poison, &prompts)
+                .await
+                .unwrap();
+        }
+        assert!(
+            !db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&"p_cleanup_poison".to_string()),
+            "sanity: p_cleanup_poison must have actually poison-pilled"
+        );
+        assert_eq!(
+            count_attempt_rows(&db, "p_cleanup_poison").await,
+            0,
+            "the attempts-exhausted terminal write must delete every attempt row for this page"
+        );
+
+        assert_eq!(
+            db.get_app_metadata("citation_backfill_attempts:unrelated_page:v1:s1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("2"),
+            "an unrelated key must survive both cleanups above"
         );
     }
 
@@ -1309,9 +1489,10 @@ mod tests {
             "the third provider failure must terminally drain this Page generation"
         );
         assert_eq!(
-            db.get_app_metadata(&key).await.unwrap().as_deref(),
-            Some("0"),
-            "the terminal attempt must clear the generation-scoped counter"
+            db.get_app_metadata(&key).await.unwrap(),
+            None,
+            "the terminal attempt must delete the generation-scoped counter, not reset it to \
+             \"0\""
         );
         let log = db.get_page_changelog("p_provider_error").await.unwrap();
         assert!(
@@ -1613,6 +1794,112 @@ mod tests {
             "p_resolvable must get annotated on the very next slice, not \
              starved behind p_orphan: {:?}",
             resolved.citations
+        );
+    }
+
+    /// Round-4 finding (LOW): `get_page_source_revision` errors with
+    /// `Validation("page '...' does not exist")` on a missing row. The
+    /// backfill loop's first per-page read used to be that call, so a page
+    /// deleted between selection (`get_pages_missing_citations`, which
+    /// materializes the whole batch up front) and its own turn in the loop
+    /// aborted the ENTIRE slice with `Err`, discarding whatever pages ahead
+    /// of it in the batch had already been annotated. Fixed by
+    /// `try_get_page_source_revision` (`Ok(None)` on a missing row) plus a
+    /// `continue`, mirroring the existing `get_page` miss right below it.
+    ///
+    /// There is no live interposable await between `get_pages_missing_citations`
+    /// and the first page's read (same reasoning as the read-order tests
+    /// above), so this races the SECOND selected page's read against the
+    /// FIRST page's blocking LLM call instead: two pages selected in one
+    /// batch, the second deleted while the first is still mid-flight (proof
+    /// the batch really did contain both before either was fully
+    /// processed), first finishes and gets annotated normally, the loop
+    /// then reaches the now-missing second page.
+    #[tokio::test]
+    async fn backfill_slice_skips_a_page_deleted_after_selection_instead_of_erroring() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        // Explicit timestamps: `get_pages_missing_citations` orders
+        // `last_modified ASC`, so p_first is selected/processed before
+        // p_deleted_mid_slice.
+        db.insert_page(
+            "p_first",
+            "T",
+            None,
+            BACKFILL_BODY,
+            None,
+            None,
+            &[],
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        insert_test_memory(&db, "mem_first", BACKFILL_MEM_CONTENT).await;
+        db.link_page_evidence("p_first", "memory", Some("mem_first"), None, "test")
+            .await
+            .unwrap();
+
+        let later = chrono::Utc::now().to_rfc3339();
+        db.insert_page(
+            "p_deleted_mid_slice",
+            "T",
+            None,
+            BACKFILL_BODY,
+            None,
+            None,
+            &[],
+            &later,
+        )
+        .await
+        .unwrap();
+        insert_test_memory(&db, "mem_deleted", BACKFILL_MEM_CONTENT).await;
+        db.link_page_evidence(
+            "p_deleted_mid_slice",
+            "memory",
+            Some("mem_deleted"),
+            None,
+            "test",
+        )
+        .await
+        .unwrap();
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let llm: Arc<dyn LlmProvider> = Arc::new(BlockingCitationProvider {
+            entered: entered.clone(),
+            release: release.clone(),
+            response: format!("{BACKFILL_BODY}[1]"),
+        });
+        let db = Arc::new(db);
+        let task = {
+            let db = db.clone();
+            let llm = llm.clone();
+            tokio::spawn(async move {
+                run_citation_backfill_with_page_limit(&db, &llm, &PromptRegistry::default(), 2)
+                    .await
+            })
+        };
+
+        // p_first has entered its (blocked) LLM call -- both pages were
+        // already selected into the batch by this point.
+        entered.notified().await;
+        db.delete_page("p_deleted_mid_slice").await.unwrap();
+        release.notify_one();
+
+        let selected = task
+            .await
+            .unwrap()
+            .expect("a page deleted mid-slice must be skipped, not error the whole slice");
+        assert_eq!(
+            selected, 2,
+            "the slice must still report both pages as selected"
+        );
+
+        let page = db.get_page("p_first").await.unwrap().unwrap();
+        assert_eq!(
+            page.citations.len(),
+            1,
+            "p_first, selected ahead of the deleted page, must still be annotated: {:?}",
+            page.citations
         );
     }
 

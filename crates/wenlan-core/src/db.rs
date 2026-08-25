@@ -53360,6 +53360,37 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("get_page_source_revision: {e}")))
     }
 
+    /// Same token as [`Self::get_page_source_revision`], but tolerant of the
+    /// page having been deleted: `Ok(None)` when the row is missing, `Err`
+    /// only on an actual database error. Callers that select page ids and
+    /// then read them back one at a time (e.g. the citation backfill slice)
+    /// need this instead of the panic-on-missing variant, so a page deleted
+    /// between selection and read is skipped rather than aborting the whole
+    /// slice.
+    pub async fn try_get_page_source_revision(
+        &self,
+        page_id: &str,
+    ) -> Result<Option<i64>, WenlanError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COALESCE(source_revision, 0) FROM pages WHERE id = ?1",
+                libsql::params![page_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("try_get_page_source_revision: {e}")))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("try_get_page_source_revision: {e}")))?
+        else {
+            return Ok(None);
+        };
+        row.get::<i64>(0)
+            .map(Some)
+            .map_err(|e| WenlanError::VectorDb(format!("try_get_page_source_revision: {e}")))
+    }
+
     /// A verified refresh can produce byte-identical prose and sources. In
     /// that case advance only the compile watermark and clear the exact stale
     /// work item; do not invent a prose version or changelog entry.
@@ -55133,6 +55164,28 @@ impl MemoryDB {
         )
         .await
         .map_err(|e| WenlanError::VectorDb(format!("set_app_metadata: {}", e)))?;
+        Ok(())
+    }
+
+    /// Delete every app_metadata row whose key starts with `prefix`. Used by
+    /// per-generation counters (e.g. the citation backfill's
+    /// `citation_backfill_attempts:{page_id}:v{version}:s{source_revision}`
+    /// keys) to clean up on every terminal write instead of accumulating one
+    /// row per generation forever. `%` and `_` are LIKE wildcards in SQLite;
+    /// both are escaped so a literal `%` or `_` inside `prefix` (e.g. inside
+    /// a page id) is matched as itself, never as a wildcard.
+    pub async fn delete_app_metadata_prefix(&self, prefix: &str) -> Result<(), WenlanError> {
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM app_metadata WHERE key LIKE ?1 || '%' ESCAPE '\\'",
+            libsql::params![escaped],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("delete_app_metadata_prefix: {}", e)))?;
         Ok(())
     }
 
