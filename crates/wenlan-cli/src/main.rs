@@ -100,7 +100,7 @@ enum Commands {
     },
     /// Connect Wenlan to a supported agent or editor.
     Connect(commands::mcp::ConnectArgs),
-    /// Search memories and pages by query (hybrid vector + keyword); --limit controls the count.
+    /// Search memories and pages by query (hybrid vector + keyword); --limit caps the primary results, plus up to 3 supplemental pages.
     Search {
         /// Search query.
         query: String,
@@ -108,7 +108,7 @@ enum Commands {
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
     },
-    /// Recall the memories most relevant to a query (memories only, scored, top 20).
+    /// Recall scored memories for a query (up to 20; the table shows the top 10, JSON also carries supplemental pages).
     Recall {
         /// Query to recall memories for.
         query: String,

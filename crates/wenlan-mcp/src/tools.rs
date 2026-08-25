@@ -2528,7 +2528,7 @@ impl WenlanMcpServer {
     }
 
     #[tool(
-        description = "Create or refresh a distilled wiki page. Omit page_id to create a new page (title required); the daemon writes the DB row and the on-disk ~/.wenlan/pages/<slug>.md projection atomically. Pass page_id (from the `stale_pages` block in distill output) to refresh that page in place — replaces content + source_memory_ids + optional summary, clears stale_reason, preserves page_id and created_at, bumps version monotonically so external [[wikilinks]] keep working. Never delete_page + recreate to refresh: that churns ids and loses version history. Refresh is not available over remote HTTP MCP transport (local stdio only).",
+        description = "Create or refresh a distilled wiki page. Omit page_id to create a new page (title required); the daemon writes the DB row and the on-disk <pages dir>/<slug>.md projection atomically (default ~/.wenlan/pages/, slug made unique on collision). Pass page_id (from the `stale_pages` block in distill output) to refresh that page in place — replaces content + source_memory_ids + optional summary, clears stale_reason, preserves page_id and created_at, bumps version monotonically so external [[wikilinks]] keep working. Never delete_page + recreate to refresh: that churns ids and loses version history. Refresh is not available over remote HTTP MCP transport (local stdio only).",
         annotations(
             title = "Write page",
             read_only_hint = false,
