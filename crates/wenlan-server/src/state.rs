@@ -150,6 +150,22 @@ pub struct ServerState {
     pub optional_runtime_workers_suspended: bool,
     pub lint_config: LintServerConfig,
     pub lint_observer: Arc<dyn LintRunObserver>,
+    /// Latest resource/host-activity admission the background ambient
+    /// scheduler tick observed, published each tick so `GET
+    /// /api/ambient/status` can report the idle gate's current state without
+    /// independently re-sampling CPU/host-activity (a fresh sampler would
+    /// always disagree during its own warm-up window). `None` before the
+    /// scheduler's first post-startup tick.
+    pub ambient_gate: Arc<std::sync::Mutex<Option<crate::scheduler::AmbientGateSnapshot>>>,
+    /// Mutual exclusion between `POST /api/ambient/sweep` and the
+    /// scheduler's own passive ambient-lane execution. Both sides run the
+    /// same nine ambient jobs against the same on-device LLM and DB rows;
+    /// letting them run at once would double LLM contention and risks two
+    /// callers claiming the same document/page. The force-sweep endpoint
+    /// holds this for its entire lap; the scheduler tick only `try_lock`s it
+    /// and skips its whole ambient section for that tick if held — it must
+    /// never block its other duties waiting for a multi-minute sweep.
+    pub ambient_run_lock: Arc<Mutex<()>>,
 }
 
 impl Default for ServerState {
@@ -183,6 +199,8 @@ impl Default for ServerState {
             optional_runtime_workers_suspended: false,
             lint_config: LintServerConfig::default(),
             lint_observer: Arc::new(NoopLintRunObserver),
+            ambient_gate: Arc::new(std::sync::Mutex::new(None)),
+            ambient_run_lock: Arc::new(Mutex::new(())),
         }
     }
 }

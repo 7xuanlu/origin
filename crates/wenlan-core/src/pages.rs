@@ -19,6 +19,26 @@ pub enum PageDraftDeleteOutcome {
     VersionConflict { current_version: i64 },
 }
 
+/// Result of publishing a Page draft as an active Page.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum PageDraftPublishOutcome {
+    Published(Page),
+    VersionConflict {
+        current_version: i64,
+    },
+    /// Another active Page in the same scope already carries this trimmed,
+    /// case-insensitively equal title.
+    TitleConflict {
+        existing_page_id: String,
+        existing_page_title: String,
+        /// Stored (sentinel-mirrored) scope the conflict was found in. The
+        /// disclosure recheck needs it: a page moved to another space after
+        /// the publish transaction is no longer this conflict.
+        scope: String,
+    },
+}
+
 /// Generate a new unique page ID.
 ///
 /// Replaces the former `Page::new_id()` associated function now that `Page`

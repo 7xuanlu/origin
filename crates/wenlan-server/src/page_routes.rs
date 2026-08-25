@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::error::ServerError;
 use crate::memory_routes::extract_agent_name;
-use crate::route_registry::{get, post, TrackedRouter};
+use crate::route_registry::{get, post, put, TrackedRouter};
 use crate::state::{ServerState, SharedState};
 use axum::{
     extract::{Path, State},
@@ -11,8 +11,11 @@ use axum::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use wenlan_types::requests::{CreateConceptRequest, ExportPagesRequest, SearchPagesRequest};
-use wenlan_types::responses::CreatePageResponse;
+use wenlan_types::requests::{
+    CreateConceptRequest, CreatePageDraftRequest, ExportPagesRequest, PageDraftVersionRequest,
+    SearchPagesRequest, UpdatePageDraftRequest,
+};
+use wenlan_types::responses::{CreatePageResponse, PageDraftResponse};
 use wenlan_types::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};
 
 pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
@@ -22,6 +25,15 @@ pub(crate) fn register(router: TrackedRouter<SharedState>) -> TrackedRouter<Shar
             get(handle_list_pages).post(handle_create_page),
         )
         .route("/api/pages/search", post(handle_search_pages))
+        .route("/api/pages/drafts", post(handle_create_page_draft))
+        .route(
+            "/api/pages/drafts/{id}",
+            put(handle_update_page_draft).delete(handle_discard_page_draft),
+        )
+        .route(
+            "/api/pages/drafts/{id}/publish",
+            post(handle_publish_page_draft),
+        )
         .route("/api/pages/export", post(handle_export_pages))
         .route(
             "/api/pages/recent-changes",
@@ -325,6 +337,253 @@ pub async fn handle_create_page(
             WriteOutcome::Created
         }),
     }))
+}
+
+/// Map core draft errors onto the editor's wire contract.
+///
+/// The desktop editor (`src/lib/tauri.ts` `parsePageDraftError`) parses a JSON
+/// object with a `code` field out of the error text; the codes and messages
+/// here mirror `e2e/tauriMock/runtime.ts`, the executable spec the UI is
+/// tested against. Anything uncoded (validation, internal) falls through to
+/// the plain `ServerError` mapping.
+fn page_draft_error(err: wenlan_core::WenlanError) -> ServerError {
+    match err {
+        wenlan_core::WenlanError::PageDraftIdConflict(_) => ServerError::Structured {
+            status: axum::http::StatusCode::CONFLICT,
+            body: serde_json::json!({
+                "code": "page_draft_id_conflict",
+                "error": "Page draft id already belongs to another Page",
+            }),
+        },
+        wenlan_core::WenlanError::NotFound(_) => draft_not_found(),
+        other => ServerError::from(other),
+    }
+}
+
+fn draft_not_found() -> ServerError {
+    ServerError::Structured {
+        status: axum::http::StatusCode::NOT_FOUND,
+        body: serde_json::json!({
+            "code": "page_draft_not_found",
+            "error": "Page draft not found",
+        }),
+    }
+}
+
+/// Pass a draft-chain page echo through the caller's truth grant, the same
+/// contract as `handle_get_page`: a page this caller may not see is not there,
+/// and the structured draft 404 is the honest wire answer. Fresh drafts and
+/// publishes are `Unevaluated` and pass in full; this bites only when a
+/// publish replay echoes a page since classified unsupported.
+async fn filter_draft_echo(
+    db: &wenlan_core::db::MemoryDB,
+    view: &crate::truth_guard::TruthView,
+    page: wenlan_core::pages::Page,
+) -> Result<wenlan_core::pages::Page, ServerError> {
+    wenlan_core::truth_adapter::filter_page(db, &view.grant, Some(page))
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?
+        .ok_or_else(draft_not_found)
+}
+
+/// Decide whether a publish title-conflict 409 may disclose the conflicting
+/// page's identity, and if so, which identity. Page ids are reusable, so the
+/// pair captured inside the publish transaction can be stale by the time the
+/// handler runs. `MemoryDB::conflict_identity_snapshot` makes the row reload,
+/// the truth verdict, and the title-fold recheck under one connection guard,
+/// so no concurrent rename, delete, or id reuse can split the visibility
+/// decision from the disclosed identity. Any failure degrades to omission —
+/// the 409 itself is already established and never turns into a 500 here.
+async fn visible_conflict_identity(
+    db: &wenlan_core::db::MemoryDB,
+    view: &crate::truth_guard::TruthView,
+    existing_page_id: &str,
+    wanted_key: &str,
+    expected_scope: &str,
+) -> Option<(String, String)> {
+    match db
+        .conflict_identity_snapshot(&view.grant, existing_page_id, wanted_key, expected_scope)
+        .await
+    {
+        Ok(identity) => identity,
+        Err(e) => {
+            tracing::warn!(
+                "[page] conflict identity check failed for {existing_page_id}; omitting: {e}"
+            );
+            None
+        }
+    }
+}
+
+fn draft_version_conflict(current_version: i64) -> ServerError {
+    ServerError::Structured {
+        status: axum::http::StatusCode::CONFLICT,
+        body: serde_json::json!({
+            "code": "draft_version_conflict",
+            "error": "Page draft changed since it was loaded",
+            "current_version": current_version,
+        }),
+    }
+}
+
+async fn draft_db(
+    state: &Arc<RwLock<ServerState>>,
+) -> Result<Arc<wenlan_core::db::MemoryDB>, ServerError> {
+    let s = state.read().await;
+    s.db.clone().ok_or(ServerError::DbNotInitialized)
+}
+
+/// POST /api/pages/drafts
+///
+/// First durable snapshot of a human-authored Page draft. An omitted `space`
+/// key inherits the `X-Wenlan-Space` header; an explicit `null` clears it.
+pub async fn handle_create_page_draft(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    view: crate::truth_guard::TruthView,
+    Json(req): Json<CreatePageDraftRequest>,
+) -> Result<Json<PageDraftResponse>, ServerError> {
+    let db = draft_db(&state).await?;
+    let space = if req.space_was_provided() {
+        req.space.clone()
+    } else {
+        header_space
+    };
+    let page = db
+        .create_page_draft_with_id_in_registered_space(
+            &req.draft_id,
+            &req.title,
+            &req.content,
+            space.as_deref(),
+        )
+        .await
+        .map_err(page_draft_error)?;
+    let page = filter_draft_echo(&db, &view, page).await?;
+    Ok(Json(PageDraftResponse { page }))
+}
+
+/// PUT /api/pages/drafts/{id}
+pub async fn handle_update_page_draft(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    view: crate::truth_guard::TruthView,
+    Path(id): Path<String>,
+    Json(req): Json<UpdatePageDraftRequest>,
+) -> Result<Json<PageDraftResponse>, ServerError> {
+    let db = draft_db(&state).await?;
+    match db
+        .update_page_draft_in_registered_space(
+            &id,
+            req.expected_version,
+            &req.title,
+            &req.content,
+            req.space.as_deref(),
+        )
+        .await
+        .map_err(page_draft_error)?
+    {
+        wenlan_core::pages::PageDraftUpdateOutcome::Updated(page) => {
+            let page = filter_draft_echo(&db, &view, page).await?;
+            Ok(Json(PageDraftResponse { page }))
+        }
+        wenlan_core::pages::PageDraftUpdateOutcome::VersionConflict { current_version } => {
+            Err(draft_version_conflict(current_version))
+        }
+    }
+}
+
+/// POST /api/pages/drafts/{id}/publish
+pub async fn handle_publish_page_draft(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    view: crate::truth_guard::TruthView,
+    Path(id): Path<String>,
+    Json(req): Json<PageDraftVersionRequest>,
+) -> Result<Json<PageDraftResponse>, ServerError> {
+    let (db, page_root) = {
+        let s = state.read().await;
+        (
+            s.db.clone().ok_or(ServerError::DbNotInitialized)?,
+            s.lint_config.page_root().map(std::path::Path::to_path_buf),
+        )
+    };
+    let page = match db
+        .publish_page_draft(&id, req.expected_version)
+        .await
+        .map_err(page_draft_error)?
+    {
+        wenlan_core::pages::PageDraftPublishOutcome::Published(page) => page,
+        wenlan_core::pages::PageDraftPublishOutcome::VersionConflict { current_version } => {
+            return Err(draft_version_conflict(current_version))
+        }
+        wenlan_core::pages::PageDraftPublishOutcome::TitleConflict {
+            existing_page_id,
+            existing_page_title,
+            scope,
+        } => {
+            let disclosed = visible_conflict_identity(
+                &db,
+                &view,
+                &existing_page_id,
+                &wenlan_core::db::MemoryDB::page_title_key(&existing_page_title),
+                &scope,
+            )
+            .await;
+            let mut body = serde_json::json!({
+                "code": "page_title_conflict",
+                "error": "A Page with this title already exists",
+            });
+            if let Some((current_id, current_title)) = disclosed {
+                body["existing_page_id"] = current_id.into();
+                body["existing_page_title"] = current_title.into();
+            }
+            return Err(ServerError::Structured {
+                status: axum::http::StatusCode::CONFLICT,
+                body,
+            });
+        }
+    };
+    let page = filter_draft_echo(&db, &view, page).await?;
+    // First projection write for this page: `reconcile` only repairs pages
+    // already in the projection state, so skipping here would leave the
+    // published page invisible to `wenlan pages` until another write projects
+    // it. Same root as `handle_create_page` (None disables projection);
+    // DB-first with a warn on projection failure mirrors `handle_delete_page`:
+    // the publish must not be reported as failed once the row flipped.
+    if let Some(page_root) = page_root {
+        let projection =
+            wenlan_core::export::knowledge::KnowledgeProjectionWrite::new(page_root, &db);
+        if let Err(e) = projection.write_page_gated(&db, &page).await {
+            tracing::warn!(
+                "[page] draft {} published but md projection write failed: {}",
+                page.id,
+                e
+            );
+        }
+    }
+    Ok(Json(PageDraftResponse { page }))
+}
+
+/// DELETE /api/pages/drafts/{id}
+///
+/// Drafts are never projected to md, so unlike `handle_delete_page` there is
+/// no projection cleanup here.
+pub async fn handle_discard_page_draft(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    Path(id): Path<String>,
+    Json(req): Json<PageDraftVersionRequest>,
+) -> Result<Json<serde_json::Value>, ServerError> {
+    let db = draft_db(&state).await?;
+    match db
+        .delete_page_draft(&id, req.expected_version)
+        .await
+        .map_err(page_draft_error)?
+    {
+        wenlan_core::pages::PageDraftDeleteOutcome::Deleted => {
+            Ok(Json(serde_json::json!({"status": "deleted"})))
+        }
+        wenlan_core::pages::PageDraftDeleteOutcome::VersionConflict { current_version } => {
+            Err(draft_version_conflict(current_version))
+        }
+    }
 }
 
 fn normalize_page_write_target(
@@ -1400,6 +1659,149 @@ mod create_page_endpoint_tests {
             pages.len(),
             2,
             "below configured threshold should mint a new page"
+        );
+    }
+}
+
+#[cfg(test)]
+mod conflict_identity_tests {
+    use super::visible_conflict_identity;
+    use crate::truth_guard::TruthView;
+    use std::sync::Arc;
+    use wenlan_core::db::MemoryDB;
+
+    const PAGE: &str = "page_00000000-0000-4000-8000-0000000000c1";
+    /// Stored scope of an unfiled publish: the M1 sentinel space id.
+    const SCOPE: &str = "00000000-0000-4000-8000-000000000001";
+
+    async fn test_db() -> (Arc<MemoryDB>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let emitter: Arc<dyn wenlan_core::events::EventEmitter> =
+            Arc::new(wenlan_core::events::NoopEmitter);
+        let db = Arc::new(MemoryDB::new(tmp.path(), emitter).await.unwrap());
+        (db, tmp)
+    }
+
+    async fn publish(db: &MemoryDB, id: &str, title: &str) -> wenlan_core::pages::Page {
+        let draft = db
+            .create_page_draft_with_id(id, title, "Body", None, None)
+            .await
+            .unwrap();
+        match db.publish_page_draft(id, draft.version).await.unwrap() {
+            wenlan_core::pages::PageDraftPublishOutcome::Published(page) => page,
+            _ => panic!("expected a clean publish"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_visible_conflicting_page_discloses_its_current_identity() {
+        let (db, _tmp) = test_db().await;
+        let page = publish(&db, PAGE, "Secret Plan").await;
+        let wanted = MemoryDB::page_title_key("  secret PLAN ");
+        let got =
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted, SCOPE).await;
+        assert_eq!(got, Some((page.id, page.title)));
+    }
+
+    #[tokio::test]
+    async fn a_concurrently_deleted_page_degrades_to_omission() {
+        let (db, _tmp) = test_db().await;
+        publish(&db, PAGE, "Secret Plan").await;
+        db.delete_page(PAGE).await.unwrap();
+        let wanted = MemoryDB::page_title_key("Secret Plan");
+        assert_eq!(
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted, SCOPE).await,
+            None
+        );
+    }
+
+    /// Replace the row's title out from under the open `MemoryDB`, the way a
+    /// concurrent writer would between the publish transaction and the
+    /// handler's reload. Same direct-file seam as the routes tests.
+    async fn overwrite_title(tmp: &tempfile::TempDir, id: &str, title: &str) {
+        let raw = libsql::Builder::new_local(tmp.path().join("origin_memory.db"))
+            .build()
+            .await
+            .unwrap();
+        let conn = raw.connect().unwrap();
+        conn.execute(
+            "UPDATE pages SET title = ?1 WHERE id = ?2",
+            libsql::params![title, id],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_replaced_row_with_an_unrelated_title_stays_omitted() {
+        // Page ids are reusable and rows are mutable: between the publish
+        // transaction and this reload the id can hold a different title. The
+        // reloaded row no longer folds to the conflicting title, so neither
+        // the stale captured title nor the new row's title may be disclosed.
+        let (db, tmp) = test_db().await;
+        publish(&db, PAGE, "Secret Plan").await;
+        overwrite_title(&tmp, PAGE, "Innocuous Note").await;
+        let wanted = MemoryDB::page_title_key("Secret Plan");
+        assert_eq!(
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted, SCOPE).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_row_still_folding_to_the_conflict_discloses_the_reloaded_row() {
+        let (db, tmp) = test_db().await;
+        let page = publish(&db, PAGE, "Secret Plan").await;
+        overwrite_title(&tmp, PAGE, "SECRET plan").await;
+        let wanted = MemoryDB::page_title_key("Secret Plan");
+        let got =
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted, SCOPE).await;
+        // The identity comes from the reloaded row, never the stale capture.
+        assert_eq!(got, Some((page.id, "SECRET plan".to_string())));
+    }
+
+    /// Same direct-file seam as `overwrite_title`, for an arbitrary column.
+    async fn overwrite_column(tmp: &tempfile::TempDir, id: &str, column: &str, value: &str) {
+        let raw = libsql::Builder::new_local(tmp.path().join("origin_memory.db"))
+            .build()
+            .await
+            .unwrap();
+        let conn = raw.connect().unwrap();
+        conn.execute(
+            &format!("UPDATE pages SET {column} = ?1 WHERE id = ?2"),
+            libsql::params![value, id],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_page_moved_to_another_space_degrades_to_omission() {
+        // The publish found the conflict in one scope; if the page moves to a
+        // different space before the handler reloads it, it is no longer that
+        // conflict and its identity must not be disclosed.
+        let (db, tmp) = test_db().await;
+        publish(&db, PAGE, "Secret Plan").await;
+        overwrite_column(&tmp, PAGE, "space", "another-space").await;
+        let wanted = MemoryDB::page_title_key("Secret Plan");
+        assert_eq!(
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted, SCOPE).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entity_shadow_conflict_stays_omitted() {
+        // Publish treats entity shadow pages as conflicts, but conflict
+        // responses have never disclosed their identity; the snapshot must
+        // keep that fence.
+        let (db, tmp) = test_db().await;
+        publish(&db, PAGE, "Secret Plan").await;
+        overwrite_column(&tmp, PAGE, "kind", "entity").await;
+        let wanted = MemoryDB::page_title_key("Secret Plan");
+        assert_eq!(
+            visible_conflict_identity(&db, &TruthView::automatic(), PAGE, &wanted, SCOPE).await,
+            None
         );
     }
 }

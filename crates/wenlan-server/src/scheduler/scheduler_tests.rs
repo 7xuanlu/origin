@@ -386,6 +386,84 @@ fn ambient_schedule_round_robins_all_due_jobs() {
 }
 
 #[test]
+fn drain_due_returns_the_full_lap_in_cursor_order_when_everything_is_due() {
+    let now = Instant::now();
+    let mut schedule = AmbientSchedule::new(now);
+    let available = AmbientAvailability {
+        document: true,
+        classification: true,
+        structured_extract: true,
+        entity: true,
+        title: true,
+        page_growth: true,
+        reconcile: true,
+        citation: true,
+        edge_grounding_promote: true,
+    };
+    assert_eq!(
+        schedule.drain_due(now, available),
+        vec![
+            AmbientJob::Document,
+            AmbientJob::Classification,
+            AmbientJob::StructuredExtract,
+            AmbientJob::Entity,
+            AmbientJob::Title,
+            AmbientJob::PageGrowth,
+            AmbientJob::Reconcile,
+            AmbientJob::Citation,
+            AmbientJob::EdgeGroundingPromote,
+        ]
+    );
+}
+
+#[test]
+fn drain_due_lets_a_later_cursor_job_run_alongside_an_always_due_earlier_one() {
+    // Reproduces the reported starvation directly: Document (cursor slot 0)
+    // is unconditionally due every tick, while Citation (slot 7) only
+    // becomes due every `CITATION_SWEEP_INTERVAL`. A single-shot `select_due`
+    // per tick lets Document's always-due status re-claim the tick before
+    // the cursor ever reaches Citation. `drain_due` must surface both in one
+    // quiet turn without repeating either.
+    let now = Instant::now();
+    let mut schedule = AmbientSchedule::new(now);
+    let available = AmbientAvailability {
+        document: true,
+        classification: true,
+        structured_extract: true,
+        entity: true,
+        title: true,
+        page_growth: true,
+        reconcile: true,
+        citation: true,
+        edge_grounding_promote: true,
+    };
+    // Mark every periodic lane except Citation as freshly run-and-empty so it
+    // is not due again this instant. Citation and Document are left alone:
+    // Citation because it never ran (due since `last_citation` is `None`),
+    // Document because nothing ever gates it.
+    for job in [
+        AmbientJob::Classification,
+        AmbientJob::StructuredExtract,
+        AmbientJob::Entity,
+        AmbientJob::Title,
+        AmbientJob::PageGrowth,
+        AmbientJob::Reconcile,
+        AmbientJob::EdgeGroundingPromote,
+    ] {
+        schedule.note_job_result(job, now, false);
+    }
+
+    // Without the fix in `drain_due` (bounding by call count instead of by
+    // "stop at the first repeat"), this returns a 9-element vec alternating
+    // [Document, Citation, Document, Citation, ...] instead of stopping
+    // cleanly after each fires exactly once.
+    assert_eq!(
+        schedule.drain_due(now, available),
+        vec![AmbientJob::Document, AmbientJob::Citation]
+    );
+}
+
+#[test]
 fn selected_backlog_lane_stays_due_after_global_cooldown() {
     let now = Instant::now();
     let mut schedule = AmbientSchedule::new(now);
@@ -1305,6 +1383,65 @@ fn ambient_thermal_work_completion_starts_conservative_cooldown() {
 }
 
 #[test]
+fn charge_lap_thermal_cooldown_uses_the_full_lap_elapsed_time_not_a_single_jobs_slice() {
+    // Simulate a two-job lap: Document ran for 8s, then Citation (the last
+    // thermal-consuming job) ran for only 2s — 10s of real lap time in
+    // total. Charging the cooldown against the *lap's* elapsed time (what
+    // `charge_lap_thermal_cooldown` does) must produce a materially
+    // different, larger cooldown than charging it against only the last
+    // job's own 2s slice (what the pre-fix per-job call site did).
+    let lap_started = Instant::now();
+    let lap_completed = lap_started + Duration::from_secs(10);
+    let mut schedule = AmbientSchedule::new(lap_started);
+
+    charge_lap_thermal_cooldown(
+        &mut schedule,
+        lap_started,
+        lap_completed,
+        true, // some job in the lap consumed a thermal turn
+        ThermalPolicy::conservative(),
+    );
+
+    // cooldown_after(10s) = max(120s, 10 * 19) = 190s.
+    assert_eq!(
+        schedule.next_allowed_at,
+        lap_completed + Duration::from_secs(190),
+        "cooldown must be sized from the full 10s lap, not the last job's 2s slice"
+    );
+    // The bug this guards against: charging only the last job's 2s slice
+    // gives cooldown_after(2s) = max(120s, 2 * 19) = 120s — the floor, and
+    // 70s short of the correct 190s. Pin that the fixed behavior is not
+    // merely "at least the floor" but the specific, larger lap-sized value.
+    assert_ne!(
+        schedule.next_allowed_at,
+        lap_completed + Duration::from_secs(120),
+        "must not fall back to the floor value a single 2s job's slice would produce"
+    );
+}
+
+#[test]
+fn charge_lap_thermal_cooldown_leaves_the_cooldown_untouched_when_no_job_in_the_lap_did_billable_work(
+) {
+    let lap_started = Instant::now();
+    let mut schedule = AmbientSchedule::new(lap_started);
+    let next_allowed_before = schedule.next_allowed_at;
+    let lap_completed = lap_started + Duration::from_secs(10);
+
+    charge_lap_thermal_cooldown(
+        &mut schedule,
+        lap_started,
+        lap_completed,
+        false, // every job in the lap was a no-op skip, nothing panicked
+        ThermalPolicy::conservative(),
+    );
+
+    assert_eq!(
+        schedule.next_allowed_at, next_allowed_before,
+        "an all-empty lap must not arm a cooldown at all"
+    );
+}
+
+#[test]
 fn empty_automatic_scan_does_not_consume_a_thermal_turn() {
     assert!(
         !automatic_work_consumes_thermal_turn(false, 0, false),
@@ -1909,6 +2046,159 @@ async fn document_provider_panic_pauses_claimed_generation() {
         .as_deref()
         .is_some_and(|reason| reason.contains("panicked")));
     assert_eq!(after.last_completed_chunk, before.last_completed_chunk);
+}
+
+#[tokio::test]
+async fn force_ambient_sweep_runs_document_and_reports_unsupported_phases_as_not_attempted() {
+    let _lock = crate::TEST_DATA_DIR_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let _env = DataDirGuard::new();
+
+    let source_root = tempfile::tempdir().unwrap();
+    let file_path = source_root.path().join("sweep-note.txt");
+    std::fs::write(
+        &file_path,
+        "Wenlan should chunk this document during a forced sweep, not wait for a quiet tick.",
+    )
+    .unwrap();
+    register_directory_source("directory-sweep", source_root.path());
+
+    let (db, _db_dir) = new_test_db().await;
+    sync_directory_sources(&db).await;
+
+    // No LLM provider configured at all: only Document (which has no
+    // provider gate) should be attempted. Every provider-gated phase must be
+    // reported as `attempted: false`, not silently dropped from `phases`.
+    let report = force_ambient_sweep(
+        &db,
+        None,
+        None,
+        None,
+        None,
+        &wenlan_core::prompts::PromptRegistry::default(),
+        &wenlan_core::tuning::RefineryConfig::default(),
+        &wenlan_core::tuning::DistillationConfig::default(),
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        report.phases.len(),
+        AmbientJob::ALL.len(),
+        "the sweep must report on every ambient job type, not only the ones that ran"
+    );
+
+    let document = report
+        .phases
+        .iter()
+        .find(|phase| phase.job == "document")
+        .expect("document phase must be present in the report");
+    assert!(
+        document.attempted,
+        "Document has no provider gate and must run even with no LLM configured"
+    );
+    assert!(
+        document.selected,
+        "the freshly-synced document should be claimed and chunked by the forced sweep"
+    );
+
+    for job_key in [
+        "classification",
+        "structured_extract",
+        "title",
+        "page_growth",
+    ] {
+        let phase = report
+            .phases
+            .iter()
+            .find(|phase| phase.job == job_key)
+            .unwrap_or_else(|| panic!("{job_key} phase must be present in the report"));
+        assert!(
+            !phase.attempted,
+            "{job_key} requires an LLM provider and must be reported as not attempted"
+        );
+        assert!(!phase.selected);
+        assert_eq!(phase.llm_calls, 0);
+    }
+}
+
+#[tokio::test]
+async fn ambient_status_reports_pending_queue_and_gate_snapshot() {
+    let _lock = crate::TEST_DATA_DIR_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let _env = DataDirGuard::new();
+
+    let source_root = tempfile::tempdir().unwrap();
+    let file_path = source_root.path().join("status-note.txt");
+    std::fs::write(
+        &file_path,
+        "Wenlan should count this as pending before it is chunked.",
+    )
+    .unwrap();
+    register_directory_source("directory-status", source_root.path());
+
+    let (db, _db_dir) = new_test_db().await;
+    sync_directory_sources(&db).await;
+
+    let gate = Some(AmbientGateSnapshot {
+        admitted: false,
+        blocked_reason: Some("HostActive".to_string()),
+        sampled_at_epoch: 1_700_000_000,
+    });
+
+    let status = ambient_status(&db, gate).await.unwrap();
+    assert_eq!(
+        status.unchunked_documents, 1,
+        "the freshly-synced, not-yet-chunked document must count as pending"
+    );
+    assert_eq!(status.idle_gate_admitted, Some(false));
+    assert_eq!(
+        status.idle_gate_blocked_reason.as_deref(),
+        Some("HostActive")
+    );
+    assert_eq!(status.idle_gate_sampled_at_epoch, Some(1_700_000_000));
+    assert_eq!(status.phase_last_run_epoch.len(), AmbientJob::ALL.len());
+    assert!(
+        status.phase_last_run_epoch.values().all(Option::is_none),
+        "nothing has run yet against a fresh database"
+    );
+}
+
+#[tokio::test]
+async fn ambient_status_records_last_run_after_force_ambient_sweep() {
+    let _lock = crate::TEST_DATA_DIR_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let _env = DataDirGuard::new();
+    let (db, _db_dir) = new_test_db().await;
+
+    force_ambient_sweep(
+        &db,
+        None,
+        None,
+        None,
+        None,
+        &wenlan_core::prompts::PromptRegistry::default(),
+        &wenlan_core::tuning::RefineryConfig::default(),
+        &wenlan_core::tuning::DistillationConfig::default(),
+        None,
+    )
+    .await;
+
+    let status = ambient_status(&db, None).await.unwrap();
+    assert!(
+        status.phase_last_run_epoch["document"].is_some(),
+        "force_ambient_sweep must persist a last-run timestamp for a phase it actually attempted"
+    );
+    assert!(
+        status.phase_last_run_epoch["classification"].is_none(),
+        "a phase parked by the provider gate must not be recorded as having run"
+    );
 }
 
 struct MaintenanceTestProvider {

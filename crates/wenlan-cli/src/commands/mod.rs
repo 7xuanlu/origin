@@ -18,6 +18,7 @@ pub mod setup;
 pub mod space;
 pub mod status;
 pub mod store;
+pub mod sweep;
 
 #[cfg(not(target_os = "windows"))]
 pub use service::service_unit_path;

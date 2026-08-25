@@ -1257,6 +1257,7 @@ fn structure_violations_with_children(
     let expected_scheduler_files: BTreeSet<String> = [
         phase.external_tests().then_some("scheduler_tests.rs"),
         phase.ambient_child().then_some("ambient.rs"),
+        phase.ambient_child().then_some("ambient_admin.rs"),
     ]
     .into_iter()
     .flatten()

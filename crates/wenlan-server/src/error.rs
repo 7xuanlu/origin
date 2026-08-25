@@ -24,6 +24,13 @@ pub enum ServerError {
         similar_to: Option<String>,
     },
     ChatImport(String),
+    /// A route-owned wire contract: the exact status and JSON body pass
+    /// through untouched. First consumer: the page-draft error codes the
+    /// desktop editor parses (`src/lib/tauri.ts` `parsePageDraftError`).
+    Structured {
+        status: StatusCode,
+        body: serde_json::Value,
+    },
 }
 
 impl std::fmt::Display for ServerError {
@@ -42,6 +49,7 @@ impl std::fmt::Display for ServerError {
                 write!(f, "Quality gate rejected: {}", detail)
             }
             ServerError::ChatImport(msg) => write!(f, "Chat import failed: {}", msg),
+            ServerError::Structured { body, .. } => write!(f, "{}", body),
         }
     }
 }
@@ -64,6 +72,9 @@ impl IntoResponse for ServerError {
             }));
             return (StatusCode::UNPROCESSABLE_ENTITY, body).into_response();
         }
+        if let ServerError::Structured { status, body } = self {
+            return (status, Json(body)).into_response();
+        }
 
         let (status, error_message) = match self {
             ServerError::DbNotInitialized => (
@@ -79,7 +90,9 @@ impl IntoResponse for ServerError {
             ServerError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             ServerError::ValidationError(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             ServerError::ChatImport(msg) => (StatusCode::BAD_REQUEST, msg),
-            ServerError::QualityGateRejected { .. } => unreachable!(),
+            ServerError::QualityGateRejected { .. } | ServerError::Structured { .. } => {
+                unreachable!()
+            }
         };
 
         let body = Json(json!({

@@ -3,7 +3,7 @@
 use super::tests::test_db;
 use super::MemoryDB;
 use crate::error::WenlanError;
-use crate::pages::{PageDraftDeleteOutcome, PageDraftUpdateOutcome};
+use crate::pages::{PageDraftDeleteOutcome, PageDraftPublishOutcome, PageDraftUpdateOutcome};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{Barrier, Notify};
@@ -509,6 +509,9 @@ async fn update_supports_exact_retry_and_rejects_stale_active_missing_and_empty(
         "2026-01-01T00:00:00Z",
     )
     .await;
+    // Wire contract: a non-draft row is "no such draft" (structured 404), not
+    // a validation error — a queued editor update racing after publish relies
+    // on it.
     assert!(matches!(
         db.update_page_draft(
             "page_active_update_guard",
@@ -519,7 +522,7 @@ async fn update_supports_exact_retry_and_rejects_stale_active_missing_and_empty(
             None,
         )
         .await,
-        Err(WenlanError::Validation(_))
+        Err(WenlanError::NotFound(_))
     ));
     assert!(matches!(
         db.update_page_draft("page_missing", 1, "Title", "Body", None, None)
@@ -656,9 +659,11 @@ async fn delete_is_version_safe_and_rejects_active_and_missing_pages() {
         "2026-01-01T00:00:00Z",
     )
     .await;
+    // Same wire contract as update: non-draft rows discard as "no such draft"
+    // — the editor treats the structured 404 as completed cleanup.
     assert!(matches!(
         db.delete_page_draft("page_active_delete_guard", 1).await,
-        Err(WenlanError::Validation(_))
+        Err(WenlanError::NotFound(_))
     ));
     assert!(matches!(
         db.delete_page_draft("page_missing", 1).await,
@@ -1027,4 +1032,397 @@ async fn description_delete_keep_and_failed_space_paths_do_not_bump_drafts() {
     assert!(db.reassign_memories_space("missing", "dest").await.is_err());
     assert!(db.delete_space("missing", "move:dest").await.is_err());
     assert_eq!(page_version_and_modified(&db, &draft.id).await, before);
+}
+
+async fn page_status_kind_and_embedding(db: &MemoryDB, id: &str) -> (String, String, bool) {
+    let conn = db.conn.lock().await;
+    let mut rows = conn
+        .query(
+            "SELECT status, kind, embedding IS NOT NULL FROM pages WHERE id=?1",
+            libsql::params![id],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    (
+        row.get(0).unwrap(),
+        row.get(1).unwrap(),
+        row.get::<i64>(2).unwrap() == 1,
+    )
+}
+
+#[tokio::test]
+async fn publish_flips_draft_to_active_and_replays_idempotently() {
+    let (db, _tmp) = test_db().await;
+    let draft = db
+        .create_page_draft("  Sharding notes  ", "Body text", None, None)
+        .await
+        .unwrap();
+
+    let published = match db.publish_page_draft(&draft.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::Published(page) => page,
+        other => panic!("expected Published, got {other:?}"),
+    };
+    assert_eq!(published.status, "active");
+    assert_eq!(published.title, "Sharding notes");
+    assert_eq!(published.version, 2);
+    assert_eq!(published.creation_kind, "authored");
+    assert_eq!(published.review_status, "unconfirmed");
+    assert_eq!(published.last_compiled, published.last_modified);
+    let (status, kind, has_embedding) = page_status_kind_and_embedding(&db, &draft.id).await;
+    assert_eq!(status, "active");
+    assert_eq!(kind, "authored");
+    assert!(has_embedding, "publish must write the page embedding");
+
+    // Exact retry of the publish that landed replays the active page.
+    let replayed = match db.publish_page_draft(&draft.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::Published(page) => page,
+        other => panic!("expected replay, got {other:?}"),
+    };
+    assert_eq!(replayed.version, 2);
+    assert_eq!(replayed.status, "active");
+
+    // Any other version on the now-active page is a conflict, not "not a draft".
+    assert!(matches!(
+        db.publish_page_draft(&draft.id, 5).await.unwrap(),
+        PageDraftPublishOutcome::VersionConflict { current_version: 2 }
+    ));
+    // The matching version on an active page is the not-a-draft validation.
+    assert!(matches!(
+        db.publish_page_draft(&draft.id, 2).await,
+        Err(WenlanError::Validation(_))
+    ));
+}
+
+#[tokio::test]
+async fn publish_rejects_stale_missing_and_incomplete_drafts() {
+    let (db, _tmp) = test_db().await;
+
+    assert!(matches!(
+        db.publish_page_draft("page_00000000-0000-4000-8000-00000000f001", 1)
+            .await,
+        Err(WenlanError::NotFound(_))
+    ));
+
+    let draft = db
+        .create_page_draft("Draft title", "Body", None, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.publish_page_draft(&draft.id, 7).await.unwrap(),
+        PageDraftPublishOutcome::VersionConflict { current_version: 1 }
+    ));
+
+    // Publishing requires BOTH a trimmed title and non-empty content; a
+    // title-only or body-only draft (legal to save) cannot publish, and the
+    // failed attempt must not mutate the row.
+    let title_only = db
+        .create_page_draft("Title only", "", None, None)
+        .await
+        .unwrap();
+    let body_only = db
+        .create_page_draft("  \t", "Body only", None, None)
+        .await
+        .unwrap();
+    for draft in [&title_only, &body_only] {
+        assert!(matches!(
+            db.publish_page_draft(&draft.id, 1).await,
+            Err(WenlanError::Validation(_))
+        ));
+        let (status, _, _) = page_status_kind_and_embedding(&db, &draft.id).await;
+        assert_eq!(status, "draft");
+        assert_eq!(page_version_and_modified(&db, &draft.id).await.0, 1);
+    }
+}
+
+#[tokio::test]
+async fn publish_blocks_on_same_scope_case_insensitive_title_conflict() {
+    let (db, _tmp) = test_db().await;
+    db.create_space("work", None, false).await.unwrap();
+    seed_non_draft_page(
+        &db,
+        "page_active",
+        "active",
+        "work",
+        3,
+        "2026-01-01T00:00:00Z",
+    )
+    .await;
+
+    // Same scope + case-insensitively equal trimmed title -> conflict, and the
+    // draft stays a draft.
+    let clash = db
+        .create_page_draft("  ACTIVE PAGE ", "Body", Some("work"), Some("work"))
+        .await
+        .unwrap();
+    match db.publish_page_draft(&clash.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::TitleConflict {
+            existing_page_id,
+            existing_page_title,
+            scope,
+        } => {
+            assert_eq!(existing_page_id, "page_active");
+            assert_eq!(existing_page_title, "active page");
+            assert_eq!(scope, "work");
+        }
+        other => panic!("expected TitleConflict, got {other:?}"),
+    }
+    let (status, _, _) = page_status_kind_and_embedding(&db, &clash.id).await;
+    assert_eq!(status, "draft");
+
+    // The same title in a different scope (unfiled here) publishes fine.
+    let elsewhere = db
+        .create_page_draft("Active page", "Body", None, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.publish_page_draft(&elsewhere.id, 1).await.unwrap(),
+        PageDraftPublishOutcome::Published(_)
+    ));
+
+    // An archived page with the same title does not block a publish.
+    seed_non_draft_page(
+        &db,
+        "page_archived",
+        "archived",
+        "work",
+        1,
+        "2026-01-01T00:00:00Z",
+    )
+    .await;
+    let vs_archived = db
+        .create_page_draft("Archived page", "Body", Some("work"), Some("work"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.publish_page_draft(&vs_archived.id, 1).await.unwrap(),
+        PageDraftPublishOutcome::Published(_)
+    ));
+}
+
+#[tokio::test]
+async fn publish_folds_unicode_titles_when_checking_conflicts() {
+    let (db, _tmp) = test_db().await;
+    // The two titles only collide under Unicode case folding; SQLite's
+    // ASCII-only lower() would treat them as distinct.
+    let existing = db
+        .create_page_draft("i σχεδιο проект", "Body", None, None)
+        .await
+        .unwrap();
+    match db.publish_page_draft(&existing.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::Published(_) => {}
+        other => panic!("seed publish failed: {other:?}"),
+    }
+
+    let draft = db
+        .create_page_draft("  I ΣΧΕΔΙΟ ПРОЕКТ  ", "Body", None, None)
+        .await
+        .unwrap();
+    match db.publish_page_draft(&draft.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::TitleConflict {
+            existing_page_id,
+            existing_page_title,
+            scope,
+        } => {
+            assert_eq!(existing_page_id, existing.id);
+            assert_eq!(existing_page_title, "i σχεδιο проект");
+            assert_eq!(scope, super::UNFILED_SPACE_ID);
+        }
+        other => panic!("expected TitleConflict, got {other:?}"),
+    }
+    let (status, _, _) = page_status_kind_and_embedding(&db, &draft.id).await;
+    assert_eq!(
+        status, "draft",
+        "conflicted publish must not flip the draft"
+    );
+}
+
+#[tokio::test]
+async fn publish_appends_history_and_maintains_wikilinks() {
+    let (db, _tmp) = test_db().await;
+    // An active page that references [[Launch Checklist]] before any page
+    // carries that title: publishing it leaves an orphan page_links row.
+    let referrer = db
+        .create_page_draft("Referrer", "See [[Launch Checklist]]", None, None)
+        .await
+        .unwrap();
+    match db.publish_page_draft(&referrer.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::Published(_) => {}
+        other => panic!("referrer publish failed: {other:?}"),
+    }
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM page_links \
+             WHERE source_page_id=?1 AND target_page_id IS NULL",
+            &referrer.id,
+        )
+        .await,
+        1,
+        "publishing a body with an unresolved wikilink must record the orphan"
+    );
+
+    let draft = db
+        .create_page_draft("Launch Checklist", "Links back to [[Referrer]]", None, None)
+        .await
+        .unwrap();
+    let published = match db.publish_page_draft(&draft.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::Published(page) => page,
+        other => panic!("publish failed: {other:?}"),
+    };
+
+    // The version bump left its immutable history row in the same tx.
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM page_history \
+             WHERE page_id=?1 AND edited_by='publish' AND version=2",
+            &draft.id,
+        )
+        .await,
+        1
+    );
+
+    // The published body's resolved [[Referrer]] link minted an active edge
+    // (resolved links live in edges, not page_links).
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM edges \
+             WHERE edge_type='links' AND src_id=?1 AND valid_until IS NULL",
+            &draft.id,
+        )
+        .await,
+        1
+    );
+
+    // Publishing the page named by the pre-existing orphan resolved it: the
+    // orphan row is gone and the referrer now carries an active links edge.
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM page_links \
+             WHERE source_page_id=?1 AND target_page_id IS NULL",
+            &referrer.id,
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM edges \
+             WHERE edge_type='links' AND src_id=?1 AND valid_until IS NULL",
+            &referrer.id,
+        )
+        .await,
+        1
+    );
+    assert_eq!(published.version, 2);
+}
+
+/// Link identity and conflict identity share one fold. The bundled SQLite
+/// `lower()` is ASCII-only, so a SQL-side fold resolves `[[launch]]` against
+/// "Launch" but leaves `[[i σχεδιο проект]]` orphaned next to
+/// "I ΣΧΕΔΙΟ ПРОЕКТ" — while the publish conflict check (Rust fold) calls the
+/// same pair a duplicate title. Both now run through `page_title_key`.
+#[tokio::test]
+async fn wikilinks_fold_unicode_titles_like_the_conflict_check() {
+    let (db, _tmp) = test_db().await;
+    let referrer = db
+        .create_page_draft("Referrer", "See [[i σχεδιο проект]]", None, None)
+        .await
+        .unwrap();
+    match db.publish_page_draft(&referrer.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::Published(_) => {}
+        other => panic!("referrer publish failed: {other:?}"),
+    }
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM page_links \
+             WHERE source_page_id=?1 AND target_page_id IS NULL",
+            &referrer.id,
+        )
+        .await,
+        1,
+        "no page carries that title yet, so the link must record as an orphan"
+    );
+
+    // Publish the target under different Greek/Cyrillic casing, with a body
+    // that links back to the referrer cross-case too.
+    let target = db
+        .create_page_draft("I ΣΧΕΔΙΟ ПРОЕКТ", "Back to [[rEfErReR]]", None, None)
+        .await
+        .unwrap();
+    let published = match db.publish_page_draft(&target.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::Published(page) => page,
+        other => panic!("target publish failed: {other:?}"),
+    };
+    assert_eq!(published.title, "I ΣΧΕΔΙΟ ПРОЕКТ");
+
+    // The outgoing cross-case link resolved at publish time.
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM edges \
+             WHERE edge_type='links' AND src_id=?1 AND valid_until IS NULL",
+            &target.id,
+        )
+        .await,
+        1,
+        "the published body's cross-case [[rEfErReR]] link must mint an edge"
+    );
+
+    // The pre-existing Unicode orphan resolved through the same fold: the
+    // orphan row is gone and the referrer carries an active links edge.
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM page_links \
+             WHERE source_page_id=?1 AND target_page_id IS NULL",
+            &referrer.id,
+        )
+        .await,
+        0,
+        "the Greek/Cyrillic orphan must resolve once its target publishes"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) FROM edges \
+             WHERE edge_type='links' AND src_id=?1 AND valid_until IS NULL",
+            &referrer.id,
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn update_and_discard_after_publish_report_draft_not_found() {
+    let (db, _tmp) = test_db().await;
+    let draft = db
+        .create_page_draft("Ship notes", "Body", None, None)
+        .await
+        .unwrap();
+    match db.publish_page_draft(&draft.id, 1).await.unwrap() {
+        PageDraftPublishOutcome::Published(_) => {}
+        other => panic!("publish failed: {other:?}"),
+    }
+
+    // A queued editor update or discard racing after publish must get the
+    // structured "no such draft" answer, never a validation error: discard
+    // treats the 404 as completed cleanup.
+    assert!(matches!(
+        db.update_page_draft(&draft.id, 2, "Ship notes", "Body v2", None, None)
+            .await,
+        Err(WenlanError::NotFound(_))
+    ));
+    assert!(matches!(
+        db.delete_page_draft(&draft.id, 2).await,
+        Err(WenlanError::NotFound(_))
+    ));
+    let (status, _, _) = page_status_kind_and_embedding(&db, &draft.id).await;
+    assert_eq!(status, "active", "the published page must survive both");
 }

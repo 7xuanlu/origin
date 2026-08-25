@@ -828,7 +828,7 @@ async fn generate_e2e_answers_for_question(
     let mut structured_parts: Vec<String> = Vec::new();
 
     // Concept articles (like chat-context's "Compiled Knowledge" section)
-    let concepts = db.search_pages(question, 3, None).await.unwrap_or_default();
+    let concepts = db.search_pages_strict(question, 3, None).await?;
     if !concepts.is_empty() {
         structured_parts.push("## Compiled Knowledge".to_string());
         for c in &concepts {
@@ -1102,7 +1102,9 @@ pub async fn run_e2e_context_eval_longmemeval(
 
         let category = category_name(&sample.question_type);
 
-        if let Ok(tuples) = generate_e2e_answers_for_question(
+        // A failed question must fail the run: silently omitting it would
+        // score a biased partial sample as if it were the full set.
+        let tuples = generate_e2e_answers_for_question(
             &db,
             &sample.question,
             &ground_truth,
@@ -1110,10 +1112,8 @@ pub async fn run_e2e_context_eval_longmemeval(
             search_limit,
             &llm,
         )
-        .await
-        {
-            all_tuples.extend(tuples);
-        }
+        .await?;
+        all_tuples.extend(tuples);
 
         if q_idx % 50 == 49 {
             eprintln!(
@@ -1245,7 +1245,7 @@ async fn build_structured_context(
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| crate::tuning::DistillationConfig::default().page_min_overlap);
 
-        let raw_concepts = db.search_pages(question, 3, None).await.unwrap_or_default();
+        let raw_concepts = db.search_pages_strict(question, 3, None).await?;
         let concepts =
             filter_pages_by_source_overlap(&raw_concepts, &search_source_ids, min_overlap);
 

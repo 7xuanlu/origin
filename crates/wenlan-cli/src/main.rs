@@ -180,6 +180,9 @@ enum Commands {
         #[command(subcommand)]
         cmd: commands::entities::EntitiesCmd,
     },
+    /// Force one bounded pass over every due ambient job now, instead of
+    /// waiting for a quiet turn.
+    Sweep,
 }
 
 #[tokio::main]
@@ -379,6 +382,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         Commands::Entities { cmd } => {
             commands::entities::run(&client, format, cli.quiet, cmd).await?
         }
+        Commands::Sweep => commands::sweep::run(&client, format, cli.quiet).await?,
     }
     Ok(ExitCode::SUCCESS)
 }
