@@ -16072,6 +16072,26 @@ impl MemoryDB {
             // CREATEs with IF NOT EXISTS, while `repair_community_cutover`
             // drops and recreates its own at every startup -- so copying it is
             // what keeps this migration's result stable across the next boot.
+            //
+            // The three `m4_parity_input_entity_*` bodies below write to
+            // `community_parity_input_state`. A database that reached this
+            // version through the local-only M96 shape (see
+            // `migration_96_converges_local_only_parity_shape_and_invalidates_old_proof`)
+            // does not have that table until the post-chain
+            // `repair_community_cutover` creates it -- but SQLite resolves a
+            // trigger body at statement-prepare time, so every `UPDATE pages`
+            // in a later migration (first: m126's citation re-arm) would fail
+            // with "no such table" before the repair pass ever runs. Install
+            // the table shape first; `IF NOT EXISTS` makes this a no-op on
+            // every other database, and the startup repair still seeds and
+            // re-arms it.
+            tx.execute_batch(PARITY_INPUT_STATE_TABLE_DDL)
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "m123 ensure parity input state table: {error}"
+                    ))
+                })?;
             tx.execute_batch(
                 "DROP TRIGGER IF EXISTS m4_grouping_entity_insert;
                  DROP TRIGGER IF EXISTS m4_grouping_entity_delete;
@@ -48779,6 +48799,51 @@ impl MemoryDB {
         .await
     }
 
+    /// Combined version + source_revision CAS variant for the citation
+    /// backfill's annotate-success write. `try_update_page_content_with_
+    /// changelog_at_version` alone misses a concurrent source attach
+    /// (`link_page_source` bumps `source_revision` and resets `citations` to
+    /// NULL without ever bumping `version`), so a version-only CAS can still
+    /// match and overwrite a page re-armed that way. Fencing on BOTH here
+    /// (not switching to source_revision alone) also keeps the `status =
+    /// 'active'` check, which the SQL builder below only attaches alongside
+    /// the version fence -- a source_revision-only CAS would silently drop
+    /// it and let a stale write land on an archived page (caught by
+    /// `citation_result_is_dropped_when_page_is_archived`). `link_reason`
+    /// must be `"citation_backfill"`: `try_update_page_content`'s guard
+    /// otherwise rejects combining both fences for any caller but page
+    /// growth.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_update_page_content_with_changelog_at_versions(
+        &self,
+        id: &str,
+        content: &str,
+        source_memory_ids: &[&str],
+        link_reason: &str,
+        changelog: &str,
+        citations_json: Option<&str>,
+        expected_version: i64,
+        expected_source_revision: i64,
+        receipt: Option<OperationReceipt<'_>>,
+    ) -> Result<bool, WenlanError> {
+        self.try_update_page_content(
+            id,
+            content,
+            source_memory_ids,
+            link_reason,
+            false,
+            Some(changelog),
+            citations_json,
+            Some(expected_version),
+            Some(expected_source_revision),
+            None,
+            receipt,
+            None,
+            false,
+        )
+        .await
+    }
+
     /// Page-growth commit variant: the Page body, source/evidence links, fresh
     /// citations, changelog, embedding, and versioned memory receipt land in
     /// one transaction. Either the matched Page generation or triggering
@@ -48875,9 +48940,16 @@ impl MemoryDB {
         page_growth_guard: Option<(&str, i64)>,
         machine_owned_only: bool,
     ) -> Result<bool, WenlanError> {
+        // Page growth and the citation backfill are the two machine writers
+        // that snapshot both counters BEFORE reading evidence, so combining
+        // both fences for them is stricter, not looser, than either alone --
+        // and `status = 'active'` rides along with the version fence, so
+        // this can never drop that check. Every other caller stays
+        // single-fence.
         if expected_version.is_some()
             && expected_source_revision.is_some()
             && page_growth_guard.is_none()
+            && link_reason != "citation_backfill"
         {
             return Err(WenlanError::Validation(
                 "only page growth may combine version and source-revision CAS".to_string(),
@@ -52291,12 +52363,24 @@ impl MemoryDB {
     /// Version-guarded variant for background citation work. Returns `false`
     /// when the Page changed, left the active state, or another writer already
     /// resolved its citation eligibility.
+    ///
+    /// `expected_source_revision` closes a second staleness window `version`
+    /// alone misses: a concurrent source attach (`link_page_source`,
+    /// `mark_pages_depending_on_memory_sources_except`) resets `citations`
+    /// back to NULL and bumps `source_revision` to re-arm the page for
+    /// backfill, but does NOT bump `version`. Without this guard a caller
+    /// that read evidence before that attach can still match on `version` and
+    /// overwrite the freshly-armed page with a stale result (e.g. a
+    /// give-up `[]`), permanently dropping it out of the citations-missing
+    /// queue. Same `COALESCE(source_revision, 0) = ?N` pattern as
+    /// `try_update_page_content_with_changelog_at_source_revision`.
     pub async fn set_page_citations_with_changelog_at_version(
         &self,
         page_id: &str,
         citations_json: Option<&str>,
         changelog_json: &str,
         expected_version: i64,
+        expected_source_revision: i64,
     ) -> Result<bool, WenlanError> {
         let conn = self.conn.lock().await;
         conn.execute("BEGIN", ()).await.map_err(|e| {
@@ -52309,8 +52393,14 @@ impl MemoryDB {
                 .execute(
                     "UPDATE pages SET citations = ?1, changelog = ?2
                      WHERE id = ?3 AND version = ?4 AND status = 'active'
-                       AND citations IS NULL",
-                    libsql::params![citations_json, changelog_json, page_id, expected_version],
+                       AND citations IS NULL AND COALESCE(source_revision, 0) = ?5",
+                    libsql::params![
+                        citations_json,
+                        changelog_json,
+                        page_id,
+                        expected_version,
+                        expected_source_revision
+                    ],
                 )
                 .await?;
             // Dual-write (G6 Stage 0): the guard above means the OLD value was

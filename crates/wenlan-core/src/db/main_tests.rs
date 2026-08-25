@@ -52538,6 +52538,295 @@ async fn dual_write_page_citations_retracts_dropped_citation_when_unbacked() {
     );
 }
 
+/// CAS seam for the round-2 doc-citation-locator fix (a concurrent source
+/// attach can be overwritten by a stale terminal citation write): `version`
+/// alone does not see a re-arming source attach. `link_page_source` resets
+/// `citations` to NULL and bumps `source_revision` to re-arm a page for
+/// backfill, but never bumps `version` -- so a backfill writer that captured
+/// `source_revision` before that attach, and only that attach, must be
+/// rejected even though `version` still matches. Mirrors the existing
+/// version-staleness CAS proof at `citation_result_for_old_page_version_is_
+/// dropped` (citations.rs), but for the source_revision axis.
+#[tokio::test]
+async fn set_page_citations_with_changelog_at_version_rejects_stale_source_revision() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_source_cas",
+        "T",
+        None,
+        "body",
+        None,
+        None,
+        &["mem_seed"],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let version = db
+        .get_page("page_source_cas")
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    // The source_revision a racy backfill writer would have captured BEFORE
+    // the concurrent attach below.
+    let stale_source_revision = db
+        .get_page_source_revision("page_source_cas")
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_source_revision, 0,
+        "sanity: a fresh page starts at source_revision 0"
+    );
+
+    // Concurrent source attach: bumps source_revision, resets citations to
+    // NULL, leaves version untouched -- the exact re-arming this guard
+    // exists to detect.
+    db.link_page_source("page_source_cas", "mem_added_mid_race", "test")
+        .await
+        .unwrap();
+    let after_attach = db.get_page("page_source_cas").await.unwrap().unwrap();
+    assert_eq!(
+        after_attach.version, version,
+        "sanity: link_page_source must not bump version -- that IS the hazard \
+         this guard closes"
+    );
+    assert!(
+        db.get_pages_missing_citations(10)
+            .await
+            .unwrap()
+            .contains(&"page_source_cas".to_string()),
+        "sanity: citations must be NULL again after the re-arming attach"
+    );
+
+    // The stale writer's CAS must not match: version still matches, but
+    // source_revision has moved on.
+    let stale_changelog =
+        r#"[{"edited_by":"citation_backfill","at":1,"citations_summary":"stale write"}]"#;
+    let wrote_stale = db
+        .set_page_citations_with_changelog_at_version(
+            "page_source_cas",
+            Some("[]"),
+            stale_changelog,
+            version,
+            stale_source_revision,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !wrote_stale,
+        "a stale source_revision must not be allowed to overwrite a page \
+         re-armed by a concurrent source attach"
+    );
+    assert!(
+        db.get_pages_missing_citations(10)
+            .await
+            .unwrap()
+            .contains(&"page_source_cas".to_string()),
+        "citations must still be NULL -- the rejected stale write must not \
+         have knocked the page out of the missing-citations queue"
+    );
+    assert!(
+        !db.get_page_changelog("page_source_cas")
+            .await
+            .unwrap()
+            .contains("stale write"),
+        "the stale write's changelog entry must not have landed"
+    );
+
+    // The CURRENT source_revision must be accepted.
+    let current_source_revision = db
+        .get_page_source_revision("page_source_cas")
+        .await
+        .unwrap();
+    let current_changelog =
+        r#"[{"edited_by":"citation_backfill","at":2,"citations_summary":"current write"}]"#;
+    let wrote_current = db
+        .set_page_citations_with_changelog_at_version(
+            "page_source_cas",
+            Some("[]"),
+            current_changelog,
+            version,
+            current_source_revision,
+        )
+        .await
+        .unwrap();
+    assert!(
+        wrote_current,
+        "the current source_revision must be accepted"
+    );
+    assert!(
+        !db.get_pages_missing_citations(10)
+            .await
+            .unwrap()
+            .contains(&"page_source_cas".to_string()),
+        "the accepted write must take the page out of the missing-citations queue"
+    );
+    assert!(
+        db.get_page_changelog("page_source_cas")
+            .await
+            .unwrap()
+            .contains("current write"),
+        "the accepted write's changelog entry must have landed"
+    );
+}
+
+/// Round-2 widen-scope (option 1): `try_update_page_content`'s "only page
+/// growth may combine version and source-revision CAS" guard now also
+/// allows `link_reason == "citation_backfill"`, but every other caller
+/// combining both fences must still be rejected. `try_update_page_content`
+/// is a private associated fn on `MemoryDB`, reachable here because
+/// `db::tests` (this file) is a child module of `db` and inherits access to
+/// its ancestor's private items.
+#[tokio::test]
+async fn combine_version_and_source_revision_cas_rejected_for_non_growth_non_backfill() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_combine_reject",
+        "T",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    let version = db
+        .get_page("page_combine_reject")
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    let source_revision = db
+        .get_page_source_revision("page_combine_reject")
+        .await
+        .unwrap();
+
+    let err = db
+        .try_update_page_content(
+            "page_combine_reject",
+            "new body",
+            &[],
+            "manual_edit",
+            false,
+            None,
+            None,
+            Some(version),
+            Some(source_revision),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err(
+            "combining both fences outside page growth and citation_backfill must be rejected",
+        );
+    assert!(
+        matches!(
+            err,
+            WenlanError::Validation(ref msg)
+                if msg == "only page growth may combine version and source-revision CAS"
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// The `citation_backfill` exception itself: combining both fences via
+/// `try_update_page_content_with_changelog_at_versions` must write when both
+/// match, and must reject (return `Ok(false)`, not an error) on a stale
+/// `source_revision` -- the same CAS-miss semantics as every other stale-CAS
+/// path, not a validation error.
+#[tokio::test]
+async fn citation_backfill_combined_cas_writes_on_match_and_rejects_stale_source_revision() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_combine_backfill",
+        "T",
+        None,
+        "body",
+        None,
+        None,
+        &["mem_seed"],
+        &now,
+    )
+    .await
+    .unwrap();
+    let version = db
+        .get_page("page_combine_backfill")
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    let current_source_revision = db
+        .get_page_source_revision("page_combine_backfill")
+        .await
+        .unwrap();
+    let stale_source_revision = current_source_revision + 1;
+
+    let wrote_stale = db
+        .try_update_page_content_with_changelog_at_versions(
+            "page_combine_backfill",
+            "stale attempt",
+            &["mem_seed"],
+            "citation_backfill",
+            "[]",
+            None,
+            version,
+            stale_source_revision,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !wrote_stale,
+        "a stale source_revision must be rejected, not accepted -- CAS miss, not a validation error"
+    );
+    assert_eq!(
+        db.get_page("page_combine_backfill")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "body",
+        "the stale write must not have landed"
+    );
+
+    let wrote_current = db
+        .try_update_page_content_with_changelog_at_versions(
+            "page_combine_backfill",
+            "annotated body",
+            &["mem_seed"],
+            "citation_backfill",
+            "[]",
+            None,
+            version,
+            current_source_revision,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        wrote_current,
+        "a matching version and source_revision must be accepted for citation_backfill"
+    );
+    assert_eq!(
+        db.get_page("page_combine_backfill")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "annotated body",
+        "the matching write must have landed"
+    );
+}
+
 // G6 Stage 2 PR 2b (item 4) retired `refcount_retracts_only_after_last_
 // backing_store_drops_citation`: it asserted D7's order-independent refcount
 // -- an edge stays active until BOTH page_evidence and pages.citations drop

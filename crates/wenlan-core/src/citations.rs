@@ -369,6 +369,7 @@ async fn record_annotate_failure(
     db: &MemoryDB,
     page_id: &str,
     page_version: i64,
+    expected_source_revision: i64,
     giveup_reason: &str,
 ) -> Result<(), WenlanError> {
     let key = attempt_key(page_id, page_version);
@@ -386,6 +387,7 @@ async fn record_annotate_failure(
                 Some("[]"),
                 &changelog,
                 page_version,
+                expected_source_revision,
             )
             .await;
         let _ = db.set_app_metadata(&key, "0").await;
@@ -438,6 +440,14 @@ async fn run_citation_backfill_with_page_limit(
         let Some(page) = db.get_page(&page_id).await? else {
             continue;
         };
+        // Captured before any evidence read (and before every terminal
+        // write below): a concurrent source attach resets `citations` to
+        // NULL and bumps `source_revision` to re-arm this page for
+        // backfill, but does not bump `version`. Threading this value into
+        // every CAS write closes the window where a stale result computed
+        // from evidence read before that attach would otherwise still match
+        // on `version` alone and overwrite the freshly-armed page.
+        let source_revision = db.get_page_source_revision(&page_id).await?;
 
         let evidence = db.get_page_evidence(&page_id).await.unwrap_or_default();
         let evidence_sources: Vec<(String, String)> = evidence
@@ -466,6 +476,7 @@ async fn run_citation_backfill_with_page_limit(
                     Some("[]"),
                     &changelog,
                     page.version,
+                    source_revision,
                 )
                 .await;
             continue;
@@ -528,6 +539,7 @@ async fn run_citation_backfill_with_page_limit(
                     Some("[]"),
                     &changelog,
                     page.version,
+                    source_revision,
                 )
                 .await;
             continue;
@@ -556,6 +568,7 @@ async fn run_citation_backfill_with_page_limit(
                     db,
                     &page_id,
                     page.version,
+                    source_revision,
                     "citation backfill gave up: provider error after 3 attempts",
                 )
                 .await?;
@@ -582,6 +595,7 @@ async fn run_citation_backfill_with_page_limit(
                     db,
                     &page_id,
                     page.version,
+                    source_revision,
                     "citation backfill gave up: zero markers after 3 attempts",
                 )
                 .await?;
@@ -592,8 +606,16 @@ async fn run_citation_backfill_with_page_limit(
                         .await;
                 let existing_sources: Vec<&str> =
                     page.source_memory_ids.iter().map(String::as_str).collect();
+                // Fenced on BOTH version and source_revision: a concurrent
+                // source attach (`link_page_source`) re-arms this page
+                // (citations -> NULL, source_revision bumped) without
+                // touching `version`, so a version-only CAS here would still
+                // match and overwrite the freshly-armed page with a stale
+                // annotate result computed from evidence read before that
+                // attach. `source_revision` was captured at page load,
+                // before the evidence read, same as `page.version`.
                 let committed = db
-                    .try_update_page_content_with_changelog_at_version(
+                    .try_update_page_content_with_changelog_at_versions(
                         &page_id,
                         &body,
                         &existing_sources,
@@ -601,6 +623,7 @@ async fn run_citation_backfill_with_page_limit(
                         &changelog,
                         Some(&json),
                         page.version,
+                        source_revision,
                         None,
                     )
                     .await?;
@@ -615,6 +638,7 @@ async fn run_citation_backfill_with_page_limit(
                 db,
                 &page_id,
                 page.version,
+                source_revision,
                 "citation backfill gave up: annotate guard rejected 3x",
             )
             .await?;
@@ -1010,6 +1034,91 @@ mod tests {
         assert!(page.citations.is_empty());
     }
 
+    /// Round-2 doc-citation-locator fix, widened (option 1, `citation_backfill`
+    /// combined-fence caller): the annotate-success write now fences on BOTH
+    /// `version` and `source_revision`
+    /// (`try_update_page_content_with_changelog_at_versions`), closing the
+    /// window a version-only CAS left open -- `link_page_source` re-arms a
+    /// page (citations back to NULL, `source_revision` bumped) WITHOUT
+    /// touching `version`, so a version-only CAS would still match and
+    /// clobber the freshly re-armed page with a stale annotate result
+    /// computed from evidence read before the attach.
+    ///
+    /// Unlike the give-up paths
+    /// (`backfill_page_rearmed_by_link_page_source_after_giveup_is_annotated_
+    /// next_slice`, which never call the LLM and so have no interposable
+    /// await), the annotate-success path calls `LlmProvider::generate`,
+    /// giving `BlockingCitationProvider` a real seam to race a live
+    /// `link_page_source` attach against the in-flight write.
+    #[tokio::test]
+    async fn citation_result_for_stale_source_revision_is_dropped() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        seed_backfill_page(&db, "p_stale_source_rev", true).await;
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let llm: Arc<dyn LlmProvider> = Arc::new(BlockingCitationProvider {
+            entered: entered.clone(),
+            release: release.clone(),
+            response: format!("{BACKFILL_BODY}[1]"),
+        });
+        let db = Arc::new(db);
+        let task = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                run_citation_backfill_slice(&db, &llm, &PromptRegistry::default()).await
+            })
+        };
+
+        entered.notified().await;
+        insert_test_memory(&db, "mem_stale_new", "A second source attached mid-flight").await;
+        db.link_page_source("p_stale_source_rev", "mem_stale_new", "test")
+            .await
+            .unwrap();
+        release.notify_one();
+        task.await.unwrap().unwrap();
+
+        let page = db.get_page("p_stale_source_rev").await.unwrap().unwrap();
+        assert_eq!(
+            page.content, BACKFILL_BODY,
+            "stale annotate output computed before the source attach must not commit"
+        );
+        assert!(
+            db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&"p_stale_source_rev".to_string()),
+            "the source attach must win: citations stay NULL, not overwritten by the stale write"
+        );
+        assert_eq!(
+            page.source_memory_ids.len(),
+            2,
+            "the concurrently attached source must be preserved: {:?}",
+            page.source_memory_ids
+        );
+        assert!(page.source_memory_ids.contains(&"mem_a".to_string()));
+        assert!(page
+            .source_memory_ids
+            .contains(&"mem_stale_new".to_string()));
+
+        // The very next slice must pick the page back up and annotate with
+        // the new source visible -- proving the fence drops the stale write
+        // without starving the page.
+        let annotated = format!("{BACKFILL_BODY}[1][2]");
+        let llm2: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(&annotated));
+        let selected2 = run_citation_backfill_slice(&db, &llm2, &PromptRegistry::default())
+            .await
+            .unwrap();
+        assert_eq!(selected2, 1, "the next slice must select the re-armed page");
+        let resolved = db.get_page("p_stale_source_rev").await.unwrap().unwrap();
+        assert_eq!(
+            resolved.citations.len(),
+            2,
+            "both sources must be cited once the page is annotated cleanly: {:?}",
+            resolved.citations
+        );
+    }
+
     #[tokio::test]
     async fn ambient_backfill_slice_processes_at_most_one_page() {
         let (db, _dir) = crate::db::tests::test_db().await;
@@ -1391,6 +1500,85 @@ mod tests {
             "p_resolvable must get annotated on the very next slice, not \
              starved behind p_orphan: {:?}",
             resolved.citations
+        );
+    }
+
+    /// Round-2 doc-citation-locator fix: the give-up write's terminal CAS
+    /// (`set_page_citations_with_changelog_at_version`) now also fences on
+    /// `source_revision`, closing the window where a concurrent source
+    /// attach (`link_page_source`) re-arms a page (citations back to NULL,
+    /// source_revision bumped, `version` untouched) and a stale give-up
+    /// write computed from evidence read before that attach would otherwise
+    /// still match on `version` and clobber the re-armed page.
+    ///
+    /// The give-up paths never call the LLM, so unlike the annotate-success
+    /// path (`citation_result_for_old_page_version_is_dropped`'s
+    /// `BlockingCitationProvider` seam) there is no deterministic,
+    /// test-interposable await between a give-up's evidence read and its
+    /// terminal write to race a concurrent attach against directly -- see
+    /// the round-2 report for that gap. This proves the fix's actual
+    /// guarantee end-to-end instead: a page the sweep gave up on is re-armed
+    /// by `link_page_source`, and the very next slice picks it up and
+    /// annotates it, i.e. the new source_revision fence does not starve the
+    /// page it exists to protect.
+    #[tokio::test]
+    async fn backfill_page_rearmed_by_link_page_source_after_giveup_is_annotated_next_slice() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_page("p_rearmed", "T", None, BACKFILL_BODY, None, None, &[], &now)
+            .await
+            .unwrap();
+        // Evidence points at a locator with no matching `memories` row --
+        // resolves to zero content, hitting the `numbered.is_empty()`
+        // give-up (round-1's fix).
+        db.link_page_evidence("p_rearmed", "memory", Some("orphan_locator"), None, "test")
+            .await
+            .unwrap();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::unavailable());
+        let prompts = PromptRegistry::default();
+        let selected = run_citation_backfill_slice(&db, &llm, &prompts)
+            .await
+            .expect("the guard must skip before ever calling the (unavailable) LLM");
+        assert_eq!(selected, 1, "the slice must select p_rearmed");
+        assert!(
+            !db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&"p_rearmed".to_string()),
+            "sanity: the give-up write must leave citations = '[]', not NULL"
+        );
+
+        // Re-arm the SAME page via link_page_source: resets citations to
+        // NULL and bumps source_revision without touching version -- the
+        // exact concurrent-attach shape the fix guards against, replayed
+        // here sequentially (after the give-up commits) as a recovery
+        // proof rather than a live interleaving.
+        insert_test_memory(&db, "mem_rearmed", BACKFILL_MEM_CONTENT).await;
+        db.link_page_source("p_rearmed", "mem_rearmed", "test")
+            .await
+            .unwrap();
+        assert!(
+            db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&"p_rearmed".to_string()),
+            "sanity: link_page_source must re-arm the page (citations back to NULL)"
+        );
+
+        let annotated = format!("{BACKFILL_BODY}[1]");
+        let llm2: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(&annotated));
+        let selected2 = run_citation_backfill_slice(&db, &llm2, &prompts)
+            .await
+            .unwrap();
+        assert_eq!(selected2, 1, "the next slice must select p_rearmed again");
+        let page = db.get_page("p_rearmed").await.unwrap().unwrap();
+        assert_eq!(
+            page.citations.len(),
+            1,
+            "the source_revision fence must not starve the page it protects -- \
+             p_rearmed must be annotated on the very next slice: {:?}",
+            page.citations
         );
     }
 
