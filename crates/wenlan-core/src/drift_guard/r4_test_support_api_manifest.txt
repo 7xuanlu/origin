@@ -814,6 +814,12 @@ crates/wenlan-core/src/post_ingest.rs|crate::post_ingest::tests::relates_payload
 crates/wenlan-core/src/post_ingest.rs|crate::post_ingest::tests::relates_payload_between|test_primary_session|1
 crates/wenlan-core/src/post_ingest.rs|crate::post_ingest::tests::title_slice_commits_one_current_result|TestDbSession::execute|1
 crates/wenlan-core/src/post_ingest.rs|crate::post_ingest::tests::title_slice_commits_one_current_result|test_primary_session|1
+crates/wenlan-core/src/post_write/post_write_tests.rs|crate::post_write::tests::a_card_whose_supersedes_is_not_a_page_is_never_a_page_write|TestDbSession::execute|1
+crates/wenlan-core/src/post_write/post_write_tests.rs|crate::post_write::tests::a_card_whose_supersedes_is_not_a_page_is_never_a_page_write|test_primary_session|1
+crates/wenlan-core/src/post_write/post_write_tests.rs|crate::post_write::tests::accepting_the_latest_of_two_staged_corrections_leaves_the_older_pending|TestDbSession::execute|1
+crates/wenlan-core/src/post_write/post_write_tests.rs|crate::post_write::tests::accepting_the_latest_of_two_staged_corrections_leaves_the_older_pending|TestDbSession::execute|2
+crates/wenlan-core/src/post_write/post_write_tests.rs|crate::post_write::tests::accepting_the_latest_of_two_staged_corrections_leaves_the_older_pending|TestDbSession::execute|3
+crates/wenlan-core/src/post_write/post_write_tests.rs|crate::post_write::tests::accepting_the_latest_of_two_staged_corrections_leaves_the_older_pending|test_primary_session|1
 crates/wenlan-core/src/post_write/post_write_tests.rs|crate::post_write::tests::accept_page_revision_consume_failure_keeps_page_retryable|TestDbSession::execute|1
 crates/wenlan-core/src/post_write/post_write_tests.rs|crate::post_write::tests::accept_page_revision_consume_failure_keeps_page_retryable|TestDbSession::execute_batch|1
 crates/wenlan-core/src/post_write/post_write_tests.rs|crate::post_write::tests::accept_page_revision_consume_failure_keeps_page_retryable|test_primary_session|1

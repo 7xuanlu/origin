@@ -34,6 +34,12 @@ pub struct StoreMemoryResponse {
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub near_duplicate: Option<NearDuplicate>,
+    /// True when the write was staged for human review instead of taking effect.
+    /// Only a store carrying `supersedes` from an agent whose `trust_level` is not
+    /// `"full"` stages. `source_id` is the staged revision's id, and it is what
+    /// `POST /api/memory/revision/{id}/accept` takes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gated: bool,
     /// How structured fields were populated. "agent" | "llm" | "none" | "unknown" (forward-compat default).
     #[serde(default = "default_extraction_method")]
     pub extraction_method: String,
@@ -1469,6 +1475,7 @@ mod tests {
             quality: None,
             warnings: vec![],
             near_duplicate: None,
+            gated: false,
             extraction_method: "none".into(),
             enrichment: "not_needed".into(),
             hint: String::new(),
@@ -1492,6 +1499,33 @@ mod tests {
     }
 
     #[test]
+    fn gated_flag_is_absent_from_the_wire_when_false() {
+        let response = StoreMemoryResponse {
+            source_id: "mem_not_gated".into(),
+            chunks_created: 1,
+            memory_type: "fact".into(),
+            entity_id: None,
+            quality: None,
+            warnings: vec![],
+            near_duplicate: None,
+            gated: false,
+            extraction_method: "none".into(),
+            enrichment: String::new(),
+            hint: String::new(),
+            space: None,
+            space_source: None,
+            write_outcome: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(
+            !json.contains("\"gated\""),
+            "gated: false must be skipped on the wire, got: {json}"
+        );
+        let parsed: StoreMemoryResponse = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.gated);
+    }
+
+    #[test]
     fn store_memory_response_roundtrips_paused_state_with_hint() {
         let response = StoreMemoryResponse {
             source_id: "mem_paused".into(),
@@ -1501,6 +1535,7 @@ mod tests {
             quality: None,
             warnings: vec![],
             near_duplicate: None,
+            gated: false,
             extraction_method: "none".into(),
             enrichment: "paused".into(),
             hint: "Stored; choose a model source to enable enrichment.".into(),

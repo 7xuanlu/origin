@@ -119,7 +119,10 @@ lists every unconfirmed memory (pass `space` only if the user named one, e.g.
 - **Reject** → `forget(memory_id=<source_id>)`
 - **Skip** → nothing
 - *Other (typed text)* → edit: `capture(content=<text>, supersedes=<source_id>)`,
-  then `forget(memory_id=<source_id>)`.
+  then `forget(memory_id=<source_id>)`. If the capture response says
+  `gated: true`, the edit was staged for review instead of applied — skip the
+  `forget` call (the original is still the live version) and tell the user
+  their correction is waiting on approval in the review queue.
 
 ## `/curate refinements` (explicit proposal audit, MCP)
 

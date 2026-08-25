@@ -7,6 +7,17 @@ HTTP daemon — owns the Axum router + all routes. All handlers operate on `Arc<
 The module map and the RB-01 profiling env-flag table live in `REFERENCE.md`; read it
 when a task needs the module list or those flags.
 
+## Agent `trust_level` gates a write, not only visibility
+
+`agent_connections.trust_level` (`full`, `review`, `unknown`) used to govern only
+page-read visibility and confidence scoring. A `/api/memory/store` request that
+carries `supersedes` also stages instead of taking effect when the storing
+agent's `trust_level` is not `"full"` — see `memory_routes.rs`, the
+`pending_revision` decision next to where `trust_level` is resolved. The
+superseded memory stays live and searchable until a human accepts the staged
+row from the existing pending-revisions queue; nothing else about the store
+path changes.
+
 ## Adding or rescoping a route
 
 - If the route reads user data, register it in `crates/wenlan-core/src/lint/serving/routes.rs`.

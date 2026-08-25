@@ -388,7 +388,7 @@ pub struct CaptureParams {
     )]
     pub confidence: Option<f32>,
     #[schemars(
-        description = "source_id of a memory this replaces. Use when correcting or updating an existing memory — get the ID from recall first."
+        description = "source_id of a memory this replaces. Use when correcting or updating an existing memory — get the ID from recall first. If the user has set your agent's trust level below full, a capture that sets supersedes is staged for review rather than applied: the response says gated: true, and the memory you meant to replace keeps answering searches until a human accepts your change. Tell the user the correction is waiting for their approval; do not repeat the capture."
     )]
     pub supersedes: Option<String>,
     #[schemars(
@@ -957,10 +957,18 @@ pub struct ListPendingRevisionsParams {
 // ===== Internal Implementations =====
 
 fn format_capture_success(resp: &StoreMemoryResponse) -> String {
-    let mut msg = format!(
-        "Stored {}\nsource_memory_id: {}",
-        resp.source_id, resp.source_id
-    );
+    let mut msg = if resp.gated {
+        format!(
+            "Staged {} for review. Not live yet. The memory it replaces still \
+             answers searches until a human accepts it.\nsource_memory_id: {}\ngated: true",
+            resp.source_id, resp.source_id
+        )
+    } else {
+        format!(
+            "Stored {}\nsource_memory_id: {}",
+            resp.source_id, resp.source_id
+        )
+    };
     append_write_receipt(
         &mut msg,
         resp.space.as_deref(),
@@ -2374,7 +2382,7 @@ impl WenlanMcpServer {
     }
 
     #[tool(
-        description = "Delete a memory by ID. Use when the user says 'forget this', 'delete that', 'that's wrong and should be removed'. Requires the source_id — get it from recall first.\n\nThis is destructive and cannot be undone. For corrections, prefer storing a new memory with the supersedes param pointing to the old one — this preserves history.",
+        description = "Delete a memory by ID. Use when the user says 'forget this', 'delete that', 'that's wrong and should be removed'. Requires the source_id — get it from recall first.\n\nThis is destructive and cannot be undone. For corrections, prefer storing a new memory with the supersedes param pointing to the old one — this preserves history. If your agent's trust level is below full, that supersedes write may stage for human review instead of taking effect immediately.",
         annotations(
             title = "Forget",
             read_only_hint = false,
@@ -4051,6 +4059,7 @@ mod tests {
             quality: Some("high".into()),
             warnings: vec![],
             near_duplicate: None,
+            gated: false,
             extraction_method: "llm".into(),
             enrichment: String::new(),
             hint: String::new(),
@@ -4069,6 +4078,29 @@ mod tests {
     }
 
     #[test]
+    fn capture_success_message_says_gated() {
+        let resp = StoreMemoryResponse {
+            source_id: "mem_staged".into(),
+            chunks_created: 1,
+            memory_type: "fact".into(),
+            entity_id: None,
+            quality: None,
+            warnings: vec![],
+            near_duplicate: None,
+            gated: true,
+            extraction_method: "agent".into(),
+            enrichment: String::new(),
+            hint: String::new(),
+            space: None,
+            space_source: None,
+            write_outcome: Some(wenlan_types::WriteOutcome::Created),
+        };
+        let msg = format_capture_success(&resp);
+        assert!(msg.contains("gated: true"), "got: {msg}");
+        assert!(!msg.starts_with("Stored"), "got: {msg}");
+    }
+
+    #[test]
     fn capture_success_message_surfaces_warnings() {
         let resp = StoreMemoryResponse {
             source_id: "mem_abc".into(),
@@ -4078,6 +4110,7 @@ mod tests {
             quality: None,
             warnings: vec!["decision memory missing required 'claim' field".into()],
             near_duplicate: None,
+            gated: false,
             extraction_method: "agent".into(),
             enrichment: String::new(),
             hint: String::new(),
@@ -4101,6 +4134,7 @@ mod tests {
             quality: None,
             warnings: vec![],
             near_duplicate: None,
+            gated: false,
             extraction_method: "agent".into(),
             enrichment: String::new(),
             hint: String::new(),

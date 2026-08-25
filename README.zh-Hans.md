@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=7b7171a095587f65f249b9f82d918776815fd3a1325bdc1eb74ee83823d8fa53 -->
+<!-- README_SYNC: source=README.md sha256=0a1d0787e9875aa46c3a6aa2db9495207ff0eae9925ac1e77010bcfb2ad16c5a -->
 
 <p align="center">
   <picture>
@@ -194,7 +194,7 @@ Capture 与明确的 supersession 属于核心流程。模型支持的阶段只�
 | **Classify** | 配置本地模型后，Wenlan 将记忆分为 `identity`、`preference`、`decision`、`lesson`、`gotcha` 或 `fact`；调用方明确提供的准确类型优先。 |
 | **Enrich** | 配置本地模型后，在可用时补充结构化字段、检索提示、事件日期、质量、重要性与标签。 |
 | **Link** | 保留出处；启用 enrichment 后，把记忆连接到知识图谱中的实体与关系。 |
-| **Reconcile** | 明确取代旧说法时保留 `supersedes` 链。可选的本地模型流程可以把受保护内容的冲突放入审核，而不是覆盖历史；它默认关闭，必须明确启用。 |
+| **Reconcile** | 明确取代旧说法时保留 `supersedes` 链。若发起替换的 agent 信任级别低于 full，该替换会自动进入人工审核队列，无需任何开关。可选的本地模型流程还可以把受保护内容的冲突放入审核，而不是覆盖历史；这个流程默认关闭，必须明确启用。 |
 
 高级设置：使用 `WENLAN_ENABLE_DUAL_POOL_RESOLVE=1` 启用这个 Reconcile 流程。
 
