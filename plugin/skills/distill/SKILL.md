@@ -120,7 +120,8 @@ JSON. Possible shapes:
   "orphan_topics": [
     { "label": "Topic Z", "count": 3 },
     ...
-  ]
+  ],
+  "clusters_found": 0
 }
 ```
 
@@ -129,7 +130,16 @@ when called from this skill; `pending` carries every cluster the
 daemon found. The agent synthesizes them in this session — that's why
 the LLM choice is consistent with how the user invoked the skill.
 
-`unresolved` + `hint`: relay to user verbatim and stop.
+`clusters_found` is the raw cluster count *before* the existing-page
+overlap filter drops fully-covered clusters — it can be nonzero even
+when `pending` ends up empty. A top-level `hint` (string) is present
+only when `clusters_found` is 0 *and* `pages_created` is 0: nothing
+formed at all, and the text explains why.
+
+`unresolved` + `hint`: a target-resolution failure (different condition,
+same field name as the empty-pass hint). The MCP tool renders it as one
+line of text — ``Could not resolve target `<target>`. <hint>`` — not as
+JSON; relay that line to the user verbatim and stop.
 
 ### 3. Synthesize each `pending` cluster
 
@@ -290,7 +300,13 @@ Skip the section when `orphan_topics` is empty.
 
 Three output shapes. Pick the one that matches what happened.
 
-**If `pending` is empty (every cluster already fully covered):**
+**If `clusters_found` is 0 (no cluster formed at all):**
+
+```
+No page formed yet in `<scope>`: <hint text from the response>
+```
+
+**If `clusters_found` is nonzero but `pending` is empty (every cluster already fully covered):**
 
 ```
 Scope `<scope>` is up to date — no new memories to distill.

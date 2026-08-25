@@ -845,7 +845,11 @@ pub async fn handle_distill(
             .collect()
     };
 
-    Ok(Json(serde_json::json!({
+    // `clusters_found` is the raw cluster count BEFORE the covered-page
+    // filter above drops clusters a page already subsumes -- "found" means
+    // clustering formed them, not that they survived disclosure.
+    let no_clusters_and_no_pages = result.pending.is_empty() && result.created.is_empty();
+    let mut response = serde_json::json!({
         "pages_created": result.created.len(),
         "scoped": scoped,
         "created_ids": result.created,
@@ -853,7 +857,19 @@ pub async fn handle_distill(
         "stale_pages": stale_pages_payload,
         "stale_truncated": stale_truncated,
         "orphan_topics": orphan_topics,
-    })))
+        "clusters_found": result.pending.len(),
+    });
+    if no_clusters_and_no_pages {
+        if let serde_json::Value::Object(ref mut map) = response {
+            map.insert(
+                "hint".into(),
+                serde_json::json!(
+                    "No page-sized cluster formed in this scope: nothing grouped into 3 or more related memories that fit one page. Capture more related memories, or check the daemon log for dropped clusters."
+                ),
+            );
+        }
+    }
+    Ok(Json(response))
 }
 
 /// POST /api/distill/{page_id}
