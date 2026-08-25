@@ -4180,13 +4180,18 @@ impl MemoryDB {
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chunks'",
                     libsql::params![],
                 ).await.map_err(|e| WenlanError::VectorDb(format!("check chunks: {e}")))?;
-                    rows.next()
+                    match rows
+                        .next()
                         .await
-                        .ok()
-                        .flatten()
-                        .and_then(|r| r.get::<i64>(0).ok())
-                        .unwrap_or(0)
-                        > 0
+                        .map_err(|e| WenlanError::VectorDb(format!("check chunks row: {e}")))?
+                    {
+                        Some(r) => {
+                            r.get::<i64>(0).map_err(|e| {
+                                WenlanError::VectorDb(format!("check chunks count: {e}"))
+                            })? > 0
+                        }
+                        None => false,
+                    }
                 };
 
             if has_chunks {
@@ -4505,9 +4510,10 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
             // PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
-            if let Ok(name) = row.get::<String>(1) {
-                columns.insert(name);
-            }
+            let name = row.get::<String>(1).map_err(|e| {
+                WenlanError::VectorDb(format!("get_table_columns({table}) name: {e}"))
+            })?;
+            columns.insert(name);
         }
         Ok(columns)
     }
@@ -6948,7 +6954,11 @@ impl MemoryDB {
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m43 pragma: {e}")))?;
                     let mut found = false;
-                    while let Ok(Some(row)) = rows.next().await {
+                    while let Some(row) = rows
+                        .next()
+                        .await
+                        .map_err(|e| WenlanError::VectorDb(format!("m43 pragma scan: {e}")))?
+                    {
                         let col_name: String = row.get(1).unwrap_or_default();
                         if col_name == "needs_reembed" {
                             found = true;
@@ -14203,9 +14213,10 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("m113 scan row: {e}")))?
             {
-                if let Ok(id) = row.get::<String>(0) {
-                    unmapped.push(id);
-                }
+                let id = row
+                    .get::<String>(0)
+                    .map_err(|e| WenlanError::VectorDb(format!("m113 scan id: {e}")))?;
+                unmapped.push(id);
             }
 
             let now_iso = chrono::Utc::now().to_rfc3339();
@@ -14321,9 +14332,10 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("m114 scan row: {e}")))?
             {
-                if let Ok(id) = row.get::<String>(0) {
-                    mapped.push(id);
-                }
+                let id = row
+                    .get::<String>(0)
+                    .map_err(|e| WenlanError::VectorDb(format!("m114 scan id: {e}")))?;
+                mapped.push(id);
             }
 
             let now_iso = chrono::Utc::now().to_rfc3339();
@@ -24256,7 +24268,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("get_reembed_candidates: {}", e)))?;
         let mut results = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("get_reembed_candidates row scan: {e}")))?
+        {
             let id: String = row.get(0).unwrap_or_default();
             let content: String = row.get(1).unwrap_or_default();
             let source_text: Option<String> = row.get::<Option<String>>(2).unwrap_or(None);
@@ -24284,7 +24300,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("get_pending_reembeds: {}", e)))?;
         let mut results = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("get_pending_reembeds row scan: {e}")))?
+        {
             let chunk_id: String = row.get(0).unwrap_or_default();
             let source_id: String = row.get(1).unwrap_or_default();
             let content: String = row.get(2).unwrap_or_default();
@@ -25731,14 +25751,20 @@ impl MemoryDB {
             params.extend(filter_values.clone());
 
             match conn.query(&sql, params).await {
-                Ok(mut rows) => {
-                    while let Ok(Some(row)) = rows.next().await {
-                        let distance: f64 = row.get(30).unwrap_or(1.0);
-                        if let Ok(result) = Self::row_to_search_result(&row, distance as f32) {
-                            vector_results.push(result);
+                Ok(mut rows) => loop {
+                    let row = match rows.next().await {
+                        Ok(Some(row)) => row,
+                        Ok(None) => break,
+                        Err(e) => {
+                            log::warn!("[search] row scan aborted early: {e}");
+                            break;
                         }
+                    };
+                    let distance: f64 = row.get(30).unwrap_or(1.0);
+                    if let Ok(result) = Self::row_to_search_result(&row, distance as f32) {
+                        vector_results.push(result);
                     }
-                }
+                },
                 Err(e) => {
                     log::warn!(
                         "[memory_db] vector search failed (index may not exist): {}",
@@ -25823,14 +25849,20 @@ impl MemoryDB {
                 params.extend(filter_values.clone());
 
                 match conn.query(&fts_sql, params).await {
-                    Ok(mut rows) => {
-                        while let Ok(Some(row)) = rows.next().await {
-                            let rank: f64 = row.get(30).unwrap_or(0.0);
-                            if let Ok(result) = Self::row_to_search_result(&row, rank as f32) {
-                                fts_results.push(result);
+                    Ok(mut rows) => loop {
+                        let row = match rows.next().await {
+                            Ok(Some(row)) => row,
+                            Ok(None) => break,
+                            Err(e) => {
+                                log::warn!("[search] row scan aborted early: {e}");
+                                break;
                             }
+                        };
+                        let rank: f64 = row.get(30).unwrap_or(0.0);
+                        if let Ok(result) = Self::row_to_search_result(&row, rank as f32) {
+                            fts_results.push(result);
                         }
-                    }
+                    },
                     Err(e) => {
                         log::warn!("[memory_db] FTS search failed: {}", e);
                     }
@@ -26102,14 +26134,20 @@ impl MemoryDB {
             params.extend(filter_values.clone());
 
             match conn.query(&sql, params).await {
-                Ok(mut rows) => {
-                    while let Ok(Some(row)) = rows.next().await {
-                        let distance: f64 = row.get(30).unwrap_or(1.0);
-                        if let Ok(result) = Self::row_to_search_result(&row, distance as f32) {
-                            vector_results.push(result);
+                Ok(mut rows) => loop {
+                    let row = match rows.next().await {
+                        Ok(Some(row)) => row,
+                        Ok(None) => break,
+                        Err(e) => {
+                            log::warn!("[search_memory_with_cue] row scan aborted early: {e}");
+                            break;
                         }
+                    };
+                    let distance: f64 = row.get(30).unwrap_or(1.0);
+                    if let Ok(result) = Self::row_to_search_result(&row, distance as f32) {
+                        vector_results.push(result);
                     }
-                }
+                },
                 Err(e) => {
                     log::warn!("[memory_db] memory vector search failed: {}", e);
                 }
@@ -26192,14 +26230,20 @@ impl MemoryDB {
                 params.extend(filter_values.clone());
 
                 match conn.query(&fts_sql, params).await {
-                    Ok(mut rows) => {
-                        while let Ok(Some(row)) = rows.next().await {
-                            let rank: f64 = row.get(30).unwrap_or(0.0);
-                            if let Ok(result) = Self::row_to_search_result(&row, rank as f32) {
-                                fts_results.push(result);
+                    Ok(mut rows) => loop {
+                        let row = match rows.next().await {
+                            Ok(Some(row)) => row,
+                            Ok(None) => break,
+                            Err(e) => {
+                                log::warn!("[search_memory_with_cue] row scan aborted early: {e}");
+                                break;
                             }
+                        };
+                        let rank: f64 = row.get(30).unwrap_or(0.0);
+                        if let Ok(result) = Self::row_to_search_result(&row, rank as f32) {
+                            fts_results.push(result);
                         }
-                    }
+                    },
                     Err(e) => {
                         log::warn!("[memory_db] memory FTS search failed: {}", e);
                     }
@@ -26285,10 +26329,15 @@ impl MemoryDB {
                 .query(&sql, libsql::params_from_iter(scope_values))
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("archived_ids query: {e}")))?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(sid) = row.get::<String>(0) {
-                    ids.insert(sid);
-                }
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("archived_ids row scan: {e}")))?
+            {
+                let sid = row
+                    .get::<String>(0)
+                    .map_err(|e| WenlanError::VectorDb(format!("archived_ids id: {e}")))?;
+                ids.insert(sid);
             }
             ids
         };
@@ -26680,7 +26729,15 @@ impl MemoryDB {
             let mut entity_names: HashMap<String, String> = HashMap::new();
             let conn = self.conn.lock().await;
             if let Ok(mut rows) = conn.query(&sql, params).await {
-                while let Ok(Some(row)) = rows.next().await {
+                loop {
+                    let row = match rows.next().await {
+                        Ok(Some(row)) => row,
+                        Ok(None) => break,
+                        Err(e) => {
+                            log::warn!("[search_memory_with_cue] row scan aborted early: {e}");
+                            break;
+                        }
+                    };
                     if let (Ok(id), Ok(name)) = (row.get::<String>(0), row.get::<String>(1)) {
                         entity_names.insert(id, name);
                     }
@@ -26888,14 +26945,20 @@ impl MemoryDB {
                 ),
             };
             match conn.query(&sql, params).await {
-                Ok(mut rows) => {
-                    while let Ok(Some(row)) = rows.next().await {
-                        let distance: f64 = row.get(30).unwrap_or(1.0);
-                        if let Ok(result) = Self::row_to_search_result(&row, distance as f32) {
-                            vector_results.push(result);
+                Ok(mut rows) => loop {
+                    let row = match rows.next().await {
+                        Ok(Some(row)) => row,
+                        Ok(None) => break,
+                        Err(e) => {
+                            log::warn!("[search_episodes_scoped] row scan aborted early: {e}");
+                            break;
                         }
+                    };
+                    let distance: f64 = row.get(30).unwrap_or(1.0);
+                    if let Ok(result) = Self::row_to_search_result(&row, distance as f32) {
+                        vector_results.push(result);
                     }
-                }
+                },
                 Err(e) => {
                     log::warn!("[memory_db] episode vector search failed: {}", e);
                 }
@@ -26935,14 +26998,20 @@ impl MemoryDB {
                     params.push(value.clone());
                 }
                 match conn.query(&fts_sql, params).await {
-                    Ok(mut rows) => {
-                        while let Ok(Some(row)) = rows.next().await {
-                            let rank: f64 = row.get(30).unwrap_or(0.0);
-                            if let Ok(result) = Self::row_to_search_result(&row, rank as f32) {
-                                fts_results.push(result);
+                    Ok(mut rows) => loop {
+                        let row = match rows.next().await {
+                            Ok(Some(row)) => row,
+                            Ok(None) => break,
+                            Err(e) => {
+                                log::warn!("[search_episodes_scoped] row scan aborted early: {e}");
+                                break;
                             }
+                        };
+                        let rank: f64 = row.get(30).unwrap_or(0.0);
+                        if let Ok(result) = Self::row_to_search_result(&row, rank as f32) {
+                            fts_results.push(result);
                         }
-                    }
+                    },
                     Err(e) => {
                         log::warn!("[memory_db] episode FTS search failed: {}", e);
                     }
@@ -27088,7 +27157,11 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("fact channel query: {e}")))?;
             let mut rank = 0usize;
-            while let Ok(Some(row)) = rows.next().await {
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("fact channel row scan: {e}")))?
+            {
                 let parent_id: String = match row.get(0) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -27152,13 +27225,19 @@ impl MemoryDB {
         }
         let mut by_source: HashMap<String, SearchResult> = HashMap::new();
         match conn.query(&sql, params).await {
-            Ok(mut rows) => {
-                while let Ok(Some(row)) = rows.next().await {
-                    if let Ok(result) = Self::row_to_search_result(&row, 0.0) {
-                        by_source.insert(result.source_id.clone(), result);
+            Ok(mut rows) => loop {
+                let row = match rows.next().await {
+                    Ok(Some(row)) => row,
+                    Ok(None) => break,
+                    Err(e) => {
+                        log::warn!("[search_facts_channel] row scan aborted early: {e}");
+                        break;
                     }
+                };
+                if let Ok(result) = Self::row_to_search_result(&row, 0.0) {
+                    by_source.insert(result.source_id.clone(), result);
                 }
-            }
+            },
             Err(e) => {
                 return Err(WenlanError::VectorDb(format!(
                     "fact channel rehydrate: {e}"
@@ -27984,7 +28063,9 @@ impl MemoryDB {
 
             let fetch_cap = max_nodes.max(anchor_entity_ids.len());
             let mut next_frontier: Vec<String> = Vec::new();
-            while let Ok(Some(row)) = rows.next().await {
+            while let Some(row) = rows.next().await.map_err(|e| {
+                WenlanError::VectorDb(format!("expand_anchor_entities_khop row scan: {e}"))
+            })? {
                 // FIX 1 (runaway): bound the per-hop fetch the same way T9's
                 // expand_entities_khop does — stop reading rows once the visited
                 // set hits the cap, so a hub with thousands of relations can't read
@@ -28055,7 +28136,13 @@ impl MemoryDB {
     ) -> Result<Vec<SearchResult>, WenlanError> {
         let entity_hits = match self.search_entities_by_vector_scoped(query, 5, scope).await {
             Ok(hits) if !hits.is_empty() => hits,
-            _ => return Ok(results),
+            Ok(_) => return Ok(results),
+            Err(e) => {
+                log::warn!(
+                    "[graph_stream] entity-anchor search failed; graph contributes nothing: {e}"
+                );
+                return Ok(results);
+            }
         };
 
         // v3 (WENLAN_GRAPH_MEMORY_STREAM): live entity→memory stream replaces the
@@ -28185,7 +28272,20 @@ impl MemoryDB {
     ) -> Result<Vec<SearchResult>, WenlanError> {
         // 1. Shared anchor eligibility (type + degree). One source of truth
         //    with the G3 touch probe so the two can never drift.
-        let ranked_anchor_ids = self.stream_anchor_ids(entity_hits, scope).await?;
+        //
+        // The graph stream is a default-on *augmentation* of the primary
+        // search: its DB helpers propagate scan errors honestly, but a
+        // failure here must degrade to the untouched base results rather
+        // than fail the whole search the caller asked for.
+        let ranked_anchor_ids = match self.stream_anchor_ids(entity_hits, scope).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                log::warn!(
+                    "[graph_stream] anchor eligibility failed; graph contributes nothing: {e}"
+                );
+                return Ok(results);
+            }
+        };
         if ranked_anchor_ids.is_empty() {
             log::info!(
                 "[graph_stream] no eligible anchors after type+degree filter (cap={}); graph contributes nothing",
@@ -28195,9 +28295,18 @@ impl MemoryDB {
         }
 
         // 2. Linked memories, one per source_id, best anchor rank.
-        let graph_memories = self
+        let graph_memories = match self
             .get_memories_for_entities_scoped(&ranked_anchor_ids, limit, scope)
-            .await?;
+            .await
+        {
+            Ok(memories) => memories,
+            Err(e) => {
+                log::warn!(
+                    "[graph_stream] linked-memory fetch failed; graph contributes nothing: {e}"
+                );
+                return Ok(results);
+            }
+        };
         if graph_memories.is_empty() {
             return Ok(results);
         }
@@ -28330,7 +28439,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("entity_degrees: {e}")))?;
         let mut out = HashMap::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("entity_degrees row scan: {e}")))?
+        {
             let id: String = row.get(0).unwrap_or_default();
             let c: i64 = row.get(1).unwrap_or(0);
             if !id.is_empty() {
@@ -28393,7 +28506,9 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("get_memories_for_entities: {e}")))?;
         // Per memory, keep the best (lowest) anchor rank across its edges.
         let mut best: HashMap<String, (usize, SearchResult)> = HashMap::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows.next().await.map_err(|e| {
+            WenlanError::VectorDb(format!("get_memories_for_entities row scan: {e}"))
+        })? {
             let ent: String = row.get(34).unwrap_or_default();
             let rank = anchor_rank.get(ent.as_str()).copied().unwrap_or(usize::MAX);
             let res = match Self::row_to_search_result(&row, 0.0) {
@@ -28527,7 +28642,11 @@ impl MemoryDB {
                 .map_err(|e| WenlanError::VectorDb(format!("expand_entities_khop: {}", e)))?;
 
             let mut next_frontier: Vec<String> = Vec::new();
-            while let Ok(Some(row)) = rows.next().await {
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("expand_entities_khop row scan: {e}")))?
+            {
                 let eid: String = row.get(0).unwrap_or_default();
                 if !eid.is_empty() && !visited.contains(&eid) {
                     visited.insert(eid.clone());
@@ -28623,7 +28742,20 @@ impl MemoryDB {
             .map(|(rank, id)| (id.clone(), rank))
             .collect();
         let seeds = crate::retrieval::signals::seed_entities_by_rank(&pool_pairs, top_k);
-        let seeds = self.filter_entity_ids_scoped(&seeds, scope).await?;
+        // Graph augmentation is optional: propagating this error would drop
+        // `results` (already moved here), and the caller's retry-with-empty
+        // path would then erase healthy base hits. Degrade to the base
+        // results instead; the filter's own decode errors stay loud for
+        // callers that ask it directly.
+        let seeds = match self.filter_entity_ids_scoped(&seeds, scope).await {
+            Ok(seeds) => seeds,
+            Err(e) => {
+                log::warn!(
+                    "[augment_seeded] scoped seed filter failed; graph contributes nothing: {e}"
+                );
+                return Ok(results);
+            }
+        };
 
         // BFS to expand seed set
         let expanded = match self
@@ -28741,20 +28873,26 @@ impl MemoryDB {
             )
         };
 
+        // Eval baseline: partial output would be scored as if complete
+        // (NDCG/MRR over a truncated candidate list), so both the query and
+        // the row scan propagate instead of degrading.
         let mut results = Vec::new();
-        match conn.query(&sql, params).await {
-            Ok(mut rows) => {
-                while let Ok(Some(row)) = rows.next().await {
-                    let distance: f64 = row.get(30).unwrap_or(1.0);
-                    let score = (1.0 - distance).max(0.0) as f32;
-                    if let Ok(result) = Self::row_to_search_result(&row, score) {
-                        results.push(result);
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!("[naive_vector_search] vector index query failed: {}", e);
-            }
+        let mut rows = conn
+            .query(&sql, params)
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("naive_vector_search query: {e}")))?;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("naive_vector_search row scan: {e}")))?
+        {
+            let distance: f64 = row
+                .get(30)
+                .map_err(|e| WenlanError::VectorDb(format!("naive_vector_search distance: {e}")))?;
+            let score = (1.0 - distance).max(0.0) as f32;
+            results.push(Self::row_to_search_result(&row, score).map_err(|e| {
+                WenlanError::VectorDb(format!("naive_vector_search row decode: {e}"))
+            })?);
         }
 
         results.sort_by(|a, b| {
@@ -28835,7 +28973,8 @@ impl MemoryDB {
         };
         let mut results: Vec<SearchResult> = Vec::new();
 
-        for fts_query in &fts_queries {
+        for (attempt, fts_query) in fts_queries.iter().enumerate() {
+            let is_last_attempt = attempt + 1 == fts_queries.len();
             let mut params: Vec<libsql::Value> = vec![
                 libsql::Value::Text(fts_query.clone()),
                 libsql::Value::Integer(fetch_limit),
@@ -28844,23 +28983,44 @@ impl MemoryDB {
                 params.push(dp.clone());
             }
 
-            match conn.query(&fts_sql, params).await {
-                Ok(mut rows) => {
-                    while let Ok(Some(row)) = rows.next().await {
+            // Eval baseline: silent truncation of the scored candidate list is
+            // the failure this exists to remove, so the WHOLE attempt — query,
+            // scan, rank, and decode — is fallible as one unit. A failure on a
+            // non-final form (the AND form can be invalid FTS5 syntax for free
+            // text) discards that attempt's partial prefix and falls through
+            // to the next form; the final form's failure is the caller's error.
+            let attempt_result: Result<Vec<SearchResult>, WenlanError> =
+                async {
+                    let mut attempt_results = Vec::new();
+                    let mut rows = conn.query(&fts_sql, params).await.map_err(|e| {
+                        WenlanError::VectorDb(format!("fts_only_search query: {e}"))
+                    })?;
+                    while let Some(row) = rows.next().await.map_err(|e| {
+                        WenlanError::VectorDb(format!("fts_only_search row scan: {e}"))
+                    })? {
                         // FTS5 rank is negative BM25; negate so higher = better
-                        let rank: f64 = row.get(30).unwrap_or(0.0);
+                        let rank: f64 = row.get(30).map_err(|e| {
+                            WenlanError::VectorDb(format!("fts_only_search rank: {e}"))
+                        })?;
                         let score = (-rank) as f32;
-                        if let Ok(result) = Self::row_to_search_result(&row, score) {
-                            results.push(result);
-                        }
+                        attempt_results.push(Self::row_to_search_result(&row, score).map_err(
+                            |e| WenlanError::VectorDb(format!("fts_only_search row decode: {e}")),
+                        )?);
+                    }
+                    Ok(attempt_results)
+                }
+                .await;
+            match attempt_result {
+                Ok(attempt_results) => {
+                    results = attempt_results;
+                    if !results.is_empty() {
+                        break;
                     }
                 }
-                Err(e) => {
-                    log::warn!("[fts_only_search] FTS search failed: {}", e);
+                Err(e) if !is_last_attempt => {
+                    log::warn!("[fts_only_search] FTS attempt failed; trying fallback: {e}");
                 }
-            }
-            if !results.is_empty() {
-                break;
+                Err(e) => return Err(e),
             }
         }
 
@@ -28966,6 +29126,10 @@ impl MemoryDB {
                    LIMIT ?3";
 
         let mut results = Vec::new();
+        // A step error mid-scan leaves a partial prefix in `results`; without
+        // this flag one good row would suppress the brute-force retry below
+        // and the prefix would be served as a complete top-k.
+        let mut primary_scan_failed = false;
         match conn
             .query(
                 sql,
@@ -28974,7 +29138,16 @@ impl MemoryDB {
             .await
         {
             Ok(mut rows) => {
-                while let Ok(Some(row)) = rows.next().await {
+                loop {
+                    let row = match rows.next().await {
+                        Ok(Some(row)) => row,
+                        Ok(None) => break,
+                        Err(e) => {
+                            log::warn!("[search_entities_by_vector] row scan aborted early: {e}");
+                            primary_scan_failed = true;
+                            break;
+                        }
+                    };
                     let entity = Entity {
                         id: row.get::<String>(0).unwrap_or_default(),
                         name: row.get::<String>(1).unwrap_or_default(),
@@ -29013,7 +29186,10 @@ impl MemoryDB {
         // now, same shape as the primary path above -- `entities` is no
         // longer written by `store_entity`, so a shadow-only entity had no
         // row here and silently dropped out of auto-link/dedup matching.
-        if results.is_empty() {
+        if results.is_empty() || primary_scan_failed {
+            // Retry from scratch: the aborted prefix must not mix with (or
+            // stand in for) the brute-force ranking.
+            results.clear();
             let fallback_sql =
                 "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, vector_distance_cos(p.embedding, vector32(?1)) as distance, p.aliases
                  FROM entity_page_map epm
@@ -29026,7 +29202,17 @@ impl MemoryDB {
                 .await
             {
                 Ok(mut rows) => {
-                    while let Ok(Some(row)) = rows.next().await {
+                    loop {
+                        let row = match rows.next().await {
+                            Ok(Some(row)) => row,
+                            Ok(None) => break,
+                            Err(e) => {
+                                log::warn!(
+                                    "[search_entities_by_vector] row scan aborted early: {e}"
+                                );
+                                break;
+                            }
+                        };
                         let entity = Entity {
                             id: row.get::<String>(0).unwrap_or_default(),
                             name: row.get::<String>(1).unwrap_or_default(),
@@ -29168,7 +29354,9 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("get_observations_for_entities: {}", e)))?;
 
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows.next().await.map_err(|e| {
+            WenlanError::VectorDb(format!("get_observations_for_entities row scan: {e}"))
+        })? {
             let id: String = row.get(0).unwrap_or_default();
             let content: String = row.get(1).unwrap_or_default();
             let entity_name: String = row.get(2).unwrap_or_default();
@@ -29565,9 +29753,27 @@ impl MemoryDB {
             ReadScope::Space(space) => vec![libsql::Value::Text(space.clone())],
             ReadScope::Global | ReadScope::Uncategorized => Vec::new(),
         };
-        if let Ok(mut rows) = conn.query(&root_sql, root_params).await {
-            if let Ok(Some(row)) = rows.next().await {
-                root = Self::row_to_summary_node(&row).ok();
+        // Root-first invariant: no readable root, no summary results. A failed
+        // root lookup or decode must empty the whole channel — scoring buckets
+        // under an unknown root would return results the invariant forbids.
+        match conn.query(&root_sql, root_params).await {
+            Ok(mut rows) => match rows.next().await {
+                Ok(Some(row)) => match Self::row_to_summary_node(&row) {
+                    Ok(node) => root = Some(node),
+                    Err(e) => {
+                        log::warn!("[summary_search] root row undecodable; channel empty: {e}");
+                        return Ok(Vec::new());
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    log::warn!("[summary_search] root scan aborted; channel empty: {e}");
+                    return Ok(Vec::new());
+                }
+            },
+            Err(e) => {
+                log::warn!("[summary_search] root query failed; channel empty: {e}");
+                return Ok(Vec::new());
             }
         }
 
@@ -29600,7 +29806,15 @@ impl MemoryDB {
         }
         if let Ok(mut rows) = conn.query(&vec_sql, vector_params).await {
             let mut rank = 0usize;
-            while let Ok(Some(row)) = rows.next().await {
+            loop {
+                let row = match rows.next().await {
+                    Ok(Some(row)) => row,
+                    Ok(None) => break,
+                    Err(e) => {
+                        log::warn!("[search_summary_nodes_scoped] row scan aborted early: {e}");
+                        break;
+                    }
+                };
                 if let Ok(node) = Self::row_to_summary_node(&row) {
                     let rrf = 1.0 / (60.0 + rank as f32);
                     ranked.entry(node.id.clone()).or_insert((rrf, node));
@@ -29628,7 +29842,15 @@ impl MemoryDB {
         }
         if let Ok(mut rows) = conn.query(&fts_sql, fts_params).await {
             let mut rank = 0usize;
-            while let Ok(Some(row)) = rows.next().await {
+            loop {
+                let row = match rows.next().await {
+                    Ok(Some(row)) => row,
+                    Ok(None) => break,
+                    Err(e) => {
+                        log::warn!("[search_summary_nodes_scoped] row scan aborted early: {e}");
+                        break;
+                    }
+                };
                 if let Ok(node) = Self::row_to_summary_node(&row) {
                     let rrf = 1.0 / (60.0 + rank as f32);
                     ranked
@@ -29672,8 +29894,12 @@ impl MemoryDB {
             body: row
                 .get(4)
                 .map_err(|e| WenlanError::VectorDb(e.to_string()))?,
-            source_count: row.get(5).unwrap_or(0),
-            generated_at: row.get(6).unwrap_or(0),
+            source_count: row
+                .get(5)
+                .map_err(|e| WenlanError::VectorDb(format!("summary node source_count: {e}")))?,
+            generated_at: row
+                .get(6)
+                .map_err(|e| WenlanError::VectorDb(format!("summary node generated_at: {e}")))?,
         })
     }
 
@@ -31086,7 +31312,9 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("get_memories: {}", e)))?;
 
         let mut results = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows.next().await.map_err(|e| {
+            WenlanError::VectorDb(format!("get_memories_by_source_id row scan: {e}"))
+        })? {
             results.push(MemoryDetail {
                 id: row.get::<String>(0).unwrap_or_default(),
                 content: row.get::<String>(1).unwrap_or_default(),
@@ -31388,7 +31616,12 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("count_unembedded_chunks: {}", e)))?;
         let mut missing = 0usize;
-        while let Ok(Some(_)) = rows.next().await {
+        while rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("count_unembedded_chunks row: {e}")))?
+            .is_some()
+        {
             missing += 1;
         }
         Ok(missing)
@@ -31514,7 +31747,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("get_memory_details: {}", e)))?;
 
-        if let Ok(Some(row)) = rows.next().await {
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("get_memory_details row: {e}")))?
+        {
             Ok(Some(MemoryDetail {
                 id: row.get::<String>(0).unwrap_or_default(),
                 content: row.get::<String>(1).unwrap_or_default(),
@@ -32453,7 +32690,11 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("rebuild_missing scan: {e}")))?;
             let mut ids = Vec::new();
-            while let Ok(Some(row)) = rows.next().await {
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("rebuild_missing row scan: {e}")))?
+            {
                 if let Ok(id) = row.get::<String>(0) {
                     ids.push(id);
                 }
@@ -32486,23 +32727,25 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("update_doc_content: {}", e)))?;
 
-        let meta = if let Ok(Some(row)) = rows.next().await {
-            Some((
-                row.get::<String>(0).unwrap_or_default(),
-                row.get::<String>(1).unwrap_or_default(),
-                row.get::<Option<String>>(2).unwrap_or(None),
-                row.get::<Option<String>>(3).unwrap_or(None),
-                row.get::<Option<String>>(4).unwrap_or(None),
-                row.get::<Option<String>>(5).unwrap_or(None),
-                row.get::<Option<String>>(6).unwrap_or(None),
-                row.get::<Option<f64>>(7).unwrap_or(None).map(|v| v as f32),
-                row.get::<Option<i64>>(8).unwrap_or(None).map(|v| v != 0),
-                row.get::<Option<String>>(9).unwrap_or(None),
-                row.get::<i64>(10).unwrap_or(0),
-            ))
-        } else {
-            None
-        };
+        let meta = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("update_doc_content row: {e}")))?
+            .map(|row| {
+                (
+                    row.get::<String>(0).unwrap_or_default(),
+                    row.get::<String>(1).unwrap_or_default(),
+                    row.get::<Option<String>>(2).unwrap_or(None),
+                    row.get::<Option<String>>(3).unwrap_or(None),
+                    row.get::<Option<String>>(4).unwrap_or(None),
+                    row.get::<Option<String>>(5).unwrap_or(None),
+                    row.get::<Option<String>>(6).unwrap_or(None),
+                    row.get::<Option<f64>>(7).unwrap_or(None).map(|v| v as f32),
+                    row.get::<Option<i64>>(8).unwrap_or(None).map(|v| v != 0),
+                    row.get::<Option<String>>(9).unwrap_or(None),
+                    row.get::<i64>(10).unwrap_or(0),
+                )
+            });
         drop(rows);
         drop(conn);
 
@@ -32553,7 +32796,11 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("count_by_source: {}", e)))?;
 
         let mut map = HashMap::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("count_by_source row scan: {e}")))?
+        {
             let source: String = row.get(0).unwrap_or_default();
             let count: i64 = row.get(1).unwrap_or(0);
             map.insert(source, count as u64);
@@ -33101,7 +33348,11 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("list_filtered: {}", e)))?;
 
         let mut results = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("list_filtered row scan: {e}")))?
+        {
             results.push(IndexedFileInfo {
                 source_id: row.get::<String>(0).unwrap_or_default(),
                 title: row.get::<String>(1).unwrap_or_default(),
@@ -36208,7 +36459,11 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("resolve_entity exact: {}", e)))?;
-            if let Ok(Some(row)) = rows.next().await {
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("resolve_entity exact row: {e}")))?
+            {
                 let id: String = row.get(0).unwrap();
                 return Ok(Some(id));
             }
@@ -36226,17 +36481,20 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("resolve_entity fuzzy: {}", e)))?;
-            if let Ok(Some(row)) = rows.next().await {
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("resolve_entity fuzzy row: {e}")))?
+            {
                 let id: String = row.get(0).unwrap();
                 return Ok(Some(id));
             }
         } // Drop conn lock before vector search (which acquires its own lock)
           // Step C: vector similarity match (cosine distance < 0.15 ≈ similarity > 0.85)
-        if let Ok(hits) = self.search_entities_by_vector(name, 1).await {
-            if let Some(hit) = hits.first() {
-                if hit.distance < 0.15 {
-                    return Ok(Some(hit.entity.id.clone()));
-                }
+        let hits = self.search_entities_by_vector(name, 1).await?;
+        if let Some(hit) = hits.first() {
+            if hit.distance < 0.15 {
+                return Ok(Some(hit.entity.id.clone()));
             }
         }
         Ok(None)
@@ -36321,8 +36579,15 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("degree_stats group: {e}")))?;
         let mut degs: Vec<i64> = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
-            degs.push(row.get::<i64>(0).unwrap_or(0));
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("degree_stats row scan: {e}")))?
+        {
+            degs.push(
+                row.get::<i64>(0)
+                    .map_err(|e| WenlanError::VectorDb(format!("degree_stats count: {e}")))?,
+            );
         }
         let edges: i64 = degs.iter().sum();
         let distinct_entities = degs.len() as i64;
@@ -36333,16 +36598,19 @@ impl MemoryDB {
                 a[((a.len() as f64 * p) as usize).min(a.len() - 1)]
             }
         };
-        let memories_linked: i64 = conn
+        let memories_linked: i64 = match conn
             .query("SELECT COUNT(DISTINCT memory_id) FROM memory_entities", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("degree_stats memcount: {e}")))?
             .next()
             .await
-            .ok()
-            .flatten()
-            .and_then(|r| r.get::<i64>(0).ok())
-            .unwrap_or(0);
+            .map_err(|e| WenlanError::VectorDb(format!("degree_stats memcount row: {e}")))?
+        {
+            Some(row) => row
+                .get::<i64>(0)
+                .map_err(|e| WenlanError::VectorDb(format!("degree_stats memcount decode: {e}")))?,
+            None => 0,
+        };
         Ok(MemoryEntitiesDegreeStats {
             edges,
             distinct_entities,
@@ -36381,7 +36649,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("unlinked_memories: {e}")))?;
         let mut out = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("unlinked_memories row scan: {e}")))?
+        {
             let sid: String = row.get(0).unwrap_or_default();
             let content: String = row.get(1).unwrap_or_default();
             if !sid.is_empty() {
@@ -36417,7 +36689,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("top_hubs: {e}")))?;
         let mut out = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("top_hubs row scan: {e}")))?
+        {
             let c: i64 = row.get(1).unwrap_or(0);
             let nm: String = row.get(2).unwrap_or_default();
             out.push((c, nm));
@@ -36771,7 +37047,7 @@ impl MemoryDB {
                 // `insert_entity_shadow_page`'s embedding param and
                 // `refresh_entity_embedding`'s shadow re-sync).
                 if resolved.is_none() {
-                    if let Ok(mut vector_rows) = conn
+                    let mut vector_rows = conn
                         .query(
                             "SELECT epm.entity_id, vector_distance_cos(p.embedding, vector32(?1)) AS distance
                              FROM entity_page_map epm
@@ -36781,8 +37057,17 @@ impl MemoryDB {
                             libsql::params![embedding.as_str()],
                         )
                         .await
+                        .map_err(|e| {
+                            WenlanError::VectorDb(format!(
+                                "entity enrichment vector resolve: {e}"
+                            ))
+                        })?;
                     {
-                        if let Ok(Some(row)) = vector_rows.next().await {
+                        if let Some(row) = vector_rows.next().await.map_err(|e| {
+                            WenlanError::VectorDb(format!(
+                                "entity enrichment vector resolve row: {e}"
+                            ))
+                        })? {
                             let distance = row.get::<f64>(1).unwrap_or(1.0);
                             // Same entropy gate `resolve_or_create_entity`
                             // step 3 applies: a short/low-entropy name ("API"
@@ -37744,7 +38029,11 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("get_memory_entity_id: {}", e)))?;
-        if let Ok(Some(row)) = rows.next().await {
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("get_memory_entity_id row: {e}")))?
+        {
             Ok(row.get::<Option<String>>(0).unwrap_or(None))
         } else {
             Ok(None)
@@ -37764,7 +38053,11 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("get_memory_source_agent: {}", e)))?;
-        if let Ok(Some(row)) = rows.next().await {
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("get_memory_source_agent row: {e}")))?
+        {
             Ok(row.get::<Option<String>>(0).unwrap_or(None))
         } else {
             Ok(None)
@@ -38059,7 +38352,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("get_enrichment_steps: {e}")))?;
         let mut steps = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("get_enrichment_steps row scan: {e}")))?
+        {
             steps.push(wenlan_types::EnrichmentStepStatus {
                 step: row.get::<String>(0).unwrap_or_default(),
                 status: row.get::<String>(1).unwrap_or_default(),
@@ -38086,7 +38383,11 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("get_enrichment_summary: {e}")))?;
-        if let Ok(Some(row)) = rows.next().await {
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("get_enrichment_summary row: {e}")))?
+        {
             let total: i64 = row.get(0).unwrap_or(0);
             let failed: i64 = row.get(1).unwrap_or(0);
             let ok: i64 = row.get(2).unwrap_or(0);
@@ -38128,7 +38429,11 @@ impl MemoryDB {
                 WenlanError::VectorDb(format!("get_failed_enrichment_memories: {e}"))
             })?;
         let mut results = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("get_failed_enrichment row scan: {e}")))?
+        {
             results.push((
                 row.get::<String>(0).unwrap_or_default(),
                 row.get::<String>(1).unwrap_or_default(),
@@ -38162,7 +38467,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("get_title_reenrich_candidates: {e}")))?;
         let mut results = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("get_title_reenrich row scan: {e}")))?
+        {
             results.push((
                 row.get::<String>(0).unwrap_or_default(),
                 row.get::<String>(1).unwrap_or_default(),
@@ -38194,7 +38503,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("get_truncated_title_memories: {e}")))?;
         let mut results = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("get_truncated_titles row scan: {e}")))?
+        {
             results.push((
                 row.get::<String>(0).unwrap_or_default(),
                 row.get::<String>(1).unwrap_or_default(),
@@ -42373,7 +42686,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("find_same_type_memories: {}", e)))?;
         let mut results = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("find_same_type_memories row scan: {e}")))?
+        {
             let source_id: String = row.get(0).unwrap_or_default();
             let sf: Option<String> = row.get::<Option<String>>(1).unwrap_or(None);
             let content: String = row.get(2).unwrap_or_default();
@@ -45289,7 +45606,11 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("list_recent_retrievals scan: {e}")))?;
 
         let mut raw: Vec<(i64, String, Option<String>, Vec<String>)> = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("list_recent_retrievals row scan: {e}")))?
+        {
             let ts_s: i64 = row.get(0).unwrap_or(0);
             let agent: String = row.get(1).unwrap_or_default();
             let q: String = row.get(2).unwrap_or_default();
@@ -45324,7 +45645,9 @@ impl MemoryDB {
                     .map_err(|e| {
                         WenlanError::VectorDb(format!("list_recent_retrievals resolve: {e}"))
                     })?;
-                while let Ok(Some(tr)) = t_rows.next().await {
+                while let Some(tr) = t_rows.next().await.map_err(|e| {
+                    WenlanError::VectorDb(format!("list_recent_retrievals resolve row: {e}"))
+                })? {
                     let cid: String = tr.get(0).unwrap_or_default();
                     let title: String = tr.get(1).unwrap_or_default();
                     if !cid.is_empty() && !title.is_empty() && seen_concept_ids.insert(cid.clone())
@@ -45366,7 +45689,9 @@ impl MemoryDB {
                     })?;
                 let mut snippet_map: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
-                while let Ok(Some(mr)) = m_rows.next().await {
+                while let Some(mr) = m_rows.next().await.map_err(|e| {
+                    WenlanError::VectorDb(format!("list_recent_retrievals snippets row: {e}"))
+                })? {
                     let source_id: String = mr.get(0).unwrap_or_default();
                     let title: String = mr.get(1).unwrap_or_default();
                     let content: String = mr.get(2).unwrap_or_default();
@@ -45629,7 +45954,11 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("list_recent_changes scan: {e}")))?;
 
         let mut out = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("list_recent_changes row scan: {e}")))?
+        {
             let id: String = row.get(0).unwrap_or_default();
             let title: String = row.get(1).unwrap_or_default();
             let version: i64 = row.get(2).unwrap_or(1);
@@ -45730,7 +46059,11 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("list_recent_memories scan: {e}")))?;
             let mut out = Vec::new();
-            while let Ok(Some(row)) = rows.next().await {
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("list_recent_memories row scan: {e}")))?
+            {
                 let source_id: String = row.get(0).unwrap_or_default();
                 let title: String = row.get(1).unwrap_or_default();
                 let summary: Option<String> = row.get::<Option<String>>(2).unwrap_or(None);
@@ -45871,7 +46204,11 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("list_unconfirmed_memories scan: {e}")))?;
 
         let mut items = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("list_unconfirmed row scan: {e}")))?
+        {
             let source_id: String = row.get(0).unwrap_or_default();
             let title: String = row.get(1).unwrap_or_default();
             let summary: Option<String> = row.get::<Option<String>>(2).unwrap_or(None);
@@ -45930,9 +46267,10 @@ impl MemoryDB {
         let since_s: Option<i64> = since_ms.map(|ms| ms / 1000);
 
         // --- Phase A: fetch top-N active pages (scoped guard) ---
-        let concept_rows: Vec<(String, String, String, String, i64, String, String)> = {
-            let conn = self.conn.lock().await;
-            let mut rows = conn
+        let concept_rows: Vec<(String, String, String, String, i64, String, String)> =
+            {
+                let conn = self.conn.lock().await;
+                let mut rows = conn
                 .query(
                     "SELECT id, title, COALESCE(summary, ''), COALESCE(source_memory_ids, '[]'), \
                             version, created_at, last_modified \
@@ -45944,28 +46282,30 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("list_recent_concepts scan: {e}")))?;
-            let mut out = Vec::new();
-            while let Ok(Some(row)) = rows.next().await {
-                let id: String = row.get(0).unwrap_or_default();
-                let title: String = row.get(1).unwrap_or_default();
-                let summary: String = row.get(2).unwrap_or_default();
-                let src_json: String = row.get(3).unwrap_or_else(|_| "[]".to_string());
-                let version: i64 = row.get(4).unwrap_or(1);
-                let created_at: String = row.get(5).unwrap_or_default();
-                let last_modified: String = row.get(6).unwrap_or_default();
-                out.push((
-                    id,
-                    title,
-                    summary,
-                    src_json,
-                    version,
-                    created_at,
-                    last_modified,
-                ));
-            }
-            out
-            // conn guard dropped here
-        };
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await.map_err(|e| {
+                    WenlanError::VectorDb(format!("list_recent_pages row scan: {e}"))
+                })? {
+                    let id: String = row.get(0).unwrap_or_default();
+                    let title: String = row.get(1).unwrap_or_default();
+                    let summary: String = row.get(2).unwrap_or_default();
+                    let src_json: String = row.get(3).unwrap_or_else(|_| "[]".to_string());
+                    let version: i64 = row.get(4).unwrap_or(1);
+                    let created_at: String = row.get(5).unwrap_or_default();
+                    let last_modified: String = row.get(6).unwrap_or_default();
+                    out.push((
+                        id,
+                        title,
+                        summary,
+                        src_json,
+                        version,
+                        created_at,
+                        last_modified,
+                    ));
+                }
+                out
+                // conn guard dropped here
+            };
 
         // --- Phase B: collect all source_memory_ids + call pending_review once ---
         let mut all_source_ids: Vec<String> = Vec::new();
@@ -46097,7 +46437,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("pipeline_status enrichment: {e}")))?;
         let mut enrichment = serde_json::Map::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("pipeline_status row scan: {e}")))?
+        {
             let status: String = row.get(0).unwrap_or_default();
             let count: i64 = row.get(1).unwrap_or(0);
             enrichment.insert(status, serde_json::Value::Number(count.into()));
@@ -46107,7 +46451,11 @@ impl MemoryDB {
             "SELECT COUNT(DISTINCT source_id) FROM memories WHERE source = 'memory' AND source_id NOT IN (SELECT DISTINCT source_id FROM enrichment_steps)",
             (),
         ).await.map_err(|e| WenlanError::VectorDb(format!("pipeline_status raw count: {e}")))?;
-        if let Ok(Some(row)) = raw_rows.next().await {
+        if let Some(row) = raw_rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("pipeline_status raw count row: {e}")))?
+        {
             let raw_count: i64 = row.get(0).unwrap_or(0);
             if raw_count > 0 {
                 enrichment.insert(
@@ -46128,7 +46476,11 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("pipeline_status entity: {e}")))?;
-        let (linked, unlinked) = if let Ok(Some(row)) = rows.next().await {
+        let (linked, unlinked) = if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("pipeline_status entity row: {e}")))?
+        {
             (
                 row.get::<i64>(0).unwrap_or(0),
                 row.get::<i64>(1).unwrap_or(0),
@@ -46146,7 +46498,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("pipeline_status queue: {e}")))?;
         let mut queue = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("pipeline_status row scan: {e}")))?
+        {
             let action: String = row.get(0).unwrap_or_default();
             let status: String = row.get(1).unwrap_or_default();
             let count: i64 = row.get(2).unwrap_or(0);
@@ -46174,7 +46530,11 @@ impl MemoryDB {
             (),
         ).await.map_err(|e| WenlanError::VectorDb(format!("pipeline_status types: {e}")))?;
         let mut types = serde_json::Map::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("pipeline_status row scan: {e}")))?
+        {
             let mt: String = row.get(0).unwrap_or_else(|_| "null".to_string());
             let count: i64 = row.get(1).unwrap_or(0);
             types.insert(mt, serde_json::Value::Number(count.into()));
@@ -46186,7 +46546,11 @@ impl MemoryDB {
             (),
         ).await.map_err(|e| WenlanError::VectorDb(format!("pipeline_status quality: {e}")))?;
         let mut quality = serde_json::Map::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("pipeline_status row scan: {e}")))?
+        {
             let q: String = row.get(0).unwrap_or_default();
             let count: i64 = row.get(1).unwrap_or(0);
             quality.insert(q, serde_json::Value::Number(count.into()));
@@ -47762,7 +48126,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("list_pages: {e}")))?;
         let mut results = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("list_pages row scan: {e}")))?
+        {
             results.push(Self::row_to_page(&row)?);
         }
         Ok(results)
@@ -47793,7 +48161,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("list_pages_stale: {e}")))?;
         let mut results = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("list_pages_stale row scan: {e}")))?
+        {
             results.push(Self::row_to_page(&row)?);
         }
         Ok(results)
@@ -50299,7 +50671,23 @@ impl MemoryDB {
         limit: usize,
         page_type: Option<&str>,
     ) -> Result<Vec<Page>, WenlanError> {
-        self.search_pages_inner(query, limit, page_type, true).await
+        self.search_pages_inner(query, limit, page_type, true, false)
+            .await
+    }
+
+    /// Strict-scan twin of `search_pages` for eval baselines. Production
+    /// retrieval treats the page channel as optional and degrades on a
+    /// mid-scan step error; an eval that scores the result list as complete
+    /// must fail instead of silently measuring a truncated candidate set.
+    #[allow(dead_code)] // Used by eval module (context_path.rs, answer_quality.rs)
+    pub(crate) async fn search_pages_strict(
+        &self,
+        query: &str,
+        limit: usize,
+        page_type: Option<&str>,
+    ) -> Result<Vec<Page>, WenlanError> {
+        self.search_pages_inner(query, limit, page_type, true, true)
+            .await
     }
 
     /// Browse-facing twin of `search_pages`: the Global-scope delegate for
@@ -50312,7 +50700,7 @@ impl MemoryDB {
         limit: usize,
         page_type: Option<&str>,
     ) -> Result<Vec<Page>, WenlanError> {
-        self.search_pages_inner(query, limit, page_type, false)
+        self.search_pages_inner(query, limit, page_type, false, false)
             .await
     }
 
@@ -50322,6 +50710,7 @@ impl MemoryDB {
         limit: usize,
         page_type: Option<&str>,
         fence_entity: bool,
+        strict_scan: bool,
     ) -> Result<Vec<Page>, WenlanError> {
         // Embed query before acquiring conn lock (same pattern as search_memory)
         let embedding = self.get_or_compute_embedding(query)?;
@@ -50364,20 +50753,44 @@ impl MemoryDB {
                 .await
         };
         match vec_result {
-            Ok(mut rows) => {
-                while let Ok(Some(row)) = rows.next().await {
-                    match Self::row_to_page(&row) {
-                        Ok(page) => {
-                            let distance: f64 = row.get(21).unwrap_or(1.0);
-                            let id = page.id.clone();
-                            vector_results.push((id, distance, page));
-                        }
-                        Err(e) => {
-                            log::warn!("[search_pages] skipping malformed vector row: {e}")
-                        }
+            Ok(mut rows) => loop {
+                let row = match rows.next().await {
+                    Ok(Some(row)) => row,
+                    Ok(None) => break,
+                    Err(e) if strict_scan => {
+                        return Err(WenlanError::VectorDb(format!(
+                            "search_pages vector row scan: {e}"
+                        )));
+                    }
+                    Err(e) => {
+                        log::warn!("[search_pages] row scan aborted early: {e}");
+                        break;
+                    }
+                };
+                match Self::row_to_page(&row) {
+                    Ok(page) => {
+                        let distance: f64 = match row.get(21) {
+                            Ok(d) => d,
+                            Err(e) if strict_scan => {
+                                return Err(WenlanError::VectorDb(format!(
+                                    "search_pages vector distance: {e}"
+                                )));
+                            }
+                            Err(_) => 1.0,
+                        };
+                        let id = page.id.clone();
+                        vector_results.push((id, distance, page));
+                    }
+                    Err(e) if strict_scan => {
+                        return Err(WenlanError::VectorDb(format!(
+                            "search_pages vector row decode: {e}"
+                        )));
+                    }
+                    Err(e) => {
+                        log::warn!("[search_pages] skipping malformed vector row: {e}")
                     }
                 }
-            }
+            },
             Err(e) => {
                 log::warn!("[search_pages] vector search failed: {e}");
             }
@@ -50421,14 +50834,35 @@ impl MemoryDB {
                     .await
             };
             match fts_result {
-                Ok(mut rows) => {
-                    while let Ok(Some(row)) = rows.next().await {
-                        if let Ok(page) = Self::row_to_page(&row) {
+                Ok(mut rows) => loop {
+                    let row = match rows.next().await {
+                        Ok(Some(row)) => row,
+                        Ok(None) => break,
+                        Err(e) if strict_scan => {
+                            return Err(WenlanError::VectorDb(format!(
+                                "search_pages fts row scan: {e}"
+                            )));
+                        }
+                        Err(e) => {
+                            log::warn!("[search_pages] row scan aborted early: {e}");
+                            break;
+                        }
+                    };
+                    match Self::row_to_page(&row) {
+                        Ok(page) => {
                             let id = page.id.clone();
                             fts_results.push((id, page));
                         }
+                        Err(e) if strict_scan => {
+                            return Err(WenlanError::VectorDb(format!(
+                                "search_pages fts row decode: {e}"
+                            )));
+                        }
+                        Err(e) => {
+                            log::warn!("[search_pages] skipping malformed fts row: {e}")
+                        }
                     }
-                }
+                },
                 Err(e) => {
                     log::debug!("[search_pages] FTS query failed ({}): {e}", fts_q);
                 }
@@ -50510,7 +50944,11 @@ impl MemoryDB {
                 .map_err(|e| WenlanError::VectorDb(format!("backfill pages fetch: {e}")))?;
 
             let mut out = Vec::new();
-            while let Ok(Some(row)) = rows.next().await {
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("backfill_pages row scan: {e}")))?
+            {
                 let id: String = row.get(0).unwrap_or_default();
                 let title: String = row.get(1).unwrap_or_default();
                 let summary: Option<String> = row.get::<String>(2).ok();
@@ -51571,7 +52009,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("fetch_last_distilled_at: {e}")))?;
         let mut out: HashMap<String, i64> = HashMap::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("fetch_last_distilled_at row scan: {e}")))?
+        {
             let sid: String = row.get(0).unwrap_or_default();
             let ts: i64 = row.get(1).unwrap_or(0);
             if !sid.is_empty() {
