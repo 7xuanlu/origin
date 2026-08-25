@@ -491,6 +491,21 @@ async fn run_citation_backfill_with_page_limit(
             })
             .collect();
 
+        if numbered.is_empty() {
+            // Non-empty evidence locators that all failed to resolve to
+            // content is a provenance data bug (e.g. a genuinely pruned
+            // chunk), not an annotate failure -- it must never spend an LLM
+            // call, count toward the 3-attempt poison-pill, or write '[]'.
+            // The page stays `citations IS NULL` and is retried once its
+            // provenance is repaired.
+            log::warn!(
+                "[citation_backfill] page {page_id} has {} source evidence locator(s) that \
+                 resolved to zero content rows; skipping without spending an attempt",
+                locators.len()
+            );
+            continue;
+        }
+
         let user_prompt = format!(
             "## Page Body\n{}\n\n## Numbered Sources\n{}",
             page.content,
@@ -1264,6 +1279,128 @@ mod tests {
         assert!(
             log.contains("citation backfill gave up"),
             "changelog: {log}"
+        );
+    }
+
+    /// Guard B: evidence LOCATORS are non-empty (unlike
+    /// `backfill_no_evidence_page_gives_up_without_llm_call`, which has no
+    /// evidence at all), but every locator fails to resolve to a content row
+    /// -- a provenance data bug (e.g. a genuinely pruned chunk), not an
+    /// annotate failure. `MockProvider::unavailable()` errors on any call,
+    /// so if the guard failed to skip, the tick would either fall through to
+    /// `record_annotate_failure` (setting the attempt key) or return Err;
+    /// neither happens when the guard fires first.
+    #[tokio::test]
+    async fn backfill_empty_numbered_skips_without_attempt_or_llm_call() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_page("p_orphan", "T", None, BACKFILL_BODY, None, None, &[], &now)
+            .await
+            .unwrap();
+        // Evidence points at a locator with no matching `memories` row at
+        // all -- not inserted here on purpose.
+        db.link_page_evidence("p_orphan", "memory", Some("orphan_locator"), None, "test")
+            .await
+            .unwrap();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::unavailable());
+        let prompts = PromptRegistry::default();
+
+        run_citation_backfill_tick(&db, &llm, &prompts)
+            .await
+            .expect("the guard must skip before ever calling the (unavailable) LLM");
+
+        assert!(
+            db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&"p_orphan".to_string()),
+            "citations must stay NULL (not poisoned to '[]') so the page is \
+             retried once its provenance is repaired"
+        );
+        let version = db.get_page("p_orphan").await.unwrap().unwrap().version;
+        let attempts = db
+            .get_app_metadata(&attempt_key("p_orphan", version))
+            .await
+            .unwrap();
+        assert_eq!(
+            attempts, None,
+            "a provenance data bug must not spend an attempt -- an attempt \
+             key here would mean the LLM was actually called \
+             (MockProvider::unavailable would error and record one)"
+        );
+    }
+
+    /// Change A end-to-end through the real backfill sweep: a document
+    /// source page's evidence locator is a chunk `id` (document_enrichment.
+    /// rs:297), not a `source_id`. Before the read-side fix this locator
+    /// resolved to zero content rows (LOCATOR MISMATCH), building an empty
+    /// numbered block; after the fix it resolves and the page annotates
+    /// normally.
+    #[tokio::test]
+    async fn backfill_id_shaped_locator_resolves_and_annotates() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_page(
+            "p_doc_chunk",
+            "T",
+            None,
+            BACKFILL_BODY,
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        // A document chunk row: `id` distinct from `source_id`, mirroring
+        // the chunk id document_enrichment.rs:297 mints.
+        {
+            let now_ts = chrono::Utc::now().timestamp();
+            let conn = db.test_primary_session().await;
+            conn.execute(
+                "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, source_agent, created_at, last_modified, confirmed, stability, source) \
+                 VALUES ('chunk_id_0', 'doc_source_id', 'chunk_id_0', ?1, 0, 'text', 'fact', 'folder', ?2, ?2, 1, 'confirmed', 'memory')",
+                libsql::params![BACKFILL_MEM_CONTENT.to_string(), now_ts],
+            )
+            .await
+            .unwrap();
+        }
+        // Evidence locator is the chunk's id, not doc_source_id -- the exact
+        // shape a document source page's evidence stores.
+        db.link_page_evidence(
+            "p_doc_chunk",
+            "external_file",
+            Some("chunk_id_0"),
+            None,
+            "test",
+        )
+        .await
+        .unwrap();
+
+        let annotated = format!("{BACKFILL_BODY}[1]");
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(&annotated));
+        let prompts = PromptRegistry::default();
+
+        run_citation_backfill_tick(&db, &llm, &prompts)
+            .await
+            .unwrap();
+
+        let page = db.get_page("p_doc_chunk").await.unwrap().unwrap();
+        assert_eq!(
+            page.citations.len(),
+            1,
+            "the id-shaped locator must resolve to content, producing a \
+             non-empty numbered block and a real citation: {:?}",
+            page.citations
+        );
+        assert_eq!(page.citations[0].locator, "chunk_id_0");
+        assert!(
+            !db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&"p_doc_chunk".to_string()),
+            "page should no longer be citations-missing"
         );
     }
 

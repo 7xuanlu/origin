@@ -6963,6 +6963,83 @@ async fn test_get_memory_contents_by_ids_includes_superseded_archive() {
 }
 
 #[tokio::test]
+async fn test_get_memory_contents_by_ids_resolves_id_shaped_locator_without_chunk_index_zero() {
+    let (db, _dir) = test_db().await;
+    // Chunk index 1 (not 0) -- the id branch must not carry over the
+    // source_id branch's `chunk_index = 0` restriction, since `id` already
+    // pins one exact chunk.
+    insert_doc_chunk(
+        &db,
+        "recompile_chunk1",
+        "recompile_doc",
+        1,
+        "Second chunk content",
+    )
+    .await;
+
+    let results = db
+        .get_memory_contents_by_ids(&["recompile_chunk1".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        results,
+        vec![(
+            "recompile_chunk1".to_string(),
+            "Second chunk content".to_string()
+        )],
+        "an id-shaped locator at a non-zero chunk_index must resolve, keyed \
+         by the requested id"
+    );
+}
+
+#[tokio::test]
+async fn test_get_memory_contents_by_ids_mixed_request_supersede_hide_exclusion_still_applies() {
+    let (db, _dir) = test_db().await;
+    // Hidden by supersession -- must stay excluded on the source_id branch
+    // (unchanged behavior) even in a request that ALSO carries an id-shaped
+    // locator.
+    let old_doc = make_memory_doc(
+        "mixed_old",
+        "I prefer Python for all projects",
+        "fact",
+        "personal",
+        "claude",
+    );
+    db.upsert_documents(vec![old_doc]).await.unwrap();
+    let mut new_doc = make_memory_doc(
+        "mixed_new",
+        "I prefer Rust for all projects",
+        "fact",
+        "personal",
+        "claude",
+    );
+    new_doc.supersedes = Some("mixed_old".to_string());
+    db.upsert_documents(vec![new_doc]).await.unwrap();
+    insert_doc_chunk(&db, "mixed_chunk0", "mixed_doc", 0, "Doc chunk content").await;
+
+    let results = db
+        .get_memory_contents_by_ids(&[
+            "mixed_old".to_string(),
+            "mixed_new".to_string(),
+            "mixed_chunk0".to_string(),
+        ])
+        .await
+        .unwrap();
+    let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(
+        !ids.contains(&"mixed_old"),
+        "supersede-hide exclusion must still apply to source_id-matched rows \
+         when the request is mixed with an id-shaped locator"
+    );
+    assert!(ids.contains(&"mixed_new"));
+    assert!(
+        ids.contains(&"mixed_chunk0"),
+        "the id-shaped locator in the same mixed request must still resolve"
+    );
+}
+
+#[tokio::test]
 async fn test_quality_multiplier_in_search() {
     let (db, _dir) = test_db().await;
 
@@ -26306,6 +26383,126 @@ async fn test_get_memories_by_source_ids_missing_id() {
 
     assert_eq!(results.len(), 1, "should only return the existing memory");
     assert_eq!(results[0].source_id, "sid_real");
+}
+
+/// Insert a bare `memories` row with an explicit `id` distinct from
+/// `source_id`, mirroring the chunk id document_enrichment.rs:297/db.rs:
+/// 24905-24909 mints (`sha256(source_id ‖ chunk_index)[..16]`). Document
+/// source pages cite chunks by this `id`, not `source_id` -- the locator
+/// mismatch the read-side fix (change A) repairs.
+async fn insert_doc_chunk(
+    db: &MemoryDB,
+    id: &str,
+    source_id: &str,
+    chunk_index: i64,
+    content: &str,
+) {
+    let now_ts = chrono::Utc::now().timestamp();
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, source_agent, created_at, last_modified, confirmed, stability, source) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'text', 'fact', 'folder', ?6, ?6, 1, 'confirmed', 'memory')",
+        libsql::params![
+            id.to_string(),
+            source_id.to_string(),
+            source_id.to_string(),
+            content.to_string(),
+            chunk_index,
+            now_ts
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn test_get_memories_by_source_ids_resolves_id_shaped_locator() {
+    let (db, _dir) = test_db().await;
+    insert_doc_chunk(&db, "chunk_a0", "doc_a", 0, "First chunk of document A").await;
+
+    // The locator is the chunk's `id`, not its `source_id` -- exactly what a
+    // document source page's evidence stores.
+    let results = db
+        .get_memories_by_source_ids(&["chunk_a0".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "id-shaped locator must resolve to content"
+    );
+    assert_eq!(
+        results[0].content, "First chunk of document A",
+        "must return the chunk's own content"
+    );
+    assert_eq!(
+        results[0].source_id, "chunk_a0",
+        "the returned item must be keyed under the REQUESTED key (the id), \
+         not the row's true underlying source_id (doc_a) -- callers join \
+         back by this field"
+    );
+}
+
+#[tokio::test]
+async fn test_get_memories_by_source_ids_multi_chunk_document_returns_every_chunk_under_its_own_id()
+{
+    let (db, _dir) = test_db().await;
+    insert_doc_chunk(&db, "chunk_b0", "doc_b", 0, "Doc B chunk zero content").await;
+    insert_doc_chunk(&db, "chunk_b1", "doc_b", 1, "Doc B chunk one content").await;
+
+    let results = db
+        .get_memories_by_source_ids(&["chunk_b0".to_string(), "chunk_b1".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        results.len(),
+        2,
+        "each chunk of a multi-chunk document must resolve as its own \
+         distinct source, not merge into one aggregated row: {:?}",
+        results.iter().map(|m| &m.source_id).collect::<Vec<_>>()
+    );
+    let by_id: std::collections::HashMap<&str, &str> = results
+        .iter()
+        .map(|m| (m.source_id.as_str(), m.content.as_str()))
+        .collect();
+    assert_eq!(by_id.get("chunk_b0"), Some(&"Doc B chunk zero content"));
+    assert_eq!(by_id.get("chunk_b1"), Some(&"Doc B chunk one content"));
+}
+
+#[tokio::test]
+async fn test_get_memories_by_source_ids_mixed_request_preserves_join_contract() {
+    let (db, _dir) = test_db().await;
+    // A plain memory (id == source_id, resolved via the source_id branch).
+    db.upsert_documents(vec![make_memory_doc(
+        "mem_plain",
+        "Plain memory content",
+        "knowledge",
+        "work",
+        "agent",
+    )])
+    .await
+    .unwrap();
+    // A document chunk (id != source_id, resolved via the id branch).
+    insert_doc_chunk(&db, "chunk_c0", "doc_c", 0, "Doc C chunk content").await;
+
+    let results = db
+        .get_memories_by_source_ids(&["mem_plain".to_string(), "chunk_c0".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        results.len(),
+        2,
+        "a mixed request of a memory source_id and a doc chunk id must resolve both"
+    );
+    let by_id: std::collections::HashMap<&str, &str> = results
+        .iter()
+        .map(|m| (m.source_id.as_str(), m.content.as_str()))
+        .collect();
+    assert_eq!(by_id.get("mem_plain"), Some(&"Plain memory content"));
+    assert_eq!(by_id.get("chunk_c0"), Some(&"Doc C chunk content"));
 }
 
 // ==================== Migration 43: enrichment_steps ====================
@@ -54848,6 +55045,146 @@ async fn reopening_a_db_with_pre_125_duplicate_observations_migrates_cleanly() {
     assert_eq!(
         idx_count, 1,
         "migration 125 must create the identity index on reopen"
+    );
+}
+
+// ==================== Migration 126: re-arm poisoned citations ====================
+
+/// 2026-08-24 doc-citation-locator fix, change C: `citations = '[]'` was a
+/// permanent pill written by the pre-fix locator mismatch (change A/B, same
+/// PR). Migration 126 re-arms every poisoned ACTIVE page back to NULL
+/// exactly once, so the (now-fixed) backfill sweep picks it up again --
+/// while a NULL page, a page with a real citation map, and a non-active
+/// page carrying the same '[]' value must all stay untouched.
+#[tokio::test]
+async fn migration_126_rearms_empty_citations_to_null_exactly_once() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    db.insert_page_with_kind(
+        "m126-pill",
+        "Pilled page",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &now,
+        "distilled",
+        "confirmed",
+        None,
+        Some("[]"),
+    )
+    .await
+    .unwrap();
+    db.insert_page(
+        "m126-null",
+        "Never-processed page",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    db.insert_page_with_kind(
+        "m126-real",
+        "Annotated page",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &now,
+        "distilled",
+        "confirmed",
+        None,
+        Some(r#"{"1":{"locator":"src1","status":"verified"}}"#),
+    )
+    .await
+    .unwrap();
+    db.insert_page_with_kind(
+        "m126-archived-pill",
+        "Archived pilled page",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &now,
+        "distilled",
+        "confirmed",
+        None,
+        Some("[]"),
+    )
+    .await
+    .unwrap();
+    db.archive_page("m126-archived-pill").await.unwrap();
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("PRAGMA user_version = 125", ()).await.unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("migration 126 must apply");
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+
+    async fn citations_of(db: &MemoryDB, id: &str) -> Option<String> {
+        let conn = db.conn.lock().await;
+        conn.query(
+            "SELECT citations FROM pages WHERE id = ?1",
+            libsql::params![id],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<Option<String>>(0)
+        .unwrap()
+    }
+
+    assert_eq!(
+        citations_of(&db, "m126-pill").await,
+        None,
+        "an active page poisoned with '[]' must be re-armed to NULL"
+    );
+    assert_eq!(
+        citations_of(&db, "m126-null").await,
+        None,
+        "an already-NULL page must stay untouched"
+    );
+    assert_eq!(
+        citations_of(&db, "m126-real").await,
+        Some(r#"{"1":{"locator":"src1","status":"verified"}}"#.to_string()),
+        "a page with a real citation map must stay untouched"
+    );
+    assert_eq!(
+        citations_of(&db, "m126-archived-pill").await,
+        Some("[]".to_string()),
+        "the migration only re-arms ACTIVE pages -- a non-active page's \
+         pill must survive unchanged"
+    );
+
+    // Idempotency: rewind and replay finds nothing left to re-arm (the
+    // migration is a plain conditional UPDATE, so this mainly proves the
+    // migration-runner gate itself, but mirrors the migration 125 idiom).
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("PRAGMA user_version = 125", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("re-running migration 126 must be a no-op");
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+    assert_eq!(
+        citations_of(&db, "m126-archived-pill").await,
+        Some("[]".to_string())
     );
 }
 

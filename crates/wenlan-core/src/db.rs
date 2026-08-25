@@ -1162,7 +1162,7 @@ pub const EMBEDDING_DIM: usize = 768;
 /// `entities` table, skip every `version < N` branch, and quietly operate
 /// against a schema it cannot see. Refusing to open is recoverable; writing is
 /// not.
-pub const SCHEMA_VERSION: u32 = 125;
+pub const SCHEMA_VERSION: u32 = 126;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -9465,6 +9465,14 @@ impl MemoryDB {
             if version < 125 {
                 self.migrate_125_observation_identity(version).await?;
             }
+
+            // Migration 126 (2026-08-24 doc-citation-locator fix): one-time
+            // re-arm of pages poisoned by the citation backfill's now-fixed
+            // locator mismatch (change A/B, same PR). See
+            // migrate_126_rearm_empty_citations.
+            if version < 126 {
+                self.migrate_126_rearm_empty_citations(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -16405,6 +16413,64 @@ impl MemoryDB {
         log::info!(
             "[migration] Migration 125 applied: {deleted} duplicate observation(s) deleted, \
              idx_observations_identity created"
+        );
+        Ok(())
+    }
+
+    /// Migration 126 (2026-08-24 doc-citation-locator fix, PR change C):
+    /// one-time re-arm of pages poisoned by the citation backfill's
+    /// locator mismatch (change A/B, same PR). Before the fix, a document
+    /// source page's evidence locators were `memories.id` values that the
+    /// content readers could never resolve, so the backfill spent 3 model
+    /// calls on an empty numbered source block and wrote `citations = '[]'`
+    /// -- a pill the `citations IS NULL` sweep selector then skipped
+    /// forever, with `refresh_page`'s "sources are all orphaned" bail
+    /// blocking the only recovery path. Now that the read side resolves
+    /// those locators, re-arm every poisoned active page by clearing the
+    /// pill back to NULL so the sweep picks it up again. No new API route;
+    /// the `citations IS NULL` selector is unchanged. See
+    /// migrate_126_rearm_empty_citations.
+    async fn migrate_126_rearm_empty_citations(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(126, prior_version).await?;
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m126 begin: {e}")))?;
+
+        let result: Result<u64, WenlanError> = async {
+            let rearmed = conn
+                .execute(
+                    "UPDATE pages SET citations = NULL WHERE citations = '[]' AND status = 'active'",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m126 rearm: {e}")))?;
+            Ok(rearmed)
+        }
+        .await;
+
+        let rearmed = match result {
+            Ok(value) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m126 commit: {e}")))?;
+                value
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+
+        conn.execute("PRAGMA user_version = 126", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m126 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 126 applied: {rearmed} active page(s) with citations = '[]' \
+             re-armed to NULL"
         );
         Ok(())
     }
@@ -33119,6 +33185,65 @@ impl MemoryDB {
             let item = Self::memory_item_from_row(&row);
             map.insert(item.source_id.clone(), item);
         }
+
+        // Document source pages store `memories.id` row keys as their
+        // evidence locators (document_enrichment.rs:297 -- a value distinct
+        // from `source_id` for multi-chunk documents; see db.rs's chunk id
+        // minting, `sha256(source_id ++ chunk_index)[..16]`). Any requested
+        // key the source_id branch above left unresolved is retried as an
+        // `id` lookup. `id` is the primary key -- one row per id, so a
+        // multi-chunk document's chunks each resolve as their own distinct
+        // source under their own requested key, with no aggregation across
+        // chunks.
+        let unresolved: Vec<String> = source_ids
+            .iter()
+            .filter(|id| !map.contains_key(id.as_str()))
+            .cloned()
+            .collect();
+        if !unresolved.is_empty() {
+            let id_placeholders = unresolved
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let id_sql = format!(
+                "SELECT {columns}, id
+                 FROM memories
+                 WHERE pending_revision = 0
+                   AND source != 'episode'
+                   AND id IN ({id_placeholders})
+                 GROUP BY id"
+            );
+            let id_params: Vec<libsql::Value> = unresolved
+                .iter()
+                .map(|id| libsql::Value::Text(id.clone()))
+                .collect();
+            let mut id_rows = conn
+                .query(&id_sql, libsql::params_from_iter(id_params))
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("get_memories_by_source_ids (id branch): {e}"))
+                })?;
+            while let Some(row) = id_rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?
+            {
+                let mut item = Self::memory_item_from_row(&row);
+                // Trailing `id` column, appended after the fixed 0..25
+                // indices the shared columns projection always yields.
+                let matched_id = row.get::<String>(26).unwrap_or_default();
+                // Return the row under the key it was requested with, per
+                // the join contract every caller relies on: backfill keys
+                // its `by_source` map by the locator it asked with, and
+                // refresh feeds returned keys straight back into kind
+                // resolution.
+                item.source_id = matched_id.clone();
+                map.insert(matched_id, item);
+            }
+        }
+
         // Return in input order, skipping missing ids.
         let items = source_ids.iter().filter_map(|id| map.remove(id)).collect();
         Ok(items)
@@ -49500,6 +49625,7 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("get memories by ids: {}", e)))?;
 
         let mut results = vec![];
+        let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(row) = rows
             .next()
             .await
@@ -49511,8 +49637,62 @@ impl MemoryDB {
             let content: String = row
                 .get(1)
                 .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+            resolved.insert(id.clone());
             results.push((id, content));
         }
+
+        // Document source pages store `memories.id` row keys as their
+        // evidence locators (document_enrichment.rs:297), distinct from
+        // `source_id` for multi-chunk documents. Any requested key the
+        // source_id branch above left unresolved is retried as an `id`
+        // lookup, dropping the `chunk_index = 0` restriction -- an `id`
+        // already pins one exact chunk row, so a multi-chunk document's
+        // source page cites every chunk, each id its own source.
+        let unresolved: Vec<String> = source_ids
+            .iter()
+            .filter(|id| !resolved.contains(id.as_str()))
+            .cloned()
+            .collect();
+        if !unresolved.is_empty() {
+            let id_placeholders = unresolved
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let id_sql = format!(
+                "SELECT id, content FROM memories WHERE source != 'episode' AND id IN ({})",
+                id_placeholders
+            );
+            let id_params: Vec<libsql::Value> = unresolved
+                .iter()
+                .map(|id| libsql::Value::Text(id.clone()))
+                .collect();
+            let mut id_rows = conn
+                .query(&id_sql, libsql::params_from_iter(id_params))
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("get memories by ids (id branch): {}", e))
+                })?;
+            while let Some(row) = id_rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?
+            {
+                // The query already selects `id` (not `source_id`) as the
+                // join key, and `id` IS the requested locator on this
+                // branch -- no rewrite needed, unlike the aggregated
+                // MemoryItem reader above.
+                let id: String = row
+                    .get(0)
+                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+                let content: String = row
+                    .get(1)
+                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+                results.push((id, content));
+            }
+        }
+
         Ok(results)
     }
 
