@@ -52572,6 +52572,114 @@ async fn a_poisoned_orphan_does_not_block_the_other_repairs() {
     assert_eq!(db.resolve_orphan_page_links().await.unwrap(), 0);
 }
 
+/// A full batch of unresolvable orphans in front of the ordered backlog must
+/// not starve the resolvable rows behind it forever: the rotating keyset
+/// cursor advances past every examined row -- resolved or not -- so the next
+/// sweep resumes where the last one left off instead of re-selecting the
+/// same ordered prefix every time.
+#[tokio::test]
+async fn a_full_batch_of_unresolvable_orphans_does_not_starve_the_tail() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, title) in [
+        ("page_starve_a_src", "Starve Src"),
+        ("page_starve_z_src", "Tail Src"),
+        ("page_starve_z_target", "Tail Target"),
+    ] {
+        db.insert_page(id, title, None, "content", None, None, &[], &now)
+            .await
+            .unwrap();
+    }
+
+    let wikilinks: Vec<crate::synthesis::wikilinks::Wikilink> = (0..512)
+        .map(|i| crate::synthesis::wikilinks::Wikilink {
+            label: format!("Missing {i:03}"),
+            target_page_id: None,
+        })
+        .collect();
+    db.replace_page_links("page_starve_a_src", &wikilinks)
+        .await
+        .unwrap();
+    db.replace_page_links(
+        "page_starve_z_src",
+        &[crate::synthesis::wikilinks::Wikilink {
+            label: "Tail Target".to_string(),
+            target_page_id: None,
+        }],
+    )
+    .await
+    .unwrap();
+
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM page_links WHERE target_page_id IS NULL",
+                (),
+            )
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            count, 513,
+            "fixture guard: 512 unresolvable orphans plus the 1 resolvable tail row"
+        );
+    }
+
+    assert_eq!(
+        db.resolve_orphan_page_links().await.unwrap(),
+        0,
+        "the first batch is exactly the 512 unresolvable rows"
+    );
+    assert!(
+        db.get_app_metadata(super::ORPHAN_SWEEP_CURSOR_KEY)
+            .await
+            .unwrap()
+            .is_some(),
+        "a full unresolvable batch must still leave a cursor for the next sweep to resume from"
+    );
+
+    assert_eq!(
+        db.resolve_orphan_page_links().await.unwrap(),
+        1,
+        "the cursor moves past the unresolvable prefix so the tail resolves"
+    );
+
+    let remaining = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT source_page_id FROM page_links WHERE target_page_id IS NULL",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut remaining = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            remaining.push(row.get::<String>(0).unwrap());
+        }
+        remaining
+    };
+    assert_eq!(remaining.len(), 512);
+    assert!(
+        !remaining.iter().any(|id| id == "page_starve_z_src"),
+        "the tail's orphan row resolved and was deleted, not left behind"
+    );
+
+    assert_eq!(
+        db.resolve_orphan_page_links().await.unwrap(),
+        0,
+        "the sweep wrapped to the head and re-examined the unresolvable prefix"
+    );
+    assert_eq!(
+        db.get_app_metadata(super::ORPHAN_SWEEP_CURSOR_KEY)
+            .await
+            .unwrap(),
+        None,
+        "the tail was reached, so the cursor clears and the next sweep starts fresh"
+    );
+}
+
 /// A page merge repoints inbound links rows and copies the absorbed page's
 /// evidence onto the survivor — both moves change which edges the stores
 /// imply, so both must reconcile in the merge transaction.

@@ -388,6 +388,45 @@ async fn an_automatic_reader_sees_only_supported_pages_after_the_cutover() {
     );
 }
 
+/// `conflict_identity_snapshot` gates disclosure on `generation != 0`, not
+/// `generation > 0`, because canonical visibility (`page_visibility` via
+/// `visible_at`) treats every nonzero generation -- including a corrupted
+/// negative one -- as active. A `> 0` check would let a negative generation
+/// slip past the truth filter and disclose an unsupported page's identity.
+#[tokio::test]
+async fn a_negative_generation_still_hides_an_unsupported_conflict_identity() {
+    let (db, _tmp) = db_with_truth_rows().await;
+    db.set_truth_cutover_generation(-1).await.unwrap();
+    let scope = crate::db::UNFILED_SPACE_ID; // the stored scope of a page inserted with space None
+    let hidden = db
+        .conflict_identity_snapshot(
+            &TruthGrant::Automatic,
+            "p2",
+            &MemoryDB::page_title_key("p2"),
+            scope,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        hidden, None,
+        "a corrupted negative generation must fail closed like any nonzero one"
+    );
+    let shown = db
+        .conflict_identity_snapshot(
+            &TruthGrant::Automatic,
+            "p1",
+            &MemoryDB::page_title_key("p1"),
+            scope,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        shown,
+        Some(("p1".to_string(), "p1".to_string())),
+        "the filter ran; a supported page is still disclosed"
+    );
+}
+
 #[tokio::test]
 async fn promoter_results_default_to_advisory_on_an_existing_cutover() {
     let (db, _tmp) = db_with_truth_rows().await;

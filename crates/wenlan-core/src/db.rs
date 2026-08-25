@@ -50198,22 +50198,79 @@ impl MemoryDB {
         }
         Ok(out)
     }
+}
 
+/// The `app_metadata` key holding the orphan sweep's rotating keyset cursor:
+/// the `(source_page_id, label_key)` of the last row the previous sweep
+/// examined, serialized as a JSON pair. Lets [`MemoryDB::resolve_orphan_page_links`]
+/// resume the backlog where it left off instead of re-selecting the same
+/// ordered prefix every invocation.
+const ORPHAN_SWEEP_CURSOR_KEY: &str = "orphan_sweep_cursor";
+
+impl MemoryDB {
     /// Per-invocation cap on the orphan sweep: bounds how long the sweep can
     /// hold the sole connection mutex. The sweep re-runs after every publish,
     /// so a backlog above the cap drains across invocations instead of
-    /// stalling every other request in one.
+    /// stalling every other request in one; [`ORPHAN_SWEEP_CURSOR_KEY`]
+    /// tracks where in the backlog the next invocation resumes.
     const ORPHAN_SWEEP_BATCH: i64 = 512;
+
+    /// [`Self::resolve_orphan_page_links`]'s batch fetch on an already-held
+    /// connection guard, keyed after `cursor` (or from the head when absent),
+    /// so it can be called twice in one sweep — once from the stored cursor,
+    /// once from the head if that cursor turns out to be stale. Fetches one
+    /// row beyond [`Self::ORPHAN_SWEEP_BATCH`] so the caller can tell whether
+    /// more orphan rows remain.
+    async fn orphan_batch_after_on_conn(
+        conn: &libsql::Connection,
+        cursor: Option<&(String, String)>,
+    ) -> Result<Vec<(String, String, String, Option<String>)>, WenlanError> {
+        let (after_id, after_key) = cursor
+            .map(|(id, key)| (id.as_str(), key.as_str()))
+            .unwrap_or(("", ""));
+        let mut rows = conn
+            .query(
+                "SELECT pl.source_page_id, pl.label_key, pl.label, p.space
+                 FROM page_links pl
+                 INNER JOIN pages p ON p.id = pl.source_page_id
+                 WHERE pl.target_page_id IS NULL AND p.status = 'active'
+                   AND (pl.source_page_id > ?2
+                        OR (pl.source_page_id = ?2 AND pl.label_key > ?3))
+                 ORDER BY pl.source_page_id ASC, pl.label_key ASC
+                 LIMIT ?1",
+                libsql::params![Self::ORPHAN_SWEEP_BATCH + 1, after_id, after_key],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("resolve_orphan_links list: {e}")))?;
+        let mut orphan_rows = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(e.to_string()))?
+        {
+            orphan_rows.push((
+                row.get::<String>(0).unwrap_or_default(),
+                row.get::<String>(1).unwrap_or_default(),
+                row.get::<String>(2).unwrap_or_default(),
+                row.get::<Option<String>>(3).unwrap_or(None),
+            ));
+        }
+        Ok(orphan_rows)
+    }
 
     /// Walk the orphan rows and re-resolve them against current page titles.
     /// Returns the number of distinct labels that flipped at least one row
     /// from NULL to a real target — the refinery uses this for the log line.
     /// The whole sweep holds the connection mutex for one transaction, capped
     /// at [`Self::ORPHAN_SWEEP_BATCH`] orphan rows per invocation so a large
-    /// backlog cannot stall other database work unboundedly; the remainder is
-    /// picked up by the next sweep. Resolution is per source Page and space;
-    /// existing non-NULL targets are explicit inventory and are never
-    /// rewritten here.
+    /// backlog cannot stall other database work unboundedly. The sweep walks
+    /// the backlog with a durable rotating cursor ([`ORPHAN_SWEEP_CURSOR_KEY`]
+    /// in `app_metadata`) keyed on `(source_page_id, label_key)`: it advances
+    /// past every row examined this invocation — resolved, unresolvable, or
+    /// failed — and wraps back to the head once the tail is reached, so a
+    /// full batch of unresolvable rows can never starve the rows behind it.
+    /// Resolution is per source Page and space; existing non-NULL targets are
+    /// explicit inventory and are never rewritten here.
     pub async fn resolve_orphan_page_links(&self) -> Result<usize, WenlanError> {
         // The whole sweep — orphan list, owner maps, deletes, edge mints —
         // runs under one connection guard and one transaction, so every
@@ -50228,42 +50285,58 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("resolve_orphan_links begin: {e}")))?;
         let result: Result<usize, WenlanError> = async {
-            let orphan_rows: Vec<(String, String, String, Option<String>)> = {
+            let cursor: Option<(String, String)> = {
                 let mut rows = conn
                     .query(
-                        "SELECT pl.source_page_id, pl.label_key, pl.label, p.space
-                     FROM page_links pl
-                     INNER JOIN pages p ON p.id = pl.source_page_id
-                     WHERE pl.target_page_id IS NULL AND p.status = 'active'
-                     ORDER BY pl.source_page_id ASC, pl.label_key ASC
-                     LIMIT ?1",
-                        libsql::params![Self::ORPHAN_SWEEP_BATCH],
+                        "SELECT value FROM app_metadata WHERE key = ?1",
+                        libsql::params![ORPHAN_SWEEP_CURSOR_KEY],
                     )
                     .await
                     .map_err(|e| {
-                        WenlanError::VectorDb(format!("resolve_orphan_links list: {e}"))
+                        WenlanError::VectorDb(format!("resolve_orphan_links cursor: {e}"))
                     })?;
-                let mut orphan_rows = Vec::new();
-                while let Some(row) = rows
-                    .next()
-                    .await
-                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?
-                {
-                    orphan_rows.push((
-                        row.get::<String>(0).unwrap_or_default(),
-                        row.get::<String>(1).unwrap_or_default(),
-                        row.get::<String>(2).unwrap_or_default(),
-                        row.get::<Option<String>>(3).unwrap_or(None),
-                    ));
+                match rows.next().await.map_err(|e| {
+                    WenlanError::VectorDb(format!("resolve_orphan_links cursor: {e}"))
+                })? {
+                    Some(row) => {
+                        let value: String = row.get(0).map_err(|e| {
+                            WenlanError::VectorDb(format!("resolve_orphan_links cursor: {e}"))
+                        })?;
+                        // Unparsable is treated the same as absent (start from
+                        // the head) rather than failing the sweep -- a
+                        // corrupted cursor value should self-heal, not wedge
+                        // orphan resolution forever.
+                        serde_json::from_str::<(String, String)>(&value).ok()
+                    }
+                    None => None,
                 }
-                orphan_rows
             };
-            if orphan_rows.len() as i64 == Self::ORPHAN_SWEEP_BATCH {
+
+            let mut orphan_rows =
+                Self::orphan_batch_after_on_conn(&conn, cursor.as_ref()).await?;
+            if cursor.is_some() && orphan_rows.is_empty() {
+                // The stored cursor points past the current tail (the rows it
+                // followed were all resolved elsewhere since). Fall back to
+                // the head once so a stale cursor never wastes a whole sweep.
+                orphan_rows = Self::orphan_batch_after_on_conn(&conn, None).await?;
+            }
+            let more = orphan_rows.len() as i64 > Self::ORPHAN_SWEEP_BATCH;
+            orphan_rows.truncate(Self::ORPHAN_SWEEP_BATCH as usize);
+            if more {
                 log::warn!(
-                    "[orphan_links] sweep cap of {} rows hit; the remainder resolves next sweep",
+                    "[orphan_links] sweep cap of {} rows hit; more orphan rows remain; \
+                     the next sweep continues after this cursor",
                     Self::ORPHAN_SWEEP_BATCH
                 );
             }
+            // Captured before the processing loop below consumes the vector.
+            // Every fetched row counts as examined -- resolved, unresolvable,
+            // or failed -- so the cursor always advances past the whole batch.
+            let next_cursor = orphan_rows
+                .last()
+                .map(|(source_page_id, label_key, _, _)| {
+                    (source_page_id.clone(), label_key.clone())
+                });
 
             let mut resolved_labels = std::collections::BTreeSet::new();
             let mut failed_rows: Vec<(String, String, String)> = Vec::new();
@@ -50416,6 +50489,39 @@ impl MemoryDB {
                     failed_rows.len(),
                     failed_rows
                 );
+            }
+            // Advance the cursor past the whole examined batch, or clear it
+            // once the tail is reached so the next sweep wraps to the head.
+            // Inside the same transaction as the repairs above, so a rolled-
+            // back sweep never advances the cursor either.
+            match next_cursor.filter(|_| more) {
+                Some((next_id, next_key)) => {
+                    let cursor_value =
+                        serde_json::to_string(&(next_id, next_key)).map_err(|e| {
+                            WenlanError::VectorDb(format!(
+                                "resolve_orphan_links cursor encode: {e}"
+                            ))
+                        })?;
+                    conn.execute(
+                        "INSERT INTO app_metadata (key, value) VALUES (?1, ?2)
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        libsql::params![ORPHAN_SWEEP_CURSOR_KEY, cursor_value],
+                    )
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("resolve_orphan_links cursor save: {e}"))
+                    })?;
+                }
+                None => {
+                    conn.execute(
+                        "DELETE FROM app_metadata WHERE key = ?1",
+                        libsql::params![ORPHAN_SWEEP_CURSOR_KEY],
+                    )
+                    .await
+                    .map_err(|e| {
+                        WenlanError::VectorDb(format!("resolve_orphan_links cursor clear: {e}"))
+                    })?;
+                }
             }
             Ok(resolved_labels.len())
         }
