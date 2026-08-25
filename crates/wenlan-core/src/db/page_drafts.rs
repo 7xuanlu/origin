@@ -2,7 +2,7 @@
 
 use super::MemoryDB;
 use crate::error::WenlanError;
-use crate::pages::{Page, PageDraftDeleteOutcome, PageDraftUpdateOutcome};
+use crate::pages::{Page, PageDraftDeleteOutcome, PageDraftPublishOutcome, PageDraftUpdateOutcome};
 
 const PAGE_COLUMNS: &str = "id, title, summary, content, entity_id, space,
     source_memory_ids, version, status, created_at, last_compiled, last_modified,
@@ -405,7 +405,12 @@ impl MemoryDB {
             .map_err(|error| WenlanError::VectorDb(format!("update Page draft begin: {error}")))?;
 
         let current = Self::required_page_draft_on_conn(&tx, id).await?;
-        ensure_draft(&current)?;
+        if current.status != "draft" {
+            // Wire contract: only draft rows are findable as drafts. A queued
+            // update racing after publish gets the structured 404, not a 422 —
+            // the editor treats "draft not found" as the terminal answer.
+            return Err(WenlanError::NotFound(format!("Page draft {id}")));
+        }
         // M1 read-collapse: the write below mirrors ONE resolved scope onto both
         // NOT NULL columns via the Option A ladder (workspace wins, else space,
         // else the reserved sentinel id), and `row_to_page` translates that
@@ -492,7 +497,11 @@ impl MemoryDB {
             .await
             .map_err(|error| WenlanError::VectorDb(format!("delete Page draft begin: {error}")))?;
         let current = Self::required_page_draft_on_conn(&tx, id).await?;
-        ensure_draft(&current)?;
+        if current.status != "draft" {
+            // Same wire contract as update: a discard racing after publish gets
+            // the structured 404, which the editor treats as completed cleanup.
+            return Err(WenlanError::NotFound(format!("Page draft {id}")));
+        }
         if current.version != expected_version {
             return Ok(PageDraftDeleteOutcome::VersionConflict {
                 current_version: current.version,
@@ -528,5 +537,188 @@ impl MemoryDB {
             .await
             .map_err(|error| WenlanError::VectorDb(format!("delete Page draft commit: {error}")))?;
         Ok(PageDraftDeleteOutcome::Deleted)
+    }
+
+    /// Publish a draft as an active Page if the caller still holds its version.
+    ///
+    /// Editor contract (mirrored by `e2e/tauriMock/runtime.ts`): an exact retry
+    /// of a publish that already landed — the row is active at
+    /// `expected_version + 1` — replays the published Page; any other version
+    /// mismatch is a `VersionConflict`; an active Page in the same scope whose
+    /// trimmed title matches case-insensitively blocks with `TitleConflict`.
+    /// Publishing requires both a trimmed title and non-empty content, stamps
+    /// the trimmed title, flips `status` to active, re-derives `kind` from the
+    /// one shared rule, bumps the version, and stamps `last_compiled` /
+    /// `last_modified`. The page embedding is computed best-effort like every
+    /// other page insert; the FTS reindex is the `pages_fts_update` trigger's
+    /// job.
+    pub async fn publish_page_draft(
+        &self,
+        id: &str,
+        expected_version: i64,
+    ) -> Result<PageDraftPublishOutcome, WenlanError> {
+        // Snapshot outside the write transaction so the embedding compute
+        // (slow on first call while the model loads) never holds it. Any
+        // concurrent draft write bumps the version, so if the in-transaction
+        // recheck still sees `expected_version` the snapshot's title and
+        // content are exactly what gets published.
+        let snapshot = {
+            let conn = self.conn.lock().await;
+            Self::required_page_draft_on_conn(&conn, id).await?
+        };
+        let embedding_sql = if snapshot.status == "draft" && snapshot.version == expected_version {
+            let embed_text = crate::pages::page_embedding_text(
+                snapshot.title.trim(),
+                snapshot.summary.as_deref(),
+                &snapshot.content,
+            );
+            match self.generate_embeddings(&[embed_text]) {
+                Ok(vecs) if !vecs.is_empty() => Some(Self::vec_to_sql(&vecs[0])),
+                Ok(_) => {
+                    log::warn!("publish_page_draft: empty embedding result for {id}");
+                    None
+                }
+                Err(e) => {
+                    log::warn!("publish_page_draft: embedding failed for {id}: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|error| WenlanError::VectorDb(format!("publish Page draft begin: {error}")))?;
+        let current = Self::required_page_draft_on_conn(&tx, id).await?;
+        if current.status == "active" && expected_version.checked_add(1) == Some(current.version) {
+            return Ok(PageDraftPublishOutcome::Published(current));
+        }
+        if current.version != expected_version {
+            return Ok(PageDraftPublishOutcome::VersionConflict {
+                current_version: current.version,
+            });
+        }
+        ensure_draft(&current)?;
+        let title = current.title.trim().to_string();
+        if title.is_empty() || current.content.trim().is_empty() {
+            return Err(WenlanError::Validation(
+                "Title and content are required".to_string(),
+            ));
+        }
+        // Same-scope title uniqueness among active Pages, compared on the
+        // stored (sentinel-mirrored) scope column so unfiled matches unfiled.
+        // `page_title_key` folds in Rust: the bundled SQLite lower() is
+        // ASCII-only (no ICU), while the editor contract folds Unicode titles
+        // too — the same reason migration 31 re-ran canonicalization in Rust.
+        // The wikilink resolver folds through the same seam, so "conflicts
+        // with" and "links to" agree on what counts as the same title.
+        let scope = current
+            .space
+            .clone()
+            .unwrap_or_else(|| super::UNFILED_SPACE_ID.to_string());
+        let wanted = Self::page_title_key(&title);
+        let mut rows = tx
+            .query(
+                "SELECT id, title FROM pages
+                 WHERE id<>?1 AND status='active' AND space=?2",
+                libsql::params![id, scope.as_str()],
+            )
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("publish Page draft title check: {error}"))
+            })?;
+        let mut conflict: Option<(String, String)> = None;
+        while let Some(row) = rows.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("publish Page draft title row: {error}"))
+        })? {
+            let existing_page_id: String = row
+                .get(0)
+                .map_err(|error| WenlanError::VectorDb(format!("title conflict id: {error}")))?;
+            let existing_page_title: String = row
+                .get(1)
+                .map_err(|error| WenlanError::VectorDb(format!("title conflict title: {error}")))?;
+            if Self::page_title_key(&existing_page_title) == wanted {
+                conflict = Some((existing_page_id, existing_page_title));
+                break;
+            }
+        }
+        drop(rows);
+        if let Some((existing_page_id, existing_page_title)) = conflict {
+            return Ok(PageDraftPublishOutcome::TitleConflict {
+                existing_page_id,
+                existing_page_title,
+                scope,
+            });
+        }
+
+        let kind = crate::pages::page_kind_for(&title, &current.creation_kind, "active");
+        let publish = match &embedding_sql {
+            Some(emb) => {
+                tx.execute(
+                    "UPDATE pages
+                     SET title=?1, status='active', kind=?2, version=version+1,
+                         last_compiled=?3, last_modified=?3, embedding=vector32(?4)
+                     WHERE id=?5 AND status='draft' AND version=?6",
+                    libsql::params![
+                        title.as_str(),
+                        kind,
+                        now.as_str(),
+                        emb.as_str(),
+                        id,
+                        expected_version
+                    ],
+                )
+                .await
+            }
+            None => {
+                tx.execute(
+                    "UPDATE pages
+                     SET title=?1, status='active', kind=?2, version=version+1,
+                         last_compiled=?3, last_modified=?3
+                     WHERE id=?4 AND status='draft' AND version=?5",
+                    libsql::params![title.as_str(), kind, now.as_str(), id, expected_version],
+                )
+                .await
+            }
+        };
+        let affected = publish
+            .map_err(|error| WenlanError::VectorDb(format!("publish Page draft row: {error}")))?;
+        if affected != 1 {
+            return Err(WenlanError::Conflict(format!(
+                "Page draft {id} changed during publish"
+            )));
+        }
+        // Every path that bumps `pages.version` appends its immutable history
+        // row in the same transaction (`append_page_history` is the ONE site).
+        Self::append_page_history(&tx, id, "publish", chrono::Utc::now().timestamp())
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("publish Page draft history: {error}"))
+            })?;
+        let outcome =
+            PageDraftPublishOutcome::Published(Self::required_page_draft_on_conn(&tx, id).await?);
+        tx.commit().await.map_err(|error| {
+            WenlanError::VectorDb(format!("publish Page draft commit: {error}"))
+        })?;
+        drop(conn);
+        if let PageDraftPublishOutcome::Published(page) = &outcome {
+            // Wikilink upkeep, the same best-effort post-write as insert_page /
+            // update_page_content: a stale link index is recoverable on the
+            // next save and must not fail a durable publish.
+            if let Err(e) = self.refresh_page_wikilinks(&page.id, &page.content).await {
+                log::warn!(
+                    "[publish_page_draft] wikilink refresh failed for {}: {e}",
+                    page.id
+                );
+            }
+            if let Err(e) = self.resolve_orphan_page_links().await {
+                log::warn!("[publish_page_draft] orphan link resolve failed: {e}");
+            }
+        }
+        Ok(outcome)
     }
 }

@@ -46665,6 +46665,121 @@ async fn find_unique_active_page_id_by_title_scoped_excludes_entity_kind_shadow(
 }
 
 #[tokio::test]
+async fn find_unique_folds_untrimmed_stored_titles() {
+    // Ordinary PageWrite creation stores `req.title` unchanged, so a title can
+    // sit in the table with padding. The fold trims stored titles too: the
+    // padded row must resolve for its trimmed lookup, and a clean twin must
+    // then make the pair ambiguous.
+    let (db, _dir) = test_db().await;
+    db.insert_page(
+        "page_00000000-0000-4000-8000-0000000000d1",
+        "  Padded Title  ",
+        None,
+        "Body",
+        None,
+        Some("work"),
+        &[],
+        "2026-08-24T00:00:00Z",
+    )
+    .await
+    .unwrap();
+
+    let found = db
+        .find_unique_active_page_id_by_title_scoped("padded title", Some("work"))
+        .await
+        .unwrap();
+    assert_eq!(
+        found.as_deref(),
+        Some("page_00000000-0000-4000-8000-0000000000d1"),
+        "a stored title with padding must match its trimmed fold"
+    );
+
+    db.insert_page(
+        "page_00000000-0000-4000-8000-0000000000d2",
+        "Padded Title",
+        None,
+        "Body",
+        None,
+        Some("work"),
+        &[],
+        "2026-08-24T00:00:00Z",
+    )
+    .await
+    .unwrap();
+
+    let ambiguous = db
+        .find_unique_active_page_id_by_title_scoped("padded title", Some("work"))
+        .await
+        .unwrap();
+    assert!(
+        ambiguous.is_none(),
+        "whitespace-only title twins must be ambiguous, not first-wins"
+    );
+}
+
+/// Manual perf receipt, not a CI gate: the Unicode-correct Rust-side fold
+/// must scan every same-scope title because SQLite's LOWER() is ASCII-only.
+/// This measures that scan against the old LOWER() SQL shape it replaced so
+/// the cost claim stays a number, not an argument.
+#[tokio::test]
+#[ignore = "perf receipt; run with -- --ignored find_unique_scan_cost_receipt"]
+async fn find_unique_scan_cost_receipt() {
+    let (db, _dir) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("BEGIN", ()).await.unwrap();
+        for i in 0..2000 {
+            conn.execute(
+                "INSERT INTO pages (id, title, content, source_memory_ids, version, status, \
+                 created_at, last_compiled, last_modified, workspace, space, creation_kind, \
+                 review_status) VALUES (?1, ?2, 'body', '[]', 1, 'active', 'now', 'now', 'now', \
+                 '00000000-0000-4000-8000-000000000001', \
+                 '00000000-0000-4000-8000-000000000001', 'distilled', 'confirmed')",
+                libsql::params![format!("page_bench_{i:05}"), format!("Bench Title {i:05}")],
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute("COMMIT", ()).await.unwrap();
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        let got = db
+            .find_unique_active_page_id_by_title_scoped("bench title 01234", None)
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("page_bench_01234"));
+    }
+    let rust_fold = start.elapsed();
+    let conn = db.conn.lock().await;
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        let mut rows = conn
+            .query(
+                "SELECT id FROM pages WHERE status = 'active' \
+                 AND COALESCE(kind, 'concept') != 'entity' \
+                 AND space = COALESCE(?1, '00000000-0000-4000-8000-000000000001') \
+                 AND LOWER(title) = LOWER(?2) LIMIT 2",
+                libsql::params![Option::<String>::None, "bench title 01234"],
+            )
+            .await
+            .unwrap();
+        let mut n = 0;
+        while rows.next().await.unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 1);
+    }
+    let sql_lower = start.elapsed();
+    println!(
+        "2000-page scope, 100 lookups: rust-fold scan {rust_fold:?} ({:?}/op), \
+         old LOWER() SQL {sql_lower:?} ({:?}/op)",
+        rust_fold / 100,
+        sql_lower / 100
+    );
+}
+
+#[tokio::test]
 async fn count_active_pages_excludes_entity_kind_shadow() {
     let (db, _dir) = test_db().await;
     db.store_entity("Count Marker", "person", None, None, None)
@@ -52364,6 +52479,252 @@ async fn resolve_orphan_page_links_mints_links_edges() {
     // G6 Stage 2 PR 2b: parity oracle retired, correctness carried by per-writer regression tests (item 7).
 
     assert_eq!(db.resolve_orphan_page_links().await.unwrap(), 1);
+}
+
+/// One poisoned orphan must not roll back the other repairs: each orphan
+/// commits in its own savepoint, so the sweep makes progress on every run
+/// even when a pre-existing edge row's free-text payload makes that one
+/// row's edge upsert fail.
+#[tokio::test]
+async fn a_poisoned_orphan_does_not_block_the_other_repairs() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, title) in [
+        ("page_a_bad_src", "Bad Src"),
+        ("page_a_poisoned_target", "Poisoned Target"),
+        ("page_b_good_src", "Good Src"),
+        ("page_b_good_target", "Good Target"),
+    ] {
+        db.insert_page(id, title, None, "content", None, None, &[], &now)
+            .await
+            .unwrap();
+    }
+    for (src, label) in [
+        ("page_a_bad_src", "Poisoned Target"),
+        ("page_b_good_src", "Good Target"),
+    ] {
+        db.replace_page_links(
+            src,
+            &[crate::synthesis::wikilinks::Wikilink {
+                label: label.to_string(),
+                target_page_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+    }
+
+    // Pre-existing edge row under the exact id the sweep will upsert, with a
+    // payload the upsert's json functions reject. The bad source sorts before
+    // the good one, so an all-or-nothing sweep would re-run into it first and
+    // commit nothing, forever.
+    let edge_id = crate::provenance::compute_edge_id(
+        "links",
+        "page",
+        "page_a_bad_src",
+        "page",
+        "page_a_poisoned_target",
+        "poisoned target",
+    );
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO edges (edge_id, src_id, src_kind, dst_id, dst_kind, edge_type, \
+             lineage, grounded, space, payload, created_at) \
+             VALUES (?1, 'page_a_bad_src', 'page', 'page_a_poisoned_target', 'page', 'links', \
+                     'legacy', 0, ?2, 'not json', 1)",
+            libsql::params![edge_id, UNFILED_SPACE_ID],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.resolve_orphan_page_links().await.unwrap(),
+        1,
+        "the good orphan must resolve despite the poisoned one"
+    );
+
+    let remaining = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT source_page_id FROM page_links WHERE target_page_id IS NULL \
+                 ORDER BY source_page_id",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut remaining = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            remaining.push(row.get::<String>(0).unwrap());
+        }
+        remaining
+    };
+    assert_eq!(
+        remaining,
+        vec!["page_a_bad_src".to_string()],
+        "only the poisoned orphan stays unresolved"
+    );
+
+    // Re-runnable: the poisoned row keeps failing alone instead of erroring
+    // or blocking the sweep.
+    assert_eq!(db.resolve_orphan_page_links().await.unwrap(), 0);
+}
+
+/// A full batch of unresolvable orphans in front of the ordered backlog must
+/// not starve the resolvable rows behind it forever: the rotating keyset
+/// cursor advances past every examined row -- resolved or not -- so the next
+/// sweep resumes where the last one left off instead of re-selecting the
+/// same ordered prefix every time. All 513 links live on the SAME source
+/// page (`page_starve_a_src`), so the keyset predicate's intra-page arm
+/// (`source_page_id = ?2 AND label_key > ?3`) is the one that has to do the
+/// work here -- a fixture that puts the resolvable row on a different source
+/// page would pass even if that arm were deleted, since the cross-page arm
+/// (`source_page_id > ?2`) alone would still land the cursor past it.
+#[tokio::test]
+async fn a_full_batch_of_unresolvable_orphans_does_not_starve_the_tail() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, title) in [
+        ("page_starve_a_src", "Starve Src"),
+        ("page_starve_a_target", "Tail Target"),
+    ] {
+        db.insert_page(id, title, None, "content", None, None, &[], &now)
+            .await
+            .unwrap();
+    }
+
+    // Folded key "tail target" sorts after "missing 511", so the resolvable
+    // link is the last row in keyset order on this same source page.
+    let mut wikilinks: Vec<crate::synthesis::wikilinks::Wikilink> = (0..512)
+        .map(|i| crate::synthesis::wikilinks::Wikilink {
+            label: format!("Missing {i:03}"),
+            target_page_id: None,
+        })
+        .collect();
+    wikilinks.push(crate::synthesis::wikilinks::Wikilink {
+        label: "Tail Target".to_string(),
+        target_page_id: None,
+    });
+    db.replace_page_links("page_starve_a_src", &wikilinks)
+        .await
+        .unwrap();
+
+    {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM page_links WHERE target_page_id IS NULL",
+                (),
+            )
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            count, 513,
+            "fixture guard: 512 unresolvable orphans plus the 1 resolvable tail row, all on one source page"
+        );
+    }
+
+    assert_eq!(
+        db.resolve_orphan_page_links().await.unwrap(),
+        0,
+        "the first batch is exactly the 512 unresolvable rows"
+    );
+    assert!(
+        db.get_app_metadata(super::ORPHAN_SWEEP_CURSOR_KEY)
+            .await
+            .unwrap()
+            .is_some(),
+        "a full unresolvable batch must still leave a cursor for the next sweep to resume from"
+    );
+
+    assert_eq!(
+        db.resolve_orphan_page_links().await.unwrap(),
+        1,
+        "the cursor moves past the unresolvable prefix so the tail resolves"
+    );
+
+    let remaining = {
+        let conn = db.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT label_key FROM page_links WHERE target_page_id IS NULL",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut remaining = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            remaining.push(row.get::<String>(0).unwrap());
+        }
+        remaining
+    };
+    assert_eq!(remaining.len(), 512);
+    assert!(
+        !remaining.iter().any(|key| key == "tail target"),
+        "the tail's orphan row resolved and was deleted, not left behind"
+    );
+
+    assert_eq!(
+        db.resolve_orphan_page_links().await.unwrap(),
+        0,
+        "the sweep wrapped to the head and re-examined the unresolvable prefix"
+    );
+    assert_eq!(
+        db.get_app_metadata(super::ORPHAN_SWEEP_CURSOR_KEY)
+            .await
+            .unwrap(),
+        None,
+        "the tail was reached, so the cursor clears and the next sweep starts fresh"
+    );
+}
+
+/// A cursor that points past the current tail (every row it followed has
+/// since resolved elsewhere) must not wedge the sweep: the sweep falls back
+/// to the head once, resolves what remains, and clears the stale cursor.
+#[tokio::test]
+async fn a_stale_cursor_past_the_tail_falls_back_to_the_head() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, title) in [
+        ("page_stale_src", "Stale Src"),
+        ("page_stale_target", "Stale Target"),
+    ] {
+        db.insert_page(id, title, None, "content", None, None, &[], &now)
+            .await
+            .unwrap();
+    }
+    db.replace_page_links(
+        "page_stale_src",
+        &[crate::synthesis::wikilinks::Wikilink {
+            label: "Stale Target".to_string(),
+            target_page_id: None,
+        }],
+    )
+    .await
+    .unwrap();
+
+    db.set_app_metadata(
+        super::ORPHAN_SWEEP_CURSOR_KEY,
+        "[\"zzzz-past-the-tail\",\"\"]",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        db.resolve_orphan_page_links().await.unwrap(),
+        1,
+        "a stale past-the-tail cursor falls back to the head within the same sweep"
+    );
+    assert_eq!(
+        db.get_app_metadata(super::ORPHAN_SWEEP_CURSOR_KEY)
+            .await
+            .unwrap(),
+        None,
+        "the fallback sweep reached the tail, so the stale cursor is replaced with none"
+    );
 }
 
 /// A page merge repoints inbound links rows and copies the absorbed page's
