@@ -48809,17 +48809,17 @@ impl MemoryDB {
     /// 'active'` check, which the SQL builder below only attaches alongside
     /// the version fence -- a source_revision-only CAS would silently drop
     /// it and let a stale write land on an archived page (caught by
-    /// `citation_result_is_dropped_when_page_is_archived`). `link_reason`
-    /// must be `"citation_backfill"`: `try_update_page_content`'s guard
-    /// otherwise rejects combining both fences for any caller but page
-    /// growth.
+    /// `citation_result_is_dropped_when_page_is_archived`). `link_reason` is
+    /// hardcoded to `"citation_backfill"`, not caller-supplied: it is the
+    /// sole reason `try_update_page_content`'s guard allows this caller to
+    /// combine both fences outside page growth, so a caller-supplied value
+    /// could silently open that exception to any other write.
     #[allow(clippy::too_many_arguments)]
     pub async fn try_update_page_content_with_changelog_at_versions(
         &self,
         id: &str,
         content: &str,
         source_memory_ids: &[&str],
-        link_reason: &str,
         changelog: &str,
         citations_json: Option<&str>,
         expected_version: i64,
@@ -48830,7 +48830,7 @@ impl MemoryDB {
             id,
             content,
             source_memory_ids,
-            link_reason,
+            "citation_backfill",
             false,
             Some(changelog),
             citations_json,

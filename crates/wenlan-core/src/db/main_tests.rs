@@ -52775,7 +52775,6 @@ async fn citation_backfill_combined_cas_writes_on_match_and_rejects_stale_source
             "page_combine_backfill",
             "stale attempt",
             &["mem_seed"],
-            "citation_backfill",
             "[]",
             None,
             version,
@@ -52803,7 +52802,6 @@ async fn citation_backfill_combined_cas_writes_on_match_and_rejects_stale_source
             "page_combine_backfill",
             "annotated body",
             &["mem_seed"],
-            "citation_backfill",
             "[]",
             None,
             version,
@@ -52824,6 +52822,93 @@ async fn citation_backfill_combined_cas_writes_on_match_and_rejects_stale_source
             .content,
         "annotated body",
         "the matching write must have landed"
+    );
+}
+
+/// Round-3 finding (MEDIUM, mixed snapshot): the citation backfill tick
+/// reads its fence counter (`source_revision`) FIRST, then `get_page`
+/// SECOND -- not the other way around. If `get_page` ran first, a source
+/// attach landing between the two reads would show up in `source_revision`
+/// (bumped) but NOT in `page.source_memory_ids` (still the old list): both
+/// fences would then pass on a write that carries the stale source list and
+/// drops the freshly attached source.
+///
+/// This is a seam-level proof mirroring the fixed read order exactly (no
+/// live interposable await exists between the two reads in the real tick,
+/// so there is nothing to race the way `BlockingCitationProvider` races the
+/// LLM call): read the fence, then attach, then `get_page` (which already
+/// reflects the attach), then the combined write using that page's own
+/// `version` and `source_memory_ids` but the PRE-attach `source_revision`.
+/// The write must be rejected purely because the fence is stale -- not
+/// because the source list happens to be stale too, which it isn't here.
+#[tokio::test]
+async fn combined_cas_read_order_rejects_write_racing_a_mid_read_attach() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_read_order",
+        "T",
+        None,
+        "body",
+        None,
+        None,
+        &["mem_seed"],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    // Fixed order: read the fence FIRST.
+    let source_revision = db
+        .get_page_source_revision("page_read_order")
+        .await
+        .unwrap();
+
+    // A concurrent attach lands between the two reads. `link_page_source`
+    // does not require the target memory row to exist (mirrors
+    // `set_page_citations_with_changelog_at_version_rejects_stale_source_
+    // revision` above).
+    db.link_page_source("page_read_order", "mem_read_order_new", "test")
+        .await
+        .unwrap();
+
+    // Then `get_page`, which already reflects the attach.
+    let page = db.get_page("page_read_order").await.unwrap().unwrap();
+    assert!(
+        page.source_memory_ids
+            .contains(&"mem_read_order_new".to_string()),
+        "sanity: get_page (read second) must already see the attach"
+    );
+
+    let existing_sources: Vec<&str> = page.source_memory_ids.iter().map(String::as_str).collect();
+    let committed = db
+        .try_update_page_content_with_changelog_at_versions(
+            "page_read_order",
+            "annotated body",
+            &existing_sources,
+            "[]",
+            Some("[]"),
+            page.version,
+            source_revision,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !committed,
+        "the stale (pre-attach) source_revision must reject the write, even \
+         though it carries the up-to-date (post-attach) source list -- the \
+         fence must catch staleness on ITS OWN axis, not rely on the source \
+         list happening to be fresh too"
+    );
+
+    let after = db.get_page("page_read_order").await.unwrap().unwrap();
+    assert!(
+        after
+            .source_memory_ids
+            .contains(&"mem_read_order_new".to_string()),
+        "the rejected write must not have dropped the concurrently attached \
+         source"
     );
 }
 

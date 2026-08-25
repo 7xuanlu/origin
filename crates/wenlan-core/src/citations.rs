@@ -326,9 +326,14 @@ const CHANGELOG_CAP: usize = 20;
 
 /// `app_metadata` key tracking consecutive failed annotation calls for one
 /// exact Page generation. A stale inference can only touch its old-version
-/// budget, never consume retries for the current Page.
-fn attempt_key(page_id: &str, page_version: i64) -> String {
-    format!("citation_backfill_attempts:{page_id}:v{page_version}")
+/// budget, never consume retries for the current Page. Keyed on BOTH
+/// `version` and `source_revision`: a source attach (`link_page_source`)
+/// bumps only `source_revision`, leaving `version` unchanged, so keying on
+/// `version` alone would let failed attempts against the OLD evidence set
+/// carry over and poison-pill a page that has since gained fresh,
+/// never-tried evidence.
+fn attempt_key(page_id: &str, page_version: i64, source_revision: i64) -> String {
+    format!("citation_backfill_attempts:{page_id}:v{page_version}:s{source_revision}")
 }
 
 /// Collapse all whitespace runs to a single space and trim. Used by the
@@ -372,7 +377,7 @@ async fn record_annotate_failure(
     expected_source_revision: i64,
     giveup_reason: &str,
 ) -> Result<(), WenlanError> {
-    let key = attempt_key(page_id, page_version);
+    let key = attempt_key(page_id, page_version, expected_source_revision);
     let attempts = db
         .get_app_metadata(&key)
         .await?
@@ -437,17 +442,27 @@ async fn run_citation_backfill_with_page_limit(
     let page_ids = db.get_pages_missing_citations(page_limit).await?;
     let selected = page_ids.len();
     for page_id in page_ids {
+        // Read the fence counter FIRST, then the fields it protects. A
+        // concurrent source attach resets `citations` to NULL and bumps
+        // `source_revision` to re-arm this page for backfill, but never
+        // bumps `version` -- threading `source_revision` into every CAS
+        // write below closes the window where a stale result computed from
+        // evidence read before that attach would otherwise still match on
+        // `version` alone and overwrite the freshly-armed page. Reading it
+        // in this order (fence, then the fields it protects) also matters:
+        // an attach that lands AFTER this read bumps the counter past what
+        // we captured, so the CAS below catches it; an attach that lands
+        // BEFORE this read is already reflected in the `get_page` that
+        // follows, so its source list is never stale. Reading `get_page`
+        // first would leave a window where an attach landing between the
+        // two reads shows up in `source_revision` but not in
+        // `page.source_memory_ids` -- both fences would then pass on a
+        // write that still carries the old source list and drops the
+        // freshly attached source.
+        let source_revision = db.get_page_source_revision(&page_id).await?;
         let Some(page) = db.get_page(&page_id).await? else {
             continue;
         };
-        // Captured before any evidence read (and before every terminal
-        // write below): a concurrent source attach resets `citations` to
-        // NULL and bumps `source_revision` to re-arm this page for
-        // backfill, but does not bump `version`. Threading this value into
-        // every CAS write closes the window where a stale result computed
-        // from evidence read before that attach would otherwise still match
-        // on `version` alone and overwrite the freshly-armed page.
-        let source_revision = db.get_page_source_revision(&page_id).await?;
 
         let evidence = db.get_page_evidence(&page_id).await.unwrap_or_default();
         let evidence_sources: Vec<(String, String)> = evidence
@@ -612,14 +627,13 @@ async fn run_citation_backfill_with_page_limit(
                 // touching `version`, so a version-only CAS here would still
                 // match and overwrite the freshly-armed page with a stale
                 // annotate result computed from evidence read before that
-                // attach. `source_revision` was captured at page load,
-                // before the evidence read, same as `page.version`.
+                // attach. `source_revision` was captured before `page` (see
+                // the read-order note above), before the evidence read.
                 let committed = db
                     .try_update_page_content_with_changelog_at_versions(
                         &page_id,
                         &body,
                         &existing_sources,
-                        "citation_backfill",
                         &changelog,
                         Some(&json),
                         page.version,
@@ -629,7 +643,10 @@ async fn run_citation_backfill_with_page_limit(
                     .await?;
                 if committed {
                     let _ = db
-                        .set_app_metadata(&attempt_key(&page_id, page.version), "0")
+                        .set_app_metadata(
+                            &attempt_key(&page_id, page.version, source_revision),
+                            "0",
+                        )
                         .await;
                 }
             }
@@ -1210,8 +1227,9 @@ mod tests {
             "citations should still be NULL (not processed)"
         );
         let version = db.get_page("p_guard").await.unwrap().unwrap().version;
+        let source_revision = db.get_page_source_revision("p_guard").await.unwrap();
         let attempts = db
-            .get_app_metadata(&attempt_key("p_guard", version))
+            .get_app_metadata(&attempt_key("p_guard", version, source_revision))
             .await
             .unwrap();
         assert_eq!(attempts.as_deref(), Some("1"));
@@ -1248,8 +1266,9 @@ mod tests {
             "changelog: {log}"
         );
         let version = db.get_page("p_poison").await.unwrap().unwrap().version;
+        let source_revision = db.get_page_source_revision("p_poison").await.unwrap();
         let attempts = db
-            .get_app_metadata(&attempt_key("p_poison", version))
+            .get_app_metadata(&attempt_key("p_poison", version, source_revision))
             .await
             .unwrap();
         assert_eq!(
@@ -1269,7 +1288,11 @@ mod tests {
             .unwrap()
             .unwrap()
             .version;
-        let key = attempt_key("p_provider_error", version);
+        let source_revision = db
+            .get_page_source_revision("p_provider_error")
+            .await
+            .unwrap();
+        let key = attempt_key("p_provider_error", version, source_revision);
         db.set_app_metadata(&key, "2").await.unwrap();
 
         let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::unavailable());
@@ -1362,8 +1385,9 @@ mod tests {
             "citations should still be NULL after one zero-marker attempt (retry, not drain)"
         );
         let version = db.get_page("p_zero").await.unwrap().unwrap().version;
+        let source_revision = db.get_page_source_revision("p_zero").await.unwrap();
         let attempts = db
-            .get_app_metadata(&attempt_key("p_zero", version))
+            .get_app_metadata(&attempt_key("p_zero", version, source_revision))
             .await
             .unwrap();
         assert_eq!(attempts.as_deref(), Some("1"));
@@ -1385,6 +1409,94 @@ mod tests {
         assert!(
             log.contains("citation backfill gave up"),
             "changelog: {log}"
+        );
+    }
+
+    /// Round-3 finding (LOW): `attempt_key` is now keyed on BOTH `version`
+    /// and `source_revision`, not `version` alone. A source attach
+    /// (`link_page_source`) bumps only `source_revision`, so two failed
+    /// attempts against the OLD evidence set followed by an attach followed
+    /// by one failure on the NEW evidence must count as attempt 1 of a
+    /// fresh budget, not attempt 3 of the old one -- the new evidence has
+    /// never actually been tried 3 times, so poison-pilling it now would
+    /// throw away citations the model was never even given a fair shot at.
+    #[tokio::test]
+    async fn attempt_budget_resets_when_source_revision_advances_mid_generation() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        seed_backfill_page(&db, "p_budget_reset", true).await;
+
+        let rewritten = "A completely different sentence about something else.[1]";
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(rewritten));
+        let prompts = PromptRegistry::default();
+
+        // Two guard rejections against the ORIGINAL source_revision
+        // generation.
+        for _ in 0..2 {
+            run_citation_backfill_tick(&db, &llm, &prompts)
+                .await
+                .unwrap();
+        }
+        let version = db
+            .get_page("p_budget_reset")
+            .await
+            .unwrap()
+            .unwrap()
+            .version;
+        let original_source_revision = db.get_page_source_revision("p_budget_reset").await.unwrap();
+        assert_eq!(
+            db.get_app_metadata(&attempt_key(
+                "p_budget_reset",
+                version,
+                original_source_revision
+            ))
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("2"),
+            "sanity: two consecutive rejections must have recorded 2 attempts \
+             against the original generation"
+        );
+
+        // A concurrent source attach advances the generation: bumps
+        // `source_revision` (and resets `citations`, already NULL) without
+        // touching `version`.
+        insert_test_memory(
+            &db,
+            "mem_budget_new",
+            "A newly attached source mid-generation",
+        )
+        .await;
+        db.link_page_source("p_budget_reset", "mem_budget_new", "test")
+            .await
+            .unwrap();
+        let new_source_revision = db.get_page_source_revision("p_budget_reset").await.unwrap();
+        assert_ne!(
+            new_source_revision, original_source_revision,
+            "sanity: the attach must advance source_revision"
+        );
+
+        // One more rejection, now against the NEW generation.
+        run_citation_backfill_tick(&db, &llm, &prompts)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&"p_budget_reset".to_string()),
+            "one failure on a fresh generation must not poison-pill it -- the \
+             old generation's 2 failures must not carry over just because \
+             `version` is unchanged"
+        );
+        let attempts_after = db
+            .get_app_metadata(&attempt_key("p_budget_reset", version, new_source_revision))
+            .await
+            .unwrap();
+        assert_eq!(
+            attempts_after.as_deref(),
+            Some("1"),
+            "the new generation's attempt count must start fresh at 1"
         );
     }
 
@@ -1466,8 +1578,9 @@ mod tests {
              page forever and starve every page behind it"
         );
         let page = db.get_page("p_orphan").await.unwrap().unwrap();
+        let source_revision = db.get_page_source_revision("p_orphan").await.unwrap();
         let attempts = db
-            .get_app_metadata(&attempt_key("p_orphan", page.version))
+            .get_app_metadata(&attempt_key("p_orphan", page.version, source_revision))
             .await
             .unwrap();
         assert_eq!(
