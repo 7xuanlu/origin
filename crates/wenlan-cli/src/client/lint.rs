@@ -8,10 +8,34 @@ use wenlan_types::lint::{
 const MAX_LINT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn origin_host_from_env() -> String {
-    std::env::var("WENLAN_HOST")
-        .unwrap_or_else(|_| DEFAULT_HOST.to_string())
-        .trim_end_matches('/')
-        .to_string()
+    normalize_origin_host(
+        &std::env::var("WENLAN_HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string()),
+    )
+}
+
+/// `WENLAN_HOST` is a full URL, but the first thing people try is a bare
+/// port (`17917`) or `host:port`; reqwest then fails with "relative URL
+/// without a base", which the CLI used to report as "is the daemon
+/// running?". Complete the obvious shorthand instead: digits become a
+/// loopback URL, a schemeless host gets `http://`, and an empty value means
+/// the default. A value with a scheme is only trimmed. A loopback shorthand
+/// takes part in autostart exactly like the full loopback URL would; digits
+/// that are not a valid non-zero port are left alone so the error names them.
+pub fn normalize_origin_host(raw: &str) -> String {
+    let value = raw.trim().trim_end_matches('/');
+    if value.is_empty() {
+        return DEFAULT_HOST.to_string();
+    }
+    if value.contains("://") {
+        return value.to_string();
+    }
+    if value.bytes().all(|b| b.is_ascii_digit()) {
+        return match value.parse::<u16>() {
+            Ok(port) if port > 0 => format!("http://127.0.0.1:{port}"),
+            _ => value.to_string(),
+        };
+    }
+    format!("http://{value}")
 }
 
 impl WenlanClient {
@@ -83,4 +107,33 @@ async fn read_lint_body(mut response: reqwest::Response, url: &str) -> Result<Ve
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod origin_host_tests {
+    use super::{normalize_origin_host, DEFAULT_HOST};
+
+    #[test]
+    fn shorthand_hosts_become_full_urls() {
+        assert_eq!(normalize_origin_host("17917"), "http://127.0.0.1:17917");
+        assert_eq!(
+            normalize_origin_host("127.0.0.1:17917"),
+            "http://127.0.0.1:17917"
+        );
+        assert_eq!(
+            normalize_origin_host("localhost:7878/"),
+            "http://localhost:7878"
+        );
+        assert_eq!(normalize_origin_host(""), DEFAULT_HOST);
+        assert_eq!(normalize_origin_host("0"), "0");
+        assert_eq!(normalize_origin_host("70000"), "70000");
+        assert_eq!(
+            normalize_origin_host("http://127.0.0.1:17917/"),
+            "http://127.0.0.1:17917"
+        );
+        assert_eq!(
+            normalize_origin_host("https://wenlan.example:8443"),
+            "https://wenlan.example:8443"
+        );
+    }
 }

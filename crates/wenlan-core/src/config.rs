@@ -235,10 +235,40 @@ pub fn outbox_dir() -> PathBuf {
     data_root().join("outbox")
 }
 
+/// The last reported configuration failure (path and parse error), so a
+/// corrupt file is logged once rather than on every request and scheduler
+/// tick. It is reported again when the error changes or after a successful
+/// parse in between.
+static LAST_CONFIG_WARNING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record the current parse outcome; true when a failure is new.
+fn note_config_parse(failure: Option<&str>) -> bool {
+    let mut last = LAST_CONFIG_WARNING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let is_new = failure.is_some() && last.as_deref() != failure;
+    *last = failure.map(str::to_owned);
+    is_new
+}
+
 pub fn load_config() -> Config {
     let path = config_path();
     let mut config = match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Ok(contents) => match serde_json::from_str(&contents) {
+            Ok(config) => {
+                note_config_parse(None);
+                config
+            }
+            Err(error) => {
+                if note_config_parse(Some(&format!("{}|{error}", path.display()))) {
+                    log::warn!(
+                        "[config] {} is not valid JSON ({error}); using defaults until it is fixed",
+                        path.display()
+                    );
+                }
+                Config::default()
+            }
+        },
         Err(_) => Config::default(),
     };
     config.migrate();

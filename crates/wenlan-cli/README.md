@@ -51,6 +51,9 @@ Set `WENLAN_HOST` to point at a remote daemon:
 export WENLAN_HOST=http://127.0.0.1:7878  # default
 ```
 
+A bare port (`17917`) or `host:port` is completed to `http://127.0.0.1:17917` /
+`http://host:port`; a loopback shorthand takes part in autostart like the full URL.
+
 When a request to a loopback daemon cannot connect, the CLI automatically starts
 the registered background service (`com.wenlan.server`) and waits for its health
 endpoint. Remote or invalid `WENLAN_HOST` values keep the original connection

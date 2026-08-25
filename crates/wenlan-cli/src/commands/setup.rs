@@ -261,18 +261,19 @@ pub async fn run_doctor() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where the daemon logs when its data root is not writable (mirrors
+/// `fallback_log_root` in wenlan-server).
+#[cfg(target_os = "macos")]
+fn fallback_log_root() -> std::path::PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join("Library/Logs/com.wenlan.server-fallback"))
+        .unwrap_or_else(|| std::env::temp_dir().join("wenlan-server-fallback"))
+}
+
 #[cfg(target_os = "macos")]
 fn print_daemon_log_paths() {
-    let data_root = std::env::var_os("WENLAN_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("wenlan")
-        });
-    let fallback_root = dirs::home_dir()
-        .map(|home| home.join("Library/Logs/com.wenlan.server-fallback"))
-        .unwrap_or_else(|| std::env::temp_dir().join("wenlan-server-fallback"));
+    let data_root = config::data_root();
+    let fallback_root = fallback_log_root();
     println!(
         "Daemon log: {}",
         data_root.join("logs/wenlan-server.log").display()
@@ -676,15 +677,123 @@ async fn print_daemon_health() {
         Ok(resp) => println!("Daemon: unhealthy ({})", resp.status()),
         Err(_) => {
             println!("Daemon: not reachable on {}", url);
-            print_downgrade_barrier_hint();
+            if super::service::autostart_off_marker_exists() {
+                println!(
+                    "  The background service is switched off (`wenlan background off`); turn it back on with `wenlan background on`."
+                );
+                return;
+            }
+            print_last_daemon_error();
         }
     }
+}
+
+/// macOS: the daemon keeps a rotating file log (primary data root, else the
+/// fallback root), so a daemon that exited on purpose can say why.
+#[cfg(target_os = "macos")]
+fn print_last_daemon_error() {
+    let log_path = config::data_root().join("logs/wenlan-server.log");
+    // The fallback log is consulted only when the primary one does not exist
+    // at all (the daemon could not write its data root), so an old fallback
+    // entry never shadows a healthy primary log.
+    let found = if log_path.exists() {
+        last_daemon_error(&log_path).map(|line| (log_path.clone(), line))
+    } else {
+        let fallback = fallback_log_root().join("logs/wenlan-server.log");
+        last_daemon_error(&fallback).map(|line| (fallback, line))
+    };
+    match found {
+        Some((path, line)) => {
+            println!("  Last daemon error ({}):", path.display());
+            println!("    {line}");
+            if line.contains("newer than this build supports") {
+                print_downgrade_barrier_hint();
+            } else {
+                println!(
+                    "  Fix the cause above, then run `wenlan background on` (or open the Wenlan app)."
+                );
+            }
+        }
+        None => {
+            println!("  No daemon error recorded in {}.", log_path.display());
+            println!(
+                "  Start it with `wenlan background on` (or open the Wenlan app); if it stops again, that log says why."
+            );
+        }
+    }
+}
+
+/// Linux and Windows: the daemon logs to the service's console (journal or
+/// Task Scheduler), not to a file this command can read.
+#[cfg(not(target_os = "macos"))]
+fn print_last_daemon_error() {
+    println!("  Start it with `wenlan background on` (or open the Wenlan app).");
+    println!(
+        "  If it stops again, the service log says why (Linux: `journalctl --user -u wenlan-server`); \
+         a store migrated by a NEWER Wenlan is refused on purpose — upgrade Wenlan."
+    );
+}
+
+/// The last `ERROR` line of the daemon's most recent run, colour codes
+/// stripped, so a daemon that exited on purpose (newer schema, missing model,
+/// bad data root) is not reported as merely "not running". Only the lines
+/// after the last startup banner count, and an error that was followed by a
+/// clean shutdown is history rather than the current state.
+#[cfg(any(target_os = "macos", test))]
+fn last_daemon_error(log_path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(log_path).ok()?;
+    let lines: Vec<String> = String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(strip_ansi)
+        .collect();
+    let start = lines
+        .iter()
+        .rposition(|line| line.contains("wenlan-server v"))
+        .unwrap_or(0);
+    let run = &lines[start..];
+    let error_at = run.iter().rposition(|line| line.contains("ERROR"))?;
+    if run[error_at..]
+        .iter()
+        .any(|line| line.contains("graceful shutdown complete"))
+    {
+        return None;
+    }
+    let line = run[error_at].trim();
+    let count = line.chars().count();
+    Some(if count > 400 {
+        // Keep both ends: the cause sits at the front, the advice at the back.
+        let head: String = line.chars().take(300).collect();
+        let tail: String = line.chars().skip(count - 80).collect();
+        format!("{head} … {tail}")
+    } else {
+        line.to_string()
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// A daemon that refuses to start because the store was migrated by a newer
 /// build looks exactly like a daemon that is simply not running. Say the
 /// difference out loud: the refusal is deliberate, it is written to the daemon
 /// log verbatim, and the fix is to upgrade rather than to keep restarting.
+#[cfg(target_os = "macos")]
 fn print_downgrade_barrier_hint() {
     println!(
         "  If the store was migrated by a NEWER Wenlan, this build refuses to open it \
@@ -849,4 +958,72 @@ fn prompt_secret(prompt: &str) -> anyhow::Result<String> {
     println!();
     read?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::{last_daemon_error, strip_ansi};
+
+    #[test]
+    fn last_daemon_error_returns_the_final_error_line_without_colour_codes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("wenlan-server.log");
+        std::fs::write(
+            &log,
+            concat!(
+                "\x1b[2m2026-08-25T07:01:50Z\x1b[0m \x1b[32m INFO\x1b[0m wenlan_server: wenlan-server v0.17.0\n",
+                "\x1b[2m2026-08-25T07:01:52Z\x1b[0m \x1b[33m WARN\x1b[0m wenlan_core::db: creating schema...\n",
+                "\x1b[2m2026-08-25T07:01:53Z\x1b[0m \x1b[31mERROR\x1b[0m wenlan_server: first failure\n",
+                "\x1b[2m2026-08-25T07:01:54Z\x1b[0m \x1b[31mERROR\x1b[0m wenlan_server: wenlan-server terminated with an error: Embedding error: could not load the embedding model\n",
+                "\x1b[2m2026-08-25T07:01:55Z\x1b[0m \x1b[32m INFO\x1b[0m wenlan_server: bye\n",
+            ),
+        )
+        .expect("write log");
+        let line = last_daemon_error(&log).expect("an ERROR line");
+        assert!(!line.contains('\x1b'), "{line}");
+        assert!(
+            line.ends_with("could not load the embedding model"),
+            "{line}"
+        );
+        assert!(line.starts_with("2026-08-25T07:01:54Z"), "{line}");
+        assert_eq!(last_daemon_error(&dir.path().join("missing.log")), None);
+    }
+
+    #[test]
+    fn an_error_from_a_previous_run_or_before_a_clean_shutdown_is_not_current() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("wenlan-server.log");
+        // Run 1 failed, then run 2 came up and shut down cleanly: nothing current.
+        std::fs::write(
+            &log,
+            concat!(
+                "2026-08-24T10:00:00Z  INFO wenlan_server: wenlan-server v0.17.0\n",
+                "2026-08-24T10:00:01Z ERROR wenlan_server: wenlan-server terminated with an error: old failure\n",
+                "2026-08-25T09:00:00Z  INFO wenlan_server: wenlan-server v0.17.0\n",
+                "2026-08-25T09:00:05Z ERROR wenlan_core::scheduler: one job failed\n",
+                "2026-08-25T09:30:00Z  INFO wenlan_server: graceful shutdown complete\n",
+            ),
+        )
+        .expect("write log");
+        assert_eq!(last_daemon_error(&log), None);
+
+        // Run 3 failed again: only that run's error counts, and one bad byte
+        // in the file does not hide it.
+        let mut bytes = std::fs::read(&log).expect("read log");
+        bytes.extend_from_slice(
+            b"2026-08-25T10:00:00Z  INFO wenlan_server: wenlan-server v0.17.0 \xff\n",
+        );
+        bytes.extend_from_slice(
+            b"2026-08-25T10:00:01Z ERROR wenlan_server: wenlan-server terminated with an error: new failure\n",
+        );
+        std::fs::write(&log, bytes).expect("rewrite log");
+        let line = last_daemon_error(&log).expect("the current run's ERROR line");
+        assert!(line.ends_with("new failure"), "{line}");
+    }
+
+    #[test]
+    fn strip_ansi_leaves_plain_text_alone() {
+        assert_eq!(strip_ansi("plain ERROR line"), "plain ERROR line");
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+    }
 }

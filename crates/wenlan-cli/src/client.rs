@@ -139,13 +139,26 @@ impl WenlanClient {
             Ok(response) => Ok(response),
             Err(error) if error.is_connect() => {
                 let Some(retry) = retry else {
-                    return Err(error).with_context(|| what.to_owned());
+                    return Err(error)
+                        .with_context(|| what.to_owned())
+                        .with_context(|| recovery::connect_failure_hint(&self.base_url));
                 };
                 let original = anyhow::Error::new(error).context(what.to_owned());
                 if let Err(recovery_error) = recovery::recover(&self.base_url).await {
-                    return Err(original.context(format!("{recovery_error:#}")));
+                    return Err(original.context(format!("{recovery_error:#}")).context(
+                        "the daemon did not come up on its own — run `wenlan doctor` to see why",
+                    ));
                 }
-                retry.send().await.with_context(|| what.to_owned())
+                retry
+                    .send()
+                    .await
+                    .with_context(|| what.to_owned())
+                    .with_context(|| {
+                        format!(
+                            "the daemon was started but {} still does not answer — run `wenlan doctor`",
+                            self.base_url
+                        )
+                    })
             }
             Err(error) => Err(error).with_context(|| what.to_owned()),
         }
@@ -652,6 +665,29 @@ mod tests {
         let request = build_list_request(Some(20), None, None);
         let json = serde_json::to_value(request).expect("serialize list request");
         assert!(json.get("confirmed").is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_failure_says_what_to_do_next() {
+        // An ephemeral port that was just released: nothing listens there.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+        let base = format!("http://{addr}");
+        let client = client_for(&base).with_recovery(false);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), client.health())
+            .await
+            .expect("connect failure within 10s")
+            .expect_err("nothing listens on the released port");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!("no Wenlan daemon is listening at {base}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("GET {base}/api/health failed")),
+            "{text}"
+        );
     }
 
     fn client_for(base_url: &str) -> WenlanClient {

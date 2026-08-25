@@ -1306,6 +1306,49 @@ pub(crate) fn init_text_embedding(options: InitOptions) -> anyhow::Result<TextEm
     TextEmbedding::try_new(options)
 }
 
+/// The message a user sees when the embedding model cannot be loaded. The raw
+/// fastembed error ("Failed to retrieve model_optimized.onnx") does not say
+/// that this is a one-time download, where it goes, or what to do next.
+pub(crate) fn embedder_init_error(
+    error: &anyhow::Error,
+    cache: Option<&std::path::Path>,
+) -> WenlanError {
+    // fastembed gives HF_HOME precedence over the configured cache dir, so
+    // name the directory it actually used.
+    let cache = std::env::var_os("HF_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| cache.map(std::path::Path::to_path_buf));
+    let location = cache
+        .as_deref()
+        .map(|path| format!(" from {}", path.display()))
+        .unwrap_or_default();
+    let cause = format!("{error:#}");
+    let lower = cause.to_ascii_lowercase();
+    let is_download = !lower.contains("permission denied")
+        && [
+            "retrieve",
+            "request",
+            "connect",
+            "dns",
+            "timed out",
+            "timeout",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let advice = if is_download {
+        "The first start downloads it from huggingface.co; check the network or proxy, then \
+         start Wenlan again"
+    } else {
+        "If the cached files are damaged or unreadable, fix or delete that cache directory and \
+         start Wenlan again to download a fresh copy; an ONNX Runtime error usually means an \
+         unsupported CPU or a broken install"
+    };
+    WenlanError::Embedding(format!(
+        "could not load the embedding model (quantized BGE base en v1.5, about 210 MB){location}. \
+         {advice}. Cause: {cause}"
+    ))
+}
+
 /// Known-client registry — maps canonical technical IDs (what clients send in
 /// `x-agent-name`) to human-friendly display names (what users see in UI).
 ///
@@ -4331,6 +4374,7 @@ impl MemoryDB {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "<default>".into())
         );
+        let embed_cache_label = embed_cache_dir.clone();
         let (embed_tx, embed_rx) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("embedder-init".into())
@@ -4348,7 +4392,7 @@ impl MemoryDB {
         let embedder = embed_rx
             .await
             .map_err(|_| WenlanError::Embedding("embedder thread panicked".into()))?
-            .map_err(|e| WenlanError::Embedding(format!("init embedder: {}", e)))?;
+            .map_err(|e| embedder_init_error(&e, embed_cache_label.as_deref()))?;
 
         log::info!("[memory_db] initialized at {}", db_file.display());
 
@@ -4486,7 +4530,7 @@ impl MemoryDB {
         let embedder = rx
             .await
             .map_err(|_| WenlanError::Embedding("embedder thread panicked".into()))?
-            .map_err(|e| WenlanError::Embedding(format!("init embedder: {}", e)))?;
+            .map_err(|e| embedder_init_error(&e, None))?;
         Ok(Arc::new(std::sync::Mutex::new(embedder)))
     }
 
