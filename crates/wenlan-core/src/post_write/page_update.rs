@@ -119,12 +119,21 @@ pub fn page_is_human_owned(page: &crate::pages::Page) -> bool {
 /// `list_pending_revisions` surfaces on the `/curate revisions` queue. The page
 /// itself is never mutated here — the human accepts or dismisses the card.
 /// Returns a gated `WriteResult` carrying the new card id.
+///
+/// `source_revision` is required: every caller must fence the card with a
+/// real counter. Note this is an *acceptance-time staging token*, not
+/// necessarily a compile fence — a caller that captured its own counter
+/// before it began compiling passes that value straight through (a true
+/// compile fence, catching staleness from before the request even started);
+/// a caller with no such value falls back to reading the counter here, at
+/// staging time, which only fences staging→accept and cannot detect a
+/// request that was already stale before it reached this call.
 pub async fn stage_page_revision_card(
     db: &MemoryDB,
     page: &crate::pages::Page,
     content: &str,
     source_memory_ids: &[String],
-    source_revision: Option<i64>,
+    source_revision: i64,
     edited_by: &str,
     retry: Option<&RetryIdentity>,
 ) -> Result<WriteResult, WenlanError> {
@@ -641,12 +650,23 @@ pub(super) async fn update_page_impl(
             // it is no longer advisory: whatever it decided is what the write
             // guards on.
             if writer.is_machine() && page_is_human_owned(&current) {
+                // `expected_source_revision` is the caller's compile fence
+                // when it supplied one. A caller with none (e.g. the generic
+                // `update_page` wrapper) gets an acceptance-time staging
+                // token instead: the counter as of right now, which fences
+                // staging→accept for this card but cannot detect that the
+                // caller's own compile was already stale before it got here
+                // — see `stage_page_revision_card`'s doc comment.
+                let staged_source_revision = match expected_source_revision {
+                    Some(source_revision) => source_revision,
+                    None => db.get_page_source_revision(page_id).await?,
+                };
                 let result = stage_page_revision_card(
                     db,
                     &current,
                     &req.content,
                     effective_sources,
-                    expected_source_revision,
+                    staged_source_revision,
                     edited_by,
                     retry.as_ref(),
                 )

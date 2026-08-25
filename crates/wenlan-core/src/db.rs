@@ -9468,10 +9468,12 @@ impl MemoryDB {
 
             // Migration 126 (2026-08-24 doc-citation-locator fix): one-time
             // re-arm of pages poisoned by the citation backfill's now-fixed
-            // locator mismatch (change A/B, same PR). See
-            // migrate_126_rearm_empty_citations.
+            // locator mismatch (change A/B, same PR), and drop of legacy
+            // per-generation citation-backfill attempt keys. See
+            // migrate_126_rearm_empty_citations_and_drop_legacy_attempt_keys.
             if version < 126 {
-                self.migrate_126_rearm_empty_citations(version).await?;
+                self.migrate_126_rearm_empty_citations_and_drop_legacy_attempt_keys(version)
+                    .await?;
             }
         }
 
@@ -16448,9 +16450,15 @@ impl MemoryDB {
     /// blocking the only recovery path. Now that the read side resolves
     /// those locators, re-arm every poisoned active page by clearing the
     /// pill back to NULL so the sweep picks it up again. No new API route;
-    /// the `citations IS NULL` selector is unchanged. See
-    /// migrate_126_rearm_empty_citations.
-    async fn migrate_126_rearm_empty_citations(
+    /// the `citations IS NULL` selector is unchanged.
+    ///
+    /// Same transaction also drops legacy-format citation-backfill attempt
+    /// keys (`citation_backfill_attempts:<page_id>:v...`), predating the
+    /// one-row-per-page redesign (`citations::attempt_key`) -- a dead key a
+    /// live page can never match again, since every read is gated on the
+    /// current `v{version}:s{source_revision}:` generation prefix. See
+    /// migrate_126_rearm_empty_citations_and_drop_legacy_attempt_keys.
+    async fn migrate_126_rearm_empty_citations_and_drop_legacy_attempt_keys(
         &self,
         prior_version: i64,
     ) -> Result<(), WenlanError> {
@@ -16460,7 +16468,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("m126 begin: {e}")))?;
 
-        let result: Result<u64, WenlanError> = async {
+        let result: Result<(u64, u64), WenlanError> = async {
             let rearmed = conn
                 .execute(
                     "UPDATE pages SET citations = NULL WHERE citations = '[]' AND status = 'active'",
@@ -16468,11 +16476,18 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("m126 rearm: {e}")))?;
-            Ok(rearmed)
+            let legacy_attempt_keys_dropped = conn
+                .execute(
+                    "DELETE FROM app_metadata WHERE key LIKE 'citation_backfill_attempts:%:v%'",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m126 legacy attempt keys: {e}")))?;
+            Ok((rearmed, legacy_attempt_keys_dropped))
         }
         .await;
 
-        let rearmed = match result {
+        let (rearmed, legacy_attempt_keys_dropped) = match result {
             Ok(value) => {
                 conn.execute("COMMIT", ())
                     .await
@@ -16490,7 +16505,8 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("m126 bump: {e}")))?;
         log::info!(
             "[migration] Migration 126 applied: {rearmed} active page(s) with citations = '[]' \
-             re-armed to NULL"
+             re-armed to NULL, {legacy_attempt_keys_dropped} legacy citation-backfill attempt \
+             key(s) dropped"
         );
         Ok(())
     }
@@ -48942,12 +48958,17 @@ impl MemoryDB {
         page_growth_guard: Option<(&str, i64)>,
         machine_owned_only: bool,
     ) -> Result<bool, WenlanError> {
-        // Page growth, the citation backfill, and revision-card accept are
-        // the three machine writers that snapshot both counters BEFORE
-        // reading evidence, so combining both fences for them is stricter,
-        // not looser, than either alone -- and `status = 'active'` rides
-        // along with the version fence, so this can never drop that check.
-        // Every other caller stays single-fence.
+        // Page growth and the citation backfill are the two machine writers
+        // that snapshot both counters BEFORE reading evidence, so combining
+        // both fences for them is stricter, not looser, than either alone.
+        // Revision-card accept's source-revision half can instead be an
+        // acceptance-time staging token read at staging time, not always a
+        // pre-inference snapshot -- see `stage_page_revision_card`'s doc
+        // comment. Combining is still safe either way: the SQL builder below
+        // appends `status = 'active'` on both the version-only and the
+        // source-revision-only branch, so combining never drops that check
+        // regardless of which fence supplied it. Every other caller stays
+        // single-fence.
         if expected_version.is_some()
             && expected_source_revision.is_some()
             && page_growth_guard.is_none()
@@ -49102,9 +49123,11 @@ impl MemoryDB {
             }
             if expected_source_revision.is_some() {
                 if expected_version.is_some() {
+                    // `status = 'active'` already rode along with the version
+                    // fence above; do not append it a second time.
                     sql.push_str(" AND COALESCE(source_revision, 0) = ?9");
                 } else {
-                    sql.push_str(" AND COALESCE(source_revision, 0) = ?8");
+                    sql.push_str(" AND COALESCE(source_revision, 0) = ?8 AND status = 'active'");
                 }
             }
             let update_result = match (expected_version, expected_source_revision) {
@@ -49223,9 +49246,11 @@ impl MemoryDB {
             }
             if expected_source_revision.is_some() {
                 if expected_version.is_some() {
+                    // `status = 'active'` already rode along with the version
+                    // fence above; do not append it a second time.
                     sql.push_str(" AND COALESCE(source_revision, 0) = ?8");
                 } else {
-                    sql.push_str(" AND COALESCE(source_revision, 0) = ?7");
+                    sql.push_str(" AND COALESCE(source_revision, 0) = ?7 AND status = 'active'");
                 }
             }
             let update_result = match (expected_version, expected_source_revision) {
@@ -50502,6 +50527,20 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete_page history: {e}")))?;
+            // G4: the citation-backfill attempt counter is one row keyed by
+            // this exact page id (`citations::attempt_key`). Without this, a
+            // later page recreated at the same id would inherit a stale
+            // attempt count -- or worse, a stale count that still matches the
+            // new page's fresh version/source_revision generation prefix by
+            // coincidence, silently poison-pilling it early.
+            conn.execute(
+                "DELETE FROM app_metadata WHERE key = ?1",
+                libsql::params![crate::citations::attempt_key(id)],
+            )
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("delete_page citation backfill attempts: {e}"))
+            })?;
             conn.execute("DELETE FROM pages WHERE id = ?1", libsql::params![id])
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("delete_page row: {e}")))?;

@@ -329,7 +329,7 @@ const CHANGELOG_CAP: usize = 20;
 /// count belongs to is encoded in the VALUE (`attempt_generation`), not the
 /// key, so this can be looked up and cleaned up with a single row instead
 /// of accumulating one dead key per generation forever.
-fn attempt_key(page_id: &str) -> String {
+pub(crate) fn attempt_key(page_id: &str) -> String {
     format!("citation_backfill_attempts:{page_id}")
 }
 

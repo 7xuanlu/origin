@@ -61,10 +61,14 @@ async fn resolve_page_revision_card(
         })
         .unwrap_or_default();
     let page_version = structured.get("page_version").and_then(|v| v.as_i64());
-    // Legacy cards (staged before this fence existed) have no
-    // "source_revision" key at all -- `None` here, same as `page_version`
-    // for a pre-versioning card, keeps them accepted on the version fence
-    // alone rather than inventing a base to check.
+    // `stage_page_revision_card` now requires every caller to pass a real
+    // counter, so a fresh card always carries a concrete number here. `None`
+    // only decodes two legacy shapes: cards staged before the field existed
+    // at all (missing key), and cards staged in the window where the field
+    // existed but callers could still pass `None` through it (a literal JSON
+    // `null`). Both are treated the same as a pre-versioning `page_version`:
+    // accepted on the version fence alone rather than inventing a base to
+    // check.
     let source_revision = structured.get("source_revision").and_then(|v| v.as_i64());
 
     Ok(Some(PageRevisionCard {

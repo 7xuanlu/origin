@@ -27803,6 +27803,73 @@ async fn archive_page_records_history_once_for_status_flip() {
     assert_eq!(history_again, history, "idempotent archive adds no row");
 }
 
+/// G3: `try_update_page_content`'s CAS SQL builder only appends `AND status =
+/// 'active'` alongside the `expected_version` fence, never alongside the
+/// `expected_source_revision` fence. `update_page_at_source_revision`'s
+/// callers (`grow_page`, the agent-refresh route) pass a source-revision
+/// fence with no version fence at all, so before this fix a stale write
+/// computed before an archive could still land, the same hazard
+/// `citation_result_is_dropped_when_page_is_archived`
+/// (crates/wenlan-core/src/citations.rs) proves for the citation backfill's
+/// *combined*-fence write -- that write is unaffected by this gap only
+/// because its `expected_version` half already carries `status = 'active'`
+/// along with it.
+#[tokio::test]
+async fn source_revision_only_cas_is_rejected_by_an_archived_page() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page-archived-source-revision-cas",
+        "Archived source-revision CAS",
+        None,
+        "original body",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    let expected_source_revision = db
+        .get_page_source_revision("page-archived-source-revision-cas")
+        .await
+        .unwrap();
+
+    db.archive_page("page-archived-source-revision-cas")
+        .await
+        .unwrap();
+
+    let wrote = db
+        .try_update_page_content_with_changelog_at_source_revision(
+            "page-archived-source-revision-cas",
+            "a stale write computed before the archive",
+            &[],
+            "test_g3",
+            false,
+            "test_g3 stale write",
+            None,
+            expected_source_revision,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !wrote,
+        "a source-revision-only CAS must not write to an archived page, matching the version-fenced CAS"
+    );
+    let page = db
+        .get_page("page-archived-source-revision-cas")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.status, "archived");
+    assert_eq!(
+        page.content, "original body",
+        "the stale write must not land"
+    );
+}
+
 #[tokio::test]
 async fn find_stale_archived_concepts_returns_only_qualifying_rows() {
     let (db, _dir) = test_db().await;
@@ -53441,6 +53508,51 @@ async fn delete_page_retires_all_page_edges() {
     assert_eq!(active, 0, "no active edge may still touch the deleted page");
 }
 
+/// G4: `delete_page` must delete the citation-backfill attempt row
+/// (`app_metadata` key `citations::attempt_key`) inside its existing
+/// transaction. Left behind, a page recreated at the same id inherits a
+/// stale attempt count from a Page generation it never had -- and a fresh
+/// insert's `version`/`source_revision` restart at the same defaults every
+/// time, so the stale row's generation prefix can silently match the new
+/// page and start it partway toward the backfill's poison-pill limit.
+#[tokio::test]
+async fn delete_page_removes_its_citation_backfill_attempt_row() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_g4_del",
+        "Delete Target",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    db.set_app_metadata(&crate::citations::attempt_key("page_g4_del"), "v1:s0:2")
+        .await
+        .unwrap();
+    assert!(
+        db.get_app_metadata(&crate::citations::attempt_key("page_g4_del"))
+            .await
+            .unwrap()
+            .is_some(),
+        "the attempt row must exist before delete for this test to prove anything"
+    );
+
+    db.delete_page("page_g4_del").await.unwrap();
+
+    assert!(
+        db.get_app_metadata(&crate::citations::attempt_key("page_g4_del"))
+            .await
+            .unwrap()
+            .is_none(),
+        "delete_page must remove the citation-backfill attempt row along with the page"
+    );
+}
+
 // ---- G6 Stage 0 part 2: secondary-writer dual-write gaps (parity oracle) ----
 
 /// A resolved orphan link makes the canonical `links` edge implied — the
@@ -55591,6 +55703,13 @@ async fn reopening_a_db_with_pre_125_duplicate_observations_migrates_cleanly() {
 /// exactly once, so the (now-fixed) backfill sweep picks it up again --
 /// while a NULL page, a page with a real citation map, and a non-active
 /// page carrying the same '[]' value must all stay untouched.
+///
+/// G5: the same migration also drops legacy-format citation-backfill
+/// attempt keys (`citation_backfill_attempts:<page_id>:v...`, predating the
+/// one-row-per-page redesign in `citations::attempt_key`) -- two seeded here
+/// -- while a current-format row (`citation_backfill_attempts:<page_id>`,
+/// no `:v` suffix) must survive, since it is still live and read by the
+/// backfill.
 #[tokio::test]
 async fn migration_126_rearms_empty_citations_to_null_exactly_once() {
     let (db, _dir) = test_db().await;
@@ -55658,6 +55777,16 @@ async fn migration_126_rearms_empty_citations_to_null_exactly_once() {
     .unwrap();
     db.archive_page("m126-archived-pill").await.unwrap();
 
+    db.set_app_metadata("citation_backfill_attempts:m126-legacy-a:v1:s0:2", "3")
+        .await
+        .unwrap();
+    db.set_app_metadata("citation_backfill_attempts:m126-legacy-b:v3:s1:1", "1")
+        .await
+        .unwrap();
+    db.set_app_metadata(&crate::citations::attempt_key("m126-current"), "v1:s0:2")
+        .await
+        .unwrap();
+
     {
         let conn = db.conn.lock().await;
         conn.execute("PRAGMA user_version = 125", ()).await.unwrap();
@@ -55704,6 +55833,28 @@ async fn migration_126_rearms_empty_citations_to_null_exactly_once() {
         Some("[]".to_string()),
         "the migration only re-arms ACTIVE pages -- a non-active page's \
          pill must survive unchanged"
+    );
+
+    assert!(
+        db.get_app_metadata("citation_backfill_attempts:m126-legacy-a:v1:s0:2")
+            .await
+            .unwrap()
+            .is_none(),
+        "a legacy-format attempt key must be dropped by the migration"
+    );
+    assert!(
+        db.get_app_metadata("citation_backfill_attempts:m126-legacy-b:v3:s1:1")
+            .await
+            .unwrap()
+            .is_none(),
+        "every legacy-format attempt key must be dropped, not just the first"
+    );
+    assert_eq!(
+        db.get_app_metadata(&crate::citations::attempt_key("m126-current"))
+            .await
+            .unwrap(),
+        Some("v1:s0:2".to_string()),
+        "a current-format attempt key (no `:v` suffix) must survive the migration"
     );
 
     // Idempotency: rewind and replay finds nothing left to re-arm (the
