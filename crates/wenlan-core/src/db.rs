@@ -48888,6 +48888,7 @@ impl MemoryDB {
     /// Apply a staged Page revision and consume its pending card in the same
     /// transaction. `expected_version=None` preserves legacy card behavior;
     /// versioned cards use CAS and return `false` on a stale Page.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_accept_page_revision(
         &self,
         id: &str,
@@ -48895,6 +48896,7 @@ impl MemoryDB {
         source_memory_ids: &[&str],
         changelog: &str,
         expected_version: Option<i64>,
+        expected_source_revision: Option<i64>,
         revision_source_id: &str,
     ) -> Result<bool, WenlanError> {
         self.try_update_page_content(
@@ -48906,7 +48908,7 @@ impl MemoryDB {
             Some(changelog),
             None,
             expected_version,
-            None,
+            expected_source_revision,
             Some(revision_source_id),
             None,
             None,
@@ -48940,19 +48942,20 @@ impl MemoryDB {
         page_growth_guard: Option<(&str, i64)>,
         machine_owned_only: bool,
     ) -> Result<bool, WenlanError> {
-        // Page growth and the citation backfill are the two machine writers
-        // that snapshot both counters BEFORE reading evidence, so combining
-        // both fences for them is stricter, not looser, than either alone --
-        // and `status = 'active'` rides along with the version fence, so
-        // this can never drop that check. Every other caller stays
-        // single-fence.
+        // Page growth, the citation backfill, and revision-card accept are
+        // the three machine writers that snapshot both counters BEFORE
+        // reading evidence, so combining both fences for them is stricter,
+        // not looser, than either alone -- and `status = 'active'` rides
+        // along with the version fence, so this can never drop that check.
+        // Every other caller stays single-fence.
         if expected_version.is_some()
             && expected_source_revision.is_some()
             && page_growth_guard.is_none()
             && link_reason != "citation_backfill"
+            && consume_revision_id.is_none()
         {
             return Err(WenlanError::Validation(
-                "only page growth may combine version and source-revision CAS".to_string(),
+                "only page growth, citation backfill, and revision accept may combine version and source-revision CAS".to_string(),
             ));
         }
         let citations_bind = citations_json;
@@ -55167,26 +55170,35 @@ impl MemoryDB {
         Ok(())
     }
 
-    /// Delete every app_metadata row whose key starts with `prefix`. Used by
-    /// per-generation counters (e.g. the citation backfill's
-    /// `citation_backfill_attempts:{page_id}:v{version}:s{source_revision}`
-    /// keys) to clean up on every terminal write instead of accumulating one
-    /// row per generation forever. `%` and `_` are LIKE wildcards in SQLite;
-    /// both are escaped so a literal `%` or `_` inside `prefix` (e.g. inside
-    /// a page id) is matched as itself, never as a wildcard.
-    pub async fn delete_app_metadata_prefix(&self, prefix: &str) -> Result<(), WenlanError> {
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
+    /// Delete an app_metadata row only if its CURRENT value still starts
+    /// with `value_prefix`, returning whether it was deleted. Used by the
+    /// citation backfill's single per-page attempt counter
+    /// (`citation_backfill_attempts:{page_id}`, value
+    /// `v{version}:s{source_revision}:{attempts}`) to clean up on a terminal
+    /// write without racing a re-arm: if a source attach lands between the
+    /// terminal write's own CAS and this delete, the counter's value has
+    /// already moved to the new generation's prefix, the comparison here
+    /// misses, and the just-started counter for the NEW generation survives
+    /// instead of being wiped by the OLD generation's slow cleanup. Compares
+    /// with `substr` rather than `LIKE` so no wildcard-escaping is needed —
+    /// the value alphabet (`v`, `s`, `:`, digits) never contains `%` or `_`.
+    pub async fn delete_app_metadata_if_value_starts_with(
+        &self,
+        key: &str,
+        value_prefix: &str,
+    ) -> Result<bool, WenlanError> {
         let conn = self.conn.lock().await;
-        conn.execute(
-            "DELETE FROM app_metadata WHERE key LIKE ?1 || '%' ESCAPE '\\'",
-            libsql::params![escaped],
-        )
-        .await
-        .map_err(|e| WenlanError::VectorDb(format!("delete_app_metadata_prefix: {}", e)))?;
-        Ok(())
+        let affected = conn
+            .execute(
+                "DELETE FROM app_metadata
+                 WHERE key = ?1 AND substr(value, 1, length(?2)) = ?2",
+                libsql::params![key, value_prefix],
+            )
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("delete_app_metadata_if_value_starts_with: {}", e))
+            })?;
+        Ok(affected > 0)
     }
 
     // ==================== Migration 55 Pass A — backfill event_date ===========

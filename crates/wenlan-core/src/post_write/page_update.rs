@@ -124,6 +124,7 @@ pub async fn stage_page_revision_card(
     page: &crate::pages::Page,
     content: &str,
     source_memory_ids: &[String],
+    source_revision: Option<i64>,
     edited_by: &str,
     retry: Option<&RetryIdentity>,
 ) -> Result<WriteResult, WenlanError> {
@@ -143,6 +144,7 @@ pub async fn stage_page_revision_card(
         "target_kind": "page",
         "revises_page": page.id,
         "page_version": page.version,
+        "source_revision": source_revision,
         "edited_by": edited_by,
         "source_memory_ids": source_memory_ids,
     })
@@ -644,6 +646,7 @@ pub(super) async fn update_page_impl(
                     &current,
                     &req.content,
                     effective_sources,
+                    expected_source_revision,
                     edited_by,
                     retry.as_ref(),
                 )

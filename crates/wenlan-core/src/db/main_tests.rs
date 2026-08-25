@@ -52725,16 +52725,57 @@ async fn combine_version_and_source_revision_cas_rejected_for_non_growth_non_bac
         )
         .await
         .expect_err(
-            "combining both fences outside page growth and citation_backfill must be rejected",
+            "combining both fences outside page growth, citation_backfill, and revision accept must be rejected",
         );
     assert!(
         matches!(
             err,
             WenlanError::Validation(ref msg)
-                if msg == "only page growth may combine version and source-revision CAS"
+                if msg == "only page growth, citation backfill, and revision accept may combine version and source-revision CAS"
         ),
         "unexpected error: {err:?}"
     );
+}
+
+/// Round-5 finding F2/F3: `delete_app_metadata_if_value_starts_with` only
+/// deletes when the row's CURRENT value still matches the given prefix.
+/// The citation backfill's attempt counter relies on exactly this to avoid
+/// a re-arm race -- a terminal write from an OLD generation must never wipe
+/// a counter a NEW generation has already started writing to, because by
+/// the time the old write's cleanup runs, the stored value no longer
+/// matches its prefix.
+#[tokio::test]
+async fn delete_app_metadata_if_value_starts_with_only_deletes_a_matching_value() {
+    let (db, _dir) = test_db().await;
+    db.set_app_metadata("some_key", "v1:s2:1").await.unwrap();
+
+    let deleted_mismatch = db
+        .delete_app_metadata_if_value_starts_with("some_key", "v1:s1:")
+        .await
+        .unwrap();
+    assert!(
+        !deleted_mismatch,
+        "a non-matching value prefix must not delete the row"
+    );
+    assert_eq!(
+        db.get_app_metadata("some_key").await.unwrap().as_deref(),
+        Some("v1:s2:1"),
+        "the row must be untouched"
+    );
+
+    let deleted_match = db
+        .delete_app_metadata_if_value_starts_with("some_key", "v1:s2:")
+        .await
+        .unwrap();
+    assert!(deleted_match, "a matching value prefix must delete the row");
+    assert_eq!(db.get_app_metadata("some_key").await.unwrap(), None);
+
+    // A missing key never matches any prefix.
+    let deleted_missing = db
+        .delete_app_metadata_if_value_starts_with("no_such_key", "v1:")
+        .await
+        .unwrap();
+    assert!(!deleted_missing);
 }
 
 /// The `citation_backfill` exception itself: combining both fences via

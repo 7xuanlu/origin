@@ -981,6 +981,15 @@ pub async fn handle_refresh_page(
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
 
+    // Read the staleness fence before the fields it protects (same
+    // fence-first discipline as the refresh/growth path): a source attached
+    // between this read and the page read below is then either fully
+    // reflected in `existing` or fully caught by the card's CAS on accept.
+    let source_revision = db
+        .try_get_page_source_revision(&id)
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
+
     let existing = db
         .get_page(&id)
         .await
@@ -997,6 +1006,7 @@ pub async fn handle_refresh_page(
             &existing,
             &req.content,
             &req.source_memory_ids,
+            source_revision,
             "agent_refresh",
             None,
         )

@@ -324,16 +324,35 @@ const MAX_ANNOTATE_ATTEMPTS: i64 = 3;
 /// Changelog cap, matching `post_write.rs`'s `DEFAULT_CHANGELOG_CAP`.
 const CHANGELOG_CAP: usize = 20;
 
-/// `app_metadata` key tracking consecutive failed annotation calls for one
-/// exact Page generation. A stale inference can only touch its old-version
-/// budget, never consume retries for the current Page. Keyed on BOTH
-/// `version` and `source_revision`: a source attach (`link_page_source`)
-/// bumps only `source_revision`, leaving `version` unchanged, so keying on
-/// `version` alone would let failed attempts against the OLD evidence set
-/// carry over and poison-pill a page that has since gained fresh,
-/// never-tried evidence.
-fn attempt_key(page_id: &str, page_version: i64, source_revision: i64) -> String {
-    format!("citation_backfill_attempts:{page_id}:v{page_version}:s{source_revision}")
+/// `app_metadata` key tracking consecutive failed annotation calls for a
+/// page — exactly ONE row per page, ever. Which Page generation the stored
+/// count belongs to is encoded in the VALUE (`attempt_generation`), not the
+/// key, so this can be looked up and cleaned up with a single row instead
+/// of accumulating one dead key per generation forever.
+fn attempt_key(page_id: &str) -> String {
+    format!("citation_backfill_attempts:{page_id}")
+}
+
+/// The value prefix a stored attempt count must start with to belong to
+/// this exact Page generation. Keyed on BOTH `version` and
+/// `source_revision`: a source attach (`link_page_source`) bumps only
+/// `source_revision`, leaving `version` unchanged, so matching on `version`
+/// alone would let failed attempts against the OLD evidence set carry over
+/// and poison-pill a page that has since gained fresh, never-tried
+/// evidence.
+fn attempt_generation(page_version: i64, source_revision: i64) -> String {
+    format!("v{page_version}:s{source_revision}:")
+}
+
+/// Parse the attempt count out of a stored `app_metadata` value, but only
+/// when it was recorded against `generation` — a value from a different
+/// (older or newer) generation is stale for this read and counts as zero,
+/// exactly as if no row existed yet.
+fn parse_attempts(value: &str, generation: &str) -> i64 {
+    value
+        .strip_prefix(generation)
+        .and_then(|rest| rest.parse::<i64>().ok())
+        .unwrap_or(0)
 }
 
 /// Collapse all whitespace runs to a single space and trim. Used by the
@@ -377,16 +396,17 @@ async fn record_annotate_failure(
     expected_source_revision: i64,
     giveup_reason: &str,
 ) -> Result<(), WenlanError> {
-    let key = attempt_key(page_id, page_version, expected_source_revision);
+    let key = attempt_key(page_id);
+    let generation = attempt_generation(page_version, expected_source_revision);
     let attempts = db
         .get_app_metadata(&key)
         .await?
-        .and_then(|v| v.parse::<i64>().ok())
+        .map(|v| parse_attempts(&v, &generation))
         .unwrap_or(0)
         + 1;
     if attempts >= MAX_ANNOTATE_ATTEMPTS {
         let changelog = build_backfill_changelog(db, page_id, page_version, giveup_reason).await;
-        let _ = db
+        let landed = db
             .set_page_citations_with_changelog_at_version(
                 page_id,
                 Some("[]"),
@@ -394,17 +414,24 @@ async fn record_annotate_failure(
                 page_version,
                 expected_source_revision,
             )
-            .await;
-        // Terminal write: `citations` is now poison-pilled to `[]`, so no
-        // future write will ever key on this (page, version,
-        // source_revision) generation again. Delete the counter rather than
-        // resetting it to "0" so app_metadata doesn't keep one dead row per
-        // generation forever.
-        let _ = db
-            .delete_app_metadata_prefix(&format!("citation_backfill_attempts:{page_id}:"))
-            .await;
+            .await?;
+        if landed {
+            // Terminal write: `citations` is now poison-pilled to `[]` for
+            // this generation, so no future write will ever key on it
+            // again. Delete the counter only because our own write landed —
+            // a rejected CAS means the generation already moved on, and the
+            // stale value left behind will read as zero attempts against
+            // whatever generation comes next (`parse_attempts`), so leaving
+            // it is harmless while deleting it unconditionally here could
+            // race a re-arm's own counter (see the helper's doc comment).
+            let _ = db
+                .delete_app_metadata_if_value_starts_with(&key, &generation)
+                .await;
+        }
     } else {
-        let _ = db.set_app_metadata(&key, &attempts.to_string()).await;
+        let _ = db
+            .set_app_metadata(&key, &format!("{generation}{attempts}"))
+            .await;
         log::info!(
             "[citation_backfill] page {page_id} annotate attempt failed (attempt {attempts})"
         );
@@ -498,7 +525,7 @@ async fn run_citation_backfill_with_page_limit(
                 "citation backfill gave up: no source evidence",
             )
             .await;
-            let _ = db
+            let landed = db
                 .set_page_citations_with_changelog_at_version(
                     &page_id,
                     Some("[]"),
@@ -506,15 +533,22 @@ async fn run_citation_backfill_with_page_limit(
                     page.version,
                     source_revision,
                 )
-                .await;
-            // Terminal write (poison-pilled to `[]`): clean up any attempt
-            // rows a prior guard-rejection/provider-error left behind for
-            // this generation before evidence dropped to zero, so
-            // app_metadata doesn't keep a dead row this give-up itself never
-            // wrote.
-            let _ = db
-                .delete_app_metadata_prefix(&format!("citation_backfill_attempts:{page_id}:"))
-                .await;
+                .await?;
+            if landed {
+                // Terminal write (poison-pilled to `[]`): clean up any
+                // attempt row a prior guard-rejection/provider-error left
+                // behind for this generation before evidence dropped to
+                // zero, so app_metadata doesn't keep a dead row this
+                // give-up itself never wrote. Only when our own write
+                // landed -- a rejected CAS means the generation moved on
+                // and the row here already belongs to something else.
+                let _ = db
+                    .delete_app_metadata_if_value_starts_with(
+                        &attempt_key(&page_id),
+                        &attempt_generation(page.version, source_revision),
+                    )
+                    .await;
+            }
             continue;
         }
 
@@ -569,7 +603,7 @@ async fn run_citation_backfill_with_page_limit(
                 ),
             )
             .await;
-            let _ = db
+            let landed = db
                 .set_page_citations_with_changelog_at_version(
                     &page_id,
                     Some("[]"),
@@ -577,12 +611,17 @@ async fn run_citation_backfill_with_page_limit(
                     page.version,
                     source_revision,
                 )
-                .await;
-            // Terminal write; same cleanup as the "no source evidence"
-            // give-up above.
-            let _ = db
-                .delete_app_metadata_prefix(&format!("citation_backfill_attempts:{page_id}:"))
-                .await;
+                .await?;
+            if landed {
+                // Terminal write; same landed-gated cleanup as the "no
+                // source evidence" give-up above.
+                let _ = db
+                    .delete_app_metadata_if_value_starts_with(
+                        &attempt_key(&page_id),
+                        &attempt_generation(page.version, source_revision),
+                    )
+                    .await;
+            }
             continue;
         }
 
@@ -670,11 +709,14 @@ async fn run_citation_backfill_with_page_limit(
                 if committed {
                     // Terminal write (citations now populated): delete
                     // rather than reset the counter so app_metadata doesn't
-                    // keep a dead row per generation forever.
+                    // keep a dead row per generation forever. Only because
+                    // our own write landed -- see the give-up branches
+                    // above for why an unlanded CAS must leave the row.
                     let _ = db
-                        .delete_app_metadata_prefix(&format!(
-                            "citation_backfill_attempts:{page_id}:"
-                        ))
+                        .delete_app_metadata_if_value_starts_with(
+                            &attempt_key(&page_id),
+                            &attempt_generation(page.version, source_revision),
+                        )
                         .await;
                 }
             }
@@ -1256,11 +1298,11 @@ mod tests {
         );
         let version = db.get_page("p_guard").await.unwrap().unwrap().version;
         let source_revision = db.get_page_source_revision("p_guard").await.unwrap();
-        let attempts = db
-            .get_app_metadata(&attempt_key("p_guard", version, source_revision))
-            .await
-            .unwrap();
-        assert_eq!(attempts.as_deref(), Some("1"));
+        let attempts = db.get_app_metadata(&attempt_key("p_guard")).await.unwrap();
+        assert_eq!(
+            attempts.as_deref(),
+            Some(format!("{}1", attempt_generation(version, source_revision)).as_str())
+        );
     }
 
     #[tokio::test]
@@ -1293,34 +1335,29 @@ mod tests {
             log.contains("citation backfill gave up"),
             "changelog: {log}"
         );
-        let version = db.get_page("p_poison").await.unwrap().unwrap().version;
-        let source_revision = db.get_page_source_revision("p_poison").await.unwrap();
-        let attempts = db
-            .get_app_metadata(&attempt_key("p_poison", version, source_revision))
-            .await
-            .unwrap();
+        let attempts = db.get_app_metadata(&attempt_key("p_poison")).await.unwrap();
         assert_eq!(
             attempts, None,
-            "the terminal write must delete the attempt row, not reset it to \"0\", so \
+            "a landed terminal write must delete the attempt row, not reset it to \"0\", so \
              app_metadata doesn't keep a dead row per drained generation"
         );
     }
 
-    /// Count `app_metadata` rows keyed under a page's attempt-counter
-    /// prefix. Used to check `delete_app_metadata_prefix` cleanup instead of
-    /// a single known key, since the point of the fix is that NO row for
-    /// this page survives a terminal write, not just the current
-    /// generation's.
+    /// Whether an attempt-counter row exists for a page under the
+    /// one-row-per-page scheme (`attempt_key`). Named for continuity with
+    /// the per-generation-prefix COUNT this replaces; under the new scheme
+    /// there is at most one row per page, so this can only ever be 0 or 1.
     async fn count_attempt_rows(db: &crate::db::MemoryDB, page_id: &str) -> i64 {
-        let conn = db.test_primary_session().await;
-        let mut rows = conn
-            .query(
-                "SELECT COUNT(*) FROM app_metadata WHERE key LIKE ?1",
-                libsql::params![format!("citation_backfill_attempts:{page_id}:%")],
-            )
+        if db
+            .get_app_metadata(&attempt_key(page_id))
             .await
-            .unwrap();
-        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+            .unwrap()
+            .is_some()
+        {
+            1
+        } else {
+            0
+        }
     }
 
     /// Round-4 finding (LOW): every terminal citation write (annotate
@@ -1328,17 +1365,18 @@ mod tests {
     /// attempt-key row behind forever -- success and the poison-pill wrote
     /// `"0"` instead of deleting, and the give-up paths never touched the
     /// key at all even when an earlier failed attempt on the same
-    /// generation had left one. One `app_metadata` row per (page, version,
-    /// source_revision) accumulated permanently. Fixed by
-    /// `delete_app_metadata_prefix`, called on every terminal write instead
-    /// of `set_app_metadata(key, "0")`.
+    /// generation had left one. Round 5 replaced the per-generation-key
+    /// scheme with a single per-page key whose VALUE encodes the
+    /// generation, cleaned up via
+    /// `delete_app_metadata_if_value_starts_with` gated on the terminal
+    /// write's own CAS having landed.
     #[tokio::test]
-    async fn backfill_terminal_writes_delete_the_attempt_key_prefix() {
+    async fn backfill_terminal_writes_delete_the_attempt_counter() {
         let (db, _dir) = crate::db::tests::test_db().await;
         let prompts = PromptRegistry::default();
 
-        // An unrelated key must survive every cleanup below.
-        db.set_app_metadata("citation_backfill_attempts:unrelated_page:v1:s1", "2")
+        // An unrelated page's key must survive every cleanup below.
+        db.set_app_metadata(&attempt_key("unrelated_page"), "v1:s1:2")
             .await
             .unwrap();
 
@@ -1382,8 +1420,8 @@ mod tests {
         // generation, proving the delete removes something real rather
         // than deleting nothing.
         db.set_app_metadata(
-            &attempt_key("p_cleanup_success", version, source_revision),
-            "1",
+            &attempt_key("p_cleanup_success"),
+            &format!("{}1", attempt_generation(version, source_revision)),
         )
         .await
         .unwrap();
@@ -1449,13 +1487,220 @@ mod tests {
         );
 
         assert_eq!(
-            db.get_app_metadata("citation_backfill_attempts:unrelated_page:v1:s1")
+            db.get_app_metadata(&attempt_key("unrelated_page"))
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("2"),
-            "an unrelated key must survive both cleanups above"
+            Some("v1:s1:2"),
+            "an unrelated page's key must survive both cleanups above"
         );
+    }
+
+    /// Round-5 finding F2/F3 (LOW): the poison-pill's terminal write
+    /// (`set_page_citations_with_changelog_at_version`) is itself CAS-gated
+    /// on `(version, source_revision)`. If that CAS is rejected -- the page
+    /// moved on since the caller's own stale read -- the attempt counter
+    /// must be left exactly as it was: a rejected write is not a terminal
+    /// write for the generation that rejected it, and deleting the row
+    /// anyway would either lose real attempt history or (worse) wipe a
+    /// counter a fresh generation had already started writing to.
+    #[tokio::test]
+    async fn record_annotate_failure_leaves_the_counter_when_the_poison_cas_is_rejected() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_page(
+            "p_poison_cas_rejected",
+            "T",
+            None,
+            BACKFILL_BODY,
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        let page = db.get_page("p_poison_cas_rejected").await.unwrap().unwrap();
+        let version = page.version;
+        let stale_source_revision = db
+            .get_page_source_revision("p_poison_cas_rejected")
+            .await
+            .unwrap();
+
+        // Seed 2 prior failures against the (version, stale_source_revision)
+        // generation -- the call below is the 3rd, reaching the poison
+        // threshold and attempting the terminal CAS write.
+        let key = attempt_key("p_poison_cas_rejected");
+        let generation = attempt_generation(version, stale_source_revision);
+        db.set_app_metadata(&key, &format!("{generation}2"))
+            .await
+            .unwrap();
+
+        // Advance the ACTUAL page past `stale_source_revision` -- the CAS
+        // inside the poison branch below will target the now-superseded
+        // value and must be rejected.
+        insert_test_memory(&db, "mem_poison_cas_rejected", BACKFILL_MEM_CONTENT).await;
+        db.link_page_source("p_poison_cas_rejected", "mem_poison_cas_rejected", "test")
+            .await
+            .unwrap();
+        let current_source_revision = db
+            .get_page_source_revision("p_poison_cas_rejected")
+            .await
+            .unwrap();
+        assert_ne!(
+            current_source_revision, stale_source_revision,
+            "sanity: the attach must advance source_revision past the stale value"
+        );
+
+        record_annotate_failure(
+            &db,
+            "p_poison_cas_rejected",
+            version,
+            stale_source_revision,
+            "citation backfill gave up: test",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&"p_poison_cas_rejected".to_string()),
+            "citations must still be NULL -- a rejected CAS must not have poison-pilled the page"
+        );
+        assert_eq!(
+            db.get_app_metadata(&key).await.unwrap().as_deref(),
+            Some(format!("{generation}2").as_str()),
+            "a rejected terminal CAS must leave the counter exactly as seeded, not delete it"
+        );
+    }
+
+    /// Round-5 finding F2/F3: the two "give up without evidence" branches
+    /// discard the attempt counter unconditionally on the old scheme, so a
+    /// stray row left by an earlier failed attempt on this exact generation
+    /// must still be cleaned up by a give-up whose own terminal CAS lands
+    /// (this give-up never itself wrote the row, but is still responsible
+    /// for the generation's cleanup once the row's generation matches its
+    /// own terminal write).
+    #[tokio::test]
+    async fn give_up_branches_delete_the_counter_only_when_their_write_lands() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        seed_backfill_page(&db, "p_giveup_cleanup", false).await;
+        let page = db.get_page("p_giveup_cleanup").await.unwrap().unwrap();
+        let source_revision = db
+            .get_page_source_revision("p_giveup_cleanup")
+            .await
+            .unwrap();
+        db.set_app_metadata(
+            &attempt_key("p_giveup_cleanup"),
+            &format!("{}1", attempt_generation(page.version, source_revision)),
+        )
+        .await
+        .unwrap();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::unavailable());
+        run_citation_backfill_slice(&db, &llm, &PromptRegistry::default())
+            .await
+            .unwrap();
+
+        assert!(
+            !db.get_pages_missing_citations(10)
+                .await
+                .unwrap()
+                .contains(&"p_giveup_cleanup".to_string()),
+            "sanity: the give-up (no source evidence) must have poison-pilled to '[]'"
+        );
+        assert_eq!(
+            count_attempt_rows(&db, "p_giveup_cleanup").await,
+            0,
+            "the give-up's own landed terminal write must delete the pre-existing attempt row \
+             even though this give-up never itself wrote it"
+        );
+    }
+
+    /// Round-5 finding F2/F3: under the single-row-per-page scheme, a
+    /// generation rollover must overwrite the row in place rather than
+    /// leaving the old generation's row behind under a different key --
+    /// there is only ever ONE `app_metadata` row for a page's attempt
+    /// counter, for its whole lifetime.
+    #[tokio::test]
+    async fn generation_rollover_keeps_exactly_one_attempt_row() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        seed_backfill_page(&db, "p_rollover", true).await;
+
+        let rewritten = "A completely different sentence about something else.[1]";
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(rewritten));
+        let prompts = PromptRegistry::default();
+        run_citation_backfill_tick(&db, &llm, &prompts)
+            .await
+            .unwrap();
+
+        let version = db.get_page("p_rollover").await.unwrap().unwrap().version;
+
+        insert_test_memory(&db, "mem_rollover_new", "A newly attached source").await;
+        db.link_page_source("p_rollover", "mem_rollover_new", "test")
+            .await
+            .unwrap();
+        let new_source_revision = db.get_page_source_revision("p_rollover").await.unwrap();
+
+        run_citation_backfill_tick(&db, &llm, &prompts)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_attempt_rows(&db, "p_rollover").await,
+            1,
+            "exactly one attempt row must ever exist for a page"
+        );
+        assert_eq!(
+            db.get_app_metadata(&attempt_key("p_rollover"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(format!("{}1", attempt_generation(version, new_source_revision)).as_str()),
+            "the rolled-over generation's count must start fresh at 1, overwriting the old \
+             generation's value in place"
+        );
+    }
+
+    /// Round-5 finding F2/F3, citations-level: the same guarantee
+    /// `delete_app_metadata_if_value_starts_with_only_deletes_a_matching_value`
+    /// proves at the db level (db/main_tests.rs), exercised through the
+    /// citation-backfill key/generation helpers this feature actually uses.
+    #[tokio::test]
+    async fn terminal_cleanup_does_not_touch_a_newer_generation() {
+        let (db, _dir) = crate::db::tests::test_db().await;
+        let key = attempt_key("p_generation_race");
+        let older = attempt_generation(1, 1);
+        let newer = attempt_generation(1, 2);
+        db.set_app_metadata(&key, &format!("{newer}1"))
+            .await
+            .unwrap();
+
+        let deleted_stale = db
+            .delete_app_metadata_if_value_starts_with(&key, &older)
+            .await
+            .unwrap();
+        assert!(
+            !deleted_stale,
+            "an older generation's prefix must not delete a row a newer generation already wrote"
+        );
+        assert_eq!(
+            db.get_app_metadata(&key).await.unwrap().as_deref(),
+            Some(format!("{newer}1").as_str()),
+            "the newer generation's row must be untouched"
+        );
+
+        let deleted_matching = db
+            .delete_app_metadata_if_value_starts_with(&key, &newer)
+            .await
+            .unwrap();
+        assert!(
+            deleted_matching,
+            "the matching generation's prefix must delete the row"
+        );
+        assert_eq!(db.get_app_metadata(&key).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1472,8 +1717,13 @@ mod tests {
             .get_page_source_revision("p_provider_error")
             .await
             .unwrap();
-        let key = attempt_key("p_provider_error", version, source_revision);
-        db.set_app_metadata(&key, "2").await.unwrap();
+        let key = attempt_key("p_provider_error");
+        db.set_app_metadata(
+            &key,
+            &format!("{}2", attempt_generation(version, source_revision)),
+        )
+        .await
+        .unwrap();
 
         let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::unavailable());
         let selected = run_citation_backfill_slice(&db, &llm, &PromptRegistry::default())
@@ -1567,11 +1817,11 @@ mod tests {
         );
         let version = db.get_page("p_zero").await.unwrap().unwrap().version;
         let source_revision = db.get_page_source_revision("p_zero").await.unwrap();
-        let attempts = db
-            .get_app_metadata(&attempt_key("p_zero", version, source_revision))
-            .await
-            .unwrap();
-        assert_eq!(attempts.as_deref(), Some("1"));
+        let attempts = db.get_app_metadata(&attempt_key("p_zero")).await.unwrap();
+        assert_eq!(
+            attempts.as_deref(),
+            Some(format!("{}1", attempt_generation(version, source_revision)).as_str())
+        );
 
         // Two more zero-marker ticks trigger the poison-pill.
         for _ in 0..2 {
@@ -1593,14 +1843,17 @@ mod tests {
         );
     }
 
-    /// Round-3 finding (LOW): `attempt_key` is now keyed on BOTH `version`
-    /// and `source_revision`, not `version` alone. A source attach
-    /// (`link_page_source`) bumps only `source_revision`, so two failed
-    /// attempts against the OLD evidence set followed by an attach followed
-    /// by one failure on the NEW evidence must count as attempt 1 of a
-    /// fresh budget, not attempt 3 of the old one -- the new evidence has
-    /// never actually been tried 3 times, so poison-pilling it now would
-    /// throw away citations the model was never even given a fair shot at.
+    /// Round-3 finding (LOW): the attempt budget is matched on BOTH
+    /// `version` and `source_revision`, not `version` alone -- round 5 moved
+    /// that match from the `app_metadata` KEY to a generation prefix in the
+    /// VALUE (`attempt_generation`/`parse_attempts`), but the guarantee is
+    /// the same. A source attach (`link_page_source`) bumps only
+    /// `source_revision`, so two failed attempts against the OLD evidence
+    /// set followed by an attach followed by one failure on the NEW
+    /// evidence must count as attempt 1 of a fresh budget, not attempt 3 of
+    /// the old one -- the new evidence has never actually been tried 3
+    /// times, so poison-pilling it now would throw away citations the model
+    /// was never even given a fair shot at.
     #[tokio::test]
     async fn attempt_budget_resets_when_source_revision_advances_mid_generation() {
         let (db, _dir) = crate::db::tests::test_db().await;
@@ -1625,15 +1878,11 @@ mod tests {
             .version;
         let original_source_revision = db.get_page_source_revision("p_budget_reset").await.unwrap();
         assert_eq!(
-            db.get_app_metadata(&attempt_key(
-                "p_budget_reset",
-                version,
-                original_source_revision
-            ))
-            .await
-            .unwrap()
-            .as_deref(),
-            Some("2"),
+            db.get_app_metadata(&attempt_key("p_budget_reset"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(format!("{}2", attempt_generation(version, original_source_revision)).as_str()),
             "sanity: two consecutive rejections must have recorded 2 attempts \
              against the original generation"
         );
@@ -1671,13 +1920,14 @@ mod tests {
              `version` is unchanged"
         );
         let attempts_after = db
-            .get_app_metadata(&attempt_key("p_budget_reset", version, new_source_revision))
+            .get_app_metadata(&attempt_key("p_budget_reset"))
             .await
             .unwrap();
         assert_eq!(
             attempts_after.as_deref(),
-            Some("1"),
-            "the new generation's attempt count must start fresh at 1"
+            Some(format!("{}1", attempt_generation(version, new_source_revision)).as_str()),
+            "the new generation's attempt count must start fresh at 1, overwriting the old \
+             generation's value in place -- exactly one app_metadata row for this page, ever"
         );
     }
 
@@ -1758,12 +2008,7 @@ mod tests {
              the missing-citations selection; NULL would re-select the same \
              page forever and starve every page behind it"
         );
-        let page = db.get_page("p_orphan").await.unwrap().unwrap();
-        let source_revision = db.get_page_source_revision("p_orphan").await.unwrap();
-        let attempts = db
-            .get_app_metadata(&attempt_key("p_orphan", page.version, source_revision))
-            .await
-            .unwrap();
+        let attempts = db.get_app_metadata(&attempt_key("p_orphan")).await.unwrap();
         assert_eq!(
             attempts, None,
             "a provenance data bug must not spend an attempt -- an attempt \

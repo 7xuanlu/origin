@@ -9,6 +9,7 @@ struct PageRevisionCard {
     page_id: String,
     revision_id: String,
     page_version: Option<i64>,
+    source_revision: Option<i64>,
     content: String,
     source_memory_ids: Vec<String>,
 }
@@ -60,11 +61,17 @@ async fn resolve_page_revision_card(
         })
         .unwrap_or_default();
     let page_version = structured.get("page_version").and_then(|v| v.as_i64());
+    // Legacy cards (staged before this fence existed) have no
+    // "source_revision" key at all -- `None` here, same as `page_version`
+    // for a pre-versioning card, keeps them accepted on the version fence
+    // alone rather than inventing a base to check.
+    let source_revision = structured.get("source_revision").and_then(|v| v.as_i64());
 
     Ok(Some(PageRevisionCard {
         page_id,
         revision_id: payload.revision_id,
         page_version,
+        source_revision,
         content: payload.content,
         source_memory_ids,
     }))
@@ -132,6 +139,7 @@ async fn accept_page_revision_card(
             &source_refs,
             &new_changelog,
             card.page_version,
+            card.source_revision,
             &card.revision_id,
         )
         .await?;
@@ -148,10 +156,25 @@ async fn accept_page_revision_card(
                 card.revision_id, card.page_id
             )));
         };
-        return Err(WenlanError::Conflict(format!(
+        let mut msg = format!(
             "page revision card {} was staged for page {} at staged version {}, but current version {} no longer matches",
             card.revision_id, card.page_id, staged_version, current_version
-        )));
+        );
+        // A source attached after this card was staged bumps only
+        // `source_revision`, leaving `version` unchanged -- so a
+        // source-revision-only conflict would otherwise report identical
+        // staged/current versions here with no clue why the write was
+        // rejected. Name the counter that actually moved.
+        if let Some(staged_source_revision) = card.source_revision {
+            let current_source_revision = db.try_get_page_source_revision(&card.page_id).await?;
+            msg.push_str(&format!(
+                ", staged source revision {staged_source_revision}, current source revision {}",
+                current_source_revision
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        return Err(WenlanError::Conflict(msg));
     }
 
     if let Some(ref projection) = projection {

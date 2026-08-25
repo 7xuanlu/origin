@@ -1031,3 +1031,9 @@ crates/wenlan-core/src/synthesis/refinement_queue.rs|crate::synthesis::refinemen
 crates/wenlan-core/src/synthesis/refinement_queue.rs|crate::synthesis::refinement_queue::tests::apply_refinement_vocab_promote_retypes_proposing_entities|TestDbRows::next|1
 crates/wenlan-core/src/synthesis/refinement_queue.rs|crate::synthesis::refinement_queue::tests::apply_refinement_vocab_promote_retypes_proposing_entities|TestDbSession::query|1
 crates/wenlan-core/src/synthesis/refinement_queue.rs|crate::synthesis::refinement_queue::tests::apply_refinement_vocab_promote_retypes_proposing_entities|test_primary_session|1
+crates/wenlan-core/src/citations.rs|crate::citations::tests::backfill_id_shaped_locator_resolves_and_annotates|TestDbSession::execute|1
+crates/wenlan-core/src/citations.rs|crate::citations::tests::backfill_id_shaped_locator_resolves_and_annotates|test_primary_session|1
+crates/wenlan-core/src/post_write/post_write_tests.rs|crate::post_write::tests::stage_page_revision_card_via_fenced_update_records_source_revision|TestDbRow::get|1
+crates/wenlan-core/src/post_write/post_write_tests.rs|crate::post_write::tests::stage_page_revision_card_via_fenced_update_records_source_revision|TestDbRows::next|1
+crates/wenlan-core/src/post_write/post_write_tests.rs|crate::post_write::tests::stage_page_revision_card_via_fenced_update_records_source_revision|TestDbSession::query|1
+crates/wenlan-core/src/post_write/post_write_tests.rs|crate::post_write::tests::stage_page_revision_card_via_fenced_update_records_source_revision|test_primary_session|1
