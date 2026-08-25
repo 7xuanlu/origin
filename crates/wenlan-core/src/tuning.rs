@@ -292,10 +292,11 @@ pub struct DistillationConfig {
     pub max_unlinked_cluster_size: usize,
     /// Hard cap on size of entity- or community-grouped clusters before the
     /// agent's coherence check rejects them as grab-bags. A 12+ prose-memory
-    /// cluster at the default 0.73 similarity is almost always a community
+    /// cluster at the default 0.60 similarity is almost always a community
     /// pile (e.g. cid=16 "Wenlan" sweeping in unrelated sub-topics). When a
-    /// grouped sub-cluster exceeds this, re-split once at threshold +0.05
-    /// (cap 0.92) and drop sub-clusters that still overflow.
+    /// grouped sub-cluster exceeds this, re-split repeatedly in +0.05
+    /// threshold steps up to a ceiling of 0.92; only a sub-cluster still
+    /// over cap at that ceiling is dropped.
     #[serde(default = "d_12_usize")]
     pub max_grouped_cluster_size: usize,
     /// Minimum source-memory overlap required for a page to pass the

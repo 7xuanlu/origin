@@ -2552,6 +2552,13 @@ fn has_capture_seed_floor(memories: &[ClusterMemRow], cluster: &DistillationClus
         >= MIN_CAPTURE_SEED_MEMBERS
 }
 
+/// Bounded re-split ladder for an oversized cluster (see `cluster_distillation_rows`):
+/// each round tightens the similarity threshold by this much...
+const RESPLIT_STEP: f64 = 0.05;
+/// ...until it hits this ceiling, past which an oversized sub-cluster is dropped
+/// rather than tightened further.
+const RESPLIT_MAX_THRESHOLD: f64 = 0.92;
+
 #[derive(Debug, Clone, Copy)]
 enum DistillationClusterMode {
     SpaceScoped,
@@ -2583,13 +2590,38 @@ fn cluster_distillation_rows(
                           indices: &[usize],
                           cap: usize,
                           clusters: &mut Vec<DistillationCluster>| {
-        let sub = cluster_by_similarity(memories, indices, similarity_threshold);
-        for group in sub {
+        // FIFO queue of (group, threshold-that-produced-it), seeded at
+        // `similarity_threshold`. An oversized group is re-split in
+        // `RESPLIT_STEP` increments (pushed to the back) rather than given a
+        // single re-split attempt, so a stubborn cluster tightens repeatedly
+        // up to `RESPLIT_MAX_THRESHOLD` before it is dropped. Popping from
+        // the front preserves today's output order for groups that never
+        // need a re-split.
+        let mut queue: std::collections::VecDeque<(Vec<usize>, f64)> =
+            cluster_by_similarity(memories, indices, similarity_threshold)
+                .into_iter()
+                .map(|group| (group, similarity_threshold))
+                .collect();
+
+        while let Some((group, threshold)) = queue.pop_front() {
             if group.len() < min_size {
                 continue;
             }
             if group.len() > cap {
-                let tighter = (similarity_threshold + 0.05).min(0.92);
+                if threshold >= RESPLIT_MAX_THRESHOLD {
+                    log::warn!(
+                        "[distill] dropping {} sub-cluster after re-split: \
+                             {} memories still > cap {} at threshold {:.2} -- raise \
+                             max_{}_cluster_size if this is a genuine page",
+                        bucket_label,
+                        group.len(),
+                        cap,
+                        threshold,
+                        bucket_label,
+                    );
+                    continue;
+                }
+                let tighter = (threshold + RESPLIT_STEP).min(RESPLIT_MAX_THRESHOLD);
                 log::info!(
                     "[distill] re-splitting oversized {} cluster: \
                          {} memories at threshold {:.2} (cap = {})",
@@ -2600,23 +2632,7 @@ fn cluster_distillation_rows(
                 );
                 let resplit = cluster_by_similarity(memories, &group, tighter);
                 for sub_group in resplit {
-                    if sub_group.len() < min_size {
-                        continue;
-                    }
-                    if sub_group.len() > cap {
-                        log::warn!(
-                            "[distill] dropping {} sub-cluster after re-split: \
-                                 {} memories still > cap {} -- raise \
-                                 max_{}_cluster_size if this is a genuine page",
-                            bucket_label,
-                            sub_group.len(),
-                            cap,
-                            bucket_label,
-                        );
-                        continue;
-                    }
-                    let cluster = build_distillation_cluster(memories, &sub_group);
-                    emit_split(cluster, clusters);
+                    queue.push_back((sub_group, tighter));
                 }
                 continue;
             }
