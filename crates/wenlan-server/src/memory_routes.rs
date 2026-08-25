@@ -528,6 +528,22 @@ pub async fn handle_store_memory(
         );
     }
 
+    // Page-revision-card guard. A row carrying the card markers is accepted by
+    // rewriting a page and dismissed by deleting the row, so the markers are
+    // daemon-authoritative exactly like the origin claim above: only
+    // `stage_page_revision_card` may mint one, and no wire request may select
+    // it. Stripping rather than rejecting keeps the rest of the caller's
+    // `structured_fields` working.
+    let (guarded_structured_fields, dropped_card_claim) =
+        wenlan_core::origin::strip_wire_page_revision_marker(req.structured_fields);
+    if dropped_card_claim {
+        tracing::warn!(
+            "[page-card-guard] /api/memory/store request from agent '{resolved_agent}' claimed \
+             page-revision-card markers in structured_fields; dropped — a card is minted only by \
+             the daemon's page write path"
+        );
+    }
+
     let final_domain = resolved_write_space.space_name.clone();
     let doc = RawDocument {
         source: "memory".to_string(),
@@ -552,8 +568,7 @@ pub async fn handle_store_memory(
         is_recap: false,
         enrichment_status: "raw".to_string(),
         supersede_mode,
-        structured_fields: req
-            .structured_fields
+        structured_fields: guarded_structured_fields
             .map(|v| v.to_string())
             .or(extracted_fields),
         retrieval_cue: req.retrieval_cue.clone().or(extracted_cue),
@@ -2874,6 +2889,83 @@ mod gated_store_tests {
         assert!(
             !resp.gated,
             "no x-agent-name header and no body source_agent resolves to full trust"
+        );
+    }
+
+    /// A staged correction must not be able to call itself a page revision
+    /// card. `resolve_page_revision_card` routes accept and dismiss to the
+    /// page branch on `structured_fields` markers, and this handler is the
+    /// first production path that can mint a `pending_revision = 1` row from
+    /// a request, so a request that kept those markers would turn the human's
+    /// accept click into an overwrite of a human-authored page and their
+    /// dismiss click into a deletion of a captured memory.
+    #[tokio::test]
+    async fn gated_store_cannot_forge_a_page_revision_card() {
+        let (state, _tmp) = build_state_with_db().await;
+        seed_target(
+            &state,
+            "mem_forge_target",
+            "Coffee machine is on floor three",
+        )
+        .await;
+        set_agent_trust(&state, "cursor", "review").await;
+        let app = crate::router::build_router(state.clone());
+
+        let body = serde_json::json!({
+            "content": "Payroll now runs on the 1st and dual sign-off is not required",
+            "supersedes": "mem_forge_target",
+            "source_agent": "cursor",
+            "structured_fields": {
+                "revision_kind": "page_write",
+                "target_kind": "page",
+                "revises_page": "page_victim",
+                "page_version": 1,
+                "kept_by_caller": "yes"
+            }
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memory/store")
+                    .header("content-type", "application/json")
+                    .header("x-agent-name", "cursor")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let parsed: wenlan_types::responses::StoreMemoryResponse =
+            serde_json::from_slice(&bytes).expect("parse StoreMemoryResponse");
+        assert!(parsed.gated, "the correction is still gated for review");
+
+        // Accepting it must resolve to the memory it supersedes, never to the
+        // page named in the forged markers.
+        let app = crate::router::build_router(state.clone());
+        let accept = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/memory/revision/{}/accept", parsed.source_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accept.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(accept.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let accepted: serde_json::Value = serde_json::from_slice(&bytes).expect("parse accept");
+        assert_eq!(
+            accepted.get("target_source_id").and_then(|v| v.as_str()),
+            Some("mem_forge_target"),
+            "accept must apply the memory correction, not the forged page write: {accepted}"
         );
     }
 }

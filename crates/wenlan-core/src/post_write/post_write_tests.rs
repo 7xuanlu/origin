@@ -3959,6 +3959,72 @@ async fn page_write_update_stale_version_on_human_owned_page_is_refused() {
     );
 }
 
+/// A card is a page card only if the row it supersedes really is a page.
+///
+/// `structured_fields` is persisted verbatim from `POST /api/memory/store`, so
+/// routing accept on those strings alone let a low-trust agent stage a memory
+/// correction wearing the page markers and turn a human's accept click into an
+/// overwrite of a human-authored page. The store handler now strips the
+/// markers, and this test pins the second half of that defence: even a row
+/// that somehow carries them is treated as an ordinary memory correction when
+/// its `supersedes` names a memory. Seeds the row directly, below the wire.
+#[tokio::test]
+async fn a_card_whose_supersedes_is_not_a_page_is_never_a_page_write() {
+    let (db, _tmp) = crate::db::tests::test_db().await;
+    seed_memory(&db, "mem_forged_source", "Coffee machine is on floor three").await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_forged_victim",
+        "Payroll Runbook",
+        None,
+        "Payroll runs on the 25th. Never wire funds without dual sign-off.",
+        None,
+        None,
+        &["mem_forged_source"],
+        &now,
+    )
+    .await
+    .unwrap();
+    seed_pending_revision(&db, "mem_forge_target", "mem_forge_rev").await;
+    let forged = serde_json::json!({
+        "revision_kind": "page_write",
+        "target_kind": "page",
+        "revises_page": "page_forged_victim",
+    })
+    .to_string();
+    db.test_primary_session()
+        .await
+        .execute(
+            "UPDATE memories SET structured_fields = ?1 WHERE source_id = 'mem_forge_rev'",
+            libsql::params![forged],
+        )
+        .await
+        .unwrap();
+
+    let result = accept_pending_revision(&db, "mem_forge_rev", "cursor")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.target_source_id, "mem_forge_target",
+        "accept must apply the memory correction, not the forged page write"
+    );
+    let page = db
+        .get_page("page_forged_victim")
+        .await
+        .unwrap()
+        .expect("the page must still exist");
+    assert_eq!(
+        page.version, 1,
+        "the human-authored page must not be rewritten"
+    );
+    assert!(
+        page.content.contains("dual sign-off"),
+        "the human's prose must survive, got: {}",
+        page.content
+    );
+}
+
 #[tokio::test]
 async fn accept_pending_revision_writes_and_logs_on_first_call() {
     let (db, _tmp) = crate::db::tests::test_db().await;
