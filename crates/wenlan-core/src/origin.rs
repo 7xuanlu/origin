@@ -92,6 +92,41 @@ pub fn is_document_ingest_source_agent(source_agent: &str) -> bool {
     DOCUMENT_INGEST_SOURCE_AGENTS.contains(&canonical.as_str())
 }
 
+/// Strip a wire-claimed page-revision marker out of `structured_fields`.
+///
+/// A memory row whose `structured_fields` carry `revision_kind: "page_write"`
+/// and `target_kind: "page"` is a page revision card: accepting it rewrites a
+/// page's prose, and dismissing it deletes the row. Only
+/// `post_write::stage_page_revision_card` may mint one. `structured_fields` is
+/// persisted verbatim from `POST /api/memory/store`, so without this guard a
+/// request could hand itself that meaning, the same way a request could once
+/// hand itself a document-ingest origin. Daemon-authoritative, like
+/// `source_agent` above.
+///
+/// Returns the sanitised value and whether a claim was dropped. Only the four
+/// card keys are removed; anything else the caller stored is kept.
+pub fn strip_wire_page_revision_marker(
+    fields: Option<serde_json::Value>,
+) -> (Option<serde_json::Value>, bool) {
+    let Some(serde_json::Value::Object(mut map)) = fields else {
+        return (fields, false);
+    };
+    let claims_card = map.get("revision_kind").and_then(|v| v.as_str()) == Some("page_write")
+        || map.get("target_kind").and_then(|v| v.as_str()) == Some("page");
+    if !claims_card {
+        return (Some(serde_json::Value::Object(map)), false);
+    }
+    for key in [
+        "revision_kind",
+        "target_kind",
+        "revises_page",
+        "page_version",
+    ] {
+        map.remove(key);
+    }
+    (Some(serde_json::Value::Object(map)), true)
+}
+
 /// The daemon's origin verdict for a row about to be written.
 ///
 /// Called from the `RawDocument` ingest path (`db.rs upsert_documents`), which
@@ -222,5 +257,38 @@ mod tests {
         ] {
             assert_eq!(OriginClass::from_stored(Some(class.as_str())), class);
         }
+    }
+
+    #[test]
+    fn wire_page_revision_marker_is_stripped_but_other_fields_survive() {
+        let claimed = serde_json::json!({
+            "revision_kind": "page_write",
+            "target_kind": "page",
+            "revises_page": "page_victim",
+            "page_version": 3,
+            "mine": "kept"
+        });
+        let (sanitised, dropped) = strip_wire_page_revision_marker(Some(claimed));
+        assert!(dropped, "a claimed card must be reported as dropped");
+        let out = sanitised.expect("the object survives, minus the markers");
+        for key in [
+            "revision_kind",
+            "target_kind",
+            "revises_page",
+            "page_version",
+        ] {
+            assert!(out.get(key).is_none(), "{key} must be removed");
+        }
+        assert_eq!(out.get("mine").and_then(|v| v.as_str()), Some("kept"));
+    }
+
+    #[test]
+    fn ordinary_structured_fields_pass_through_untouched() {
+        let plain = serde_json::json!({ "grounded_in": "doc_1", "page_version": 2 });
+        let (sanitised, dropped) = strip_wire_page_revision_marker(Some(plain.clone()));
+        assert!(!dropped, "no card claim, nothing dropped");
+        assert_eq!(sanitised, Some(plain));
+        let (none, dropped_none) = strip_wire_page_revision_marker(None);
+        assert!(none.is_none() && !dropped_none);
     }
 }

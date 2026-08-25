@@ -482,13 +482,22 @@ pub async fn handle_store_memory(
     };
     let confirmed = Some(stability == "confirmed");
 
-    let pending_revision = false;
+    // Proposal gate (task #7). A store that carries `supersedes` is the only
+    // agent write that destroys text: the row it names stops being retrievable.
+    // From an agent the user has downgraded below "full", stage it instead of
+    // applying it. The old row is left alone by `upsert_documents` (db.rs, the
+    // `if !doc.pending_revision` suppression skip) and stays visible to every
+    // reader, because `not_hidden_by_superseder` requires a non-pending superseder.
+    // An absent agent resolved to "unknown" was already granted "full" above, so
+    // a first-party local write is never gated. An append is never gated.
+    let pending_revision = req.supersedes.is_some() && trust_level != "full";
     let final_supersedes = req.supersedes.clone();
 
     #[cfg(test)]
     wait_at_store_lock_test_hook(StoreLockTestStage::ActivityAgentLookup).await;
     let agent_for_activity = extract_agent_name(&headers, req.source_agent.as_deref());
     let supersedes_for_activity = final_supersedes.clone();
+    let final_supersedes_for_warning = final_supersedes.clone();
 
     let supersede_mode = if memory_type_str == "decision" {
         "archive".to_string()
@@ -519,6 +528,22 @@ pub async fn handle_store_memory(
         );
     }
 
+    // Page-revision-card guard. A row carrying the card markers is accepted by
+    // rewriting a page and dismissed by deleting the row, so the markers are
+    // daemon-authoritative exactly like the origin claim above: only
+    // `stage_page_revision_card` may mint one, and no wire request may select
+    // it. Stripping rather than rejecting keeps the rest of the caller's
+    // `structured_fields` working.
+    let (guarded_structured_fields, dropped_card_claim) =
+        wenlan_core::origin::strip_wire_page_revision_marker(req.structured_fields);
+    if dropped_card_claim {
+        tracing::warn!(
+            "[page-card-guard] /api/memory/store request from agent '{resolved_agent}' claimed \
+             page-revision-card markers in structured_fields; dropped — a card is minted only by \
+             the daemon's page write path"
+        );
+    }
+
     let final_domain = resolved_write_space.space_name.clone();
     let doc = RawDocument {
         source: "memory".to_string(),
@@ -543,8 +568,7 @@ pub async fn handle_store_memory(
         is_recap: false,
         enrichment_status: "raw".to_string(),
         supersede_mode,
-        structured_fields: req
-            .structured_fields
+        structured_fields: guarded_structured_fields
             .map(|v| v.to_string())
             .or(extracted_fields),
         retrieval_cue: req.retrieval_cue.clone().or(extracted_cue),
@@ -779,6 +803,14 @@ pub async fn handle_store_memory(
         warnings.push(warning.clone());
     }
 
+    if pending_revision {
+        warnings.push(format!(
+            "gated: this correction is staged for review, not live. {} still answers \
+             searches until a human accepts the change.",
+            final_supersedes_for_warning.as_deref().unwrap_or_default()
+        ));
+    }
+
     let persisted_space = origin_db
         .get_memory_space(&source_id)
         .await
@@ -916,6 +948,7 @@ pub async fn handle_store_memory(
         space_source: Some(persisted_space_source),
         write_outcome: Some(WriteOutcome::Created),
         near_duplicate: near_duplicate_response.map(|(near_duplicate, _)| near_duplicate),
+        gated: pending_revision,
     }))
 }
 
@@ -2573,6 +2606,367 @@ mod novelty_store_tests {
             "record_near_duplicate_flag must log the flag from the batcher branch too"
         );
         assert_eq!(rejections[0].rejection_reason, "near_duplicate");
+    }
+}
+
+#[cfg(test)]
+mod gated_store_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+    use wenlan_core::read_scope::ReadScope;
+    use wenlan_types::sources::RawDocument;
+
+    use crate::{router::AppRouter, state::ServerState};
+
+    async fn build_state_with_db() -> (Arc<RwLock<ServerState>>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let emitter: Arc<dyn wenlan_core::events::EventEmitter> =
+            Arc::new(wenlan_core::events::NoopEmitter);
+        let db = wenlan_core::db::MemoryDB::new(tmp.path(), emitter)
+            .await
+            .expect("MemoryDB::new should succeed");
+        let server_state = ServerState {
+            db: Some(Arc::new(db)),
+            ..Default::default()
+        };
+        (Arc::new(RwLock::new(server_state)), tmp)
+    }
+
+    /// Seeds a live, confirmed target memory directly — this module tests
+    /// what a gated *correction* does to it, not the seeding path itself.
+    async fn seed_target(state: &Arc<RwLock<ServerState>>, source_id: &str, content: &str) {
+        let s = state.read().await;
+        let db = s.db.as_ref().unwrap();
+        db.upsert_documents(vec![RawDocument {
+            source: "memory".to_string(),
+            source_id: source_id.to_string(),
+            title: "Target".to_string(),
+            content: content.to_string(),
+            memory_type: Some("fact".to_string()),
+            last_modified: chrono::Utc::now().timestamp(),
+            confirmed: Some(true),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+    }
+
+    /// Registers `agent` at its auto-assigned "full" trust (first write),
+    /// then downgrades it — mirrors a human editing the Settings dropdown
+    /// before the gate can ever bite.
+    async fn set_agent_trust(state: &Arc<RwLock<ServerState>>, agent: &str, trust_level: &str) {
+        let s = state.read().await;
+        let db = s.db.as_ref().unwrap();
+        db.check_agent_for_write(agent).await.unwrap();
+        db.update_agent(agent, None, None, None, Some(trust_level), None)
+            .await
+            .unwrap();
+    }
+
+    async fn store(
+        app: AppRouter,
+        agent: Option<&str>,
+        content: &str,
+        supersedes: Option<&str>,
+    ) -> (StatusCode, wenlan_types::responses::StoreMemoryResponse) {
+        // The `x-agent-name` header alone drives trust resolution and
+        // gating; the persisted `memories.source_agent` column comes only
+        // from the body `source_agent` field (see `extract_agent_name`'s
+        // doc comment). Send both so the pending-revision queue attributes
+        // the staged row to the acting agent, matching a real client.
+        let body = serde_json::json!({
+            "content": content,
+            "supersedes": supersedes,
+            "source_agent": agent,
+        });
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/memory/store")
+            .header("content-type", "application/json");
+        if let Some(a) = agent {
+            builder = builder.header("x-agent-name", a);
+        }
+        let resp = app
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("parse StoreMemoryResponse"),
+        )
+    }
+
+    async fn search_source_ids(app: AppRouter, query: &str) -> Vec<String> {
+        let body = serde_json::json!({ "query": query });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memory/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "search should succeed");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let parsed: wenlan_types::responses::SearchMemoryResponse =
+            serde_json::from_slice(&bytes).expect("parse SearchMemoryResponse");
+        parsed.results.into_iter().map(|r| r.source_id).collect()
+    }
+
+    #[tokio::test]
+    async fn store_with_supersedes_from_review_trust_agent_is_gated() {
+        let (state, _tmp) = build_state_with_db().await;
+        seed_target(
+            &state,
+            "mem_a1b2c3",
+            "The team meeting is on Tuesday at 10am",
+        )
+        .await;
+        set_agent_trust(&state, "cursor", "review").await;
+        let app = crate::router::build_router(state.clone());
+
+        let (status, resp) = store(
+            app,
+            Some("cursor"),
+            "The team meeting is on Wednesday at 10am",
+            Some("mem_a1b2c3"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp.gated, "response must report gated: true");
+
+        let s = state.read().await;
+        let db = s.db.as_ref().unwrap();
+        let pending = db
+            .list_pending_revisions_scoped(10, &ReadScope::Global)
+            .await
+            .unwrap();
+        let card = pending
+            .iter()
+            .find(|item| item.revision_source_id == resp.source_id)
+            .expect("staged row must appear in the pending-revisions queue");
+        assert_eq!(card.target_source_id, "mem_a1b2c3");
+        assert_eq!(card.source_agent.as_deref(), Some("cursor"));
+    }
+
+    #[tokio::test]
+    async fn gated_store_leaves_the_superseded_memory_live() {
+        let (state, _tmp) = build_state_with_db().await;
+        seed_target(
+            &state,
+            "mem_a1b2c3",
+            "The team meeting is on Tuesday at 10am",
+        )
+        .await;
+        set_agent_trust(&state, "cursor", "review").await;
+        let app = crate::router::build_router(state.clone());
+
+        let (status, resp) = store(
+            app.clone(),
+            Some("cursor"),
+            "The team meeting is on Wednesday at 10am",
+            Some("mem_a1b2c3"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp.gated);
+
+        {
+            let s = state.read().await;
+            let db = s.db.as_ref().unwrap();
+            let target = db
+                .get_memory_detail("mem_a1b2c3")
+                .await
+                .unwrap()
+                .expect("target must still exist and be non-pending");
+            assert!(
+                target.confirmed,
+                "target must stay confirmed while the correction is staged"
+            );
+        }
+
+        // The safety claim in full: retrieval, not just the flag, must still
+        // prefer the target over the staged correction.
+        let hits = search_source_ids(app, "team meeting").await;
+        assert!(
+            hits.contains(&"mem_a1b2c3".to_string()),
+            "search must still return the target, got: {hits:?}"
+        );
+        assert!(
+            !hits.contains(&resp.source_id),
+            "search must not return the staged correction, got: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_with_supersedes_from_full_trust_agent_is_not_gated() {
+        let (state, _tmp) = build_state_with_db().await;
+        seed_target(
+            &state,
+            "mem_full_trust",
+            "The team meeting is on Tuesday at 10am",
+        )
+        .await;
+        // "trusted-agent" is auto-registered at full trust on its first
+        // write and never downgraded.
+        let app = crate::router::build_router(state.clone());
+
+        let (status, resp) = store(
+            app,
+            Some("trusted-agent"),
+            "The team meeting is on Wednesday at 10am",
+            Some("mem_full_trust"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(!resp.gated, "a full-trust agent's correction must not gate");
+
+        let s = state.read().await;
+        let db = s.db.as_ref().unwrap();
+        let target = db
+            .get_memory_detail("mem_full_trust")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !target.confirmed,
+            "a full-trust supersede suppresses the target immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_from_review_trust_agent_is_never_gated() {
+        let (state, _tmp) = build_state_with_db().await;
+        set_agent_trust(&state, "cursor", "review").await;
+        let app = crate::router::build_router(state.clone());
+
+        let (status, resp) = store(
+            app,
+            Some("cursor"),
+            "A brand new standalone fact with no supersedes target",
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(!resp.gated, "an append with no supersedes is never gated");
+    }
+
+    #[tokio::test]
+    async fn store_without_agent_header_is_never_gated() {
+        let (state, _tmp) = build_state_with_db().await;
+        seed_target(
+            &state,
+            "mem_no_agent_header",
+            "The team meeting is on Tuesday at 10am",
+        )
+        .await;
+        let app = crate::router::build_router(state.clone());
+
+        let (status, resp) = store(
+            app,
+            None,
+            "The team meeting is on Wednesday at 10am",
+            Some("mem_no_agent_header"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !resp.gated,
+            "no x-agent-name header and no body source_agent resolves to full trust"
+        );
+    }
+
+    /// A staged correction must not be able to call itself a page revision
+    /// card. `resolve_page_revision_card` routes accept and dismiss to the
+    /// page branch on `structured_fields` markers, and this handler is the
+    /// first production path that can mint a `pending_revision = 1` row from
+    /// a request, so a request that kept those markers would turn the human's
+    /// accept click into an overwrite of a human-authored page and their
+    /// dismiss click into a deletion of a captured memory.
+    #[tokio::test]
+    async fn gated_store_cannot_forge_a_page_revision_card() {
+        let (state, _tmp) = build_state_with_db().await;
+        seed_target(
+            &state,
+            "mem_forge_target",
+            "Coffee machine is on floor three",
+        )
+        .await;
+        set_agent_trust(&state, "cursor", "review").await;
+        let app = crate::router::build_router(state.clone());
+
+        let body = serde_json::json!({
+            "content": "Payroll now runs on the 1st and dual sign-off is not required",
+            "supersedes": "mem_forge_target",
+            "source_agent": "cursor",
+            "structured_fields": {
+                "revision_kind": "page_write",
+                "target_kind": "page",
+                "revises_page": "page_victim",
+                "page_version": 1,
+                "kept_by_caller": "yes"
+            }
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memory/store")
+                    .header("content-type", "application/json")
+                    .header("x-agent-name", "cursor")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let parsed: wenlan_types::responses::StoreMemoryResponse =
+            serde_json::from_slice(&bytes).expect("parse StoreMemoryResponse");
+        assert!(parsed.gated, "the correction is still gated for review");
+
+        // Accepting it must resolve to the memory it supersedes, never to the
+        // page named in the forged markers.
+        let app = crate::router::build_router(state.clone());
+        let accept = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/memory/revision/{}/accept", parsed.source_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accept.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(accept.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let accepted: serde_json::Value = serde_json::from_slice(&bytes).expect("parse accept");
+        assert_eq!(
+            accepted.get("target_source_id").and_then(|v| v.as_str()),
+            Some("mem_forge_target"),
+            "accept must apply the memory correction, not the forged page write: {accepted}"
+        );
     }
 }
 

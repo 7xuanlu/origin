@@ -332,6 +332,13 @@ fn distillation_not_superseded(alias: &str) -> String {
     not_hidden_by_superseder(&ReadScope::Global, alias)
 }
 
+/// A staged revision is a proposal, not content. It must not seed or join a page
+/// cluster before a human accepts it. `load_summary_buckets` already applies this;
+/// the three distillation pool queries did not, which is what this shares.
+fn distillation_row_is_reviewed(alias: &str) -> String {
+    format!("COALESCE({alias}.pending_revision, 0) = 0")
+}
+
 fn capture_memory_source(source: &str) -> &str {
     match source {
         "focus" => "focus_capture",
@@ -43192,6 +43199,7 @@ impl MemoryDB {
         // space touch, LEFT JOIN semantics preserved.
         let live = not_self_archived("m");
         let not_superseded = distillation_not_superseded("m");
+        let reviewed = distillation_row_is_reviewed("m");
         let mut sql = format!(
             "SELECT m.source_id, m.content, m.entity_id, m.space, m.embedding, p.title, m.source_agent, m.content_hash \
              FROM memories m \
@@ -43201,6 +43209,7 @@ impl MemoryDB {
                AND (m.pinned = 0 OR m.pinned IS NULL) \
                AND {live} \
                AND {not_superseded} \
+               AND {reviewed} \
                AND m.source_id NOT LIKE 'merged_%' \
                AND m.source_id NOT LIKE 'recap_%' \
                AND m.is_recap = 0 \
@@ -43454,6 +43463,7 @@ impl MemoryDB {
         // `query_distillation_staging_pool` above.
         let live = not_self_archived("m");
         let not_superseded = distillation_not_superseded("m");
+        let reviewed = distillation_row_is_reviewed("m");
         let mut sql = format!(
             "SELECT m.id, m.source_id, m.content, m.entity_id, m.space, m.embedding, \
                     p.title, m.source_agent, m.content_hash, \
@@ -43461,6 +43471,7 @@ impl MemoryDB {
                            AND (m.pinned = 0 OR m.pinned IS NULL) \
                            AND {live} \
                            AND {not_superseded} \
+                           AND {reviewed} \
                            AND m.source_id NOT LIKE 'merged_%' \
                            AND m.source_id NOT LIKE 'recap_%' \
                            AND m.is_recap = 0 \
@@ -43527,6 +43538,7 @@ impl MemoryDB {
         // sibling distillation queries above.
         let live = not_self_archived("m");
         let not_superseded = distillation_not_superseded("m");
+        let reviewed = distillation_row_is_reviewed("m");
         let mut rows = conn
             .query(
                 &format!(
@@ -43536,6 +43548,7 @@ impl MemoryDB {
                                AND (m.pinned = 0 OR m.pinned IS NULL) \
                                AND {live} \
                                AND {not_superseded} \
+                               AND {reviewed} \
                                AND m.source_id NOT LIKE 'merged_%' \
                                AND m.source_id NOT LIKE 'recap_%' \
                                AND m.is_recap = 0 \

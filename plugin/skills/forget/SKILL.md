@@ -31,7 +31,8 @@ forget(memory_id="<source_id>")
 
 - For corrections, prefer storing a new memory with `supersedes` pointing
   at the old one. That preserves history. Use `/capture` with the
-  `supersedes` arg instead.
+  `supersedes` arg instead. If your agent's trust level is below full, that
+  write may stage for human review instead of taking effect immediately.
 - Bulk deletions — call `/curate` first, confirm with the user,
   then delete one at a time.
 

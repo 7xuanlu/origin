@@ -35,11 +35,20 @@ async fn resolve_page_revision_card(
         return Ok(None);
     }
 
-    let page_id = structured
-        .get("revises_page")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&payload.supersedes)
-        .to_string();
+    // The page branch must prove itself against the database, never against
+    // the card's own JSON. `structured_fields` is persisted verbatim from a
+    // wire store, so routing on those three strings alone let a low-trust
+    // agent stage a memory correction that carried the page markers and turn
+    // the human's accept click into an overwrite of a human-authored page
+    // (and their dismiss click into a deletion of a captured memory). The one
+    // writer of real cards, `stage_page_revision_card`, always sets
+    // `supersedes` to the page id, so this check costs a genuine card
+    // nothing. It is also the same fact `list_pending_revisions_scoped` uses
+    // to label the card for the human, so accept and the queue now agree.
+    if db.get_page(&payload.supersedes).await?.is_none() {
+        return Ok(None);
+    }
+    let page_id = payload.supersedes.clone();
     let source_memory_ids = structured
         .get("source_memory_ids")
         .and_then(|v| v.as_array())

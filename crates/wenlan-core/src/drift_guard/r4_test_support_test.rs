@@ -3229,7 +3229,7 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        1027,
+        1033,
         "PR-D integration must expose the frozen 967 support calls, the 6 PR-D test identities, \
          the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, \
          the 7 G6 BindPageLink repair-test calls (G6 Stage 2 PR 2b, item 3: \
@@ -3327,7 +3327,14 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
          summary_eligibility_excludes_a_pending_revision_peer contributes test_primary_session|1, \
          TestDbSession::execute|1, TestDbSession::query|1, TestDbRows::next|1, TestDbRow::get|1, \
          and summary_eligibility_excludes_a_hide_superseded_peer the same five plus a second \
-         TestDbSession::execute for the superseder row)"
+         TestDbSession::execute for the superseder row); plus the net +6 proposal-gated \
+         agent-write calls in post_write_tests.rs: the gate acceptance test \
+         accepting_the_latest_of_two_staged_corrections_leaves_the_older_pending \
+         contributes test_primary_session|1 and TestDbSession::execute|1..3 (two staged \
+         low-trust corrections plus the memory they supersede), and the page-card forgery \
+         guard test a_card_whose_supersedes_is_not_a_page_is_never_a_page_write \
+         contributes test_primary_session|1 and TestDbSession::execute|1 (the forged \
+         structured_fields UPDATE that the DB-proven page branch must now ignore)"
     );
 }
 

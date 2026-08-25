@@ -118,7 +118,10 @@ Apply only explicit actions:
 - `skip`: no call
 - `edit: <replacement>`:
   1. `mcp__wenlan__capture(content="<replacement>", supersedes="<source_id>")`
-  2. `mcp__wenlan__forget(memory_id="<source_id>")`
+  2. `mcp__wenlan__forget(memory_id="<source_id>")` — skip this step if the
+     capture response says `gated: true`; the edit was staged for review
+     instead of applied, the original is still the live version, and the
+     user should be told the correction is waiting on approval.
 
 Reject and edit delete the original pending capture, so require the numbered
 item and action verb in the same reply.
