@@ -296,6 +296,9 @@ fn render_citations(citations: &[wenlan_types::pages::PageCitation]) -> String {
 fn print_list(shown: &[(String, usize)], total_titles: usize, total_pages: usize, dir: &Path) {
     if total_pages == 0 {
         println!("(no pages in {})", dir.display());
+        println!(
+            "  Pages are written by /distill in the Claude Code plugin once 3 or more related memories exist in a space."
+        );
         return;
     }
     if shown.len() < total_titles {

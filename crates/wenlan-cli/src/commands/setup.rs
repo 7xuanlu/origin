@@ -251,25 +251,8 @@ pub async fn run_doctor() -> anyhow::Result<()> {
     print_model_status();
     print_reranker_status().await;
 
-    let cfg = config::load_config();
-    let has_key = cfg
-        .anthropic_api_key
-        .as_deref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    let has_cached_model = configured_model()
-        .map(on_device_models::is_cached)
-        .unwrap_or(false);
-
     println!();
-    if has_key || has_cached_model {
-        println!("Model provider: available for explicit foreground use.");
-        println!("  Provider availability does not authorize background inference.");
-    } else {
-        println!("Model provider: none configured.");
-        println!("  Run: wenlan models install");
-        println!("  Or:  wenlan keys set anthropic");
-    }
+    print_model_provider_hint();
     print_enrichment_status().await;
 
     let cwd = std::env::current_dir()?;
@@ -313,6 +296,7 @@ fn print_daemon_log_paths() {
 pub async fn print_runtime_status() -> anyhow::Result<()> {
     print_key_status();
     print_model_status();
+    print_model_provider_hint();
     print_reranker_status().await;
     print_enrichment_status().await;
     Ok(())
@@ -395,6 +379,27 @@ fn print_model_status() {
             "not downloaded"
         }
     );
+}
+
+fn print_model_provider_hint() {
+    let cfg = config::load_config();
+    let has_key = cfg
+        .anthropic_api_key
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_cached_model = configured_model()
+        .map(on_device_models::is_cached)
+        .unwrap_or(false);
+
+    if has_key || has_cached_model {
+        println!("Model provider: available for explicit foreground use.");
+        println!("  Provider availability does not authorize background inference.");
+    } else {
+        println!("Model provider: none configured.");
+        println!("  Run: wenlan models install");
+        println!("  Or:  wenlan keys set anthropic");
+    }
 }
 
 async fn install_model(model_id: &str, yes: bool) -> anyhow::Result<()> {
