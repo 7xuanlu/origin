@@ -52576,39 +52576,40 @@ async fn a_poisoned_orphan_does_not_block_the_other_repairs() {
 /// not starve the resolvable rows behind it forever: the rotating keyset
 /// cursor advances past every examined row -- resolved or not -- so the next
 /// sweep resumes where the last one left off instead of re-selecting the
-/// same ordered prefix every time.
+/// same ordered prefix every time. All 513 links live on the SAME source
+/// page (`page_starve_a_src`), so the keyset predicate's intra-page arm
+/// (`source_page_id = ?2 AND label_key > ?3`) is the one that has to do the
+/// work here -- a fixture that puts the resolvable row on a different source
+/// page would pass even if that arm were deleted, since the cross-page arm
+/// (`source_page_id > ?2`) alone would still land the cursor past it.
 #[tokio::test]
 async fn a_full_batch_of_unresolvable_orphans_does_not_starve_the_tail() {
     let (db, _dir) = test_db().await;
     let now = chrono::Utc::now().to_rfc3339();
     for (id, title) in [
         ("page_starve_a_src", "Starve Src"),
-        ("page_starve_z_src", "Tail Src"),
-        ("page_starve_z_target", "Tail Target"),
+        ("page_starve_a_target", "Tail Target"),
     ] {
         db.insert_page(id, title, None, "content", None, None, &[], &now)
             .await
             .unwrap();
     }
 
-    let wikilinks: Vec<crate::synthesis::wikilinks::Wikilink> = (0..512)
+    // Folded key "tail target" sorts after "missing 511", so the resolvable
+    // link is the last row in keyset order on this same source page.
+    let mut wikilinks: Vec<crate::synthesis::wikilinks::Wikilink> = (0..512)
         .map(|i| crate::synthesis::wikilinks::Wikilink {
             label: format!("Missing {i:03}"),
             target_page_id: None,
         })
         .collect();
+    wikilinks.push(crate::synthesis::wikilinks::Wikilink {
+        label: "Tail Target".to_string(),
+        target_page_id: None,
+    });
     db.replace_page_links("page_starve_a_src", &wikilinks)
         .await
         .unwrap();
-    db.replace_page_links(
-        "page_starve_z_src",
-        &[crate::synthesis::wikilinks::Wikilink {
-            label: "Tail Target".to_string(),
-            target_page_id: None,
-        }],
-    )
-    .await
-    .unwrap();
 
     {
         let conn = db.conn.lock().await;
@@ -52622,7 +52623,7 @@ async fn a_full_batch_of_unresolvable_orphans_does_not_starve_the_tail() {
         let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(
             count, 513,
-            "fixture guard: 512 unresolvable orphans plus the 1 resolvable tail row"
+            "fixture guard: 512 unresolvable orphans plus the 1 resolvable tail row, all on one source page"
         );
     }
 
@@ -52649,7 +52650,7 @@ async fn a_full_batch_of_unresolvable_orphans_does_not_starve_the_tail() {
         let conn = db.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT source_page_id FROM page_links WHERE target_page_id IS NULL",
+                "SELECT label_key FROM page_links WHERE target_page_id IS NULL",
                 (),
             )
             .await
@@ -52662,7 +52663,7 @@ async fn a_full_batch_of_unresolvable_orphans_does_not_starve_the_tail() {
     };
     assert_eq!(remaining.len(), 512);
     assert!(
-        !remaining.iter().any(|id| id == "page_starve_z_src"),
+        !remaining.iter().any(|key| key == "tail target"),
         "the tail's orphan row resolved and was deleted, not left behind"
     );
 
@@ -52677,6 +52678,52 @@ async fn a_full_batch_of_unresolvable_orphans_does_not_starve_the_tail() {
             .unwrap(),
         None,
         "the tail was reached, so the cursor clears and the next sweep starts fresh"
+    );
+}
+
+/// A cursor that points past the current tail (every row it followed has
+/// since resolved elsewhere) must not wedge the sweep: the sweep falls back
+/// to the head once, resolves what remains, and clears the stale cursor.
+#[tokio::test]
+async fn a_stale_cursor_past_the_tail_falls_back_to_the_head() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, title) in [
+        ("page_stale_src", "Stale Src"),
+        ("page_stale_target", "Stale Target"),
+    ] {
+        db.insert_page(id, title, None, "content", None, None, &[], &now)
+            .await
+            .unwrap();
+    }
+    db.replace_page_links(
+        "page_stale_src",
+        &[crate::synthesis::wikilinks::Wikilink {
+            label: "Stale Target".to_string(),
+            target_page_id: None,
+        }],
+    )
+    .await
+    .unwrap();
+
+    db.set_app_metadata(
+        super::ORPHAN_SWEEP_CURSOR_KEY,
+        "[\"zzzz-past-the-tail\",\"\"]",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        db.resolve_orphan_page_links().await.unwrap(),
+        1,
+        "a stale past-the-tail cursor falls back to the head within the same sweep"
+    );
+    assert_eq!(
+        db.get_app_metadata(super::ORPHAN_SWEEP_CURSOR_KEY)
+            .await
+            .unwrap(),
+        None,
+        "the fallback sweep reached the tail, so the stale cursor is replaced with none"
     );
 }
 

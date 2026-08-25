@@ -50204,7 +50204,9 @@ impl MemoryDB {
 /// the `(source_page_id, label_key)` of the last row the previous sweep
 /// examined, serialized as a JSON pair. Lets [`MemoryDB::resolve_orphan_page_links`]
 /// resume the backlog where it left off instead of re-selecting the same
-/// ordered prefix every invocation.
+/// ordered prefix every invocation. Present only while more rows remain past
+/// the last examined one; deleted once a sweep reaches the tail, so the next
+/// sweep starts fresh from the head.
 const ORPHAN_SWEEP_CURSOR_KEY: &str = "orphan_sweep_cursor";
 
 impl MemoryDB {
@@ -50285,6 +50287,8 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("resolve_orphan_links begin: {e}")))?;
         let result: Result<usize, WenlanError> = async {
+            // Raw SQL, not get/set_app_metadata: those take the conn guard we
+            // already hold.
             let cursor: Option<(String, String)> = {
                 let mut rows = conn
                     .query(
@@ -50322,13 +50326,6 @@ impl MemoryDB {
             }
             let more = orphan_rows.len() as i64 > Self::ORPHAN_SWEEP_BATCH;
             orphan_rows.truncate(Self::ORPHAN_SWEEP_BATCH as usize);
-            if more {
-                log::warn!(
-                    "[orphan_links] sweep cap of {} rows hit; more orphan rows remain; \
-                     the next sweep continues after this cursor",
-                    Self::ORPHAN_SWEEP_BATCH
-                );
-            }
             // Captured before the processing loop below consumes the vector.
             // Every fetched row counts as examined -- resolved, unresolvable,
             // or failed -- so the cursor always advances past the whole batch.
@@ -50494,10 +50491,14 @@ impl MemoryDB {
             // once the tail is reached so the next sweep wraps to the head.
             // Inside the same transaction as the repairs above, so a rolled-
             // back sweep never advances the cursor either.
+            // Raw SQL, not get/set_app_metadata: those take the conn guard we
+            // already hold.
             match next_cursor.filter(|_| more) {
                 Some((next_id, next_key)) => {
+                    // Borrow, not move: `next_id`/`next_key` are still needed
+                    // for the log line below.
                     let cursor_value =
-                        serde_json::to_string(&(next_id, next_key)).map_err(|e| {
+                        serde_json::to_string(&(&next_id, &next_key)).map_err(|e| {
                             WenlanError::VectorDb(format!(
                                 "resolve_orphan_links cursor encode: {e}"
                             ))
@@ -50511,6 +50512,11 @@ impl MemoryDB {
                     .map_err(|e| {
                         WenlanError::VectorDb(format!("resolve_orphan_links cursor save: {e}"))
                     })?;
+                    log::warn!(
+                        "[orphan_links] sweep cap of {} rows hit; more orphan rows remain; \
+                         the next sweep continues after cursor ({next_id}, {next_key})",
+                        Self::ORPHAN_SWEEP_BATCH
+                    );
                 }
                 None => {
                     conn.execute(
