@@ -864,7 +864,7 @@ pub async fn handle_distill(
             map.insert(
                 "hint".into(),
                 serde_json::json!(
-                    "No page-sized cluster formed: a page needs at least 3 related memories in one space. Keep capturing, or run distill again after more memories exist."
+                    "No page-sized cluster formed in this scope: nothing grouped into 3 or more related memories that fit one page. Capture more related memories, or check the daemon log for dropped clusters."
                 ),
             );
         }

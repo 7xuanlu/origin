@@ -21782,6 +21782,137 @@ fn oversized_space_cluster_resplits_in_steps_instead_of_dropping() {
 }
 
 #[test]
+fn resplit_children_keep_their_base_group_position_for_max_clusters_ties() {
+    // Regression test: re-split children must be emitted where their base
+    // group sat, not queued behind every later sibling. The stable size sort
+    // plus `max_clusters` truncation break ties by emission order, so a
+    // FIFO across base groups would silently swap which tied cluster
+    // survives.
+    //
+    // Fixture: topic A = two sub-topics (5 + 8 members) whose cross-sub
+    // cosine ~0.62 sits between the formation threshold (0.60) and the first
+    // re-split step (0.65); topic B = 5 members far from A (~0.30). At 0.60
+    // A forms one 13-member group (over cap 12) and B its own group; A
+    // re-splits into [5, 8] at 0.65. With `max_clusters = 2` the survivors
+    // must be A1 (8) and then A0 (5), never B.
+    let s = 0.30f32.sqrt(); // shared
+    let t = 0.32f32.sqrt(); // topic
+    let u = 0.3575f32.sqrt(); // sub-topic
+    let m = 0.15f32; // per-member noise
+    let mut memories: Vec<ClusterMemRow> = Vec::new();
+    let mut push = |prefix: &str, topic_dim: usize, sub_dim: usize, count: usize| {
+        for i in 0..count {
+            let mut emb = vec![0.0f32; 768];
+            emb[0] = s;
+            emb[topic_dim] = t;
+            emb[sub_dim] = u;
+            emb[10 + memories.len()] = m;
+            memories.push(ClusterMemRow {
+                source_id: format!("{prefix}_m{i}"),
+                content: format!("{prefix} note {i}"),
+                entity_id: None,
+                entity_name: None,
+                space: Some("wenlan".to_string()),
+                can_seed_page: true,
+                embedding: emb,
+            });
+        }
+    };
+    push("a0", 1, 3, 5);
+    push("a1", 1, 4, 8);
+    push("b", 2, 5, 5);
+
+    // Fixture self-checks.
+    let cross_sub = cosine_similarity(&memories[0].embedding, &memories[5].embedding);
+    assert!(
+        (cross_sub - 0.62).abs() < 0.02,
+        "cross-sub-topic cosine drifted: {cross_sub}"
+    );
+    let cross_topic = cosine_similarity(&memories[0].embedding, &memories[13].embedding);
+    assert!(
+        (cross_topic - 0.30).abs() < 0.03,
+        "cross-topic cosine drifted: {cross_topic}"
+    );
+    let within = cosine_similarity(&memories[0].embedding, &memories[1].embedding);
+    assert!(
+        (within - 0.98).abs() < 0.02,
+        "within-sub cosine drifted: {within}"
+    );
+
+    let clusters = cluster_distillation_rows(
+        &memories,
+        0.60,
+        3,
+        2,
+        16_000,
+        50,
+        12,
+        DistillationClusterMode::SpaceScoped,
+    );
+
+    let shape: Vec<(usize, String)> = clusters
+        .iter()
+        .map(|c| {
+            let prefixes: std::collections::BTreeSet<&str> = c
+                .source_ids
+                .iter()
+                .map(|id| id.split('_').next().unwrap())
+                .collect();
+            (
+                c.source_ids.len(),
+                prefixes.into_iter().collect::<Vec<_>>().join("+"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![(8, "a1".to_string()), (5, "a0".to_string())],
+        "re-split children must keep their base group's position (b must lose the tie)"
+    );
+}
+
+#[test]
+fn a_threshold_that_cannot_advance_drops_instead_of_looping() {
+    // Regression test: a tuned formation threshold the loader never
+    // validated (`-inf`, NaN, or a huge negative) makes `threshold +
+    // RESPLIT_STEP` land on the same value, so a group over cap would be
+    // re-queued forever. The loop must drop such a group instead.
+    let mut memories: Vec<ClusterMemRow> = Vec::new();
+    for i in 0..20usize {
+        let mut emb = vec![0.0f32; 768];
+        emb[0] = 1.0;
+        emb[10 + i] = 0.15;
+        memories.push(ClusterMemRow {
+            source_id: format!("m{i}"),
+            content: format!("note {i}"),
+            entity_id: None,
+            entity_name: None,
+            space: Some("wenlan".to_string()),
+            can_seed_page: true,
+            embedding: emb,
+        });
+    }
+    for threshold in [f64::NEG_INFINITY, f64::NAN, -1.0e17] {
+        let clusters = cluster_distillation_rows(
+            &memories,
+            threshold,
+            3,
+            20,
+            16_000,
+            50,
+            12,
+            DistillationClusterMode::SpaceScoped,
+        );
+        assert!(
+            clusters.is_empty(),
+            "threshold {threshold}: an oversized group that cannot be re-split must be \
+             dropped, got {} clusters",
+            clusters.len()
+        );
+    }
+}
+
+#[test]
 fn sub_cluster_by_tokens_drops_single_member_subclusters_after_split() {
     // A token-split can strand a single memory in its own sub-cluster
     // (the farthest-first orthogonal outlier). The floor re-check (spec
