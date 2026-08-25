@@ -19,9 +19,11 @@ pub async fn run(client: &WenlanClient, format: ResolvedFormat, quiet: bool) -> 
         ResolvedFormat::Json => match client.health().await {
             Ok(health) => print_json(&health)?,
             Err(err) => {
+                // The whole chain: the hint first, then the endpoint and the
+                // transport cause, so a script reading this field sees both.
                 let status = serde_json::json!({
                     "status": "unreachable",
-                    "error": err.to_string(),
+                    "error": format!("{err:#}"),
                 });
                 print_json(&status)?;
             }

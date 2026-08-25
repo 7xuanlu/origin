@@ -1313,13 +1313,39 @@ pub(crate) fn embedder_init_error(
     error: &anyhow::Error,
     cache: Option<&std::path::Path>,
 ) -> WenlanError {
+    // fastembed gives HF_HOME precedence over the configured cache dir, so
+    // name the directory it actually used.
+    let cache = std::env::var_os("HF_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| cache.map(std::path::Path::to_path_buf));
     let location = cache
+        .as_deref()
         .map(|path| format!(" from {}", path.display()))
         .unwrap_or_default();
-    WenlanError::Embedding(format!(
-        "could not load the embedding model (BGE base v1.5, about 140 MB){location}: {error:#}. \
-         The first start downloads it from huggingface.co; check the network or proxy, then \
+    let cause = format!("{error:#}");
+    let lower = cause.to_ascii_lowercase();
+    let is_download = !lower.contains("permission denied")
+        && [
+            "retrieve",
+            "request",
+            "connect",
+            "dns",
+            "timed out",
+            "timeout",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let advice = if is_download {
+        "The first start downloads it from huggingface.co; check the network or proxy, then \
          start Wenlan again"
+    } else {
+        "If the cached files are damaged or unreadable, fix or delete that cache directory and \
+         start Wenlan again to download a fresh copy; an ONNX Runtime error usually means an \
+         unsupported CPU or a broken install"
+    };
+    WenlanError::Embedding(format!(
+        "could not load the embedding model (quantized BGE base en v1.5, about 210 MB){location}. \
+         {advice}. Cause: {cause}"
     ))
 }
 

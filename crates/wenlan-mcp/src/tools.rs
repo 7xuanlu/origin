@@ -991,7 +991,7 @@ fn format_capture_success(resp: &StoreMemoryResponse) -> String {
 }
 
 fn daemon_setup_hint() -> &'static str {
-    "If Wenlan is already installed, the daemon may just be stopped: run `wenlan status`, then `wenlan background on`.
+    "If Wenlan is already installed, the daemon may just be stopped. If you use the Wenlan app, open or restart it; if the `wenlan` CLI is on PATH, run `wenlan status`, then `wenlan background on`. A connector-only install (`wenlan-mcp` from npm, Homebrew, or Cargo) has no daemon of its own and needs the local runtime below.
 
 Otherwise install the local Wenlan runtime and run `wenlan setup`.
 

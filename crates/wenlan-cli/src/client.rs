@@ -145,9 +145,20 @@ impl WenlanClient {
                 };
                 let original = anyhow::Error::new(error).context(what.to_owned());
                 if let Err(recovery_error) = recovery::recover(&self.base_url).await {
-                    return Err(original.context(format!("{recovery_error:#}")));
+                    return Err(original.context(format!("{recovery_error:#}")).context(
+                        "the daemon did not come up on its own — run `wenlan doctor` to see why",
+                    ));
                 }
-                retry.send().await.with_context(|| what.to_owned())
+                retry
+                    .send()
+                    .await
+                    .with_context(|| what.to_owned())
+                    .with_context(|| {
+                        format!(
+                            "the daemon was started but {} still does not answer — run `wenlan doctor`",
+                            self.base_url
+                        )
+                    })
             }
             Err(error) => Err(error).with_context(|| what.to_owned()),
         }
@@ -658,18 +669,23 @@ mod tests {
 
     #[tokio::test]
     async fn connect_failure_says_what_to_do_next() {
-        let client = client_for("http://127.0.0.1:1").with_recovery(false);
-        let error = client
-            .health()
+        // An ephemeral port that was just released: nothing listens there.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+        let base = format!("http://{addr}");
+        let client = client_for(&base).with_recovery(false);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), client.health())
             .await
-            .expect_err("nothing listens on port 1");
+            .expect("connect failure within 10s")
+            .expect_err("nothing listens on the released port");
         let text = format!("{error:#}");
         assert!(
-            text.contains("no Wenlan daemon is listening at http://127.0.0.1:1"),
+            text.contains(&format!("no Wenlan daemon is listening at {base}")),
             "{text}"
         );
         assert!(
-            text.contains("GET http://127.0.0.1:1/api/health failed"),
+            text.contains(&format!("GET {base}/api/health failed")),
             "{text}"
         );
     }
