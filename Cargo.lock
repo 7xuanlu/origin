@@ -9097,6 +9097,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wenlan-types",
+ "windows-sys 0.59.0",
  "zip 2.4.2",
 ]
 
