@@ -757,11 +757,12 @@ must be demoted individually with a recorded reason. **Every MCP tool is
 | `verify_lint_repair` | yes | automatic | `none` | tool handler |
 | `write_page` | yes | automatic | `none` | tool handler |
 
-## CLI — all 22 `Commands` variants
+## CLI — all 23 `Commands` variants
 
-From `crates/wenlan-cli/src/main.rs:45`. The count is 22, not 20: `Connect` and
+From `crates/wenlan-cli/src/main.rs:45`. The count is 23, not 20: `Connect` and
 `Brief` are tuple variants, easy to miss when scanning for brace-shaped
-variants, and `Outbox` is the last brace variant before `Entities`. The CLI
+variants, `Outbox` is the last brace variant before `Entities`, and `Sweep`
+follows `Entities`. The CLI
 renders daemon responses, so it inherits the daemon's classification and adds
 the projection-directory reader.
 
@@ -789,6 +790,7 @@ the projection-directory reader.
 | `wenlan spaces` | yes | automatic | `none` | subcommand renderer |
 | `wenlan outbox` | yes | automatic | `none` | subcommand renderer |
 | `wenlan entities` | yes | automatic | `none` | subcommand renderer |
+| `wenlan sweep` | yes | automatic | `none` | subcommand renderer |
 
 ## Projection, export, internal
 
