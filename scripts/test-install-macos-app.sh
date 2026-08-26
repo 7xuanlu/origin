@@ -4,7 +4,14 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 INSTALLER="$ROOT_DIR/scripts/install-macos-app.sh"
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/wenlan-app-installer-test.XXXXXX")
-trap 'rm -rf "$TMP_DIR"' EXIT
+STUB_SERVER=
+cleanup() {
+  if [[ -n $STUB_SERVER ]]; then
+    kill "$STUB_SERVER" 2>/dev/null || true
+  fi
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
 
 make_fixture() {
   local fixture_dir=$1
@@ -195,7 +202,79 @@ test_fails_when_running_app_does_not_quit() {
   test -f "$install_dir/Wenlan.app/existing-marker"
 }
 
+test_names_rate_limiting_and_sends_the_token() {
+  local fixture_dir="$TMP_DIR/rate-limit"
+  local install_dir="$fixture_dir/Applications"
+  mkdir -p "$fixture_dir"
+
+  # A loopback stand-in for api.github.com that answers 403 like a rate limit
+  # and records the Authorization header it was sent.
+  cat > "$fixture_dir/server.py" <<'PY'
+import http.server
+import pathlib
+import sys
+
+auth_log = pathlib.Path(sys.argv[1])
+port_file = pathlib.Path(sys.argv[2])
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        auth_log.write_text(self.headers.get("Authorization", "") + "\n")
+        body = b'{"message":"API rate limit exceeded"}'
+        self.send_response(403)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+port_file.write_text(str(server.server_address[1]))
+server.serve_forever()
+PY
+  python3 "$fixture_dir/server.py" "$fixture_dir/auth.log" "$fixture_dir/port" &
+  STUB_SERVER=$!
+  disown "$STUB_SERVER"
+  for _ in $(seq 1 50); do
+    [[ -s "$fixture_dir/port" ]] && break
+    sleep 0.1
+  done
+  if [[ ! -s "$fixture_dir/port" ]]; then
+    echo "rate-limit stub server did not start" >&2
+    return 1
+  fi
+
+  local status=0
+  GITHUB_TOKEN=test-token \
+    WENLAN_APP_RELEASE_JSON_URL="http://127.0.0.1:$(cat "$fixture_dir/port")/releases/latest" \
+    WENLAN_APP_INSTALL_DIR="$install_dir" \
+    WENLAN_APP_NO_LAUNCH=1 \
+    WENLAN_APP_SKIP_PLATFORM_CHECK=1 \
+    bash "$INSTALLER" > "$fixture_dir/installer.log" 2>&1 || status=$?
+  kill "$STUB_SERVER" 2>/dev/null || true
+  STUB_SERVER=
+
+  if [[ $status -eq 0 ]]; then
+    echo "installer succeeded against a rate-limited release lookup" >&2
+    return 1
+  fi
+  if ! grep -q "GitHub's API rate limit" "$fixture_dir/installer.log"; then
+    echo "installer did not name rate limiting:" >&2
+    cat "$fixture_dir/installer.log" >&2
+    return 1
+  fi
+  if [[ $(cat "$fixture_dir/auth.log") != "Bearer test-token" ]]; then
+    echo "installer did not send GITHUB_TOKEN as a bearer token" >&2
+    return 1
+  fi
+}
+
 test_installs_verified_app_without_quarantine
+test_names_rate_limiting_and_sends_the_token
 test_rejects_bad_digest_before_replacing_existing_app
 test_restores_existing_app_when_interrupted_after_backup
 test_quits_running_app_before_replacing_it

@@ -337,6 +337,9 @@ jobs:
       GAUNTLET_OUT: ${{ github.workspace }}/gauntlet-out
       GAUNTLET_CHANNEL: macos-app
       REPO_ROOT: ${{ github.workspace }}
+      # The app installer's release lookup is a GitHub API call; the workflow
+      # token keeps repeated runs off the anonymous per-IP limit.
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Port 7878 precheck
