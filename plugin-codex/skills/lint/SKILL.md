@@ -32,8 +32,10 @@ statically lists repair tools, plain and deep modes may call only
 
 ## Plain and deep diagnostics
 
-General uses exactly one lint MCP call with the resolved scope. `/lint deep`
-uses the Agent-assisted Deep protocol below. Render only the final canonical
+General uses exactly one lint MCP call with the resolved scope; it returns the
+same text `wenlan lint` prints, whose `Lint:` line carries the check, finding,
+advisory and incomplete counts. `/lint deep` uses the Agent-assisted Deep
+protocol below and returns the typed report. Render only the final canonical
 report in canonical order. State is `incomplete` when `complete` is false,
 otherwise `findings` when actionable findings are nonzero, otherwise `clean`.
 Advisories remain visible but do not change the state to findings.

@@ -10,7 +10,7 @@
 //! freshly migrated database rather than from a hand-written list. The rebuild
 //! must restore exactly this set.
 
-use super::tests::test_db;
+use super::tests::{test_db, test_db_at};
 use super::MemoryDB;
 
 async fn schema_objects(kind: &str) -> Vec<String> {
@@ -743,7 +743,12 @@ async fn the_copy_verifier_catches_a_corrupted_copy() {
 /// fixture to plant a row in it.
 #[tokio::test]
 async fn the_pre_migration_97_backup_is_a_usable_restore_point() {
-    let (db, _temp) = test_db().await;
+    // A database that already exists at 96 is what gets a restore point; a
+    // store created in this boot takes none.
+    let (db, _temp) = test_db_at(96).await;
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
     let source_path = {
         let conn = db.conn.lock().await;
         MemoryDB::main_db_path(&conn).await.unwrap()
@@ -754,7 +759,7 @@ async fn the_pre_migration_97_backup_is_a_usable_restore_point() {
         .join("pre_migration_97_backup.db");
     assert!(
         dest.exists(),
-        "migration 98 must leave a restore point at {}",
+        "migration 97 must leave a restore point at {}",
         dest.display()
     );
 

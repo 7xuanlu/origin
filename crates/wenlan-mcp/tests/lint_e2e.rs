@@ -13,10 +13,10 @@ use wenlan_types::lint::{
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn fixture() -> LintReport {
+fn fixture_for(profile: LintProfile) -> LintReport {
     let digest = || LintDigest::from_u64(1);
     LintReport::try_new_for_profile(
-        LintProfile::Deep,
+        profile,
         LintScope::global(),
         LintCapabilityContext::daemon_operator_endpoint(),
         LintSnapshotReceipts::new(
@@ -33,7 +33,7 @@ fn fixture() -> LintReport {
         ),
         LintConfigFingerprint::from_effective_config(&[]),
         LintProducerReceipt::new(None),
-        canonical_check_ids(LintProfile::Deep)
+        canonical_check_ids(profile)
             .map(|check_id| {
                 LintCheckResult::try_new_with_gate_effect(
                     LintCheckResultInput {
@@ -57,13 +57,56 @@ fn fixture() -> LintReport {
                         evidence: Vec::new(),
                         duration_ms: 0,
                     },
-                    canonical_gate_effect(LintProfile::Deep, check_id).unwrap(),
+                    canonical_gate_effect(profile, check_id).unwrap(),
                 )
                 .unwrap()
             })
             .collect(),
     )
     .unwrap()
+}
+
+fn fixture() -> LintReport {
+    fixture_for(LintProfile::Deep)
+}
+
+#[tokio::test]
+async fn mcp_general_lint_returns_the_cli_text_and_no_structured_report() {
+    let mock = MockServer::start().await;
+    let report = fixture_for(LintProfile::General);
+    Mock::given(method("GET"))
+        .and(path("/api/lint"))
+        .and(query_param("profile", "general"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&report))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let server = WenlanMcpServer::new(
+        WenlanClient::new(mock.uri()),
+        TransportMode::Stdio,
+        "test-agent".to_string(),
+        None,
+    );
+
+    let result = server
+        .lint_impl(LintParams {
+            profile: Some(LintProfileParam::General),
+            space: None,
+            agent_assist: false,
+            agent_submission: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        result.structured_content.is_none(),
+        "General carries no typed report: clients drop the text when one is present"
+    );
+    assert_eq!(result.content.len(), 1);
+    assert_eq!(
+        result.content[0].as_text().map(|text| text.text.as_str()),
+        Some(report.render_text().as_str())
+    );
 }
 
 #[tokio::test]

@@ -501,6 +501,10 @@ pub async fn test_db() -> (MemoryDB, tempfile::TempDir) {
         community_grouping_runtime: std::sync::Mutex::new(
             crate::community_grouping::CommunityGroupingRuntime::default(),
         ),
+        // The fixture created the file just above, so the first chain is a
+        // fresh-store chain exactly as `MemoryDB::new` would decide it.
+        opened_fresh_file: std::sync::atomic::AtomicBool::new(true),
+        skip_migration_backups: std::sync::atomic::AtomicBool::new(false),
     };
     memory_db
         .run_migrations(&crate::events::NoopEmitter)
@@ -566,6 +570,10 @@ pub async fn test_db_at(ceiling: i64) -> (MemoryDB, tempfile::TempDir) {
         community_grouping_runtime: std::sync::Mutex::new(
             crate::community_grouping::CommunityGroupingRuntime::default(),
         ),
+        // The fixture created the file just above, so the first chain is a
+        // fresh-store chain exactly as `MemoryDB::new` would decide it.
+        opened_fresh_file: std::sync::atomic::AtomicBool::new(true),
+        skip_migration_backups: std::sync::atomic::AtomicBool::new(false),
     };
     memory_db
         .run_migrations_up_to(&crate::events::NoopEmitter, ceiling)
@@ -43738,6 +43746,10 @@ async fn startup_reconciles_v79_observations_without_source_memory_id() {
         community_grouping_runtime: std::sync::Mutex::new(
             crate::community_grouping::CommunityGroupingRuntime::default(),
         ),
+        // The fixture created the file just above, so the first chain is a
+        // fresh-store chain exactly as `MemoryDB::new` would decide it.
+        opened_fresh_file: std::sync::atomic::AtomicBool::new(true),
+        skip_migration_backups: std::sync::atomic::AtomicBool::new(false),
     };
 
     db.run_migrations(&crate::events::NoopEmitter)
@@ -46337,6 +46349,102 @@ async fn backup_before_migration_publishes_a_valid_restore_point() {
     assert_eq!(
         before, after,
         "an existing valid pre-migration backup must be preserved across a retry, not re-snapshotted"
+    );
+}
+
+#[tokio::test]
+async fn a_database_created_in_this_boot_takes_no_pre_migration_backups() {
+    // Soak gap 7: a fresh install replays the whole chain from
+    // `user_version = 0`, and every backed-up migration used to leave a
+    // `pre_migration_<n>_backup.db` of an empty store beside the live db.
+    // Through the production constructor, so the fresh-file decision is the
+    // one a real first boot makes, not a fixture flag.
+    let dir = tempdir().unwrap();
+    let db = MemoryDB::new(dir.path(), Arc::new(crate::events::NoopEmitter))
+        .await
+        .unwrap();
+    let backups: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("pre_migration_"))
+        .collect();
+    assert!(
+        backups.is_empty(),
+        "a database created in this boot must take no pre-migration backups, found {backups:?}"
+    );
+    assert!(
+        db.get_app_metadata("backup_before_migration_123")
+            .await
+            .unwrap()
+            .is_none(),
+        "no backup receipt either"
+    );
+
+    // The same chain on a database that already existed still takes them.
+    let (db, dir) = test_db_at(122).await;
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
+    assert!(dir.path().join("pre_migration_123_backup.db").exists());
+    assert!(db
+        .get_app_metadata("backup_before_migration_123")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// `user_version == 0` alone does not prove the file was created in this boot.
+/// A store that already existed at version 0 (an old install, or a file whose
+/// version was reset) carries data, and its migration 123 restore point is the
+/// one that matters.
+#[tokio::test]
+async fn a_store_that_already_existed_at_user_version_0_still_takes_pre_migration_backups() {
+    let dir = tempdir().unwrap();
+    let db_file = dir.path().join("origin_memory.db");
+    {
+        let raw = libsql::Builder::new_local(db_file.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = raw.connect().unwrap();
+        conn.execute_batch(SCHEMA).await.unwrap();
+        conn.execute_batch(
+            "CREATE TABLE owner_data (note TEXT NOT NULL); \
+             INSERT INTO owner_data (note) VALUES ('rows an earlier build wrote');",
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        db_file.exists(),
+        "fixture precondition: the file exists before the open"
+    );
+
+    let db = MemoryDB::new(dir.path(), Arc::new(crate::events::NoopEmitter))
+        .await
+        .expect("an existing store at user_version 0 must open and migrate");
+    assert!(
+        dir.path().join("pre_migration_123_backup.db").exists(),
+        "a store that existed before this boot keeps its migration 123 restore point"
+    );
+    assert!(db
+        .get_app_metadata("backup_before_migration_123")
+        .await
+        .unwrap()
+        .is_some());
+    let conn = db.conn.lock().await;
+    let mut rows = conn.query("SELECT note FROM owner_data", ()).await.unwrap();
+    let note = rows
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    assert_eq!(
+        note, "rows an earlier build wrote",
+        "the open reused the existing file"
     );
 }
 
@@ -54882,7 +54990,12 @@ async fn migration_123_downgrade_barrier_refuses_a_newer_database() {
 /// what proves the snapshot predates it.
 #[tokio::test]
 async fn the_pre_migration_123_backup_is_a_usable_restore_point() {
-    let (db, dir) = test_db().await;
+    // A database that already exists at 122 is what gets a restore point; a
+    // store created in this boot takes none (see the test below).
+    let (db, dir) = test_db_at(122).await;
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
     let dest = dir.path().join("pre_migration_123_backup.db");
     assert!(
         dest.exists(),
