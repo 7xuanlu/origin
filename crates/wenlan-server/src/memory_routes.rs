@@ -1806,14 +1806,16 @@ pub async fn handle_correct_memory(
         let llm = s.llm.clone();
         (db, llm)
     };
-    let llm =
-        llm.ok_or_else(|| ServerError::Internal("LLM not available for correction".to_string()))?;
-    // Get the existing memory content
+    // Get the existing memory content first: a missing memory is a 404
+    // regardless of whether an LLM is configured, so this must not wait on
+    // the availability check below.
     let memory = db
         .get_memory_detail(&id)
         .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .ok_or_else(|| ServerError::Internal(format!("memory {} not found", id)))?;
+        .map_err(ServerError::from)?
+        .ok_or_else(|| ServerError::NotFound(format!("memory {} not found", id)))?;
+    let llm =
+        llm.ok_or_else(|| ServerError::Internal("LLM not available for correction".to_string()))?;
 
     // Build a correction prompt for the LLM
     let prompt = format!(
@@ -3041,10 +3043,70 @@ mod blocked_agent_store_tests {
             .get("error")
             .and_then(|v| v.as_str())
             .expect("error body must carry a message");
-        assert!(
-            message.contains("disabled"),
+        assert_eq!(
+            message, "Agent 'blocked-agent' is disabled",
             "error message must name the disabled agent, got: {message}"
         );
+    }
+}
+
+#[cfg(test)]
+mod missing_memory_correction_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+
+    use crate::state::ServerState;
+
+    async fn build_state_with_db() -> (Arc<RwLock<ServerState>>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let emitter: Arc<dyn wenlan_core::events::EventEmitter> =
+            Arc::new(wenlan_core::events::NoopEmitter);
+        let db = wenlan_core::db::MemoryDB::new(tmp.path(), emitter)
+            .await
+            .expect("MemoryDB::new should succeed");
+        let server_state = ServerState {
+            db: Some(Arc::new(db)),
+            ..Default::default()
+        };
+        (Arc::new(RwLock::new(server_state)), tmp)
+    }
+
+    /// The lookup that turns a missing memory into 404 must run before the
+    /// LLM-availability check, so this deliberately leaves `state.llm` unset
+    /// (its `Default`) -- if the ordering regressed back to checking the LLM
+    /// first, this would fail on the LLM-unavailable 500 instead of ever
+    /// reaching the assertion below.
+    #[tokio::test]
+    async fn correct_missing_memory_is_not_found_not_internal_error() {
+        let (state, _tmp) = build_state_with_db().await;
+        let app = crate::router::build_router(state.clone());
+
+        let body = serde_json::json!({ "correction_prompt": "fix the date" });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memory/does-not-exist/correct")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse error body");
+        let message = parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .expect("error body must carry a message");
+        assert_eq!(message, "memory does-not-exist not found");
     }
 }
 
