@@ -885,7 +885,7 @@ jobs:
         with:
           name: homebrew-artifacts
           path: |
-            ${{ runner.temp }}/promoted-assets/wenlan-cli-darwin-arm64.tar.gz
+            ${{ runner.temp }}/promoted-assets/wenlan-darwin-arm64.tar.gz
             ${{ runner.temp }}/promoted-assets/wenlan-mcp-darwin-arm64.tar.gz
           retention-days: 1
           if-no-files-found: error
@@ -1499,14 +1499,14 @@ jobs:
           require_event_tag
           VERSION="${RELEASE_TAG#v}"
           SHA_MCP_DARWIN_ARM64=$(shasum -a 256 wenlan-mcp-darwin-arm64.tar.gz | cut -d' ' -f1)
-          SHA_CLI_DARWIN_ARM64=$(shasum -a 256 wenlan-cli-darwin-arm64.tar.gz | cut -d' ' -f1)
+          SHA_DARWIN_ARM64=$(shasum -a 256 wenlan-darwin-arm64.tar.gz | cut -d' ' -f1)
 
           git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/7xuanlu/homebrew-tap.git" tap
           mkdir -p tap/Formula
 
           cat > tap/Formula/wenlan-mcp.rb << 'FORMULA'
           class WenlanMcp < Formula
-            desc "MCP server for Wenlan â€” personal agent memory layer"
+            desc "MCP server for Wenlan — personal agent memory layer"
             homepage "https://github.com/7xuanlu/wenlan"
             version "VERSION_PLACEHOLDER"
             url "https://github.com/7xuanlu/wenlan/releases/download/vVERSION_PLACEHOLDER/wenlan-mcp-darwin-arm64.tar.gz"
@@ -1540,12 +1540,16 @@ jobs:
             -e 's/VERSION_PLACEHOLDER/$ENV{VERSION}/g; s/SHA_PLACEHOLDER/$ENV{SHA}/g' \
             tap/Formula/wenlan-mcp.rb
 
+          # The formula installs from the full darwin archive, not the CLI-only one:
+          # `wenlan background on` looks for wenlan-server next to the `wenlan`
+          # binary, so a CLI-only install failed at the documented first step
+          # (first-run gauntlet finding F7). wenlan-mcp stays in its own formula.
           cat > tap/Formula/wenlan.rb << 'FORMULA'
           class Wenlan < Formula
-            desc "Wenlan CLI â€” local-first memory + knowledge layer for AI agents"
+            desc "Wenlan CLI and daemon — local-first memory + knowledge layer for AI agents"
             homepage "https://github.com/7xuanlu/wenlan"
             version "VERSION_PLACEHOLDER"
-            url "https://github.com/7xuanlu/wenlan/releases/download/vVERSION_PLACEHOLDER/wenlan-cli-darwin-arm64.tar.gz"
+            url "https://github.com/7xuanlu/wenlan/releases/download/vVERSION_PLACEHOLDER/wenlan-darwin-arm64.tar.gz"
             sha256 "SHA_PLACEHOLDER"
             license "Apache-2.0"
 
@@ -1559,16 +1563,17 @@ jobs:
             end
 
             def install
-              bin.install "wenlan"
+              bin.install "wenlan", "wenlan-server"
             end
 
             test do
               assert_match "wenlan", shell_output("#{bin}/wenlan --help")
+              assert_match "wenlan-server", shell_output("#{bin}/wenlan-server --help")
             end
           end
           FORMULA
 
-          VERSION="$VERSION" SHA="$SHA_CLI_DARWIN_ARM64" perl -pi \
+          VERSION="$VERSION" SHA="$SHA_DARWIN_ARM64" perl -pi \
             -e 's/VERSION_PLACEHOLDER/$ENV{VERSION}/g; s/SHA_PLACEHOLDER/$ENV{SHA}/g' \
             tap/Formula/wenlan.rb
 

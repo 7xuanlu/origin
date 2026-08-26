@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=c4e73e02e9e5607b16b7e0d2282e1bc5cc3aff927b0e5acb7bbdfb038a688fc5 -->
+<!-- README_SYNC: source=README.md sha256=c8dbe1b39a702cde2a79dfc1b7f8b7c836fa3ee3efe5a6ac6e77d084ca31e413 -->
 
 <p align="center">
   <picture>
@@ -51,11 +51,11 @@ Wenlan funciona como un único daemon local. La aplicación de escritorio lo lle
 
 ### Aplicación de escritorio
 
-**[Descarga Wenlan para macOS](https://github.com/7xuanlu/wenlan/releases/latest)** (Apple Silicon), abre el `.dmg` y arrastra la aplicación a Aplicaciones.
+**[Descarga Wenlan para macOS](https://github.com/7xuanlu/wenlan/releases/latest)** (Apple Silicon), abre el `.dmg` y arrastra la aplicación a Aplicaciones. Para actualizar, arrastra la aplicación nueva sobre la antigua y ábrela: si Wenlan está en ejecución se cierra y arranca la versión nueva (Wenlan 0.17.0 y anteriores hay que cerrarlos a mano antes).
 
 No hay nada más que instalar. La aplicación incluye el daemon, la CLI y el conector MCP, arranca el daemon al abrirse y ofrece conectar los clientes de IA que detecta: el plugin para Claude Code y Codex, una entrada MCP para el resto. A partir de ahí lees Páginas, inspeccionas la Fuente detrás de cualquier cita y gestionas el sistema de conocimiento.
 
-Esta vista previa aún no está notarizada, así que macOS bloquea el primer arranque. Permítelo una vez en Ajustes del Sistema, Privacidad y seguridad, "Abrir de todos modos". Un comando se salta ese paso: comprueba la descarga contra el SHA-256 publicado en GitHub, elimina la cuarentena solo para esta aplicación y no cambia ninguna configuración de seguridad de macOS.
+Esta vista previa está firmada ad hoc y no notarizada, así que macOS bloquea el primer arranque: puede decir que Wenlan "no se puede abrir" o que no ha podido comprobar si contiene software malicioso. Cierra ese aviso y luego permite la aplicación una vez en Ajustes del Sistema, Privacidad y seguridad, "Abrir de todos modos". Un comando se salta ese paso: comprueba la descarga contra el SHA-256 publicado en GitHub, elimina la cuarentena solo para esta aplicación y no cambia ninguna configuración de seguridad de macOS.
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
