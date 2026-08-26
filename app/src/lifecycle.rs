@@ -827,9 +827,8 @@ pub fn handover_pending() -> bool {
 /// is closed, or `limit` passes. The limit is a hard ceiling: it bounds the
 /// health calls themselves, not only the gaps between them. The closed port
 /// is the fact the reopened app needs; health can stop answering while the
-/// listener lingers.
-#[cfg(target_os = "macos")]
-async fn wait_for_daemon_to_stop(limit: Duration) {
+/// listener lingers. Returns whether the port was released within `limit`.
+pub(crate) async fn wait_for_daemon_to_stop(limit: Duration) -> bool {
     let client = crate::api::WenlanClient::new();
     let listener = listener_addr(client.base_url());
     let released = tokio::time::timeout(limit, async {
@@ -845,14 +844,14 @@ async fn wait_for_daemon_to_stop(limit: Duration) {
     .await;
     if released.is_err() {
         log::warn!(
-            "[handover] daemon still holding {} after {limit:?}; the new app will retry",
+            "[lifecycle] daemon still holding {} after {limit:?}",
             client.base_url()
         );
     }
+    released.is_ok()
 }
 
 /// `host:port` of the daemon listener behind a base URL, for a raw TCP probe.
-#[cfg(target_os = "macos")]
 fn listener_addr(base_url: &str) -> Option<String> {
     let rest = base_url
         .strip_prefix("http://")
@@ -861,7 +860,7 @@ fn listener_addr(base_url: &str) -> Option<String> {
     (!authority.is_empty()).then(|| authority.to_string())
 }
 
-fn shutdown_url_for(client: &crate::api::WenlanClient) -> String {
+pub(crate) fn shutdown_url_for(client: &crate::api::WenlanClient) -> String {
     format!("{}/api/shutdown", client.base_url())
 }
 
@@ -875,6 +874,8 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
 
     if data_dir_env_overridden() {
         log::info!("[lifecycle] skipping quit teardown: isolated run (data-dir env override)");
+        // The isolated run has no launchd job: the daemon is our sidecar.
+        crate::daemon_start::stop_sidecar().await;
         exit_after_quit(app_handle, 0);
         attempt.commit();
         return Ok(());
@@ -926,6 +927,9 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
     }
 
     if quit_plan.exit_app {
+        // A sidecar we spawned (no launchd job, or a respawn from Diagnostics)
+        // must not outlive the app: the next launch would adopt it.
+        crate::daemon_start::stop_sidecar().await;
         exit_after_quit(app_handle, 0);
         attempt.commit();
     }
@@ -1464,7 +1468,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn listener_addr_is_the_authority_of_the_base_url() {
         assert_eq!(

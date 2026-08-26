@@ -1092,7 +1092,8 @@ pub fn run() {
 
             // Launch wenlan-server daemon as a sidecar process.
             // If a daemon is already running on the port, the sidecar exits cleanly.
-            // The shell plugin kills the child when the Tauri app exits.
+            // The quit flow stops it (`daemon_start::stop_sidecar`); the shell
+            // plugin only kills children spawned from its JS `execute` command.
             //
             // Skip the sidecar only when the current Wenlan launchd service
             // already targets this app-selected data root. A stale launchd
@@ -1112,6 +1113,48 @@ pub fn run() {
                 } else if let Err(e) = crate::daemon_start::spawn_daemon_sidecar(app.handle()) {
                     log::error!("[init] {e}. Run: xattr -cr /Applications/Origin.app or /Applications/Wenlan.app");
                 }
+            }
+
+            // SIGTERM (`kill`, logout, a supervisor) ends the process without any
+            // Tauri exit event, which orphaned the sidecar. Stop the sidecar we
+            // spawned and exit; nothing else: LaunchAgents and a launchd-owned
+            // daemon are not ours to remove on a signal.
+            #[cfg(unix)]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    // A second SIGTERM, or a stop that hangs, must still end the
+                    // process: `kill <pid>` has to mean exit.
+                    const SIGTERM_STOP_LIMIT: std::time::Duration =
+                        std::time::Duration::from_secs(10);
+                    match signal(SignalKind::terminate()) {
+                        Ok(mut sigterm) => {
+                            sigterm.recv().await;
+                            log::info!("[app] SIGTERM received; stopping the sidecar and exiting");
+                            tauri::async_runtime::spawn(async move {
+                                sigterm.recv().await;
+                                log::warn!(
+                                    "[app] second SIGTERM; exiting without waiting for the sidecar"
+                                );
+                                std::process::exit(1);
+                            });
+                            if tokio::time::timeout(
+                                SIGTERM_STOP_LIMIT,
+                                crate::daemon_start::stop_sidecar(),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                log::warn!(
+                                    "[app] sidecar stop did not finish within {SIGTERM_STOP_LIMIT:?}; exiting anyway"
+                                );
+                            }
+                            handle.exit(0);
+                        }
+                        Err(e) => log::warn!("[app] cannot listen for SIGTERM: {e}"),
+                    }
+                });
             }
 
             // Wait for daemon health, then initialize local state + file watcher
