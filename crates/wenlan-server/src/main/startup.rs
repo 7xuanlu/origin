@@ -601,7 +601,10 @@ pub(super) async fn prepare_startup_state(
     // configured model — exactly the pre-mode behavior. First construction downloads
     // weights (turbo ~146MB, bge-base ~1.1GB) into the shared FastEmbed cache;
     // failure is non-fatal (the affected path falls back to embedding+FTS ordering).
-    let reranker_cache_dir = wenlan_core::db::resolve_fastembed_cache_dir(&data_dir);
+    // The same directory `MemoryDB::new` gave the text embedder: fastembed does
+    // not read HF_HOME for rerankers and would otherwise fall back to a cache
+    // relative to the working directory (`/` under launchd).
+    let reranker_cache_dir = Some(wenlan_core::db::daemon_fastembed_cache_dir(&data_dir));
     let mut deep_bgebase_pending = false;
     if optional_runtime_workers_allowed(repair_recovery_pending) {
         use wenlan_core::reranker::{RerankerMode, RerankerPick};

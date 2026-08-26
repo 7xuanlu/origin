@@ -165,9 +165,10 @@ stop_process() {
 daemon_postmortem() {
     # Call from teardown, after the service is stopped and before the data
     # root is deleted. The daemon owns its log files (the launchd plist sends
-    # stdout/stderr to /dev/null), so those files plus a foreground replay
-    # under the service's environment shape (cwd /, minimal PATH, the plist
-    # env) are the only way to learn why a managed daemon never got healthy.
+    # stdout to /dev/null and stderr to logs/launchd-stderr.log), so those
+    # files plus a foreground replay under the service's environment shape
+    # (cwd /, minimal PATH, the plist env) are the only way to learn why a
+    # managed daemon never got healthy.
     local bin="$1" data_root="$2" log tail_text
     collect "$data_root/logs" "$HOME/Library/Logs/com.wenlan.server-fallback"
     for log in "$data_root/logs/wenlan-server.log" "$data_root/logs/wenlan-server.bootstrap.log"; do
@@ -192,15 +193,13 @@ daemon_postmortem() {
     # fault is in how the service runs it. Anything else is the daemon's exit.
     info daemon-replay "rc=$rc (124 = still running at 30s) $(tail -c 1500 "$replay" | tr '\n' '|')"
 
-    # Discriminating replay: identical environment shape, but with an explicit
-    # absolute writable embedder cache. Default failing while this one lives
-    # past init pins the crash on the cwd-relative fastembed default cache;
-    # both failing points away from it (network/TLS under the service env).
-    local replay2="$GAUNTLET_OUT/checks/daemon-replay-cache-dir.log" rc2=0
-    mkdir -p "$data_root/replay-cache"
-    _replay_capped "$bin" "$replay2" "$data_root" 127.0.0.1:17918 \
-        FASTEMBED_CACHE_DIR="$data_root/replay-cache" || rc2=$?
-    info daemon-replay-cache-dir "rc=$rc2 (124 = still running at 30s) $(tail -c 1500 "$replay2" | tr '\n' '|')"
+    # Where the replay put the embedding model. The daemon must use the cache
+    # next to its store and never fastembed's default, which is relative to
+    # the working directory (`/` under launchd, finding F4).
+    local per_store=no cwd_relative=no
+    [ -d "$data_root/memorydb/fastembed_cache" ] && per_store=yes
+    [ -e /.fastembed_cache ] && cwd_relative=yes
+    info daemon-replay-cache "per-store=$per_store cwd-relative=$cwd_relative"
 }
 
 # Run the daemon exactly as launchd would (cwd /, minimal env) for at most
