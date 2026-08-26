@@ -292,6 +292,10 @@ fn print_daemon_log_paths() {
         "Daemon fallback log: {}",
         fallback_root.join("logs/wenlan-server.log").display()
     );
+    println!(
+        "Launchd stderr log: {}",
+        super::service::launchd_stderr_log_path(&data_root).display()
+    );
 }
 
 pub async fn print_runtime_status() -> anyhow::Result<()> {
@@ -688,21 +692,33 @@ async fn print_daemon_health() {
     }
 }
 
+/// The daemon's rotating file log in the data root (macOS only; Linux and
+/// Windows log to the service console).
+#[cfg(target_os = "macos")]
+pub(crate) fn daemon_log_path() -> std::path::PathBuf {
+    config::data_root().join("logs/wenlan-server.log")
+}
+
+/// The error the daemon's most recent run ended with, and the log it was read
+/// from. The fallback log is consulted only when the primary one does not
+/// exist at all (the daemon could not write its data root), so an old fallback
+/// entry never shadows a healthy primary log.
+#[cfg(target_os = "macos")]
+pub(crate) fn current_daemon_error() -> Option<(std::path::PathBuf, String)> {
+    let log_path = daemon_log_path();
+    if log_path.exists() {
+        last_daemon_error(&log_path).map(|line| (log_path, line))
+    } else {
+        let fallback = fallback_log_root().join("logs/wenlan-server.log");
+        last_daemon_error(&fallback).map(|line| (fallback, line))
+    }
+}
+
 /// macOS: the daemon keeps a rotating file log (primary data root, else the
 /// fallback root), so a daemon that exited on purpose can say why.
 #[cfg(target_os = "macos")]
 fn print_last_daemon_error() {
-    let log_path = config::data_root().join("logs/wenlan-server.log");
-    // The fallback log is consulted only when the primary one does not exist
-    // at all (the daemon could not write its data root), so an old fallback
-    // entry never shadows a healthy primary log.
-    let found = if log_path.exists() {
-        last_daemon_error(&log_path).map(|line| (log_path.clone(), line))
-    } else {
-        let fallback = fallback_log_root().join("logs/wenlan-server.log");
-        last_daemon_error(&fallback).map(|line| (fallback, line))
-    };
-    match found {
+    match current_daemon_error() {
         Some((path, line)) => {
             println!("  Last daemon error ({}):", path.display());
             println!("    {line}");
@@ -715,7 +731,10 @@ fn print_last_daemon_error() {
             }
         }
         None => {
-            println!("  No daemon error recorded in {}.", log_path.display());
+            println!(
+                "  No daemon error recorded in {}.",
+                daemon_log_path().display()
+            );
             println!(
                 "  Start it with `wenlan background on` (or open the Wenlan app); if it stops again, that log says why."
             );
@@ -741,8 +760,19 @@ fn print_last_daemon_error() {
 /// clean shutdown is history rather than the current state.
 #[cfg(any(target_os = "macos", test))]
 fn last_daemon_error(log_path: &std::path::Path) -> Option<String> {
+    last_daemon_error_since(log_path, 0)
+}
+
+/// Like [`last_daemon_error`], but only the bytes written after `offset`
+/// count: a caller that noted the log's length before starting the daemon
+/// never blames this start for an error from an earlier run.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn last_daemon_error_since(log_path: &std::path::Path, offset: u64) -> Option<String> {
     let bytes = std::fs::read(log_path).ok()?;
-    let lines: Vec<String> = String::from_utf8_lossy(&bytes)
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    let lines: Vec<String> = String::from_utf8_lossy(&bytes[start..])
         .lines()
         .map(strip_ansi)
         .collect();
@@ -962,7 +992,37 @@ fn prompt_secret(prompt: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod doctor_tests {
-    use super::{last_daemon_error, strip_ansi};
+    use super::{last_daemon_error, last_daemon_error_since, strip_ansi};
+
+    #[test]
+    fn last_daemon_error_since_ignores_errors_written_before_the_mark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("wenlan-server.log");
+        std::fs::write(
+            &log,
+            "INFO wenlan-server v0.17.0\nERROR wenlan_server: stale failure from last week\n",
+        )
+        .expect("write log");
+        let mark = std::fs::metadata(&log).expect("metadata").len();
+        assert_eq!(last_daemon_error_since(&log, mark), None);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .expect("open log");
+        std::io::Write::write_all(
+            &mut file,
+            b"INFO wenlan-server v0.17.1\nERROR wenlan_server: fresh failure\n",
+        )
+        .expect("append");
+        assert_eq!(
+            last_daemon_error_since(&log, mark).as_deref(),
+            Some("ERROR wenlan_server: fresh failure")
+        );
+        assert_eq!(
+            last_daemon_error(&log).as_deref(),
+            Some("ERROR wenlan_server: fresh failure")
+        );
+    }
 
     #[test]
     fn last_daemon_error_returns_the_final_error_line_without_colour_codes() {
