@@ -2659,10 +2659,19 @@ const RESPLIT_MAX_THRESHOLD: f64 = 0.92;
 ///
 /// Two clusters of one bucket merge when their centroids' cosine is at or above
 /// `RESPLIT_MAX_THRESHOLD` — the same ceiling the ladder tightens toward, so a
-/// merge can only undo a split the ladder itself made. A merge that would push
-/// the result back over the bucket's member cap or over the LLM token limit is
-/// skipped: those two bounds are exactly why the ladder split in the first
-/// place, and re-merging past them would reintroduce the oversized cluster.
+/// merge can only undo a split the ladder itself made.
+///
+/// The member caps (`max_grouped_cluster_size` / `max_unlinked_cluster_size`)
+/// deliberately do NOT gate this merge. They are formation-time bounds: they
+/// tell the greedy grouping and the re-split ladder when a blob is still too
+/// coarse to be one topic, which is a statement about the threshold the blob
+/// was cut at, not a ceiling on how large a genuine topic may be. Once two
+/// shards' centroids meet the ladder's own ceiling, the evidence that they are
+/// one topic is stronger than the size heuristic that separated them, and a cap
+/// check here would just re-impose the split it exists to repair: a 20-memory
+/// topic under a cap of 12 emits [10, 10], and both halves would still become
+/// their own page. The LLM token limit is the real page-size guard, and it is
+/// still enforced below.
 ///
 /// Deterministic and model-free: candidates are scanned in emission order, the
 /// earlier cluster absorbs the later one, and the absorbing cluster is rebuilt
@@ -2672,7 +2681,6 @@ const RESPLIT_MAX_THRESHOLD: f64 = 0.92;
 fn merge_sibling_shards(
     memories: &[ClusterMemRow],
     clusters: Vec<DistillationCluster>,
-    cap: usize,
     token_limit: usize,
 ) -> Vec<DistillationCluster> {
     if clusters.len() < 2 {
@@ -2725,9 +2733,6 @@ fn merge_sibling_shards(
             // just a concatenation.
             let mut union = members[i].clone();
             union.extend_from_slice(&members[j]);
-            if union.len() > cap {
-                continue;
-            }
             let merged = build_distillation_cluster(memories, &union);
             if merged.estimated_tokens > token_limit {
                 continue;
@@ -2841,7 +2846,7 @@ fn cluster_distillation_rows(
         // about. Cross-space candidates (`Global`) are a different feature and
         // are left untouched.
         if matches!(mode, DistillationClusterMode::SpaceScoped) {
-            bucket = merge_sibling_shards(memories, bucket, cap, token_limit);
+            bucket = merge_sibling_shards(memories, bucket, token_limit);
         }
         clusters.extend(bucket);
     };
