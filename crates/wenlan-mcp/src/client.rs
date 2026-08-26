@@ -250,8 +250,6 @@ impl WenlanClient {
     /// Returns None if compatible OR if the daemon is unreachable / response
     /// can't be parsed (handshake never blocks startup).
     pub async fn version_handshake(&self) -> Option<String> {
-        use crate::version_check::{compare, VersionStatus};
-
         let url = format!("{}/api/health", self.base_url);
         // Bypass send_with_retry: a 6s retry loop at startup against a missing
         // or hung daemon would be worse UX than a silent skip. 2s timeout bounds
@@ -265,25 +263,27 @@ impl WenlanClient {
             .ok()?;
         let body: serde_json::Value = resp.json().await.ok()?;
         let daemon_version = body["version"].as_str()?;
-        // A dev daemon reports a `+g<sha>` build-metadata suffix (local source
-        // build). Its release-granular version is stale by construction, so skip
-        // the handshake rather than nag about release-vs-commit drift.
-        if daemon_version.contains("+g") {
-            return None;
-        }
-        let mcp_version = env!("CARGO_PKG_VERSION");
+        handshake_message(env!("CARGO_PKG_VERSION"), daemon_version)
+    }
+}
 
-        match compare(mcp_version, daemon_version) {
-            VersionStatus::Compatible => None,
-            VersionStatus::McpOutdated { mcp, daemon } => Some(format!(
-                "Your wenlan-mcp v{mcp} is older than the daemon v{daemon}. \
-                 Run `brew upgrade wenlan-mcp` (or `npm update -g wenlan-mcp`)."
-            )),
-            VersionStatus::DaemonOutdated { mcp, daemon } => Some(format!(
-                "The Wenlan daemon is running v{daemon} but wenlan-mcp v{mcp} is installed. \
-                 The daemon was not restarted after an upgrade. Run `wenlan restart` to load it."
-            )),
-        }
+/// The handshake warning for a daemon version, or `None` when the two are
+/// compatible. Build metadata (`+g<sha8>`) goes through the semver compare and
+/// never skips the check: a published daemon carries it too, because its binary
+/// is built before its release tag exists.
+fn handshake_message(mcp_version: &str, daemon_version: &str) -> Option<String> {
+    use crate::version_check::{compare, VersionStatus};
+
+    match compare(mcp_version, daemon_version) {
+        VersionStatus::Compatible => None,
+        VersionStatus::McpOutdated { mcp, daemon } => Some(format!(
+            "Your wenlan-mcp v{mcp} is older than the daemon v{daemon}. \
+             Run `brew upgrade wenlan-mcp` (or `npm update -g wenlan-mcp`)."
+        )),
+        VersionStatus::DaemonOutdated { mcp, daemon } => Some(format!(
+            "The Wenlan daemon is running v{daemon} but wenlan-mcp v{mcp} is installed. \
+             The daemon was not restarted after an upgrade. Run `wenlan restart` to load it."
+        )),
     }
 }
 
@@ -339,6 +339,17 @@ fn parse_api_error_reason(bytes: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_published_daemon_with_build_metadata_still_gets_the_handshake() {
+        let outdated = super::handshake_message("0.17.0", "0.16.0+gf240c141")
+            .expect("an older daemon is reported even with build metadata");
+        assert!(outdated.contains("wenlan restart"), "{outdated}");
+        assert_eq!(super::handshake_message("0.17.0", "0.17.0+gf240c141"), None);
+        let newer = super::handshake_message("0.17.0", "0.18.0+gf240c141")
+            .expect("a newer daemon is reported even with build metadata");
+        assert!(newer.contains("brew upgrade wenlan-mcp"), "{newer}");
+    }
+
     use super::*;
 
     #[test]
