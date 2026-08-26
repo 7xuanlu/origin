@@ -137,7 +137,7 @@ pub(crate) async fn build_page_compile_user_prompt(
     format!("{titles_hint}Topic: {capped_topic}\n\n{memories_block}")
 }
 
-/// LLM cluster refinement: for entities with multiple clusters, ask the LLM to merge/split/rename.
+/// LLM cluster refinement: for entities with multiple clusters, ask the LLM to merge/rename.
 pub(crate) async fn refine_clusters_with_llm(
     llm: &Arc<dyn LlmProvider>,
     prompts: &PromptRegistry,
@@ -157,7 +157,7 @@ pub(crate) async fn refine_clusters_with_llm(
         by_entity.entry(key).or_default().push(i);
     }
 
-    // Only refine entities with 2+ clusters (single clusters = nothing to merge/split)
+    // Only refine entities with 2+ clusters (single clusters = nothing to merge)
     let entities_to_refine: Vec<(String, Vec<usize>)> = by_entity
         .into_iter()
         .filter(|(_, indices)| indices.len() >= 2)
@@ -289,6 +289,14 @@ pub(crate) async fn refine_clusters_with_llm(
                                         }
                                     }
                                 }
+                                // Anything else (including the `split` action
+                                // the prompt used to offer) is a keep. `split`
+                                // was never implemented and landed here
+                                // silently, so it is no longer offered — see
+                                // the note above `REFINE_CLUSTERS` in
+                                // `prompts/defaults.rs`. An overridden prompt
+                                // can still emit it; keeping is the same
+                                // behavior it always had.
                                 _ => {}
                             }
                         }
@@ -984,7 +992,7 @@ pub async fn distill_pages_scoped(
 }
 
 /// Same as `distill_pages_scoped`, with an explicit switch for the LLM
-/// coherence gate (merge/split/rename cluster review, spec §3.1). The compile
+/// coherence gate (merge/rename cluster review, spec §3.1). The compile
 /// router (`refinery::run_periodic_steep_with_api`) skips the gate for an
 /// on-device-only compile — the page's keep-card carries that judgment
 /// instead of an LLM review. Every other caller goes through the
@@ -1081,7 +1089,7 @@ pub(crate) async fn distill_pages_scoped_gated(
     let raw_clusters =
         cap_document_majority_clusters(db, raw_clusters, tuning.page_min_cluster_size).await?;
 
-    // LLM cluster refinement: let LLM merge/split/rename clusters per entity.
+    // LLM cluster refinement: let LLM merge/rename clusters per entity.
     // Coherence gate (spec §3.1) — skipped for an on-device-only compile.
     let clusters = if run_coherence_gate {
         refine_clusters_with_llm(llm, prompts, raw_clusters, token_limit).await
