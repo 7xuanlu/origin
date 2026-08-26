@@ -69,7 +69,7 @@ EXPECTED_MM=$(mm "$EXPECTED_VER")
 if [ -n "$DAEMON_MM" ] && [ -n "$EXPECTED_MM" ] && [ "$DAEMON_MM" != "$EXPECTED_MM" ]; then
   cat <<MSG
 [wenlan] daemon v${DAEMON_VER}, plugin expects v${EXPECTED_VER}.
-  Run /wenlan:setup to repair. It will upgrade/restart the runtime and verify MCP.
+  Run /wenlan:setup to repair: it updates an older runtime, or says when the plugin cache is stale, then verifies MCP.
 MSG
 fi
 

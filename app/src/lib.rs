@@ -469,9 +469,9 @@ fn request_full_quit(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
     Ok(())
 }
 
-/// The release part of a daemon version. Build metadata (`0.17.0+g1234abcd`)
-/// never counts as a mismatch: a source build carries it, and so can a
-/// published daemon whose binary was built before its tag existed.
+/// The release part of a version. Build metadata (`0.17.0+g1234abcd`) never
+/// counts as a mismatch on either side: a source build carries it, and so can
+/// a published daemon whose binary was built before its tag existed.
 #[cfg(not(feature = "review-fixtures"))]
 fn release_part(version: &str) -> &str {
     version.split('+').next().unwrap_or(version)
@@ -1080,7 +1080,9 @@ pub fn run() {
                             // path (LaunchAgent, sidecar, or dev checkout) —
                             // a stale one can hold the port and answer health
                             // while breaking newer API calls.
-                            if release_part(&health.version) != env!("CARGO_PKG_VERSION") {
+                            if release_part(&health.version)
+                                != release_part(env!("CARGO_PKG_VERSION"))
+                            {
                                 log::warn!(
                                     "[init] Daemon version mismatch: daemon v{}, app v{} at {}; restart it (e.g. `wenlan restart`)",
                                     health.version,
@@ -1684,6 +1686,12 @@ mod platform_tests {
         assert_eq!(release_part("0.17.0+gf240c141"), "0.17.0");
         assert_eq!(release_part("0.17.0"), "0.17.0");
         assert_eq!(release_part(""), "");
+        // A prerelease survives, and app-side metadata strips the same way.
+        assert_eq!(release_part("0.18.0-rc.1+g1"), "0.18.0-rc.1");
+        assert_eq!(
+            release_part("0.18.0+app1"),
+            release_part("0.18.0+gf240c141")
+        );
     }
 
     #[test]

@@ -106,27 +106,32 @@ managed background process.
 
 ### 4. Re-probe health and version
 
-A first boot downloads the embedding model before it answers, which can take
-most of a minute on a slow connection, so poll for up to 60 seconds:
+If `wenlan background on` exited non-zero, print its output and stop: it
+already waited for the daemon and named what went wrong. Otherwise poll for up
+to 240 seconds, the budget the first-run checks use, because a first boot
+downloads the embedding model (about 210 MB) before it answers:
 
 ```bash
-for i in $(seq 1 60); do
-  curl -fsS -m 3 http://127.0.0.1:7878/api/health && break
+healthy=
+deadline=$((SECONDS + 240))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if curl -fsS -m 3 http://127.0.0.1:7878/api/health >/dev/null 2>&1; then
+    healthy=1
+    break
+  fi
   sleep 1
 done
+if [ -z "$healthy" ]; then
+  W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
+  "$W" doctor
+  exit 1
+fi
 ```
 
-If the local runtime still is not reachable after 60 seconds, print the doctor
-output and stop; it names the daemon state and the log files to read:
-
-```bash
-W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
-"$W" doctor
-```
-
-Likely causes: the model download is still running or failed (read the daemon
-log the doctor output points at), launchd load failure, port 7878 already in
-use, or a local runtime crash.
+When the loop ends without a healthy answer, the doctor output names the daemon
+state and where its logs are (a file path on macOS, `journalctl` on Linux);
+stop there. Likely causes: the model download is still running or failed,
+launchd load failure, port 7878 already in use, or a local runtime crash.
 
 Once healthy, repeat the version comparison from step 2. If the versions still
 differ, stop instead of claiming setup succeeded:

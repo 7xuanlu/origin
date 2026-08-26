@@ -60,15 +60,28 @@ check 'no outbox line when CLI missing' 'outbox:' missing "$out"
 # Version drift: the stub answers with a chosen daemon version.
 www="$tmpbase/www"
 mkdir -p "$www/api"
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
-(cd "$www" && exec python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1) &
+# The stub binds port 0 itself and publishes the port once bound: no
+# pick-then-bind race, and readiness is the port file, not a guess.
+cat > "$tmpbase/server.py" <<'PY'
+import http.server
+import os
+import pathlib
+import sys
+
+os.chdir(sys.argv[1])
+server = http.server.HTTPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
+pathlib.Path(sys.argv[2]).write_text(str(server.server_address[1]))
+server.serve_forever()
+PY
+python3 "$tmpbase/server.py" "$www" "$tmpbase/port" >/dev/null 2>&1 &
 server=$!
-disown "$server"
-trap 'kill "$server" 2>/dev/null; rm -rf "$tmpbase"' EXIT
+trap 'kill "$server" 2>/dev/null; wait "$server" 2>/dev/null; rm -rf "$tmpbase"' EXIT
 for _ in $(seq 1 50); do
-    curl -fsS -m 1 "http://127.0.0.1:$port/" >/dev/null 2>&1 && break
+    [ -s "$tmpbase/port" ] && break
     sleep 0.1
 done
+[ -s "$tmpbase/port" ] || { echo "FAIL stub daemon did not start" >&2; exit 1; }
+port=$(cat "$tmpbase/port")
 plugin_root="$tmpbase/plugin"
 mkdir -p "$plugin_root/.claude-plugin"
 
