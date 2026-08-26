@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # First-run gauntlet: Homebrew tap (macos-15, arm64).
-# `brew install 7xuanlu/tap/wenlan` ships the CLI only, so the documented next
-# step (`wenlan background on`) is expected to fail; that gap is recorded, then
-# a daemon from the release archive stands in for the CLI and MCP loops.
+# `brew install 7xuanlu/tap/wenlan` must ship wenlan-server beside the CLI so the
+# documented next step (`wenlan background on`) registers the daemon. The CLI
+# and MCP loops still run against a daemon from the release archive on a
+# scratch port and data dir, so they never depend on the launchd service.
 # No `set -e`: a failed step records a row and the later steps still run.
 # shellcheck disable=SC2016  # bash -c snippets take $1/$2 positionally on purpose
 set -u -o pipefail
@@ -21,8 +22,15 @@ cleanup() {
     if [ -n "$DAEMON_PID" ]; then
         stop_process "$DAEMON_PID"
     fi
-    # `background on` should fail before registering, but never trust that: unload anyway.
+    # `background on` registers a launchd service in the runner's real HOME: unload it.
     launchctl bootout "gui/$UID_NUM/com.wenlan.server" 2>/dev/null || true
+    # bootout returns before the job has exited; uninstalling or deleting
+    # state under a daemon that is still shutting down races it, so wait.
+    local i=0
+    while pgrep -x wenlan-server >/dev/null 2>&1 && [ "$i" -lt 15 ]; do
+        sleep 1
+        i=$((i + 1))
+    done
     rm -f "$HOME/Library/LaunchAgents/com.wenlan.server.plist"
     brew uninstall wenlan wenlan-mcp >"$GAUNTLET_OUT/logs/teardown-brew-uninstall.log" 2>&1 || true
     brew untap 7xuanlu/tap >"$GAUNTLET_OUT/logs/teardown-brew-untap.log" 2>&1 || true
@@ -51,13 +59,12 @@ WENLAN_PATH="$(command -v wenlan || true)"
 info brew-wenlan-path "${WENLAN_PATH:-not on PATH}"
 info brew-server-next-to-cli "$(ls -l "$(dirname "${WENLAN_PATH:-/nonexistent}")/wenlan-server" 2>&1 || true)"
 
-# The documented next step. Today it fails because the formula ships no
-# wenlan-server (finding F7) — that is a real user-facing failure, so it is a
-# plain check and stays red until packaging or the docs change. Encoding the
-# known defect as the success condition would hide the breakage and turn the
-# eventual fix into a false red.
+# The documented next step. It failed on every release up to v0.17.0 because
+# the formula shipped no wenlan-server (finding F7); the formula now installs
+# both binaries from the full darwin archive, so this row must be green.
+check brew-server-installed -- test -x "$(dirname "${WENLAN_PATH:-/nonexistent}")/wenlan-server"
 check brew-background-on -- wenlan background on
-info brew-status-without-daemon "$(WENLAN_NO_AUTOSTART=1 wenlan status 2>&1 || true)"
+info brew-status-after-background-on "$(WENLAN_NO_AUTOSTART=1 wenlan status 2>&1 || true)"
 
 # Stand-in daemon from the release archive so the brew CLI and MCP can be exercised.
 DAEMON_LINE="$(TAG="$TAG" PORT="$PORT" DATA_DIR="$DATA_DIR" VERSION="$VERSION" \

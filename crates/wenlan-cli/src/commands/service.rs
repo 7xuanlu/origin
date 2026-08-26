@@ -158,7 +158,9 @@ fn current_server_path() -> Result<PathBuf> {
     }
     if !server.exists() {
         anyhow::bail!(
-            "wenlan-server not found next to origin at {}. Re-run the Wenlan installer.",
+            "wenlan-server not found next to wenlan at {}. If you installed with Homebrew, \
+             run `brew upgrade 7xuanlu/tap/wenlan` (the current formula ships the daemon); \
+             otherwise re-run the installer with `npx wenlan setup`.",
             server.display()
         );
     }
