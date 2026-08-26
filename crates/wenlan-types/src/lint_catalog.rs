@@ -186,10 +186,6 @@ pub enum LintRecommendationCode {
     RestorePrerequisite,
     RerunAfterSnapshotStabilizes,
     InspectRuntime,
-    /// The check needs a model source and none is chosen yet. Pairs with a
-    /// passing, expected-empty verdict: nothing is broken, the owner simply has
-    /// not picked where inference runs.
-    ChooseModelSource,
 }
 impl LintRecommendationCode {
     /// One plain sentence saying what to do next. See [`LintSummaryCode::meaning`].
@@ -205,6 +201,33 @@ impl LintRecommendationCode {
             Self::InspectRuntime => {
                 "Check the daemon logs for the error behind this, then run `wenlan lint` again."
             }
+        }
+    }
+}
+/// Something the owner can do about a check that is *not* a defect.
+///
+/// This is deliberately a separate field from `recommendation_code` rather than
+/// a fifth variant of it. `recommendation_code` is part of the frozen
+/// `LINT_REPORT_SCHEMA_VERSION` 5 wire shape, and a patch-ahead daemon is
+/// explicitly compatible with an older CLI or MCP client
+/// (`wenlan-mcp/src/version_check.rs`). Serde rejects an unknown enum variant,
+/// so teaching the daemon to emit a fifth `recommendation_code` would make an
+/// old reader fail to parse the whole report; an added optional *field* is
+/// simply ignored by that same reader, because `LintCheckResultInput` does not
+/// deny unknown fields. Additive field now, enum variant at the next schema
+/// bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LintActionCode {
+    /// The check needs a model source and none is chosen yet. Pairs with a
+    /// passing, expected-empty verdict: nothing is broken, the owner simply has
+    /// not picked where inference runs.
+    ChooseModelSource,
+}
+impl LintActionCode {
+    /// One plain sentence saying what to do next. See [`LintSummaryCode::meaning`].
+    pub const fn action(self) -> &'static str {
+        match self {
             Self::ChooseModelSource => {
                 "Run `wenlan setup` and choose a model source so Wenlan can build this in the background."
             }

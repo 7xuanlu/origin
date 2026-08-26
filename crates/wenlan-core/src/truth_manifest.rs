@@ -409,6 +409,7 @@ pub const CLI_READERS: &[CliReader] = &[
     CliReader { subcommand: "wenlan spaces", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan outbox", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
     CliReader { subcommand: "wenlan entities", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
+    CliReader { subcommand: "wenlan sweep", page_bearing: PageBearing::Yes, class: TruthClass::Automatic, marker_shape: MarkerShape::None, adapter: "subcommand renderer" },
 ];
 
 /// Look up a registered HTTP reader by its runtime identity.

@@ -3,8 +3,8 @@ use crate::db::tests::test_db;
 use crate::lint::context::{CancellationToken, LintClock};
 use crate::lint::runner::LintRunner;
 use wenlan_types::lint::{
-    LintApplicability, LintMetricCode, LintMetricValue, LintOutcome, LintPrecondition, LintQuery,
-    LintRecommendationCode, LintSummaryCode,
+    LintActionCode, LintApplicability, LintMetricCode, LintMetricValue, LintOutcome,
+    LintPrecondition, LintQuery, LintSummaryCode,
 };
 
 #[path = "serving_review_fact_test.rs"]
@@ -55,9 +55,10 @@ fn graph_channel_without_a_model_source_passes_and_says_to_choose_one() {
     assert_eq!(result.applicability(), LintApplicability::ExpectedEmpty);
     assert_eq!(result.precondition(), LintPrecondition::ExpectedEmpty);
     assert_eq!(result.summary_code(), LintSummaryCode::ExpectedEmpty);
+    assert_eq!(result.recommendation_code(), None);
     assert_eq!(
-        result.recommendation_code(),
-        Some(LintRecommendationCode::ChooseModelSource)
+        result.action_code(),
+        Some(LintActionCode::ChooseModelSource)
     );
     // No opaque ordinals for a state that is not a defect.
     assert!(result.evidence().is_empty());
@@ -80,16 +81,15 @@ async fn the_model_source_pin_reaches_only_the_graph_channel_through_the_runner(
     assert_eq!(graph.outcome(), LintOutcome::Pass);
     assert_eq!(graph.applicability(), LintApplicability::ExpectedEmpty);
     assert_eq!(graph.precondition(), LintPrecondition::ExpectedEmpty);
-    assert_eq!(
-        graph.recommendation_code(),
-        Some(LintRecommendationCode::ChooseModelSource)
-    );
+    assert_eq!(graph.recommendation_code(), None);
+    assert_eq!(graph.action_code(), Some(LintActionCode::ChooseModelSource));
     assert!(unconfigured.complete());
 
     // The fact channel is off in this fixture and stays configured-off.
     let fact = channel(&unconfigured, CHANNEL_FACT_ID);
     assert_eq!(fact.precondition(), LintPrecondition::ConfiguredOff);
     assert_eq!(fact.recommendation_code(), None);
+    assert_eq!(fact.action_code(), None);
 
     // The same store with a model source chosen: the graph channel and the kg
     // liveness check are exactly what the fresh-store report stops gating on.

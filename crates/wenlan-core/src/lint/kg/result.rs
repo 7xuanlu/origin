@@ -2,10 +2,10 @@ use super::config::KgRunConfig;
 use super::query::RowCheck;
 use crate::lint::context::{LintContext, PopulationBasis, PopulationLedgerError};
 use wenlan_types::lint::{
-    LintApplicability, LintCheckResult, LintCheckResultInput, LintContractError, LintCoverage,
-    LintEvidenceRef, LintMetric, LintMetricCode, LintMetricStringCode, LintMetricValue,
-    LintOpaqueId, LintOutcome, LintPrecondition, LintRecommendationCode, LintSeverity,
-    LintSummaryCode, LintValidationMethod, LINT_MAX_EVIDENCE_PER_CHECK,
+    LintActionCode, LintApplicability, LintCheckResult, LintCheckResultInput, LintContractError,
+    LintCoverage, LintEvidenceRef, LintMetric, LintMetricCode, LintMetricStringCode,
+    LintMetricValue, LintOpaqueId, LintOutcome, LintPrecondition, LintRecommendationCode,
+    LintSeverity, LintSummaryCode, LintValidationMethod, LINT_MAX_EVIDENCE_PER_CHECK,
 };
 
 pub(super) struct Assessment {
@@ -29,7 +29,9 @@ pub(super) struct Assessment {
     reports_evidence: bool,
     /// Advice to attach when the check passes. A finding always recommends
     /// reviewing it; a pass is silent unless it is waiting on the owner.
-    passing_recommendation: Option<LintRecommendationCode>,
+    /// Carried as `action_code`, not `recommendation_code` — see
+    /// [`LintActionCode`] for why the wire keeps the two apart.
+    passing_action: Option<LintActionCode>,
 }
 
 impl Assessment {
@@ -46,7 +48,7 @@ impl Assessment {
             method: LintValidationMethod::FullEnumeration,
             basis: PopulationBasis::SelectedScope,
             reports_evidence: true,
-            passing_recommendation: None,
+            passing_action: None,
         }
     }
 
@@ -80,7 +82,7 @@ impl Assessment {
             method: LintValidationMethod::ExactAggregate,
             basis,
             reports_evidence: false,
-            passing_recommendation: None,
+            passing_action: None,
         }
     }
 
@@ -136,8 +138,7 @@ impl Assessment {
             method: LintValidationMethod::ExactAggregate,
             basis: PopulationBasis::SelectedScope,
             reports_evidence: false,
-            passing_recommendation: waiting_on_model_source
-                .then_some(LintRecommendationCode::ChooseModelSource),
+            passing_action: waiting_on_model_source.then_some(LintActionCode::ChooseModelSource),
         }
     }
 }
@@ -197,14 +198,11 @@ pub(super) fn finish(
         } else {
             LintSummaryCode::CheckPassed
         },
-        recommendation_code: if finding {
-            Some(LintRecommendationCode::ReviewFinding)
-        } else {
-            assessment.passing_recommendation
-        },
+        recommendation_code: finding.then_some(LintRecommendationCode::ReviewFinding),
         evidence,
         duration_ms: context.clock().duration_ms(),
-    })?;
+    })?
+    .with_action_code(assessment.passing_action);
     context.record_population(assessment.id, basis, assessment.population)?;
     Ok(result)
 }

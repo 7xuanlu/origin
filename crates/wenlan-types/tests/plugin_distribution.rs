@@ -148,6 +148,78 @@ fn pages_skill_replaces_read() {
     }
 }
 
+// The MCP surface hands the agent raw snake_case codes; the plain sentence the
+// CLI prints is not in that payload. Both lint skills therefore carry the
+// mapping in prose -- and it has to stay the *same* prose, so this test reads
+// the sentences straight off the enums rather than from a second hardcoded
+// copy.
+#[test]
+fn both_lint_skills_spell_out_every_check_code_in_plain_english() {
+    use wenlan_types::lint::{LintActionCode, LintRecommendationCode, LintSummaryCode};
+
+    let expected: Vec<(&str, &str)> = vec![
+        ("check_passed", LintSummaryCode::CheckPassed.meaning()),
+        (
+            "finding_detected",
+            LintSummaryCode::FindingDetected.meaning(),
+        ),
+        (
+            "prerequisite_unavailable",
+            LintSummaryCode::PrerequisiteUnavailable.meaning(),
+        ),
+        (
+            "snapshot_inconsistent",
+            LintSummaryCode::SnapshotInconsistent.meaning(),
+        ),
+        (
+            "execution_failed",
+            LintSummaryCode::ExecutionFailed.meaning(),
+        ),
+        ("expected_empty", LintSummaryCode::ExpectedEmpty.meaning()),
+        (
+            "review_finding",
+            LintRecommendationCode::ReviewFinding.action(),
+        ),
+        (
+            "restore_prerequisite",
+            LintRecommendationCode::RestorePrerequisite.action(),
+        ),
+        (
+            "rerun_after_snapshot_stabilizes",
+            LintRecommendationCode::RerunAfterSnapshotStabilizes.action(),
+        ),
+        (
+            "inspect_runtime",
+            LintRecommendationCode::InspectRuntime.action(),
+        ),
+        (
+            "choose_model_source",
+            LintActionCode::ChooseModelSource.action(),
+        ),
+    ];
+
+    for path in [
+        "plugin/skills/lint/SKILL.md",
+        "plugin-codex/skills/lint/SKILL.md",
+    ] {
+        let text = read_text(path);
+        for (code, sentence) in &expected {
+            assert!(
+                text.contains(&format!("`{code}`")),
+                "{path} never names the `{code}` code"
+            );
+            assert!(
+                text.contains(sentence),
+                "{path} does not say what `{code}` means: expected {sentence:?}"
+            );
+        }
+        assert!(
+            text.contains("does not count toward actionable"),
+            "{path} must say a passing check with an action is not a finding"
+        );
+    }
+}
+
 #[test]
 fn lint_is_the_only_public_repair_flow_on_both_surfaces() {
     for path in [

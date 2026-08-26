@@ -3,8 +3,8 @@ use crate::lint::context::{CancellationToken, LintClock};
 use crate::lint::runner::LintRunner;
 use crate::lint::test_support::DbSemanticFingerprint;
 use wenlan_types::lint::{
-    LintApplicability, LintMetricCode, LintMetricValue, LintOutcome, LintPrecondition, LintQuery,
-    LintRecommendationCode, LintSeverity, LintSummaryCode,
+    LintActionCode, LintApplicability, LintMetricCode, LintMetricValue, LintOutcome,
+    LintPrecondition, LintQuery, LintSeverity, LintSummaryCode,
 };
 
 const ENTITY_INTEGRITY: &str = "entities.structural_integrity";
@@ -156,9 +156,10 @@ async fn no_model_source_is_a_complete_expected_empty_pass_that_says_to_choose_o
     assert_eq!(liveness.applicability(), LintApplicability::ExpectedEmpty);
     assert_eq!(liveness.precondition(), LintPrecondition::ExpectedEmpty);
     assert_eq!(liveness.summary_code(), LintSummaryCode::ExpectedEmpty);
+    assert_eq!(liveness.recommendation_code(), None);
     assert_eq!(
-        liveness.recommendation_code(),
-        Some(LintRecommendationCode::ChooseModelSource)
+        liveness.action_code(),
+        Some(LintActionCode::ChooseModelSource)
     );
     // The substrate is still reported honestly; only the verdict changed.
     assert_eq!(metric(liveness, LintMetricCode::EligibleRecords), 1);

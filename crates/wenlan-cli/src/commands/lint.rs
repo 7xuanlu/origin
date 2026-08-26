@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use wenlan_types::lint::{
-    LintAgentSubmission, LintCheckGroup, LintEvidenceRef, LintGateEffect, LintMetricCode,
-    LintMetricValue, LintOutcome, LintProfile, LintReasonCode, LintRecommendationCode, LintReport,
-    LintSummaryCode,
+    LintActionCode, LintAgentSubmission, LintCheckGroup, LintEvidenceRef, LintGateEffect,
+    LintMetricCode, LintMetricValue, LintOutcome, LintProfile, LintReasonCode,
+    LintRecommendationCode, LintReport, LintSummaryCode,
 };
 
 use crate::client::WenlanClient;
@@ -163,9 +163,7 @@ fn render_human(report: &LintReport) -> String {
     let waiting: Vec<_> = report
         .checks()
         .iter()
-        .filter(|check| {
-            check.outcome() == LintOutcome::Pass && check.recommendation_code().is_some()
-        })
+        .filter(|check| check.outcome() == LintOutcome::Pass && check.action_code().is_some())
         .collect();
     append_selected(&mut output, &waiting);
     output.push_str("Incomplete");
@@ -203,25 +201,24 @@ fn append_selected(output: &mut String, checks: &[&wenlan_types::lint::LintCheck
     output.push_str(&format!(" ({}):\n", checks.len()));
     for check in checks {
         let summary = summary_name(check.summary_code());
-        match check.recommendation_code() {
-            Some(recommendation) => output.push_str(&format!(
-                "  {}: {summary}; recommendation: {}\n",
-                check.check_id(),
-                recommendation_name(recommendation)
-            )),
-            None => output.push_str(&format!("  {}: {summary}\n", check.check_id())),
-        }
+        let code_suffix = match (check.recommendation_code(), check.action_code()) {
+            (Some(recommendation), _) => {
+                format!("; recommendation: {}", recommendation_name(recommendation))
+            }
+            (None, Some(action)) => format!("; action: {}", action_name(action)),
+            (None, None) => String::new(),
+        };
+        output.push_str(&format!("  {}: {summary}{code_suffix}\n", check.check_id()));
         // The codes above are stable identifiers for scripts. This line is the
         // same thing in plain English for the person reading the terminal.
         output.push_str(&format!(
             "    {}{}\n",
             check.summary_code().meaning(),
-            check
-                .recommendation_code()
-                .map_or_else(String::new, |recommendation| format!(
-                    " {}",
-                    recommendation.action()
-                ))
+            match (check.recommendation_code(), check.action_code()) {
+                (Some(recommendation), _) => format!(" {}", recommendation.action()),
+                (None, Some(action)) => format!(" {}", action.action()),
+                (None, None) => String::new(),
+            }
         ));
         let affected = check.metrics().iter().find_map(|metric| {
             if metric.code() == LintMetricCode::AffectedRecords {
@@ -327,7 +324,12 @@ const fn recommendation_name(recommendation: LintRecommendationCode) -> &'static
         LintRecommendationCode::RestorePrerequisite => "restore_prerequisite",
         LintRecommendationCode::RerunAfterSnapshotStabilizes => "rerun_after_snapshot_stabilizes",
         LintRecommendationCode::InspectRuntime => "inspect_runtime",
-        LintRecommendationCode::ChooseModelSource => "choose_model_source",
+    }
+}
+
+const fn action_name(action: LintActionCode) -> &'static str {
+    match action {
+        LintActionCode::ChooseModelSource => "choose_model_source",
     }
 }
 
@@ -346,12 +348,12 @@ const fn summary_name(summary: LintSummaryCode) -> &'static str {
 mod tests {
     use super::{exit_code, render_human};
     use wenlan_types::lint::{
-        LintApplicability, LintCapabilityContext, LintCheckResult, LintCheckResultInput,
-        LintConfigFingerprint, LintCoverage, LintDbSnapshotMode, LintDbSnapshotReceipt, LintDigest,
-        LintOutcome, LintPageSnapshotMode, LintPageSnapshotReceipt, LintPrecondition,
-        LintPrecondition as Pre, LintProducerReceipt, LintProfile, LintRecommendationCode,
-        LintReport, LintScope, LintSeverity, LintSnapshotReceipts, LintSummaryCode,
-        LintValidationMethod, LINT_MAX_EVIDENCE_PER_CHECK,
+        LintActionCode, LintApplicability, LintCapabilityContext, LintCheckResult,
+        LintCheckResultInput, LintConfigFingerprint, LintCoverage, LintDbSnapshotMode,
+        LintDbSnapshotReceipt, LintDigest, LintOutcome, LintPageSnapshotMode,
+        LintPageSnapshotReceipt, LintPrecondition, LintPrecondition as Pre, LintProducerReceipt,
+        LintProfile, LintRecommendationCode, LintReport, LintScope, LintSeverity,
+        LintSnapshotReceipts, LintSummaryCode, LintValidationMethod, LINT_MAX_EVIDENCE_PER_CHECK,
     };
 
     /// The two checks a fresh store with no model source used to fail on, as the
@@ -372,8 +374,9 @@ mod tests {
             LintApplicability::ExpectedEmpty,
             Pre::ExpectedEmpty,
             LintSummaryCode::ExpectedEmpty,
-            Some(LintRecommendationCode::ChooseModelSource),
+            None,
         )
+        .with_action_code(Some(LintActionCode::ChooseModelSource))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -479,7 +482,7 @@ mod tests {
         for check_id in ["kg.substrate_liveness", "serving.channel.graph"] {
             assert!(
                 rendered.contains(&format!(
-                    "  {check_id}: expected_empty; recommendation: choose_model_source\n"
+                    "  {check_id}: expected_empty; action: choose_model_source\n"
                 )),
                 "{rendered}"
             );

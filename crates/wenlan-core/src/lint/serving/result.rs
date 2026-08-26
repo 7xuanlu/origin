@@ -1,9 +1,9 @@
 use super::{ChannelAssessment, OBSERVABILITY_ID, RERANKER_ID, ROUTE_SCOPE_ID};
 use crate::lint::context::{LintClock, LintContext, PopulationBasis};
 use wenlan_types::lint::{
-    LintApplicability, LintCheckResult, LintCheckResultInput, LintCoverage, LintEvidenceRef,
-    LintMetric, LintMetricCode, LintMetricValue, LintOpaqueId, LintOutcome, LintPrecondition,
-    LintRecommendationCode, LintSeverity, LintSummaryCode, LintValidationMethod,
+    LintActionCode, LintApplicability, LintCheckResult, LintCheckResultInput, LintCoverage,
+    LintEvidenceRef, LintMetric, LintMetricCode, LintMetricValue, LintOpaqueId, LintOutcome,
+    LintPrecondition, LintRecommendationCode, LintSeverity, LintSummaryCode, LintValidationMethod,
     LINT_MAX_EVIDENCE_PER_CHECK,
 };
 
@@ -207,15 +207,13 @@ fn build(clock: &LintClock, id: &'static str, spec: ResultSpec) -> LintCheckResu
         } else {
             LintSummaryCode::CheckPassed
         },
-        recommendation_code: if finding {
-            Some(LintRecommendationCode::ReviewFinding)
-        } else if state == ChannelState::ModelSourceUnconfigured {
-            Some(LintRecommendationCode::ChooseModelSource)
-        } else {
-            None
-        },
+        recommendation_code: finding.then_some(LintRecommendationCode::ReviewFinding),
         evidence,
         duration_ms: clock.duration_ms(),
     })
     .unwrap()
+    .with_action_code(
+        (state == ChannelState::ModelSourceUnconfigured)
+            .then_some(LintActionCode::ChooseModelSource),
+    )
 }
