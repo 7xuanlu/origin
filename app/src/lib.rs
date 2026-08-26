@@ -15,6 +15,8 @@ pub mod config;
 mod daemon_start;
 pub mod error;
 pub mod events;
+#[cfg(target_os = "macos")]
+mod handover;
 mod identity_paths;
 mod indexer;
 mod lifecycle;
@@ -418,7 +420,14 @@ fn acknowledge_guarded_quit_request(request_id: u64, delivery_id: u64) -> bool {
 #[cfg(not(feature = "review-fixtures"))]
 #[tauri::command]
 fn cancel_guarded_quit_request(request_id: u64, delivery_id: u64) -> bool {
-    with_guarded_quit(|guard| guard.cancel(request_id, delivery_id))
+    let cancelled = with_guarded_quit(|guard| guard.cancel(request_id, delivery_id));
+    // A refused quit ends a pending handover too: the user keeps this app to
+    // fix the save, and a later quit must not reopen the newer bundle.
+    #[cfg(target_os = "macos")]
+    if cancelled {
+        lifecycle::clear_handover_bundle();
+    }
+    cancelled
 }
 
 #[cfg(not(feature = "review-fixtures"))]
@@ -426,7 +435,30 @@ fn force_full_quit(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         if let Err(e) = crate::lifecycle::quit_origin(&app).await {
             log::error!("[app] forced quit failed: {e}");
-            app.exit(1);
+            crate::lifecycle::exit_after_quit(&app, 1);
+        }
+    });
+}
+
+/// The guarded quit's own timer only covers the acknowledgement. Once the
+/// frontend has acknowledged, nothing bounds how long it takes to call the
+/// full quit, and a hung persist would leave the old app hidden with the user
+/// staring at nothing. A handover therefore carries a hard deadline: a quit
+/// still in flight when it passes is forced. A guard the frontend refused (it
+/// could not save) has already dropped the handover and is left alone.
+#[cfg(all(target_os = "macos", not(feature = "review-fixtures")))]
+fn arm_handover_deadline(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(handover::QUIT_DEADLINE).await;
+        if lifecycle::handover_pending()
+            && !lifecycle::is_quitting()
+            && with_guarded_quit(GuardedQuitCoordinator::force_if_in_flight)
+        {
+            log::warn!(
+                "[handover] the guarded quit did not finish within {:?}; forcing shutdown",
+                handover::QUIT_DEADLINE
+            );
+            force_full_quit(app);
         }
     });
 }
@@ -539,8 +571,32 @@ pub fn run() {
     let app_state = AppState::new();
 
     let builder =
-        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             use tauri::Manager;
+            // A second launch of a *newer* bundle means the user upgraded and
+            // wants the new version, not the old window brought to the front.
+            #[cfg(target_os = "macos")]
+            {
+                let running = app.package_info().version.clone();
+                if let Some(newer) = handover::newer_bundle_from_launch(&argv, &running) {
+                    log::info!(
+                        "[handover] Wenlan {} was launched while {running} is running; quitting so {} can take over",
+                        newer.version,
+                        newer.bundle.display()
+                    );
+                    lifecycle::set_handover_bundle(newer.bundle);
+                    match request_full_quit(app) {
+                        Ok(()) => arm_handover_deadline(app.clone()),
+                        Err(e) => {
+                            log::error!("[handover] failed to request guarded quit: {e}");
+                            force_full_quit(app.clone());
+                        }
+                    }
+                    return;
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = &argv;
             if let Some(window) = app.get_webview_window("main") {
                 set_main_window_dock_visibility(app, true);
                 let _ = window.show();
@@ -1667,6 +1723,32 @@ mod platform_tests {
                 request_id: 3,
                 delivery_id: 1,
             }
+        );
+    }
+
+    #[test]
+    fn an_acknowledged_guard_that_never_resolves_is_still_in_flight_for_the_handover_deadline() {
+        let mut guard = GuardedQuitCoordinator::new();
+        assert!(matches!(
+            guard.request(),
+            GuardedQuitAction::RequestFrontendGuard { .. }
+        ));
+        assert!(guard.acknowledge(1, 1));
+        assert!(
+            guard.force_if_in_flight(),
+            "acknowledged but never resolved: the deadline may force"
+        );
+        assert!(!guard.force_if_in_flight(), "forcing once is enough");
+
+        let mut guard = GuardedQuitCoordinator::new();
+        assert!(matches!(
+            guard.request(),
+            GuardedQuitAction::RequestFrontendGuard { .. }
+        ));
+        assert!(guard.cancel(1, 1));
+        assert!(
+            !guard.force_if_in_flight(),
+            "a refused quit is not in flight; the deadline leaves it alone"
         );
     }
 
