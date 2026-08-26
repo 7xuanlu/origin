@@ -24,6 +24,13 @@ cleanup() {
     fi
     # `background on` registers a launchd service in the runner's real HOME: unload it.
     launchctl bootout "gui/$UID_NUM/com.wenlan.server" 2>/dev/null || true
+    # bootout returns before the job has exited; uninstalling or deleting
+    # state under a daemon that is still shutting down races it, so wait.
+    local i=0
+    while pgrep -x wenlan-server >/dev/null 2>&1 && [ "$i" -lt 15 ]; do
+        sleep 1
+        i=$((i + 1))
+    done
     rm -f "$HOME/Library/LaunchAgents/com.wenlan.server.plist"
     brew uninstall wenlan wenlan-mcp >"$GAUNTLET_OUT/logs/teardown-brew-uninstall.log" 2>&1 || true
     brew untap 7xuanlu/tap >"$GAUNTLET_OUT/logs/teardown-brew-untap.log" 2>&1 || true
