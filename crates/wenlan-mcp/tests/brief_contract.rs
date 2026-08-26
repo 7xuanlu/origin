@@ -82,9 +82,13 @@ async fn no_topic_reads_only_the_complete_brief_and_preserves_versions() {
         .expect("brief read succeeds");
     let text = text_of(&result);
 
-    assert!(text.starts_with("Space Brief:\n"));
-    assert!(text.contains("\"id\": \"item-1\""));
-    assert!(text.contains("\"version\": 3"));
+    assert!(text.starts_with("Space Brief: wenlan (v7)\n"), "{text}");
+    assert!(text.contains("Last session: MCP work is next.\n"), "{text}");
+    assert!(
+        text.contains("Active (1):\n  - item-1 (v3): Replace the public context tool. [gate: MCP tests pass]\n"),
+        "{text}"
+    );
+    assert!(text.contains("Backlog: none\n"), "{text}");
     assert!(!text.contains("Related Context"));
 }
 

@@ -4318,6 +4318,10 @@ pub struct MemoryDB {
         std::sync::Mutex<BTreeMap<String, BTreeMap<i64, BTreeSet<String>>>>,
     pub(crate) community_grouping_runtime:
         std::sync::Mutex<crate::community_grouping::CommunityGroupingRuntime>,
+    /// The `user_version` the last migration chain started from. `0` means the
+    /// database was created in this boot: the chain is a replay onto an empty
+    /// store, and a pre-migration backup would have nothing to restore.
+    migration_chain_start_version: std::sync::atomic::AtomicI64,
 }
 
 /// Returns true when a memory title looks like it would make a poor snippet —
@@ -4472,6 +4476,7 @@ impl MemoryDB {
             community_grouping_runtime: std::sync::Mutex::new(
                 crate::community_grouping::CommunityGroupingRuntime::default(),
             ),
+            migration_chain_start_version: std::sync::atomic::AtomicI64::new(-1),
         })
     }
 
@@ -4696,6 +4701,7 @@ impl MemoryDB {
             community_grouping_runtime: std::sync::Mutex::new(
                 crate::community_grouping::CommunityGroupingRuntime::default(),
             ),
+            migration_chain_start_version: std::sync::atomic::AtomicI64::new(-1),
         };
 
         // Run schema migrations for existing databases
@@ -4785,6 +4791,7 @@ impl MemoryDB {
             community_grouping_runtime: std::sync::Mutex::new(
                 crate::community_grouping::CommunityGroupingRuntime::default(),
             ),
+            migration_chain_start_version: std::sync::atomic::AtomicI64::new(-1),
         };
 
         instance.run_migrations(emitter.as_ref()).await?;
@@ -4881,9 +4888,10 @@ impl MemoryDB {
     /// state -- the pages shape at 112, say -- instead of hand-dropping the
     /// columns later migrations add, which is exactly the fixture gap that
     /// let migrations 113/114 ship UPDATEs against columns 117 creates.
-    /// Only the checkpoints a test needs exist: a ceiling below 113 stops
-    /// before migration 113, a ceiling of 113 or 114 stops before 115, and
-    /// anything higher runs the whole chain. The post-chain repairs
+    /// Only the checkpoints a test needs exist: a ceiling below 97 stops
+    /// before migration 97, a ceiling below 113 stops before 113, a ceiling
+    /// of 113 or 114 stops before 115, a ceiling below 123 stops before 123,
+    /// and anything higher runs the whole chain. The post-chain repairs
     /// (community substrate/cutover, embedding recovery) are skipped on an
     /// early return -- they belong to a fully migrated database.
     pub(crate) async fn run_migrations_up_to(
@@ -4908,6 +4916,8 @@ impl MemoryDB {
             0
         };
         drop(rows);
+        self.migration_chain_start_version
+            .store(version, std::sync::atomic::Ordering::Relaxed);
 
         // The downgrade barrier — see `refuse_if_newer_schema`. The constructors
         // now run it at open time, before any DDL; this call is defense in depth
@@ -9475,6 +9485,9 @@ impl MemoryDB {
             // row carries the bit so renames preserve the selection and deletes
             // clear it through ordinary row deletion. A partial unique index
             // makes "at most one" a database invariant.
+            if ceiling < 97 {
+                return Ok(());
+            }
             if version < 97 {
                 self.migrate_97_default_save_space(version).await?;
             }
@@ -9731,6 +9744,9 @@ impl MemoryDB {
             // `kind='entity'` shadow page exist, and 121/122 are what make the
             // surviving dependents readable and writable without the legacy
             // table. Only then is dropping it a no-op for every reader.
+            if ceiling < 123 {
+                return Ok(());
+            }
             if version < 123 {
                 self.migrate_123_retire_legacy_entity_tables(version)
                     .await?;
@@ -10506,14 +10522,28 @@ impl MemoryDB {
     /// BEFORE a migration's DDL so a botched migration has a restore point, and
     /// record the receipt in `app_metadata` (key `backup_before_migration_<n>`)
     /// so an operator can find it. Runs on every open that reaches the
-    /// migration, including a fresh DB (`prior_version` is the `user_version`
-    /// the dispatch re-read after the early migrations, never 0 here). The
+    /// migration on a database that already existed (`prior_version` is the
+    /// `user_version` the dispatch re-read after the early migrations, never
+    /// 0 here). A database created in this boot is skipped: its chain is a
+    /// replay onto an empty store, and a fresh install would otherwise write
+    /// one snapshot per backed-up migration (29 files, 37 MB, on 0.17.0). The
     /// snapshot lands beside the live db as `pre_migration_<n>_backup.db`.
     async fn backup_before_migration(
         &self,
         migration: i64,
         prior_version: i64,
     ) -> Result<(), WenlanError> {
+        if self
+            .migration_chain_start_version
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            log::info!(
+                "[migration] pre-migration {migration} backup skipped: the database was created \
+                 in this boot, so there is no earlier state to restore"
+            );
+            return Ok(());
+        }
         let source_path = {
             let conn = self.conn.lock().await;
             Self::main_db_path(&conn).await?

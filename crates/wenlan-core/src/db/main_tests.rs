@@ -501,6 +501,7 @@ pub async fn test_db() -> (MemoryDB, tempfile::TempDir) {
         community_grouping_runtime: std::sync::Mutex::new(
             crate::community_grouping::CommunityGroupingRuntime::default(),
         ),
+        migration_chain_start_version: std::sync::atomic::AtomicI64::new(-1),
     };
     memory_db
         .run_migrations(&crate::events::NoopEmitter)
@@ -566,6 +567,7 @@ pub async fn test_db_at(ceiling: i64) -> (MemoryDB, tempfile::TempDir) {
         community_grouping_runtime: std::sync::Mutex::new(
             crate::community_grouping::CommunityGroupingRuntime::default(),
         ),
+        migration_chain_start_version: std::sync::atomic::AtomicI64::new(-1),
     };
     memory_db
         .run_migrations_up_to(&crate::events::NoopEmitter, ceiling)
@@ -43738,6 +43740,7 @@ async fn startup_reconciles_v79_observations_without_source_memory_id() {
         community_grouping_runtime: std::sync::Mutex::new(
             crate::community_grouping::CommunityGroupingRuntime::default(),
         ),
+        migration_chain_start_version: std::sync::atomic::AtomicI64::new(-1),
     };
 
     db.run_migrations(&crate::events::NoopEmitter)
@@ -46338,6 +46341,43 @@ async fn backup_before_migration_publishes_a_valid_restore_point() {
         before, after,
         "an existing valid pre-migration backup must be preserved across a retry, not re-snapshotted"
     );
+}
+
+#[tokio::test]
+async fn a_database_created_in_this_boot_takes_no_pre_migration_backups() {
+    // Soak gap 7: a fresh install replays the whole chain from
+    // `user_version = 0`, and every backed-up migration used to leave a
+    // `pre_migration_<n>_backup.db` of an empty store beside the live db.
+    let (db, dir) = test_db().await;
+    let backups: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("pre_migration_"))
+        .collect();
+    assert!(
+        backups.is_empty(),
+        "a database created in this boot must take no pre-migration backups, found {backups:?}"
+    );
+    assert!(
+        db.get_app_metadata("backup_before_migration_123")
+            .await
+            .unwrap()
+            .is_none(),
+        "no backup receipt either"
+    );
+
+    // The same chain on a database that already existed still takes them.
+    let (db, dir) = test_db_at(122).await;
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
+    assert!(dir.path().join("pre_migration_123_backup.db").exists());
+    assert!(db
+        .get_app_metadata("backup_before_migration_123")
+        .await
+        .unwrap()
+        .is_some());
 }
 
 // -- M3 PR-1 stage f: store_entity dual-write + fence coverage --
@@ -54882,7 +54922,12 @@ async fn migration_123_downgrade_barrier_refuses_a_newer_database() {
 /// what proves the snapshot predates it.
 #[tokio::test]
 async fn the_pre_migration_123_backup_is_a_usable_restore_point() {
-    let (db, dir) = test_db().await;
+    // A database that already exists at 122 is what gets a restore point; a
+    // store created in this boot takes none (see the test below).
+    let (db, dir) = test_db_at(122).await;
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
     let dest = dir.path().join("pre_migration_123_backup.db");
     assert!(
         dest.exists(),

@@ -953,3 +953,90 @@ fn a_frozen_schema_five_reader_still_parses_the_fresh_store_check() {
     // The old reader simply does not see the action; it does not choke on it.
     assert_eq!(old.recommendation_code, None);
 }
+
+/// The two checks a fresh store with no model source used to fail on, as the
+/// daemon now produces them: complete, passing, expected-empty, each asking
+/// the owner to pick a model source.
+fn fresh_store_report() -> LintReport {
+    report(
+        LintScope::global(),
+        vec![
+            model_source_check("kg.substrate_liveness"),
+            model_source_check("serving.channel.graph"),
+        ],
+    )
+}
+
+fn model_source_check(check_id: &str) -> LintCheckResult {
+    LintCheckResult::try_new(LintCheckResultInput {
+        check_id: check_id.to_string(),
+        outcome: LintOutcome::Pass,
+        severity: LintSeverity::Info,
+        applicability: LintApplicability::ExpectedEmpty,
+        precondition: LintPrecondition::ExpectedEmpty,
+        coverage: coverage(0),
+        metrics: vec![],
+        summary_code: LintSummaryCode::ExpectedEmpty,
+        recommendation_code: None,
+        evidence: vec![],
+        duration_ms: 0,
+    })
+    .expect("expected-empty pass is a legal check result")
+    .with_action_code(Some(LintActionCode::ChooseModelSource))
+}
+
+#[test]
+fn the_model_source_checks_render_with_a_plain_sentence_and_no_findings() {
+    let rendered = fresh_store_report().render_text();
+
+    assert!(rendered.contains("0 actionable findings"), "{rendered}");
+    assert!(rendered.contains("Findings: none\n"), "{rendered}");
+    assert!(rendered.contains("Waiting on you (2):"), "{rendered}");
+    for check_id in ["kg.substrate_liveness", "serving.channel.graph"] {
+        assert!(
+            rendered.contains(&format!(
+                "  {check_id}: expected_empty; action: choose_model_source\n"
+            )),
+            "{rendered}"
+        );
+    }
+    assert!(
+        rendered.contains(
+            "    There was nothing here to check, which is the expected state right now. \
+             Run `wenlan setup` and choose a model source so Wenlan can build this in the \
+             background.\n"
+        ),
+        "{rendered}"
+    );
+}
+
+// Every rendered line carries the sentence, not just the new one -- the
+// codes stay for scripts, the English is for the person reading.
+#[test]
+fn a_rendered_finding_carries_both_the_code_and_the_plain_sentence() {
+    let rendered = report(
+        LintScope::global(),
+        vec![check_with_id(
+            "pages.projection.identity",
+            LintOutcome::Finding,
+            LintSeverity::Error,
+        )
+        .unwrap()],
+    )
+    .render_text();
+
+    assert!(
+        rendered.contains(
+            "  pages.projection.identity: finding_detected; recommendation: review_finding\n"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "    This check found records that do not match what Wenlan expects. \
+             Look at the listed records and fix or dismiss them.\n"
+        ),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Waiting on you: none\n"), "{rendered}");
+}
