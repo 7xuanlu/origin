@@ -773,3 +773,91 @@ fn coverage_deserialization_preserves_valid_methods_and_additive_fields() {
         assert!(coverage.is_ok());
     }
 }
+
+const ALL_SUMMARY_CODES: [LintSummaryCode; 6] = [
+    LintSummaryCode::CheckPassed,
+    LintSummaryCode::FindingDetected,
+    LintSummaryCode::PrerequisiteUnavailable,
+    LintSummaryCode::SnapshotInconsistent,
+    LintSummaryCode::ExecutionFailed,
+    LintSummaryCode::ExpectedEmpty,
+];
+
+const ALL_RECOMMENDATION_CODES: [LintRecommendationCode; 5] = [
+    LintRecommendationCode::ReviewFinding,
+    LintRecommendationCode::RestorePrerequisite,
+    LintRecommendationCode::RerunAfterSnapshotStabilizes,
+    LintRecommendationCode::InspectRuntime,
+    LintRecommendationCode::ChooseModelSource,
+];
+
+// The match arms are exhaustive by the compiler. What a test has to hold is
+// that nobody satisfied the compiler with a shared placeholder: every code says
+// its own thing, in a full sentence, so a rendered line reads as English.
+#[test]
+fn every_summary_and_recommendation_code_carries_its_own_plain_sentence() {
+    let meanings = ALL_SUMMARY_CODES
+        .iter()
+        .map(|code| code.meaning())
+        .collect::<Vec<_>>();
+    let actions = ALL_RECOMMENDATION_CODES
+        .iter()
+        .map(|code| code.action())
+        .collect::<Vec<_>>();
+
+    for sentence in meanings.iter().chain(actions.iter()) {
+        assert!(sentence.len() > 20, "{sentence:?} is not a sentence");
+        assert!(sentence.ends_with('.'), "{sentence:?} is not a sentence");
+        assert!(
+            !sentence.to_ascii_lowercase().contains("unknown"),
+            "{sentence:?} is a fallback, not a sentence"
+        );
+    }
+
+    assert_eq!(
+        meanings
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        meanings.len()
+    );
+    assert_eq!(
+        actions
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        actions.len()
+    );
+    assert!(LintRecommendationCode::ChooseModelSource
+        .action()
+        .contains("model source"));
+}
+
+// A passing, expected-empty check is allowed to carry advice: nothing is wrong,
+// the owner simply has to choose a model source before the substrate can exist.
+// This shape must stay legal and must round-trip on the wire.
+#[test]
+fn expected_empty_pass_may_recommend_choosing_a_model_source() {
+    let result = LintCheckResult::try_new(LintCheckResultInput {
+        check_id: "kg.substrate_liveness".to_string(),
+        outcome: LintOutcome::Pass,
+        severity: LintSeverity::Info,
+        applicability: LintApplicability::ExpectedEmpty,
+        precondition: LintPrecondition::ExpectedEmpty,
+        coverage: coverage(0),
+        metrics: vec![],
+        summary_code: LintSummaryCode::ExpectedEmpty,
+        recommendation_code: Some(LintRecommendationCode::ChooseModelSource),
+        evidence: vec![],
+        duration_ms: 0,
+    })
+    .expect("expected-empty pass with advice is a legal check result");
+
+    let encoded = serde_json::to_value(&result).unwrap();
+    assert_eq!(encoded["recommendation_code"], json!("choose_model_source"));
+    assert_eq!(encoded["precondition"], json!("expected_empty"));
+    assert_eq!(
+        serde_json::from_value::<LintCheckResult>(encoded).unwrap(),
+        result
+    );
+}

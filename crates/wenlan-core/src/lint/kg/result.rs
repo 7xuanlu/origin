@@ -19,6 +19,17 @@ pub(super) struct Assessment {
     evidence_positions: Vec<usize>,
     method: LintValidationMethod,
     basis: PopulationBasis,
+    /// Whether this assessment can point at individual records at all.
+    ///
+    /// `truncated` means "there was more evidence than we listed". An
+    /// aggregate-only assessment never produces evidence positions, so its
+    /// affected count can never be evidence that was cut off — reporting
+    /// `truncated=true` there tells the reader to go look for a list that does
+    /// not exist. Only an assessment that does emit positions can truncate.
+    reports_evidence: bool,
+    /// Advice to attach when the check passes. A finding always recommends
+    /// reviewing it; a pass is silent unless it is waiting on the owner.
+    passing_recommendation: Option<LintRecommendationCode>,
 }
 
 impl Assessment {
@@ -34,6 +45,8 @@ impl Assessment {
             evidence_positions: rows.evidence_positions,
             method: LintValidationMethod::FullEnumeration,
             basis: PopulationBasis::SelectedScope,
+            reports_evidence: true,
+            passing_recommendation: None,
         }
     }
 
@@ -66,11 +79,21 @@ impl Assessment {
             evidence_positions: Vec::new(),
             method: LintValidationMethod::ExactAggregate,
             basis,
+            reports_evidence: false,
+            passing_recommendation: None,
         }
     }
 
     pub(super) fn liveness(config: KgRunConfig, eligible: u64, linked: u64) -> Self {
-        let affected = if config.serving_enabled && eligible > 0 && linked == 0 {
+        // An empty graph substrate is only a defect once the graph could
+        // actually have been built. Two states make it the expected shape:
+        // the channel is switched off, or nobody has chosen a model source yet,
+        // so the enrichment that would populate it has never been authorized to
+        // run. `serving_enabled` is checked first: an owner who turned the
+        // channel off should not be told to go pick a model source for it.
+        let waiting_on_model_source = config.serving_enabled && !config.model_source_configured;
+        let live = config.serving_enabled && config.model_source_configured;
+        let affected = if live && eligible > 0 && linked == 0 {
             eligible
         } else {
             0
@@ -80,13 +103,15 @@ impl Assessment {
             population: eligible,
             affected,
             severity: LintSeverity::Warning,
-            applicability: if config.serving_enabled {
+            applicability: if live {
                 LintApplicability::Applicable
             } else {
                 LintApplicability::ExpectedEmpty
             },
-            precondition: if config.serving_enabled {
+            precondition: if live {
                 LintPrecondition::Ready
+            } else if waiting_on_model_source {
+                LintPrecondition::ExpectedEmpty
             } else {
                 LintPrecondition::ConfiguredOff
             },
@@ -110,6 +135,9 @@ impl Assessment {
             evidence_positions: Vec::new(),
             method: LintValidationMethod::ExactAggregate,
             basis: PopulationBasis::SelectedScope,
+            reports_evidence: false,
+            passing_recommendation: waiting_on_model_source
+                .then_some(LintRecommendationCode::ChooseModelSource),
         }
     }
 }
@@ -157,18 +185,23 @@ pub(super) fn finish(
             assessment.population,
             assessment.population,
             LINT_MAX_EVIDENCE_PER_CHECK,
-            assessment.affected > u64::try_from(evidence.len()).unwrap_or(u64::MAX),
+            assessment.reports_evidence
+                && assessment.affected > u64::try_from(evidence.len()).unwrap_or(u64::MAX),
             u64::try_from(evidence.len()).unwrap_or(u64::MAX),
         )?,
         metrics: assessment.metrics,
         summary_code: if finding {
             LintSummaryCode::FindingDetected
-        } else if assessment.precondition == LintPrecondition::ConfiguredOff {
+        } else if assessment.applicability == LintApplicability::ExpectedEmpty {
             LintSummaryCode::ExpectedEmpty
         } else {
             LintSummaryCode::CheckPassed
         },
-        recommendation_code: finding.then_some(LintRecommendationCode::ReviewFinding),
+        recommendation_code: if finding {
+            Some(LintRecommendationCode::ReviewFinding)
+        } else {
+            assessment.passing_recommendation
+        },
         evidence,
         duration_ms: context.clock().duration_ms(),
     })?;

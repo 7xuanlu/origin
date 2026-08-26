@@ -152,6 +152,33 @@ pub enum LintSummaryCode {
     ExecutionFailed,
     ExpectedEmpty,
 }
+impl LintSummaryCode {
+    /// One plain sentence saying what this outcome means for the reader.
+    ///
+    /// Every surface that shows a check line pairs this with
+    /// [`LintRecommendationCode::action`] so the reader never has to decode a
+    /// snake_case code. The table lives here, beside the codes, because the
+    /// CLI and the MCP tool both render it; `wenlan-types` stays dependency
+    /// free, so these are plain `&'static str`.
+    pub const fn meaning(self) -> &'static str {
+        match self {
+            Self::CheckPassed => "This check looked at everything it covers and found nothing wrong.",
+            Self::FindingDetected => {
+                "This check found records that do not match what Wenlan expects."
+            }
+            Self::PrerequisiteUnavailable => {
+                "This check could not run because something it depends on was missing."
+            }
+            Self::SnapshotInconsistent => {
+                "Your data changed while this check was reading it, so its answer is not trustworthy."
+            }
+            Self::ExecutionFailed => "This check hit an error and did not finish.",
+            Self::ExpectedEmpty => {
+                "There was nothing here to check, which is the expected state right now."
+            }
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LintRecommendationCode {
@@ -159,6 +186,30 @@ pub enum LintRecommendationCode {
     RestorePrerequisite,
     RerunAfterSnapshotStabilizes,
     InspectRuntime,
+    /// The check needs a model source and none is chosen yet. Pairs with a
+    /// passing, expected-empty verdict: nothing is broken, the owner simply has
+    /// not picked where inference runs.
+    ChooseModelSource,
+}
+impl LintRecommendationCode {
+    /// One plain sentence saying what to do next. See [`LintSummaryCode::meaning`].
+    pub const fn action(self) -> &'static str {
+        match self {
+            Self::ReviewFinding => "Look at the listed records and fix or dismiss them.",
+            Self::RestorePrerequisite => {
+                "Restore the missing piece this check needs, then run `wenlan lint` again."
+            }
+            Self::RerunAfterSnapshotStabilizes => {
+                "Run `wenlan lint` again once writes have settled."
+            }
+            Self::InspectRuntime => {
+                "Check the daemon logs for the error behind this, then run `wenlan lint` again."
+            }
+            Self::ChooseModelSource => {
+                "Run `wenlan setup` and choose a model source so Wenlan can build this in the background."
+            }
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

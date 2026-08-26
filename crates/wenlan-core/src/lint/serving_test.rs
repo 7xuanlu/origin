@@ -1,10 +1,10 @@
-use super::{assess_channel, ChannelAssessment, CHANNEL_FACT_ID, ROUTE_SCOPE_ID};
+use super::{assess_channel, ChannelAssessment, CHANNEL_FACT_ID, CHANNEL_GRAPH_ID, ROUTE_SCOPE_ID};
 use crate::db::tests::test_db;
 use crate::lint::context::{CancellationToken, LintClock};
 use crate::lint::runner::LintRunner;
 use wenlan_types::lint::{
     LintApplicability, LintMetricCode, LintMetricValue, LintOutcome, LintPrecondition, LintQuery,
-    LintSummaryCode,
+    LintRecommendationCode, LintSummaryCode,
 };
 
 #[path = "serving_review_fact_test.rs"]
@@ -37,6 +37,132 @@ fn disabled_channel_is_expected_empty() {
     assert_eq!(result.applicability(), LintApplicability::ExpectedEmpty);
     assert_eq!(result.precondition(), LintPrecondition::ConfiguredOff);
     assert_eq!(result.summary_code(), LintSummaryCode::ExpectedEmpty);
+}
+
+// Tracker row 17: the graph channel serves a substrate that model-backed
+// background enrichment builds. With no model source chosen, an empty channel
+// is the expected state and the fix is a settings choice, not a repair -- so it
+// passes, carries the "choose a model source" advice, and does not gate a fresh
+// install's exit code.
+#[test]
+fn graph_channel_without_a_model_source_passes_and_says_to_choose_one() {
+    let result = super::channel_result(
+        &LintClock::fixed(),
+        CHANNEL_GRAPH_ID,
+        ChannelAssessment::ModelSourceUnconfigured { eligible: 2 },
+    );
+    assert_eq!(result.outcome(), LintOutcome::Pass);
+    assert_eq!(result.applicability(), LintApplicability::ExpectedEmpty);
+    assert_eq!(result.precondition(), LintPrecondition::ExpectedEmpty);
+    assert_eq!(result.summary_code(), LintSummaryCode::ExpectedEmpty);
+    assert_eq!(
+        result.recommendation_code(),
+        Some(LintRecommendationCode::ChooseModelSource)
+    );
+    // No opaque ordinals for a state that is not a defect.
+    assert!(result.evidence().is_empty());
+    assert!(!result.coverage().truncated());
+    assert_eq!(result.coverage().denominator(), 2);
+}
+
+// End to end through the runner: the captured model-source pin reaches the
+// graph channel, and it is the only channel it reaches. A channel the owner
+// switched off keeps saying so rather than nagging about a model source it will
+// not use, and dropping the graph finding takes the report's actionable count
+// down with it.
+#[tokio::test]
+async fn the_model_source_pin_reaches_only_the_graph_channel_through_the_runner() {
+    let (db, _tmp) = test_db().await;
+    insert_memory(&db, "eligible", None).await;
+
+    let unconfigured = run_with_kg_config(&db, kg_config(false)).await;
+    let graph = channel(&unconfigured, CHANNEL_GRAPH_ID);
+    assert_eq!(graph.outcome(), LintOutcome::Pass);
+    assert_eq!(graph.applicability(), LintApplicability::ExpectedEmpty);
+    assert_eq!(graph.precondition(), LintPrecondition::ExpectedEmpty);
+    assert_eq!(
+        graph.recommendation_code(),
+        Some(LintRecommendationCode::ChooseModelSource)
+    );
+    assert!(unconfigured.complete());
+
+    // The fact channel is off in this fixture and stays configured-off.
+    let fact = channel(&unconfigured, CHANNEL_FACT_ID);
+    assert_eq!(fact.precondition(), LintPrecondition::ConfiguredOff);
+    assert_eq!(fact.recommendation_code(), None);
+
+    // The same store with a model source chosen: the graph channel and the kg
+    // liveness check are exactly what the fresh-store report stops gating on.
+    let configured = run_with_kg_config(&db, kg_config(true)).await;
+    assert_eq!(
+        channel(&configured, CHANNEL_GRAPH_ID).outcome(),
+        LintOutcome::Finding
+    );
+    let mut newly_gating = actionable_ids(&configured);
+    for id in actionable_ids(&unconfigured) {
+        assert!(newly_gating.remove(&id), "{id} lost its finding");
+    }
+    assert_eq!(
+        newly_gating,
+        ["kg.substrate_liveness", CHANNEL_GRAPH_ID]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+}
+
+fn actionable_ids(report: &wenlan_types::lint::LintReport) -> std::collections::BTreeSet<String> {
+    report
+        .checks()
+        .iter()
+        .filter(|check| {
+            check.outcome() == LintOutcome::Finding
+                && check.gate_effect() == wenlan_types::lint::LintGateEffect::Actionable
+        })
+        .map(|check| check.check_id().to_string())
+        .collect()
+}
+
+fn kg_config(model_source_configured: bool) -> crate::lint::kg::KgRunConfig {
+    crate::lint::kg::KgRunConfig::for_test(true, true, true, model_source_configured, 20)
+}
+
+async fn run_with_kg_config(
+    db: &crate::db::MemoryDB,
+    config: crate::lint::kg::KgRunConfig,
+) -> wenlan_types::lint::LintReport {
+    temp_env::async_with_vars(
+        [
+            ("WENLAN_ENABLE_PAGE_CHANNEL", Some("0")),
+            ("WENLAN_ENABLE_EPISODE_CHANNEL", Some("0")),
+            ("WENLAN_ENABLE_FACT_CHANNEL", Some("0")),
+            ("WENLAN_ENABLE_GLOBAL_PRELUDE", Some("0")),
+        ],
+        LintRunner::new(LintClock::fixed(), CancellationToken::new())
+            .with_test_kg_config(config)
+            .run(
+                db,
+                &LintQuery {
+                    profile: None,
+                    space: None,
+                },
+                None,
+                false,
+            ),
+    )
+    .await
+    .unwrap()
+}
+
+fn channel<'a>(
+    report: &'a wenlan_types::lint::LintReport,
+    id: &str,
+) -> &'a wenlan_types::lint::LintCheckResult {
+    report
+        .checks()
+        .iter()
+        .find(|check| check.check_id() == id)
+        .unwrap()
 }
 
 #[tokio::test]
