@@ -2296,6 +2296,8 @@ jobs:
           python3 scripts/validate-codex-plugin-slice.py
           python3 scripts/validate-plugin-contract.py
           bash scripts/validate-plugin-contract.test.sh
+      - name: Run the SessionStart hook tests
+        run: bash plugin/hooks/test-check-daemon.sh
       - name: Validate skill frontmatter
         run: |
           for f in plugin/skills/*/SKILL.md; do
