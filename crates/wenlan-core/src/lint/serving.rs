@@ -31,6 +31,10 @@ pub(crate) struct ServingRunConfig {
     pub(crate) reranker_deep: bool,
     pub(crate) reranker_paths: u64,
     pub(crate) fact_limit: usize,
+    /// Whether the owner has chosen a model source. Threaded from
+    /// [`crate::lint::kg::KgRunConfig`] so both this check and
+    /// `kg.substrate_liveness` read one captured value.
+    model_source_configured: bool,
 }
 
 impl ServingRunConfig {
@@ -41,6 +45,7 @@ impl ServingRunConfig {
         fact_limit: usize,
         reranker_light: bool,
         reranker_deep: bool,
+        model_source_configured: bool,
     ) -> Self {
         Self {
             page,
@@ -53,15 +58,29 @@ impl ServingRunConfig {
             reranker_deep,
             reranker_paths: u64::from(reranker_light) + u64::from(reranker_deep),
             fact_limit,
+            model_source_configured,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChannelAssessment {
-    ExpectedEmpty { eligible: u64 },
-    Finding { eligible: u64 },
-    Live { eligible: u64, observed: u64 },
+    ExpectedEmpty {
+        eligible: u64,
+    },
+    /// The channel is on, but the substrate it serves is built by background
+    /// enrichment that has no model source to run on. Empty is the expected
+    /// state, and the fix is a settings choice, not a repair.
+    ModelSourceUnconfigured {
+        eligible: u64,
+    },
+    Finding {
+        eligible: u64,
+    },
+    Live {
+        eligible: u64,
+        observed: u64,
+    },
 }
 
 pub(crate) const fn assess_channel(
@@ -95,18 +114,24 @@ pub(crate) async fn run(
         route_scope_finding(bypasses),
         false,
     )];
-    for (id, enabled, count) in [
-        (CHANNEL_EPISODE_ID, config.episode, counts.episode),
-        (CHANNEL_FACT_ID, config.fact, counts.fact),
-        (CHANNEL_GRAPH_ID, config.graph, counts.graph),
-        (CHANNEL_PAGE_ID, config.page, counts.page),
-        (CHANNEL_SUMMARY_ID, config.summary, counts.summary),
+    // The graph channel is the one channel here whose substrate is built by
+    // model-backed background enrichment. With no model source chosen, an empty
+    // graph is the expected state, not a dead channel.
+    for (id, enabled, count, needs_model_source) in [
+        (CHANNEL_EPISODE_ID, config.episode, counts.episode, false),
+        (CHANNEL_FACT_ID, config.fact, counts.fact, false),
+        (CHANNEL_GRAPH_ID, config.graph, counts.graph, true),
+        (CHANNEL_PAGE_ID, config.page, counts.page, false),
+        (CHANNEL_SUMMARY_ID, config.summary, counts.summary, false),
     ] {
-        results.push(result::channel(
-            context,
-            id,
-            assess_channel(id, enabled, count.eligible, count.observed),
-        ));
+        let assessment = if enabled && needs_model_source && !config.model_source_configured {
+            ChannelAssessment::ModelSourceUnconfigured {
+                eligible: count.eligible,
+            }
+        } else {
+            assess_channel(id, enabled, count.eligible, count.observed)
+        };
+        results.push(result::channel(context, id, assessment));
     }
     let fact_probe = if config.fact {
         match fact_probe::run(context, config.fact_limit).await {

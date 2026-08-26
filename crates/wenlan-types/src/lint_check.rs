@@ -14,6 +14,12 @@ pub struct LintCheckResult {
     metrics: Vec<LintMetric>,
     summary_code: LintSummaryCode,
     recommendation_code: Option<LintRecommendationCode>,
+    /// Additive since schema 5; see [`LintActionCode`] for why this is a field
+    /// and not a fifth `recommendation_code` variant. Omitted from the wire
+    /// entirely when absent, so a report that carries no action serializes
+    /// exactly as it did before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action_code: Option<LintActionCode>,
     evidence: Vec<LintEvidenceRef>,
     duration_ms: u64,
 }
@@ -37,6 +43,11 @@ struct LintCheckResultWire {
     input: LintCheckResultInput,
     #[serde(default)]
     gate_effect: LintGateEffect,
+    /// Read outside `LintCheckResultInput` on purpose: the input struct is the
+    /// frozen schema-5 shape that older readers also parse, and keeping the
+    /// additive field out of it means the two stay the same struct.
+    #[serde(default)]
+    action_code: Option<LintActionCode>,
 }
 impl LintCheckResult {
     pub fn try_new(input: LintCheckResultInput) -> Result<Self, LintContractError> {
@@ -134,9 +145,21 @@ impl LintCheckResult {
             metrics,
             summary_code,
             recommendation_code,
+            action_code: None,
             evidence,
             duration_ms,
         })
+    }
+
+    /// Attach an owner-facing action to an already legal result.
+    ///
+    /// Separate from `try_new` so the ~20 existing `LintCheckResultInput`
+    /// literals in the tree keep compiling unchanged; only a producer that has
+    /// something to ask of the owner calls this.
+    #[must_use]
+    pub fn with_action_code(mut self, action_code: Option<LintActionCode>) -> Self {
+        self.action_code = action_code;
+        self
     }
     pub fn check_id(&self) -> &str {
         &self.check_id
@@ -168,6 +191,9 @@ impl LintCheckResult {
     pub const fn recommendation_code(&self) -> Option<LintRecommendationCode> {
         self.recommendation_code
     }
+    pub const fn action_code(&self) -> Option<LintActionCode> {
+        self.action_code
+    }
     pub fn evidence(&self) -> &[LintEvidenceRef] {
         &self.evidence
     }
@@ -181,6 +207,8 @@ impl<'de> Deserialize<'de> for LintCheckResult {
         D: Deserializer<'de>,
     {
         let wire = LintCheckResultWire::deserialize(deserializer)?;
-        Self::try_new_with_gate_effect(wire.input, wire.gate_effect).map_err(D::Error::custom)
+        Self::try_new_with_gate_effect(wire.input, wire.gate_effect)
+            .map(|result| result.with_action_code(wire.action_code))
+            .map_err(D::Error::custom)
     }
 }

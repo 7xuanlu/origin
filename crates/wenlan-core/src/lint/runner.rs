@@ -208,7 +208,11 @@ impl LintRunner {
             #[cfg(not(test))]
             super::kg::KgRunConfig::capture()
         };
-        let serving_config = super::serving::capture(memory_config, kg_config.serving_enabled);
+        let serving_config = super::serving::capture(
+            memory_config,
+            kg_config.serving_enabled,
+            kg_config.model_source_configured,
+        );
         let semantic_provider_ready = self
             .semantic_provider
             .as_deref()

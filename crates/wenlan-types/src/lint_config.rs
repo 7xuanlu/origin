@@ -30,6 +30,7 @@ pub enum LintConfigSetting {
     SemanticProviderOnDevice,
     SemanticExternalEgressEnabled,
     SemanticCallingAgentEnabled,
+    ModelSourceConfigured,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -93,6 +94,7 @@ impl LintConfigSelection {
             LintConfigSetting::SemanticProviderOnDevice => 24,
             LintConfigSetting::SemanticExternalEgressEnabled => 25,
             LintConfigSetting::SemanticCallingAgentEnabled => 26,
+            LintConfigSetting::ModelSourceConfigured => 27,
         };
         let mut bytes = vec![setting];
         match self.value {
