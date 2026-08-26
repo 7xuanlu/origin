@@ -14,8 +14,9 @@
 //! and [`stop_sidecar`] ends it on quit, and on Windows the process is bound
 //! to a kill-on-close job object so a hard kill of the app takes it too.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri_plugin_shell::process::CommandChild;
 use tokio::sync::RwLock;
 
@@ -40,38 +41,62 @@ fn startup_preflight_ok() -> bool {
 /// handle used to be dropped at spawn, so the daemon outlived the app on
 /// every exit path (first-run gauntlet finding F14); the shell plugin only
 /// kills children spawned through its JS `execute` command.
-static SIDECAR: Mutex<Option<CommandChild>> = Mutex::new(None);
+static SIDECAR: Mutex<Option<(u64, CommandChild)>> = Mutex::new(None);
 
-/// How long [`stop_sidecar`] waits for a SIGTERM to be honored before it
-/// kills: the daemon drains and exits in about a second.
-#[cfg(unix)]
-const SIDECAR_STOP_POLLS: usize = 30;
-#[cfg(unix)]
-const SIDECAR_STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Counts spawns. The shell plugin's own wait thread reaps a child that exits
+/// on its own, and a later spawn can reuse its PID, so a termination event
+/// clears the slot only when it names the same spawn.
+static SIDECAR_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-fn remember_sidecar(child: CommandChild) {
-    *SIDECAR
+/// How long [`stop_sidecar`] waits for the daemon to release its port after
+/// the shutdown request before it kills the child: the daemon drains and
+/// exits in about a second.
+const SIDECAR_STOP_LIMIT: Duration = Duration::from_secs(3);
+
+/// Remember a freshly spawned sidecar; returns its spawn generation. A child
+/// still in the slot is killed first: two sidecars would race for one port,
+/// and the first would be left unowned.
+fn remember_sidecar(child: CommandChild) -> u64 {
+    let generation = SIDECAR_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let previous = SIDECAR
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace((generation, child));
+    if let Some((old_generation, old)) = previous {
+        log::warn!(
+            "[daemon-start] sidecar {} (spawn {old_generation}) was still in the slot; killing it",
+            old.pid()
+        );
+        if let Err(e) = old.kill() {
+            log::warn!("[daemon-start] could not kill the earlier sidecar: {e}");
+        }
+    }
+    generation
 }
 
-fn forget_sidecar(pid: u32) {
+fn forget_sidecar(generation: u64) {
     let mut slot = SIDECAR
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if slot.as_ref().is_some_and(|child| child.pid() == pid) {
+    if slot
+        .as_ref()
+        .is_some_and(|(spawned, _)| *spawned == generation)
+    {
         *slot = None;
     }
 }
 
-/// Stop the sidecar this app spawned, if any. On Unix it asks first (SIGTERM)
-/// and kills only after a bounded wait; on Windows the daemon was already
-/// asked over HTTP by the quit flow, so what is left is killed. A daemon
-/// owned by launchd or the Task Scheduler is never in the slot and is never
-/// touched. Without this a quit left the daemon holding the port, and the
-/// next launch adopted the stale one (the upgrade shape of finding F2).
+/// Stop the sidecar this app spawned, if any: ask the daemon to shut down
+/// over HTTP (its own clean path, the one the quit flow uses), wait a bounded
+/// time for it to release the port, and kill it only if it has not. The kill
+/// goes through the child handle, which is a no-op once the child was reaped,
+/// so it can never reach a process that reused the PID; a raw signal to the
+/// numeric PID could. A daemon owned by launchd or the Task Scheduler is never
+/// in the slot and is never touched. Without this a quit left the daemon
+/// holding the port, and the next launch adopted the stale one (the upgrade
+/// shape of finding F2).
 pub async fn stop_sidecar() {
-    let Some(child) = SIDECAR
+    let Some((_, child)) = SIDECAR
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
@@ -79,28 +104,23 @@ pub async fn stop_sidecar() {
         return;
     };
     let pid = child.pid();
-    #[cfg(unix)]
+    let client = crate::api::WenlanClient::new();
+    if let Ok(http) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
     {
-        let sys_pid = sysinfo::Pid::from_u32(pid);
-        let mut system = sysinfo::System::new();
-        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sys_pid]), true);
-        if let Some(process) = system.process(sys_pid) {
-            process.kill_with(sysinfo::Signal::Term);
-        }
-        for _ in 0..SIDECAR_STOP_POLLS {
-            tokio::time::sleep(SIDECAR_STOP_POLL_INTERVAL).await;
-            system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sys_pid]), true);
-            let gone = match system.process(sys_pid) {
-                None => true,
-                Some(process) => process.status() == sysinfo::ProcessStatus::Zombie,
-            };
-            if gone {
-                log::info!("[daemon-start] sidecar {pid} exited after SIGTERM");
-                return;
-            }
-        }
-        log::warn!("[daemon-start] sidecar {pid} still running after SIGTERM; killing it");
+        let _ = http
+            .post(crate::lifecycle::shutdown_url_for(&client))
+            .send()
+            .await;
     }
+    if crate::lifecycle::wait_for_daemon_to_stop(SIDECAR_STOP_LIMIT).await {
+        log::info!("[daemon-start] sidecar {pid} released the port after the shutdown request");
+        return;
+    }
+    log::warn!(
+        "[daemon-start] sidecar {pid} still holds the port after {SIDECAR_STOP_LIMIT:?}; killing it"
+    );
     match child.kill() {
         Ok(()) => log::info!("[daemon-start] killed sidecar {pid}"),
         Err(e) => log::warn!("[daemon-start] could not kill sidecar {pid}: {e}"),
@@ -254,7 +274,7 @@ pub fn spawn_daemon_sidecar(app: &tauri::AppHandle) -> Result<(), String> {
     if let Err(e) = job::bind(pid) {
         log::warn!("[daemon-start] sidecar {pid} is not bound to the app's job object: {e}");
     }
-    remember_sidecar(child);
+    let generation = remember_sidecar(child);
     tauri::async_runtime::spawn(async move {
         use tauri_plugin_shell::process::CommandEvent;
         while let Some(event) = rx.recv().await {
@@ -267,7 +287,7 @@ pub fn spawn_daemon_sidecar(app: &tauri::AppHandle) -> Result<(), String> {
                 }
                 CommandEvent::Terminated(status) => {
                     log::warn!("[daemon] exited: {:?}", status);
-                    forget_sidecar(pid);
+                    forget_sidecar(generation);
                     break;
                 }
                 _ => {}

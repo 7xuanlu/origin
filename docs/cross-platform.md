@@ -16,9 +16,17 @@ Supported builds and prebuilt releases cover macOS arm64, Linux x86_64/aarch64 w
 The Windows desktop app installs to `%LOCALAPPDATA%\Programs\Wenlan`:
 `app/windows/installer-hooks.nsh` moves the NSIS per-user default off
 `%LOCALAPPDATA%\Wenlan`, which is the CLI data root above on a case-insensitive
-filesystem. A directory the user picks in the installer is kept. In sidecar mode
-(no service registration) the app binds the daemon to a kill-on-close job object on
-Windows and sends it SIGTERM on quit elsewhere, so the daemon never outlives the app.
+filesystem. A directory the user picks in the installer is kept, and so is the
+directory of an install that predates the move when the in-app updater runs (that
+path skips the old uninstaller and keeps the existing shortcuts); running the full
+installer moves it.
+
+In sidecar mode (no service registration) a quit or SIGTERM asks the daemon to shut
+down over HTTP and kills it through the child handle if it has not released the port
+within 3 s. On Windows the sidecar is also bound to a kill-on-close job object, so an
+app crash takes it down too; when that binding fails the app logs it and keeps the
+daemon running, and the crash case is then not covered. A launchd, systemd, or Task
+Scheduler daemon is service-owned and outlives the app by design.
 
 ## llama-cpp-2 backend
 

@@ -1116,11 +1116,32 @@ pub fn run() {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     use tokio::signal::unix::{signal, SignalKind};
+                    // A second SIGTERM, or a stop that hangs, must still end the
+                    // process: `kill <pid>` has to mean exit.
+                    const SIGTERM_STOP_LIMIT: std::time::Duration =
+                        std::time::Duration::from_secs(10);
                     match signal(SignalKind::terminate()) {
                         Ok(mut sigterm) => {
                             sigterm.recv().await;
                             log::info!("[app] SIGTERM received; stopping the sidecar and exiting");
-                            crate::daemon_start::stop_sidecar().await;
+                            tauri::async_runtime::spawn(async move {
+                                sigterm.recv().await;
+                                log::warn!(
+                                    "[app] second SIGTERM; exiting without waiting for the sidecar"
+                                );
+                                std::process::exit(1);
+                            });
+                            if tokio::time::timeout(
+                                SIGTERM_STOP_LIMIT,
+                                crate::daemon_start::stop_sidecar(),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                log::warn!(
+                                    "[app] sidecar stop did not finish within {SIGTERM_STOP_LIMIT:?}; exiting anyway"
+                                );
+                            }
                             handle.exit(0);
                         }
                         Err(e) => log::warn!("[app] cannot listen for SIGTERM: {e}"),
