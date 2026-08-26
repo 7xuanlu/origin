@@ -541,10 +541,23 @@ def contract_violations(
         "Existing release asset $name differs; refusing to clobber.",
         "name: release-promotion-plan-${{ github.run_id }}",
         "name: homebrew-artifacts",
+        "promoted-assets/wenlan-darwin-arm64.tar.gz",
         "name: docker-runtime-inputs",
     ]:
         if marker not in promote:
             violations.append(f"validated asset promotion omits {marker!r}")
+    # `wenlan background on` needs wenlan-server next to the brewed CLI, so the
+    # `wenlan` formula must install from the full darwin archive and ship both.
+    homebrew = job_body(release, "update-homebrew")
+    for marker in [
+        "shasum -a 256 wenlan-darwin-arm64.tar.gz",
+        'bin.install "wenlan", "wenlan-server"',
+        'shell_output("#{bin}/wenlan-server --help")',
+    ]:
+        if marker not in homebrew:
+            violations.append(f"Homebrew wenlan formula omits {marker!r}")
+    if "wenlan-cli-darwin-arm64.tar.gz" in homebrew:
+        violations.append("Homebrew wenlan formula still installs the CLI-only archive")
 
     app_bundle = job_body(release, "app-bundle")
     app_bundle_windows = job_body(release, "app-bundle-windows")
