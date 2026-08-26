@@ -760,8 +760,19 @@ fn print_last_daemon_error() {
 /// clean shutdown is history rather than the current state.
 #[cfg(any(target_os = "macos", test))]
 fn last_daemon_error(log_path: &std::path::Path) -> Option<String> {
+    last_daemon_error_since(log_path, 0)
+}
+
+/// Like [`last_daemon_error`], but only the bytes written after `offset`
+/// count: a caller that noted the log's length before starting the daemon
+/// never blames this start for an error from an earlier run.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn last_daemon_error_since(log_path: &std::path::Path, offset: u64) -> Option<String> {
     let bytes = std::fs::read(log_path).ok()?;
-    let lines: Vec<String> = String::from_utf8_lossy(&bytes)
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    let lines: Vec<String> = String::from_utf8_lossy(&bytes[start..])
         .lines()
         .map(strip_ansi)
         .collect();
@@ -981,7 +992,37 @@ fn prompt_secret(prompt: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod doctor_tests {
-    use super::{last_daemon_error, strip_ansi};
+    use super::{last_daemon_error, last_daemon_error_since, strip_ansi};
+
+    #[test]
+    fn last_daemon_error_since_ignores_errors_written_before_the_mark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("wenlan-server.log");
+        std::fs::write(
+            &log,
+            "INFO wenlan-server v0.17.0\nERROR wenlan_server: stale failure from last week\n",
+        )
+        .expect("write log");
+        let mark = std::fs::metadata(&log).expect("metadata").len();
+        assert_eq!(last_daemon_error_since(&log, mark), None);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .expect("open log");
+        std::io::Write::write_all(
+            &mut file,
+            b"INFO wenlan-server v0.17.1\nERROR wenlan_server: fresh failure\n",
+        )
+        .expect("append");
+        assert_eq!(
+            last_daemon_error_since(&log, mark).as_deref(),
+            Some("ERROR wenlan_server: fresh failure")
+        );
+        assert_eq!(
+            last_daemon_error(&log).as_deref(),
+            Some("ERROR wenlan_server: fresh failure")
+        );
+    }
 
     #[test]
     fn last_daemon_error_returns_the_final_error_line_without_colour_codes() {

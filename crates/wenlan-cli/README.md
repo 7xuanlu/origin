@@ -84,7 +84,7 @@ wenlan setup --anthropic-api-key-env ANTHROPIC_API_KEY
 
 ### `wenlan background <on|off>`
 
-Start or stop the per-user background runtime. `wenlan background off` stops the current daemon while preserving its login registration and writes `<data root>/autostart.off`, so recovery will not start it again. Run `wenlan background on` to remove the marker and start it again; it waits up to 10 s for the daemon to answer and, on macOS, reports the daemon's last logged error instead of a false "started". Most users run `wenlan background on` once after setup and `wenlan restart` after upgrades installed outside `wenlan setup`.
+Start or stop the per-user background runtime. `wenlan background off` stops the current daemon while preserving its login registration and writes `<data root>/autostart.off`, so recovery will not start it again. Run `wenlan background on` to remove the marker and start it again; it waits up to 10 s for the daemon to answer before saying "started" and, on macOS, reports an error the daemon logged during this start (never one left over from an earlier run). Most users run `wenlan background on` once after setup and `wenlan restart` after upgrades installed outside `wenlan setup`.
 
 ```bash
 wenlan background on

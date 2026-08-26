@@ -55740,26 +55740,43 @@ fn daemon_cache_dir_never_falls_through_to_the_cwd_default() {
     let db_path = dir.path();
     // Nothing populated, nothing configured: the store's own directory.
     assert_eq!(
-        daemon_fastembed_cache_dir_from(None, None, db_path),
+        daemon_fastembed_cache_dir_from(None, None, None, db_path),
         db_path.join("fastembed_cache")
     );
     // The CI hook keeps its pre-populated cache.
     assert_eq!(
-        daemon_fastembed_cache_dir_from(None, Some("/ci/cache".into()), db_path),
+        daemon_fastembed_cache_dir_from(None, None, Some("/ci/cache".into()), db_path),
         std::path::PathBuf::from("/ci/cache")
     );
     // An empty override is not a directory.
     assert_eq!(
-        daemon_fastembed_cache_dir_from(None, Some("".into()), db_path),
+        daemon_fastembed_cache_dir_from(None, None, Some("".into()), db_path),
         db_path.join("fastembed_cache")
     );
-    // A populated cache always wins.
+    // A populated cache beats the configured one.
     assert_eq!(
         daemon_fastembed_cache_dir_from(
+            None,
             Some("/populated".into()),
             Some("/ci/cache".into()),
             db_path
         ),
         std::path::PathBuf::from("/populated")
+    );
+    // HF_HOME beats everything: fastembed uses it for the text model whatever
+    // the daemon configures, so the reranker, lock and messages follow it.
+    assert_eq!(
+        daemon_fastembed_cache_dir_from(
+            Some("/hf/home".into()),
+            Some("/populated".into()),
+            Some("/ci/cache".into()),
+            db_path
+        ),
+        std::path::PathBuf::from("/hf/home")
+    );
+    // An empty HF_HOME is not a directory either.
+    assert_eq!(
+        daemon_fastembed_cache_dir_from(Some("".into()), None, None, db_path),
+        db_path.join("fastembed_cache")
     );
 }

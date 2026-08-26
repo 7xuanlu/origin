@@ -1512,17 +1512,23 @@ pub fn resolve_fastembed_cache_dir(db_path: &std::path::Path) -> Option<std::pat
     None
 }
 
-/// The cache directory the daemon hands to fastembed. Unlike
-/// [`resolve_fastembed_cache_dir`] this never returns `None`: fastembed's own
-/// default is `.fastembed_cache` **relative to the process working directory**
-/// (`FASTEMBED_CACHE_DIR` overrides it), and launchd starts the daemon with
-/// cwd `/`, so a first boot that fell through could never write the model
-/// download and every launchd attempt died with `Failed to retrieve
-/// model_optimized.onnx` (first-run gauntlet finding F4). Order: a populated
-/// cache from the resolver, then `FASTEMBED_CACHE_DIR` (CI pre-populates it),
+/// The cache directory the daemon hands to fastembed, for the text embedder
+/// and every reranker alike. Unlike [`resolve_fastembed_cache_dir`] this never
+/// returns `None`: fastembed's own default is `.fastembed_cache` **relative to
+/// the process working directory** (`FASTEMBED_CACHE_DIR` overrides it), and
+/// launchd starts the daemon with cwd `/`, so a first boot that fell through
+/// could never write the model download and every launchd attempt died with
+/// `Failed to retrieve model_optimized.onnx` (first-run gauntlet finding F4).
+///
+/// Order: a non-empty `HF_HOME` first — fastembed 5.13 gives it precedence
+/// over the configured directory for text models but ignores it for
+/// rerankers, so naming it here keeps every model, the lock, the log line and
+/// the error message on the directory fastembed really uses; then a populated
+/// cache from the resolver; then `FASTEMBED_CACHE_DIR` (CI pre-populates it);
 /// then `<db_path>/fastembed_cache` next to the store.
 pub fn daemon_fastembed_cache_dir(db_path: &std::path::Path) -> std::path::PathBuf {
     daemon_fastembed_cache_dir_from(
+        std::env::var_os("HF_HOME"),
         resolve_fastembed_cache_dir(db_path),
         std::env::var_os("FASTEMBED_CACHE_DIR"),
         db_path,
@@ -1530,10 +1536,14 @@ pub fn daemon_fastembed_cache_dir(db_path: &std::path::Path) -> std::path::PathB
 }
 
 fn daemon_fastembed_cache_dir_from(
+    hf_home: Option<std::ffi::OsString>,
     existing: Option<std::path::PathBuf>,
     configured: Option<std::ffi::OsString>,
     db_path: &std::path::Path,
 ) -> std::path::PathBuf {
+    if let Some(hf_home) = hf_home.filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(hf_home);
+    }
     if let Some(existing) = existing {
         return existing;
     }
@@ -4401,6 +4411,13 @@ impl MemoryDB {
         // starts the daemon at `/`, where the first-run download cannot be
         // written — every launchd attempt died with "Failed to retrieve
         // model_optimized.onnx" (first-run gauntlet finding F4).
+        // fastembed treats an empty HF_HOME as set and resolves it against the
+        // working directory, which is exactly the launchd failure above.
+        if std::env::var_os("HF_HOME").is_some_and(|value| value.is_empty()) {
+            return Err(WenlanError::Embedding(
+                "HF_HOME is set but empty, so the embedding model would download into the working directory; unset it or point it at a writable directory".into(),
+            ));
+        }
         let embed_cache_dir = daemon_fastembed_cache_dir(db_path);
         std::fs::create_dir_all(&embed_cache_dir).map_err(|e| {
             WenlanError::Embedding(format!(
