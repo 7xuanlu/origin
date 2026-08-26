@@ -27,6 +27,14 @@ pub fn set_handover_bundle(bundle: PathBuf) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bundle);
 }
 
+/// Drop a pending handover: the frontend refused the quit (it could not
+/// save), so the user keeps this app and a later, unrelated quit must not
+/// reopen the newer bundle.
+#[cfg(target_os = "macos")]
+pub fn clear_handover_bundle() {
+    take_handover_bundle();
+}
+
 #[cfg(target_os = "macos")]
 fn take_handover_bundle() -> Option<PathBuf> {
     HANDOVER_BUNDLE
@@ -35,13 +43,15 @@ fn take_handover_bundle() -> Option<PathBuf> {
         .take()
 }
 
-/// Finish a quit: schedule the handover reopen when one is pending, then exit.
-fn exit_after_quit(app_handle: &AppHandle) {
+/// Finish a quit: schedule the handover reopen when one is pending, then exit
+/// with `code`. A failed teardown exits non-zero but still hands over, so the
+/// newer bundle opens either way.
+pub(crate) fn exit_after_quit(app_handle: &AppHandle, code: i32) {
     #[cfg(target_os = "macos")]
     if let Some(bundle) = take_handover_bundle() {
         crate::handover::relaunch_after_exit(&bundle);
     }
-    app_handle.exit(0);
+    app_handle.exit(code);
 }
 
 struct QuitAttemptGuard<'a> {
@@ -806,28 +816,49 @@ pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> R
 }
 
 #[cfg(target_os = "macos")]
-fn handover_pending() -> bool {
+pub fn handover_pending() -> bool {
     HANDOVER_BUNDLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_some()
 }
 
-/// Poll the daemon's health route until it stops answering or `limit` passes.
+/// Wait until the daemon stops answering its health route *and* its listener
+/// is closed, or `limit` passes. The limit is a hard ceiling: it bounds the
+/// health calls themselves, not only the gaps between them. The closed port
+/// is the fact the reopened app needs; health can stop answering while the
+/// listener lingers.
 #[cfg(target_os = "macos")]
 async fn wait_for_daemon_to_stop(limit: Duration) {
     let client = crate::api::WenlanClient::new();
-    let deadline = std::time::Instant::now() + limit;
-    while client.health().await.is_ok() {
-        if std::time::Instant::now() >= deadline {
-            log::warn!(
-                "[handover] daemon still answering at {} after {limit:?}; the new app will retry",
-                client.base_url()
-            );
-            return;
+    let listener = listener_addr(client.base_url());
+    let released = tokio::time::timeout(limit, async {
+        while client.health().await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Some(addr) = listener.as_deref() {
+            while tokio::net::TcpStream::connect(addr).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    })
+    .await;
+    if released.is_err() {
+        log::warn!(
+            "[handover] daemon still holding {} after {limit:?}; the new app will retry",
+            client.base_url()
+        );
     }
+}
+
+/// `host:port` of the daemon listener behind a base URL, for a raw TCP probe.
+#[cfg(target_os = "macos")]
+fn listener_addr(base_url: &str) -> Option<String> {
+    let rest = base_url
+        .strip_prefix("http://")
+        .or_else(|| base_url.strip_prefix("https://"))?;
+    let authority = rest.split('/').next()?;
+    (!authority.is_empty()).then(|| authority.to_string())
 }
 
 fn shutdown_url_for(client: &crate::api::WenlanClient) -> String {
@@ -844,7 +875,7 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
 
     if data_dir_env_overridden() {
         log::info!("[lifecycle] skipping quit teardown: isolated run (data-dir env override)");
-        exit_after_quit(app_handle);
+        exit_after_quit(app_handle, 0);
         attempt.commit();
         return Ok(());
     }
@@ -895,7 +926,7 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
     }
 
     if quit_plan.exit_app {
-        exit_after_quit(app_handle);
+        exit_after_quit(app_handle, 0);
         attempt.commit();
     }
     Ok(())
@@ -1431,6 +1462,25 @@ mod tests {
             !is_run_at_login_enabled(&staging_only),
             ".staging suffixed labels must not satisfy exact-label match"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn listener_addr_is_the_authority_of_the_base_url() {
+        assert_eq!(
+            listener_addr("http://127.0.0.1:7878").as_deref(),
+            Some("127.0.0.1:7878")
+        );
+        assert_eq!(
+            listener_addr("http://127.0.0.1:7878/").as_deref(),
+            Some("127.0.0.1:7878")
+        );
+        assert_eq!(
+            listener_addr("https://localhost:7878/api").as_deref(),
+            Some("localhost:7878")
+        );
+        assert_eq!(listener_addr("127.0.0.1:7878"), None);
+        assert_eq!(listener_addr("http://"), None);
     }
 
     #[test]

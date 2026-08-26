@@ -13,6 +13,12 @@
 
 use std::path::{Path, PathBuf};
 
+/// How long the old app may take to finish its guarded quit once a newer
+/// bundle asked for the handover. The frontend normally acknowledges within
+/// 2 s and persists in well under a second; past this the old app is hidden
+/// and the user sees nothing at all, so the quit is forced.
+pub const QUIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// A newer app bundle that just tried to launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewerBundle {
@@ -29,7 +35,9 @@ pub struct NewerBundle {
 pub fn newer_bundle_from_launch(argv: &[String], running: &semver::Version) -> Option<NewerBundle> {
     let bundle = bundle_root(Path::new(argv.first()?))?;
     let version = bundle_version(&bundle)?;
-    (version > *running).then_some(NewerBundle { bundle, version })
+    // Precedence only: build metadata (`0.18.0+abc`) never decides an upgrade.
+    (version.cmp_precedence(running) == std::cmp::Ordering::Greater)
+        .then_some(NewerBundle { bundle, version })
 }
 
 fn bundle_root(exe: &Path) -> Option<PathBuf> {
@@ -141,6 +149,27 @@ mod tests {
             newer_bundle_from_launch(&argv(&exe), &semver::Version::new(0, 19, 0)),
             None,
             "an older newcomer must never take over"
+        );
+        std::fs::remove_dir_all(bundle.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn build_metadata_never_decides_an_upgrade() {
+        let (bundle, exe) = scratch_bundle(Some("0.18.0+build.1"));
+        let running = semver::Version::parse("0.18.0+build.2").unwrap();
+        assert_eq!(
+            newer_bundle_from_launch(&argv(&exe), &running),
+            None,
+            "a lower build tag on the same release is not an upgrade"
+        );
+        assert_eq!(
+            newer_bundle_from_launch(&argv(&exe), &semver::Version::new(0, 18, 0)),
+            None,
+            "a build tag alone does not make the same release newer"
+        );
+        assert!(
+            newer_bundle_from_launch(&argv(&exe), &semver::Version::new(0, 17, 9)).is_some(),
+            "a higher release with a build tag is still an upgrade"
         );
         std::fs::remove_dir_all(bundle.parent().unwrap()).unwrap();
     }

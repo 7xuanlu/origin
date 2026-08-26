@@ -94,6 +94,31 @@ xattr -dr com.apple.quarantine "$source_app" 2>/dev/null || true
 ditto "$source_app" "$incoming"
 xattr -dr com.apple.quarantine "$incoming" 2>/dev/null || true
 
+# A Wenlan that is still running would only come to the front when the new one
+# is opened (its single-instance socket sends the newcomer straight back to
+# exit), so ask it to quit before its bundle is replaced. Apps from 0.18.0 on
+# hand over by themselves; this covers upgrades from 0.17.0 and older, wherever
+# the running bundle lives. The Apple event is bounded, so a stuck or
+# unanswered permission prompt cannot hold the install, and a Wenlan that will
+# not quit is an error rather than a success message.
+running_wenlan() {
+  pgrep -f '\.app/Contents/MacOS/wenlan-app$' >/dev/null 2>&1
+}
+if running_wenlan; then
+  echo "Asking the running Wenlan to quit so the new version can start..."
+  osascript -e 'tell application id "com.wenlan.desktop" to quit' >/dev/null 2>&1 &
+  quit_request=$!
+  for _ in $(seq 1 100); do
+    running_wenlan || break
+    sleep 0.1
+  done
+  kill "$quit_request" 2>/dev/null || true
+  wait "$quit_request" 2>/dev/null || true
+  if running_wenlan; then
+    die "the running Wenlan did not quit within 10 s. Quit it from its menu bar icon, then run this command again."
+  fi
+fi
+
 if [[ -e $target ]]; then
   mv "$target" "$backup"
 fi
@@ -106,23 +131,6 @@ if ! mv "$incoming" "$target"; then
 fi
 
 rm -rf "$backup"
-
-# A Wenlan that is still running from the replaced bundle would only come to
-# the front when the new one is opened (its single-instance socket sends the
-# newcomer straight back to exit), so ask it to quit first. Apps from 0.18.0 on
-# hand over by themselves; this covers upgrades from 0.17.0 and older.
-app_exe="$target/Contents/MacOS/wenlan-app"
-if pgrep -f "$app_exe" >/dev/null 2>&1; then
-  echo "Asking the running Wenlan to quit so the new version can start..."
-  osascript -e 'tell application id "com.wenlan.desktop" to quit' >/dev/null 2>&1 || true
-  for _ in $(seq 1 100); do
-    pgrep -f "$app_exe" >/dev/null 2>&1 || break
-    sleep 0.1
-  done
-  if pgrep -f "$app_exe" >/dev/null 2>&1; then
-    echo "Wenlan app install warning: the previous Wenlan is still running. Quit it, then open Wenlan again." >&2
-  fi
-fi
 
 echo "Installed Wenlan at $target"
 if [[ ${WENLAN_APP_NO_LAUNCH:-0} != 1 ]]; then

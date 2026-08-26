@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=5e3c459d2b63607afbca51d7c7c6695326138156a9be535bcd02ef675c37a927 -->
+<!-- README_SYNC: source=README.md sha256=c8dbe1b39a702cde2a79dfc1b7f8b7c836fa3ee3efe5a6ac6e77d084ca31e413 -->
 
 <p align="center">
   <picture>
@@ -55,7 +55,7 @@ Wenlan funciona como un único daemon local. La aplicación de escritorio lo lle
 
 No hay nada más que instalar. La aplicación incluye el daemon, la CLI y el conector MCP, arranca el daemon al abrirse y ofrece conectar los clientes de IA que detecta: el plugin para Claude Code y Codex, una entrada MCP para el resto. A partir de ahí lees Páginas, inspeccionas la Fuente detrás de cualquier cita y gestionas el sistema de conocimiento.
 
-Esta vista previa aún no está notarizada, así que macOS bloquea el primer arranque con "Apple no ha podido verificar que Wenlan no contenga software malicioso". Pulsa Listo y luego permítelo una vez en Ajustes del Sistema, Privacidad y seguridad, "Abrir de todos modos". Un comando se salta ese paso: comprueba la descarga contra el SHA-256 publicado en GitHub, elimina la cuarentena solo para esta aplicación y no cambia ninguna configuración de seguridad de macOS.
+Esta vista previa está firmada ad hoc y no notarizada, así que macOS bloquea el primer arranque: puede decir que Wenlan "no se puede abrir" o que no ha podido comprobar si contiene software malicioso. Cierra ese aviso y luego permite la aplicación una vez en Ajustes del Sistema, Privacidad y seguridad, "Abrir de todos modos". Un comando se salta ese paso: comprueba la descarga contra el SHA-256 publicado en GitHub, elimina la cuarentena solo para esta aplicación y no cambia ninguna configuración de seguridad de macOS.
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
