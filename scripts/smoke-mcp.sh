@@ -73,7 +73,7 @@ echo "==> Driving wenlan-mcp over stdio JSON-RPC"
 # The JSON-RPC driver lives in the first-run gauntlet helper (shared with the
 # release-artifact workflow); it records every step and never exits early.
 # WENLAN_MCP_CACHE_DIR keeps the self-update probe out of the user cache (the
-# empty temp cache still forces one GET to api.github.com; its 3s timeout is
+# empty temp cache still forces one GET to github.com; its 3s timeout is
 # fail-soft).
 GAUNTLET_OUT="$DATA_DIR/gauntlet" GAUNTLET_CHANNEL=smoke-mcp \
 WENLAN_MCP_CACHE_DIR="$DATA_DIR/mcp-cache" \

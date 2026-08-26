@@ -17,8 +17,20 @@ const REQUESTED_TAG =
   "";
 const BINARIES = ["wenlan", "wenlan-server", "wenlan-mcp"];
 
+const RELEASE_TAG_PATTERN = /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+
 function safeTag(tag) {
   return tag.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function checkTag(tag) {
+  if (!RELEASE_TAG_PATTERN.test(tag)) {
+    throw new Error(
+      `'${tag}' is not a Wenlan release tag (expected vX.Y.Z, like v0.17.0). ` +
+        `See https://github.com/${REPO}/releases.`
+    );
+  }
+  return tag;
 }
 
 function binDir() {
@@ -28,11 +40,32 @@ function binDir() {
   return path.join(os.homedir(), ".wenlan", "bin");
 }
 
-function githubApiUrl() {
-  if (REQUESTED_TAG) {
-    return `https://api.github.com/repos/${REPO}/releases/tags/${REQUESTED_TAG}`;
-  }
-  return `https://api.github.com/repos/${REPO}/releases/latest`;
+// The public releases page redirects to the latest tag. Unlike the GitHub API
+// it has no limit of 60 anonymous calls per hour per IP address, which a
+// shared network can exhaust before a first install.
+function latestTag() {
+  const url = `https://github.com/${REPO}/releases/latest`;
+  const tagPage = `https://github.com/${REPO}/releases/tag/`;
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, { headers: { "User-Agent": "wenlan" } }, (res) => {
+        res.resume();
+        try {
+          const redirected = res.statusCode >= 300 && res.statusCode < 400;
+          const location = (res.headers.location || "").split(/[?#]/)[0];
+          if (!redirected || !location.startsWith(tagPage)) {
+            throw new Error(
+              `Could not find the latest Wenlan release at ${url} (HTTP ${res.statusCode}). ` +
+                "Check the network, or pin one with WENLAN_RELEASE_TAG=vX.Y.Z."
+            );
+          }
+          resolve(checkTag(decodeURIComponent(location.slice(tagPage.length))));
+        } catch (err) {
+          reject(err);
+        }
+      })
+      .on("error", reject);
+  });
 }
 
 function request(url, headers = {}) {
@@ -53,15 +86,6 @@ function request(url, headers = {}) {
       })
       .on("error", reject);
   });
-}
-
-async function fetchJson(url) {
-  const res = await request(url, { Accept: "application/vnd.github+json" });
-  let body = "";
-  for await (const chunk of res) {
-    body += chunk;
-  }
-  return JSON.parse(body);
 }
 
 async function download(url, dest) {
@@ -109,9 +133,7 @@ async function installBinaries() {
     throw new Error("Wenlan setup currently supports macOS Apple Silicon only.");
   }
 
-  const release = await fetchJson(githubApiUrl());
-  const tag = release.tag_name;
-  if (!tag) throw new Error("Could not determine Wenlan release tag.");
+  const tag = REQUESTED_TAG ? checkTag(REQUESTED_TAG) : await latestTag();
 
   const dir = binDir();
   fs.mkdirSync(dir, { recursive: true });
@@ -121,7 +143,13 @@ async function installBinaries() {
   process.stderr.write(`Downloading Wenlan ${tag}...\n`);
 
   try {
-    await download(url, archivePath);
+    try {
+      await download(url, archivePath);
+    } catch (err) {
+      throw new Error(
+        `${err.message}. Check that the release exists at https://github.com/${REPO}/releases/tag/${tag}`
+      );
+    }
     extractBinaries(archivePath, dir);
   } finally {
     try {

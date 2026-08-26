@@ -58,8 +58,34 @@ release_json="$tmp_dir/release.json"
 archive="$tmp_dir/$ASSET_NAME"
 extract_dir="$tmp_dir/extracted"
 
+# The release lookup is this installer's one GitHub API call (the asset's
+# SHA-256 digest comes from it). Anonymous callers get 60 calls per hour per IP
+# address, so a token is sent when the user has one, and a rate-limited answer
+# is named as such instead of surfacing as a bare curl error. The token goes to
+# GitHub's API only, never to a plaintext or overridden metadata URL.
+fetch_release_json() {
+  local curl_args=(-sSL -o "$release_json" -w '%{http_code}')
+  local token=${GH_TOKEN:-${GITHUB_TOKEN:-}}
+  if [[ -n $token && $RELEASE_JSON_URL == https://api.github.com/* ]]; then
+    curl_args+=(-H "Authorization: Bearer $token")
+  fi
+
+  local http_code
+  http_code=$(curl "${curl_args[@]}" "$RELEASE_JSON_URL") || die "could not fetch release metadata from $RELEASE_JSON_URL"
+  case $http_code in
+    000 | 2??) ;;
+    401)
+      die "GitHub rejected the token sent with the release lookup (HTTP 401): GH_TOKEN or GITHUB_TOKEN is invalid or expired."
+      ;;
+    403 | 429)
+      die "GitHub's API rate limit blocked the release lookup (HTTP $http_code). Wait for the limit to reset (up to an hour for anonymous callers), or set GITHUB_TOKEN to a GitHub token and run the command again."
+      ;;
+    *) die "release lookup at $RELEASE_JSON_URL failed (HTTP $http_code)" ;;
+  esac
+}
+
 echo "Finding the latest Wenlan app release..."
-curl -fsSL "$RELEASE_JSON_URL" -o "$release_json"
+fetch_release_json
 
 asset_count=$(plutil -extract assets raw -o - "$release_json" 2>/dev/null) || die "release metadata has no assets"
 asset_url=

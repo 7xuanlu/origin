@@ -161,6 +161,10 @@ jobs:
               - 'playwright.review.config.ts'
               - 'scripts/prepare-sidecars.sh'
               - 'scripts/prepare-tauri-build-sidecars.sh'
+              # The macOS app installer and its harness need a macOS runner;
+              # app-check is the only job that runs them.
+              - 'scripts/install-macos-app.sh'
+              - 'scripts/test-install-macos-app.sh'
               # Deliberate pair: fnmatch vs picomatch zero-dir ** behavior.
               - 'scripts/*.test.ts'
               - 'scripts/**/*.test.ts'
@@ -2374,6 +2378,8 @@ jobs:
         run: cargo clippy -p wenlan-app --all-targets -- -D warnings
       - name: Rust tests (app)
         run: cargo test -p wenlan-app --lib
+      - name: macOS app installer tests
+        run: bash scripts/test-install-macos-app.sh
       - name: TypeScript check
         run: pnpm exec tsc -b
       - name: i18n gates
