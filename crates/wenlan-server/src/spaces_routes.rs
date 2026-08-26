@@ -132,7 +132,7 @@ pub async fn handle_create_space(
     let space = db
         .create_space(&req.name, req.description.as_deref(), false)
         .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+        .map_err(ServerError::from)?;
     Ok(Json(space))
 }
 
@@ -149,7 +149,7 @@ pub async fn handle_update_space(
     let space = db
         .update_space(&name, new_name, req.description.as_deref())
         .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+        .map_err(ServerError::from)?;
     Ok(Json(space))
 }
 
@@ -163,7 +163,7 @@ pub async fn handle_delete_space(
     };
     db.delete_space(&name, "keep")
         .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+        .map_err(ServerError::from)?;
     Ok(Json(serde_json::json!({"deleted": name})))
 }
 
@@ -273,6 +273,70 @@ pub async fn handle_set_document_space(
         registered_request_space(&db, &requested_space, "set_document_space").await?;
     db.update_memory_space_opt(&source_id, registered_space.as_deref())
         .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+        .map_err(ServerError::from)?;
     Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
+}
+
+#[cfg(test)]
+mod not_found_mapping_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    use crate::state::ServerState;
+
+    async fn build_state_with_db() -> (
+        std::sync::Arc<tokio::sync::RwLock<ServerState>>,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let emitter: std::sync::Arc<dyn wenlan_core::events::EventEmitter> =
+            std::sync::Arc::new(wenlan_core::events::NoopEmitter);
+        let db = wenlan_core::db::MemoryDB::new(tmp.path(), emitter)
+            .await
+            .expect("MemoryDB::new should succeed");
+        let server_state = ServerState {
+            db: Some(std::sync::Arc::new(db)),
+            ..Default::default()
+        };
+        (
+            std::sync::Arc::new(tokio::sync::RwLock::new(server_state)),
+            tmp,
+        )
+    }
+
+    /// Same #586 pattern as the blocked-agent store handler: `delete_space`
+    /// returns `WenlanError::NotFound`, which maps to `ServerError::NotFound`
+    /// (404). Forcing it through `ServerError::Internal` would hide a normal
+    /// "no such space" refusal behind a fake daemon fault (500).
+    #[tokio::test]
+    async fn delete_missing_space_is_not_found_not_internal_error() {
+        let (state, _tmp) = build_state_with_db().await;
+        let app = crate::router::build_router(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/spaces/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse error body");
+        let message = parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .expect("error body must carry a message");
+        assert!(
+            message.contains("not found"),
+            "error message must say the space was not found, got: {message}"
+        );
+    }
 }

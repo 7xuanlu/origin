@@ -383,7 +383,7 @@ pub async fn handle_store_memory(
         wait_at_store_lock_test_hook(StoreLockTestStage::AgentGate).await;
         db.check_agent_for_write(&resolved_agent)
             .await
-            .map_err(|e| ServerError::Internal(e.to_string()))?
+            .map_err(ServerError::from)?
     };
     let ambient_route_mode = wenlan_core::refinery::resolve_everyday(
         everyday_pin,
@@ -1835,7 +1835,7 @@ pub async fn handle_correct_memory(
     // Update the memory with corrected content
     db.update_memory(&id, &corrected)
         .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+        .map_err(ServerError::from)?;
 
     Ok(Json(serde_json::json!({
         "corrected": corrected,
@@ -2966,6 +2966,84 @@ mod gated_store_tests {
             accepted.get("target_source_id").and_then(|v| v.as_str()),
             Some("mem_forge_target"),
             "accept must apply the memory correction, not the forged page write: {accepted}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod blocked_agent_store_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+
+    use crate::state::ServerState;
+
+    async fn build_state_with_db() -> (Arc<RwLock<ServerState>>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let emitter: Arc<dyn wenlan_core::events::EventEmitter> =
+            Arc::new(wenlan_core::events::NoopEmitter);
+        let db = wenlan_core::db::MemoryDB::new(tmp.path(), emitter)
+            .await
+            .expect("MemoryDB::new should succeed");
+        let server_state = ServerState {
+            db: Some(Arc::new(db)),
+            ..Default::default()
+        };
+        (Arc::new(RwLock::new(server_state)), tmp)
+    }
+
+    /// Registers `agent` (auto-registers at "full" trust on first write) then
+    /// disables it, mirroring a human toggling it off in Settings.
+    async fn disable_agent(state: &Arc<RwLock<ServerState>>, agent: &str) {
+        let s = state.read().await;
+        let db = s.db.as_ref().unwrap();
+        db.check_agent_for_write(agent).await.unwrap();
+        db.update_agent(agent, None, None, Some(false), None, None)
+            .await
+            .unwrap();
+    }
+
+    /// #586: `check_agent_for_write` returns `WenlanError::AgentDisabled`,
+    /// which maps to `ServerError::AgentDisabled` (403). The store handler
+    /// used to force every error through `ServerError::Internal` (500),
+    /// hiding the disabled-agent refusal behind a fake daemon fault.
+    #[tokio::test]
+    async fn store_from_disabled_agent_is_forbidden_not_internal_error() {
+        let (state, _tmp) = build_state_with_db().await;
+        disable_agent(&state, "blocked-agent").await;
+        let app = crate::router::build_router(state.clone());
+
+        let body = serde_json::json!({
+            "content": "a fact from a blocked agent",
+            "source_agent": "blocked-agent",
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memory/store")
+                    .header("content-type", "application/json")
+                    .header("x-agent-name", "blocked-agent")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse error body");
+        let message = parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .expect("error body must carry a message");
+        assert!(
+            message.contains("disabled"),
+            "error message must name the disabled agent, got: {message}"
         );
     }
 }
