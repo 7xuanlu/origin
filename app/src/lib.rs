@@ -469,6 +469,14 @@ fn request_full_quit(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
     Ok(())
 }
 
+/// The release part of a daemon version. Build metadata (`0.17.0+g1234abcd`)
+/// never counts as a mismatch: a source build carries it, and so can a
+/// published daemon whose binary was built before its tag existed.
+#[cfg(not(feature = "review-fixtures"))]
+fn release_part(version: &str) -> &str {
+    version.split('+').next().unwrap_or(version)
+}
+
 #[cfg(target_os = "macos")]
 fn startup_reveal_fallback_delay() -> std::time::Duration {
     std::time::Duration::from_millis(1200)
@@ -1072,7 +1080,7 @@ pub fn run() {
                             // path (LaunchAgent, sidecar, or dev checkout) —
                             // a stale one can hold the port and answer health
                             // while breaking newer API calls.
-                            if health.version != env!("CARGO_PKG_VERSION") {
+                            if release_part(&health.version) != env!("CARGO_PKG_VERSION") {
                                 log::warn!(
                                     "[init] Daemon version mismatch: daemon v{}, app v{} at {}; restart it (e.g. `wenlan restart`)",
                                     health.version,
@@ -1668,6 +1676,14 @@ mod platform_tests {
                 delivery_id: 1,
             }
         );
+    }
+
+    #[cfg(not(feature = "review-fixtures"))]
+    #[test]
+    fn daemon_build_metadata_is_not_a_version_mismatch() {
+        assert_eq!(release_part("0.17.0+gf240c141"), "0.17.0");
+        assert_eq!(release_part("0.17.0"), "0.17.0");
+        assert_eq!(release_part(""), "");
     }
 
     #[test]
