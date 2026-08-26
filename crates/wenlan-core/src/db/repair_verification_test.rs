@@ -205,7 +205,12 @@ fn r4_24a_source_contract_is_atomic_bounded_and_caller_ordered() {
     assert_eq!(precommit.matches("ROLLBACK").count(), 0);
     assert_eq!(precommit.matches("COMMIT").count(), 0);
     assert_eq!(finalization.matches("ROLLBACK").count(), 1);
-    assert_eq!(finalization.matches("COMMIT").count(), 1);
+    // The commit goes through the shared `commit_or_rollback`, which rolls the
+    // transaction back when the COMMIT itself fails; a bare `execute("COMMIT")`
+    // here would leave the daemon's one writer connection inside the
+    // transaction after a busy commit.
+    assert_eq!(finalization.matches("COMMIT").count(), 0);
+    assert_eq!(finalization.matches("commit_or_rollback(").count(), 1);
     assert_eq!(
         precommit
             .matches("KnowledgeProjectionWrite::with_projection_lock(")
@@ -242,7 +247,7 @@ fn r4_24a_source_contract_is_atomic_bounded_and_caller_ordered() {
             "persist_verification_receipt(",
         ],
     );
-    ordered(finalization, &["ROLLBACK", "COMMIT"]);
+    ordered(finalization, &["ROLLBACK", "commit_or_rollback("]);
     assert_eq!(
         precommit.matches("persist_verification_receipt(").count(),
         3
@@ -542,7 +547,7 @@ fn r4_24b_test_control_is_scoped_consumed_capability_free_and_ordered() {
         .find("if consume_repair_verification_test_commit_failure()")
         .expect("commit failure control");
     let commit = finalization
-        .find(".execute(\"COMMIT\", ())")
+        .find("commit_or_rollback(")
         .expect("literal commit");
     assert!(commit_fault < commit);
 

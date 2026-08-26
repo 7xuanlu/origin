@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::MemoryDB;
+use super::{commit_or_rollback, MemoryDB};
 use crate::{
     error::WenlanError,
     post_write::RepairWriteProof,
@@ -510,8 +510,7 @@ pub(crate) async fn recover_rename_page_title_apply_receipt(
             ));
         }
     }
-    connection
-        .execute("COMMIT", ())
+    commit_or_rollback(&connection)
         .await
         .map_err(|_| WenlanError::Conflict("repair_apply_recovery_required".to_string()))?;
     #[cfg(test)]

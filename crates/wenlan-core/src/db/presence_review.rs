@@ -7,7 +7,7 @@
 //! presence-carrying mutation later, and the wrong order is not a crash — it is
 //! a retry that reports failure over a write that succeeded.
 
-use super::MemoryDB;
+use super::{commit_or_rollback, MemoryDB};
 use crate::error::WenlanError;
 use crate::presence::{PresenceAction, PresenceDemand, PresenceRefusal, VerifiedPresence};
 use std::path::Path;
@@ -88,7 +88,7 @@ impl MemoryDB {
 
         match result {
             Ok(ReviewOutcome::Applied(receipt)) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("presence review commit: {e}")))?;
                 Ok(ReviewOutcome::Applied(receipt))
