@@ -14,11 +14,9 @@ REQUESTED_TAG="${WENLAN_RELEASE_TAG:-${WENLAN_TAG:-${ORIGIN_RELEASE_TAG:-${ORIGI
 if [[ -n "${REQUESTED_TAG}" ]]; then
   SAFE_TAG="$(printf '%s' "${REQUESTED_TAG}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
   BIN_DIR="${HOME}/.wenlan/releases/${SAFE_TAG}"
-  API_URL="https://api.github.com/repos/${REPO}/releases/tags/${REQUESTED_TAG}"
   RELEASE_PAGE="https://github.com/${REPO}/releases/tag/${REQUESTED_TAG}"
 else
   BIN_DIR="${HOME}/.wenlan/bin"
-  API_URL="https://api.github.com/repos/${REPO}/releases/latest"
   RELEASE_PAGE="https://github.com/${REPO}/releases"
 fi
 
@@ -63,20 +61,31 @@ esac
 
 info "Detected platform: ${OS}-${ARCH} (${ASSET})"
 
-# ── Fetch latest release tag ──────────────────────────────────────────────────
+# ── Resolve the release tag ───────────────────────────────────────────────────
+# No GitHub API call on either path: a pinned tag is used as given, and the
+# latest release is read from the redirect of the public releases page. The API
+# allows 60 anonymous calls per hour per IP address, which a shared network can
+# exhaust before a first install.
 
-info "Fetching latest release from GitHub..."
-
-TAG="$(curl -fsSL "${API_URL}" \
-  | grep '"tag_name"' \
-  | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
-
-[[ -n "${TAG}" ]] || die "Could not determine release tag. Is the GitHub API reachable?"
+TAG_PAGE_PREFIX="https://github.com/${REPO}/releases/tag/"
+TAG_PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
 
 if [[ -n "${REQUESTED_TAG}" ]]; then
+  TAG="${REQUESTED_TAG}"
   ok "Requested release: ${TAG}"
 else
+  info "Finding the latest release on GitHub..."
+  LATEST_URL="$(curl -fsSI -o /dev/null -w '%{redirect_url}' "https://github.com/${REPO}/releases/latest" || true)"
+  LATEST_URL="${LATEST_URL%%[?#]*}"
+  if [[ "${LATEST_URL}" != "${TAG_PAGE_PREFIX}"* ]]; then
+    die "Could not find the latest release at ${RELEASE_PAGE}. Check the network, or pin a release with WENLAN_RELEASE_TAG=vX.Y.Z."
+  fi
+  TAG="${LATEST_URL#"${TAG_PAGE_PREFIX}"}"
   ok "Latest release: ${TAG}"
+fi
+
+if [[ ! "${TAG}" =~ ${TAG_PATTERN} ]]; then
+  die "'${TAG}' is not a Wenlan release tag (expected vX.Y.Z, like v0.17.0). See https://github.com/${REPO}/releases."
 fi
 
 # ── Download & extract ───────────────────────────────────────────────────────
@@ -91,7 +100,7 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
 
 info "Downloading ${ASSET}..."
 if ! curl -fSL --progress-bar -o "${TMP_DIR}/${ASSET}" "${DOWNLOAD_URL}"; then
-  die "Failed to download ${ASSET} from ${DOWNLOAD_URL}"
+  die "Failed to download ${ASSET} from ${DOWNLOAD_URL}. Check that the release exists at ${RELEASE_PAGE} and has that asset."
 fi
 ok "Downloaded ${ASSET}"
 
