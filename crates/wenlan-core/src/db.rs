@@ -1244,12 +1244,85 @@ pub(crate) async fn commit_or_rollback(conn: &libsql::Connection) -> libsql::Res
     match conn.execute("COMMIT", ()).await {
         Ok(rows) => Ok(rows),
         Err(error) => {
-            // Best effort. If the failure did end the transaction after all,
-            // this reports "cannot rollback - no transaction is active",
-            // which is the state we wanted anyway.
-            let _ = conn.execute("ROLLBACK", ()).await;
+            // A rollback error is usually "cannot rollback - no transaction is
+            // active", meaning the failed commit had already ended the
+            // transaction — the state we wanted, so nothing to report. Only a
+            // rollback that leaves the connection still inside a transaction
+            // is a real recovery failure, and that one is silent otherwise:
+            // the caller sees the commit error either way.
+            let rollback = conn.execute("ROLLBACK", ()).await;
+            if let Err(rollback_error) = rollback {
+                if !conn.is_autocommit() {
+                    log::error!(
+                        "[tx-watchdog] COMMIT failed ({error}) and the recovery ROLLBACK \
+                         failed too ({rollback_error}); the writer connection is still \
+                         inside a transaction and every later write will fail with \
+                         \"cannot start a transaction within a transaction\""
+                    );
+                }
+            }
             Err(error)
         }
+    }
+}
+
+// Test-only fault injection: fail one named site's `COMMIT` with the
+// transaction still open, the state SQLite leaves behind when a commit hits
+// `SQLITE_BUSY`. Task-scoped, like the repair verifier's control, so the same
+// code running in a parallel test cannot consume another test's armed fault.
+// Keyed by site so one mechanism serves every caller that needs it.
+#[cfg(test)]
+tokio::task_local! {
+    static FAIL_COMMIT_AT: std::cell::Cell<Option<&'static str>>;
+}
+
+/// Run `future` with the next `COMMIT` at `site` armed to fail.
+#[cfg(test)]
+pub(crate) async fn with_failing_commit_at<T>(
+    site: &'static str,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    FAIL_COMMIT_AT
+        .scope(std::cell::Cell::new(Some(site)), future)
+        .await
+}
+
+/// Stage a deferred foreign-key violation inside the caller's open
+/// transaction when `site` is the armed one, so the `COMMIT` that follows
+/// fails while the transaction stays open on the connection.
+///
+/// Contention cannot produce that state here: a second connection holding the
+/// write lock fails the caller at its first write, long before `COMMIT` (see
+/// `a_review_meeting_a_foreign_writer_marks_nothing` in the presence-review
+/// tests). A deferred constraint is only checked at commit time, so it fails
+/// the `COMMIT` statement itself and leaves the transaction active — the same
+/// end state as a busy commit, without the timing.
+#[cfg(test)]
+async fn arm_commit_failure(conn: &libsql::Connection, site: &'static str) {
+    let armed = FAIL_COMMIT_AT
+        .try_with(|armed| {
+            if armed.get() == Some(site) {
+                armed.set(None);
+                return true;
+            }
+            false
+        })
+        .unwrap_or(false);
+    if !armed {
+        return;
+    }
+    for sql in [
+        "CREATE TABLE commit_fault_parent (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE commit_fault_child (
+             id INTEGER PRIMARY KEY,
+             parent_id INTEGER NOT NULL
+                 REFERENCES commit_fault_parent(id) DEFERRABLE INITIALLY DEFERRED
+         )",
+        "INSERT INTO commit_fault_child (id, parent_id) VALUES (1, 404)",
+    ] {
+        conn.execute(sql, ())
+            .await
+            .expect("stage the deferred foreign-key violation");
     }
 }
 
@@ -5819,9 +5892,15 @@ impl MemoryDB {
                             }
                         }
                     }
-                    if let Err(e) = commit_or_rollback(&conn).await {
-                        log::warn!("[memory_db] m24 re-embed batch commit: {}", e);
-                    }
+                    // Propagated, not logged: the batch is chosen by
+                    // `embedding IS NULL`, so a rolled-back commit leaves the
+                    // same rows selected next time round. Swallowing the error
+                    // re-selects them forever while `embedded` climbs past
+                    // `total_memories` and the migrations behind this one
+                    // never run.
+                    commit_or_rollback(&conn).await.map_err(|e| {
+                        WenlanError::VectorDb(format!("m24 re-embed batch commit: {e}"))
+                    })?;
                     drop(conn);
 
                     embedded += batch.len();
@@ -5916,9 +5995,10 @@ impl MemoryDB {
                             }
                         }
                     }
-                    if let Err(e) = commit_or_rollback(&conn).await {
-                        log::warn!("[memory_db] m24 entity re-embed commit: {}", e);
-                    }
+                    // Same unbounded-loop reason as the memories batch above.
+                    commit_or_rollback(&conn).await.map_err(|e| {
+                        WenlanError::VectorDb(format!("m24 entity re-embed commit: {e}"))
+                    })?;
                     drop(conn);
 
                     entity_embedded += batch.len();
@@ -6120,9 +6200,12 @@ impl MemoryDB {
                             }
                         }
                     }
-                    if let Err(e) = commit_or_rollback(&conn).await {
-                        log::warn!("[memory_db] null embed recovery commit: {}", e);
-                    }
+                    #[cfg(test)]
+                    arm_commit_failure(&conn, "null_embed_recovery").await;
+                    // Same unbounded-loop reason as migration 24's batches.
+                    commit_or_rollback(&conn).await.map_err(|e| {
+                        WenlanError::VectorDb(format!("null embed recovery commit: {e}"))
+                    })?;
                     drop(conn);
 
                     recovered += batch.len();
@@ -9680,9 +9763,10 @@ impl MemoryDB {
                             }
                         }
                     }
-                    if let Err(e) = commit_or_rollback(&conn).await {
-                        log::warn!("[memory_db] null entity embed recovery commit: {}", e);
-                    }
+                    // Same unbounded-loop reason as migration 24's batches.
+                    commit_or_rollback(&conn).await.map_err(|e| {
+                        WenlanError::VectorDb(format!("null entity embed recovery commit: {e}"))
+                    })?;
                     drop(conn);
 
                     recovered += batch.len();
@@ -50737,58 +50821,6 @@ impl MemoryDB {
 /// sweep starts fresh from the head.
 const ORPHAN_SWEEP_CURSOR_KEY: &str = "orphan_sweep_cursor";
 
-// Test-only fault injection: fail the orphan sweep's `COMMIT` with the
-// transaction still open, the state SQLite leaves behind when a commit hits
-// `SQLITE_BUSY`. Task-scoped, like the repair verifier's control, so a sweep
-// running in a parallel test cannot consume another test's armed fault.
-#[cfg(test)]
-tokio::task_local! {
-    static FAIL_ORPHAN_SWEEP_COMMIT: std::cell::Cell<bool>;
-}
-
-/// Run `future` with the next orphan sweep's `COMMIT` armed to fail.
-#[cfg(test)]
-pub(crate) async fn with_failing_orphan_sweep_commit<T>(
-    future: impl std::future::Future<Output = T>,
-) -> T {
-    FAIL_ORPHAN_SWEEP_COMMIT
-        .scope(std::cell::Cell::new(true), future)
-        .await
-}
-
-/// Stage a deferred foreign-key violation inside the caller's open
-/// transaction when the fault is armed, so the `COMMIT` that follows fails
-/// while the transaction stays open on the connection.
-///
-/// Contention cannot produce that state here: a second connection holding the
-/// write lock fails the sweep at its first write, long before `COMMIT` (see
-/// `a_review_meeting_a_foreign_writer_marks_nothing` in the presence-review
-/// tests). A deferred constraint is only checked at commit time, so it fails
-/// the `COMMIT` statement itself and leaves the transaction active — the same
-/// end state as a busy commit, without the timing.
-#[cfg(test)]
-async fn arm_orphan_sweep_commit_failure(conn: &libsql::Connection) {
-    let armed = FAIL_ORPHAN_SWEEP_COMMIT
-        .try_with(|flag| flag.replace(false))
-        .unwrap_or(false);
-    if !armed {
-        return;
-    }
-    for sql in [
-        "CREATE TABLE commit_fault_parent (id INTEGER PRIMARY KEY)",
-        "CREATE TABLE commit_fault_child (
-             id INTEGER PRIMARY KEY,
-             parent_id INTEGER NOT NULL
-                 REFERENCES commit_fault_parent(id) DEFERRABLE INITIALLY DEFERRED
-         )",
-        "INSERT INTO commit_fault_child (id, parent_id) VALUES (1, 404)",
-    ] {
-        conn.execute(sql, ())
-            .await
-            .expect("stage the deferred foreign-key violation");
-    }
-}
-
 impl MemoryDB {
     /// Per-invocation cap on the orphan sweep: bounds how long the sweep can
     /// hold the sole connection mutex. The sweep re-runs after every publish,
@@ -51113,7 +51145,7 @@ impl MemoryDB {
         }
         .await;
         #[cfg(test)]
-        arm_orphan_sweep_commit_failure(&conn).await;
+        arm_commit_failure(&conn, "orphan_sweep").await;
         match result {
             Ok(resolved) => {
                 commit_or_rollback(&conn).await.map_err(|e| {

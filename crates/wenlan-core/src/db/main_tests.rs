@@ -52902,7 +52902,7 @@ async fn a_failed_orphan_sweep_commit_does_not_wedge_the_writer_connection() {
     .await
     .unwrap();
 
-    let error = crate::db::with_failing_orphan_sweep_commit(db.resolve_orphan_page_links())
+    let error = crate::db::with_failing_commit_at("orphan_sweep", db.resolve_orphan_page_links())
         .await
         .expect_err("the staged commit failure must reach the caller");
     assert!(
@@ -52923,6 +52923,67 @@ async fn a_failed_orphan_sweep_commit_does_not_wedge_the_writer_connection() {
     )
     .await
     .expect("a failed sweep commit must not wedge later writes");
+}
+
+/// A failed commit inside the NULL-embedding recovery loop must abort the
+/// migration, not be logged and walked past.
+///
+/// That loop selects its batch with `WHERE embedding IS NULL` and bumps a
+/// progress counter after each batch. `commit_or_rollback` rolls a failed
+/// commit back, so the rows it just embedded go back to NULL and the very
+/// next iteration selects the same batch again. Swallowing the error means
+/// the loop never ends, `recovered` climbs past the declared total, and every
+/// migration behind this one is never reached -- a worse failure than the
+/// stuck transaction the rollback was added to prevent.
+///
+/// The recovery pass is unconditional on startup, so a memory row with no
+/// embedding plus a second `run_migrations` is the whole fixture. The staged
+/// fault is one-shot, so before the fix this test does not hang: the loop
+/// swallows the error, re-embeds the same row, commits, and `run_migrations`
+/// returns `Ok` -- which is exactly what the assertion below catches.
+#[tokio::test]
+async fn a_failed_recovery_commit_aborts_the_migration_instead_of_looping() {
+    let (db, _dir) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO memories
+                (id, content, source, source_id, title, chunk_index,
+                 last_modified, chunk_type, space)
+             VALUES ('mem_null_embedding', 'a memory whose embedding never landed',
+                     'memory', 'mem_null_embedding', 'Null Embedding',
+                     0, 1, 'text', ?1)",
+            libsql::params![UNFILED_SPACE_ID],
+        )
+        .await
+        .unwrap();
+    }
+
+    let error = crate::db::with_failing_commit_at(
+        "null_embed_recovery",
+        db.run_migrations(&crate::events::NoopEmitter),
+    )
+    .await
+    .expect_err("the staged commit failure must abort the migration");
+    assert!(
+        error.to_string().contains("null embed recovery commit"),
+        "the recovery loop must surface its own commit label, got: {error}"
+    );
+
+    // And the connection it ran on is still usable, same as the sweep.
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_after_failed_recovery",
+        "After Failed Recovery",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .expect("a failed recovery commit must not wedge later writes");
 }
 
 /// A full batch of unresolvable orphans in front of the ordered backlog must
