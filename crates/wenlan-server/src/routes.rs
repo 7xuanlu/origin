@@ -622,7 +622,7 @@ pub async fn handle_distill(
                 }
                 db.clear_user_edited(page_id)
                     .await
-                    .map_err(|e| ServerError::Internal(e.to_string()))?;
+                    .map_err(ServerError::from)?;
                 let updated = wenlan_core::refinery::deep_distill_single(
                     &db,
                     prefer_llm,
@@ -910,7 +910,7 @@ pub async fn handle_redistill(
         // run. The skipped no-LLM path must leave user prose locked.
         db.clear_user_edited(&page_id)
             .await
-            .map_err(|e| ServerError::Internal(e.to_string()))?;
+            .map_err(ServerError::from)?;
         let updated = wenlan_core::refinery::deep_distill_single(
             &db,
             prefer_llm,

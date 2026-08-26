@@ -15,6 +15,8 @@ pub mod config;
 mod daemon_start;
 pub mod error;
 pub mod events;
+#[cfg(target_os = "macos")]
+mod handover;
 mod identity_paths;
 mod indexer;
 mod lifecycle;
@@ -418,7 +420,14 @@ fn acknowledge_guarded_quit_request(request_id: u64, delivery_id: u64) -> bool {
 #[cfg(not(feature = "review-fixtures"))]
 #[tauri::command]
 fn cancel_guarded_quit_request(request_id: u64, delivery_id: u64) -> bool {
-    with_guarded_quit(|guard| guard.cancel(request_id, delivery_id))
+    let cancelled = with_guarded_quit(|guard| guard.cancel(request_id, delivery_id));
+    // A refused quit ends a pending handover too: the user keeps this app to
+    // fix the save, and a later quit must not reopen the newer bundle.
+    #[cfg(target_os = "macos")]
+    if cancelled {
+        lifecycle::clear_handover_bundle();
+    }
+    cancelled
 }
 
 #[cfg(not(feature = "review-fixtures"))]
@@ -426,7 +435,30 @@ fn force_full_quit(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         if let Err(e) = crate::lifecycle::quit_origin(&app).await {
             log::error!("[app] forced quit failed: {e}");
-            app.exit(1);
+            crate::lifecycle::exit_after_quit(&app, 1);
+        }
+    });
+}
+
+/// The guarded quit's own timer only covers the acknowledgement. Once the
+/// frontend has acknowledged, nothing bounds how long it takes to call the
+/// full quit, and a hung persist would leave the old app hidden with the user
+/// staring at nothing. A handover therefore carries a hard deadline: a quit
+/// still in flight when it passes is forced. A guard the frontend refused (it
+/// could not save) has already dropped the handover and is left alone.
+#[cfg(all(target_os = "macos", not(feature = "review-fixtures")))]
+fn arm_handover_deadline(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(handover::QUIT_DEADLINE).await;
+        if lifecycle::handover_pending()
+            && !lifecycle::is_quitting()
+            && with_guarded_quit(GuardedQuitCoordinator::force_if_in_flight)
+        {
+            log::warn!(
+                "[handover] the guarded quit did not finish within {:?}; forcing shutdown",
+                handover::QUIT_DEADLINE
+            );
+            force_full_quit(app);
         }
     });
 }
@@ -467,6 +499,14 @@ fn request_full_quit(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
         }
     }
     Ok(())
+}
+
+/// The release part of a version. Build metadata (`0.17.0+g1234abcd`) never
+/// counts as a mismatch on either side: a source build carries it, and so can
+/// a published daemon whose binary was built before its tag existed.
+#[cfg(not(feature = "review-fixtures"))]
+fn release_part(version: &str) -> &str {
+    version.split('+').next().unwrap_or(version)
 }
 
 #[cfg(target_os = "macos")]
@@ -539,8 +579,32 @@ pub fn run() {
     let app_state = AppState::new();
 
     let builder =
-        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             use tauri::Manager;
+            // A second launch of a *newer* bundle means the user upgraded and
+            // wants the new version, not the old window brought to the front.
+            #[cfg(target_os = "macos")]
+            {
+                let running = app.package_info().version.clone();
+                if let Some(newer) = handover::newer_bundle_from_launch(&argv, &running) {
+                    log::info!(
+                        "[handover] Wenlan {} was launched while {running} is running; quitting so {} can take over",
+                        newer.version,
+                        newer.bundle.display()
+                    );
+                    lifecycle::set_handover_bundle(newer.bundle);
+                    match request_full_quit(app) {
+                        Ok(()) => arm_handover_deadline(app.clone()),
+                        Err(e) => {
+                            log::error!("[handover] failed to request guarded quit: {e}");
+                            force_full_quit(app.clone());
+                        }
+                    }
+                    return;
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = &argv;
             if let Some(window) = app.get_webview_window("main") {
                 set_main_window_dock_visibility(app, true);
                 let _ = window.show();
@@ -1028,7 +1092,8 @@ pub fn run() {
 
             // Launch wenlan-server daemon as a sidecar process.
             // If a daemon is already running on the port, the sidecar exits cleanly.
-            // The shell plugin kills the child when the Tauri app exits.
+            // The quit flow stops it (`daemon_start::stop_sidecar`); the shell
+            // plugin only kills children spawned from its JS `execute` command.
             //
             // Skip the sidecar only when the current Wenlan launchd service
             // already targets this app-selected data root. A stale launchd
@@ -1048,6 +1113,48 @@ pub fn run() {
                 } else if let Err(e) = crate::daemon_start::spawn_daemon_sidecar(app.handle()) {
                     log::error!("[init] {e}. Run: xattr -cr /Applications/Origin.app or /Applications/Wenlan.app");
                 }
+            }
+
+            // SIGTERM (`kill`, logout, a supervisor) ends the process without any
+            // Tauri exit event, which orphaned the sidecar. Stop the sidecar we
+            // spawned and exit; nothing else: LaunchAgents and a launchd-owned
+            // daemon are not ours to remove on a signal.
+            #[cfg(unix)]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    // A second SIGTERM, or a stop that hangs, must still end the
+                    // process: `kill <pid>` has to mean exit.
+                    const SIGTERM_STOP_LIMIT: std::time::Duration =
+                        std::time::Duration::from_secs(10);
+                    match signal(SignalKind::terminate()) {
+                        Ok(mut sigterm) => {
+                            sigterm.recv().await;
+                            log::info!("[app] SIGTERM received; stopping the sidecar and exiting");
+                            tauri::async_runtime::spawn(async move {
+                                sigterm.recv().await;
+                                log::warn!(
+                                    "[app] second SIGTERM; exiting without waiting for the sidecar"
+                                );
+                                std::process::exit(1);
+                            });
+                            if tokio::time::timeout(
+                                SIGTERM_STOP_LIMIT,
+                                crate::daemon_start::stop_sidecar(),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                log::warn!(
+                                    "[app] sidecar stop did not finish within {SIGTERM_STOP_LIMIT:?}; exiting anyway"
+                                );
+                            }
+                            handle.exit(0);
+                        }
+                        Err(e) => log::warn!("[app] cannot listen for SIGTERM: {e}"),
+                    }
+                });
             }
 
             // Wait for daemon health, then initialize local state + file watcher
@@ -1072,7 +1179,9 @@ pub fn run() {
                             // path (LaunchAgent, sidecar, or dev checkout) —
                             // a stale one can hold the port and answer health
                             // while breaking newer API calls.
-                            if health.version != env!("CARGO_PKG_VERSION") {
+                            if release_part(&health.version)
+                                != release_part(env!("CARGO_PKG_VERSION"))
+                            {
                                 log::warn!(
                                     "[init] Daemon version mismatch: daemon v{}, app v{} at {}; restart it (e.g. `wenlan restart`)",
                                     health.version,
@@ -1667,6 +1776,46 @@ mod platform_tests {
                 request_id: 3,
                 delivery_id: 1,
             }
+        );
+    }
+
+    #[cfg(not(feature = "review-fixtures"))]
+    #[test]
+    fn daemon_build_metadata_is_not_a_version_mismatch() {
+        assert_eq!(release_part("0.17.0+gf240c141"), "0.17.0");
+        assert_eq!(release_part("0.17.0"), "0.17.0");
+        assert_eq!(release_part(""), "");
+        // A prerelease survives, and app-side metadata strips the same way.
+        assert_eq!(release_part("0.18.0-rc.1+g1"), "0.18.0-rc.1");
+        assert_eq!(
+            release_part("0.18.0+app1"),
+            release_part("0.18.0+gf240c141")
+        );
+    }
+
+    #[test]
+    fn an_acknowledged_guard_that_never_resolves_is_still_in_flight_for_the_handover_deadline() {
+        let mut guard = GuardedQuitCoordinator::new();
+        assert!(matches!(
+            guard.request(),
+            GuardedQuitAction::RequestFrontendGuard { .. }
+        ));
+        assert!(guard.acknowledge(1, 1));
+        assert!(
+            guard.force_if_in_flight(),
+            "acknowledged but never resolved: the deadline may force"
+        );
+        assert!(!guard.force_if_in_flight(), "forcing once is enough");
+
+        let mut guard = GuardedQuitCoordinator::new();
+        assert!(matches!(
+            guard.request(),
+            GuardedQuitAction::RequestFrontendGuard { .. }
+        ));
+        assert!(guard.cancel(1, 1));
+        assert!(
+            !guard.force_if_in_flight(),
+            "a refused quit is not in flight; the deadline leaves it alone"
         );
     }
 

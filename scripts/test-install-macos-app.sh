@@ -113,7 +113,91 @@ SH
   fi
 }
 
+
+# The quit path runs against a stubbed `pgrep` and `osascript`: the stub `pgrep`
+# reports a running Wenlan until the stub `osascript` has been asked to quit it.
+make_quit_stubs() {
+  local fake_bin=$1
+  local quit_marker=$2
+  local quits=$3
+
+  mkdir -p "$fake_bin"
+  cat > "$fake_bin/pgrep" <<SH
+#!/usr/bin/env bash
+[[ -e "$quit_marker" ]] && exit 1
+exit 0
+SH
+  cat > "$fake_bin/osascript" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" > "$quit_marker.request"
+if [[ "$quits" == yes ]]; then
+  sleep 0.3
+  : > "$quit_marker"
+fi
+sleep 30
+SH
+  chmod +x "$fake_bin/pgrep" "$fake_bin/osascript"
+}
+
+test_quits_running_app_before_replacing_it() {
+  local fixture_dir="$TMP_DIR/quits"
+  local install_dir="$fixture_dir/Applications"
+  local fake_bin="$fixture_dir/fake-bin"
+  local quit_marker="$fixture_dir/quit"
+  mkdir -p "$fixture_dir" "$install_dir/Wenlan.app"
+  printf 'keep me\n' > "$install_dir/Wenlan.app/existing-marker"
+  make_fixture "$fixture_dir" actual
+  make_quit_stubs "$fake_bin" "$quit_marker" yes
+
+  PATH="$fake_bin:$PATH" \
+    WENLAN_APP_RELEASE_JSON_URL="file://$fixture_dir/release.json" \
+    WENLAN_APP_INSTALL_DIR="$install_dir" \
+    WENLAN_APP_NO_LAUNCH=1 \
+    WENLAN_APP_SKIP_PLATFORM_CHECK=1 \
+    bash "$INSTALLER"
+
+  if ! grep -q 'tell application id "com.wenlan.desktop" to quit' "$quit_marker.request"; then
+    echo "installer did not ask the running Wenlan to quit" >&2
+    return 1
+  fi
+  test -x "$install_dir/Wenlan.app/Contents/MacOS/wenlan-app"
+  if [[ -f "$install_dir/Wenlan.app/existing-marker" ]]; then
+    echo "installer kept the old app after the running Wenlan quit" >&2
+    return 1
+  fi
+}
+
+test_fails_when_running_app_does_not_quit() {
+  local fixture_dir="$TMP_DIR/never-quits"
+  local install_dir="$fixture_dir/Applications"
+  local fake_bin="$fixture_dir/fake-bin"
+  local quit_marker="$fixture_dir/quit"
+  mkdir -p "$fixture_dir" "$install_dir/Wenlan.app"
+  printf 'keep me\n' > "$install_dir/Wenlan.app/existing-marker"
+  make_fixture "$fixture_dir" actual
+  make_quit_stubs "$fake_bin" "$quit_marker" no
+
+  if PATH="$fake_bin:$PATH" \
+    WENLAN_APP_RELEASE_JSON_URL="file://$fixture_dir/release.json" \
+    WENLAN_APP_INSTALL_DIR="$install_dir" \
+    WENLAN_APP_NO_LAUNCH=1 \
+    WENLAN_APP_SKIP_PLATFORM_CHECK=1 \
+    bash "$INSTALLER" > "$fixture_dir/installer.log" 2>&1; then
+    echo "installer replaced an app that never quit" >&2
+    return 1
+  fi
+
+  if ! grep -q 'did not quit within 10 s' "$fixture_dir/installer.log"; then
+    echo "installer failed without naming the app that would not quit:" >&2
+    cat "$fixture_dir/installer.log" >&2
+    return 1
+  fi
+  test -f "$install_dir/Wenlan.app/existing-marker"
+}
+
 test_installs_verified_app_without_quarantine
 test_rejects_bad_digest_before_replacing_existing_app
 test_restores_existing_app_when_interrupted_after_backup
+test_quits_running_app_before_replacing_it
+test_fails_when_running_app_does_not_quit
 echo "install-macos-app tests passed"

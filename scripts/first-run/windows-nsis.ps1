@@ -60,7 +60,10 @@ try {
     # main binary after the crate's default-run, not the productName). The
     # display name Wenlan.exe resolves case-insensitively to the CLI sidecar
     # wenlan.exe — launching that was this script's own bug in the first runs.
-    $candidate = Join-Path $env:LOCALAPPDATA "Wenlan\wenlan-app.exe"
+    # The installer hook moves the per-user default off the data root
+    # (%LOCALAPPDATA%\Wenlan is %LOCALAPPDATA%\wenlan on a case-insensitive
+    # filesystem); the search below still finds an older layout.
+    $candidate = Join-Path $env:LOCALAPPDATA "Programs\Wenlan\wenlan-app.exe"
     if (Test-Path $candidate) { $AppExe = $candidate }
     else {
         foreach ($root in @($env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
@@ -72,6 +75,11 @@ try {
     Check -Name "app-exe-found" -Script { if (-not $AppExe) { throw "wenlan-app.exe not found under LOCALAPPDATA or Program Files" }; Write-Output $AppExe }
     if ($AppExe) { $Install = Split-Path -Parent $AppExe }
     Info "install-dir" "$Install"
+    Check -Name "install-dir-outside-data-root" -Script {
+        if (-not $Install) { throw "no install dir was discovered" }
+        if ($Install.TrimEnd('\') -ieq $DataDir.TrimEnd('\')) { throw "app installed into the CLI data root $DataDir (finding F6)" }
+        Write-Output "$Install is not $DataDir"
+    }
     if ($Install) {
         Info "install-dir-exes" ((Get-ChildItem -Path $Install -Filter *.exe -File -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) $($_.Length)" }) -join "; ")
     }
