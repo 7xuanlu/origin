@@ -25,6 +25,8 @@ const SHUTDOWN_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from
 const SHUTDOWN_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const DAEMON_PROCESS_ID_HEADER: &str = "x-wenlan-process-id";
 const AUTOSTART_OFF_MARKER: &str = "autostart.off";
+/// How long `background on` waits for `/api/health` before reporting.
+const FIRST_HEALTH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug)]
 struct DaemonProcessIdentity {
@@ -203,7 +205,12 @@ fn origin_data_root() -> PathBuf {
 /// embedded `com.wenlan.server.plist` template carried: stdout/stderr routing,
 /// `EnvironmentVariables.RUST_LOG`, and the canonical `WENLAN_DATA_DIR`
 /// ownership marker consumed by the desktop app. The daemon owns bounded file
-/// logging, so launchd routes its raw streams to `/dev/null`.
+/// logging, so launchd's stdout goes to `/dev/null`; stderr goes to
+/// `<data root>/logs/launchd-stderr.log` so a crash before file logging is up
+/// (a missing library, an abort) is never silent. launchd does not rotate
+/// that file: the daemon writes only bootstrap failures there (progress bars
+/// are hidden off a terminal), so it grows a couple of lines per attempt only
+/// while launchd keeps retrying a daemon that cannot start.
 ///
 /// `LaunchdInstallConfig` in service-manager 0.11 only exposes `keep_alive`;
 /// stdout/stderr paths must come through `ServiceInstallCtx.contents` as a
@@ -294,13 +301,14 @@ pub async fn install() -> Result<()> {
             ],
             "create scheduled task",
         )?;
+        let log_marks = DaemonLogMarks::capture();
         run_schtasks(&["/run", "/tn", WINDOWS_TASK_NAME], "run scheduled task")?;
         remove_autostart_off_marker()?;
-        println!(
-            "Installed and started Windows scheduled task '{}' (wenlan-server).",
-            WINDOWS_TASK_NAME
-        );
-        return Ok(());
+        return wait_for_first_health(
+            &format!("Windows scheduled task '{WINDOWS_TASK_NAME}' (wenlan-server)"),
+            &log_marks,
+        )
+        .await;
     }
 
     #[cfg_attr(target_os = "windows", allow(unreachable_code))]
@@ -347,10 +355,16 @@ pub async fn install() -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             let data_root = origin_data_root();
+            let stderr_log = launchd_stderr_log_path(&data_root);
+            if let Some(log_dir) = stderr_log.parent() {
+                std::fs::create_dir_all(log_dir).with_context(|| {
+                    format!("create the daemon log directory {}", log_dir.display())
+                })?;
+            }
             Some(build_launchd_plist(
                 &program,
                 Path::new("/dev/null"),
-                Path::new("/dev/null"),
+                &stderr_log,
                 "info",
                 &data_root,
             ))
@@ -361,6 +375,7 @@ pub async fn install() -> Result<()> {
         }
     };
 
+    let log_marks = DaemonLogMarks::capture();
     m.install(ServiceInstallCtx {
         label: label_value.clone(),
         program,
@@ -381,8 +396,126 @@ pub async fn install() -> Result<()> {
     m.start(ServiceStartCtx { label: label_value })
         .context("start service")?;
     remove_autostart_off_marker()?;
-    println!("Installed and started {}.", SERVICE_LABEL);
+    wait_for_first_health(SERVICE_LABEL, &log_marks).await
+}
+
+/// Where launchd writes the daemon's raw stderr (see `build_launchd_plist`).
+#[cfg(target_os = "macos")]
+pub(crate) fn launchd_stderr_log_path(data_root: &Path) -> PathBuf {
+    data_root.join("logs/launchd-stderr.log")
+}
+
+/// Where the daemon's logs ended before this command started the daemon, so
+/// an error reported afterwards is one this start produced and not a stale
+/// line from an earlier run (the logs outlive the daemon).
+struct DaemonLogMarks {
+    #[cfg(target_os = "macos")]
+    daemon_log: (PathBuf, u64),
+    #[cfg(target_os = "macos")]
+    stderr_log: (PathBuf, u64),
+}
+
+impl DaemonLogMarks {
+    fn capture() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self::at(
+                crate::commands::setup::daemon_log_path(),
+                launchd_stderr_log_path(&origin_data_root()),
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self {}
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn at(daemon_log: PathBuf, stderr_log: PathBuf) -> Self {
+        let len = |path: &Path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        Self {
+            daemon_log: (daemon_log.clone(), len(&daemon_log)),
+            stderr_log: (stderr_log.clone(), len(&stderr_log)),
+        }
+    }
+
+    /// The error this start produced, if any: the daemon log's last `ERROR`
+    /// line written after the mark, else the last line launchd captured on
+    /// stderr since then (a crash before file logging is up, such as a
+    /// missing library).
+    #[cfg(target_os = "macos")]
+    fn error_since(&self) -> Option<(PathBuf, String)> {
+        let (daemon_log, daemon_mark) = &self.daemon_log;
+        if let Some(line) =
+            crate::commands::setup::last_daemon_error_since(daemon_log, *daemon_mark)
+        {
+            return Some((daemon_log.clone(), line));
+        }
+        let (stderr_log, stderr_mark) = &self.stderr_log;
+        let bytes = std::fs::read(stderr_log).ok()?;
+        let start = usize::try_from(*stderr_mark)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let line = String::from_utf8_lossy(&bytes[start..])
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())?
+            .chars()
+            .take(400)
+            .collect();
+        Some((stderr_log.clone(), line))
+    }
+}
+
+/// `background on` used to return as soon as the service manager accepted the
+/// job, so a daemon that crash-looped under launchd still printed "Installed
+/// and started" (first-run gauntlet finding F4). Wait for the daemon to
+/// answer before claiming it started; when it does not, tell a first start
+/// that is still downloading the embedding model apart from a daemon that
+/// failed during this start.
+async fn wait_for_first_health(installed: &str, marks: &DaemonLogMarks) -> Result<()> {
+    // A routable `WENLAN_BIND_ADDR` has no local URL to poll; the install
+    // itself succeeded, so there is nothing more to report.
+    let Ok(base_url) = local_daemon_base_url() else {
+        println!("Installed and started {installed}.");
+        return Ok(());
+    };
+    let health_url = format!("{base_url}/api/health");
+    if poll_health(&health_url, FIRST_HEALTH_WAIT).await.is_ok() {
+        println!("Installed and started {installed}; daemon healthy at {base_url}.");
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    if let Some((log_path, line)) = marks.error_since() {
+        anyhow::bail!(
+            "installed {installed}, but the daemon stopped with an error ({}):\n  {line}\nFix the cause above, then run `wenlan background on` again.",
+            log_path.display()
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = marks;
+    println!("Installed {installed}; the daemon is still starting.");
+    println!("{}", first_health_pending_note(&health_url));
     Ok(())
+}
+
+/// The message for a daemon that has not answered yet but has not failed
+/// either, as far as this command can see.
+fn first_health_pending_note(health_url: &str) -> String {
+    let mut note = format!(
+        "Daemon not answering yet at {health_url} after {}s. A first start downloads the 210 MB embedding model; check `wenlan status` in a minute.",
+        FIRST_HEALTH_WAIT.as_secs()
+    );
+    #[cfg(target_os = "macos")]
+    note.push_str(&format!(
+        "\nIf it stays down, `wenlan doctor` shows the daemon's last error (log: {}).",
+        crate::commands::setup::daemon_log_path().display()
+    ));
+    #[cfg(target_os = "linux")]
+    note.push_str("\nIf it stays down, `journalctl --user -u wenlan-server` says why.");
+    #[cfg(target_os = "windows")]
+    note.push_str("\nIf it stays down, run `wenlan doctor`.");
+    note
 }
 
 #[cfg(target_os = "macos")]
@@ -958,6 +1091,85 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_plist_keeps_stderr_in_the_data_root() {
+        let data_root = Path::new("/tmp/wenlan-plist-test-root");
+        let stderr_log = launchd_stderr_log_path(data_root);
+        assert_eq!(
+            stderr_log,
+            Path::new("/tmp/wenlan-plist-test-root/logs/launchd-stderr.log")
+        );
+        let plist = build_launchd_plist(
+            Path::new("/opt/wenlan/wenlan-server"),
+            Path::new("/dev/null"),
+            &stderr_log,
+            "info",
+            data_root,
+        );
+        assert!(plist.contains(
+            "<key>StandardErrorPath</key>\n\t<string>/tmp/wenlan-plist-test-root/logs/launchd-stderr.log</string>"
+        ));
+        assert!(plist.contains("<key>StandardOutPath</key>\n\t<string>/dev/null</string>"));
+        assert!(plist.contains(
+            "<key>WENLAN_DATA_DIR</key>\n\t\t<string>/tmp/wenlan-plist-test-root</string>"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_reports_only_errors_written_after_it_started_the_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let daemon_log = dir.path().join("wenlan-server.log");
+        let stderr_log = dir.path().join("launchd-stderr.log");
+        std::fs::write(
+            &daemon_log,
+            "INFO wenlan-server v0.17.0\nERROR wenlan_server: stale failure\n",
+        )
+        .expect("write daemon log");
+        let marks = DaemonLogMarks::at(daemon_log.clone(), stderr_log.clone());
+        assert_eq!(
+            marks.error_since(),
+            None,
+            "an error from an earlier run must not be blamed on this start"
+        );
+        std::fs::write(
+            &stderr_log,
+            "dyld[123]: Library not loaded: libonnxruntime.dylib\n",
+        )
+        .expect("write stderr log");
+        assert_eq!(
+            marks.error_since(),
+            Some((
+                stderr_log.clone(),
+                "dyld[123]: Library not loaded: libonnxruntime.dylib".to_string()
+            ))
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&daemon_log)
+            .expect("open daemon log");
+        std::io::Write::write_all(
+            &mut file,
+            b"INFO wenlan-server v0.17.1\nERROR wenlan_server: fresh failure\n",
+        )
+        .expect("append");
+        assert_eq!(
+            marks.error_since(),
+            Some((daemon_log, "ERROR wenlan_server: fresh failure".to_string())),
+            "the daemon log's own error wins over launchd's stderr"
+        );
+    }
+
+    #[test]
+    fn first_health_note_says_how_long_it_waited_and_what_to_do() {
+        let note = first_health_pending_note("http://127.0.0.1:7878/api/health");
+        assert!(note.contains("after 10s"), "{note}");
+        assert!(note.contains("210 MB embedding model"), "{note}");
+        assert!(note.contains("`wenlan status`"), "{note}");
+        assert!(note.contains("If it stays down"), "{note}");
     }
 
     #[test]
