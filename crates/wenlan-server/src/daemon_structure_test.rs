@@ -31,7 +31,7 @@ const MAIN_BASELINE_ORDER: &[&str] = &[
     "server_state.api_llm = Some(",
     "server_state.synthesis_llm = Some(",
     "server_state.external_llm = Some(",
-    "let reranker_cache_dir = wenlan_core::db::resolve_fastembed_cache_dir(",
+    "let reranker_cache_dir = Some(wenlan_core::db::daemon_fastembed_cache_dir(",
     "let mut deep_bgebase_pending = false",
     "reranker_mode_resolved(",
     "import_legacy_default_once(",
@@ -101,7 +101,7 @@ const STARTUP_CHILD_ORDER: &[&str] = &[
     "server_state.api_llm = Some(",
     "server_state.synthesis_llm = Some(",
     "server_state.external_llm = Some(",
-    "let reranker_cache_dir = wenlan_core::db::resolve_fastembed_cache_dir(",
+    "let reranker_cache_dir = Some(wenlan_core::db::daemon_fastembed_cache_dir(",
     "let mut deep_bgebase_pending = false",
     "reranker_mode_resolved(",
     "import_legacy_default_once(",
@@ -753,6 +753,7 @@ fn runtime_recompute_violations(source: &str, owner: &str) -> Vec<String> {
     for path in [
         "load_config",
         "resolve_fastembed_cache_dir",
+        "daemon_fastembed_cache_dir",
         "reranker_mode_resolved",
         "resolve_reranker_plan",
     ] {
@@ -1330,7 +1331,7 @@ fn structure_violations_with_children(
     };
     for anchor in [
         "let config = wenlan_core::config::load_config(",
-        "let reranker_cache_dir = wenlan_core::db::resolve_fastembed_cache_dir(",
+        "let reranker_cache_dir = Some(wenlan_core::db::daemon_fastembed_cache_dir(",
         "let mut deep_bgebase_pending = false",
     ] {
         violations.extend(exact_anchor_owner_violations(
@@ -2231,7 +2232,7 @@ fn reviewer_mutations_reject_value_ownership_and_shared_read_drift() {
 
     for anchor in [
         "let config = wenlan_core::config::load_config(",
-        "let reranker_cache_dir = wenlan_core::db::resolve_fastembed_cache_dir(",
+        "let reranker_cache_dir = Some(wenlan_core::db::daemon_fastembed_cache_dir(",
         "let mut deep_bgebase_pending = false",
     ] {
         let duplicated = format!("{main}\nfn hidden_startup_value() {{ {anchor}; }}\n");

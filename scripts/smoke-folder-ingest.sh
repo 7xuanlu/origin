@@ -44,8 +44,11 @@ if lsof -ti ":${PORT}" >/dev/null 2>&1; then
 fi
 
 echo "==> Starting daemon on port ${PORT} (data dir ${DATA_DIR})"
-# cwd = repo root so the daemon finds the shared .fastembed_cache.
+# The daemon no longer reads a cache relative to its working directory, so
+# name the repo's shared .fastembed_cache explicitly instead of downloading
+# 210 MB into every scratch data dir.
 (cd "$ROOT" && WENLAN_PORT="$PORT" WENLAN_DATA_DIR="$DATA_DIR" \
+    FASTEMBED_CACHE_DIR="${FASTEMBED_CACHE_DIR:-$ROOT/.fastembed_cache}" \
     exec "$BIN/wenlan-server" >"$DATA_DIR/daemon.log" 2>&1) &
 DAEMON_PID=$!
 

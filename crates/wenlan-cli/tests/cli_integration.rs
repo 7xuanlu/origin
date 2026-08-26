@@ -1257,13 +1257,18 @@ fn setup_background_status_roundtrip_isolated() {
     assert!(config.contains(r#""on_device_model": null"#));
     assert!(config.contains(r#""anthropic_api_key": null"#));
 
+    // The fake launchctl never starts a daemon, so `background on` must not
+    // claim one started: it reports the install and that the daemon is still
+    // starting, with the health URL it waited on.
     cli_with_isolated_runtime(&runtime)
         .args(["background", "on"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Installed and started com.wenlan.server",
-        ));
+            "Installed com.wenlan.server; the daemon is still starting.",
+        ))
+        .stdout(predicate::str::contains("Daemon not answering yet at"))
+        .stdout(predicate::str::contains("Installed and started").not());
     assert!(!runtime.data.path().join("autostart.off").exists());
 
     let plist = fs::read_to_string(runtime.service_unit_path()).expect("plist written");

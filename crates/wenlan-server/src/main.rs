@@ -938,8 +938,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Resolving the path is read-only. Before rotating tracing is available,
-    // a bounded bootstrap file keeps launchd failures and panics observable
-    // even though the plist intentionally redirects stdout/stderr to /dev/null.
+    // a bounded bootstrap file keeps launchd failures and panics observable;
+    // the plist sends stdout to /dev/null and stderr to
+    // `<data root>/logs/launchd-stderr.log`.
     let wenlan_root = resolve_wenlan_root();
     install_bootstrap_panic_hook(wenlan_root.clone());
 
