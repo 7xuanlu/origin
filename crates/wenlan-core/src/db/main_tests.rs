@@ -21913,6 +21913,190 @@ fn a_threshold_that_cannot_advance_drops_instead_of_looping() {
 }
 
 #[test]
+fn same_topic_sibling_shards_merge_before_distill_writes_pages() {
+    // Regression test for issue #596: the re-split ladder tightens an
+    // oversized same-space cluster up to RESPLIT_MAX_THRESHOLD (0.92) and can
+    // slice one coherent topic into two near-duplicate shards. Nothing
+    // downstream ever compares siblings — the Jaccard filter scores a cluster
+    // only against *existing* pages, and the page a shard creates is born
+    // unconfirmed — so both shards became pages in the same pass.
+    // `cluster_distillation_rows` must hand back ONE cluster instead.
+    //
+    // Fixture: two 5-member shards of one topic plus 20 scattered members, all
+    // in space "wenlan". Squared member weights are shared 0.88, topic 0.05,
+    // per-member noise 0.07, which puts within-shard member cosine at 0.93 (at
+    // or above the 0.92 rung, so each shard survives it) and a cross-shard
+    // member against the other shard's centroid at 0.906 (below the rung, so
+    // the rung really does split them) — while the two mean-pooled centroids
+    // sit at 0.932, above the ceiling. The 20 scattered members make the base
+    // group oversized so the ladder fires at all, then fall out as singletons
+    // below the member floor, which leaves the merged 10 members inside the
+    // grouped cap of 12.
+    let shared = 0.88f32.sqrt();
+    let topic = 0.05f32.sqrt();
+    let noise = 0.07f32.sqrt();
+    let scattered_shared = 0.85f32.sqrt();
+    let scattered_own = 0.15f32.sqrt();
+
+    let mut memories: Vec<ClusterMemRow> = Vec::new();
+    for (shard, topic_dim) in [("a", 1usize), ("b", 2usize)] {
+        for i in 0..5 {
+            let mut emb = vec![0.0f32; 768];
+            emb[0] = shared;
+            emb[topic_dim] = topic;
+            emb[10 + memories.len()] = noise;
+            memories.push(ClusterMemRow {
+                source_id: format!("{shard}_m{i}"),
+                content: format!("{shard} note {i}"),
+                entity_id: None,
+                entity_name: None,
+                space: Some("wenlan".to_string()),
+                can_seed_page: true,
+                embedding: emb,
+            });
+        }
+    }
+    for i in 0..20 {
+        let mut emb = vec![0.0f32; 768];
+        emb[0] = scattered_shared;
+        emb[100 + i] = scattered_own;
+        memories.push(ClusterMemRow {
+            source_id: format!("x_m{i}"),
+            content: format!("scattered note {i}"),
+            entity_id: None,
+            entity_name: None,
+            space: Some("wenlan".to_string()),
+            can_seed_page: true,
+            embedding: emb,
+        });
+    }
+
+    // Fixture self-checks: the shards must be separable at the 0.92 rung and
+    // still be one topic by centroid.
+    let within = cosine_similarity(&memories[0].embedding, &memories[1].embedding);
+    assert!(
+        (within - 0.93).abs() < 0.005,
+        "within-shard cosine drifted: {within}"
+    );
+    let shard_a = build_distillation_cluster(&memories, &(0..5).collect::<Vec<_>>());
+    let shard_b = build_distillation_cluster(&memories, &(5..10).collect::<Vec<_>>());
+    let centroid_cos = cosine_similarity(
+        shard_a.centroid_embedding.as_ref().unwrap(),
+        shard_b.centroid_embedding.as_ref().unwrap(),
+    );
+    assert!(
+        (centroid_cos - 0.932).abs() < 0.005,
+        "sibling centroid cosine drifted: {centroid_cos}"
+    );
+    let member_vs_sibling_centroid = cosine_similarity(
+        &memories[5].embedding,
+        shard_a.centroid_embedding.as_ref().unwrap(),
+    );
+    assert!(
+        member_vs_sibling_centroid < 0.92,
+        "fixture no longer splits at the ceiling: {member_vs_sibling_centroid}"
+    );
+
+    let clusters = cluster_distillation_rows(
+        &memories,
+        0.87, // one rung below the 0.92 ceiling
+        3,    // min_size
+        20,   // max_clusters
+        16_000,
+        50, // max_unlinked_cluster_size
+        12, // max_grouped_cluster_size
+        DistillationClusterMode::SpaceScoped,
+    );
+
+    assert_eq!(
+        clusters.len(),
+        1,
+        "two shards of one topic must merge into one cluster before any page is written: {:?}",
+        clusters
+            .iter()
+            .map(|c| c.source_ids.clone())
+            .collect::<Vec<_>>()
+    );
+    let mut merged: Vec<String> = clusters[0].source_ids.clone();
+    merged.sort();
+    let mut expected: Vec<String> = memories
+        .iter()
+        .take(10)
+        .map(|memory| memory.source_id.clone())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        merged, expected,
+        "the merged cluster must carry both shards' members"
+    );
+}
+
+#[test]
+fn unrelated_distill_clusters_are_not_merged_as_siblings() {
+    // Control for the sibling merge above: two same-space clusters whose
+    // centroids sit far below the 0.92 ceiling are two topics, and must stay
+    // two clusters. Same geometry, but the topic component carries 0.33 of the
+    // squared weight instead of 0.05, so centroid cosine is ~0.64.
+    let shared = 0.60f32.sqrt();
+    let topic = 0.33f32.sqrt();
+    let noise = 0.07f32.sqrt();
+
+    let mut memories: Vec<ClusterMemRow> = Vec::new();
+    for (cluster, topic_dim) in [("a", 1usize), ("b", 2usize)] {
+        for i in 0..5 {
+            let mut emb = vec![0.0f32; 768];
+            emb[0] = shared;
+            emb[topic_dim] = topic;
+            emb[10 + memories.len()] = noise;
+            memories.push(ClusterMemRow {
+                source_id: format!("{cluster}_m{i}"),
+                content: format!("{cluster} note {i}"),
+                entity_id: None,
+                entity_name: None,
+                space: Some("wenlan".to_string()),
+                can_seed_page: true,
+                embedding: emb,
+            });
+        }
+    }
+
+    let cluster_a = build_distillation_cluster(&memories, &(0..5).collect::<Vec<_>>());
+    let cluster_b = build_distillation_cluster(&memories, &(5..10).collect::<Vec<_>>());
+    let centroid_cos = cosine_similarity(
+        cluster_a.centroid_embedding.as_ref().unwrap(),
+        cluster_b.centroid_embedding.as_ref().unwrap(),
+    );
+    assert!(
+        (centroid_cos - 0.636).abs() < 0.005,
+        "control centroid cosine drifted: {centroid_cos}"
+    );
+
+    let clusters = cluster_distillation_rows(
+        &memories,
+        0.87,
+        3,
+        20,
+        16_000,
+        50,
+        12,
+        DistillationClusterMode::SpaceScoped,
+    );
+
+    assert_eq!(
+        clusters.len(),
+        2,
+        "unrelated same-space clusters must not be merged as siblings: {:?}",
+        clusters
+            .iter()
+            .map(|c| c.source_ids.clone())
+            .collect::<Vec<_>>()
+    );
+    for cluster in &clusters {
+        assert_eq!(cluster.source_ids.len(), 5, "{:?}", cluster.source_ids);
+    }
+}
+
+#[test]
 fn sub_cluster_by_tokens_drops_single_member_subclusters_after_split() {
     // A token-split can strand a single memory in its own sub-cluster
     // (the farthest-first orthogonal outlier). The floor re-check (spec

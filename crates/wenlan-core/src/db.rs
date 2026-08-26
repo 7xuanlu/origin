@@ -2642,6 +2642,114 @@ const RESPLIT_STEP: f64 = 0.05;
 /// rather than tightened further.
 const RESPLIT_MAX_THRESHOLD: f64 = 0.92;
 
+/// Same-topic sibling shards (issue #596). The re-split ladder above can slice
+/// one coherent topic into several shards, and nothing downstream ever compares
+/// a pending cluster with its siblings: the Jaccard/subset filter in
+/// `handle_distill` scores a cluster only against *existing* pages, and two
+/// disjoint shards of one topic score 0 there. The page each shard creates is
+/// born `unconfirmed`, so shard one cannot deduplicate shard two inside the
+/// same pass either — one topic becomes two pages.
+///
+/// Merge those siblings back together before the pass writes anything, using
+/// the one same-pass signal already computed for every cluster: the mean-pooled
+/// `centroid_embedding`. (Entity identity is not usable here — a cluster
+/// carries a single `entity_id` taken from its first member, not the member set
+/// a "shared majority of entities" rule would need, so computing it would mean
+/// new work rather than reusing what the pass already has.)
+///
+/// Two clusters of one bucket merge when their centroids' cosine is at or above
+/// `RESPLIT_MAX_THRESHOLD` — the same ceiling the ladder tightens toward, so a
+/// merge can only undo a split the ladder itself made. A merge that would push
+/// the result back over the bucket's member cap or over the LLM token limit is
+/// skipped: those two bounds are exactly why the ladder split in the first
+/// place, and re-merging past them would reintroduce the oversized cluster.
+///
+/// Deterministic and model-free: candidates are scanned in emission order, the
+/// earlier cluster absorbs the later one, and the absorbing cluster is rebuilt
+/// through `build_distillation_cluster` so its centroid, token estimate, and
+/// member order match any other cluster of the pass. Survivors keep their
+/// emission order, which the `max_clusters` truncation below relies on.
+fn merge_sibling_shards(
+    memories: &[ClusterMemRow],
+    clusters: Vec<DistillationCluster>,
+    cap: usize,
+    token_limit: usize,
+) -> Vec<DistillationCluster> {
+    if clusters.len() < 2 {
+        return clusters;
+    }
+
+    let position: std::collections::HashMap<&str, usize> = memories
+        .iter()
+        .enumerate()
+        .map(|(index, memory)| (memory.source_id.as_str(), index))
+        .collect();
+
+    // Member indices per cluster. A cluster whose members can't all be resolved
+    // back to `memories` is left alone rather than guessed at.
+    let mut members: Vec<Vec<usize>> = Vec::with_capacity(clusters.len());
+    let mut survivors: Vec<Option<DistillationCluster>> = Vec::with_capacity(clusters.len());
+    for cluster in clusters {
+        let resolved: Option<Vec<usize>> = cluster
+            .source_ids
+            .iter()
+            .map(|source_id| position.get(source_id.as_str()).copied())
+            .collect();
+        members.push(resolved.unwrap_or_default());
+        survivors.push(Some(cluster));
+    }
+
+    for i in 0..survivors.len() {
+        if members[i].is_empty() {
+            continue;
+        }
+        for j in (i + 1)..survivors.len() {
+            if survivors[j].is_none() || members[j].is_empty() {
+                continue;
+            }
+            let same_topic = match (
+                survivors[i]
+                    .as_ref()
+                    .and_then(|c| c.centroid_embedding.as_deref()),
+                survivors[j]
+                    .as_ref()
+                    .and_then(|c| c.centroid_embedding.as_deref()),
+            ) {
+                (Some(a), Some(b)) => cosine_similarity(a, b) >= RESPLIT_MAX_THRESHOLD,
+                _ => false,
+            };
+            if !same_topic {
+                continue;
+            }
+            // Clusters of one bucket partition their members, so the union is
+            // just a concatenation.
+            let mut union = members[i].clone();
+            union.extend_from_slice(&members[j]);
+            if union.len() > cap {
+                continue;
+            }
+            let merged = build_distillation_cluster(memories, &union);
+            if merged.estimated_tokens > token_limit {
+                continue;
+            }
+            log::info!(
+                "[distill] merging same-topic sibling shards: {} + {} memories -> {} \
+                 (centroids at or above the {:.2} re-split ceiling)",
+                members[i].len(),
+                members[j].len(),
+                union.len(),
+                RESPLIT_MAX_THRESHOLD,
+            );
+            members[i] = union;
+            members[j].clear();
+            survivors[i] = Some(merged);
+            survivors[j] = None;
+        }
+    }
+
+    survivors.into_iter().flatten().collect()
+}
+
 #[derive(Debug, Clone, Copy)]
 enum DistillationClusterMode {
     SpaceScoped,
@@ -2673,6 +2781,9 @@ fn cluster_distillation_rows(
                           indices: &[usize],
                           cap: usize,
                           clusters: &mut Vec<DistillationCluster>| {
+        // Clusters this bucket produces are collected here first so the
+        // sibling-shard merge below sees the whole bucket at once.
+        let mut bucket: Vec<DistillationCluster> = Vec::new();
         // Each base group is drained, together with every re-split
         // descendant, before the next sibling starts. That keeps the output
         // order of the one-shot re-split this replaces: a group that never
@@ -2722,9 +2833,17 @@ fn cluster_distillation_rows(
                     continue;
                 }
                 let cluster = build_distillation_cluster(memories, &group);
-                emit_split(cluster, clusters);
+                emit_split(cluster, &mut bucket);
             }
         }
+        // One bucket is one space (or the single "no declared space"
+        // catch-all), so its clusters are exactly the siblings issue #596 is
+        // about. Cross-space candidates (`Global`) are a different feature and
+        // are left untouched.
+        if matches!(mode, DistillationClusterMode::SpaceScoped) {
+            bucket = merge_sibling_shards(memories, bucket, cap, token_limit);
+        }
+        clusters.extend(bucket);
     };
 
     match mode {

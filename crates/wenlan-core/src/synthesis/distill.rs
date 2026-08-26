@@ -289,6 +289,14 @@ pub(crate) async fn refine_clusters_with_llm(
                                         }
                                     }
                                 }
+                                // Anything else (including the `split` action
+                                // the prompt used to offer) is a keep. `split`
+                                // was never implemented and landed here
+                                // silently, so it is no longer offered — see
+                                // the note above `REFINE_CLUSTERS` in
+                                // `prompts/defaults.rs`. An overridden prompt
+                                // can still emit it; keeping is the same
+                                // behavior it always had.
                                 _ => {}
                             }
                         }
