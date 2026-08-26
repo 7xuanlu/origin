@@ -1,6 +1,6 @@
 {
   "name": "wenlan-mcp",
-  "version": "0.17.0",
+  "version": "0.17.1",
   "description": "Local-first memory layer for AI agents - MCP server",
   "keywords": [
     "mcp",
