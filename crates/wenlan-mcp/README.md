@@ -28,14 +28,16 @@ If you only need the raw MCP connector config, add this to your MCP client:
 }
 ```
 
-The npm wrapper auto-detects the host platform and downloads the matching prebuilt binary from the Wenlan release. Supported: macOS (arm64), Linux (x64, arm64; glibc), Windows (x64). Other targets require building the connector from source via `cargo install wenlan-mcp`; macOS Intel does not currently have a supported complete local runtime.
+The npm wrapper auto-detects the host platform and downloads the matching prebuilt binary from the Wenlan release. Supported: macOS (arm64), Linux (x64, arm64; glibc), Windows (x64). Other targets require building the connector from source via `cargo install --locked wenlan-mcp`; macOS Intel does not currently have a supported complete local runtime.
 
 Or install a binary directly:
 
 ```bash
 brew install 7xuanlu/tap/wenlan-mcp
-cargo install wenlan-mcp
+cargo install --locked wenlan-mcp
 ```
+
+`--locked` builds with the dependency versions the release was tested with; a plain `cargo install wenlan-mcp` also works, since the crate pins its proc-macro crate to the same minor as `rmcp`.
 
 Then use:
 
