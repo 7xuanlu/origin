@@ -12,7 +12,7 @@
 // `PageMapEdge` / the create outcomes as real cross-crate types, not just
 // methods on `MemoryDB`.
 
-use super::MemoryDB;
+use super::{commit_or_rollback, MemoryDB};
 use crate::WenlanError;
 
 /// A `page_maps` row.
@@ -768,7 +768,7 @@ impl MemoryDB {
                 return Err(e);
             }
         };
-        conn.execute("COMMIT", ())
+        commit_or_rollback(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("init_page_map commit: {e}")))?;
 
@@ -875,7 +875,7 @@ impl MemoryDB {
 
         match result {
             Ok(outcome) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("create_map_node commit: {e}")))?;
                 Ok(outcome)
@@ -991,7 +991,7 @@ impl MemoryDB {
 
         match result {
             Ok(outcome) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("create_suggested_map_node commit: {e}"))
                 })?;
                 Ok(outcome)
@@ -1151,7 +1151,7 @@ impl MemoryDB {
 
         match result {
             Ok(node) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("patch_map_node commit: {e}")))?;
                 Ok(node)
@@ -1274,7 +1274,7 @@ impl MemoryDB {
 
         match result {
             Ok(outcome) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("create_map_edge commit: {e}")))?;
                 Ok(outcome)
@@ -1394,7 +1394,7 @@ impl MemoryDB {
 
         match result {
             Ok(outcome) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("create_suggested_map_edge commit: {e}"))
                 })?;
                 Ok(outcome)
@@ -1473,7 +1473,7 @@ impl MemoryDB {
 
         match result {
             Ok(edge) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("patch_map_edge commit: {e}")))?;
                 Ok(edge)
@@ -1569,7 +1569,7 @@ impl MemoryDB {
 
         match result {
             Ok(data) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("put_page_map_layout commit: {e}"))
                 })?;
                 Ok(data)

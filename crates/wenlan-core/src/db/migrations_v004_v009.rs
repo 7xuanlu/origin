@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-use super::{MemoryDB, WenlanError};
+use super::{commit_or_rollback, MemoryDB, WenlanError};
 
 impl MemoryDB {
     // Migration 4: Refinement pipeline columns + queue table
@@ -73,7 +73,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("set user_version=4: {}", e)))?;
 
-        conn.execute("COMMIT", ())
+        commit_or_rollback(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("migration4 commit: {}", e)))?;
 
@@ -150,7 +150,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("set user_version=5: {}", e)))?;
 
-        conn.execute("COMMIT", ())
+        commit_or_rollback(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("migration5 commit: {}", e)))?;
 
@@ -203,7 +203,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("set user_version=6: {}", e)))?;
 
-        conn.execute("COMMIT", ())
+        commit_or_rollback(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("migration6 commit: {}", e)))?;
 
@@ -234,7 +234,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("set user_version=7: {}", e)))?;
 
-        conn.execute("COMMIT", ())
+        commit_or_rollback(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("migration7 commit: {}", e)))?;
 
@@ -265,7 +265,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("set user_version=8: {}", e)))?;
 
-        conn.execute("COMMIT", ())
+        commit_or_rollback(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("migration8 commit: {}", e)))?;
 
@@ -313,7 +313,7 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("set user_version=9: {}", e)))?;
 
-        conn.execute("COMMIT", ())
+        commit_or_rollback(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("migration9 commit: {}", e)))?;
 
