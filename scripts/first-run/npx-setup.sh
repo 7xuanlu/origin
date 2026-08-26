@@ -48,7 +48,7 @@ GAUNTLET_TIMEOUT=900 check npx-setup -- bash -c "$CMD"
 LOG="$GAUNTLET_OUT/checks/npx-setup.log"
 check_output npx-downloading-line "Downloading Wenlan $TAG..." -- grep -F "Downloading Wenlan $TAG..." "$LOG"
 check_output npx-binaries-installed-line "Wenlan binaries are installed in" -- grep -F "Wenlan binaries are installed in" "$LOG"
-check_output npx-background-on-line "Installed and started com.wenlan.server." -- grep -F "Installed and started com.wenlan.server." "$LOG"
+check_output npx-background-on-line "Installed and started com.wenlan.server; daemon healthy at" -- grep -F "Installed and started com.wenlan.server; daemon healthy at" "$LOG"
 for b in wenlan wenlan-server wenlan-mcp; do
     check "bin-$b-executable" -- test -x "$BIN_DIR/$b"
 done

@@ -69,7 +69,7 @@ fi
 export PATH="$BIN_DIR:$PATH"
 info path-export "export PATH=\"$BIN_DIR:\$PATH\""
 check_output setup-basic "Wenlan is set up for local memory." -- wenlan setup --basic
-check_output background-on "Installed and started com.wenlan.server." -- wenlan background on
+check_output background-on "Installed and started com.wenlan.server; daemon healthy at" -- wenlan background on
 check unit-file-exists -- test -f "$UNIT"
 check_output unit-enabled "enabled" -- systemctl --user is-enabled wenlan-server
 wait_health "$HEALTH" 240 || true

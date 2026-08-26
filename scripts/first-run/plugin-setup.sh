@@ -107,7 +107,7 @@ GAUNTLET_TIMEOUT=600 check skill-bootstrap -- bash -c "$BOOTSTRAP"
 export PATH="$HOME/.wenlan/bin:$PATH"
 info path-export 'export PATH="$HOME/.wenlan/bin:$PATH"'
 check_output setup-basic "Wenlan is set up for local memory." -- wenlan setup --basic
-check_output background-on "Installed and started com.wenlan.server." -- wenlan background on
+check_output background-on "Installed and started com.wenlan.server; daemon healthy at" -- wenlan background on
 if [ "$OS" = Linux ]; then
     check unit-file-exists -- test -f "$UNIT"
 else
