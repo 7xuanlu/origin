@@ -106,15 +106,26 @@ managed background process.
 
 ### 4. Re-probe health and version
 
+A first boot downloads the embedding model before it answers, which can take
+most of a minute on a slow connection, so poll for up to 60 seconds:
+
 ```bash
-for i in 1 2 3 4 5; do
+for i in $(seq 1 60); do
   curl -fsS -m 3 http://127.0.0.1:7878/api/health && break
   sleep 1
 done
 ```
 
-If the local runtime still is not reachable after about five seconds, surface
-the error and stop. Likely causes: launchd load failure, port 7878 already in
+If the local runtime still is not reachable after 60 seconds, print the doctor
+output and stop; it names the daemon state and the log files to read:
+
+```bash
+W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
+"$W" doctor
+```
+
+Likely causes: the model download is still running or failed (read the daemon
+log the doctor output points at), launchd load failure, port 7878 already in
 use, or a local runtime crash.
 
 Once healthy, repeat the version comparison from step 2. If the versions still

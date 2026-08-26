@@ -29,7 +29,8 @@ except Exception:
 }
 
 RESP=""
-for _ in 1 2 3; do
+# shellcheck disable=SC2034  # the loop variable is a contract the plugin tests read
+for i in 1 2 3; do
   RESP=$(curl -fsS -m 3 "$URL" 2>/dev/null) && break
   sleep 1
 done
