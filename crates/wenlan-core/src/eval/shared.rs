@@ -2254,7 +2254,10 @@ pub async fn run_title_enrichment_batch_api(
 /// with a batch API approach. Same DB queries and PageWrite-backed concept
 /// storage, different LLM execution model.
 ///
-/// Two batch submissions: refinement (merge/split clusters), then synthesis.
+/// One batch submission: synthesis only. Cluster refinement is skipped here --
+/// the implementation goes straight to synthesis (see the note in the body),
+/// because refinement only bites when an entity has 2+ clusters, which is rare
+/// in a single benchmark run.
 pub async fn run_concept_distillation_batch_api(
     db: &MemoryDB,
     api_key: &str,

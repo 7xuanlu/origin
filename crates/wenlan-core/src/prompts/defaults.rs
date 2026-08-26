@@ -232,26 +232,27 @@ Change NOTHING else: do not rewrite, reorder, add, or remove any text. \
 If you are unsure a source supports a claim, leave the claim unmarked. \
 Output the complete page body with the markers inserted.";
 
+// `split` used to be offered here alongside keep/merge/rename, but no parser
+// ever implemented it — `refine_clusters_with_llm` fell through to the catch-all
+// arm, so a SPLIT answer was silently a KEEP. Offering an action the system
+// ignores only spends tokens and misleads the model, so it is gone (issue #596).
 pub(crate) const REFINE_CLUSTERS: &str = r#"You are organizing memory clusters for wiki compilation. Each cluster will become a separate concept page.
 
 Given clusters for an entity, decide for each:
 - KEEP: cluster is a coherent topic, compile as-is
 - MERGE [i,j]: clusters i and j should be one concept (same topic from different angles)
-- SPLIT [i]: cluster i covers two distinct topics — provide two sub-topic titles
 - RENAME [i]: better title for cluster i
 
 Return a JSON array of actions, one per line:
 [
   {"action": "keep", "cluster": 0},
   {"action": "merge", "clusters": [1, 3], "title": "Combined Topic"},
-  {"action": "split", "cluster": 2, "titles": ["Sub-topic A", "Sub-topic B"]},
   {"action": "rename", "cluster": 4, "title": "Better Name"}
 ]
 
 Rules:
 - Default to KEEP unless you're confident about a change
 - MERGE when two clusters are clearly the same topic from different angles
-- SPLIT when a cluster mixes unrelated topics (e.g., licensing + architecture)
 - Only return valid JSON"#;
 
 pub(crate) const COMPRESS_CONTEXT: &str = "\
@@ -290,5 +291,19 @@ mod tests {
         assert!(!UPDATE_PAGE.contains("Open Questions, Sources"));
         assert!(UPDATE_PAGE.contains("appending [N]"));
         assert!(UPDATE_PAGE.contains("HTML comment"));
+    }
+
+    #[test]
+    fn refine_clusters_does_not_offer_the_unimplemented_split_action() {
+        // Issue #596: `refine_clusters_with_llm` implements only merge and
+        // rename, so a SPLIT answer fell through to the catch-all arm and was
+        // silently a KEEP. The action must not be advertised.
+        let prompt = REFINE_CLUSTERS.to_lowercase();
+        assert!(
+            !prompt.contains("split"),
+            "REFINE_CLUSTERS still offers an action no parser implements"
+        );
+        assert!(REFINE_CLUSTERS.contains(r#""action": "merge""#));
+        assert!(REFINE_CLUSTERS.contains(r#""action": "rename""#));
     }
 }
