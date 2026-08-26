@@ -13,6 +13,13 @@ Supported builds and prebuilt releases cover macOS arm64, Linux x86_64/aarch64 w
 
 `wenlan background on` / `wenlan background off` work on macOS, Linux, and Windows. macOS + Linux go through the `service-manager` crate (launchd / systemd-user); Windows takes the schtasks path described above so the daemon does not need a service dispatcher.
 
+The Windows desktop app installs to `%LOCALAPPDATA%\Programs\Wenlan`:
+`app/windows/installer-hooks.nsh` moves the NSIS per-user default off
+`%LOCALAPPDATA%\Wenlan`, which is the CLI data root above on a case-insensitive
+filesystem. A directory the user picks in the installer is kept. In sidecar mode
+(no service registration) the app binds the daemon to a kill-on-close job object on
+Windows and sends it SIGTERM on quit elsewhere, so the daemon never outlives the app.
+
 ## llama-cpp-2 backend
 
 macOS builds use Metal, Windows x86_64 builds use Vulkan with observable CPU/OpenMP fallback, and Linux builds remain CPU/OpenMP. Windows setup, device selection, CI/release prerequisites, and physical Qwen live-smoke commands are in [`windows-vulkan.md`](windows-vulkan.md).

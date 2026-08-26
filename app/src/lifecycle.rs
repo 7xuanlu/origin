@@ -875,6 +875,8 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
 
     if data_dir_env_overridden() {
         log::info!("[lifecycle] skipping quit teardown: isolated run (data-dir env override)");
+        // The isolated run has no launchd job: the daemon is our sidecar.
+        crate::daemon_start::stop_sidecar().await;
         exit_after_quit(app_handle, 0);
         attempt.commit();
         return Ok(());
@@ -926,6 +928,9 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
     }
 
     if quit_plan.exit_app {
+        // A sidecar we spawned (no launchd job, or a respawn from Diagnostics)
+        // must not outlive the app: the next launch would adopt it.
+        crate::daemon_start::stop_sidecar().await;
         exit_after_quit(app_handle, 0);
         attempt.commit();
     }
