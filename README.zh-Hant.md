@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=c4e73e02e9e5607b16b7e0d2282e1bc5cc3aff927b0e5acb7bbdfb038a688fc5 -->
+<!-- README_SYNC: source=README.md sha256=5e3c459d2b63607afbca51d7c7c6695326138156a9be535bcd02ef675c37a927 -->
 
 <p align="center">
   <picture>
@@ -51,11 +51,11 @@ Wenlan 以單一本地 daemon 運行。桌面 app 內建這個 daemon；無 GUI 
 
 ### 桌面 app
 
-**[下載 macOS 版 Wenlan](https://github.com/7xuanlu/wenlan/releases/latest)**（Apple Silicon），打開 `.dmg`，把 app 拖進「應用程式」。
+**[下載 macOS 版 Wenlan](https://github.com/7xuanlu/wenlan/releases/latest)**（Apple Silicon），打開 `.dmg`，把 app 拖進「應用程式」。升級時把新 app 拖到舊 app 上覆蓋，再打開它：正在執行的 Wenlan 會自動結束，新版本隨即啟動（Wenlan 0.17.0 及更早的版本需要先手動結束）。
 
 不需要再安裝其他東西。App 內已打包 daemon、CLI 與 MCP 連接器，啟動時會自動執行 daemon，並會為偵測到的 AI 用戶端提供接入：Claude Code 與 Codex 安裝 plugin，其餘用戶端寫入 MCP 設定。之後你就可以閱讀 Page、檢查任一引用背後的 Source，並整理整個知識體系。
 
-這個預覽版尚未經 Apple notarization，首次啟動會被 macOS 擋下，在「系統設定」的「隱私權與安全性」裡點一次「仍要打開」即可。一條指令可以跳過這一步：它會用 GitHub 發布的 SHA-256 核對下載檔案，只為這一個 app 清除 quarantine，不會變更任何 macOS 安全設定。
+這個預覽版尚未經 Apple notarization，首次啟動會被 macOS 擋下，提示「Apple 無法驗證 Wenlan 是否含有惡意軟體」。點「完成」，再到「系統設定」的「隱私權與安全性」裡點一次「仍要打開」即可。一條指令可以跳過這一步：它會用 GitHub 發布的 SHA-256 核對下載檔案，只為這一個 app 清除 quarantine，不會變更任何 macOS 安全設定。
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
