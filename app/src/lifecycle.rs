@@ -14,6 +14,36 @@ use tauri::AppHandle;
 /// teardown releases it so the recovered app can guard a later retry.
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
+/// The newer app bundle to reopen once this quit has finished, set by the
+/// single-instance handover (see `handover.rs`). Only ever read on macOS.
+#[cfg(target_os = "macos")]
+static HANDOVER_BUNDLE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Remember the newer bundle that the running quit must hand over to.
+#[cfg(target_os = "macos")]
+pub fn set_handover_bundle(bundle: PathBuf) {
+    *HANDOVER_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bundle);
+}
+
+#[cfg(target_os = "macos")]
+fn take_handover_bundle() -> Option<PathBuf> {
+    HANDOVER_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+/// Finish a quit: schedule the handover reopen when one is pending, then exit.
+fn exit_after_quit(app_handle: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = take_handover_bundle() {
+        crate::handover::relaunch_after_exit(&bundle);
+    }
+    app_handle.exit(0);
+}
+
 struct QuitAttemptGuard<'a> {
     flag: &'a AtomicBool,
     committed: bool,
@@ -775,6 +805,31 @@ pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> R
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn handover_pending() -> bool {
+    HANDOVER_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+}
+
+/// Poll the daemon's health route until it stops answering or `limit` passes.
+#[cfg(target_os = "macos")]
+async fn wait_for_daemon_to_stop(limit: Duration) {
+    let client = crate::api::WenlanClient::new();
+    let deadline = std::time::Instant::now() + limit;
+    while client.health().await.is_ok() {
+        if std::time::Instant::now() >= deadline {
+            log::warn!(
+                "[handover] daemon still answering at {} after {limit:?}; the new app will retry",
+                client.base_url()
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 fn shutdown_url_for(client: &crate::api::WenlanClient) -> String {
     format!("{}/api/shutdown", client.base_url())
 }
@@ -789,7 +844,7 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
 
     if data_dir_env_overridden() {
         log::info!("[lifecycle] skipping quit teardown: isolated run (data-dir env override)");
-        app_handle.exit(0);
+        exit_after_quit(app_handle);
         attempt.commit();
         return Ok(());
     }
@@ -830,10 +885,17 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
 
         // Wait briefly for the daemon to flush.
         tokio::time::sleep(Duration::from_millis(500)).await;
+        // A handover reopens a newer app right after this one exits, and
+        // that app starts its own daemon on the same port: give the old
+        // daemon a bounded moment to release it.
+        #[cfg(target_os = "macos")]
+        if handover_pending() {
+            wait_for_daemon_to_stop(Duration::from_secs(5)).await;
+        }
     }
 
     if quit_plan.exit_app {
-        app_handle.exit(0);
+        exit_after_quit(app_handle);
         attempt.commit();
     }
     Ok(())

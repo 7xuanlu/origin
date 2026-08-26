@@ -15,6 +15,8 @@ pub mod config;
 mod daemon_start;
 pub mod error;
 pub mod events;
+#[cfg(target_os = "macos")]
+mod handover;
 mod identity_paths;
 mod indexer;
 mod lifecycle;
@@ -539,8 +541,29 @@ pub fn run() {
     let app_state = AppState::new();
 
     let builder =
-        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             use tauri::Manager;
+            // A second launch of a *newer* bundle means the user upgraded and
+            // wants the new version, not the old window brought to the front.
+            #[cfg(target_os = "macos")]
+            {
+                let running = app.package_info().version.clone();
+                if let Some(newer) = handover::newer_bundle_from_launch(&argv, &running) {
+                    log::info!(
+                        "[handover] Wenlan {} was launched while {running} is running; quitting so {} can take over",
+                        newer.version,
+                        newer.bundle.display()
+                    );
+                    lifecycle::set_handover_bundle(newer.bundle);
+                    if let Err(e) = request_full_quit(app) {
+                        log::error!("[handover] failed to request guarded quit: {e}");
+                        force_full_quit(app.clone());
+                    }
+                    return;
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = &argv;
             if let Some(window) = app.get_webview_window("main") {
                 set_main_window_dock_visibility(app, true);
                 let _ = window.show();
