@@ -292,6 +292,10 @@ fn print_daemon_log_paths() {
         "Daemon fallback log: {}",
         fallback_root.join("logs/wenlan-server.log").display()
     );
+    println!(
+        "Launchd stderr log: {}",
+        super::service::launchd_stderr_log_path(&data_root).display()
+    );
 }
 
 pub async fn print_runtime_status() -> anyhow::Result<()> {
@@ -688,21 +692,33 @@ async fn print_daemon_health() {
     }
 }
 
+/// The daemon's rotating file log in the data root (macOS only; Linux and
+/// Windows log to the service console).
+#[cfg(target_os = "macos")]
+pub(crate) fn daemon_log_path() -> std::path::PathBuf {
+    config::data_root().join("logs/wenlan-server.log")
+}
+
+/// The error the daemon's most recent run ended with, and the log it was read
+/// from. The fallback log is consulted only when the primary one does not
+/// exist at all (the daemon could not write its data root), so an old fallback
+/// entry never shadows a healthy primary log.
+#[cfg(target_os = "macos")]
+pub(crate) fn current_daemon_error() -> Option<(std::path::PathBuf, String)> {
+    let log_path = daemon_log_path();
+    if log_path.exists() {
+        last_daemon_error(&log_path).map(|line| (log_path, line))
+    } else {
+        let fallback = fallback_log_root().join("logs/wenlan-server.log");
+        last_daemon_error(&fallback).map(|line| (fallback, line))
+    }
+}
+
 /// macOS: the daemon keeps a rotating file log (primary data root, else the
 /// fallback root), so a daemon that exited on purpose can say why.
 #[cfg(target_os = "macos")]
 fn print_last_daemon_error() {
-    let log_path = config::data_root().join("logs/wenlan-server.log");
-    // The fallback log is consulted only when the primary one does not exist
-    // at all (the daemon could not write its data root), so an old fallback
-    // entry never shadows a healthy primary log.
-    let found = if log_path.exists() {
-        last_daemon_error(&log_path).map(|line| (log_path.clone(), line))
-    } else {
-        let fallback = fallback_log_root().join("logs/wenlan-server.log");
-        last_daemon_error(&fallback).map(|line| (fallback, line))
-    };
-    match found {
+    match current_daemon_error() {
         Some((path, line)) => {
             println!("  Last daemon error ({}):", path.display());
             println!("    {line}");
@@ -715,7 +731,10 @@ fn print_last_daemon_error() {
             }
         }
         None => {
-            println!("  No daemon error recorded in {}.", log_path.display());
+            println!(
+                "  No daemon error recorded in {}.",
+                daemon_log_path().display()
+            );
             println!(
                 "  Start it with `wenlan background on` (or open the Wenlan app); if it stops again, that log says why."
             );

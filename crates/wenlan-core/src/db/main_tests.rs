@@ -55731,3 +55731,35 @@ async fn strict_page_search_fails_on_a_row_the_lenient_path_skips() {
         "lenient search must degrade to the vector arm and still return the page"
     );
 }
+
+/// The daemon must never let fastembed pick its cwd-relative default: under
+/// launchd the cwd is `/` and the first-run download has nowhere to go.
+#[test]
+fn daemon_cache_dir_never_falls_through_to_the_cwd_default() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path();
+    // Nothing populated, nothing configured: the store's own directory.
+    assert_eq!(
+        daemon_fastembed_cache_dir_from(None, None, db_path),
+        db_path.join("fastembed_cache")
+    );
+    // The CI hook keeps its pre-populated cache.
+    assert_eq!(
+        daemon_fastembed_cache_dir_from(None, Some("/ci/cache".into()), db_path),
+        std::path::PathBuf::from("/ci/cache")
+    );
+    // An empty override is not a directory.
+    assert_eq!(
+        daemon_fastembed_cache_dir_from(None, Some("".into()), db_path),
+        db_path.join("fastembed_cache")
+    );
+    // A populated cache always wins.
+    assert_eq!(
+        daemon_fastembed_cache_dir_from(
+            Some("/populated".into()),
+            Some("/ci/cache".into()),
+            db_path
+        ),
+        std::path::PathBuf::from("/populated")
+    );
+}

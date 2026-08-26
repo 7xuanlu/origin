@@ -25,6 +25,8 @@ const SHUTDOWN_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from
 const SHUTDOWN_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const DAEMON_PROCESS_ID_HEADER: &str = "x-wenlan-process-id";
 const AUTOSTART_OFF_MARKER: &str = "autostart.off";
+/// How long `background on` waits for `/api/health` before reporting.
+const FIRST_HEALTH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug)]
 struct DaemonProcessIdentity {
@@ -203,7 +205,11 @@ fn origin_data_root() -> PathBuf {
 /// embedded `com.wenlan.server.plist` template carried: stdout/stderr routing,
 /// `EnvironmentVariables.RUST_LOG`, and the canonical `WENLAN_DATA_DIR`
 /// ownership marker consumed by the desktop app. The daemon owns bounded file
-/// logging, so launchd routes its raw streams to `/dev/null`.
+/// logging, so launchd's stdout goes to `/dev/null`; stderr goes to
+/// `<data root>/logs/launchd-stderr.log` so a crash before file logging is up
+/// (a missing library, an abort) is never silent. That file stays small: the
+/// daemon writes only bootstrap failures there and download progress bars are
+/// hidden off a terminal.
 ///
 /// `LaunchdInstallConfig` in service-manager 0.11 only exposes `keep_alive`;
 /// stdout/stderr paths must come through `ServiceInstallCtx.contents` as a
@@ -300,7 +306,7 @@ pub async fn install() -> Result<()> {
             "Installed and started Windows scheduled task '{}' (wenlan-server).",
             WINDOWS_TASK_NAME
         );
-        return Ok(());
+        return wait_for_first_health().await;
     }
 
     #[cfg_attr(target_os = "windows", allow(unreachable_code))]
@@ -347,10 +353,16 @@ pub async fn install() -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             let data_root = origin_data_root();
+            let stderr_log = launchd_stderr_log_path(&data_root);
+            if let Some(log_dir) = stderr_log.parent() {
+                std::fs::create_dir_all(log_dir).with_context(|| {
+                    format!("create the daemon log directory {}", log_dir.display())
+                })?;
+            }
             Some(build_launchd_plist(
                 &program,
                 Path::new("/dev/null"),
-                Path::new("/dev/null"),
+                &stderr_log,
                 "info",
                 &data_root,
             ))
@@ -382,7 +394,59 @@ pub async fn install() -> Result<()> {
         .context("start service")?;
     remove_autostart_off_marker()?;
     println!("Installed and started {}.", SERVICE_LABEL);
+    wait_for_first_health().await
+}
+
+/// Where launchd writes the daemon's raw stderr (see `build_launchd_plist`).
+#[cfg(target_os = "macos")]
+pub(crate) fn launchd_stderr_log_path(data_root: &Path) -> PathBuf {
+    data_root.join("logs/launchd-stderr.log")
+}
+
+/// `background on` used to return as soon as the service manager accepted the
+/// job, so a daemon that crash-looped under launchd still printed "Installed
+/// and started" (first-run gauntlet finding F4). Wait for the daemon to
+/// answer; when it does not, tell a first start that is still downloading the
+/// embedding model apart from a daemon that has already failed.
+async fn wait_for_first_health() -> Result<()> {
+    // A routable `WENLAN_BIND_ADDR` has no local URL to poll; the install
+    // itself succeeded, so there is nothing to report.
+    let Ok(base_url) = local_daemon_base_url() else {
+        return Ok(());
+    };
+    let health_url = format!("{base_url}/api/health");
+    if poll_health(&health_url, FIRST_HEALTH_WAIT).await.is_ok() {
+        println!("Daemon healthy at {base_url}.");
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    if let Some((log_path, line)) = crate::commands::setup::current_daemon_error() {
+        anyhow::bail!(
+            "the daemon started but stopped with an error ({}):\n  {line}\nFix the cause above, then run `wenlan background on` again.",
+            log_path.display()
+        );
+    }
+    println!("{}", first_health_pending_note(&health_url));
     Ok(())
+}
+
+/// The message for a daemon that has not answered yet but has not failed
+/// either, as far as this command can see.
+fn first_health_pending_note(health_url: &str) -> String {
+    let mut note = format!(
+        "Daemon not answering yet at {health_url} after {}s. A first start downloads the 210 MB embedding model; check `wenlan status` in a minute.",
+        FIRST_HEALTH_WAIT.as_secs()
+    );
+    #[cfg(target_os = "macos")]
+    note.push_str(&format!(
+        "\nIf it stays down, `wenlan doctor` shows the daemon's last error (log: {}).",
+        crate::commands::setup::daemon_log_path().display()
+    ));
+    #[cfg(target_os = "linux")]
+    note.push_str("\nIf it stays down, `journalctl --user -u wenlan-server` says why.");
+    #[cfg(target_os = "windows")]
+    note.push_str("\nIf it stays down, run `wenlan doctor`.");
+    note
 }
 
 #[cfg(target_os = "macos")]
@@ -958,6 +1022,40 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_plist_keeps_stderr_in_the_data_root() {
+        let data_root = Path::new("/tmp/wenlan-plist-test-root");
+        let stderr_log = launchd_stderr_log_path(data_root);
+        assert_eq!(
+            stderr_log,
+            Path::new("/tmp/wenlan-plist-test-root/logs/launchd-stderr.log")
+        );
+        let plist = build_launchd_plist(
+            Path::new("/opt/wenlan/wenlan-server"),
+            Path::new("/dev/null"),
+            &stderr_log,
+            "info",
+            data_root,
+        );
+        assert!(plist.contains(
+            "<key>StandardErrorPath</key>\n\t<string>/tmp/wenlan-plist-test-root/logs/launchd-stderr.log</string>"
+        ));
+        assert!(plist.contains("<key>StandardOutPath</key>\n\t<string>/dev/null</string>"));
+        assert!(plist.contains(
+            "<key>WENLAN_DATA_DIR</key>\n\t\t<string>/tmp/wenlan-plist-test-root</string>"
+        ));
+    }
+
+    #[test]
+    fn first_health_note_says_how_long_it_waited_and_what_to_do() {
+        let note = first_health_pending_note("http://127.0.0.1:7878/api/health");
+        assert!(note.contains("after 10s"), "{note}");
+        assert!(note.contains("210 MB embedding model"), "{note}");
+        assert!(note.contains("`wenlan status`"), "{note}");
+        assert!(note.contains("If it stays down"), "{note}");
     }
 
     #[test]
