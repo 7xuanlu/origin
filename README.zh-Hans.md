@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=0a1d0787e9875aa46c3a6aa2db9495207ff0eae9925ac1e77010bcfb2ad16c5a -->
+<!-- README_SYNC: source=README.md sha256=c4e73e02e9e5607b16b7e0d2282e1bc5cc3aff927b0e5acb7bbdfb038a688fc5 -->
 
 <p align="center">
   <picture>
@@ -124,6 +124,8 @@ Wenlan 把文档、笔记和过去的 AI 对话整理成会随工作持续更新
 
 - **[LLM-wiki v1](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)：** Karpathy 提出不可变的来源、由 AI 维护的 Markdown Wiki，以及会随你和 AI 一起演进、规定组织与维护方式的 Schema（规则层）。Wenlan 以[类型化记忆字段](docs/technical-foundations.md#typed-memory-schema)与内建规则，落实页面结构、出处、引用、刷新、归属和审核。
 - **[LLM-wiki v2](https://gist.github.com/rohitg00/2067ab416f7bbe447c1977edaaa681e2)：** Rohitg00 加入记忆生命周期。Wenlan 把这个方向做成可以直接使用的产品：可追溯的来源、由 AI agent 按 Zettelkasten（卡片盒笔记法）捕获的原子记忆（每条只表达一个完整想法），以及同时由两者建立并持续维护的页面。
+
+完整流程请见 [LLM-wiki 实现指南](https://wenlan.app/zh-CN/learn/distilled-wiki-pages-ai-memory)。
 
 **Wenlan 最独特的做法：** 来源与原子记忆会分别支撑持续维护的页面。记忆历史保留知识如何改变；页面历史说明当前结论由哪些依据支撑。机器维护的页面可以依当前依据重建；对人工文字的改动则成为可审核的修订，不会直接覆盖。
 
