@@ -1240,7 +1240,9 @@ fn take_fail_before_commit(_page_id: &str) -> bool {
 /// every call site keeps its own `map_err` label. Sites whose own
 /// commit-error arm already rolls back call `execute` directly and are left
 /// as they are.
-pub(crate) async fn commit_or_rollback(conn: &libsql::Connection) -> libsql::Result<u64> {
+/// Private on purpose: the R4 drift guard forbids crate-visible `db.rs` functions that
+/// take a raw `libsql::Connection`; the `db/*` child modules reach it through `super::`.
+async fn commit_or_rollback(conn: &libsql::Connection) -> libsql::Result<u64> {
     match conn.execute("COMMIT", ()).await {
         Ok(rows) => Ok(rows),
         Err(error) => {
