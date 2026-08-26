@@ -1,4 +1,4 @@
-use super::MemoryDB;
+use super::{commit_or_rollback, MemoryDB};
 use crate::derived_artifact_state::summary_eligible_predicate;
 use crate::error::WenlanError;
 
@@ -155,8 +155,7 @@ impl MemoryDB {
         }
         .await;
         match result {
-            Ok(()) => conn
-                .execute("COMMIT", ())
+            Ok(()) => commit_or_rollback(&conn)
                 .await
                 .map(|_| ())
                 .map_err(|error| WenlanError::VectorDb(format!("derived sweep commit: {error}"))),

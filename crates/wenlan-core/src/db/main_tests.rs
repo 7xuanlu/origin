@@ -52846,6 +52846,85 @@ async fn a_poisoned_orphan_does_not_block_the_other_repairs() {
     assert_eq!(db.resolve_orphan_page_links().await.unwrap(), 0);
 }
 
+/// A failed `COMMIT` must not leave the sweep's transaction open.
+///
+/// SQLite keeps the transaction active when `COMMIT` itself fails --
+/// `SQLITE_BUSY` from a checkpoint or a reader still holding the WAL is the
+/// shape seen in the field. `MemoryDB` owns ONE writer connection, so a sweep
+/// that returns the commit error without rolling back leaves that connection
+/// mid-transaction: the next `BEGIN` fails with "cannot start a transaction
+/// within a transaction", and so does every write after it until something
+/// rolls back. One failed sweep commit wedges the whole daemon.
+///
+/// The busy commit is not reproducible by contention here. A second
+/// connection holding the write lock fails the sweep at its first write, long
+/// before `COMMIT` (`a_review_meeting_a_foreign_writer_marks_nothing` in the
+/// presence-review tests documents that window). So the fault is staged
+/// instead: a deferred foreign-key violation inside the sweep's own
+/// transaction is checked only at commit time, which fails the `COMMIT`
+/// statement and leaves the transaction active -- the same end state,
+/// deterministically.
+#[tokio::test]
+async fn a_failed_orphan_sweep_commit_does_not_wedge_the_writer_connection() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_commit_src",
+        "Commit Src",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    db.replace_page_links(
+        "page_commit_src",
+        &[crate::synthesis::wikilinks::Wikilink {
+            label: "Commit Target".to_string(),
+            target_page_id: None,
+        }],
+    )
+    .await
+    .unwrap();
+    db.insert_page(
+        "page_commit_target",
+        "Commit Target",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let error = crate::db::with_failing_orphan_sweep_commit(db.resolve_orphan_page_links())
+        .await
+        .expect_err("the staged commit failure must reach the caller");
+    assert!(
+        error.to_string().contains("resolve_orphan_links commit"),
+        "the sweep must surface its own commit label, got: {error}"
+    );
+
+    // The wedge itself: the next `BEGIN`-using write on the same connection.
+    db.insert_page(
+        "page_after_failed_commit",
+        "After Failed Commit",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .expect("a failed sweep commit must not wedge later writes");
+}
+
 /// A full batch of unresolvable orphans in front of the ordered backlog must
 /// not starve the resolvable rows behind it forever: the rotating keyset
 /// cursor advances past every examined row -- resolved or not -- so the next

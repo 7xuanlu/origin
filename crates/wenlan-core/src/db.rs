@@ -893,7 +893,7 @@ impl MemoryDB {
 
         match result {
             Ok(folded) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("fold commit: {e}")))?;
                 Ok(folded)
@@ -1017,7 +1017,7 @@ impl MemoryDB {
 
         match result {
             Ok(n) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("fold_entity commit: {e}")))?;
                 Ok(n)
@@ -1110,7 +1110,7 @@ impl MemoryDB {
 
         match result {
             Ok(n) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("retype commit: {e}")))?;
                 Ok(n)
@@ -1223,6 +1223,34 @@ fn take_fail_before_commit(page_id: &str) -> bool {
 #[inline(always)]
 fn take_fail_before_commit(_page_id: &str) -> bool {
     false
+}
+
+/// `COMMIT`, rolling the transaction back when the commit itself fails.
+///
+/// SQLite leaves the transaction open when `COMMIT` returns an error —
+/// `SQLITE_BUSY` raised by a checkpoint or by a reader still holding the WAL
+/// is the one seen in the field. `MemoryDB` owns ONE writer connection, so a
+/// caller that returns the commit error without rolling back leaves that
+/// connection mid-transaction: the next `BEGIN` fails with "cannot start a
+/// transaction within a transaction", and so does every write after it until
+/// something issues `ROLLBACK`. One failed commit would wedge every write in
+/// the daemon.
+///
+/// Drop-in for a bare `COMMIT` execute — same result, same error — so
+/// every call site keeps its own `map_err` label. Sites whose own
+/// commit-error arm already rolls back call `execute` directly and are left
+/// as they are.
+pub(crate) async fn commit_or_rollback(conn: &libsql::Connection) -> libsql::Result<u64> {
+    match conn.execute("COMMIT", ()).await {
+        Ok(rows) => Ok(rows),
+        Err(error) => {
+            // Best effort. If the failure did end the transaction after all,
+            // this reports "cannot rollback - no transaction is active",
+            // which is the state we wanted anyway.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(error)
+        }
+    }
 }
 
 /// One recorded version of a page, as stored in `page_history`.
@@ -4767,7 +4795,7 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("set user_version=2: {}", e)))?;
 
-            conn.execute("COMMIT", ())
+            commit_or_rollback(&conn)
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("migration2 commit: {}", e)))?;
 
@@ -4829,7 +4857,7 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("set user_version=3: {}", e)))?;
 
-            conn.execute("COMMIT", ())
+            commit_or_rollback(&conn)
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("migration3 commit: {}", e)))?;
 
@@ -4962,7 +4990,7 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("set user_version=10: {}", e)))?;
 
-            conn.execute("COMMIT", ())
+            commit_or_rollback(&conn)
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("migration10 commit: {}", e)))?;
 
@@ -5044,7 +5072,7 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("set user_version=12: {}", e)))?;
 
-            conn.execute("COMMIT", ())
+            commit_or_rollback(&conn)
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("migration12 commit: {}", e)))?;
 
@@ -5273,7 +5301,7 @@ impl MemoryDB {
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("migration 19 update {}: {}", source_id, e)))?;
                 }
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
                 log::info!(
@@ -5335,7 +5363,7 @@ impl MemoryDB {
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("migration 20 update {}: {}", source_id, e)))?;
                 }
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
                 log::info!(
@@ -5423,7 +5451,7 @@ impl MemoryDB {
             conn.execute("PRAGMA user_version = 22", ())
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("set user_version=22: {}", e)))?;
-            conn.execute("COMMIT", ())
+            commit_or_rollback(&conn)
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("migration 22 commit: {}", e)))?;
 
@@ -5461,7 +5489,7 @@ impl MemoryDB {
             conn.execute("PRAGMA user_version = 23", ())
                 .await
                 .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
-            conn.execute("COMMIT", ())
+            commit_or_rollback(&conn)
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("migration 23 commit: {}", e)))?;
 
@@ -5686,7 +5714,7 @@ impl MemoryDB {
                 .await
                 .ok();
 
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m24 commit: {}", e)))?;
 
@@ -5791,7 +5819,7 @@ impl MemoryDB {
                             }
                         }
                     }
-                    if let Err(e) = conn.execute("COMMIT", ()).await {
+                    if let Err(e) = commit_or_rollback(&conn).await {
                         log::warn!("[memory_db] m24 re-embed batch commit: {}", e);
                     }
                     drop(conn);
@@ -5888,7 +5916,7 @@ impl MemoryDB {
                             }
                         }
                     }
-                    if let Err(e) = conn.execute("COMMIT", ()).await {
+                    if let Err(e) = commit_or_rollback(&conn).await {
                         log::warn!("[memory_db] m24 entity re-embed commit: {}", e);
                     }
                     drop(conn);
@@ -6092,7 +6120,7 @@ impl MemoryDB {
                             }
                         }
                     }
-                    if let Err(e) = conn.execute("COMMIT", ()).await {
+                    if let Err(e) = commit_or_rollback(&conn).await {
                         log::warn!("[memory_db] null embed recovery commit: {}", e);
                     }
                     drop(conn);
@@ -6823,7 +6851,7 @@ impl MemoryDB {
                         }
                     }
 
-                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                    commit_or_rollback(&conn).await.map_err(|e| {
                         WenlanError::VectorDb(format!("migration 40 backfill commit: {e}"))
                     })?;
                 }
@@ -7130,7 +7158,7 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("m43 create view: {e}")))?;
 
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m43 commit: {e}")))?;
 
@@ -7205,7 +7233,7 @@ impl MemoryDB {
                     }
                 }
 
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m44 commit: {e}")))?;
 
@@ -7238,7 +7266,7 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("m45 update: {e}")))?;
 
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m45 commit: {e}")))?;
 
@@ -7477,7 +7505,7 @@ impl MemoryDB {
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m46 agent_activity: {e}")))?;
 
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m46 commit: {e}")))?;
 
@@ -7715,7 +7743,7 @@ impl MemoryDB {
                     .await;
                     match result {
                         Ok(()) => {
-                            conn.execute("COMMIT", ())
+                            commit_or_rollback(&conn)
                                 .await
                                 .map_err(|e| WenlanError::VectorDb(format!("m50 commit: {e}")))?;
                         }
@@ -7771,7 +7799,7 @@ impl MemoryDB {
                 .await;
                 match result {
                     Ok(()) => {
-                        conn.execute("COMMIT", ())
+                        commit_or_rollback(&conn)
                             .await
                             .map_err(|e| WenlanError::VectorDb(format!("m51 commit: {e}")))?;
                         log::info!("[migration] Migration 51 applied: document_tags table created");
@@ -7839,7 +7867,7 @@ impl MemoryDB {
                     .await;
                     match result {
                         Ok(()) => {
-                            conn.execute("COMMIT", ())
+                            commit_or_rollback(&conn)
                                 .await
                                 .map_err(|e| WenlanError::VectorDb(format!("m52 commit: {e}")))?;
                             log::info!("[migration] Migration 52 applied: event_date + event_end columns + indexes");
@@ -9652,7 +9680,7 @@ impl MemoryDB {
                             }
                         }
                     }
-                    if let Err(e) = conn.execute("COMMIT", ()).await {
+                    if let Err(e) = commit_or_rollback(&conn).await {
                         log::warn!("[memory_db] null entity embed recovery commit: {}", e);
                     }
                     drop(conn);
@@ -9770,7 +9798,7 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(()) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m80 commit setup: {e}")))?;
                 }
@@ -9841,13 +9869,13 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(Some(hi)) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m80 commit batch: {e}")))?;
                     cursor = hi;
                 }
                 Ok(None) => {
-                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                    commit_or_rollback(&conn).await.map_err(|e| {
                         WenlanError::VectorDb(format!("m80 commit final batch: {e}"))
                     })?;
                     break;
@@ -9891,7 +9919,7 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(()) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m80 commit assert: {e}")))?;
                 }
@@ -10245,7 +10273,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m81 commit: {e}")))?;
             }
@@ -10384,7 +10412,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m82 commit: {e}")))?;
             }
@@ -10497,7 +10525,7 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(()) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m89 commit setup: {e}")))?;
                 }
@@ -10581,13 +10609,13 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(Some(hi)) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m89 commit batch: {e}")))?;
                     cursor = hi;
                 }
                 Ok(None) => {
-                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                    commit_or_rollback(&conn).await.map_err(|e| {
                         WenlanError::VectorDb(format!("m89 commit final batch: {e}"))
                     })?;
                     break;
@@ -10620,7 +10648,7 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(()) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m89 commit assert: {e}")))?;
                 }
@@ -10727,7 +10755,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m90 commit: {e}")))?;
             }
@@ -10837,13 +10865,13 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(Some(hi)) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m91 commit batch: {e}")))?;
                     cursor = hi;
                 }
                 Ok(None) => {
-                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                    commit_or_rollback(&conn).await.map_err(|e| {
                         WenlanError::VectorDb(format!("m91 commit final batch: {e}"))
                     })?;
                     break;
@@ -10878,7 +10906,7 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(()) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m91 commit assert: {e}")))?;
                 }
@@ -11342,7 +11370,7 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(()) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m92 commit setup: {e}")))?;
                 }
@@ -11535,14 +11563,14 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(Some((hi, created))) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m92 commit batch: {e}")))?;
                     cursor = hi;
                     total_created += created;
                 }
                 Ok(None) => {
-                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                    commit_or_rollback(&conn).await.map_err(|e| {
                         WenlanError::VectorDb(format!("m92 commit final batch: {e}"))
                     })?;
                     break;
@@ -11578,7 +11606,7 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(()) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m92 commit assert: {e}")))?;
                 }
@@ -11747,13 +11775,13 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(Some(hi)) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m93 commit batch: {e}")))?;
                     cursor = hi;
                 }
                 Ok(None) => {
-                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                    commit_or_rollback(&conn).await.map_err(|e| {
                         WenlanError::VectorDb(format!("m93 commit final batch: {e}"))
                     })?;
                     break;
@@ -11868,7 +11896,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m94 commit: {e}")))?;
             }
@@ -11920,7 +11948,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m97 commit: {e}")))?;
             }
@@ -12356,7 +12384,7 @@ impl MemoryDB {
         let result = Self::ensure_community_substrate_tables(&conn).await;
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|error| WenlanError::VectorDb(format!("m95 commit: {error}")))?;
             }
@@ -14074,7 +14102,7 @@ impl MemoryDB {
 
         let (backfilled, healed, orphans_retracted, generation_updates) = match result {
             Ok(value) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m111 commit: {e}")))?;
                 value
@@ -14255,7 +14283,7 @@ impl MemoryDB {
 
         let (classified, defaulted) = match result {
             Ok(value) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m112 commit: {e}")))?;
                 value
@@ -14396,7 +14424,7 @@ impl MemoryDB {
 
         let repaired = match result {
             Ok(value) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m113 commit: {e}")))?;
                 value
@@ -14489,7 +14517,7 @@ impl MemoryDB {
 
         let resynced = match result {
             Ok(value) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m114 commit: {e}")))?;
                 value
@@ -14882,7 +14910,7 @@ impl MemoryDB {
 
         let (relates_updated, cites_updated, links_updated) = match result {
             Ok(counts) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m115 commit: {e}")))?;
                 counts
@@ -14982,7 +15010,7 @@ impl MemoryDB {
 
         let updated = match result {
             Ok(count) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m116 commit: {e}")))?;
                 count
@@ -15095,7 +15123,7 @@ impl MemoryDB {
 
         let updated = match result {
             Ok(count) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m117 commit: {e}")))?;
                 count
@@ -15236,13 +15264,13 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(Some(hi)) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m118 commit batch: {e}")))?;
                     cursor = hi;
                 }
                 Ok(None) => {
-                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                    commit_or_rollback(&conn).await.map_err(|e| {
                         WenlanError::VectorDb(format!("m118 commit final batch: {e}"))
                     })?;
                     break;
@@ -15278,7 +15306,7 @@ impl MemoryDB {
             .await;
             match result {
                 Ok(()) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("m118 commit assert: {e}")))?;
                 }
@@ -15452,7 +15480,7 @@ impl MemoryDB {
 
         let reactivated = match result {
             Ok(count) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m119 commit: {e}")))?;
                 count
@@ -15508,7 +15536,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m120 commit: {e}")))?;
             }
@@ -15667,7 +15695,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m121 commit: {e}")))?;
             }
@@ -16364,7 +16392,7 @@ impl MemoryDB {
 
         let (retired, requeued, downgraded, generation_updates) = match result {
             Ok(value) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m124 commit: {e}")))?;
                 value
@@ -16441,7 +16469,7 @@ impl MemoryDB {
 
         let deleted = match result {
             Ok(value) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m125 commit: {e}")))?;
                 value
@@ -16513,8 +16541,7 @@ impl MemoryDB {
             .map_err(|error| WenlanError::VectorDb(format!("M4 startup repair begin: {error}")))?;
         let result = Self::ensure_community_substrate_tables(&conn).await;
         match result {
-            Ok(()) => conn
-                .execute("COMMIT", ())
+            Ok(()) => commit_or_rollback(&conn)
                 .await
                 .map_err(|error| {
                     WenlanError::VectorDb(format!("M4 startup repair commit: {error}"))
@@ -18340,7 +18367,7 @@ impl MemoryDB {
         .await;
         match result {
             Ok((flipped, generation_updates)) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("promote_edges_grounded commit: {e}"))
                 })?;
                 self.record_community_dirty_nodes(generation_updates);
@@ -19897,7 +19924,7 @@ impl MemoryDB {
         .await;
         let (input_generation, candidates, space_snapshots) = match snapshot_result {
             Ok(snapshot) => {
-                snapshot_conn.execute("COMMIT", ()).await.map_err(|error| {
+                commit_or_rollback(&snapshot_conn).await.map_err(|error| {
                     WenlanError::VectorDb(format!("community parity snapshot commit: {error}"))
                 })?;
                 snapshot
@@ -24047,7 +24074,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("reorder commit: {}", e)))?;
                 Ok(())
@@ -24188,7 +24215,7 @@ impl MemoryDB {
         .await;
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("set_document_tags commit: {e}")))?;
             }
@@ -29767,7 +29794,7 @@ impl MemoryDB {
 
             match result {
                 Ok(()) => {
-                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                    commit_or_rollback(&conn).await.map_err(|e| {
                         WenlanError::VectorDb(format!("insert_summary_node srcs commit: {e}"))
                     })?;
                 }
@@ -32771,7 +32798,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("rebuild_child commit: {e}")))?;
                 Ok(())
@@ -33562,7 +33589,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("create_entity commit: {}", e)))?;
             }
@@ -33640,7 +33667,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("store_entity commit: {}", e)))?;
             }
@@ -33801,7 +33828,7 @@ impl MemoryDB {
         .await;
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("store_minhash commit: {e}")))?;
                 Ok(())
@@ -34392,7 +34419,7 @@ impl MemoryDB {
         .await;
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("refresh_entity_embedding commit: {}", e))
                 })?;
                 Ok(())
@@ -34487,7 +34514,7 @@ impl MemoryDB {
 
         let inserted = match result {
             Ok(inserted) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("add_observation commit: {}", e)))?;
                 inserted
@@ -35378,7 +35405,7 @@ impl MemoryDB {
 
         match result {
             Ok((generation_updates, observations_moved, aliases_added)) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("merge_entities commit: {e}")))?;
                 self.record_community_dirty_nodes(generation_updates);
@@ -35498,7 +35525,7 @@ impl MemoryDB {
 
         match exec {
             Ok((snapshot, generation_updates)) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("supersede_relation commit: {e}"))
                 })?;
                 self.record_community_dirty_nodes(generation_updates);
@@ -35817,7 +35844,7 @@ impl MemoryDB {
 
         match exec {
             Ok((edge_id, existed_before, generation_updates)) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("create_relation commit: {e}")))?;
                 self.record_community_dirty_nodes(generation_updates);
@@ -36199,7 +36226,7 @@ impl MemoryDB {
         .await;
         match result {
             Ok(archived) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("archive_entity commit: {e}")))?;
                 Ok(archived)
@@ -36333,7 +36360,7 @@ impl MemoryDB {
         .await;
         match result {
             Ok(restored) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("restore_entity commit: {e}")))?;
                 Ok(restored)
@@ -36676,7 +36703,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("link_memory_entities COMMIT: {e}"))
                 })?;
                 Ok(())
@@ -37704,7 +37731,7 @@ impl MemoryDB {
 
         match result {
             Ok(true) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("entity enrichment commit: {e}")))?;
                 self.record_community_dirty_nodes(generation_updates);
@@ -37856,7 +37883,7 @@ impl MemoryDB {
 
         match result {
             Ok(true) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("entity link commit: {e}")))?;
                 Ok(true)
@@ -38424,7 +38451,7 @@ impl MemoryDB {
 
         match result {
             Ok(true) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("versioned enrichment receipt commit: {e}"))
                 })?;
                 Ok(true)
@@ -38712,7 +38739,7 @@ impl MemoryDB {
     ) -> Result<(), WenlanError> {
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("confirm_entity commit: {}", e)))?;
                 Ok(())
@@ -41107,7 +41134,7 @@ impl MemoryDB {
             return Err(error);
         }
 
-        conn.execute("COMMIT", ())
+        commit_or_rollback(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("accept_pending_revision commit: {}", e)))?;
 
@@ -41863,7 +41890,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("mark_packaged commit: {}", e)))?;
                 Ok(())
@@ -43982,7 +44009,7 @@ impl MemoryDB {
 
         match result {
             Ok(updated) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("set_event_dates commit: {e}")))?;
                 Ok(updated)
@@ -44187,7 +44214,7 @@ impl MemoryDB {
             .await;
             match res {
                 Ok(n) => {
-                    conn.execute("COMMIT", ()).await.map_err(|e| {
+                    commit_or_rollback(&conn).await.map_err(|e| {
                         WenlanError::VectorDb(format!("backfill_episodes commit: {e}"))
                     })?;
                     written += n;
@@ -44689,7 +44716,7 @@ impl MemoryDB {
         .await;
         match result {
             Ok(true) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("title commit: {e}")))?;
                 Ok(true)
@@ -45074,7 +45101,7 @@ impl MemoryDB {
 
         match result {
             Ok(true) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("classification commit commit: {e}"))
                 })?;
                 Ok(true)
@@ -45198,7 +45225,7 @@ impl MemoryDB {
 
         match result {
             Ok(true) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("structured extraction commit commit: {e}"))
                 })?;
                 Ok(true)
@@ -45567,7 +45594,7 @@ impl MemoryDB {
 
             match result {
                 Ok(()) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("decay commit: {}", e)))?;
                 }
@@ -45613,7 +45640,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("flush_access commit: {}", e)))?;
                 Ok(())
@@ -45655,7 +45682,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("log_accesses commit: {}", e)))?;
                 Ok(())
@@ -47148,7 +47175,7 @@ impl MemoryDB {
 
             match result {
                 Ok(()) => {
-                    conn.execute("COMMIT", ())
+                    commit_or_rollback(&conn)
                         .await
                         .map_err(|e| WenlanError::VectorDb(format!("evict commit: {e}")))?;
                 }
@@ -47708,7 +47735,7 @@ impl MemoryDB {
             return Err(WenlanError::VectorDb(format!("insert_page history: {e}")));
         }
 
-        conn.execute("COMMIT", ())
+        commit_or_rollback(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("insert_page commit: {e}")))?;
         drop(conn);
@@ -49320,7 +49347,7 @@ impl MemoryDB {
             ));
         }
 
-        conn.execute("COMMIT", ())
+        commit_or_rollback(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("update_page_content commit: {e}")))?;
         drop(conn);
@@ -50030,7 +50057,7 @@ impl MemoryDB {
 
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("accept_page_merge commit: {e}")))?;
             }
@@ -50649,7 +50676,7 @@ impl MemoryDB {
         .await;
         match exec {
             Ok(()) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("replace_page_links commit: {e}"))
                 })?;
                 Ok(())
@@ -50709,6 +50736,58 @@ impl MemoryDB {
 /// the last examined one; deleted once a sweep reaches the tail, so the next
 /// sweep starts fresh from the head.
 const ORPHAN_SWEEP_CURSOR_KEY: &str = "orphan_sweep_cursor";
+
+// Test-only fault injection: fail the orphan sweep's `COMMIT` with the
+// transaction still open, the state SQLite leaves behind when a commit hits
+// `SQLITE_BUSY`. Task-scoped, like the repair verifier's control, so a sweep
+// running in a parallel test cannot consume another test's armed fault.
+#[cfg(test)]
+tokio::task_local! {
+    static FAIL_ORPHAN_SWEEP_COMMIT: std::cell::Cell<bool>;
+}
+
+/// Run `future` with the next orphan sweep's `COMMIT` armed to fail.
+#[cfg(test)]
+pub(crate) async fn with_failing_orphan_sweep_commit<T>(
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    FAIL_ORPHAN_SWEEP_COMMIT
+        .scope(std::cell::Cell::new(true), future)
+        .await
+}
+
+/// Stage a deferred foreign-key violation inside the caller's open
+/// transaction when the fault is armed, so the `COMMIT` that follows fails
+/// while the transaction stays open on the connection.
+///
+/// Contention cannot produce that state here: a second connection holding the
+/// write lock fails the sweep at its first write, long before `COMMIT` (see
+/// `a_review_meeting_a_foreign_writer_marks_nothing` in the presence-review
+/// tests). A deferred constraint is only checked at commit time, so it fails
+/// the `COMMIT` statement itself and leaves the transaction active — the same
+/// end state as a busy commit, without the timing.
+#[cfg(test)]
+async fn arm_orphan_sweep_commit_failure(conn: &libsql::Connection) {
+    let armed = FAIL_ORPHAN_SWEEP_COMMIT
+        .try_with(|flag| flag.replace(false))
+        .unwrap_or(false);
+    if !armed {
+        return;
+    }
+    for sql in [
+        "CREATE TABLE commit_fault_parent (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE commit_fault_child (
+             id INTEGER PRIMARY KEY,
+             parent_id INTEGER NOT NULL
+                 REFERENCES commit_fault_parent(id) DEFERRABLE INITIALLY DEFERRED
+         )",
+        "INSERT INTO commit_fault_child (id, parent_id) VALUES (1, 404)",
+    ] {
+        conn.execute(sql, ())
+            .await
+            .expect("stage the deferred foreign-key violation");
+    }
+}
 
 impl MemoryDB {
     /// Per-invocation cap on the orphan sweep: bounds how long the sweep can
@@ -51033,9 +51112,11 @@ impl MemoryDB {
             Ok(resolved_labels.len())
         }
         .await;
+        #[cfg(test)]
+        arm_orphan_sweep_commit_failure(&conn).await;
         match result {
             Ok(resolved) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("resolve_orphan_links commit: {e}"))
                 })?;
                 Ok(resolved)
@@ -51610,8 +51691,7 @@ impl MemoryDB {
         }
         .await;
         match result {
-            Ok(()) => conn
-                .execute("COMMIT", ())
+            Ok(()) => commit_or_rollback(&conn)
                 .await
                 .map(|_| ())
                 .map_err(|e| WenlanError::VectorDb(format!("link_page_source commit: {e}"))),
@@ -51812,8 +51892,7 @@ impl MemoryDB {
         .await;
 
         match result {
-            Ok(()) => conn
-                .execute("COMMIT", ())
+            Ok(()) => commit_or_rollback(&conn)
                 .await
                 .map(|_| ())
                 .map_err(|e| WenlanError::VectorDb(format!("replace_page_sources commit: {e}"))),
@@ -52035,7 +52114,7 @@ impl MemoryDB {
         .await;
         match exec {
             Ok(()) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("set_page_citations commit: {e}"))
                 })?;
                 Ok(())
@@ -52077,7 +52156,7 @@ impl MemoryDB {
         .await;
         match exec {
             Ok(()) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("set_page_citations_with_changelog commit: {e}"))
                 })?;
                 Ok(())
@@ -52127,7 +52206,7 @@ impl MemoryDB {
         .await;
         match exec {
             Ok(affected) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!(
                         "set_page_citations_with_changelog_at_version commit: {e}"
                     ))
@@ -52287,7 +52366,7 @@ impl MemoryDB {
 
         match exec {
             Ok(()) => {
-                conn.execute("COMMIT", ()).await.map_err(|e| {
+                commit_or_rollback(&conn).await.map_err(|e| {
                     WenlanError::VectorDb(format!("link_page_evidence commit: {e}"))
                 })?;
                 Ok(())
@@ -52330,7 +52409,7 @@ impl MemoryDB {
         }
         .await;
         match res {
-            Ok(()) => conn.execute("COMMIT", ()).await.map_err(|e| {
+            Ok(()) => commit_or_rollback(&conn).await.map_err(|e| {
                 WenlanError::VectorDb(format!("stamp_last_distilled_at commit: {e}"))
             })?,
             Err(e) => {
@@ -53174,7 +53253,7 @@ impl MemoryDB {
                 return Err(error);
             }
         };
-        conn.execute("COMMIT", ())
+        commit_or_rollback(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("acknowledge_page_compile commit: {e}")))?;
         Ok(acknowledged)
@@ -54503,7 +54582,7 @@ impl MemoryDB {
                 "store raw import origin: {e}"
             )));
         }
-        conn.execute("COMMIT", ())
+        commit_or_rollback(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("store raw import commit: {e}")))?;
         Ok(memory_id)
@@ -54574,7 +54653,7 @@ impl MemoryDB {
             count += 1;
         }
 
-        conn.execute("COMMIT", ())
+        commit_or_rollback(&conn)
             .await
             .map_err(|e| WenlanError::VectorDb(format!("batch import commit: {e}")))?;
         Ok(count)
@@ -54945,7 +55024,7 @@ impl MemoryDB {
 
                 match result {
                     Ok(()) => {
-                        conn.execute("COMMIT", ())
+                        commit_or_rollback(&conn)
                             .await
                             .map_err(|e| WenlanError::VectorDb(format!("m55a commit: {e}")))?;
                     }
@@ -55077,7 +55156,7 @@ impl MemoryDB {
 
         let inserted = match result {
             Ok(inserted) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m55b commit: {e}")))?;
                 inserted
