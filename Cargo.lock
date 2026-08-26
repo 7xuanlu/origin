@@ -6193,9 +6193,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "1.6.0"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7caa6743cc0888e433105fe1bc551a7f607940b126a37bc97b478e86064627eb"
+checksum = "48fdc01c81097b0aed18633e676e269fefa3a78ec1df56b4fe597c1241b92025"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -9162,6 +9162,7 @@ dependencies = [
  "rand 0.10.1",
  "reqwest 0.12.28",
  "rmcp",
+ "rmcp-macros",
  "schemars 1.2.1",
  "semver",
  "serde",

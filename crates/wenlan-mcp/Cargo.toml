@@ -21,6 +21,11 @@ path = "src/main.rs"
 
 [dependencies]
 rmcp = { version = "~1.5", features = ["server", "transport-io", "transport-streamable-http-server"] }
+# rmcp 1.x only requires `rmcp-macros = "^X.Y.0"`, so an unlocked `cargo install`
+# resolves the newest macros crate, whose `#[tool]` expansion calls helpers the
+# pinned rmcp does not have (`schema_for_input`, first-run gauntlet finding F3).
+# Keep the macros crate on the same minor as rmcp.
+rmcp-macros = "~1.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
