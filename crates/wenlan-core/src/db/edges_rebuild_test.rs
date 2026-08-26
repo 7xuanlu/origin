@@ -759,7 +759,7 @@ async fn the_pre_migration_97_backup_is_a_usable_restore_point() {
         .join("pre_migration_97_backup.db");
     assert!(
         dest.exists(),
-        "migration 98 must leave a restore point at {}",
+        "migration 97 must leave a restore point at {}",
         dest.display()
     );
 

@@ -1432,15 +1432,19 @@ impl WenlanMcpServer {
         } else if let Some(submission) = submission.as_ref() {
             self.remove_submitted_agent_work(submission.work_digest())?;
         }
-        // The typed report stays in `structured_content` for the skill's
-        // digests and completeness flags; the text the agent reads is the
-        // rendering `wenlan lint` prints, not the raw report JSON.
-        let text = report.render_text();
-        let value = serde_json::to_value(report)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let mut result = CallToolResult::structured(value);
-        result.content = vec![Content::text(text)];
-        Ok(result)
+        // Deep stays typed: the skill's prepare-and-submit protocol reads
+        // `complete`, `coverage` and the digests from `structured_content`.
+        // General returns only the text `wenlan lint` prints. The two cannot
+        // be combined: Claude Code and Codex hand the model the structured
+        // value and drop the text blocks when both are present.
+        if matches!(report.profile(), wenlan_types::lint::LintProfile::Deep) {
+            let value = serde_json::to_value(report)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            return Ok(CallToolResult::structured(value));
+        }
+        Ok(CallToolResult::success(vec![Content::text(
+            report.render_text(),
+        )]))
     }
 
     pub async fn get_lint_agent_work_page_impl(
@@ -2377,7 +2381,7 @@ impl WenlanMcpServer {
     }
 
     #[tool(
-        description = "Run Wenlan's read-only system lint on demand. General is the default bounded deterministic profile. Deep adds expensive deterministic checks plus full-store local semantic candidate generation; bounded candidate packets are adjudicated either by the daemon's configured provider or, with explicit agent_assist consent, by the calling agent through a typed prepare-and-submit protocol. Results are the canonical typed report; incomplete takes precedence over findings.",
+        description = "Run Wenlan's read-only system lint on demand. General is the default bounded deterministic profile. Deep adds expensive deterministic checks plus full-store local semantic candidate generation; bounded candidate packets are adjudicated either by the daemon's configured provider or, with explicit agent_assist consent, by the calling agent through a typed prepare-and-submit protocol. General returns the text `wenlan lint` prints; Deep returns the canonical typed report. Incomplete takes precedence over findings.",
         annotations(title = "Lint", read_only_hint = true, open_world_hint = false)
     )]
     async fn lint(

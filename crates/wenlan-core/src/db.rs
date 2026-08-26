@@ -4318,10 +4318,15 @@ pub struct MemoryDB {
         std::sync::Mutex<BTreeMap<String, BTreeMap<i64, BTreeSet<String>>>>,
     pub(crate) community_grouping_runtime:
         std::sync::Mutex<crate::community_grouping::CommunityGroupingRuntime>,
-    /// The `user_version` the last migration chain started from. `0` means the
-    /// database was created in this boot: the chain is a replay onto an empty
-    /// store, and a pre-migration backup would have nothing to restore.
-    migration_chain_start_version: std::sync::atomic::AtomicI64,
+    /// `true` when this instance created `origin_memory.db`: the file did not
+    /// exist before the open. `run_migrations_up_to` consumes it. The first
+    /// migration chain on a file created in this open, starting at
+    /// `user_version` 0, has no earlier state a pre-migration backup could
+    /// restore, so it takes none; every later chain on the same instance does.
+    opened_fresh_file: std::sync::atomic::AtomicBool,
+    /// Set by `run_migrations_up_to` for the chain it is running and read by
+    /// `backup_before_migration`.
+    skip_migration_backups: std::sync::atomic::AtomicBool,
 }
 
 /// Returns true when a memory title looks like it would make a poor snippet —
@@ -4476,13 +4481,16 @@ impl MemoryDB {
             community_grouping_runtime: std::sync::Mutex::new(
                 crate::community_grouping::CommunityGroupingRuntime::default(),
             ),
-            migration_chain_start_version: std::sync::atomic::AtomicI64::new(-1),
+            opened_fresh_file: std::sync::atomic::AtomicBool::new(false),
+            skip_migration_backups: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub async fn new(db_path: &Path, emitter: Arc<dyn EventEmitter>) -> Result<Self, WenlanError> {
         std::fs::create_dir_all(db_path)?;
         let db_file = db_path.join("origin_memory.db");
+        // Decided before the open: `Builder::new_local` creates the file.
+        let created_in_this_open = !db_file.exists();
         log::warn!("[memory_db] opening DB at {}", db_file.display());
 
         let db = libsql::Builder::new_local(db_file.to_str().unwrap_or("origin_memory.db"))
@@ -4701,7 +4709,8 @@ impl MemoryDB {
             community_grouping_runtime: std::sync::Mutex::new(
                 crate::community_grouping::CommunityGroupingRuntime::default(),
             ),
-            migration_chain_start_version: std::sync::atomic::AtomicI64::new(-1),
+            opened_fresh_file: std::sync::atomic::AtomicBool::new(created_in_this_open),
+            skip_migration_backups: std::sync::atomic::AtomicBool::new(false),
         };
 
         // Run schema migrations for existing databases
@@ -4723,6 +4732,8 @@ impl MemoryDB {
     ) -> Result<Self, WenlanError> {
         std::fs::create_dir_all(db_path)?;
         let db_file = db_path.join("origin_memory.db");
+        // Decided before the open: `Builder::new_local` creates the file.
+        let created_in_this_open = !db_file.exists();
 
         let db = libsql::Builder::new_local(db_file.to_str().unwrap_or("origin_memory.db"))
             .build()
@@ -4791,7 +4802,8 @@ impl MemoryDB {
             community_grouping_runtime: std::sync::Mutex::new(
                 crate::community_grouping::CommunityGroupingRuntime::default(),
             ),
-            migration_chain_start_version: std::sync::atomic::AtomicI64::new(-1),
+            opened_fresh_file: std::sync::atomic::AtomicBool::new(created_in_this_open),
+            skip_migration_backups: std::sync::atomic::AtomicBool::new(false),
         };
 
         instance.run_migrations(emitter.as_ref()).await?;
@@ -4916,8 +4928,17 @@ impl MemoryDB {
             0
         };
         drop(rows);
-        self.migration_chain_start_version
-            .store(version, std::sync::atomic::Ordering::Relaxed);
+        // A file this instance created, whose first chain starts at 0, has no
+        // earlier state a pre-migration backup could restore. The flag is
+        // consumed here so a later chain on the same instance (a restore-point
+        // drill, a retried migration) takes its backups again.
+        let created_in_this_open = self
+            .opened_fresh_file
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        self.skip_migration_backups.store(
+            created_in_this_open && version == 0,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // The downgrade barrier — see `refuse_if_newer_schema`. The constructors
         // now run it at open time, before any DDL; this call is defense in depth
@@ -10534,9 +10555,8 @@ impl MemoryDB {
         prior_version: i64,
     ) -> Result<(), WenlanError> {
         if self
-            .migration_chain_start_version
+            .skip_migration_backups
             .load(std::sync::atomic::Ordering::Relaxed)
-            == 0
         {
             log::info!(
                 "[migration] pre-migration {migration} backup skipped: the database was created \
