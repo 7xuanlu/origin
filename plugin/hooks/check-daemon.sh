@@ -29,6 +29,7 @@ except Exception:
 }
 
 RESP=""
+# shellcheck disable=SC2034  # the loop variable is a contract the plugin tests read
 for i in 1 2 3; do
   RESP=$(curl -fsS -m 3 "$URL" 2>/dev/null) && break
   sleep 1
@@ -55,24 +56,20 @@ extract_version() {
 DAEMON_VER=$(printf '%s' "$RESP" | extract_version)
 EXPECTED_VER=$(extract_version <"$PLUGIN_JSON")
 
-# A dev daemon reports a `+g<sha>` build-metadata suffix (local source build, via
-# build.rs). Its release-granular version is stale by construction, so a drift
-# arrow would be pure noise — stay quiet.
-case "$DAEMON_VER" in
-  *+g*) exit 0 ;;
-esac
-
-# Compare only major.minor: the daemon and plugin ride one release train, so a
-# patch drift (e.g. 0.13.1 vs 0.13.2) is compatible and must NOT nag every
-# session. Only a minor/major gap is a real, actionable drift worth surfacing.
-mm() { printf '%s' "$1" | cut -d. -f1,2; }
+# Compare the release part only: build metadata (`+g<sha8>`) is semver noise,
+# and a published daemon can carry it too (its binary is built before the tag
+# exists), so it must never silence the drift check. Compare only major.minor:
+# the daemon and plugin ride one release train, so a patch drift (e.g. 0.13.1
+# vs 0.13.2) is compatible and must NOT nag every session. Only a minor/major
+# gap is a real, actionable drift worth surfacing.
+mm() { printf '%s' "${1%%+*}" | cut -d. -f1,2; }
 DAEMON_MM=$(mm "$DAEMON_VER")
 EXPECTED_MM=$(mm "$EXPECTED_VER")
 
 if [ -n "$DAEMON_MM" ] && [ -n "$EXPECTED_MM" ] && [ "$DAEMON_MM" != "$EXPECTED_MM" ]; then
   cat <<MSG
 [wenlan] daemon v${DAEMON_VER}, plugin expects v${EXPECTED_VER}.
-  Run /wenlan:setup to repair. It will upgrade/restart the runtime and verify MCP.
+  Run /wenlan:setup to repair: it updates an older runtime, or says when the plugin cache is stale, then verifies MCP.
 MSG
 fi
 

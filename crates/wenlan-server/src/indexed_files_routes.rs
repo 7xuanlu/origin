@@ -75,7 +75,7 @@ pub async fn handle_update_chunk(
     };
     db.update_memory(&id, &req.content)
         .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+        .map_err(ServerError::from)?;
     Ok(Json(wenlan_types::responses::SuccessResponse { ok: true }))
 }
 

@@ -1243,7 +1243,7 @@ pub type SharedEmbedder = Arc<std::sync::Mutex<TextEmbedding>>;
 
 /// Process-wide lock that serializes FastEmbed (BGE) embedder initialization.
 ///
-/// `TextEmbedding::try_new()` performs filesystem I/O against `~/.fastembed_cache`
+/// `TextEmbedding::try_new()` performs filesystem I/O against the fastembed cache
 /// via the `hf-hub` crate. Concurrent first-time inits race on that cache and
 /// one of them fails with `Failed to retrieve model_optimized.onnx` (verified
 /// against PR #23 CI: same process, same module, two parallel `MemoryDB::new`
@@ -1474,11 +1474,10 @@ mod agent_id_tests {
 ///      matches the production daemon's conventional path on the same
 ///      host, so tests that use a tempdir DB still pick up the already-
 ///      downloaded model instead of re-fetching from HuggingFace.
-///   4. `None` — let FastEmbed use its own default (`~/.fastembed_cache/`)
-///      and download the model if it isn't there. Fine for a dev box
-///      with internet, fails noisily on hosts where the HuggingFace TLS
-///      bundle misbehaves (see the `OSStatus -26276` symptom from
-///      2026-04-16 that blocked ~240 tests from `test_db()`).
+///   4. `None` — no populated cache exists yet. fastembed's own default is
+///      `.fastembed_cache` relative to the process working directory
+///      (`FASTEMBED_CACHE_DIR` overrides it), which is why the daemon never
+///      falls through to it: see [`daemon_fastembed_cache_dir`].
 pub fn resolve_fastembed_cache_dir(db_path: &std::path::Path) -> Option<std::path::PathBuf> {
     // 1. Per-DB cache — production daemon populates this.
     let per_db = db_path.join("fastembed_cache");
@@ -1513,11 +1512,52 @@ pub fn resolve_fastembed_cache_dir(db_path: &std::path::Path) -> Option<std::pat
     None
 }
 
+/// The cache directory the daemon hands to fastembed, for the text embedder
+/// and every reranker alike. Unlike [`resolve_fastembed_cache_dir`] this never
+/// returns `None`: fastembed's own default is `.fastembed_cache` **relative to
+/// the process working directory** (`FASTEMBED_CACHE_DIR` overrides it), and
+/// launchd starts the daemon with cwd `/`, so a first boot that fell through
+/// could never write the model download and every launchd attempt died with
+/// `Failed to retrieve model_optimized.onnx` (first-run gauntlet finding F4).
+///
+/// Order: a non-empty `HF_HOME` first — fastembed 5.13 gives it precedence
+/// over the configured directory for text models but ignores it for
+/// rerankers, so naming it here keeps every model, the lock, the log line and
+/// the error message on the directory fastembed really uses; then a populated
+/// cache from the resolver; then `FASTEMBED_CACHE_DIR` (CI pre-populates it);
+/// then `<db_path>/fastembed_cache` next to the store.
+pub fn daemon_fastembed_cache_dir(db_path: &std::path::Path) -> std::path::PathBuf {
+    daemon_fastembed_cache_dir_from(
+        std::env::var_os("HF_HOME"),
+        resolve_fastembed_cache_dir(db_path),
+        std::env::var_os("FASTEMBED_CACHE_DIR"),
+        db_path,
+    )
+}
+
+fn daemon_fastembed_cache_dir_from(
+    hf_home: Option<std::ffi::OsString>,
+    existing: Option<std::path::PathBuf>,
+    configured: Option<std::ffi::OsString>,
+    db_path: &std::path::Path,
+) -> std::path::PathBuf {
+    if let Some(hf_home) = hf_home.filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(hf_home);
+    }
+    if let Some(existing) = existing {
+        return existing;
+    }
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(configured);
+    }
+    db_path.join("fastembed_cache")
+}
+
 /// Build the chunking engine for a DB at `db_path`, preferring token-aware
 /// sizing (the BGE tokenizer loaded from the resolved FastEmbed cache) so no
 /// embedded chunk exceeds the model's 512-token limit. Falls back to
-/// character-based sizing when the tokenizer isn't on disk (e.g. FastEmbed's
-/// default `~/.fastembed_cache` with no per-DB/shared cache resolved).
+/// character-based sizing when the tokenizer isn't on disk (no populated
+/// per-DB, env, or shared cache resolved).
 fn build_chunker(db_path: &Path) -> ChunkingEngine {
     resolve_fastembed_cache_dir(db_path)
         .as_deref()
@@ -2602,6 +2642,119 @@ const RESPLIT_STEP: f64 = 0.05;
 /// rather than tightened further.
 const RESPLIT_MAX_THRESHOLD: f64 = 0.92;
 
+/// Same-topic sibling shards (issue #596). The re-split ladder above can slice
+/// one coherent topic into several shards, and nothing downstream ever compares
+/// a pending cluster with its siblings: the Jaccard/subset filter in
+/// `handle_distill` scores a cluster only against *existing* pages, and two
+/// disjoint shards of one topic score 0 there. The page each shard creates is
+/// born `unconfirmed`, so shard one cannot deduplicate shard two inside the
+/// same pass either — one topic becomes two pages.
+///
+/// Merge those siblings back together before the pass writes anything, using
+/// the one same-pass signal already computed for every cluster: the mean-pooled
+/// `centroid_embedding`. (Entity identity is not usable here — a cluster
+/// carries a single `entity_id` taken from its first member, not the member set
+/// a "shared majority of entities" rule would need, so computing it would mean
+/// new work rather than reusing what the pass already has.)
+///
+/// Two clusters of one bucket merge when their centroids' cosine is at or above
+/// `RESPLIT_MAX_THRESHOLD` — the same ceiling the ladder tightens toward, so a
+/// merge can only undo a split the ladder itself made.
+///
+/// The member caps (`max_grouped_cluster_size` / `max_unlinked_cluster_size`)
+/// deliberately do NOT gate this merge. They are formation-time bounds: they
+/// tell the greedy grouping and the re-split ladder when a blob is still too
+/// coarse to be one topic, which is a statement about the threshold the blob
+/// was cut at, not a ceiling on how large a genuine topic may be. Once two
+/// shards' centroids meet the ladder's own ceiling, the evidence that they are
+/// one topic is stronger than the size heuristic that separated them, and a cap
+/// check here would just re-impose the split it exists to repair: a 20-memory
+/// topic under a cap of 12 emits [10, 10], and both halves would still become
+/// their own page. The LLM token limit is the real page-size guard, and it is
+/// still enforced below.
+///
+/// Deterministic and model-free: candidates are scanned in emission order, the
+/// earlier cluster absorbs the later one, and the absorbing cluster is rebuilt
+/// through `build_distillation_cluster` so its centroid, token estimate, and
+/// member order match any other cluster of the pass. Survivors keep their
+/// emission order, which the `max_clusters` truncation below relies on.
+fn merge_sibling_shards(
+    memories: &[ClusterMemRow],
+    clusters: Vec<DistillationCluster>,
+    token_limit: usize,
+) -> Vec<DistillationCluster> {
+    if clusters.len() < 2 {
+        return clusters;
+    }
+
+    let position: std::collections::HashMap<&str, usize> = memories
+        .iter()
+        .enumerate()
+        .map(|(index, memory)| (memory.source_id.as_str(), index))
+        .collect();
+
+    // Member indices per cluster. A cluster whose members can't all be resolved
+    // back to `memories` is left alone rather than guessed at.
+    let mut members: Vec<Vec<usize>> = Vec::with_capacity(clusters.len());
+    let mut survivors: Vec<Option<DistillationCluster>> = Vec::with_capacity(clusters.len());
+    for cluster in clusters {
+        let resolved: Option<Vec<usize>> = cluster
+            .source_ids
+            .iter()
+            .map(|source_id| position.get(source_id.as_str()).copied())
+            .collect();
+        members.push(resolved.unwrap_or_default());
+        survivors.push(Some(cluster));
+    }
+
+    for i in 0..survivors.len() {
+        if members[i].is_empty() {
+            continue;
+        }
+        for j in (i + 1)..survivors.len() {
+            if survivors[j].is_none() || members[j].is_empty() {
+                continue;
+            }
+            let same_topic = match (
+                survivors[i]
+                    .as_ref()
+                    .and_then(|c| c.centroid_embedding.as_deref()),
+                survivors[j]
+                    .as_ref()
+                    .and_then(|c| c.centroid_embedding.as_deref()),
+            ) {
+                (Some(a), Some(b)) => cosine_similarity(a, b) >= RESPLIT_MAX_THRESHOLD,
+                _ => false,
+            };
+            if !same_topic {
+                continue;
+            }
+            // Clusters of one bucket partition their members, so the union is
+            // just a concatenation.
+            let mut union = members[i].clone();
+            union.extend_from_slice(&members[j]);
+            let merged = build_distillation_cluster(memories, &union);
+            if merged.estimated_tokens > token_limit {
+                continue;
+            }
+            log::info!(
+                "[distill] merging same-topic sibling shards: {} + {} memories -> {} \
+                 (centroids at or above the {:.2} re-split ceiling)",
+                members[i].len(),
+                members[j].len(),
+                union.len(),
+                RESPLIT_MAX_THRESHOLD,
+            );
+            members[i] = union;
+            members[j].clear();
+            survivors[i] = Some(merged);
+            survivors[j] = None;
+        }
+    }
+
+    survivors.into_iter().flatten().collect()
+}
+
 #[derive(Debug, Clone, Copy)]
 enum DistillationClusterMode {
     SpaceScoped,
@@ -2633,6 +2786,9 @@ fn cluster_distillation_rows(
                           indices: &[usize],
                           cap: usize,
                           clusters: &mut Vec<DistillationCluster>| {
+        // Clusters this bucket produces are collected here first so the
+        // sibling-shard merge below sees the whole bucket at once.
+        let mut bucket: Vec<DistillationCluster> = Vec::new();
         // Each base group is drained, together with every re-split
         // descendant, before the next sibling starts. That keeps the output
         // order of the one-shot re-split this replaces: a group that never
@@ -2682,9 +2838,17 @@ fn cluster_distillation_rows(
                     continue;
                 }
                 let cluster = build_distillation_cluster(memories, &group);
-                emit_split(cluster, clusters);
+                emit_split(cluster, &mut bucket);
             }
         }
+        // One bucket is one space (or the single "no declared space"
+        // catch-all), so its clusters are exactly the siblings issue #596 is
+        // about. Cross-space candidates (`Global`) are a different feature and
+        // are left untouched.
+        if matches!(mode, DistillationClusterMode::SpaceScoped) {
+            bucket = merge_sibling_shards(memories, bucket, token_limit);
+        }
+        clusters.extend(bucket);
     };
 
     match mode {
@@ -4366,13 +4530,28 @@ impl MemoryDB {
         // runtime — spawn_blocking still occupies runtime-managed threads and
         // its JoinHandle needs worker threads to poll, which caused deadlocks
         // when combined with block_on calls during startup.
-        let embed_cache_dir = resolve_fastembed_cache_dir(db_path);
+        // Always hand fastembed an explicit directory. Its own default is
+        // `.fastembed_cache` relative to the working directory, and launchd
+        // starts the daemon at `/`, where the first-run download cannot be
+        // written — every launchd attempt died with "Failed to retrieve
+        // model_optimized.onnx" (first-run gauntlet finding F4).
+        // fastembed treats an empty HF_HOME as set and resolves it against the
+        // working directory, which is exactly the launchd failure above.
+        if std::env::var_os("HF_HOME").is_some_and(|value| value.is_empty()) {
+            return Err(WenlanError::Embedding(
+                "HF_HOME is set but empty, so the embedding model would download into the working directory; unset it or point it at a writable directory".into(),
+            ));
+        }
+        let embed_cache_dir = daemon_fastembed_cache_dir(db_path);
+        std::fs::create_dir_all(&embed_cache_dir).map_err(|e| {
+            WenlanError::Embedding(format!(
+                "create the embedding-model cache directory {}: {e}",
+                embed_cache_dir.display()
+            ))
+        })?;
         log::info!(
             "[memory_db] starting embedder init (std::thread), cache={}",
-            embed_cache_dir
-                .as_deref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<default>".into())
+            embed_cache_dir.display()
         );
         let embed_cache_label = embed_cache_dir.clone();
         let (embed_tx, embed_rx) = tokio::sync::oneshot::channel();
@@ -4380,11 +4559,9 @@ impl MemoryDB {
             .name("embedder-init".into())
             .spawn(move || {
                 log::info!("[memory_db] embedder thread: loading ONNX model...");
-                let mut opts = InitOptions::new(EmbeddingModel::BGEBaseENV15Q)
-                    .with_show_download_progress(true);
-                if let Some(cache) = embed_cache_dir {
-                    opts = opts.with_cache_dir(cache);
-                }
+                let opts = InitOptions::new(EmbeddingModel::BGEBaseENV15Q)
+                    .with_show_download_progress(true)
+                    .with_cache_dir(embed_cache_dir);
                 let result = init_text_embedding(opts);
                 let _ = embed_tx.send(result);
             })
@@ -4392,7 +4569,7 @@ impl MemoryDB {
         let embedder = embed_rx
             .await
             .map_err(|_| WenlanError::Embedding("embedder thread panicked".into()))?
-            .map_err(|e| embedder_init_error(&e, embed_cache_label.as_deref()))?;
+            .map_err(|e| embedder_init_error(&e, Some(embed_cache_label.as_path())))?;
 
         log::info!("[memory_db] initialized at {}", db_file.display());
 

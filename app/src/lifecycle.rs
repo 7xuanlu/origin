@@ -14,6 +14,46 @@ use tauri::AppHandle;
 /// teardown releases it so the recovered app can guard a later retry.
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
+/// The newer app bundle to reopen once this quit has finished, set by the
+/// single-instance handover (see `handover.rs`). Only ever read on macOS.
+#[cfg(target_os = "macos")]
+static HANDOVER_BUNDLE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Remember the newer bundle that the running quit must hand over to.
+#[cfg(target_os = "macos")]
+pub fn set_handover_bundle(bundle: PathBuf) {
+    *HANDOVER_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bundle);
+}
+
+/// Drop a pending handover: the frontend refused the quit (it could not
+/// save), so the user keeps this app and a later, unrelated quit must not
+/// reopen the newer bundle.
+#[cfg(target_os = "macos")]
+pub fn clear_handover_bundle() {
+    take_handover_bundle();
+}
+
+#[cfg(target_os = "macos")]
+fn take_handover_bundle() -> Option<PathBuf> {
+    HANDOVER_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+/// Finish a quit: schedule the handover reopen when one is pending, then exit
+/// with `code`. A failed teardown exits non-zero but still hands over, so the
+/// newer bundle opens either way.
+pub(crate) fn exit_after_quit(app_handle: &AppHandle, code: i32) {
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = take_handover_bundle() {
+        crate::handover::relaunch_after_exit(&bundle);
+    }
+    app_handle.exit(code);
+}
+
 struct QuitAttemptGuard<'a> {
     flag: &'a AtomicBool,
     committed: bool,
@@ -775,7 +815,52 @@ pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> R
     Ok(())
 }
 
-fn shutdown_url_for(client: &crate::api::WenlanClient) -> String {
+#[cfg(target_os = "macos")]
+pub fn handover_pending() -> bool {
+    HANDOVER_BUNDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+}
+
+/// Wait until the daemon stops answering its health route *and* its listener
+/// is closed, or `limit` passes. The limit is a hard ceiling: it bounds the
+/// health calls themselves, not only the gaps between them. The closed port
+/// is the fact the reopened app needs; health can stop answering while the
+/// listener lingers. Returns whether the port was released within `limit`.
+pub(crate) async fn wait_for_daemon_to_stop(limit: Duration) -> bool {
+    let client = crate::api::WenlanClient::new();
+    let listener = listener_addr(client.base_url());
+    let released = tokio::time::timeout(limit, async {
+        while client.health().await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if let Some(addr) = listener.as_deref() {
+            while tokio::net::TcpStream::connect(addr).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    })
+    .await;
+    if released.is_err() {
+        log::warn!(
+            "[lifecycle] daemon still holding {} after {limit:?}",
+            client.base_url()
+        );
+    }
+    released.is_ok()
+}
+
+/// `host:port` of the daemon listener behind a base URL, for a raw TCP probe.
+fn listener_addr(base_url: &str) -> Option<String> {
+    let rest = base_url
+        .strip_prefix("http://")
+        .or_else(|| base_url.strip_prefix("https://"))?;
+    let authority = rest.split('/').next()?;
+    (!authority.is_empty()).then(|| authority.to_string())
+}
+
+pub(crate) fn shutdown_url_for(client: &crate::api::WenlanClient) -> String {
     format!("{}/api/shutdown", client.base_url())
 }
 
@@ -789,7 +874,9 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
 
     if data_dir_env_overridden() {
         log::info!("[lifecycle] skipping quit teardown: isolated run (data-dir env override)");
-        app_handle.exit(0);
+        // The isolated run has no launchd job: the daemon is our sidecar.
+        crate::daemon_start::stop_sidecar().await;
+        exit_after_quit(app_handle, 0);
         attempt.commit();
         return Ok(());
     }
@@ -830,10 +917,20 @@ pub async fn quit_origin(app_handle: &AppHandle) -> Result<()> {
 
         // Wait briefly for the daemon to flush.
         tokio::time::sleep(Duration::from_millis(500)).await;
+        // A handover reopens a newer app right after this one exits, and
+        // that app starts its own daemon on the same port: give the old
+        // daemon a bounded moment to release it.
+        #[cfg(target_os = "macos")]
+        if handover_pending() {
+            wait_for_daemon_to_stop(Duration::from_secs(5)).await;
+        }
     }
 
     if quit_plan.exit_app {
-        app_handle.exit(0);
+        // A sidecar we spawned (no launchd job, or a respawn from Diagnostics)
+        // must not outlive the app: the next launch would adopt it.
+        crate::daemon_start::stop_sidecar().await;
+        exit_after_quit(app_handle, 0);
         attempt.commit();
     }
     Ok(())
@@ -1369,6 +1466,24 @@ mod tests {
             !is_run_at_login_enabled(&staging_only),
             ".staging suffixed labels must not satisfy exact-label match"
         );
+    }
+
+    #[test]
+    fn listener_addr_is_the_authority_of_the_base_url() {
+        assert_eq!(
+            listener_addr("http://127.0.0.1:7878").as_deref(),
+            Some("127.0.0.1:7878")
+        );
+        assert_eq!(
+            listener_addr("http://127.0.0.1:7878/").as_deref(),
+            Some("127.0.0.1:7878")
+        );
+        assert_eq!(
+            listener_addr("https://localhost:7878/api").as_deref(),
+            Some("localhost:7878")
+        );
+        assert_eq!(listener_addr("127.0.0.1:7878"), None);
+        assert_eq!(listener_addr("http://"), None);
     }
 
     #[test]
