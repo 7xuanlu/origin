@@ -17,8 +17,20 @@ const REQUESTED_TAG =
   "";
 const BINARIES = ["wenlan", "wenlan-server", "wenlan-mcp"];
 
+const RELEASE_TAG_PATTERN = /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+
 function safeTag(tag) {
   return tag.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function checkTag(tag) {
+  if (!RELEASE_TAG_PATTERN.test(tag)) {
+    throw new Error(
+      `'${tag}' is not a Wenlan release tag (expected vX.Y.Z, like v0.17.0). ` +
+        `See https://github.com/${REPO}/releases.`
+    );
+  }
+  return tag;
 }
 
 function binDir() {
@@ -33,21 +45,24 @@ function binDir() {
 // shared network can exhaust before a first install.
 function latestTag() {
   const url = `https://github.com/${REPO}/releases/latest`;
+  const tagPage = `https://github.com/${REPO}/releases/tag/`;
   return new Promise((resolve, reject) => {
     https
       .get(url, { headers: { "User-Agent": "wenlan" } }, (res) => {
         res.resume();
-        const match = /\/releases\/tag\/([^/?#]+)$/.exec(res.headers.location || "");
-        if (!match) {
-          reject(
-            new Error(
+        try {
+          const redirected = res.statusCode >= 300 && res.statusCode < 400;
+          const location = (res.headers.location || "").split(/[?#]/)[0];
+          if (!redirected || !location.startsWith(tagPage)) {
+            throw new Error(
               `Could not find the latest Wenlan release at ${url} (HTTP ${res.statusCode}). ` +
                 "Check the network, or pin one with WENLAN_RELEASE_TAG=vX.Y.Z."
-            )
-          );
-          return;
+            );
+          }
+          resolve(checkTag(decodeURIComponent(location.slice(tagPage.length))));
+        } catch (err) {
+          reject(err);
         }
-        resolve(decodeURIComponent(match[1]));
       })
       .on("error", reject);
   });
@@ -118,7 +133,7 @@ async function installBinaries() {
     throw new Error("Wenlan setup currently supports macOS Apple Silicon only.");
   }
 
-  const tag = REQUESTED_TAG || (await latestTag());
+  const tag = REQUESTED_TAG ? checkTag(REQUESTED_TAG) : await latestTag();
 
   const dir = binDir();
   fs.mkdirSync(dir, { recursive: true });

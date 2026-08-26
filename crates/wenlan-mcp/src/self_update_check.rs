@@ -11,7 +11,7 @@ const LATEST_RELEASE_URL: &str = "https://github.com/7xuanlu/wenlan/releases/lat
 /// fail (locked-down sandboxes, missing dirs::cache_dir, etc). Without this,
 /// `store_cache` would silently no-op and every invocation in the same
 /// long-lived process (e.g. an MCP server hosting many sessions) would re-hit
-/// the GitHub API, risking the 60-req/hr unauthenticated rate limit.
+/// the GitHub release page on every start.
 static MEMORY_FALLBACK: Mutex<Option<CacheEntry>> = Mutex::new(None);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -131,7 +131,8 @@ pub async fn check() -> Option<String> {
     if latest > mcp {
         Some(format!(
             "A newer wenlan-mcp is available (v{latest}, you are on v{mcp}). \
-             Run `brew upgrade wenlan-mcp`."
+             Run `brew upgrade wenlan-mcp`, `npm update -g wenlan-mcp`, or \
+             `cargo install wenlan-mcp`, whichever installed it."
         ))
     } else {
         None

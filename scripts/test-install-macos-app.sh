@@ -202,13 +202,14 @@ test_fails_when_running_app_does_not_quit() {
   test -f "$install_dir/Wenlan.app/existing-marker"
 }
 
-test_names_rate_limiting_and_sends_the_token() {
+test_names_rate_limiting_without_sending_the_token_elsewhere() {
   local fixture_dir="$TMP_DIR/rate-limit"
   local install_dir="$fixture_dir/Applications"
   mkdir -p "$fixture_dir"
 
-  # A loopback stand-in for api.github.com that answers 403 like a rate limit
-  # and records the Authorization header it was sent.
+  # A loopback server that answers 403 like a rate limit and records the
+  # Authorization header it was sent. It is not GitHub's API, so the token
+  # must not reach it.
   cat > "$fixture_dir/server.py" <<'PY'
 import http.server
 import pathlib
@@ -267,14 +268,55 @@ PY
     cat "$fixture_dir/installer.log" >&2
     return 1
   fi
-  if [[ $(cat "$fixture_dir/auth.log") != "Bearer test-token" ]]; then
-    echo "installer did not send GITHUB_TOKEN as a bearer token" >&2
+  if [[ -s "$fixture_dir/auth.log" && $(cat "$fixture_dir/auth.log") != "" ]]; then
+    echo "installer sent the token to a host that is not api.github.com: $(cat "$fixture_dir/auth.log")" >&2
+    return 1
+  fi
+}
+
+test_sends_the_token_to_the_github_api() {
+  local fixture_dir="$TMP_DIR/token"
+  local fake_bin="$fixture_dir/fake-bin"
+  mkdir -p "$fake_bin"
+
+  # A stand-in curl that records its arguments and answers like an expired
+  # token, so nothing reaches the network.
+  cat > "$fake_bin/curl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$CURL_RECORD"
+printf '401'
+SH
+  chmod +x "$fake_bin/curl"
+
+  local status=0
+  PATH="$fake_bin:$PATH" \
+    CURL_RECORD="$fixture_dir/curl-args" \
+    GH_TOKEN=test-token \
+    WENLAN_APP_RELEASE_JSON_URL="https://api.github.com/repos/7xuanlu/wenlan/releases/latest" \
+    WENLAN_APP_INSTALL_DIR="$fixture_dir/Applications" \
+    WENLAN_APP_NO_LAUNCH=1 \
+    WENLAN_APP_SKIP_PLATFORM_CHECK=1 \
+    bash "$INSTALLER" > "$fixture_dir/installer.log" 2>&1 || status=$?
+
+  if [[ $status -eq 0 ]]; then
+    echo "installer succeeded against a rejected token" >&2
+    return 1
+  fi
+  if ! grep -q "invalid or expired" "$fixture_dir/installer.log"; then
+    echo "installer did not name the rejected token:" >&2
+    cat "$fixture_dir/installer.log" >&2
+    return 1
+  fi
+  if ! grep -qx "Authorization: Bearer test-token" "$fixture_dir/curl-args"; then
+    echo "installer did not send GH_TOKEN as a bearer token to api.github.com:" >&2
+    cat "$fixture_dir/curl-args" >&2
     return 1
   fi
 }
 
 test_installs_verified_app_without_quarantine
-test_names_rate_limiting_and_sends_the_token
+test_names_rate_limiting_without_sending_the_token_elsewhere
+test_sends_the_token_to_the_github_api
 test_rejects_bad_digest_before_replacing_existing_app
 test_restores_existing_app_when_interrupted_after_backup
 test_quits_running_app_before_replacing_it

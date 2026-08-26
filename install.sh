@@ -67,17 +67,25 @@ info "Detected platform: ${OS}-${ARCH} (${ASSET})"
 # allows 60 anonymous calls per hour per IP address, which a shared network can
 # exhaust before a first install.
 
+TAG_PAGE_PREFIX="https://github.com/${REPO}/releases/tag/"
+TAG_PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+
 if [[ -n "${REQUESTED_TAG}" ]]; then
   TAG="${REQUESTED_TAG}"
   ok "Requested release: ${TAG}"
 else
   info "Finding the latest release on GitHub..."
   LATEST_URL="$(curl -fsSI -o /dev/null -w '%{redirect_url}' "https://github.com/${REPO}/releases/latest" || true)"
-  TAG="${LATEST_URL##*/releases/tag/}"
-  if [[ -z "${LATEST_URL}" || -z "${TAG}" || "${TAG}" == "${LATEST_URL}" ]]; then
+  LATEST_URL="${LATEST_URL%%[?#]*}"
+  if [[ "${LATEST_URL}" != "${TAG_PAGE_PREFIX}"* ]]; then
     die "Could not find the latest release at ${RELEASE_PAGE}. Check the network, or pin a release with WENLAN_RELEASE_TAG=vX.Y.Z."
   fi
+  TAG="${LATEST_URL#"${TAG_PAGE_PREFIX}"}"
   ok "Latest release: ${TAG}"
+fi
+
+if [[ ! "${TAG}" =~ ${TAG_PATTERN} ]]; then
+  die "'${TAG}' is not a Wenlan release tag (expected vX.Y.Z, like v0.17.0). See https://github.com/${REPO}/releases."
 fi
 
 # ── Download & extract ───────────────────────────────────────────────────────
