@@ -117,6 +117,18 @@ fn main() {
             );
         }
     }
+    // Exposed to lib.rs's regression test via `env!` so it can tell a real
+    // marker match from an absent or mismatched one, independent of
+    // `is_release_build` below (which also honors a bare git tag). A test
+    // that only reads this and not `is_release_build` would miss the two
+    // computations drifting apart — see the mutation control referenced from
+    // the test's doc comment.
+    let release_marker = match &release_version {
+        Some(marker) if marker == &pkg_version => "matched",
+        Some(_) => "mismatch",
+        None => "absent",
+    };
+    println!("cargo:rustc-env=WENLAN_RELEASE_MARKER={}", release_marker);
     let is_release_build =
         head_on_release_tag() || release_version.as_deref() == Some(pkg_version.as_str());
     let suffix = match (&sha, is_release_build) {

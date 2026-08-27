@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=c8dbe1b39a702cde2a79dfc1b7f8b7c836fa3ee3efe5a6ac6e77d084ca31e413 -->
+<!-- README_SYNC: source=README.md sha256=2f466515650a08fff4668e51f8542f5aacf6a0eeeda1691b6cee72dfea897725 -->
 
 <p align="center">
   <picture>
@@ -291,9 +291,9 @@ a1b2c3d distill: 4 pages
 
 ### 你的数据与卸载
 
-没有任何锁定。页面和会话笔记是 `~/.wenlan/` 下的 Markdown；记忆保存在平台数据目录下的一个 libSQL 数据库中（macOS 为 `~/Library/Application Support/wenlan/`，Linux 为 `~/.local/share/wenlan/`，Windows 为 `%LOCALAPPDATA%\wenlan\`）。复制这两个文件夹即可备份或迁移你的 Wenlan。
+没有任何锁定。页面和会话笔记是 `~/.wenlan/` 下的 Markdown；记忆保存在平台数据目录下的一个 libSQL 数据库中（macOS 为 `~/Library/Application Support/wenlan/`，Linux 为 `~/.local/share/wenlan/`，Windows 为 `%LOCALAPPDATA%\wenlan\`）。复制这两个文件夹即可备份或迁移你的 Wenlan。如果这次安装是从 Origin 升级而来，其数据库可能仍保存在同级的 `origin` 文件夹中（macOS 为 `~/Library/Application Support/origin/`，Linux 为 `~/.local/share/origin/`，Windows 为 `%LOCALAPPDATA%\origin\`）；也请删除或复制这个文件夹。
 
-卸载：在 app 中关闭“登录时在后台运行文澜”并退出（或运行 `wenlan background off`，它会停止守护进程并移除开机注册），删除 `Wenlan.app` 或运行 Windows 卸载程序，最后删除上述两个文件夹。Wenlan 写入的所有路径见 [PRIVACY.md](PRIVACY.md)。
+卸载：app 中「登录时在后台运行文澜」开关会移除开机注册——关闭它并退出，删除 `Wenlan.app` 或运行 Windows 卸载程序，然后删除上述文件夹。`wenlan background off` 只会停止守护进程并关闭开机自启，不会移除开机注册；仅使用 CLI 的安装请改为参照 [PRIVACY.md](PRIVACY.md) 中守护进程的卸载条目。Wenlan 写入的所有路径都列在其中。
 
 ---
 

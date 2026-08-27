@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=c8dbe1b39a702cde2a79dfc1b7f8b7c836fa3ee3efe5a6ac6e77d084ca31e413 -->
+<!-- README_SYNC: source=README.md sha256=2f466515650a08fff4668e51f8542f5aacf6a0eeeda1691b6cee72dfea897725 -->
 
 <p align="center">
   <picture>
@@ -289,9 +289,9 @@ Referencia completa del flujo de trabajo: [plugin/skills](plugin/skills/README.m
 
 ### Tus datos y la desinstalación
 
-Nada queda encerrado. Las páginas y las notas de sesión son Markdown en `~/.wenlan/`; las memorias viven en una base de datos libSQL dentro del directorio de datos de la plataforma (`~/Library/Application Support/wenlan/` en macOS, `~/.local/share/wenlan/` en Linux, `%LOCALAPPDATA%\wenlan\` en Windows). Copia esas dos carpetas para hacer una copia de seguridad o mover tu Wenlan.
+Nada queda encerrado. Las páginas y las notas de sesión son Markdown en `~/.wenlan/`; las memorias viven en una base de datos libSQL dentro del directorio de datos de la plataforma (`~/Library/Application Support/wenlan/` en macOS, `~/.local/share/wenlan/` en Linux, `%LOCALAPPDATA%\wenlan\` en Windows). Copia esas dos carpetas para hacer una copia de seguridad o mover tu Wenlan. Si esta instalación se actualizó desde Origin, puede que todavía guarde su base de datos en la carpeta hermana `origin` (`~/Library/Application Support/origin/` en macOS, `~/.local/share/origin/` en Linux, `%LOCALAPPDATA%\origin\` en Windows); borra o copia esa también.
 
-Para desinstalar: en la app desactiva *Ejecutar Wenlan en segundo plano al iniciar sesión* y ciérrala (o ejecuta `wenlan background off`, que detiene el daemon y elimina su registro de arranque), borra `Wenlan.app` o ejecuta el desinstalador de Windows y, por último, borra las dos carpetas anteriores. Todas las rutas que Wenlan escribe están en [PRIVACY.md](PRIVACY.md).
+Para desinstalar: el interruptor *Ejecutar Wenlan en segundo plano al iniciar sesión* de la app elimina el registro de arranque — desactívalo, cierra la app y borra `Wenlan.app` o ejecuta el desinstalador de Windows, y después borra las carpetas anteriores. `wenlan background off` solo detiene el daemon y desactiva el arranque automático; no elimina el registro de arranque, así que una instalación solo de CLI debe seguir en su lugar el punto de desinstalación del daemon en [PRIVACY.md](PRIVACY.md). Todas las rutas que Wenlan escribe están ahí.
 
 ---
 

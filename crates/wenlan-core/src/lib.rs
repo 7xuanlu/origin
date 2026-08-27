@@ -110,20 +110,34 @@ mod tests {
     // never calls this function, so it cannot prove the WENLAN_RELEASE_VERSION
     // marker build.rs reads (issue #606). This test is the only surface that
     // does: it prints the built-in version for a human comparing the three
-    // build scenarios, and asserts the durable shape either way — the bare
-    // crate version for a release build, or that version plus a `+g<sha8>`
-    // dev suffix for a local build.
+    // build scenarios. `WENLAN_RELEASE_MARKER` (build.rs) records whether the
+    // marker matched this crate's own version, independent of the git-tag
+    // check `is_release_build` also honors — when it is `matched`, the bare
+    // version is asserted exactly; otherwise (`mismatch` or `absent`, which
+    // both legitimately fall back to a real tag-based release or a local dev
+    // build) either shape is accepted. A mutation that computed
+    // `is_release_build` from the git tag alone while still reporting
+    // `matched` would slip past the loose branch but fails the exact one —
+    // that is the regression this test exists to catch.
     #[test]
     fn version_matches_bare_or_dev_suffix_shape() {
         let v = version();
         eprintln!("wenlan_core::version() = {v}");
         let base = env!("CARGO_PKG_VERSION");
-        assert!(
-            v == base
-                || (v.starts_with(base)
-                    && v[base.len()..].starts_with("+g")
-                    && v.len() == base.len() + 10),
-            "version {v:?} is neither the bare crate version {base:?} nor a `+g<sha8>` dev build"
-        );
+        let marker = env!("WENLAN_RELEASE_MARKER");
+        if marker == "matched" {
+            assert_eq!(
+                v, base,
+                "WENLAN_RELEASE_MARKER=matched but version() is {v:?}, not the bare crate version {base:?}"
+            );
+        } else {
+            assert!(
+                v == base
+                    || (v.starts_with(base)
+                        && v[base.len()..].starts_with("+g")
+                        && v.len() == base.len() + 10),
+                "version {v:?} is neither the bare crate version {base:?} nor a `+g<sha8>` dev build"
+            );
+        }
     }
 }

@@ -56,7 +56,7 @@ The workflow is already wired: once the secrets below exist, the next release is
 - The entitlements `allow-jit` and `allow-unsigned-executable-memory` are ordinary hardened-runtime exceptions and pass notarization.
 - A Developer ID certificate is valid for five years; apps notarized before it expires keep opening after.
 - Keep the `.p12` and its password out of the repository and out of chat; the secrets are the only copy the workflow needs.
-- Tauri notarizes and staples the `.app` only; the DMG is Developer ID signed but never notarized or stapled itself. If the gauntlet's `dmg-gatekeeper` check still says `rejected` after signing, add a step to the `app-bundle` job that runs `xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_PASSWORD" --wait` followed by `xcrun stapler staple "$dmg"`.
+- Tauri notarizes and staples the `.app` only; the DMG is Developer ID signed but never notarized or stapled itself. The gauntlet's `dmg-gatekeeper` check runs `spctl -a -t exec` on the mounted `.app`, not the DMG file, so it flips to accepted once the app is notarized and stapled and says nothing about the DMG itself. If users report macOS blocking the DMG on open, notarize the DMG too with the `notarytool submit … --wait` and `stapler staple` step already described.
 - Developer ID signing without notarization still fails Gatekeeper, so set all six secrets together.
 
 ## 2. Windows: Authenticode or Azure Trusted Signing
@@ -71,7 +71,7 @@ Not wired yet; pick a provider first. Since 2023 code-signing private keys must 
 
 Prices are approximate; check the vendor page before buying.
 
-When a provider is chosen: add a `scripts/windows-sign.ps1` that runs the vendor CLI on `%1` and exits 0 with a log line when its secrets are absent (so forks and unsigned builds still bundle), point `bundle.windows.signCommand` at it, pass the secrets to *Build Windows desktop app bundle* in `release.yml`, and add a verification step (`Get-AuthenticodeSignature` status must be `Valid`) mirroring the macOS one. The first-run gauntlet's `windows-nsis` leg then proves the installer from a clean Windows runner.
+When a provider is chosen: add a `scripts/windows-sign.ps1` that runs the vendor CLI on `%1` and exits 0 with a log line when its secrets are absent (so forks and unsigned builds still bundle), point `bundle.windows.signCommand` at it, pass the secrets to *Build Windows desktop app bundle* in `release.yml`, and add a verification step (`Get-AuthenticodeSignature` status must be `Valid`) mirroring the macOS one. The first-run gauntlet's `windows-nsis` leg then proves the installer from a clean Windows runner. <!-- drift-ok -->
 
 ## 3. Related integrity checks already in place
 

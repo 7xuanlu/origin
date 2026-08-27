@@ -1982,7 +1982,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
       - name: Mark release-candidate build
-        if: startsWith(github.head_ref, 'release-please--branches--')
+        if: startsWith(github.head_ref, 'release-please--branches--') && github.event.pull_request.head.repo.full_name == github.repository
         shell: bash
         run: |
           v="$(jq -er '.["."]' .release-please-manifest.json)"
