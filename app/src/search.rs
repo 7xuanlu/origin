@@ -4656,12 +4656,20 @@ pub async fn is_run_at_login_enabled() -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub async fn set_run_at_login(enabled: bool) -> Result<(), String> {
+pub async fn set_run_at_login(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     crate::lifecycle::run_at_login_capability(std::env::consts::OS).map_err(str::to_string)?;
     use crate::lifecycle::{set_run_at_login as inner, SystemLaunchctl};
-    inner(enabled, &SystemLaunchctl)
-        .await
-        .map_err(|e| e.to_string())
+    let result = inner(enabled, &SystemLaunchctl).await;
+    if enabled && result.is_err() {
+        // Turning the toggle on stops an app-owned sidecar before the launchd
+        // handover; a handover that then fails must not leave the user with
+        // no daemon at all, so start one again unless something owns it.
+        let outcome =
+            crate::daemon_start::start_daemon_if_unowned(&app, &crate::api::WenlanClient::new())
+                .await;
+        log::warn!("[run-at-login] launchd handover failed; daemon fallback: {outcome:?}");
+    }
+    result.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
