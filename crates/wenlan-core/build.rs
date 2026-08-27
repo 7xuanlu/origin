@@ -14,9 +14,12 @@
 //!   the None case gracefully).
 //!
 //! - `WENLAN_VERSION_SUFFIX`: `+g<sha8>` for a local source build, empty for a
-//!   release build (HEAD on a `v*` tag) or a git-less tarball. Appended to the
-//!   version by `wenlan_core::version()` so the drift nudges can tell a dev
-//!   daemon from a released one. Always emitted (even empty) so `env!` resolves.
+//!   release build — HEAD on a `v*` tag, or the `WENLAN_RELEASE_VERSION` env
+//!   var set to exactly this crate's `CARGO_PKG_VERSION` (CI sets it on the
+//!   release-please PR branch, where release binaries are built before the
+//!   tag exists) — or a git-less tarball. Appended to the version by
+//!   `wenlan_core::version()` so the drift nudges can tell a dev daemon from
+//!   a released one. Always emitted (even empty) so `env!` resolves.
 
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -90,11 +93,33 @@ fn main() {
     // Dev builds carry a `+g<sha8>` build-metadata suffix so the daemon↔plugin
     // and daemon↔mcp drift nudges can recognize a local source build (its
     // release-granular CARGO_PKG_VERSION is stale by construction) and stay
-    // quiet. A release build — HEAD exactly on a `v*` tag — reports the bare
-    // version. `+build` metadata is semver-legal and ignored in ordering, so it
-    // never perturbs the mcp handshake `compare()`. Always emit (even empty) so
+    // quiet. A release build — HEAD exactly on a `v*` tag, or
+    // `WENLAN_RELEASE_VERSION` set to this crate's own `CARGO_PKG_VERSION` —
+    // reports the bare version. Release binaries are built on the
+    // release-please PR branch before the tag exists, so CI sets
+    // `WENLAN_RELEASE_VERSION` there to mark the build as a release without a
+    // tag to check; a marker that does not match the crate version is
+    // untrusted and the dev suffix stays on. `+build` metadata is semver-legal
+    // and ignored in ordering, so it never perturbs the mcp handshake
+    // `compare()`. Always emit (even empty) so
     // `env!("WENLAN_VERSION_SUFFIX")` resolves at compile time.
-    let suffix = match (&sha, head_on_release_tag()) {
+    println!("cargo:rerun-if-env-changed=WENLAN_RELEASE_VERSION");
+    let release_version = std::env::var("WENLAN_RELEASE_VERSION")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let pkg_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    if let Some(marker) = &release_version {
+        if marker != &pkg_version {
+            println!(
+                "cargo:warning=WENLAN_RELEASE_VERSION={} does not match crate version {}; keeping the dev suffix",
+                marker, pkg_version
+            );
+        }
+    }
+    let is_release_build =
+        head_on_release_tag() || release_version.as_deref() == Some(pkg_version.as_str());
+    let suffix = match (&sha, is_release_build) {
         (Some(sha), false) => format!("+g{}", sha.chars().take(8).collect::<String>()),
         _ => String::new(),
     };

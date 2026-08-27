@@ -289,6 +289,12 @@ a1b2c3d distill: 4 pages
 
 完整 workflow 參考：[plugin/skills](plugin/skills/README.md)。模型分工與限制見：[技術基礎（英文）](docs/technical-foundations.md#model-roles)。
 
+### 你的資料與移除
+
+沒有任何鎖定。頁面和工作階段筆記是 `~/.wenlan/` 下的 Markdown；記憶保存在平台資料目錄下的一個 libSQL 資料庫中（macOS 為 `~/Library/Application Support/wenlan/`，Linux 為 `~/.local/share/wenlan/`，Windows 為 `%LOCALAPPDATA%\wenlan\`）。複製這兩個資料夾即可備份或搬移你的 Wenlan。
+
+移除：在 app 中關閉「登入時在背景執行文瀾」並結束（或執行 `wenlan background off`，它會停止守護程序並移除開機註冊），刪除 `Wenlan.app` 或執行 Windows 解除安裝程式，最後刪除上述兩個資料夾。Wenlan 寫入的所有路徑見 [PRIVACY.md](PRIVACY.md)。
+
 ---
 
 <a id="evaluation"></a>

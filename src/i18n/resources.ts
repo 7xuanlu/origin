@@ -1538,8 +1538,9 @@ const en = {
   },
   remoteAccess: {
     title: "Web access",
+    experimentalBadge: "Experimental",
     description:
-      "Claude.ai and ChatGPT reach your memory through Wenlan's relay — nothing to configure.",
+      "Experimental — Claude.ai and ChatGPT reach your memory through Wenlan's relay; nothing to configure.",
     noAuthWarning:
       "Creates a public HTTPS URL with no authentication for Claude.ai and ChatGPT. Anyone with the URL can access Wenlan; turn Remote Access off when unused.",
     testConnection: "Test connection",
@@ -3056,8 +3057,9 @@ const zhHans = {
   },
   remoteAccess: {
     title: "网页访问",
+    experimentalBadge: "实验性",
     description:
-      "Claude.ai 和 ChatGPT 通过文澜中继访问你的记忆——无需任何配置。",
+      "实验性功能——Claude.ai 和 ChatGPT 通过文澜中继访问你的记忆，无需任何配置。",
     noAuthWarning:
       "将为 Claude.ai 与 ChatGPT 创建一个无需身份验证的公开 HTTPS 地址。任何拥有该地址的人都能访问 Wenlan；不使用时请关闭远程访问。",
     testConnection: "测试连接",
@@ -4574,8 +4576,9 @@ const zhHant = {
   },
   remoteAccess: {
     title: "網頁存取",
+    experimentalBadge: "實驗性",
     description:
-      "Claude.ai 和 ChatGPT 透過文瀾中繼存取你的記憶——無需任何設定。",
+      "實驗性功能——Claude.ai 和 ChatGPT 透過文瀾中繼存取你的記憶，無需任何設定。",
     noAuthWarning:
       "將為 Claude.ai 與 ChatGPT 建立一個無需身份驗證的公開 HTTPS 位址。任何擁有該位址的人都能存取 Wenlan；不使用時請關閉遠端存取。",
     testConnection: "測試連線",

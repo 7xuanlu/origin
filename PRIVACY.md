@@ -25,6 +25,7 @@ None by default. Two opt-in integrations exist:
 
 - **Anthropic API (BYOK):** If you run `wenlan keys set anthropic`, your memories are sent to the Anthropic API for richer extraction and synthesis. Anthropic's privacy policy applies to that data. Wenlan does not store or relay your API key beyond the local config file.
 - **On-device model:** If you run `wenlan models install`, a Qwen model is downloaded from Hugging Face Hub. No memory data leaves your machine in this mode.
+- **Remote Access (experimental, desktop app only):** when you turn it on, the app opens a Cloudflare tunnel to the local MCP server and registers the tunnel URL with Wenlan's relay (a Cloudflare Worker) so Claude.ai and ChatGPT get a stable address. The address has no login: anyone who has it can read and write your memory until you turn Remote Access off. Nothing is sent while it is off.
 
 ## Telemetry
 
@@ -35,9 +36,10 @@ None. Wenlan collects no usage analytics, crash reports, or diagnostics.
 - Delete individual memories: `/forget` skill.
 - Delete everything: remove `~/.wenlan/` and your platform data directory (`~/Library/Application Support/wenlan/` on macOS, `~/.local/share/wenlan/` on Linux, `%LOCALAPPDATA%\wenlan\` on Windows).
 - Uninstall the daemon: run `wenlan background off` to stop it and disable autostart (this is a reversible runtime stop, not an uninstall), then remove the service registration for your platform -- `~/Library/LaunchAgents/com.wenlan.server.plist` (macOS), `~/.config/systemd/user/wenlan-server.service` (Linux), or the `WenlanServer` scheduled task (Windows) -- and delete `~/.wenlan/bin/`.
+- **Uninstall the desktop app:** turn off *Run Wenlan in background at login* in Settings and quit the app (this removes `~/Library/LaunchAgents/com.wenlan.server.plist` and `com.wenlan.desktop.plist` on macOS), then delete `Wenlan.app`; on Windows run the uninstaller from Apps & features. The data folders above stay until you delete them.
 
 ## Contact
 
 Questions or concerns: open an issue at https://github.com/7xuanlu/wenlan/issues.
 
-Last updated: 2026-05-10.
+Last updated: 2026-08-27.

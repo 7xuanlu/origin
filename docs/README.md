@@ -27,3 +27,4 @@ If you have a local `plans/` or `superpowers/` directory, treat everything in it
 - Review-flavor UI environment for realistic native rendering: `review-environment.md`
 - Windows Vulkan development and live verification: `windows-vulkan.md`
 - Eval sweep results and receipts: `eval-sweep-results.md`
+- Code signing and notarization for the desktop app: `code-signing.md`

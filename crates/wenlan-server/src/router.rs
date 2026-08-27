@@ -146,19 +146,56 @@ mod repair_only_tests {
     use tower::ServiceExt;
 
     async fn status(method: Method, path: &str) -> StatusCode {
+        status_with_headers(method, path, &[]).await
+    }
+
+    async fn status_with_headers(
+        method: Method,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> StatusCode {
         let state = Arc::new(RwLock::new(crate::state::ServerState::new()));
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
         build_repair_router(state)
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(path)
-                    .header("content-type", "application/json")
-                    .body(Body::from("{}"))
-                    .unwrap(),
-            )
+            .oneshot(builder.body(Body::from("{}")).unwrap())
             .await
             .unwrap()
             .status()
+    }
+
+    #[tokio::test]
+    async fn sec_fetch_site_cross_site_without_origin_is_forbidden() {
+        assert_eq!(
+            status_with_headers(
+                Method::GET,
+                "/api/health",
+                &[("sec-fetch-site", "cross-site")]
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn sec_fetch_site_cross_site_with_local_origin_passes() {
+        assert_eq!(
+            status_with_headers(
+                Method::GET,
+                "/api/health",
+                &[
+                    ("sec-fetch-site", "cross-site"),
+                    ("origin", "tauri://localhost")
+                ],
+            )
+            .await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

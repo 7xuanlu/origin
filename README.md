@@ -287,6 +287,12 @@ If the local daemon is unreachable, `wenlan capture` and `wenlan brief update` w
 
 Full workflow reference: [plugin/skills](plugin/skills/README.md). Technical model roles: [technical foundations](docs/technical-foundations.md#model-roles).
 
+### Your data and uninstall
+
+Nothing is locked in. Pages and session notes are Markdown under `~/.wenlan/`; memories live in one libSQL database under the platform data directory (`~/Library/Application Support/wenlan/` on macOS, `~/.local/share/wenlan/` on Linux, `%LOCALAPPDATA%\wenlan\` on Windows). Copy those two folders to back up or move a Wenlan.
+
+To uninstall: in the app turn off *Run Wenlan in background at login* and quit (or run `wenlan background off`, which stops the daemon and removes its launch registration), delete `Wenlan.app` or run the Windows uninstaller, then delete the two folders above. Every path Wenlan writes is listed in [PRIVACY.md](PRIVACY.md).
+
 ---
 
 <a id="evaluation"></a>

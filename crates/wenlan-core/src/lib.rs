@@ -105,4 +105,25 @@ mod tests {
         // The dev suffix (if any) is appended, never replaces the base version.
         assert!(version().starts_with(env!("CARGO_PKG_VERSION")));
     }
+
+    // `wenlan-server --version` reports its own crate version via clap and
+    // never calls this function, so it cannot prove the WENLAN_RELEASE_VERSION
+    // marker build.rs reads (issue #606). This test is the only surface that
+    // does: it prints the built-in version for a human comparing the three
+    // build scenarios, and asserts the durable shape either way — the bare
+    // crate version for a release build, or that version plus a `+g<sha8>`
+    // dev suffix for a local build.
+    #[test]
+    fn version_matches_bare_or_dev_suffix_shape() {
+        let v = version();
+        eprintln!("wenlan_core::version() = {v}");
+        let base = env!("CARGO_PKG_VERSION");
+        assert!(
+            v == base
+                || (v.starts_with(base)
+                    && v[base.len()..].starts_with("+g")
+                    && v.len() == base.len() + 10),
+            "version {v:?} is neither the bare crate version {base:?} nor a `+g<sha8>` dev build"
+        );
+    }
 }

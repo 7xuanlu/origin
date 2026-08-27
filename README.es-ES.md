@@ -287,6 +287,12 @@ Si el daemon local no está accesible, `wenlan capture` y `wenlan brief update` 
 
 Referencia completa del flujo de trabajo: [plugin/skills](plugin/skills/README.md). Roles técnicos del modelo: [fundamentos técnicos](docs/technical-foundations.md#model-roles).
 
+### Tus datos y la desinstalación
+
+Nada queda encerrado. Las páginas y las notas de sesión son Markdown en `~/.wenlan/`; las memorias viven en una base de datos libSQL dentro del directorio de datos de la plataforma (`~/Library/Application Support/wenlan/` en macOS, `~/.local/share/wenlan/` en Linux, `%LOCALAPPDATA%\wenlan\` en Windows). Copia esas dos carpetas para hacer una copia de seguridad o mover tu Wenlan.
+
+Para desinstalar: en la app desactiva *Ejecutar Wenlan en segundo plano al iniciar sesión* y ciérrala (o ejecuta `wenlan background off`, que detiene el daemon y elimina su registro de arranque), borra `Wenlan.app` o ejecuta el desinstalador de Windows y, por último, borra las dos carpetas anteriores. Todas las rutas que Wenlan escribe están en [PRIVACY.md](PRIVACY.md).
+
 ---
 
 <a id="evaluation"></a>

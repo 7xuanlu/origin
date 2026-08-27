@@ -289,6 +289,12 @@ a1b2c3d distill: 4 pages
 
 完整 workflow 参考：[plugin/skills](plugin/skills/README.md)。模型分工与限制见：[技术基础（英文）](docs/technical-foundations.md#model-roles)。
 
+### 你的数据与卸载
+
+没有任何锁定。页面和会话笔记是 `~/.wenlan/` 下的 Markdown；记忆保存在平台数据目录下的一个 libSQL 数据库中（macOS 为 `~/Library/Application Support/wenlan/`，Linux 为 `~/.local/share/wenlan/`，Windows 为 `%LOCALAPPDATA%\wenlan\`）。复制这两个文件夹即可备份或迁移你的 Wenlan。
+
+卸载：在 app 中关闭“登录时在后台运行文澜”并退出（或运行 `wenlan background off`，它会停止守护进程并移除开机注册），删除 `Wenlan.app` 或运行 Windows 卸载程序，最后删除上述两个文件夹。Wenlan 写入的所有路径见 [PRIVACY.md](PRIVACY.md)。
+
 ---
 
 <a id="evaluation"></a>

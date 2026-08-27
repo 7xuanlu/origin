@@ -81,6 +81,7 @@ describe("RemoteAccessPanel", () => {
     await waitFor(() => {
       expect(screen.getByText("Web access")).toBeInTheDocument();
     });
+    expect(screen.getByText("Experimental")).toBeInTheDocument();
     expect(screen.queryByText("Off")).not.toBeInTheDocument();
     // No disclosure to expand any more — Test/Reconnect only exist when up.
     expect(screen.queryByRole("button", { name: "View relay URL" })).not.toBeInTheDocument();
