@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.17.3](https://github.com/7xuanlu/wenlan/compare/v0.17.2...v0.17.3) (2026-08-27)
+
+
+### Bug Fixes
+
+* **core:** resolve chunk-id page locators and fence citation and page writes on source_revision ([#598](https://github.com/7xuanlu/wenlan/issues/598)) ([9e3a8be](https://github.com/7xuanlu/wenlan/commit/9e3a8beeacd07e4d6f3cbbddf126c559e23247d9))
+* **release,server,app:** pre-launch trust — SHA256SUMS + verified install, Sec-Fetch-Site guard, experimental Remote Access, release version marker, Apple signing behind secrets ([#618](https://github.com/7xuanlu/wenlan/issues/618)) ([8e61a31](https://github.com/7xuanlu/wenlan/commit/8e61a310bdd2da96867427f755547eb5bb9faeb6))
+
 ## [0.17.2](https://github.com/7xuanlu/wenlan/compare/v0.17.1...v0.17.2) (2026-08-27)
 
 
