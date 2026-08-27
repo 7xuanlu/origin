@@ -10,7 +10,14 @@
 //! is rejected. A non-local `Host` (DNS rebinding) is rejected too — unless the
 //! operator deliberately exposed the daemon via `WENLAN_BIND_ADDR` (e.g. the
 //! Docker image), which opts out of the Host check and owns its own access
-//! control.
+//! control. A browser omits `Origin` on a no-cors GET — a plain `<img>`,
+//! `<script>`, or a top-level navigation from a link — so a blind cross-site
+//! GET would otherwise reach every route; browsers always attach
+//! `Sec-Fetch-Site` to those same requests, so checking it closes that gap.
+//! A local `Origin` still passes even when `Sec-Fetch-Site` says cross-site,
+//! because the Tauri webview (`tauri://localhost`) and the Vite dev server
+//! are cross-site to `127.0.0.1` by that header's definition yet are
+//! legitimate local callers.
 
 use axum::{
     extract::Request,
@@ -18,6 +25,22 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+
+/// True when a browser's `Sec-Fetch-Site` proves the request is cross-site
+/// and no local `Origin` vouches for it. `sec_fetch_site` is compared
+/// trimmed and ASCII-lowercased; `"cross-site"` and `"same-site"` are the
+/// only values treated as cross-origin evidence — `"same-origin"`, `"none"`,
+/// an absent header, or any other value all return `false`.
+pub(crate) fn fetch_site_blocks(sec_fetch_site: Option<&str>, origin: Option<&str>) -> bool {
+    let Some(site) = sec_fetch_site else {
+        return false;
+    };
+    let site = site.trim().to_ascii_lowercase();
+    if site != "cross-site" && site != "same-site" {
+        return false;
+    }
+    !origin.is_some_and(origin_is_local)
+}
 
 /// Reject browser-driven cross-origin requests before they reach a handler.
 pub async fn guard_local_only(req: Request, next: Next) -> Result<Response, StatusCode> {
@@ -27,6 +50,15 @@ pub async fn guard_local_only(req: Request, next: Next) -> Result<Response, Stat
         if !origin_is_local(origin) {
             return Err(StatusCode::FORBIDDEN);
         }
+    }
+
+    // A browser attaches `Sec-Fetch-Site` even when it omits `Origin` on a
+    // no-cors GET, closing the blind cross-site GET gap the Origin-only check
+    // above leaves open.
+    let sec_fetch_site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    if fetch_site_blocks(sec_fetch_site, origin) {
+        return Err(StatusCode::FORBIDDEN);
     }
 
     // DNS-rebinding defense applies unless the operator deliberately bound the
@@ -175,6 +207,28 @@ mod tests {
     fn origin_cross_site_and_null_rejected() {
         for o in ["https://evil.com", "http://attacker.test:1420", "null"] {
             assert!(!origin_is_local(o), "expected rejected origin: {o}");
+        }
+    }
+
+    #[test]
+    fn fetch_site_blocks_cases() {
+        for (sec_fetch_site, origin, expected) in [
+            (Some("cross-site"), None, true),
+            (Some("same-site"), None, true),
+            (Some("Cross-Site"), None, true),
+            (Some("cross-site"), Some("tauri://localhost"), false),
+            (Some("cross-site"), Some("http://localhost:1420"), false),
+            (Some("cross-site"), Some("https://evil.com"), true),
+            (Some("same-origin"), None, false),
+            (Some("none"), None, false),
+            (None, None, false),
+            (Some("garbage"), None, false),
+        ] {
+            assert_eq!(
+                fetch_site_blocks(sec_fetch_site, origin),
+                expected,
+                "sec_fetch_site={sec_fetch_site:?} origin={origin:?}"
+            );
         }
     }
 

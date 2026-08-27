@@ -4,6 +4,7 @@ set -euo pipefail
 # Wenlan installer — downloads Wenlan runtime binaries to ~/.wenlan/bin/
 # Usage:      curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/install.sh | bash
 # Prerelease: curl -fsSL ... | WENLAN_RELEASE_TAG=v0.2.0-alpha.1 bash
+# Skip checksum verification (only if the release predates SHA256SUMS): WENLAN_SKIP_CHECKSUM=1
 #
 # Supported platforms: macOS (arm64), Linux (aarch64, x86_64).
 # Windows users: download wenlan-windows-x64.zip from the GitHub release page.
@@ -103,6 +104,33 @@ if ! curl -fSL --progress-bar -o "${TMP_DIR}/${ASSET}" "${DOWNLOAD_URL}"; then
   die "Failed to download ${ASSET} from ${DOWNLOAD_URL}. Check that the release exists at ${RELEASE_PAGE} and has that asset."
 fi
 ok "Downloaded ${ASSET}"
+
+SUMS_URL="${RELEASE_BASE}/SHA256SUMS"
+info "Verifying checksum..."
+SUMS_HTTP="$(curl -sSL --retry 3 -o "${TMP_DIR}/SHA256SUMS" -w '%{http_code}' "${SUMS_URL}" 2>/dev/null || true)"
+case "${SUMS_HTTP}" in
+  200)
+    EXPECTED="$(awk -v a="${ASSET}" '$2 == a { print $1; exit }' "${TMP_DIR}/SHA256SUMS")"
+    [[ "${EXPECTED}" =~ ^[0-9a-f]{64}$ ]] || die "SHA256SUMS for ${TAG} has no usable entry for ${ASSET}. See ${RELEASE_PAGE}."
+    if command -v sha256sum >/dev/null 2>&1; then
+      ACTUAL="$(sha256sum "${TMP_DIR}/${ASSET}" | awk '{ print $1 }')"
+    else
+      ACTUAL="$(shasum -a 256 "${TMP_DIR}/${ASSET}" | awk '{ print $1 }')"
+    fi
+    [[ "${ACTUAL}" == "${EXPECTED}" ]] || die "Checksum mismatch for ${ASSET}: expected ${EXPECTED}, got ${ACTUAL}. The download is corrupted or was tampered with; run the installer again."
+    ok "Checksum verified (SHA-256 ${ACTUAL:0:12}…)"
+    ;;
+  404)
+    if [[ "${WENLAN_SKIP_CHECKSUM:-}" == "1" ]]; then
+      warn "No SHA256SUMS on release ${TAG}; skipping verification because WENLAN_SKIP_CHECKSUM=1"
+    else
+      die "Release ${TAG} has no SHA256SUMS file (releases before v0.17.3 have none), so the download cannot be verified. Pin a newer release with WENLAN_RELEASE_TAG=vX.Y.Z, or set WENLAN_SKIP_CHECKSUM=1 to install without verification."
+    fi
+    ;;
+  *)
+    die "Could not download ${SUMS_URL} (HTTP ${SUMS_HTTP:-000}). Check the network and run the installer again."
+    ;;
+esac
 
 info "Extracting..."
 if ! tar -xzf "${TMP_DIR}/${ASSET}" -C "${TMP_DIR}"; then

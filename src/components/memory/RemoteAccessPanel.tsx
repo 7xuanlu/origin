@@ -102,15 +102,18 @@ export function RemoteAccessPanel() {
           configured. */}
       <div className="px-5 py-4">
         <div className="flex items-start justify-between gap-4">
-          <div
-            style={{
-              fontFamily: "var(--mem-font-body)",
-              fontSize: "var(--mem-text-lg)",
-              fontWeight: 600,
-              color: "var(--mem-text)",
-            }}
-          >
-            {t("remoteAccess.title")}
+          <div className="flex items-center gap-2">
+            <div
+              style={{
+                fontFamily: "var(--mem-font-body)",
+                fontSize: "var(--mem-text-lg)",
+                fontWeight: 600,
+                color: "var(--mem-text)",
+              }}
+            >
+              {t("remoteAccess.title")}
+            </div>
+            <Tag tone="accent">{t("remoteAccess.experimentalBadge")}</Tag>
           </div>
           <div className="mt-0.5">
             <Toggle

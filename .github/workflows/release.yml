@@ -450,6 +450,12 @@ jobs:
       dmg_sha256: ${{ steps.stage.outputs.dmg_sha256 }}
       tarball_sha256: ${{ steps.stage.outputs.tarball_sha256 }}
       sig_sha256: ${{ steps.stage.outputs.sig_sha256 }}
+    env:
+      # An empty secret value is falsy in bash but truthy to Tauri (a
+      # set-but-empty APPLE_CERTIFICATE is still treated as a certificate), so
+      # gate on this boolean rather than letting `pnpm tauri build` discover
+      # emptiness itself.
+      APPLE_SIGNING_CONFIGURED: ${{ secrets.APPLE_CERTIFICATE != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -511,6 +517,63 @@ jobs:
           xattr -cr /tmp/cloudflared
           echo "CLOUDFLARED_BIN=/tmp/cloudflared" >> "$GITHUB_ENV"
 
+      - name: Load Apple signing and notarization secrets
+        if: env.APPLE_SIGNING_CONFIGURED == 'true'
+        shell: bash
+        env:
+          SECRET_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          SECRET_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          SECRET_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SECRET_APPLE_ID: ${{ secrets.APPLE_ID }}
+          SECRET_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          SECRET_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY; do
+            var="SECRET_${name}"
+            if [[ -z "${!var:-}" ]]; then
+              echo "ERROR: APPLE_SIGNING_CONFIGURED is true but secret $name is empty." >&2
+              exit 1
+            fi
+          done
+
+          notarization_names=(APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID)
+          notarization_set=0
+          for name in "${notarization_names[@]}"; do
+            var="SECRET_${name}"
+            [[ -n "${!var:-}" ]] && notarization_set=$((notarization_set + 1))
+          done
+          if [[ "$notarization_set" -ne 0 && "$notarization_set" -ne 3 ]]; then
+            for name in "${notarization_names[@]}"; do
+              var="SECRET_${name}"
+              if [[ -z "${!var:-}" ]]; then
+                echo "ERROR: notarization secrets must be all set or all unset; $name is missing." >&2
+                exit 1
+              fi
+            done
+          fi
+
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            var="SECRET_${name}"
+            value="${!var:-}"
+            if [[ "$name" == "APPLE_CERTIFICATE" ]]; then
+              value="$(tr -d '[:space:]' <<<"$value")"
+            fi
+            if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+              echo "ERROR: secret $name contains a line break." >&2
+              exit 1
+            fi
+            if [[ -n "$value" ]]; then
+              printf '%s=%s\n' "$name" "$value" >> "$GITHUB_ENV"
+            fi
+          done
+
+          if [[ "$notarization_set" -eq 3 ]]; then
+            echo "Developer ID signing + notarization"
+          else
+            echo "Developer ID signing without notarization"
+          fi
+
       - name: Build macOS desktop app bundle
         shell: bash
         env:
@@ -521,6 +584,27 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --target aarch64-apple-darwin
+
+      - name: Verify Apple signature and notarization
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${APPLE_SIGNING_CONFIGURED}" != "true" ]]; then
+            echo "Apple signing not configured; bundle is ad-hoc signed (Gatekeeper will reject the DMG). See docs/code-signing.md."
+            exit 0
+          fi
+          bundle_dir="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle"
+          app="$(find "$bundle_dir/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [[ -n "$app" && -d "$app" ]] || { echo "ERROR: no .app bundle found under $bundle_dir/macos." >&2; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          sign_info="$(codesign -dv --verbose=2 "$app" 2>&1)"
+          grep -q 'Authority=Developer ID Application' <<<"$sign_info" || { echo "ERROR: app is not signed with a Developer ID Application certificate." >&2; exit 1; }
+          if [[ -n "${APPLE_ID:-}" ]]; then
+            spctl --assess --type execute --verbose=2 "$app"
+            xcrun stapler validate "$app"
+          else
+            echo "Notarization not configured (APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID); the app is Developer ID signed but Gatekeeper still blocks the first launch. See docs/code-signing.md."
+          fi
 
       - name: Stage app bundle assets and checksums
         id: stage
@@ -1637,6 +1721,48 @@ jobs:
       # promoted the release, leaving v0.15.5 stable but still labelled pending.
       pull-requests: write
     steps:
+      - name: Publish SHA256SUMS
+        run: |
+          set -euo pipefail
+          tag_sha="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "ERROR: $RELEASE_TAG moved from release SHA $RELEASE_SHA to $tag_sha." >&2
+            exit 1
+          fi
+
+          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")"
+
+          missing_digest="$(jq -r '[.assets[] | select(.name != "SHA256SUMS") | select((.digest // "") | startswith("sha256:") | not) | .name] | join(", ")' <<<"$release_json")"
+          if [[ -n "$missing_digest" ]]; then
+            echo "ERROR: GitHub has no sha256 digest recorded for: $missing_digest" >&2
+            exit 1
+          fi
+
+          jq -r '[.assets[] | select(.name != "SHA256SUMS")] | sort_by(.name) | .[] | "\(.digest | sub("^sha256:"; ""))  \(.name)"' \
+            <<<"$release_json" > "$RUNNER_TEMP/SHA256SUMS"
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | grep -Fxq "SHA256SUMS"; then
+            mkdir -p "$RUNNER_TEMP/existing-sha256sums"
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern SHA256SUMS --dir "$RUNNER_TEMP/existing-sha256sums" --clobber
+            if cmp -s "$RUNNER_TEMP/SHA256SUMS" "$RUNNER_TEMP/existing-sha256sums/SHA256SUMS"; then
+              echo "SHA256SUMS already present on $RELEASE_TAG and matches; not re-uploading."
+            else
+              echo "ERROR: SHA256SUMS already exists on $RELEASE_TAG and differs from the recomputed file." >&2
+              exit 1
+            fi
+          else
+            gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/SHA256SUMS" --repo "$GITHUB_REPOSITORY"
+          fi
+
+          echo "---- SHA256SUMS ----"
+          cat "$RUNNER_TEMP/SHA256SUMS"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Promote
         run: |
           set -euo pipefail

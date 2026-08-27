@@ -1981,6 +1981,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/download-run-artifact.sh "$GITHUB_RUN_ID" "fastembed-bge-base-en-v1.5-q-v3-portable-${GITHUB_RUN_ID}" .fastembed_cache
+      - name: Mark release-candidate build
+        if: startsWith(github.head_ref, 'release-please--branches--') && github.event.pull_request.head.repo.full_name == github.repository
+        shell: bash
+        run: |
+          v="$(jq -er '.["."]' .release-please-manifest.json)"
+          echo "WENLAN_RELEASE_VERSION=$v" >> "$GITHUB_ENV"
+          echo "release candidate $v"
       - name: Build and smoke shipped release binaries
         shell: bash
         run: bash scripts/build-release-binaries.sh "${{ matrix.target }}"
