@@ -16830,7 +16830,7 @@ impl MemoryDB {
 
         let (rearmed, legacy_attempt_keys_dropped) = match result {
             Ok(value) => {
-                conn.execute("COMMIT", ())
+                commit_or_rollback(&conn)
                     .await
                     .map_err(|e| WenlanError::VectorDb(format!("m126 commit: {e}")))?;
                 value
