@@ -28,6 +28,11 @@ app crash takes it down too; when that binding fails the app logs it and keeps t
 daemon running, and the crash case is then not covered. A launchd, systemd, or Task
 Scheduler daemon is service-owned and outlives the app by design.
 
+On macOS the app registers the launchd job first on a fresh install and starts its
+own sidecar only when that registration is skipped (opted out, unstable app path,
+isolated data dir) or fails, so the two never compete for the port; turning on
+"Run at Login" stops an app-owned sidecar before it hands the daemon to launchd.
+
 ## llama-cpp-2 backend
 
 macOS builds use Metal, Windows x86_64 builds use Vulkan with observable CPU/OpenMP fallback, and Linux builds remain CPU/OpenMP. Windows setup, device selection, CI/release prerequisites, and physical Qwen live-smoke commands are in [`windows-vulkan.md`](windows-vulkan.md).

@@ -800,6 +800,12 @@ pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> R
             );
         }
         set_user_opted_out(false)?;
+        // A sidecar this app spawned holds the port that `wenlan background
+        // on` is about to hand to launchd, and the CLI's pre-install shutdown
+        // request failed against it (first-run gauntlet finding F16). Stop it
+        // through its child handle first; a launchd-owned daemon is never in
+        // that slot, so this is a no-op once launchd owns the daemon.
+        crate::daemon_start::stop_sidecar().await;
         install_server_plist_via_subprocess(launchctl)?;
         install_app_plist(launchctl)?;
     } else {

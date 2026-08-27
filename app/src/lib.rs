@@ -693,9 +693,18 @@ pub fn run() {
 
             // First-run silent install — H6: run on a blocking task so we
             // don't block setup() (which delays Tauri start by hundreds of ms).
+            //
+            // The daemon's owner is decided here, once that install has
+            // settled: launchd when the server LaunchAgent is in place,
+            // otherwise our own sidecar. Spawning the sidecar at once and
+            // registering launchd in parallel made the two fight for the port
+            // on a fresh Mac (first-run gauntlet finding F16): `wenlan
+            // background on` failed against the still-booting sidecar, or
+            // launchd's daemon lost the port to it and looped on exit 75.
             if launch_agent_startup {
                 use tauri::Emitter;
                 let install_handle = handle.clone();
+                crate::daemon_start::set_launchd_install_pending(true);
                 tauri::async_runtime::spawn(async move {
                     let result = tauri::async_runtime::spawn_blocking(|| {
                         let launchctl = crate::lifecycle::SystemLaunchctl;
@@ -715,6 +724,31 @@ pub fn run() {
                         Err(e) => {
                             log::warn!("[first-run] install task join error: {e}");
                             let _ = install_handle.emit("origin-fallback-mode", ());
+                        }
+                    }
+                    crate::daemon_start::set_launchd_install_pending(false);
+                    let launchd_owns_daemon =
+                        crate::lifecycle::current_server_plist_matches_selected_data_dir();
+                    match crate::daemon_start::decide_startup_sidecar(
+                        daemon_startup_preflight_ok,
+                        launchd_owns_daemon,
+                    ) {
+                        crate::daemon_start::StartupSidecar::SkipPreflightFailed => {
+                            log::warn!(
+                                "[init] skipping daemon sidecar because server plist preflight failed"
+                            );
+                        }
+                        crate::daemon_start::StartupSidecar::SkipLaunchdOwns => {
+                            log::info!(
+                                "[init] launchd owns the daemon after the first-run install; no sidecar"
+                            );
+                        }
+                        crate::daemon_start::StartupSidecar::Spawn => {
+                            if let Err(e) =
+                                crate::daemon_start::spawn_daemon_sidecar(&install_handle)
+                            {
+                                log::error!("[init] {e}. Run: xattr -cr /Applications/Origin.app or /Applications/Wenlan.app");
+                            }
                         }
                     }
                 });
@@ -1090,28 +1124,17 @@ pub fn run() {
                 }
             }
 
-            // Launch wenlan-server daemon as a sidecar process.
-            // If a daemon is already running on the port, the sidecar exits cleanly.
-            // The quit flow stops it (`daemon_start::stop_sidecar`); the shell
-            // plugin only kills children spawned from its JS `execute` command.
+            // Launch wenlan-server daemon as a sidecar process where no
+            // LaunchAgent exists (Windows, Linux). If a daemon is already
+            // running on the port, the sidecar exits cleanly. The quit flow
+            // stops it (`daemon_start::stop_sidecar`); the shell plugin only
+            // kills children spawned from its JS `execute` command.
             //
-            // Skip the sidecar only when the current Wenlan launchd service
-            // already targets this app-selected data root. A stale launchd
-            // plist can exist during migration and first-run repair, but it
-            // must not suppress the selected-data-dir sidecar fallback.
-            if !daemon_startup_preflight_ok {
-                log::warn!(
-                    "[init] skipping daemon sidecar because server plist preflight failed"
-                );
-            } else {
-                let launchd_managed = launch_agent_startup
-                    && crate::lifecycle::current_server_plist_matches_selected_data_dir();
-                if launchd_managed {
-                    log::info!(
-                        "[init] launchd-managed daemon detected, skipping sidecar spawn"
-                    );
-                } else if let Err(e) = crate::daemon_start::spawn_daemon_sidecar(app.handle()) {
-                    log::error!("[init] {e}. Run: xattr -cr /Applications/Origin.app or /Applications/Wenlan.app");
+            // On macOS the first-run install task above decides the owner once
+            // it has settled, so nothing is spawned here.
+            if !launch_agent_startup {
+                if let Err(e) = crate::daemon_start::spawn_daemon_sidecar(app.handle()) {
+                    log::error!("[init] {e}");
                 }
             }
 
