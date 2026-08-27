@@ -704,7 +704,7 @@ pub fn run() {
             if launch_agent_startup {
                 use tauri::Emitter;
                 let install_handle = handle.clone();
-                crate::daemon_start::set_launchd_install_pending(true);
+                let pending = crate::daemon_start::LaunchdInstallPending::begin();
                 tauri::async_runtime::spawn(async move {
                     let result = tauri::async_runtime::spawn_blocking(|| {
                         let launchctl = crate::lifecycle::SystemLaunchctl;
@@ -726,31 +726,14 @@ pub fn run() {
                             let _ = install_handle.emit("origin-fallback-mode", ());
                         }
                     }
-                    crate::daemon_start::set_launchd_install_pending(false);
-                    let launchd_owns_daemon =
-                        crate::lifecycle::current_server_plist_matches_selected_data_dir();
-                    match crate::daemon_start::decide_startup_sidecar(
+                    // The guard moved into this task, so a panic above
+                    // releases it too; here it is released under the owner
+                    // lock, together with the decision it was protecting.
+                    crate::daemon_start::settle_startup_owner(
+                        &install_handle,
                         daemon_startup_preflight_ok,
-                        launchd_owns_daemon,
-                    ) {
-                        crate::daemon_start::StartupSidecar::SkipPreflightFailed => {
-                            log::warn!(
-                                "[init] skipping daemon sidecar because server plist preflight failed"
-                            );
-                        }
-                        crate::daemon_start::StartupSidecar::SkipLaunchdOwns => {
-                            log::info!(
-                                "[init] launchd owns the daemon after the first-run install; no sidecar"
-                            );
-                        }
-                        crate::daemon_start::StartupSidecar::Spawn => {
-                            if let Err(e) =
-                                crate::daemon_start::spawn_daemon_sidecar(&install_handle)
-                            {
-                                log::error!("[init] {e}. Run: xattr -cr /Applications/Origin.app or /Applications/Wenlan.app");
-                            }
-                        }
-                    }
+                        pending,
+                    );
                 });
             }
 

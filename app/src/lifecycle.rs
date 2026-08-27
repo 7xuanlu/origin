@@ -212,6 +212,15 @@ pub fn current_server_plist_matches_selected_data_dir() -> bool {
         .is_some_and(|content| server_plist_has_selected_data_dir(&content))
 }
 
+/// True when launchd owns the daemon: the server LaunchAgent targets the
+/// selected data root *and* launchd has the job loaded. The file alone is not
+/// ownership — `wenlan background on` writes it before `launchctl load`, and a
+/// failed load leaves it behind with no job to run the daemon.
+pub fn launchd_owns_server_daemon(launchctl: &dyn LaunchctlExec) -> bool {
+    current_server_plist_matches_selected_data_dir()
+        && label_is_loaded(launchctl, SERVER_PLIST_LABEL)
+}
+
 pub fn legacy_server_plist_exists() -> bool {
     legacy_server_plist_path()
         .map(|p| p.exists())
@@ -800,6 +809,9 @@ pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> R
             );
         }
         set_user_opted_out(false)?;
+        // The "Start Wenlan" button must not spawn a sidecar between the stop
+        // below and the launchd registration; the count releases on drop.
+        let _pending = crate::daemon_start::LaunchdInstallPending::begin();
         // A sidecar this app spawned holds the port that `wenlan background
         // on` is about to hand to launchd, and the CLI's pre-install shutdown
         // request failed against it (first-run gauntlet finding F16). Stop it
@@ -2074,6 +2086,60 @@ mod tests {
 
         assert!(current_server_plist_exists());
         assert!(current_server_plist_matches_selected_data_dir());
+    }
+
+    // The owner test behind the startup sidecar decision and the "Start
+    // Wenlan" button: a server plist that targets the selected data root is
+    // only launchd's daemon when launchd has the job loaded. `wenlan
+    // background on` writes the file before `launchctl load`, so a failed
+    // load leaves a matching file and no job; trusting the file alone would
+    // skip the sidecar and leave the user with no daemon.
+    #[test]
+    #[serial_test::serial]
+    fn launchd_owns_the_daemon_only_when_its_job_is_loaded() {
+        let _env = EnvGuard::capture(LIFECYCLE_ENV_KEYS);
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("WENLAN_DATA_DIR", data.path());
+        std::env::remove_var("ORIGIN_DATA_DIR");
+        let loaded = MockLaunchctl::default();
+        *loaded.list_stdout.lock().unwrap() = format!("123\t0\t{SERVER_PLIST_LABEL}\n");
+        let unloaded = MockLaunchctl::default();
+
+        // A loaded job with no plist for the selected data root is not ours.
+        assert!(!launchd_owns_server_daemon(&loaded));
+
+        let plist = server_plist_path().unwrap();
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(
+            &plist,
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wenlan.server</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>WENLAN_DATA_DIR</key>
+        <string>{}</string>
+    </dict>
+</dict>
+</plist>
+"#,
+                data.path().display()
+            ),
+        )
+        .unwrap();
+        assert!(current_server_plist_matches_selected_data_dir());
+
+        assert!(
+            !launchd_owns_server_daemon(&unloaded),
+            "a matching plist that launchd never loaded must not count as launchd's daemon"
+        );
+        assert!(launchd_owns_server_daemon(&loaded));
     }
 
     #[test]
