@@ -1134,6 +1134,7 @@ carrying the authority of agreement.
 | `core/db.rs::try_update_page_content_with_changelog` | `pub` | no | no | — | `core/db.rs::try_update_page_content` |
 | `core/db.rs::try_update_page_content_with_changelog_at_source_revision` | `pub` | no | no | — | `core/db.rs::try_update_page_content` |
 | `core/db.rs::try_update_page_content_with_changelog_at_version` | `pub` | no | no | — | `core/db.rs::try_update_page_content` |
+| `core/db.rs::try_update_page_content_with_changelog_at_versions` | `pub` | no | no | — | `core/db.rs::try_update_page_content` |
 | `core/db.rs::try_update_page_growth_at_versions` | `pub` | no | no | — | `core/db.rs::try_update_page_content` |
 | `core/db.rs::update_page_content` | `pub` | no | no | — | `core/db.rs::try_update_page_content` |
 | `core/db/claim_derivation.rs::run_page_linked_truth_promotion_turn` | `pub` | no | **yes** | `server/main/runtime.rs::register_optional_runtime_workers` | `core/db/claim_derivation.rs::run_leased_page_linked_truth_promotion` |
@@ -1290,8 +1291,8 @@ carrying the authority of agreement.
 | `core/maintenance/page_merge_order.rs::order_survivor` | `pub(super)` | no | no | — | `core/maintenance/page_merge_order.rs::load_candidate` |
 | `core/post_ingest.rs::write_grown_page` | `private` | no | no | — | `core/db.rs::find_page_by_source_memory` |
 | `core/post_write/page_dispatch.rs::create_page_with_tuning` | `pub` | no | **yes** | `server/page_routes.rs::handle_create_page` | `core/post_write/page_dispatch.rs::page_write` |
-| `core/post_write/page_dispatch.rs::update_page` | `pub` | no | **yes** | `server/page_routes.rs::handle_refresh_page` | `core/post_write/page_dispatch.rs::page_write` |
-| `core/post_write/page_dispatch.rs::update_page_at_source_revision` | `pub(crate)` | no | no | — | `core/post_write/page_dispatch.rs::page_write` |
+| `core/post_write/page_dispatch.rs::update_page` | `pub` | no | no | — | `core/post_write/page_dispatch.rs::page_write` |
+| `core/post_write/page_dispatch.rs::update_page_at_source_revision` | `pub` | no | **yes** | `server/page_routes.rs::handle_refresh_page` | `core/post_write/page_dispatch.rs::page_write` |
 | `core/post_write/page_dispatch.rs::update_page_growth_at_versions` | `pub(crate)` | no | no | — | `core/post_write/page_update.rs::update_page_impl` |
 | `core/post_write/page_dispatch.rs::update_page_preserving_sources` | `pub` | no | **yes** | `server/page_routes.rs::handle_update_page` | `core/post_write/page_dispatch.rs::page_write` |
 | `core/post_write/page_revision.rs::accept_pending_revision_with_knowledge_path` | `pub` | no | **yes** | `server/memory_routes.rs::handle_accept_revision` | `core/post_write/page_revision.rs::accept_page_revision_card`, `core/post_write/page_revision.rs::resolve_page_revision_card` |

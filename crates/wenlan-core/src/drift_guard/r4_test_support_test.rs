@@ -3229,7 +3229,7 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        1033,
+        1039,
         "PR-D integration must expose the frozen 967 support calls, the 6 PR-D test identities, \
          the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, \
          the 7 G6 BindPageLink repair-test calls (G6 Stage 2 PR 2b, item 3: \
@@ -3334,7 +3334,17 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
          low-trust corrections plus the memory they supersede), and the page-card forgery \
          guard test a_card_whose_supersedes_is_not_a_page_is_never_a_page_write \
          contributes test_primary_session|1 and TestDbSession::execute|1 (the forged \
-         structured_fields UPDATE that the DB-proven page branch must now ignore)"
+         structured_fields UPDATE that the DB-proven page branch must now ignore); \
+         plus the fix/doc-citation-locators \
+         arc's net +6: citations.rs's backfill_id_shaped_locator_resolves_and_annotates (added \
+         by an earlier round of this same arc, commit 98b62a8c) contributes \
+         TestDbSession::execute|1 + test_primary_session|1 for its raw chunk-row INSERT seeding \
+         a document-chunk id-shaped locator, and the new \
+         post_write::tests::stage_page_revision_card_via_fenced_update_records_source_revision \
+         (round 5, F1 revision-card source_revision fencing) contributes \
+         TestDbSession::query|1, TestDbRows::next|1, TestDbRow::get|1, and \
+         test_primary_session|1 reading the page back after a fenced update to assert \
+         source_revision landed"
     );
 }
 

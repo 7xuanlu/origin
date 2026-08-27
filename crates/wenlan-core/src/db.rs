@@ -1162,7 +1162,7 @@ pub const EMBEDDING_DIM: usize = 768;
 /// `entities` table, skip every `version < N` branch, and quietly operate
 /// against a schema it cannot see. Refusing to open is recoverable; writing is
 /// not.
-pub const SCHEMA_VERSION: u32 = 125;
+pub const SCHEMA_VERSION: u32 = 126;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -9792,6 +9792,16 @@ impl MemoryDB {
             if version < 125 {
                 self.migrate_125_observation_identity(version).await?;
             }
+
+            // Migration 126 (2026-08-24 doc-citation-locator fix): one-time
+            // re-arm of pages poisoned by the citation backfill's now-fixed
+            // locator mismatch (change A/B, same PR), and drop of legacy
+            // per-generation citation-backfill attempt keys. See
+            // migrate_126_rearm_empty_citations_and_drop_legacy_attempt_keys.
+            if version < 126 {
+                self.migrate_126_rearm_empty_citations_and_drop_legacy_attempt_keys(version)
+                    .await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -16405,6 +16415,26 @@ impl MemoryDB {
             // CREATEs with IF NOT EXISTS, while `repair_community_cutover`
             // drops and recreates its own at every startup -- so copying it is
             // what keeps this migration's result stable across the next boot.
+            //
+            // The three `m4_parity_input_entity_*` bodies below write to
+            // `community_parity_input_state`. A database that reached this
+            // version through the local-only M96 shape (see
+            // `migration_96_converges_local_only_parity_shape_and_invalidates_old_proof`)
+            // does not have that table until the post-chain
+            // `repair_community_cutover` creates it -- but SQLite resolves a
+            // trigger body at statement-prepare time, so every `UPDATE pages`
+            // in a later migration (first: m126's citation re-arm) would fail
+            // with "no such table" before the repair pass ever runs. Install
+            // the table shape first; `IF NOT EXISTS` makes this a no-op on
+            // every other database, and the startup repair still seeds and
+            // re-arms it.
+            tx.execute_batch(PARITY_INPUT_STATE_TABLE_DDL)
+                .await
+                .map_err(|error| {
+                    WenlanError::VectorDb(format!(
+                        "m123 ensure parity input state table: {error}"
+                    ))
+                })?;
             tx.execute_batch(
                 "DROP TRIGGER IF EXISTS m4_grouping_entity_insert;
                  DROP TRIGGER IF EXISTS m4_grouping_entity_delete;
@@ -16746,6 +16776,78 @@ impl MemoryDB {
         log::info!(
             "[migration] Migration 125 applied: {deleted} duplicate observation(s) deleted, \
              idx_observations_identity created"
+        );
+        Ok(())
+    }
+
+    /// Migration 126 (2026-08-24 doc-citation-locator fix, PR change C):
+    /// one-time re-arm of pages poisoned by the citation backfill's
+    /// locator mismatch (change A/B, same PR). Before the fix, a document
+    /// source page's evidence locators were `memories.id` values that the
+    /// content readers could never resolve, so the backfill spent 3 model
+    /// calls on an empty numbered source block and wrote `citations = '[]'`
+    /// -- a pill the `citations IS NULL` sweep selector then skipped
+    /// forever, with `refresh_page`'s "sources are all orphaned" bail
+    /// blocking the only recovery path. Now that the read side resolves
+    /// those locators, re-arm every poisoned active page by clearing the
+    /// pill back to NULL so the sweep picks it up again. No new API route;
+    /// the `citations IS NULL` selector is unchanged.
+    ///
+    /// Same transaction also drops legacy-format citation-backfill attempt
+    /// keys (`citation_backfill_attempts:<page_id>:v...`), predating the
+    /// one-row-per-page redesign (`citations::attempt_key`) -- a dead key a
+    /// live page can never match again, since every read is gated on the
+    /// current `v{version}:s{source_revision}:` generation prefix. See
+    /// migrate_126_rearm_empty_citations_and_drop_legacy_attempt_keys.
+    async fn migrate_126_rearm_empty_citations_and_drop_legacy_attempt_keys(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(126, prior_version).await?;
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m126 begin: {e}")))?;
+
+        let result: Result<(u64, u64), WenlanError> = async {
+            let rearmed = conn
+                .execute(
+                    "UPDATE pages SET citations = NULL WHERE citations = '[]' AND status = 'active'",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m126 rearm: {e}")))?;
+            let legacy_attempt_keys_dropped = conn
+                .execute(
+                    "DELETE FROM app_metadata WHERE key LIKE 'citation_backfill_attempts:%:v%'",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m126 legacy attempt keys: {e}")))?;
+            Ok((rearmed, legacy_attempt_keys_dropped))
+        }
+        .await;
+
+        let (rearmed, legacy_attempt_keys_dropped) = match result {
+            Ok(value) => {
+                commit_or_rollback(&conn)
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m126 commit: {e}")))?;
+                value
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+
+        conn.execute("PRAGMA user_version = 126", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m126 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 126 applied: {rearmed} active page(s) with citations = '[]' \
+             re-armed to NULL, {legacy_attempt_keys_dropped} legacy citation-backfill attempt \
+             key(s) dropped"
         );
         Ok(())
     }
@@ -33311,6 +33413,17 @@ impl MemoryDB {
         }
     }
 
+    /// Decode the trailing `id` column an id-branch reader appends after the
+    /// shared `memory_item_columns` projection (`SELECT {columns}, id ...`).
+    /// Reads the row's own reported column count rather than a fixed index,
+    /// so a column added to `memory_item_columns` later can't silently
+    /// misalign this read into a wrong (or absent) value.
+    fn trailing_id_column(row: &libsql::Row) -> Result<String, WenlanError> {
+        let idx = row.column_count() - 1;
+        row.get::<String>(idx)
+            .map_err(|e| WenlanError::VectorDb(format!("trailing id column (index {idx}): {e}")))
+    }
+
     pub async fn list_memories_scoped(
         &self,
         scope: &ReadScope,
@@ -33459,6 +33572,63 @@ impl MemoryDB {
             let item = Self::memory_item_from_row(&row);
             map.insert(item.source_id.clone(), item);
         }
+
+        // Document source pages store `memories.id` row keys as their
+        // evidence locators (document_enrichment.rs:297 -- a value distinct
+        // from `source_id` for multi-chunk documents; see db.rs's chunk id
+        // minting, `sha256(source_id ++ chunk_index)[..16]`). Any requested
+        // key the source_id branch above left unresolved is retried as an
+        // `id` lookup. `id` is the primary key -- one row per id, so a
+        // multi-chunk document's chunks each resolve as their own distinct
+        // source under their own requested key, with no aggregation across
+        // chunks.
+        let unresolved: Vec<String> = source_ids
+            .iter()
+            .filter(|id| !map.contains_key(id.as_str()))
+            .cloned()
+            .collect();
+        if !unresolved.is_empty() {
+            let id_placeholders = unresolved
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let id_sql = format!(
+                "SELECT {columns}, id
+                 FROM memories
+                 WHERE pending_revision = 0
+                   AND source != 'episode'
+                   AND id IN ({id_placeholders})
+                 GROUP BY id"
+            );
+            let id_params: Vec<libsql::Value> = unresolved
+                .iter()
+                .map(|id| libsql::Value::Text(id.clone()))
+                .collect();
+            let mut id_rows = conn
+                .query(&id_sql, libsql::params_from_iter(id_params))
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("get_memories_by_source_ids (id branch): {e}"))
+                })?;
+            while let Some(row) = id_rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?
+            {
+                let mut item = Self::memory_item_from_row(&row);
+                let matched_id = Self::trailing_id_column(&row)?;
+                // Return the row under the key it was requested with, per
+                // the join contract every caller relies on: backfill keys
+                // its `by_source` map by the locator it asked with, and
+                // refresh feeds returned keys straight back into kind
+                // resolution.
+                item.source_id = matched_id.clone();
+                map.insert(matched_id, item);
+            }
+        }
+
         // Return in input order, skipping missing ids.
         let items = source_ids.iter().filter_map(|id| map.remove(id)).collect();
         Ok(items)
@@ -33520,6 +33690,61 @@ impl MemoryDB {
         })? {
             let item = Self::memory_item_from_row(&row);
             map.insert(item.source_id.clone(), item);
+        }
+
+        // Document source pages store `memories.id` row keys as their
+        // evidence locators (document_enrichment.rs:297), distinct from
+        // `source_id` for multi-chunk documents -- identical resolution to
+        // the unscoped `get_memories_by_source_ids`. Any requested key the
+        // source_id branch above left unresolved is retried as an `id`
+        // lookup, with the same scope predicate re-applied so a chunk
+        // outside the caller's scope stays excluded even when requested by
+        // its exact id.
+        let unresolved: Vec<String> = source_ids
+            .iter()
+            .filter(|id| !map.contains_key(id.as_str()))
+            .cloned()
+            .collect();
+        if !unresolved.is_empty() {
+            let id_placeholders = std::iter::repeat_n("?", unresolved.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut id_conditions = vec![
+                "pending_revision = 0".to_string(),
+                "source = 'memory'".to_string(),
+                format!("id IN ({id_placeholders})"),
+            ];
+            let mut id_values = unresolved
+                .iter()
+                .cloned()
+                .map(libsql::Value::Text)
+                .collect::<Vec<_>>();
+            push_read_scope_filter_folded(scope, "space", &mut id_conditions, &mut id_values);
+            let id_conditions_sql = id_conditions.join(" AND ");
+            let id_sql = format!(
+                "SELECT {columns}, id
+                 FROM memories
+                 WHERE {id_conditions_sql}
+                 GROUP BY id"
+            );
+            let mut id_rows = conn
+                .query(&id_sql, libsql::params_from_iter(id_values))
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!(
+                        "get_memories_by_source_ids_scoped (id branch): {e}"
+                    ))
+                })?;
+            while let Some(row) = id_rows.next().await.map_err(|e| {
+                WenlanError::VectorDb(format!("get_memories_by_source_ids_scoped id row: {e}"))
+            })? {
+                let mut item = Self::memory_item_from_row(&row);
+                let matched_id = Self::trailing_id_column(&row)?;
+                // Same join contract as the unscoped reader: return the row
+                // under the key it was requested with.
+                item.source_id = matched_id.clone();
+                map.insert(matched_id, item);
+            }
         }
 
         Ok(source_ids.iter().filter_map(|id| map.remove(id)).collect())
@@ -48930,6 +49155,51 @@ impl MemoryDB {
         .await
     }
 
+    /// Combined version + source_revision CAS variant for the citation
+    /// backfill's annotate-success write. `try_update_page_content_with_
+    /// changelog_at_version` alone misses a concurrent source attach
+    /// (`link_page_source` bumps `source_revision` and resets `citations` to
+    /// NULL without ever bumping `version`), so a version-only CAS can still
+    /// match and overwrite a page re-armed that way. Fencing on BOTH here
+    /// (not switching to source_revision alone) also keeps the `status =
+    /// 'active'` check, which the SQL builder below only attaches alongside
+    /// the version fence -- a source_revision-only CAS would silently drop
+    /// it and let a stale write land on an archived page (caught by
+    /// `citation_result_is_dropped_when_page_is_archived`). `link_reason` is
+    /// hardcoded to `"citation_backfill"`, not caller-supplied: it is the
+    /// sole reason `try_update_page_content`'s guard allows this caller to
+    /// combine both fences outside page growth, so a caller-supplied value
+    /// could silently open that exception to any other write.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_update_page_content_with_changelog_at_versions(
+        &self,
+        id: &str,
+        content: &str,
+        source_memory_ids: &[&str],
+        changelog: &str,
+        citations_json: Option<&str>,
+        expected_version: i64,
+        expected_source_revision: i64,
+        receipt: Option<OperationReceipt<'_>>,
+    ) -> Result<bool, WenlanError> {
+        self.try_update_page_content(
+            id,
+            content,
+            source_memory_ids,
+            "citation_backfill",
+            false,
+            Some(changelog),
+            citations_json,
+            Some(expected_version),
+            Some(expected_source_revision),
+            None,
+            receipt,
+            None,
+            false,
+        )
+        .await
+    }
+
     /// Page-growth commit variant: the Page body, source/evidence links, fresh
     /// citations, changelog, embedding, and versioned memory receipt land in
     /// one transaction. Either the matched Page generation or triggering
@@ -48974,6 +49244,7 @@ impl MemoryDB {
     /// Apply a staged Page revision and consume its pending card in the same
     /// transaction. `expected_version=None` preserves legacy card behavior;
     /// versioned cards use CAS and return `false` on a stale Page.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_accept_page_revision(
         &self,
         id: &str,
@@ -48981,6 +49252,7 @@ impl MemoryDB {
         source_memory_ids: &[&str],
         changelog: &str,
         expected_version: Option<i64>,
+        expected_source_revision: Option<i64>,
         revision_source_id: &str,
     ) -> Result<bool, WenlanError> {
         self.try_update_page_content(
@@ -48992,7 +49264,7 @@ impl MemoryDB {
             Some(changelog),
             None,
             expected_version,
-            None,
+            expected_source_revision,
             Some(revision_source_id),
             None,
             None,
@@ -49026,12 +49298,25 @@ impl MemoryDB {
         page_growth_guard: Option<(&str, i64)>,
         machine_owned_only: bool,
     ) -> Result<bool, WenlanError> {
+        // Page growth and the citation backfill are the two machine writers
+        // that snapshot both counters BEFORE reading evidence, so combining
+        // both fences for them is stricter, not looser, than either alone.
+        // Revision-card accept's source-revision half can instead be an
+        // acceptance-time staging token read at staging time, not always a
+        // pre-inference snapshot -- see `stage_page_revision_card`'s doc
+        // comment. Combining is still safe either way: the SQL builder below
+        // appends `status = 'active'` on both the version-only and the
+        // source-revision-only branch, so combining never drops that check
+        // regardless of which fence supplied it. Every other caller stays
+        // single-fence.
         if expected_version.is_some()
             && expected_source_revision.is_some()
             && page_growth_guard.is_none()
+            && link_reason != "citation_backfill"
+            && consume_revision_id.is_none()
         {
             return Err(WenlanError::Validation(
-                "only page growth may combine version and source-revision CAS".to_string(),
+                "only page growth, citation backfill, and revision accept may combine version and source-revision CAS".to_string(),
             ));
         }
         let citations_bind = citations_json;
@@ -49178,9 +49463,11 @@ impl MemoryDB {
             }
             if expected_source_revision.is_some() {
                 if expected_version.is_some() {
+                    // `status = 'active'` already rode along with the version
+                    // fence above; do not append it a second time.
                     sql.push_str(" AND COALESCE(source_revision, 0) = ?9");
                 } else {
-                    sql.push_str(" AND COALESCE(source_revision, 0) = ?8");
+                    sql.push_str(" AND COALESCE(source_revision, 0) = ?8 AND status = 'active'");
                 }
             }
             let update_result = match (expected_version, expected_source_revision) {
@@ -49299,9 +49586,11 @@ impl MemoryDB {
             }
             if expected_source_revision.is_some() {
                 if expected_version.is_some() {
+                    // `status = 'active'` already rode along with the version
+                    // fence above; do not append it a second time.
                     sql.push_str(" AND COALESCE(source_revision, 0) = ?8");
                 } else {
-                    sql.push_str(" AND COALESCE(source_revision, 0) = ?7");
+                    sql.push_str(" AND COALESCE(source_revision, 0) = ?7 AND status = 'active'");
                 }
             }
             let update_result = match (expected_version, expected_source_revision) {
@@ -49840,6 +50129,7 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("get memories by ids: {}", e)))?;
 
         let mut results = vec![];
+        let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(row) = rows
             .next()
             .await
@@ -49851,8 +50141,68 @@ impl MemoryDB {
             let content: String = row
                 .get(1)
                 .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+            resolved.insert(id.clone());
             results.push((id, content));
         }
+
+        // Document source pages store `memories.id` row keys as their
+        // evidence locators (document_enrichment.rs:297), distinct from
+        // `source_id` for multi-chunk documents. Any requested key the
+        // source_id branch above left unresolved is retried as an `id`
+        // lookup, dropping the `chunk_index = 0` restriction -- an `id`
+        // already pins one exact chunk row, so a multi-chunk document's
+        // source page cites every chunk, each id its own source.
+        let unresolved: Vec<String> = source_ids
+            .iter()
+            .filter(|id| !resolved.contains(id.as_str()))
+            .cloned()
+            .collect();
+        if !unresolved.is_empty() {
+            let id_placeholders = unresolved
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let id_sql = format!(
+                "SELECT id, content FROM memories WHERE source != 'episode' AND id IN ({}) \
+                 AND source_id NOT IN (\
+                     SELECT supersedes FROM memories \
+                     WHERE supersedes IS NOT NULL AND pending_revision = 0 \
+                     AND source = 'memory' AND supersede_mode = 'hide' \
+                     GROUP BY supersedes\
+                 )",
+                id_placeholders
+            );
+            let id_params: Vec<libsql::Value> = unresolved
+                .iter()
+                .map(|id| libsql::Value::Text(id.clone()))
+                .collect();
+            let mut id_rows = conn
+                .query(&id_sql, libsql::params_from_iter(id_params))
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("get memories by ids (id branch): {}", e))
+                })?;
+            while let Some(row) = id_rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(e.to_string()))?
+            {
+                // The query already selects `id` (not `source_id`) as the
+                // join key, and `id` IS the requested locator on this
+                // branch -- no rewrite needed, unlike the aggregated
+                // MemoryItem reader above.
+                let id: String = row
+                    .get(0)
+                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+                let content: String = row
+                    .get(1)
+                    .map_err(|e| WenlanError::VectorDb(e.to_string()))?;
+                results.push((id, content));
+            }
+        }
+
         Ok(results)
     }
 
@@ -50517,6 +50867,20 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete_page history: {e}")))?;
+            // G4: the citation-backfill attempt counter is one row keyed by
+            // this exact page id (`citations::attempt_key`). Without this, a
+            // later page recreated at the same id would inherit a stale
+            // attempt count -- or worse, a stale count that still matches the
+            // new page's fresh version/source_revision generation prefix by
+            // coincidence, silently poison-pilling it early.
+            conn.execute(
+                "DELETE FROM app_metadata WHERE key = ?1",
+                libsql::params![crate::citations::attempt_key(id)],
+            )
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("delete_page citation backfill attempts: {e}"))
+            })?;
             conn.execute("DELETE FROM pages WHERE id = ?1", libsql::params![id])
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("delete_page row: {e}")))?;
@@ -52381,12 +52745,24 @@ impl MemoryDB {
     /// Version-guarded variant for background citation work. Returns `false`
     /// when the Page changed, left the active state, or another writer already
     /// resolved its citation eligibility.
+    ///
+    /// `expected_source_revision` closes a second staleness window `version`
+    /// alone misses: a concurrent source attach (`link_page_source`,
+    /// `mark_pages_depending_on_memory_sources_except`) resets `citations`
+    /// back to NULL and bumps `source_revision` to re-arm the page for
+    /// backfill, but does NOT bump `version`. Without this guard a caller
+    /// that read evidence before that attach can still match on `version` and
+    /// overwrite the freshly-armed page with a stale result (e.g. a
+    /// give-up `[]`), permanently dropping it out of the citations-missing
+    /// queue. Same `COALESCE(source_revision, 0) = ?N` pattern as
+    /// `try_update_page_content_with_changelog_at_source_revision`.
     pub async fn set_page_citations_with_changelog_at_version(
         &self,
         page_id: &str,
         citations_json: Option<&str>,
         changelog_json: &str,
         expected_version: i64,
+        expected_source_revision: i64,
     ) -> Result<bool, WenlanError> {
         let conn = self.conn.lock().await;
         conn.execute("BEGIN", ()).await.map_err(|e| {
@@ -52399,8 +52775,14 @@ impl MemoryDB {
                 .execute(
                     "UPDATE pages SET citations = ?1, changelog = ?2
                      WHERE id = ?3 AND version = ?4 AND status = 'active'
-                       AND citations IS NULL",
-                    libsql::params![citations_json, changelog_json, page_id, expected_version],
+                       AND citations IS NULL AND COALESCE(source_revision, 0) = ?5",
+                    libsql::params![
+                        citations_json,
+                        changelog_json,
+                        page_id,
+                        expected_version,
+                        expected_source_revision
+                    ],
                 )
                 .await?;
             // Dual-write (G6 Stage 0): the guard above means the OLD value was
@@ -53358,6 +53740,37 @@ impl MemoryDB {
             .ok_or_else(|| WenlanError::Validation(format!("page '{page_id}' does not exist")))?;
         row.get::<i64>(0)
             .map_err(|e| WenlanError::VectorDb(format!("get_page_source_revision: {e}")))
+    }
+
+    /// Same token as [`Self::get_page_source_revision`], but tolerant of the
+    /// page having been deleted: `Ok(None)` when the row is missing, `Err`
+    /// only on an actual database error. Callers that select page ids and
+    /// then read them back one at a time (e.g. the citation backfill slice)
+    /// need this instead of the panic-on-missing variant, so a page deleted
+    /// between selection and read is skipped rather than aborting the whole
+    /// slice.
+    pub async fn try_get_page_source_revision(
+        &self,
+        page_id: &str,
+    ) -> Result<Option<i64>, WenlanError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COALESCE(source_revision, 0) FROM pages WHERE id = ?1",
+                libsql::params![page_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("try_get_page_source_revision: {e}")))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("try_get_page_source_revision: {e}")))?
+        else {
+            return Ok(None);
+        };
+        row.get::<i64>(0)
+            .map(Some)
+            .map_err(|e| WenlanError::VectorDb(format!("try_get_page_source_revision: {e}")))
     }
 
     /// A verified refresh can produce byte-identical prose and sources. In
@@ -55134,6 +55547,37 @@ impl MemoryDB {
         .await
         .map_err(|e| WenlanError::VectorDb(format!("set_app_metadata: {}", e)))?;
         Ok(())
+    }
+
+    /// Delete an app_metadata row only if its CURRENT value still starts
+    /// with `value_prefix`, returning whether it was deleted. Used by the
+    /// citation backfill's single per-page attempt counter
+    /// (`citation_backfill_attempts:{page_id}`, value
+    /// `v{version}:s{source_revision}:{attempts}`) to clean up on a terminal
+    /// write without racing a re-arm: if a source attach lands between the
+    /// terminal write's own CAS and this delete, the counter's value has
+    /// already moved to the new generation's prefix, the comparison here
+    /// misses, and the just-started counter for the NEW generation survives
+    /// instead of being wiped by the OLD generation's slow cleanup. Compares
+    /// with `substr` rather than `LIKE` so no wildcard-escaping is needed —
+    /// the value alphabet (`v`, `s`, `:`, digits) never contains `%` or `_`.
+    pub async fn delete_app_metadata_if_value_starts_with(
+        &self,
+        key: &str,
+        value_prefix: &str,
+    ) -> Result<bool, WenlanError> {
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "DELETE FROM app_metadata
+                 WHERE key = ?1 AND substr(value, 1, length(?2)) = ?2",
+                libsql::params![key, value_prefix],
+            )
+            .await
+            .map_err(|e| {
+                WenlanError::VectorDb(format!("delete_app_metadata_if_value_starts_with: {}", e))
+            })?;
+        Ok(affected > 0)
     }
 
     // ==================== Migration 55 Pass A — backfill event_date ===========

@@ -28,6 +28,49 @@ use crate::prompts::PromptRegistry;
 use std::sync::Arc;
 use wenlan_types::requests::UpdatePageRequest;
 
+/// Test-only seam. A test installs a `(page_id, parked, go)` handshake here
+/// and `run_page_growth_slice` uses it once for that page only, right after
+/// the CPU-only page match and *before* the `source_revision` counter is
+/// read -- the exact window a concurrent source detach must land in to prove
+/// the counter alone (without a reload of the matched page) cannot catch it.
+///
+/// One-shot (`take`), so a retry runs unblocked. Compiled out entirely in
+/// non-test builds. Same shape as `post_write::page_update`'s
+/// `PRE_WRITE_GATE`/`pre_write_pause`.
+#[cfg(test)]
+type PostMatchPauseGate = (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+pub(crate) static POST_MATCH_PAUSE_GATE: std::sync::Mutex<Option<PostMatchPauseGate>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn pause_after_match(page_id: &str) {
+    let gate = {
+        let mut slot = POST_MATCH_PAUSE_GATE.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|(target, _, _)| target == page_id)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, parked, go)) = gate {
+        let _ = parked.send(());
+        let _ = go.await;
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+async fn pause_after_match(_page_id: &str) {}
+
 /// Result of the title enrichment step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TitleEnrichResult {
@@ -201,7 +244,33 @@ pub async fn run_page_growth_slice(
             llm_calls: 0,
         });
     };
+    pause_after_match(&page.id).await;
     let expected_source_revision = db.get_page_source_revision(&page.id).await?;
+    // Reload after the counter read: the match above can be arbitrarily
+    // stale (a source detach can land in the match-to-counter-read window),
+    // and `expected_source_revision` alone only fences the *write* -- it
+    // does not refresh `page` itself. Every downstream read of `page`
+    // (content, version, source_memory_ids) must come from this fresh row
+    // or a detach that landed just before the counter read gets baked back
+    // into the write it is supposed to prevent.
+    let Some(page) = db.get_page(&page.id).await? else {
+        let committed = db
+            .record_enrichment_step_at_version(
+                &input.source_id,
+                "page_growth",
+                "ok",
+                None,
+                input.version,
+            )
+            .await?;
+        return Ok(PageGrowthSliceReport {
+            selected: true,
+            matched: false,
+            terminal_no_match: true,
+            committed,
+            llm_calls: 0,
+        });
+    };
 
     let clean_current = crate::citations::strip_markers(&page.content);
     let evidence = db.get_page_evidence(&page.id).await.unwrap_or_default();
@@ -837,6 +906,17 @@ pub(crate) async fn grow_page(
         Some(c) => c,
         None => return Ok(false),
     };
+    pause_after_match(&page.id).await;
+    let expected_source_revision = db.get_page_source_revision(&page.id).await?;
+    // Reload after the counter read, same reasoning as
+    // `run_page_growth_slice`: the match above can be arbitrarily stale (a
+    // source detach can land in the match-to-counter-read window), and
+    // `expected_source_revision` alone only fences the *write* below -- it
+    // does not refresh `page` itself. A detach landing just before the
+    // counter read would otherwise get baked back into the write.
+    let Some(page) = db.get_page(&page.id).await? else {
+        return Ok(false);
+    };
 
     // (a) Input hygiene — strip stale [N] markers from the current body before
     // it goes into the prompt (⚖ §4). The old markers pointed at a numbered
@@ -945,7 +1025,7 @@ pub(crate) async fn grow_page(
         source_ids.push(source_id.to_string());
     }
     let citations_json = serde_json::to_string(&cites).unwrap_or_else(|_| "[]".to_string());
-    let write_result = crate::post_write::update_page(
+    let write_result = crate::post_write::update_page_at_source_revision(
         db,
         &page.id,
         UpdatePageRequest {
@@ -957,6 +1037,7 @@ pub(crate) async fn grow_page(
         },
         "page_growth",
         false,
+        expected_source_revision,
         None,
         Some((citations_json, stats.summary())),
     )
@@ -2066,6 +2147,108 @@ mod tests {
             .all(|step| step.step != "page_growth"));
     }
 
+    /// G1: a source detached in the window between the CPU-only match and
+    /// the `source_revision` counter read must not be re-attached by the
+    /// growth write. The counter itself cannot catch this -- nothing
+    /// mutates the counter *after* it is read here, so the CAS token still
+    /// matches at write time. Only a reload of the matched page (after the
+    /// counter read) keeps the stale `source_memory_ids` snapshot out of the
+    /// write. Mutation check: drop the post-counter-read reload and this
+    /// test re-attaches the detached source.
+    #[tokio::test]
+    async fn page_growth_slice_reloads_the_page_after_a_source_detach_lands_before_the_counter_read(
+    ) {
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        let entity_id = db
+            .create_entity("Match Reload Race", "Topic", Some("work"))
+            .await
+            .unwrap();
+        insert_growth_page(
+            &db,
+            "match-reload-page",
+            &entity_id,
+            "work",
+            "page before match-reload race",
+        )
+        .await;
+        seed_page_growth_memory(
+            &db,
+            "match-reload-a",
+            "source A evidence",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+        seed_page_growth_memory(
+            &db,
+            "match-reload-b",
+            "source B evidence",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+        db.link_page_source("match-reload-page", "match-reload-a", "test_source_a")
+            .await
+            .unwrap();
+        db.link_page_source("match-reload-page", "match-reload-b", "test_source_b")
+            .await
+            .unwrap();
+        seed_page_growth_memory(
+            &db,
+            "match-reload-trigger",
+            "new evidence that triggers page growth",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+
+        let provider = Arc::new(MutatingGrowthProvider {
+            db: db.clone(),
+            response: "page after match-reload race.[1][2]".to_string(),
+            mutation: GrowthMutation::None,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel();
+        *POST_MATCH_PAUSE_GATE.lock().unwrap() =
+            Some(("match-reload-page".to_string(), parked_tx, go_rx));
+
+        let prompts = PromptRegistry::default();
+        let slice = run_page_growth_slice(&db, &llm, &prompts, 2.0, None);
+        let detach = async {
+            parked_rx
+                .await
+                .expect("growth slice must reach the post-match pause");
+            db.replace_page_sources("match-reload-page", &["match-reload-a"], "test_detach_b")
+                .await
+                .unwrap();
+            go_tx.send(()).expect("growth slice must still be parked");
+        };
+
+        let (report, _) = tokio::join!(slice, detach);
+        let report = report.unwrap();
+
+        assert!(report.selected);
+        assert!(report.matched);
+        assert!(
+            report.committed,
+            "the write must still land against source A + trigger"
+        );
+        assert_eq!(report.llm_calls, 1);
+        let page = db.get_page("match-reload-page").await.unwrap().unwrap();
+        assert!(
+            !page.source_memory_ids.contains(&"match-reload-b".to_string()),
+            "a source detached before the counter read must not be re-attached by the growth write: {:?}",
+            page.source_memory_ids
+        );
+        assert!(page
+            .source_memory_ids
+            .contains(&"match-reload-a".to_string()));
+    }
+
     #[tokio::test]
     async fn page_growth_slice_rejects_page_changed_during_inference() {
         let (db, _dir) = test_db().await;
@@ -2365,6 +2548,126 @@ mod tests {
         let log: Vec<wenlan_types::responses::PageChangelogEntry> =
             serde_json::from_str(&db.get_page_changelog(&page_id).await.unwrap()).unwrap();
         assert!(log.last().unwrap().citations_summary.is_some());
+    }
+
+    /// G2(b): same class of bug as G1's `run_page_growth_slice` seam, but for
+    /// the legacy `grow_page` entrypoint -- a source detached in the window
+    /// between the CPU-only match and the `source_revision` counter read
+    /// must not be re-attached by the write. Also covers the fence itself:
+    /// `grow_page` used to write through the generic, unfenced `update_page`
+    /// wrapper (hardcoded `expected_source_revision: None`), so even a
+    /// same-generation write had no CAS protection against a concurrent
+    /// source change. Mutation check: drop the post-counter-read reload, or
+    /// revert the write back to the generic `update_page` wrapper, and this
+    /// test re-attaches the detached source.
+    #[tokio::test]
+    async fn grow_page_reloads_the_page_after_a_source_detach_lands_before_the_counter_read() {
+        let (db, _dir) = test_db().await;
+        let entity_id = db
+            .create_entity("Grow Page Match Reload Race", "Topic", Some("work"))
+            .await
+            .unwrap();
+        insert_growth_page(
+            &db,
+            "grow-page-match-reload-page",
+            &entity_id,
+            "work",
+            "page before grow_page match-reload race",
+        )
+        .await;
+        seed_page_growth_memory(
+            &db,
+            "grow-page-match-reload-a",
+            "source A evidence",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+        seed_page_growth_memory(
+            &db,
+            "grow-page-match-reload-b",
+            "source B evidence",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+        db.link_page_source(
+            "grow-page-match-reload-page",
+            "grow-page-match-reload-a",
+            "test_source_a",
+        )
+        .await
+        .unwrap();
+        db.link_page_source(
+            "grow-page-match-reload-page",
+            "grow-page-match-reload-b",
+            "test_source_b",
+        )
+        .await
+        .unwrap();
+        seed_page_growth_memory(
+            &db,
+            "grow-page-match-reload-trigger",
+            "new evidence that triggers page growth",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+
+        let stub = std::sync::Arc::new(CapturingStubProvider {
+            response: "page after grow_page match-reload race.[1][2]".to_string(),
+            captured_prompt: std::sync::Mutex::new(None),
+        });
+        let llm: std::sync::Arc<dyn LlmProvider> = stub.clone();
+
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel();
+        *POST_MATCH_PAUSE_GATE.lock().unwrap() =
+            Some(("grow-page-match-reload-page".to_string(), parked_tx, go_rx));
+
+        let prompts = crate::prompts::PromptRegistry::default();
+        let grow = grow_page(
+            &db,
+            "grow-page-match-reload-trigger",
+            "new evidence that triggers page growth",
+            Some(&entity_id),
+            Some("work"),
+            Some(&llm),
+            &prompts,
+            2.0,
+        );
+        let detach = async {
+            parked_rx
+                .await
+                .expect("grow_page must reach the post-match pause");
+            db.replace_page_sources(
+                "grow-page-match-reload-page",
+                &["grow-page-match-reload-a"],
+                "test_detach_b",
+            )
+            .await
+            .unwrap();
+            go_tx.send(()).expect("grow_page must still be parked");
+        };
+
+        let (grew, _) = tokio::join!(grow, detach);
+        assert!(grew.unwrap(), "grow_page should report growth");
+
+        let page = db
+            .get_page("grow-page-match-reload-page")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !page
+                .source_memory_ids
+                .contains(&"grow-page-match-reload-b".to_string()),
+            "a source detached before the counter read must not be re-attached by grow_page's write: {:?}",
+            page.source_memory_ids
+        );
+        assert!(page
+            .source_memory_ids
+            .contains(&"grow-page-match-reload-a".to_string()));
     }
 
     /// Spec §5.1 (True source kinds): `grow_page`'s numbered-source list must

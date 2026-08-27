@@ -329,8 +329,13 @@ pub async fn update_page_preserving_sources(
     .await
 }
 
+/// Update a Page under an explicit source-revision fence. Unlike the generic
+/// `update_page` (which never fences on the source counter at all), every
+/// caller here supplies a real `expected_source_revision`. `pub`, not
+/// `pub(crate)`: wenlan-server's agent-refresh route writes through this
+/// wrapper too, not just wenlan-core's own page-growth callers.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn update_page_at_source_revision(
+pub async fn update_page_at_source_revision(
     db: &MemoryDB,
     page_id: &str,
     req: UpdatePageRequest,

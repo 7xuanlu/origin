@@ -1745,6 +1745,90 @@ async fn refresh_revision_cas_preserves_source_attached_during_synthesis() {
     assert_eq!(page.stale_reason.as_deref(), Some("source_updated"));
 }
 
+/// G2(c): `handle_refresh_page`'s non-human (machine) branch used to write
+/// through the generic, unfenced `update_page` -- a source attached between
+/// the route's own `source_revision` read and its write would be silently
+/// clobbered by the refresh, the same class of race
+/// `refresh_revision_cas_preserves_source_attached_during_synthesis` above
+/// proves for the `re_distill` path. This exercises the exact wrapper and
+/// call shape `handle_refresh_page` now uses (`edited_by: "agent_refresh"`,
+/// `require_stale: false`) -- the shape that had zero CAS protection before
+/// the fix, since the route used to pass no fence at all.
+///
+/// A true interleaved race cannot be driven from wenlan-server's own
+/// integration tests: the deterministic pause hook this crate uses for
+/// races (`PRE_WRITE_GATE`) is `#[cfg(test)]` and `pub(crate)` to
+/// wenlan-core, so it is not compiled into the rlib wenlan-server links
+/// against even in wenlan-server's own test builds. This proves the same
+/// staleness at the seam the route calls into instead -- see the round-7
+/// report for why the route-level test was not attempted.
+#[tokio::test]
+async fn agent_refresh_cas_rejects_a_source_attached_after_the_route_read_its_fence() {
+    let (db, _dir) = test_db().await;
+    seed_memory(&db, "mem-agent-refresh-a", "first source").await;
+    seed_memory(&db, "mem-agent-refresh-b", "second source").await;
+    let page_id = seed_page(&db, "mem-agent-refresh-a", "first source").await;
+    let source_revision = db.get_page_source_revision(&page_id).await.unwrap();
+
+    // A source attach lands in the window between the route's own counter
+    // read and its write -- exactly the race the fenced write must catch.
+    page_write(
+        &db,
+        PageWrite::Attach {
+            page_id: &page_id,
+            source_memory_ids: &["mem-agent-refresh-b".to_string()],
+            link_reason: "attached_during_agent_refresh",
+            agent: "test",
+        },
+    )
+    .await
+    .unwrap();
+
+    let result = update_page_at_source_revision(
+        &db,
+        &page_id,
+        UpdatePageRequest {
+            content: "refreshed body computed before the source attach".to_string(),
+            source_memory_ids: vec!["mem-agent-refresh-a".to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        "agent_refresh",
+        false,
+        source_revision,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !result.wrote,
+        "a stale agent_refresh must not overwrite a page whose sources moved after the route read its fence"
+    );
+    let page = db.get_page(&page_id).await.unwrap().unwrap();
+    assert_eq!(
+        page.content, "first source",
+        "the pre-race content must survive"
+    );
+    assert_eq!(
+        db.get_page_sources(&page_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|source| source.memory_source_id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "mem-agent-refresh-a".to_string(),
+            "mem-agent-refresh-b".to_string()
+        ]
+        .into_iter()
+        .collect(),
+        "the attach that won the race must survive"
+    );
+}
+
 #[tokio::test]
 async fn identical_refresh_cannot_acknowledge_a_new_source_revision() {
     let (db, _dir) = test_db().await;
@@ -3372,6 +3456,7 @@ async fn page_write_concurrent_gated_retry_replays_the_winner() {
             &page,
             "The concurrent proposal must converge on one review card.",
             &sources,
+            0, // never accepted in this test
             "re_distill",
             Some(&retry),
         ),
@@ -3380,6 +3465,7 @@ async fn page_write_concurrent_gated_retry_replays_the_winner() {
             &page,
             "The concurrent proposal must converge on one review card.",
             &sources,
+            0, // never accepted in this test
             "re_distill",
             Some(&retry),
         ),
@@ -4081,6 +4167,7 @@ async fn dismiss_pending_revision_deletes_a_page_card_rather_than_unstaging_it()
         &before,
         proposed_content,
         &[mem_id.to_string()],
+        0, // never accepted in this test
         "page_growth",
         None,
     )
@@ -4142,11 +4229,13 @@ async fn accept_page_revision_projection_failure_preserves_committed_db_authorit
     drop(projection);
 
     let expected_sources = vec![mem_id.to_string(), new_mem_id.to_string()];
+    let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
     let card = stage_page_revision_card(
         &db,
         &before,
         proposed_content,
         &expected_sources,
+        staged_source_revision,
         "page_growth",
         None,
     )
@@ -4218,11 +4307,13 @@ async fn accept_pending_revision_page_write_card_updates_page_content() {
     let before = db.get_page(&page_id).await.unwrap().unwrap();
     assert!(before.user_edited, "precondition: page is human-owned");
 
+    let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
     let card = stage_page_revision_card(
         &db,
         &before,
         proposed_content,
         &[mem_id.to_string(), new_mem_id.to_string()],
+        staged_source_revision,
         "page_growth",
         None,
     )
@@ -4509,6 +4600,7 @@ async fn pending_revision_queue_scopes_a_page_card_by_the_page_workspace() {
         &page,
         proposed_content,
         &[mem_id.to_string()],
+        0, // never accepted in this test
         "page_growth",
         None,
     )
@@ -4584,11 +4676,13 @@ async fn accept_page_revision_consume_failure_keeps_page_retryable() {
     seed_memory(&db, new_mem_id, proposed_content).await;
     let page_id = seed_page(&db, mem_id, original_content).await;
     let before = db.get_page(&page_id).await.unwrap().unwrap();
+    let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
     let card = stage_page_revision_card(
         &db,
         &before,
         proposed_content,
         &[mem_id.to_string(), new_mem_id.to_string()],
+        staged_source_revision,
         "page_growth",
         None,
     )
@@ -4652,11 +4746,13 @@ async fn accept_page_revision_source_failure_keeps_page_retryable() {
     seed_memory(&db, new_mem_id, proposed_content).await;
     let page_id = seed_page(&db, mem_id, original_content).await;
     let before = db.get_page(&page_id).await.unwrap().unwrap();
+    let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
     let card = stage_page_revision_card(
         &db,
         &before,
         proposed_content,
         &[mem_id.to_string(), new_mem_id.to_string()],
+        staged_source_revision,
         "page_growth",
         None,
     )
@@ -4745,11 +4841,13 @@ async fn accept_pending_revision_page_write_card_conflicts_when_page_version_cha
 
     let before = db.get_page(&page_id).await.unwrap().unwrap();
     let staged_version = before.version;
+    let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
     let card = stage_page_revision_card(
         &db,
         &before,
         proposed_content,
         &[mem_id.to_string(), new_mem_id.to_string()],
+        staged_source_revision,
         "page_growth",
         None,
     )
@@ -4810,6 +4908,268 @@ async fn accept_pending_revision_page_write_card_conflicts_when_page_version_cha
     );
 }
 
+/// Round-5 finding F1 (MEDIUM): a human-owned page's staged revision card
+/// used to fence acceptance on `page_version` alone. `link_page_source`
+/// bumps only `source_revision`, leaving `version` unchanged, so a source
+/// attached after the card was staged (but before the human accepted it)
+/// passed the version-only CAS and was silently dropped when the card's
+/// (now-stale) source list overwrote it. Same lost-update class rounds 3/4
+/// fixed for other write paths.
+#[tokio::test]
+async fn accept_pending_revision_page_write_card_conflicts_when_a_source_attached_after_staging() {
+    let (db, _dir) = test_db().await;
+    let mem_id = "mem_card_fence_original";
+    let attached_mem_id = "mem_attached_after_staging";
+    let original_content = "Rust ownership keeps memory safety rules explicit";
+    let human_content = "Rust ownership keeps memory safety rules explicit, with human notes";
+    let proposed_content =
+        "Rust ownership lets the compiler enforce memory safety during page refresh";
+
+    seed_memory(&db, mem_id, original_content).await;
+    seed_memory(
+        &db,
+        attached_mem_id,
+        "A source attached after the card was staged",
+    )
+    .await;
+    let page_id = seed_page(&db, mem_id, original_content).await;
+    update_page(
+        &db,
+        &page_id,
+        UpdatePageRequest {
+            content: human_content.to_string(),
+            source_memory_ids: vec![mem_id.to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        "fs_edit",
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let before = db.get_page(&page_id).await.unwrap().unwrap();
+    let staged_version = before.version;
+    let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
+    let card = stage_page_revision_card(
+        &db,
+        &before,
+        proposed_content,
+        &[mem_id.to_string()],
+        staged_source_revision,
+        "page_growth",
+        None,
+    )
+    .await
+    .unwrap();
+    let card_id = card
+        .revision_card_id
+        .clone()
+        .expect("staged page card must return an id");
+
+    db.link_page_source(&page_id, attached_mem_id, "concurrent_attach")
+        .await
+        .unwrap();
+    let mid = db.get_page(&page_id).await.unwrap().unwrap();
+    assert_eq!(
+        mid.version, staged_version,
+        "sanity: a source attach must not bump version -- only source_revision"
+    );
+
+    let err = accept_pending_revision(&db, &card_id, "test-agent")
+        .await
+        .unwrap_err();
+    match err {
+        WenlanError::Conflict(msg) => {
+            assert!(
+                msg.contains("staged source revision"),
+                "conflict message must name the source-revision fence, got: {msg}"
+            );
+        }
+        other => panic!("expected a source-revision conflict, got {other:?}"),
+    }
+
+    let after = db.get_page(&page_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.content, human_content,
+        "a card staged against a stale source_revision must not overwrite the page"
+    );
+    assert!(
+        after
+            .source_memory_ids
+            .contains(&attached_mem_id.to_string()),
+        "the concurrently attached source must survive the rejected accept"
+    );
+    assert!(
+        db.list_pending_revisions(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.revision_source_id == card_id),
+        "conflicted page-write card must remain pending"
+    );
+}
+
+/// Companion to the conflict test above: when NOTHING attaches between
+/// staging and accept, the same source-revision fence must let the write
+/// through exactly as before.
+#[tokio::test]
+async fn accept_pending_revision_page_write_card_with_matching_source_revision_writes() {
+    let (db, _dir) = test_db().await;
+    let mem_id = "mem_card_fence_match_original";
+    let original_content = "Rust borrowing enforces aliasing rules at compile time";
+    let human_content = "Rust borrowing enforces aliasing rules at compile time, with human notes";
+    let proposed_content = "Rust borrowing lets the compiler enforce aliasing during page refresh";
+
+    seed_memory(&db, mem_id, original_content).await;
+    let page_id = seed_page(&db, mem_id, original_content).await;
+    update_page(
+        &db,
+        &page_id,
+        UpdatePageRequest {
+            content: human_content.to_string(),
+            source_memory_ids: vec![mem_id.to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        "fs_edit",
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let before = db.get_page(&page_id).await.unwrap().unwrap();
+    let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
+    let card = stage_page_revision_card(
+        &db,
+        &before,
+        proposed_content,
+        &[mem_id.to_string()],
+        staged_source_revision,
+        "page_growth",
+        None,
+    )
+    .await
+    .unwrap();
+    let card_id = card
+        .revision_card_id
+        .clone()
+        .expect("staged page card must return an id");
+
+    accept_pending_revision(&db, &card_id, "test-agent")
+        .await
+        .unwrap();
+
+    let after = db.get_page(&page_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.content, proposed_content,
+        "an unchanged source_revision must accept and overwrite the page"
+    );
+    assert_eq!(after.source_memory_ids, vec![mem_id.to_string()]);
+    assert!(
+        !db.list_pending_revisions(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.revision_source_id == card_id),
+        "an accepted card must be consumed"
+    );
+}
+
+/// Proves the source_revision fence is actually wired end-to-end through
+/// the daemon-internal path a machine refresh uses to reach a human-owned
+/// page's gate: `update_page_at_source_revision` (the same wrapper
+/// `synthesis::distill`'s refresh calls) threads `expected_source_revision`
+/// into `stage_page_revision_card`, which must record it on the staged
+/// card's `structured_fields` rather than silently dropping it.
+#[tokio::test]
+async fn stage_page_revision_card_via_fenced_update_records_source_revision() {
+    let (db, _dir) = test_db().await;
+    let mem_id = "mem_fenced_card_source_revision";
+    let original_content = "Rust ownership keeps memory safety rules explicit";
+    let human_content = "Rust ownership keeps memory safety rules explicit, with human notes";
+    let proposed_content = "Rust ownership lets the compiler enforce memory safety during refresh";
+
+    seed_memory(&db, mem_id, original_content).await;
+    let page_id = seed_page(&db, mem_id, original_content).await;
+    update_page(
+        &db,
+        &page_id,
+        UpdatePageRequest {
+            content: human_content.to_string(),
+            source_memory_ids: vec![mem_id.to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        "fs_edit",
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let source_revision = db.get_page_source_revision(&page_id).await.unwrap();
+
+    let result = update_page_at_source_revision(
+        &db,
+        &page_id,
+        UpdatePageRequest {
+            content: proposed_content.to_string(),
+            source_memory_ids: vec![mem_id.to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        "re_distill",
+        false,
+        source_revision,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        result.gated,
+        "a machine write to a human-owned page must be gated as a revision card"
+    );
+    let revision_card_id = result
+        .revision_card_id
+        .expect("gated write must return a card id");
+
+    let conn = db.test_primary_session().await;
+    let mut rows = conn
+        .query(
+            "SELECT structured_fields FROM memories WHERE source_id = ?1",
+            libsql::params![revision_card_id.clone()],
+        )
+        .await
+        .unwrap();
+    let row = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("revision card row must be persisted");
+    let structured_fields = row.get::<String>(0).unwrap();
+    drop(rows);
+    drop(conn);
+
+    let structured: serde_json::Value = serde_json::from_str(&structured_fields).unwrap();
+    assert_eq!(
+        structured["source_revision"], source_revision,
+        "a card staged through the fenced daemon-internal update path must record the \
+         source_revision it was staged from, structured_fields: {structured_fields}"
+    );
+}
+
 #[tokio::test]
 async fn accept_pending_revision_legacy_page_write_card_without_version_still_accepts() {
     let (db, _dir) = test_db().await;
@@ -4842,11 +5202,13 @@ async fn accept_pending_revision_legacy_page_write_card_without_version_still_ac
     .unwrap();
 
     let before = db.get_page(&page_id).await.unwrap().unwrap();
+    let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
     let card = stage_page_revision_card(
         &db,
         &before,
         proposed_content,
         &[mem_id.to_string(), new_mem_id.to_string()],
+        staged_source_revision,
         "page_growth",
         None,
     )

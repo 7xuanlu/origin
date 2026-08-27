@@ -1260,15 +1260,27 @@ pub(crate) async fn refresh_page_with_prompt(
         return Ok(RefreshOutcome::default());
     }
 
+    // Read the fence counter FIRST, then the fields it protects (same
+    // reasoning as the citation backfill's read order, citations.rs). A
+    // concurrent source change (`link_page_source` / `replace_page_sources`)
+    // bumps `source_revision` without necessarily bumping `version`, so
+    // threading `source_revision` into the terminal CAS below closes the
+    // window where a stale source list computed from a page/sources read
+    // taken before that change would otherwise still match on `version`
+    // alone and overwrite (or re-attach into) the freshly changed page. A
+    // change landing AFTER this read bumps the counter past what we
+    // captured, so the CAS below catches it; a change landing BEFORE this
+    // read is already reflected in the `get_page`/`get_page_sources` reads
+    // that follow. Reading `get_page` first would leave a window where a
+    // detach landing between the two reads shows up in `source_revision` but
+    // not in the page/sources snapshot -- the CAS would then pass on a write
+    // that still carries the stale (pre-detach) source list.
+    let source_revision = db.get_page_source_revision(page_id).await?;
+
     let page = db
         .get_page(page_id)
         .await?
         .ok_or_else(|| WenlanError::VectorDb(format!("page {page_id} not found")))?;
-
-    // Read the monotonic compile-input token before reading the sources. Any
-    // source-set or source-content change after this point advances the token,
-    // so the final CAS rejects prose synthesized from an obsolete snapshot.
-    let source_revision = db.get_page_source_revision(page_id).await?;
 
     // Rebuild from the page's CURRENT sources: join table first, JSON column
     // fallback for legacy pages.
@@ -2069,6 +2081,118 @@ mod tests {
         assert!(
             latest.get("citations_summary").is_some(),
             "citations committed atomically with the content bump"
+        );
+    }
+
+    /// Round-4 finding (MEDIUM): `refresh_page_with_prompt` used to read
+    /// `get_page` before `get_page_source_revision` -- the same read-order
+    /// hazard as the citation backfill (citations.rs), but here it can
+    /// re-attach a removed source instead of dropping a new one. A detach
+    /// landing between the page read and the (join-table-derived)
+    /// `get_page_sources` read leaves `page.source_memory_ids` holding the
+    /// pre-detach list while `get_page_sources` already reflects the detach
+    /// (empty) -- the fallback (`if source_ids.is_empty() { source_ids =
+    /// page.source_memory_ids }`) then picks the STALE list right back up,
+    /// and if `source_revision` was captured after the detach too (the old,
+    /// broken order), the terminal CAS would pass and write it.
+    ///
+    /// Seam-level proof mirroring the fixed order exactly (there is no live
+    /// interposable await in the real function to race the way
+    /// `BlockingCitationProvider` races the LLM call, same reasoning as
+    /// `combined_cas_read_order_rejects_write_racing_a_mid_read_attach` in
+    /// db.rs): read the fence FIRST (fixed order), then `get_page` (still
+    /// pre-detach), then the detach itself, then `get_page_sources` (already
+    /// post-detach, empty -- triggering the fallback onto the now-stale
+    /// `page` snapshot), then run the exact write the real function runs,
+    /// using the counter captured before any of this.
+    #[tokio::test]
+    async fn refresh_fallback_rejects_write_racing_a_mid_read_detach() {
+        let (db, _db_dir) = crate::db::tests::test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_page(
+            "page_refresh_race",
+            "T",
+            None,
+            "original body",
+            None,
+            None,
+            &[],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.link_page_source("page_refresh_race", "mem_old", "test")
+            .await
+            .unwrap();
+        db.set_page_stale("page_refresh_race", "source_updated")
+            .await
+            .unwrap();
+
+        // Fixed order: read the fence FIRST.
+        let source_revision = db
+            .get_page_source_revision("page_refresh_race")
+            .await
+            .unwrap();
+
+        // `get_page`, still pre-detach.
+        let page = db.get_page("page_refresh_race").await.unwrap().unwrap();
+        assert_eq!(
+            page.source_memory_ids,
+            vec!["mem_old".to_string()],
+            "sanity: get_page (read second) must still see mem_old, before the race below"
+        );
+
+        // A concurrent detach lands between the page read and the sources
+        // read -- exactly the window the fixed order (fence captured before
+        // either) is meant to survive.
+        db.replace_page_sources("page_refresh_race", &[], "test")
+            .await
+            .unwrap();
+
+        // `get_page_sources`, already post-detach.
+        let sources = db.get_page_sources("page_refresh_race").await.unwrap();
+        let mut source_ids: Vec<String> =
+            sources.iter().map(|s| s.memory_source_id.clone()).collect();
+        if source_ids.is_empty() {
+            source_ids = page.source_memory_ids.clone();
+        }
+        assert_eq!(
+            source_ids,
+            vec!["mem_old".to_string()],
+            "sanity: the fallback must pick up the stale (pre-detach) list, \
+             reproducing the exact hazard this test proves the fence closes"
+        );
+
+        let result = crate::post_write::update_page_at_source_revision(
+            &db,
+            "page_refresh_race",
+            wenlan_types::requests::UpdatePageRequest {
+                content: "refreshed body".to_string(),
+                source_memory_ids: source_ids,
+                expected_version: None,
+                caller_id: None,
+                operation_id: None,
+            },
+            "re_distill",
+            true,
+            source_revision,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !result.wrote,
+            "the stale (pre-detach) source_revision must reject the write, \
+             not re-attach the just-detached source: {:?}",
+            result
+        );
+
+        let after = db.get_page("page_refresh_race").await.unwrap().unwrap();
+        assert!(
+            after.source_memory_ids.is_empty(),
+            "the rejected write must not have re-attached the detached source: {:?}",
+            after.source_memory_ids
         );
     }
 

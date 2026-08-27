@@ -6971,6 +6971,121 @@ async fn test_get_memory_contents_by_ids_includes_superseded_archive() {
 }
 
 #[tokio::test]
+async fn test_get_memory_contents_by_ids_resolves_id_shaped_locator_without_chunk_index_zero() {
+    let (db, _dir) = test_db().await;
+    // Chunk index 1 (not 0) -- the id branch must not carry over the
+    // source_id branch's `chunk_index = 0` restriction, since `id` already
+    // pins one exact chunk.
+    insert_doc_chunk(
+        &db,
+        "recompile_chunk1",
+        "recompile_doc",
+        1,
+        "Second chunk content",
+    )
+    .await;
+
+    let results = db
+        .get_memory_contents_by_ids(&["recompile_chunk1".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        results,
+        vec![(
+            "recompile_chunk1".to_string(),
+            "Second chunk content".to_string()
+        )],
+        "an id-shaped locator at a non-zero chunk_index must resolve, keyed \
+         by the requested id"
+    );
+}
+
+#[tokio::test]
+async fn test_get_memory_contents_by_ids_mixed_request_supersede_hide_exclusion_still_applies() {
+    let (db, _dir) = test_db().await;
+    // Hidden by supersession -- must stay excluded on the source_id branch
+    // (unchanged behavior) even in a request that ALSO carries an id-shaped
+    // locator.
+    let old_doc = make_memory_doc(
+        "mixed_old",
+        "I prefer Python for all projects",
+        "fact",
+        "personal",
+        "claude",
+    );
+    db.upsert_documents(vec![old_doc]).await.unwrap();
+    let mut new_doc = make_memory_doc(
+        "mixed_new",
+        "I prefer Rust for all projects",
+        "fact",
+        "personal",
+        "claude",
+    );
+    new_doc.supersedes = Some("mixed_old".to_string());
+    db.upsert_documents(vec![new_doc]).await.unwrap();
+    insert_doc_chunk(&db, "mixed_chunk0", "mixed_doc", 0, "Doc chunk content").await;
+
+    let results = db
+        .get_memory_contents_by_ids(&[
+            "mixed_old".to_string(),
+            "mixed_new".to_string(),
+            "mixed_chunk0".to_string(),
+        ])
+        .await
+        .unwrap();
+    let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(
+        !ids.contains(&"mixed_old"),
+        "supersede-hide exclusion must still apply to source_id-matched rows \
+         when the request is mixed with an id-shaped locator"
+    );
+    assert!(ids.contains(&"mixed_new"));
+    assert!(
+        ids.contains(&"mixed_chunk0"),
+        "the id-shaped locator in the same mixed request must still resolve"
+    );
+}
+
+/// Codex review finding 2 (2026-08-24, on d584b1cf): the id branch had no
+/// supersede-hide exclusion at all, unlike the source_id branch right above
+/// it -- a chunk requested by its exact `id` would leak even after its
+/// underlying `source_id` was superseded with `supersede_mode = 'hide'`.
+#[tokio::test]
+async fn test_get_memory_contents_by_ids_id_branch_excludes_superseded_hide() {
+    let (db, _dir) = test_db().await;
+    // A document chunk: `id` distinct from `source_id`, so a request for
+    // `id` alone must fall through to the id branch (the source_id branch's
+    // `source_id IN (...)` won't match "hidden_chunk0").
+    insert_doc_chunk(&db, "hidden_chunk0", "hidden_doc", 0, "old chunk content").await;
+
+    // Supersede the chunk's `source_id` ("hidden_doc") with a hide-mode
+    // revision -- the same mechanism the source_id-branch test above uses,
+    // just targeting a chunked document's source_id instead of a plain fact.
+    let mut new_doc = make_memory_doc(
+        "hidden_doc_revised",
+        "revised chunk content",
+        "fact",
+        "personal",
+        "claude",
+    );
+    new_doc.supersedes = Some("hidden_doc".to_string());
+    db.upsert_documents(vec![new_doc]).await.unwrap();
+
+    let results = db
+        .get_memory_contents_by_ids(&["hidden_chunk0".to_string()])
+        .await
+        .unwrap();
+    let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(
+        !ids.contains(&"hidden_chunk0"),
+        "a chunk requested by exact id must be excluded once its source_id \
+         is superseded in hide mode: {:?}",
+        results
+    );
+}
+
+#[tokio::test]
 async fn test_quality_multiplier_in_search() {
     let (db, _dir) = test_db().await;
 
@@ -26826,6 +26941,208 @@ async fn test_get_memories_by_source_ids_missing_id() {
     assert_eq!(results[0].source_id, "sid_real");
 }
 
+/// Insert a bare `memories` row with an explicit `id` distinct from
+/// `source_id`, mirroring the chunk id document_enrichment.rs:297/db.rs:
+/// 24905-24909 mints (`sha256(source_id ‖ chunk_index)[..16]`). Document
+/// source pages cite chunks by this `id`, not `source_id` -- the locator
+/// mismatch the read-side fix (change A) repairs.
+async fn insert_doc_chunk(
+    db: &MemoryDB,
+    id: &str,
+    source_id: &str,
+    chunk_index: i64,
+    content: &str,
+) {
+    let now_ts = chrono::Utc::now().timestamp();
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, source_agent, created_at, last_modified, confirmed, stability, source) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'text', 'fact', 'folder', ?6, ?6, 1, 'confirmed', 'memory')",
+        libsql::params![
+            id.to_string(),
+            source_id.to_string(),
+            source_id.to_string(),
+            content.to_string(),
+            chunk_index,
+            now_ts
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn test_get_memories_by_source_ids_resolves_id_shaped_locator() {
+    let (db, _dir) = test_db().await;
+    insert_doc_chunk(&db, "chunk_a0", "doc_a", 0, "First chunk of document A").await;
+
+    // The locator is the chunk's `id`, not its `source_id` -- exactly what a
+    // document source page's evidence stores.
+    let results = db
+        .get_memories_by_source_ids(&["chunk_a0".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "id-shaped locator must resolve to content"
+    );
+    assert_eq!(
+        results[0].content, "First chunk of document A",
+        "must return the chunk's own content"
+    );
+    assert_eq!(
+        results[0].source_id, "chunk_a0",
+        "the returned item must be keyed under the REQUESTED key (the id), \
+         not the row's true underlying source_id (doc_a) -- callers join \
+         back by this field"
+    );
+}
+
+#[tokio::test]
+async fn test_get_memories_by_source_ids_multi_chunk_document_returns_every_chunk_under_its_own_id()
+{
+    let (db, _dir) = test_db().await;
+    insert_doc_chunk(&db, "chunk_b0", "doc_b", 0, "Doc B chunk zero content").await;
+    insert_doc_chunk(&db, "chunk_b1", "doc_b", 1, "Doc B chunk one content").await;
+
+    let results = db
+        .get_memories_by_source_ids(&["chunk_b0".to_string(), "chunk_b1".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        results.len(),
+        2,
+        "each chunk of a multi-chunk document must resolve as its own \
+         distinct source, not merge into one aggregated row: {:?}",
+        results.iter().map(|m| &m.source_id).collect::<Vec<_>>()
+    );
+    let by_id: std::collections::HashMap<&str, &str> = results
+        .iter()
+        .map(|m| (m.source_id.as_str(), m.content.as_str()))
+        .collect();
+    assert_eq!(by_id.get("chunk_b0"), Some(&"Doc B chunk zero content"));
+    assert_eq!(by_id.get("chunk_b1"), Some(&"Doc B chunk one content"));
+}
+
+#[tokio::test]
+async fn test_get_memories_by_source_ids_mixed_request_preserves_join_contract() {
+    let (db, _dir) = test_db().await;
+    // A plain memory (id == source_id, resolved via the source_id branch).
+    db.upsert_documents(vec![make_memory_doc(
+        "mem_plain",
+        "Plain memory content",
+        "knowledge",
+        "work",
+        "agent",
+    )])
+    .await
+    .unwrap();
+    // A document chunk (id != source_id, resolved via the id branch).
+    insert_doc_chunk(&db, "chunk_c0", "doc_c", 0, "Doc C chunk content").await;
+
+    let results = db
+        .get_memories_by_source_ids(&["mem_plain".to_string(), "chunk_c0".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        results.len(),
+        2,
+        "a mixed request of a memory source_id and a doc chunk id must resolve both"
+    );
+    let by_id: std::collections::HashMap<&str, &str> = results
+        .iter()
+        .map(|m| (m.source_id.as_str(), m.content.as_str()))
+        .collect();
+    assert_eq!(by_id.get("mem_plain"), Some(&"Plain memory content"));
+    assert_eq!(by_id.get("chunk_c0"), Some(&"Doc C chunk content"));
+}
+
+/// Same shape as `insert_doc_chunk`, plus an explicit `space` so a scoped
+/// reader test can put a chunk inside or outside a `ReadScope::Space`.
+async fn insert_doc_chunk_with_space(
+    db: &MemoryDB,
+    id: &str,
+    source_id: &str,
+    chunk_index: i64,
+    content: &str,
+    space: &str,
+) {
+    let now_ts = chrono::Utc::now().timestamp();
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, source_agent, space, created_at, last_modified, confirmed, stability, source) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'text', 'fact', 'folder', ?6, ?7, ?7, 1, 'confirmed', 'memory')",
+        libsql::params![
+            id.to_string(),
+            source_id.to_string(),
+            source_id.to_string(),
+            content.to_string(),
+            chunk_index,
+            space.to_string(),
+            now_ts
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+/// Codex review finding 3 (2026-08-24, on d584b1cf): `get_memories_by_source_ids_scoped`
+/// was source_id-only, so the scoped page-sources route (page_routes.rs,
+/// `handle_get_page_sources`) showed a null memory for document chunk
+/// locators once a caller passed a non-Global scope. Mirrors the unscoped
+/// id-shaped-locator test above, plus the scope predicate must still apply
+/// on the id branch: a chunk outside the requested scope must not leak
+/// through just because it was asked for by its exact id.
+#[tokio::test]
+async fn test_get_memories_by_source_ids_scoped_resolves_id_shaped_locator_within_scope_and_excludes_outside_scope(
+) {
+    let (db, _dir) = test_db().await;
+    insert_doc_chunk_with_space(
+        &db,
+        "scoped_chunk_work0",
+        "scoped_doc_work",
+        0,
+        "Work-space chunk content",
+        "work",
+    )
+    .await;
+    insert_doc_chunk_with_space(
+        &db,
+        "scoped_chunk_personal0",
+        "scoped_doc_personal",
+        0,
+        "Personal-space chunk content",
+        "personal",
+    )
+    .await;
+
+    let scope = crate::read_scope::ReadScope::Space("work".to_string());
+    let results = db
+        .get_memories_by_source_ids_scoped(
+            &[
+                "scoped_chunk_work0".to_string(),
+                "scoped_chunk_personal0".to_string(),
+            ],
+            &scope,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "only the in-scope chunk must resolve on the id branch, keyed by \
+         its requested id, not the personal-space chunk: {:?}",
+        results.iter().map(|m| &m.source_id).collect::<Vec<_>>()
+    );
+    assert_eq!(results[0].source_id, "scoped_chunk_work0");
+    assert_eq!(results[0].content, "Work-space chunk content");
+}
+
 // ==================== Migration 43: enrichment_steps ====================
 
 #[tokio::test]
@@ -28002,6 +28319,73 @@ async fn archive_page_records_history_once_for_status_flip() {
         .unwrap();
     assert_eq!(archived_again.version, archived.version);
     assert_eq!(history_again, history, "idempotent archive adds no row");
+}
+
+/// G3: `try_update_page_content`'s CAS SQL builder only appends `AND status =
+/// 'active'` alongside the `expected_version` fence, never alongside the
+/// `expected_source_revision` fence. `update_page_at_source_revision`'s
+/// callers (`grow_page`, the agent-refresh route) pass a source-revision
+/// fence with no version fence at all, so before this fix a stale write
+/// computed before an archive could still land, the same hazard
+/// `citation_result_is_dropped_when_page_is_archived`
+/// (crates/wenlan-core/src/citations.rs) proves for the citation backfill's
+/// *combined*-fence write -- that write is unaffected by this gap only
+/// because its `expected_version` half already carries `status = 'active'`
+/// along with it.
+#[tokio::test]
+async fn source_revision_only_cas_is_rejected_by_an_archived_page() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page-archived-source-revision-cas",
+        "Archived source-revision CAS",
+        None,
+        "original body",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    let expected_source_revision = db
+        .get_page_source_revision("page-archived-source-revision-cas")
+        .await
+        .unwrap();
+
+    db.archive_page("page-archived-source-revision-cas")
+        .await
+        .unwrap();
+
+    let wrote = db
+        .try_update_page_content_with_changelog_at_source_revision(
+            "page-archived-source-revision-cas",
+            "a stale write computed before the archive",
+            &[],
+            "test_g3",
+            false,
+            "test_g3 stale write",
+            None,
+            expected_source_revision,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !wrote,
+        "a source-revision-only CAS must not write to an archived page, matching the version-fenced CAS"
+    );
+    let page = db
+        .get_page("page-archived-source-revision-cas")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.status, "archived");
+    assert_eq!(
+        page.content, "original body",
+        "the stale write must not land"
+    );
 }
 
 #[tokio::test]
@@ -52839,6 +53223,421 @@ async fn dual_write_page_citations_retracts_dropped_citation_when_unbacked() {
     );
 }
 
+/// CAS seam for the round-2 doc-citation-locator fix (a concurrent source
+/// attach can be overwritten by a stale terminal citation write): `version`
+/// alone does not see a re-arming source attach. `link_page_source` resets
+/// `citations` to NULL and bumps `source_revision` to re-arm a page for
+/// backfill, but never bumps `version` -- so a backfill writer that captured
+/// `source_revision` before that attach, and only that attach, must be
+/// rejected even though `version` still matches. Mirrors the existing
+/// version-staleness CAS proof at `citation_result_for_old_page_version_is_
+/// dropped` (citations.rs), but for the source_revision axis.
+#[tokio::test]
+async fn set_page_citations_with_changelog_at_version_rejects_stale_source_revision() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_source_cas",
+        "T",
+        None,
+        "body",
+        None,
+        None,
+        &["mem_seed"],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let version = db
+        .get_page("page_source_cas")
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    // The source_revision a racy backfill writer would have captured BEFORE
+    // the concurrent attach below.
+    let stale_source_revision = db
+        .get_page_source_revision("page_source_cas")
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_source_revision, 0,
+        "sanity: a fresh page starts at source_revision 0"
+    );
+
+    // Concurrent source attach: bumps source_revision, resets citations to
+    // NULL, leaves version untouched -- the exact re-arming this guard
+    // exists to detect.
+    db.link_page_source("page_source_cas", "mem_added_mid_race", "test")
+        .await
+        .unwrap();
+    let after_attach = db.get_page("page_source_cas").await.unwrap().unwrap();
+    assert_eq!(
+        after_attach.version, version,
+        "sanity: link_page_source must not bump version -- that IS the hazard \
+         this guard closes"
+    );
+    assert!(
+        db.get_pages_missing_citations(10)
+            .await
+            .unwrap()
+            .contains(&"page_source_cas".to_string()),
+        "sanity: citations must be NULL again after the re-arming attach"
+    );
+
+    // The stale writer's CAS must not match: version still matches, but
+    // source_revision has moved on.
+    let stale_changelog =
+        r#"[{"edited_by":"citation_backfill","at":1,"citations_summary":"stale write"}]"#;
+    let wrote_stale = db
+        .set_page_citations_with_changelog_at_version(
+            "page_source_cas",
+            Some("[]"),
+            stale_changelog,
+            version,
+            stale_source_revision,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !wrote_stale,
+        "a stale source_revision must not be allowed to overwrite a page \
+         re-armed by a concurrent source attach"
+    );
+    assert!(
+        db.get_pages_missing_citations(10)
+            .await
+            .unwrap()
+            .contains(&"page_source_cas".to_string()),
+        "citations must still be NULL -- the rejected stale write must not \
+         have knocked the page out of the missing-citations queue"
+    );
+    assert!(
+        !db.get_page_changelog("page_source_cas")
+            .await
+            .unwrap()
+            .contains("stale write"),
+        "the stale write's changelog entry must not have landed"
+    );
+
+    // The CURRENT source_revision must be accepted.
+    let current_source_revision = db
+        .get_page_source_revision("page_source_cas")
+        .await
+        .unwrap();
+    let current_changelog =
+        r#"[{"edited_by":"citation_backfill","at":2,"citations_summary":"current write"}]"#;
+    let wrote_current = db
+        .set_page_citations_with_changelog_at_version(
+            "page_source_cas",
+            Some("[]"),
+            current_changelog,
+            version,
+            current_source_revision,
+        )
+        .await
+        .unwrap();
+    assert!(
+        wrote_current,
+        "the current source_revision must be accepted"
+    );
+    assert!(
+        !db.get_pages_missing_citations(10)
+            .await
+            .unwrap()
+            .contains(&"page_source_cas".to_string()),
+        "the accepted write must take the page out of the missing-citations queue"
+    );
+    assert!(
+        db.get_page_changelog("page_source_cas")
+            .await
+            .unwrap()
+            .contains("current write"),
+        "the accepted write's changelog entry must have landed"
+    );
+}
+
+/// Round-2 widen-scope (option 1): `try_update_page_content`'s "only page
+/// growth may combine version and source-revision CAS" guard now also
+/// allows `link_reason == "citation_backfill"`, but every other caller
+/// combining both fences must still be rejected. `try_update_page_content`
+/// is a private associated fn on `MemoryDB`, reachable here because
+/// `db::tests` (this file) is a child module of `db` and inherits access to
+/// its ancestor's private items.
+#[tokio::test]
+async fn combine_version_and_source_revision_cas_rejected_for_non_growth_non_backfill() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_combine_reject",
+        "T",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    let version = db
+        .get_page("page_combine_reject")
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    let source_revision = db
+        .get_page_source_revision("page_combine_reject")
+        .await
+        .unwrap();
+
+    let err = db
+        .try_update_page_content(
+            "page_combine_reject",
+            "new body",
+            &[],
+            "manual_edit",
+            false,
+            None,
+            None,
+            Some(version),
+            Some(source_revision),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err(
+            "combining both fences outside page growth, citation_backfill, and revision accept must be rejected",
+        );
+    assert!(
+        matches!(
+            err,
+            WenlanError::Validation(ref msg)
+                if msg == "only page growth, citation backfill, and revision accept may combine version and source-revision CAS"
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// Round-5 finding F2/F3: `delete_app_metadata_if_value_starts_with` only
+/// deletes when the row's CURRENT value still matches the given prefix.
+/// The citation backfill's attempt counter relies on exactly this to avoid
+/// a re-arm race -- a terminal write from an OLD generation must never wipe
+/// a counter a NEW generation has already started writing to, because by
+/// the time the old write's cleanup runs, the stored value no longer
+/// matches its prefix.
+#[tokio::test]
+async fn delete_app_metadata_if_value_starts_with_only_deletes_a_matching_value() {
+    let (db, _dir) = test_db().await;
+    db.set_app_metadata("some_key", "v1:s2:1").await.unwrap();
+
+    let deleted_mismatch = db
+        .delete_app_metadata_if_value_starts_with("some_key", "v1:s1:")
+        .await
+        .unwrap();
+    assert!(
+        !deleted_mismatch,
+        "a non-matching value prefix must not delete the row"
+    );
+    assert_eq!(
+        db.get_app_metadata("some_key").await.unwrap().as_deref(),
+        Some("v1:s2:1"),
+        "the row must be untouched"
+    );
+
+    let deleted_match = db
+        .delete_app_metadata_if_value_starts_with("some_key", "v1:s2:")
+        .await
+        .unwrap();
+    assert!(deleted_match, "a matching value prefix must delete the row");
+    assert_eq!(db.get_app_metadata("some_key").await.unwrap(), None);
+
+    // A missing key never matches any prefix.
+    let deleted_missing = db
+        .delete_app_metadata_if_value_starts_with("no_such_key", "v1:")
+        .await
+        .unwrap();
+    assert!(!deleted_missing);
+}
+
+/// The `citation_backfill` exception itself: combining both fences via
+/// `try_update_page_content_with_changelog_at_versions` must write when both
+/// match, and must reject (return `Ok(false)`, not an error) on a stale
+/// `source_revision` -- the same CAS-miss semantics as every other stale-CAS
+/// path, not a validation error.
+#[tokio::test]
+async fn citation_backfill_combined_cas_writes_on_match_and_rejects_stale_source_revision() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_combine_backfill",
+        "T",
+        None,
+        "body",
+        None,
+        None,
+        &["mem_seed"],
+        &now,
+    )
+    .await
+    .unwrap();
+    let version = db
+        .get_page("page_combine_backfill")
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    let current_source_revision = db
+        .get_page_source_revision("page_combine_backfill")
+        .await
+        .unwrap();
+    let stale_source_revision = current_source_revision + 1;
+
+    let wrote_stale = db
+        .try_update_page_content_with_changelog_at_versions(
+            "page_combine_backfill",
+            "stale attempt",
+            &["mem_seed"],
+            "[]",
+            None,
+            version,
+            stale_source_revision,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !wrote_stale,
+        "a stale source_revision must be rejected, not accepted -- CAS miss, not a validation error"
+    );
+    assert_eq!(
+        db.get_page("page_combine_backfill")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "body",
+        "the stale write must not have landed"
+    );
+
+    let wrote_current = db
+        .try_update_page_content_with_changelog_at_versions(
+            "page_combine_backfill",
+            "annotated body",
+            &["mem_seed"],
+            "[]",
+            None,
+            version,
+            current_source_revision,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        wrote_current,
+        "a matching version and source_revision must be accepted for citation_backfill"
+    );
+    assert_eq!(
+        db.get_page("page_combine_backfill")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "annotated body",
+        "the matching write must have landed"
+    );
+}
+
+/// Round-3 finding (MEDIUM, mixed snapshot): the citation backfill tick
+/// reads its fence counter (`source_revision`) FIRST, then `get_page`
+/// SECOND -- not the other way around. If `get_page` ran first, a source
+/// attach landing between the two reads would show up in `source_revision`
+/// (bumped) but NOT in `page.source_memory_ids` (still the old list): both
+/// fences would then pass on a write that carries the stale source list and
+/// drops the freshly attached source.
+///
+/// This is a seam-level proof mirroring the fixed read order exactly (no
+/// live interposable await exists between the two reads in the real tick,
+/// so there is nothing to race the way `BlockingCitationProvider` races the
+/// LLM call): read the fence, then attach, then `get_page` (which already
+/// reflects the attach), then the combined write using that page's own
+/// `version` and `source_memory_ids` but the PRE-attach `source_revision`.
+/// The write must be rejected purely because the fence is stale -- not
+/// because the source list happens to be stale too, which it isn't here.
+#[tokio::test]
+async fn combined_cas_read_order_rejects_write_racing_a_mid_read_attach() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_read_order",
+        "T",
+        None,
+        "body",
+        None,
+        None,
+        &["mem_seed"],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    // Fixed order: read the fence FIRST.
+    let source_revision = db
+        .get_page_source_revision("page_read_order")
+        .await
+        .unwrap();
+
+    // A concurrent attach lands between the two reads. `link_page_source`
+    // does not require the target memory row to exist (mirrors
+    // `set_page_citations_with_changelog_at_version_rejects_stale_source_
+    // revision` above).
+    db.link_page_source("page_read_order", "mem_read_order_new", "test")
+        .await
+        .unwrap();
+
+    // Then `get_page`, which already reflects the attach.
+    let page = db.get_page("page_read_order").await.unwrap().unwrap();
+    assert!(
+        page.source_memory_ids
+            .contains(&"mem_read_order_new".to_string()),
+        "sanity: get_page (read second) must already see the attach"
+    );
+
+    let existing_sources: Vec<&str> = page.source_memory_ids.iter().map(String::as_str).collect();
+    let committed = db
+        .try_update_page_content_with_changelog_at_versions(
+            "page_read_order",
+            "annotated body",
+            &existing_sources,
+            "[]",
+            Some("[]"),
+            page.version,
+            source_revision,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !committed,
+        "the stale (pre-attach) source_revision must reject the write, even \
+         though it carries the up-to-date (post-attach) source list -- the \
+         fence must catch staleness on ITS OWN axis, not rely on the source \
+         list happening to be fresh too"
+    );
+
+    let after = db.get_page("page_read_order").await.unwrap().unwrap();
+    assert!(
+        after
+            .source_memory_ids
+            .contains(&"mem_read_order_new".to_string()),
+        "the rejected write must not have dropped the concurrently attached \
+         source"
+    );
+}
+
 // G6 Stage 2 PR 2b (item 4) retired `refcount_retracts_only_after_last_
 // backing_store_drops_citation`: it asserted D7's order-independent refcount
 // -- an edge stays active until BOTH page_evidence and pages.citations drop
@@ -53325,6 +54124,51 @@ async fn delete_page_retires_all_page_edges() {
         .unwrap();
     let active: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
     assert_eq!(active, 0, "no active edge may still touch the deleted page");
+}
+
+/// G4: `delete_page` must delete the citation-backfill attempt row
+/// (`app_metadata` key `citations::attempt_key`) inside its existing
+/// transaction. Left behind, a page recreated at the same id inherits a
+/// stale attempt count from a Page generation it never had -- and a fresh
+/// insert's `version`/`source_revision` restart at the same defaults every
+/// time, so the stale row's generation prefix can silently match the new
+/// page and start it partway toward the backfill's poison-pill limit.
+#[tokio::test]
+async fn delete_page_removes_its_citation_backfill_attempt_row() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_g4_del",
+        "Delete Target",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    db.set_app_metadata(&crate::citations::attempt_key("page_g4_del"), "v1:s0:2")
+        .await
+        .unwrap();
+    assert!(
+        db.get_app_metadata(&crate::citations::attempt_key("page_g4_del"))
+            .await
+            .unwrap()
+            .is_some(),
+        "the attempt row must exist before delete for this test to prove anything"
+    );
+
+    db.delete_page("page_g4_del").await.unwrap();
+
+    assert!(
+        db.get_app_metadata(&crate::citations::attempt_key("page_g4_del"))
+            .await
+            .unwrap()
+            .is_none(),
+        "delete_page must remove the citation-backfill attempt row along with the page"
+    );
 }
 
 // ---- G6 Stage 0 part 2: secondary-writer dual-write gaps (parity oracle) ----
@@ -55611,6 +56455,185 @@ async fn reopening_a_db_with_pre_125_duplicate_observations_migrates_cleanly() {
     assert_eq!(
         idx_count, 1,
         "migration 125 must create the identity index on reopen"
+    );
+}
+
+// ==================== Migration 126: re-arm poisoned citations ====================
+
+/// 2026-08-24 doc-citation-locator fix, change C: `citations = '[]'` was a
+/// permanent pill written by the pre-fix locator mismatch (change A/B, same
+/// PR). Migration 126 re-arms every poisoned ACTIVE page back to NULL
+/// exactly once, so the (now-fixed) backfill sweep picks it up again --
+/// while a NULL page, a page with a real citation map, and a non-active
+/// page carrying the same '[]' value must all stay untouched.
+///
+/// G5: the same migration also drops legacy-format citation-backfill
+/// attempt keys (`citation_backfill_attempts:<page_id>:v...`, predating the
+/// one-row-per-page redesign in `citations::attempt_key`) -- two seeded here
+/// -- while a current-format row (`citation_backfill_attempts:<page_id>`,
+/// no `:v` suffix) must survive, since it is still live and read by the
+/// backfill.
+#[tokio::test]
+async fn migration_126_rearms_empty_citations_to_null_exactly_once() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    db.insert_page_with_kind(
+        "m126-pill",
+        "Pilled page",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &now,
+        "distilled",
+        "confirmed",
+        None,
+        Some("[]"),
+    )
+    .await
+    .unwrap();
+    db.insert_page(
+        "m126-null",
+        "Never-processed page",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    db.insert_page_with_kind(
+        "m126-real",
+        "Annotated page",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &now,
+        "distilled",
+        "confirmed",
+        None,
+        Some(r#"{"1":{"locator":"src1","status":"verified"}}"#),
+    )
+    .await
+    .unwrap();
+    db.insert_page_with_kind(
+        "m126-archived-pill",
+        "Archived pilled page",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &now,
+        "distilled",
+        "confirmed",
+        None,
+        Some("[]"),
+    )
+    .await
+    .unwrap();
+    db.archive_page("m126-archived-pill").await.unwrap();
+
+    db.set_app_metadata("citation_backfill_attempts:m126-legacy-a:v1:s0:2", "3")
+        .await
+        .unwrap();
+    db.set_app_metadata("citation_backfill_attempts:m126-legacy-b:v3:s1:1", "1")
+        .await
+        .unwrap();
+    db.set_app_metadata(&crate::citations::attempt_key("m126-current"), "v1:s0:2")
+        .await
+        .unwrap();
+
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("PRAGMA user_version = 125", ()).await.unwrap();
+    }
+
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("migration 126 must apply");
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+
+    async fn citations_of(db: &MemoryDB, id: &str) -> Option<String> {
+        let conn = db.conn.lock().await;
+        conn.query(
+            "SELECT citations FROM pages WHERE id = ?1",
+            libsql::params![id],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<Option<String>>(0)
+        .unwrap()
+    }
+
+    assert_eq!(
+        citations_of(&db, "m126-pill").await,
+        None,
+        "an active page poisoned with '[]' must be re-armed to NULL"
+    );
+    assert_eq!(
+        citations_of(&db, "m126-null").await,
+        None,
+        "an already-NULL page must stay untouched"
+    );
+    assert_eq!(
+        citations_of(&db, "m126-real").await,
+        Some(r#"{"1":{"locator":"src1","status":"verified"}}"#.to_string()),
+        "a page with a real citation map must stay untouched"
+    );
+    assert_eq!(
+        citations_of(&db, "m126-archived-pill").await,
+        Some("[]".to_string()),
+        "the migration only re-arms ACTIVE pages -- a non-active page's \
+         pill must survive unchanged"
+    );
+
+    assert!(
+        db.get_app_metadata("citation_backfill_attempts:m126-legacy-a:v1:s0:2")
+            .await
+            .unwrap()
+            .is_none(),
+        "a legacy-format attempt key must be dropped by the migration"
+    );
+    assert!(
+        db.get_app_metadata("citation_backfill_attempts:m126-legacy-b:v3:s1:1")
+            .await
+            .unwrap()
+            .is_none(),
+        "every legacy-format attempt key must be dropped, not just the first"
+    );
+    assert_eq!(
+        db.get_app_metadata(&crate::citations::attempt_key("m126-current"))
+            .await
+            .unwrap(),
+        Some("v1:s0:2".to_string()),
+        "a current-format attempt key (no `:v` suffix) must survive the migration"
+    );
+
+    // Idempotency: rewind and replay finds nothing left to re-arm (the
+    // migration is a plain conditional UPDATE, so this mainly proves the
+    // migration-runner gate itself, but mirrors the migration 125 idiom).
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("PRAGMA user_version = 125", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("re-running migration 126 must be a no-op");
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+    assert_eq!(
+        citations_of(&db, "m126-archived-pill").await,
+        Some("[]".to_string())
     );
 }
 

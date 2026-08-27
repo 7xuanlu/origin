@@ -981,11 +981,34 @@ pub async fn handle_refresh_page(
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
 
+    // Read the staleness fence before the fields it protects (same
+    // fence-first discipline as the refresh/growth path): a source attached
+    // between this read and the page read below is then either fully
+    // reflected in `existing` or fully caught by the card's CAS on accept.
+    // This is an acceptance-time staging token, not a compile fence — the
+    // request carries no counter of its own, so this only proves nothing
+    // attached a new source between here and the write/staging below; it
+    // cannot detect that the agent's own compile was already stale before
+    // the request reached this route.
+    let source_revision = db
+        .try_get_page_source_revision(&id)
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
+
     let existing = db
         .get_page(&id)
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))?
         .ok_or_else(|| ServerError::ValidationError(format!("page {} not found", id)))?;
+    // `existing` just proved the page row exists, so the counter read a
+    // moment earlier must also have found one; `None` here means the page
+    // was deleted in the gap between the two reads — an internal race, not
+    // the ordinary "page not found" the check above already handles.
+    let source_revision = source_revision.ok_or_else(|| {
+        ServerError::Internal(format!(
+            "page {id} vanished between the source_revision read and the page read"
+        ))
+    })?;
 
     // Ownership gate (spec §5.1/§5.2): agent refresh is a machine write, so a
     // human-owned page (user_edited=1 OR creation_kind='authored') must never be
@@ -997,6 +1020,7 @@ pub async fn handle_refresh_page(
             &existing,
             &req.content,
             &req.source_memory_ids,
+            source_revision,
             "agent_refresh",
             None,
         )
@@ -1080,7 +1104,7 @@ pub async fn handle_refresh_page(
     use wenlan_core::post_write::WriteOutcome;
     let db_result: Result<wenlan_core::post_write::WriteResult, wenlan_core::error::WenlanError> =
         async {
-            let result = wenlan_core::post_write::update_page(
+            let result = wenlan_core::post_write::update_page_at_source_revision(
                 &db,
                 &id,
                 wenlan_types::requests::UpdatePageRequest {
@@ -1092,6 +1116,7 @@ pub async fn handle_refresh_page(
                 },
                 "agent_refresh",
                 false,
+                source_revision,
                 None,
                 None,
             )

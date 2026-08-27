@@ -203,9 +203,18 @@ async fn sync_one_file(
         return Ok(Outcome::Unchanged);
     }
 
-    // Preserve existing source list — the user edited prose, not the
-    // memory provenance. Sources change only via /distill refresh or
-    // explicit POST.
+    // The user edited prose, not the memory provenance -- sources change
+    // only via /distill refresh or explicit POST. `existing` here is a
+    // snapshot taken above, before this function's only other await
+    // (`page_write_permit`, only reached on the Unchanged branch above) and
+    // well before the write's own CAS loop, so a source attached via API in
+    // that window must not be reverted by handing the write a stale
+    // `source_memory_ids` list. `update_page_preserving_sources` re-reads
+    // the source list from the exact Page generation the CAS loop selects
+    // (page_dispatch.rs's `UpdatePreservingSources`), so `req`'s
+    // `source_memory_ids` below is never read for the actual write --
+    // keeping this snapshot value on the struct is only to satisfy
+    // `UpdatePageRequest`'s shape.
     let req = wenlan_types::requests::UpdatePageRequest {
         content: body_norm,
         source_memory_ids: existing.source_memory_ids.clone(),
@@ -216,17 +225,14 @@ async fn sync_one_file(
     // Pass knowledge_path so update_page re-projects the md with the new
     // version stamp; without that the next tick would see origin_version
     // trailing the DB and skip as SkippedDaemonAhead.
-    // require_stale=false: user edits are unconditional.
     // knowledge_path=Some: page_watcher IS the fs writer; update_page
     //   re-projects rather than skipping the write.
-    crate::post_write::update_page(
+    crate::post_write::update_page_preserving_sources(
         db,
         &page_id,
         req,
         "fs_edit",
-        false,
         Some(knowledge_path),
-        None,
     )
     .await?;
 
@@ -349,6 +355,71 @@ mod tests {
         // fs_edit must flip user_edited so refinery escalates instead of
         // overwriting on the next re-distill.
         assert!(p.user_edited);
+    }
+
+    /// Change D (2026-08-24 doc-citation-locator fix): the watcher's sync
+    /// used to snapshot `existing.source_memory_ids` and hand it to
+    /// `update_page` with `preserve_sources=false` -- the CAS loop re-read
+    /// content fresh but wrote the STALE source list, silently reverting a
+    /// source attached via API in that window (observed live during the
+    /// demo build). `sync_one_file` has no await between its `existing`
+    /// snapshot and the write in the content-differs branch, so a
+    /// deterministic differential through the real polling path isn't
+    /// reachable without a test-only pause hook -- this tests at the update
+    /// seam instead (spec's own words): a manually-stale request, the exact
+    /// shape `sync_one_file` builds, sent through the fix's call
+    /// (`update_page_preserving_sources`) with `edited_by = "fs_edit"`,
+    /// after a source was attached to represent the race window.
+    #[tokio::test]
+    async fn fs_edit_write_preserves_a_source_attached_after_the_snapshot() {
+        let (db, _ddir) = fresh_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_page(
+            "page_race",
+            "Topic Race",
+            None,
+            "original body",
+            None,
+            None,
+            &["mem_seed"],
+            &now,
+        )
+        .await
+        .unwrap();
+
+        // A source attached via API after the watcher would have snapshotted
+        // `existing.source_memory_ids`, before the CAS-safe write commits.
+        db.link_page_source("page_race", "mem_added_mid_race", "concurrent_attach")
+            .await
+            .unwrap();
+
+        // The exact request shape sync_one_file builds: content read from
+        // disk, and the (now stale) source snapshot read before the
+        // concurrent attach above.
+        let req = wenlan_types::requests::UpdatePageRequest {
+            content: "user-edited body from disk".to_string(),
+            source_memory_ids: vec!["mem_seed".to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        };
+        crate::post_write::update_page_preserving_sources(&db, "page_race", req, "fs_edit", None)
+            .await
+            .unwrap();
+
+        let page = db.get_page("page_race").await.unwrap().unwrap();
+        let mut sources = page.source_memory_ids.clone();
+        sources.sort();
+        assert_eq!(
+            sources,
+            vec!["mem_added_mid_race".to_string(), "mem_seed".to_string()],
+            "a source attached between the watcher's snapshot and its write must survive: {:?}",
+            page.source_memory_ids
+        );
+        assert!(
+            page.user_edited,
+            "fs_edit must still flip user_edited even on the CAS-safe path"
+        );
     }
 
     #[tokio::test]
