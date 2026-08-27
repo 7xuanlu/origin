@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.2](https://github.com/7xuanlu/wenlan/compare/v0.17.1...v0.17.2) (2026-08-27)
+
+
+### Bug Fixes
+
+* **app:** register the daemon with launchd first; the sidecar is the fallback ([#614](https://github.com/7xuanlu/wenlan/issues/614)) ([48dac27](https://github.com/7xuanlu/wenlan/commit/48dac272d9f993840c98513271aeeaadaa96bf82))
+
 ## [0.17.1](https://github.com/7xuanlu/wenlan/compare/v0.17.0...v0.17.1) (2026-08-26)
 
 
