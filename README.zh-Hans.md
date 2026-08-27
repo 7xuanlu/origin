@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=0a1d0787e9875aa46c3a6aa2db9495207ff0eae9925ac1e77010bcfb2ad16c5a -->
+<!-- README_SYNC: source=README.md sha256=c8dbe1b39a702cde2a79dfc1b7f8b7c836fa3ee3efe5a6ac6e77d084ca31e413 -->
 
 <p align="center">
   <picture>
@@ -51,11 +51,11 @@ Wenlan 以单个本地 daemon 运行。桌面 app 内置这个 daemon；无 GUI 
 
 ### 桌面 app
 
-**[下载 macOS 版 Wenlan](https://github.com/7xuanlu/wenlan/releases/latest)**（Apple Silicon），打开 `.dmg`，把 app 拖进「应用程序」。
+**[下载 macOS 版 Wenlan](https://github.com/7xuanlu/wenlan/releases/latest)**（Apple Silicon），打开 `.dmg`，把 app 拖进「应用程序」。升级时把新 app 拖到旧 app 上覆盖，再打开它：正在运行的 Wenlan 会自动退出，新版本随即启动（Wenlan 0.17.0 及更早的版本需要先手动退出）。
 
 不需要再安装别的东西。App 内已打包 daemon、CLI 与 MCP 连接器，启动时会自动运行 daemon，并会为检测到的 AI 客户端提供接入：Claude Code 与 Codex 安装 plugin，其余客户端写入 MCP 配置。之后你就可以阅读 Page、检查任一引用背后的 Source，并整理整个知识体系。
 
-这个预览版尚未经过 Apple notarization，首次启动会被 macOS 拦下，在「系统设置」的「隐私与安全性」里点一次「仍要打开」即可。一条命令可以跳过这一步：它会用 GitHub 发布的 SHA-256 核对下载文件，只为这一个 app 清除 quarantine，不会更改任何 macOS 安全设置。
+这个预览版只做了 ad-hoc 签名、未经 Apple notarization，首次启动会被 macOS 拦下：可能提示 Wenlan「无法打开」，或者无法检查它是否包含恶意软件。关掉这个提示，再到「系统设置」的「隐私与安全性」里点一次「仍要打开」即可。一条命令可以跳过这一步：它会用 GitHub 发布的 SHA-256 核对下载文件，只为这一个 app 清除 quarantine，不会更改任何 macOS 安全设置。
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
@@ -124,6 +124,8 @@ Wenlan 把文档、笔记和过去的 AI 对话整理成会随工作持续更新
 
 - **[LLM-wiki v1](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)：** Karpathy 提出不可变的来源、由 AI 维护的 Markdown Wiki，以及会随你和 AI 一起演进、规定组织与维护方式的 Schema（规则层）。Wenlan 以[类型化记忆字段](docs/technical-foundations.md#typed-memory-schema)与内建规则，落实页面结构、出处、引用、刷新、归属和审核。
 - **[LLM-wiki v2](https://gist.github.com/rohitg00/2067ab416f7bbe447c1977edaaa681e2)：** Rohitg00 加入记忆生命周期。Wenlan 把这个方向做成可以直接使用的产品：可追溯的来源、由 AI agent 按 Zettelkasten（卡片盒笔记法）捕获的原子记忆（每条只表达一个完整想法），以及同时由两者建立并持续维护的页面。
+
+完整流程请见 [LLM-wiki 实现指南](https://wenlan.app/zh-CN/learn/distilled-wiki-pages-ai-memory)。
 
 **Wenlan 最独特的做法：** 来源与原子记忆会分别支撑持续维护的页面。记忆历史保留知识如何改变；页面历史说明当前结论由哪些依据支撑。机器维护的页面可以依当前依据重建；对人工文字的改动则成为可审核的修订，不会直接覆盖。
 

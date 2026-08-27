@@ -107,15 +107,15 @@ GAUNTLET_TIMEOUT=600 check skill-bootstrap -- bash -c "$BOOTSTRAP"
 export PATH="$HOME/.wenlan/bin:$PATH"
 info path-export 'export PATH="$HOME/.wenlan/bin:$PATH"'
 check_output setup-basic "Wenlan is set up for local memory." -- wenlan setup --basic
-check_output background-on "Installed and started com.wenlan.server." -- wenlan background on
+check_output background-on "Installed and started com.wenlan.server; daemon healthy at" -- wenlan background on
 if [ "$OS" = Linux ]; then
     check unit-file-exists -- test -f "$UNIT"
 else
     check plist-exists -- test -f "$PLIST"
 fi
 
-# Step 3: the skill's five-second re-probe, as written; then the real first-boot wait.
-check skill-reprobe-5s -- bash -c 'for _ in 1 2 3 4 5; do curl -fsS -m 3 http://127.0.0.1:7878/api/health && exit 0; sleep 1; done; exit 1'
+# Step 3: the skill's 240-second re-probe, as written; then the usual first-boot wait.
+check skill-reprobe-240s -- bash -c 'deadline=$((SECONDS + 240)); while [ "$SECONDS" -lt "$deadline" ]; do curl -fsS -m 3 http://127.0.0.1:7878/api/health >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
 wait_health "$HEALTH" 240 || true
 assert_version "$HEALTH" "$VERSION"
 DAEMON_VER="$(curl -sf --max-time 5 "$HEALTH" 2>/dev/null | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"

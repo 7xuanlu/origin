@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.17.1](https://github.com/7xuanlu/wenlan/compare/v0.17.0...v0.17.1) (2026-08-26)
+
+
+### Features
+
+* **server,cli:** manual ambient sweep, status route, and quiet-tick drain ([#584](https://github.com/7xuanlu/wenlan/issues/584)) ([43f557b](https://github.com/7xuanlu/wenlan/commit/43f557b28d355b7061a4fc870463830484d7c75b))
+* **server,core:** stage an agent's correction for review when its trust is not full ([#592](https://github.com/7xuanlu/wenlan/issues/592)) ([5709369](https://github.com/7xuanlu/wenlan/commit/57093695b1b9a076ae48cfaa34d967816c9b8740))
+
+
+### Bug Fixes
+
+* **app:** let a newer Wenlan.app take over from a running older one ([#603](https://github.com/7xuanlu/wenlan/issues/603)) ([a85eec7](https://github.com/7xuanlu/wenlan/commit/a85eec730764d4e931f079f23b25885036f51b69))
+* **app:** stop the sidecar the app spawned and install outside the data root on Windows ([#604](https://github.com/7xuanlu/wenlan/issues/604)) ([6fd0461](https://github.com/7xuanlu/wenlan/commit/6fd0461bea6b0e03dee0c9e57664b164ceffeb69))
+* **cli,core,mcp:** say what to do when the daemon, model, or config is broken ([#597](https://github.com/7xuanlu/wenlan/issues/597)) ([7c96f33](https://github.com/7xuanlu/wenlan/commit/7c96f3303a9fbb05f22b334199498f9625f27e72))
+* **cli,mcp:** first-hour hints and the real pages path ([#594](https://github.com/7xuanlu/wenlan/issues/594)) ([b49cc70](https://github.com/7xuanlu/wenlan/commit/b49cc70df54f05d5528e35e4856e615262075893))
+* **core,cli:** stop the fresh-install daemon crash-loop under launchd ([#600](https://github.com/7xuanlu/wenlan/issues/600)) ([81c4f07](https://github.com/7xuanlu/wenlan/commit/81c4f073a6cf6c307c77b1aa9f3b53a5981ddbfd))
+* **core:** merge same-topic sibling shards before distill writes a page ([#608](https://github.com/7xuanlu/wenlan/issues/608)) ([0e068c8](https://github.com/7xuanlu/wenlan/commit/0e068c8f3efac609a5bc69609b493ccdec1d3e30))
+* **core:** split oversized distill clusters in steps instead of dropping them ([#595](https://github.com/7xuanlu/wenlan/issues/595)) ([ca79267](https://github.com/7xuanlu/wenlan/commit/ca7926732c3f9453d8a06f81f29cb0021d4f82cf))
+* **core:** surface row-scan step errors instead of silently truncating ([#591](https://github.com/7xuanlu/wenlan/issues/591)) ([cb1c69b](https://github.com/7xuanlu/wenlan/commit/cb1c69ba10a8295d1bb4a22073b76d4edd04106a))
+* **db:** roll back when COMMIT fails so the writer connection is not left in a transaction ([#611](https://github.com/7xuanlu/wenlan/issues/611)) ([81e6ee0](https://github.com/7xuanlu/wenlan/commit/81e6ee0d8fcbd53ad29fa002baeccabeb68282cf))
+* **install:** stop depending on anonymous GitHub API calls ([#607](https://github.com/7xuanlu/wenlan/issues/607)) ([5d3376a](https://github.com/7xuanlu/wenlan/commit/5d3376a12b6e789c6c5d5e440f1055ae88644df0))
+* **lint:** a fresh store without a model source is not a failing lint ([#612](https://github.com/7xuanlu/wenlan/issues/612)) ([b43ccd8](https://github.com/7xuanlu/wenlan/commit/b43ccd8c1a7c435a52b09eac8d4b71026cc058c4))
+* **mcp,core:** trim MCP recall hits, render brief and lint as text, no migration backups on a fresh store ([#609](https://github.com/7xuanlu/wenlan/issues/609)) ([2b7024e](https://github.com/7xuanlu/wenlan/commit/2b7024e73911383820e7f109479b11984e1216d9))
+* **mcp:** pin rmcp-macros beside rmcp so an unlocked cargo install compiles ([#601](https://github.com/7xuanlu/wenlan/issues/601)) ([43c0047](https://github.com/7xuanlu/wenlan/commit/43c004708bd2d1ff14367c2402eb1fdec8aeefe3))
+* **plugin:** warn on daemon drift by release part and give a first boot 60 s ([#605](https://github.com/7xuanlu/wenlan/issues/605)) ([7223c68](https://github.com/7xuanlu/wenlan/commit/7223c6861168871f193a4e3b86b6ca70ce586dd3))
+* **release:** ship wenlan-server in the Homebrew wenlan formula ([#602](https://github.com/7xuanlu/wenlan/issues/602)) ([e34fd76](https://github.com/7xuanlu/wenlan/commit/e34fd76139c2482a0f70116443d8b68c02cac5a9))
+* **server:** a blocked agent storing a memory gets 403, not 500 ([#610](https://github.com/7xuanlu/wenlan/issues/610)) ([2846552](https://github.com/7xuanlu/wenlan/commit/28465529f3b7b97397e474a4935e16b73f256544))
+* **server:** wire the four /api/pages/drafts editor routes ([#590](https://github.com/7xuanlu/wenlan/issues/590)) ([083a2fb](https://github.com/7xuanlu/wenlan/commit/083a2fb73b188066f47a2005a5a7aa6f871737b4))
+
 ## [0.17.0](https://github.com/7xuanlu/wenlan/compare/v0.16.0...v0.17.0) (2026-08-24)
 
 

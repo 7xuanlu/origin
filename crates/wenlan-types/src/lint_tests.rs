@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use super::*;
+use serde::Deserialize;
 use serde_json::json;
 
 fn coverage(authorized_denominator: u64) -> LintCoverage {
@@ -772,4 +773,270 @@ fn coverage_deserialization_preserves_valid_methods_and_additive_fields() {
 
         assert!(coverage.is_ok());
     }
+}
+
+const ALL_SUMMARY_CODES: [LintSummaryCode; 6] = [
+    LintSummaryCode::CheckPassed,
+    LintSummaryCode::FindingDetected,
+    LintSummaryCode::PrerequisiteUnavailable,
+    LintSummaryCode::SnapshotInconsistent,
+    LintSummaryCode::ExecutionFailed,
+    LintSummaryCode::ExpectedEmpty,
+];
+
+const ALL_RECOMMENDATION_CODES: [LintRecommendationCode; 4] = [
+    LintRecommendationCode::ReviewFinding,
+    LintRecommendationCode::RestorePrerequisite,
+    LintRecommendationCode::RerunAfterSnapshotStabilizes,
+    LintRecommendationCode::InspectRuntime,
+];
+
+const ALL_ACTION_CODES: [LintActionCode; 1] = [LintActionCode::ChooseModelSource];
+
+// The match arms are exhaustive by the compiler. What a test has to hold is
+// that nobody satisfied the compiler with a shared placeholder: every code says
+// its own thing, in a full sentence, so a rendered line reads as English.
+#[test]
+fn every_summary_and_recommendation_code_carries_its_own_plain_sentence() {
+    let meanings = ALL_SUMMARY_CODES
+        .iter()
+        .map(|code| code.meaning())
+        .collect::<Vec<_>>();
+    let actions = ALL_RECOMMENDATION_CODES
+        .iter()
+        .map(|code| code.action())
+        .chain(ALL_ACTION_CODES.iter().map(|code| code.action()))
+        .collect::<Vec<_>>();
+
+    for sentence in meanings.iter().chain(actions.iter()) {
+        assert!(sentence.len() > 20, "{sentence:?} is not a sentence");
+        assert!(sentence.ends_with('.'), "{sentence:?} is not a sentence");
+        assert!(
+            !sentence.to_ascii_lowercase().contains("unknown"),
+            "{sentence:?} is a fallback, not a sentence"
+        );
+    }
+
+    assert_eq!(
+        meanings
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        meanings.len()
+    );
+    assert_eq!(
+        actions
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        actions.len()
+    );
+    assert!(LintActionCode::ChooseModelSource
+        .action()
+        .contains("model source"));
+}
+
+/// The fresh-store shape: a passing, expected-empty check that still has one
+/// thing to ask of the owner. Nothing is wrong, so `recommendation_code` stays
+/// empty; the ask travels in the additive `action_code` field.
+fn fresh_store_check() -> LintCheckResult {
+    LintCheckResult::try_new(LintCheckResultInput {
+        check_id: "kg.substrate_liveness".to_string(),
+        outcome: LintOutcome::Pass,
+        severity: LintSeverity::Info,
+        applicability: LintApplicability::ExpectedEmpty,
+        precondition: LintPrecondition::ExpectedEmpty,
+        coverage: coverage(0),
+        metrics: vec![],
+        summary_code: LintSummaryCode::ExpectedEmpty,
+        recommendation_code: None,
+        evidence: vec![],
+        duration_ms: 0,
+    })
+    .expect("expected-empty pass with an action is a legal check result")
+    .with_action_code(Some(LintActionCode::ChooseModelSource))
+}
+
+// A passing, expected-empty check is allowed to carry advice: nothing is wrong,
+// the owner simply has to choose a model source before the substrate can exist.
+// This shape must stay legal and must round-trip on the wire.
+#[test]
+fn expected_empty_pass_may_carry_a_choose_model_source_action() {
+    let result = fresh_store_check();
+
+    let encoded = serde_json::to_value(&result).unwrap();
+    assert_eq!(encoded["action_code"], json!("choose_model_source"));
+    assert_eq!(encoded["precondition"], json!("expected_empty"));
+    // The frozen schema-5 field stays empty: a pass is not a recommendation.
+    assert!(encoded
+        .get("recommendation_code")
+        .is_none_or(serde_json::Value::is_null));
+    assert_eq!(
+        serde_json::from_value::<LintCheckResult>(encoded).unwrap(),
+        result
+    );
+}
+
+// A check with nothing to ask of the owner must serialize exactly as it did
+// before `action_code` existed -- the key is absent, not null.
+#[test]
+fn a_check_without_an_action_does_not_grow_a_wire_key() {
+    let result = LintCheckResult::try_new(LintCheckResultInput {
+        check_id: "kg.substrate_liveness".to_string(),
+        outcome: LintOutcome::Pass,
+        severity: LintSeverity::Info,
+        applicability: LintApplicability::ExpectedEmpty,
+        precondition: LintPrecondition::ConfiguredOff,
+        coverage: coverage(0),
+        metrics: vec![],
+        summary_code: LintSummaryCode::ExpectedEmpty,
+        recommendation_code: None,
+        evidence: vec![],
+        duration_ms: 0,
+    })
+    .expect("configured-off pass is a legal check result");
+
+    let encoded = serde_json::to_value(&result).unwrap();
+    assert!(
+        encoded.get("action_code").is_none(),
+        "absent action must not appear on the wire: {encoded}"
+    );
+}
+
+/// A byte-for-byte copy of the `recommendation_code` enum as it stands in the
+/// released schema-5 wire shape (base `43c00470`). Frozen on purpose: it must
+/// NOT gain variants when the live enum does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FrozenRecommendationCode {
+    ReviewFinding,
+    RestorePrerequisite,
+    RerunAfterSnapshotStabilizes,
+    InspectRuntime,
+}
+
+/// A copy of `LintCheckResultInput` as an older CLI or MCP client parses it.
+/// Like the real one it does not deny unknown fields, so an added field is
+/// ignored -- but serde rejects an unknown *enum variant*, which is exactly the
+/// break this test exists to catch.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct FrozenReaderCheck {
+    check_id: String,
+    outcome: LintOutcome,
+    severity: LintSeverity,
+    applicability: LintApplicability,
+    precondition: LintPrecondition,
+    coverage: LintCoverage,
+    metrics: Vec<LintMetric>,
+    summary_code: LintSummaryCode,
+    recommendation_code: Option<FrozenRecommendationCode>,
+    evidence: Vec<LintEvidenceRef>,
+    duration_ms: u64,
+}
+
+// Patch-ahead daemons are explicitly compatible with older clients
+// (`wenlan-mcp/src/version_check.rs`), so a daemon on this build must not emit
+// a report that a client on the released schema-5 shape cannot parse. Putting
+// `choose_model_source` into `recommendation_code` would do exactly that.
+#[test]
+fn a_frozen_schema_five_reader_still_parses_the_fresh_store_check() {
+    let encoded = serde_json::to_value(fresh_store_check()).unwrap();
+    assert_eq!(encoded["action_code"], json!("choose_model_source"));
+
+    let old = serde_json::from_value::<FrozenReaderCheck>(encoded)
+        .expect("a released schema-5 reader must still parse this check");
+
+    assert_eq!(old.check_id, "kg.substrate_liveness");
+    assert_eq!(old.outcome, LintOutcome::Pass);
+    assert_eq!(old.precondition, LintPrecondition::ExpectedEmpty);
+    assert_eq!(old.summary_code, LintSummaryCode::ExpectedEmpty);
+    // The old reader simply does not see the action; it does not choke on it.
+    assert_eq!(old.recommendation_code, None);
+}
+
+/// The two checks a fresh store with no model source used to fail on, as the
+/// daemon now produces them: complete, passing, expected-empty, each asking
+/// the owner to pick a model source.
+fn fresh_store_report() -> LintReport {
+    report(
+        LintScope::global(),
+        vec![
+            model_source_check("kg.substrate_liveness"),
+            model_source_check("serving.channel.graph"),
+        ],
+    )
+}
+
+fn model_source_check(check_id: &str) -> LintCheckResult {
+    LintCheckResult::try_new(LintCheckResultInput {
+        check_id: check_id.to_string(),
+        outcome: LintOutcome::Pass,
+        severity: LintSeverity::Info,
+        applicability: LintApplicability::ExpectedEmpty,
+        precondition: LintPrecondition::ExpectedEmpty,
+        coverage: coverage(0),
+        metrics: vec![],
+        summary_code: LintSummaryCode::ExpectedEmpty,
+        recommendation_code: None,
+        evidence: vec![],
+        duration_ms: 0,
+    })
+    .expect("expected-empty pass is a legal check result")
+    .with_action_code(Some(LintActionCode::ChooseModelSource))
+}
+
+#[test]
+fn the_model_source_checks_render_with_a_plain_sentence_and_no_findings() {
+    let rendered = fresh_store_report().render_text();
+
+    assert!(rendered.contains("0 actionable findings"), "{rendered}");
+    assert!(rendered.contains("Findings: none\n"), "{rendered}");
+    assert!(rendered.contains("Waiting on you (2):"), "{rendered}");
+    for check_id in ["kg.substrate_liveness", "serving.channel.graph"] {
+        assert!(
+            rendered.contains(&format!(
+                "  {check_id}: expected_empty; action: choose_model_source\n"
+            )),
+            "{rendered}"
+        );
+    }
+    assert!(
+        rendered.contains(
+            "    There was nothing here to check, which is the expected state right now. \
+             Run `wenlan setup` and choose a model source so Wenlan can build this in the \
+             background.\n"
+        ),
+        "{rendered}"
+    );
+}
+
+// Every rendered line carries the sentence, not just the new one -- the
+// codes stay for scripts, the English is for the person reading.
+#[test]
+fn a_rendered_finding_carries_both_the_code_and_the_plain_sentence() {
+    let rendered = report(
+        LintScope::global(),
+        vec![check_with_id(
+            "pages.projection.identity",
+            LintOutcome::Finding,
+            LintSeverity::Error,
+        )
+        .unwrap()],
+    )
+    .render_text();
+
+    assert!(
+        rendered.contains(
+            "  pages.projection.identity: finding_detected; recommendation: review_finding\n"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "    This check found records that do not match what Wenlan expects. \
+             Look at the listed records and fix or dismiss them.\n"
+        ),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Waiting on you: none\n"), "{rendered}");
 }

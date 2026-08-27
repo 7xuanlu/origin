@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::MemoryDB;
+use super::{commit_or_rollback, MemoryDB};
 use crate::{
     error::WenlanError,
     export::knowledge::{KnowledgeProjectionWrite, OwnedRepairProjectionSession},
@@ -400,8 +400,7 @@ pub(crate) async fn record_repair_verification_atomic(
             "repair verify commit: injected test failure".to_string(),
         ));
     }
-    connection
-        .execute("COMMIT", ())
+    commit_or_rollback(&connection)
         .await
         .map_err(|error| WenlanError::VectorDb(format!("repair verify commit: {error}")))?;
     Ok(receipt)

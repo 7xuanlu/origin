@@ -1055,6 +1055,91 @@ macro_rules! try_call {
     };
 }
 
+/// The fields of a recall hit a skill reads. The daemon's `SearchResult` also
+/// carries ranking internals and ingest metadata (chunk index, raw score,
+/// source text, content hash, ...) that only cost the agent context.
+#[derive(Serialize)]
+struct RecallHit<'a> {
+    source_id: &'a str,
+    #[serde(skip_serializing_if = "is_empty_str")]
+    title: &'a str,
+    content: &'a str,
+    score: f32,
+    last_modified: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_type: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    space: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirmed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entity_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supersedes: Option<&'a str>,
+    version: i64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pending_revision: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merged_from: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_delta_summary: Option<&'a str>,
+}
+
+fn is_empty_str(value: &&str) -> bool {
+    value.is_empty()
+}
+
+impl<'a> From<&'a wenlan_types::SearchResult> for RecallHit<'a> {
+    fn from(hit: &'a wenlan_types::SearchResult) -> Self {
+        Self {
+            source_id: &hit.source_id,
+            title: &hit.title,
+            content: &hit.content,
+            score: hit.score,
+            last_modified: hit.last_modified,
+            memory_type: hit.memory_type.as_deref(),
+            space: hit.space.as_deref(),
+            source_agent: hit.source_agent.as_deref(),
+            confidence: hit.confidence,
+            confirmed: hit.confirmed,
+            entity_name: hit.entity_name.as_deref(),
+            supersedes: hit.supersedes.as_deref(),
+            version: hit.version,
+            pending_revision: hit.pending_revision,
+            merged_from: hit.merged_from.as_deref(),
+            last_delta_summary: hit.last_delta_summary.as_deref(),
+        }
+    }
+}
+
+fn recall_hits(results: &[wenlan_types::SearchResult]) -> Vec<RecallHit<'_>> {
+    results.iter().map(RecallHit::from).collect()
+}
+
+/// One Brief item list as text, keeping the stable item ids and versions the
+/// handoff skill reconciles against.
+fn render_brief_items(output: &mut String, label: &str, items: &[wenlan_types::BriefItem]) {
+    if items.is_empty() {
+        output.push_str(&format!("{label}: none\n"));
+        return;
+    }
+    output.push_str(&format!("{label} ({}):\n", items.len()));
+    for item in items {
+        output.push_str(&format!(
+            "  - {} (v{}): {}",
+            item.id, item.version, item.text
+        ));
+        if let Some(gate) = item.gate.as_deref() {
+            output.push_str(&format!(" [gate: {gate}]"));
+        }
+        output.push('\n');
+    }
+}
+
 impl WenlanMcpServer {
     /// Resolve the source_agent for a write operation.
     /// Priority: explicit param > MCP client name (from initialize) > configured agent_name.
@@ -1139,7 +1224,7 @@ impl WenlanMcpServer {
         let resp: SearchMemoryResponse =
             try_call!(self.client.post("/api/memory/search", &req), "search");
 
-        let json = serde_json::to_string_pretty(&resp.results)
+        let json = serde_json::to_string_pretty(&recall_hits(&resp.results))
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let mut output = format!(
@@ -1179,14 +1264,27 @@ impl WenlanMcpServer {
                 let brief = response.brief.as_ref().ok_or_else(|| {
                     McpError::internal_error("ready Brief response omitted brief", None)
                 })?;
-                let brief_json = serde_json::to_string_pretty(brief)
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                let mut output = format!("Space Brief:\n{brief_json}");
+                let mut output = format!(
+                    "Space Brief: {} (v{})\nLast session: {}\n",
+                    brief.space,
+                    brief.version,
+                    if brief.last_session_summary.trim().is_empty() {
+                        "(none recorded)"
+                    } else {
+                        brief.last_session_summary.trim()
+                    }
+                );
+                render_brief_items(&mut output, "Active", &brief.active);
+                render_brief_items(&mut output, "Backlog", &brief.backlog);
                 if let Some(related) = response.related_context.as_ref() {
-                    let results_json = serde_json::to_string_pretty(&related.results)
-                        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                    let results_json = if related.results.is_empty() {
+                        "none".to_string()
+                    } else {
+                        serde_json::to_string_pretty(&recall_hits(&related.results))
+                            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+                    };
                     output.push_str(&format!(
-                        "\n\nRelated Context (query: {}):\n{}",
+                        "\nRelated Context (query: {}):\n{}",
                         related.query, results_json
                     ));
                 }
@@ -1334,9 +1432,19 @@ impl WenlanMcpServer {
         } else if let Some(submission) = submission.as_ref() {
             self.remove_submitted_agent_work(submission.work_digest())?;
         }
-        let value = serde_json::to_value(report)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        Ok(CallToolResult::structured(value))
+        // Deep stays typed: the skill's prepare-and-submit protocol reads
+        // `complete`, `coverage` and the digests from `structured_content`.
+        // General returns only the text `wenlan lint` prints. The two cannot
+        // be combined: Claude Code and Codex hand the model the structured
+        // value and drop the text blocks when both are present.
+        if matches!(report.profile(), wenlan_types::lint::LintProfile::Deep) {
+            let value = serde_json::to_value(report)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            return Ok(CallToolResult::structured(value));
+        }
+        Ok(CallToolResult::success(vec![Content::text(
+            report.render_text(),
+        )]))
     }
 
     pub async fn get_lint_agent_work_page_impl(
@@ -2273,7 +2381,7 @@ impl WenlanMcpServer {
     }
 
     #[tool(
-        description = "Run Wenlan's read-only system lint on demand. General is the default bounded deterministic profile. Deep adds expensive deterministic checks plus full-store local semantic candidate generation; bounded candidate packets are adjudicated either by the daemon's configured provider or, with explicit agent_assist consent, by the calling agent through a typed prepare-and-submit protocol. Results are the canonical typed report; incomplete takes precedence over findings.",
+        description = "Run Wenlan's read-only system lint on demand. General is the default bounded deterministic profile. Deep adds expensive deterministic checks plus full-store local semantic candidate generation; bounded candidate packets are adjudicated either by the daemon's configured provider or, with explicit agent_assist consent, by the calling agent through a typed prepare-and-submit protocol. General returns the text `wenlan lint` prints; Deep returns the canonical typed report. Incomplete takes precedence over findings.",
         annotations(title = "Lint", read_only_hint = true, open_world_hint = false)
     )]
     async fn lint(
@@ -3235,6 +3343,47 @@ mod tests {
         let cache = server.agent_work_cache.lock().unwrap();
         assert!(cache.get(&LintDigest::from_u64(7)).is_none());
         assert!(cache.get(&LintDigest::from_u64(8)).is_some());
+    }
+
+    #[test]
+    fn a_recall_hit_keeps_only_the_fields_a_skill_reads() {
+        let hit: wenlan_types::SearchResult = serde_json::from_value(serde_json::json!({
+            "id": "chunk-1",
+            "content": "Prefers tabs.",
+            "source": "memory",
+            "source_id": "mem_r1",
+            "title": "",
+            "chunk_index": 0,
+            "last_modified": 1_700_000_000,
+            "score": 0.5,
+            "raw_score": 0.9,
+            "chunk_type": "text",
+            "source_text": "Prefers tabs. (raw)",
+            "content_hash": "abc",
+            "memory_type": "preference",
+            "space": "wenlan"
+        }))
+        .unwrap();
+        let value = serde_json::to_value(RecallHit::from(&hit)).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "content",
+                "last_modified",
+                "memory_type",
+                "score",
+                "source_id",
+                "space",
+                "version"
+            ]
+        );
     }
 
     #[test]

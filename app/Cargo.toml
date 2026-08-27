@@ -1,6 +1,6 @@
 [package]
 name = "wenlan-app"
-version = "0.17.0" # x-release-please-version
+version = "0.17.1" # x-release-please-version
 edition = "2021"
 license = "AGPL-3.0-only"
 default-run = "wenlan-app"
@@ -44,6 +44,7 @@ serde_json = "1"
 toml = "0.8"
 toml_edit = "0.22"
 plist = "1"
+semver = "1"
 base64 = "0.22"
 
 # File watching
@@ -80,8 +81,8 @@ sysinfo = { workspace = true }
 pdf-extract = "0.10"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
-# Keep this table LAST. A TOML table runs until the next header, so any
-# dependency written below it silently becomes macOS-only. That is how
+# Keep the target tables LAST. A TOML table runs until the next header, so any
+# dependency written below one silently becomes platform-specific. That is how
 # wenlan-types, sysinfo, pdf-extract, and zip stopped existing off macOS and
 # left the app crate uncompilable on Windows (15 unresolved-import errors,
 # unnoticed because app-check only runs on macOS).
@@ -89,6 +90,10 @@ zip = { version = "2.2", default-features = false, features = ["deflate"] }
 cocoa = "0.26"
 objc = "0.2"
 raw-window-handle = "0.6"
+
+# Job object that ends the sidecar daemon with the app (daemon_start::job).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 serial_test = "3"

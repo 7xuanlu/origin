@@ -88,7 +88,7 @@ command -v wenlan >/dev/null 2>&1 && echo present || echo absent
 If absent, install and configure local memory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/v0.17.0/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/v0.17.1/install.sh | bash
 export PATH="$HOME/.wenlan/bin:$PATH"
 wenlan setup --basic
 wenlan background on
@@ -106,16 +106,32 @@ managed background process.
 
 ### 4. Re-probe health and version
 
+If `wenlan background on` exited non-zero, print its output and stop: it
+already waited for the daemon and named what went wrong. Otherwise poll for up
+to 240 seconds, the budget the first-run checks use, because a first boot
+downloads the embedding model (about 210 MB) before it answers:
+
 ```bash
-for i in 1 2 3 4 5; do
-  curl -fsS -m 3 http://127.0.0.1:7878/api/health && break
+healthy=
+deadline=$((SECONDS + 240))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if curl -fsS -m 3 http://127.0.0.1:7878/api/health >/dev/null 2>&1; then
+    healthy=1
+    break
+  fi
   sleep 1
 done
+if [ -z "$healthy" ]; then
+  W="$(command -v wenlan || echo "$HOME/.wenlan/bin/wenlan")"
+  "$W" doctor
+  exit 1
+fi
 ```
 
-If the local runtime still is not reachable after about five seconds, surface
-the error and stop. Likely causes: launchd load failure, port 7878 already in
-use, or a local runtime crash.
+When the loop ends without a healthy answer, the doctor output names the daemon
+state and where its logs are (a file path on macOS, `journalctl` on Linux);
+stop there. Likely causes: the model download is still running or failed,
+launchd load failure, port 7878 already in use, or a local runtime crash.
 
 Once healthy, repeat the version comparison from step 2. If the versions still
 differ, stop instead of claiming setup succeeded:

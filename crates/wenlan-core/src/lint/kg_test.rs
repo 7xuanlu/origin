@@ -3,8 +3,8 @@ use crate::lint::context::{CancellationToken, LintClock};
 use crate::lint::runner::LintRunner;
 use crate::lint::test_support::DbSemanticFingerprint;
 use wenlan_types::lint::{
-    LintApplicability, LintMetricCode, LintMetricValue, LintOutcome, LintPrecondition, LintQuery,
-    LintSeverity,
+    LintActionCode, LintApplicability, LintMetricCode, LintMetricValue, LintOutcome,
+    LintPrecondition, LintQuery, LintSeverity, LintSummaryCode,
 };
 
 const ENTITY_INTEGRITY: &str = "entities.structural_integrity";
@@ -140,6 +140,59 @@ async fn configured_off_is_expected_empty_and_enabled_empty_substrate_is_actiona
     assert_eq!(metric(on_liveness, LintMetricCode::EligibleRecords), 1);
 }
 
+// Tracker row 17: on a fresh store whose owner has not chosen a model source,
+// nothing has been authorized to build the graph, so an empty graph is the
+// expected state -- not a warning a first-hour user has to decode.
+#[tokio::test]
+async fn no_model_source_is_a_complete_expected_empty_pass_that_says_to_choose_one() {
+    let (db, _tmp) = test_db().await;
+    insert_memory(&db, "eligible", None).await;
+
+    let report = run(&db, None, test_config_with_model_source(true, false)).await;
+    let liveness = check(&report, LIVENESS);
+
+    assert_eq!(liveness.outcome(), LintOutcome::Pass);
+    assert_eq!(liveness.severity(), LintSeverity::Info);
+    assert_eq!(liveness.applicability(), LintApplicability::ExpectedEmpty);
+    assert_eq!(liveness.precondition(), LintPrecondition::ExpectedEmpty);
+    assert_eq!(liveness.summary_code(), LintSummaryCode::ExpectedEmpty);
+    assert_eq!(liveness.recommendation_code(), None);
+    assert_eq!(
+        liveness.action_code(),
+        Some(LintActionCode::ChooseModelSource)
+    );
+    // The substrate is still reported honestly; only the verdict changed.
+    assert_eq!(metric(liveness, LintMetricCode::EligibleRecords), 1);
+    assert_eq!(metric(liveness, LintMetricCode::AffectedRecords), 0);
+    // The report stays complete -- routing this through NotRunPrerequisite would
+    // make it incomplete and force exit 2 instead of 0.
+    assert!(report.complete());
+
+    // ...and this check stops contributing to the gate the CLI's exit code
+    // reads. The same store with a model source chosen counts it again.
+    let configured = run(&db, None, test_config(true)).await;
+    assert_eq!(check(&configured, LIVENESS).outcome(), LintOutcome::Finding);
+    assert!(configured.totals().actionable_findings() > report.totals().actionable_findings());
+}
+
+// Reporting bug in the same tracker row: liveness is an aggregate-only check --
+// it never produces evidence positions -- so it must never claim it truncated a
+// list of evidence it could not have produced.
+#[tokio::test]
+async fn aggregate_only_liveness_never_claims_truncated_evidence() {
+    let (db, _tmp) = test_db().await;
+    insert_memory(&db, "eligible", None).await;
+
+    let report = run(&db, None, test_config(true)).await;
+    let liveness = check(&report, LIVENESS);
+
+    assert_eq!(liveness.outcome(), LintOutcome::Finding);
+    assert_eq!(metric(liveness, LintMetricCode::AffectedRecords), 1);
+    assert!(liveness.evidence().is_empty());
+    assert!(!liveness.coverage().truncated());
+    assert_eq!(liveness.coverage().evidence_returned(), 0);
+}
+
 #[tokio::test]
 async fn duplicate_names_hubs_and_semantic_suspicion_are_advisory_only() {
     let (db, _tmp) = test_db().await;
@@ -199,7 +252,14 @@ async fn run(
 }
 
 fn test_config(serving_enabled: bool) -> super::KgRunConfig {
-    super::KgRunConfig::for_test(serving_enabled, true, true, 20)
+    test_config_with_model_source(serving_enabled, true)
+}
+
+fn test_config_with_model_source(
+    serving_enabled: bool,
+    model_source_configured: bool,
+) -> super::KgRunConfig {
+    super::KgRunConfig::for_test(serving_enabled, true, true, model_source_configured, 20)
 }
 
 fn check<'a>(

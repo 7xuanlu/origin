@@ -152,6 +152,33 @@ pub enum LintSummaryCode {
     ExecutionFailed,
     ExpectedEmpty,
 }
+impl LintSummaryCode {
+    /// One plain sentence saying what this outcome means for the reader.
+    ///
+    /// Every surface that shows a check line pairs this with
+    /// [`LintRecommendationCode::action`] so the reader never has to decode a
+    /// snake_case code. The table lives here, beside the codes, because the
+    /// CLI and the MCP tool both render it; `wenlan-types` stays dependency
+    /// free, so these are plain `&'static str`.
+    pub const fn meaning(self) -> &'static str {
+        match self {
+            Self::CheckPassed => "This check looked at everything it covers and found nothing wrong.",
+            Self::FindingDetected => {
+                "This check found records that do not match what Wenlan expects."
+            }
+            Self::PrerequisiteUnavailable => {
+                "This check could not run because something it depends on was missing."
+            }
+            Self::SnapshotInconsistent => {
+                "Your data changed while this check was reading it, so its answer is not trustworthy."
+            }
+            Self::ExecutionFailed => "This check hit an error and did not finish.",
+            Self::ExpectedEmpty => {
+                "There was nothing here to check, which is the expected state right now."
+            }
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LintRecommendationCode {
@@ -159,6 +186,53 @@ pub enum LintRecommendationCode {
     RestorePrerequisite,
     RerunAfterSnapshotStabilizes,
     InspectRuntime,
+}
+impl LintRecommendationCode {
+    /// One plain sentence saying what to do next. See [`LintSummaryCode::meaning`].
+    pub const fn action(self) -> &'static str {
+        match self {
+            Self::ReviewFinding => "Look at the listed records and fix or dismiss them.",
+            Self::RestorePrerequisite => {
+                "Restore the missing piece this check needs, then run `wenlan lint` again."
+            }
+            Self::RerunAfterSnapshotStabilizes => {
+                "Run `wenlan lint` again once writes have settled."
+            }
+            Self::InspectRuntime => {
+                "Check the daemon logs for the error behind this, then run `wenlan lint` again."
+            }
+        }
+    }
+}
+/// Something the owner can do about a check that is *not* a defect.
+///
+/// This is deliberately a separate field from `recommendation_code` rather than
+/// a fifth variant of it. `recommendation_code` is part of the frozen
+/// `LINT_REPORT_SCHEMA_VERSION` 5 wire shape, and a patch-ahead daemon is
+/// explicitly compatible with an older CLI or MCP client
+/// (`wenlan-mcp/src/version_check.rs`). Serde rejects an unknown enum variant,
+/// so teaching the daemon to emit a fifth `recommendation_code` would make an
+/// old reader fail to parse the whole report; an added optional *field* is
+/// simply ignored by that same reader, because `LintCheckResultInput` does not
+/// deny unknown fields. Additive field now, enum variant at the next schema
+/// bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LintActionCode {
+    /// The check needs a model source and none is chosen yet. Pairs with a
+    /// passing, expected-empty verdict: nothing is broken, the owner simply has
+    /// not picked where inference runs.
+    ChooseModelSource,
+}
+impl LintActionCode {
+    /// One plain sentence saying what to do next. See [`LintSummaryCode::meaning`].
+    pub const fn action(self) -> &'static str {
+        match self {
+            Self::ChooseModelSource => {
+                "Run `wenlan setup` and choose a model source so Wenlan can build this in the background."
+            }
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

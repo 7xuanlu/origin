@@ -49,11 +49,11 @@ Wenlan runs as one local daemon. The desktop app carries that daemon inside it; 
 
 ### Desktop app
 
-**[Download Wenlan for macOS](https://github.com/7xuanlu/wenlan/releases/latest)** (Apple Silicon), open the `.dmg`, and drag the app to Applications.
+**[Download Wenlan for macOS](https://github.com/7xuanlu/wenlan/releases/latest)** (Apple Silicon), open the `.dmg`, and drag the app to Applications. To upgrade, drag the new app over the old one and open it: a running Wenlan quits and the new version starts (Wenlan 0.17.0 and older must be quit by hand first).
 
 Nothing else to install. The app bundles the daemon, CLI, and MCP connector, starts the daemon on launch, and offers to connect the AI clients it detects: the plugin for Claude Code and Codex, an MCP entry for the rest. From there you read Pages, inspect the Source behind any citation, and curate the knowledge system.
 
-This preview is not notarized yet, so macOS blocks the first launch. Allow it once under System Settings, Privacy & Security, "Open Anyway". One command skips that step: it verifies the download against GitHub's published SHA-256, clears quarantine for this app alone, and changes no macOS security settings.
+This preview is ad-hoc signed and not notarized, so macOS blocks the first launch: it may say Wenlan "cannot be opened" or that it could not check it for malicious software. Close that dialog, then allow the app once under System Settings, Privacy & Security, "Open Anyway". One command skips that step: it verifies the download against GitHub's published SHA-256, clears quarantine for this app alone, and changes no macOS security settings.
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
@@ -122,6 +122,8 @@ Wenlan turns documents, notes, and past AI conversations into a source-backed kn
 
 - **[LLM-wiki v1](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f):** Karpathy defined immutable Sources, an AI-maintained Markdown Wiki, and a co-evolving Schema of rules for structuring and maintaining it. Wenlan implements that foundation with [typed Memory fields](docs/technical-foundations.md#typed-memory-schema) and built-in rules for Page structure, provenance, citations, refresh, ownership, and review.
 - **[LLM-wiki v2](https://gist.github.com/rohitg00/2067ab416f7bbe447c1977edaaa681e2):** Rohitg00 added a memory lifecycle. Wenlan makes that direction concrete with traceable Sources, agent-captured Zettelkasten-style atomic Memories (one complete idea each), and maintained Pages built from both.
+
+For the complete workflow, see the [LLM-wiki implementation guide](https://wenlan.app/learn/distilled-wiki-pages-ai-memory).
 
 **Wenlan's distinctive move:** Sources and atomic Memories independently support maintained Pages. Memory history preserves how knowledge changed; Page history shows which current evidence supports the synthesis. Machine-maintained Pages can rebuild from current support, while changes to human writing wait as reviewable revisions.
 

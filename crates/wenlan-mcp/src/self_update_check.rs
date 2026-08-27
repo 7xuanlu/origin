@@ -5,13 +5,13 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 const CACHE_TTL: Duration = Duration::from_secs(24 * 3600);
-const RELEASES_URL: &str = "https://api.github.com/repos/7xuanlu/origin/releases/latest";
+const LATEST_RELEASE_URL: &str = "https://github.com/7xuanlu/wenlan/releases/latest";
 
 /// Process-wide in-memory fallback for environments where on-disk cache writes
 /// fail (locked-down sandboxes, missing dirs::cache_dir, etc). Without this,
 /// `store_cache` would silently no-op and every invocation in the same
 /// long-lived process (e.g. an MCP server hosting many sessions) would re-hit
-/// the GitHub API, risking the 60-req/hr unauthenticated rate limit.
+/// the GitHub release page on every start.
 static MEMORY_FALLBACK: Mutex<Option<CacheEntry>> = Mutex::new(None);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -71,9 +71,27 @@ fn store_cache(entry: &CacheEntry) {
     }
 }
 
+/// The version a GitHub "latest release" redirect points at, without its `v`.
+/// A repository with no releases redirects to the releases list instead, which
+/// yields `None`.
+fn version_from_location(location: &str) -> Option<String> {
+    let tag = location.rsplit_once("/releases/tag/")?.1;
+    let tag = tag.split(['?', '#']).next().unwrap_or(tag);
+    if tag.is_empty() || tag.contains('/') {
+        return None;
+    }
+    Some(tag.trim_start_matches('v').to_string())
+}
+
+/// The public releases page redirects to the latest tag. Unlike the API it has
+/// no limit of 60 anonymous calls per hour per IP address, a budget the
+/// install scripts share with this check on the user's network.
 async fn fetch_latest_tag() -> Option<String> {
-    let resp = reqwest::Client::new()
-        .get(RELEASES_URL)
+    let resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?
+        .get(LATEST_RELEASE_URL)
         .header(
             "User-Agent",
             concat!("wenlan-mcp/", env!("CARGO_PKG_VERSION")),
@@ -82,10 +100,12 @@ async fn fetch_latest_tag() -> Option<String> {
         .send()
         .await
         .ok()?;
-    let body: serde_json::Value = resp.json().await.ok()?;
-    body["tag_name"]
-        .as_str()
-        .map(|s| s.trim_start_matches('v').to_string())
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)?
+        .to_str()
+        .ok()?;
+    version_from_location(location)
 }
 
 /// Check for a newer published release. Returns Some(message) if behind,
@@ -111,7 +131,8 @@ pub async fn check() -> Option<String> {
     if latest > mcp {
         Some(format!(
             "A newer wenlan-mcp is available (v{latest}, you are on v{mcp}). \
-             Run `brew upgrade wenlan-mcp`."
+             Run `brew upgrade wenlan-mcp`, `npm update -g wenlan-mcp`, or \
+             `cargo install wenlan-mcp`, whichever installed it."
         ))
     } else {
         None
@@ -129,6 +150,24 @@ mod tests {
     /// override is per-test (set inside the lock) so each disk-test gets its
     /// own temp dir — no pollution of the user's real cache.
     static CACHE_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn the_latest_version_comes_from_the_release_page_redirect() {
+        assert_eq!(
+            version_from_location("https://github.com/7xuanlu/wenlan/releases/tag/v0.17.0")
+                .as_deref(),
+            Some("0.17.0")
+        );
+        assert_eq!(
+            version_from_location("/7xuanlu/wenlan/releases/tag/v0.18.0-rc.1?raw=1").as_deref(),
+            Some("0.18.0-rc.1")
+        );
+        assert_eq!(
+            version_from_location("https://github.com/7xuanlu/wenlan/releases"),
+            None
+        );
+        assert_eq!(version_from_location(""), None);
+    }
 
     fn set_temp_cache(label: &str) -> PathBuf {
         let dir =

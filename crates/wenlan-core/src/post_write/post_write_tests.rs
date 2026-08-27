@@ -5874,21 +5874,30 @@ async fn update_page_shrink_guard_skips_human_edits() {
 
 // merge_shrink_threshold parse tests
 
-#[test]
-fn merge_shrink_threshold_unset_returns_none() {
+// These three read and write the same process-global env var as the
+// `update_page_shrink_guard_*` integration tests above, but were the only
+// members of that group that never took `env_lock()`. Run in parallel they
+// raced each other (one test's `remove_var` landing between another's
+// `set_var` and its assertion), which surfaces as whichever of the three
+// happened to read at the wrong moment. They take the same lock now.
+#[tokio::test]
+async fn merge_shrink_threshold_unset_returns_none() {
+    let _lock = env_lock().await;
     std::env::remove_var("WENLAN_MERGE_SHRINK_GUARD");
     assert!(merge_shrink_threshold().is_none());
 }
 
-#[test]
-fn merge_shrink_threshold_valid_float() {
+#[tokio::test]
+async fn merge_shrink_threshold_valid_float() {
+    let _lock = env_lock().await;
     std::env::set_var("WENLAN_MERGE_SHRINK_GUARD", "0.7");
     assert_eq!(merge_shrink_threshold(), Some(0.7));
     std::env::remove_var("WENLAN_MERGE_SHRINK_GUARD");
 }
 
-#[test]
-fn merge_shrink_threshold_garbage_returns_none() {
+#[tokio::test]
+async fn merge_shrink_threshold_garbage_returns_none() {
+    let _lock = env_lock().await;
     std::env::set_var("WENLAN_MERGE_SHRINK_GUARD", "garbage");
     assert!(merge_shrink_threshold().is_none());
     std::env::remove_var("WENLAN_MERGE_SHRINK_GUARD");

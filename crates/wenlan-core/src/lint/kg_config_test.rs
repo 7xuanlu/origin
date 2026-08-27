@@ -54,6 +54,7 @@ fn production_capture_reads_process_provider_readiness_once() {
         config.serving_enabled,
         config.sweep_enabled,
         !config.provider_ready,
+        config.model_source_configured,
         config.hub_cap,
     );
     let captured = wenlan_types::lint::LintConfigFingerprint::from_effective_config(
@@ -71,14 +72,29 @@ async fn production_run(
     sweep: &str,
     hub_cap: &str,
 ) -> wenlan_types::lint::LintReport {
+    // `capture()` reads the everyday-source pin from config, and an empty
+    // substrate is only a finding once a model source exists to have filled it.
+    // Point the config at a scratch data dir that has one, so this test keeps
+    // measuring what it is about: fingerprint separation.
+    let data_dir = tempfile::tempdir().expect("scratch data dir");
+    std::fs::write(
+        data_dir.path().join("config.json"),
+        br#"{"everyday_source":"on_device"}"#,
+    )
+    .expect("scratch config");
     let config = temp_env::with_vars(
         [
             ("WENLAN_GRAPH_MEMORY_STREAM", Some(stream)),
             ("WENLAN_ENABLE_ENTITY_SWEEP", Some(sweep)),
             ("WENLAN_GRAPH_HUB_CAP", Some(hub_cap)),
+            (
+                "WENLAN_DATA_DIR",
+                Some(data_dir.path().to_str().expect("utf-8 scratch path")),
+            ),
         ],
         super::KgRunConfig::capture,
     );
+    assert!(config.model_source_configured);
     LintRunner::new(LintClock::fixed(), CancellationToken::new())
         .with_test_kg_config(config)
         .run(

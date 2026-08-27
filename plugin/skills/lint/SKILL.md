@@ -31,8 +31,10 @@ statically lists repair tools, plain and deep modes may call only
 
 ## Plain and deep diagnostics
 
-General uses exactly one lint MCP call with the resolved scope. `/lint deep`
-uses the Agent-assisted Deep protocol below. Render only the final canonical
+General uses exactly one lint MCP call with the resolved scope; it returns the
+same text `wenlan lint` prints, whose `Lint:` line carries the check, finding,
+advisory and incomplete counts. `/lint deep` uses the Agent-assisted Deep
+protocol below and returns the typed report. Render only the final canonical
 report in canonical order. State is `incomplete` when `complete` is false,
 otherwise `findings` when actionable findings are nonzero, otherwise `clean`.
 Advisories remain visible but do not change the state to findings.
@@ -66,6 +68,52 @@ accepted verdict; trust the typed report's `complete` flag and preserve its
 denominator, evaluated, and truncation metadata. Unjudged packet candidates,
 provider failure, or unresolved disagreement are never clean. Do not expose
 packet excerpts.
+
+## Say what each code means
+
+The report identifies every check with stable snake_case codes. Never show a
+code on its own: pair it with the plain sentence below so the reader does not
+have to decode it. These sentences are the same ones `wenlan lint` prints, and
+they come from `LintSummaryCode::meaning`, `LintRecommendationCode::action`,
+and `LintActionCode::action` in `wenlan-types`. If the daemon sends a code that
+is not listed here, show the code and say it is unrecognized; never invent a
+sentence for it.
+
+`summary_code` -- what the check found:
+
+| code | say |
+|---|---|
+| `check_passed` | This check looked at everything it covers and found nothing wrong. |
+| `finding_detected` | This check found records that do not match what Wenlan expects. |
+| `prerequisite_unavailable` | This check could not run because something it depends on was missing. |
+| `snapshot_inconsistent` | Your data changed while this check was reading it, so its answer is not trustworthy. |
+| `execution_failed` | This check hit an error and did not finish. |
+| `expected_empty` | There was nothing here to check, which is the expected state right now. |
+
+`recommendation_code` -- what to do about a problem. Present only when
+something is actually wrong:
+
+| code | say |
+|---|---|
+| `review_finding` | Look at the listed records and fix or dismiss them. |
+| `restore_prerequisite` | Restore the missing piece this check needs, then run `wenlan lint` again. |
+| `rerun_after_snapshot_stabilizes` | Run `wenlan lint` again once writes have settled. |
+| `inspect_runtime` | Check the daemon logs for the error behind this, then run `wenlan lint` again. |
+
+`action_code` -- an optional field carrying something the owner can do about a
+check that is **not** a defect. It may be absent entirely, and older daemons
+never send it:
+
+| code | say |
+|---|---|
+| `choose_model_source` | Run `wenlan setup` and choose a model source so Wenlan can build this in the background. |
+
+A passing check that carries an `action_code` is waiting on the owner, not
+broken. Report it separately from findings: it does not count toward actionable
+findings and does not make the state `findings`. A fresh store where nobody has
+chosen a model source yet is the common case -- `kg.substrate_liveness` and
+`serving.channel.graph` both come back as passing, expected-empty checks asking
+for a model source, and that report is `clean`.
 
 ## `/lint repair`: resolve the complete plan
 

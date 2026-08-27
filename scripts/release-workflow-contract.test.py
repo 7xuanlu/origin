@@ -58,6 +58,16 @@ def named_step_body(job: str, step_name: str) -> str:
     return match.group("body").strip() if match else ""
 
 
+def heredoc_body(job: str, path: str) -> str:
+    """The body of `cat > <path> << 'TAG'` inside a job, without the delimiters."""
+    match = re.search(
+        rf"^\s*cat > {re.escape(path)} << '(?P<tag>[A-Z_]+)'\n(?P<body>.*?)^\s*(?P=tag)\s*$",
+        job,
+        re.MULTILINE | re.DOTALL,
+    )
+    return match.group("body") if match else ""
+
+
 def contract_violations(
     ci: str,
     release: str,
@@ -541,10 +551,39 @@ def contract_violations(
         "Existing release asset $name differs; refusing to clobber.",
         "name: release-promotion-plan-${{ github.run_id }}",
         "name: homebrew-artifacts",
+        "promoted-assets/wenlan-darwin-arm64.tar.gz",
         "name: docker-runtime-inputs",
     ]:
         if marker not in promote:
             violations.append(f"validated asset promotion omits {marker!r}")
+    # `wenlan background on` needs wenlan-server next to the brewed CLI, so the
+    # `wenlan` formula must install from the full darwin archive and ship both.
+    # The assertions read the formula heredoc's active lines, not the job
+    # text, so a marker moved into a comment cannot satisfy them.
+    homebrew = job_body(release, "update-homebrew")
+    formula = heredoc_body(homebrew, "tap/Formula/wenlan.rb")
+    if not formula:
+        violations.append("Homebrew wenlan formula heredoc is missing")
+    active_formula = [
+        line.strip()
+        for line in formula.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    for marker in [
+        'url "https://github.com/7xuanlu/wenlan/releases/download/vVERSION_PLACEHOLDER/wenlan-darwin-arm64.tar.gz"',
+        'bin.install "wenlan", "wenlan-server"',
+        'assert_match "wenlan-server", shell_output("#{bin}/wenlan-server --help")',
+    ]:
+        if marker not in active_formula:
+            violations.append(f"Homebrew wenlan formula omits {marker!r}")
+    if "wenlan-cli-darwin-arm64.tar.gz" in formula:
+        violations.append("Homebrew wenlan formula still installs the CLI-only archive")
+    # The checksum the formula is stamped with must come from the same archive.
+    if "SHA_DARWIN_ARM64=$(shasum -a 256 wenlan-darwin-arm64.tar.gz" not in homebrew:
+        violations.append("Homebrew wenlan formula checksum is not taken from the full darwin archive")
+    after_formula = homebrew.split("cat > tap/Formula/wenlan.rb", 1)[-1]
+    if 'SHA="$SHA_DARWIN_ARM64" perl' not in after_formula:
+        violations.append("Homebrew wenlan formula sha256 is not stamped from SHA_DARWIN_ARM64")
 
     app_bundle = job_body(release, "app-bundle")
     app_bundle_windows = job_body(release, "app-bundle-windows")
@@ -1669,6 +1708,21 @@ def main() -> None:
             "observer reruns are accepted",
             "conflicting release semantics",
             "promotion",
+        ),
+        # The Homebrew formula must ship the daemon: an install line moved
+        # into a comment, or only the URL pointing back at the CLI-only
+        # archive, must each be caught on its own.
+        (
+            '              bin.install "wenlan", "wenlan-server"',
+            '              # bin.install "wenlan", "wenlan-server"\n              bin.install "wenlan"',
+            "Homebrew wenlan formula omits 'bin.install",
+            "release",
+        ),
+        (
+            'vVERSION_PLACEHOLDER/wenlan-darwin-arm64.tar.gz"',
+            'vVERSION_PLACEHOLDER/wenlan-cli-darwin-arm64.tar.gz"',
+            "still installs the CLI-only archive",
+            "release",
         ),
     ]
     for old, new, expected, owner in release_mutations:

@@ -3,11 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use wenlan_types::lint::{
-    LintAgentSubmission, LintCheckGroup, LintEvidenceRef, LintGateEffect, LintMetricCode,
-    LintMetricValue, LintOutcome, LintProfile, LintReasonCode, LintRecommendationCode, LintReport,
-    LintSummaryCode,
-};
+use wenlan_types::lint::{LintAgentSubmission, LintProfile, LintReport};
 
 use crate::client::WenlanClient;
 use crate::output::{print_json, ResolvedFormat};
@@ -76,7 +72,7 @@ pub async fn run(
         match format {
             ResolvedFormat::Json => print_json(&report),
             ResolvedFormat::Table => {
-                print!("{}", render_human(&report));
+                print!("{}", report.render_text());
                 Ok(())
             }
         }
@@ -109,209 +105,131 @@ pub const fn exit_code(report: &LintReport) -> u8 {
     }
 }
 
-fn render_human(report: &LintReport) -> String {
-    let totals = report.totals();
-    let mut groups = [(0_u32, 0_u32, 0_u32); 7];
-    for check in report.checks() {
-        let Some(group) = LintCheckGroup::for_check_id(check.check_id()) else {
-            continue;
-        };
-        let counts = &mut groups[group_index(group)];
-        counts.0 += 1;
-        match check.outcome() {
-            LintOutcome::Pass => {}
-            LintOutcome::Finding => counts.1 += 1,
-            LintOutcome::NotRunPrerequisite
-            | LintOutcome::InconsistentSnapshot
-            | LintOutcome::FailedToRun => counts.2 += 1,
-        }
-    }
-    let mut output = format!(
-        "Lint: {} checks, {} passed, {} actionable findings, {} advisor{}, {} incomplete\nGroups:\n",
-        totals.checks(),
-        totals.passed(),
-        totals.actionable_findings(),
-        totals.advisory_findings(),
-        if totals.advisory_findings() == 1 { "y" } else { "ies" },
-        totals.incomplete()
-    );
-    for group in LintCheckGroup::ALL {
-        let (checks, findings, incomplete) = groups[group_index(group)];
-        if checks == 0 {
-            continue;
-        }
-        output.push_str(&format!(
-            "  {}: {checks} check{}, {findings} findings, {incomplete} incomplete\n",
-            group.as_str(),
-            if checks == 1 { "" } else { "s" }
-        ));
-    }
-    if let Some(work) = report.agent_work() {
-        output.push_str(&format!(
-            "Agent work: {} bounded records; digest={}\n",
-            work.records().len(),
-            work.work_digest().as_str()
-        ));
-    }
-    append_findings(&mut output, "Findings", report, LintGateEffect::Actionable);
-    append_findings(&mut output, "Advisories", report, LintGateEffect::Advisory);
-    output.push_str("Incomplete");
-    let incomplete: Vec<_> = report
-        .checks()
-        .iter()
-        .filter(|check| !matches!(check.outcome(), LintOutcome::Pass | LintOutcome::Finding))
-        .collect();
-    append_selected(&mut output, &incomplete);
-    output
-}
+#[cfg(test)]
+mod tests {
+    use super::exit_code;
+    use wenlan_types::lint::{
+        LintActionCode, LintApplicability, LintCapabilityContext, LintCheckResult,
+        LintCheckResultInput, LintConfigFingerprint, LintCoverage, LintDbSnapshotMode,
+        LintDbSnapshotReceipt, LintDigest, LintOutcome, LintPageSnapshotMode,
+        LintPageSnapshotReceipt, LintPrecondition, LintPrecondition as Pre, LintProducerReceipt,
+        LintProfile, LintRecommendationCode, LintReport, LintScope, LintSeverity,
+        LintSnapshotReceipts, LintSummaryCode, LintValidationMethod, LINT_MAX_EVIDENCE_PER_CHECK,
+    };
 
-fn append_findings(
-    output: &mut String,
-    label: &str,
-    report: &LintReport,
-    gate_effect: LintGateEffect,
-) {
-    output.push_str(label);
-    let selected: Vec<_> = report
-        .checks()
-        .iter()
-        .filter(|check| {
-            check.outcome() == LintOutcome::Finding && check.gate_effect() == gate_effect
+    /// The two checks a fresh store with no model source used to fail on, as the
+    /// daemon now produces them: complete, passing, expected-empty, each asking
+    /// the owner to pick a model source.
+    fn fresh_store_report() -> LintReport {
+        report(vec![
+            model_source_check("kg.substrate_liveness"),
+            model_source_check("serving.channel.graph"),
+        ])
+    }
+
+    fn model_source_check(check_id: &str) -> LintCheckResult {
+        check(
+            check_id,
+            LintOutcome::Pass,
+            LintSeverity::Info,
+            LintApplicability::ExpectedEmpty,
+            Pre::ExpectedEmpty,
+            LintSummaryCode::ExpectedEmpty,
+            None,
+        )
+        .with_action_code(Some(LintActionCode::ChooseModelSource))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check(
+        check_id: &str,
+        outcome: LintOutcome,
+        severity: LintSeverity,
+        applicability: LintApplicability,
+        precondition: LintPrecondition,
+        summary_code: LintSummaryCode,
+        recommendation_code: Option<LintRecommendationCode>,
+    ) -> LintCheckResult {
+        LintCheckResult::try_new(LintCheckResultInput {
+            check_id: check_id.to_string(),
+            outcome,
+            severity,
+            applicability,
+            precondition,
+            coverage: LintCoverage::new(
+                LintValidationMethod::ExactAggregate,
+                2,
+                2,
+                LINT_MAX_EVIDENCE_PER_CHECK,
+                false,
+                0,
+            )
+            .expect("valid synthetic coverage"),
+            metrics: vec![],
+            summary_code,
+            recommendation_code,
+            evidence: vec![],
+            duration_ms: 1,
         })
-        .collect();
-    append_selected(output, &selected);
-}
-
-fn append_selected(output: &mut String, checks: &[&wenlan_types::lint::LintCheckResult]) {
-    if checks.is_empty() {
-        output.push_str(": none\n");
-        return;
+        .expect("valid synthetic check")
     }
-    output.push_str(&format!(" ({}):\n", checks.len()));
-    for check in checks {
-        let summary = summary_name(check.summary_code());
-        match check.recommendation_code() {
-            Some(recommendation) => output.push_str(&format!(
-                "  {}: {summary}; recommendation: {}\n",
-                check.check_id(),
-                recommendation_name(recommendation)
-            )),
-            None => output.push_str(&format!("  {}: {summary}\n", check.check_id())),
-        }
-        let affected = check.metrics().iter().find_map(|metric| {
-            if metric.code() == LintMetricCode::AffectedRecords {
-                match metric.value() {
-                    LintMetricValue::Count { value } => Some(*value),
-                    LintMetricValue::Boolean { .. } | LintMetricValue::CatalogCode { .. } => None,
-                }
-            } else {
-                None
-            }
-        });
-        let mut evidence_items = check
-            .evidence()
-            .iter()
-            .take(8)
-            .map(evidence_name)
-            .collect::<Vec<_>>();
-        if check.evidence().len() > evidence_items.len() {
-            evidence_items.push(format!(
-                "+{}_more",
-                check.evidence().len() - evidence_items.len()
-            ));
-        }
-        let evidence = evidence_items.join(",");
-        output.push_str(&format!(
-            "    affected={}; evaluated={}/{}; evidence={}; truncated={}\n",
-            affected.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-            check.coverage().evaluated(),
-            check.coverage().denominator(),
-            if evidence.is_empty() {
-                "none"
-            } else {
-                &evidence
-            },
-            check.coverage().truncated(),
-        ));
-    }
-}
 
-const fn group_index(group: LintCheckGroup) -> usize {
-    match group {
-        LintCheckGroup::Identity => 0,
-        LintCheckGroup::KnowledgeGraph => 1,
-        LintCheckGroup::Memories => 2,
-        LintCheckGroup::Operations => 3,
-        LintCheckGroup::Pages => 4,
-        LintCheckGroup::Runtime => 5,
-        LintCheckGroup::Serving => 6,
+    fn report(checks: Vec<LintCheckResult>) -> LintReport {
+        LintReport::try_new_for_profile(
+            LintProfile::General,
+            LintScope::global(),
+            LintCapabilityContext::daemon_operator_endpoint(),
+            LintSnapshotReceipts::new(
+                LintDbSnapshotReceipt::new(
+                    LintDbSnapshotMode::TransactionalReadOnly,
+                    LintDigest::from_u64(1),
+                    Some(LintDigest::from_u64(1)),
+                ),
+                LintPageSnapshotReceipt::new(
+                    LintPageSnapshotMode::BestEffort,
+                    LintDigest::from_u64(2),
+                    Some(LintDigest::from_u64(2)),
+                ),
+            ),
+            LintConfigFingerprint::from_effective_config(&[]),
+            LintProducerReceipt::new(None),
+            checks,
+        )
+        .expect("valid synthetic report")
     }
-}
 
-fn evidence_name(evidence: &LintEvidenceRef) -> String {
-    match evidence {
-        LintEvidenceRef::OpaqueId { opaque_id } => format!("opaque:{}", opaque_id.ordinal()),
-        LintEvidenceRef::OpaqueDigest { opaque_digest } => {
-            format!("opaque-digest:{}", opaque_digest.as_str())
-        }
-        LintEvidenceRef::ReasonCode { reason_code } => {
-            format!("reason:{}", reason_name(*reason_code))
-        }
-        LintEvidenceRef::SafeRootRelativePath {
-            safe_root_relative_path,
-        } => format!("path:{safe_root_relative_path:?}"),
-        LintEvidenceRef::SemanticFinding { finding } => format!(
-            "semantic:{}:{:?}:{:?}:{}:{:?}",
-            finding.candidate_id().ordinal(),
-            finding.proposed_action(),
-            finding.reason_code(),
-            finding.confidence_basis_points(),
-            finding.provider_route(),
-        ),
+    // Tracker row 17: a first-hour install must not read as broken to a script.
+    #[test]
+    fn a_fresh_store_without_a_model_source_exits_zero() {
+        let report = fresh_store_report();
+
+        assert!(report.complete());
+        assert_eq!(report.totals().actionable_findings(), 0);
+        assert_eq!(exit_code(&report), 0);
     }
-}
 
-const fn reason_name(reason: LintReasonCode) -> &'static str {
-    match reason {
-        LintReasonCode::MissingArtifact => "missing_artifact",
-        LintReasonCode::InvalidCatalogState => "invalid_catalog_state",
-        LintReasonCode::ExpectedEmptySubstrate => "expected_empty_substrate",
-        LintReasonCode::InvalidSourceConfiguration => "invalid_source_configuration",
-        LintReasonCode::TerminalOperationFailure => "terminal_operation_failure",
-        LintReasonCode::ExpiredRetry => "expired_retry",
-        LintReasonCode::InvalidOperationState => "invalid_operation_state",
-        LintReasonCode::DurableNoProgress => "durable_no_progress",
-        LintReasonCode::SemanticProviderUnavailable => "semantic_provider_unavailable",
-        LintReasonCode::InsufficientSemanticEvidence => "insufficient_semantic_evidence",
-        LintReasonCode::SemanticExecutionFailure => "semantic_execution_failure",
-        LintReasonCode::SemanticAgentAdjudicationRequired => "semantic_agent_adjudication_required",
-        LintReasonCode::SemanticAgentWorkStale => "semantic_agent_work_stale",
-        LintReasonCode::SemanticAgentSubmissionInvalid => "semantic_agent_submission_invalid",
-        LintReasonCode::SemanticCandidateGenerationFailure => {
-            "semantic_candidate_generation_failure"
-        }
-        LintReasonCode::SemanticPopulationIncomplete => "semantic_population_incomplete",
-        LintReasonCode::SemanticDisagreementUnresolved => "semantic_disagreement_unresolved",
-        LintReasonCode::SemanticSecondJudgeRequired => "semantic_second_judge_required",
-    }
-}
+    #[test]
+    fn exit_code_is_one_only_for_actionable_findings_and_two_for_incomplete() {
+        let finding = report(vec![check(
+            "pages.projection.identity",
+            LintOutcome::Finding,
+            LintSeverity::Error,
+            LintApplicability::Applicable,
+            Pre::Ready,
+            LintSummaryCode::FindingDetected,
+            Some(LintRecommendationCode::ReviewFinding),
+        )]);
+        assert_eq!(exit_code(&finding), 1);
 
-const fn recommendation_name(recommendation: LintRecommendationCode) -> &'static str {
-    match recommendation {
-        LintRecommendationCode::ReviewFinding => "review_finding",
-        LintRecommendationCode::RestorePrerequisite => "restore_prerequisite",
-        LintRecommendationCode::RerunAfterSnapshotStabilizes => "rerun_after_snapshot_stabilizes",
-        LintRecommendationCode::InspectRuntime => "inspect_runtime",
-    }
-}
-
-const fn summary_name(summary: LintSummaryCode) -> &'static str {
-    match summary {
-        LintSummaryCode::CheckPassed => "check_passed",
-        LintSummaryCode::FindingDetected => "finding_detected",
-        LintSummaryCode::PrerequisiteUnavailable => "prerequisite_unavailable",
-        LintSummaryCode::SnapshotInconsistent => "snapshot_inconsistent",
-        LintSummaryCode::ExecutionFailed => "execution_failed",
-        LintSummaryCode::ExpectedEmpty => "expected_empty",
+        let incomplete = report(vec![check(
+            "runtime.provider_inventory",
+            LintOutcome::NotRunPrerequisite,
+            LintSeverity::Error,
+            LintApplicability::NotApplicable,
+            Pre::MissingPrerequisite,
+            LintSummaryCode::PrerequisiteUnavailable,
+            Some(LintRecommendationCode::RestorePrerequisite),
+        )]);
+        assert_eq!(exit_code(&incomplete), 2);
     }
 }

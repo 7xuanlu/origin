@@ -501,6 +501,10 @@ pub async fn test_db() -> (MemoryDB, tempfile::TempDir) {
         community_grouping_runtime: std::sync::Mutex::new(
             crate::community_grouping::CommunityGroupingRuntime::default(),
         ),
+        // The fixture created the file just above, so the first chain is a
+        // fresh-store chain exactly as `MemoryDB::new` would decide it.
+        opened_fresh_file: std::sync::atomic::AtomicBool::new(true),
+        skip_migration_backups: std::sync::atomic::AtomicBool::new(false),
     };
     memory_db
         .run_migrations(&crate::events::NoopEmitter)
@@ -566,6 +570,10 @@ pub async fn test_db_at(ceiling: i64) -> (MemoryDB, tempfile::TempDir) {
         community_grouping_runtime: std::sync::Mutex::new(
             crate::community_grouping::CommunityGroupingRuntime::default(),
         ),
+        // The fixture created the file just above, so the first chain is a
+        // fresh-store chain exactly as `MemoryDB::new` would decide it.
+        opened_fresh_file: std::sync::atomic::AtomicBool::new(true),
+        skip_migration_backups: std::sync::atomic::AtomicBool::new(false),
     };
     memory_db
         .run_migrations_up_to(&crate::events::NoopEmitter, ceiling)
@@ -15002,33 +15010,52 @@ async fn find_distillation_clusters_treats_empty_entity_id_as_unlinked() {
     // cap. entity_id is irrelevant to partitioning here — these rows have
     // space = None, so the unlinked cap must hold regardless of entity_id.
     //
-    // Setup: 8 highly-similar memories with no space and empty-string
-    // entity_id, with max_unlinked_cluster_size = 5. They land in the
-    // unlinked catch-all → cap kicks in → returned cluster sizes <= 5.
+    // Setup: 8 memories with no space and empty-string entity_id, split across
+    // TWO unrelated subjects (4 each), with max_unlinked_cluster_size = 5.
+    // They land in the unlinked catch-all, the group of 8 is over the cap, and
+    // the ladder re-splits it along the subject boundary → sizes <= 5.
+    //
+    // The subjects have to be genuinely unrelated: since issue #596 the sibling
+    // merge rejoins two clusters of one bucket whose centroids meet the 0.92
+    // ceiling, so a fixture of eight paraphrases of one sentence would be
+    // re-merged (correctly) into a single 8-member topic and would no longer
+    // say anything about the cap. Two subjects keep the centroids far apart, so
+    // what this test observes is the cap alone.
     let (db, _dir) = test_db().await;
 
     let now = chrono::Utc::now().timestamp_millis();
-    for i in 0..8 {
-        let doc = RawDocument {
-            source: "memory".to_string(),
-            source_id: format!("mem_empty_eid_{}", i),
-            content: format!("origin notes about distillation iteration {}", i),
-            title: format!("Note {}", i),
-            last_modified: now + i as i64,
-            memory_type: None,
-            space: None,
-            entity_id: Some(String::new()), // <-- the marker
-            ..Default::default()
-        };
-        db.upsert_documents(vec![doc]).await.unwrap();
-        db.record_enrichment_step(
-            &format!("mem_empty_eid_{}", i),
-            "entity_backfill",
-            "skipped",
-            None,
-        )
-        .await
-        .unwrap();
+    for (subject, sentence) in [
+        (
+            "sourdough",
+            "The sourdough starter doubled in volume after six hours on the warm counter",
+        ),
+        (
+            "derailleur",
+            "The rear derailleur cable had stretched and needed a quarter turn of the barrel adjuster",
+        ),
+    ] {
+        for i in 0..4 {
+            let doc = RawDocument {
+                source: "memory".to_string(),
+                source_id: format!("mem_empty_eid_{subject}_{i}"),
+                content: format!("{sentence}, batch {i}"),
+                title: format!("{subject} note {i}"),
+                last_modified: now + i as i64,
+                memory_type: None,
+                space: None,
+                entity_id: Some(String::new()), // <-- the marker
+                ..Default::default()
+            };
+            db.upsert_documents(vec![doc]).await.unwrap();
+            db.record_enrichment_step(
+                &format!("mem_empty_eid_{subject}_{i}"),
+                "entity_backfill",
+                "skipped",
+                None,
+            )
+            .await
+            .unwrap();
+        }
     }
 
     let clusters = db
@@ -15036,6 +15063,16 @@ async fn find_distillation_clusters_treats_empty_entity_id_as_unlinked() {
         .await
         .unwrap();
 
+    // Non-vacuous: the cap assertion below says nothing at all if the pass
+    // returned no clusters, so pin that the split actually happened first.
+    assert!(
+        clusters.len() >= 2,
+        "the unlinked group of 8 must be re-split, not dropped: {:?}",
+        clusters
+            .iter()
+            .map(|cluster| cluster.source_ids.len())
+            .collect::<Vec<_>>()
+    );
     for cluster in &clusters {
         assert!(
             cluster.source_ids.len() <= 5,
@@ -15050,37 +15087,70 @@ async fn find_distillation_clusters_treats_empty_entity_id_as_unlinked() {
 async fn find_distillation_clusters_caps_oversized_unlinked() {
     let (db, _dir) = test_db().await;
 
-    // Insert 60 unlinked memories (no entity_id, no domain) with similar
-    // content — should form ONE big unlinked cluster.
+    // Insert 60 unlinked memories (no entity_id, no domain) spread over THREE
+    // unrelated subjects, 20 each. At the formation threshold they collapse
+    // into one oversized unlinked blob; the ladder must re-split it along the
+    // subject boundaries so nothing over the cap is returned.
+    //
+    // The subjects are unrelated on purpose. Since issue #596 the sibling merge
+    // rejoins two clusters of one bucket whose centroids meet the 0.92 ceiling,
+    // so 60 paraphrases of one sentence would be re-merged into a single
+    // 60-member topic — correct behavior, but it would leave this test with
+    // nothing to say about the cap. Distinct subjects keep the emitted
+    // centroids far below the ceiling, so the cap is what the test observes.
     let now = chrono::Utc::now().timestamp_millis();
-    for i in 0..60 {
-        let doc = RawDocument {
-            source: "memory".to_string(),
-            source_id: format!("mem_unlinked_{}", i),
-            // Highly similar content — all about same topic
-            content: format!("notes on origin distillation pipeline iteration {}", i),
-            title: format!("Note {}", i),
-            url: None,
-            last_modified: now + i as i64,
-            memory_type: None,
-            space: None,
-            entity_id: None,
-            ..Default::default()
-        };
-        db.upsert_documents(vec![doc]).await.unwrap();
-        // Mark enriched (must satisfy Task 4 gate)
-        db.record_enrichment_step(&format!("mem_unlinked_{}", i), "dedup", "ok", None)
-            .await
-            .unwrap();
+    for (subject, sentence) in [
+        (
+            "sourdough",
+            "The sourdough starter doubled in volume after six hours on the warm counter",
+        ),
+        (
+            "derailleur",
+            "The rear derailleur cable had stretched and needed a quarter turn of the barrel adjuster",
+        ),
+        (
+            "hohmann",
+            "A Hohmann transfer orbit spends two engine burns raising the apoapsis toward the target",
+        ),
+    ] {
+        for i in 0..20 {
+            let doc = RawDocument {
+                source: "memory".to_string(),
+                source_id: format!("mem_unlinked_{subject}_{i}"),
+                content: format!("{sentence}, entry {i}"),
+                title: format!("{subject} note {i}"),
+                url: None,
+                last_modified: now + i as i64,
+                memory_type: None,
+                space: None,
+                entity_id: None,
+                ..Default::default()
+            };
+            db.upsert_documents(vec![doc]).await.unwrap();
+            // Mark enriched (must satisfy Task 4 gate)
+            db.record_enrichment_step(&format!("mem_unlinked_{subject}_{i}"), "dedup", "ok", None)
+                .await
+                .unwrap();
+        }
     }
 
-    // Run with cap = 30. The single 60-memory unlinked cluster should be
-    // skipped entirely. No clusters > 30 should be returned.
+    // Run with cap = 30. The 60-memory unlinked blob must come back re-split,
+    // never as one oversized cluster.
     let clusters = db
         .find_distillation_clusters(0.3, 2, 20, 3500, 30, 50)
         .await
         .unwrap();
 
+    // Non-vacuous: an empty result would satisfy the cap loop below without
+    // proving anything, so pin that the re-split really produced clusters.
+    assert!(
+        clusters.len() >= 2,
+        "the oversized unlinked blob must be re-split, not dropped: {:?}",
+        clusters
+            .iter()
+            .map(|cluster| cluster.source_ids.len())
+            .collect::<Vec<_>>()
+    );
     for cluster in &clusters {
         assert!(
             cluster.source_ids.len() <= 30,
@@ -15101,32 +15171,67 @@ async fn find_distillation_clusters_caps_oversized_entity_group() {
     let (db, _dir) = test_db().await;
 
     let now = chrono::Utc::now().timestamp_millis();
-    // 20 memories on the same entity, all with similar prose so they
-    // collapse into one greedy cluster at threshold 0.3 — well above the
-    // grouped cap of 6 used below.
-    for i in 0..20 {
-        let doc = RawDocument {
-            source: "memory".to_string(),
-            source_id: format!("mem_origin_{}", i),
-            content: format!("origin distillation pipeline note number {}", i),
-            title: format!("Note {}", i),
-            url: None,
-            last_modified: now + i as i64,
-            memory_type: None,
-            space: Some("origin".to_string()),
-            entity_id: Some("ent_origin".to_string()),
-            ..Default::default()
-        };
-        db.upsert_documents(vec![doc]).await.unwrap();
+    // 20 memories on the same entity in one space, spread over FOUR unrelated
+    // subjects (5 each). At threshold 0.3 they collapse into one greedy cluster
+    // — well above the grouped cap of 6 used below — so the ladder has to
+    // re-split along the subject boundaries.
+    //
+    // Unrelated subjects are load-bearing: since issue #596 the sibling merge
+    // rejoins two clusters of one bucket whose centroids meet the 0.92 ceiling,
+    // so 20 paraphrases of one sentence would (correctly) come back as one
+    // 20-member topic and this test would no longer observe the cap at all.
+    for (subject, sentence) in [
+        (
+            "sourdough",
+            "The sourdough starter doubled in volume after six hours on the warm counter",
+        ),
+        (
+            "derailleur",
+            "The rear derailleur cable had stretched and needed a quarter turn of the barrel adjuster",
+        ),
+        (
+            "hohmann",
+            "A Hohmann transfer orbit spends two engine burns raising the apoapsis toward the target",
+        ),
+        (
+            "estimated_tax",
+            "Quarterly estimated tax payments fall due on the fifteenth of the month after the quarter closes",
+        ),
+    ] {
+        for i in 0..5 {
+            let doc = RawDocument {
+                source: "memory".to_string(),
+                source_id: format!("mem_origin_{subject}_{i}"),
+                content: format!("{sentence}, note {i}"),
+                title: format!("{subject} note {i}"),
+                url: None,
+                last_modified: now + i as i64,
+                memory_type: None,
+                space: Some("origin".to_string()),
+                entity_id: Some("ent_origin".to_string()),
+                ..Default::default()
+            };
+            db.upsert_documents(vec![doc]).await.unwrap();
+        }
     }
 
-    // grouped cap = 6 → original blob must re-split or drop; no cluster
-    // returned can exceed 6 memories.
+    // grouped cap = 6 → original blob must re-split; no cluster returned can
+    // exceed 6 memories.
     let clusters = db
         .find_distillation_clusters(0.3, 2, 20, 3500, 50, 6)
         .await
         .unwrap();
 
+    // Non-vacuous: with no clusters the cap loop below asserts nothing, so pin
+    // that the re-split produced the sub-topics first.
+    assert!(
+        clusters.len() >= 2,
+        "the oversized space blob must be re-split, not dropped: {:?}",
+        clusters
+            .iter()
+            .map(|cluster| cluster.source_ids.len())
+            .collect::<Vec<_>>()
+    );
     for cluster in &clusters {
         assert!(
             cluster.source_ids.len() <= 6,
@@ -22025,6 +22130,419 @@ fn a_threshold_that_cannot_advance_drops_instead_of_looping() {
             clusters.len()
         );
     }
+}
+
+#[test]
+fn same_topic_sibling_shards_merge_before_distill_writes_pages() {
+    // Regression test for issue #596: the re-split ladder tightens an
+    // oversized same-space cluster up to RESPLIT_MAX_THRESHOLD (0.92) and can
+    // slice one coherent topic into two near-duplicate shards. Nothing
+    // downstream ever compares siblings — the Jaccard filter scores a cluster
+    // only against *existing* pages, and the page a shard creates is born
+    // unconfirmed — so both shards became pages in the same pass.
+    // `cluster_distillation_rows` must hand back ONE cluster instead.
+    //
+    // Fixture: two 5-member shards of one topic plus 20 scattered members, all
+    // in space "wenlan". Squared member weights are shared 0.88, topic 0.05,
+    // per-member noise 0.07, which puts within-shard member cosine at 0.93 (at
+    // or above the 0.92 rung, so each shard survives it) and a cross-shard
+    // member against the other shard's centroid at 0.906 (below the rung, so
+    // the rung really does split them) — while the two mean-pooled centroids
+    // sit at 0.932, above the ceiling. The 20 scattered members make the base
+    // group oversized so the ladder fires at all, then fall out as singletons
+    // below the member floor. (See `ladder_shards_of_one_topic_rejoin_into_one_
+    // distill_cluster` for the case where the rejoined topic is larger than the
+    // grouped cap — the cap does not gate the merge.)
+    let shared = 0.88f32.sqrt();
+    let topic = 0.05f32.sqrt();
+    let noise = 0.07f32.sqrt();
+    let scattered_shared = 0.85f32.sqrt();
+    let scattered_own = 0.15f32.sqrt();
+
+    let mut memories: Vec<ClusterMemRow> = Vec::new();
+    for (shard, topic_dim) in [("a", 1usize), ("b", 2usize)] {
+        for i in 0..5 {
+            let mut emb = vec![0.0f32; 768];
+            emb[0] = shared;
+            emb[topic_dim] = topic;
+            emb[10 + memories.len()] = noise;
+            memories.push(ClusterMemRow {
+                source_id: format!("{shard}_m{i}"),
+                content: format!("{shard} note {i}"),
+                entity_id: None,
+                entity_name: None,
+                space: Some("wenlan".to_string()),
+                can_seed_page: true,
+                embedding: emb,
+            });
+        }
+    }
+    for i in 0..20 {
+        let mut emb = vec![0.0f32; 768];
+        emb[0] = scattered_shared;
+        emb[100 + i] = scattered_own;
+        memories.push(ClusterMemRow {
+            source_id: format!("x_m{i}"),
+            content: format!("scattered note {i}"),
+            entity_id: None,
+            entity_name: None,
+            space: Some("wenlan".to_string()),
+            can_seed_page: true,
+            embedding: emb,
+        });
+    }
+
+    // Fixture self-checks: the shards must be separable at the 0.92 rung and
+    // still be one topic by centroid.
+    let within = cosine_similarity(&memories[0].embedding, &memories[1].embedding);
+    assert!(
+        (within - 0.93).abs() < 0.005,
+        "within-shard cosine drifted: {within}"
+    );
+    let shard_a = build_distillation_cluster(&memories, &(0..5).collect::<Vec<_>>());
+    let shard_b = build_distillation_cluster(&memories, &(5..10).collect::<Vec<_>>());
+    let centroid_cos = cosine_similarity(
+        shard_a.centroid_embedding.as_ref().unwrap(),
+        shard_b.centroid_embedding.as_ref().unwrap(),
+    );
+    assert!(
+        (centroid_cos - 0.932).abs() < 0.005,
+        "sibling centroid cosine drifted: {centroid_cos}"
+    );
+    let member_vs_sibling_centroid = cosine_similarity(
+        &memories[5].embedding,
+        shard_a.centroid_embedding.as_ref().unwrap(),
+    );
+    assert!(
+        member_vs_sibling_centroid < 0.92,
+        "fixture no longer splits at the ceiling: {member_vs_sibling_centroid}"
+    );
+
+    let clusters = cluster_distillation_rows(
+        &memories,
+        0.87, // one rung below the 0.92 ceiling
+        3,    // min_size
+        20,   // max_clusters
+        16_000,
+        50, // max_unlinked_cluster_size
+        12, // max_grouped_cluster_size
+        DistillationClusterMode::SpaceScoped,
+    );
+
+    assert_eq!(
+        clusters.len(),
+        1,
+        "two shards of one topic must merge into one cluster before any page is written: {:?}",
+        clusters
+            .iter()
+            .map(|c| c.source_ids.clone())
+            .collect::<Vec<_>>()
+    );
+    let mut merged: Vec<String> = clusters[0].source_ids.clone();
+    merged.sort();
+    let mut expected: Vec<String> = memories
+        .iter()
+        .take(10)
+        .map(|memory| memory.source_id.clone())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        merged, expected,
+        "the merged cluster must carry both shards' members"
+    );
+}
+
+#[test]
+fn unrelated_distill_clusters_are_not_merged_as_siblings() {
+    // Control for the sibling merge above: two same-space clusters whose
+    // centroids sit far below the 0.92 ceiling are two topics, and must stay
+    // two clusters. Same geometry, but the topic component carries 0.33 of the
+    // squared weight instead of 0.05, so centroid cosine is ~0.64.
+    let shared = 0.60f32.sqrt();
+    let topic = 0.33f32.sqrt();
+    let noise = 0.07f32.sqrt();
+
+    let mut memories: Vec<ClusterMemRow> = Vec::new();
+    for (cluster, topic_dim) in [("a", 1usize), ("b", 2usize)] {
+        for i in 0..5 {
+            let mut emb = vec![0.0f32; 768];
+            emb[0] = shared;
+            emb[topic_dim] = topic;
+            emb[10 + memories.len()] = noise;
+            memories.push(ClusterMemRow {
+                source_id: format!("{cluster}_m{i}"),
+                content: format!("{cluster} note {i}"),
+                entity_id: None,
+                entity_name: None,
+                space: Some("wenlan".to_string()),
+                can_seed_page: true,
+                embedding: emb,
+            });
+        }
+    }
+
+    let cluster_a = build_distillation_cluster(&memories, &(0..5).collect::<Vec<_>>());
+    let cluster_b = build_distillation_cluster(&memories, &(5..10).collect::<Vec<_>>());
+    let centroid_cos = cosine_similarity(
+        cluster_a.centroid_embedding.as_ref().unwrap(),
+        cluster_b.centroid_embedding.as_ref().unwrap(),
+    );
+    assert!(
+        (centroid_cos - 0.636).abs() < 0.005,
+        "control centroid cosine drifted: {centroid_cos}"
+    );
+
+    let clusters = cluster_distillation_rows(
+        &memories,
+        0.87,
+        3,
+        20,
+        16_000,
+        50,
+        12,
+        DistillationClusterMode::SpaceScoped,
+    );
+
+    assert_eq!(
+        clusters.len(),
+        2,
+        "unrelated same-space clusters must not be merged as siblings: {:?}",
+        clusters
+            .iter()
+            .map(|c| c.source_ids.clone())
+            .collect::<Vec<_>>()
+    );
+    for cluster in &clusters {
+        assert_eq!(cluster.source_ids.len(), 5, "{:?}", cluster.source_ids);
+    }
+}
+
+/// Shared geometry for the ladder-rejoin tests below. Builds `2 * members`
+/// rows in one space: two halves of ONE topic, laid out so the re-split ladder
+/// separates them at the 0.92 ceiling and nowhere earlier.
+///
+/// Squared weights are shared 0.88, per-half topic 0.05, per-member noise 0.07,
+/// which gives within-half member cosine 0.930 (at or above the 0.92 rung, so
+/// each half survives it), a cross-half member against the other half's
+/// centroid at 0.909 (below 0.92 so the ceiling rung splits them, but at or
+/// above 0.90 so no earlier rung does), and mean-pooled centroids 0.939 apart —
+/// above the ceiling, so the two halves are one topic by the merge rule.
+fn one_topic_two_ladder_halves(members: usize, content: &str) -> Vec<ClusterMemRow> {
+    let shared = 0.88f32.sqrt();
+    let topic = 0.05f32.sqrt();
+    let noise = 0.07f32.sqrt();
+
+    let mut memories: Vec<ClusterMemRow> = Vec::new();
+    for (half, topic_dim) in [("a", 1usize), ("b", 2usize)] {
+        for i in 0..members {
+            let mut emb = vec![0.0f32; 768];
+            emb[0] = shared;
+            emb[topic_dim] = topic;
+            emb[10 + memories.len()] = noise;
+            memories.push(ClusterMemRow {
+                source_id: format!("{half}_m{i}"),
+                content: content.to_string(),
+                entity_id: None,
+                entity_name: None,
+                space: Some("wenlan".to_string()),
+                can_seed_page: true,
+                embedding: emb,
+            });
+        }
+    }
+    memories
+}
+
+#[test]
+fn ladder_shards_of_one_topic_rejoin_into_one_distill_cluster() {
+    // Issue #596, the case that matters in production: ONE coherent topic of 20
+    // memories under a grouped cap of 12. The ladder tightens from the default
+    // formation threshold (0.60) rung by rung, and at the 0.92 ceiling it emits
+    // [10, 10] — two halves of one topic, each already inside the cap, so the
+    // ladder stops there and both halves would become their own unconfirmed
+    // page in this pass.
+    //
+    // The member cap must NOT gate the sibling merge: it is a formation-time
+    // bound on how coarse a group may be, not a ceiling on how large a real
+    // topic is, and the union here (20) is over the cap by construction. The
+    // centroids are 0.939 apart, above the ladder's own ceiling, so the pass
+    // must hand back ONE cluster of all 20.
+    let memories = one_topic_two_ladder_halves(10, "one topic note");
+
+    // Fixture self-checks — the whole point is WHERE the ladder splits.
+    let within = cosine_similarity(&memories[0].embedding, &memories[1].embedding);
+    assert!(
+        (within - 0.930).abs() < 0.005,
+        "within-half cosine drifted: {within}"
+    );
+    let half_a = build_distillation_cluster(&memories, &(0..10).collect::<Vec<_>>());
+    let half_b = build_distillation_cluster(&memories, &(10..20).collect::<Vec<_>>());
+    let centroid_cos = cosine_similarity(
+        half_a.centroid_embedding.as_ref().unwrap(),
+        half_b.centroid_embedding.as_ref().unwrap(),
+    );
+    assert!(
+        (centroid_cos - 0.939).abs() < 0.005,
+        "sibling centroid cosine drifted: {centroid_cos}"
+    );
+    let member_vs_sibling_centroid = cosine_similarity(
+        &memories[10].embedding,
+        half_a.centroid_embedding.as_ref().unwrap(),
+    );
+    assert!(
+        (0.90..0.92).contains(&member_vs_sibling_centroid),
+        "the ladder must split this topic at the 0.92 ceiling and no earlier rung: \
+         {member_vs_sibling_centroid}"
+    );
+
+    let clusters = cluster_distillation_rows(
+        &memories,
+        0.60, // the default formation threshold
+        3,    // min_size
+        20,   // max_clusters
+        16_000,
+        50, // max_unlinked_cluster_size
+        12, // max_grouped_cluster_size — the union of 20 is deliberately over it
+        DistillationClusterMode::SpaceScoped,
+    );
+
+    assert_eq!(
+        clusters.len(),
+        1,
+        "a coherent topic the ladder cut in half must come back as one cluster, \
+         even though the rejoined 20 members exceed the grouped cap of 12: {:?}",
+        clusters
+            .iter()
+            .map(|c| c.source_ids.len())
+            .collect::<Vec<_>>()
+    );
+    let mut merged: Vec<String> = clusters[0].source_ids.clone();
+    merged.sort();
+    let mut expected: Vec<String> = memories
+        .iter()
+        .map(|memory| memory.source_id.clone())
+        .collect();
+    expected.sort();
+    assert_eq!(merged, expected, "every member must survive the rejoin");
+}
+
+#[test]
+fn sibling_merge_refuses_a_union_over_the_token_limit() {
+    // Safety control for the lifted member cap: the LLM token limit is now the
+    // only size guard on a merge, so it has to actually hold. Same geometry as
+    // the rejoin test — centroids 0.939 apart, so the merge rule qualifies —
+    // but each member carries 400 characters. Each half estimates at 1250
+    // tokens (inside the 1500 limit, so `sub_cluster_by_tokens` leaves it
+    // alone) while the union estimates at 2400, over the limit. The two halves
+    // must stay two clusters.
+    let memories = one_topic_two_ladder_halves(10, &"x".repeat(400));
+
+    let half_a = build_distillation_cluster(&memories, &(0..10).collect::<Vec<_>>());
+    let half_b = build_distillation_cluster(&memories, &(10..20).collect::<Vec<_>>());
+    let centroid_cos = cosine_similarity(
+        half_a.centroid_embedding.as_ref().unwrap(),
+        half_b.centroid_embedding.as_ref().unwrap(),
+    );
+    assert!(
+        centroid_cos >= 0.92,
+        "fixture must qualify for the merge on similarity, so that only the token \
+         limit can stop it: {centroid_cos}"
+    );
+    assert_eq!(half_a.estimated_tokens, 1250);
+    let union = build_distillation_cluster(&memories, &(0..20).collect::<Vec<_>>());
+    assert_eq!(union.estimated_tokens, 2400);
+
+    let clusters = cluster_distillation_rows(
+        &memories,
+        0.60,
+        3,
+        20,
+        1_500, // token_limit: fits one half, not both
+        50,
+        12,
+        DistillationClusterMode::SpaceScoped,
+    );
+
+    assert_eq!(
+        clusters.len(),
+        2,
+        "a merge whose union exceeds the token limit must be refused: {:?}",
+        clusters
+            .iter()
+            .map(|c| c.source_ids.len())
+            .collect::<Vec<_>>()
+    );
+    for cluster in &clusters {
+        assert_eq!(cluster.source_ids.len(), 10, "{:?}", cluster.source_ids);
+        assert!(cluster.estimated_tokens <= 1_500);
+    }
+}
+
+#[test]
+fn sibling_shards_in_different_spaces_are_not_merged() {
+    // Safety control on the bucket boundary: the merge runs per space bucket,
+    // so two near-identical clusters that live in DIFFERENT spaces must stay
+    // two clusters. Their centroids are ~1.0 apart here, so similarity alone
+    // would merge them — only the space scoping stops it.
+    let mut memories: Vec<ClusterMemRow> = Vec::new();
+    for space in ["alpha", "beta"] {
+        for i in 0..5 {
+            let mut emb = vec![0.0f32; 768];
+            emb[0] = 0.999f32.sqrt();
+            emb[10 + memories.len()] = 0.001f32.sqrt();
+            memories.push(ClusterMemRow {
+                source_id: format!("{space}_m{i}"),
+                content: format!("{space} note {i}"),
+                entity_id: None,
+                entity_name: None,
+                space: Some(space.to_string()),
+                can_seed_page: true,
+                embedding: emb,
+            });
+        }
+    }
+
+    let alpha = build_distillation_cluster(&memories, &(0..5).collect::<Vec<_>>());
+    let beta = build_distillation_cluster(&memories, &(5..10).collect::<Vec<_>>());
+    let centroid_cos = cosine_similarity(
+        alpha.centroid_embedding.as_ref().unwrap(),
+        beta.centroid_embedding.as_ref().unwrap(),
+    );
+    assert!(
+        centroid_cos >= 0.92,
+        "fixture must qualify on similarity so only the space bucket can stop the \
+         merge: {centroid_cos}"
+    );
+
+    let clusters = cluster_distillation_rows(
+        &memories,
+        0.60,
+        3,
+        20,
+        16_000,
+        50,
+        12,
+        DistillationClusterMode::SpaceScoped,
+    );
+
+    assert_eq!(
+        clusters.len(),
+        2,
+        "clusters of two different spaces must never merge: {:?}",
+        clusters
+            .iter()
+            .map(|c| c.source_ids.clone())
+            .collect::<Vec<_>>()
+    );
+    let spaces: std::collections::BTreeSet<&str> = clusters
+        .iter()
+        .filter_map(|cluster| cluster.space.as_deref())
+        .collect();
+    assert_eq!(
+        spaces,
+        ["alpha", "beta"].into_iter().collect(),
+        "one cluster per space"
+    );
 }
 
 #[test]
@@ -43612,6 +44130,10 @@ async fn startup_reconciles_v79_observations_without_source_memory_id() {
         community_grouping_runtime: std::sync::Mutex::new(
             crate::community_grouping::CommunityGroupingRuntime::default(),
         ),
+        // The fixture created the file just above, so the first chain is a
+        // fresh-store chain exactly as `MemoryDB::new` would decide it.
+        opened_fresh_file: std::sync::atomic::AtomicBool::new(true),
+        skip_migration_backups: std::sync::atomic::AtomicBool::new(false),
     };
 
     db.run_migrations(&crate::events::NoopEmitter)
@@ -46211,6 +46733,102 @@ async fn backup_before_migration_publishes_a_valid_restore_point() {
     assert_eq!(
         before, after,
         "an existing valid pre-migration backup must be preserved across a retry, not re-snapshotted"
+    );
+}
+
+#[tokio::test]
+async fn a_database_created_in_this_boot_takes_no_pre_migration_backups() {
+    // Soak gap 7: a fresh install replays the whole chain from
+    // `user_version = 0`, and every backed-up migration used to leave a
+    // `pre_migration_<n>_backup.db` of an empty store beside the live db.
+    // Through the production constructor, so the fresh-file decision is the
+    // one a real first boot makes, not a fixture flag.
+    let dir = tempdir().unwrap();
+    let db = MemoryDB::new(dir.path(), Arc::new(crate::events::NoopEmitter))
+        .await
+        .unwrap();
+    let backups: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("pre_migration_"))
+        .collect();
+    assert!(
+        backups.is_empty(),
+        "a database created in this boot must take no pre-migration backups, found {backups:?}"
+    );
+    assert!(
+        db.get_app_metadata("backup_before_migration_123")
+            .await
+            .unwrap()
+            .is_none(),
+        "no backup receipt either"
+    );
+
+    // The same chain on a database that already existed still takes them.
+    let (db, dir) = test_db_at(122).await;
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
+    assert!(dir.path().join("pre_migration_123_backup.db").exists());
+    assert!(db
+        .get_app_metadata("backup_before_migration_123")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// `user_version == 0` alone does not prove the file was created in this boot.
+/// A store that already existed at version 0 (an old install, or a file whose
+/// version was reset) carries data, and its migration 123 restore point is the
+/// one that matters.
+#[tokio::test]
+async fn a_store_that_already_existed_at_user_version_0_still_takes_pre_migration_backups() {
+    let dir = tempdir().unwrap();
+    let db_file = dir.path().join("origin_memory.db");
+    {
+        let raw = libsql::Builder::new_local(db_file.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = raw.connect().unwrap();
+        conn.execute_batch(SCHEMA).await.unwrap();
+        conn.execute_batch(
+            "CREATE TABLE owner_data (note TEXT NOT NULL); \
+             INSERT INTO owner_data (note) VALUES ('rows an earlier build wrote');",
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        db_file.exists(),
+        "fixture precondition: the file exists before the open"
+    );
+
+    let db = MemoryDB::new(dir.path(), Arc::new(crate::events::NoopEmitter))
+        .await
+        .expect("an existing store at user_version 0 must open and migrate");
+    assert!(
+        dir.path().join("pre_migration_123_backup.db").exists(),
+        "a store that existed before this boot keeps its migration 123 restore point"
+    );
+    assert!(db
+        .get_app_metadata("backup_before_migration_123")
+        .await
+        .unwrap()
+        .is_some());
+    let conn = db.conn.lock().await;
+    let mut rows = conn.query("SELECT note FROM owner_data", ()).await.unwrap();
+    let note = rows
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    assert_eq!(
+        note, "rows an earlier build wrote",
+        "the open reused the existing file"
     );
 }
 
@@ -53690,6 +54308,146 @@ async fn a_poisoned_orphan_does_not_block_the_other_repairs() {
     assert_eq!(db.resolve_orphan_page_links().await.unwrap(), 0);
 }
 
+/// A failed `COMMIT` must not leave the sweep's transaction open.
+///
+/// SQLite keeps the transaction active when `COMMIT` itself fails --
+/// `SQLITE_BUSY` from a checkpoint or a reader still holding the WAL is the
+/// shape seen in the field. `MemoryDB` owns ONE writer connection, so a sweep
+/// that returns the commit error without rolling back leaves that connection
+/// mid-transaction: the next `BEGIN` fails with "cannot start a transaction
+/// within a transaction", and so does every write after it until something
+/// rolls back. One failed sweep commit wedges the whole daemon.
+///
+/// The busy commit is not reproducible by contention here. A second
+/// connection holding the write lock fails the sweep at its first write, long
+/// before `COMMIT` (`a_review_meeting_a_foreign_writer_marks_nothing` in the
+/// presence-review tests documents that window). So the fault is staged
+/// instead: a deferred foreign-key violation inside the sweep's own
+/// transaction is checked only at commit time, which fails the `COMMIT`
+/// statement and leaves the transaction active -- the same end state,
+/// deterministically.
+#[tokio::test]
+async fn a_failed_orphan_sweep_commit_does_not_wedge_the_writer_connection() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_commit_src",
+        "Commit Src",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    db.replace_page_links(
+        "page_commit_src",
+        &[crate::synthesis::wikilinks::Wikilink {
+            label: "Commit Target".to_string(),
+            target_page_id: None,
+        }],
+    )
+    .await
+    .unwrap();
+    db.insert_page(
+        "page_commit_target",
+        "Commit Target",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let error = crate::db::with_failing_commit_at("orphan_sweep", db.resolve_orphan_page_links())
+        .await
+        .expect_err("the staged commit failure must reach the caller");
+    assert!(
+        error.to_string().contains("resolve_orphan_links commit"),
+        "the sweep must surface its own commit label, got: {error}"
+    );
+
+    // The wedge itself: the next `BEGIN`-using write on the same connection.
+    db.insert_page(
+        "page_after_failed_commit",
+        "After Failed Commit",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .expect("a failed sweep commit must not wedge later writes");
+}
+
+/// A failed commit inside the NULL-embedding recovery loop must abort the
+/// migration, not be logged and walked past.
+///
+/// That loop selects its batch with `WHERE embedding IS NULL` and bumps a
+/// progress counter after each batch. `commit_or_rollback` rolls a failed
+/// commit back, so the rows it just embedded go back to NULL and the very
+/// next iteration selects the same batch again. Swallowing the error means
+/// the loop never ends, `recovered` climbs past the declared total, and every
+/// migration behind this one is never reached -- a worse failure than the
+/// stuck transaction the rollback was added to prevent.
+///
+/// The recovery pass is unconditional on startup, so a memory row with no
+/// embedding plus a second `run_migrations` is the whole fixture. The staged
+/// fault is one-shot, so before the fix this test does not hang: the loop
+/// swallows the error, re-embeds the same row, commits, and `run_migrations`
+/// returns `Ok` -- which is exactly what the assertion below catches.
+#[tokio::test]
+async fn a_failed_recovery_commit_aborts_the_migration_instead_of_looping() {
+    let (db, _dir) = test_db().await;
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "INSERT INTO memories
+                (id, content, source, source_id, title, chunk_index,
+                 last_modified, chunk_type, space)
+             VALUES ('mem_null_embedding', 'a memory whose embedding never landed',
+                     'memory', 'mem_null_embedding', 'Null Embedding',
+                     0, 1, 'text', ?1)",
+            libsql::params![UNFILED_SPACE_ID],
+        )
+        .await
+        .unwrap();
+    }
+
+    let error = crate::db::with_failing_commit_at(
+        "null_embed_recovery",
+        db.run_migrations(&crate::events::NoopEmitter),
+    )
+    .await
+    .expect_err("the staged commit failure must abort the migration");
+    assert!(
+        error.to_string().contains("null embed recovery commit"),
+        "the recovery loop must surface its own commit label, got: {error}"
+    );
+
+    // And the connection it ran on is still usable, same as the sweep.
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_after_failed_recovery",
+        "After Failed Recovery",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .expect("a failed recovery commit must not wedge later writes");
+}
+
 /// A full batch of unresolvable orphans in front of the ordered backlog must
 /// not starve the resolvable rows behind it forever: the rotating keyset
 /// cursor advances past every examined row -- resolved or not -- so the next
@@ -55076,7 +55834,12 @@ async fn migration_123_downgrade_barrier_refuses_a_newer_database() {
 /// what proves the snapshot predates it.
 #[tokio::test]
 async fn the_pre_migration_123_backup_is_a_usable_restore_point() {
-    let (db, dir) = test_db().await;
+    // A database that already exists at 122 is what gets a restore point; a
+    // store created in this boot takes none (see the test below).
+    let (db, dir) = test_db_at(122).await;
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
     let dest = dir.path().join("pre_migration_123_backup.db");
     assert!(
         dest.exists(),
@@ -56752,5 +57515,54 @@ async fn strict_page_search_fails_on_a_row_the_lenient_path_skips() {
     assert!(
         lenient.iter().any(|p| p.id == "c_strict"),
         "lenient search must degrade to the vector arm and still return the page"
+    );
+}
+
+/// The daemon must never let fastembed pick its cwd-relative default: under
+/// launchd the cwd is `/` and the first-run download has nowhere to go.
+#[test]
+fn daemon_cache_dir_never_falls_through_to_the_cwd_default() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path();
+    // Nothing populated, nothing configured: the store's own directory.
+    assert_eq!(
+        daemon_fastembed_cache_dir_from(None, None, None, db_path),
+        db_path.join("fastembed_cache")
+    );
+    // The CI hook keeps its pre-populated cache.
+    assert_eq!(
+        daemon_fastembed_cache_dir_from(None, None, Some("/ci/cache".into()), db_path),
+        std::path::PathBuf::from("/ci/cache")
+    );
+    // An empty override is not a directory.
+    assert_eq!(
+        daemon_fastembed_cache_dir_from(None, None, Some("".into()), db_path),
+        db_path.join("fastembed_cache")
+    );
+    // A populated cache beats the configured one.
+    assert_eq!(
+        daemon_fastembed_cache_dir_from(
+            None,
+            Some("/populated".into()),
+            Some("/ci/cache".into()),
+            db_path
+        ),
+        std::path::PathBuf::from("/populated")
+    );
+    // HF_HOME beats everything: fastembed uses it for the text model whatever
+    // the daemon configures, so the reranker, lock and messages follow it.
+    assert_eq!(
+        daemon_fastembed_cache_dir_from(
+            Some("/hf/home".into()),
+            Some("/populated".into()),
+            Some("/ci/cache".into()),
+            db_path
+        ),
+        std::path::PathBuf::from("/hf/home")
+    );
+    // An empty HF_HOME is not a directory either.
+    assert_eq!(
+        daemon_fastembed_cache_dir_from(Some("".into()), None, None, db_path),
+        db_path.join("fastembed_cache")
     );
 }
