@@ -14,7 +14,7 @@
 //! and [`stop_sidecar`] ends it on quit, and on Windows the process is bound
 //! to a kill-on-close job object so a hard kill of the app takes it too.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri_plugin_shell::process::CommandChild;
@@ -34,6 +34,50 @@ pub fn set_startup_preflight_ok(ok: bool) {
 
 fn startup_preflight_ok() -> bool {
     STARTUP_PREFLIGHT_OK.load(Ordering::Relaxed)
+}
+
+/// How many launchd registrations are in flight: `setup()`'s first-run
+/// install and the "Run at Login" toggle each hold a [`LaunchdInstallPending`]
+/// while they run `wenlan background on`. Above zero, the on-demand "Start
+/// Wenlan" command must not spawn a sidecar that would race the job being
+/// registered (first-run gauntlet finding F16).
+static LAUNCHD_INSTALLS_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// Marks a launchd registration in flight for as long as it is held. The
+/// count is released on drop, so a registration that panics or returns early
+/// can never leave the "Start Wenlan" button stuck on `launchd_managed`.
+pub struct LaunchdInstallPending(());
+
+impl LaunchdInstallPending {
+    pub fn begin() -> Self {
+        LAUNCHD_INSTALLS_PENDING.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Drop for LaunchdInstallPending {
+    fn drop(&mut self) {
+        LAUNCHD_INSTALLS_PENDING.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn launchd_install_pending() -> bool {
+    LAUNCHD_INSTALLS_PENDING.load(Ordering::Relaxed) > 0
+}
+
+/// Serialises each owner decision with the spawn it leads to. Without it the
+/// startup path and the on-demand command could both read "nothing owns the
+/// daemon" and each spawn a sidecar; the second spawn kills the first, and a
+/// second child that had already seen the first one healthy exits 75, which
+/// leaves zero owners.
+static OWNER_DECISION: Mutex<()> = Mutex::new(());
+
+/// Whether this app's own sidecar is in the slot: booting or serving.
+fn sidecar_alive() -> bool {
+    SIDECAR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
 }
 
 /// The sidecar this app spawned, so quitting can stop it. Empty when launchd
@@ -209,12 +253,45 @@ mod job {
 pub enum DaemonStartDecision {
     /// The port already answers — never double-spawn.
     AlreadyRunning,
-    /// launchd owns a matching daemon — it will restart it; don't fight it.
+    /// This app's own sidecar is alive (booting or serving). One child is the
+    /// most it ever runs: a second spawn kills the first.
+    SidecarStarting,
+    /// launchd holds a loaded job for the selected data root — it will
+    /// (re)start the daemon; don't fight it.
     LaunchdManaged,
     /// The startup plist preflight failed — same skip as `setup()`.
     PreflightFailed,
+    /// `setup()` is still registering the launchd job; it decides the owner
+    /// when that settles, so don't spawn a rival meanwhile.
+    LaunchdInstallPending,
     /// Nothing is serving and it's safe to spawn our own sidecar.
     Spawn,
+}
+
+/// What `setup()` does with the sidecar once the first-run LaunchAgent
+/// install has settled. Pure output of [`decide_startup_sidecar`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupSidecar {
+    /// The startup plist preflight failed: no daemon start at all.
+    SkipPreflightFailed,
+    /// The server LaunchAgent targets the selected data root: launchd owns
+    /// the daemon and restarts it; a sidecar would only fight it for the port.
+    SkipLaunchdOwns,
+    /// No usable LaunchAgent (install skipped or failed): the app runs its
+    /// own sidecar, the fallback owner.
+    Spawn,
+}
+
+/// Owner decision for the startup path: launchd first, sidecar as fallback.
+/// Pure so it is unit-testable without a running app.
+pub fn decide_startup_sidecar(preflight_ok: bool, launchd_owns_daemon: bool) -> StartupSidecar {
+    if !preflight_ok {
+        StartupSidecar::SkipPreflightFailed
+    } else if launchd_owns_daemon {
+        StartupSidecar::SkipLaunchdOwns
+    } else {
+        StartupSidecar::Spawn
+    }
 }
 
 /// Guard order for the on-demand start. Pure so it is unit-testable without a
@@ -223,15 +300,21 @@ pub enum DaemonStartDecision {
 /// could answer, but the button runs when one might already be back up.
 pub fn decide_daemon_start(
     port_healthy: bool,
+    sidecar_alive: bool,
     launchd_managed: bool,
+    launchd_install_pending: bool,
     preflight_ok: bool,
 ) -> DaemonStartDecision {
     if port_healthy {
         DaemonStartDecision::AlreadyRunning
+    } else if sidecar_alive {
+        DaemonStartDecision::SidecarStarting
     } else if launchd_managed {
         DaemonStartDecision::LaunchdManaged
     } else if !preflight_ok {
         DaemonStartDecision::PreflightFailed
+    } else if launchd_install_pending {
+        DaemonStartDecision::LaunchdInstallPending
     } else {
         DaemonStartDecision::Spawn
     }
@@ -301,6 +384,85 @@ pub fn spawn_daemon_sidecar(app: &tauri::AppHandle) -> Result<(), String> {
 /// Probes the port first (a daemon that came back on its own must not be
 /// double-spawned), then defers to launchd, then honors the startup preflight,
 /// and only then spawns. Returns a discriminated result the UI renders inline.
+/// `setup()`'s owner decision once the first-run LaunchAgent install has
+/// settled: launchd when it holds a loaded job for the selected data root,
+/// otherwise this app's sidecar. Takes the install's [`LaunchdInstallPending`]
+/// so the flag clears under the same lock that decides and spawns; the
+/// on-demand command then sees either "still pending" or the final owner,
+/// never the gap between the two.
+pub fn settle_startup_owner(
+    app: &tauri::AppHandle,
+    preflight_ok: bool,
+    pending: LaunchdInstallPending,
+) {
+    let _decision = OWNER_DECISION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    drop(pending);
+    let launchd_owns_daemon =
+        crate::lifecycle::launchd_owns_server_daemon(&crate::lifecycle::SystemLaunchctl);
+    match decide_startup_sidecar(preflight_ok, launchd_owns_daemon) {
+        StartupSidecar::SkipPreflightFailed => {
+            log::warn!("[init] skipping daemon sidecar because server plist preflight failed");
+        }
+        StartupSidecar::SkipLaunchdOwns => {
+            log::info!("[init] launchd owns the daemon after the first-run install; no sidecar");
+        }
+        StartupSidecar::Spawn => {
+            if let Err(e) = spawn_daemon_sidecar(app) {
+                log::error!(
+                    "[init] {e}. Run: xattr -cr /Applications/Origin.app or /Applications/Wenlan.app"
+                );
+            }
+        }
+    }
+}
+
+/// Start the daemon only when nothing owns it. Shared by the on-demand "Start
+/// Wenlan" command and the "Run at Login" toggle's failure path. The health
+/// probe awaits before the lock; everything the decision reads, and the spawn,
+/// sit under it.
+pub async fn start_daemon_if_unowned(
+    app: &tauri::AppHandle,
+    client: &crate::api::WenlanClient,
+) -> DaemonStartResult {
+    let port_healthy = client.health().await.is_ok();
+    start_daemon_under_owner_lock(app, port_healthy)
+}
+
+fn start_daemon_under_owner_lock(app: &tauri::AppHandle, port_healthy: bool) -> DaemonStartResult {
+    let _decision = OWNER_DECISION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let launchd_managed =
+        crate::lifecycle::launchd_owns_server_daemon(&crate::lifecycle::SystemLaunchctl);
+    match decide_daemon_start(
+        port_healthy,
+        sidecar_alive(),
+        launchd_managed,
+        launchd_install_pending(),
+        startup_preflight_ok(),
+    ) {
+        DaemonStartDecision::AlreadyRunning => DaemonStartResult::AlreadyRunning,
+        // Our own child is still booting: to the UI that is a start in
+        // progress, not a failure and not a second daemon.
+        DaemonStartDecision::SidecarStarting => DaemonStartResult::Started,
+        // The job is being registered right now; to the UI that is the
+        // same "the system service starts it" outcome.
+        DaemonStartDecision::LaunchdManaged | DaemonStartDecision::LaunchdInstallPending => {
+            DaemonStartResult::LaunchdManaged
+        }
+        DaemonStartDecision::PreflightFailed => DaemonStartResult::Failed {
+            message: "Wenlan's startup configuration needs repair. Restart the app to fix it."
+                .to_string(),
+        },
+        DaemonStartDecision::Spawn => match spawn_daemon_sidecar(app) {
+            Ok(()) => DaemonStartResult::Started,
+            Err(e) => DaemonStartResult::Failed { message: e },
+        },
+    }
+}
+
 #[tauri::command]
 pub async fn start_daemon_sidecar(
     app: tauri::AppHandle,
@@ -310,23 +472,7 @@ pub async fn start_daemon_sidecar(
         let s = state.read().await;
         s.client.clone()
     };
-    let port_healthy = client.health().await.is_ok();
-    let launchd_managed = crate::lifecycle::current_server_plist_matches_selected_data_dir();
-
-    Ok(
-        match decide_daemon_start(port_healthy, launchd_managed, startup_preflight_ok()) {
-            DaemonStartDecision::AlreadyRunning => DaemonStartResult::AlreadyRunning,
-            DaemonStartDecision::LaunchdManaged => DaemonStartResult::LaunchdManaged,
-            DaemonStartDecision::PreflightFailed => DaemonStartResult::Failed {
-                message: "Wenlan's startup configuration needs repair. Restart the app to fix it."
-                    .to_string(),
-            },
-            DaemonStartDecision::Spawn => match spawn_daemon_sidecar(&app) {
-                Ok(()) => DaemonStartResult::Started,
-                Err(e) => DaemonStartResult::Failed { message: e },
-            },
-        },
-    )
+    Ok(start_daemon_if_unowned(&app, &client).await)
 }
 
 #[cfg(test)]
@@ -338,11 +484,11 @@ mod tests {
     #[test]
     fn healthy_port_reports_already_running_without_spawning() {
         assert_eq!(
-            decide_daemon_start(true, false, true),
+            decide_daemon_start(true, false, false, false, true),
             DaemonStartDecision::AlreadyRunning
         );
         assert_eq!(
-            decide_daemon_start(true, true, false),
+            decide_daemon_start(true, false, true, false, false),
             DaemonStartDecision::AlreadyRunning
         );
     }
@@ -351,7 +497,7 @@ mod tests {
     #[test]
     fn launchd_managed_defers_without_spawning() {
         assert_eq!(
-            decide_daemon_start(false, true, true),
+            decide_daemon_start(false, false, true, false, true),
             DaemonStartDecision::LaunchdManaged
         );
     }
@@ -360,7 +506,7 @@ mod tests {
     #[test]
     fn preflight_failure_skips_spawn() {
         assert_eq!(
-            decide_daemon_start(false, false, false),
+            decide_daemon_start(false, false, false, false, false),
             DaemonStartDecision::PreflightFailed
         );
     }
@@ -369,8 +515,70 @@ mod tests {
     #[test]
     fn clear_field_spawns() {
         assert_eq!(
-            decide_daemon_start(false, false, true),
+            decide_daemon_start(false, false, false, false, true),
             DaemonStartDecision::Spawn
+        );
+    }
+
+    // setup() is still registering the launchd job: a click must not spawn a
+    // sidecar that races it for the port (F16). A healthy port still wins.
+    #[test]
+    fn pending_launchd_install_defers_the_sidecar() {
+        assert_eq!(
+            decide_daemon_start(false, false, false, true, true),
+            DaemonStartDecision::LaunchdInstallPending
+        );
+        assert_eq!(
+            decide_daemon_start(true, false, false, true, true),
+            DaemonStartDecision::AlreadyRunning
+        );
+    }
+
+    // This app's sidecar is already booting: a second spawn would kill it, and
+    // a second child that saw the first one healthy exits 75 — zero owners.
+    #[test]
+    fn a_live_sidecar_is_never_spawned_twice() {
+        assert_eq!(
+            decide_daemon_start(false, true, false, false, true),
+            DaemonStartDecision::SidecarStarting
+        );
+        assert_eq!(
+            decide_daemon_start(true, true, false, false, true),
+            DaemonStartDecision::AlreadyRunning
+        );
+    }
+
+    // Two registrations can overlap (the first-run install and the Run at
+    // Login toggle): the flag holds until the last one releases, and releases
+    // on drop so an aborted install cannot pin the button on launchd_managed.
+    #[test]
+    #[serial_test::serial]
+    fn pending_flag_counts_overlapping_installs_and_releases_on_drop() {
+        assert!(!launchd_install_pending());
+        let first = LaunchdInstallPending::begin();
+        let second = LaunchdInstallPending::begin();
+        drop(first);
+        assert!(launchd_install_pending());
+        drop(second);
+        assert!(!launchd_install_pending());
+    }
+
+    // Startup owner: launchd first, sidecar only when no LaunchAgent took the
+    // daemon, and nothing at all when the preflight failed.
+    #[test]
+    fn startup_sidecar_is_the_fallback_owner() {
+        assert_eq!(
+            decide_startup_sidecar(true, true),
+            StartupSidecar::SkipLaunchdOwns
+        );
+        assert_eq!(decide_startup_sidecar(true, false), StartupSidecar::Spawn);
+        assert_eq!(
+            decide_startup_sidecar(false, false),
+            StartupSidecar::SkipPreflightFailed
+        );
+        assert_eq!(
+            decide_startup_sidecar(false, true),
+            StartupSidecar::SkipPreflightFailed
         );
     }
 }
