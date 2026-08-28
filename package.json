@@ -101,7 +101,7 @@
     "comment": "overrides: smallest safe version for an advisory, held inside the major the parents already use, and applied only to the vulnerable range so an already-safe copy is left alone. Drop an entry once every parent resolves past it by itself; `pnpm audit` is the check.",
     "overrides": {
       "brace-expansion@>=4.0.0 <5.0.9": "^5.0.9",
-      "fast-uri@>=3.0.0 <3.1.5": "^3.1.5",
+      "fast-uri@>=3.0.0 <3.1.6": "^3.1.6",
       "nanoid@<3.3.18": "^3.3.18",
       "postcss@<=8.5.22": "^8.5.23",
       "undici@>=7.0.0 <7.29.0": "^7.29.0"
