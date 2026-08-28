@@ -987,7 +987,6 @@ const UNSTUBBED_DEBT = new Set([
   "remove_watch_path",
   "reorder_space",
   "reset_onboarding_milestones",
-  "rotate_remote_token",
   "save_temp_file",
   "set_api_key",
   "set_avatar",

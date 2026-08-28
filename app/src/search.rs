@@ -623,14 +623,6 @@ pub async fn test_remote_mcp_connection(
     }
 }
 
-#[tauri::command]
-pub async fn rotate_remote_token(
-    _state: tauri::State<'_, State>,
-    app_handle: tauri::AppHandle,
-) -> Result<String, String> {
-    crate::remote_access::rotate_token(&app_handle).await
-}
-
 // ── File / open commands ──────────────────────────────────────────────
 
 /// What `open_file` will hand to the OS: a web page, a local file, or a bare

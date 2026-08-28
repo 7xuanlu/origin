@@ -197,7 +197,6 @@ pub enum RemoteAccessStatus {
     Starting,
     Connected {
         tunnel_url: String,
-        token: String,
         /// Stable relay URL (if relay registration succeeded).
         relay_url: Option<String>,
     },
@@ -775,80 +774,12 @@ fn write_private_file(path: &Path, contents: &[u8], file_name: &str) -> Result<(
     restrict_private_file(path, file_name)
 }
 
-fn import_nonempty_legacy_file(
-    current_dir: &Path,
-    legacy_dir: &Path,
-    file_name: &str,
-) -> Result<PathBuf, String> {
-    let current_path = current_dir.join(file_name);
-    if current_path.exists() {
-        restrict_private_dir(current_dir, file_name)?;
-        restrict_private_file(&current_path, file_name)?;
-        return Ok(current_path);
-    }
-
-    let legacy_path = legacy_dir.join(file_name);
-    let contents = match std::fs::read_to_string(&legacy_path) {
-        Ok(contents) => contents,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(current_path),
-        Err(e) => {
-            log::warn!(
-                "[remote-access] Skipping legacy {} import from {}: {}",
-                file_name,
-                legacy_path.display(),
-                e
-            );
-            return Ok(current_path);
-        }
-    };
-
-    if contents.trim().is_empty() {
-        return Ok(current_path);
-    }
-
-    write_private_file(&current_path, contents.as_bytes(), file_name)?;
-
-    Ok(current_path)
-}
-
-fn token_file_path_for_dirs(current_dir: &Path, legacy_dir: &Path) -> Result<PathBuf, String> {
-    import_nonempty_legacy_file(current_dir, legacy_dir, "token")
-}
-
 fn relay_id_path_for_dirs(current_dir: &Path) -> PathBuf {
     current_dir.join("relay_id")
 }
 
-/// Token file path for wenlan-mcp authentication.
-/// wenlan-mcp stores tokens at ~/.config/wenlan-mcp/token (XDG convention),
-/// NOT ~/Library/Application Support/ (macOS convention from dirs::config_dir).
-fn token_file_path() -> Result<PathBuf, String> {
-    let current = crate::identity_paths::mcp_config_dir();
-    if crate::identity_paths::isolated_dev_state_dir().is_some() {
-        return token_file_path_for_dirs(&current, &current);
-    }
-    token_file_path_for_dirs(&current, &crate::identity_paths::legacy_mcp_config_dir())
-}
-
 fn relay_id_path() -> PathBuf {
     relay_id_path_for_dirs(&crate::identity_paths::mcp_config_dir())
-}
-
-fn token_generate_args(path: &std::path::Path) -> Vec<String> {
-    vec![
-        "token".to_string(),
-        "generate".to_string(),
-        "--output".to_string(),
-        path.to_string_lossy().into_owned(),
-    ]
-}
-
-/// Read the bearer token from disk.
-pub fn read_token() -> Result<String, String> {
-    let path = token_file_path()?;
-    std::fs::read_to_string(&path)
-        .map(|s| s.trim().to_string())
-        .map_err(|e| format!("Failed to read token at {}: {}", path.display(), e))
 }
 
 /// Start the remote access tunnel (wenlan-mcp serve + cloudflared).
@@ -907,7 +838,7 @@ async fn toggle_on_inner(
     let result = start_tunnel(&app_handle, operation_generation).await;
 
     match result {
-        Ok((tunnel_url, token, mcp_child, tunnel_child, tunnel_owner, port, mcp_rx, tunnel_rx)) => {
+        Ok((tunnel_url, mcp_child, tunnel_child, tunnel_owner, port, mcp_rx, tunnel_rx)) => {
             {
                 let state = app_handle
                     .state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
@@ -934,7 +865,6 @@ async fn toggle_on_inner(
 
             let status = RemoteAccessStatus::Connected {
                 tunnel_url: tunnel_url.clone(),
-                token: token.clone(),
                 relay_url: relay_url.clone(),
             };
             // Store process handles in state
@@ -1567,7 +1497,6 @@ async fn start_tunnel(
 ) -> Result<
     (
         String,                                                                 // tunnel_url
-        String,                                                                 // token
         tauri_plugin_shell::process::CommandChild,                              // mcp_child
         tauri_plugin_shell::process::CommandChild,                              // tunnel_child
         CloudflaredOwner, // tunnel owner receipt
@@ -1600,48 +1529,20 @@ async fn start_tunnel(
         )
     })?;
 
-    // 2. Ensure token exists
-    let token_path = token_file_path()?;
-    log::warn!(
-        "[remote-access] token_path={}, exists={}",
-        token_path.display(),
-        token_path.exists()
-    );
-    if !token_path.exists() {
-        prepare_private_parent(&token_path, "token")?;
-        let shell = app_handle.shell();
-        log::warn!("[remote-access] generating token via sidecar...");
-        let cmd = shell
-            .sidecar(MCP_SIDECAR_NAME)
-            .map_err(|e| format!("{} sidecar not found: {}", MCP_SIDECAR_NAME, e))?;
-        log::warn!("[remote-access] sidecar command created, executing token generate...");
-        let output = cmd
-            .args(token_generate_args(&token_path))
-            .output()
-            .await
-            .map_err(|e| format!("Failed to generate token (exec error: {})", e))?;
-        log::warn!(
-            "[remote-access] token generate exit status: {:?}, stderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if !output.status.success() {
-            return Err(format!(
-                "Token generation failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        restrict_private_file(&token_path, "token")?;
-    }
-    let token = read_token()?;
+    // No bearer token here on purpose: the relay endpoint below is reached by
+    // the Claude.ai and ChatGPT connectors, which have no way to attach an
+    // `Authorization` header to their requests, so `spawn_mcp` runs the
+    // sidecar with `--no-auth`. What actually guards this endpoint is the
+    // unguessable relay ID (see `new_relay_id`), the explicit in-app warning
+    // (`remoteAccess.noAuthWarning`), and Remote Access being off by default.
     if !remote_generation_is_current(app_handle, generation).await {
         return Err("Remote access start cancelled.".to_string());
     }
 
-    // 3. Spawn wenlan-mcp serve (with health check)
+    // 2. Spawn wenlan-mcp serve (with health check)
     let (mcp_rx, mcp_child) = spawn_mcp(app_handle, port, generation).await?;
 
-    // 4. Spawn cloudflared tunnel
+    // 3. Spawn cloudflared tunnel
     let tunnel_command = match app_handle.shell().sidecar("cloudflared") {
         Ok(command) => command,
         Err(error) => {
@@ -1673,7 +1574,7 @@ async fn start_tunnel(
         return Err("Remote access start cancelled.".to_string());
     }
 
-    // 5. Parse tunnel URL from cloudflared output (it logs to stderr)
+    // 4. Parse tunnel URL from cloudflared output (it logs to stderr)
     let tunnel_result = tokio::select! {
         result = timeout(
             Duration::from_secs(20),
@@ -1705,7 +1606,7 @@ async fn start_tunnel(
         }
     };
 
-    // 6. Best-effort tunnel verification — don't kill on failure.
+    // 5. Best-effort tunnel verification — don't kill on failure.
     // Quick tunnels can take 10-20s to become fully reachable after URL is printed.
     let verify_url = format!("{}/health", tunnel_url);
     let verify_ok = timeout(Duration::from_secs(10), async {
@@ -1733,7 +1634,6 @@ async fn start_tunnel(
 
     Ok((
         tunnel_url,
-        token,
         mcp_child,
         tunnel_child,
         tunnel_owner,
@@ -1794,47 +1694,6 @@ async fn transition_off(
 /// Stop the remote access tunnel — kill both processes and invalidate stale tasks.
 pub async fn toggle_off(app_handle: &tauri::AppHandle) {
     let _ = transition_off(app_handle, None).await;
-}
-
-/// Rotate the bearer token — generate a new token then kill the old wenlan-mcp.
-/// The crash recovery monitor detects the MCP exit and respawns only wenlan-mcp
-/// (tunnel stays alive). The new instance reads the updated token from disk.
-pub async fn rotate_token(app_handle: &tauri::AppHandle) -> Result<String, String> {
-    // 1. Generate new token first (before killing anything)
-    let token_path = token_file_path()?;
-    prepare_private_parent(&token_path, "token")?;
-    let shell = app_handle.shell();
-    let output = shell
-        .sidecar(MCP_SIDECAR_NAME)
-        .map_err(|e| format!("{} sidecar not found: {}", MCP_SIDECAR_NAME, e))?
-        .args(token_generate_args(&token_path))
-        .output()
-        .await
-        .map_err(|e| format!("Failed to generate token: {}", e))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Token generation failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    restrict_private_file(&token_path, "token")?;
-
-    let token = read_token()?;
-
-    // 2. Kill old wenlan-mcp — crash recovery monitor will detect this,
-    //    kill cloudflared, wait 2s, and restart everything with the new token
-    //    (already written to disk above).
-    {
-        let state =
-            app_handle.state::<std::sync::Arc<tokio::sync::RwLock<crate::state::AppState>>>();
-        let app_state = state.read().await;
-        let mut ra = app_state.remote_access.lock().await;
-        if let Some(child) = ra.mcp_child.take() {
-            let _ = child.kill();
-        }
-    }
-
-    Ok(token)
 }
 
 #[cfg(test)]
@@ -1940,7 +1799,6 @@ mod tests {
 
         let status = RemoteAccessStatus::Connected {
             tunnel_url: "https://test.trycloudflare.com".to_string(),
-            token: "abc123".to_string(),
             relay_url: None,
         };
         let json = serde_json::to_string(&status).unwrap();
@@ -2220,107 +2078,6 @@ mod tests {
     }
 
     #[test]
-    fn token_path_imports_nonempty_legacy_token_when_current_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let current = tmp.path().join("wenlan-mcp");
-        let legacy = tmp.path().join("origin-mcp");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("token"), "legacy-token\n").unwrap();
-
-        let path = token_file_path_for_dirs(&current, &legacy).unwrap();
-
-        assert_eq!(path, current.join("token"));
-        assert_eq!(
-            std::fs::read_to_string(current.join("token")).unwrap(),
-            "legacy-token\n"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn token_path_imports_legacy_token_with_private_permissions() {
-        let tmp = tempfile::tempdir().unwrap();
-        let current = tmp.path().join("wenlan-mcp");
-        let legacy = tmp.path().join("origin-mcp");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("token"), "legacy-token\n").unwrap();
-
-        let path = token_file_path_for_dirs(&current, &legacy).unwrap();
-
-        assert_eq!(path, current.join("token"));
-        assert_eq!(file_mode(&path), 0o600);
-        assert_eq!(file_mode(&current), 0o700);
-    }
-
-    #[test]
-    fn token_path_keeps_current_token_when_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let current = tmp.path().join("wenlan-mcp");
-        let legacy = tmp.path().join("origin-mcp");
-        std::fs::create_dir_all(&current).unwrap();
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(current.join("token"), "current-token\n").unwrap();
-        std::fs::write(legacy.join("token"), "legacy-token\n").unwrap();
-
-        let path = token_file_path_for_dirs(&current, &legacy).unwrap();
-
-        assert_eq!(path, current.join("token"));
-        assert_eq!(
-            std::fs::read_to_string(current.join("token")).unwrap(),
-            "current-token\n"
-        );
-    }
-
-    #[test]
-    fn token_path_does_not_import_empty_legacy_token() {
-        let tmp = tempfile::tempdir().unwrap();
-        let current = tmp.path().join("wenlan-mcp");
-        let legacy = tmp.path().join("origin-mcp");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("token"), " \n").unwrap();
-
-        let path = token_file_path_for_dirs(&current, &legacy).unwrap();
-
-        assert_eq!(path, current.join("token"));
-        assert!(!current.join("token").exists());
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    #[serial_test::serial]
-    fn dev_token_path_does_not_import_production_credentials() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = HomeGuard::set(tmp.path());
-        let production_legacy = tmp.path().join(".config/origin-mcp");
-        std::fs::create_dir_all(&production_legacy).unwrap();
-        std::fs::write(production_legacy.join("token"), "production-token\n").unwrap();
-        let dev_state = tmp.path().join("dev-state");
-        std::env::set_var("WENLAN_DEV_STATE_DIR", &dev_state);
-
-        let path = token_file_path().unwrap();
-
-        assert_eq!(path, dev_state.join("mcp-config/token"));
-        assert!(
-            !path.exists(),
-            "production token must not be copied into dev"
-        );
-    }
-
-    #[test]
-    fn token_path_skips_invalid_legacy_token() {
-        let tmp = tempfile::tempdir().unwrap();
-        let current = tmp.path().join("wenlan-mcp");
-        let legacy = tmp.path().join("origin-mcp");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("token"), [0xff, 0xfe]).unwrap();
-
-        let path = token_file_path_for_dirs(&current, &legacy).unwrap();
-
-        assert_eq!(path, current.join("token"));
-        assert!(!current.join("token").exists());
-    }
-
-    #[test]
     fn relay_id_path_does_not_import_legacy_relay_id() {
         let tmp = tempfile::tempdir().unwrap();
         let current = tmp.path().join("wenlan-mcp");
@@ -2420,21 +2177,5 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
 
         assert!(get_or_create_relay_id().is_err());
-    }
-
-    #[test]
-    fn test_token_generate_args_include_wenlan_output_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(".config").join("wenlan-mcp").join("token");
-
-        assert_eq!(
-            token_generate_args(&path),
-            vec![
-                "token".to_string(),
-                "generate".to_string(),
-                "--output".to_string(),
-                path.to_string_lossy().into_owned()
-            ]
-        );
     }
 }

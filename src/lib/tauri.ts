@@ -2496,7 +2496,7 @@ export async function listAgentActivity(
 export type RemoteAccessStatus =
   | { status: "off" }
   | { status: "starting" }
-  | { status: "connected"; tunnel_url: string; token: string; relay_url: string | null }
+  | { status: "connected"; tunnel_url: string; relay_url: string | null }
   | { status: "error"; error: string };
 
 export async function toggleRemoteAccess(
@@ -2507,10 +2507,6 @@ export async function toggleRemoteAccess(
 
 export async function getRemoteAccessStatus(): Promise<RemoteAccessStatus> {
   return invoke<RemoteAccessStatus>("get_remote_access_status");
-}
-
-export async function rotateRemoteToken(): Promise<string> {
-  return invoke<string>("rotate_remote_token");
 }
 
 /** Result of a one-shot probe against the Remote MCP tunnel's `/health`. */

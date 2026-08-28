@@ -19,7 +19,6 @@ vi.mock("../lib/tauri", () => ({
   getWenlanMcpEntry: vi.fn().mockResolvedValue({ command: "npx", args: ["-y", "wenlan-mcp"] }),
   getRemoteAccessStatus: vi.fn().mockResolvedValue({ status: "off" }),
   toggleRemoteAccess: vi.fn().mockResolvedValue({ status: "off" }),
-  rotateRemoteToken: vi.fn().mockResolvedValue("new-token"),
   testRemoteMcpConnection: vi.fn().mockResolvedValue({ ok: true, latency_ms: 42, error: null }),
   clipboardWrite: vi.fn().mockResolvedValue(undefined),
   getApiKey: vi.fn().mockResolvedValue(null),

@@ -111,7 +111,6 @@ const OUTSIDE_THE_REVIEW_SURFACE: readonly string[] = [
   "remove_source",
   "remove_watch_path",
   "reset_onboarding_milestones",
-  "rotate_remote_token",
   "save_temp_file",
   "set_api_key",
   "set_avatar",
