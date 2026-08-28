@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=90db35bbc97fc5e4c0d30948df87d79d26a6a79a924f0ec60bd1a3ea5974c769 -->
+<!-- README_SYNC: source=README.md sha256=a0a769a739c5e46353dc5a2c480ce641cc39512b6a517dc976aa174aa35d6c3d -->
 
 <p align="center">
   <picture>
@@ -329,6 +329,7 @@ Documentación más detallada, conceptos y comparaciones:
 - [Memoria de IA local-first](https://wenlan.app/learn/local-first-ai-memory): datos, privacidad y control.
 - [Markdown e índice local](https://wenlan.app/learn/markdown-local-index-ai-memory): almacenamiento, recuperación y propiedad.
 - [Bucle de entrega de agentes de IA](https://wenlan.app/learn/ai-agent-handoff-loop): cómo trasladar el trabajo limpiamente a la siguiente sesión.
+- [Base de conocimiento para investigación](https://wenlan.app/learn/source-backed-research-knowledge-base): convierte artículos seleccionados en una matriz bibliográfica y una síntesis verificable con fuentes.
 
 ### Comparaciones
 

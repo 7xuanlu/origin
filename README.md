@@ -329,6 +329,7 @@ More detailed documentation, concepts, and comparisons:
 - [Local-first AI memory](https://wenlan.app/learn/local-first-ai-memory): data, privacy, and control.
 - [Markdown and local index](https://wenlan.app/learn/markdown-local-index-ai-memory): storage, retrieval, and ownership.
 - [AI agent handoff loop](https://wenlan.app/learn/ai-agent-handoff-loop): carrying work cleanly into the next session.
+- [Research knowledge base from papers](https://wenlan.app/learn/source-backed-research-knowledge-base): build an inspectable literature matrix and source-backed synthesis from papers you already have.
 
 ### Comparisons
 
