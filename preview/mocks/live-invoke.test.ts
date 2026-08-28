@@ -973,6 +973,7 @@ const UNSTUBBED_DEBT = new Set([
   "list_external_models",
   "move_space",
   "open_file",
+  "open_search_result",
   "quick_capture",
   "read_source_dir",
   "read_text_file",

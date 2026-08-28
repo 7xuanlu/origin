@@ -1307,6 +1307,7 @@ pub fn run() {
             search::delete_by_time_range,
             search::delete_bulk,
             search::open_file,
+            search::open_search_result,
             search::read_source_dir,
             search::detect_obsidian_vaults,
             search::read_text_file,

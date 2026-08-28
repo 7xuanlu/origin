@@ -228,6 +228,17 @@ export async function openFile(url: string): Promise<void> {
   return invoke("open_file", { path });
 }
 
+/**
+ * Open a search result's target. Unlike {@link openFile}, this does NOT strip
+ * a `file://` prefix — `open_search_result` refuses `file:` URLs on purpose,
+ * since the value came from a search result and is attacker-influenced (see
+ * the Rust command's doc comment). Local files reach it as bare paths, which
+ * it checks against an allowlist of indexed document types.
+ */
+export async function openSearchResult(url: string): Promise<void> {
+  return invoke("open_search_result", { url });
+}
+
 export interface SourceDirEntry {
   name: string;
   isDirectory: boolean;

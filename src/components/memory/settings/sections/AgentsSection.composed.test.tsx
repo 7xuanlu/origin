@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import AgentsSection from "./AgentsSection";
+import type { RemoteAccessStatus } from "../../../../lib/tauri";
 
 // Unlike AgentsSection.test.tsx, this file does NOT stub out
 // RemoteAccessPanel/ClientSetupList — it renders the real composition so the
@@ -20,9 +21,8 @@ vi.mock("../../../../lib/tauri", () => ({
   getRemoteAccessStatus: vi.fn().mockResolvedValue({
     status: "connected",
     tunnel_url: "https://x.trycloudflare.com",
-    token: "t",
     relay_url: null,
-  }),
+  } satisfies RemoteAccessStatus),
   getWireState: vi.fn().mockResolvedValue({
     daemon: { base_url: "", reachable: true, version: null, error: null },
     mcp_binary: { command: "", args: [], candidates: [] },
