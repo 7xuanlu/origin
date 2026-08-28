@@ -4,7 +4,13 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/lib-test.XXXXXX")"
-trap 'rm -rf -- "$tmp"' EXIT
+# Fail loudly when the run aborts partway. A bare `rm -rf` EXIT trap succeeds
+# and overwrites the exit status, and in bash 3.2 (the macOS system shell) `$?`
+# inside the trap does not carry a `set -u` abort either — so a run that died on
+# an unbound variable in lib.sh exited 0 and read as a pass. Only reaching the
+# last line counts as a pass. This suite gates every gauntlet dispatch.
+reached_end=0
+trap 'rc=$?; rm -rf -- "$tmp"; [ "$reached_end" = 1 ] || rc=1; exit "$rc"' EXIT
 
 failures=0
 assert() {
@@ -61,6 +67,35 @@ assert "check_fails PASS for nonzero + substring" [ "$(row_status cf-pass)" = PA
 assert "check_fails keeps the rc"                 [ "$(row_rc cf-pass)" = 3 ]
 assert "check_fails FAIL when command exits 0"    [ "$(row_status cf-zero)" = FAIL ]
 assert "check_fails FAIL when substring absent"   [ "$(row_status cf-nosub)" = FAIL ]
+
+# Deterministic retry counting: the probe fails until it has been called
+# THRESHOLD times, so nothing here depends on how fast the runner is.
+cat >"$tmp/attempts.sh" <<'PROBE'
+#!/usr/bin/env bash
+counter="$1"; threshold="$2"
+n=$(( $(cat "$counter" 2>/dev/null || echo 0) + 1 ))
+printf '%s' "$n" >"$counter"
+echo "attempt $n"
+[ "$n" -ge "$threshold" ]
+PROBE
+chmod +x "$tmp/attempts.sh"
+
+check_eventually ce-now 5 -- "$tmp/attempts.sh" "$tmp/now-count" 1 >/dev/null
+check_eventually ce-later 60 -- "$tmp/attempts.sh" "$tmp/later-count" 3 >/dev/null
+check_eventually ce-never 2 -- false >/dev/null
+check_eventually ce-badsecs x -- true >/dev/null
+assert "check_eventually PASS on the first try"    [ "$(row_status ce-now)" = PASS ]
+assert "check_eventually runs once when it passes" [ "$(cat "$tmp/now-count")" = 1 ]
+assert "check_eventually PASS once state appears"  [ "$(row_status ce-later)" = PASS ]
+assert "check_eventually retries until it passes"  [ "$(cat "$tmp/later-count")" = 3 ]
+assert "check_eventually keeps the last output"    contains "$(row_detail ce-later)" "attempt 3"
+assert "check_eventually reports a real wait"      [ "$(row_detail ce-later)" != "ready after 0s; attempt 3" ]
+assert "check_eventually FAIL after the cap"       [ "$(row_status ce-never)" = FAIL ]
+assert "check_eventually FAIL reports the wait"    contains "$(row_detail ce-never)" "still failing after "
+assert "check_eventually records one row"          [ "$(row_count ce-never)" = 1 ]
+assert "check_eventually FAIL on a bad SECS"       [ "$(row_status ce-badsecs)" = FAIL ]
+assert "bad SECS names the argument"               contains "$(row_detail ce-badsecs)" "got: x"
+assert "bad SECS runs nothing"                     [ ! -f "$GAUNTLET_OUT/checks/ce-badsecs.log" ]
 
 info note "hello world" >/dev/null
 assert "info records INFO"        [ "$(row_status note)" = INFO ]
@@ -156,6 +191,7 @@ assert "FAIL rows precede INFO rows" [ "$fail_line" -lt "$info_line" ]
 empty="$(python3 "$here/summary.py" "$tmp/nothing-here")"
 assert "empty dir still prints a line" contains "$empty" "No findings.tsv"
 
+reached_end=1
 if [ "$failures" != 0 ]; then
     echo "FAIL: lib.test.sh ($failures assertion(s))" >&2
     exit 1
