@@ -62,6 +62,21 @@ assert "check_fails keeps the rc"                 [ "$(row_rc cf-pass)" = 3 ]
 assert "check_fails FAIL when command exits 0"    [ "$(row_status cf-zero)" = FAIL ]
 assert "check_fails FAIL when substring absent"   [ "$(row_status cf-nosub)" = FAIL ]
 
+check_eventually ce-now 3 -- true >/dev/null
+check_eventually ce-never 2 -- false >/dev/null
+# The file appears 2 s in: a plain `check` here races the writer and fails.
+(trap - EXIT; sleep 2; : >"$tmp/appears") &
+check_eventually ce-later 20 -- test -f "$tmp/appears" >/dev/null
+wait
+assert "check_eventually PASS on the first try"   [ "$(row_status ce-now)" = PASS ]
+assert "check_eventually reports no wait"         starts_with "$(row_detail ce-now)" "ready after 0s"
+assert "check_eventually PASS once state appears" [ "$(row_status ce-later)" = PASS ]
+assert "check_eventually reports the wait"        starts_with "$(row_detail ce-later)" "ready after "
+assert "check_eventually did wait for it"         [ "$(row_detail ce-later)" != "ready after 0s" ]
+assert "check_eventually FAIL after the cap"      [ "$(row_status ce-never)" = FAIL ]
+assert "check_eventually FAIL names the cap"      contains "$(row_detail ce-never)" "still failing after 2s"
+assert "check_eventually records one row"         [ "$(row_count ce-never)" = 1 ]
+
 info note "hello world" >/dev/null
 assert "info records INFO"        [ "$(row_status note)" = INFO ]
 assert "info detail is the value" [ "$(row_detail note)" = "hello world" ]

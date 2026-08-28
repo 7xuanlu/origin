@@ -13,6 +13,8 @@
 #   check NAME -- CMD ARGS...            PASS when CMD exits 0
 #   check_output NAME SUBSTR -- CMD...   PASS when CMD exits 0 and output contains SUBSTR
 #   check_fails NAME SUBSTR -- CMD...    PASS when CMD exits nonzero and output contains SUBSTR
+#   check_eventually NAME SECS -- CMD...  PASS as soon as CMD exits 0, retrying
+#                                        once a second for up to SECS; one row
 #   info NAME VALUE                      informational row (never fails the run)
 #   wait_health URL SECS                 poll /api/health; records seconds-to-health; returns 1 on timeout
 #   assert_version URL EXPECTED          PASS when health .version == EXPECTED (leading v stripped)
@@ -106,6 +108,29 @@ check_fails() {
         _gauntlet_record PASS "$name" "$rc" "$out"
     else
         _gauntlet_record FAIL "$name" "$rc" "expected nonzero exit with substring: $want; got: $out"
+    fi
+    return 0
+}
+
+# For state some other process writes shortly after the signal we waited on —
+# a launch agent plist, a spawned process — where testing once immediately
+# races the writer. Records a single row: the elapsed seconds on PASS, the last
+# attempt's output on FAIL.
+check_eventually() {
+    local name="$1" secs="$2"; shift 2
+    [ "${1:-}" = "--" ] && shift
+    local i rc=1
+    for ((i = 1; i <= secs; i++)); do
+        rc="$(_gauntlet_run "$name" "$@")"
+        [ "$rc" = 0 ] && break
+        [ "$i" -lt "$secs" ] && sleep 1
+    done
+    local out
+    out="$(cat "$GAUNTLET_OUT/checks/$name.log" 2>/dev/null)"
+    if [ "$rc" = 0 ]; then
+        _gauntlet_record PASS "$name" "$rc" "ready after $((i - 1))s${out:+; $out}"
+    else
+        _gauntlet_record FAIL "$name" "$rc" "still failing after ${secs}s${out:+; $out}"
     fi
     return 0
 }

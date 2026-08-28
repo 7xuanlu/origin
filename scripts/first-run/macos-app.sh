@@ -68,11 +68,11 @@ GAUNTLET_TIMEOUT=600 check app-install -- bash -c "$ONE_LINER"
 
 check app-installed -- test -d "$APP"
 check app-no-quarantine -- bash -c '! xattr -l "$1" | grep -q com.apple.quarantine' _ "$APP"
-check app-process-started -- bash -c 'for _ in $(seq 1 30); do pgrep -x wenlan-app >/dev/null && exit 0; sleep 1; done; exit 1'
+check_eventually app-process-started 30 -- pgrep -x wenlan-app
 wait_health "$HEALTH" 240 || true
 assert_version "$HEALTH" "$VERSION"
-check plist-desktop-exists -- test -f "$AGENTS/com.wenlan.desktop.plist"
-check plist-server-exists -- test -f "$AGENTS/com.wenlan.server.plist"
+check_eventually plist-desktop-exists 30 -- test -f "$AGENTS/com.wenlan.desktop.plist"
+check_eventually plist-server-exists 30 -- test -f "$AGENTS/com.wenlan.server.plist"
 if launchctl print "gui/$UID_NUM/com.wenlan.server" >"$GAUNTLET_OUT/checks/launchctl-print-server.log" 2>&1; then
     check launchctl-server-loaded -- launchctl print "gui/$UID_NUM/com.wenlan.server"
 else

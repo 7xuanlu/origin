@@ -77,6 +77,12 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
+      # Every channel script sources lib.sh, so a broken helper would burn all
+      # fifteen jobs below before anyone saw why. Seconds here, and the only
+      # place these unit tests run.
+      - name: Self-test the gauntlet helper library
+        run: bash scripts/first-run/lib.test.sh
+
       # The release JSON is fetched once and reused by the inventory and parity
       # steps below so every job in the run talks about the same asset list.
       - name: Resolve release tag
