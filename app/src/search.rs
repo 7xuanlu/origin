@@ -641,11 +641,13 @@ pub async fn test_remote_mcp_connection(
 /// application schemes are all reachable via that route. The other opener in
 /// the app, the Tauri shell plugin behind citation links, has been
 /// scheme-restricted all along by its default scope; these two were not.
-/// `file:` is deliberately absent from both. The callers that deal in `file:`
-/// URLs strip the prefix before invoking (`openFile` in `src/lib/tauri.ts`;
-/// `open_search_result` refuses it outright rather than stripping it), so a
-/// local file arrives here as a bare path and goes through the filesystem
-/// checks below. Accepting the URL form as well would be a way around them.
+/// `file:` is deliberately absent from both. Whoever sees a `file://` URL
+/// strips the prefix before this scheme check runs (`openFile`'s wrapper in
+/// `src/lib/tauri.ts` for `open_file`; `refuse_unopenable_search_result`
+/// itself for `open_search_result`, since `local_files.rs` stores every
+/// local-file source's `url` in that form), so a local file arrives here as a
+/// bare path and goes through the filesystem checks below. Accepting the URL
+/// form as a scheme in its own right would be a way around them.
 const OPENABLE_SCHEMES: [&str; 2] = ["http", "https"];
 
 /// Filename endings this platform treats as something to run rather than
@@ -828,10 +830,22 @@ const INDEXED_DOCUMENT_SUFFIXES: [&str; 3] = ["md", "txt", "pdf"];
 /// Returns the canonical path the decision was made about, so the caller can
 /// hand the OS exactly what was judged rather than the string it started
 /// from. A `None` means the target is a URL and goes through unchanged.
+///
+/// `local_files.rs` stores every local-file source's `url` as
+/// `format!("file://{}", path.display())` — no percent-encoding — so a
+/// leading `file://` is stripped before the scheme check, right here rather
+/// than by the caller: the guard must be complete on its own, so a caller
+/// that forgets to strip gets the same answer as one that remembers. What
+/// remains after stripping still goes through every filesystem check below
+/// (canonicalize, must be a regular file, must be an indexed extension), so
+/// `file:///Applications/Utilities/Terminal.app` is still refused — it
+/// canonicalizes to a directory.
 fn refuse_unopenable_search_result(target: &str) -> Result<Option<std::path::PathBuf>, String> {
     if target.contains('\0') {
         return Err("Refusing to open a path containing a NUL byte.".to_string());
     }
+
+    let target = target.strip_prefix("file://").unwrap_or(target);
 
     if let Some(scheme) = target_scheme(target) {
         if OPENABLE_SCHEMES.contains(&scheme.as_str()) {
@@ -1073,6 +1087,22 @@ mod open_target_tests {
         }
     }
 
+    /// The regression test for the CI-caught bug: `local_files.rs` stores
+    /// every local-file source's `url` as `file://` plus the path, so a real
+    /// search result target is a `file://` URL, not a bare path. It must
+    /// still resolve to the allowed canonical file.
+    #[test]
+    fn a_file_url_naming_a_real_document_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let note = tmp.path().join("note.md");
+        std::fs::write(&note, "hi").unwrap();
+        let url = format!("file://{}", note.display());
+
+        let canonical = refuse_unopenable_search_result(&url).unwrap();
+
+        assert_eq!(canonical, Some(note.canonicalize().unwrap()));
+    }
+
     #[test]
     fn a_search_result_web_url_is_allowed() {
         for url in ["https://example.com/a", "http://example.com/a"] {
@@ -1136,6 +1166,18 @@ mod open_target_tests {
     fn a_search_result_pointing_at_a_directory_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!search_result_allowed(tmp.path().to_str().unwrap()));
+    }
+
+    /// `file:///Applications/Utilities/Terminal.app`-shaped input: stripping
+    /// the `file://` prefix must not skip the directory check that follows.
+    #[test]
+    fn a_file_url_naming_a_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("subdir");
+        std::fs::create_dir(&dir).unwrap();
+        let url = format!("file://{}", dir.display());
+
+        assert!(!search_result_allowed(&url));
     }
 
     #[test]
