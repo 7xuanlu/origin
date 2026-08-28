@@ -78,7 +78,7 @@ open = "5"
 wenlan-types = { workspace = true }
 # Workspace-pinned (=0.38.3): the scheduler tooth requires exactly one sysinfo in Cargo.lock
 sysinfo = { workspace = true }
-pdf-extract = "0.10"
+pdf-extract = "0.12"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 # Keep the target tables LAST. A TOML table runs until the next header, so any

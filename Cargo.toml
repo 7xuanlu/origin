@@ -98,7 +98,7 @@ encoding_rs = "0.8"
 lru = "0.12"
 futures = "0.3"
 tempfile = "3"
-pdf-extract = "0.10"
+pdf-extract = "0.12"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 service-manager = "0.11"
 serde_yaml = "0.9"
