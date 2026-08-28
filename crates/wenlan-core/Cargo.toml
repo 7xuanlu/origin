@@ -130,7 +130,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # lopdf generates byte-valid PDF fixtures for sources::directory tests (the same
 # lopdf pdf-extract parses with). default-features=false keeps it to the writer
 # path only, so no new crates enter the graph (mirrors the tokenizers/tempfile note).
-lopdf = { version = "0.42", default-features = false }
+lopdf = { version = "0.38", default-features = false }
 # R4 test-support source teeth parse Rust syntax and retain stable source
 # locations. Exact pins keep the manifest identities deterministic.
 syn = { version = "=2.0.117", features = ["full", "visit"] }
