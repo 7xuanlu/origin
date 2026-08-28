@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=90db35bbc97fc5e4c0d30948df87d79d26a6a79a924f0ec60bd1a3ea5974c769 -->
+<!-- README_SYNC: source=README.md sha256=a0a769a739c5e46353dc5a2c480ce641cc39512b6a517dc976aa174aa35d6c3d -->
 
 <p align="center">
   <picture>
@@ -331,6 +331,7 @@ a1b2c3d distill: 4 pages
 - [本地优先的 AI 记忆](https://wenlan.app/learn/local-first-ai-memory)：数据、隐私与控制权。
 - [Markdown 与本地索引](https://wenlan.app/learn/markdown-local-index-ai-memory)：存储、检索与所有权。
 - [AI agent 的交接循环](https://wenlan.app/learn/ai-agent-handoff-loop)：把工作完整带到下一次会话。
+- [用论文建立研究知识库](https://wenlan.app/zh-CN/learn/source-backed-research-knowledge-base)：把已选好的论文整理成可检查的文献矩阵与来源支撑综述。
 
 ### 比较
 
