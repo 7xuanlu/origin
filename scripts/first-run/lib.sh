@@ -13,8 +13,9 @@
 #   check NAME -- CMD ARGS...            PASS when CMD exits 0
 #   check_output NAME SUBSTR -- CMD...   PASS when CMD exits 0 and output contains SUBSTR
 #   check_fails NAME SUBSTR -- CMD...    PASS when CMD exits nonzero and output contains SUBSTR
-#   check_eventually NAME SECS -- CMD...  PASS as soon as CMD exits 0, retrying
-#                                        once a second for up to SECS; one row
+#   check_eventually NAME SECS -- CMD...  PASS as soon as CMD exits 0, retried
+#                                        once a second within SECS of wall clock;
+#                                        one row, carrying the seconds waited
 #   info NAME VALUE                      informational row (never fails the run)
 #   wait_health URL SECS                 poll /api/health; records seconds-to-health; returns 1 on timeout
 #   assert_version URL EXPECTED          PASS when health .version == EXPECTED (leading v stripped)
@@ -113,24 +114,37 @@ check_fails() {
 }
 
 # For state some other process writes shortly after the signal we waited on —
-# a launch agent plist, a spawned process — where testing once immediately
-# races the writer. Records a single row: the elapsed seconds on PASS, the last
-# attempt's output on FAIL.
+# a loaded launch agent, a spawned process — where testing once immediately
+# races the writer. Retries CMD until it exits 0 or SECS of wall clock have
+# passed, and records a single row carrying the seconds actually waited. Each
+# attempt is handed the time still left as its GAUNTLET_TIMEOUT, so retrying
+# cannot multiply the per-check cap — on a runner with no `timeout` or
+# `gtimeout` that cap is unenforced, the same as for every other check here.
 check_eventually() {
     local name="$1" secs="$2"; shift 2
     [ "${1:-}" = "--" ] && shift
-    local i rc=1
-    for ((i = 1; i <= secs; i++)); do
-        rc="$(_gauntlet_run "$name" "$@")"
+    case "$secs" in
+        '' | *[!0-9]* | 0)
+            _gauntlet_record FAIL "$name" 2 \
+                "check_eventually needs a positive whole number of seconds, got: $secs"
+            return 0
+            ;;
+    esac
+    local start=$SECONDS deadline=$((SECONDS + secs)) left rc=1
+    while :; do
+        left=$((deadline - SECONDS))
+        [ "$left" -lt 1 ] && left=1
+        rc="$(GAUNTLET_TIMEOUT="$left" _gauntlet_run "$name" "$@")"
         [ "$rc" = 0 ] && break
-        [ "$i" -lt "$secs" ] && sleep 1
+        [ "$SECONDS" -ge "$deadline" ] && break
+        sleep 1
     done
-    local out
-    out="$(cat "$GAUNTLET_OUT/checks/$name.log" 2>/dev/null)"
+    local waited=$((SECONDS - start)) out
+    out="$(cat "$GAUNTLET_OUT/checks/$name.log" 2>/dev/null || true)"
     if [ "$rc" = 0 ]; then
-        _gauntlet_record PASS "$name" "$rc" "ready after $((i - 1))s${out:+; $out}"
+        _gauntlet_record PASS "$name" "$rc" "ready after ${waited}s${out:+; $out}"
     else
-        _gauntlet_record FAIL "$name" "$rc" "still failing after ${secs}s${out:+; $out}"
+        _gauntlet_record FAIL "$name" "$rc" "still failing after ${waited}s${out:+; $out}"
     fi
     return 0
 }

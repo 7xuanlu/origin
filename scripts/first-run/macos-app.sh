@@ -71,14 +71,25 @@ check app-no-quarantine -- bash -c '! xattr -l "$1" | grep -q com.apple.quaranti
 check_eventually app-process-started 30 -- pgrep -x wenlan-app
 wait_health "$HEALTH" 240 || true
 assert_version "$HEALTH" "$VERSION"
-check_eventually plist-desktop-exists 30 -- test -f "$AGENTS/com.wenlan.desktop.plist"
-check_eventually plist-server-exists 30 -- test -f "$AGENTS/com.wenlan.server.plist"
-if launchctl print "gui/$UID_NUM/com.wenlan.server" >"$GAUNTLET_OUT/checks/launchctl-print-server.log" 2>&1; then
-    check launchctl-server-loaded -- launchctl print "gui/$UID_NUM/com.wenlan.server"
+# The app writes each plist, runs `launchctl load` on it, and deletes the file
+# again when that load fails (app/src/lifecycle.rs, install_app_plist). Testing
+# for the file races both the write and that rollback, and can go green on a
+# broken install by catching the file mid-window. The loaded job is the state
+# run-at-login actually depends on and is only reachable after a load that
+# stuck, so wait for that; the file tests below then run on a settled install.
+# Probing the domain rather than a label keeps the headless fallback honest: a
+# label that is merely not loaded yet must not read as "no launchd here".
+if launchctl print "gui/$UID_NUM" >"$GAUNTLET_OUT/checks/launchctl-print-domain.log" 2>&1; then
+    check_eventually launchctl-server-loaded 30 -- launchctl print "gui/$UID_NUM/com.wenlan.server"
+    check_eventually launchctl-desktop-loaded 30 -- launchctl print "gui/$UID_NUM/com.wenlan.desktop"
 else
     # Headless runners may have no usable GUI launchd domain; a runner artifact, not a product finding.
-    info launchctl-server-loaded "launchctl print failed: $(head -c 400 "$GAUNTLET_OUT/checks/launchctl-print-server.log")"
+    NO_DOMAIN="no usable GUI launchd domain: $(head -c 400 "$GAUNTLET_OUT/checks/launchctl-print-domain.log")"
+    info launchctl-server-loaded "$NO_DOMAIN"
+    info launchctl-desktop-loaded "$NO_DOMAIN"
 fi
+check_eventually plist-desktop-exists 30 -- test -f "$AGENTS/com.wenlan.desktop.plist"
+check_eventually plist-server-exists 30 -- test -f "$AGENTS/com.wenlan.server.plist"
 SERVER_PID="$(pgrep -x wenlan-server | head -1 || true)"
 SERVER_CMD="$(ps -o command= -p "${SERVER_PID:-0}" 2>/dev/null || true)"
 info daemon-command "pid=${SERVER_PID:-none} cmd=$SERVER_CMD"
