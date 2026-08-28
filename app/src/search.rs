@@ -637,7 +637,34 @@ pub async fn test_remote_mcp_connection(
 /// long tail of registered application schemes are all reachable that way.
 /// The other opener in the app, the Tauri shell plugin behind citation links,
 /// has been scheme-restricted all along by its default scope; this one was not.
-const OPENABLE_SCHEMES: [&str; 3] = ["http", "https", "file"];
+/// `file:` is deliberately absent. The one caller that deals in `file:` URLs
+/// strips the prefix before it invokes (`openFile` in `src/lib/tauri.ts`), so
+/// a local file arrives here as a bare path and goes through the filesystem
+/// checks below. Accepting the URL form as well would be a way around them.
+const OPENABLE_SCHEMES: [&str; 2] = ["http", "https"];
+
+/// Filename endings this platform treats as something to run rather than
+/// something to read. The lists are per-platform on purpose: a `.py` file on
+/// macOS opens in an editor and should stay openable, while on Windows the
+/// script hosts turn several of these into execution.
+#[cfg(target_os = "macos")]
+const LAUNCHER_SUFFIXES: [&str; 8] = [
+    "app",
+    "command",
+    "pkg",
+    "mpkg",
+    "scpt",
+    "applescript",
+    "workflow",
+    "webloc",
+];
+#[cfg(target_os = "windows")]
+const LAUNCHER_SUFFIXES: [&str; 23] = [
+    "exe", "com", "bat", "cmd", "scr", "msi", "msp", "cpl", "hta", "pif", "ps1", "vbs", "vbe",
+    "js", "jse", "wsf", "wsh", "reg", "lnk", "msc", "jar", "url", "scf",
+];
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const LAUNCHER_SUFFIXES: [&str; 1] = ["desktop"];
 
 /// The URL scheme of `target`, lowercased, or `None` when it is a filesystem
 /// path.
@@ -660,24 +687,66 @@ fn target_scheme(target: &str) -> Option<String> {
     Some(head.to_ascii_lowercase())
 }
 
+/// Whether the last extension of `path` is one this platform launches.
+///
+/// Read off the string rather than the disk, so it holds for a path that does
+/// not exist yet and for a macOS `.app`, which is a directory.
+fn has_launcher_suffix(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .is_some_and(|ext| LAUNCHER_SUFFIXES.contains(&ext.as_str()))
+}
+
+/// Whether `path` is a regular file carrying an executable bit. Follows
+/// symlinks, so the question is asked of what would actually run. Always
+/// `false` off Unix, where the extension carries this instead.
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+#[cfg(not(unix))]
+fn is_executable_file(_path: &std::path::Path) -> bool {
+    false
+}
+
+/// `Ok(())` when `open_file` may hand `target` to the OS. This is the whole of
+/// the decision, kept out of `open_file` so the tests below exercise the same
+/// code the command runs rather than a copy of its reasoning.
+///
+/// Two gates, because the finding has two shapes. A URL must carry a scheme
+/// this app opens. A filesystem path must not be a thing the OS would run:
+/// the audit's own example was a memory whose `url` was
+/// `/Applications/Utilities/Terminal.app`, which carries no scheme at all and
+/// would sail past a scheme check.
+fn refuse_unopenable_target(target: &str) -> Result<(), String> {
+    if let Some(scheme) = target_scheme(target) {
+        if OPENABLE_SCHEMES.contains(&scheme.as_str()) {
+            return Ok(());
+        }
+        return Err(format!(
+            "Refusing to open a \"{scheme}:\" link. Wenlan opens web pages and files on this computer."
+        ));
+    }
+
+    let path = std::path::Path::new(target);
+    if has_launcher_suffix(path) || is_executable_file(path) {
+        return Err(format!(
+            "Refusing to run \"{target}\". Wenlan opens documents and folders, not programs."
+        ));
+    }
+    Ok(())
+}
+
 /// Hand `path` — a filesystem path or a URL, both of which callers pass — to
 /// the desktop's default handler via the `open` crate rather than a hand-built
 /// per-OS argv: its Windows launcher never routes the path through `cmd.exe`
 /// (so a filename containing shell metacharacters cannot inject a second
-/// command), and it covers macOS/Linux/BSD the same way. A URL scheme outside
-/// `OPENABLE_SCHEMES` is refused before it gets there.
-/// `Ok(())` when `open_file` may hand `target` to the OS. This is the whole of
-/// the decision, kept out of `open_file` so the tests below exercise the same
-/// code the command runs rather than a copy of its reasoning.
-fn refuse_unopenable_target(target: &str) -> Result<(), String> {
-    match target_scheme(target) {
-        Some(scheme) if !OPENABLE_SCHEMES.contains(&scheme.as_str()) => Err(format!(
-            "Refusing to open a \"{scheme}:\" link. Wenlan opens web pages and local files."
-        )),
-        _ => Ok(()),
-    }
-}
-
+/// command), and it covers macOS/Linux/BSD the same way. Anything
+/// `refuse_unopenable_target` turns down never reaches it.
 #[tauri::command]
 pub async fn open_file(path: String) -> Result<(), String> {
     refuse_unopenable_target(&path)?;
@@ -707,12 +776,12 @@ mod open_target_tests {
     }
 
     #[test]
-    fn web_and_file_urls_are_opened() {
+    fn web_urls_are_opened() {
         for url in [
             "https://example.com/a",
             "http://example.com/a",
-            "file:///Users/someone/a.md",
             "HTTPS://Example.com/A",
+            "https://example.com/Terminal.app",
         ] {
             assert!(allowed(url), "{url}");
         }
@@ -730,18 +799,90 @@ mod open_target_tests {
             "mailto:someone@example.com",
             "x-apple-helpbasic://x",
             "ms-msdt:/id",
+            // The one caller strips `file://` before invoking, so a local file
+            // arrives as a bare path and gets the filesystem checks below.
+            // Letting the URL form through would be a way around them.
+            "file:///Applications/Utilities/Terminal.app",
+            "file:///Users/someone/a.md",
         ] {
             assert!(!allowed(url), "{url}");
         }
     }
 
+    /// The audit's own example: a memory whose `url` is an application, which
+    /// carries no scheme and would sail past a scheme check.
     #[test]
-    fn a_refusal_says_which_scheme_and_what_is_allowed() {
+    #[cfg(target_os = "macos")]
+    fn a_memory_path_cannot_launch_an_application() {
+        for path in [
+            "/Applications/Utilities/Terminal.app",
+            "/Applications/Utilities/TERMINAL.APP",
+            "/Users/someone/Downloads/installer.pkg",
+            "/Users/someone/Downloads/run-me.command",
+            "/Users/someone/Downloads/thing.workflow",
+            "/Users/someone/Downloads/redirect.webloc",
+        ] {
+            assert!(!allowed(path), "{path}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn a_memory_path_cannot_launch_a_program() {
+        for path in [
+            "C:\\Users\\someone\\Downloads\\evil.exe",
+            "C:\\Users\\someone\\Downloads\\EVIL.EXE",
+            "C:\\Users\\someone\\Downloads\\evil.bat",
+            "C:\\Users\\someone\\Downloads\\evil.ps1",
+            "C:\\Users\\someone\\Downloads\\evil.lnk",
+        ] {
+            assert!(!allowed(path), "{path}");
+        }
+    }
+
+    /// On Unix the extension carries no authority, so the executable bit does.
+    /// A shell script a user could be tricked into clicking is refused; the
+    /// notes and folders the Sources view opens are not.
+    #[test]
+    #[cfg(unix)]
+    fn an_executable_file_is_refused_and_a_document_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("payload.sh");
+        let note = tmp.path().join("note.md");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::write(&note, "# hi\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(!allowed(script.to_str().unwrap()));
+        assert!(allowed(note.to_str().unwrap()));
+        // A folder carries the executable bit too, and the Sources view opens
+        // folders in the file manager. It must not be caught by this check.
+        assert!(allowed(tmp.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn a_refused_scheme_says_which_one_and_what_is_allowed() {
         let message = refuse_unopenable_target("JavaScript:alert(1)").unwrap_err();
 
         assert_eq!(
             message,
-            "Refusing to open a \"javascript:\" link. Wenlan opens web pages and local files."
+            "Refusing to open a \"javascript:\" link. \
+             Wenlan opens web pages and files on this computer."
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_refused_program_says_which_one() {
+        let message = refuse_unopenable_target("/Applications/Utilities/Terminal.app").unwrap_err();
+
+        assert_eq!(
+            message,
+            "Refusing to run \"/Applications/Utilities/Terminal.app\". \
+             Wenlan opens documents and folders, not programs."
         );
     }
 }
