@@ -1307,6 +1307,7 @@ pub fn run() {
             search::delete_by_time_range,
             search::delete_bulk,
             search::open_file,
+            search::open_search_result,
             search::read_source_dir,
             search::detect_obsidian_vaults,
             search::read_text_file,
@@ -1423,7 +1424,6 @@ pub fn run() {
             // Remote access commands
             search::toggle_remote_access,
             search::get_remote_access_status,
-            search::rotate_remote_token,
             search::test_remote_mcp_connection,
             // Memory nurture commands
             search::get_nurture_cards_cmd,

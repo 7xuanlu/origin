@@ -623,24 +623,598 @@ pub async fn test_remote_mcp_connection(
     }
 }
 
-#[tauri::command]
-pub async fn rotate_remote_token(
-    _state: tauri::State<'_, State>,
-    app_handle: tauri::AppHandle,
-) -> Result<String, String> {
-    crate::remote_access::rotate_token(&app_handle).await
+// ── File / open commands ──────────────────────────────────────────────
+
+/// What `open_file` and `open_search_result` will hand to the OS: a web page,
+/// a local file, or a bare filesystem path. Everything else is refused.
+///
+/// `open_file` serves the Sources view, where the value is a path the user is
+/// browsing in their own configured folder, or the configured folder itself
+/// — not attacker-influenced. Search results are the attacker-influenced
+/// value: `POST /api/ingest/webpage` and `/api/ingest/memory` store the
+/// caller's `url` verbatim (`crates/wenlan-server/src/ingest_routes.rs`), it
+/// rides out on every search result, so any agent or page that can put a
+/// memory in the store chooses a string the desktop's scheme handlers will
+/// act on. That is why clicking a search result calls `open_search_result`,
+/// not `open_file` — see its allowlist-based check.
+/// `javascript:`, `data:`, `vbscript:` and the long tail of registered
+/// application schemes are all reachable via that route. The other opener in
+/// the app, the Tauri shell plugin behind citation links, has been
+/// scheme-restricted all along by its default scope; these two were not.
+/// `file:` is deliberately absent from both. Whoever sees a `file://` URL
+/// strips the prefix before this scheme check runs (`openFile`'s wrapper in
+/// `src/lib/tauri.ts` for `open_file`; `refuse_unopenable_search_result`
+/// itself for `open_search_result`, since `local_files.rs` stores every
+/// local-file source's `url` in that form), so a local file arrives here as a
+/// bare path and goes through the filesystem checks below. Accepting the URL
+/// form as a scheme in its own right would be a way around them.
+const OPENABLE_SCHEMES: [&str; 2] = ["http", "https"];
+
+/// Filename endings this platform treats as something to run rather than
+/// something to read. The lists are per-platform on purpose: a `.py` file on
+/// macOS opens in an editor and should stay openable, while on Windows the
+/// script hosts turn several of these into execution.
+#[cfg(target_os = "macos")]
+const LAUNCHER_SUFFIXES: [&str; 8] = [
+    "app",
+    "command",
+    "pkg",
+    "mpkg",
+    "scpt",
+    "applescript",
+    "workflow",
+    "webloc",
+];
+#[cfg(target_os = "windows")]
+const LAUNCHER_SUFFIXES: [&str; 25] = [
+    "exe",
+    "com",
+    "bat",
+    "cmd",
+    "scr",
+    "msi",
+    "msp",
+    "cpl",
+    "hta",
+    "pif",
+    "ps1",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "wsf",
+    "wsh",
+    "reg",
+    "lnk",
+    "msc",
+    "jar",
+    "url",
+    "scf",
+    "appref-ms",
+    "application",
+];
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const LAUNCHER_SUFFIXES: [&str; 1] = ["desktop"];
+
+/// The URL scheme of `target`, lowercased, or `None` when it is a filesystem
+/// path.
+///
+/// A one-character scheme is read as a Windows drive letter (`C:\Users\...`),
+/// never as a scheme: RFC 3986 allows a single letter, but nothing registers
+/// one, and treating `C:` as a scheme would refuse every Windows path.
+fn target_scheme(target: &str) -> Option<String> {
+    let (head, _) = target.split_once(':')?;
+    if head.len() < 2 || head.contains('/') || head.contains('\\') {
+        return None;
+    }
+    let mut chars = head.chars();
+    if !chars.next()?.is_ascii_alphabetic() {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') {
+        return None;
+    }
+    Some(head.to_ascii_lowercase())
 }
 
-// ── File / open commands ──────────────────────────────────────────────
+/// Whether the last extension of `path` is one this platform launches.
+///
+/// Read off the string rather than the disk, so it holds for a path that does
+/// not exist yet and for a macOS `.app`, which is a directory. Trailing `.`
+/// and trailing space are trimmed off the extension before comparing, because
+/// Win32 strips both before resolving a filename — `evil.exe   ` opens
+/// `evil.exe`.
+fn has_launcher_suffix(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.trim_end_matches(['.', ' ']).to_ascii_lowercase())
+        .is_some_and(|ext| LAUNCHER_SUFFIXES.contains(&ext.as_str()))
+}
+
+/// Whether `path` is a regular file carrying an executable bit. Follows
+/// symlinks, so the question is asked of what would actually run. Always
+/// `false` off Unix, where the extension carries this instead.
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+#[cfg(not(unix))]
+fn is_executable_file(_path: &std::path::Path) -> bool {
+    false
+}
+
+/// `Ok(())` when `open_file` may hand `target` to the OS. This is the whole of
+/// the decision, kept out of `open_file` so the tests below exercise the same
+/// code the command runs rather than a copy of its reasoning.
+///
+/// Two gates, because the finding has two shapes. A URL must carry a scheme
+/// this app opens. A filesystem path must not be a thing the OS would run:
+/// the audit's own example was a memory whose `url` was
+/// `/Applications/Utilities/Terminal.app`, which carries no scheme at all and
+/// would sail past a scheme check.
+///
+/// The path is canonicalized before either filesystem check runs, so a
+/// symlink whose own name carries no launcher suffix but which resolves to a
+/// `.app` bundle (or any other launcher) is judged on what it actually points
+/// at, not on its name. Canonicalizing also has the OS resolve a Windows
+/// trailing dot or space the way `ShellExecuteExW` would. Canonicalization
+/// failing (a path that does not exist, or has just moved) falls back to the
+/// raw path rather than refusing outright — this command also serves the
+/// Sources view, which can legitimately be handed a path like that.
+fn refuse_unopenable_target(target: &str) -> Result<(), String> {
+    if target.contains('\0') {
+        return Err("Refusing to open a path containing a NUL byte.".to_string());
+    }
+
+    if let Some(scheme) = target_scheme(target) {
+        if OPENABLE_SCHEMES.contains(&scheme.as_str()) {
+            return Ok(());
+        }
+        return Err(format!(
+            "Refusing to open a \"{scheme}:\" link. Wenlan opens web pages and files on this computer."
+        ));
+    }
+
+    let path = std::path::Path::new(target);
+    let canonical = std::fs::canonicalize(path).ok();
+    let checked = canonical.as_deref().unwrap_or(path);
+    if has_launcher_suffix(checked) || is_executable_file(checked) {
+        return Err(format!(
+            "Refusing to run \"{target}\". Wenlan opens documents and folders, not programs."
+        ));
+    }
+    Ok(())
+}
 
 /// Hand `path` — a filesystem path or a URL, both of which callers pass — to
 /// the desktop's default handler via the `open` crate rather than a hand-built
 /// per-OS argv: its Windows launcher never routes the path through `cmd.exe`
 /// (so a filename containing shell metacharacters cannot inject a second
-/// command), and it covers macOS/Linux/BSD the same way.
+/// command), and it covers macOS/Linux/BSD the same way. Anything
+/// `refuse_unopenable_target` turns down never reaches it.
 #[tauri::command]
 pub async fn open_file(path: String) -> Result<(), String> {
+    refuse_unopenable_target(&path)?;
     open::that_detached(&path).map_err(|e| format!("Failed to open file: {}", e))
+}
+
+/// What the daemon's directory ingest actually indexes
+/// (`crates/wenlan-core/src/sources/directory.rs`). A search result that
+/// points at a local file points at one of these, because that is all that
+/// gets indexed — so this can be an allowlist rather than a denylist of
+/// everything the OS might run.
+const INDEXED_DOCUMENT_SUFFIXES: [&str; 3] = ["md", "txt", "pdf"];
+
+/// `Ok(())` when `open_search_result` may hand `target` to the OS.
+///
+/// `target` is a search result's `url`, stored verbatim from whatever an
+/// ingest call sent (`POST /api/ingest/webpage`, `/api/ingest/memory`) — any
+/// agent or page that can write a memory chooses this string. That rules out
+/// the denylist `refuse_unopenable_target` uses for the Sources view: a
+/// denylist only refuses what it happens to enumerate, and this input is
+/// adversarial. So a filesystem path here is judged by an allowlist instead —
+/// it must canonicalize to a regular file whose extension is one of the
+/// document types Wenlan actually indexes.
+///
+/// Canonicalizing resolves symlinks and `..` before either filesystem check
+/// runs, so a symlink named to look like a document but pointing at an `.app`
+/// bundle is judged on what it resolves to. It also fails outright for a
+/// trailing Windows dot/space or an embedded NUL, since none of those name a
+/// file that exists — a search result points at something Wenlan indexed, so
+/// a path that is not there is not openable anyway. The NUL is also checked
+/// explicitly first: canonicalize's behaviour on an interior NUL is not
+/// something to depend on.
+/// Returns the canonical path the decision was made about, so the caller can
+/// hand the OS exactly what was judged rather than the string it started
+/// from. A `None` means the target is a URL and goes through unchanged.
+///
+/// `local_files.rs` stores every local-file source's `url` as
+/// `format!("file://{}", path.display())` — no percent-encoding — so a
+/// leading `file://` is stripped before the scheme check, right here rather
+/// than by the caller: the guard must be complete on its own, so a caller
+/// that forgets to strip gets the same answer as one that remembers. What
+/// remains after stripping still goes through every filesystem check below
+/// (canonicalize, must be a regular file, must be an indexed extension), so
+/// `file:///Applications/Utilities/Terminal.app` is still refused — it
+/// canonicalizes to a directory.
+fn refuse_unopenable_search_result(target: &str) -> Result<Option<std::path::PathBuf>, String> {
+    if target.contains('\0') {
+        return Err("Refusing to open a path containing a NUL byte.".to_string());
+    }
+
+    let target = target.strip_prefix("file://").unwrap_or(target);
+
+    if let Some(scheme) = target_scheme(target) {
+        if OPENABLE_SCHEMES.contains(&scheme.as_str()) {
+            return Ok(None);
+        }
+        return Err(format!(
+            "Refusing to open a \"{scheme}:\" link. Wenlan opens web pages and files on this computer."
+        ));
+    }
+
+    let canonical = std::fs::canonicalize(target)
+        .map_err(|_| format!("Refusing to open \"{target}\": no such file."))?;
+
+    let is_file = std::fs::metadata(&canonical)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false);
+    if !is_file {
+        return Err(format!(
+            "Refusing to open \"{target}\". Wenlan opens documents, not folders or applications."
+        ));
+    }
+
+    let is_indexed_document = canonical
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .is_some_and(|ext| INDEXED_DOCUMENT_SUFFIXES.contains(&ext.as_str()));
+    if !is_indexed_document {
+        return Err(format!(
+            "Refusing to open \"{target}\". Wenlan opens the document types it indexes."
+        ));
+    }
+
+    Ok(Some(canonical))
+}
+
+/// Hand a search result's `url` to the desktop's default handler.
+///
+/// This is the attacker-influenced twin of `open_file` — see
+/// `refuse_unopenable_search_result` — kept as a separate command so the two
+/// call sites carry two different trust levels instead of one shared,
+/// necessarily looser check.
+///
+/// A path is handed to the OS in the canonical form the check ran against,
+/// not the string it arrived as. Re-resolving the original would leave a
+/// window in which a symlink swapped after the check but before the open
+/// sends the OS somewhere the check never saw. A URL goes through unchanged.
+#[tauri::command]
+pub async fn open_search_result(url: String) -> Result<(), String> {
+    let opened = match refuse_unopenable_search_result(&url)? {
+        Some(canonical) => open::that_detached(&canonical),
+        None => open::that_detached(&url),
+    };
+    opened.map_err(|e| format!("Failed to open: {e}"))
+}
+
+#[cfg(test)]
+mod open_target_tests {
+    use super::{refuse_unopenable_search_result, refuse_unopenable_target, target_scheme};
+
+    fn allowed(target: &str) -> bool {
+        refuse_unopenable_target(target).is_ok()
+    }
+
+    fn search_result_allowed(target: &str) -> bool {
+        refuse_unopenable_search_result(target).is_ok()
+    }
+
+    #[test]
+    fn filesystem_paths_have_no_scheme() {
+        for path in [
+            "/Users/someone/notes/a.md",
+            "./relative/file.txt",
+            "C:\\Users\\someone\\a.md",
+            "\\\\server\\share\\a.md",
+            "/Users/someone/notes/12:30 meeting.md",
+        ] {
+            assert_eq!(target_scheme(path), None, "{path}");
+            assert!(allowed(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn web_urls_are_opened() {
+        for url in [
+            "https://example.com/a",
+            "http://example.com/a",
+            "HTTPS://Example.com/A",
+            "https://example.com/Terminal.app",
+        ] {
+            assert!(allowed(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_memory_url_cannot_reach_another_scheme() {
+        for url in [
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "data:text/html;base64,PHNjcmlwdD4=",
+            "vbscript:msgbox(1)",
+            "smb://attacker.example/share",
+            "ftp://example.com/a",
+            "mailto:someone@example.com",
+            "x-apple-helpbasic://x",
+            "ms-msdt:/id",
+            // The one caller strips `file://` before invoking, so a local file
+            // arrives as a bare path and gets the filesystem checks below.
+            // Letting the URL form through would be a way around them.
+            "file:///Applications/Utilities/Terminal.app",
+            "file:///Users/someone/a.md",
+        ] {
+            assert!(!allowed(url), "{url}");
+        }
+    }
+
+    /// The audit's own example: a memory whose `url` is an application, which
+    /// carries no scheme and would sail past a scheme check.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_memory_path_cannot_launch_an_application() {
+        for path in [
+            "/Applications/Utilities/Terminal.app",
+            "/Applications/Utilities/TERMINAL.APP",
+            "/Users/someone/Downloads/installer.pkg",
+            "/Users/someone/Downloads/run-me.command",
+            "/Users/someone/Downloads/thing.workflow",
+            "/Users/someone/Downloads/redirect.webloc",
+        ] {
+            assert!(!allowed(path), "{path}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn a_memory_path_cannot_launch_a_program() {
+        for path in [
+            "C:\\Users\\someone\\Downloads\\evil.exe",
+            "C:\\Users\\someone\\Downloads\\EVIL.EXE",
+            "C:\\Users\\someone\\Downloads\\evil.bat",
+            "C:\\Users\\someone\\Downloads\\evil.ps1",
+            "C:\\Users\\someone\\Downloads\\evil.lnk",
+        ] {
+            assert!(!allowed(path), "{path}");
+        }
+    }
+
+    /// On Unix the extension carries no authority, so the executable bit does.
+    /// A shell script a user could be tricked into clicking is refused; the
+    /// notes and folders the Sources view opens are not.
+    #[test]
+    #[cfg(unix)]
+    fn an_executable_file_is_refused_and_a_document_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("payload.sh");
+        let note = tmp.path().join("note.md");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::write(&note, "# hi\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(!allowed(script.to_str().unwrap()));
+        assert!(allowed(note.to_str().unwrap()));
+        // A folder carries the executable bit too, and the Sources view opens
+        // folders in the file manager. It must not be caught by this check.
+        assert!(allowed(tmp.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn a_refused_scheme_says_which_one_and_what_is_allowed() {
+        let message = refuse_unopenable_target("JavaScript:alert(1)").unwrap_err();
+
+        assert_eq!(
+            message,
+            "Refusing to open a \"javascript:\" link. \
+             Wenlan opens web pages and files on this computer."
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_refused_program_says_which_one() {
+        let message = refuse_unopenable_target("/Applications/Utilities/Terminal.app").unwrap_err();
+
+        assert_eq!(
+            message,
+            "Refusing to run \"/Applications/Utilities/Terminal.app\". \
+             Wenlan opens documents and folders, not programs."
+        );
+    }
+
+    /// The reviewer's exact bypass: a symlink whose own name carries no
+    /// launcher suffix, pointing at a directory that is a macOS app bundle.
+    /// `fs::metadata` follows the link and sees a directory, so the old
+    /// executable-bit check missed it; canonicalizing first fixes that.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_disguised_as_a_document_cannot_launch_the_app_bundle_it_points_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("Terminal.app");
+        std::fs::create_dir(&bundle).unwrap();
+        let link = tmp.path().join("Quarterly Notes");
+        std::os::unix::fs::symlink(&bundle, &link).unwrap();
+
+        assert!(!allowed(link.to_str().unwrap()));
+    }
+
+    #[test]
+    fn a_target_containing_a_nul_byte_is_refused() {
+        assert!(!allowed("/tmp/notes\0.md"));
+    }
+
+    #[test]
+    fn a_real_directory_and_a_real_document_stay_openable_after_canonicalization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let note = tmp.path().join("note.md");
+        std::fs::write(&note, "# hi\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        assert!(allowed(tmp.path().to_str().unwrap()));
+        assert!(allowed(note.to_str().unwrap()));
+    }
+
+    // ── refuse_unopenable_search_result ─────────────────────────────────
+
+    #[test]
+    fn an_indexed_document_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["note.md", "note.txt", "note.pdf"] {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, "hi").unwrap();
+            assert!(search_result_allowed(path.to_str().unwrap()), "{name}");
+        }
+    }
+
+    /// The regression test for the CI-caught bug: `local_files.rs` stores
+    /// every local-file source's `url` as `file://` plus the path, so a real
+    /// search result target is a `file://` URL, not a bare path. It must
+    /// still resolve to the allowed canonical file.
+    #[test]
+    fn a_file_url_naming_a_real_document_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let note = tmp.path().join("note.md");
+        std::fs::write(&note, "hi").unwrap();
+        let url = format!("file://{}", note.display());
+
+        let canonical = refuse_unopenable_search_result(&url).unwrap();
+
+        assert_eq!(canonical, Some(note.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn a_search_result_web_url_is_allowed() {
+        for url in ["https://example.com/a", "http://example.com/a"] {
+            assert!(search_result_allowed(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_search_result_cannot_reach_another_scheme() {
+        for url in [
+            "file:///Users/someone/a.md",
+            "javascript:alert(1)",
+            "smb://x/y",
+        ] {
+            assert!(!search_result_allowed(url), "{url}");
+        }
+    }
+
+    /// Proves the NUL itself is what stops it: the prefix up to the NUL is a
+    /// genuinely allowed file.
+    #[test]
+    fn a_search_result_with_an_embedded_nul_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let note = tmp.path().join("note.md");
+        std::fs::write(&note, "hi").unwrap();
+        let with_nul = format!("{}\0{}", note.to_str().unwrap(), ".txt");
+
+        assert!(!search_result_allowed(&with_nul));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_search_result_executable_script_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("payload.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!search_result_allowed(script.to_str().unwrap()));
+    }
+
+    /// The allowlist, not the executable bit, is what stops this: a `.exe`
+    /// with no execute permission is refused purely for not being an indexed
+    /// document type.
+    #[test]
+    #[cfg(unix)]
+    fn a_search_result_windows_executable_is_refused_by_the_allowlist() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("evil.exe");
+        std::fs::write(&exe, "MZ").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(!search_result_allowed(exe.to_str().unwrap()));
+    }
+
+    #[test]
+    fn a_search_result_pointing_at_a_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!search_result_allowed(tmp.path().to_str().unwrap()));
+    }
+
+    /// `file:///Applications/Utilities/Terminal.app`-shaped input: stripping
+    /// the `file://` prefix must not skip the directory check that follows.
+    #[test]
+    fn a_file_url_naming_a_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("subdir");
+        std::fs::create_dir(&dir).unwrap();
+        let url = format!("file://{}", dir.display());
+
+        assert!(!search_result_allowed(&url));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_search_result_symlink_to_an_app_bundle_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("Bundle.app");
+        std::fs::create_dir(&bundle).unwrap();
+        let link = tmp.path().join("notes");
+        std::os::unix::fs::symlink(&bundle, &link).unwrap();
+
+        assert!(!search_result_allowed(link.to_str().unwrap()));
+    }
+
+    /// Canonicalization must see through the harmless name: the symlink's own
+    /// name ends in `.md`, but it resolves to an executable script.
+    #[test]
+    #[cfg(unix)]
+    fn a_search_result_symlink_disguised_as_markdown_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("payload.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = tmp.path().join("notes.md");
+        std::os::unix::fs::symlink(&script, &link).unwrap();
+
+        assert!(!search_result_allowed(link.to_str().unwrap()));
+    }
+
+    #[test]
+    fn a_search_result_pointing_at_a_missing_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist.md");
+        assert!(!search_result_allowed(missing.to_str().unwrap()));
+    }
 }
 
 #[derive(serde::Serialize)]

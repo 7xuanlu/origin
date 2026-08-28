@@ -15,6 +15,7 @@ const eventListeners = vi.hoisted(
 );
 const listSpacesMock = vi.hoisted(() => vi.fn<() => Promise<readonly Space[]>>());
 const openFileMock = vi.hoisted(() => vi.fn<(url: string) => Promise<void>>());
+const openSearchResultMock = vi.hoisted(() => vi.fn<(url: string) => Promise<void>>());
 const draftRequestBackMock = vi.hoisted(
   () => vi.fn<(onBack: () => void) => Promise<void>>(),
 );
@@ -50,6 +51,7 @@ vi.mock("../../lib/tauri", () => ({
   searchPages: vi.fn().mockResolvedValue([]),
   listSpaces: listSpacesMock,
   openFile: openFileMock,
+  openSearchResult: openSearchResultMock,
   deleteFileChunks: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -347,6 +349,8 @@ describe("Main search", () => {
     listSpacesMock.mockResolvedValue([]);
     openFileMock.mockReset();
     openFileMock.mockResolvedValue(undefined);
+    openSearchResultMock.mockReset();
+    openSearchResultMock.mockResolvedValue(undefined);
     setSearchQueryMock.mockReset();
     draftRequestBackMock.mockReset();
     draftRequestBackMock.mockImplementation(async (onBack) => onBack());
@@ -1024,7 +1028,32 @@ describe("Main search", () => {
 
     await user.click(screen.getByText("Source credibility notes"));
 
-    expect(openFileMock).toHaveBeenCalledWith("/tmp/source.md");
+    expect(openSearchResultMock).toHaveBeenCalledWith("/tmp/source.md");
+  });
+
+  it("passes a file:// source url through to the file bridge intact", async () => {
+    useSearchMock.mockReturnValue({
+      query: "source",
+      setQuery: setSearchQueryMock,
+      debouncedQuery: "source",
+      results: [{
+        id: "source-hit",
+        content: "Source credibility notes",
+        source: "local_files",
+        source_id: "source-1",
+        title: "source.md",
+        url: "file:///tmp/source.md",
+        chunk_index: 0,
+        last_modified: 0,
+        score: 0.9,
+      }],
+    });
+    const user = userEvent.setup();
+    renderMain();
+
+    await user.click(screen.getByText("Source credibility notes"));
+
+    expect(openSearchResultMock).toHaveBeenCalledWith("file:///tmp/source.md");
   });
 
   it("uses one Activity action instead of a Home and Activity segmented control", async () => {

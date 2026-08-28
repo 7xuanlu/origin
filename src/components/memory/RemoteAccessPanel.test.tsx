@@ -3,6 +3,7 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { i18n } from "../../i18n";
+import type { RemoteAccessStatus } from "../../lib/tauri";
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(() => Promise.resolve(() => {})),
@@ -53,11 +54,10 @@ function renderPanel() {
 }
 
 const CONNECTED = {
-  status: "connected" as const,
+  status: "connected",
   tunnel_url: "https://example.trycloudflare.com",
-  token: "secret-token",
   relay_url: null,
-};
+} satisfies RemoteAccessStatus;
 
 describe("RemoteAccessPanel", () => {
   beforeEach(() => {
@@ -216,9 +216,8 @@ describe("RemoteAccessPanel", () => {
     mocks.getRemoteAccessStatus.mockResolvedValue({
       status: "connected",
       tunnel_url: "https://example.trycloudflare.com",
-      token: "t",
       relay_url: "https://relay.example/abc",
-    });
+    } satisfies RemoteAccessStatus);
     renderPanel();
     await waitFor(() => {
       expect(screen.getAllByText("https://relay.example/abc")).toHaveLength(1);

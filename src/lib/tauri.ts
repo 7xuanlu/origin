@@ -228,6 +228,17 @@ export async function openFile(url: string): Promise<void> {
   return invoke("open_file", { path });
 }
 
+/**
+ * Open a search result's target. Unlike {@link openFile}, this does NOT strip
+ * a `file://` prefix — `open_search_result` refuses `file:` URLs on purpose,
+ * since the value came from a search result and is attacker-influenced (see
+ * the Rust command's doc comment). Local files reach it as bare paths, which
+ * it checks against an allowlist of indexed document types.
+ */
+export async function openSearchResult(url: string): Promise<void> {
+  return invoke("open_search_result", { url });
+}
+
 export interface SourceDirEntry {
   name: string;
   isDirectory: boolean;
@@ -2496,7 +2507,7 @@ export async function listAgentActivity(
 export type RemoteAccessStatus =
   | { status: "off" }
   | { status: "starting" }
-  | { status: "connected"; tunnel_url: string; token: string; relay_url: string | null }
+  | { status: "connected"; tunnel_url: string; relay_url: string | null }
   | { status: "error"; error: string };
 
 export async function toggleRemoteAccess(
@@ -2507,10 +2518,6 @@ export async function toggleRemoteAccess(
 
 export async function getRemoteAccessStatus(): Promise<RemoteAccessStatus> {
   return invoke<RemoteAccessStatus>("get_remote_access_status");
-}
-
-export async function rotateRemoteToken(): Promise<string> {
-  return invoke<string>("rotate_remote_token");
 }
 
 /** Result of a one-shot probe against the Remote MCP tunnel's `/health`. */
