@@ -41,20 +41,63 @@ const RELAY_URL: &str = "https://origin-relay.originmemory.workers.dev";
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Random bytes behind a relay ID. The ID is the whole of the protection on a
+/// public MCP endpoint: it is the path segment of the URL handed to Claude.ai
+/// and ChatGPT, and it is also what `register_with_relay` posts as `secret`.
+/// Anyone who can produce it can read and write the user's memory, so it has
+/// to be unguessable on its own. 16 bytes is 128 bits.
+const RELAY_ID_BYTES: usize = 16;
+
+/// The shape a relay ID has today: `u` then `RELAY_ID_BYTES` of lowercase hex.
+fn relay_id_is_current(id: &str) -> bool {
+    id.len() == 1 + RELAY_ID_BYTES * 2
+        && id.starts_with('u')
+        && id[1..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A relay ID from a CSPRNG.
+fn new_relay_id() -> Result<String, String> {
+    let mut buf = [0_u8; RELAY_ID_BYTES];
+    getrandom::getrandom(&mut buf)
+        .map_err(|e| format!("CSPRNG unavailable for the relay ID: {e}"))?;
+    let mut id = String::with_capacity(1 + RELAY_ID_BYTES * 2);
+    id.push('u');
+    for byte in buf {
+        id.push_str(&format!("{byte:02x}"));
+    }
+    Ok(id)
+}
+
 /// Get or create a persistent relay user ID.
 /// Stored in ~/.config/wenlan-mcp/relay_id
+///
+/// An ID that is not the current shape is replaced rather than reused. Before
+/// this, the ID was `u` plus 11 hex characters of a `DefaultHasher` over the
+/// wall clock and the process ID — a hash with fixed keys over two guessable
+/// inputs, truncated to 44 bits. Keeping such an ID would leave the endpoint
+/// it protects as reachable as it was. The cost is that Remote Access hands
+/// out a new URL once on those installs, so a saved connector has to be
+/// re-added; the feature is off by default and marked experimental.
 fn get_or_create_relay_id() -> Result<String, String> {
     let path = relay_id_path();
 
     match std::fs::read_to_string(&path) {
         Ok(id) => {
             let id = id.trim().to_string();
-            if !id.is_empty() {
+            if relay_id_is_current(&id) {
                 if let Some(parent) = path.parent() {
                     restrict_private_dir(parent, "relay_id")?;
                 }
                 restrict_private_file(&path, "relay_id")?;
                 return Ok(id);
+            }
+            if !id.is_empty() {
+                log::warn!(
+                    "[remote-access] replacing a relay ID that predates the CSPRNG; \
+                     Remote Access will hand out a new URL"
+                );
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -67,17 +110,7 @@ fn get_or_create_relay_id() -> Result<String, String> {
         }
     }
 
-    // Generate a short random ID
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    std::time::SystemTime::now().hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    let id = format!("u{:x}", hasher.finish())
-        .chars()
-        .take(12)
-        .collect::<String>();
-
+    let id = new_relay_id()?;
     write_private_file(&path, id.as_bytes(), "relay_id")?;
     Ok(id)
 }
@@ -2314,6 +2347,68 @@ mod tests {
         assert!(!id.is_empty());
         assert_eq!(file_mode(&path), 0o600);
         assert_eq!(file_mode(path.parent().unwrap()), 0o700);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_fresh_relay_id_has_128_bits_behind_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+
+        let id = get_or_create_relay_id().unwrap();
+
+        assert!(relay_id_is_current(&id), "unexpected shape: {id}");
+        assert_eq!(id.len(), 33, "u + 32 hex characters: {id}");
+    }
+
+    #[test]
+    fn two_relay_ids_do_not_collide() {
+        // A weak generator shows up here as a repeat. The old one hashed the
+        // wall clock and the process ID, so two IDs made in the same
+        // millisecond by the same process were the same string.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            assert!(seen.insert(new_relay_id().unwrap()), "repeated relay ID");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_relay_id_from_before_the_csprng_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let path = relay_id_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Exactly what the previous generator wrote: `u` plus 11 hex characters.
+        std::fs::write(&path, "u1a2b3c4d5e6").unwrap();
+
+        let id = get_or_create_relay_id().unwrap();
+
+        assert_ne!(id, "u1a2b3c4d5e6");
+        assert!(relay_id_is_current(&id), "unexpected shape: {id}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_current_relay_id_survives_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+
+        let first = get_or_create_relay_id().unwrap();
+        let second = get_or_create_relay_id().unwrap();
+
+        assert_eq!(first, second, "the URL must not change on every launch");
+    }
+
+    #[test]
+    fn relay_id_shape_rejects_the_old_and_the_malformed() {
+        assert!(!relay_id_is_current(""));
+        assert!(!relay_id_is_current("u1a2b3c4d5e6"));
+        assert!(!relay_id_is_current(&"u".repeat(33)));
+        assert!(!relay_id_is_current(&format!("u{}", "A".repeat(32))));
+        assert!(!relay_id_is_current(&format!("x{}", "0".repeat(32))));
+        assert!(relay_id_is_current(&format!("u{}", "0f".repeat(16))));
     }
 
     #[test]

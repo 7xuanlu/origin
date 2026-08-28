@@ -633,14 +633,125 @@ pub async fn rotate_remote_token(
 
 // ── File / open commands ──────────────────────────────────────────────
 
+/// What `open_file` will hand to the OS: a web page, a local file, or a bare
+/// filesystem path. Everything else is refused.
+///
+/// The value reaching here is not the app's own. `POST /api/ingest/webpage`
+/// and `/api/ingest/memory` store the caller's `url` verbatim
+/// (`crates/wenlan-server/src/ingest_routes.rs`), it rides out on every search
+/// result, and clicking a result calls this command with it — so any agent or
+/// page that can put a memory in the store chooses a string the desktop's
+/// scheme handlers will act on. `javascript:`, `data:`, `vbscript:` and the
+/// long tail of registered application schemes are all reachable that way.
+/// The other opener in the app, the Tauri shell plugin behind citation links,
+/// has been scheme-restricted all along by its default scope; this one was not.
+const OPENABLE_SCHEMES: [&str; 3] = ["http", "https", "file"];
+
+/// The URL scheme of `target`, lowercased, or `None` when it is a filesystem
+/// path.
+///
+/// A one-character scheme is read as a Windows drive letter (`C:\Users\...`),
+/// never as a scheme: RFC 3986 allows a single letter, but nothing registers
+/// one, and treating `C:` as a scheme would refuse every Windows path.
+fn target_scheme(target: &str) -> Option<String> {
+    let (head, _) = target.split_once(':')?;
+    if head.len() < 2 || head.contains('/') || head.contains('\\') {
+        return None;
+    }
+    let mut chars = head.chars();
+    if !chars.next()?.is_ascii_alphabetic() {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') {
+        return None;
+    }
+    Some(head.to_ascii_lowercase())
+}
+
 /// Hand `path` — a filesystem path or a URL, both of which callers pass — to
 /// the desktop's default handler via the `open` crate rather than a hand-built
 /// per-OS argv: its Windows launcher never routes the path through `cmd.exe`
 /// (so a filename containing shell metacharacters cannot inject a second
-/// command), and it covers macOS/Linux/BSD the same way.
+/// command), and it covers macOS/Linux/BSD the same way. A URL scheme outside
+/// `OPENABLE_SCHEMES` is refused before it gets there.
+/// `Ok(())` when `open_file` may hand `target` to the OS. This is the whole of
+/// the decision, kept out of `open_file` so the tests below exercise the same
+/// code the command runs rather than a copy of its reasoning.
+fn refuse_unopenable_target(target: &str) -> Result<(), String> {
+    match target_scheme(target) {
+        Some(scheme) if !OPENABLE_SCHEMES.contains(&scheme.as_str()) => Err(format!(
+            "Refusing to open a \"{scheme}:\" link. Wenlan opens web pages and local files."
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[tauri::command]
 pub async fn open_file(path: String) -> Result<(), String> {
+    refuse_unopenable_target(&path)?;
     open::that_detached(&path).map_err(|e| format!("Failed to open file: {}", e))
+}
+
+#[cfg(test)]
+mod open_target_tests {
+    use super::{refuse_unopenable_target, target_scheme};
+
+    fn allowed(target: &str) -> bool {
+        refuse_unopenable_target(target).is_ok()
+    }
+
+    #[test]
+    fn filesystem_paths_have_no_scheme() {
+        for path in [
+            "/Users/someone/notes/a.md",
+            "./relative/file.txt",
+            "C:\\Users\\someone\\a.md",
+            "\\\\server\\share\\a.md",
+            "/Users/someone/notes/12:30 meeting.md",
+        ] {
+            assert_eq!(target_scheme(path), None, "{path}");
+            assert!(allowed(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn web_and_file_urls_are_opened() {
+        for url in [
+            "https://example.com/a",
+            "http://example.com/a",
+            "file:///Users/someone/a.md",
+            "HTTPS://Example.com/A",
+        ] {
+            assert!(allowed(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_memory_url_cannot_reach_another_scheme() {
+        for url in [
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "data:text/html;base64,PHNjcmlwdD4=",
+            "vbscript:msgbox(1)",
+            "smb://attacker.example/share",
+            "ftp://example.com/a",
+            "mailto:someone@example.com",
+            "x-apple-helpbasic://x",
+            "ms-msdt:/id",
+        ] {
+            assert!(!allowed(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_says_which_scheme_and_what_is_allowed() {
+        let message = refuse_unopenable_target("JavaScript:alert(1)").unwrap_err();
+
+        assert_eq!(
+            message,
+            "Refusing to open a \"javascript:\" link. Wenlan opens web pages and local files."
+        );
+    }
 }
 
 #[derive(serde::Serialize)]
