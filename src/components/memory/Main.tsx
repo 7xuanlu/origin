@@ -3,10 +3,11 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import {
   listMemoriesRich,
   listSpaces,
-  openFile,
+  openSearchResult as openSearchResultTarget,
   searchEntities,
   searchPages,
   type Page,
@@ -517,7 +518,11 @@ export default function Main({
     if (target.kind === "page") {
       navigateTo({ kind: "page", pageId: target.pageId });
     } else if (target.kind === "file") {
-      await openFile(target.url);
+      try {
+        await openSearchResultTarget(target.url);
+      } catch (err) {
+        toast.error(String(err));
+      }
     } else {
       navigateTo({ kind: "memory", sourceId: result.source_id });
     }

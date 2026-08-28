@@ -646,7 +646,11 @@ function FileDetail({
           </div>
           <div className="shrink-0">
             <button
-              onClick={() => openFile(node.path)}
+              onClick={() =>
+                openFile(node.path).catch((err) =>
+                  toast("Couldn't open file", { description: String(err) })
+                )
+              }
               className="rounded-md transition-colors duration-150 hover:bg-[var(--mem-hover)]"
               style={{
                 padding: "6px 13px",
